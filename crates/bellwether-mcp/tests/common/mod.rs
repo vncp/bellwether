@@ -160,16 +160,30 @@ pub const CLOCK: &str = "2026-10-24T12:00:00.000Z";
 
 /// A server over `data` with a fixed clock and `budget`.
 pub fn server_with(data: &Path, budget: bellwether_mcp::Budget) -> bellwether_mcp::Server {
+    server_at(data, budget, Some(CLOCK))
+}
+
+/// A server over `data` with `budget`, under `clock` (`None`: the system
+/// clock, so two records written at different moments differ).
+pub fn server_at(
+    data: &Path,
+    budget: bellwether_mcp::Budget,
+    clock: Option<&str>,
+) -> bellwether_mcp::Server {
     bellwether_mcp::Server::new(&bellwether_mcp::Config {
         root: data.to_str().unwrap().to_string(),
         engine: bellwether::EngineOptions {
-            clock: Some(CLOCK.into()),
+            clock: clock.map(str::to_string),
             ..bellwether::EngineOptions::default()
         },
         budget,
     })
     .unwrap()
 }
+
+/// Write-nothing tests run under both: a fixed clock makes a rewritten
+/// record byte-identical to the one already stored and could hide a write.
+pub const CLOCKS: [Option<&str>; 2] = [Some(CLOCK), None];
 
 /// A server over `data` with a fixed clock and the default budget.
 pub fn server(data: &Path) -> bellwether_mcp::Server {

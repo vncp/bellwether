@@ -28,9 +28,9 @@ use bellwether_build::{BuildOptions, Builder};
 use bellwether_replay::{proposed_specs, Replayer, Workload};
 use bellwether_store::{parse_rfc3339, Cache, ObjectStoreBackend};
 use bellwether_types::{
-    format, Certificate, Coverage, Error, Evidence, EvidenceBody, FileFingerprint, Hash, KeySpec,
-    Proposal, ProposalBody, Provenance, Receipt, Record, Result, RowGroupMeta, ScanEntry, ScanPlan,
-    Source,
+    format, Certificate, Coverage, Error, Evidence, EvidenceBody, FileFingerprint, Hash, HashKind,
+    KeySpec, Proposal, ProposalBody, Provenance, Receipt, Record, Result, RowGroupMeta, ScanEntry,
+    ScanPlan, Source,
 };
 use bellwether_verify::{
     AgedInput, CertificateContext, CoverageRequest, ManifestAnchor, Options, ReconcileSpec,
@@ -257,19 +257,31 @@ impl Engine {
         guard(|| self.apply_certificate(certificate, true))
     }
 
-    /// Reads a record. With `existing_only`, never creates the index
-    /// location: an absent one holds no record.
-    fn read(&self, hash: &Hash, existing_only: bool) -> Result<Written> {
-        if !existing_only {
-            return self.get(hash);
-        }
-        let Some(store) = self.existing_store()? else {
-            return Err(Error::NotFound(*hash));
-        };
-        let record = bellwether_ledger::Ledger::new(Arc::clone(store)).get(hash)?;
-        Ok(Written {
+    /// Reads the record `hash` names, given as `kind`. With
+    /// `existing_only`, never creates the index location: an absent one
+    /// holds no record.
+    fn read(&self, hash: &Hash, kind: HashKind, existing_only: bool) -> Result<Written> {
+        let not_found = || Error::RecordNotFound {
+            kind,
             hash: *hash,
-            record,
+            place: format!("the ledger at {}", self.index_location()),
+        };
+        let read = if existing_only {
+            let Some(store) = self.existing_store()? else {
+                return Err(not_found());
+            };
+            bellwether_ledger::Ledger::new(Arc::clone(store))
+                .get(hash)
+                .map(|record| Written {
+                    hash: *hash,
+                    record,
+                })
+        } else {
+            self.get(hash)
+        };
+        read.map_err(|e| match e {
+            Error::NotFound(h) if h == *hash => not_found(),
+            other => other,
         })
     }
 
@@ -278,14 +290,7 @@ impl Engine {
     }
 
     fn proposal_read(&self, hash: &Hash, existing_only: bool) -> Result<(Written, Proposal)> {
-        let w = self.read(hash, existing_only).map_err(|e| match e {
-            Error::NotFound(h) => Error::Other(format!(
-                "proposal {h} is not in the ledger at {}; pass a hash `bellwether propose` or \
-                 `bellwether why` printed",
-                self.index_location()
-            )),
-            other => other,
-        })?;
+        let w = self.read(hash, HashKind::Proposal, existing_only)?;
         match &w.record {
             Record::Proposal(p) => {
                 let p = p.clone();
@@ -293,10 +298,8 @@ impl Engine {
             }
             _ => Err(Error::WrongKind {
                 hash: *hash,
-                expected: "a proposal".into(),
+                expected: HashKind::Proposal,
                 found: w.kind().with_article().into(),
-                next: "pass a proposal hash `bellwether propose` or `bellwether why` printed"
-                    .into(),
             }),
         }
     }
@@ -330,12 +333,18 @@ impl Engine {
                 Ok(result)
             }
             ProposalBody::Key { spec } => {
-                let workload_hash = req.workload.ok_or_else(|| {
-                    Error::Other(
-                        "a key proposal is scored on a recorded workload; pass --workload <hash> \
-                         (bellwether why prints it)"
-                            .into(),
-                    )
+                // A key already complete has nothing to apply: refused
+                // before anything is scored, so the refusal writes nothing.
+                if !req.verify_only && complete(pinned.as_ref(), spec) {
+                    result.outcome = refused(Refusal::NothingToApply {
+                        sequence: before.to_string(),
+                    });
+                    return Ok(result);
+                }
+                let workload_hash = req.workload.ok_or(Error::NoWorkload {
+                    proposal: "key",
+                    field: "workload",
+                    needs: "a recorded workload (the keys a slow lookup ran)",
                 })?;
                 let source = self.source(pinned.as_ref())?;
                 let replayer = replayer(self, &*source, pinned.as_ref())?;
@@ -392,12 +401,10 @@ impl Engine {
                         .into(),
                 });
                 result.invariant = Some(shape.invariant.clone());
-                let outputs = req.rewrite.as_ref().ok_or_else(|| {
-                    Error::Other(
-                        "a rewrite proposal is verified on the outputs before and after it; pass \
-                         --before-output <dir> --after-output <dir> --key <cols>"
-                            .into(),
-                    )
+                let outputs = req.rewrite.as_ref().ok_or(Error::NoWorkload {
+                    proposal: "rewrite",
+                    field: "rewrite",
+                    needs: "the outputs before and after it",
                 })?;
                 let (cert, verification) = self.verify_rewrite(hash, outputs, pinned.as_ref())?;
                 result.verification = Some(verification);
@@ -418,13 +425,12 @@ impl Engine {
     /// Apply and attest a certificate written earlier: every check runs
     /// before anything is written, and the replay is recomputed now.
     fn apply_certificate(&self, cert_hash: &Hash, dry_run: bool) -> Result<FixResult> {
-        let w = self.read(cert_hash, dry_run)?;
+        let w = self.read(cert_hash, HashKind::Certificate, dry_run)?;
         let Record::Certificate(certificate) = &w.record else {
             return Err(Error::WrongKind {
                 hash: *cert_hash,
-                expected: "a certificate".into(),
+                expected: HashKind::Certificate,
                 found: w.kind().with_article().into(),
-                next: "pass the certificate hash `bellwether fix --verify-only` printed".into(),
             });
         };
         let certificate = certificate.clone();
@@ -468,6 +474,14 @@ impl Engine {
                 result.invariant = Some(shape.invariant.clone());
                 result.outcome = refused(Refusal::NoReplay {
                     certificate: *cert_hash,
+                });
+            }
+            // Already complete: the apply would commit nothing. Refused
+            // here, before the replay is scored, so the dry run and the
+            // real apply agree and the refusal writes nothing.
+            ProposalBody::Key { spec } if complete(self.pin()?.as_ref(), spec) => {
+                result.outcome = refused(Refusal::NothingToApply {
+                    sequence: before.to_string(),
                 });
             }
             ProposalBody::Key { .. } if dry_run => {
@@ -547,16 +561,24 @@ impl Engine {
     ) -> Result<(Written, Written, Reconciliation)> {
         let specs = proposed_specs(replayer.current_specs(), spec);
         let runs = workload.runs();
-        let columns = runs
-            .first()
-            .map(|r| r.columns.clone())
-            .ok_or_else(|| Error::Other("the workload records no run, so there is nothing to verify; record keys with `bellwether why --from`".into()))?;
+        let columns =
+            runs.first()
+                .map(|r| r.columns.clone())
+                .ok_or_else(|| Error::InvalidArgument {
+                    field: "workload",
+                    reason:
+                        "the workload records no run, so there is nothing to verify; record one \
+                         from the keys a slow lookup ran"
+                            .into(),
+                })?;
         if runs.iter().any(|r| r.columns != columns) {
-            return Err(Error::Other(
-                "the workload's runs look up different key columns; fix verifies one key-column \
-                 set at a time, so record a workload whose runs share their key columns"
+            return Err(Error::InvalidArgument {
+                field: "workload",
+                reason: "the workload's runs look up different key columns; verify checks one \
+                         key-column set at a time, so record a workload whose runs share their \
+                         key columns"
                     .into(),
-            ));
+            });
         }
         // The hypothetical plan: per run, the plan under the current specs
         // plus the proposed one (transient segments for the latter), united.
@@ -898,6 +920,12 @@ fn refused(refusal: Refusal) -> FixOutcome {
     FixOutcome::Refused { refusal }
 }
 
+/// Whether `spec` is complete at the pinned manifest: applying it would
+/// commit nothing.
+fn complete(pinned: Option<&Pinned>, spec: &KeySpec) -> bool {
+    pinned.is_some_and(|p| p.planner.completeness(spec).is_some())
+}
+
 fn not_workload_covered(cert_hash: &Hash) -> Error {
     Error::LedgerRule(format!(
         "certificate {cert_hash} does not cover a recorded workload, so the key proposal it \
@@ -948,29 +976,41 @@ fn replayer<'a>(
     }
 }
 
-fn load_workload(
+/// The recorded workload `hash`: absent is [`Error::RecordNotFound`];
+/// present but unreadable names the workload and the cause.
+pub(crate) fn load_workload(
     engine: &Engine,
     cache: &Cache<ObjectStoreBackend>,
     hash: &Hash,
 ) -> Result<Workload> {
-    Workload::load(cache, hash).map_err(|e| {
-        Error::Other(format!(
-            "workload {hash} is not in the cache at {} ({e}); record it with `bellwether why \
-             --from <keys.parquet>`",
+    Workload::load(cache, hash).map_err(|e| match e {
+        Error::NotFound(h) if h == *hash => Error::RecordNotFound {
+            kind: HashKind::Workload,
+            hash: *hash,
+            place: format!("the cache at {}", engine.index_location()),
+        },
+        other => Error::Other(format!(
+            "workload {hash} in the cache at {} cannot be read ({other}); record it again from \
+             the keys a slow lookup ran",
             engine.index_location()
-        ))
+        )),
     })
 }
 
+/// A rewrite output folder the caller named, canonical.
 fn canonical_dir(p: &str) -> Result<String> {
+    let invalid = |reason: String| Error::InvalidArgument {
+        field: "rewrite",
+        reason,
+    };
     let c = std::fs::canonicalize(p).map_err(|e| {
-        Error::Source(format!(
+        invalid(format!(
             "cannot open the output {p:?} ({e}); pass an existing folder"
         ))
     })?;
     c.to_str()
         .map(ToString::to_string)
-        .ok_or_else(|| Error::Source(format!("{} is not valid UTF-8", c.display())))
+        .ok_or_else(|| invalid(format!("{} is not valid UTF-8", c.display())))
 }
 
 /// The united hypothetical plan as a `ScanPlan`, with each entry's bytes

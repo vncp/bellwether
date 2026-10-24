@@ -109,17 +109,64 @@ pub enum Error {
         message: String,
     },
     /// A hash resolved to a record of another kind than the operation takes
-    /// (for example a proposal hash where a certificate is applied).
-    #[error("{hash} is {found}, not {expected}; {next}")]
+    /// (for example a proposal hash where a certificate is applied). Each
+    /// surface says what to pass instead, by `expected`.
+    #[error("{hash} is {found}, not {}", .expected.with_article())]
     WrongKind {
         /// The hash given.
         hash: Hash,
-        /// The kind the operation takes, with its article ("a certificate").
-        expected: String,
+        /// The kind the operation takes.
+        expected: HashKind,
         /// The kind found, with its article ("a proposal").
         found: String,
-        /// What to pass instead.
-        next: String,
+    },
+    /// A hash the caller named is not where the operation looked: no such
+    /// record in the ledger, or no such workload in the cache. Each surface
+    /// says which argument to fix, by `kind`.
+    #[error("{kind} {hash} is not in {place}")]
+    RecordNotFound {
+        /// What the hash was given as.
+        kind: HashKind,
+        /// The hash given.
+        hash: Hash,
+        /// Where the operation looked ("the ledger at …", "the cache at …").
+        place: String,
+    },
+    /// Scoring or verifying a proposal needs input that was not given: a
+    /// recorded workload for a key, the outputs before and after it for a
+    /// rewrite.
+    #[error("a {proposal} proposal is verified on {needs}, and none was given")]
+    NoWorkload {
+        /// The proposal kind: "key" or "rewrite".
+        proposal: &'static str,
+        /// The request field that carries it: "workload" or "rewrite".
+        field: &'static str,
+        /// What it is, in words.
+        needs: &'static str,
+    },
+    /// A lookup needs an index the data folder does not have: no index at
+    /// all (`needs: None`), or no complete key spec of the kind it plans
+    /// with (`needs` names it).
+    #[error("{}", not_indexed(root, operation, needs.as_deref()))]
+    NotIndexed {
+        /// The data root.
+        root: String,
+        /// The operation refused ("locate", "asof").
+        operation: &'static str,
+        /// The key spec it needs, when an index exists but lacks it.
+        needs: Option<String>,
+    },
+    /// An argument is well-formed but cannot be used: an empty proposer, no
+    /// evidence cited, an instant that is not one, a key file that cannot be
+    /// read. `field` is the request field's name; `reason` says what is
+    /// wrong in words that name no surface's flag.
+    #[error("{reason}")]
+    InvalidArgument {
+        /// The request field: `by`, `evidence`, `at`, `keys`, `key_columns`,
+        /// `cluster_by`, `shape`, `workload`, `rewrite`.
+        field: &'static str,
+        /// What is wrong with it, and what a usable value looks like.
+        reason: String,
     },
     /// Serialization failure.
     #[error("serde error: {0}")]
@@ -131,6 +178,65 @@ pub enum Error {
 
 /// Result alias used throughout the engine.
 pub type Result<T> = std::result::Result<T, Error>;
+
+/// What a hash given to an operation names. Errors about a hash carry it,
+/// so each surface (the CLI's flags, the MCP server's fields) can say which
+/// argument to fix without reading a message.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum HashKind {
+    /// An Evidence record.
+    Evidence,
+    /// A Proposal record.
+    Proposal,
+    /// A Certificate record.
+    Certificate,
+    /// A Receipt record.
+    Receipt,
+    /// A recorded workload (a cache entry, not a ledger record).
+    Workload,
+}
+
+impl HashKind {
+    /// The kind's name: `evidence`, `proposal`, `certificate`, `receipt`,
+    /// `workload`.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Evidence => "evidence",
+            Self::Proposal => "proposal",
+            Self::Certificate => "certificate",
+            Self::Receipt => "receipt",
+            Self::Workload => "workload",
+        }
+    }
+
+    /// The name with its article: "an evidence record", "a proposal".
+    #[must_use]
+    pub fn with_article(self) -> &'static str {
+        match self {
+            Self::Evidence => "an evidence record",
+            Self::Proposal => "a proposal",
+            Self::Certificate => "a certificate",
+            Self::Receipt => "a receipt",
+            Self::Workload => "a workload",
+        }
+    }
+}
+
+impl fmt::Display for HashKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+fn not_indexed(root: &str, operation: &str, needs: Option<&str>) -> String {
+    match needs {
+        None => format!("{root} is not indexed, so {operation} has no index to plan with"),
+        Some(spec) => format!(
+            "{root} has no complete {spec} key spec, so {operation} has no index to plan with"
+        ),
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Identity and hashing

@@ -4,7 +4,9 @@
 //! certificate, one computed against an older manifest, and a hash that is
 //! not a certificate, each with its typed code and nothing written; dry runs
 //! write nothing; the success path writes a Receipt whose explain chain is
-//! intact; refusals carry codes, facts, and a next line.
+//! intact; refusals carry codes, facts, and a next line. Every test that
+//! asserts nothing was written runs under a fixed clock and under the
+//! system clock, so a rewrite of an identical record cannot hide a write.
 
 #![allow(
     clippy::unwrap_used,
@@ -20,8 +22,8 @@ use std::path::{Path, PathBuf};
 
 use bellwether_mcp::{Budget, Status};
 use common::{
-    code, delta, finish, json, ledger_corpus, objects, ok, server, server_with, write_file,
-    write_keys,
+    code, delta, finish, json, ledger_corpus, objects, ok, server, server_at, write_file,
+    write_keys, CLOCKS,
 };
 use serde_json::{json, Value};
 
@@ -55,8 +57,14 @@ fn s(p: &Path) -> &str {
 /// envelope.
 #[test]
 fn the_loop_through_the_tools_ends_in_an_intact_receipt() {
+    for clock in CLOCKS {
+        the_loop(clock);
+    }
+}
+
+fn the_loop(clock: Option<&str>) {
     let f = folder();
-    let srv = server(&f.data);
+    let srv = server_at(&f.data, Budget::default(), clock);
 
     let before = objects(&f.index);
     let why = ok(&srv, "observe.why", json!({}));
@@ -69,6 +77,9 @@ fn the_loop_through_the_tools_ends_in_an_intact_receipt() {
         .any(|c| c.hash.to_hex() == ev && c.kind == "evidence"));
     let (kinds, _) = delta(&before, &objects(&f.index));
     assert_eq!(kinds, vec!["evidence"], "observe writes Evidence only");
+    // Under the system clock, the next profile Evidence is a millisecond
+    // later at least, so it is a distinct record.
+    std::thread::sleep(std::time::Duration::from_millis(5));
 
     let before = objects(&f.index);
     let scored = ok(
@@ -79,9 +90,15 @@ fn the_loop_through_the_tools_ends_in_an_intact_receipt() {
     let sv = json(&scored);
     let workload = sv["workload"]["hash"].as_str().unwrap().to_string();
     let (kinds, _) = delta(&before, &objects(&f.index));
-    // The profile Evidence is the same record observe.why wrote (fixed
-    // clock), so only the engine's Proposals and Replays are new.
-    assert_eq!(kinds, vec!["proposal", "replay"]);
+    // Under a fixed clock the profile Evidence is the same record
+    // observe.why wrote, so only the engine's Proposals and Replays are new;
+    // under the system clock it is a new Evidence.
+    let expected = if clock.is_some() {
+        vec!["proposal", "replay"]
+    } else {
+        vec!["evidence", "proposal", "replay"]
+    };
+    assert_eq!(kinds, expected, "[clock={clock:?}]");
     assert!(scored.envelope.budget.spent.replays >= 1);
 
     let before = objects(&f.index);
@@ -105,11 +122,13 @@ fn the_loop_through_the_tools_ends_in_an_intact_receipt() {
         .as_str()
         .unwrap()
         .to_string();
-    assert_eq!(
-        p,
-        json(&dry)["proposal"]["hash"].as_str().unwrap(),
-        "dry run predicts the hash"
-    );
+    if clock.is_some() {
+        assert_eq!(
+            p,
+            json(&dry)["proposal"]["hash"].as_str().unwrap(),
+            "dry run predicts the hash under a fixed clock"
+        );
+    }
 
     let verified = ok(
         &srv,
@@ -172,23 +191,32 @@ fn the_loop_through_the_tools_ends_in_an_intact_receipt() {
     let card: Value =
         serde_json::from_str(&srv.resource(bellwether_mcp::SCORECARD).unwrap()).unwrap();
     assert!(!card["rules"].as_array().unwrap().is_empty());
-    // observe.profile is the findings view, and mentions the receipt with
-    // its chain.
+    // observe.profile is the findings view. Under a fixed clock its newest
+    // profile Evidence is the one the receipt cites, so it mentions the
+    // receipt with its chain; under the system clock score.why wrote a newer
+    // one, which no receipt cites yet.
     let profile = ok(&srv, "observe.profile", json!({}));
     assert_eq!(json(&profile), findings);
-    assert!(profile
+    let mentioned = profile
         .envelope
         .chains
         .iter()
-        .any(|c| c.receipt.to_hex() == receipt && c.intact));
+        .any(|c| c.receipt.to_hex() == receipt && c.intact);
+    assert_eq!(mentioned, clock.is_some(), "[clock={clock:?}]");
 }
 
 /// A `score` field anywhere in a propose tool's arguments is rejected by the
 /// schema, top level or nested, and nothing is written.
 #[test]
 fn a_score_cannot_be_smuggled_into_any_propose_tool() {
+    for clock in CLOCKS {
+        no_smuggled_score(clock);
+    }
+}
+
+fn no_smuggled_score(clock: Option<&str>) {
     let f = folder();
-    let srv = server(&f.data);
+    let srv = server_at(&f.data, Budget::default(), clock);
     let why = ok(&srv, "observe.why", json!({}));
     let ev = json(&why)["evidence"]["hash"].as_str().unwrap().to_string();
     let before = objects(&f.index);
@@ -254,8 +282,14 @@ fn a_score_cannot_be_smuggled_into_any_propose_tool() {
 /// typed code, and writes nothing.
 #[test]
 fn apply_refuses_unverified_applies_and_writes_nothing() {
+    for clock in CLOCKS {
+        apply_refuses(clock);
+    }
+}
+
+fn apply_refuses(clock: Option<&str>) {
     let f = folder();
-    let srv = server(&f.data);
+    let srv = server_at(&f.data, Budget::default(), clock);
     let why = ok(&srv, "observe.why", json!({}));
     let ev = json(&why)["evidence"]["hash"].as_str().unwrap().to_string();
 
@@ -366,8 +400,14 @@ fn apply_refuses_unverified_applies_and_writes_nothing() {
 /// lists, no workload, and the session budget.
 #[test]
 fn refusals_carry_codes_facts_and_next() {
+    for clock in CLOCKS {
+        refusals(clock);
+    }
+}
+
+fn refusals(clock: Option<&str>) {
     let f = folder();
-    let srv = server(&f.data);
+    let srv = server_at(&f.data, Budget::default(), clock);
     let why = ok(&srv, "observe.why", json!({}));
     let ev = json(&why)["evidence"]["hash"].as_str().unwrap().to_string();
     let before = objects(&f.index);
@@ -414,12 +454,13 @@ fn refusals_carry_codes_facts_and_next() {
     // A budget of one replay: score.why spends it, the next scoring call is
     // refused before anything runs.
     let g = folder();
-    let tight = server_with(
+    let tight = server_at(
         &g.data,
         Budget {
             replays: 1,
             ..Budget::default()
         },
+        clock,
     );
     ok(
         &tight,

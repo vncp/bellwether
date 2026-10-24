@@ -23,15 +23,18 @@ fail if the two differ.
    want to see the Proposal without writing it. A proposal has no score
    field; anything that looks like one is rejected by the schema.
 4. **Ask the engine to score and verify.** Call `score.verify` with the
-   proposal hash (and `workload` for a key, the before and after outputs for
-   a rewrite). The engine replays the workload, reconciles the plan against a
-   full scan, and writes a Certificate, passing or failing. A long run
-   returns a job id; poll `jobs.status` and read `jobs.result`.
+   proposal hash (and `workload` for a key, the before and after outputs in
+   `rewrite` for a rewrite). The engine replays the workload, reconciles the
+   plan against a full scan, and writes a Certificate, passing or failing. A
+   long run returns a job id; poll `jobs.status` and read `jobs.result`.
+   Calling the same request again returns the same job, and once it has
+   finished, its stored result; pass `wait: true` to run it again now.
 5. **Apply.** Call `apply.receipt` with the certificate hash, after an
-   optional `dry_run: true`. The engine refuses unverified applies: a failing
-   certificate, a certificate computed against an older manifest, or data
-   that changed since verification is refused with a typed code and nothing
-   is written. On success it returns the Receipt.
+   optional `dry_run: true`, which runs the same checks and gives the same
+   answer. The engine refuses unverified applies: a failing certificate, a
+   certificate computed against an older manifest, data that changed since
+   verification, or a key that is already complete is refused with a typed
+   code before anything is written. On success it returns the Receipt.
 6. **Report.** Quote the receipt hash to the human verbatim, with the
    predicted and realized bytes. `bellwether receipt show <hash>` (or the
    `explain` chain in the result) shows every record behind it.
@@ -48,7 +51,7 @@ already holds.
 | observe | `observe.why` (no keys), `observe.profile`, `observe.locate`, `observe.asof` | Evidence and cache entries only |
 | score (engine-scored) | `score.why` (with keys or a workload), `score.verify` | engine Proposals, Replays, plan Evidence, Certificates |
 | propose | `propose.key`, `propose.layout`, `propose.rewrite` | one Proposal, or nothing with `dry_run` |
-| apply | `apply.receipt` | Replay, the index commit, Receipt; nothing with `dry_run` or on a refusal |
+| apply | `apply.receipt` | Replay, the index commit, Receipt; nothing with `dry_run` or on a refusal, unless another commit lands during the apply (`concurrent_commit`: the key is built, the receipt withheld) |
 | jobs | `jobs.start`, `jobs.status`, `jobs.result` | whatever the started tool writes |
 
 ## Refusal codes
@@ -62,17 +65,19 @@ line. No refusal is prose only.
 | `stale_manifest` | The certificate was computed against an older manifest. Call `score.verify` again. |
 | `data_changed` | Files changed after verification. Call `score.verify` again. |
 | `concurrent_commit` | Another commit landed during the apply; the key is built but not attested. Tell the human. |
-| `nothing_to_apply` | The key is already complete; there is nothing to attest. |
+| `nothing_to_apply` | The key is already complete; there is nothing to apply or attest. |
 | `layout_not_applicable` | Layout proposals cannot be applied in this release. |
 | `no_replay` | A rewrite verified but cannot be attested yet (rewrites have no replay). |
 | `reserved_proposer` | The name in `by` is reserved for the engine. Pass your own name. |
-| `no_workload` | Scoring needs keys, a recorded workload hash, or rewrite outputs. |
+| `no_workload` | Scoring needs input that was not given: `keys` or a recorded `workload` for `score.why`, `workload` for a key proposal, `rewrite` outputs for a rewrite; `fields.field` names it. |
 | `stale_index` | Files landed, changed, or vanished since the index was built; `fields` lists them. Ask the human to run `bellwether index`. |
-| `wrong_kind` | The hash is a record of another kind than the tool takes. Pass the hash the earlier step printed. |
-| `not_found` | The hash is not in this ledger. |
+| `not_indexed` | The lookup needs an index the folder does not have (none at all, or no complete key spec of the kind it plans with, in `fields.needs`). Ask the human to index the folder. |
+| `wrong_kind` | The hash is a record of another kind than the tool takes; `fields.field` names the argument. Pass the hash the earlier step printed. |
+| `not_found` | The hash is not in this ledger (or, for a workload, the cache); `fields.kind` and `fields.field` say which argument. |
 | `invalid_input` | The arguments do not match the tool's schema (an unknown field such as `score` included). |
+| `invalid_argument` | An argument matches the schema but cannot be used (an empty `by`, no `evidence`, an `at` that is not an instant, an unreadable `keys` file); `fields.field` names it. |
 | `invalid_spec` | The key spec or a column is not valid for this dataset. |
-| `budget_exceeded` | This session spent its replay, rows, or wall-time budget. Stop and ask the human. |
+| `budget_exceeded` | This session spent its replay, rows, or wall-time budget. Stop and ask the human. Every tool call is charged its wall time; score and apply calls run one at a time against the budget. |
 | `job_not_found` | No job has that id in this session. |
 | `job_running` | The job has not finished; poll `jobs.status`. |
 | `unknown_tool` | No tool has that name. |

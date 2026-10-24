@@ -123,7 +123,7 @@ impl Engine {
                 LookupKind::Locate,
             ),
             Mode::Latest => {
-                serving_temporal(&specs, &columns)?;
+                serving_temporal(self.root(), verb, &specs, &columns)?;
                 (
                     Lookup::Latest {
                         columns: columns.clone(),
@@ -133,7 +133,7 @@ impl Engine {
                 )
             }
             Mode::Asof(at) => {
-                let ts_column = serving_temporal(&specs, &columns)?;
+                let ts_column = serving_temporal(self.root(), verb, &specs, &columns)?;
                 let ts_type = pinned
                     .planner
                     .column_types(std::slice::from_ref(&ts_column))?
@@ -156,10 +156,7 @@ impl Engine {
         };
         let plan = pinned.planner.plan(&specs, &lookup).map_err(|e| {
             if specs.is_empty() && !excluded.is_empty() {
-                Error::KeySpec(format!(
-                    "{e}; the declared specs are not complete yet, run `bellwether index` to \
-                     finish them"
-                ))
+                not_complete_yet(self.root(), verb, &excluded)
             } else {
                 e
             }
@@ -278,9 +275,31 @@ pub(crate) fn stale_index(root: &str, verb: &str, c: &FolderChanges) -> Error {
     }
 }
 
+/// The lookup's refusal when key specs are declared but none is complete
+/// yet: there is nothing to plan with until the index finishes them.
+fn not_complete_yet(root: &str, operation: &'static str, excluded: &[KeySpec]) -> Error {
+    Error::NotIndexed {
+        root: root.to_string(),
+        operation,
+        needs: Some(
+            excluded
+                .iter()
+                .map(KeySpec::name)
+                .collect::<Vec<_>>()
+                .join(", "),
+        ),
+    }
+}
+
 /// The timestamp column of the one complete temporal spec whose columns are
-/// all key columns; none or several is an error naming what to do.
-fn serving_temporal(specs: &[KeySpec], columns: &[String]) -> Result<String> {
+/// all key columns. None is [`Error::NotIndexed`]; several is an
+/// ambiguous `key_columns`.
+fn serving_temporal(
+    root: &str,
+    operation: &'static str,
+    specs: &[KeySpec],
+    columns: &[String],
+) -> Result<String> {
     let mut found = specs.iter().filter_map(|s| match s {
         KeySpec::Temporal {
             columns: c,
@@ -290,15 +309,18 @@ fn serving_temporal(specs: &[KeySpec], columns: &[String]) -> Result<String> {
     });
     match (found.next(), found.next()) {
         (Some(ts), None) => Ok(ts),
-        (None, _) => Err(Error::KeySpec(format!(
-            "no complete temporal key spec serves a lookup on {columns:?}; run `bellwether index \
-             --key temporal:{}@<timestamp column>` first",
-            columns.join(",")
-        ))),
-        (Some(_), Some(_)) => Err(Error::KeySpec(format!(
-            "more than one temporal key spec serves a lookup on {columns:?}; name the key \
-             columns of exactly one"
-        ))),
+        (None, _) => Err(Error::NotIndexed {
+            root: root.to_string(),
+            operation,
+            needs: Some(format!("temporal:{}@<timestamp column>", columns.join(","))),
+        }),
+        (Some(_), Some(_)) => Err(Error::InvalidArgument {
+            field: "key_columns",
+            reason: format!(
+                "more than one temporal key spec serves a lookup on {columns:?}; name the key \
+                 columns of exactly one"
+            ),
+        }),
     }
 }
 
@@ -349,21 +371,25 @@ fn instant_in_unit(at: &str, ts_column: &str, ts_type: &DataType) -> Result<i64>
             | DataType::UInt64
     );
     if integer_column {
-        return Err(Error::KeySpec(format!(
-            "{ts_column} is an integer column ({ts_type}), so --at must be an integer in its \
-             unit, not {at:?}"
-        )));
+        return Err(Error::InvalidArgument {
+            field: "at",
+            reason: format!(
+                "{ts_column} is an integer column ({ts_type}), so the instant must be an integer \
+                 in its unit, not {at:?}"
+            ),
+        });
     }
     let instant = if at.len() == 10 && at.as_bytes().get(4) == Some(&b'-') {
         format!("{at}T00:00:00Z")
     } else {
         at.to_string()
     };
-    let parsed = parse_rfc3339(&instant).map_err(|_| {
-        Error::KeySpec(format!(
-            "--at {at:?} is neither an RFC 3339 instant (2026-03-03T00:00:00Z), a date \
+    let parsed = parse_rfc3339(&instant).map_err(|_| Error::InvalidArgument {
+        field: "at",
+        reason: format!(
+            "the instant {at:?} is neither an RFC 3339 instant (2026-03-03T00:00:00Z), a date \
              (2026-03-03), nor an integer in {ts_column}'s unit"
-        ))
+        ),
     })?;
     let nanos = i128::from(parsed.timestamp()) * 1_000_000_000
         + i128::from(parsed.timestamp_subsec_nanos());
@@ -381,15 +407,17 @@ fn instant_in_unit(at: &str, ts_column: &str, ts_type: &DataType) -> Result<i64>
         }
     };
     if nanos % per_unit != 0 {
-        return Err(Error::KeySpec(format!(
-            "--at {at:?} is finer than {ts_column}'s unit ({ts_type}); give an instant that is a \
-             whole number of that unit"
-        )));
+        return Err(Error::InvalidArgument {
+            field: "at",
+            reason: format!(
+                "the instant {at:?} is finer than {ts_column}'s unit ({ts_type}); give an \
+                 instant that is a whole number of that unit"
+            ),
+        });
     }
-    i64::try_from(nanos / per_unit).map_err(|_| {
-        Error::KeySpec(format!(
-            "--at {at:?} is out of range for {ts_column} ({ts_type})"
-        ))
+    i64::try_from(nanos / per_unit).map_err(|_| Error::InvalidArgument {
+        field: "at",
+        reason: format!("the instant {at:?} is out of range for {ts_column} ({ts_type})"),
     })
 }
 

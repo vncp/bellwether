@@ -26,6 +26,7 @@
 #![forbid(unsafe_code)]
 #![deny(clippy::unwrap_used, clippy::expect_used)]
 
+pub mod args;
 pub mod budget;
 pub mod envelope;
 pub mod handler;
@@ -35,6 +36,7 @@ pub mod refusal;
 pub mod server;
 pub mod tools;
 
+pub use args::{BudgetArgs, EngineArgs};
 pub use budget::{Budget, BudgetState};
 pub use envelope::{Envelope, Status};
 pub use handler::Handler;
@@ -47,31 +49,6 @@ pub const FINDINGS: &str = "bellwether://findings";
 pub const RECEIPTS: &str = "bellwether://receipts";
 /// The scorecard resource: per rule id, proposals, certificates, receipts.
 pub const SCORECARD: &str = "bellwether://scorecard";
-
-/// The per-session budget flags, shared by `bellwether-mcp` and
-/// `bellwether mcp`.
-#[derive(Clone, Copy, Debug, clap::Args)]
-pub struct BudgetArgs {
-    /// Replay records this session may cause the engine to write.
-    #[arg(long, value_name = "N", default_value_t = Budget::default().replays)]
-    pub budget_replays: u64,
-    /// Rows the verifier may read in this session, both sides summed.
-    #[arg(long, value_name = "N", default_value_t = Budget::default().rows)]
-    pub budget_rows: u64,
-    /// Wall time this session's tool calls may take, in seconds.
-    #[arg(long, value_name = "SECONDS", default_value_t = Budget::default().seconds)]
-    pub budget_seconds: u64,
-}
-
-impl From<BudgetArgs> for Budget {
-    fn from(a: BudgetArgs) -> Self {
-        Self {
-            replays: a.budget_replays,
-            rows: a.budget_rows,
-            seconds: a.budget_seconds,
-        }
-    }
-}
 
 /// Why [`serve_stdio`] stopped with an error.
 #[derive(Debug)]

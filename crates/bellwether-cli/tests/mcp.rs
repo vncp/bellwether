@@ -286,6 +286,163 @@ fn every_tool_with_a_cli_counterpart_returns_the_cli_json_line() {
     }
 }
 
+/// `cols` Int64 columns `c0..` over `rows` rows in two row groups (value
+/// `(row * (i + 3)) % 97` in column `i`, so every column is id-like and
+/// distinct), and a key file holding the first four rows' tuples.
+fn wide(dir: &Path, cols: usize, rows: i64) -> (std::path::PathBuf, std::path::PathBuf) {
+    use std::sync::Arc;
+
+    use arrow::array::{ArrayRef, Int64Array, RecordBatch};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use parquet::arrow::ArrowWriter;
+    use parquet::file::properties::WriterProperties;
+
+    let schema = Arc::new(Schema::new(
+        (0..cols)
+            .map(|i| Field::new(format!("c{i}"), DataType::Int64, false))
+            .collect::<Vec<_>>(),
+    ));
+    let batch = |range: std::ops::Range<i64>| {
+        RecordBatch::try_new(
+            Arc::clone(&schema),
+            (0..cols)
+                .map(|i| {
+                    let m = i64::try_from(i).unwrap() + 3;
+                    Arc::new(Int64Array::from_iter_values(
+                        range.clone().map(|r| (r * m) % 97),
+                    )) as ArrayRef
+                })
+                .collect(),
+        )
+        .unwrap()
+    };
+    let data = dir.join("wide");
+    std::fs::create_dir_all(&data).unwrap();
+    let props = WriterProperties::builder()
+        .set_max_row_group_row_count(Some(usize::MAX))
+        .build();
+    let file = std::fs::File::create(data.join("part-000.parquet")).unwrap();
+    let mut w = ArrowWriter::try_new(file, Arc::clone(&schema), Some(props)).unwrap();
+    for half in [0..rows / 2, rows / 2..rows] {
+        w.write(&batch(half)).unwrap();
+        w.flush().unwrap();
+    }
+    w.close().unwrap();
+    let kf = dir.join("wide-keys.parquet");
+    let mut w = ArrowWriter::try_new(
+        std::fs::File::create(&kf).unwrap(),
+        Arc::clone(&schema),
+        None,
+    )
+    .unwrap();
+    w.write(&batch(0..4)).unwrap();
+    w.close().unwrap();
+    (data, kf)
+}
+
+/// ADR 010 with non-default arguments: each one reaches the facade the way
+/// its CLI flag does, so dropping one (or changing a default) changes the
+/// text and fails here. `observe.why` `columns` = `why --columns`;
+/// `score.why` `key_columns` = `why --key`, `max_candidates` =
+/// `--max-candidates`, and with neither, more profile candidates than the
+/// default cap, the default is the CLI's.
+#[test]
+fn non_default_arguments_reach_the_facade_as_the_cli_flags_do() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    corpus(&data, 2, 3, 30, 200);
+    let kf = dir.path().join("k.parquet");
+    keys(&kf, "id", &[7, 8, 150]);
+    let (d, k) = (path(&data), path(&kf));
+    let srv = server(&data);
+
+    let all = mcp(&srv, "observe.why", json!({})).0;
+    let batch = both(
+        &srv,
+        "observe.why",
+        json!({"columns": ["batch"]}),
+        &["why", d, "--columns", "batch"],
+        0,
+    );
+    assert_ne!(
+        serde_json::to_string(&batch).unwrap() + "\n",
+        all,
+        "columns changed nothing"
+    );
+    let one = both(
+        &srv,
+        "score.why",
+        json!({"keys": k, "max_candidates": 1, "wait": true}),
+        &["why", d, "--from", k, "--max-candidates", "1"],
+        0,
+    );
+    let profile_candidates = |v: &Value| {
+        v["candidates"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|c| c["origin"] == "profile")
+            .count()
+    };
+    assert!(profile_candidates(&one) <= 1);
+
+    // A wide table: ten id-like columns, every one a profile candidate.
+    let (wd, wk) = wide(dir.path(), 10, 200);
+    let (wd, wk) = (path(&wd), path(&wk));
+    let wide_srv = server(Path::new(wd));
+    let cols: Vec<String> = (0..10).map(|i| format!("c{i}")).collect();
+    let joined = cols.join(",");
+    let capped = both(
+        &wide_srv,
+        "score.why",
+        json!({"keys": wk, "key_columns": cols, "columns": cols, "wait": true}),
+        &[
+            "why",
+            wd,
+            "--from",
+            wk,
+            "--key",
+            &joined,
+            "--columns",
+            &joined,
+        ],
+        0,
+    );
+    assert_eq!(
+        profile_candidates(&capped),
+        bellwether::DEFAULT_MAX_CANDIDATES,
+        "the default cap binds: {capped}"
+    );
+    // key_columns: a lookup on c0 alone is another workload.
+    let narrow = both(
+        &wide_srv,
+        "score.why",
+        json!({"keys": wk, "key_columns": ["c0"], "wait": true}),
+        &["why", wd, "--from", wk, "--key", "c0"],
+        0,
+    );
+    assert_eq!(narrow["workload"]["columns"], json!([["c0"]]), "{narrow}");
+}
+
+/// `bellwether mcp` takes every engine and budget flag `bellwether-mcp`
+/// takes, from the same definitions (`bellwether_mcp::args`), so the two
+/// open an unindexed CSV or JSON lines folder the same way.
+#[test]
+fn bellwether_mcp_takes_the_shared_engine_and_budget_flags() {
+    use clap::Args as _;
+    let shared = bellwether_mcp::BudgetArgs::augment_args(
+        bellwether_mcp::EngineArgs::augment_args(clap::Command::new("shared")),
+    );
+    let help = run(&["mcp", "--help"], 0);
+    let mut flags = 0;
+    for a in shared.get_arguments().filter(|a| !a.is_hide_set()) {
+        let long = format!("--{}", a.get_long().unwrap());
+        assert!(help.contains(&long), "{long} missing from:\n{help}");
+        flags += 1;
+    }
+    assert_eq!(flags, 8);
+}
+
 /// `bellwether mcp <root>` is the same server: a handshake and one tool
 /// call over its stdio, then a clean exit when stdin closes.
 #[test]

@@ -430,14 +430,12 @@ impl Engine {
         })
     }
 
-    /// Pins the manifest or refuses with what to do.
-    pub(crate) fn pin_required(&self, verb: &str) -> Result<Pinned> {
-        self.pin()?.ok_or_else(|| {
-            Error::KeySpec(format!(
-                "{} is not indexed, so {verb} has no index to plan with; run `bellwether index \
-                 {} --key <spec>` first",
-                self.root, self.root
-            ))
+    /// Pins the manifest, or refuses: the folder is not indexed.
+    pub(crate) fn pin_required(&self, operation: &'static str) -> Result<Pinned> {
+        self.pin()?.ok_or_else(|| Error::NotIndexed {
+            root: self.root.clone(),
+            operation,
+            needs: None,
         })
     }
 

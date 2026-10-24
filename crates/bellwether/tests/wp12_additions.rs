@@ -15,7 +15,7 @@ mod common;
 
 use std::path::{Path, PathBuf};
 
-use bellwether::types::{Error, Hash, KeySpec, ProposalBody};
+use bellwether::types::{Error, Hash, HashKind, KeySpec, ProposalBody};
 use bellwether::{
     spec, Engine, EngineOptions, FixOutcome, FixRequest, KeyFile, ProposeRefusal, ProposeResult,
     Refusal, WhyRequest, UNATTRIBUTED,
@@ -147,7 +147,8 @@ fn folder_status_is_the_source_of_the_stale_index_lists() {
 }
 
 /// A hash that resolves to another kind is a typed `WrongKind` at apply
-/// and at propose; an absent one is `NotFound`. Nothing is written.
+/// and at propose; an absent one is `RecordNotFound` with the kind it was
+/// given as. Nothing is written.
 #[test]
 fn wrong_kind_and_not_found_are_typed() {
     let f = fixture(false);
@@ -169,10 +170,9 @@ fn wrong_kind_and_not_found_are_typed() {
                 hash,
                 expected,
                 found,
-                ..
             } => {
                 assert_eq!(hash, f.proposal);
-                assert_eq!(expected, "a certificate");
+                assert_eq!(expected, HashKind::Certificate);
                 assert_eq!(found, "a proposal");
             }
             other => panic!("[dry={dry}] {other}"),
@@ -189,8 +189,8 @@ fn wrong_kind_and_not_found_are_typed() {
                 .unwrap_err()
         };
         assert!(
-            matches!(err, Error::NotFound(h) if h == absent),
-            "[dry={dry}]"
+            matches!(err, Error::RecordNotFound { kind: HashKind::Certificate, hash, .. } if hash == absent),
+            "[dry={dry}] {err}"
         );
     }
     let err = f

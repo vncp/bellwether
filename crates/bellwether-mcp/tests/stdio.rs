@@ -169,3 +169,47 @@ fn a_bad_root_fails_before_the_handshake_with_nothing_on_stdout() {
     assert!(err.starts_with("bellwether-mcp: "), "{err}");
     assert_eq!(err.lines().count(), 1, "{err}");
 }
+
+/// The binary takes every engine and budget flag `bellwether mcp` takes:
+/// both flatten the same definitions (`bellwether_mcp::args`). A schema
+/// file that cannot be read is a usage error.
+#[test]
+fn the_binary_takes_the_shared_engine_and_budget_flags() {
+    use clap::Args as _;
+    let shared = bellwether_mcp::BudgetArgs::augment_args(
+        bellwether_mcp::EngineArgs::augment_args(clap::Command::new("shared")),
+    );
+    let help = std::process::Command::new(EXE)
+        .arg("--help")
+        .output()
+        .unwrap();
+    assert!(help.status.success());
+    let help = String::from_utf8(help.stdout).unwrap();
+    let mut flags = 0;
+    for a in shared.get_arguments().filter(|a| !a.is_hide_set()) {
+        let long = format!("--{}", a.get_long().unwrap());
+        assert!(help.contains(&long), "{long} missing from:\n{help}");
+        flags += 1;
+    }
+    assert_eq!(
+        flags, 8,
+        "index, format, chunk-size, schema, fingerprint-policy, 3 budgets"
+    );
+
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    ledger_corpus(&data, 1, 1, 5, 5);
+    let out = std::process::Command::new(EXE)
+        .args([
+            "--schema",
+            "/nonexistent/schema.json",
+            data.to_str().unwrap(),
+        ])
+        .stdin(std::process::Stdio::null())
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    assert_eq!(out.stdout, [] as [u8; 0]);
+    let err = String::from_utf8(out.stderr).unwrap();
+    assert!(err.contains("cannot read the schema file"), "{err}");
+}

@@ -318,7 +318,7 @@ fn fix_human(r: &FixResult, out: &Out) -> String {
                     "the data changed after the certificate was computed (its catalog digest differs), so the certificate no longer describes it; run fix again to re-verify".into()
                 }
                 Refusal::NothingToApply { sequence } => format!(
-                    "applying changed nothing (the key is already complete at sequence {sequence}); no receipt"
+                    "the key is already complete at sequence {sequence}, so applying it changes nothing; no receipt"
                 ),
                 Refusal::LayoutNotApplicable => {
                     "layout proposals are applied by evolve, which has not landed".into()

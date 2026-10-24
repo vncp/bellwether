@@ -16,7 +16,7 @@ use bellwether::{
 use serde::Serialize;
 use serde_json::{json, Value};
 
-use crate::budget::{Budget, BudgetState, Spent};
+use crate::budget::{Budget, BudgetState, Exceeded, Meter};
 use crate::envelope::{cites_of, Chain, Envelope, Status};
 use crate::jobs::{job_id, Job, JobInfo, JobState, Jobs};
 use crate::refusal::{self, Refusal, RefusalCode};
@@ -86,7 +86,7 @@ fn failed(e: &Error) -> Done {
 
 struct Inner {
     engine: Engine,
-    budget: Mutex<BudgetState>,
+    budget: Meter,
     jobs: Mutex<Jobs>,
 }
 
@@ -115,10 +115,7 @@ impl Server {
         Ok(Self {
             inner: Arc::new(Inner {
                 engine,
-                budget: Mutex::new(BudgetState {
-                    limit: config.budget,
-                    spent: Spent::default(),
-                }),
+                budget: Meter::new(config.budget),
                 jobs: Mutex::new(Jobs::new()),
             }),
         })
@@ -133,7 +130,7 @@ impl Server {
     /// The session budget now.
     #[must_use]
     pub fn budget(&self) -> BudgetState {
-        *lock(&self.inner.budget)
+        self.inner.budget.state()
     }
 
     /// Calls `tool` with `args`. Never panics into the caller: the facade
@@ -172,24 +169,48 @@ impl Server {
                 Err(e) => self.invalid(tool, def.tier, &e),
             },
             _ if runs_as_job(tool, &args) => self.start(tool, args, false),
-            _ => self.run(tool, def.tier, args),
+            _ => self.run(tool, def.tier, args, None),
         }
     }
 
-    /// Runs a tool now: budget check, the facade call, the charge, the
-    /// envelope.
-    fn run(&self, tool: &str, tier: Tier, args: Value) -> Reply {
-        if let Some((dimension, spent, limit)) = self.budget().exceeded() {
-            return self.refused(
-                tool,
-                tier,
-                Refusal::new(
-                    RefusalCode::BudgetExceeded,
-                    format!("this session spent its {dimension} budget ({spent} of {limit})"),
-                    json!({ "dimension": dimension, "spent": spent, "limit": limit }),
-                ),
-            );
+    /// Runs a tool now: admission (the budget check, and for a charged call
+    /// the reservation, `crate::budget`), the facade call, the charge, the
+    /// envelope. `job` is the job this run is for, whose progress says so
+    /// while it waits for another charged call to settle.
+    fn run(&self, tool: &str, tier: Tier, args: Value, job: Option<&str>) -> Reply {
+        let mark_queued = |queued: bool| {
+            if let Some(id) = job {
+                if let Some(j) = lock(&self.inner.jobs).get_mut(id) {
+                    j.queued = queued;
+                }
+            }
+        };
+        let waited = std::cell::Cell::new(false);
+        let admitted = self.inner.budget.admit(charged(tier, &args), || {
+            waited.set(true);
+            mark_queued(true);
+        });
+        if waited.get() {
+            mark_queued(false);
         }
+        let reservation = match admitted {
+            Ok(r) => r,
+            Err(Exceeded {
+                dimension,
+                spent,
+                limit,
+            }) => {
+                return self.refused(
+                    tool,
+                    tier,
+                    Refusal::new(
+                        RefusalCode::BudgetExceeded,
+                        format!("this session spent its {dimension} budget ({spent} of {limit})"),
+                        json!({ "dimension": dimension, "spent": spent, "limit": limit }),
+                    ),
+                )
+            }
+        };
         let started = Instant::now();
         let outcome = self.dispatch(tool, args);
         let elapsed = started.elapsed();
@@ -199,7 +220,7 @@ impl Server {
                 value,
                 refusal,
             } => {
-                lock(&self.inner.budget).charge(Some(&value), elapsed);
+                reservation.settle(Some(&value), elapsed);
                 let (cites, receipts) = cites_of(&value);
                 let chains = receipts
                     .iter()
@@ -226,7 +247,7 @@ impl Server {
                 }
             }
             Done::Failed(r) => {
-                lock(&self.inner.budget).charge(None, elapsed);
+                reservation.settle(None, elapsed);
                 self.refused(tool, tier, r)
             }
         }
@@ -367,7 +388,9 @@ impl Server {
     }
 
     /// Starts `tool` as a job, or returns the job already started for the
-    /// same request.
+    /// same request: a job id always names one run and one result. A direct
+    /// call of a request whose job has finished returns that job's stored
+    /// result (what `jobs.result` returns); `jobs.start` returns the job.
     fn start(&self, tool: &str, args: Value, via_jobs_start: bool) -> Reply {
         let shown = if via_jobs_start { "jobs.start" } else { tool };
         let Some(def) = tools::find(tool).filter(|d| d.tier != Tier::Jobs) else {
@@ -400,8 +423,10 @@ impl Server {
         let id = job_id(tool, &key);
         {
             let mut jobs = lock(&self.inner.jobs);
-            let rerun = !via_jobs_start && jobs.get(&id).is_some_and(|j| j.finished.is_some());
-            if let Some(j) = jobs.get(&id).filter(|_| !rerun) {
+            if let Some(j) = jobs.get(&id) {
+                if let (false, Some((_, reply))) = (via_jobs_start, &j.finished) {
+                    return reply.clone();
+                }
                 let info = j.info(&id);
                 drop(jobs);
                 return self.job_reply(shown, def.tier, info);
@@ -411,6 +436,7 @@ impl Server {
                 Job {
                     tool: tool.to_string(),
                     started: Instant::now(),
+                    queued: false,
                     finished: None,
                 },
             );
@@ -420,7 +446,7 @@ impl Server {
         let spawned = std::thread::Builder::new()
             .name(format!("bellwether-job-{}", &id[..12]))
             .spawn(move || {
-                let mut reply = server.run(&t, tier, args);
+                let mut reply = server.run(&t, tier, args, Some(&jid));
                 let mut jobs = lock(&server.inner.jobs);
                 if let Some(j) = jobs.get_mut(&jid) {
                     let now = Instant::now();
@@ -554,6 +580,17 @@ fn running_info(id: &str, tool: &str) -> JobInfo {
         state: JobState::Running,
         progress: format!("{tool} started"),
     }
+}
+
+/// Whether a call is charged (`crate::budget`): a score or apply call that
+/// is not a dry run, the calls that can write Replays or read rows to
+/// verify. Charged calls are admitted one at a time.
+fn charged(tier: Tier, args: &Value) -> bool {
+    let dry_run = args
+        .get("dry_run")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    matches!(tier, Tier::Score | Tier::Apply) && !dry_run
 }
 
 /// The static rule for which calls become jobs (`crate::jobs`).

@@ -1,12 +1,18 @@
 //! Long operations as jobs (WP12 addition 9). A job id is the BLAKE3 of the
-//! request (the tool name and its arguments, keys sorted), so starting the
-//! same request again returns the same job, running or finished, rather
-//! than a second run. Jobs live for the session.
+//! request (the tool name and its arguments, keys sorted, `wait` left out),
+//! so starting the same request again returns the same job, running or
+//! finished, rather than a second run, and an id always names one result:
+//! calling the tool again directly with a finished job's request returns
+//! that job's stored result. Jobs live for the session; to run a request
+//! again now, call it with `wait: true`, which runs in the call and is not
+//! a job.
 //!
 //! Which calls become jobs is a static rule, not a timer, so a result never
 //! depends on how fast the machine is: `score.*` and `apply.receipt` run as
 //! jobs unless called with `wait: true` (or, for apply, `dry_run: true`);
 //! every other tool runs in the call; `jobs.start` runs any tool as a job.
+//! A charged job waits for the session's charged call in flight to settle
+//! before it starts (`crate::budget`); its progress says so.
 
 use std::collections::BTreeMap;
 use std::time::Instant;
@@ -46,12 +52,23 @@ pub struct JobInfo {
 pub(crate) struct Job {
     pub tool: String,
     pub started: Instant,
+    /// Waiting for another charged call in this session to settle.
+    pub queued: bool,
     pub finished: Option<(Instant, Reply)>,
 }
 
 impl Job {
     pub fn info(&self, id: &str) -> JobInfo {
         let (state, progress) = match &self.finished {
+            None if self.queued => (
+                JobState::Running,
+                format!(
+                    "{} waiting for {:.1} s: another score or apply call in this session is \
+                     running, and the budget admits one at a time (poll jobs.status)",
+                    self.tool,
+                    self.started.elapsed().as_secs_f64()
+                ),
+            ),
             None => (
                 JobState::Running,
                 format!(
