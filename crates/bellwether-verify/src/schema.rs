@@ -17,6 +17,7 @@ use bellwether_core::encoding;
 
 use crate::error::{Result, VerifyError};
 use crate::spec::ReconcileSpec;
+use crate::totals::parse_total_spec;
 
 /// What a dataset type's canonical encoding depends on (ADR 016): two types
 /// of one class encode every value they can both hold to identical bytes.
@@ -68,23 +69,28 @@ pub(crate) fn class(dt: &DataType) -> Result<Class> {
         DataType::Timestamp(u, _) => Class::Timestamp(*u),
         other => {
             return Err(VerifyError::Schema(format!(
-                "type {other} has no canonical encoding in encoding version 1"
+                "type {} has no canonical encoding in encoding version 1",
+                encoding::type_summary(other)
             )))
         }
     })
 }
 
-/// A decimal total column.
+/// A total column: a decimal column at its dataset scale, or a float column
+/// quantized half-to-even at an explicit scale (`<column>:dec(<scale>)`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct TotalCol {
-    /// Column name.
+    /// Label as reported in totals and certificates (`col` or `col:dec(S)`).
     pub name: String,
     /// Index into [`Plan::projection`].
     pub proj: usize,
-    /// `true` for Decimal256 (an `i256` total), `false` for Decimal128.
+    /// `true` for Decimal256 (an `i256` total), `false` for Decimal128 or
+    /// quantized float (`i128` total).
     pub wide: bool,
-    /// The dataset scale every total is expressed at.
+    /// The scale every total is expressed at.
     pub scale: i8,
+    /// `true` when the column is a float quantized via `:dec(scale)`.
+    pub quantized_float: bool,
 }
 
 /// The columns a reconcile reads and how it uses them, resolved against
@@ -142,21 +148,51 @@ impl Plan {
             None => None,
         };
         let mut totals = Vec::with_capacity(spec.total_columns.len());
-        for c in &spec.total_columns {
+        for raw in &spec.total_columns {
+            let (c, quant_scale) = parse_total_spec(raw).map_err(VerifyError::InvalidSpec)?;
             let i = index(c);
-            let Class::Decimal { wide, scale } = class(&types[0][i])? else {
-                return Err(VerifyError::InvalidSpec(format!(
-                    "total column {c:?} is {}, not a decimal; totals are exact decimal sums and \
-                     never use floats",
-                    types[0][i]
-                )));
-            };
-            totals.push(TotalCol {
-                name: c.clone(),
-                proj: i,
-                wide,
-                scale,
-            });
+            match (class(&types[0][i])?, quant_scale) {
+                (Class::Decimal { wide, scale }, None) => {
+                    totals.push(TotalCol {
+                        name: c.to_string(),
+                        proj: i,
+                        wide,
+                        scale,
+                        quantized_float: false,
+                    });
+                }
+                (Class::Float, Some(scale)) => {
+                    totals.push(TotalCol {
+                        name: format!("{c}:dec({scale})"),
+                        proj: i,
+                        wide: false,
+                        scale,
+                        quantized_float: true,
+                    });
+                }
+                (Class::Float, None) => {
+                    return Err(VerifyError::InvalidSpec(format!(
+                        "total column {c:?} is {}, not a decimal; cast it to a decimal column or \
+                         quantize it explicitly with --totals {c}:dec(<scale>) (for example \
+                         {c}:dec(4))",
+                        types[0][i]
+                    )));
+                }
+                (_, Some(scale)) => {
+                    return Err(VerifyError::InvalidSpec(format!(
+                        "total column {c:?} is {}, not a float; :dec({scale}) applies only to \
+                         float columns",
+                        types[0][i]
+                    )));
+                }
+                (_, None) => {
+                    return Err(VerifyError::InvalidSpec(format!(
+                        "total column {c:?} is {}, not a decimal; totals require a decimal column \
+                         (or a float column with :dec(<scale>))",
+                        types[0][i]
+                    )));
+                }
+            }
         }
         Ok(Self {
             key: spec.key_columns.iter().map(|c| index(c)).collect(),
@@ -236,12 +272,22 @@ fn projection(
     hashed: &[String],
 ) -> Result<Vec<String>> {
     let mut needed: HashSet<&str> = hashed.iter().map(String::as_str).collect();
+    let total_cols = spec
+        .total_columns
+        .iter()
+        .map(|s| {
+            parse_total_spec(s)
+                .map(|(c, _)| c)
+                .map_err(VerifyError::InvalidSpec)
+        })
+        .collect::<Result<Vec<_>>>()?;
     for c in spec
         .key_columns
         .iter()
-        .chain(spec.latest_by.iter())
-        .chain(&spec.total_columns)
-        .chain(&spec.group_by)
+        .map(String::as_str)
+        .chain(spec.latest_by.iter().map(String::as_str))
+        .chain(total_cols)
+        .chain(spec.group_by.iter().map(String::as_str))
     {
         for (side, schema) in [("left", left), ("right", right)] {
             if schema.field_with_name(c).is_err() {
@@ -250,7 +296,7 @@ fn projection(
                 )));
             }
         }
-        needed.insert(c.as_str());
+        needed.insert(c);
     }
     Ok(left
         .fields()
@@ -289,8 +335,9 @@ fn side_types(projection: &[String], left: &Schema, right: &Schema) -> Result<[V
 
 fn unsupported(name: &str, dt: &DataType, e: &VerifyError) -> VerifyError {
     VerifyError::Schema(format!(
-        "column {name:?} has type {dt}, which cannot be compared ({e}); add it to \
-         ignored_columns to leave it out"
+        "column {name:?} has type {}, which cannot be compared ({e}); add it to \
+         ignored_columns to leave it out",
+        encoding::type_summary(dt)
     ))
 }
 

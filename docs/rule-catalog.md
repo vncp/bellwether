@@ -5,9 +5,9 @@ One entry per lint the profiler raises. A lint is a `Lint` record inside an
 catalog is the skeleton WP5 implements against; entries change by pull
 request, and a new rule id is never reused for a different pattern.
 
-Status (2026-10-24): the four statistics rules (`batch_stamp_key`,
-`low_selectivity_single_column`, `declared_but_unused_key`,
-`scattered_time_column`) are implemented in `bellwether-profile` (WP5), with
+Status (2026-10-25): the five statistics rules (`batch_stamp_key`,
+`low_selectivity_single_column`, `no_discriminating_column`,
+`declared_but_unused_key`, `scattered_time_column`) are implemented in `bellwether-profile` (WP5), with
 the detectors and thresholds stated in their entries below. Two decisions
 are defined once in `bellwether_source::stats` and called by both the
 profiler and the benchmark's ground truth: `overlap_depth` decides
@@ -74,7 +74,7 @@ and **low**, recorded in `Lint.confidence` as 0.9, 0.6, and 0.3.
 
 ### Inputs outside the current contract
 
-Four rules read only statistics, which `EvidenceBody::Profile` carries.
+Five rules read only statistics, which `EvidenceBody::Profile` carries.
 Three rules (`unprefiltered_window`, `lookback_unbounded`,
 `wide_projection_before_filter`) need a description of the consumer's query
 plan. No `EvidenceBody` variant carries a plan of a consumer query today;
@@ -163,6 +163,27 @@ added.
   of them, which then leads the composite so prefix seek works, or when
   there is no workload. Low if the workload supplies neither: no recorded
   lookup could seek the composite by its leading column. Low when sampled.
+
+
+### no_discriminating_column
+
+- **id**: `no_discriminating_column`
+- **Detector**: every measured non-batch-stamp column and composite touches at
+  least 50 % (`LOW_SELECTIVITY_MIN_FRACTION`) of all row groups at p95 (when
+  the dataset has at least 2 row groups), so no index on the current layout
+  can prune point lookups. Names the lowest-fanout candidate and its
+  `p50 / p95 / max` row groups per value.
+- **Estimator**: `row_groups_per_value` at p50, p95, max for the lowest-fanout
+  candidate over `row_groups_total`. Bytes: replay under the floor (`Exact` on
+  the lookup columns) equals the full dataset scan.
+- **Guidance template**: file `<writer job>`, step `<the write>`. Before:
+  `written in arrival or time order with every key value in every row group`.
+  After: `sort or cluster files by <key column> when writing`. Invariant:
+  `the multiset of rows is unchanged`.
+- **Verification method**: reconcile over touched keys (or full dataset)
+  before and after re-clustering.
+- **Confidence rubric**: high with an unsampled measurement and a workload.
+  Medium without a workload. Low when any candidate measurement is sampled.
 
 ### declared_but_unused_key
 

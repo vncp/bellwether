@@ -44,6 +44,10 @@ pub struct CertificateContext {
     pub manifest: Option<ManifestAnchor>,
     /// Further inputs, cited in order after this crate's own.
     pub inputs: Vec<AgedInput>,
+    /// Optional RFC 3339 `created_at` timestamp (for example from the facade's
+    /// clock); when `None`, the current UTC time at millisecond precision is
+    /// used.
+    pub created_at: Option<String>,
 }
 
 /// A reconciliation with its certificate, ready to record.
@@ -88,8 +92,30 @@ impl Reconciler {
                 }
             }
         }
-        let exec = self.execute(left, right)?;
-        let created_at = now_rfc3339()?;
+        let mut exec = self.execute(left, right)?;
+        let created_at = match &ctx.created_at {
+            Some(c) => c.clone(),
+            None => now_rfc3339()?,
+        };
+        if ctx.created_at.is_some() {
+            for ev in &mut exec.evidence {
+                let old_hash = Record::Evidence(ev.clone()).hash()?;
+                ev.provenance.created_at.clone_from(&created_at);
+                let new_hash = Record::Evidence(ev.clone()).hash()?;
+                for (h, _, _) in &mut exec.inputs {
+                    if *h == old_hash {
+                        *h = new_hash;
+                    }
+                }
+                for s in &mut exec.outcome.sides {
+                    if let crate::outcome::SidePath::Planned { plan_evidence, .. } = &mut s.path {
+                        if *plan_evidence == old_hash {
+                            *plan_evidence = new_hash;
+                        }
+                    }
+                }
+            }
+        }
         let now = Instant::now();
         build(exec, ctx, handed, now, created_at)
     }

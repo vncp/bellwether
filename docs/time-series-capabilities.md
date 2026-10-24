@@ -10,16 +10,16 @@ Files (Parquet, CSV, or JSON lines) partitioned by date, each file holding rows 
 
 | Capability | The question it makes cheap | How to call it | Status |
 |---|---|---|---|
-| Diagnose the layout | Which column is a real key here, and exactly how many bytes would each candidate index save on my recorded queries? | `bellwether why ./data --from keys.parquet` | merged |
+| Diagnose the layout | Which column is a real key here, and exactly how many bytes would each candidate index save on my recorded point, latest, or as-of queries? | `bellwether why ./data --from keys.parquet [--mode locate\|latest\|asof] [--latest-by ts] [--at T] [--lookback 252d]` | merged |
 | Symbol-set lookup | Which files and row groups hold these 300 symbols, with exact bytes, without scanning the lake | `bellwether index ./data --key exact:symbol` then `locate --keys` | merged |
 | Composite keys | Lookups on (symbol, date) or (symbol, venue) with prefix seek on the leading column | `--key exact:symbol,date` | merged |
 | Bloom keys | Cheap membership for very large key sets, with a stated false-positive rate | `--key bloom:symbol@0.01` | merged |
 | Range keys | Row groups whose timestamp (or price, or volume) range overlaps a window | `--key range:ts` | merged |
 | Latest per symbol | The newest row per symbol across the whole history, located to the row group | `bellwether latest ./data --keys` with `temporal:symbol@ts` | merged |
 | As-of per symbol | The row current at time T per symbol: the point-in-time read a backtest needs to avoid lookahead | `bellwether asof ./data --keys --at T` | merged |
-| Verify a derived dataset | Do my bars, factors, or vendor files agree with the source by key, newest version, row hash, and exact decimal totals? | `bellwether reconcile ./a ./b --key symbol,ts --total volume` | merged |
+| Verify a derived dataset | Do my bars, factors, or vendor files agree with the source by key, newest version, row hash, and exact decimal or quantized float totals? | `bellwether reconcile ./a ./b --key symbol,ts --totals volume:dec(4) [--memory-budget 8G]` | merged |
 | Receipts | A hash-linked proof that an index or rewrite returned the same rows, for review or CI | `bellwether fix`, `receipt show`, `report --html` | merged |
-| Exact what-if pricing | The cost of a hypothetical key before building it, from statistics, with zero estimation error | part of `why` | merged |
+| Exact what-if pricing | The cost of a hypothetical key (point, latest, or as-of with lookback) before building it, from statistics, with zero estimation error | `bellwether why --mode locate\|latest\|asof` | merged |
 | Partition values from paths | `day=2024-03-01/` directories prune without being read | automatic | building (WP21) |
 | Ordered plans | Row groups returned in time order for per-symbol sequence math | automatic with a timestamp range key | building (WP21) |
 | Pinned snapshots | Run any query against an earlier index state, for reproducible backtests over a growing lake | `--at-manifest N` | building (WP21) |

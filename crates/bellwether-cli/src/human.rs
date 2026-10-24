@@ -93,12 +93,19 @@ pub(crate) fn index(r: &IndexResult, out: &Out) -> String {
         num(r.segments_written),
         num(r.segments)
     );
-    let _ = writeln!(s, "\n  {:<40} {:>14}", "key spec", "complete at");
+    let spec_width = r
+        .specs
+        .iter()
+        .map(|spec| label(&spec.spec).chars().count())
+        .max()
+        .unwrap_or(40)
+        .max(40);
+    let _ = writeln!(s, "\n  {:<spec_width$} {:>14}", "key spec", "complete at");
     for spec in &r.specs {
         let at = spec
             .complete_at
             .map_or_else(|| "incomplete".to_string(), |n| n.to_string());
-        let _ = writeln!(s, "  {:<40} {at:>14}", label(&spec.spec));
+        let _ = writeln!(s, "  {:<spec_width$} {at:>14}", label(&spec.spec));
     }
     let _ = writeln!(s, "\nmanifest {}", r.manifest);
     s
@@ -337,6 +344,21 @@ pub(crate) fn why(r: &bellwether::WhyReport, out: &Out) -> String {
                 "no index serves this lookup, so it reads every row group".to_string()
             }
             CulpritReason::ServingSpec { spec } => format!("the serving key {}", label(spec)),
+            CulpritReason::Layout {
+                lowest_fanout_columns,
+                lowest_fanout,
+            } => {
+                let low_name = lowest_fanout_columns.join(", ");
+                match lowest_fanout {
+                    Some(lf) => format!(
+                        "the layout is the cause: every candidate touches nearly every row group, and the lowest-fanout candidate ({low_name}) touches {} row groups (p50 / p95 / max)",
+                        quantiles(&lf.row_groups_per_value)
+                    ),
+                    None => format!(
+                        "the layout is the cause: every candidate touches nearly every row group (lowest-fanout candidate: {low_name})"
+                    ),
+                }
+            }
         };
         let _ = writeln!(s, "\nculprit ({}): {why}{fan}", c.columns.join(", "));
     }
@@ -386,6 +408,15 @@ pub(crate) fn why(r: &bellwether::WhyReport, out: &Out) -> String {
             quantiles(&f.row_groups_per_value),
             if f.sampled { "sampled" } else { "exact" }
         );
+    }
+    if !r.profile.skipped.is_empty() {
+        let skipped: Vec<String> = r
+            .profile
+            .skipped
+            .iter()
+            .map(|x| format!("{} ({})", x.column, x.reason))
+            .collect();
+        let _ = writeln!(s, "  not candidates: {}", skipped.join("; "));
     }
     if !r.profile.lints.is_empty() {
         let _ = writeln!(s, "\nlints");

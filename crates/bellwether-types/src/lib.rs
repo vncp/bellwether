@@ -384,6 +384,26 @@ impl KeySpec {
         };
         format!("{kind}:{}", self.columns().join(","))
     }
+
+    /// The short command-line form of this spec (`exact:a,b`, `bloom:a@0.01`,
+    /// `range:ts`, `temporal:id@ts`).
+    #[must_use]
+    pub fn label(&self) -> String {
+        match self {
+            Self::Exact { columns } => format!("exact:{}", columns.join(",")),
+            Self::Bloom { columns, fpr } => format!("bloom:{}@{fpr}", columns.join(",")),
+            Self::Range { column } => format!("range:{column}"),
+            Self::Temporal { columns, ts_column } => {
+                format!("temporal:{}@{ts_column}", columns.join(","))
+            }
+        }
+    }
+}
+
+impl std::fmt::Display for KeySpec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.label())
+    }
 }
 
 /// A residual predicate the consumer applies after reading the planned row

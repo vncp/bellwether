@@ -39,10 +39,12 @@
 //!   groups with an empty `In`.
 
 use std::borrow::Cow;
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use arrow::datatypes::Schema;
 use bellwether_core::segment::{ColumnType, ReadAt, SegmentReader};
+use bellwether_core::temporal::{self, VersionChain, VersionHit};
 use bellwether_store::{Snapshot, StoreExt};
 use bellwether_types::{Error, Hash, KeySpec, Predicate, Result, RunCost, ScanPlan};
 use bytes::Bytes;
@@ -51,7 +53,7 @@ use roaring::RoaringBitmap;
 use crate::catalog::Catalog;
 use crate::keys::RunKeys;
 use crate::transient::TransientIndex;
-
+use crate::workload::RunQuery;
 /// How a key spec serves a run's keys ([`servable`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Lookup {
@@ -107,6 +109,17 @@ pub trait PlanSource: Send + Sync {
     /// The plan for one run's keys under `specs` (module docs for the
     /// serving, intersection, and no-pruning rules).
     fn plan(&self, specs: &[KeySpec], keys: &RunKeys) -> Result<ScanPlan>;
+
+    /// The plan for one run's keys under `specs` and `query`.
+    fn plan_query(&self, specs: &[KeySpec], keys: &RunKeys, query: RunQuery) -> Result<ScanPlan> {
+        match query {
+            RunQuery::Locate { window: None } => self.plan(specs, keys),
+            _ => Err(Error::Other(format!(
+                "this PlanSource does not implement {:?}",
+                query.as_kind_string()
+            ))),
+        }
+    }
 
     /// This source with hypothetical specs' transient segments added, so
     /// each plans exactly as committed segments of that spec would. A
@@ -221,7 +234,7 @@ impl SpecSegments {
         for r in &readers {
             if r.key_spec() != &spec {
                 return Err(Error::KeySpec(format!(
-                    "a segment indexes {:?}, not {spec:?}",
+                    "a segment indexes {}, not {spec}",
                     r.key_spec()
                 )));
             }
@@ -254,6 +267,65 @@ impl SpecSegments {
                 Lookup::Prefix => {
                     for p in probes {
                         out |= r.lookup_prefix(p)?;
+                    }
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Temporal lookup (`latest` or `asof`, with optional `lookback`) over
+    /// every segment of this temporal spec, restricted to `live` row groups.
+    fn temporal_hits(
+        &self,
+        probes: &[Vec<u8>],
+        live: &RoaringBitmap,
+        asof: Option<i64>,
+        lookback: Option<i64>,
+    ) -> Result<BTreeMap<Vec<u8>, VersionHit>> {
+        let mut out = BTreeMap::new();
+        let mut redo = Vec::new();
+        if lookback.is_some() {
+            redo = probes.to_vec();
+        } else {
+            let raw = match asof {
+                None => temporal::latest(&self.readers, probes)?,
+                Some(ts) => temporal::asof(&self.readers, probes, ts)?,
+            };
+            for (key, mut hit) in raw {
+                hit.row_groups &= live;
+                if hit.row_groups.is_empty() {
+                    redo.push(key);
+                } else {
+                    out.insert(key, hit);
+                }
+            }
+        }
+        if redo.is_empty() {
+            return Ok(out);
+        }
+        if let Some(lb) = lookback {
+            let mut chains: BTreeMap<Vec<u8>, VersionChain> = BTreeMap::new();
+            for r in &self.readers {
+                for (key, value) in r.get(&redo)? {
+                    chains.entry(key).or_default().merge(&value.chain);
+                }
+            }
+            for (key, chain) in chains {
+                if let Some(h) = live_window(&chain, live, asof, lb) {
+                    out.insert(key, h);
+                }
+            }
+            return Ok(out);
+        }
+        for r in &self.readers {
+            for (key, value) in r.get(&redo)? {
+                if let Some(h) = live_winner(&value.chain, live, asof) {
+                    match out.get_mut(&key) {
+                        Some(acc) => acc.combine(&h),
+                        None => {
+                            out.insert(key, h);
+                        }
                     }
                 }
             }
@@ -378,7 +450,7 @@ impl SegmentPlanner {
     fn add_shared(&mut self, segments: Arc<SpecSegments>) -> Result<()> {
         if self.find(&segments.spec).is_some() {
             return Err(Error::KeySpec(format!(
-                "key spec {:?} already has segments in this planner",
+                "key spec {} already has segments in this planner",
                 segments.spec
             )));
         }
@@ -405,7 +477,7 @@ impl SegmentPlanner {
             return Err(Error::KeySpec(why.clone()));
         }
         Err(Error::KeySpec(format!(
-            "no complete segments for {spec:?} at manifest {}",
+            "no complete segments for {spec} at manifest {}",
             self.catalog.manifest_version()
         )))
     }
@@ -447,6 +519,134 @@ impl SegmentPlanner {
             }
         }
         Ok(out)
+    }
+    fn select_temporal(
+        &self,
+        serving: &[(&SpecSegments, Lookup)],
+        keys: &RunKeys,
+        asof: Option<i64>,
+        lookback: Option<i64>,
+    ) -> Result<RoaringBitmap> {
+        let mut temporal = serving
+            .iter()
+            .filter(|(s, _)| matches!(s.spec, KeySpec::Temporal { .. }));
+        let (t, how) = match (temporal.next(), temporal.next()) {
+            (Some((t, how)), None) => (*t, how),
+            (None, _) => {
+                return Err(Error::KeySpec(format!(
+                    "latest and asof need a temporal key spec serving {:?}",
+                    keys.columns()
+                )))
+            }
+            (Some(_), Some(_)) => {
+                return Err(Error::KeySpec(
+                    "more than one temporal key spec serves this lookup; name one".into(),
+                ))
+            }
+        };
+        let Lookup::Point { project: positions } = how else {
+            return Err(Error::KeySpec(format!(
+                "latest and asof need every column of {} in the lookup",
+                t.spec.name()
+            )));
+        };
+        let variants: Vec<Vec<Vec<u8>>> =
+            (0..keys.len()).map(|i| keys.probes(i, positions)).collect();
+        let mut probes: Vec<Vec<u8>> = variants.iter().flatten().cloned().collect();
+        probes.sort_unstable();
+        probes.dedup();
+        let live = self.catalog.all_ids();
+        let hits = t.temporal_hits(&probes, &live, asof, lookback)?;
+        let winners: Vec<Option<VersionHit>> = variants
+            .iter()
+            .map(|vs| {
+                vs.iter()
+                    .filter_map(|v| hits.get(v))
+                    .fold(None, |acc: Option<VersionHit>, h| {
+                        Some(match acc {
+                            Some(mut a) => {
+                                a.combine(h);
+                                a
+                            }
+                            None => h.clone(),
+                        })
+                    })
+            })
+            .collect();
+        let mut acc: Vec<Option<RoaringBitmap>> = winners
+            .iter()
+            .map(|w| Some(w.as_ref().map(|h| h.row_groups.clone()).unwrap_or_default()))
+            .collect();
+        let all: Vec<usize> = (0..keys.columns().len()).collect();
+        for (seg, lookup) in serving {
+            if std::ptr::eq(*seg, t) {
+                continue;
+            }
+            let cols = match lookup {
+                Lookup::Point { project } => project,
+                Lookup::Prefix => &all,
+            };
+            for (i, slot) in acc.iter_mut().enumerate() {
+                let Some(prev) = slot.take() else { continue };
+                if prev.is_empty() {
+                    *slot = Some(prev);
+                    continue;
+                }
+                let found = seg.lookup(&keys.probes(i, cols), lookup)?;
+                *slot = Some(prev & found);
+            }
+        }
+        Ok(acc
+            .into_iter()
+            .flatten()
+            .fold(RoaringBitmap::new(), |u, b| u | b))
+    }
+
+    fn plan_temporal_query(
+        &self,
+        specs: &[KeySpec],
+        keys: &RunKeys,
+        asof: Option<i64>,
+        lookback: Option<i64>,
+    ) -> Result<ScanPlan> {
+        check_key_types(self.catalog.schema(), keys)?;
+        let mut listed = Vec::with_capacity(specs.len());
+        for (i, spec) in specs.iter().enumerate() {
+            if specs[..i].iter().any(|s| s.name() == spec.name()) {
+                return Err(Error::KeySpec(format!(
+                    "key spec {} is listed twice",
+                    spec.name()
+                )));
+            }
+            listed.push(self.listed(spec)?);
+        }
+        if keys.is_empty() {
+            return Ok(with_residual(
+                self.catalog.plan_for(&RoaringBitmap::new())?,
+                keys,
+            ));
+        }
+        if specs.is_empty() {
+            return Ok(with_residual(
+                self.catalog.plan_for(&self.catalog.all_ids())?,
+                keys,
+            ));
+        }
+        let mut serving = Vec::with_capacity(specs.len());
+        for (spec, segments) in specs.iter().zip(listed) {
+            if let Some(lookup) = servable(spec, keys.columns()) {
+                serving.push((segments.as_ref(), lookup));
+            }
+        }
+        if serving.is_empty() {
+            return Err(Error::KeySpec(format!(
+                "none of {:?} serves keys on {:?}",
+                specs.iter().map(KeySpec::name).collect::<Vec<_>>(),
+                keys.columns()
+            )));
+        }
+        let selected = self.select_temporal(&serving, keys, asof, lookback)?;
+        Ok(with_residual(self.catalog.plan_for(&selected)?, keys))
     }
 }
 
@@ -501,6 +701,15 @@ impl PlanSource for SegmentPlanner {
         let selected = Self::select(&serving, keys)?;
         Ok(with_residual(self.catalog.plan_for(&selected)?, keys))
     }
+    fn plan_query(&self, specs: &[KeySpec], keys: &RunKeys, query: RunQuery) -> Result<ScanPlan> {
+        match query {
+            RunQuery::Locate { .. } => self.plan(specs, keys),
+            RunQuery::Latest { lookback } => self.plan_temporal_query(specs, keys, None, lookback),
+            RunQuery::AsOf { ts, lookback } => {
+                self.plan_temporal_query(specs, keys, Some(ts), lookback)
+            }
+        }
+    }
 
     fn with_transient(
         &self,
@@ -542,7 +751,7 @@ pub(crate) fn check_key_types(schema: &Schema, keys: &RunKeys) -> Result<()> {
             .data_type();
         if &ColumnType::of(declared)? != recorded {
             return Err(Error::KeySpec(format!(
-                "keys on {c:?} were encoded as {recorded:?}, but the dataset declares {declared}"
+                "keys on {c:?} were encoded as {recorded}, but the dataset declares {declared}"
             )));
         }
     }
@@ -559,6 +768,53 @@ fn with_residual(mut plan: ScanPlan, keys: &RunKeys) -> ScanPlan {
         values: keys.all_probes(&all),
     });
     plan
+}
+
+fn live_winner(
+    chain: &VersionChain,
+    live: &RoaringBitmap,
+    asof: Option<i64>,
+) -> Option<VersionHit> {
+    let mut best: Option<VersionHit> = None;
+    for &(ts, rg) in chain.versions() {
+        if !live.contains(rg.0) || asof.is_some_and(|a| ts > a) {
+            continue;
+        }
+        let hit = VersionHit {
+            ts,
+            row_groups: std::iter::once(rg.0).collect(),
+        };
+        match &mut best {
+            Some(b) => b.combine(&hit),
+            None => best = Some(hit),
+        }
+    }
+    best
+}
+
+fn live_window(
+    chain: &VersionChain,
+    live: &RoaringBitmap,
+    asof: Option<i64>,
+    lookback: i64,
+) -> Option<VersionHit> {
+    let hi = match asof {
+        Some(t) => t,
+        None => chain
+            .versions()
+            .iter()
+            .rev()
+            .find(|(_, rg)| live.contains(rg.0))
+            .map(|(ts, _)| *ts)?,
+    };
+    let lo = hi.saturating_sub(lookback.max(0));
+    let mut row_groups = RoaringBitmap::new();
+    for &(ts, rg) in chain.versions() {
+        if live.contains(rg.0) && ts >= lo && ts <= hi {
+            row_groups.insert(rg.0);
+        }
+    }
+    (!row_groups.is_empty()).then_some(VersionHit { ts: lo, row_groups })
 }
 
 #[cfg(test)]

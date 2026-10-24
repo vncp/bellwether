@@ -5,8 +5,8 @@ use std::fmt::Write as _;
 use bellwether::spec::label;
 use bellwether::types::{Coverage, ProposalBody, Record};
 use bellwether::{
-    FixOutcome, FixRequest, FixResult, ReconcileRequest, ReconcileResult, Refusal, RewriteOutputs,
-    Score,
+    FixOutcome, FixRequest, FixResult, GroupRepr, KeyRepr, Mismatch, ReconcileRequest,
+    ReconcileResult, Refusal, RewriteOutputs, Score, Sides, DEFAULT_DISPLAY_MISMATCHES,
 };
 use clap::{Args, Subcommand};
 
@@ -59,8 +59,10 @@ pub(crate) struct ReconcileArgs {
     /// Sampling seed.
     #[arg(long, default_value_t = 0, requires = "sample")]
     seed: u64,
+    /// Memory budget for the comparison state (bytes, or with K/M/G/KiB/MiB/GiB).
+    #[arg(long, value_name = "BYTES")]
+    memory_budget: Option<String>,
 }
-
 #[derive(Args)]
 pub(crate) struct FixArgs {
     #[command(flatten)]
@@ -77,6 +79,9 @@ pub(crate) struct FixArgs {
     /// Score and verify only; apply nothing.
     #[arg(long)]
     verify_only: bool,
+    /// Apply a proposal even when its replay predicts no byte saving.
+    #[arg(long)]
+    allow_no_gain: bool,
     /// A rewrite's output before the rewrite (a folder).
     #[arg(long, value_name = "DIR", requires = "after_output")]
     before_output: Option<String>,
@@ -97,8 +102,15 @@ pub(crate) fn run(g: &Global, out: &Out, cmd: &VerifyCommand) -> Result<Outcome,
                 totals: a.compare.totals.clone(),
                 group_by: a.compare.group_by.clone(),
                 sample: a.sample.map(|f| (f, a.seed)),
+                memory_budget: a
+                    .memory_budget
+                    .as_deref()
+                    .map(parse_memory_budget)
+                    .transpose()?,
             };
-            let r = engine(g, &a.left)?.reconcile(&a.right, &request)?;
+            let r = engine(g, &a.left)?
+                .reconcile(&a.right, &request)
+                .map_err(reconcile_err)?;
             let code = if r.outcome.pass { EXIT_OK } else { EXIT_FAILED };
             done(&r, reconcile_human(&r, out), code)
         }
@@ -133,8 +145,11 @@ pub(crate) fn run(g: &Global, out: &Out, cmd: &VerifyCommand) -> Result<Outcome,
                     .transpose()?,
                 rewrite,
                 verify_only: a.verify_only,
+                allow_no_gain: a.allow_no_gain,
             };
-            let r = engine(g, &a.root.root)?.fix(&request)?;
+            let r = engine(g, &a.root.root)?
+                .fix(&request)
+                .map_err(reconcile_err)?;
             let code = match &r.outcome {
                 FixOutcome::Applied { .. } | FixOutcome::Verified => EXIT_OK,
                 FixOutcome::Refused {
@@ -145,6 +160,89 @@ pub(crate) fn run(g: &Global, out: &Out, cmd: &VerifyCommand) -> Result<Outcome,
             done(&r, fix_human(&r, out), code)
         }
     }
+}
+fn parse_memory_budget(s: &str) -> Result<u64, Failure> {
+    let raw = s.trim();
+    if raw.is_empty() {
+        return Err(Failure::Usage(
+            "--memory-budget is empty; pass a positive byte count such as 256M or 8G".into(),
+        ));
+    }
+    let cleaned = raw.replace('_', "");
+    let split = cleaned
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(cleaned.len());
+    let (digits, unit) = cleaned.split_at(split);
+    if digits.is_empty() {
+        return Err(Failure::Usage(format!(
+            "--memory-budget {raw:?} is not a byte count; pass a positive integer with an optional K, M, or G suffix (for example 512M or 8G)"
+        )));
+    }
+    let n: u64 = digits.parse().map_err(|_| {
+        Failure::Usage(format!(
+            "--memory-budget {raw:?} is out of range; pass a positive byte count such as 512M or 8G"
+        ))
+    })?;
+    let mult: u64 = match unit.trim().to_ascii_lowercase().as_str() {
+        "" | "b" => 1,
+        "k" | "kb" | "kib" => 1024,
+        "m" | "mb" | "mib" => 1024 * 1024,
+        "g" | "gb" | "gib" => 1024 * 1024 * 1024,
+        "t" | "tb" | "tib" => 1024_u64.pow(4),
+        _ => {
+            return Err(Failure::Usage(format!(
+                "--memory-budget {raw:?} has unknown unit {unit:?}; use B, K, M, G, KiB, MiB, or GiB (for example 512M or 8G)"
+            )))
+        }
+    };
+    let bytes = n.checked_mul(mult).ok_or_else(|| {
+        Failure::Usage(format!(
+            "--memory-budget {raw:?} overflows u64 bytes; pass a smaller budget"
+        ))
+    })?;
+    if bytes == 0 {
+        return Err(Failure::Usage(
+            "--memory-budget must be at least 1 byte (for example 512M or 8G)".into(),
+        ));
+    }
+    Ok(bytes)
+}
+
+fn reconcile_err(e: bellwether::types::Error) -> Failure {
+    if let bellwether::types::Error::KeySpec(m) = &e {
+        if let Some(rest) = m.strip_prefix("invalid reconcile spec: ") {
+            return Failure::Usage(rest.to_string());
+        }
+        if m.starts_with("a reconcile compares rows by key") {
+            return Failure::Usage(m.clone());
+        }
+    }
+    Failure::Engine(e)
+}
+
+fn fmt_key(k: &KeyRepr) -> String {
+    let vals: Vec<&str> = k
+        .values
+        .iter()
+        .map(|v| v.as_deref().unwrap_or("null"))
+        .collect();
+    if vals.len() == 1 {
+        vals[0].to_string()
+    } else {
+        format!("({})", vals.join(", "))
+    }
+}
+
+fn fmt_group(g: &GroupRepr) -> String {
+    if g.values.is_empty() {
+        return String::new();
+    }
+    let parts: Vec<String> = g
+        .values
+        .iter()
+        .map(|(c, v)| format!("{c}={}", v.as_deref().unwrap_or("null")))
+        .collect();
+    format!(" [{}]", parts.join(", "))
 }
 
 fn coverage(c: &Coverage) -> String {
@@ -158,6 +256,7 @@ fn coverage(c: &Coverage) -> String {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn reconcile_human(r: &ReconcileResult, out: &Out) -> String {
     let mut s = String::new();
     let o = &r.outcome;
@@ -181,8 +280,91 @@ fn reconcile_human(r: &ReconcileResult, out: &Out) -> String {
         "missing on the right", num(c.missing_right),
         "totals that differ", num(c.totals_differ)
     );
+    let _ = writeln!(
+        s,
+        "  {:<22} {:>14}  (budget {}, rows read left {}, right {})",
+        "passes",
+        num(u64::from(o.memory.passes)),
+        size(o.memory.budget_bytes),
+        num(o.memory.rows_read[0]),
+        num(o.memory.rows_read[1])
+    );
     if !o.ignored_columns.is_empty() {
         let _ = writeln!(s, "  not compared: {}", o.ignored_columns.join(", "));
+    }
+    let key_mismatches: Vec<&Mismatch> = o
+        .mismatches
+        .iter()
+        .filter(|m| !matches!(m, Mismatch::TotalDiffers { .. }))
+        .collect();
+    if !key_mismatches.is_empty() {
+        let total_diff_keys = c.mismatched + c.missing_left + c.missing_right;
+        let shown = key_mismatches.len().min(DEFAULT_DISPLAY_MISMATCHES);
+        let _ = writeln!(
+            s,
+            "\nmismatches (first {shown} of {} differing keys, at most {DEFAULT_DISPLAY_MISMATCHES} shown)",
+            num(total_diff_keys)
+        );
+        for m in key_mismatches.into_iter().take(DEFAULT_DISPLAY_MISMATCHES) {
+            match m {
+                Mismatch::RowHashDiffers { key, left, right } => {
+                    let _ = writeln!(
+                        s,
+                        "  row_hash_differs  key {}  (left {} row(s), right {} row(s))",
+                        fmt_key(key),
+                        num(left.compared_rows),
+                        num(right.compared_rows)
+                    );
+                }
+                Mismatch::MissingOnLeft { key, right } => {
+                    let _ = writeln!(
+                        s,
+                        "  missing_on_left   key {}  (right {} row(s))",
+                        fmt_key(key),
+                        num(right.compared_rows)
+                    );
+                }
+                Mismatch::MissingOnRight { key, left } => {
+                    let _ = writeln!(
+                        s,
+                        "  missing_on_right  key {}  (left {} row(s))",
+                        fmt_key(key),
+                        num(left.compared_rows)
+                    );
+                }
+                Mismatch::NoComparableVersion { key, sides, .. } => {
+                    let side = match sides {
+                        Sides::Left => "left",
+                        Sides::Right => "right",
+                        Sides::Both => "both sides",
+                    };
+                    let _ = writeln!(
+                        s,
+                        "  no_comparable_version  key {}  (all versions null on {side})",
+                        fmt_key(key)
+                    );
+                }
+                Mismatch::TotalDiffers { .. } => {}
+            }
+        }
+    }
+    if !o.totals.is_empty() {
+        let _ = writeln!(s, "\ntotals");
+        for t in &o.totals {
+            let grp = fmt_group(&t.group);
+            if t.left == t.right {
+                let _ = writeln!(s, "  {}{}  {}", t.column, grp, t.left.render());
+            } else {
+                let _ = writeln!(
+                    s,
+                    "  {}{}  left {} != right {}",
+                    t.column,
+                    grp,
+                    t.left.render(),
+                    t.right.render()
+                );
+            }
+        }
     }
     let _ = writeln!(s, "\ncertificate {}", r.certificate.hash);
     s
@@ -310,6 +492,15 @@ fn fix_human(r: &FixResult, out: &Out) -> String {
                 }
                 Refusal::NothingToApply { sequence } => format!(
                     "applying changed nothing (the key is already complete at sequence {sequence}); no receipt"
+                ),
+                Refusal::NothingToGain {
+                    replay,
+                    current_bytes,
+                    proposed_bytes,
+                } => format!(
+                    "replay {replay} predicts no byte saving ({} -> {} bytes); pass --allow-no-gain to apply anyway; no receipt",
+                    num(*current_bytes),
+                    num(*proposed_bytes)
                 ),
                 Refusal::LayoutNotApplicable => {
                     "layout proposals are applied by evolve, which has not landed".into()

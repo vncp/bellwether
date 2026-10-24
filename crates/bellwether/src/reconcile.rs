@@ -10,6 +10,9 @@ use serde::{Deserialize, Serialize};
 use crate::engine::{guard, Engine};
 use crate::results::Written;
 
+/// How many per-key mismatches the CLI's human `reconcile` output prints.
+pub const DEFAULT_DISPLAY_MISMATCHES: usize = 20;
+
 /// How to reconcile two folders.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct ReconcileRequest {
@@ -26,6 +29,10 @@ pub struct ReconcileRequest {
     pub group_by: Vec<String>,
     /// Compare a deterministic sample of keys: `(fraction, seed)`.
     pub sample: Option<(f64, u64)>,
+    /// Memory budget for the comparison state, in bytes (`None` uses the
+    /// verifier's default, 256 MiB).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_budget: Option<u64>,
 }
 
 /// What [`Engine::reconcile`] found.
@@ -82,8 +89,13 @@ impl Engine {
                 age: p.age,
             }),
             inputs: Vec::new(),
+            created_at: Some(self.now()),
         };
-        let certified = Reconciler::new(spec, Options::default())?.certify(
+        let mut opts = Options::default();
+        if let Some(b) = req.memory_budget {
+            opts.memory_budget = b;
+        }
+        let certified = Reconciler::new(spec, opts)?.certify(
             &Side::new(&*left_source, self.root()),
             &Side::new(&*right_source, &right),
             &ctx,

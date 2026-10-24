@@ -370,7 +370,10 @@ impl Engine {
     /// RFC 3339 UTC, the time every record this engine writes carries:
     /// the fixed clock when one is set.
     pub(crate) fn now(&self) -> String {
-        self.options.clock.clone().unwrap_or_else(now_rfc3339)
+        match &self.options.clock {
+            Some(c) => bellwether_store::format_rfc3339_millis(c).unwrap_or_else(|_| c.clone()),
+            None => now_rfc3339(),
+        }
     }
 
     /// "Now" in nanoseconds since the epoch, for ages: the fixed clock when
@@ -568,21 +571,18 @@ pub(crate) fn folder_changes(
         .map(|f| (f.fingerprint.path.as_str(), &f.fingerprint))
         .collect();
     let policy = pinned.policy()?;
-    let extensions: &[&str] = match format.text() {
-        None => &["parquet"],
-        Some(text) => text.extensions(),
-    };
     let fs = LocalFs;
     let mut found = std::collections::BTreeSet::new();
     let mut changes = FolderChanges::default();
     let mut paths: Vec<String> = fs
         .list(root)?
         .into_iter()
-        .filter(|p| {
-            Path::new(p)
+        .filter(|p| match format.text() {
+            None => Path::new(p)
                 .extension()
                 .and_then(|e| e.to_str())
-                .is_some_and(|e| extensions.iter().any(|x| e.eq_ignore_ascii_case(x)))
+                .is_some_and(|e| e.eq_ignore_ascii_case("parquet")),
+            Some(text) => text.matches_path(p),
         })
         .collect();
     paths.sort();

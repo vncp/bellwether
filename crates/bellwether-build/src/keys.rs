@@ -58,7 +58,8 @@ fn element_shape(dt: &DataType) -> Result<(Vec<u8>, Option<usize>)> {
         DataType::Dictionary(_, v) => return element_shape(v),
         other => {
             return Err(Error::KeySpec(format!(
-                "type {other} has no canonical encoding in encoding version 1"
+                "type {} has no canonical encoding in encoding version 1",
+                bellwether_core::encoding::type_summary(other)
             )))
         }
     })

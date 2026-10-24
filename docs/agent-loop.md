@@ -8,9 +8,10 @@ are the types in
 the boundary they enforce is in [`architecture.md`](architecture.md) and
 [`threat-model.md`](threat-model.md).
 
-Status: pre-alpha. The types exist; the engine that writes them does not
-yet. The example is illustrative and every value in angle brackets is a
-placeholder.
+Status: implemented across the workspace crates (`bellwether-types`, `-core`,
+`-source`, `-store`, `-ledger`, `-build`, `-profile`, `-replay`, `-verify`,
+and the `bellwether` facade / `bellwether-cli`). Angle-bracket values in the
+worked example below stand in for concrete numbers and hashes.
 
 ## The four stages
 

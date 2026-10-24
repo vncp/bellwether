@@ -385,15 +385,30 @@ fn a_workload_naming_an_unknown_query_kind_is_refused() {
         .unwrap();
     let w = rec.finish().unwrap();
     assert_eq!(w.runs()[0].query_kind, QUERY_KIND_LOCATE);
-    let mut manifest = w.manifest().clone();
-    manifest.runs[0].query_kind = "latest".into();
-    assert!(matches!(
-        Workload::new(manifest),
-        Err(Error::UnknownKind {
-            what: "query kind",
-            ..
-        })
-    ));
+    for known in [
+        "latest",
+        "asof:100",
+        "latest:lookback=10",
+        "asof:100:lookback=10",
+    ] {
+        let mut m = w.manifest().clone();
+        m.runs[0].query_kind = known.into();
+        assert!(Workload::new(m).is_ok(), "{known}");
+    }
+    for bad in ["unknown", "asof:", "asof:notanint", "latest:lookback=-1"] {
+        let mut manifest = w.manifest().clone();
+        manifest.runs[0].query_kind = bad.into();
+        assert!(
+            matches!(
+                Workload::new(manifest),
+                Err(Error::UnknownKind {
+                    what: "query kind",
+                    ..
+                })
+            ),
+            "{bad}"
+        );
+    }
 }
 
 /// A source that serves other bytes than it was asked for.

@@ -62,6 +62,8 @@ pub const LOW_SELECTIVITY_SINGLE_COLUMN: &str = "low_selectivity_single_column";
 pub const SCATTERED_TIME_COLUMN: &str = "scattered_time_column";
 /// Rule id: a declared key spec no recorded run uses.
 pub const DECLARED_BUT_UNUSED_KEY: &str = "declared_but_unused_key";
+/// Rule id: no candidate column or composite narrows row groups at p95.
+pub const NO_DISCRIMINATING_COLUMN: &str = "no_discriminating_column";
 
 /// Confidence of a high finding.
 pub const HIGH: f64 = 0.9;
@@ -93,6 +95,9 @@ pub struct LintInputs<'a> {
     pub row_groups: &'a [RowGroupMeta],
     /// The recorded workload, if any.
     pub workload: Option<&'a WorkloadSummary>,
+    /// Columns supplied by any workload (bench workload, key file, or
+    /// recorded workload hash).
+    pub supplied_columns: &'a [String],
     /// The manifest, if the folder is indexed.
     pub manifest: Option<&'a ManifestInfo>,
     /// Rows in the dataset.
@@ -104,6 +109,7 @@ pub fn run(inputs: &LintInputs<'_>) -> Result<Vec<Lint>> {
     let mut lints = batch_stamp(inputs)?;
     let stamps: Vec<String> = lints.iter().map(|l| l.columns[0].clone()).collect();
     lints.extend(low_selectivity(inputs, &stamps));
+    lints.extend(no_discriminating_column(inputs, &stamps));
     lints.extend(scattered_time(inputs));
     lints.extend(declared_but_unused(inputs));
     Ok(lints)
@@ -128,6 +134,11 @@ fn supplied(inputs: &LintInputs<'_>, column: &str) -> bool {
     inputs
         .workload
         .is_some_and(|w| w.key_columns.iter().any(|c| c == column))
+        || inputs.supplied_columns.iter().any(|c| c == column)
+}
+
+fn has_workload(inputs: &LintInputs<'_>) -> bool {
+    inputs.workload.is_some() || !inputs.supplied_columns.is_empty()
 }
 
 /// `candidates` (`(partner, composite)`, in schema order) in the shared
@@ -162,7 +173,7 @@ fn label(columns: &[String]) -> String {
 /// The clause stating a composite order's assumption when no workload says
 /// which columns lookups supply.
 fn order_assumption(inputs: &LintInputs<'_>, composite: &[String]) -> String {
-    if inputs.workload.is_some() {
+    if has_workload(inputs) {
         String::new()
     } else {
         format!(
@@ -236,7 +247,7 @@ fn batch_stamp(inputs: &LintInputs<'_>) -> Result<Vec<Lint>> {
         let sampled = f.sampled || k.fanout.sampled || comp.fanout.sampled;
         let confidence = if sampled {
             LOW
-        } else if inputs.workload.is_some()
+        } else if has_workload(inputs)
             && comp.fanout.files_per_value[1] <= BATCH_HIGH_FILES_RATIO * f.files_per_value[1]
         {
             HIGH
@@ -307,7 +318,7 @@ fn low_selectivity(inputs: &LintInputs<'_>, stamps: &[String]) -> Vec<Lint> {
         let sampled = f.sampled || comp.fanout.sampled;
         let confidence = if sampled {
             LOW
-        } else if inputs.workload.is_none() {
+        } else if !has_workload(inputs) {
             MEDIUM
         } else if supplied(inputs, name) && supplied(inputs, other) {
             HIGH
@@ -338,6 +349,76 @@ fn low_selectivity(inputs: &LintInputs<'_>, stamps: &[String]) -> Vec<Lint> {
     out
 }
 
+fn no_discriminating_column(inputs: &LintInputs<'_>, stamps: &[String]) -> Vec<Lint> {
+    let candidates: Vec<&FanoutEntry> = inputs
+        .entries
+        .iter()
+        .filter(|e| !e.fanout.columns.iter().any(|c| stamps.contains(c)))
+        .collect();
+    let Some(first) = candidates.first() else {
+        return Vec::new();
+    };
+    let total = first.fanout.row_groups_total;
+    if total < 2 {
+        return Vec::new();
+    }
+    #[allow(clippy::cast_precision_loss)]
+    let ratio = |v: f64| v / total as f64;
+    let all_wide = candidates
+        .iter()
+        .all(|e| ratio(e.fanout.row_groups_per_value[1]) >= LOW_SELECTIVITY_MIN_FRACTION);
+    if !all_wide {
+        return Vec::new();
+    }
+    let best = candidates
+        .iter()
+        .min_by(|a, b| {
+            let (fa, fb) = (&a.fanout, &b.fanout);
+            fa.row_groups_per_value[0]
+                .total_cmp(&fb.row_groups_per_value[0])
+                .then(fa.row_groups_per_value[1].total_cmp(&fb.row_groups_per_value[1]))
+                .then(fa.row_groups_per_value[2].total_cmp(&fb.row_groups_per_value[2]))
+                .then(fa.columns.len().cmp(&fb.columns.len()))
+        })
+        .copied()
+        .unwrap_or(first);
+    let bf = &best.fanout;
+    let best_name = if bf.columns.len() == 1 {
+        bf.columns[0].clone()
+    } else {
+        label(&bf.columns)
+    };
+    let confidence = if candidates.iter().any(|e| e.fanout.sampled) {
+        LOW
+    } else if has_workload(inputs) {
+        HIGH
+    } else {
+        MEDIUM
+    };
+    let cluster = inputs
+        .plan
+        .columns
+        .first()
+        .map_or_else(|| best_name.as_str(), |c| c.name.as_str());
+    vec![Lint {
+        rule: NO_DISCRIMINATING_COLUMN.into(),
+        columns: bf.columns.clone(),
+        message: format!(
+            "No candidate column narrows the {total} row groups: every measured column and \
+             composite touches at least {:.0}% of row groups at p95, and the lowest-fanout \
+             candidate {best_name} touches {} / {} / {} row groups (p50 / p95 / max), so an \
+             index on the current layout cannot prune point lookups; sort or cluster files by \
+             {cluster} when writing.",
+            LOW_SELECTIVITY_MIN_FRACTION * 100.0,
+            fmt_count(bf.row_groups_per_value[0]),
+            fmt_count(bf.row_groups_per_value[1]),
+            fmt_count(bf.row_groups_per_value[2]),
+        ),
+        confidence,
+        site: None,
+    }]
+}
+
 fn scattered_time(inputs: &LintInputs<'_>) -> Vec<Lint> {
     inputs
         .time
@@ -364,9 +445,12 @@ fn scattered_time(inputs: &LintInputs<'_>) -> Vec<Lint> {
 }
 
 fn declared_but_unused(inputs: &LintInputs<'_>) -> Vec<Lint> {
-    let (Some(manifest), Some(_)) = (inputs.manifest, inputs.workload) else {
+    let Some(manifest) = inputs.manifest else {
         return Vec::new();
     };
+    if !has_workload(inputs) {
+        return Vec::new();
+    }
     let mut out = Vec::new();
     for spec in &manifest.key_specs {
         let Some(lead) = spec.columns().first() else {

@@ -479,9 +479,7 @@ fn normalize<'a>(v: &Value<'a>, declared: &DataType) -> Result<Normalized<'a>> {
                 value: convert_time_unit(value, unit, *u)?,
             })
         }
-        other => Err(Error::Other(format!(
-            "type {other} has no canonical encoding in encoding version 1"
-        ))),
+        other => Err(unsupported_encoding(other)),
     }
 }
 
@@ -596,6 +594,89 @@ pub fn encode_tuple(values: &[Value<'_>]) -> Result<Vec<u8>> {
     Ok(out)
 }
 
+/// A concise human-readable name for `dt` that never prints nested child
+/// `Field` debug strings.
+#[must_use]
+pub fn type_summary(dt: &DataType) -> String {
+    match dt {
+        DataType::List(_) => "a list".into(),
+        DataType::LargeList(_) => "a large list".into(),
+        DataType::FixedSizeList(_, n) => format!("a fixed-size list ({n})"),
+        DataType::ListView(_) => "a list view".into(),
+        DataType::LargeListView(_) => "a large list view".into(),
+        DataType::Struct(fields) => format!(
+            "a struct ({})",
+            fields
+                .iter()
+                .map(|f| f.name().as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        DataType::Map(_, _) => "a map".into(),
+        DataType::Union(_, _) => "a union".into(),
+        DataType::RunEndEncoded(_, _) => "run-end encoded".into(),
+        DataType::Dictionary(k, v) => format!("Dictionary({k}, {})", type_summary(v)),
+        other => other.to_string(),
+    }
+}
+
+/// Whether `dt` is a nested or field-carrying type (struct, list, map, union,
+/// or run-end encoded, including inside a dictionary).
+#[must_use]
+pub fn is_nested_type(dt: &DataType) -> bool {
+    match dt {
+        DataType::List(_)
+        | DataType::LargeList(_)
+        | DataType::FixedSizeList(_, _)
+        | DataType::ListView(_)
+        | DataType::LargeListView(_)
+        | DataType::Struct(_)
+        | DataType::Map(_, _)
+        | DataType::Union(_, _)
+        | DataType::RunEndEncoded(_, _) => true,
+        DataType::Dictionary(k, v) => is_nested_type(k) || is_nested_type(v),
+        _ => false,
+    }
+}
+
+fn unsupported_encoding(dt: &DataType) -> Error {
+    if is_nested_type(dt) {
+        Error::KeySpec(format!(
+            "type {} is a nested column and has no canonical encoding in encoding version 1; \
+             flatten nested fields into top-level columns before using them as keys",
+            type_summary(dt)
+        ))
+    } else {
+        Error::Other(format!(
+            "type {} has no canonical encoding in encoding version 1",
+            type_summary(dt)
+        ))
+    }
+}
+
+/// Returns an [`Error::KeySpec`] explaining why `name` is not in `schema`,
+/// including a flatten hint when `name` uses dotted nested-field syntax
+/// (`repo.id`) on a nested column.
+#[must_use]
+pub fn missing_column(schema: &arrow::datatypes::Schema, name: &str) -> Error {
+    if let Some((root, _)) = name.split_once('.') {
+        if let Ok(f) = schema.field_with_name(root) {
+            if is_nested_type(f.data_type()) {
+                return Error::KeySpec(format!(
+                    "column {name:?} not in the dataset schema ({root:?} is {}); nested field \
+                     addressing is not supported, so flatten {name:?} into a top-level column first",
+                    type_summary(f.data_type())
+                ));
+            }
+        }
+        return Error::KeySpec(format!(
+            "column {name:?} not in the dataset schema; nested field addressing is not supported, \
+             so flatten nested fields into top-level columns first"
+        ));
+    }
+    Error::KeySpec(format!("column {name:?} not in the dataset schema"))
+}
+
 /// Returns `Ok(())` if `dt` has a canonical encoding in version 1.
 pub fn check_supported(dt: &DataType) -> Result<()> {
     match dt {
@@ -626,9 +707,7 @@ pub fn check_supported(dt: &DataType) -> Result<()> {
         | DataType::Time64(TimeUnit::Microsecond | TimeUnit::Nanosecond)
         | DataType::Timestamp(_, _) => Ok(()),
         DataType::Dictionary(_, v) => check_supported(v),
-        other => Err(Error::Other(format!(
-            "type {other} has no canonical encoding in encoding version 1"
-        ))),
+        other => Err(unsupported_encoding(other)),
     }
 }
 
@@ -752,11 +831,7 @@ pub fn value_at(array: &dyn Array, row: usize) -> Result<Option<Value<'_>>> {
                 t => Err(Error::Other(format!("unsupported dictionary type {t}")))
             )
         }
-        other => {
-            return Err(Error::Other(format!(
-                "type {other} has no canonical encoding in encoding version 1"
-            )))
-        }
+        other => return Err(unsupported_encoding(other)),
     };
     Ok(Some(v))
 }

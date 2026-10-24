@@ -170,6 +170,277 @@ pub(crate) fn finalize(sum: Wide, wide: bool, scale: i8) -> Option<ExactTotal> {
     Some(ExactTotal { unscaled, scale })
 }
 
+/// Parses a `--totals` column specification: either a bare decimal column
+/// name, or `<column>:dec(<scale>)` for exact float quantization.
+pub(crate) fn parse_total_spec(spec: &str) -> Result<(&str, Option<i8>), String> {
+    let Some((col, rest)) = spec.rsplit_once(':') else {
+        return Ok((spec, None));
+    };
+    if col.is_empty() {
+        return Err(format!(
+            "total spec {spec:?} has no column name; write <column> or <column>:dec(<scale>)"
+        ));
+    }
+    let Some(inner) = rest.strip_prefix("dec(").and_then(|s| s.strip_suffix(')')) else {
+        return Err(format!(
+            "total spec {spec:?} has unknown quantization {rest:?}; use {col}:dec(<scale>), for example {col}:dec(4)"
+        ));
+    };
+    let scale: i8 = inner.parse().map_err(|_| {
+        format!(
+            "total spec {spec:?} has invalid scale {inner:?}; pass an integer in -38..=38, for example {col}:dec(4)"
+        )
+    })?;
+    if !(-38..=38).contains(&scale) {
+        return Err(format!(
+            "total spec {spec:?} has scale {scale} outside -38..=38"
+        ));
+    }
+    Ok((col, Some(scale)))
+}
+
+/// Exact unsigned multi-word big integer (little-endian `u64` limbs, no
+/// trailing zero limbs) for exact binary-float to decimal conversion.
+#[derive(Clone, Default, PartialEq, Eq)]
+struct BigUint(Vec<u64>);
+
+impl BigUint {
+    fn from_u64(v: u64) -> Self {
+        if v == 0 {
+            Self(Vec::new())
+        } else {
+            Self(vec![v])
+        }
+    }
+
+    fn is_zero(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    fn is_odd(&self) -> bool {
+        self.0.first().is_some_and(|w| w & 1 == 1)
+    }
+
+    fn trim(&mut self) {
+        while self.0.last() == Some(&0) {
+            self.0.pop();
+        }
+    }
+
+    #[allow(clippy::cast_possible_truncation)]
+    fn mul_small(&mut self, factor: u64) {
+        if self.is_zero() || factor == 1 {
+            return;
+        }
+        if factor == 0 {
+            self.0.clear();
+            return;
+        }
+        let mut carry = 0u128;
+        for w in &mut self.0 {
+            let prod = u128::from(*w) * u128::from(factor) + carry;
+            *w = prod as u64;
+            carry = prod >> 64;
+        }
+        if carry != 0 {
+            self.0.push(carry as u64);
+        }
+    }
+
+    fn mul_pow5(&mut self, mut exp: u32) {
+        const POW5_27: u64 = 7_450_580_596_923_828_125; // 5^27
+        while exp >= 27 {
+            self.mul_small(POW5_27);
+            exp -= 27;
+        }
+        if exp > 0 {
+            self.mul_small(5u64.pow(exp));
+        }
+    }
+
+    fn shl_bits(&mut self, bits: u32) {
+        if self.is_zero() || bits == 0 {
+            return;
+        }
+        let word_shift = (bits / 64) as usize;
+        let bit_shift = bits % 64;
+        if bit_shift == 0 {
+            let mut out = vec![0u64; word_shift];
+            out.extend_from_slice(&self.0);
+            self.0 = out;
+            return;
+        }
+        let mut out = vec![0u64; word_shift + self.0.len() + 1];
+        let mut carry = 0u64;
+        for (i, &w) in self.0.iter().enumerate() {
+            out[word_shift + i] = (w << bit_shift) | carry;
+            carry = w >> (64 - bit_shift);
+        }
+        out[word_shift + self.0.len()] = carry;
+        self.0 = out;
+        self.trim();
+    }
+
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        match self.0.len().cmp(&other.0.len()) {
+            std::cmp::Ordering::Equal => {
+                for (&a, &b) in self.0.iter().zip(&other.0).rev() {
+                    if a != b {
+                        return a.cmp(&b);
+                    }
+                }
+                std::cmp::Ordering::Equal
+            }
+            ord => ord,
+        }
+    }
+
+    #[allow(clippy::cast_possible_truncation)]
+    fn bit_len(&self) -> u32 {
+        match self.0.last() {
+            None => 0,
+            Some(&top) => (self.0.len() as u32 - 1) * 64 + (64 - top.leading_zeros()),
+        }
+    }
+
+    fn bit(&self, idx: u32) -> bool {
+        let w = (idx / 64) as usize;
+        let b = idx % 64;
+        self.0.get(w).is_some_and(|v| (v >> b) & 1 == 1)
+    }
+
+    fn set_bit(&mut self, idx: u32) {
+        let w = (idx / 64) as usize;
+        let b = idx % 64;
+        if self.0.len() <= w {
+            self.0.resize(w + 1, 0);
+        }
+        self.0[w] |= 1u64 << b;
+    }
+
+    fn shl1_with_bit(&mut self, b: bool) {
+        let mut carry = u64::from(b);
+        for w in &mut self.0 {
+            let next = *w >> 63;
+            *w = (*w << 1) | carry;
+            carry = next;
+        }
+        if carry != 0 {
+            self.0.push(carry);
+        }
+    }
+
+    fn sub_assign(&mut self, other: &Self) {
+        let mut borrow = 0u64;
+        for (i, w) in self.0.iter_mut().enumerate() {
+            let rhs = other.0.get(i).copied().unwrap_or(0);
+            let (d1, b1) = w.overflowing_sub(rhs);
+            let (d2, b2) = d1.overflowing_sub(borrow);
+            *w = d2;
+            borrow = u64::from(b1 || b2);
+        }
+        debug_assert_eq!(borrow, 0);
+        self.trim();
+    }
+
+    fn add_one(&mut self) {
+        let mut carry = 1u64;
+        for w in &mut self.0 {
+            let (s, c) = w.overflowing_add(carry);
+            *w = s;
+            carry = u64::from(c);
+            if carry == 0 {
+                break;
+            }
+        }
+        if carry != 0 {
+            self.0.push(carry);
+        }
+    }
+
+    /// Exact division `self / rhs`, returning `(quotient, remainder)`.
+    fn div_rem(&self, rhs: &Self) -> (Self, Self) {
+        debug_assert!(!rhs.is_zero());
+        if self.cmp(rhs) == std::cmp::Ordering::Less {
+            return (Self::default(), self.clone());
+        }
+        let mut q = Self::default();
+        let mut r = Self::default();
+        for i in (0..self.bit_len()).rev() {
+            r.shl1_with_bit(self.bit(i));
+            if r.cmp(rhs) != std::cmp::Ordering::Less {
+                r.sub_assign(rhs);
+                q.set_bit(i);
+            }
+        }
+        q.trim();
+        r.trim();
+        (q, r)
+    }
+
+    fn to_u128(&self) -> Option<u128> {
+        match self.0.as_slice() {
+            [] => Some(0),
+            [lo] => Some(u128::from(*lo)),
+            [lo, hi] => Some(u128::from(*lo) | (u128::from(*hi) << 64)),
+            _ => None,
+        }
+    }
+}
+
+/// Converts an `f64` to its exact decimal expansion and rounds half-to-even at
+/// `scale`, returning the scaled integer as an `i128` (or `None` on overflow;
+/// caller checks `is_finite` first).
+pub(crate) fn quantize_f64_half_to_even(v: f64, scale: i8) -> Option<i128> {
+    debug_assert!(v.is_finite());
+    if v == 0.0 {
+        return Some(0);
+    }
+    let bits = v.to_bits();
+    let neg = (bits >> 63) != 0;
+    let exp_bits = ((bits >> 52) & 0x7ff) as i32;
+    let frac = bits & ((1u64 << 52) - 1);
+    let (mant, exp2) = if exp_bits == 0 {
+        (frac, -1074i32)
+    } else {
+        (frac | (1u64 << 52), exp_bits - 1023 - 52)
+    };
+    let s = i32::from(scale);
+    // Exact value * 10^s = mant * 2^(exp2 + s) * 5^s = num / den.
+    let mut num = BigUint::from_u64(mant);
+    let mut den = BigUint::from_u64(1);
+    if s >= 0 {
+        num.mul_pow5(s.unsigned_abs());
+    } else {
+        den.mul_pow5(s.unsigned_abs());
+    }
+    let e2 = exp2 + s;
+    if e2 >= 0 {
+        num.shl_bits(e2.unsigned_abs());
+    } else {
+        den.shl_bits(e2.unsigned_abs());
+    }
+    let (mut q, r) = num.div_rem(&den);
+    if !r.is_zero() {
+        let mut twice_r = r;
+        twice_r.shl_bits(1);
+        match twice_r.cmp(&den) {
+            std::cmp::Ordering::Greater => q.add_one(),
+            std::cmp::Ordering::Equal if q.is_odd() => q.add_one(),
+            _ => {}
+        }
+    }
+    let mag = q.to_u128()?;
+    if neg {
+        if mag == (1u128 << 127) {
+            Some(i128::MIN)
+        } else {
+            i128::try_from(mag).ok().map(|x| -x)
+        }
+    } else {
+        i128::try_from(mag).ok()
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;

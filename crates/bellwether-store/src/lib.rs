@@ -39,10 +39,10 @@ pub use gc::{
 };
 pub use local::LOCK_TIMEOUT as LOCAL_LOCK_TIMEOUT;
 pub use manifest::{
-    join, manifest_path, now_rfc3339, parse_rfc3339, segment_path, ChunkRange, ColumnDef,
-    DeleteClaim, Extra, FileEntry, Manifest, RowGroupRange, RowGroupSpace, RowGroupTombstone,
-    SchemaInfo, SegmentRef, SegmentTombstone, SourceInfo, CACHE_DIR, MANIFEST_FILE, SEGMENTS_DIR,
-    UNSUPPORTED_SHAPE, UNSUPPORTED_STORAGE,
+    format_rfc3339_millis, join, manifest_path, now_rfc3339, parse_rfc3339, segment_path,
+    ChunkRange, ColumnDef, DeleteClaim, Extra, FileEntry, Manifest, RowGroupRange, RowGroupSpace,
+    RowGroupTombstone, SchemaInfo, SegmentRef, SegmentTombstone, SourceInfo, CACHE_DIR,
+    MANIFEST_FILE, SEGMENTS_DIR, UNSUPPORTED_SHAPE, UNSUPPORTED_STORAGE,
 };
 pub use object_store::ObjectMeta;
 pub use snapshot::Snapshot;

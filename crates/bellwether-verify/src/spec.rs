@@ -7,6 +7,7 @@ use std::time::Duration;
 use bellwether_types::Hash;
 
 use crate::error::{Result, VerifyError};
+use crate::totals::parse_total_spec;
 
 /// Default memory budget for the comparison state: 256 MiB. See
 /// [`Options::memory_budget`] and the crate README for what it bounds.
@@ -164,6 +165,15 @@ impl ReconcileSpec {
         distinct("key_columns", &self.key_columns)?;
         distinct("ignored_columns", &self.ignored_columns)?;
         distinct("total_columns", &self.total_columns)?;
+        let mut total_cols = BTreeSet::new();
+        for t in &self.total_columns {
+            let (col, _) = parse_total_spec(t).map_err(VerifyError::InvalidSpec)?;
+            if !total_cols.insert(col) {
+                return Err(VerifyError::InvalidSpec(format!(
+                    "total_columns lists column {col:?} twice"
+                )));
+            }
+        }
         distinct("group_by", &self.group_by)?;
         for k in &self.key_columns {
             if self.ignored_columns.contains(k) {

@@ -25,7 +25,7 @@ use std::time::Duration;
 use arrow::array::RecordBatch;
 use arrow::datatypes::SchemaRef;
 use bellwether_build::{BuildOptions, Builder};
-use bellwether_replay::{proposed_specs, Replayer, Workload};
+use bellwether_replay::{proposed_specs, Replayer, RunQuery, Workload};
 use bellwether_store::{Cache, ObjectStoreBackend};
 use bellwether_types::{
     format, Certificate, Coverage, Error, Evidence, EvidenceBody, FileFingerprint, Hash, KeySpec,
@@ -79,6 +79,10 @@ pub struct FixRequest {
     pub rewrite: Option<RewriteOutputs>,
     /// Stop after the certificate: score and verify, apply nothing.
     pub verify_only: bool,
+    /// Allow applying a proposal even when its replay predicts no byte
+    /// saving over the current configuration.
+    #[serde(default)]
+    pub allow_no_gain: bool,
 }
 
 /// The score stage's outcome.
@@ -160,6 +164,16 @@ pub enum Refusal {
         /// The unchanged sequence.
         sequence: String,
     },
+    /// The proposal's replay predicts no byte saving over the current
+    /// configuration; refused unless `--allow-no-gain` is passed.
+    NothingToGain {
+        /// The Replay record computed at the score stage.
+        replay: Hash,
+        /// Bytes under the current configuration.
+        current_bytes: u64,
+        /// Bytes under the proposal.
+        proposed_bytes: u64,
+    },
     /// A Layout proposal: layout apply arrives with evolve.
     LayoutNotApplicable,
     /// A passing Rewrite cannot be attested yet: a receipt cites a Replay
@@ -226,7 +240,7 @@ impl Engine {
     pub fn fix(&self, request: &FixRequest) -> Result<FixResult> {
         guard(|| match (&request.proposal, &request.certificate) {
             (Some(p), None) => self.fix_proposal(p, request),
-            (None, Some(c)) => self.apply_certificate(c),
+            (None, Some(c)) => self.apply_certificate(c, request.allow_no_gain),
             _ => Err(Error::Other(
                 "fix takes a proposal (--proposal) or a certificate to apply (--certificate), \
                  not both"
@@ -304,6 +318,20 @@ impl Engine {
                     current: replay.1,
                     proposed: replay.2,
                 });
+                if !req.verify_only && replayer.current_specs().contains(spec) {
+                    result.outcome = refused(Refusal::NothingToApply {
+                        sequence: before.to_string(),
+                    });
+                    return Ok(result);
+                }
+                if !req.verify_only && !req.allow_no_gain && replay.2.bytes >= replay.1.bytes {
+                    result.outcome = refused(Refusal::NothingToGain {
+                        replay: replay_hash,
+                        current_bytes: replay.1.bytes,
+                        proposed_bytes: replay.2.bytes,
+                    });
+                    return Ok(result);
+                }
                 // 2. Verify.
                 let (plan, cert, verification) = self.verify_key(
                     hash,
@@ -372,7 +400,7 @@ impl Engine {
 
     /// Apply and attest a certificate written earlier: every check runs
     /// before anything is written, and the replay is recomputed now.
-    fn apply_certificate(&self, cert_hash: &Hash) -> Result<FixResult> {
+    fn apply_certificate(&self, cert_hash: &Hash, allow_no_gain: bool) -> Result<FixResult> {
         let w = self.get(cert_hash)?;
         let Record::Certificate(certificate) = &w.record else {
             return Err(Error::LedgerRule(format!(
@@ -444,6 +472,20 @@ impl Engine {
                     current: current_cost,
                     proposed: proposed_cost,
                 });
+                if replayer.current_specs().contains(spec) {
+                    result.outcome = refused(Refusal::NothingToApply {
+                        sequence: before.to_string(),
+                    });
+                    return Ok(result);
+                }
+                if !allow_no_gain && proposed_cost.bytes >= current_cost.bytes {
+                    result.outcome = refused(Refusal::NothingToGain {
+                        replay: replay_hash,
+                        current_bytes: current_cost.bytes,
+                        proposed_bytes: proposed_cost.bytes,
+                    });
+                    return Ok(result);
+                }
                 result.outcome = self.apply_and_attest(
                     &proposal,
                     &proposal_hash,
@@ -511,8 +553,9 @@ impl Engine {
         let mut selected: BTreeMap<String, (FileFingerprint, RoaringBitmap)> = BTreeMap::new();
         let mut keys: Vec<Vec<u8>> = Vec::new();
         for run in runs {
+            let query = RunQuery::parse(&run.query_kind)?;
             let rk = workload.run_keys(cache, run)?;
-            let plan = replayer.plan_of_keys(&specs, &rk)?;
+            let plan = replayer.plan_of_query(&specs, &rk, query)?;
             for e in plan.entries {
                 selected
                     .entry(e.file.path.clone())
@@ -547,11 +590,32 @@ impl Engine {
         let workload_age = cache
             .get_cached(&workload.hash())?
             .map_or(Duration::ZERO, |(_, age)| age);
-        let spec = ReconcileSpec::new(columns).coverage(CoverageRequest::Workload(WorkloadKeys {
-            workload: workload.hash(),
-            age: workload_age,
-            keys,
-        }));
+        let mut ignored: Vec<String> = replayer
+            .schema()
+            .fields()
+            .iter()
+            .filter(|f| bellwether_core::encoding::check_supported(f.data_type()).is_err())
+            .map(|f| f.name().clone())
+            .collect();
+        ignored.retain(|c| !columns.contains(c));
+        let mut rec_spec =
+            ReconcileSpec::new(columns)
+                .ignore(ignored)
+                .coverage(CoverageRequest::Workload(WorkloadKeys {
+                    workload: workload.hash(),
+                    age: workload_age,
+                    keys,
+                }));
+        if runs.iter().all(|r| {
+            matches!(
+                RunQuery::parse(&r.query_kind),
+                Ok(RunQuery::Latest { lookback: None })
+            )
+        }) {
+            if let KeySpec::Temporal { ts_column, .. } = spec {
+                rec_spec = rec_spec.latest_by(ts_column.clone());
+            }
+        }
         let ctx = CertificateContext {
             proposal: Some(*proposal),
             manifest: pinned.map(anchor),
@@ -559,11 +623,13 @@ impl Engine {
                 hash: plan_evidence.hash,
                 age: Duration::ZERO,
             }],
+            created_at: Some(self.now()),
         };
         let root = self.root();
         let left = Side::new(source, root);
         let right = Side::new(&planned, root);
-        let certified = Reconciler::new(spec, Options::default())?.certify(&left, &right, &ctx)?;
+        let certified =
+            Reconciler::new(rec_spec, Options::default())?.certify(&left, &right, &ctx)?;
         let cert = self.record_certified(&certified)?;
         Ok((plan_evidence, cert, certified.outcome))
     }
@@ -590,6 +656,7 @@ impl Engine {
             proposal: Some(*proposal),
             manifest: pinned.map(anchor),
             inputs: Vec::new(),
+            created_at: Some(self.now()),
         };
         let certified = Reconciler::new(spec, Options::default())?.certify(
             &Side::new(&*left_source, &before),

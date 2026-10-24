@@ -99,6 +99,15 @@ enum FormatArg {
     /// JSON lines.
     Jsonl,
 }
+#[derive(Clone, Copy, ValueEnum)]
+enum WhyModeArg {
+    /// Point lookup (`locate`).
+    Locate,
+    /// Newest version per key (`latest`).
+    Latest,
+    /// Version current at `--at` (`asof`).
+    Asof,
+}
 
 #[derive(Subcommand)]
 enum Command {
@@ -165,6 +174,20 @@ struct WhyArgs {
     /// columns.
     #[arg(long, value_name = "N", default_value_t = bellwether::DEFAULT_MAX_CANDIDATES)]
     max_candidates: usize,
+    /// Lookup mode to price candidates under (`locate`, `latest`, or `asof`).
+    #[arg(long, value_enum, default_value_t = WhyModeArg::Locate)]
+    mode: WhyModeArg,
+    /// Timestamp column ordering versions for `latest` or `asof`.
+    #[arg(long, value_name = "COL")]
+    latest_by: Option<String>,
+    /// Instant for `asof` mode (RFC 3339, `YYYY-MM-DD`, or integer in the
+    /// timestamp column's unit).
+    #[arg(long, value_name = "INSTANT")]
+    at: Option<String>,
+    /// Lookback window for `latest` or `asof` mode (`252d`, `4w`, `24h`,
+    /// `30m`, `60s`; calendar units).
+    #[arg(long, value_name = "DURATION")]
+    lookback: Option<String>,
 }
 
 #[derive(Args)]
@@ -500,6 +523,14 @@ fn why(g: &Global, out: &Out, a: &WhyArgs) -> Result<Outcome, Failure> {
             .transpose()?,
         columns: a.columns.clone(),
         max_candidates: a.max_candidates,
+        mode: match a.mode {
+            WhyModeArg::Locate => bellwether::WhyMode::Locate,
+            WhyModeArg::Latest => bellwether::WhyMode::Latest,
+            WhyModeArg::Asof => bellwether::WhyMode::Asof,
+        },
+        latest_by: a.latest_by.clone(),
+        at: a.at.clone(),
+        lookback: a.lookback.clone(),
     };
     let r = engine(g, &a.root.root)?.why(&request)?;
     done(&r, human::why(&r, out), EXIT_OK)

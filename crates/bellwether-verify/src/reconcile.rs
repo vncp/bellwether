@@ -11,7 +11,7 @@
 //! exact, order-independent sum, so the result does not depend on `P`.
 
 use std::mem::size_of;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use arrow::array::{Array, RecordBatch};
 use arrow::datatypes::{i256, DataType};
@@ -30,13 +30,13 @@ use crate::outcome::{
 use crate::planner::{ManifestIdentity, SidePlanner};
 use crate::render::render_tuple;
 use crate::rowhash::{check_probe, hex, push_hashed_column};
-use crate::schema::{class, Plan};
+use crate::schema::{class, Plan, TotalCol};
 use crate::spec::{CoverageRequest, Options, ReconcileSpec, MAX_PASSES};
 use crate::state::{
     charge_heap, heap, release_heap, table_peak, Contrib, Examples, GroupError, Groups, KeyState,
     Meter, MeteredMap, Overflow, SideState,
 };
-use crate::totals::{finalize, ExactTotal, Wide};
+use crate::totals::{finalize, quantize_f64_half_to_even, ExactTotal, Wide};
 
 /// Seed of the key-space partition hash. Fixed: the partition never
 /// depends on the caller's sampling seed.
@@ -1000,8 +1000,16 @@ fn read_row_group(
         let gid = match a.groups.as_mut() {
             Some(groups) => {
                 for (slot, t) in scratch.values.iter_mut().zip(&plan.totals) {
-                    *slot = decimal_at(cols[t.proj], row, &types[t.proj], &mut scratch.decimal)
-                        .map_err(|e| locate(t.proj, &e))?;
+                    *slot = total_at(
+                        cols[t.proj],
+                        row,
+                        &types[t.proj],
+                        t,
+                        &scratch.key,
+                        &plan.key_types(s),
+                        &mut scratch.decimal,
+                    )
+                    .map_err(|e| locate(t.proj, &e))?;
                 }
                 scratch.group.clear();
                 for &i in &plan.group {
@@ -1334,6 +1342,49 @@ fn add_contrib(
     Ok(())
 }
 
+fn total_at(
+    array: &dyn Array,
+    row: usize,
+    dataset_type: &DataType,
+    total: &TotalCol,
+    key: &[u8],
+    key_types: &[DataType],
+    scratch: &mut Vec<u8>,
+) -> bellwether_types::Result<Option<i256>> {
+    if !total.quantized_float {
+        return decimal_at(array, row, dataset_type, scratch);
+    }
+    let Some(encoding::Value::Float(v)) = encoding::value_at(array, row)? else {
+        return Ok(None);
+    };
+    let render_key = || {
+        render_tuple(key, key_types).map_or_else(
+            || hex(key),
+            |vals| {
+                vals.into_iter()
+                    .map(|x| x.unwrap_or_else(|| "null".to_string()))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            },
+        )
+    };
+    if !v.is_finite() {
+        let rendered_key = render_key();
+        return Err(bellwether_types::Error::Other(format!(
+            "float value {v} on key ({rendered_key}) cannot be quantized for {}; NaN and infinity are refused",
+            total.name
+        )));
+    }
+    let scaled = quantize_f64_half_to_even(v, total.scale).ok_or_else(|| {
+        let rendered_key = render_key();
+        bellwether_types::Error::Other(format!(
+            "float value {v} on key ({rendered_key}) overflows i128 when quantized for {}",
+            total.name
+        ))
+    })?;
+    Ok(Some(i256::from_i128(scaled)))
+}
+
 /// A decimal value at its dataset scale, through the canonical encoder so
 /// the rescale (exact, or an error) is the one the row hash uses.
 fn decimal_at(
@@ -1557,10 +1608,8 @@ fn plan_evidence(plan: ScanPlan, m: &ManifestIdentity, taken: Instant) -> Result
     })
 }
 
-/// The current time, RFC 3339 UTC with nanoseconds.
+/// The current time, RFC 3339 UTC with milliseconds.
+#[allow(clippy::unnecessary_wraps)]
 pub(crate) fn now_rfc3339() -> Result<String> {
-    let since = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_err(|e| VerifyError::Engine(bellwether_types::Error::Other(format!("clock: {e}"))))?;
-    Ok(bellwether_source::storage::rfc3339_utc(since))
+    Ok(bellwether_store::now_rfc3339())
 }

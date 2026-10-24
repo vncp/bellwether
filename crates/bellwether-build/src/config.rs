@@ -331,41 +331,10 @@ pub(crate) fn columns_to_schema(columns: &[ColumnDef]) -> Result<SchemaRef> {
                     c.name, c.data_type
                 ))
             })?;
-            if !recordable(&dt) {
-                return Err(Error::Other(format!(
-                    "manifest column {:?} has data type {:?}, a nested or field-carrying type, which the manifest does not record",
-                    c.name, c.data_type
-                )));
-            }
             Ok(Field::new(c.name.clone(), dt, c.nullable))
         })
         .collect::<Result<Vec<_>>>()?;
     Ok(Arc::new(Schema::new(fields)))
-}
-
-/// Whether the manifest records columns of type `dt`.
-///
-/// Types that carry child fields (lists, list views, structs, maps, unions,
-/// run-end encoding) are refused, at any depth of a dictionary. Before the
-/// 2026-10-24 Arrow upgrade this held implicitly: Arrow 53 printed such a
-/// type with its fields' debug form, which its own parser could not read, so
-/// [`persistable`] refused every dataset with one. Arrow 59 prints a form it
-/// can parse back, so the refusal is now explicit, and a dataset with a
-/// nested column is refused exactly as before.
-pub(crate) fn recordable(dt: &DataType) -> bool {
-    match dt {
-        DataType::List(_)
-        | DataType::LargeList(_)
-        | DataType::FixedSizeList(_, _)
-        | DataType::ListView(_)
-        | DataType::LargeListView(_)
-        | DataType::Struct(_)
-        | DataType::Map(_, _)
-        | DataType::Union(_, _)
-        | DataType::RunEndEncoded(_, _) => false,
-        DataType::Dictionary(k, v) => recordable(k) && recordable(v),
-        _ => true,
-    }
 }
 
 /// A manifest column type: Arrow's `Display` form as this build prints it,
@@ -671,11 +640,12 @@ mod tests {
         }
     }
 
-    /// Nested and field-carrying types were refused before the Arrow 59
-    /// upgrade (Arrow 53 could not parse its own display form of them), and
-    /// still are, although Arrow 59 now round-trips their spelling.
+    /// Non-key nested and field-carrying columns round-trip through the
+    /// manifest's dataset schema by their Arrow spelling so datasets with
+    /// struct, list, or map columns can still be indexed on their flat
+    /// columns.
     #[test]
-    fn nested_columns_are_refused_as_before_the_upgrade() {
+    fn nested_columns_round_trip_through_the_manifest_schema() {
         use arrow::datatypes::{Fields, UnionFields, UnionMode};
         let item = |t: DataType| Arc::new(Field::new("item", t, true));
         let nested = [
@@ -711,23 +681,23 @@ mod tests {
             ),
         ];
         for t in nested {
-            assert!(!recordable(&t), "{t}");
             let schema = Schema::new(vec![
                 Field::new("id", DataType::Int64, false),
                 Field::new("x", t.clone(), true),
             ]);
-            let err = persistable(&schema).unwrap_err();
-            assert!(matches!(err, Error::Other(_)), "{t}: {err}");
+            let back = persistable(&schema).unwrap();
+            assert_eq!(back.field(1).data_type(), &t, "{t}");
             let columns = vec![ColumnDef {
                 name: "x".into(),
                 data_type: t.to_string(),
                 nullable: true,
                 extra: Extra::new(),
             }];
-            assert!(columns_to_schema(&columns).is_err(), "{t}");
-        }
-        for (_, t) in arrow53_spellings() {
-            assert!(recordable(&t), "{t}");
+            assert_eq!(
+                columns_to_schema(&columns).unwrap().field(0).data_type(),
+                &t,
+                "{t}"
+            );
         }
     }
 

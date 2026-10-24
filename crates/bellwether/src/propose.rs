@@ -118,17 +118,25 @@ impl Engine {
         let source = self.source(pinned.as_ref())?;
         let schema = source.schema(self.root())?;
         for c in cols {
-            if schema.field_with_name(c).is_err() {
-                return Err(Error::KeySpec(format!(
-                    "column {c:?} is not in the dataset under {}; propose over its columns ({})",
-                    self.root(),
-                    schema
-                        .fields()
-                        .iter()
-                        .map(|f| f.name().as_str())
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                )));
+            match schema.field_with_name(c) {
+                Ok(f) => {
+                    bellwether_core::encoding::check_supported(f.data_type()).map_err(|e| {
+                        Error::KeySpec(format!("column {c:?} cannot be a key: {e}"))
+                    })?;
+                }
+                Err(_) => {
+                    return Err(Error::KeySpec(format!(
+                        "{}; propose over the dataset columns under {} ({})",
+                        bellwether_core::encoding::missing_column(&schema, c),
+                        self.root(),
+                        schema
+                            .fields()
+                            .iter()
+                            .map(|f| f.name().as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )));
+                }
             }
         }
         Ok(())

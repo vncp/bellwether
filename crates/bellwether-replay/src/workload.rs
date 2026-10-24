@@ -74,6 +74,107 @@ const BENCH_WORKLOAD_FORMAT_PREFIX: &str = "bellwether-bench-workload/";
 /// The query kind of a recorded run that looks keys up (`locate`), the only
 /// kind replay prices today.
 pub const QUERY_KIND_LOCATE: &str = "locate";
+/// The query kind of a recorded run that asks for the newest version per key
+/// (`latest`).
+pub const QUERY_KIND_LATEST: &str = "latest";
+/// Prefix of an `asof` query kind (`asof:<ts>`).
+pub const QUERY_KIND_ASOF_PREFIX: &str = "asof:";
+
+/// Parsed query kind of a recorded run.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RunQuery {
+    /// Point lookup (`locate`), or window over `[lo, hi]`.
+    Locate {
+        /// Optional window `[lo, hi]` in the timestamp column's unit.
+        window: Option<(i64, i64)>,
+    },
+    /// Newest version per key (`latest`), optionally with a lookback window.
+    Latest {
+        /// Optional lookback span in the timestamp column's unit.
+        lookback: Option<i64>,
+    },
+    /// Version current at `ts` (`asof`), optionally with a lookback window.
+    AsOf {
+        /// Instant in the timestamp column's unit.
+        ts: i64,
+        /// Optional lookback span in the timestamp column's unit.
+        lookback: Option<i64>,
+    },
+}
+
+impl RunQuery {
+    /// Parses `query_kind` from a workload manifest.
+    pub fn parse(kind: &str) -> Result<Self> {
+        let unknown = || Error::UnknownKind {
+            what: "query kind",
+            found: kind.to_string(),
+        };
+        if kind == QUERY_KIND_LOCATE {
+            return Ok(Self::Locate { window: None });
+        }
+        if let Some(rest) = kind.strip_prefix("locate:window=") {
+            let (lo, hi) = rest.split_once("..").ok_or_else(unknown)?;
+            let lo = lo.parse::<i64>().map_err(|_| unknown())?;
+            let hi = hi.parse::<i64>().map_err(|_| unknown())?;
+            return Ok(Self::Locate {
+                window: Some((lo, hi)),
+            });
+        }
+        if kind == QUERY_KIND_LATEST {
+            return Ok(Self::Latest { lookback: None });
+        }
+        if let Some(lb) = kind.strip_prefix("latest:lookback=") {
+            let lookback = lb.parse::<i64>().map_err(|_| unknown())?;
+            if lookback < 0 {
+                return Err(unknown());
+            }
+            return Ok(Self::Latest {
+                lookback: Some(lookback),
+            });
+        }
+        if let Some(rest) = kind.strip_prefix(QUERY_KIND_ASOF_PREFIX) {
+            let (ts_str, lb) = match rest.split_once(":lookback=") {
+                Some((t, l)) => {
+                    let l = l.parse::<i64>().map_err(|_| unknown())?;
+                    if l < 0 {
+                        return Err(unknown());
+                    }
+                    (t, Some(l))
+                }
+                None => (rest, None),
+            };
+            let ts = ts_str.parse::<i64>().map_err(|_| unknown())?;
+            return Ok(Self::AsOf { ts, lookback: lb });
+        }
+        Err(unknown())
+    }
+
+    /// Canonical string representation for `RecordedRun::query_kind`.
+    #[must_use]
+    pub fn as_kind_string(&self) -> String {
+        match *self {
+            Self::Locate { window: None } => QUERY_KIND_LOCATE.to_string(),
+            Self::Locate {
+                window: Some((lo, hi)),
+            } => format!("locate:window={lo}..{hi}"),
+            Self::Latest { lookback: None } => QUERY_KIND_LATEST.to_string(),
+            Self::Latest {
+                lookback: Some(lookback),
+            } => format!("latest:lookback={lookback}"),
+            Self::AsOf { ts, lookback: None } => format!("asof:{ts}"),
+            Self::AsOf {
+                ts,
+                lookback: Some(lookback),
+            } => format!("asof:{ts}:lookback={lookback}"),
+        }
+    }
+
+    /// Whether this query is `latest` or `asof`.
+    #[must_use]
+    pub const fn is_temporal(&self) -> bool {
+        matches!(self, Self::Latest { .. } | Self::AsOf { .. })
+    }
+}
 
 /// One recorded run.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -163,12 +264,7 @@ impl Workload {
                     "a recorded run needs an id and a template".into(),
                 ));
             }
-            if run.query_kind != QUERY_KIND_LOCATE {
-                return Err(Error::UnknownKind {
-                    what: "query kind",
-                    found: run.query_kind.clone(),
-                });
-            }
+            RunQuery::parse(&run.query_kind)?;
             if i > 0 && manifest.runs[i - 1].run_id >= run.run_id {
                 return Err(Error::Other(format!(
                     "workload runs must be sorted by id without duplicates; {:?} follows {:?}",
@@ -466,8 +562,19 @@ impl<'a> WorkloadRecorder<'a> {
         keys: KeyInput<'_>,
         template: Option<&str>,
     ) -> Result<&RecordedRun> {
+        self.record_with_query(run_id, keys, template, RunQuery::Locate { window: None })
+    }
+
+    /// Records run `run_id` with an explicit [`RunQuery`] kind.
+    pub fn record_with_query(
+        &mut self,
+        run_id: &str,
+        keys: KeyInput<'_>,
+        template: Option<&str>,
+        query: RunQuery,
+    ) -> Result<&RecordedRun> {
         self.check_new(run_id)?;
-        let prepared = self.prepare(run_id, keys, template)?;
+        let prepared = self.prepare(run_id, keys, template, query)?;
         self.sink
             .put(&prepared.run.key_set, Bytes::from(prepared.payload))?;
         Ok(self.runs.entry(run_id.to_string()).or_insert(prepared.run))
@@ -489,6 +596,7 @@ impl<'a> WorkloadRecorder<'a> {
         run_id: &str,
         keys: KeyInput<'_>,
         template: Option<&str>,
+        query: RunQuery,
     ) -> Result<Prepared> {
         let (built, null_tuples) = match keys {
             KeyInput::Batch(batch) => {
@@ -510,7 +618,7 @@ impl<'a> WorkloadRecorder<'a> {
                     || format!("columns({})", columns.join(",")),
                     ToString::to_string,
                 ),
-                query_kind: QUERY_KIND_LOCATE.to_string(),
+                query_kind: query.as_kind_string(),
                 key_types: built.key_types().to_vec(),
                 columns,
                 keys: built.len() as u64,
@@ -712,7 +820,12 @@ pub fn record_bench_workload(
             vec![Arc::new(UInt64Array::from(keys)) as ArrayRef],
         )
         .map_err(|e| bench_err(Some(&run.run_id), e.to_string()))?;
-        let p = recorder.prepare(&run.run_id, KeyInput::Batch(&batch), None)?;
+        let p = recorder.prepare(
+            &run.run_id,
+            KeyInput::Batch(&batch),
+            None,
+            RunQuery::Locate { window: None },
+        )?;
         recorder.sink.put(&p.run.key_set, Bytes::from(p.payload))?;
         prepared.push(p.run);
     }

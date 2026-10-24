@@ -130,10 +130,11 @@ pub(crate) fn spec_types(
     let lookup = |c: &str| -> Result<DataType> {
         let dt = schema
             .field_with_name(c)
-            .map_err(|_| Error::KeySpec(format!("column {c} is not in the dataset schema")))?
+            .map_err(|_| encoding::missing_column(schema, c))?
             .data_type()
             .clone();
-        encoding::check_supported(&dt)?;
+        encoding::check_supported(&dt)
+            .map_err(|e| Error::KeySpec(format!("{}: key column {c:?}: {e}", spec.name())))?;
         Ok(dt)
     };
     let keys = spec

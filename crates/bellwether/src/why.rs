@@ -11,7 +11,8 @@ use std::sync::Arc;
 use bellwether_profile::{ProfileOptions, ProfileReport};
 
 use bellwether_replay::{
-    record_bench_workload, servable, KeyInput, Lookup, Replayer, Workload, WorkloadRecorder,
+    record_bench_workload, servable, KeyInput, Lookup, Replayer, RunQuery, Workload,
+    WorkloadRecorder,
 };
 use bellwether_store::{Cache, ObjectStoreBackend, StoreExt};
 use bellwether_types::{
@@ -20,6 +21,7 @@ use bellwether_types::{
 use serde::{Deserialize, Serialize};
 
 use crate::engine::{folder_changes, guard, schema_hint, Engine, Pinned};
+use crate::index::{instant_in_unit, lookback_in_unit, serving_temporal};
 use crate::keys::KeyFile;
 use crate::results::{total, Cost, Written};
 
@@ -34,6 +36,19 @@ pub const RESERVED_PROPOSERS: &[&str] = &[ENGINE_PROPOSER];
 /// Default cap on the profile's candidates `why` replays beyond the
 /// workload's own key columns.
 pub const DEFAULT_MAX_CANDIDATES: usize = 8;
+
+/// Which lookup mode `why` prices candidates under.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WhyMode {
+    /// Point lookup (`locate`).
+    #[default]
+    Locate,
+    /// Newest version per key (`latest`).
+    Latest,
+    /// Version current at `--at` (`asof`).
+    Asof,
+}
 
 /// What `why` looks at. With no workload, `why` reports the dataset and its
 /// profile.
@@ -53,6 +68,20 @@ pub struct WhyRequest {
     /// Most profile candidates replayed beyond the workload's own key
     /// columns.
     pub max_candidates: usize,
+    /// Lookup mode to price candidates under (`locate`, `latest`, or `asof`).
+    #[serde(default)]
+    pub mode: WhyMode,
+    /// Timestamp column ordering versions for `latest` or `asof`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest_by: Option<String>,
+    /// Instant for `asof` mode (RFC 3339, `YYYY-MM-DD`, or integer in the
+    /// timestamp column's unit).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub at: Option<String>,
+    /// Lookback window for `latest` or `asof` mode (`252d`, `4w`, `24h`,
+    /// `30m`, `60s`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lookback: Option<String>,
 }
 
 impl Default for WhyRequest {
@@ -63,6 +92,10 @@ impl Default for WhyRequest {
             workload: None,
             columns: None,
             max_candidates: DEFAULT_MAX_CANDIDATES,
+            mode: WhyMode::Locate,
+            latest_by: None,
+            at: None,
+            lookback: None,
         }
     }
 }
@@ -177,6 +210,14 @@ pub enum CulpritReason {
     ServingSpec {
         /// The serving spec.
         spec: KeySpec,
+    },
+    /// Every candidate including the floor touches nearly every row group,
+    /// so the physical file layout (not a missing index) is the cause.
+    Layout {
+        /// Lowest-fanout candidate column or composite.
+        lowest_fanout_columns: Vec<String>,
+        /// Its measured fanout.
+        lowest_fanout: Option<Fanout>,
     },
 }
 
@@ -309,7 +350,22 @@ impl Engine {
             }
         }
         let has_workload = given.iter().any(|g| *g);
-        let (profile, evidence) = self.profile(req, &*source, pinned.as_ref(), has_workload)?;
+        let mut supplied_cols: Vec<String> = Vec::new();
+        let workload = if has_workload {
+            let cache = self.cache()?;
+            let w = self.record_workload(req, &replayer, &current_specs, &cache)?;
+            let set: BTreeSet<String> = w
+                .runs()
+                .iter()
+                .flat_map(|r| r.columns.iter().cloned())
+                .collect();
+            supplied_cols = set.into_iter().collect();
+            Some((w, cache))
+        } else {
+            None
+        };
+        let (profile, evidence) =
+            self.profile(req, &*source, pinned.as_ref(), has_workload, &supplied_cols)?;
         let mut report = WhyReport {
             root: self.root().to_string(),
             sequence,
@@ -325,15 +381,19 @@ impl Engine {
             recommended: None,
             culprit: None,
         };
-        let workload = if has_workload {
-            let cache = self.cache()?;
-            let workload = self.record_workload(req, &replayer, &cache)?;
+        let workload_ref = if let Some((workload, cache)) = workload {
             self.replay_candidates(&mut report, &replayer, &workload, &cache, req)?;
             Some(workload)
         } else {
             None
         };
-        report.culprit = culprit(&report.current_specs, &report.profile, workload.as_ref());
+        report.culprit = culprit(
+            &report.current_specs,
+            &report.profile,
+            workload_ref.as_ref(),
+            &report.candidates,
+            report.dataset.row_groups,
+        );
         Ok(report)
     }
 
@@ -347,6 +407,7 @@ impl Engine {
         source: &dyn bellwether_types::Source,
         pinned: Option<&Pinned>,
         has_workload: bool,
+        supplied_columns: &[String],
     ) -> Result<(ProfileReport, ProfileEvidence)> {
         let writable = if has_workload {
             Some(Arc::clone(self.store()?))
@@ -372,6 +433,7 @@ impl Engine {
         // artifacts rather than reuse them, so no input carries a wall-clock
         // age or a cache hit.
         options.reuse_cache = self.options().clock.is_none();
+        options.supplied_columns = supplied_columns.to_vec();
         options.workload = req.bench_workload.as_ref().map(|p| {
             if p.is_dir() {
                 p.clone()
@@ -406,10 +468,90 @@ impl Engine {
         Ok((profile, out))
     }
 
+    fn resolve_temporal_query(
+        req: &WhyRequest,
+        schema: &arrow::datatypes::Schema,
+        current_specs: &[KeySpec],
+        key_columns: &[String],
+    ) -> Result<(RunQuery, Option<String>)> {
+        let effective_mode = if req.mode == WhyMode::Locate {
+            if req.at.is_some() {
+                WhyMode::Asof
+            } else if req.latest_by.is_some() || req.lookback.is_some() {
+                WhyMode::Latest
+            } else {
+                WhyMode::Locate
+            }
+        } else {
+            req.mode
+        };
+        if effective_mode == WhyMode::Locate {
+            return Ok((RunQuery::Locate { window: None }, None));
+        }
+        if effective_mode == WhyMode::Latest && req.at.is_some() {
+            return Err(Error::KeySpec(
+                "--at applies to `--mode asof`, not `--mode latest`".into(),
+            ));
+        }
+        let ts_col = match &req.latest_by {
+            Some(ts) => {
+                let f = schema
+                    .field_with_name(ts)
+                    .map_err(|_| bellwether_core::encoding::missing_column(schema, ts))?;
+                bellwether_core::encoding::check_ts_type(f.data_type())?;
+                if key_columns.contains(ts) {
+                    return Err(Error::KeySpec(format!(
+                        "--latest-by column {ts:?} is also a key column; pass a distinct timestamp column"
+                    )));
+                }
+                ts.clone()
+            }
+            None => serving_temporal(current_specs, key_columns).or_else(|_| {
+                let mut time_cols = schema.fields().iter().filter(|f| {
+                    !key_columns.contains(f.name())
+                        && bellwether_profile::ranges::is_time_type(f.data_type())
+                });
+                match (time_cols.next(), time_cols.next()) {
+                    (Some(f), None) => Ok(f.name().clone()),
+                    (None, _) => Err(Error::KeySpec(
+                        "temporal pricing needs a timestamp column; pass --latest-by <ts_column>"
+                            .into(),
+                    )),
+                    (Some(_), Some(_)) => Err(Error::KeySpec(
+                        "the dataset has more than one timestamp column; pass --latest-by <ts_column>"
+                            .into(),
+                    )),
+                }
+            })?,
+        };
+        let ts_type = schema
+            .field_with_name(&ts_col)
+            .map_err(|_| bellwether_core::encoding::missing_column(schema, &ts_col))?
+            .data_type();
+        let lookback = req
+            .lookback
+            .as_deref()
+            .map(|lb| lookback_in_unit(lb, &ts_col, ts_type))
+            .transpose()?;
+        let query = match effective_mode {
+            WhyMode::Locate => RunQuery::Locate { window: None },
+            WhyMode::Latest => RunQuery::Latest { lookback },
+            WhyMode::Asof => {
+                let at_str = req.at.as_deref().ok_or_else(|| {
+                    Error::KeySpec("`--mode asof` requires `--at <instant>`".into())
+                })?;
+                let ts = instant_in_unit(at_str, &ts_col, ts_type)?;
+                RunQuery::AsOf { ts, lookback }
+            }
+        };
+        Ok((query, Some(ts_col)))
+    }
+
     fn record_workload(
         &self,
         req: &WhyRequest,
         replayer: &Replayer<'_>,
+        current_specs: &[KeySpec],
         cache: &Cache<ObjectStoreBackend>,
     ) -> Result<Workload> {
         if let Some(h) = &req.workload {
@@ -424,7 +566,15 @@ impl Engine {
         let mut recorder = WorkloadRecorder::new(cache, std::sync::Arc::clone(replayer.schema()));
         if let Some(keys) = &req.keys {
             let batch = keys.read()?;
-            recorder.record("keys", KeyInput::Batch(&batch))?;
+            let cols: Vec<String> = batch
+                .schema()
+                .fields()
+                .iter()
+                .map(|f| f.name().clone())
+                .collect();
+            let (query, _) =
+                Self::resolve_temporal_query(req, replayer.schema(), current_specs, &cols)?;
+            recorder.record_with_query("keys", KeyInput::Batch(&batch), None, query)?;
         } else if let Some(dir) = &req.bench_workload {
             let file = if dir.is_dir() {
                 dir.join("workload.json")
@@ -465,8 +615,10 @@ impl Engine {
             keys_p50_p95_max: workload.keys_p50_p95_max(),
             null_tuples: workload.runs().iter().map(|r| r.null_tuples).sum(),
         });
-        let current_names: BTreeSet<String> =
-            report.current_specs.iter().map(KeySpec::name).collect();
+        let workload_is_temporal = workload
+            .runs()
+            .iter()
+            .any(|r| RunQuery::parse(&r.query_kind).is_ok_and(|q| q.is_temporal()));
         // How a measured key serves the workload: by point lookup on some
         // run, only by prefix of a run's columns, or not at all. A key that
         // serves only by prefix is a composite led by a run's whole key, so
@@ -481,18 +633,46 @@ impl Engine {
         let serves = |spec: &KeySpec| run_columns.iter().any(|c| servable(spec, c).is_some());
         let mut chosen: Vec<(KeySpec, CandidateOrigin)> = Vec::new();
         let mut names = BTreeSet::new();
+        let first_cols = run_columns.first().cloned().unwrap_or_default();
+        let ts_col = if workload_is_temporal
+            || req.mode != WhyMode::Locate
+            || req.latest_by.is_some()
+            || req.at.is_some()
+            || req.lookback.is_some()
+        {
+            let mut eff_req = req.clone();
+            if eff_req.mode == WhyMode::Locate && workload_is_temporal {
+                eff_req.mode = WhyMode::Latest;
+            }
+            Self::resolve_temporal_query(
+                &eff_req,
+                replayer.schema(),
+                &report.current_specs,
+                &first_cols,
+            )?
+            .1
+        } else {
+            None
+        };
+        let make_spec = |columns: Vec<String>| -> KeySpec {
+            match &ts_col {
+                Some(ts) => KeySpec::Temporal {
+                    columns,
+                    ts_column: ts.clone(),
+                },
+                None => KeySpec::Exact { columns },
+            }
+        };
         for c in &run_columns {
-            let spec = KeySpec::Exact { columns: c.clone() };
-            if !current_names.contains(&spec.name()) && names.insert(spec.name()) {
+            let spec = make_spec(c.clone());
+            if !report.current_specs.contains(&spec) && names.insert(spec.name()) {
                 chosen.push((spec, CandidateOrigin::Workload));
             }
         }
         let mut from_profile = 0usize;
         for entry in &report.profile.fanout {
-            let spec = KeySpec::Exact {
-                columns: entry.fanout.columns.clone(),
-            };
-            if current_names.contains(&spec.name()) || names.contains(&spec.name()) {
+            let spec = make_spec(entry.fanout.columns.clone());
+            if report.current_specs.contains(&spec) || names.contains(&spec.name()) {
                 continue;
             }
             if !serves(&spec) {
@@ -586,6 +766,8 @@ fn culprit(
     current_specs: &[KeySpec],
     profile: &ProfileReport,
     workload: Option<&Workload>,
+    candidates: &[Candidate],
+    dataset_row_groups: u64,
 ) -> Option<Culprit> {
     let mut used: BTreeSet<&String> = current_specs
         .iter()
@@ -616,10 +798,51 @@ fn culprit(
             },
         });
     }
-    let columns = workload?.runs().first()?.columns.clone();
-    let serving = current_specs
+    let runs = workload?.runs();
+    let columns = runs.first()?.columns.clone();
+    let num_runs = runs.len() as u64;
+    let total_rgs = dataset_row_groups.saturating_mul(num_runs);
+    if total_rgs >= 2
+        && !candidates.is_empty()
+        && candidates
+            .iter()
+            .all(|c| c.proposed.row_groups * 10 >= total_rgs * 9)
+    {
+        let best = profile
+            .fanout
+            .iter()
+            .min_by(|a, b| {
+                let (fa, fb) = (&a.fanout, &b.fanout);
+                fa.row_groups_per_value[0]
+                    .total_cmp(&fb.row_groups_per_value[0])
+                    .then(fa.row_groups_per_value[1].total_cmp(&fb.row_groups_per_value[1]))
+                    .then(fa.row_groups_per_value[2].total_cmp(&fb.row_groups_per_value[2]))
+                    .then(fa.columns.len().cmp(&fb.columns.len()))
+            })
+            .map(|e| e.fanout.clone());
+        let lowest_fanout_columns = best
+            .as_ref()
+            .map_or_else(|| columns.clone(), |f| f.columns.clone());
+        return Some(Culprit {
+            fanout: fanout_of(profile, &columns),
+            columns,
+            reason: CulpritReason::Layout {
+                lowest_fanout_columns,
+                lowest_fanout: best,
+            },
+        });
+    }
+    let is_temporal = runs
         .iter()
-        .find(|s| servable(s, &columns).is_some());
+        .any(|r| RunQuery::parse(&r.query_kind).is_ok_and(|q| q.is_temporal()));
+    let serving = current_specs.iter().find(|s| {
+        if is_temporal {
+            matches!(s, KeySpec::Temporal { .. })
+                && matches!(servable(s, &columns), Some(Lookup::Point { .. }))
+        } else {
+            servable(s, &columns).is_some()
+        }
+    });
     Some(match serving {
         None => Culprit {
             fanout: fanout_of(profile, &columns),
@@ -694,7 +917,7 @@ mod tests {
             lint("batch_stamp_key", "unused", 1.0),
             lint("scattered_time_column", "tenant", 1.0),
         ]);
-        let c = culprit(&used, &p, None).unwrap();
+        let c = culprit(&used, &p, None, &[], 1).unwrap();
         assert_eq!(
             named(&c),
             ("low_selectivity_single_column".into(), "tenant".into())
@@ -704,7 +927,7 @@ mod tests {
             lint("low_selectivity_single_column", "tenant", 0.6),
         ]);
         assert_eq!(
-            named(&culprit(&used, &p, None).unwrap()),
+            named(&culprit(&used, &p, None, &[], 1).unwrap()),
             ("batch_stamp_key".into(), "stamp".into())
         );
     }
@@ -724,7 +947,7 @@ mod tests {
                 lint("low_selectivity_single_column", "tenant", 0.8),
             ],
         ] {
-            let c = culprit(&used, &profile(lints), None).unwrap();
+            let c = culprit(&used, &profile(lints), None, &[], 1).unwrap();
             assert_eq!(named(&c), ("batch_stamp_key".into(), "stamp".into()));
         }
     }

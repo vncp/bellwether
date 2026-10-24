@@ -17,10 +17,9 @@ blake3 = { workspace = true }
 bytes = { workspace = true }
 # The catalog digest serializes its input as canonical JSON.
 serde = { workspace = true }
+serde_json = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }
-serde_json = { workspace = true }
-
 [lints]
 workspace = true

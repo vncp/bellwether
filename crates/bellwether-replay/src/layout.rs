@@ -459,10 +459,11 @@ fn declared_types(columns: &[String], schema: &Schema) -> ReplayResult<Vec<DataT
         .map(|c| {
             let dt = schema
                 .field_with_name(c)
-                .map_err(|_| Error::KeySpec(format!("column {c:?} is not in the dataset schema")))?
+                .map_err(|_| encoding::missing_column(schema, c))?
                 .data_type()
                 .clone();
-            encoding::check_supported(&dt)?;
+            encoding::check_supported(&dt)
+                .map_err(|e| Error::KeySpec(format!("column {c:?}: {e}")))?;
             Ok(dt)
         })
         .collect::<bellwether_types::Result<Vec<_>>>()?)
@@ -477,7 +478,7 @@ fn check_recorded(
     for ((c, r), d) in columns.iter().zip(recorded).zip(declared) {
         if &ColumnType::of(d)? != r {
             return Err(Error::KeySpec(format!(
-                "run {run_id:?} recorded column {c:?} as {r:?}, but the dataset declares {d}"
+                "run {run_id:?} recorded column {c:?} as {r}, but the dataset declares {d}"
             ))
             .into());
         }

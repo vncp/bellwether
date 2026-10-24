@@ -512,3 +512,290 @@ fn applying_a_certificate_after_the_data_changed_exits_3_naming_re_verification(
     let human = run(&["fix", path(&data), "--certificate", &cert.to_hex()], 3);
     assert!(human.contains("re-verify"), "{human}");
 }
+
+/// Regression tests for real-data defects 3, 4, 5, 6, 13 and strategy
+/// requests 4 (`--totals col:dec(S)`) and 5 (`--memory-budget` with human
+/// units):
+/// - Defect 3: `reconcile` human output names the first mismatching keys
+///   (up to `DEFAULT_DISPLAY_MISMATCHES`) and prints totals when they pass.
+/// - Defect 4: `fix` refuses a proposal whose replay predicts no saving with
+///   typed refusal `nothing_to_gain` (exit 3) citing the replay hash, unless
+///   `--allow-no-gain`.
+/// - Defect 5 + Strategy 5: `reconcile --memory-budget <bytes|human>` accepts
+///   human units (`512M`, `8G`, `268435456`) and prints pass count and rows
+///   read per side in the human summary.
+/// - Defect 6 + Strategy 4: bare float `--totals` exits 2 (usage error)
+///   without a `key spec error` prefix and shows `:dec(S)`; `--totals
+///   col:dec(S)` converts each Float64 to its exact decimal expansion and
+///   rounds half-to-even at scale `S`, sums as i128, records the quantization
+///   spec in `totals_delta` / `totals`, and refuses NaN/infinity naming the
+///   key.
+/// - Defect 13: every record written during `fix` (Evidence, Proposal,
+///   Replay, Certificate, Receipt) carries millisecond-precision RFC 3339
+///   `created_at` from the facade clock.
+#[test]
+fn realdata_defects_reconcile_fix_totals_memory_and_timestamps() {
+    use arrow::array::{
+        ArrayRef, Decimal128Array, Float64Array, Int64Array, RecordBatch, StringArray,
+    };
+    use arrow::datatypes::{DataType, Field, Schema};
+    use parquet::arrow::ArrowWriter;
+    use std::sync::Arc;
+
+    let dir = tempfile::tempdir().unwrap();
+
+    // Defect 4: fix refuses a 0-saving proposal with nothing_to_gain (exit 3) citing replay hash,
+    // unless --allow-no-gain is passed.
+    let d4 = dir.path().join("d4");
+    corpus(&d4, 1, 2, 10, 2); // 2 distinct ids across both row groups -> floor touches all RGs
+    let kf4 = dir.path().join("k4.parquet");
+    keys(&kf4, "id", &[0, 1]);
+    let why4: WhyReport = typed(&run(&["--json", "why", path(&d4), "--from", path(&kf4)], 0));
+    assert!(why4.recommended.is_none());
+    let wl4 = why4.workload.unwrap().hash;
+    let prop4 = why4.candidates[0].proposal.hash;
+    let refused_json = run(
+        &[
+            "--json",
+            "fix",
+            path(&d4),
+            "--proposal",
+            &prop4.to_hex(),
+            "--workload",
+            &wl4.to_hex(),
+        ],
+        3,
+    );
+    let refused_res: FixResult = typed(&refused_json);
+    let FixOutcome::Refused {
+        refusal:
+            Refusal::NothingToGain {
+                replay: cited_replay,
+                current_bytes,
+                proposed_bytes,
+            },
+    } = refused_res.outcome
+    else {
+        panic!("expected NothingToGain, got {:?}", refused_res.outcome);
+    };
+    assert_eq!(current_bytes, proposed_bytes);
+    let Some(Score::Replayed { replay, .. }) = &refused_res.score else {
+        panic!();
+    };
+    assert_eq!(cited_replay, replay.hash);
+    let refused_human = run(
+        &[
+            "--clock",
+            "2026-10-25T00:00:00Z",
+            "fix",
+            path(&d4),
+            "--proposal",
+            &prop4.to_hex(),
+            "--workload",
+            &wl4.to_hex(),
+        ],
+        3,
+    );
+    assert!(
+        refused_human.contains("predicts no byte saving")
+            && refused_human.contains("--allow-no-gain")
+            && refused_human.contains("replay "),
+        "{refused_human}"
+    );
+    // With --allow-no-gain, it applies and attests. Also check Defect 13 (millisecond timestamps).
+    let applied_json = run(
+        &[
+            "--json",
+            "fix",
+            path(&d4),
+            "--proposal",
+            &prop4.to_hex(),
+            "--workload",
+            &wl4.to_hex(),
+            "--allow-no-gain",
+        ],
+        0,
+    );
+    let applied_res: FixResult = typed(&applied_json);
+    let FixOutcome::Applied { receipt, .. } = &applied_res.outcome else {
+        panic!("expected Applied, got {:?}", applied_res.outcome);
+    };
+    let shown: ReceiptResult = typed(&run(
+        &[
+            "--json",
+            "receipt",
+            "show",
+            path(&d4),
+            &receipt.hash.to_hex(),
+        ],
+        0,
+    ));
+    assert!(shown.intact);
+    for link in &shown.chain {
+        let ts = link.created_at.as_deref().unwrap();
+        // Millisecond RFC 3339 format: YYYY-MM-DDTHH:MM:SS.sssZ (24 chars).
+        assert_eq!(
+            ts.len(),
+            24,
+            "record {:?} created_at {ts:?} is not millisecond precision",
+            link.kind
+        );
+        assert!(ts.ends_with('Z') && ts.as_bytes()[19] == b'.', "{ts}");
+    }
+
+    // Defects 3, 5, 6 and Strategy requests 4, 5: reconcile human output, memory budget,
+    // decimal totals, and float quantization totals.
+    let left_dir = dir.path().join("left");
+    let right_dir = dir.path().join("right");
+    let mut_dir = dir.path().join("right_mut");
+    let nan_dir = dir.path().join("right_nan");
+    for d in [&left_dir, &right_dir, &mut_dir, &nan_dir] {
+        std::fs::create_dir_all(d).unwrap();
+    }
+    let rec_schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("grp", DataType::Utf8, false),
+        Field::new("dec_amt", DataType::Decimal128(12, 2), false),
+        Field::new("flt_vol", DataType::Float64, false),
+    ]));
+    let write_side = |target: &Path, vols: &[f64], decs: &[i128]| {
+        let dec_arr = Decimal128Array::from(decs.to_vec())
+            .with_precision_and_scale(12, 2)
+            .unwrap();
+        let b = RecordBatch::try_new(
+            Arc::clone(&rec_schema),
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2, 3])) as ArrayRef,
+                Arc::new(StringArray::from(vec!["A", "A", "B"])) as ArrayRef,
+                Arc::new(dec_arr) as ArrayRef,
+                Arc::new(Float64Array::from(vols.to_vec())) as ArrayRef,
+            ],
+        )
+        .unwrap();
+        let f = std::fs::File::create(target.join("part.parquet")).unwrap();
+        let mut w = ArrowWriter::try_new(f, Arc::clone(&rec_schema), None).unwrap();
+        w.write(&b).unwrap();
+        w.close().unwrap();
+    };
+    // 0.1 + 0.2 in IEEE 754 f64: each quantized at dec(4) is 0.1000 and 0.2000 -> sum 0.3000.
+    // Halfway tie: 1.00005 in decimal vs exact binary float: 0.125 (1/8) at dec(2) -> 0.12 (round half to even).
+    write_side(&left_dir, &[0.125, 0.375, 1.5], &[100, 250, 500]);
+    write_side(&right_dir, &[0.125, 0.375, 1.5], &[100, 250, 500]);
+    write_side(&mut_dir, &[0.125, 0.875, 1.5], &[100, 250, 500]);
+    write_side(&nan_dir, &[0.125, f64::NAN, 1.5], &[100, 250, 500]);
+
+    // Defect 6: bare float column is a usage error (exit 2) without "key spec error" prefix, naming :dec(S).
+    let bare_flt = common::bw()
+        .args([
+            "reconcile",
+            path(&left_dir),
+            path(&right_dir),
+            "--key",
+            "id",
+            "--totals",
+            "flt_vol",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(bare_flt.status.code(), Some(2));
+    let bare_stderr = String::from_utf8_lossy(&bare_flt.stderr);
+    assert!(!bare_stderr.contains("key spec error"), "{bare_stderr}");
+    assert!(bare_stderr.contains("flt_vol:dec("), "{bare_stderr}");
+
+    // Passing reconcile with decimal and quantized float totals + human --memory-budget 64M:
+    // prints passes, rows read per side, and the passing totals.
+    let pass_human = run(
+        &[
+            "reconcile",
+            path(&left_dir),
+            path(&right_dir),
+            "--key",
+            "id",
+            "--group-by",
+            "grp",
+            "--totals",
+            "dec_amt,flt_vol:dec(2)",
+            "--memory-budget",
+            "64M",
+        ],
+        0,
+    );
+    assert!(
+        pass_human.contains("passes") && pass_human.contains("rows read left 3, right 3"),
+        "{pass_human}"
+    );
+    assert!(
+        pass_human.contains("dec_amt [grp=A]  3.50")
+            && pass_human.contains("flt_vol:dec(2) [grp=A]  0.50"),
+        "{pass_human}"
+    );
+
+    // Failing reconcile names the mismatched key (2) and the differing quantized total on the certificate.
+    let fail_human = run(
+        &[
+            "reconcile",
+            path(&left_dir),
+            path(&mut_dir),
+            "--key",
+            "id",
+            "--group-by",
+            "grp",
+            "--totals",
+            "flt_vol:dec(2)",
+        ],
+        1,
+    );
+    assert!(
+        fail_human.contains("mismatches (first 1 of 1 differing keys, at most 20 shown)")
+            && fail_human.contains("row_hash_differs  key 2"),
+        "{fail_human}"
+    );
+    assert!(
+        fail_human.contains("flt_vol:dec(2) [grp=A]  left 0.50 != right 1.00"),
+        "{fail_human}"
+    );
+    let fail_json: ReconcileResult = typed(&run(
+        &[
+            "--json",
+            "reconcile",
+            path(&left_dir),
+            path(&mut_dir),
+            "--key",
+            "id",
+            "--group-by",
+            "grp",
+            "--totals",
+            "flt_vol:dec(2)",
+        ],
+        1,
+    ));
+    let Record::Certificate(cert) = &fail_json.certificate.record else {
+        panic!();
+    };
+    assert_eq!(cert.body.totals_delta.len(), 1);
+    assert!(
+        cert.body.totals_delta[0].0.contains("flt_vol:dec(2)"),
+        "{:?}",
+        cert.body.totals_delta
+    );
+
+    // NaN in quantized float column is an error naming the key (2).
+    let nan_out = common::bw()
+        .args([
+            "reconcile",
+            path(&left_dir),
+            path(&nan_dir),
+            "--key",
+            "id",
+            "--totals",
+            "flt_vol:dec(4)",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(nan_out.status.code(), Some(4));
+    let nan_stderr = String::from_utf8_lossy(&nan_out.stderr);
+    assert!(
+        nan_stderr.contains("key (2)") && nan_stderr.contains("flt_vol:dec(4)"),
+        "{nan_stderr}"
+    );
+}

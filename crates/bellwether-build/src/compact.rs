@@ -118,7 +118,7 @@ impl<S: StoreExt + ?Sized> Builder<S> {
                         SegmentReader::open_for_dataset(snapshot.read_segment(&s.id)?, &schema)?;
                     if r.key_spec() != &g.spec {
                         return Err(Error::KeySpec(format!(
-                            "segment {} indexes {:?}, but the manifest lists it under {}",
+                            "segment {} indexes {}, but the manifest lists it under {}",
                             s.id,
                             r.key_spec(),
                             g.spec.name()

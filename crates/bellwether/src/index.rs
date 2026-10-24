@@ -272,7 +272,7 @@ pub(crate) fn stale_index(root: &str, verb: &str, c: &FolderChanges) -> Error {
 
 /// The timestamp column of the one complete temporal spec whose columns are
 /// all key columns; none or several is an error naming what to do.
-fn serving_temporal(specs: &[KeySpec], columns: &[String]) -> Result<String> {
+pub(crate) fn serving_temporal(specs: &[KeySpec], columns: &[String]) -> Result<String> {
     let mut found = specs.iter().filter_map(|s| match s {
         KeySpec::Temporal {
             columns: c,
@@ -324,7 +324,7 @@ fn check_temporal_residual(plan: &ScanPlan) -> Result<()> {
 /// `at` in `ts_type`'s unit, exactly: an integer is taken as already in the
 /// unit; an RFC 3339 instant (or a `YYYY-MM-DD` date) is converted, and a
 /// remainder below the unit is an error, never rounded.
-fn instant_in_unit(at: &str, ts_column: &str, ts_type: &DataType) -> Result<i64> {
+pub(crate) fn instant_in_unit(at: &str, ts_column: &str, ts_type: &DataType) -> Result<i64> {
     let at = at.trim();
     if let Ok(n) = at.parse::<i64>() {
         return Ok(n);
@@ -381,6 +381,88 @@ fn instant_in_unit(at: &str, ts_column: &str, ts_type: &DataType) -> Result<i64>
     i64::try_from(nanos / per_unit).map_err(|_| {
         Error::KeySpec(format!(
             "--at {at:?} is out of range for {ts_column} ({ts_type})"
+        ))
+    })
+}
+
+/// Parses `--lookback` (calendar units `s`, `m`, `h`, `d`, `w`, or a plain
+/// integer in `ts_type`'s unit for integer columns) into `ts_type`'s unit.
+pub(crate) fn lookback_in_unit(lookback: &str, ts_column: &str, ts_type: &DataType) -> Result<i64> {
+    let s = lookback.trim();
+    if s.is_empty() {
+        return Err(Error::KeySpec(
+            "--lookback is empty; pass a calendar duration such as 252d, 4w, 24h, 30m, or 60s (trading-day calendars are out of scope)"
+                .into(),
+        ));
+    }
+    if let Ok(n) = s.parse::<i64>() {
+        if n < 0 {
+            return Err(Error::KeySpec(format!(
+                "--lookback {lookback:?} must be non-negative"
+            )));
+        }
+        return Ok(n);
+    }
+    let integer_column = matches!(
+        ts_type,
+        DataType::Int8
+            | DataType::Int16
+            | DataType::Int32
+            | DataType::Int64
+            | DataType::UInt8
+            | DataType::UInt16
+            | DataType::UInt32
+            | DataType::UInt64
+    );
+    if integer_column {
+        return Err(Error::KeySpec(format!(
+            "{ts_column} is an integer column ({ts_type}), so --lookback must be a non-negative integer in its unit, not {lookback:?}"
+        )));
+    }
+    let split = s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len());
+    let (digits, unit) = s.split_at(split);
+    let count: i128 = digits.parse().map_err(|_| {
+        Error::KeySpec(format!(
+            "--lookback {lookback:?} is not a calendar duration; use s, m, h, d, or w (for example 252d; trading-day calendars are out of scope)"
+        ))
+    })?;
+    let unit_nanos: i128 = match unit.trim() {
+        "s" => 1_000_000_000,
+        "m" => 60 * 1_000_000_000,
+        "h" => 3_600 * 1_000_000_000,
+        "d" => 86_400 * 1_000_000_000,
+        "w" => 7 * 86_400 * 1_000_000_000,
+        _ => {
+            return Err(Error::KeySpec(format!(
+                "--lookback {lookback:?} has unsupported unit {unit:?}; use calendar units s, m, h, d, or w (trading-day calendars are out of scope)"
+            )))
+        }
+    };
+    let nanos = count.checked_mul(unit_nanos).ok_or_else(|| {
+        Error::KeySpec(format!(
+            "--lookback {lookback:?} overflows {ts_column} ({ts_type})"
+        ))
+    })?;
+    let per_unit: i128 = match ts_type {
+        DataType::Timestamp(TimeUnit::Second, _) => 1_000_000_000,
+        DataType::Timestamp(TimeUnit::Millisecond, _) | DataType::Date64 => 1_000_000,
+        DataType::Timestamp(TimeUnit::Microsecond, _) => 1_000,
+        DataType::Timestamp(TimeUnit::Nanosecond, _) => 1,
+        DataType::Date32 => 86_400 * 1_000_000_000,
+        other => {
+            return Err(Error::KeySpec(format!(
+                "{ts_column} has type {other}, which lookback cannot order by; use a timestamp, date, or integer column"
+            )))
+        }
+    };
+    if nanos % per_unit != 0 {
+        return Err(Error::KeySpec(format!(
+            "--lookback {lookback:?} is finer than {ts_column}'s unit ({ts_type}); give a duration that is a whole number of that unit"
+        )));
+    }
+    i64::try_from(nanos / per_unit).map_err(|_| {
+        Error::KeySpec(format!(
+            "--lookback {lookback:?} is out of range for {ts_column} ({ts_type})"
         ))
     })
 }

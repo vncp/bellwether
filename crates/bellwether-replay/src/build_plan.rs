@@ -29,6 +29,7 @@ use roaring::RoaringBitmap;
 use crate::keys::RunKeys;
 use crate::plan::{check_key_types, PlanSource};
 use crate::transient::TransientIndex;
+use crate::workload::RunQuery;
 
 /// The run's keys as the build planner's lookup: canonical tuples over the
 /// run's columns, at the dataset types.
@@ -36,6 +37,43 @@ fn lookup(keys: &RunKeys) -> Lookup {
     Lookup::Keys {
         columns: keys.columns().to_vec(),
         keys: keys.tuples().map(<[u8]>::to_vec).collect(),
+    }
+}
+
+fn lookup_query(keys: &RunKeys, query: RunQuery) -> Lookup {
+    let columns = keys.columns().to_vec();
+    let tuples: Vec<Vec<u8>> = keys.tuples().map(<[u8]>::to_vec).collect();
+    match query {
+        RunQuery::Locate { .. } => Lookup::Keys {
+            columns,
+            keys: tuples,
+        },
+        RunQuery::Latest { lookback: None } => Lookup::Latest {
+            columns,
+            keys: tuples,
+        },
+        RunQuery::AsOf { ts, lookback: None } => Lookup::AsOf {
+            columns,
+            keys: tuples,
+            ts,
+        },
+        RunQuery::Latest {
+            lookback: Some(lookback),
+        } => Lookup::TemporalWindow {
+            columns,
+            keys: tuples,
+            asof: None,
+            lookback,
+        },
+        RunQuery::AsOf {
+            ts,
+            lookback: Some(lookback),
+        } => Lookup::TemporalWindow {
+            columns,
+            keys: tuples,
+            asof: Some(ts),
+            lookback,
+        },
     }
 }
 
@@ -105,6 +143,10 @@ where
         check_key_types(self.schema(), keys)?;
         Planner::plan(self, specs, &lookup(keys))
     }
+    fn plan_query(&self, specs: &[KeySpec], keys: &RunKeys, query: RunQuery) -> Result<ScanPlan> {
+        check_key_types(self.schema(), keys)?;
+        Planner::plan(self, specs, &lookup_query(keys, query))
+    }
 
     fn with_transient(
         &self,
@@ -147,6 +189,11 @@ where
         self.planner
             .plan_with_transient(specs, &lookup(keys), &self.extra)
     }
+    fn plan_query(&self, specs: &[KeySpec], keys: &RunKeys, query: RunQuery) -> Result<ScanPlan> {
+        check_key_types(self.planner.schema(), keys)?;
+        self.planner
+            .plan_with_transient(specs, &lookup_query(keys, query), &self.extra)
+    }
 
     fn with_transient(
         &self,
@@ -156,7 +203,7 @@ where
         for t in checked(self.planner, transient)? {
             if extra.iter().any(|e| e.spec == t.spec) {
                 return Err(Error::KeySpec(format!(
-                    "key spec {:?} already has transient segments in this planner",
+                    "key spec {} already has transient segments in this planner",
                     t.spec
                 )));
             }

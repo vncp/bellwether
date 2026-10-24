@@ -105,6 +105,9 @@ pub struct ProfileOptions {
     pub seed: u64,
     /// A recorded workload directory (bench format), if any.
     pub workload: Option<PathBuf>,
+    /// Columns a workload supplies (from a key file or a recorded workload),
+    /// when `workload` is not a bench workload directory.
+    pub supplied_columns: Vec<String>,
     /// Describes the source's configuration, folded into the footer cache
     /// key. **Required**: an unset value is an error. It must change whenever
     /// the source would report different row groups for the same files, for
@@ -131,6 +134,7 @@ impl Default for ProfileOptions {
             hll_precision: DEFAULT_HLL_PRECISION,
             seed: DEFAULT_SEED,
             workload: None,
+            supplied_columns: Vec::new(),
             source_config: None,
             reuse_cache: true,
             unbounded_tables: false,
@@ -280,10 +284,10 @@ where
         )?),
         None => None,
     };
-    let supplied: Vec<String> = workload
-        .as_ref()
-        .map(|w| w.key_columns.clone())
-        .unwrap_or_default();
+    let supplied: Vec<String> = workload.as_ref().map_or_else(
+        || options.supplied_columns.clone(),
+        |w| w.key_columns.clone(),
+    );
     let plan = KeyPlan::build(
         &schema,
         &footers.value,
@@ -331,6 +335,7 @@ where
         time: &time_scatter,
         row_groups: &row_groups,
         workload: workload.as_ref(),
+        supplied_columns: &supplied,
         manifest: manifest.as_ref(),
         rows_total,
     })?;

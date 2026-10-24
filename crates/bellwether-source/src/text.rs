@@ -88,8 +88,34 @@ impl TextFormat {
     pub fn extensions(&self) -> &'static [&'static str] {
         match self {
             Self::Csv { .. } => &["csv"],
-            Self::JsonLines => &["jsonl", "ndjson"],
+            Self::JsonLines => &["jsonl", "ndjson", "json"],
         }
+    }
+
+    /// Human-readable description of accepted extensions for error messages.
+    #[must_use]
+    pub fn accepted_extensions(&self) -> &'static str {
+        match self {
+            Self::Csv { .. } => ".csv",
+            Self::JsonLines => ".jsonl, .ndjson, or .json (JSON lines starting with '{')",
+        }
+    }
+
+    /// Whether `path` is a data file of this text format (ignoring index
+    /// `manifest.json` and cache `.meta.json` sidecars).
+    #[must_use]
+    pub fn matches_path(&self, path: &str) -> bool {
+        let p = std::path::Path::new(path);
+        if self == &Self::JsonLines {
+            if let Some(name) = p.file_name().and_then(|n| n.to_str()) {
+                if name.eq_ignore_ascii_case("manifest.json")
+                    || name.to_ascii_lowercase().ends_with(".meta.json")
+                {
+                    return false;
+                }
+            }
+        }
+        self.extensions().iter().any(|e| has_extension(path, e))
     }
 }
 
@@ -269,6 +295,9 @@ impl<S: Storage> ChunkedTextSource<S> {
             return Ok(hit);
         }
         let chunks = self.compute_chunks(reader, &file.path, file.size)?;
+        if self.format == TextFormat::JsonLines && has_extension(&file.path, "json") {
+            Self::validate_dot_json_jsonl(reader, &file.path, &chunks)?;
+        }
         let schema = if let Some(s) = &self.dataset {
             self.check_csv_header(reader, &file.path, file.size, s)?;
             Arc::clone(s)
@@ -324,6 +353,44 @@ impl<S: Storage> ChunkedTextSource<S> {
             return Err(Error::Source(format!(
                 "{path}: CSV header {got:?} does not match the dataset schema {want:?}"
             )));
+        }
+        Ok(())
+    }
+
+    /// A `.json` file is accepted as JSON lines only when its first byte is
+    /// `{` and every line parses as a JSON object; otherwise the error names
+    /// the accepted extensions.
+    fn validate_dot_json_jsonl(
+        reader: &S::Reader,
+        path: &str,
+        chunks: &[Range<u64>],
+    ) -> Result<()> {
+        let bad = |why: &str| {
+            Error::Source(format!(
+                "{path} is not valid JSON lines ({why}); --format jsonl accepts .jsonl, \
+                 .ndjson, and .json files whose first byte is '{{' and where every line \
+                 parses as a JSON object"
+            ))
+        };
+        let first = get_bytes(reader, path, 0..chunks.first().map_or(0, |r| r.end.min(1)))?;
+        if first.first() != Some(&b'{') {
+            return Err(bad("first byte is not '{'"));
+        }
+        let mut line_no = 0usize;
+        for range in chunks {
+            let bytes = get_bytes(reader, path, range.clone())?;
+            for raw in bytes.split(|&b| b == b'\n') {
+                let line = raw.strip_suffix(b"\r").unwrap_or(raw);
+                if line.is_empty() {
+                    continue;
+                }
+                line_no += 1;
+                match serde_json::from_slice::<serde_json::Value>(line) {
+                    Ok(serde_json::Value::Object(_)) => {}
+                    Ok(_) => return Err(bad(&format!("line {line_no} is not a JSON object"))),
+                    Err(e) => return Err(bad(&format!("line {line_no}: {e}"))),
+                }
+            }
         }
         Ok(())
     }
@@ -561,11 +628,10 @@ pub fn csv_ends_in_quotes(bytes: &[u8], delimiter: u8) -> bool {
 
 impl<S: Storage> Source for ChunkedTextSource<S> {
     fn discover(&self, root: &str) -> Result<Vec<FileFingerprint>> {
-        let exts = self.format.extensions();
         self.storage
             .list(root)?
             .into_iter()
-            .filter(|p| exts.iter().any(|e| has_extension(p, e)))
+            .filter(|p| self.format.matches_path(p))
             .map(|p| fingerprint_with_policy(&self.storage, &p, self.policy))
             .collect()
     }
@@ -653,13 +719,17 @@ impl<S: Storage> Source for ChunkedTextSource<S> {
         if let Some(s) = &self.dataset {
             return Ok(Arc::clone(s));
         }
-        let exts = self.format.extensions();
         let first = self
             .storage
             .list(root)?
             .into_iter()
-            .find(|p| exts.iter().any(|e| has_extension(p, e)))
-            .ok_or_else(|| Error::Source(format!("{root}: no {:?} files", self.format)))?;
+            .find(|p| self.format.matches_path(p))
+            .ok_or_else(|| {
+                Error::Source(format!(
+                    "{root}: no {} files found",
+                    self.format.accepted_extensions()
+                ))
+            })?;
         let fp = fingerprint_with_policy(&self.storage, &first, self.policy)?;
         let reader = open_verified(&self.storage, &fp, self.policy)?;
         Ok(Arc::clone(&self.layout_from(&fp, &reader)?.schema))

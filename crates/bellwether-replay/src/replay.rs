@@ -78,9 +78,9 @@ use crate::catalog::Catalog;
 use crate::error::{ReplayError, ReplayResult};
 use crate::keys::RunKeys;
 use crate::layout::{replay_layout, LayoutModel, LayoutReplay};
-use crate::plan::{run_cost, servable, PlanSource, SegmentPlanner};
+use crate::plan::{run_cost, servable, Lookup, PlanSource, SegmentPlanner};
 use crate::transient::{CacheStats, TransientCache, TransientIndex, TransientLimits};
-use crate::workload::{KeySetSource, Workload};
+use crate::workload::{KeySetSource, RunQuery, Workload};
 
 /// Default byte cap of a replayer's transient cache: 2 GiB.
 pub const DEFAULT_CACHE_BYTES: u64 = 2 << 30;
@@ -142,7 +142,7 @@ impl<'a> Replayer<'a> {
         for spec in &current {
             if !have.contains(spec) {
                 return Err(Error::KeySpec(format!(
-                    "the planner has no segments for current spec {spec:?}"
+                    "the planner has no segments for current spec {spec}"
                 )));
             }
         }
@@ -283,13 +283,32 @@ impl<'a> Replayer<'a> {
         specs: &[KeySpec],
         keys: &RunKeys,
     ) -> Result<ScanPlan> {
+        self.verified_plan_query(planner, specs, keys, RunQuery::Locate { window: None })
+    }
+
+    fn verified_plan_query(
+        &self,
+        planner: &dyn PlanSource,
+        specs: &[KeySpec],
+        keys: &RunKeys,
+        query: RunQuery,
+    ) -> Result<ScanPlan> {
         check_types(&self.catalog, keys)?;
-        let serving: Vec<KeySpec> = specs
+        let mut serving: Vec<KeySpec> = specs
             .iter()
             .filter(|s| servable(s, keys.columns()).is_some())
             .cloned()
             .collect();
-        let plan = planner.plan(&serving, keys)?;
+        if query.is_temporal() {
+            let has_temporal = serving.iter().any(|s| {
+                matches!(s, KeySpec::Temporal { .. })
+                    && matches!(servable(s, keys.columns()), Some(Lookup::Point { .. }))
+            });
+            if !has_temporal {
+                serving.clear();
+            }
+        }
+        let plan = planner.plan_query(&serving, keys, query)?;
         self.catalog.verify_plan(&plan)?;
         Ok(plan)
     }
@@ -307,6 +326,17 @@ impl<'a> Replayer<'a> {
         self.verified_plan(planner.as_ref(), specs, keys)
     }
 
+    /// The plan for one ad hoc key set under `specs` and `query`, as costed.
+    pub fn plan_of_query(
+        &self,
+        specs: &[KeySpec],
+        keys: &RunKeys,
+        query: RunQuery,
+    ) -> Result<ScanPlan> {
+        let planner = self.planner_for(specs)?;
+        self.verified_plan_query(planner.as_ref(), specs, keys, query)
+    }
+
     /// Every run's exact cost under `specs`, in workload order.
     pub fn replay_specs(
         &self,
@@ -319,8 +349,9 @@ impl<'a> Replayer<'a> {
             .runs()
             .iter()
             .map(|run| {
+                let query = RunQuery::parse(&run.query_kind)?;
                 let rk = workload.run_keys(keys, run)?;
-                let plan = self.verified_plan(planner.as_ref(), specs, &rk)?;
+                let plan = self.verified_plan_query(planner.as_ref(), specs, &rk, query)?;
                 Ok(run_cost(&run.run_id, rk.len() as u64, &plan, true))
             })
             .collect()
@@ -604,7 +635,7 @@ fn check_types(catalog: &Catalog, keys: &RunKeys) -> Result<()> {
             .data_type();
         if &bellwether_core::segment::ColumnType::of(declared)? != recorded {
             return Err(Error::KeySpec(format!(
-                "keys on {c:?} were recorded as {recorded:?}, but the dataset declares \
+                "keys on {c:?} were recorded as {recorded}, but the dataset declares \
                  {declared}; re-record the workload"
             )));
         }

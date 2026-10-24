@@ -69,6 +69,11 @@ pub fn parse_rfc3339(s: &str) -> Result<chrono::DateTime<chrono::Utc>> {
         .map_err(|e| Error::Other(format!("invalid timestamp {s:?}: {e}")))
 }
 
+/// Formats an RFC 3339 timestamp as UTC with millisecond precision (`...Z`).
+pub fn format_rfc3339_millis(s: &str) -> Result<String> {
+    Ok(parse_rfc3339(s)?.to_rfc3339_opts(chrono::SecondsFormat::Millis, true))
+}
+
 /// Where the indexed data lives. Mirrors `source` in `bellwether.toml`.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct SourceInfo {

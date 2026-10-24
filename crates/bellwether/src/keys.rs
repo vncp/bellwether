@@ -75,15 +75,16 @@ impl KeyFile {
         let mut leaves = Vec::with_capacity(names.len());
         for n in &names {
             let i = file_schema.index_of(n).map_err(|_| {
+                let cols: Vec<&str> = file_schema
+                    .fields()
+                    .iter()
+                    .map(|f| f.name().as_str())
+                    .collect();
                 Error::KeySpec(format!(
-                    "the key file {} has no column {n:?} (it has {:?}); name its key columns \
+                    "the key file {} has no column {n:?} (it has {}); name its key columns \
                      with --key",
                     path.display(),
-                    file_schema
-                        .fields()
-                        .iter()
-                        .map(|f| f.name().as_str())
-                        .collect::<Vec<_>>()
+                    cols.join(", ")
                 ))
             })?;
             leaves.push(i);
@@ -94,6 +95,16 @@ impl KeyFile {
             .build()
             .map_err(|e| fail(&e))?;
         let schema = reader.schema();
+        for f in schema.fields() {
+            bellwether_core::encoding::check_supported(f.data_type()).map_err(|e| {
+                Error::KeySpec(format!(
+                    "the key file {} has column {:?} ({}), which cannot be a key: {e}",
+                    path.display(),
+                    f.name(),
+                    bellwether_core::encoding::type_summary(f.data_type())
+                ))
+            })?;
+        }
         let mut batches = Vec::new();
         for b in reader {
             batches.push(b.map_err(|e| fail(&e))?);

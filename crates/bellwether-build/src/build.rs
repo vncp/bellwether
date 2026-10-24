@@ -151,7 +151,7 @@ impl<S: StoreExt + ?Sized> Builder<S> {
                     }
                     Some(d) if d != spec => {
                         return Err(Error::KeySpec(format!(
-                            "the index declares {d:?} under the name {name}, not {spec:?}"
+                            "the index declares {d} under the name {name}, not {spec}"
                         )))
                     }
                     Some(_) => {}
@@ -528,11 +528,7 @@ fn plan_specs(specs: &[KeySpec], schema: &Schema) -> Result<Vec<SpecPlan>> {
         schema
             .field_with_name(c)
             .map(|f| f.data_type().clone())
-            .map_err(|_| {
-                Error::KeySpec(format!(
-                    "key spec column {c:?} is not in the dataset schema"
-                ))
-            })
+            .map_err(|_| encoding::missing_column(schema, c))
     };
     let mut names = BTreeSet::new();
     specs
