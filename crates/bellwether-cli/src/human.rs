@@ -104,13 +104,18 @@ pub(crate) fn index(r: &IndexResult, out: &Out) -> String {
     s
 }
 
-pub(crate) fn plan(r: &PlanResult, out: &Out) -> String {
-    let mut s = String::new();
-    let what = match &r.lookup {
+/// What a plan looked up, for its heading.
+fn lookup_label(lookup: &LookupKind) -> String {
+    match lookup {
         LookupKind::Locate => "locate".to_string(),
         LookupKind::Latest => "latest".to_string(),
         LookupKind::Asof { at, ts, ts_column } => format!("asof {at} ({ts_column} = {ts})"),
-    };
+    }
+}
+
+pub(crate) fn plan(r: &PlanResult, out: &Out) -> String {
+    let mut s = String::new();
+    let what = lookup_label(&r.lookup);
     let _ = writeln!(
         s,
         "{}",
@@ -166,6 +171,18 @@ pub(crate) fn plan(r: &PlanResult, out: &Out) -> String {
     if !r.excluded_incomplete.is_empty() {
         let ex: Vec<String> = r.excluded_incomplete.iter().map(label).collect();
         let _ = writeln!(s, "  not used, incomplete: {}", ex.join(", "));
+    }
+    match (&r.ordered_by, &r.unordered_reason) {
+        (Some(c), _) => {
+            let _ = writeln!(
+                s,
+                "  order: by {c} (each row group's minimum, files below in reading order)"
+            );
+        }
+        (None, Some(why)) => {
+            let _ = writeln!(s, "  order: unspecified; {why}");
+        }
+        (None, None) => {}
     }
     if let Record::Evidence(e) = &r.evidence.record {
         if let EvidenceBody::Plan { plan } = &e.body {

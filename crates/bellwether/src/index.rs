@@ -4,7 +4,7 @@
 use std::sync::Arc;
 
 use arrow::datatypes::{DataType, TimeUnit};
-use bellwether_build::{BuildOptions, Builder, Lookup};
+use bellwether_build::{BuildOptions, Builder, Lookup, PlanOrder};
 use bellwether_store::parse_rfc3339;
 use bellwether_types::{
     format, Error, Evidence, EvidenceBody, KeySpec, Predicate, Provenance, Record, Result, ScanPlan,
@@ -94,6 +94,18 @@ impl Engine {
         guard(|| self.plan_lookup(keys, Mode::Asof(at))).map_err(schema_hint)
     }
 
+    /// Invariant 1 over the folder, not only the index: a file that landed
+    /// or changed after the last build would be silently left out of the
+    /// plan, so it is refused.
+    fn refuse_stale(&self, pinned: &Pinned, verb: &str) -> Result<()> {
+        let changes = folder_changes(self.root(), pinned, self.format())?;
+        if changes.is_empty() {
+            Ok(())
+        } else {
+            Err(stale_index(self.root(), verb, &changes))
+        }
+    }
+
     fn plan_lookup(&self, keys: &KeyFile, mode: Mode<'_>) -> Result<PlanResult> {
         let verb = match mode {
             Mode::Locate => "locate",
@@ -101,13 +113,7 @@ impl Engine {
             Mode::Asof(_) => "asof",
         };
         let pinned = self.pin_required(verb)?;
-        // Invariant 1 over the folder, not only the index: a file that
-        // landed or changed after the last build would be silently left out
-        // of the plan, so it is refused.
-        let changes = folder_changes(self.root(), &pinned, self.format())?;
-        if !changes.is_empty() {
-            return Err(stale_index(self.root(), verb, &changes));
-        }
+        self.refuse_stale(&pinned, verb)?;
         let (specs, excluded) = pinned.specs();
         let (run_keys, null_tuples) = keys.run_keys(pinned.planner.schema())?;
         let columns = run_keys.columns().to_vec();
@@ -134,35 +140,17 @@ impl Engine {
                 )
             }
             Mode::Asof(at) => {
-                let ts_column = serving_temporal(self.root(), verb, &specs, &columns)?;
-                let ts_type = pinned
-                    .planner
-                    .column_types(std::slice::from_ref(&ts_column))?
-                    .remove(0)
-                    .1;
-                let ts = instant_in_unit(at, &ts_column, &ts_type)?;
-                (
-                    Lookup::AsOf {
-                        columns: columns.clone(),
-                        keys: tuples,
-                        ts,
-                    },
-                    LookupKind::Asof {
-                        at: at.to_string(),
-                        ts,
-                        ts_column,
-                    },
-                )
+                asof_lookup(self.root(), verb, &pinned, &specs, &columns, tuples, at)?
             }
         };
-        let plan = pinned.planner.plan(&specs, &lookup).map_err(|e| {
+        let (plan, order) = pinned.planner.plan_ordered(&specs, &lookup).map_err(|e| {
             if specs.is_empty() && !excluded.is_empty() {
                 not_complete_yet(self.root(), verb, &excluded)
             } else {
                 e
             }
         })?;
-        if !matches!(kind, LookupKind::Locate) {
+        if matches!(kind, LookupKind::Latest | LookupKind::Asof { .. }) {
             check_temporal_residual(&plan)?;
         }
         let files_total = pinned.manifest().rowgroup_space.files.len() as u64;
@@ -171,6 +159,10 @@ impl Engine {
             files: plan.entries.len() as u64,
             row_groups: plan.row_groups_selected,
             bytes: plan.bytes,
+        };
+        let (ordered_by, unordered_reason) = match order {
+            PlanOrder::Ordered { column } => (Some(column), None),
+            PlanOrder::Unspecified { reason } => (None, Some(reason)),
         };
         let evidence = self.put(Record::Evidence(plan_evidence(
             &pinned,
@@ -190,6 +182,8 @@ impl Engine {
             files_total,
             row_groups_total: planned_total,
             planned,
+            ordered_by,
+            unordered_reason,
             evidence,
         })
     }
@@ -200,6 +194,38 @@ enum Mode<'a> {
     Locate,
     Latest,
     Asof(&'a str),
+}
+
+/// The as-of lookup through the one temporal spec serving `columns`, its
+/// instant converted to the timestamp column's unit exactly.
+fn asof_lookup(
+    root: &str,
+    verb: &'static str,
+    pinned: &Pinned,
+    specs: &[KeySpec],
+    columns: &[String],
+    tuples: Vec<Vec<u8>>,
+    at: &str,
+) -> Result<(Lookup, LookupKind)> {
+    let ts_column = serving_temporal(root, verb, specs, columns)?;
+    let ts_type = pinned
+        .planner
+        .column_types(std::slice::from_ref(&ts_column))?
+        .remove(0)
+        .1;
+    let ts = instant_in_unit(at, &ts_column, &ts_type)?;
+    Ok((
+        Lookup::AsOf {
+            columns: columns.to_vec(),
+            keys: tuples,
+            ts,
+        },
+        LookupKind::Asof {
+            at: at.to_string(),
+            ts,
+            ts_column,
+        },
+    ))
 }
 
 /// The `plan` Evidence: provenance cites the manifest's content hash and the

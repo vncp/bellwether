@@ -47,6 +47,23 @@
 //!   every segment of the temporal spec, so a row superseded by a version in
 //!   a row group another spec pruned is still dropped (invariant 5);
 //! - range lookups: `Between`, widened for signed zero.
+//!
+//! # Order
+//!
+//! [`Planner::plan`] lists entries by path. [`Planner::plan_ordered`]
+//! plans the same row groups, then orders entries by a range key on a
+//! timestamp or date column: the one such complete spec, or, when there
+//! are several, the one on the lookup's own time column (a window's column,
+//! or the temporal spec's timestamp). Each entry sorts by the smallest
+//! row-group minimum among its planned row groups, as the range key's
+//! segments record it (a row group whose every value is null has none and
+//! sorts last; ties by path). Row groups inside an entry stay in index
+//! order, because an entry names its row groups as a set. The result is
+//! [`PlanOrder::Ordered`] only when that reading order visits every planned
+//! row group in non-decreasing minimum; otherwise it is
+//! [`PlanOrder::Unspecified`] with the reason (two files overlap in time, or
+//! a file's own row groups are out of time order), never a claimed order
+//! that does not hold.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -113,6 +130,26 @@ pub enum Lookup {
         lo: Vec<u8>,
         /// Inclusive upper bound.
         hi: Vec<u8>,
+    },
+}
+
+/// The order of a plan's entries ([`Planner::plan_ordered`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PlanOrder {
+    /// Reading the entries in order, and each entry's row groups in
+    /// ascending index, visits the planned row groups in non-decreasing
+    /// order of `column`'s row-group minimum (as the range key on `column`
+    /// records it; row groups whose every value is null come last).
+    Ordered {
+        /// The timestamp or date column of the range key.
+        column: String,
+    },
+    /// No such order holds; `reason` says why. Entries are still in a
+    /// deterministic order: by each file's earliest row-group minimum when a
+    /// timestamp range key exists, else by path.
+    Unspecified {
+        /// Why, in a sentence.
+        reason: String,
     },
 }
 
@@ -307,6 +344,177 @@ impl<S: StoreExt + ?Sized> Planner<S> {
     /// Plans `lookup` with `specs` (see the module docs).
     pub fn plan(&self, specs: &[KeySpec], lookup: &Lookup) -> Result<ScanPlan> {
         self.plan_with_transient(specs, lookup, &[])
+    }
+
+    /// Plans `lookup` with `specs` like [`Planner::plan`], then orders the
+    /// plan's entries by a timestamp range key's row-group minimum (see
+    /// [`PlanOrder`]). The row groups planned are exactly those of
+    /// [`Planner::plan`]; only the order of `entries` differs.
+    pub fn plan_ordered(
+        &self,
+        specs: &[KeySpec],
+        lookup: &Lookup,
+    ) -> Result<(ScanPlan, PlanOrder)> {
+        let mut plan = self.plan(specs, lookup)?;
+        let order = self.order(specs, lookup, &mut plan)?;
+        Ok((plan, order))
+    }
+
+    /// The range spec a plan is ordered by: the one range spec in `specs`
+    /// on a timestamp or date column, or, when several are, the one on the
+    /// lookup's own time column.
+    fn order_spec<'a>(
+        &self,
+        specs: &'a [KeySpec],
+        lookup: &Lookup,
+    ) -> std::result::Result<&'a KeySpec, String> {
+        let timed: Vec<&KeySpec> = specs
+            .iter()
+            .filter(|s| match s {
+                KeySpec::Range { column } => self.schema.field_with_name(column).is_ok_and(|f| {
+                    matches!(
+                        f.data_type(),
+                        DataType::Timestamp(..) | DataType::Date32 | DataType::Date64
+                    )
+                }),
+                _ => false,
+            })
+            .collect();
+        match timed.as_slice() {
+            [] => Err(
+                "no complete range key on a timestamp or date column; declare one (for example \
+                 range:ts) to get plans in time order"
+                    .into(),
+            ),
+            [one] => Ok(one),
+            many => {
+                let own = match lookup {
+                    Lookup::Between { column, .. } => Some(column.as_str()),
+                    Lookup::Latest { columns, .. } | Lookup::AsOf { columns, .. } => {
+                        specs.iter().find_map(|s| match s {
+                            KeySpec::Temporal {
+                                columns: c,
+                                ts_column,
+                            } if c.iter().all(|x| columns.contains(x)) => Some(ts_column.as_str()),
+                            _ => None,
+                        })
+                    }
+                    Lookup::Keys { .. } => None,
+                };
+                many.iter()
+                    .find(|s| Some(s.columns()[0].as_str()) == own)
+                    .copied()
+                    .ok_or_else(|| {
+                        format!(
+                            "range keys on several timestamp columns ({}) and the lookup names \
+                             none of them, so no one time order applies",
+                            many.iter()
+                                .map(|s| s.columns()[0].as_str())
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        )
+                    })
+            }
+        }
+    }
+
+    /// Orders `plan.entries` by the earliest row-group minimum of the
+    /// ordering column among each entry's row groups (row groups with no
+    /// minimum, every value null, sort last; ties by path), and says whether
+    /// that order is a total time order (see [`PlanOrder`]).
+    fn order(&self, specs: &[KeySpec], lookup: &Lookup, plan: &mut ScanPlan) -> Result<PlanOrder> {
+        let spec = match self.order_spec(specs, lookup) {
+            Ok(s) => s,
+            Err(reason) => return Ok(PlanOrder::Unspecified { reason }),
+        };
+        let column = spec.columns()[0].clone();
+        // Every row group's minimum from the range key's own segments.
+        let mut mins: BTreeMap<u32, Vec<u8>> = BTreeMap::new();
+        let name = spec.name();
+        for s in self
+            .manifest()
+            .segments
+            .iter()
+            .filter(|s| s.key_spec == name)
+        {
+            let src = SegSource::Committed {
+                id: s.id,
+                size: s.bytes,
+            };
+            let r = self.open_segment(spec, &src, true)?;
+            for (rg, min, _) in r.range_entries()? {
+                let e = mins.entry(rg.0).or_insert_with(|| min.clone());
+                if min < *e {
+                    *e = min;
+                }
+            }
+        }
+        let files = &self.manifest().rowgroup_space.files;
+        let by_path: BTreeMap<&str, usize> = files
+            .iter()
+            .enumerate()
+            .map(|(i, f)| (f.fingerprint.path.as_str(), i))
+            .collect();
+        // Per entry, its row groups' minimums in index order (None: no
+        // minimum).
+        let mut keyed: Vec<(Vec<Option<Vec<u8>>>, ScanEntry)> = Vec::new();
+        for e in std::mem::take(&mut plan.entries) {
+            let fi = *by_path.get(e.file.path.as_str()).ok_or_else(|| {
+                Error::Other(format!("planned file {} is not tracked", e.file.path))
+            })?;
+            let ids = &files[fi].rowgroup_ids;
+            let rg_mins = e
+                .row_groups
+                .iter()
+                .map(|idx| {
+                    let id = usize::try_from(idx)
+                        .ok()
+                        .and_then(|i| ids.get(i))
+                        .ok_or_else(|| {
+                            Error::Other(format!("row group {idx} of {} out of range", e.file.path))
+                        })?;
+                    Ok(mins.get(&id.0).cloned())
+                })
+                .collect::<Result<Vec<_>>>()?;
+            keyed.push((rg_mins, e));
+        }
+        // None sorts after every Some.
+        let rank = |m: &Option<Vec<u8>>| -> Rank { (m.is_none(), m.clone()) };
+        keyed.sort_by(|(a, x), (b, y)| {
+            let ea = a.iter().map(rank).min();
+            let eb = b.iter().map(rank).min();
+            ea.cmp(&eb).then_with(|| x.file.path.cmp(&y.file.path))
+        });
+        let mut previous: Option<(Rank, &str)> = None;
+        let mut breach: Option<(String, String)> = None;
+        for (rg_mins, e) in &keyed {
+            for m in rg_mins {
+                let r = rank(m);
+                if let Some((p, path)) = &previous {
+                    if r < *p && breach.is_none() {
+                        breach = Some(((*path).to_string(), e.file.path.clone()));
+                    }
+                }
+                previous = Some((r, e.file.path.as_str()));
+            }
+        }
+        plan.entries = keyed.into_iter().map(|(_, e)| e).collect();
+        Ok(match breach {
+            None => PlanOrder::Ordered { column },
+            Some((a, b)) if a == b => PlanOrder::Unspecified {
+                reason: format!(
+                    "the row groups of {a} are not in {column} order, so no reading order of \
+                     whole files is a time order; entries are ordered by each file's earliest \
+                     row group"
+                ),
+            },
+            Some((a, b)) => PlanOrder::Unspecified {
+                reason: format!(
+                    "row groups of {a} and {b} overlap in {column}, so no reading order of whole \
+                     files is a time order; entries are ordered by each file's earliest row group"
+                ),
+            },
+        })
     }
 
     /// Plans `lookup` with `specs`, where a spec equal to one in `extra`
@@ -707,38 +915,12 @@ impl<S: StoreExt + ?Sized> Planner<S> {
             return self.finish(&RoaringBitmap::new(), nothing);
         }
         let (lo, hi) = widen_zero_bounds(lo, hi);
-        let serving: Vec<&SpecSegments> = segs
-            .iter()
-            .filter(|s| match &s.spec {
-                KeySpec::Range { column: c } => c == column,
-                KeySpec::Exact { columns } | KeySpec::Temporal { columns, .. } => {
-                    columns.first().is_some_and(|c| c == column)
-                }
-                KeySpec::Bloom { .. } => false,
-            })
-            .collect();
-        if !segs.is_empty() && serving.is_empty() {
+        let selected = self.column_range(segs, column, &lo, &hi)?;
+        if !segs.is_empty() && selected.is_none() {
             return Err(Error::KeySpec(format!(
                 "none of the key specs serves a range lookup on {column:?} (a range spec on it, or an \
                  exact or temporal spec led by it)"
             )));
-        }
-        let mut selected: Option<RoaringBitmap> = None;
-        for s in &serving {
-            let range = matches!(s.spec, KeySpec::Range { .. });
-            let mut found = RoaringBitmap::new();
-            for src in &s.sources {
-                let r = self.open_segment(&s.spec, src, range)?;
-                found |= if range {
-                    r.lookup_range(&lo, &hi)?
-                } else {
-                    r.lookup_prefix_range(&lo, &hi)?
-                };
-            }
-            selected = Some(match selected {
-                Some(x) => x & found,
-                None => found,
-            });
         }
         let selected = if segs.is_empty() {
             self.locator.live().clone()
@@ -751,6 +933,44 @@ impl<S: StoreExt + ?Sized> Planner<S> {
             hi,
         };
         self.finish(&selected, residual)
+    }
+
+    /// The row groups the specs on `column` place in `[lo, hi]` (canonical
+    /// bounds): a range spec on `column`, or an exact or temporal spec led
+    /// by it, intersected across specs; `None` when no spec serves.
+    fn column_range(
+        &self,
+        segs: &[SpecSegments],
+        column: &str,
+        lo: &[u8],
+        hi: &[u8],
+    ) -> Result<Option<RoaringBitmap>> {
+        let mut selected: Option<RoaringBitmap> = None;
+        for s in segs {
+            let range = match &s.spec {
+                KeySpec::Range { column: c } if c == column => true,
+                KeySpec::Exact { columns } | KeySpec::Temporal { columns, .. }
+                    if columns.first().is_some_and(|c| c == column) =>
+                {
+                    false
+                }
+                _ => continue,
+            };
+            let mut found = RoaringBitmap::new();
+            for src in &s.sources {
+                let r = self.open_segment(&s.spec, src, range)?;
+                found |= if range {
+                    r.lookup_range(lo, hi)?
+                } else {
+                    r.lookup_prefix_range(lo, hi)?
+                };
+            }
+            selected = Some(match selected {
+                Some(x) => x & found,
+                None => found,
+            });
+        }
+        Ok(selected)
     }
 
     // -- the plan --------------------------------------------------------------
@@ -841,6 +1061,9 @@ impl<S: StoreExt + ?Sized> Planner<S> {
             .collect())
     }
 }
+
+/// The order key of a row-group minimum: `None` (every value null) last.
+type Rank = (bool, Option<Vec<u8>>);
 
 /// Probes and, for each, the byte spans of its elements.
 type Probes = (Vec<Vec<u8>>, Vec<Vec<std::ops::Range<usize>>>);

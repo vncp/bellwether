@@ -129,6 +129,12 @@ pub struct PlanResult {
     pub row_groups_total: u64,
     /// What the plan reads.
     pub planned: Cost,
+    /// The timestamp or date column whose row-group minimum orders the
+    /// plan's entries (read in order, each entry's row groups ascending),
+    /// when that order holds; `None` when the order is unspecified.
+    pub ordered_by: Option<String>,
+    /// Why the order is unspecified, when it is.
+    pub unordered_reason: Option<String>,
     /// The `plan` Evidence.
     pub evidence: Written,
 }

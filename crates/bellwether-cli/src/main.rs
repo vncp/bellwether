@@ -423,19 +423,9 @@ fn run(cli: &Cli, out: &Out) -> Result<Outcome, Failure> {
             let r = engine(g, &a.root.root)?.index(&specs)?;
             done(&r, human::index(&r, out), EXIT_OK)
         }
-        Command::Locate(a) => {
-            let r = engine(g, &a.root.root)?.locate(&key_file(&a.keys, a.key.as_ref()))?;
-            done(&r, human::plan(&r, out), EXIT_OK)
-        }
-        Command::Latest(a) => {
-            let r = engine(g, &a.root.root)?.latest(&key_file(&a.keys, a.key.as_ref()))?;
-            done(&r, human::plan(&r, out), EXIT_OK)
-        }
-        Command::Asof(a) => {
-            let l = &a.lookup;
-            let r = engine(g, &l.root.root)?.asof(&key_file(&l.keys, l.key.as_ref()), &a.at)?;
-            done(&r, human::plan(&r, out), EXIT_OK)
-        }
+        Command::Locate(a) => lookup(g, out, a, |e, keys| e.locate(keys)),
+        Command::Latest(a) => lookup(g, out, a, |e, keys| e.latest(keys)),
+        Command::Asof(a) => lookup(g, out, &a.lookup, |e, keys| e.asof(keys, &a.at)),
         Command::Propose(a) => propose(g, out, a),
         Command::Receipt {
             command: ReceiptCommand::Show { root, hash: h },
@@ -504,6 +494,19 @@ fn run(cli: &Cli, out: &Out) -> Result<Outcome, Failure> {
             }
         }
     }
+}
+
+/// A plan lookup (`locate`, `latest`, `asof`): the engine and the key
+/// file, handed to `plan`.
+fn lookup(
+    g: &Global,
+    out: &Out,
+    args: &LookupArgs,
+    plan: impl FnOnce(&Engine, &KeyFile) -> Result<bellwether::PlanResult, Error>,
+) -> Result<Outcome, Failure> {
+    let engine = engine(g, &args.root.root)?;
+    let result = plan(&engine, &key_file(&args.keys, args.key.as_ref()))?;
+    done(&result, human::plan(&result, out), EXIT_OK)
 }
 
 fn propose(g: &Global, out: &Out, a: &ProposeArgs) -> Result<Outcome, Failure> {

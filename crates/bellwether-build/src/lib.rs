@@ -45,5 +45,5 @@ pub use config::{
     DEFAULT_MAX_SEGMENT_BYTES, DEFAULT_MAX_SEGMENT_KEYS, DEFAULT_MAX_SEGMENT_ROW_GROUPS,
 };
 pub use coverage::completeness;
-pub use plan::{Lookup, Planner, TransientSpec};
+pub use plan::{Lookup, PlanOrder, Planner, TransientSpec};
 pub use verify::Drift;
