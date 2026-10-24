@@ -133,7 +133,9 @@ pub enum Refusal {
     /// Another commit landed between the manifest check and the apply's
     /// commit, so the applied index is not the one the certificate
     /// verified; the receipt is withheld. The build crate has no
-    /// expected-base precondition to prevent this.
+    /// expected-base precondition to prevent this. The key is built and
+    /// serves lookups (no re-index is needed), but it cannot be attested:
+    /// a retry finds it already complete ([`Refusal::NothingToApply`]).
     ConcurrentCommit {
         /// The sequence the apply should have produced.
         expected: u64,
@@ -683,6 +685,8 @@ impl Engine {
         before: u64,
         workload: &Workload,
     ) -> Result<FixOutcome> {
+        #[cfg(test)]
+        test_seam::before_apply(self);
         let mut options = BuildOptions::new(self.format().kind());
         options.chunk_size = self.options().chunk_size;
         options.schema.clone_from(&self.options().schema);
@@ -783,6 +787,31 @@ pub(crate) mod test_seam {
         HOOK.with(|h| {
             if let Some(f) = h.borrow().as_ref() {
                 f(selected);
+            }
+        });
+    }
+
+    type ApplyHook = Box<dyn Fn(&crate::Engine)>;
+
+    thread_local! {
+        static BEFORE_APPLY: RefCell<Option<ApplyHook>> = RefCell::new(None);
+    }
+
+    /// Installs `hook`, run after the gate and before the apply's build, for
+    /// this thread until `clear_before_apply`: a commit it makes lands
+    /// between the manifest check and the apply.
+    pub(crate) fn set_before_apply(hook: impl Fn(&crate::Engine) + 'static) {
+        BEFORE_APPLY.with(|h| *h.borrow_mut() = Some(Box::new(hook)));
+    }
+
+    pub(crate) fn clear_before_apply() {
+        BEFORE_APPLY.with(|h| *h.borrow_mut() = None);
+    }
+
+    pub(crate) fn before_apply(engine: &crate::Engine) {
+        BEFORE_APPLY.with(|h| {
+            if let Some(f) = h.borrow().as_ref() {
+                f(engine);
             }
         });
     }
@@ -1150,6 +1179,56 @@ mod tests {
             .collect();
         assert_eq!(files, vec!["part-000.parquet", "part-001.parquet"]);
         assert_eq!(plan.row_groups_selected, 2);
+    }
+
+    /// The before+1 gate end to end: a commit that lands between the gate
+    /// and the apply makes the apply's commit `before + 2`, so the receipt is
+    /// withheld (`concurrent_commit`); the key is built, and a retry finds it
+    /// already complete and attests nothing.
+    #[test]
+    fn a_commit_between_the_gate_and_the_apply_withholds_the_receipt() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("data");
+        common::ledger_corpus(&data, 3, 4, 25, 400);
+        let kf = dir.path().join("k.parquet");
+        common::write_keys(&kf, "id", &[5, 77, 123]);
+        Engine::open(data.to_str().unwrap(), EngineOptions::default())
+            .unwrap()
+            .index(&[crate::spec::parse("exact:batch").unwrap()])
+            .unwrap();
+        let (e, wl, p) = setup(&data, &kf);
+        test_seam::set_before_apply(|engine| {
+            engine
+                .index(&[crate::spec::parse("range:ts").unwrap()])
+                .unwrap();
+        });
+        let r = fix_key(&e, p, wl, false);
+        test_seam::clear_before_apply();
+        assert_eq!(r.manifest_before, "1");
+        assert_eq!(
+            r.outcome,
+            FixOutcome::Refused {
+                refusal: Refusal::ConcurrentCommit {
+                    expected: 2,
+                    committed: 3
+                }
+            }
+        );
+        assert_eq!(receipts(&data.join(".bellwether")), 0);
+        // The key is built: the current configuration serves it.
+        let specs = e.pin().unwrap().unwrap().specs().0;
+        assert!(specs.iter().any(|s| s.name() == "exact:id"), "{specs:?}");
+        // A retry cannot attest it.
+        let again = fix_key(&e, p, wl, false);
+        assert_eq!(
+            again.outcome,
+            FixOutcome::Refused {
+                refusal: Refusal::NothingToApply {
+                    sequence: "3".into()
+                }
+            }
+        );
+        assert_eq!(receipts(&data.join(".bellwether")), 0);
     }
 
     /// Signed zero: a workload key 0.0 matches rows stored under -0.0 too.

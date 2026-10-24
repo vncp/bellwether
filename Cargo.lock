@@ -413,6 +413,7 @@ dependencies = [
  "bellwether-build",
  "bellwether-core",
  "bellwether-ledger",
+ "bellwether-profile",
  "bellwether-replay",
  "bellwether-source",
  "bellwether-store",

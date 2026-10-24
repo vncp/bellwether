@@ -179,7 +179,7 @@ records
 exit 0  (.688599000 s)
 ```
 
-An index does not help this workload on this layout: 1,000 random users together touch 27 of the 28 row groups, so even an exact index (the floor: only row groups that hold a queried key) saves 0.08% of the bytes. Rows are not clustered by `UserID`, and that layout, not a missing index, is what the job pays for. The replay's prediction before the index existed (1,485,098,816 bytes) is exactly what the index then planned. The bytes are exact and do not depend on the build; the timings do (most of the 17 s `why` is building a transient `exact:UserID` index over 10,000,000 rows in a debug build). Fanout, lints, and the profile Evidence join `why` with the profile crate (WP5).
+An index does not help this workload on this layout: 1,000 random users together touch 27 of the 28 row groups, so even an exact index (the floor: only row groups that hold a queried key) saves 0.08% of the bytes. Rows are not clustered by `UserID`, and that layout, not a missing index, is what the job pays for. The replay's prediction before the index existed (1,485,098,816 bytes) is exactly what the index then planned. The bytes are exact and do not depend on the build; the timings do (most of the 17 s `why` is building a transient `exact:UserID` index over 10,000,000 rows in a debug build). This transcript was taken before the profile was wired into `why`; `why` now also prints the fanout table, the lints, and the profile Evidence it records, and the funnel above is unchanged (the bytes are exact).
 
 ## Status
 
@@ -187,7 +187,7 @@ Pre-alpha. The architecture and on-disk format are fixed and documented; the cra
 
 - [x] Contract crate, architecture, invariants, threat model, format, 27 decision records
 - [x] Engine foundations: canonical encoding, segments and blooms, Parquet and text sources, object-store manifest commits, the ledger; each crate reviewed against its invariants, with the reviewer's probes kept as regression tests
-- [ ] **M1** `why` works with no index built (footers and replay today; the profile's fanout and lints with WP5)
+- [x] **M1** `why` works with no index built: footers, the profile's fanout and lints as a recorded Evidence, and replay
 - [x] **M2** the index: `index`, `locate`, `latest`, `asof`
 - [x] **M3** receipts: `fix` writes one
 - [ ] **M4** agent-first: the loop runs end to end from an MCP client

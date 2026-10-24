@@ -56,9 +56,25 @@ fn why_over_a_batch_stamp_index_recommends_the_true_key() {
         0,
     );
     let r: WhyReport = typed(&out);
+    // The profile names the batch stamp, with its measured fanout.
     let culprit = r.culprit.as_ref().unwrap();
-    assert_eq!(culprit.columns, vec!["entity_id".to_string()]);
-    assert_eq!(culprit.reason, CulpritReason::NoIndexServes);
+    assert_eq!(culprit.columns, vec!["batch_id".to_string()]);
+    assert!(
+        matches!(&culprit.reason, CulpritReason::Lint { rule, .. } if rule == "batch_stamp_key"),
+        "{culprit:?}"
+    );
+    let fanout = culprit
+        .fanout
+        .as_ref()
+        .expect("the profile measured batch_id");
+    assert_eq!(fanout.columns, vec!["batch_id".to_string()]);
+    assert!(r.evidence.recorded);
+    let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+    for (_, rec) in check_records(&index_dir(&data), &v) {
+        if let Record::Proposal(p) = rec {
+            assert_eq!(p.evidence, vec![r.evidence.hash.unwrap()]);
+        }
+    }
     let rec = r.recommended.as_ref().unwrap();
     assert_eq!(rec.spec.columns(), ["entity_id".to_string()]);
     assert!(rec.proposed.bytes < rec.current.bytes);
@@ -71,5 +87,30 @@ fn why_over_a_batch_stamp_index_recommends_the_true_key() {
     let lines: Vec<&str> = human.lines().collect();
     assert!(lines[0].starts_with("why "), "{human}");
     assert!(lines[1].starts_with("funnel:"), "{human}");
-    assert!(human.contains("culprit (entity_id): no index serves this lookup"));
+    assert!(
+        human.contains("culprit (batch_id): lint batch_stamp_key"),
+        "{human}"
+    );
+    assert!(human.contains("\nfanout: "), "{human}");
+    assert!(human.contains("  apply it: bellwether fix "), "{human}");
+}
+
+/// A read-only folder with no `--index`: `why` exits 0, the Evidence comes
+/// back unrecorded, and the human output says how to record it.
+#[test]
+fn why_on_a_read_only_folder_exits_0_with_the_evidence_unrecorded() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    corpus(&data, 2, 3, 30, 200);
+    std::fs::set_permissions(&data, std::fs::Permissions::from_mode(0o555)).unwrap();
+    let json = std::panic::catch_unwind(|| run(&["--json", "why", path(&data)], 0));
+    let human = std::panic::catch_unwind(|| run(&["why", path(&data)], 0));
+    std::fs::set_permissions(&data, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let r: WhyReport = typed(&json.unwrap());
+    assert!(!r.evidence.recorded && r.evidence.hash.is_none());
+    let human = human.unwrap();
+    assert!(human.contains("evidence  not recorded: "), "{human}");
+    assert!(human.contains("--index"), "{human}");
+    assert!(!index_dir(&data).exists());
 }

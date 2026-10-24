@@ -21,6 +21,8 @@ bellwether-store = { path = "../bellwether-store" }
 bellwether-ledger = { path = "../bellwether-ledger" }
 # `index` (Builder) and `locate`/`latest`/`asof` (Planner).
 bellwether-build = { path = "../bellwether-build" }
+# The profile `why` computes and records as Evidence.
+bellwether-profile = { path = "../bellwether-profile" }
 # Workloads and exact replay for `why` and `fix`.
 bellwether-replay = { path = "../bellwether-replay" }
 # `reconcile`, and `fix`'s verify stage.

@@ -5,7 +5,7 @@
 
 mod common;
 
-use bellwether::types::{Hash, KeySpec, ProposalBody, Record};
+use bellwether::types::{EvidenceBody, Hash, KeySpec, ProposalBody, Record};
 use bellwether::{
     spec, CandidateOrigin, CulpritReason, Engine, EngineOptions, KeyFile, WhyRequest, Written,
     ENGINE_PROPOSER,
@@ -52,8 +52,31 @@ fn why_reports_an_unindexed_folder_from_its_footers_with_no_workload() {
         (2, 6, 180)
     );
     assert_eq!(r.dataset.bytes, footer_bytes(&data));
-    // Nothing was written: no workload, no candidates.
-    assert!(!data.join(".bellwether").join("ledger").exists());
+    // The profile is computed and its Evidence recorded: the only record.
+    assert!(r.evidence.recorded && r.evidence.note.is_none());
+    assert!(matches!(
+        r.evidence.evidence.body,
+        EvidenceBody::Profile { .. }
+    ));
+    assert_eq!(r.evidence.evidence.provenance.manifest_version, None);
+    assert_ne!(r.evidence.evidence.provenance.inputs.len(), 0);
+    let bytes = serde_json::to_vec(&Record::Evidence(r.evidence.evidence.clone())).unwrap();
+    assert_eq!(Some(Hash::of(&bytes)), r.evidence.hash);
+    assert_eq!(
+        ledger_bytes(
+            &data.join(".bellwether"),
+            &r.evidence.hash.unwrap().to_hex()
+        ),
+        bytes
+    );
+    assert_eq!(
+        std::fs::read_dir(data.join(".bellwether").join("ledger"))
+            .unwrap()
+            .count(),
+        1
+    );
+    assert_eq!(r.profile.files_total, r.dataset.files);
+    assert_eq!(r.profile.row_groups_total, r.dataset.row_groups);
     // The report round-trips through its JSON exactly (it is the --json
     // output and the MCP result).
     let json = serde_json::to_string(&r).unwrap();
@@ -80,8 +103,19 @@ fn why_with_keys_replays_each_candidate_and_the_floor_is_the_oracle() {
     let current = r.current.unwrap();
     assert_eq!(current.row_groups, 12, "no index: every row group");
     assert_eq!(current.bytes, r.dataset.bytes);
-    assert_eq!(r.candidates.len(), 1);
+    // Only the floor: exact:id,batch and exact:id,payload serve an id lookup
+    // only by prefix, so they select at least the floor's row groups and are
+    // not replayed; the rest serve no run.
     let floor = &r.candidates[0];
+    let names = |v: &mut dyn Iterator<Item = &KeySpec>| v.map(KeySpec::name).collect::<Vec<_>>();
+    assert_eq!(
+        names(&mut r.candidates.iter().map(|c| &c.spec)),
+        ["exact:id"]
+    );
+    assert_eq!(
+        names(&mut r.not_serving.iter()),
+        ["exact:batch", "exact:payload", "exact:batch,payload"]
+    );
     assert_eq!(floor.origin, CandidateOrigin::Workload);
     assert_eq!(
         floor.spec,
@@ -97,6 +131,11 @@ fn why_with_keys_replays_each_candidate_and_the_floor_is_the_oracle() {
             panic!()
         };
         assert_eq!(p.proposed_by, ENGINE_PROPOSER);
+        assert_eq!(
+            p.evidence,
+            vec![r.evidence.hash.unwrap()],
+            "cites the profile"
+        );
         assert!(matches!(&p.body, ProposalBody::Key { spec } if *spec == c.spec));
         let Record::Replay(rp) = &c.replay.record else {
             panic!()
@@ -153,7 +192,13 @@ fn why_over_an_index_that_does_not_serve_the_workload() {
             ..WhyRequest::default()
         })
         .unwrap();
-    assert!(r.candidates.is_empty() && r.recommended.is_none());
+    // No floor candidate: exact:id is current. The profile's composites
+    // still replay, and none beats the serving key.
+    assert!(r
+        .candidates
+        .iter()
+        .all(|c| c.origin == CandidateOrigin::Profile));
+    assert!(r.recommended.is_none());
     assert!(matches!(
         r.culprit.unwrap().reason,
         CulpritReason::ServingSpec { .. }
@@ -209,6 +254,7 @@ fn the_recommendation_is_the_strictly_cheapest_candidate() {
     let r = e
         .why(&WhyRequest {
             workload: Some(hash),
+            max_candidates: 0,
             ..WhyRequest::default()
         })
         .unwrap();
@@ -242,10 +288,122 @@ fn a_candidate_that_saves_nothing_is_not_recommended() {
     let r = e
         .why(&WhyRequest {
             workload: Some(hash),
+            max_candidates: 0,
             ..WhyRequest::default()
         })
         .unwrap();
     assert_eq!(r.candidates.len(), 1);
     assert_eq!(r.candidates[0].proposed, r.current.unwrap());
     assert!(r.recommended.is_none(), "equal cost is no saving");
+}
+
+/// A read-only index that exists: `why` profiles in memory with the index's
+/// manifest (the Evidence names its sequence), records nothing, and says how
+/// to record it; `--columns` limits the profile's candidates.
+#[test]
+fn why_on_a_read_only_index_profiles_in_memory_with_its_manifest() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    ledger_corpus(&data, 2, 3, 30, 40);
+    open(&data)
+        .index(&[spec::parse("exact:batch").unwrap()])
+        .unwrap();
+    let index = data.join(".bellwether");
+    let before = std::fs::read_dir(index.join("ledger")).map_or(0, Iterator::count);
+    std::fs::set_permissions(&index, std::fs::Permissions::from_mode(0o555)).unwrap();
+    let r = open(&data).why(&WhyRequest {
+        columns: Some(vec!["id".into()]),
+        ..WhyRequest::default()
+    });
+    std::fs::set_permissions(&index, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let r = r.unwrap();
+    assert!(!r.evidence.recorded && r.evidence.hash.is_none());
+    assert!(r.evidence.note.as_deref().unwrap().contains("--index"));
+    assert_eq!(
+        r.evidence.evidence.provenance.manifest_version.as_deref(),
+        Some("1")
+    );
+    let profiled: Vec<_> = r
+        .profile
+        .fanout
+        .iter()
+        .map(|e| e.fanout.columns.clone())
+        .collect();
+    assert_eq!(profiled, vec![vec!["id".to_string()]]);
+    let after = std::fs::read_dir(index.join("ledger")).map_or(0, Iterator::count);
+    assert_eq!(after, before, "nothing recorded");
+}
+
+/// A run keyed on (id, batch): the floor is exact:id,batch, and the
+/// profile's single columns id and batch serve it by point lookup, so they
+/// are replayed as profile candidates after the floor, each citing the
+/// Evidence; keys on payload serve no run.
+#[test]
+fn profile_candidates_that_serve_by_point_follow_the_floor() {
+    use std::sync::Arc;
+
+    use arrow::array::{ArrayRef, Int64Array, RecordBatch};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use parquet::arrow::ArrowWriter;
+
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    ledger_corpus(&data, 3, 4, 25, 400);
+    let kf = dir.path().join("k.parquet");
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("batch", DataType::Int64, false),
+    ]));
+    let b = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(Int64Array::from(vec![5i64, 77])) as ArrayRef,
+            Arc::new(Int64Array::from(vec![0i64, 1])),
+        ],
+    )
+    .unwrap();
+    let mut w = ArrowWriter::try_new(std::fs::File::create(&kf).unwrap(), schema, None).unwrap();
+    w.write(&b).unwrap();
+    w.close().unwrap();
+    let r = open(&data)
+        .why(&WhyRequest {
+            keys: Some(KeyFile::new(&kf)),
+            ..WhyRequest::default()
+        })
+        .unwrap();
+    let got: Vec<(String, CandidateOrigin)> = r
+        .candidates
+        .iter()
+        .map(|c| (c.spec.name(), c.origin))
+        .collect();
+    assert_eq!(
+        got,
+        [
+            ("exact:id,batch".to_string(), CandidateOrigin::Workload),
+            ("exact:id".to_string(), CandidateOrigin::Profile),
+            ("exact:batch".to_string(), CandidateOrigin::Profile),
+        ]
+    );
+    let names: Vec<String> = r.not_serving.iter().map(KeySpec::name).collect();
+    assert_eq!(
+        names,
+        ["exact:payload", "exact:id,payload", "exact:batch,payload"]
+    );
+    for c in &r.candidates {
+        let Record::Proposal(p) = &c.proposal.record else {
+            panic!()
+        };
+        assert_eq!(p.evidence, vec![r.evidence.hash.unwrap()]);
+    }
+    // max_candidates caps the profile's candidates, never the floor.
+    let capped = open(&data)
+        .why(&WhyRequest {
+            keys: Some(KeyFile::new(&kf)),
+            max_candidates: 1,
+            ..WhyRequest::default()
+        })
+        .unwrap();
+    let got: Vec<String> = capped.candidates.iter().map(|c| c.spec.name()).collect();
+    assert_eq!(got, ["exact:id,batch", "exact:id"]);
 }

@@ -90,7 +90,11 @@ fn probe_receipt_and_report_over_a_real_receipt() {
     // the ledger's stored bytes.
     let r = e.receipt(&rh).unwrap();
     assert!(r.intact);
-    assert_eq!(r.chain.len(), 4, "proposal, replay, certificate, receipt");
+    assert_eq!(
+        r.chain.len(),
+        5,
+        "the profile evidence, proposal, replay, certificate, receipt"
+    );
     assert_eq!(r.records.len(), r.chain.len());
     for (w, l) in r.records.iter().zip(&r.chain) {
         assert_eq!(w.hash, l.hash);
@@ -99,11 +103,14 @@ fn probe_receipt_and_report_over_a_real_receipt() {
         assert_eq!(ledger_bytes(&index, &w.hash.to_hex()), bytes);
     }
 
-    // R5: with the floor now current there is no candidate, and the current
+    // R5: with the floor now current it is no candidate, and the current
     // cost is still computed: the prediction, 2,967 bytes.
     let w2 = e.why(&req).unwrap();
     assert_eq!(w2.sequence, 2);
-    assert_eq!(w2.candidates.len(), 0);
+    assert!(w2
+        .candidates
+        .iter()
+        .all(|c| c.origin == bellwether::CandidateOrigin::Profile));
     assert_eq!(w2.current, Some(cand.proposed), "realized equals predicted");
     assert_eq!(w2.current.unwrap().bytes, 2_967);
 
