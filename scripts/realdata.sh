@@ -5,7 +5,8 @@
 #   REALDATA_DIR=/some/scratch scripts/realdata.sh            # everything
 #   BELLWETHER=/path/to/bellwether scripts/realdata.sh        # skip the build
 #
-# Needs: curl, duckdb (1.x, run as `duckdb -no-agent`), jq, perl, cargo.
+# Needs: curl, duckdb (2.x, run as `duckdb -no-agent`), jq, perl, cargo.
+# Runs on macOS and Linux.
 # Downloads about 1.2 GB (6 taxi months, 12 GH Archive hours) into
 # $REALDATA_DIR/dl and writes everything else under $REALDATA_DIR. Deletes
 # nothing; remove $REALDATA_DIR (and the release target dir) when done.
@@ -38,7 +39,7 @@ since() { perl -e 'printf "%.3f", $ARGV[1] - $ARGV[0]' "$1" "$(now)"; }
 duck() { duckdb -no-agent -csv -noheader -c "$1"; }
 
 # ---- preflight ---------------------------------------------------------------
-free_gb=$(df -g / | awk 'NR==2 {print $4}')
+free_gb=$(df -Pk / | awk 'NR==2 {print int($4 / 1048576)}')
 if [ "$free_gb" -lt 8 ]; then
   echo "only ${free_gb} GB free on /; stopping (need 8)" >&2
   exit 1
@@ -53,13 +54,14 @@ fi
 BW=$BELLWETHER
 
 # ---- downloads (verified against Content-Length) ----------------------------
+size() { if [ -f "$1" ]; then wc -c <"$1" | tr -d ' '; else echo 0; fi; }
 fetch() { # fetch URL DEST
   local want have
   want=$(curl -sSfI "$1" | tr -d '\r' | awk 'tolower($1)=="content-length:" {print $2}' | tail -1)
-  have=$(stat -f %z "$2" 2>/dev/null || stat -c %s "$2" 2>/dev/null || echo 0)
+  have=$(size "$2")
   [ -n "$want" ] && [ "$have" = "$want" ] && return 0
   curl -sSfL --retry 3 -o "$2.part" "$1" || { echo "download failed: $1" >&2; exit 1; }
-  have=$(stat -f %z "$2.part" 2>/dev/null || stat -c %s "$2.part")
+  have=$(size "$2.part")
   [ "$have" = "$want" ] || { echo "truncated: $1 ($have of $want bytes)" >&2; exit 1; }
   mv "$2.part" "$2"
 }
@@ -185,7 +187,13 @@ pair_bytes() { # pair_bytes DIR PAIRSFILE
 
 say "# bellwether on real public data"
 say "date: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
-say "machine: $(sysctl -n machdep.cpu.brand_string 2>/dev/null || uname -m), $(sysctl -n hw.ncpu 2>/dev/null) cores, $(($(sysctl -n hw.memsize 2>/dev/null || echo 0) / 1073741824)) GB, macOS $(sw_vers -productVersion 2>/dev/null), local SSD"
+if [ "$(uname -s)" = Darwin ]; then
+  machine="$(sysctl -n machdep.cpu.brand_string), $(sysctl -n hw.ncpu) cores, $(($(sysctl -n hw.memsize) / 1073741824)) GB, macOS $(sw_vers -productVersion)"
+else
+  machine="$(uname -m), $(nproc) cores, $(awk '/^MemTotal:/ {print int($2 / 1048576)}' /proc/meminfo) GB, $(uname -sr)"
+fi
+if [ -n "${CI:-}" ]; then disk="CI runner disk"; else disk="local SSD"; fi
+say "machine: $machine, $disk"
 say "build: release, $(rustc -V 2>/dev/null), commit $(git -C "$REPO" rev-parse --short HEAD 2>/dev/null)"
 say "tools: $(duckdb -no-agent --version 2>/dev/null | head -1)"
 say "taxi: $(duck "SELECT count(*) || ' rows; ' || count(DISTINCT PULocationID) || ' distinct PULocationID; ' || count(DISTINCT VendorID) || ' distinct VendorID' FROM read_parquet('taxi/*.parquet')")"
