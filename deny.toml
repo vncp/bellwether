@@ -39,6 +39,12 @@ confidence-threshold = 0.9
 [[licenses.exceptions]]
 crate = "webpki-root-certs"
 allow = ["CDLA-Permissive-2.0"]
+# borrow-or-share is MIT No Attribution (permissive, no conditions), reached
+# through bellwether-mcp -> jsonschema (tool-argument validation) ->
+# referencing -> fluent-uri; allowed for that crate alone by WP12.
+[[licenses.exceptions]]
+crate = "borrow-or-share"
+allow = ["MIT-0"]
 
 [bans]
 multiple-versions = "warn"

@@ -49,7 +49,7 @@ Nothing above the file layer is format-specific: a text file's fixed byte-range 
 - 🎯 **Prunes to the row group, not the file.** Composite keys with prefix lookup, latest-version and as-of lookups over plain append-only files. Single-key seek in the core index: ~0.2 µs at 10k keys, ~0.5 µs at 1M keys.
 - 🧾 **Shows its receipts.** Every applied change hash-links the evidence it was based on, the proposal, the exact before-and-after replay, and a reconciliation certificate proving the same rows came back. If it cannot prove something, it says so.
 - 🧬 **Learns your workload's rulebook.** `evolve` runs a reflective, population-based search over query plans, physical designs, and whole pipelines in the style of GEPA and SkillOpt, with two substitutions those methods never had: an exact loss (replay) and a hard constraint (reconciliation). The backward pass is counterfactual attribution, numeric knobs get real finite-difference descent, selection is Pareto across your recorded runs, and the output is a rulebook promoted only by held-out replay.
-- 🤖 **Agent-first, with a trust boundary.** MCP tools in three tiers: `observe.*` and `propose.*` for the agent, `apply.*` for the engine alone. A confused or compromised agent can waste your time and nothing else.
+- 🤖 **Agent-first, with a trust boundary.** MCP tools in tiers: `observe.*` and `propose.*` for the agent; `score.*` and `apply.receipt` ask the engine, which alone scores, verifies, and applies. A confused or compromised agent can waste your time and nothing else.
 - 🗂️ **Parquet stays Parquet.** Immutable sidecar segments and a manifest committed by conditional PUT. No table format conversion, no locks, no new file format. Local disk, S3, Azure, GCS.
 - ⏱️ **Time travel without a table format.** `latest` and `asof` answer "the current state of these keys" and "their state on March 3rd" across a folder of history files, located to the row group.
 - 💻 **Runs on a laptop.** Memory is bounded per operation and stated in the docs. The "which files do I need" question no longer needs a cluster or a JVM.
@@ -122,12 +122,35 @@ bellwether reconcile ./orders/ ./orders-rewritten/ --key order_id --latest-by up
 # Render every receipt and profile from the ledger: funnel, fanout, realized-vs-predicted
 bellwether report ./orders/ --html out/
 
-# Arriving later: evolve (M6) and the MCP server (WP12)
+# Serve the same engine to a coding agent over MCP (stdio), bound to one folder
+bellwether mcp ./orders/
+
+# Arriving later: evolve (M6)
 bellwether evolve ./pipeline/ --workload runs/ --budget 50g
-bellwether mcp
 ```
 
 Every command takes `--json` and then prints its typed result as one JSON line, with each ledger record it wrote embedded with its hash: the same value the MCP server returns (ADR 010). Exit codes: 0 success, 1 a certificate failed or mismatches were found, 2 usage, 3 refused at the trust boundary, 4 engine error.
+
+### For a coding agent
+
+Add the server to the agent's MCP configuration (the `mcpServers` block most clients read):
+
+```json
+"bellwether": {
+  "command": "bellwether", "args": ["mcp", "./orders/"]
+}
+```
+
+Then ask it to run the prompt `diagnose_slow_query`, which is [`AGENTS.md`](AGENTS.md): observe, read the evidence, propose, have the engine score and verify, apply, quote the receipt hash. Every result carries the record hashes it rests on; every refusal carries a stable code, the facts to act on, and one next step. Details: [`crates/bellwether-mcp`](crates/bellwether-mcp/README.md).
+
+| Surface | What it can do | Worst case |
+|---|---|---|
+| `observe.*` (`observe.why` with no keys, `observe.profile`, `observe.locate`, `observe.asof`) | read footers and the index; write the profile Evidence and cache entries | the agent reads evidence |
+| `score.*` (`score.why` with keys or a workload, `score.verify`) | ask the engine to replay and verify; the engine writes its own Proposals, Replays, plan Evidence, and Certificates; charged to the session budget | the agent spends its budget and is refused with `budget_exceeded` |
+| `propose.*` | write a `Proposal` with no score, or nothing with `dry_run` | the ledger holds a bad proposal that scores poorly and never gets a Certificate |
+| `apply.receipt` | take a Certificate hash only; the engine applies and then writes the Receipt | the agent asks to apply something unverified and is told no, with a typed code |
+| `jobs.*` | start a score or apply call as a job, poll it, read its result | whatever the started tool may do |
+| resources (`bellwether://findings`, `receipts`, `scorecard`) | read the ledger | the agent reads the ledger |
 
 ### Measured: a ClickBench slice
 
@@ -236,7 +259,7 @@ Pre-alpha. The architecture and on-disk format are fixed and documented; the cra
 - [x] **M1** `why` works with no index built: footers, the profile's fanout and lints as a recorded Evidence, and replay
 - [x] **M2** the index: `index`, `locate`, `latest`, `asof`
 - [x] **M3** receipts: `fix` writes one
-- [ ] **M4** agent-first: the loop runs end to end from an MCP client
+- [x] **M4** agent-first: the loop runs end to end from an MCP client
 - [ ] **M5** format v0.1 frozen with a compatibility fixture
 - [ ] **M6** `evolve` and `report`: reflective optimization of plans, keys, layouts, and whole pipelines against your recorded workload, with charts rendered from the ledger
 - [ ] **M7** a SQL table reconciles against a folder of files with a certificate; plans execute inside DataFusion and DuckDB without a sidecar step; receipts gate pull requests
@@ -258,7 +281,7 @@ cargo install --git https://github.com/vncp/bellwether bellwether-cli
 
 ## Architecture at a glance
 
-Twelve crates, dependencies pointing one way, enforced by a script in CI. The CLI and the MCP server hold no engine logic: both call the `bellwether` facade, so what the CLI prints as `--json` is byte for byte what an agent receives.
+Thirteen crates, dependencies pointing one way, enforced by a script in CI. The CLI and the MCP server hold no engine logic: both call the `bellwether` facade, so what the CLI prints as `--json` is byte for byte what an agent receives.
 
 On disk: immutable `segments/` named by content hash, one `manifest.json` advanced by conditional PUT with a sequence number, an append-only `ledger/` of hash-named records, and a rebuildable `cache/`.
 

@@ -1,7 +1,13 @@
 //! Test corpora written directly with the `parquet` crate, and an oracle
 //! that reads them back without any engine code.
 
-#![allow(dead_code, clippy::unwrap_used, clippy::expect_used)]
+#![allow(
+    dead_code,
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::case_sensitive_file_extension_comparisons,
+    clippy::needless_pass_by_value
+)]
 
 use std::collections::BTreeSet;
 use std::fs::File;
@@ -263,4 +269,133 @@ pub fn finish(s: &bellwether_mcp::Server, id: &str) -> bellwether_mcp::Reply {
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
     panic!("job {id} did not finish");
+}
+
+// ---------------------------------------------------------------------------
+// A minimal MCP client over a child process's stdin and stdout: one JSON-RPC
+// message per line, as the stdio transport frames them.
+// ---------------------------------------------------------------------------
+
+/// The protocol version the client asks for in `initialize`.
+pub const PROTOCOL: &str = "2025-11-25";
+
+/// A server child process and the client end of its stdio.
+pub struct Client {
+    child: std::process::Child,
+    stdin: Option<std::process::ChildStdin>,
+    stdout: std::io::BufReader<std::process::ChildStdout>,
+    next: u64,
+    /// Every line the server wrote to stdout, in order.
+    pub lines: Vec<String>,
+}
+
+impl Client {
+    /// Spawns `exe` with `args`, stdin and stdout piped, stderr captured.
+    pub fn spawn(exe: &str, args: &[&str]) -> Self {
+        let mut child = std::process::Command::new(exe)
+            .args(args)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let stdin = child.stdin.take();
+        let stdout = std::io::BufReader::new(child.stdout.take().unwrap());
+        Self {
+            child,
+            stdin,
+            stdout,
+            next: 1,
+            lines: Vec::new(),
+        }
+    }
+
+    fn send(&mut self, msg: &serde_json::Value) {
+        use std::io::Write as _;
+        let stdin = self.stdin.as_mut().unwrap();
+        let mut line = serde_json::to_string(msg).unwrap();
+        line.push('\n');
+        stdin.write_all(line.as_bytes()).unwrap();
+        stdin.flush().unwrap();
+    }
+
+    /// Sends a request and returns its response (`result` or `error`),
+    /// skipping notifications. Every stdout line must be a JSON-RPC 2.0
+    /// message: stdout is the protocol channel and nothing else.
+    pub fn request(&mut self, method: &str, params: serde_json::Value) -> serde_json::Value {
+        use std::io::BufRead as _;
+        let id = self.next;
+        self.next += 1;
+        self.send(&serde_json::json!({
+            "jsonrpc": "2.0", "id": id, "method": method, "params": params
+        }));
+        loop {
+            let mut line = String::new();
+            let n = self.stdout.read_line(&mut line).unwrap();
+            assert!(n > 0, "the server closed stdout during {method}");
+            let v: serde_json::Value = serde_json::from_str(line.trim_end())
+                .unwrap_or_else(|e| panic!("a stdout line is not JSON ({e}): {line:?}"));
+            assert_eq!(v["jsonrpc"], "2.0", "{line}");
+            self.lines.push(line);
+            if v["id"] == serde_json::json!(id) {
+                return v;
+            }
+        }
+    }
+
+    /// Sends a notification.
+    pub fn notify(&mut self, method: &str) {
+        self.send(&serde_json::json!({ "jsonrpc": "2.0", "method": method }));
+    }
+
+    /// The handshake: `initialize`, then `notifications/initialized`.
+    pub fn initialize(&mut self) -> serde_json::Value {
+        let r = self.request(
+            "initialize",
+            serde_json::json!({
+                "protocolVersion": PROTOCOL,
+                "capabilities": {},
+                "clientInfo": { "name": "bellwether-test", "version": "0" }
+            }),
+        );
+        assert!(r.get("error").is_none(), "{r}");
+        self.notify("notifications/initialized");
+        r
+    }
+
+    /// `tools/call`, returning the result object.
+    pub fn call(&mut self, tool: &str, args: serde_json::Value) -> serde_json::Value {
+        let r = self.request(
+            "tools/call",
+            serde_json::json!({ "name": tool, "arguments": args }),
+        );
+        assert!(r.get("error").is_none(), "{r}");
+        r["result"].clone()
+    }
+
+    /// Closes stdin and waits: the server's exit status, stdout left, and
+    /// stderr.
+    pub fn close(mut self) -> (std::process::ExitStatus, String, String) {
+        use std::io::Read as _;
+        drop(self.stdin.take());
+        let mut rest = String::new();
+        self.stdout.read_to_string(&mut rest).unwrap();
+        let mut err = String::new();
+        if let Some(mut e) = self.child.stderr.take() {
+            e.read_to_string(&mut err).unwrap();
+        }
+        (self.child.wait().unwrap(), rest, err)
+    }
+}
+
+impl Drop for Client {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// The text content of a `tools/call` result.
+pub fn text(result: &serde_json::Value) -> &str {
+    result["content"][0]["text"].as_str().unwrap()
 }

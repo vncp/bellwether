@@ -6,7 +6,13 @@
 //! write nothing; the success path writes a Receipt whose explain chain is
 //! intact; refusals carry codes, facts, and a next line.
 
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::too_many_lines)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::too_many_lines,
+    clippy::assert_is_empty,
+    clippy::used_underscore_binding
+)]
 
 mod common;
 
@@ -223,6 +229,18 @@ fn a_score_cannot_be_smuggled_into_any_propose_tool() {
         assert_eq!(code(&r), "invalid_input", "{tool} {args}");
         let errors = &r.envelope.refusal.as_ref().unwrap().fields["errors"];
         assert!(!errors.as_array().unwrap().is_empty());
+    }
+    // The same specs without the extra field are accepted (as dry runs).
+    for spec in [
+        json!({"kind": "bloom", "columns": ["id"], "fpr": 0.01}),
+        json!({"kind": "temporal", "columns": ["id"], "ts_column": "ts"}),
+        json!({"kind": "range", "column": "ts"}),
+    ] {
+        ok(
+            &srv,
+            "propose.key",
+            json!({"spec": spec, "evidence": [ev], "by": "a", "dry_run": true}),
+        );
     }
     // A propose tool's published schema has no score property anywhere.
     for t in bellwether_mcp::tools::catalog() {

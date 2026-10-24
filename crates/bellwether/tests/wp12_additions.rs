@@ -3,7 +3,13 @@
 //! of the file lists, `propose_dry_run` and `apply_dry_run` writing nothing
 //! anywhere, and the ledger views (`findings`, `receipts`, `scorecard`).
 
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::too_many_lines)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::too_many_lines,
+    clippy::many_single_char_names,
+    clippy::assert_is_empty
+)]
 
 mod common;
 

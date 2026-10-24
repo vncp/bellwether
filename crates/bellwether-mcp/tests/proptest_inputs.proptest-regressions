@@ -1,0 +1,9 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 16e71826f030972b1d614b9dbccf4c2732d3eef79abe3d379a5dd59c5908ea2d # shrinks to t = 6, args = Object {"score": Object {"columns": String("8831f88eca11d285e935cc87fb40da5f70ae4ec8fcba2bedd95ef188dae7c20e")}}
+cc 6c585845bf768a50452d41151f2270b69b4e82b18ab3303948da87a44c0563eb # shrinks to t = 10, op = 121, key = "score", value = Object {}, pick = 12707568409724448116
+cc cfd75583349f70a9c3ec8581f27b120e4a4b0148e9347244307edd6250827350 # shrinks to t = 0, op = 15, key = "_h", value = Array [String("ch_w"), String("")], pick = 8118437881269485852
