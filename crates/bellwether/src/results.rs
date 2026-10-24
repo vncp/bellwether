@@ -123,6 +123,10 @@ pub struct PlanResult {
     pub specs: Vec<KeySpec>,
     /// Declared specs left out because they are not complete (ADR 012).
     pub excluded_incomplete: Vec<KeySpec>,
+    /// Timestamp column whose row-group minimum orders the plan's entries,
+    /// when a complete range key on a timestamp or date column is used;
+    /// `None` when the order is unspecified.
+    pub ordered_by: Option<String>,
     /// Live files the plan chose from.
     pub files_total: u64,
     /// Live row groups the plan chose from.

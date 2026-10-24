@@ -639,7 +639,7 @@ impl<R: ReadAt> SegmentReader<R> {
 
     /// Visits every `(min, max, rg)` entry of a range segment in order, one
     /// block at a time.
-    pub(crate) fn for_each_range_entry(
+    pub fn for_each_range_entry(
         &self,
         mut f: impl FnMut(&[u8], &[u8], u32) -> Result<()>,
     ) -> Result<()> {

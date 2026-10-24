@@ -213,3 +213,24 @@ fn schema_flag_supplies_the_dataset_schema() {
     let r: IndexResult = typed(&out);
     assert_eq!(r.committed, Some(1));
 }
+
+#[test]
+fn ordered_plans_human_output_states_ordered_by_or_unspecified() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    corpus(&data, 2, 2, 10, 8);
+    let kf = dir.path().join("k.parquet");
+    keys(&kf, "id", &[1]);
+    run(&["index", path(&data), "--key", "exact:id"], 0);
+    let out_unord = run(&["locate", path(&data), "--keys", path(&kf)], 0);
+    assert!(
+        out_unord.contains("ordered_by: unspecified"),
+        "got: {out_unord}"
+    );
+    run(&["index", path(&data), "--key", "range:ts"], 0);
+    let out_ord = run(&["locate", path(&data), "--keys", path(&kf)], 0);
+    assert!(
+        out_ord.contains("ordered_by: ts (row-group minimum)"),
+        "got: {out_ord}"
+    );
+}

@@ -155,6 +155,7 @@ impl Engine {
                 )
             }
         };
+        let ordered_by = pinned.planner.ordered_by(&specs)?;
         let plan = pinned.planner.plan(&specs, &lookup).map_err(|e| {
             if specs.is_empty() && !excluded.is_empty() {
                 Error::KeySpec(format!(
@@ -189,6 +190,7 @@ impl Engine {
             key_set,
             sequence: pinned.sequence(),
             specs,
+            ordered_by,
             excluded_incomplete: excluded,
             files_total,
             row_groups_total: planned_total,

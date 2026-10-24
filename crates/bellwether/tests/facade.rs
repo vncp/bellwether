@@ -281,3 +281,104 @@ fn report_is_one_self_contained_html_file() {
         assert!(!lower.contains(banned), "{banned}");
     }
 }
+
+#[test]
+fn ordered_plans_order_entries_by_timestamp_range_key_against_decoded_files() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    std::fs::create_dir_all(&data).unwrap();
+    // Write three files whose alphabetical path order is a.parquet, b.parquet, c.parquet,
+    // but whose timestamp minima are:
+    //   a.parquet: ts 300
+    //   b.parquet: ts 100
+    //   c.parquet: ts 200
+    common::write_file(
+        &data.join("a.parquet"),
+        &[vec![(1, 0, Some(300), "a".into())]],
+    );
+    common::write_file(
+        &data.join("b.parquet"),
+        &[vec![(1, 0, Some(100), "b".into())]],
+    );
+    common::write_file(
+        &data.join("c.parquet"),
+        &[vec![(1, 0, Some(200), "c".into())]],
+    );
+    write_keys(&dir.path().join("k.parquet"), "id", &[1]);
+    let kf = KeyFile::new(dir.path().join("k.parquet"));
+
+    let e = open(&data);
+    // Without a timestamp range key, order is unspecified (entries in path order) and said so.
+    e.index(&[spec::parse("exact:id").unwrap()]).unwrap();
+    let r_unord = e.locate(&kf).unwrap();
+    assert_eq!(r_unord.ordered_by, None);
+    let Record::Evidence(ev1) = &r_unord.evidence.record else {
+        unreachable!()
+    };
+    let EvidenceBody::Plan { plan: p1 } = &ev1.body else {
+        unreachable!()
+    };
+    let names1: Vec<&str> = p1
+        .entries
+        .iter()
+        .map(|en| {
+            std::path::Path::new(&en.file.path)
+                .file_name()
+                .unwrap()
+                .to_str()
+                .unwrap()
+        })
+        .collect();
+    assert_eq!(names1, vec!["a.parquet", "b.parquet", "c.parquet"]);
+
+    // Add range:ts -> plan entries are ordered by row-group minimum of ts (b, c, a) and ordered_by is Some("ts").
+    e.index(&[spec::parse("range:ts").unwrap()]).unwrap();
+    let r_ord = e.locate(&kf).unwrap();
+    assert_eq!(r_ord.ordered_by.as_deref(), Some("ts"));
+    let Record::Evidence(ev2) = &r_ord.evidence.record else {
+        unreachable!()
+    };
+    let EvidenceBody::Plan { plan: p2 } = &ev2.body else {
+        unreachable!()
+    };
+    let names2: Vec<&str> = p2
+        .entries
+        .iter()
+        .map(|en| {
+            std::path::Path::new(&en.file.path)
+                .file_name()
+                .unwrap()
+                .to_str()
+                .unwrap()
+        })
+        .collect();
+    assert_eq!(names2, vec!["b.parquet", "c.parquet", "a.parquet"]);
+
+    // Independently decode the planned files in plan order with the parquet crate and verify
+    // their row-group minimum timestamps are strictly non-decreasing (100, 200, 300).
+    let mut decoded_mins = Vec::new();
+    for entry in &p2.entries {
+        let file = std::fs::File::open(&entry.file.path).unwrap();
+        let reader =
+            parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(file)
+                .unwrap()
+                .with_row_groups(entry.row_groups.iter().map(|i| i as usize).collect())
+                .build()
+                .unwrap();
+        let mut min_ts = i64::MAX;
+        for batch in reader {
+            let b = batch.unwrap();
+            let ts_arr = b
+                .column_by_name("ts")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<arrow::array::TimestampMicrosecondArray>()
+                .unwrap();
+            for i in 0..ts_arr.len() {
+                min_ts = min_ts.min(ts_arr.value(i));
+            }
+        }
+        decoded_mins.push(min_ts);
+    }
+    assert_eq!(decoded_mins, vec![100, 200, 300]);
+}

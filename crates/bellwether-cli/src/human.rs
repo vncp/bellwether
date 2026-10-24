@@ -167,6 +167,17 @@ pub(crate) fn plan(r: &PlanResult, out: &Out) -> String {
         let ex: Vec<String> = r.excluded_incomplete.iter().map(label).collect();
         let _ = writeln!(s, "  not used, incomplete: {}", ex.join(", "));
     }
+    match &r.ordered_by {
+        Some(col) => {
+            let _ = writeln!(s, "  ordered_by: {col} (row-group minimum)");
+        }
+        None => {
+            let _ = writeln!(
+                s,
+                "  ordered_by: unspecified (no timestamp range key; entries in path order)"
+            );
+        }
+    }
     if let Record::Evidence(e) = &r.evidence.record {
         if let EvidenceBody::Plan { plan } = &e.body {
             let _ = writeln!(s, "\n  {:<60} {:>11} {:>18}", "file", "row groups", "bytes");

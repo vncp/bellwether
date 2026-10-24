@@ -569,7 +569,7 @@ impl<S: StoreExt + ?Sized> Planner<S> {
             columns: columns.to_vec(),
             values: expanded(keys.iter()),
         };
-        self.finish(&selected, residual)
+        self.finish(segs, &selected, residual)
     }
 
     fn plan_temporal(
@@ -663,7 +663,7 @@ impl<S: StoreExt + ?Sized> Planner<S> {
         let residual = temporal_residual(
             &t.spec, ts_column, &ts_type, columns, keys, &variants, &winners, asof,
         )?;
-        self.finish(&selected, residual)
+        self.finish(segs, &selected, residual)
     }
 
     /// Index-wide newest version per probe, from core's cross-segment
@@ -729,7 +729,7 @@ impl<S: StoreExt + ?Sized> Planner<S> {
                 columns: vec![column.to_string()],
                 values: Vec::new(),
             };
-            return self.finish(&RoaringBitmap::new(), nothing);
+            return self.finish(segs, &RoaringBitmap::new(), nothing);
         }
         let (lo, hi) = widen_zero_bounds(lo, hi);
         let serving: Vec<&SpecSegments> = segs
@@ -775,12 +775,17 @@ impl<S: StoreExt + ?Sized> Planner<S> {
             lo,
             hi,
         };
-        self.finish(&selected, residual)
+        self.finish(segs, &selected, residual)
     }
 
     // -- the plan --------------------------------------------------------------
 
-    fn finish(&self, selected: &RoaringBitmap, residual: Predicate) -> Result<ScanPlan> {
+    fn finish(
+        &self,
+        segs: &[SpecSegments],
+        selected: &RoaringBitmap,
+        residual: Predicate,
+    ) -> Result<ScanPlan> {
         self.locator.check_known(selected)?;
         let live = selected & self.locator.live();
         let mut per_file: BTreeMap<usize, RoaringBitmap> = BTreeMap::new();
@@ -793,6 +798,7 @@ impl<S: StoreExt + ?Sized> Planner<S> {
         }
         let files = &self.manifest().rowgroup_space.files;
         let mut entries = Vec::with_capacity(per_file.len());
+        let mut entry_fis = Vec::with_capacity(per_file.len());
         for (fi, row_groups) in per_file {
             let sizes = self.row_group_bytes(fi)?;
             let mut bytes = 0u64;
@@ -803,13 +809,42 @@ impl<S: StoreExt + ?Sized> Planner<S> {
                     .ok_or_else(|| Error::Other(format!("row group {idx} out of range")))?;
                 bytes += size;
             }
+            entry_fis.push(fi);
             entries.push(ScanEntry {
                 file: files[fi].fingerprint.clone(),
                 row_groups,
                 bytes,
             });
         }
-        entries.sort_by(|a, b| a.file.path.cmp(&b.file.path));
+        if let Some((col, rg_mins)) = self.timestamp_range_order(segs)? {
+            let mut keyed: Vec<((bool, Vec<u8>, String), ScanEntry)> = entries
+                .into_iter()
+                .zip(entry_fis)
+                .map(|(e, fi)| {
+                    let file_entry = &files[fi];
+                    let mut min_ts: Option<Vec<u8>> = None;
+                    for idx in &e.row_groups {
+                        if let Some(&rg_id) = file_entry.rowgroup_ids.get(idx as usize) {
+                            if let Some(m) = rg_mins.get(&rg_id.0) {
+                                if min_ts.as_ref().is_none_or(|cur| m < cur) {
+                                    min_ts = Some(m.clone());
+                                }
+                            }
+                        }
+                    }
+                    let sort_key = match min_ts {
+                        Some(m) => (false, m, e.file.path.clone()),
+                        None => (true, Vec::new(), e.file.path.clone()),
+                    };
+                    (sort_key, e)
+                })
+                .collect();
+            keyed.sort_by(|a, b| a.0.cmp(&b.0));
+            entries = keyed.into_iter().map(|(_, e)| e).collect();
+            let _ = col;
+        } else {
+            entries.sort_by(|a, b| a.file.path.cmp(&b.file.path));
+        }
         Ok(ScanPlan {
             manifest_version: self.sequence().to_string(),
             bytes: entries.iter().map(|e| e.bytes).sum(),
@@ -818,6 +853,68 @@ impl<S: StoreExt + ?Sized> Planner<S> {
             entries,
             residual: Some(residual),
         })
+    }
+
+    /// The column name of the timestamp range key that orders a plan over
+    /// `specs` (with optional `extra` transient specs), or `None` when no
+    /// range key on a timestamp or date column is available.
+    pub fn ordered_by(&self, specs: &[KeySpec]) -> Result<Option<String>> {
+        self.ordered_by_with_transient(specs, &[])
+    }
+
+    /// Like [`Planner::ordered_by`], with transient specs.
+    pub fn ordered_by_with_transient(
+        &self,
+        specs: &[KeySpec],
+        extra: &[TransientSpec],
+    ) -> Result<Option<String>> {
+        let segs = self.resolve(specs, extra)?;
+        Ok(self.timestamp_range_order(&segs)?.map(|(col, _)| col))
+    }
+
+    fn timestamp_range_order(
+        &self,
+        segs: &[SpecSegments],
+    ) -> Result<Option<(String, BTreeMap<u32, Vec<u8>>)>> {
+        let mut candidates: Vec<&SpecSegments> = Vec::new();
+        for s in segs {
+            if let KeySpec::Range { column } = &s.spec {
+                if let Ok(f) = self.schema.field_with_name(column) {
+                    if is_orderable_time_type(f.data_type()) {
+                        candidates.push(s);
+                    }
+                }
+            }
+        }
+        if candidates.is_empty() {
+            return Ok(None);
+        }
+        candidates.sort_by(|a, b| a.spec.columns()[0].cmp(&b.spec.columns()[0]));
+        let chosen = candidates[0];
+        let col = chosen.spec.columns()[0].clone();
+        let mins = self.read_range_mins(chosen)?;
+        Ok(Some((col, mins)))
+    }
+
+    fn read_range_mins(&self, seg: &SpecSegments) -> Result<BTreeMap<u32, Vec<u8>>> {
+        let mut mins: BTreeMap<u32, Vec<u8>> = BTreeMap::new();
+        for src in &seg.sources {
+            let r = self.open_segment(&seg.spec, src, true)?;
+            r.for_each_range_entry(|min, _max, rg| {
+                match mins.get_mut(&rg) {
+                    Some(cur) => {
+                        if min < cur.as_slice() {
+                            *cur = min.to_vec();
+                        }
+                    }
+                    None => {
+                        mins.insert(rg, min.to_vec());
+                    }
+                }
+                Ok(())
+            })?;
+        }
+        Ok(mins)
     }
 
     /// Prunes live row groups against virtual columns (from Hive `name=value`
@@ -979,6 +1076,18 @@ impl<S: StoreExt + ?Sized> Planner<S> {
             .iter()
             .map(|c| c.end.saturating_sub(c.start))
             .collect())
+    }
+}
+
+fn is_orderable_time_type(dt: &DataType) -> bool {
+    match dt {
+        DataType::Date32
+        | DataType::Date64
+        | DataType::Time32(_)
+        | DataType::Time64(_)
+        | DataType::Timestamp(_, _) => true,
+        DataType::Dictionary(_, v) => is_orderable_time_type(v),
+        _ => false,
     }
 }
 

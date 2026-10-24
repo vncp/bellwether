@@ -547,6 +547,7 @@ pub fn build_index(
             kind: "parquet".into(),
             root: corpus.data.clone(),
             fingerprint_policy: None,
+            path_template: None,
             extra: Extra::new(),
         };
         m.schema = SchemaInfo {

@@ -39,9 +39,10 @@
 //!   groups with an empty `In`.
 
 use std::borrow::Cow;
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use arrow::datatypes::Schema;
+use arrow::datatypes::{DataType, Schema};
 use bellwether_core::segment::{ColumnType, ReadAt, SegmentReader};
 use bellwether_source::canonical::normalize_float_bounds;
 use bellwether_source::partition::{encode_virtual_value, extract_virtual_cols, PathTemplate};
@@ -536,6 +537,69 @@ impl SegmentPlanner {
         let _ = RowGroupId(0);
         Ok(Some(allowed))
     }
+
+    fn order_plan(&self, listed: &[&Arc<SpecSegments>], mut plan: ScanPlan) -> Result<ScanPlan> {
+        let schema = self.catalog.schema();
+        let mut candidates: Vec<&Arc<SpecSegments>> = Vec::new();
+        for seg in listed {
+            if let KeySpec::Range { column } = &seg.spec {
+                if let Ok(f) = schema.field_with_name(column) {
+                    if is_orderable_time_type(f.data_type()) {
+                        candidates.push(*seg);
+                    }
+                }
+            }
+        }
+        if candidates.is_empty() {
+            return Ok(plan);
+        }
+        candidates.sort_by(|a, b| a.spec.columns()[0].cmp(&b.spec.columns()[0]));
+        let chosen = candidates[0];
+        let mut rg_mins: BTreeMap<u32, Vec<u8>> = BTreeMap::new();
+        for r in chosen.readers() {
+            r.for_each_range_entry(|min, _max, rg| {
+                match rg_mins.get_mut(&rg) {
+                    Some(cur) => {
+                        if min < cur.as_slice() {
+                            *cur = min.to_vec();
+                        }
+                    }
+                    None => {
+                        rg_mins.insert(rg, min.to_vec());
+                    }
+                }
+                Ok(())
+            })?;
+        }
+        let mut cell_id: BTreeMap<(&str, u32), u32> = BTreeMap::new();
+        for rg in self.catalog.row_groups() {
+            cell_id.insert((rg.meta.file.path.as_str(), rg.meta.index_in_file), rg.id.0);
+        }
+        let mut keyed: Vec<((bool, Vec<u8>, String), bellwether_types::ScanEntry)> = plan
+            .entries
+            .into_iter()
+            .map(|e| {
+                let mut min_ts: Option<Vec<u8>> = None;
+                for idx in &e.row_groups {
+                    if let Some(&id) = cell_id.get(&(e.file.path.as_str(), idx)) {
+                        if let Some(m) = rg_mins.get(&id) {
+                            if min_ts.as_ref().is_none_or(|cur| m < cur) {
+                                min_ts = Some(m.clone());
+                            }
+                        }
+                    }
+                }
+                let sort_key = match min_ts {
+                    Some(m) => (false, m, e.file.path.clone()),
+                    None => (true, Vec::new(), e.file.path.clone()),
+                };
+                (sort_key, e)
+            })
+            .collect();
+        keyed.sort_by(|a, b| a.0.cmp(&b.0));
+        plan.entries = keyed.into_iter().map(|(_, e)| e).collect();
+        Ok(plan)
+    }
 }
 
 impl PlanSource for SegmentPlanner {
@@ -562,10 +626,8 @@ impl PlanSource for SegmentPlanner {
             listed.push(self.listed(spec)?);
         }
         if keys.is_empty() {
-            return Ok(with_residual(
-                self.catalog.plan_for(&RoaringBitmap::new())?,
-                keys,
-            ));
+            let plan = self.catalog.plan_for(&RoaringBitmap::new())?;
+            return Ok(with_residual(self.order_plan(&listed, plan)?, keys));
         }
         let vpruned = self.prune_virtual_keys(keys)?;
         if specs.is_empty() {
@@ -573,7 +635,7 @@ impl PlanSource for SegmentPlanner {
             return Ok(with_residual(self.catalog.plan_for(&selected)?, keys));
         }
         let mut serving = Vec::with_capacity(specs.len());
-        for (spec, segments) in specs.iter().zip(listed) {
+        for (spec, &segments) in specs.iter().zip(&listed) {
             if let Some(lookup) = servable(spec, keys.columns()) {
                 serving.push((segments.as_ref(), lookup));
             }
@@ -593,7 +655,8 @@ impl PlanSource for SegmentPlanner {
         if let Some(pruned) = vpruned {
             selected &= pruned;
         }
-        Ok(with_residual(self.catalog.plan_for(&selected)?, keys))
+        let plan = self.catalog.plan_for(&selected)?;
+        Ok(with_residual(self.order_plan(&listed, plan)?, keys))
     }
 
     fn with_transient(
@@ -622,6 +685,17 @@ impl PlanSource for SegmentPlanner {
             p.add_shared(t.segments())?;
         }
         Ok(Box::new(p))
+    }
+}
+fn is_orderable_time_type(dt: &DataType) -> bool {
+    match dt {
+        DataType::Date32
+        | DataType::Date64
+        | DataType::Time32(_)
+        | DataType::Time64(_)
+        | DataType::Timestamp(_, _) => true,
+        DataType::Dictionary(_, v) => is_orderable_time_type(v),
+        _ => false,
     }
 }
 
