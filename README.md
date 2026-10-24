@@ -250,6 +250,33 @@ There are 14 defects, filed in that document. The two that matter most:
 - `index` refuses any dataset that has a nested column.
 - `fix` will attest a key that its own replay predicts saves nothing.
 
+## Time series
+
+For folders of market data (partitioned by date, many symbols per file), five additions, all additive to storage version 1 ([format](docs/format.md), [capabilities and status](docs/time-series-capabilities.md)):
+
+```bash
+# day=2026-01-02/ directories become a `day` column: pruned on, never read
+bellwether index ./data --partitioning hive --key exact:symbol@ts --key range:ts --key temporal2:symbol@ts,known_at
+# a symbol set in a window: only row groups where each symbol's own times reach the window; plans in time order when that order holds
+bellwether locate ./data --keys universe.parquet --from 2026-01-05T14:30:00Z --to 2026-01-05T15:30:00Z
+# what was known at K about the state at V: restatements and late prints without lookahead
+bellwether asof ./data --keys universe.parquet --valid 2026-01-05T16:00:00Z --known 2026-01-06T00:00:00Z
+# the same lookup against the index as it was at manifest sequence 3, for a reproducible backtest
+bellwether locate ./data --keys universe.parquet --at-manifest 3
+```
+
+Measured on the synthetic `market` corpus (`bellwether bench market --rung small`: 50 symbols, 10 days, 216 row groups, 102,739 prints with 3,786 restatements and 3,929 late prints; debug build, [`scripts/market-funnels.py`](scripts/market-funnels.py)), six one-hour windows over 1, 10, and 50 symbols together planned:
+
+| index | row groups | bytes |
+|---|---:|---:|
+| live, summed over the six | 1,296 | |
+| `exact:symbol` | 687 | 9,169,699 |
+| `exact:symbol` + `range:ts` | 263 | 3,544,697 |
+| `exact:symbol@ts` + `range:ts` (per-key bounds) | 241 | 3,251,282 |
+| row groups holding a matching print (ground truth) | 213 | |
+
+All twelve bitemporal lookups in the same workload planned exactly the row groups of the ground-truth winners; a valid-time-only temporal key differed on all twelve, because those queries were drawn around restatements and late prints.
+
 ## Status
 
 Pre-alpha. The architecture and on-disk format are fixed and documented; the crates are being built against them, each landing by reviewed pull request.
