@@ -18,6 +18,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use arrow::array::{ArrayRef, RecordBatch};
 use arrow::datatypes::{DataType, Schema};
 use bellwether_core::encoding::{self, KeyColumns};
+use bellwether_core::sidecar::{self, SidecarWriter};
 use bellwether_core::{SegmentWriter, WriterOptions};
 use bellwether_store::{segment_path, Extra, RowGroupRange, SegmentRef, StoreExt};
 use bellwether_types::{Error, FileFingerprint, KeySpec, Result, RowGroupId, RowGroupMeta};
@@ -27,6 +28,7 @@ use roaring::RoaringBitmap;
 
 use crate::config::BuildObserver;
 use crate::sources::DataSource;
+use crate::target::Target;
 
 /// A tracked file as the build sees it after id assignment.
 #[derive(Clone, Debug)]
@@ -37,14 +39,17 @@ pub(crate) struct FileRow {
     pub(crate) chunks: Option<Vec<Range<u64>>>,
 }
 
-/// A declared key spec with its dataset types and the columns a worker
-/// reads for it.
+/// A declared key spec or sidecar with its dataset types and the columns a
+/// worker reads for it.
 #[derive(Clone, Debug)]
 pub(crate) struct SpecPlan {
-    pub(crate) spec: KeySpec,
+    pub(crate) target: Target,
     pub(crate) name: String,
     pub(crate) key_types: Vec<DataType>,
+    /// A temporal key spec's timestamp type.
     pub(crate) ts_type: Option<DataType>,
+    /// A sidecar's time column types.
+    pub(crate) time_types: Vec<DataType>,
     pub(crate) columns: Vec<String>,
 }
 
@@ -312,10 +317,16 @@ fn process_item<S: StoreExt + ?Sized>(ctx: &Ctx<'_, S>, item: &Item) -> Result<I
     Ok(out)
 }
 
+/// An open segment writer: a key spec's or a sidecar's.
+enum AnyWriter {
+    Key(SegmentWriter),
+    Sidecar(SidecarWriter),
+}
+
 /// One spec's open segment within an item.
 struct SpecWriter<'a> {
     plan: &'a SpecPlan,
-    writer: Option<SegmentWriter>,
+    writer: Option<AnyWriter>,
     start: u32,
     end: u32,
     keys: u64,
@@ -355,14 +366,22 @@ impl<'a> SpecWriter<'a> {
                 self.start = id;
                 self.keys = 0;
                 self.bytes = 0;
-                slot.insert(SegmentWriter::for_dataset(
-                    self.plan.spec.clone(),
-                    ctx.schema,
-                    WriterOptions::default(),
-                )?)
+                slot.insert(match &self.plan.target {
+                    Target::Key(spec) => AnyWriter::Key(SegmentWriter::for_dataset(
+                        spec.clone(),
+                        ctx.schema,
+                        WriterOptions::default(),
+                    )?),
+                    Target::Sidecar(def) => {
+                        AnyWriter::Sidecar(SidecarWriter::for_dataset(def.clone(), ctx.schema)?)
+                    }
+                })
             }
         };
-        writer.add_batch(RowGroupId(id), batch)?;
+        match writer {
+            AnyWriter::Key(w) => w.add_batch(RowGroupId(id), batch)?,
+            AnyWriter::Sidecar(w) => w.add_batch(RowGroupId(id), batch)?,
+        }
         self.end = id
             .checked_add(1)
             .ok_or_else(|| Error::Other("row-group id space exhausted".into()))?;
@@ -373,25 +392,35 @@ impl<'a> SpecWriter<'a> {
     }
 
     fn flush<S: StoreExt + ?Sized>(&mut self, ctx: &Ctx<'_, S>) -> Result<()> {
-        let Some(mut writer) = self.writer.take() else {
+        let Some(writer) = self.writer.take() else {
             return Ok(());
         };
         // The segment records the row groups its writer processed, so its
         // bytes, and its id, differ from any other segment's even when none
         // of its row groups held a key; the manifest entry claims the same
         // range as coverage.
-        writer.set_rowgroup_range(RowGroupId(self.start)..RowGroupId(self.end))?;
-        let seg = writer.finish()?;
-        let bytes = seg.bytes.len() as u64;
-        ctx.store.put_content_addressed(
-            &segment_path(ctx.index_root, &seg.id),
-            Bytes::from(seg.bytes),
-        )?;
+        let range = RowGroupId(self.start)..RowGroupId(self.end);
+        let (id, body) = match writer {
+            AnyWriter::Key(mut w) => {
+                w.set_rowgroup_range(range)?;
+                let seg = w.finish()?;
+                (seg.id, seg.bytes)
+            }
+            AnyWriter::Sidecar(mut w) => {
+                w.set_rowgroup_range(range)?;
+                let seg = w.finish()?;
+                (seg.id, seg.bytes)
+            }
+        };
+        let bytes = body.len() as u64;
+        ctx.store
+            .put_content_addressed(&segment_path(ctx.index_root, &id), Bytes::from(body))?;
         self.done.push(SegmentRef {
-            id: seg.id,
+            id,
             key_spec: self.plan.name.clone(),
             rowgroup_range: RowGroupRange::new(self.start, self.end),
             bytes,
+            kind: self.plan.target.kind().map(str::to_string),
             extra: Extra::new(),
         });
         Ok(())
@@ -411,27 +440,34 @@ impl<'a> SpecWriter<'a> {
 ///   pair;
 /// - bloom: its distinct key tuples, and 8 bytes per tuple (the writer
 ///   holds one hash per key);
-/// - range: one entry if any key is present, and twice the longest key.
+/// - range: one entry if any key is present, and twice the longest key;
+/// - a sidecar: core's `sidecar::measure` (distinct keys, and key bytes
+///   plus 20 per stored record).
 pub(crate) fn measure(plan: &SpecPlan, batch: &RecordBatch) -> Result<(u64, u64)> {
+    let spec = match &plan.target {
+        Target::Key(spec) => spec,
+        Target::Sidecar(def) => {
+            return sidecar::measure(def, &plan.key_types, &plan.time_types, batch)
+        }
+    };
     let column = |name: &str| -> Result<ArrayRef> {
         batch
             .column_by_name(name)
             .cloned()
             .ok_or_else(|| Error::KeySpec(format!("column {name} not in batch")))
     };
-    let cols = plan
-        .spec
+    let cols = spec
         .columns()
         .iter()
         .map(|c| column(c))
         .collect::<Result<Vec<_>>>()?;
     let keys = KeyColumns::new(&cols, &plan.key_types)?;
-    let ts = match (&plan.spec, &plan.ts_type) {
+    let ts = match (spec, &plan.ts_type) {
         (KeySpec::Temporal { ts_column, .. }, Some(dt)) => Some((column(ts_column)?, dt)),
         _ => None,
     };
     let mut buf = Vec::new();
-    if matches!(plan.spec, KeySpec::Range { .. }) {
+    if matches!(spec, KeySpec::Range { .. }) {
         let mut longest = None;
         for row in 0..batch.num_rows() {
             if keys.encode_into(row, &mut buf)? {
@@ -458,7 +494,7 @@ pub(crate) fn measure(plan: &SpecPlan, batch: &RecordBatch) -> Result<(u64, u64)
         }
         if !seen.contains(buf.as_slice()) {
             seen.insert(buf.clone());
-            bytes += match plan.spec {
+            bytes += match spec {
                 KeySpec::Bloom { .. } => 8,
                 KeySpec::Temporal { .. } => key_len + 8,
                 _ => key_len,
@@ -576,9 +612,10 @@ mod tests {
         };
         SpecPlan {
             name: spec.name(),
-            spec,
+            target: Target::Key(spec),
             key_types,
             ts_type,
+            time_types: Vec::new(),
             columns,
         }
     }

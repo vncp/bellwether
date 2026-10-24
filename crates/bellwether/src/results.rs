@@ -49,6 +49,17 @@ pub struct SpecState {
     pub complete_at: Option<u64>,
 }
 
+/// A sidecar (per-key time bounds, bitemporal versions) by its manifest
+/// name, and the manifest sequence at which it became complete, or `None`
+/// while it is incomplete.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SidecarState {
+    /// The sidecar's name: `bounds:symbol@ts`, `temporal2:id@valid,known`.
+    pub sidecar: String,
+    /// Completeness sequence.
+    pub complete_at: Option<u64>,
+}
+
 /// What [`crate::Engine::index`] did.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct IndexResult {
@@ -67,6 +78,11 @@ pub struct IndexResult {
     pub segments_written: u64,
     /// Every declared spec with its completeness.
     pub specs: Vec<SpecState>,
+    /// Every declared sidecar this binary knows, with its completeness.
+    pub sidecars: Vec<SidecarState>,
+    /// Segment or sidecar kinds the manifest lists that this binary does
+    /// not know: kept unchanged by builds, never used to plan.
+    pub unknown_segment_kinds: Vec<String>,
     /// Files seen for the first time.
     pub files_new: u64,
     /// Tracked files whose fingerprint changed (ADR 013).
@@ -100,6 +116,19 @@ pub enum LookupKind {
         /// The timestamp column.
         ts_column: String,
     },
+    /// Rows of the keys whose time column lies in `[lo, hi]`.
+    Window {
+        /// The window's start as given.
+        from: String,
+        /// The window's end as given.
+        to: String,
+        /// `from` in the time column's dataset unit.
+        lo: i64,
+        /// `to` in the time column's dataset unit.
+        hi: i64,
+        /// The time column.
+        ts_column: String,
+    },
 }
 
 /// What [`crate::Engine::locate`], [`crate::Engine::latest`], and
@@ -123,6 +152,9 @@ pub struct PlanResult {
     pub specs: Vec<KeySpec>,
     /// Declared specs left out because they are not complete (ADR 012).
     pub excluded_incomplete: Vec<KeySpec>,
+    /// The complete sidecars the plan used (per-key time bounds for a
+    /// window, the bitemporal sidecar for a bitemporal lookup), by name.
+    pub sidecars: Vec<String>,
     /// Live files the plan chose from.
     pub files_total: u64,
     /// Live row groups the plan chose from.

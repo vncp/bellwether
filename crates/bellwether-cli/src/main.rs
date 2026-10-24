@@ -69,8 +69,9 @@ enum Command {
     Why(WhyArgs),
     /// Build or update the index for one or more key specs.
     Index(IndexArgs),
-    /// Plan which files and row groups hold the keys.
-    Locate(LookupArgs),
+    /// Plan which files and row groups hold the keys (in a time window with
+    /// --from and --to).
+    Locate(LocateArgs),
     /// Plan the newest version of each key.
     Latest(LookupArgs),
     /// Plan the version of each key current at an instant.
@@ -152,8 +153,9 @@ struct WhyArgs {
 struct IndexArgs {
     #[command(flatten)]
     root: RootArg,
-    /// A key spec: exact:a,b  temporal:id@ts  bloom:a@0.01  range:ts.
-    /// Repeat for several.
+    /// A key spec: exact:a,b  temporal:id@ts  bloom:a@0.01  range:ts; with
+    /// per-key time bounds exact:a@ts or bloom:a@0.01@ts; or a bitemporal
+    /// key temporal2:id@valid,known. Repeat for several.
     #[arg(long = "key", value_name = "SPEC")]
     keys: Vec<String>,
 }
@@ -174,6 +176,23 @@ struct LookupArgs {
     /// sequences are listed when one is not.
     #[arg(long, value_name = "SEQUENCE")]
     at_manifest: Option<u64>,
+}
+
+#[derive(Args)]
+struct LocateArgs {
+    #[command(flatten)]
+    lookup: LookupArgs,
+    /// Window start (inclusive): RFC 3339, a date (YYYY-MM-DD), or an
+    /// integer in the time column's unit.
+    #[arg(long, value_name = "INSTANT", requires = "to")]
+    from: Option<String>,
+    /// Window end (inclusive), as --from.
+    #[arg(long, value_name = "INSTANT", requires = "from")]
+    to: Option<String>,
+    /// The window's time column [default: the one per-key bounds or
+    /// timestamp range key names].
+    #[arg(long = "ts", value_name = "COLUMN", requires = "from")]
+    ts: Option<String>,
 }
 
 #[derive(Args)]
@@ -443,16 +462,19 @@ fn run(cli: &Cli, out: &Out) -> Result<Outcome, Failure> {
     match &cli.command {
         Command::Why(a) => why(g, out, a),
         Command::Index(a) => {
-            let specs = a
+            let declared = a
                 .keys
                 .iter()
-                .map(|s| bellwether::spec::parse(s))
+                .map(|s| bellwether::spec::parse_declaration(s))
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(|e| Failure::Usage(e.to_string()))?;
-            let r = engine(g, &a.root.root)?.index(&specs)?;
+            let r = engine(g, &a.root.root)?.index_declared(&declared)?;
             done(&r, human::index(&r, out), EXIT_OK)
         }
-        Command::Locate(a) => lookup(g, out, a, |e, keys| e.locate(keys)),
+        Command::Locate(a) => lookup(g, out, &a.lookup, |e, keys| match (&a.from, &a.to) {
+            (Some(from), Some(to)) => e.locate_window(keys, from, to, a.ts.as_deref()),
+            _ => e.locate(keys),
+        }),
         Command::Latest(a) => lookup(g, out, a, |e, keys| e.latest(keys)),
         Command::Asof(a) => lookup(g, out, &a.lookup, |e, keys| e.asof(keys, &a.at)),
         Command::Propose(a) => propose(g, out, a),

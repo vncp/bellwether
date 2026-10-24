@@ -100,6 +100,20 @@ pub(crate) fn index(r: &IndexResult, out: &Out) -> String {
             .map_or_else(|| "incomplete".to_string(), |n| n.to_string());
         let _ = writeln!(s, "  {:<40} {at:>14}", label(&spec.spec));
     }
+    for sc in &r.sidecars {
+        let at = sc
+            .complete_at
+            .map_or_else(|| "incomplete".to_string(), |n| n.to_string());
+        let _ = writeln!(s, "  {:<40} {at:>14}", sc.sidecar);
+    }
+    if !r.unknown_segment_kinds.is_empty() {
+        let _ = writeln!(
+            s,
+            "\n  segments of kinds this binary does not know ({}) are kept unchanged and not \
+             used; a newer bellwether reads them",
+            r.unknown_segment_kinds.join(", ")
+        );
+    }
     let _ = writeln!(s, "\nmanifest {}", r.manifest);
     s
 }
@@ -110,6 +124,13 @@ fn lookup_label(lookup: &LookupKind) -> String {
         LookupKind::Locate => "locate".to_string(),
         LookupKind::Latest => "latest".to_string(),
         LookupKind::Asof { at, ts, ts_column } => format!("asof {at} ({ts_column} = {ts})"),
+        LookupKind::Window {
+            from,
+            to,
+            lo,
+            hi,
+            ts_column,
+        } => format!("locate {ts_column} in [{from}, {to}] ({lo}..={hi})"),
     }
 }
 
@@ -168,6 +189,9 @@ pub(crate) fn plan(r: &PlanResult, out: &Out) -> String {
             specs.join(", ")
         }
     );
+    if !r.sidecars.is_empty() {
+        let _ = writeln!(s, "  sidecars: {}", r.sidecars.join(", "));
+    }
     if !r.excluded_incomplete.is_empty() {
         let ex: Vec<String> = r.excluded_incomplete.iter().map(label).collect();
         let _ = writeln!(s, "  not used, incomplete: {}", ex.join(", "));

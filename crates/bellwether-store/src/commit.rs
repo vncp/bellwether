@@ -491,6 +491,7 @@ mod tests {
     fn seg(id: Hash, n: u32) -> SegmentRef {
         SegmentRef {
             id,
+            kind: None,
             key_spec: "exact:id".into(),
             rowgroup_range: RowGroupRange::new(n, n + 1),
             bytes: 1,

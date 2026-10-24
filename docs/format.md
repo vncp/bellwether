@@ -11,14 +11,18 @@ Versioned from the first commit. `bellwether-types::format::STORAGE_VERSION` is 
                                  source{kind, root, fingerprint_policy?, partitioning?}
                                            (partitioning: "hive" when name=value directories are columns; see
                                             "Partition columns"; absent for none)
-                                 schema{columns[{name, data_type, nullable}], key_specs[]}
+                                 schema{columns[{name, data_type, nullable}], key_specs[],
+                                        sidecars?[{kind, columns[], time_columns[]}]}   (see "Sidecar kinds")
                                  rowgroup_space{next_id, files[{fingerprint, rowgroup_ids[], chunk_size?, chunks?[{start,end}]}],
                                                 tombstones[{since, rowgroup_ids[]}]}   (retired row-group ids, ADR 013)
                                  (chunk_size and chunks are present only for byte-range sources and are immutable per file)
                                  key_spec_completeness{name -> sequence at which the spec became complete, that is, first covered every live row group (ADR 020)}
-                                 segments[{id=blake3, key_spec=KeySpec::name(), rowgroup_range{start, end} (half-open), bytes}]
+                                 segments[{id=blake3, kind?, key_spec=KeySpec::name() or the sidecar's name,
+                                           rowgroup_range{start, end} (half-open), bytes}]
                                            (rowgroup_range = the row groups the segment's writer processed, including
-                                            any that held no keys; the spec's coverage, and recorded in the segment too)
+                                            any that held no keys; the spec's coverage, and recorded in the segment too;
+                                            kind is absent for a key spec's segment, "bounds" or "temporal2" for a
+                                            sidecar's; see "Segment kinds" for kinds a reader does not know)
                                  segment_tombstones[{id, since}]   (unreferenced segments awaiting GC, ADR 013)
                                  deleting[{id, claimed_at, token, lease_ms}]
                                                                    (GC claims; a commit referencing a claimed id is refused;
@@ -52,6 +56,8 @@ Versioned from the first commit. `bellwether-types::format::STORAGE_VERSION` is 
                                  range:    (min, max) canonical bytes per row group
                                  temporal: exact layout plus key → [(ts, rowgroup_id)] chain + max_ts;
                                            latest/asof return every row group at the winning ts (ties)
+                                 bounds, temporal2: sidecar segments, their own layout (magic "BWSIDECR"); see
+                                           "Sidecar kinds"
   ledger/<blake3>.rec            Record (Evidence | Proposal | Replay | Certificate | Receipt), canonical JSON
                                  Receipt.certificate must resolve and have pass == true
   cache/<input-hash>.bin         footer stats, fanout tables, recorded workload key sets
@@ -171,7 +177,7 @@ Additional vectors (decimal rescale, Decimal256, floats including the canonical 
 
 ## Planned for storage version 2 (ADR 026)
 
-Not part of version 1 and not read by version 1 readers: (1) exact segments may carry, per key and per set bit of its bitmap, a row count, enabled by `counts: true` on the key spec; (2) scan entries carry per-column bytes so a plan's projection cost is a sum of chunk sizes; (3) manifests record per-row-group bytes and per-column bytes at build time so plans need not open footers. The format freeze happens after these exist, so that version 2 is the frozen version.
+Not part of version 1 and not read by version 1 readers: (1) exact segments may carry, per key and per set bit of its bitmap, a row count, enabled by `counts: true` on the key spec; (2) scan entries carry per-column bytes so a plan's projection cost is a sum of chunk sizes; (3) manifests record per-row-group bytes and per-column bytes at build time so plans need not open footers; (4) the version 1 sidecar kinds (`bounds`, `temporal2`, "Sidecar kinds" below) fold into the segment they ride beside: an exact or bloom segment's per-key value carries the per-row-group time bounds, and the bitemporal triples become a temporal layout, so one segment read answers what a key segment plus a sidecar answer in version 1. A version 2 reader still reads version 1 sidecars. The format freeze happens after these exist, so that version 2 is the frozen version.
 
 ## Inference stability (2026-10-24)
 
@@ -194,3 +200,42 @@ A plan's entries are one per file and name their row groups as a set, read in as
 ## Manifest history (2026-10-24)
 
 `manifests/<sequence>.json` holds each committed manifest's exact bytes, so a lookup can be planned against an earlier sequence (`--at-manifest N`) and return the plan it returned then, byte for byte. The copy is written with `put_if_absent` after the commit's CAS is known to have succeeded (never for an attempt that lost or whose outcome is unknown); a commit that cannot write it still succeeds, and the next commit backfills the base's copy from `manifest.json`. An existing copy with different bytes is kept and never overwritten (`manifest.json` was rewritten outside the commit protocol); history never blocks a commit. Garbage collection, before deleting any segment, deletes every history manifest at or below the greatest sequence that references a segment it deletes, so the retained sequences are always one contiguous run ending at the current one, and every retained sequence's segments exist. A history object that does not parse, or whose sequence disagrees with its name, is counted and left in place. A pinned lookup refuses a sequence outside the retained run and names the run; an index written before this amendment retains sequences from its first commit by a binary that writes history.
+
+## Segment kinds (2026-10-24)
+
+`segments[].kind` names what a segment is: absent for a key spec's segment, or a sidecar kind (`bounds`, `temporal2`). A reader that finds a `kind` it does not know, in `segments[]` or in `schema.sidecars[]`, still opens the manifest; it never plans with, merges, or counts toward coverage a segment of that kind, a build keeps the segment and the declaration unchanged, and the unknown kinds are reported (`bellwether index` lists them). This is the rule that lets a later version add a sidecar kind without a storage version bump. A binary that predates the field keeps both as unknown fields; it never plans with a sidecar's segments, because their `key_spec` is the sidecar's name, which no key spec has, and a build by such a binary drops them as undeclared, after which the sidecar is incomplete until rebuilt.
+
+## Sidecar kinds (storage version 1, additive sidecar kinds, 2026-10-24)
+
+A sidecar is declared in `schema.sidecars[]` as `{kind, columns, time_columns}` and named `<kind>:<columns joined by ,>@<time columns joined by ,>`. Its segments are listed in `segments[]` with that `kind` and that name as `key_spec`, are complete under that name in `key_spec_completeness` exactly as a key spec is (their recorded ranges cover every live row group), and are built over the row groups they do not cover, like a key spec. An incomplete `bounds` sidecar is not used (the plan is a superset, never short); a bitemporal lookup without a complete `temporal2` sidecar is refused.
+
+- `bounds` (`--key exact:symbol@ts`, or `bloom:symbol@0.01@ts`, beside the exact or bloom spec): per key, per row group holding the key with at least one non-null time, the inclusive `[min, max]` of the time column over that key's rows in that row group. A window lookup `(keys, [lo, hi])` keeps a row group for a key only if that key's own range there overlaps the window; a row group where the key's times are all null holds no row of any window. The residual is `In` then `Between` on the time column.
+- `temporal2` (`--key temporal2:id@valid,known`): per key, every distinct `(valid, known, row group)` triple over rows where neither time is null. The as-of answer for `(V, K)`, either bound optional, is per key the greatest `valid <= V` among triples with `known <= K`, then the greatest `known` at that valid time; every row group holding that pair is planned (ties are kept). Retired row groups never win. The residual is `In` over keys with a winner, `Between(valid, lowest winning valid, V or the highest)`, `Between(known, lowest winning known, K or the highest)`, `NotOlderThan` on valid per key, `NotOlderThan` on known per key, then `LatestPerKey` on valid: filters first, then the newest valid version, then the newest known version of it (contract-v3 entry 11's order). No new `Predicate` variant is needed.
+
+Times are `i64` in the dataset column's unit, as temporal specs take them. Layout, all integers little-endian, `i64` two's complement:
+
+```
+preamble  magic "BWSIDECR" | storage_version u32 | encoding_version u32 | header_len u32
+header    JSON {storage_version, encoding_version, kind, columns, time_columns, codec:"none", key_types?, time_types?, ..unknown}
+          (key_types and time_types in the segment format's ColumnType spelling, present together when written from a dataset schema)
+body      blocks; block = n u32 | n x entry; entry = key_len u32 | key | count u32 | count x record
+          bounds record    = rg u32 | min i64 | max i64        (strictly ascending rg, min <= max)
+          temporal2 record = valid i64 | known i64 | rg u32    (strictly ascending (valid, known, rg))
+          keys strictly ascending across the file; count >= 1
+index     entries u64 | has_rg u8 | rg_min u32 | rg_max u32 | block_count u32 |
+          block_count x (first_key_len u32 | first_key | last_key_len u32 | last_key | off u64 | len u32 | n u32)
+footer    index_offset u64 | index_len u64 | magic "BWSIDECR"
+```
+
+A block holds at most 1024 keys or 64 KiB of key bytes. Readers refuse a newer storage or encoding version from the preamble, an unknown kind or codec, and any offset, order, or range that does not hold. A lookup holds the block index, one block at a time, and the records of the keys asked (ADR 018); the build caps a sidecar segment's keys and bytes like any segment.
+
+## Sidecar conformance vectors (storage version 1)
+
+`crates/bellwether-core/tests/sidecar_conformance.rs` builds these from already-encoded keys (`"AAPL"` = `06 41 41 50 4c 00 00`, `"MSFT"` = `06 4d 53 46 54 00 00`, row-group range 0..4, no recorded types) and checks every row of this table byte for byte. The bounds sidecar holds AAPL: rg 0 `[1, 86400000000]`, rg 2 `[-1, 1]`; MSFT: rg 1 `[86400000000, 86400000000]`. The temporal2 sidecar holds AAPL: `(1, 1, rg 0)`, `(1, 86400000000, rg 2)`; MSFT: `(86400000000, 86400000000, rg 1)`.
+
+| Vector | Bytes |
+|---|---|
+| `bounds record rg=0 min=1 max=86400000000` | `00 00 00 00 01 00 00 00 00 00 00 00 00 60 d7 1d 14 00 00 00` |
+| `temporal2 record valid=1 known=86400000000 rg=2` | `01 00 00 00 00 00 00 00 00 60 d7 1d 14 00 00 00 02 00 00 00` |
+| `bounds:symbol@ts blake3` | `56b28b58922841137a0d3b51f47293790dd8099934f56292360b683405863b95` |
+| `temporal2:symbol@valid,known blake3` | `63dc33afbfe97a78dcd5003a3390061bca9c20fdf19e811a24c839170548d31c` |

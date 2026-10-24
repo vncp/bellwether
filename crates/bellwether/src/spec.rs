@@ -10,8 +10,16 @@
 //! A spec may also be given as its JSON form (`{"kind":"exact",...}`).
 //! [`label`] and [`parse`] are inverses. Specs are validated by core's
 //! rules (non-empty, distinct columns, `fpr` strictly between 0 and 1).
+//!
+//! `index --key` also takes declarations that add a sidecar
+//! ([`parse_declaration`], WP21): `exact:a@ts` and `bloom:a@0.01@ts`
+//! declare the key spec plus per-key time bounds on `ts`
+//! (`bounds:a@ts`); `temporal2:id@valid,known` declares a bitemporal
+//! sidecar alone. A key spec itself never carries the bound, so `parse`
+//! refuses `exact:a@ts` and names `index --key`.
 
 use bellwether_core::segment::validate_spec;
+use bellwether_core::sidecar::{SidecarDef, SidecarKind};
 use bellwether_types::{Error, KeySpec, Result};
 
 /// Parses the short form or the JSON form.
@@ -104,7 +112,12 @@ fn parse_short(s: &str) -> Result<KeySpec> {
             s,
             "a temporal spec needs a timestamp column, temporal:id@ts",
         )),
-        ("exact" | "range", Some(_)) => Err(bad(s, "only bloom and temporal take '@'")),
+        ("exact", Some(_)) => Err(bad(
+            s,
+            "exact:a@ts declares per-key time bounds beside the key, which only `index --key` \
+             accepts; a key spec itself has no '@'",
+        )),
+        ("range", Some(_)) => Err(bad(s, "a range spec takes no '@'")),
         (other, _) => Err(bad(s, &format!("unknown kind {other:?}"))),
     }
 }
@@ -119,6 +132,95 @@ pub fn label(spec: &KeySpec) -> String {
         KeySpec::Temporal { columns, ts_column } => {
             format!("temporal:{}@{ts_column}", columns.join(","))
         }
+    }
+}
+
+/// What one `index --key` argument declares: a key spec, a sidecar that
+/// rides beside one (per-key time bounds, `exact:symbol@ts` or
+/// `bloom:symbol@0.01@ts`), or a sidecar alone (`temporal2:id@valid,known`,
+/// bitemporal versions).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Declaration {
+    /// The key spec, if the argument declares one.
+    pub key: Option<KeySpec>,
+    /// The sidecar, if the argument declares one.
+    pub sidecar: Option<SidecarDef>,
+}
+
+/// Parses one `index --key` argument (see [`Declaration`]): everything
+/// [`parse`] reads, plus `exact:<cols>@<ts>`, `bloom:<cols>@<fpr>@<ts>`, and
+/// `temporal2:<cols>@<valid>,<known>`.
+pub fn parse_declaration(s: &str) -> Result<Declaration> {
+    let t = s.trim();
+    let sidecar = |kind: SidecarKind, cols: &str, times: &str| -> Result<SidecarDef> {
+        let times = columns(t, times)?;
+        let def = SidecarDef {
+            kind,
+            columns: columns(t, cols)?,
+            time_columns: times,
+        };
+        def.validate().map_err(|e| {
+            Error::KeySpec(format!("{t:?} is not a valid declaration: {}", message(&e)))
+        })?;
+        Ok(def)
+    };
+    if let Some(rest) = t.strip_prefix("temporal2:") {
+        let (cols, times) = rest.split_once('@').ok_or_else(|| {
+            bad(
+                t,
+                "a bitemporal declaration names its valid and known time columns, \
+                 temporal2:id@valid,known",
+            )
+        })?;
+        return Ok(Declaration {
+            key: None,
+            sidecar: Some(sidecar(SidecarKind::Bitemporal, cols, times)?),
+        });
+    }
+    let bounded = match t.split_once(':') {
+        Some(("exact", rest)) => rest
+            .split_once('@')
+            .map(|(cols, ts)| (format!("exact:{cols}"), cols.to_string(), ts.to_string())),
+        Some(("bloom", rest)) => {
+            let parts: Vec<&str> = rest.split('@').collect();
+            match parts.as_slice() {
+                [cols, fpr, ts] => Some((
+                    format!("bloom:{cols}@{fpr}"),
+                    (*cols).to_string(),
+                    (*ts).to_string(),
+                )),
+                _ => None,
+            }
+        }
+        _ => None,
+    };
+    match bounded {
+        Some((key, cols, ts)) => {
+            let key = parse(&key)?;
+            let def = sidecar(SidecarKind::Bounds, &cols, &ts)?;
+            Ok(Declaration {
+                key: Some(key),
+                sidecar: Some(def),
+            })
+        }
+        None => Ok(Declaration {
+            key: Some(parse(t)?),
+            sidecar: None,
+        }),
+    }
+}
+
+/// The short form of a sidecar: `bounds:symbol@ts` or
+/// `temporal2:id@valid,known` (its name in the manifest).
+#[must_use]
+pub fn sidecar_label(def: &SidecarDef) -> String {
+    def.name()
+}
+
+fn message(e: &Error) -> String {
+    match e {
+        Error::KeySpec(m) | Error::Other(m) => m.clone(),
+        other => other.to_string(),
     }
 }
 
@@ -165,5 +267,44 @@ mod tests {
         ] {
             assert!(parse(s).is_err(), "{s}");
         }
+    }
+
+    #[test]
+    fn declarations_add_sidecars_beside_or_instead_of_a_key() {
+        let d = parse_declaration("exact:symbol@ts").unwrap();
+        assert_eq!(d.key, Some(parse("exact:symbol").unwrap()));
+        let s = d.sidecar.unwrap();
+        assert_eq!(
+            (s.kind, sidecar_label(&s)),
+            (SidecarKind::Bounds, "bounds:symbol@ts".into())
+        );
+        let d = parse_declaration("bloom:a,b@0.01@ts").unwrap();
+        assert_eq!(d.key, Some(parse("bloom:a,b@0.01").unwrap()));
+        assert_eq!(d.sidecar.unwrap().time_columns, vec!["ts".to_string()]);
+        let d = parse_declaration("temporal2:id@valid,known").unwrap();
+        assert_eq!(d.key, None);
+        let s = d.sidecar.unwrap();
+        assert_eq!(s.kind, SidecarKind::Bitemporal);
+        assert_eq!(
+            s.time_columns,
+            vec!["valid".to_string(), "known".to_string()]
+        );
+        let d = parse_declaration("temporal:id@ts").unwrap();
+        assert_eq!((d.key.is_some(), d.sidecar), (true, None));
+        for bad in [
+            "temporal2:id",
+            "temporal2:id@valid",
+            "temporal2:id@valid,known,x",
+            "temporal2:id@id,known",
+            "exact:a@",
+            "exact:a@a",
+            "exact:a@t1,t2",
+            "bloom:a@0.01@",
+            "range:ts@x",
+        ] {
+            assert!(parse_declaration(bad).is_err(), "{bad}");
+        }
+        // A key spec alone never carries the bound.
+        assert!(parse("exact:symbol@ts").is_err());
     }
 }

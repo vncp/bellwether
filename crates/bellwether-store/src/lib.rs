@@ -42,8 +42,9 @@ pub use local::LOCK_TIMEOUT as LOCAL_LOCK_TIMEOUT;
 pub use manifest::{
     join, manifest_history_path, manifest_path, now_rfc3339, parse_rfc3339, segment_path,
     ChunkRange, ColumnDef, DeleteClaim, Extra, FileEntry, Manifest, RowGroupRange, RowGroupSpace,
-    RowGroupTombstone, SchemaInfo, SegmentRef, SegmentTombstone, SourceInfo, CACHE_DIR,
-    MANIFESTS_DIR, MANIFEST_FILE, SEGMENTS_DIR, UNSUPPORTED_SHAPE, UNSUPPORTED_STORAGE,
+    RowGroupTombstone, SchemaInfo, SegmentRef, SegmentTombstone, SidecarDecl, SourceInfo,
+    CACHE_DIR, KNOWN_SEGMENT_KINDS, MANIFESTS_DIR, MANIFEST_FILE, SEGMENTS_DIR, UNSUPPORTED_SHAPE,
+    UNSUPPORTED_STORAGE,
 };
 pub use object_store::ObjectMeta;
 pub use snapshot::{retained_sequences, Snapshot};

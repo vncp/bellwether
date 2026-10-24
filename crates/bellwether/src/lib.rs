@@ -60,7 +60,7 @@ pub use ledger_views::{
 pub use reconcile::{ReconcileRequest, ReconcileResult};
 pub use results::{
     ChainLink, Cost, IndexResult, LinkStatus, LookupKind, PlanResult, ProposeRefusal,
-    ProposeResult, ReceiptResult, ReportResult, SpecState, Written,
+    ProposeResult, ReceiptResult, ReportResult, SidecarState, SpecState, Written,
 };
 pub use why::{
     Candidate, CandidateOrigin, Culprit, CulpritReason, Dataset, ProfileEvidence, Recommendation,

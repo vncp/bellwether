@@ -72,12 +72,13 @@ use arrow::array::{ArrayRef, RecordBatch};
 use arrow::datatypes::{DataType, SchemaRef};
 use bellwether_core::encoding::{self, tag, KeyColumns, Value};
 use bellwether_core::segment::ReadAt;
+use bellwether_core::sidecar::{SidecarDef, SidecarKind, SidecarReader};
 use bellwether_core::temporal::{self, VersionChain, VersionHit};
 use bellwether_core::SegmentReader;
 use bellwether_source::{
     fingerprint_with_policy, FingerprintPolicy, LocalFs, ParquetSource, Partitioning,
 };
-use bellwether_store::{Manifest, Snapshot, StoreExt};
+use bellwether_store::{Manifest, SegmentRef, Snapshot, StoreExt};
 use bellwether_types::{
     Error, Hash, KeySpec, Predicate, Result, RowGroupId, ScanEntry, ScanPlan, Source,
 };
@@ -85,10 +86,11 @@ use bytes::Bytes;
 use roaring::RoaringBitmap;
 
 use crate::config::{columns_to_schema, parse_policy, SourceKind};
-use crate::coverage::{completeness, Locator};
+use crate::coverage::{completeness, segment_of, sidecar_completeness, Locator};
 use crate::keys::{encode_ts, project, split_checked, widen_zero_bounds, zero_variants};
 use crate::seg_io::SegmentBytes;
 use crate::sources::parquet_source;
+use crate::target::declared_sidecars;
 
 /// What to look up.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -130,6 +132,24 @@ pub enum Lookup {
         lo: Vec<u8>,
         /// Inclusive upper bound.
         hi: Vec<u8>,
+    },
+    /// Rows whose `columns` tuple is one of `keys` and whose `ts_column`
+    /// lies in `[lo, hi]`, both in the column's dataset unit (as
+    /// [`Lookup::AsOf`] takes its instant). Served by the key specs on
+    /// `columns`, intersected with range specs on `ts_column` and with every
+    /// complete `bounds` sidecar on `columns@ts_column`, which keeps a row
+    /// group only when the key's own time range there overlaps the window.
+    Window {
+        /// Lookup columns.
+        columns: Vec<String>,
+        /// Canonical key tuples.
+        keys: Vec<Vec<u8>>,
+        /// The time column.
+        ts_column: String,
+        /// Inclusive lower bound, in the column's unit.
+        lo: i64,
+        /// Inclusive upper bound, in the column's unit.
+        hi: i64,
     },
 }
 
@@ -275,6 +295,42 @@ impl<S: StoreExt + ?Sized> Planner<S> {
         completeness(self.manifest(), spec)
     }
 
+    /// The sidecars the manifest declares that this binary knows (per-key
+    /// time bounds, bitemporal versions).
+    #[must_use]
+    pub fn declared_sidecars(&self) -> Vec<SidecarDef> {
+        declared_sidecars(self.manifest())
+    }
+
+    /// The sequence at which sidecar `def` became complete, or `None` (see
+    /// [`crate::sidecar_completeness`]).
+    #[must_use]
+    pub fn sidecar_completeness(&self, def: &SidecarDef) -> Option<u64> {
+        sidecar_completeness(self.manifest(), def)
+    }
+
+    /// The complete sidecars that take part in planning `lookup`: for a
+    /// window, every complete `bounds` sidecar whose key columns the lookup
+    /// names and whose time column is the window's.
+    #[must_use]
+    pub fn sidecars_for(&self, lookup: &Lookup) -> Vec<SidecarDef> {
+        let (kind, columns, time) = match lookup {
+            Lookup::Window {
+                columns, ts_column, ..
+            } => (SidecarKind::Bounds, columns, Some(ts_column)),
+            _ => return Vec::new(),
+        };
+        self.declared_sidecars()
+            .into_iter()
+            .filter(|d| {
+                d.kind == kind
+                    && d.columns.iter().all(|c| columns.contains(c))
+                    && time.is_none_or(|t| d.time_columns.first() == Some(t))
+                    && self.sidecar_completeness(d).is_some()
+            })
+            .collect()
+    }
+
     /// The dataset types of `columns`, which must be distinct schema
     /// columns.
     pub fn column_types(&self, columns: &[String]) -> Result<Vec<(String, DataType)>> {
@@ -390,6 +446,7 @@ impl<S: StoreExt + ?Sized> Planner<S> {
             many => {
                 let own = match lookup {
                     Lookup::Between { column, .. } => Some(column.as_str()),
+                    Lookup::Window { ts_column, .. } => Some(ts_column.as_str()),
                     Lookup::Latest { columns, .. } | Lookup::AsOf { columns, .. } => {
                         specs.iter().find_map(|s| match s {
                             KeySpec::Temporal {
@@ -431,12 +488,7 @@ impl<S: StoreExt + ?Sized> Planner<S> {
         // Every row group's minimum from the range key's own segments.
         let mut mins: BTreeMap<u32, Vec<u8>> = BTreeMap::new();
         let name = spec.name();
-        for s in self
-            .manifest()
-            .segments
-            .iter()
-            .filter(|s| s.key_spec == name)
-        {
+        for s in self.manifest().key_spec_segments(&name) {
             let src = SegSource::Committed {
                 id: s.id,
                 size: s.bytes,
@@ -534,6 +586,16 @@ impl<S: StoreExt + ?Sized> Planner<S> {
                 self.plan_temporal(&segs, columns, keys, Some(*ts))
             }
             Lookup::Between { column, lo, hi } => self.plan_between(&segs, column, lo, hi),
+            Lookup::Window {
+                columns,
+                keys,
+                ts_column,
+                lo,
+                hi,
+            } => {
+                let sidecars = self.sidecars_for(lookup);
+                self.plan_window(&segs, &sidecars, columns, keys, ts_column, *lo, *hi)
+            }
         }
     }
 
@@ -566,7 +628,7 @@ impl<S: StoreExt + ?Sized> Planner<S> {
                 let sources = m
                     .segments
                     .iter()
-                    .filter(|s| s.key_spec == name)
+                    .filter(|s| segment_of(s, &name))
                     .map(|s| SegSource::Committed {
                         id: s.id,
                         size: s.bytes,
@@ -971,6 +1033,147 @@ impl<S: StoreExt + ?Sized> Planner<S> {
             });
         }
         Ok(selected)
+    }
+
+    /// Opens one committed sidecar segment against the dataset schema,
+    /// refusing one that records another definition.
+    fn open_sidecar(
+        &self,
+        def: &SidecarDef,
+        seg: &SegmentRef,
+    ) -> Result<SidecarReader<SegmentBytes<'_, S>>> {
+        let bytes = SegmentBytes::Ranged {
+            snapshot: &self.snapshot,
+            id: seg.id,
+            size: seg.bytes,
+        };
+        let reader = SidecarReader::open_for_dataset(bytes, &self.schema)?;
+        if reader.def() != def {
+            return Err(Error::KeySpec(format!(
+                "a segment listed under {} records the sidecar {}",
+                def.name(),
+                reader.def().name()
+            )));
+        }
+        Ok(reader)
+    }
+
+    /// The committed segments of sidecar `def`.
+    fn sidecar_segments<'m>(&'m self, def: &SidecarDef) -> Vec<&'m SegmentRef> {
+        let name = def.name();
+        self.manifest()
+            .segments
+            .iter()
+            .filter(|s| segment_of(s, &name))
+            .collect()
+    }
+
+    /// Keys in a time window (see [`Lookup::Window`]).
+    #[allow(clippy::too_many_arguments)]
+    fn plan_window(
+        &self,
+        segs: &[SpecSegments],
+        sidecars: &[SidecarDef],
+        columns: &[String],
+        keys: &[Vec<u8>],
+        ts_column: &str,
+        lo: i64,
+        hi: i64,
+    ) -> Result<ScanPlan> {
+        let types = self.column_types(columns)?;
+        let ts_type = self.column_types(&[ts_column.to_string()])?.remove(0).1;
+        encoding::check_ts_type(&ts_type)?;
+        let (keys, spans) = non_null_probes(keys, &types)?;
+        let (lo_enc, hi_enc) = (encode_ts(lo, &ts_type)?, encode_ts(hi, &ts_type)?);
+        let residual = Predicate::And {
+            all: vec![
+                Predicate::In {
+                    columns: columns.to_vec(),
+                    values: expanded(keys.iter()),
+                },
+                Predicate::Between {
+                    column: ts_column.to_string(),
+                    lo: lo_enc.clone(),
+                    hi: hi_enc.clone(),
+                },
+            ],
+        };
+        if keys.is_empty() || lo > hi {
+            // No key, or an empty window: no row, never a full scan.
+            return self.finish(&RoaringBitmap::new(), residual);
+        }
+        let serving: Vec<(&SpecSegments, Serve)> = segs
+            .iter()
+            .filter_map(|s| serve(&s.spec, columns).map(|v| (s, v)))
+            .collect();
+        let window = self.column_range(segs, ts_column, &lo_enc, &hi_enc)?;
+        if !segs.is_empty() && serving.is_empty() && window.is_none() && sidecars.is_empty() {
+            return Err(Error::KeySpec(format!(
+                "none of the key specs {:?} serves a lookup on {columns:?} in a window of \
+                 {ts_column:?}; declare exact:{}@{ts_column} or a range spec on {ts_column}",
+                segs.iter().map(|s| s.spec.name()).collect::<Vec<_>>(),
+                columns.join(",")
+            )));
+        }
+        let mut acc: Vec<Option<RoaringBitmap>> = vec![None; keys.len()];
+        self.intersect(&mut acc, &serving, &keys, &spans)?;
+        if let Some(w) = &window {
+            for a in &mut acc {
+                *a = Some(match a.take() {
+                    Some(x) => x & w,
+                    None => w.clone(),
+                });
+            }
+        }
+        // Each bounds sidecar keeps, per key, exactly the row groups where
+        // that key's own non-null times reach into the window. A row group
+        // where the key has no non-null time holds no row of the window.
+        for def in sidecars {
+            let positions: Vec<usize> = def
+                .columns
+                .iter()
+                .map(|c| columns.iter().position(|x| x == c))
+                .collect::<Option<_>>()
+                .ok_or_else(|| {
+                    Error::Other(format!("{} does not serve {columns:?}", def.name()))
+                })?;
+            let variants: Vec<Vec<Vec<u8>>> = keys
+                .iter()
+                .zip(&spans)
+                .map(|(k, sp)| zero_variants(&project(k, sp, &positions)))
+                .collect();
+            let mut probes: Vec<Vec<u8>> = variants.iter().flatten().cloned().collect();
+            probes.sort_unstable();
+            probes.dedup();
+            let mut inside: BTreeMap<Vec<u8>, RoaringBitmap> = BTreeMap::new();
+            for seg in self.sidecar_segments(def) {
+                let r = self.open_sidecar(def, seg)?;
+                for (key, bounds) in r.bounds(&probes)? {
+                    let e = inside.entry(key).or_default();
+                    for b in bounds.iter().filter(|b| b.overlaps(lo, hi)) {
+                        e.insert(b.rg.0);
+                    }
+                }
+            }
+            for (a, vs) in acc.iter_mut().zip(&variants) {
+                let mine = vs
+                    .iter()
+                    .filter_map(|v| inside.get(v))
+                    .fold(RoaringBitmap::new(), |u, b| u | b);
+                *a = Some(match a.take() {
+                    Some(x) => x & mine,
+                    None => mine,
+                });
+            }
+        }
+        let selected = if segs.is_empty() && sidecars.is_empty() {
+            self.locator.live().clone()
+        } else {
+            acc.into_iter()
+                .flatten()
+                .fold(RoaringBitmap::new(), |u, b| u | b)
+        };
+        self.finish(&selected, residual)
     }
 
     // -- the plan --------------------------------------------------------------

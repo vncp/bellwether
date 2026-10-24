@@ -209,6 +209,7 @@ fn backends() -> Vec<(&'static str, ObjectStoreBackend, Option<tempfile::TempDir
 fn seg(staged: &mut StagedSegments, body: &str, n: u32) -> SegmentRef {
     SegmentRef {
         id: staged.stage(Bytes::from(body.to_string())),
+        kind: None,
         key_spec: "exact:id".into(),
         rowgroup_range: RowGroupRange::new(n, n + 1),
         bytes: body.len() as u64,

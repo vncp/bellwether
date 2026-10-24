@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use arrow::datatypes::{DataType, TimeUnit};
 use bellwether_build::{BuildOptions, Builder, Lookup, PlanOrder};
+use bellwether_core::sidecar::{SidecarDef, SidecarKind};
 use bellwether_store::parse_rfc3339;
 use bellwether_types::{
     format, Error, Evidence, EvidenceBody, KeySpec, Predicate, Provenance, Record, Result, ScanPlan,
@@ -13,7 +14,8 @@ use bytes::Bytes;
 
 use crate::engine::{folder_changes, guard, schema_hint, Engine, FolderChanges, Pinned};
 use crate::keys::KeyFile;
-use crate::results::{Cost, IndexResult, LookupKind, PlanResult, SpecState};
+use crate::results::{Cost, IndexResult, LookupKind, PlanResult, SidecarState, SpecState};
+use crate::spec::Declaration;
 
 impl Engine {
     /// Builds or updates the index so it declares `specs` (in addition to
@@ -21,19 +23,35 @@ impl Engine {
     /// one manifest commit (build crate, ADR 012, 013). Returns the committed
     /// sequence, the segment counts, and every declared spec's completeness.
     pub fn index(&self, specs: &[KeySpec]) -> Result<IndexResult> {
-        guard(|| self.index_inner(specs)).map_err(schema_hint)
+        let declared: Vec<Declaration> = specs
+            .iter()
+            .map(|s| Declaration {
+                key: Some(s.clone()),
+                sidecar: None,
+            })
+            .collect();
+        self.index_declared(&declared)
     }
 
-    fn index_inner(&self, specs: &[KeySpec]) -> Result<IndexResult> {
+    /// [`Engine::index`] for `index --key` arguments as
+    /// [`crate::spec::parse_declaration`] reads them: key specs, and the
+    /// sidecars beside or instead of them (per-key time bounds
+    /// `exact:symbol@ts`, bitemporal versions `temporal2:id@valid,known`).
+    pub fn index_declared(&self, declared: &[Declaration]) -> Result<IndexResult> {
+        guard(|| self.index_inner(declared)).map_err(schema_hint)
+    }
+
+    fn index_inner(&self, declared: &[Declaration]) -> Result<IndexResult> {
         self.require_current("index")?;
-        if specs.is_empty() && self.manifest()?.is_none() {
+        if declared.is_empty() && self.manifest()?.is_none() {
             return Err(Error::KeySpec(
                 "a new index needs at least one key spec; pass --key exact:<column> (or \
                  temporal:<column>@<ts>)"
                     .into(),
             ));
         }
-        for s in specs {
+        let specs: Vec<KeySpec> = declared.iter().filter_map(|d| d.key.clone()).collect();
+        for s in &specs {
             crate::spec::check(s)?;
         }
         let mut options = BuildOptions::new(self.format().kind());
@@ -41,8 +59,9 @@ impl Engine {
         options.schema.clone_from(&self.options().schema);
         options.fingerprint_policy = self.options().fingerprint_policy;
         options.partitioning = self.options().partitioning;
+        options.sidecars = declared.iter().filter_map(|d| d.sidecar.clone()).collect();
         let report =
-            Builder::new(Arc::clone(self.store()?), "").build(self.root(), specs, &options)?;
+            Builder::new(Arc::clone(self.store()?), "").build(self.root(), &specs, &options)?;
         let pinned = self.pin_required("index")?;
         let m = pinned.manifest();
         Ok(IndexResult {
@@ -61,6 +80,16 @@ impl Engine {
                     complete_at: pinned.planner.completeness(s),
                 })
                 .collect(),
+            sidecars: pinned
+                .planner
+                .declared_sidecars()
+                .iter()
+                .map(|d| SidecarState {
+                    sidecar: d.name(),
+                    complete_at: pinned.planner.sidecar_completeness(d),
+                })
+                .collect(),
+            unknown_segment_kinds: m.unknown_segment_kinds(),
             files_new: report.files_new,
             files_changed: report.files_changed,
             files_removed: report.files_removed,
@@ -95,6 +124,34 @@ impl Engine {
         guard(|| self.plan_lookup(keys, Mode::Asof(at))).map_err(schema_hint)
     }
 
+    /// Plans the rows of the keys in `keys` whose time column lies in
+    /// `[from, to]` (each an RFC 3339 instant, a `YYYY-MM-DD` date for a
+    /// date column, or an integer in the column's unit; converted exactly).
+    /// The time column is `ts_column`, or else the one time column that a
+    /// complete per-key bounds sidecar (`exact:<keys>@<ts>`) or a range spec
+    /// on a timestamp column names. Every bounds sidecar on that column
+    /// prunes per key: a row group stays only when the key's own times
+    /// there reach into the window. The residual is `In` and `Between`.
+    pub fn locate_window(
+        &self,
+        keys: &KeyFile,
+        from: &str,
+        to: &str,
+        ts_column: Option<&str>,
+    ) -> Result<PlanResult> {
+        guard(|| {
+            self.plan_lookup(
+                keys,
+                Mode::Window {
+                    from,
+                    to,
+                    ts_column,
+                },
+            )
+        })
+        .map_err(schema_hint)
+    }
+
     /// Invariant 1 over the folder, not only the index: a file that landed
     /// or changed after the last build would be silently left out of the
     /// plan, so it is refused. A plan pinned to an earlier manifest
@@ -115,7 +172,7 @@ impl Engine {
 
     fn plan_lookup(&self, keys: &KeyFile, mode: Mode<'_>) -> Result<PlanResult> {
         let verb = match mode {
-            Mode::Locate => "locate",
+            Mode::Locate | Mode::Window { .. } => "locate",
             Mode::Latest => "latest",
             Mode::Asof(_) => "asof",
         };
@@ -149,6 +206,11 @@ impl Engine {
             Mode::Asof(at) => {
                 asof_lookup(self.root(), verb, &pinned, &specs, &columns, tuples, at)?
             }
+            Mode::Window {
+                from,
+                to,
+                ts_column,
+            } => window_lookup(&pinned, &specs, &columns, tuples, from, to, ts_column)?,
         };
         let (plan, order) = pinned.planner.plan_ordered(&specs, &lookup).map_err(|e| {
             if specs.is_empty() && !excluded.is_empty() {
@@ -160,6 +222,12 @@ impl Engine {
         if matches!(kind, LookupKind::Latest | LookupKind::Asof { .. }) {
             check_temporal_residual(&plan)?;
         }
+        let sidecars: Vec<String> = pinned
+            .planner
+            .sidecars_for(&lookup)
+            .iter()
+            .map(SidecarDef::name)
+            .collect();
         let files_total = pinned.manifest().rowgroup_space.files.len() as u64;
         let planned_total = plan.row_groups_total;
         let planned = Cost {
@@ -186,6 +254,7 @@ impl Engine {
             sequence: pinned.sequence(),
             specs,
             excluded_incomplete: excluded,
+            sidecars,
             files_total,
             row_groups_total: planned_total,
             planned,
@@ -201,6 +270,11 @@ enum Mode<'a> {
     Locate,
     Latest,
     Asof(&'a str),
+    Window {
+        from: &'a str,
+        to: &'a str,
+        ts_column: Option<&'a str>,
+    },
 }
 
 /// The as-of lookup through the one temporal spec serving `columns`, its
@@ -233,6 +307,110 @@ fn asof_lookup(
             ts_column,
         },
     ))
+}
+
+/// The window lookup on `columns`: the time column named or found
+/// ([`window_column`]), and both ends converted to its unit exactly.
+fn window_lookup(
+    pinned: &Pinned,
+    specs: &[KeySpec],
+    columns: &[String],
+    tuples: Vec<Vec<u8>>,
+    from: &str,
+    to: &str,
+    ts_column: Option<&str>,
+) -> Result<(Lookup, LookupKind)> {
+    let ts_column = match ts_column {
+        Some(c) => c.to_string(),
+        None => window_column(pinned, specs, columns)?,
+    };
+    let ts_type = pinned
+        .planner
+        .column_types(std::slice::from_ref(&ts_column))?
+        .remove(0)
+        .1;
+    let lo = instant_in_unit(from, &ts_column, &ts_type)?;
+    let hi = instant_in_unit(to, &ts_column, &ts_type)?;
+    if lo > hi {
+        return Err(Error::Other(format!(
+            "the window starts at {from} ({ts_column} = {lo}) after it ends at {to} ({hi}); \
+             pass --from before --to"
+        )));
+    }
+    Ok((
+        Lookup::Window {
+            columns: columns.to_vec(),
+            keys: tuples,
+            ts_column: ts_column.clone(),
+            lo,
+            hi,
+        },
+        LookupKind::Window {
+            from: from.to_string(),
+            to: to.to_string(),
+            lo,
+            hi,
+            ts_column,
+        },
+    ))
+}
+
+/// The time column of a window lookup on `columns` when none is named: the
+/// one time column of the complete bounds sidecars on those key columns,
+/// else of the complete range specs on a timestamp or date column.
+fn window_column(pinned: &Pinned, specs: &[KeySpec], columns: &[String]) -> Result<String> {
+    let mut bounded: Vec<String> = pinned
+        .planner
+        .declared_sidecars()
+        .into_iter()
+        .filter(|d| {
+            d.kind == SidecarKind::Bounds
+                && d.columns.iter().all(|c| columns.contains(c))
+                && pinned.planner.sidecar_completeness(d).is_some()
+        })
+        .map(|d| d.time_columns[0].clone())
+        .collect();
+    bounded.sort();
+    bounded.dedup();
+    let mut ranged: Vec<String> = specs
+        .iter()
+        .filter_map(|s| match s {
+            KeySpec::Range { column }
+                if pinned
+                    .planner
+                    .column_types(std::slice::from_ref(column))
+                    .is_ok_and(|t| {
+                        matches!(
+                            t[0].1,
+                            DataType::Timestamp(..) | DataType::Date32 | DataType::Date64
+                        )
+                    }) =>
+            {
+                Some(column.clone())
+            }
+            _ => None,
+        })
+        .collect();
+    ranged.sort();
+    ranged.dedup();
+    match (bounded.as_slice(), ranged.as_slice()) {
+        ([one], _) | ([], [one]) => Ok(one.clone()),
+        ([], []) => Err(Error::KeySpec(format!(
+            "a window lookup on ({}) needs a time column: declare per-key bounds with \
+             `--key exact:{}@<ts>` or a range key `--key range:<ts>`, or name the column with \
+             --ts",
+            columns.join(", "),
+            columns.join(",")
+        ))),
+        (many, _) if many.len() > 1 => Err(Error::KeySpec(format!(
+            "per-key bounds exist on several time columns ({}); name one with --ts",
+            many.join(", ")
+        ))),
+        (_, many) => Err(Error::KeySpec(format!(
+            "range keys exist on several time columns ({}); name one with --ts",
+            many.join(", ")
+        ))),
+    }
 }
 
 /// The `plan` Evidence: provenance cites the manifest's content hash and the
