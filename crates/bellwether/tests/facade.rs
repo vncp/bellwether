@@ -382,3 +382,115 @@ fn ordered_plans_order_entries_by_timestamp_range_key_against_decoded_files() {
     }
     assert_eq!(decoded_mins, vec![100, 200, 300]);
 }
+
+#[test]
+fn pinned_lookup_at_manifest_returns_earlier_plan_byte_for_byte_and_refuses_gc_reclaimed() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    std::fs::create_dir_all(&data).unwrap();
+    common::write_file(
+        &data.join("part-0.parquet"),
+        &[vec![
+            (1, 0, Some(100), "v1".into()),
+            (2, 0, Some(100), "v1".into()),
+        ]],
+    );
+    write_keys(&dir.path().join("k.parquet"), "id", &[1]);
+    let kf = KeyFile::new(dir.path().join("k.parquet"));
+
+    let fixed_clock = "2026-10-25T12:00:00Z".to_string();
+    let opts_v1 = EngineOptions {
+        clock: Some(fixed_clock.clone()),
+        ..EngineOptions::default()
+    };
+    let e1 = Engine::open(data.to_str().unwrap(), opts_v1).unwrap();
+    let idx1 = e1
+        .index(&[
+            spec::parse("exact:id").unwrap(),
+            spec::parse("temporal:id@ts").unwrap(),
+        ])
+        .unwrap();
+    assert_eq!(idx1.sequence, 1);
+
+    let locate_v1 = e1.locate(&kf).unwrap();
+    let latest_v1 = e1.latest(&kf).unwrap();
+    let asof_v1 = e1.asof(&kf, "200").unwrap();
+    let why_v1 = e1
+        .why(&bellwether::WhyRequest {
+            keys: Some(kf.clone()),
+            ..bellwether::WhyRequest::default()
+        })
+        .unwrap();
+    let locate_v1_bytes = serde_json::to_vec(&locate_v1).unwrap();
+    let latest_v1_bytes = serde_json::to_vec(&latest_v1).unwrap();
+    let asof_v1_bytes = serde_json::to_vec(&asof_v1).unwrap();
+    let why_v1_bytes = serde_json::to_vec(&why_v1).unwrap();
+
+    // Add a second file holding key 1 with a newer timestamp and rebuild -> sequence 2.
+    common::write_file(
+        &data.join("part-1.parquet"),
+        &[vec![(1, 0, Some(500), "v2".into())]],
+    );
+    let idx2 = e1
+        .index(&[
+            spec::parse("exact:id").unwrap(),
+            spec::parse("temporal:id@ts").unwrap(),
+        ])
+        .unwrap();
+    assert_eq!(idx2.sequence, 2);
+
+    // Unpinned locate at sequence 2 plans both files.
+    let locate_v2 = e1.locate(&kf).unwrap();
+    assert_eq!(locate_v2.sequence, 2);
+    assert_eq!(locate_v2.planned.files, 2);
+
+    // Pinned lookup at sequence 1 returns the earlier plan byte for byte!
+    let e_pinned = Engine::open(
+        data.to_str().unwrap(),
+        EngineOptions {
+            at_manifest: Some(1),
+            clock: Some(fixed_clock),
+            ..EngineOptions::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        serde_json::to_vec(&e_pinned.locate(&kf).unwrap()).unwrap(),
+        locate_v1_bytes
+    );
+    assert_eq!(
+        serde_json::to_vec(&e_pinned.latest(&kf).unwrap()).unwrap(),
+        latest_v1_bytes
+    );
+    assert_eq!(
+        serde_json::to_vec(&e_pinned.asof(&kf, "200").unwrap()).unwrap(),
+        asof_v1_bytes
+    );
+    assert_eq!(
+        serde_json::to_vec(
+            &e_pinned
+                .why(&bellwether::WhyRequest {
+                    keys: Some(kf.clone()),
+                    at_manifest: Some(1),
+                    ..bellwether::WhyRequest::default()
+                })
+                .unwrap()
+        )
+        .unwrap(),
+        why_v1_bytes
+    );
+
+    // Now simulate GC reclaiming a segment of sequence 1 after compaction at sequence 3:
+    // remove a segment file referenced only by sequence 1, or remove sequence 1's archived manifest,
+    // and verify that pinning sequence 1 refuses and names sequence 2 as the oldest available.
+    let manifest_seq1 = data
+        .join(".bellwether")
+        .join("manifests")
+        .join(format!("{:020}.json", 1));
+    std::fs::remove_file(&manifest_seq1).unwrap();
+    let err = e_pinned.locate(&kf).unwrap_err().to_string();
+    assert!(
+        err.contains("oldest available") && err.contains('2'),
+        "expected refusal naming oldest available sequence 2, got: {err}"
+    );
+}

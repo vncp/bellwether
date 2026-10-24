@@ -50,6 +50,9 @@ pub struct WhyRequest {
     /// Candidate key columns for the profile; `None` selects every id-like
     /// column.
     pub columns: Option<Vec<String>>,
+    /// Optional manifest sequence to pin `why` against (`--at-manifest`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub at_manifest: Option<u64>,
     /// Most profile candidates replayed beyond the workload's own key
     /// columns.
     pub max_candidates: usize,
@@ -62,6 +65,7 @@ impl Default for WhyRequest {
             bench_workload: None,
             workload: None,
             columns: None,
+            at_manifest: None,
             max_candidates: DEFAULT_MAX_CANDIDATES,
         }
     }
@@ -281,7 +285,10 @@ impl Engine {
                     .into(),
             ));
         }
-        let pinned = self.pin()?;
+        let pinned = match req.at_manifest.or(self.options().at_manifest) {
+            Some(seq) => Some(self.pin_at(seq)?),
+            None => self.pin()?,
+        };
         let source = self.source(pinned.as_ref())?;
         let sequence = pinned.as_ref().map_or(0, Pinned::sequence);
         let current_specs = pinned.as_ref().map(|p| p.specs().0).unwrap_or_default();
@@ -302,14 +309,16 @@ impl Engine {
         };
         let mut untracked = Vec::new();
         if let Some(p) = &pinned {
-            for fp in folder_changes(self.root(), p, self.format())?.untracked {
-                for rg in source.row_groups(&fp)? {
-                    dataset.row_groups += 1;
-                    dataset.rows += rg.rows;
-                    dataset.bytes += rg.bytes;
+            if req.at_manifest.is_none() && self.options().at_manifest.is_none() {
+                for fp in folder_changes(self.root(), p, self.format())?.untracked {
+                    for rg in source.row_groups(&fp)? {
+                        dataset.row_groups += 1;
+                        dataset.rows += rg.rows;
+                        dataset.bytes += rg.bytes;
+                    }
+                    dataset.files += 1;
+                    untracked.push(fp.path);
                 }
-                dataset.files += 1;
-                untracked.push(fp.path);
             }
         }
         let has_workload = given.iter().any(|g| *g);
@@ -383,8 +392,43 @@ impl Engine {
                 p.parent().map(PathBuf::from).unwrap_or_default()
             }
         });
-        let profile = bellwether_profile::profile(source, self.root(), &store, &options)?;
+        let mut profile = if let (true, Some(p)) = (
+            req.at_manifest.is_some() || self.options().at_manifest.is_some(),
+            pinned,
+        ) {
+            let pinned_source = PinnedFilesSource {
+                inner: source,
+                files: p
+                    .manifest()
+                    .rowgroup_space
+                    .files
+                    .iter()
+                    .map(|f| f.fingerprint.clone())
+                    .collect(),
+            };
+            let memory = Arc::new(ObjectStoreBackend::memory()?);
+            if let Ok(bytes) = p.manifest().to_vec() {
+                let _ = memory.put_if_absent("manifest.json", bytes::Bytes::from(bytes));
+            }
+            options.reuse_cache = false;
+            bellwether_profile::profile(&pinned_source, self.root(), &memory, &options)?
+        } else {
+            bellwether_profile::profile(source, self.root(), &store, &options)?
+        };
         let mut evidence = bellwether_profile::evidence(&profile)?;
+        if let Some(p) = pinned {
+            for input in &mut profile.inputs {
+                if input.kind == bellwether_profile::evidence::InputKind::Manifest {
+                    input.age = p.age;
+                    input.hash = p.hash;
+                }
+            }
+            if let Some(m) = &mut profile.manifest {
+                m.sequence = p.sequence();
+                m.hash = p.hash;
+            }
+            evidence = bellwether_profile::evidence(&profile)?;
+        }
         // Every record this engine writes carries the engine's clock.
         evidence.provenance.created_at = self.now();
         let out = if writable.is_some() {
@@ -561,6 +605,38 @@ impl Engine {
                 proposed: c.proposed,
             });
         Ok(())
+    }
+}
+
+/// Wraps a `Source` so `discover` returns only the files tracked by a pinned
+/// manifest snapshot.
+struct PinnedFilesSource<'a> {
+    inner: &'a dyn bellwether_types::Source,
+    files: Vec<bellwether_types::FileFingerprint>,
+}
+
+impl bellwether_types::Source for PinnedFilesSource<'_> {
+    fn discover(&self, _root: &str) -> Result<Vec<bellwether_types::FileFingerprint>> {
+        Ok(self.files.clone())
+    }
+
+    fn row_groups(
+        &self,
+        file: &bellwether_types::FileFingerprint,
+    ) -> Result<Vec<bellwether_types::RowGroupMeta>> {
+        self.inner.row_groups(file)
+    }
+
+    fn read_columns(
+        &self,
+        rg: &bellwether_types::RowGroupMeta,
+        columns: &[String],
+    ) -> Result<arrow::array::RecordBatch> {
+        self.inner.read_columns(rg, columns)
+    }
+
+    fn schema(&self, root: &str) -> Result<arrow::datatypes::SchemaRef> {
+        self.inner.schema(root)
     }
 }
 

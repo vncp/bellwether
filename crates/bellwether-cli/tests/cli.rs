@@ -234,3 +234,111 @@ fn ordered_plans_human_output_states_ordered_by_or_unspecified() {
         "got: {out_ord}"
     );
 }
+
+#[test]
+fn at_manifest_flag_pins_locate_latest_asof_and_why_in_cli() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    corpus(&data, 1, 2, 10, 8);
+    let kf = dir.path().join("k.parquet");
+    keys(&kf, "id", &[1]);
+    let clk = "2026-10-25T12:00:00Z";
+    run(
+        &[
+            "--clock",
+            clk,
+            "index",
+            path(&data),
+            "--key",
+            "exact:id",
+            "--key",
+            "temporal:id@ts",
+        ],
+        0,
+    );
+    let loc1 = run(
+        &["--json", "--clock", clk, "locate", path(&data), "--keys", path(&kf)],
+        0,
+    );
+    let lat1 = run(
+        &["--json", "--clock", clk, "latest", path(&data), "--keys", path(&kf)],
+        0,
+    );
+    let asof1 = run(
+        &[
+            "--json",
+            "--clock",
+            clk,
+            "asof",
+            path(&data),
+            "--keys",
+            path(&kf),
+            "--at",
+            "100",
+        ],
+        0,
+    );
+
+    // Add another file (without touching part-000.parquet) and rebuild -> sequence 2.
+    std::fs::copy(data.join("part-000.parquet"), data.join("part-001.parquet")).unwrap();
+    run(
+        &[
+            "--clock",
+            clk,
+            "index",
+            path(&data),
+            "--key",
+            "exact:id",
+            "--key",
+            "temporal:id@ts",
+        ],
+        0,
+    );
+    let loc_pinned = run(
+        &[
+            "--json",
+            "--clock",
+            clk,
+            "locate",
+            path(&data),
+            "--keys",
+            path(&kf),
+            "--at-manifest",
+            "1",
+        ],
+        0,
+    );
+    let lat_pinned = run(
+        &[
+            "--json",
+            "--clock",
+            clk,
+            "latest",
+            path(&data),
+            "--keys",
+            path(&kf),
+            "--at-manifest",
+            "1",
+        ],
+        0,
+    );
+    let asof_pinned = run(
+        &[
+            "--json",
+            "--clock",
+            clk,
+            "asof",
+            path(&data),
+            "--keys",
+            path(&kf),
+            "--at",
+            "100",
+            "--at-manifest",
+            "1",
+        ],
+        0,
+    );
+    assert_eq!(loc_pinned, loc1);
+    assert_eq!(lat_pinned, lat1);
+    assert_eq!(asof_pinned, asof1);
+}

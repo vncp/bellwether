@@ -14,8 +14,8 @@ use bellwether_types::{Error, Hash, Result, StoreVersion};
 use bytes::Bytes;
 
 use crate::backend::StoreExt;
-use crate::commit::read_manifest;
-use crate::manifest::{segment_path, Manifest, SegmentRef};
+use crate::commit::{read_manifest, read_manifest_at};
+use crate::manifest::{manifest_seq_path, segment_path, Manifest, SegmentRef, MANIFESTS_DIR};
 
 /// A read handle pinned to one manifest version.
 #[derive(Clone)]
@@ -49,6 +49,51 @@ impl<S: StoreExt + ?Sized> Snapshot<S> {
             manifest: Arc::new(manifest),
             version,
         })
+    }
+
+    /// Opens a snapshot pinned to manifest `sequence` under `root`. Also
+    /// verifies that every segment referenced by that manifest is still
+    /// present in the store (GC retention permitting); otherwise returns an
+    /// error naming the oldest available sequence.
+    pub fn open_at(store: Arc<S>, root: &str, sequence: u64) -> Result<(Self, Bytes)> {
+        let Some((current, _)) = read_manifest(&*store, root)? else {
+            return Err(Error::KeySpec(format!(
+                "no index manifest under {root:?}; run `bellwether index` first"
+            )));
+        };
+        if sequence == 0 || sequence > current.sequence {
+            let oldest = oldest_available_sequence(&*store, root, &current)?;
+            return Err(Error::KeySpec(format!(
+                "manifest sequence {sequence} does not exist (available sequences: {oldest}..={})",
+                current.sequence
+            )));
+        }
+        let Some((manifest, bytes, version)) = read_manifest_at(&*store, root, sequence)? else {
+            let oldest = oldest_available_sequence(&*store, root, &current)?;
+            return Err(Error::KeySpec(format!(
+                "manifest sequence {sequence} is no longer retained (oldest available sequence is \
+                 {oldest}, current is {}); re-run with --at-manifest {oldest} or newer",
+                current.sequence
+            )));
+        };
+        if !all_segments_exist(&*store, root, &manifest)? {
+            let oldest = oldest_available_sequence(&*store, root, &current)?;
+            return Err(Error::KeySpec(format!(
+                "manifest sequence {sequence} has segments reclaimed by garbage collection \
+                 (oldest available complete snapshot is sequence {oldest}, current is {}); \
+                 re-run with --at-manifest {oldest} or newer",
+                current.sequence
+            )));
+        }
+        Ok((
+            Self {
+                store,
+                root: root.to_string(),
+                manifest: Arc::new(manifest),
+                version,
+            },
+            bytes,
+        ))
     }
 
     /// Opens a fresh snapshot of whatever manifest is current now. The
@@ -125,4 +170,51 @@ impl<S: StoreExt + ?Sized> Snapshot<S> {
         }
         Ok(bytes)
     }
+}
+
+fn all_segments_exist<S: StoreExt + ?Sized>(
+    store: &S,
+    root: &str,
+    manifest: &Manifest,
+) -> Result<bool> {
+    for seg in &manifest.segments {
+        if !store.exists(&segment_path(root, &seg.id))? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// Oldest manifest sequence under `root` whose manifest and all referenced
+/// segments still exist in `store`.
+pub fn oldest_available_sequence<S: StoreExt + ?Sized>(
+    store: &S,
+    root: &str,
+    current: &Manifest,
+) -> Result<u64> {
+    let prefix = crate::manifest::join(root, MANIFESTS_DIR);
+    let paths = store.list(&prefix).unwrap_or_default();
+    let mut seqs: Vec<u64> = paths
+        .iter()
+        .filter_map(|p| {
+            let name = p.rsplit('/').next()?;
+            let stem = name.strip_suffix(".json")?;
+            stem.parse::<u64>().ok()
+        })
+        .collect();
+    seqs.push(current.sequence);
+    seqs.sort_unstable();
+    seqs.dedup();
+    for seq in seqs {
+        if seq == current.sequence {
+            return Ok(current.sequence);
+        }
+        if let Ok(Some((m, _, _))) = read_manifest_at(store, root, seq) {
+            if all_segments_exist(store, root, &m).unwrap_or(false) {
+                return Ok(seq);
+            }
+        }
+    }
+    let _ = manifest_seq_path;
+    Ok(current.sequence)
 }

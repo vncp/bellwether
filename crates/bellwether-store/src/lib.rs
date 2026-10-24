@@ -31,7 +31,8 @@ pub use backend::{
 };
 pub use cache::Cache;
 pub use commit::{
-    claimed_segment, commit, commit_with, read_manifest, CommitOptions, Committed, StagedSegments,
+    claimed_segment, commit, commit_with, read_manifest, read_manifest_at, CommitOptions,
+    Committed, StagedSegments,
 };
 pub use gc::{
     gc, gc_with, GcOptions, GcReport, DEFAULT_CLAIM_LEASE, DEFAULT_DELETE_BATCH,
@@ -39,10 +40,10 @@ pub use gc::{
 };
 pub use local::LOCK_TIMEOUT as LOCAL_LOCK_TIMEOUT;
 pub use manifest::{
-    join, manifest_path, now_rfc3339, parse_rfc3339, segment_path, ChunkRange, ColumnDef,
-    DeleteClaim, Extra, FileEntry, Manifest, RowGroupRange, RowGroupSpace, RowGroupTombstone,
-    SchemaInfo, SegmentRef, SegmentTombstone, SourceInfo, CACHE_DIR, MANIFEST_FILE, SEGMENTS_DIR,
-    UNSUPPORTED_SHAPE, UNSUPPORTED_STORAGE,
+    join, manifest_path, manifest_seq_path, now_rfc3339, parse_rfc3339, segment_path, ChunkRange,
+    ColumnDef, DeleteClaim, Extra, FileEntry, Manifest, RowGroupRange, RowGroupSpace,
+    RowGroupTombstone, SchemaInfo, SegmentRef, SegmentTombstone, SourceInfo, CACHE_DIR,
+    MANIFESTS_DIR, MANIFEST_FILE, SEGMENTS_DIR, UNSUPPORTED_SHAPE, UNSUPPORTED_STORAGE,
 };
 pub use object_store::ObjectMeta;
-pub use snapshot::Snapshot;
+pub use snapshot::{oldest_available_sequence, Snapshot};

@@ -123,6 +123,9 @@ pub struct EngineOptions {
     /// Optional `--path-template` pattern for filename-derived virtual columns,
     /// e.g. `"{day}.parquet"` or `"grouped_daily_us/{day:date}.parquet"`.
     pub path_template: Option<String>,
+    /// Optional manifest sequence to pin lookups and `why` against
+    /// (`--at-manifest <sequence>`).
+    pub at_manifest: Option<u64>,
     /// A fixed RFC 3339 time used as every record's `created_at` and as
     /// "now" when ages are computed, so two runs over the same inputs write
     /// byte-identical records. `None` uses the system clock.
@@ -421,6 +424,9 @@ impl Engine {
     /// the same commit (sequence and nonce agree), retried a few times if a
     /// commit lands in between.
     pub(crate) fn pin(&self) -> Result<Option<Pinned>> {
+        if let Some(seq) = self.options.at_manifest {
+            return self.pin_at(seq).map(Some);
+        }
         let Some(store) = self.existing_store()? else {
             return Ok(None);
         };
@@ -445,6 +451,28 @@ impl Engine {
         Err(Error::VersionConflict {
             expected: "a manifest stable while it is pinned".into(),
             found: format!("{PIN_ATTEMPTS} commits in a row; retry when the writers settle"),
+        })
+    }
+
+    /// Pins the manifest at `sequence`, verifying that all its segments are
+    /// still retained, or returns a typed refusal naming the oldest available
+    /// sequence.
+    pub(crate) fn pin_at(&self, sequence: u64) -> Result<Pinned> {
+        let Some(store) = self.existing_store()? else {
+            return Err(Error::KeySpec(format!(
+                "{} is not indexed, so --at-manifest {sequence} has no index to pin; run \
+                 `bellwether index {} --key <spec>` first",
+                self.root, self.root
+            )));
+        };
+        let (snapshot, bytes) = Snapshot::open_at(Arc::clone(store), "", sequence)?;
+        let age = commit_age(snapshot.manifest(), self.now_nanos()?)?;
+        let planner = Planner::from_snapshot(snapshot.clone())?;
+        Ok(Pinned {
+            snapshot,
+            planner,
+            hash: Hash::of(&bytes),
+            age,
         })
     }
 

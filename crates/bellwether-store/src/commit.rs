@@ -45,7 +45,8 @@ use bytes::Bytes;
 
 use crate::backend::StoreExt;
 use crate::manifest::{
-    manifest_path, now_rfc3339, segment_path, Manifest, SegmentTombstone, UNSUPPORTED_STORAGE,
+    manifest_path, manifest_seq_path, now_rfc3339, segment_path, Manifest, SegmentTombstone,
+    UNSUPPORTED_STORAGE,
 };
 
 /// The typed refusal for referencing a claimed segment (contract v2
@@ -147,6 +148,28 @@ pub fn read_manifest<S: StoreExt + ?Sized>(
         None => Ok(None),
         Some((bytes, version)) => Ok(Some((Manifest::from_slice(&bytes)?, version))),
     }
+}
+
+/// Reads and parses the archived manifest at `sequence` under `root`, or
+/// falls back to the current manifest when its sequence equals `sequence`.
+pub fn read_manifest_at<S: StoreExt + ?Sized>(
+    store: &S,
+    root: &str,
+    sequence: u64,
+) -> Result<Option<(Manifest, Bytes, StoreVersion)>> {
+    if let Some((bytes, version)) = store.get_opt(&manifest_seq_path(root, sequence))? {
+        let m = Manifest::from_slice(&bytes)?;
+        if m.sequence == sequence {
+            return Ok(Some((m, bytes, version)));
+        }
+    }
+    if let Some((bytes, version)) = store.get_opt(&manifest_path(root))? {
+        let m = Manifest::from_slice(&bytes)?;
+        if m.sequence == sequence {
+            return Ok(Some((m, bytes, version)));
+        }
+    }
+    Ok(None)
 }
 
 /// Commits with [`CommitOptions::default`]. See [`commit_with`].
@@ -266,15 +289,17 @@ where
 
         let body = Bytes::from(next.to_vec()?);
         let res = match &base {
-            None => store.put_if_absent(&path, body),
-            Some((_, version)) => store.put_if_version(&path, body, version),
+            None => store.put_if_absent(&path, body.clone()),
+            Some((_, version)) => store.put_if_version(&path, body.clone(), version),
         };
         let err = match res {
             Ok(version) => {
+                let _ = store
+                    .put_content_addressed(&manifest_seq_path(root, next.sequence), body);
                 return Ok(Committed {
                     version,
                     sequence: next.sequence,
-                })
+                });
             }
             Err(e) => e,
         };
@@ -286,6 +311,8 @@ where
         match read_manifest(store, root) {
             Ok(Some((current, version))) if current.commit_nonce == nonce => {
                 tracing::debug!(attempt, error = %err, "manifest CAS reported failure but our write landed");
+                let _ = store
+                    .put_content_addressed(&manifest_seq_path(root, current.sequence), body);
                 return Ok(Committed {
                     version,
                     sequence: current.sequence,

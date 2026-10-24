@@ -104,9 +104,11 @@ impl Engine {
         // Invariant 1 over the folder, not only the index: a file that
         // landed or changed after the last build would be silently left out
         // of the plan, so it is refused.
-        let changes = folder_changes(self.root(), &pinned, self.format())?;
-        if !changes.is_empty() {
-            return Err(stale_index(self.root(), verb, &changes));
+        if self.options().at_manifest.is_none() {
+            let changes = folder_changes(self.root(), &pinned, self.format())?;
+            if !changes.is_empty() {
+                return Err(stale_index(self.root(), verb, &changes));
+            }
         }
         let (specs, excluded) = pinned.specs();
         let (run_keys, null_tuples) = keys.run_keys(pinned.planner.schema())?;

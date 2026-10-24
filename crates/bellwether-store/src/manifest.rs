@@ -32,6 +32,8 @@ pub const MANIFEST_FILE: &str = "manifest.json";
 pub const SEGMENTS_DIR: &str = "segments";
 /// Directory of the rebuildable cache under an index root.
 pub const CACHE_DIR: &str = "cache";
+/// Directory of archived manifest snapshots by sequence under an index root.
+pub const MANIFESTS_DIR: &str = "manifests";
 
 /// Joins an index root and a relative path into a store path.
 #[must_use]
@@ -48,6 +50,12 @@ pub fn join(root: &str, rel: &str) -> String {
 #[must_use]
 pub fn manifest_path(root: &str) -> String {
     join(root, MANIFEST_FILE)
+}
+/// Store path of the archived manifest for `sequence` under `root`:
+/// `manifests/<sequence>.json`.
+#[must_use]
+pub fn manifest_seq_path(root: &str, sequence: u64) -> String {
+    join(root, &format!("{MANIFESTS_DIR}/{sequence:020}.json"))
 }
 
 /// Store path of segment `id` under `root`: `segments/<blake3>.seg`.

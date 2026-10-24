@@ -169,6 +169,9 @@ struct WhyArgs {
     /// columns.
     #[arg(long, value_name = "N", default_value_t = bellwether::DEFAULT_MAX_CANDIDATES)]
     max_candidates: usize,
+    /// Pin to a specific manifest sequence snapshot.
+    #[arg(long, value_name = "SEQUENCE")]
+    at_manifest: Option<u64>,
 }
 
 #[derive(Args)]
@@ -191,6 +194,9 @@ struct LookupArgs {
     /// Key columns to take from the file, comma-separated [default: all].
     #[arg(long, value_name = "COLS", value_delimiter = ',')]
     key: Option<Vec<String>>,
+    /// Pin to a specific manifest sequence snapshot.
+    #[arg(long, value_name = "SEQUENCE")]
+    at_manifest: Option<u64>,
 }
 
 #[derive(Args)]
@@ -334,6 +340,14 @@ pub(crate) fn done<T: Serialize>(result: &T, human: String, code: u8) -> Result<
 }
 
 pub(crate) fn engine(global: &Global, root: &str) -> Result<Engine, Failure> {
+    engine_at(global, root, None)
+}
+
+pub(crate) fn engine_at(
+    global: &Global,
+    root: &str,
+    at_manifest: Option<u64>,
+) -> Result<Engine, Failure> {
     let format = match global.format {
         FormatArg::Parquet => SourceFormat::Parquet,
         FormatArg::Csv => SourceFormat::Csv {
@@ -363,6 +377,7 @@ pub(crate) fn engine(global: &Global, root: &str) -> Result<Engine, Failure> {
                 PolicyArg::Full => bellwether::FingerprintPolicy::Full,
             }),
             path_template: global.path_template.clone(),
+            at_manifest,
             clock: global.clock.clone(),
         },
     )?)
@@ -399,16 +414,19 @@ fn run(cli: &Cli, out: &Out) -> Result<Outcome, Failure> {
             done(&r, human::index(&r, out), EXIT_OK)
         }
         Command::Locate(a) => {
-            let r = engine(g, &a.root.root)?.locate(&key_file(&a.keys, a.key.as_ref()))?;
+            let r = engine_at(g, &a.root.root, a.at_manifest)?
+                .locate(&key_file(&a.keys, a.key.as_ref()))?;
             done(&r, human::plan(&r, out), EXIT_OK)
         }
         Command::Latest(a) => {
-            let r = engine(g, &a.root.root)?.latest(&key_file(&a.keys, a.key.as_ref()))?;
+            let r = engine_at(g, &a.root.root, a.at_manifest)?
+                .latest(&key_file(&a.keys, a.key.as_ref()))?;
             done(&r, human::plan(&r, out), EXIT_OK)
         }
         Command::Asof(a) => {
             let l = &a.lookup;
-            let r = engine(g, &l.root.root)?.asof(&key_file(&l.keys, l.key.as_ref()), &a.at)?;
+            let r = engine_at(g, &l.root.root, l.at_manifest)?
+                .asof(&key_file(&l.keys, l.key.as_ref()), &a.at)?;
             done(&r, human::plan(&r, out), EXIT_OK)
         }
         Command::Propose(a) => propose(g, out, a),
@@ -504,8 +522,9 @@ fn why(g: &Global, out: &Out, a: &WhyArgs) -> Result<Outcome, Failure> {
             .map(|w| hash(w, "workload"))
             .transpose()?,
         columns: a.columns.clone(),
+        at_manifest: a.at_manifest,
         max_candidates: a.max_candidates,
     };
-    let r = engine(g, &a.root.root)?.why(&request)?;
+    let r = engine_at(g, &a.root.root, a.at_manifest)?.why(&request)?;
     done(&r, human::why(&r, out), EXIT_OK)
 }
