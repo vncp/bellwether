@@ -4,7 +4,7 @@
 
 <p align="center">
   <a href="https://github.com/vncp/bellwether/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/vncp/bellwether/actions/workflows/ci.yml/badge.svg"></a>
-  <img alt="Rust 1.80+" src="https://img.shields.io/badge/rust-1.80%2B-DEA584?logo=rust&logoColor=white">
+  <img alt="Rust 1.89+" src="https://img.shields.io/badge/rust-1.89%2B-DEA584?logo=rust&logoColor=white">
   <img alt="Status: pre-alpha" src="https://img.shields.io/badge/status-pre--alpha-orange">
   <a href="LICENSE.md"><img alt="License: MIT + hosted-service provision" src="https://img.shields.io/badge/license-MIT%20%2B%20hosted--service-blue"></a>
 </p>
