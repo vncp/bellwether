@@ -17,6 +17,14 @@ blake3 = { workspace = true }
 bytes = { workspace = true }
 roaring = { workspace = true, features = ["serde"] }
 arrow = { workspace = true }
+# Only with the `schema` feature.
+schemars = { workspace = true, optional = true }
+
+[features]
+# JSON Schema derives (`schemars::JsonSchema`) on the public records and
+# enums, for the MCP server's tool schemas (WP12). Non-semantic: it changes
+# no serialization, no hash, and nothing in the default build.
+schema = ["dep:schemars"]
 
 [lints]
 workspace = true

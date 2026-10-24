@@ -190,15 +190,35 @@ impl<'de> Deserialize<'de> for Hash {
     }
 }
 
+/// With the `schema` feature: a lowercase 64-character hex string, exactly
+/// what [`Hash`](struct@Hash)'s `Serialize` writes. Non-semantic: it changes no
+/// serialization, no hash, and nothing in the default build.
+#[cfg(feature = "schema")]
+impl schemars::JsonSchema for Hash {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "Hash".into()
+    }
+
+    fn json_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        schemars::json_schema!({
+            "type": "string",
+            "description": "A BLAKE3 content hash: 64 lowercase hex characters.",
+            "pattern": "^[0-9a-f]{64}$"
+        })
+    }
+}
+
 /// Dense identifier for a row group within one index's global id space.
 /// Assigned at first sighting of `(FileFingerprint, index_in_file)` and never
 /// reused (ADR 013).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct RowGroupId(pub u32);
 
 /// Identity of a source file. Path alone is not identity; an in-place rewrite
 /// changes `size`, `etag`, or `tail_blake3` and is detected as drift.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct FileFingerprint {
     /// Full path or URL as the source reports it.
     pub path: String,
@@ -221,6 +241,7 @@ pub struct FileFingerprint {
 /// `min`/`max` are canonical-encoded bytes (ADR 016) so they compare without
 /// knowing the type.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct ColumnStats {
     /// Column name.
     pub column: String,
@@ -248,6 +269,7 @@ pub struct ColumnStats {
 /// (CSV, JSON lines) the source defines fixed byte-range chunks and reports
 /// them here; nothing above this layer knows the difference.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct RowGroupMeta {
     /// Global id within the index. Assigned by the build crate, not the source;
     /// a source leaves this as `None`.
@@ -294,6 +316,7 @@ pub trait Source: Send + Sync {
 /// Opaque version token returned by a store for a path (an etag, a generation,
 /// a content hash for local files).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct StoreVersion(pub String);
 
 /// Byte storage with conditional writes. Implemented over `object_store` in
@@ -333,6 +356,7 @@ pub trait Store: Send + Sync {
 /// composite key is not a separate kind, it is a list of length greater than
 /// one, encoded memcomparably (ADR 002).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum KeySpec {
     /// Exact set membership per row group.
@@ -389,6 +413,7 @@ impl KeySpec {
 /// A residual predicate the consumer applies after reading the planned row
 /// groups to make the result row-exact (ADR 011). Deliberately small.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum Predicate {
     /// Column tuple is one of the listed canonical-encoded values.
@@ -435,12 +460,14 @@ pub enum Predicate {
 
 /// One file's share of a scan plan.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct ScanEntry {
     /// The file.
     pub file: FileFingerprint,
     /// Row groups to read, by `index_in_file`. Serialized as a sorted list of
     /// indices so the JSON is readable; the in-memory form is a bitmap.
     #[serde(with = "bitmap_as_list")]
+    #[cfg_attr(feature = "schema", schemars(with = "Vec<u32>"))]
     pub row_groups: RoaringBitmap,
     /// Compressed bytes those row groups occupy, summed from stats. Exact,
     /// not estimated.
@@ -451,6 +478,7 @@ pub struct ScanEntry {
 /// is present. Extra rows may be present; apply `residual` for row-exact
 /// results.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct ScanPlan {
     /// Manifest version the plan was computed against.
     pub manifest_version: String,
@@ -476,6 +504,7 @@ impl Eq for KeySpec {}
 /// `Certificate`): the inputs they were derived from and how old the oldest
 /// input was when the record was made (invariant 6).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct Provenance {
     /// Hashes of cache artifacts, manifest, or other records this depends on.
     pub inputs: Vec<Hash>,
@@ -483,6 +512,7 @@ pub struct Provenance {
     /// nanoseconds so every value round-trips exactly (a float-seconds
     /// encoding loses sub-second precision past about 97 days).
     #[serde(with = "duration_nanos")]
+    #[cfg_attr(feature = "schema", schemars(with = "u64"))]
     pub oldest_input_age: Duration,
     /// Manifest version in effect, if any.
     pub manifest_version: Option<String>,
@@ -524,6 +554,7 @@ mod duration_nanos {
 /// Fanout measurement for one column or column tuple: how many files and row
 /// groups one key value touches, at quantiles over observed values.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct Fanout {
     /// Columns measured, in prefix order.
     pub columns: Vec<String>,
@@ -544,6 +575,7 @@ pub struct Fanout {
 
 /// A lint the profiler raised.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct Lint {
     /// Stable rule id, for example `batch_stamp_key`.
     pub rule: String,
@@ -561,6 +593,7 @@ pub struct Lint {
 
 /// What an observation found.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum EvidenceBody {
     /// Output of `profile`.
@@ -583,6 +616,7 @@ pub enum EvidenceBody {
 
 /// A record of something the engine observed. Agents read these.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct Evidence {
     /// Record schema version.
     pub record_version: u32,
@@ -594,6 +628,7 @@ pub struct Evidence {
 
 /// A rewrite proposal is data, never code the engine runs (threat model).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct RewriteShape {
     /// Human-readable description of the current shape.
     pub before: String,
@@ -606,6 +641,7 @@ pub struct RewriteShape {
 /// What an agent may propose. There is no score field in any variant; scoring
 /// is the engine's (ADR 009).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ProposalBody {
     /// Add or change an index key.
@@ -627,6 +663,7 @@ pub enum ProposalBody {
 
 /// A record of something an agent proposed.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct Proposal {
     /// Record schema version.
     pub record_version: u32,
@@ -643,6 +680,7 @@ pub struct Proposal {
 /// Cost of one recorded run under one configuration. Exact, from statistics,
 /// never estimated (ADR 005).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct RunCost {
     /// Identifier of the recorded run.
     pub run_id: String,
@@ -666,6 +704,7 @@ pub struct RunCost {
 
 /// A record of replaying a recorded workload against a proposal.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct Replay {
     /// Record schema version.
     pub record_version: u32,
@@ -699,6 +738,7 @@ pub struct Replay {
 
 /// How much of the key space a certificate covers.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Coverage {
     /// Every key in the dataset was compared.
@@ -728,6 +768,7 @@ pub enum Coverage {
 
 /// Outcome of a reconciliation.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct CertBody {
     /// Keys present on the left only.
     pub missing_right: u64,
@@ -745,6 +786,7 @@ pub struct CertBody {
 
 /// A record that a reconciliation ran and what it found (ADR 004).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct Certificate {
     /// Record schema version.
     pub record_version: u32,
@@ -764,6 +806,7 @@ pub struct Certificate {
 /// refuses to store one whose certificate does not resolve or did not pass
 /// (invariant 2).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct Receipt {
     /// Record schema version.
     pub record_version: u32,
@@ -785,6 +828,7 @@ pub struct Receipt {
 
 /// Any ledger record, for storage and listing.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(tag = "record", rename_all = "snake_case")]
 pub enum Record {
     /// An observation.
@@ -1021,5 +1065,173 @@ mod tests {
             .columns(),
             ["ts".to_string()]
         );
+    }
+}
+
+/// The `schema` feature is non-semantic: these tests run with it off and on
+/// and pin the same bytes (WP12, contract v2.1).
+#[cfg(test)]
+mod schema_feature {
+    use super::*;
+
+    /// One record of every kind, touching every field with custom serde
+    /// (`Hash`, the row-group bitmap, the nanosecond age) and every tagged
+    /// enum.
+    fn every_kind() -> Vec<Record> {
+        let provenance = Provenance {
+            inputs: vec![Hash::of(b"input")],
+            oldest_input_age: Duration::from_nanos(1_234_567_890_123),
+            manifest_version: Some("3".into()),
+            created_at: "2026-10-24T00:00:00.000Z".into(),
+        };
+        let mut rgs = RoaringBitmap::new();
+        rgs.insert(1);
+        rgs.insert(70_000);
+        vec![
+            Record::Evidence(Evidence {
+                record_version: format::RECORD_VERSION,
+                provenance: provenance.clone(),
+                body: EvidenceBody::Plan {
+                    plan: ScanPlan {
+                        manifest_version: "3".into(),
+                        entries: vec![ScanEntry {
+                            file: FileFingerprint {
+                                path: "a.parquet".into(),
+                                size: 10,
+                                etag: Some("e".into()),
+                                tail_blake3: Hash::of(b"t"),
+                            },
+                            row_groups: rgs,
+                            bytes: 99,
+                        }],
+                        residual: Some(Predicate::In {
+                            columns: vec!["id".into()],
+                            values: vec![vec![0, 1, 2]],
+                        }),
+                        bytes: 99,
+                        row_groups_total: 4,
+                        row_groups_selected: 2,
+                    },
+                },
+            }),
+            Record::Proposal(Proposal {
+                record_version: format::RECORD_VERSION,
+                evidence: vec![Hash::of(b"e")],
+                proposed_by: "agent".into(),
+                created_at: "2026-10-24T00:00:00.000Z".into(),
+                body: ProposalBody::Rewrite {
+                    shape: RewriteShape {
+                        before: "b".into(),
+                        after: "a".into(),
+                        invariant: "i".into(),
+                    },
+                },
+            }),
+            Record::Replay(Replay {
+                record_version: format::RECORD_VERSION,
+                proposal: Hash::of(b"p"),
+                manifest_version: "3".into(),
+                workload: Hash::of(b"w"),
+                inputs: vec![Hash::of(b"c")],
+                current: vec![RunCost {
+                    run_id: "r".into(),
+                    keys: 2,
+                    files: 3,
+                    row_groups: 4,
+                    bytes: 5,
+                    exact: true,
+                }],
+                proposed: vec![],
+                model: None,
+                created_at: "2026-10-24T00:00:00.000Z".into(),
+            }),
+            Record::Certificate(Certificate {
+                record_version: format::RECORD_VERSION,
+                proposal: Some(Hash::of(b"p")),
+                coverage: Coverage::Sampled {
+                    keys: 7,
+                    fraction: 0.25,
+                },
+                pass: false,
+                body: CertBody {
+                    missing_right: 1,
+                    missing_left: 0,
+                    mismatched: 2,
+                    ignored_columns: vec![],
+                    totals_delta: vec![("g".into(), "1.00".into(), "2.00".into())],
+                },
+                provenance,
+            }),
+            Record::Receipt(Receipt {
+                record_version: format::RECORD_VERSION,
+                evidence: vec![Hash::of(b"e")],
+                proposal: Hash::of(b"p"),
+                replay: Hash::of(b"r"),
+                certificate: Hash::of(b"c"),
+                manifest_before: "3".into(),
+                manifest_after: "4".into(),
+                created_at: "2026-10-24T00:00:00.000Z".into(),
+            }),
+        ]
+    }
+
+    /// The canonical bytes of every record kind, pinned. A derive that
+    /// changed serialization would change this hash.
+    #[test]
+    fn record_bytes_are_the_same_with_and_without_the_schema_feature() {
+        let mut all = Vec::new();
+        for r in every_kind() {
+            all.extend(serde_json::to_vec(&r).unwrap());
+            all.push(b'\n');
+        }
+        assert_eq!(Hash::of(&all).to_hex(), GOLDEN);
+    }
+
+    const GOLDEN: &str = "d00a59c94e95f3829c8a9019e964ffe276757709eb22ce4ff770079998c5fa49";
+
+    /// With the feature on, the schemas describe what serde writes: a hash
+    /// is a 64-hex string, the bitmap a list of integers, the age an
+    /// integer, and records are tagged by `record`.
+    #[cfg(feature = "schema")]
+    #[test]
+    fn schemas_describe_the_serialized_form() {
+        let hash = serde_json::to_value(schemars::schema_for!(Hash)).unwrap();
+        assert_eq!(hash["type"], "string");
+        assert_eq!(hash["pattern"], "^[0-9a-f]{64}$");
+        let entry = serde_json::to_value(schemars::schema_for!(ScanEntry)).unwrap();
+        assert_eq!(entry["properties"]["row_groups"]["type"], "array");
+        assert_eq!(
+            entry["properties"]["row_groups"]["items"]["type"],
+            "integer"
+        );
+        let prov = serde_json::to_value(schemars::schema_for!(Provenance)).unwrap();
+        assert_eq!(prov["properties"]["oldest_input_age"]["type"], "integer");
+        let record = serde_json::to_string(&schemars::schema_for!(Record)).unwrap();
+        for tag in ["evidence", "proposal", "replay", "certificate", "receipt"] {
+            assert!(record.contains(&format!("\"const\":\"{tag}\"")), "{tag}");
+        }
+        let body = serde_json::to_value(schemars::schema_for!(ProposalBody)).unwrap();
+        assert!(
+            !has_property(&body, "score"),
+            "a proposal has no score: {body}"
+        );
+        let proposal = serde_json::to_value(schemars::schema_for!(Proposal)).unwrap();
+        assert!(!has_property(&proposal, "score"), "{proposal}");
+        assert!(has_property(&proposal, "proposed_by"), "{proposal}");
+    }
+
+    /// Whether any object schema anywhere in `v` declares property `name`.
+    #[cfg(feature = "schema")]
+    fn has_property(v: &serde_json::Value, name: &str) -> bool {
+        match v {
+            serde_json::Value::Object(m) => {
+                m.get("properties")
+                    .and_then(serde_json::Value::as_object)
+                    .is_some_and(|p| p.contains_key(name))
+                    || m.values().any(|x| has_property(x, name))
+            }
+            serde_json::Value::Array(a) => a.iter().any(|x| has_property(x, name)),
+            _ => false,
+        }
     }
 }

@@ -49,6 +49,10 @@ url = "2"
 tempfile = "3"
 proptest = "1"
 criterion = "0.5"
+# JSON Schema derives for the contract (the `schema` feature of
+# bellwether-types, off by default) and the MCP server's tool schemas; the
+# same major as rmcp's.
+schemars = { version = "1.2", default-features = false, features = ["derive", "std"] }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
