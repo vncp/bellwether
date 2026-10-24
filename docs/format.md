@@ -130,3 +130,7 @@ Additional vectors (decimal rescale, Decimal256, floats including the canonical 
 
 Not part of version 1 and not read by version 1 readers: (1) exact segments may carry, per key and per set bit of its bitmap, a row count, enabled by `counts: true` on the key spec; (2) scan entries carry per-column bytes so a plan's projection cost is a sum of chunk sizes; (3) manifests record per-row-group bytes and per-column bytes at build time so plans need not open footers. The format freeze happens after these exist, so that version 2 is the frozen version.
 
+## Inference stability (2026-10-24)
+
+The dataset type a reader infers for a column is part of the format, not of the reader. Upgrading a dependency must never change the inferred type of any column that an earlier reader accepted, even when the newer library can read an embedded type hint the older one ignored. When a smarter reader becomes available, the source crate keeps the earlier mapping and the new type is added deliberately, by a dated amendment here, with a conformance vector. Found during the Phase 3 upgrade, where parquet 59 began honouring the Arrow Duration hint on INT64 columns and the INT96 unit hint, which would have broken incremental builds on existing indexes.
+
