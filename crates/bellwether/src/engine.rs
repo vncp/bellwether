@@ -320,9 +320,33 @@ impl Engine {
         Ok(self.store.get_or_init(|| store))
     }
 
+    /// The index store if this engine can write to it: it exists or can be
+    /// created, and, for a local directory, a file can be created in it.
+    /// `None` otherwise (for example a read-only folder and no `--index`).
+    pub(crate) fn writable_store(&self) -> Option<&Arc<ObjectStoreBackend>> {
+        let Ok(store) = self.store() else {
+            return None;
+        };
+        if let Some(dir) = &self.local_index {
+            let probe = dir.join(format!(".write-probe-{}", std::process::id()));
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&probe)
+            {
+                Ok(_) => {
+                    let _ = std::fs::remove_file(&probe);
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(_) => return None,
+            }
+        }
+        Some(store)
+    }
+
     /// The index store if it exists, without creating it: `None` for a local
     /// index directory that is not there yet.
-    fn existing_store(&self) -> Result<Option<&Arc<ObjectStoreBackend>>> {
+    pub(crate) fn existing_store(&self) -> Result<Option<&Arc<ObjectStoreBackend>>> {
         match &self.local_index {
             Some(dir) if self.store.get().is_none() && !dir.exists() => Ok(None),
             _ => self.store().map(Some),
@@ -418,6 +442,36 @@ impl Engine {
     /// A source over the data root, built the way the index was when one
     /// exists: its dataset schema, its fingerprint policy, and, for text, its
     /// one recorded chunk size.
+    /// The source configuration the profile folds into its footer cache key
+    /// (`ProfileOptions::source_config`), describing exactly the source
+    /// [`Engine::source`] builds: `parquet`, or the text format and its
+    /// effective chunk size.
+    pub(crate) fn source_config(&self, pinned: Option<&Pinned>) -> Result<String> {
+        let format = SourceFormat::from_kind(self.options.format.kind());
+        let chunk = match pinned {
+            Some(p) => recorded_chunk_size(p.manifest())?,
+            None => None,
+        };
+        Ok(match format {
+            SourceFormat::Parquet => "parquet".to_string(),
+            SourceFormat::Csv {
+                delimiter,
+                has_header,
+            } => format!(
+                "csv:delimiter={delimiter}:header={has_header}:chunk={}",
+                chunk
+                    .or(self.options.chunk_size)
+                    .unwrap_or(bellwether_source::DEFAULT_CHUNK_SIZE)
+            ),
+            SourceFormat::JsonLines => format!(
+                "jsonl:chunk={}",
+                chunk
+                    .or(self.options.chunk_size)
+                    .unwrap_or(bellwether_source::DEFAULT_CHUNK_SIZE)
+            ),
+        })
+    }
+
     pub(crate) fn source(&self, pinned: Option<&Pinned>) -> Result<Box<dyn Source>> {
         let (schema, policy, chunk) = match pinned {
             Some(p) => (

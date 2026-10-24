@@ -244,7 +244,12 @@ pub(crate) fn receipt(r: &ReceiptResult, out: &Out) -> String {
     s
 }
 
-// One linear screen: state, funnel, culprit, recommendation, records.
+fn quantiles(v: &[f64; 3]) -> String {
+    format!("{} / {} / {}", v[0], v[1], v[2])
+}
+
+// One linear screen: state, funnel, culprit, recommendation, fanout, lints,
+// records.
 #[allow(clippy::too_many_lines)]
 pub(crate) fn why(r: &bellwether::WhyReport, out: &Out) -> String {
     use bellwether::{CandidateOrigin, CulpritReason};
@@ -279,71 +284,139 @@ pub(crate) fn why(r: &bellwether::WhyReport, out: &Out) -> String {
         bytes: r.dataset.bytes,
     };
     let rows = format!("{} rows", num(r.dataset.rows));
-    let (Some(w), Some(current)) = (&r.workload, r.current) else {
+    if let (Some(w), Some(current)) = (&r.workload, r.current) {
+        let _ = writeln!(
+            s,
+            "funnel: {} run(s), keys p50/p95/max {}/{}/{}; exact sums of row-group statistics, summed over runs",
+            num(w.runs),
+            num(w.keys_p50_p95_max[0]),
+            num(w.keys_p50_p95_max[1]),
+            num(w.keys_p50_p95_max[2])
+        );
+        funnel_header(&mut s);
+        funnel_row(&mut s, "dataset", &dataset, &rows);
+        let current_name = if r.current_specs.is_empty() {
+            "current (no index)"
+        } else {
+            "current"
+        };
+        funnel_row(&mut s, current_name, &current, "");
+        for c in &r.candidates {
+            let mut notes = Vec::new();
+            match c.origin {
+                CandidateOrigin::Workload => notes.push("floor: only row groups holding a key"),
+                CandidateOrigin::Profile => notes.push("profile candidate"),
+            }
+            if r.recommended.as_ref().is_some_and(|x| x.spec == c.spec) {
+                notes.push("recommended");
+            }
+            funnel_row(&mut s, &label(&c.spec), &c.proposed, &notes.join(", "));
+        }
+    } else {
         let _ = writeln!(
             s,
             "funnel: no workload; pass --from <keys.parquet> to replay a run under each candidate key"
         );
         funnel_header(&mut s);
         funnel_row(&mut s, "dataset", &dataset, &rows);
-        return s;
-    };
-    let _ = writeln!(
-        s,
-        "funnel: {} run(s), keys p50/p95/max {}/{}/{}; exact sums of row-group statistics, summed over runs",
-        num(w.runs),
-        num(w.keys_p50_p95_max[0]),
-        num(w.keys_p50_p95_max[1]),
-        num(w.keys_p50_p95_max[2])
-    );
-    funnel_header(&mut s);
-    funnel_row(&mut s, "dataset", &dataset, &rows);
-    let current_name = if r.current_specs.is_empty() {
-        "current (no index)"
-    } else {
-        "current"
-    };
-    funnel_row(&mut s, current_name, &current, "");
-    for c in &r.candidates {
-        let mut notes = Vec::new();
-        if c.origin == CandidateOrigin::Workload {
-            notes.push("floor: only row groups holding a key");
-        }
-        if r.recommended.as_ref().is_some_and(|x| x.spec == c.spec) {
-            notes.push("recommended");
-        }
-        funnel_row(&mut s, &label(&c.spec), &c.proposed, &notes.join(", "));
     }
     if let Some(c) = &r.culprit {
+        let fan = c.fanout.as_ref().map_or_else(String::new, |f| {
+            format!(
+                "; one value touches {} files and {} row groups (p50 / p95 / max){}",
+                quantiles(&f.files_per_value),
+                quantiles(&f.row_groups_per_value),
+                if f.sampled { ", sampled" } else { "" }
+            )
+        });
         let why = match &c.reason {
+            CulpritReason::Lint {
+                rule, confidence, ..
+            } => format!("lint {rule} (confidence {confidence:.2})"),
             CulpritReason::NoIndexServes => {
                 "no index serves this lookup, so it reads every row group".to_string()
             }
             CulpritReason::ServingSpec { spec } => format!("the serving key {}", label(spec)),
         };
-        let _ = writeln!(s, "\nculprit ({}): {why}", c.columns.join(", "));
+        let _ = writeln!(s, "\nculprit ({}): {why}{fan}", c.columns.join(", "));
     }
-    match &r.recommended {
-        Some(rec) => {
-            let _ = writeln!(
-                s,
-                "recommended: {} reads {} bytes ({}) instead of {} ({})",
-                label(&rec.spec),
-                num(rec.proposed.bytes),
-                size(rec.proposed.bytes),
-                num(rec.current.bytes),
-                size(rec.current.bytes)
-            );
+    if let Some(w) = &r.workload {
+        match &r.recommended {
+            Some(rec) => {
+                let _ = writeln!(
+                    s,
+                    "recommended: {} reads {} bytes ({}) instead of {} ({})",
+                    label(&rec.spec),
+                    num(rec.proposed.bytes),
+                    size(rec.proposed.bytes),
+                    num(rec.current.bytes),
+                    size(rec.current.bytes)
+                );
+                let _ = writeln!(
+                    s,
+                    "  apply it: bellwether fix {} --proposal {} --workload {}",
+                    r.root, rec.proposal, w.hash
+                );
+            }
+            None => {
+                let _ = writeln!(
+                    s,
+                    "recommended: none; no candidate reads fewer bytes than the current configuration"
+                );
+            }
         }
-        None => {
+    }
+    let _ = writeln!(
+        s,
+        "\nfanout: files and row groups one value touches, p50 / p95 / max"
+    );
+    let _ = writeln!(
+        s,
+        "  {:<36} {:>12}  {:<22} {:<22} sample",
+        "key", "distinct", "files/value", "row groups/value"
+    );
+    for e in &r.profile.fanout {
+        let f = &e.fanout;
+        let _ = writeln!(
+            s,
+            "  {:<36} {:>12}  {:<22} {:<22} {}",
+            tail(&f.columns.join(", "), 36),
+            num(f.distinct),
+            quantiles(&f.files_per_value),
+            quantiles(&f.row_groups_per_value),
+            if f.sampled { "sampled" } else { "exact" }
+        );
+    }
+    if !r.profile.lints.is_empty() {
+        let _ = writeln!(s, "\nlints");
+        for l in &r.profile.lints {
             let _ = writeln!(
                 s,
-                "recommended: none; no candidate reads fewer bytes than the current configuration"
+                "  {} [{}] {:.2}\n    {}",
+                l.rule,
+                l.columns.join(", "),
+                l.confidence,
+                l.message
             );
         }
     }
     let _ = writeln!(s, "\nrecords");
-    let _ = writeln!(s, "  workload  {}", w.hash);
+    match (&r.evidence.hash, &r.evidence.note) {
+        (Some(h), _) => {
+            let _ = writeln!(s, "  evidence  {h}");
+        }
+        (None, note) => {
+            let _ = writeln!(
+                s,
+                "  evidence  not recorded: {}",
+                note.as_deref()
+                    .unwrap_or("pass a writable location with --index")
+            );
+        }
+    }
+    if let Some(w) = &r.workload {
+        let _ = writeln!(s, "  workload  {}", w.hash);
+    }
     for c in &r.candidates {
         let _ = writeln!(
             s,

@@ -43,6 +43,7 @@ pub mod spec;
 mod why;
 
 pub use bellwether_ledger::RecordKind;
+pub use bellwether_profile::ProfileReport;
 pub use bellwether_source::FingerprintPolicy;
 pub use bellwether_types as types;
 pub use bellwether_verify::Reconciliation;
@@ -57,6 +58,7 @@ pub use results::{
     ProposeResult, ReceiptResult, ReportResult, SpecState, Written,
 };
 pub use why::{
-    Candidate, CandidateOrigin, Culprit, CulpritReason, Dataset, Recommendation, WhyReport,
-    WhyRequest, WorkloadInfo, ENGINE_PROPOSER, RESERVED_PROPOSERS,
+    Candidate, CandidateOrigin, Culprit, CulpritReason, Dataset, ProfileEvidence, Recommendation,
+    WhyReport, WhyRequest, WorkloadInfo, DEFAULT_MAX_CANDIDATES, ENGINE_PROPOSER,
+    RESERVED_PROPOSERS,
 };

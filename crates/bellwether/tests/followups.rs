@@ -8,10 +8,10 @@ mod common;
 
 use std::io::{Seek, SeekFrom, Write};
 
-use bellwether::types::{KeySpec, ProposalBody};
+use bellwether::types::{KeySpec, ProposalBody, Record};
 use bellwether::{
     spec, Engine, EngineOptions, FingerprintPolicy, KeyFile, ProposeRefusal, ProposeResult,
-    WhyRequest,
+    WhyRequest, ENGINE_PROPOSER,
 };
 use common::{ledger_corpus, write_keys};
 
@@ -64,7 +64,16 @@ fn the_engines_proposer_names_are_refused() {
             ..WhyRequest::default()
         })
         .unwrap();
-    assert_eq!(w.candidates.len(), 0, "exact:id is current");
+    assert!(
+        w.candidates.iter().all(|c| c.spec.name() != "exact:id"),
+        "exact:id is current"
+    );
+    for c in &w.candidates {
+        let Record::Proposal(p) = &c.proposal.record else {
+            panic!()
+        };
+        assert_eq!(p.proposed_by, ENGINE_PROPOSER);
+    }
 }
 
 /// Under `full`, the folder check compares path, size, and mtime only. An

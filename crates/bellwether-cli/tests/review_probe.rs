@@ -147,7 +147,11 @@ fn probe_adr010_cli_json_equals_in_process_facade() {
     let out = cli(&["--json", "receipt", "show", path(&data), &receipt.to_hex()]);
     let shown = e.receipt(&receipt).unwrap();
     assert!(shown.intact);
-    assert_eq!(shown.records.len(), 4);
+    assert_eq!(
+        shown.records.len(),
+        5,
+        "the proposal's profile evidence too"
+    );
     assert_eq!(out, line(&shown));
 }
 
@@ -258,7 +262,10 @@ fn probe_why_prediction_equals_locate_on_a_bench_corpus() {
                 ..WhyRequest::default()
             })
             .unwrap();
-        assert_eq!(w.candidates.len(), 1);
+        assert_eq!(
+            w.candidates[0].origin,
+            bellwether::CandidateOrigin::Workload
+        );
         predicted.push(w.candidates[0].proposed);
     }
     e.index(&[spec::parse("exact:entity_id").unwrap()]).unwrap();

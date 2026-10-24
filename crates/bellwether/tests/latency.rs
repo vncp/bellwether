@@ -7,9 +7,12 @@
 //! test says why it skipped. CI's latency job runs it with
 //! `cargo test --release` on the corpus that job generates, `replay-small`
 //! (4 days, 64 files, 2 row groups of 2,000 rows each), which is not the
-//! pre-registered small rung. Each `why` builds a fresh source, so no footer
-//! cache carries over between calls; only the operating system's file cache
-//! is warm after the first call.
+//! pre-registered small rung. Each `why` builds a fresh source, so no
+//! source-side footer cache carries over between calls. `why` also profiles
+//! and records the profile Evidence: the first call computes the profile's
+//! footer and fanout artifacts into the index's cache and the timed calls
+//! reuse them (keyed by the files' fingerprints), as a repeated `why` over an
+//! unchanged folder does; the operating system's file cache is warm too.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 

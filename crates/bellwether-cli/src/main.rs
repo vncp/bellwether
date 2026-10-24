@@ -157,6 +157,14 @@ struct WhyArgs {
     /// A workload recorded earlier, by its hash.
     #[arg(long, value_name = "HASH", conflicts_with = "from")]
     workload: Option<String>,
+    /// Candidate key columns for the profile, comma-separated [default:
+    /// every id-like column].
+    #[arg(long, value_name = "COLS", value_delimiter = ',')]
+    columns: Option<Vec<String>>,
+    /// Most profile candidates replayed beyond the workload's own key
+    /// columns.
+    #[arg(long, value_name = "N", default_value_t = bellwether::DEFAULT_MAX_CANDIDATES)]
+    max_candidates: usize,
 }
 
 #[derive(Args)]
@@ -490,6 +498,8 @@ fn why(g: &Global, out: &Out, a: &WhyArgs) -> Result<Outcome, Failure> {
             .as_deref()
             .map(|w| hash(w, "workload"))
             .transpose()?,
+        columns: a.columns.clone(),
+        max_candidates: a.max_candidates,
     };
     let r = engine(g, &a.root.root)?.why(&request)?;
     done(&r, human::why(&r, out), EXIT_OK)

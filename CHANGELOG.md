@@ -7,6 +7,7 @@ All notable changes are documented here. The format follows Keep a Changelog; ve
 ### Added
 
 - `bellwether` (the facade, WP9): one `Engine` whose operations (`why`, `index`, `locate`, `latest`, `asof`, `propose`, `reconcile`, `fix`, `receipt`, `report`) return typed results that are the CLI's `--json` output and what the MCP server returns (ADR 010).
+- `why` profiles the data (WP5): fanout, lints, and a `profile` Evidence, recorded where the index location is writable and returned unrecorded otherwise; the profile's serving candidates join the floor, every engine Proposal cites the Evidence, and the culprit names a batch-stamp or low-selectivity lint first, with its fanout.
 - `bellwether-cli` (WP9): the `bellwether` binary over the facade, with human and `--json` output, the exit-code contract, and `bench` over the benchmark crate.
 - Repository skeleton: workspace, CI, license, contributing guide.
 - `bellwether-types`: shared records (`Evidence`, `Proposal`, `Replay`, `Certificate`, `Receipt`), `KeySpec`, `ScanPlan`, `Source` and `Store` traits, format version constants.

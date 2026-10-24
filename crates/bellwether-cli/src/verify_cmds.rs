@@ -303,7 +303,7 @@ fn fix_human(r: &FixResult, out: &Out) -> String {
                     expected,
                     committed,
                 } => format!(
-                    "another commit landed during the apply (expected sequence {expected}, got {committed}): the key is built but not attested, because the index the certificate verified is not the one that now exists. Re-run `bellwether why` with the same keys, then `bellwether fix` on its proposal, to verify and attest at the current manifest"
+                    "another commit landed during the apply (expected sequence {expected}, got {committed}). The key is built and serves lookups at sequence {committed}; no re-index is needed. It cannot be attested, and retrying will not attest it: a retry finds the key already complete (nothing_to_apply) and writes no receipt. `bellwether why` with the same keys reports the cost it now has"
                 ),
                 Refusal::DataChanged { .. } => {
                     "the data changed after the certificate was computed (its catalog digest differs), so the certificate no longer describes it; run fix again to re-verify".into()
