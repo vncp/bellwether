@@ -16,10 +16,12 @@ One crate, one owner, one interface contract each. WP0 ships first and alone. Af
 | WP8 verify | merged after four review rounds; no false pass over 12,800 chunkings |
 | WP9 facade and cli | merged: why, index, locate, latest, asof, propose, reconcile, fix, receipt, report; profile wired into `why` |
 | Dependency upgrade | merged: arrow/parquet 59, object_store 0.14, DataFusion 55 (bench feature); `deny.toml` has no advisory ignores |
-| WP12 mcp, WP20 sql | next, in that order |
+| WP12 mcp | in progress |
+| WP20 sql | next |
 | WP13 evolve | after M3 |
 | WP14 counted segments and column bytes, WP15 relational replay, WP16 engine adapters, WP17 CI receipts, WP18 transfer evaluation, WP19 signed receipts | planned 2026-10-24 (ADR 026) |
 | WP20 SQL sources | planned 2026-10-24 (ADR 027); runs right after WP12 |
+| WP21 time-series keys | in progress, concurrently with WP12 |
 
 ## WP0 · first, alone
 
@@ -68,6 +70,7 @@ One crate, one owner, one interface contract each. WP0 ships first and alone. Af
 | WP17 | `bellwether-ci` | a GitHub Action that runs `why` on a pull request's pipeline changes and posts the receipt or the refusal as a comment; the gate is the receipt hash | threat model |
 | WP18 | evaluation | transfer: the rulebook learned on one dataset applied to another and validated by replay there; the exact-versus-estimated-loss ablation at equal budget; public datasets (ClickBench slices, GH Archive, NYC taxi) beside the synthetic ledger | ADR 019, 025 |
 | WP19 | `bellwether-ledger` | signed receipts (ed25519 keys or keyless signing), so a receipt is tamper-proof rather than tamper-evident | ADR 006; threat model |
+| WP21 | time-series keys | built before storage version 2 as additive, v1-compatible changes: partition values from Hive-style paths as statistics; plans ordered by a timestamp range key; `--at-manifest` pinned lookups; per-key time bounds as a sidecar segment kind (`exact:symbol@ts`) so symbol × window prunes exactly; bitemporal `temporal2:key@valid,known` with `asof --valid --known`; a `market` bench corpus and workload; folded into storage version 2 when it lands | ADR 014, 020; format.md additive sidecar kinds |
 | WP20 | `bellwether-source-sql` | runs right after WP12: a `Source` over SQL tables per ADR 027 (ADBC for Postgres, SQLite, DuckDB, Flight SQL; ODBC for SQL Server); partitions or key ranges as the unit, identity from a version column or snapshot, statistics from the engine or one aggregate query per range, projected reads as Arrow; `reconcile` between a table and a folder of files as the headline, with the certificate naming both identities; `why` over a table with every cost labeled measured; a `MeasuredScorer` for evolve; attest-only apply; tests on SQLite and DuckDB in-process, Postgres when a server is available, SQL Server when an ODBC driver is present, each skipping with a clear message otherwise | ADR 027; contract v3 entries 10 and 21 |
 
 ## Milestones
