@@ -93,7 +93,12 @@ pub(crate) fn index(r: &IndexResult, out: &Out) -> String {
         num(r.segments_written),
         num(r.segments)
     );
-    let _ = writeln!(s, "\n  {:<40} {:>14}", "key spec", "complete at");
+    let heading = if r.sidecars.is_empty() {
+        "key spec"
+    } else {
+        "key spec or sidecar"
+    };
+    let _ = writeln!(s, "\n  {heading:<40} {:>14}", "complete at");
     for spec in &r.specs {
         let at = spec
             .complete_at
