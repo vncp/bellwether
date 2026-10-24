@@ -248,7 +248,7 @@ Twelve crates, dependencies pointing one way, enforced by a script in CI. The CL
 
 On disk: immutable `segments/` named by content hash, one `manifest.json` advanced by conditional PUT with a sequence number, an append-only `ledger/` of hash-named records, and a rebuildable `cache/`.
 
-Deeper: [glossary](docs/glossary.md) · [architecture](docs/architecture.md) · [invariants and their tests](docs/invariants.md) · [threat model](docs/threat-model.md) · [on-disk format](docs/format.md) · [decision records](docs/adr/) · [rule catalog](docs/rule-catalog.md) · [agent loop](docs/agent-loop.md) · [benchmark methodology](docs/benchmark.md) · [work packages](docs/work-packages.md)
+Deeper: [glossary](docs/glossary.md) · [adding an index kind](docs/adding-an-index-kind.md) · [architecture](docs/architecture.md) · [invariants and their tests](docs/invariants.md) · [threat model](docs/threat-model.md) · [on-disk format](docs/format.md) · [decision records](docs/adr/) · [rule catalog](docs/rule-catalog.md) · [agent loop](docs/agent-loop.md) · [benchmark methodology](docs/benchmark.md) · [work packages](docs/work-packages.md)
 
 ## Where it came from
 
