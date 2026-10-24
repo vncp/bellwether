@@ -142,10 +142,21 @@ pub(crate) fn spec_types(
         .map(|c| lookup(c))
         .collect::<Result<Vec<_>>>()?;
     let ts = match spec {
-        KeySpec::Temporal { ts_column, .. } => {
+        KeySpec::Temporal { ts_column, .. } | KeySpec::Bounds { ts_column, .. } => {
             let dt = lookup(ts_column)?;
             encoding::check_ts_type(&dt)?;
             Some(dt)
+        }
+        KeySpec::Temporal2 {
+            valid_column,
+            known_column,
+            ..
+        } => {
+            let vt = lookup(valid_column)?;
+            encoding::check_ts_type(&vt)?;
+            let kt = lookup(known_column)?;
+            encoding::check_ts_type(&kt)?;
+            Some(vt)
         }
         _ => None,
     };
@@ -173,6 +184,7 @@ pub(crate) fn measure(
     let kc = KeyColumns::new(&cols, keys)?;
     let ts_col = match (spec, ts) {
         (KeySpec::Temporal { ts_column, .. }, Some(dt)) => Some((column(ts_column)?, dt)),
+        (KeySpec::Temporal2 { valid_column, .. }, Some(dt)) => Some((column(valid_column)?, dt)),
         _ => None,
     };
     let mut buf = Vec::new();
@@ -205,6 +217,7 @@ pub(crate) fn measure(
             bytes += match spec {
                 KeySpec::Bloom { .. } => 8,
                 KeySpec::Temporal { .. } => key_len + 8,
+                KeySpec::Bounds { .. } | KeySpec::Temporal2 { .. } => key_len + 16,
                 _ => key_len,
             };
         }
@@ -231,10 +244,25 @@ impl TransientIndex {
         let schema = catalog.schema();
         let (key_types, ts_type) = spec_types(spec, schema)?;
         let mut columns: Vec<String> = spec.columns().to_vec();
-        if let KeySpec::Temporal { ts_column, .. } = spec {
-            if !columns.contains(ts_column) {
-                columns.push(ts_column.clone());
+        match spec {
+            KeySpec::Temporal { ts_column, .. } | KeySpec::Bounds { ts_column, .. } => {
+                if !columns.contains(ts_column) {
+                    columns.push(ts_column.clone());
+                }
             }
+            KeySpec::Temporal2 {
+                valid_column,
+                known_column,
+                ..
+            } => {
+                if !columns.contains(valid_column) {
+                    columns.push(valid_column.clone());
+                }
+                if !columns.contains(known_column) {
+                    columns.push(known_column.clone());
+                }
+            }
+            _ => {}
         }
         let opts = WriterOptions::default();
         let mut build = Build {

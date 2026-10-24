@@ -494,3 +494,211 @@ fn pinned_lookup_at_manifest_returns_earlier_plan_byte_for_byte_and_refuses_gc_r
         "expected refusal naming oldest available sequence 2, got: {err}"
     );
 }
+
+#[test]
+fn bounds_sidecar_and_lookback_windows_prune_against_decoded_oracle() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    std::fs::create_dir_all(&data).unwrap();
+    // Write 3 row groups in part-0.parquet and 1 row group in part-1.parquet.
+    // Key 1 has rows straddling row groups 0 and 1 (ts 100..=150 in rg 0, ts 160..=200 in rg 1),
+    // and a sentinel timestamp (year 9999 in microseconds: 253_402_300_799_000_000) in rg 2.
+    // Key 2 has rows in rg 0 at ts 500 (so rg 0's global ts range is 100..=500, overlapping 400..=600,
+    // even though key 1's own range in rg 0 is only 100..=150!).
+    let sentinel_ts = 253_402_300_799_000_000i64;
+    common::write_file(
+        &data.join("part-0.parquet"),
+        &[
+            vec![
+                (1, 0, Some(100), "k1-rg0-a".into()),
+                (1, 0, Some(150), "k1-rg0-b".into()),
+                (2, 0, Some(500), "k2-rg0".into()),
+            ],
+            vec![
+                (1, 0, Some(160), "k1-rg1-a".into()),
+                (1, 0, Some(200), "k1-rg1-b".into()),
+            ],
+            vec![(1, 0, Some(sentinel_ts), "k1-sentinel".into())],
+        ],
+    );
+    common::write_file(
+        &data.join("part-1.parquet"),
+        &[vec![(1, 0, Some(450), "k1-p1-rg0".into())]],
+    );
+    write_keys(&dir.path().join("k1.parquet"), "id", &[1]);
+    let kf1 = KeyFile::new(dir.path().join("k1.parquet"));
+
+    let e = open(&data);
+    // Index exact:id@ts (which writes both exact:id and bounds:id) and range:ts.
+    let specs = [
+        spec::parse_many("exact:id@ts").unwrap(),
+        vec![spec::parse("range:ts").unwrap()],
+    ]
+    .concat();
+    e.index(&specs).unwrap();
+
+    // Query window 400..600 for key 1:
+    // - rg 0 of part-0 has global ts 100..=500 (because of key 2 at 500), so `range:ts` alone
+    //   could NOT prune rg 0 of part-0!
+    // - `bounds:id` knows key 1's own ts range in rg 0 of part-0 is 100..=150, which does NOT
+    //   overlap 400..=600, so rg 0 of part-0 is pruned!
+    // - Only rg 0 of part-1 (where key 1 has ts 450) is planned.
+    let res = e.locate_window(&kf1, "400..600").unwrap();
+    assert_eq!(res.planned.files, 1);
+    assert_eq!(res.planned.row_groups, 1);
+    assert_eq!(
+        planned(&res.evidence),
+        BTreeSet::from([("part-1.parquet".to_string(), 0usize)])
+    );
+
+    // Query window 140..170 for key 1 (straddling rg 0 and rg 1 of part-0):
+    let res_straddle = e.locate_window(&kf1, "140..170").unwrap();
+    assert_eq!(
+        planned(&res_straddle.evidence),
+        BTreeSet::from([
+            ("part-0.parquet".to_string(), 0usize),
+            ("part-0.parquet".to_string(), 1usize),
+        ])
+    );
+
+    // Query sentinel window for key 1:
+    let res_sentinel = e
+        .locate_window(&kf1, &format!("{sentinel_ts}..{sentinel_ts}"))
+        .unwrap();
+    assert_eq!(
+        planned(&res_sentinel.evidence),
+        BTreeSet::from([("part-0.parquet".to_string(), 2usize)])
+    );
+}
+
+#[test]
+fn bitemporal_temporal2_handles_restatements_and_late_arriving_rows_against_oracle() {
+    use std::sync::Arc;
+    use arrow::array::{ArrayRef, Int64Array, RecordBatch, StringArray, TimestampMicrosecondArray};
+    use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
+    use parquet::arrow::ArrowWriter;
+
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("bitemporal");
+    std::fs::create_dir_all(&data).unwrap();
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new(
+            "valid_ts",
+            DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+            true,
+        ),
+        Field::new(
+            "known_ts",
+            DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+            true,
+        ),
+        Field::new("val", DataType::Utf8, false),
+    ]));
+    let write_bi = |path: &std::path::Path,
+                    rows: &[(i64, Option<i64>, Option<i64>, &str)]| {
+        let b = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from(
+                    rows.iter().map(|r| r.0).collect::<Vec<_>>(),
+                )) as ArrayRef,
+                Arc::new(
+                    TimestampMicrosecondArray::from(
+                        rows.iter().map(|r| r.1).collect::<Vec<_>>(),
+                    )
+                    .with_timezone("UTC"),
+                ),
+                Arc::new(
+                    TimestampMicrosecondArray::from(
+                        rows.iter().map(|r| r.2).collect::<Vec<_>>(),
+                    )
+                    .with_timezone("UTC"),
+                ),
+                Arc::new(StringArray::from(
+                    rows.iter().map(|r| r.3).collect::<Vec<_>>(),
+                )),
+            ],
+        )
+        .unwrap();
+        let mut w =
+            ArrowWriter::try_new(std::fs::File::create(path).unwrap(), Arc::clone(&schema), None)
+                .unwrap();
+        w.write(&b).unwrap();
+        w.close().unwrap();
+    };
+
+    // File 0 (initial prints):
+    //   id=1, valid=100, known=105 ("v100-initial")
+    //   id=1, valid=200, known=205 ("v200-initial")
+    // File 1 (restatement of valid=200 known at 300, plus a late print for valid=150 known at 250,
+    //         plus null-clock rows that must never win):
+    //   id=1, valid=200, known=300 ("v200-restated")
+    //   id=1, valid=150, known=250 ("v150-late")
+    //   id=1, valid=None, known=Some(110) ("null-valid")
+    //   id=1, valid=Some(210), known=None ("null-known")
+    write_bi(
+        &data.join("part-0.parquet"),
+        &[
+            (1, Some(100), Some(105), "v100-initial"),
+            (1, Some(200), Some(205), "v200-initial"),
+        ],
+    );
+    write_bi(
+        &data.join("part-1.parquet"),
+        &[
+            (1, Some(200), Some(300), "v200-restated"),
+            (1, Some(150), Some(250), "v150-late"),
+            (1, None, Some(110), "null-valid"),
+            (1, Some(210), None, "null-known"),
+        ],
+    );
+    write_keys(&dir.path().join("k1.parquet"), "id", &[1]);
+    let kf1 = KeyFile::new(dir.path().join("k1.parquet"));
+
+    let e = open(&data);
+    e.index(&[spec::parse("temporal2:id@valid_ts,known_ts").unwrap()])
+        .unwrap();
+
+    // 1. At valid=180, known=220: the late print (valid=150, known=250) was NOT known yet at 220!
+    //    So the winner at (valid<=180, known<=220) is valid=100, known=105 in part-0.parquet.
+    let r1 = e
+        .asof_with(&kf1, None, Some("180"), Some("220"), None)
+        .unwrap();
+    assert_eq!(
+        planned(&r1.evidence),
+        BTreeSet::from([("part-0.parquet".to_string(), 0usize)])
+    );
+
+    // 2. At valid=180, known=260: now the late print (valid=150, known=250) IS known, and 150 > 100!
+    //    So the winner is valid=150, known=250 in part-1.parquet.
+    let r2 = e
+        .asof_with(&kf1, None, Some("180"), Some("260"), None)
+        .unwrap();
+    assert_eq!(
+        planned(&r2.evidence),
+        BTreeSet::from([("part-1.parquet".to_string(), 0usize)])
+    );
+
+    // 3. At valid=250, known=260: valid=210 has known=None (null never wins), and valid=200 has
+    //    known=205 in part-0 (<=260) and known=300 in part-1 (>260), so only part-0 is planned.
+    let r3 = e
+        .asof_with(&kf1, None, Some("250"), Some("260"), None)
+        .unwrap();
+    assert_eq!(
+        planned(&r3.evidence),
+        BTreeSet::from([("part-0.parquet".to_string(), 0usize)])
+    );
+
+    // 4. `latest --known 350`: valid=200 is the newest valid time with known<=350, and both
+    //    part-0 (known=205) and part-1 (known=300) hold valid=200 with known<=350 (ties on valid
+    //    are kept so consumer can pick the restatement).
+    let r4 = e.latest_with(&kf1, Some("350"), None).unwrap();
+    assert_eq!(
+        planned(&r4.evidence),
+        BTreeSet::from([
+            ("part-0.parquet".to_string(), 0usize),
+            ("part-1.parquet".to_string(), 0usize),
+        ])
+    );
+}

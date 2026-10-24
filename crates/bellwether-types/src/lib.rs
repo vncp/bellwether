@@ -359,6 +359,24 @@ pub enum KeySpec {
         /// Timestamp column that orders versions. Nulls rank last (ADR 014).
         ts_column: String,
     },
+    /// Per-key, per-row-group `[min_ts, max_ts]` sidecar segment written
+    /// beside an `Exact` or `Bloom` spec that names `ts_column`.
+    Bounds {
+        /// Key columns in prefix order.
+        columns: Vec<String>,
+        /// Timestamp column whose `[min, max]` per key per row group is stored.
+        ts_column: String,
+    },
+    /// Bitemporal version chain per key over `(valid_column, known_column)`
+    /// (`temporal2:key@valid,known`).
+    Temporal2 {
+        /// Key columns in prefix order.
+        columns: Vec<String>,
+        /// Valid-time column. Nulls never win (ADR 014).
+        valid_column: String,
+        /// Known-time column. Nulls never win (ADR 014).
+        known_column: String,
+    },
 }
 
 impl KeySpec {
@@ -368,7 +386,9 @@ impl KeySpec {
         match self {
             Self::Exact { columns }
             | Self::Bloom { columns, .. }
-            | Self::Temporal { columns, .. } => columns,
+            | Self::Temporal { columns, .. }
+            | Self::Bounds { columns, .. }
+            | Self::Temporal2 { columns, .. } => columns,
             Self::Range { column } => std::slice::from_ref(column),
         }
     }
@@ -381,6 +401,8 @@ impl KeySpec {
             Self::Bloom { .. } => "bloom",
             Self::Range { .. } => "range",
             Self::Temporal { .. } => "temporal",
+            Self::Bounds { .. } => "bounds",
+            Self::Temporal2 { .. } => "temporal2",
         };
         format!("{kind}:{}", self.columns().join(","))
     }

@@ -31,6 +31,66 @@ pub fn parse(s: &str) -> Result<KeySpec> {
     Ok(spec)
 }
 
+/// Parses a spec argument that may expand into a primary spec plus its
+/// `bounds` sidecar (`exact:symbol@ts` -> `[Exact { [symbol] }, Bounds { [symbol], ts }]`,
+/// `bloom:symbol@0.01@ts` -> `[Bloom { [symbol], 0.01 }, Bounds { [symbol], ts }]`).
+pub fn parse_many(s: &str) -> Result<Vec<KeySpec>> {
+    let s = s.trim();
+    if !s.starts_with('{') {
+        if let Some((kind, rest)) = s.split_once(':') {
+            let kind = kind.trim();
+            if kind == "exact" {
+                if let Some((cols, ts)) = rest.split_once('@') {
+                    let ts = ts.trim();
+                    if ts.is_empty() || ts.contains('@') {
+                        return Err(bad(
+                            s,
+                            "an exact spec with time bounds needs a timestamp column after '@', exact:symbol@ts",
+                        ));
+                    }
+                    let c = columns(s, cols)?;
+                    let exact = KeySpec::Exact { columns: c.clone() };
+                    let bounds = KeySpec::Bounds {
+                        columns: c,
+                        ts_column: ts.to_string(),
+                    };
+                    check(&exact)?;
+                    check(&bounds)?;
+                    return Ok(vec![exact, bounds]);
+                }
+            } else if kind == "bloom" {
+                if let Some((cols, after_first_at)) = rest.split_once('@') {
+                    if let Some((fpr_str, ts)) = after_first_at.split_once('@') {
+                        let fpr: f64 = fpr_str.trim().parse().map_err(|_| {
+                            bad(s, "the false-positive rate after '@' is not a number")
+                        })?;
+                        let ts = ts.trim();
+                        if ts.is_empty() || ts.contains('@') {
+                            return Err(bad(
+                                s,
+                                "a bloom spec with time bounds needs a timestamp column after the second '@', bloom:symbol@0.01@ts",
+                            ));
+                        }
+                        let c = columns(s, cols)?;
+                        let bloom = KeySpec::Bloom {
+                            columns: c.clone(),
+                            fpr,
+                        };
+                        let bounds = KeySpec::Bounds {
+                            columns: c,
+                            ts_column: ts.to_string(),
+                        };
+                        check(&bloom)?;
+                        check(&bounds)?;
+                        return Ok(vec![bloom, bounds]);
+                    }
+                }
+            }
+        }
+    }
+    Ok(vec![parse(s)?])
+}
+
 /// Core's spec rules plus the facade's: no column listed twice (a lookup
 /// lists each column once, so such a spec could never serve one).
 pub fn check(spec: &KeySpec) -> Result<()> {
@@ -74,6 +134,22 @@ fn parse_short(s: &str) -> Result<KeySpec> {
         ("exact", None) => Ok(KeySpec::Exact {
             columns: columns(s, cols)?,
         }),
+        ("exact", Some(ts)) if !ts.is_empty() && !ts.contains('@') => Ok(KeySpec::Bounds {
+            columns: columns(s, cols)?,
+            ts_column: ts.to_string(),
+        }),
+        ("exact", Some(_)) => Err(bad(
+            s,
+            "an exact spec with time bounds needs a timestamp column after '@', exact:symbol@ts",
+        )),
+        ("bounds", Some(ts)) if !ts.is_empty() && !ts.contains('@') => Ok(KeySpec::Bounds {
+            columns: columns(s, cols)?,
+            ts_column: ts.to_string(),
+        }),
+        ("bounds", _) => Err(bad(
+            s,
+            "a bounds spec needs a timestamp column, bounds:symbol@ts",
+        )),
         ("bloom", Some(fpr)) => {
             let fpr: f64 = fpr
                 .parse()
@@ -104,7 +180,37 @@ fn parse_short(s: &str) -> Result<KeySpec> {
             s,
             "a temporal spec needs a timestamp column, temporal:id@ts",
         )),
-        ("exact" | "range", Some(_)) => Err(bad(s, "only bloom and temporal take '@'")),
+        ("temporal2", Some(clocks)) => {
+            let Some((valid, known)) = clocks.split_once(',') else {
+                return Err(bad(
+                    s,
+                    "a temporal2 spec needs valid and known columns after '@', temporal2:key@valid,known",
+                ));
+            };
+            let (valid, known) = (valid.trim(), known.trim());
+            if valid.is_empty() || known.is_empty() || known.contains(',') {
+                return Err(bad(
+                    s,
+                    "a temporal2 spec needs exactly two clock columns after '@', temporal2:key@valid,known",
+                ));
+            }
+            if valid == known {
+                return Err(bad(
+                    s,
+                    "temporal2 valid and known columns must be distinct",
+                ));
+            }
+            Ok(KeySpec::Temporal2 {
+                columns: columns(s, cols)?,
+                valid_column: valid.to_string(),
+                known_column: known.to_string(),
+            })
+        }
+        ("temporal2", None) => Err(bad(
+            s,
+            "a temporal2 spec needs valid and known columns, temporal2:key@valid,known",
+        )),
+        ("range", Some(_)) => Err(bad(s, "range does not take '@'")),
         (other, _) => Err(bad(s, &format!("unknown kind {other:?}"))),
     }
 }
@@ -118,6 +224,19 @@ pub fn label(spec: &KeySpec) -> String {
         KeySpec::Range { column } => format!("range:{column}"),
         KeySpec::Temporal { columns, ts_column } => {
             format!("temporal:{}@{ts_column}", columns.join(","))
+        }
+        KeySpec::Bounds { columns, ts_column } => {
+            format!("bounds:{}@{ts_column}", columns.join(","))
+        }
+        KeySpec::Temporal2 {
+            columns,
+            valid_column,
+            known_column,
+        } => {
+            format!(
+                "temporal2:{}@{valid_column},{known_column}",
+                columns.join(",")
+            )
         }
     }
 }
@@ -152,7 +271,7 @@ mod tests {
             "exact",
             "exact:",
             "exact:a,,b",
-            "exact:a@ts",
+            "exact:a@",
             "bloom:a",
             "bloom:a@x",
             "bloom:a@1.5",

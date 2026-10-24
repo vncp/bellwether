@@ -108,6 +108,7 @@ pub struct Replayer<'a> {
     policy: FingerprintPolicy,
     limits: TransientLimits,
     cache: TransientCache,
+    window: Option<(String, i64, i64)>,
 }
 
 impl std::fmt::Debug for Replayer<'_> {
@@ -154,6 +155,7 @@ impl<'a> Replayer<'a> {
             policy: FingerprintPolicy::default(),
             limits: TransientLimits::default(),
             cache: TransientCache::new(DEFAULT_CACHE_BYTES),
+            window: None,
         })
     }
 
@@ -235,6 +237,14 @@ impl<'a> Replayer<'a> {
         self
     }
 
+    /// Sets a time window `(ts_column, lo, hi)` (in `ts_column`'s dataset unit)
+    /// that every run's key lookup is intersected with.
+    #[must_use]
+    pub fn with_window(mut self, ts_column: String, lo: i64, hi: i64) -> Self {
+        self.window = Some((ts_column, lo, hi));
+        self
+    }
+
     /// The manifest sequence every replay is pinned to, as a string.
     #[must_use]
     pub fn manifest_version(&self) -> String {
@@ -295,6 +305,20 @@ impl<'a> Replayer<'a> {
         keys: &RunKeys,
     ) -> Result<ScanPlan> {
         check_types(&self.catalog, keys)?;
+        if let Some((ts_col, lo, hi)) = &self.window {
+            let serving: Vec<KeySpec> = specs
+                .iter()
+                .filter(|s| {
+                    servable(s, keys.columns()).is_some()
+                        || matches!(s, KeySpec::Range { column } if column == ts_col)
+                        || s.columns().first().is_some_and(|c| c == ts_col)
+                })
+                .cloned()
+                .collect();
+            let plan = planner.plan_in_window(&serving, keys, ts_col, *lo, *hi)?;
+            self.catalog.verify_plan(&plan)?;
+            return Ok(plan);
+        }
         let serving: Vec<KeySpec> = specs
             .iter()
             .filter(|s| servable(s, keys.columns()).is_some())
@@ -400,11 +424,13 @@ impl<'a> Replayer<'a> {
         let (proposed, layout) = match body {
             ProposalBody::Key { spec } => {
                 validate_spec(spec)?;
-                if !workload
-                    .runs()
-                    .iter()
-                    .any(|r| servable(spec, &r.columns).is_some())
-                {
+                if !workload.runs().iter().any(|r| {
+                    servable(spec, &r.columns).is_some()
+                        || self.window.as_ref().is_some_and(|(ts_col, _, _)| {
+                            matches!(spec, KeySpec::Range { column } if column == ts_col)
+                                || spec.columns().first().is_some_and(|c| c == ts_col)
+                        })
+                }) {
                     return Err(ReplayError::SpecServesNoRun {
                         spec: spec.name(),
                         run_columns: distinct_columns(workload),

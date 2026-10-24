@@ -428,6 +428,24 @@ impl Manifest {
             self.segments.push(seg);
         }
     }
+    /// Segment kinds (`key_spec` prefixes before `:`) referenced in `segments`
+    /// that this build does not know. Storage version 1 allows additive
+    /// sidecar segment kinds; readers that do not know a segment kind ignore
+    /// those segments and can still report the unknown kinds here.
+    #[must_use]
+    pub fn unknown_segment_kinds(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        for seg in &self.segments {
+            let kind = seg
+                .key_spec
+                .split_once(':')
+                .map_or(seg.key_spec.as_str(), |(k, _)| k);
+            if key_spec_fields(kind).is_none() && !out.iter().any(|x| x == kind) {
+                out.push(kind.to_string());
+            }
+        }
+        out
+    }
 }
 
 /// `what` of the [`Error::UnsupportedVersion`] for a newer `storage_version`.
@@ -444,7 +462,8 @@ fn key_spec_fields(kind: &str) -> Option<&'static [&'static str]> {
         "exact" => Some(&["kind", "columns"]),
         "bloom" => Some(&["kind", "columns", "fpr"]),
         "range" => Some(&["kind", "column"]),
-        "temporal" => Some(&["kind", "columns", "ts_column"]),
+        "temporal" | "bounds" => Some(&["kind", "columns", "ts_column"]),
+        "temporal2" => Some(&["kind", "columns", "valid_column", "known_column"]),
         _ => None,
     }
 }
@@ -619,6 +638,15 @@ mod tests {
                 columns: vec!["a".into()],
                 ts_column: "t".into(),
             },
+            KeySpec::Bounds {
+                columns: vec!["a".into()],
+                ts_column: "t".into(),
+            },
+            KeySpec::Temporal2 {
+                columns: vec!["a".into()],
+                valid_column: "v".into(),
+                known_column: "k".into(),
+            },
         ];
         let mut kinds_seen = BTreeSet::new();
         for spec in &specs {
@@ -627,7 +655,9 @@ mod tests {
                 KeySpec::Exact { .. }
                 | KeySpec::Bloom { .. }
                 | KeySpec::Range { .. }
-                | KeySpec::Temporal { .. } => {}
+                | KeySpec::Temporal { .. }
+                | KeySpec::Bounds { .. }
+                | KeySpec::Temporal2 { .. } => {}
             }
             let v = serde_json::to_value(spec).unwrap();
             let kind = v["kind"].as_str().unwrap().to_string();
@@ -675,6 +705,34 @@ mod tests {
                   "path": "a", "size": 1, "etag": null, "mtime_ns": 5,
                   "tail_blake3": "0000000000000000000000000000000000000000000000000000000000000000"}}]}}"#,
         );
+    }
+
+    #[test]
+    fn manifest_listing_unknown_segment_kind_still_opens_and_reports_it() {
+        let json = r#"{
+            "storage_version": 1,
+            "sequence": 1,
+            "created_at": "2026-10-25T00:00:00.000Z",
+            "committed_at": "2026-10-25T00:00:00.000Z",
+            "schema": {"key_specs": [{"kind": "exact", "columns": ["symbol"]}]},
+            "segments": [
+                {
+                    "id": "1111111111111111111111111111111111111111111111111111111111111111",
+                    "key_spec": "exact:symbol",
+                    "rowgroup_range": {"start": 0, "end": 1},
+                    "bytes": 100
+                },
+                {
+                    "id": "2222222222222222222222222222222222222222222222222222222222222222",
+                    "key_spec": "future_sidecar:symbol",
+                    "rowgroup_range": {"start": 0, "end": 1},
+                    "bytes": 64
+                }
+            ]
+        }"#;
+        let m = Manifest::from_slice(json.as_bytes()).unwrap();
+        assert_eq!(m.segments.len(), 2);
+        assert_eq!(m.unknown_segment_kinds(), vec!["future_sidecar".to_string()]);
     }
 
     #[test]

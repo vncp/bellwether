@@ -53,6 +53,15 @@ pub struct WhyRequest {
     /// Optional manifest sequence to pin `why` against (`--at-manifest`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub at_manifest: Option<u64>,
+    /// Optional time window `A..B` (`--window`) to intersect with the workload.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub window: Option<String>,
+    /// Optional upper instant `T` (`--at`) for a lookback window.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub at: Option<String>,
+    /// Optional lookback duration (`--lookback`, e.g. `252d`) for `[T - N, T]`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lookback: Option<String>,
     /// Most profile candidates replayed beyond the workload's own key
     /// columns.
     pub max_candidates: usize,
@@ -66,6 +75,9 @@ impl Default for WhyRequest {
             workload: None,
             columns: None,
             at_manifest: None,
+            window: None,
+            at: None,
+            lookback: None,
             max_candidates: DEFAULT_MAX_CANDIDATES,
         }
     }
@@ -292,7 +304,7 @@ impl Engine {
         let source = self.source(pinned.as_ref())?;
         let sequence = pinned.as_ref().map_or(0, Pinned::sequence);
         let current_specs = pinned.as_ref().map(|p| p.specs().0).unwrap_or_default();
-        let replayer = match &pinned {
+        let mut replayer = match &pinned {
             Some(p) => Replayer::for_snapshot(&*source, &p.snapshot)?,
             None => Replayer::unindexed_with_template(
                 &*source,
@@ -300,6 +312,10 @@ impl Engine {
                 self.effective_path_template(None)?,
             )?,
         };
+        let resolved_window = self.resolve_why_window(req, &replayer, &current_specs)?;
+        if let Some((ref ts_col, lo, hi)) = resolved_window {
+            replayer = replayer.with_window(ts_col.clone(), lo, hi);
+        }
         let catalog = replayer.catalog();
         let mut dataset = Dataset {
             files: catalog.files().len() as u64,
@@ -338,6 +354,7 @@ impl Engine {
             recommended: None,
             culprit: None,
         };
+        let _ = resolved_window;
         let workload = if has_workload {
             let cache = self.cache()?;
             let workload = self.record_workload(req, &replayer, &cache)?;
@@ -529,10 +546,30 @@ impl Engine {
         let serves = |spec: &KeySpec| run_columns.iter().any(|c| servable(spec, c).is_some());
         let mut chosen: Vec<(KeySpec, CandidateOrigin)> = Vec::new();
         let mut names = BTreeSet::new();
+        let win_ts_col = self
+            .resolve_why_window(req, replayer, &report.current_specs)?
+            .map(|(col, _, _)| col);
         for c in &run_columns {
             let spec = KeySpec::Exact { columns: c.clone() };
             if !current_names.contains(&spec.name()) && names.insert(spec.name()) {
                 chosen.push((spec, CandidateOrigin::Workload));
+            }
+            if let Some(ref ts_col) = win_ts_col {
+                let bspec = KeySpec::Bounds {
+                    columns: c.clone(),
+                    ts_column: ts_col.clone(),
+                };
+                if !current_names.contains(&bspec.name()) && names.insert(bspec.name()) {
+                    chosen.push((bspec, CandidateOrigin::Workload));
+                }
+            }
+        }
+        if let Some(ref ts_col) = win_ts_col {
+            let rspec = KeySpec::Range {
+                column: ts_col.clone(),
+            };
+            if !current_names.contains(&rspec.name()) && names.insert(rspec.name()) {
+                chosen.push((rspec, CandidateOrigin::Workload));
             }
         }
         let mut from_profile = 0usize;
@@ -605,6 +642,71 @@ impl Engine {
                 proposed: c.proposed,
             });
         Ok(())
+    }
+
+    fn resolve_why_window(
+        &self,
+        req: &WhyRequest,
+        replayer: &Replayer<'_>,
+        current_specs: &[KeySpec],
+    ) -> Result<Option<(String, i64, i64)>> {
+        if req.window.is_none() && req.lookback.is_none() {
+            return Ok(None);
+        }
+        if req.window.is_some() && req.lookback.is_some() {
+            return Err(Error::KeySpec(
+                "why takes either --window or --lookback, not both".into(),
+            ));
+        }
+        let schema = replayer.schema();
+        let dummy_manifest = bellwether_store::Manifest::default();
+        let (ts_column, ts_type) = crate::index::resolve_window_ts_column(
+            current_specs,
+            schema,
+            &[],
+            &dummy_manifest,
+        )?;
+        if let Some(win) = &req.window {
+            let (lo_str, hi_str) = win.split_once("..").ok_or_else(|| {
+                Error::KeySpec(format!(
+                    "--window {win:?} must be written as A..B (inclusive bounds)"
+                ))
+            })?;
+            let hi_str = hi_str.strip_prefix('=').unwrap_or(hi_str);
+            let lo = crate::index::instant_in_unit(lo_str, &ts_column, &ts_type)?;
+            let hi = crate::index::instant_in_unit(hi_str, &ts_column, &ts_type)?;
+            return Ok(Some((ts_column, lo, hi)));
+        }
+        if let Some(lb) = &req.lookback {
+            let delta = crate::index::parse_lookback(lb, &ts_column, &ts_type)?;
+            let hi = if let Some(at) = &req.at {
+                crate::index::instant_in_unit(at, &ts_column, &ts_type)?
+            } else {
+                let mut max_enc: Option<Vec<u8>> = None;
+                for rg in replayer.catalog().row_groups() {
+                    if let Some(st) = rg.meta.stats.iter().find(|s| s.column == ts_column) {
+                        if let Some(m) = &st.max {
+                            if max_enc.as_ref().is_none_or(|cur| m > cur) {
+                                max_enc = Some(m.clone());
+                            }
+                        }
+                    }
+                }
+                let enc = max_enc.ok_or_else(|| {
+                    Error::KeySpec(format!(
+                        "cannot determine latest timestamp for {ts_column:?} from dataset statistics"
+                    ))
+                })?;
+                crate::index::decode_ts_from_canonical(&enc, &ts_type).ok_or_else(|| {
+                    Error::KeySpec(format!(
+                        "cannot decode maximum timestamp of {ts_column:?} ({ts_type})"
+                    ))
+                })?
+            };
+            let lo = hi.saturating_sub(delta);
+            return Ok(Some((ts_column, lo, hi)));
+        }
+        Ok(None)
     }
 }
 

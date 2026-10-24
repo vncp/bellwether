@@ -110,6 +110,25 @@ pub(crate) fn plan(r: &PlanResult, out: &Out) -> String {
         LookupKind::Locate => "locate".to_string(),
         LookupKind::Latest => "latest".to_string(),
         LookupKind::Asof { at, ts, ts_column } => format!("asof {at} ({ts_column} = {ts})"),
+        LookupKind::Window {
+            window,
+            lo,
+            hi,
+            ts_column,
+        } => format!("window {window} ({ts_column} in {lo}..={hi})"),
+        LookupKind::Bitemporal {
+            valid,
+            valid_ts,
+            known,
+            known_ts,
+            valid_column,
+            known_column,
+        } => match (valid, valid_ts) {
+            (Some(v), Some(vt)) => format!(
+                "asof valid {v} ({valid_column} <= {vt}) known {known} ({known_column} <= {known_ts})"
+            ),
+            _ => format!("latest known {known} ({known_column} <= {known_ts})"),
+        },
     };
     let _ = writeln!(
         s,

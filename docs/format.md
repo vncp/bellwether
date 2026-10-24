@@ -163,6 +163,18 @@ Both the core encoder and any source-side stats encoder must reproduce these byt
 
 Additional vectors (decimal rescale, Decimal256, floats including the canonical NaN) are appended by the conformance test as they are agreed, never by one side alone.
 
+## Storage version 1, additive sidecar kinds (WP21)
+
+Built before storage version 2 as additive, version-1-compatible segment kinds (`bounds` and `temporal2`), and folded into storage version 2 when it lands:
+
+- **`bounds` sidecar** (`KeySpec::Bounds { columns, ts_column }`, CLI `--key exact:symbol@ts` or `bounds:symbol@ts`): written beside an exact or bloom spec when a timestamp column is named. Uses the keyed block layout (`layout: "keyed_bounds"`), header `key_types` plus `ts_type`. Each key's value record is its length-prefixed roaring bitmap (no-run cookie `3a 30 00 00`) followed by `KeyBounds`: `count u32` (little-endian), then `count` × `(rg u32, min_ts i64, max_ts i64)` (little-endian, ascending by `rg`, `min_ts <= max_ts`), giving the exact `[min_ts, max_ts]` of `ts_column` for that key's non-null rows in each row group. Readers that do not know a segment kind in `manifest.segments` ignore it (`Manifest::unknown_segment_kinds` reports any unrecognized segment kind). Storage version 2 folds per-key bounds into the primary segment.
+- **`temporal2` bitemporal** (`KeySpec::Temporal2 { columns, valid_column, known_column }`, CLI `--key temporal2:key@valid,known`): keyed block layout (`layout: "keyed_temporal2"`), header `key_types`, `ts_type` (valid clock), and `known_ts_type` (known clock). Each key's value record is its length-prefixed roaring bitmap followed by `BitemporalChain`: `count u32` (little-endian), then `count` × `(valid i64, known i64, rg u32)` (little-endian, strictly ascending). Nulls in either clock never enter the chain (ADR 014).
+
+| Sidecar payload | Bytes (hex) |
+|---|---|
+| `KeyBounds[(rg=3, min=100, max=250)]` | `01 00 00 00 03 00 00 00 64 00 00 00 00 00 00 00 fa 00 00 00 00 00 00 00` |
+| `BitemporalChain[(valid=10, known=20, rg=1)]` | `01 00 00 00 0a 00 00 00 00 00 00 00 14 00 00 00 00 00 00 00 01 00 00 00` |
+
 ## Planned for storage version 2 (ADR 026)
 
 Not part of version 1 and not read by version 1 readers: (1) exact segments may carry, per key and per set bit of its bitmap, a row count, enabled by `counts: true` on the key spec; (2) scan entries carry per-column bytes so a plan's projection cost is a sum of chunk sizes; (3) manifests record per-row-group bytes and per-column bytes at build time so plans need not open footers. The format freeze happens after these exist, so that version 2 is the frozen version.

@@ -172,6 +172,15 @@ struct WhyArgs {
     /// Pin to a specific manifest sequence snapshot.
     #[arg(long, value_name = "SEQUENCE")]
     at_manifest: Option<u64>,
+    /// Optional time window A..B to price the workload over.
+    #[arg(long, value_name = "A..B", conflicts_with = "lookback")]
+    window: Option<String>,
+    /// Optional upper instant T for a lookback window.
+    #[arg(long, value_name = "INSTANT")]
+    at: Option<String>,
+    /// Optional calendar lookback duration (e.g. 252d; units: s, m, h, d, w).
+    #[arg(long, value_name = "DURATION")]
+    lookback: Option<String>,
 }
 
 #[derive(Args)]
@@ -197,6 +206,15 @@ struct LookupArgs {
     /// Pin to a specific manifest sequence snapshot.
     #[arg(long, value_name = "SEQUENCE")]
     at_manifest: Option<u64>,
+    /// Optional time window A..B (`locate --window`).
+    #[arg(long, value_name = "A..B")]
+    window: Option<String>,
+    /// Optional known-time bound (`latest --known`).
+    #[arg(long, value_name = "INSTANT")]
+    known: Option<String>,
+    /// Optional calendar lookback duration (`latest --lookback`, units: s, m, h, d, w).
+    #[arg(long, value_name = "DURATION")]
+    lookback: Option<String>,
 }
 
 #[derive(Args)]
@@ -205,8 +223,11 @@ struct AsofArgs {
     lookup: LookupArgs,
     /// The instant: RFC 3339, a date (YYYY-MM-DD), or an integer in the
     /// timestamp column's unit.
-    #[arg(long, value_name = "INSTANT")]
-    at: String,
+    #[arg(long, value_name = "INSTANT", conflicts_with = "valid")]
+    at: Option<String>,
+    /// Bitemporal valid-time upper bound (`--valid V --known K`).
+    #[arg(long, value_name = "INSTANT", requires = "known")]
+    valid: Option<String>,
 }
 
 #[derive(Args)]
@@ -404,29 +425,69 @@ fn run(cli: &Cli, out: &Out) -> Result<Outcome, Failure> {
     match &cli.command {
         Command::Why(a) => why(g, out, a),
         Command::Index(a) => {
-            let specs = a
-                .keys
-                .iter()
-                .map(|s| bellwether::spec::parse(s))
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|e| Failure::Usage(e.to_string()))?;
+            let mut specs = Vec::new();
+            for s in &a.keys {
+                let parsed = bellwether::spec::parse_many(s)
+                    .map_err(|e| Failure::Usage(e.to_string()))?;
+                specs.extend(parsed);
+            }
             let r = engine(g, &a.root.root)?.index(&specs)?;
             done(&r, human::index(&r, out), EXIT_OK)
         }
         Command::Locate(a) => {
-            let r = engine_at(g, &a.root.root, a.at_manifest)?
-                .locate(&key_file(&a.keys, a.key.as_ref()))?;
+            if a.known.is_some() || a.lookback.is_some() {
+                return Err(Failure::Usage(
+                    "locate takes --window A..B, not --known or --lookback".into(),
+                ));
+            }
+            let eng = engine_at(g, &a.root.root, a.at_manifest)?;
+            let kf = key_file(&a.keys, a.key.as_ref());
+            let r = match &a.window {
+                Some(w) => eng.locate_window(&kf, w)?,
+                None => eng.locate(&kf)?,
+            };
             done(&r, human::plan(&r, out), EXIT_OK)
         }
         Command::Latest(a) => {
-            let r = engine_at(g, &a.root.root, a.at_manifest)?
-                .latest(&key_file(&a.keys, a.key.as_ref()))?;
+            if a.window.is_some() {
+                return Err(Failure::Usage(
+                    "latest takes --lookback or --known, not --window".into(),
+                ));
+            }
+            let eng = engine_at(g, &a.root.root, a.at_manifest)?;
+            let kf = key_file(&a.keys, a.key.as_ref());
+            let r = if a.known.is_some() || a.lookback.is_some() {
+                eng.latest_with(&kf, a.known.as_deref(), a.lookback.as_deref())?
+            } else {
+                eng.latest(&kf)?
+            };
             done(&r, human::plan(&r, out), EXIT_OK)
         }
         Command::Asof(a) => {
             let l = &a.lookup;
-            let r = engine_at(g, &l.root.root, l.at_manifest)?
-                .asof(&key_file(&l.keys, l.key.as_ref()), &a.at)?;
+            if l.window.is_some() {
+                return Err(Failure::Usage(
+                    "asof takes --at (with optional --lookback) or --valid/--known, not --window"
+                        .into(),
+                ));
+            }
+            let eng = engine_at(g, &l.root.root, l.at_manifest)?;
+            let kf = key_file(&l.keys, l.key.as_ref());
+            let r = match (&a.at, &a.valid, &l.known, &l.lookback) {
+                (Some(at), None, None, None) => eng.asof(&kf, at)?,
+                (None, None, None, _) => {
+                    return Err(Failure::Usage(
+                        "asof requires --at <instant> (or --valid <V> --known <K>)".into(),
+                    ))
+                }
+                (at, valid, known, lookback) => eng.asof_with(
+                    &kf,
+                    at.as_deref(),
+                    valid.as_deref(),
+                    known.as_deref(),
+                    lookback.as_deref(),
+                )?,
+            };
             done(&r, human::plan(&r, out), EXIT_OK)
         }
         Command::Propose(a) => propose(g, out, a),
@@ -523,6 +584,9 @@ fn why(g: &Global, out: &Out, a: &WhyArgs) -> Result<Outcome, Failure> {
             .transpose()?,
         columns: a.columns.clone(),
         at_manifest: a.at_manifest,
+        window: a.window.clone(),
+        at: a.at.clone(),
+        lookback: a.lookback.clone(),
         max_candidates: a.max_candidates,
     };
     let r = engine_at(g, &a.root.root, a.at_manifest)?.why(&request)?;

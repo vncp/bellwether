@@ -581,23 +581,43 @@ fn plan_specs(specs: &[KeySpec], schema: &Schema) -> Result<Vec<SpecPlan>> {
                 key_types.push(t);
             }
             let mut columns = spec.columns().to_vec();
-            let ts_type = match spec {
-                KeySpec::Temporal { ts_column, .. } => {
+            let (ts_type, known_ts_type) = match spec {
+                KeySpec::Temporal { ts_column, .. } | KeySpec::Bounds { ts_column, .. } => {
                     let t = column_type(ts_column)?;
                     encoding::check_ts_type(&t)?;
                     ColumnType::of(&t).map_err(|e| Error::KeySpec(format!("{name}: {e}")))?;
                     if !columns.contains(ts_column) {
                         columns.push(ts_column.clone());
                     }
-                    Some(t)
+                    (Some(t), None)
                 }
-                _ => None,
+                KeySpec::Temporal2 {
+                    valid_column,
+                    known_column,
+                    ..
+                } => {
+                    let vt = column_type(valid_column)?;
+                    encoding::check_ts_type(&vt)?;
+                    ColumnType::of(&vt).map_err(|e| Error::KeySpec(format!("{name}: {e}")))?;
+                    let kt = column_type(known_column)?;
+                    encoding::check_ts_type(&kt)?;
+                    ColumnType::of(&kt).map_err(|e| Error::KeySpec(format!("{name}: {e}")))?;
+                    if !columns.contains(valid_column) {
+                        columns.push(valid_column.clone());
+                    }
+                    if !columns.contains(known_column) {
+                        columns.push(known_column.clone());
+                    }
+                    (Some(vt), Some(kt))
+                }
+                _ => (None, None),
             };
             Ok(SpecPlan {
                 spec: spec.clone(),
                 name,
                 key_types,
                 ts_type,
+                known_ts_type,
                 columns,
             })
         })
@@ -795,8 +815,19 @@ struct WorkPlan {
 /// type under `new` than under `old` (as segment headers record them).
 fn types_differ(old: &Schema, new: &Schema, spec: &KeySpec) -> bool {
     let mut cols: Vec<&str> = spec.columns().iter().map(String::as_str).collect();
-    if let KeySpec::Temporal { ts_column, .. } = spec {
-        cols.push(ts_column);
+    match spec {
+        KeySpec::Temporal { ts_column, .. } | KeySpec::Bounds { ts_column, .. } => {
+            cols.push(ts_column);
+        }
+        KeySpec::Temporal2 {
+            valid_column,
+            known_column,
+            ..
+        } => {
+            cols.push(valid_column);
+            cols.push(known_column);
+        }
+        _ => {}
     }
     cols.iter().any(|c| {
         let recorded = |s: &Schema| {

@@ -87,10 +87,13 @@ fn merged_header<R: ReadAt>(inputs: &[SegmentReader<R>]) -> Result<SegmentHeader
                 "cannot merge segments whose filters hash different inputs".into(),
             ));
         }
-        if h.key_types != h0.key_types || h.ts_type != h0.ts_type {
+        if h.key_types != h0.key_types
+            || h.ts_type != h0.ts_type
+            || h.known_ts_type != h0.known_ts_type
+        {
             return Err(Error::KeySpec(format!(
-                "cannot merge segments whose recorded types differ: {:?} (ts {:?}) and {:?} (ts {:?})",
-                h0.key_types, h0.ts_type, h.key_types, h.ts_type
+                "cannot merge segments whose recorded types differ: {:?} (ts {:?}, known {:?}) and {:?} (ts {:?}, known {:?})",
+                h0.key_types, h0.ts_type, h0.known_ts_type, h.key_types, h.ts_type, h.known_ts_type
             )));
         }
         if h.extra != h0.extra {
@@ -103,6 +106,7 @@ fn merged_header<R: ReadAt>(inputs: &[SegmentReader<R>]) -> Result<SegmentHeader
     header.bloom_hash = h0.bloom_hash;
     header.key_types.clone_from(&h0.key_types);
     header.ts_type.clone_from(&h0.ts_type);
+    header.known_ts_type.clone_from(&h0.known_ts_type);
     header.extra.clone_from(&h0.extra);
     Ok(header)
 }
@@ -168,6 +172,8 @@ fn merge_keyed<R: ReadAt>(
             if let Some(v) = heads[j].take() {
                 value.bitmap |= v.bitmap;
                 value.chain.merge(&v.chain);
+                value.bounds.merge(&v.bounds);
+                value.chain2.merge(&v.chain2);
             }
             advance(&mut cursors, &mut heads, &mut heap, j)?;
         }

@@ -239,7 +239,7 @@ impl<R: ReadAt> SegmentReader<R> {
         let blocks = claimed as usize;
         let reserve = |min_entry| reserve_hint(u64::from(claimed), index_len as u64, min_entry);
         let index = match header.layout {
-            Layout::Keyed | Layout::KeyedTemporal => {
+            Layout::Keyed | Layout::KeyedTemporal | Layout::KeyedBounds | Layout::KeyedTemporal2 => {
                 let mut v = Vec::with_capacity(reserve(MIN_KEYED_ENTRY));
                 for _ in 0..blocks {
                     v.push(KeyedBlock {
@@ -308,26 +308,32 @@ impl<R: ReadAt> SegmentReader<R> {
     /// segment written from already-encoded keys records no types and is
     /// refused here, because its encoding cannot be verified.
     pub fn check_dataset(&self, schema: &Schema) -> Result<()> {
-        let (keys, ts) = spec_types(&self.header.key_spec, schema)?;
+        let (keys, ts, known_ts) = spec_types(&self.header.key_spec, schema)?;
         let want_keys = keys
             .iter()
             .map(ColumnType::of)
             .collect::<Result<Vec<_>>>()?;
         let want_ts = ts.as_ref().map(ColumnType::of).transpose()?;
+        let want_known = known_ts.as_ref().map(ColumnType::of).transpose()?;
         let Some(have_keys) = &self.header.key_types else {
             return Err(Error::KeySpec(format!(
                 "segment for {} records no key types, so it cannot be checked against the dataset",
                 self.header.key_spec.name()
             )));
         };
-        if have_keys != &want_keys || self.header.ts_type != want_ts {
+        if have_keys != &want_keys
+            || self.header.ts_type != want_ts
+            || self.header.known_ts_type != want_known
+        {
             return Err(Error::KeySpec(format!(
-                "segment for {} was encoded under key types {:?} (ts {:?}); the dataset declares {:?} (ts {:?})",
+                "segment for {} was encoded under key types {:?} (ts {:?}, known {:?}); the dataset declares {:?} (ts {:?}, known {:?})",
                 self.header.key_spec.name(),
                 have_keys,
                 self.header.ts_type,
+                self.header.known_ts_type,
                 want_keys,
-                want_ts
+                want_ts,
+                want_known
             )));
         }
         Ok(())
@@ -396,7 +402,7 @@ impl<R: ReadAt> SegmentReader<R> {
     pub(crate) fn value_at(&self, view: &BlockView<'_>, i: usize) -> Result<KeyValue> {
         let (off, len) = view.value_ref(i);
         let bytes = self.src.read_at(off, len)?;
-        KeyValue::decode(&bytes, matches!(self.header.layout, Layout::KeyedTemporal))
+        KeyValue::decode(&bytes, self.header.layout)
     }
 
     pub(crate) fn bloom_bitset(&self, e: &BloomEntry) -> Result<Cow<'_, [u8]>> {
@@ -704,6 +710,51 @@ impl<R: ReadAt> SegmentReader<R> {
         let mut out = BTreeMap::new();
         self.visit_keys(keys, |k, v| {
             if let Some(hit) = v.chain.asof(ts) {
+                out.insert(k.to_vec(), hit);
+            }
+        })?;
+        Ok(out)
+    }
+
+    /// For a `KeyedBounds` (`KeySpec::Bounds`) segment: row groups in which each
+    /// present key's `[min_ts, max_ts]` overlaps `[lo, hi]`.
+    pub fn lookup_bounds<K: AsRef<[u8]>>(
+        &self,
+        keys: &[K],
+        lo: i64,
+        hi: i64,
+    ) -> Result<BTreeMap<Vec<u8>, RoaringBitmap>> {
+        if self.header.layout != Layout::KeyedBounds {
+            return Err(Error::KeySpec(format!(
+                "{} is not a bounds segment",
+                self.header.key_spec.name()
+            )));
+        }
+        let mut out = BTreeMap::new();
+        self.visit_keys(keys, |k, v| {
+            out.insert(k.to_vec(), v.bounds.overlapping(lo, hi));
+        })?;
+        Ok(out)
+    }
+
+    /// For a `KeyedTemporal2` (`KeySpec::Temporal2`) segment: per key, the
+    /// newest version by valid time with `valid <= max_valid` (when `Some`)
+    /// and `known <= max_known` (when `Some`) **within this segment**.
+    pub fn query_bitemporal<K: AsRef<[u8]>>(
+        &self,
+        keys: &[K],
+        max_valid: Option<i64>,
+        max_known: Option<i64>,
+    ) -> Result<BTreeMap<Vec<u8>, VersionHit>> {
+        if self.header.layout != Layout::KeyedTemporal2 {
+            return Err(Error::KeySpec(format!(
+                "{} is not a temporal2 key spec",
+                self.header.key_spec.name()
+            )));
+        }
+        let mut out = BTreeMap::new();
+        self.visit_keys(keys, |k, v| {
+            if let Some(hit) = v.chain2.query(max_valid, max_known) {
                 out.insert(k.to_vec(), hit);
             }
         })?;

@@ -14,7 +14,9 @@ use super::format::{
 };
 use crate::bloom::{BloomHash, CanonicalHash, FilterHash, Sbbf};
 use crate::encoding::{self, KeyColumns, NEG_ZERO_KEY, POS_ZERO_KEY};
-use crate::temporal::{VersionBuffer, VersionChain};
+use crate::temporal::{
+    BitemporalBuffer, BitemporalChain, KeyBounds, VersionBuffer, VersionChain,
+};
 
 /// The bounds a range segment stores for a row group, with the Parquet
 /// statistics reading rule for signed zero applied: a minimum of +0.0 is
@@ -193,21 +195,36 @@ const NO_RUN_COOKIE: [u8; 4] = [0x3a, 0x30, 0x00, 0x00];
 pub struct KeyValue {
     /// Every row group holding the key.
     pub bitmap: RoaringBitmap,
-    /// Version chain; always empty for exact segments.
+    /// Version chain (`KeyedTemporal`).
     pub chain: VersionChain,
+    /// Per-row-group `[min_ts, max_ts]` bounds (`KeyedBounds`).
+    pub bounds: KeyBounds,
+    /// Bitemporal `(valid, known, rg)` chain (`KeyedTemporal2`).
+    pub chain2: BitemporalChain,
 }
 
 impl KeyValue {
-    pub(crate) fn encode(&self, temporal: bool, out: &mut Vec<u8>) -> Result<()> {
+    pub(crate) fn encode(&self, layout: Layout, out: &mut Vec<u8>) -> Result<()> {
         let mut bm = Vec::with_capacity(self.bitmap.serialized_size());
         self.bitmap
             .serialize_into(&mut bm)
             .map_err(|e| Error::Other(e.to_string()))?;
-        if temporal {
-            out.put_bytes(&bm)?;
-            self.chain.write_to(out)?;
-        } else {
-            out.extend_from_slice(&bm);
+        match layout {
+            Layout::KeyedTemporal => {
+                out.put_bytes(&bm)?;
+                self.chain.write_to(out)?;
+            }
+            Layout::KeyedBounds => {
+                out.put_bytes(&bm)?;
+                self.bounds.write_to(out)?;
+            }
+            Layout::KeyedTemporal2 => {
+                out.put_bytes(&bm)?;
+                self.chain2.write_to(out)?;
+            }
+            _ => {
+                out.extend_from_slice(&bm);
+            }
         }
         Ok(())
     }
@@ -217,7 +234,7 @@ impl KeyValue {
     /// emits), fill its bytes exactly, and be non-empty: every stored key is
     /// held by at least one row group (`docs/format.md`). Anything else is
     /// corruption and is refused, never decoded into a wrong answer.
-    pub(crate) fn decode(bytes: &[u8], temporal: bool) -> Result<Self> {
+    pub(crate) fn decode(bytes: &[u8], layout: Layout) -> Result<Self> {
         let read_bm = |b: &[u8]| -> Result<RoaringBitmap> {
             if b.get(..4) != Some(&NO_RUN_COOKIE[..]) {
                 return Err(Error::Other(
@@ -233,25 +250,71 @@ impl KeyValue {
             }
             Ok(bm)
         };
-        if temporal {
-            let mut c = super::format::Cursor::new(bytes);
-            let bitmap = read_bm(c.bytes()?)?;
-            Ok(Self {
-                bitmap,
-                chain: VersionChain::read_from(c.rest())?,
-            })
-        } else {
-            Ok(Self {
+        match layout {
+            Layout::KeyedTemporal => {
+                let mut c = super::format::Cursor::new(bytes);
+                let bitmap = read_bm(c.bytes()?)?;
+                Ok(Self {
+                    bitmap,
+                    chain: VersionChain::read_from(c.rest())?,
+                    bounds: KeyBounds::new(),
+                    chain2: BitemporalChain::new(),
+                })
+            }
+            Layout::KeyedBounds => {
+                let mut c = super::format::Cursor::new(bytes);
+                let bitmap = read_bm(c.bytes()?)?;
+                let bounds = KeyBounds::read_from(c.rest())?;
+                if bounds
+                    .ranges()
+                    .iter()
+                    .any(|&(rg, _, _)| !bitmap.contains(rg.0))
+                {
+                    return Err(Error::Other(
+                        "corrupt segment: key bounds reference a row group not in bitmap".into(),
+                    ));
+                }
+                Ok(Self {
+                    bitmap,
+                    chain: VersionChain::new(),
+                    bounds,
+                    chain2: BitemporalChain::new(),
+                })
+            }
+            Layout::KeyedTemporal2 => {
+                let mut c = super::format::Cursor::new(bytes);
+                let bitmap = read_bm(c.bytes()?)?;
+                let chain2 = BitemporalChain::read_from(c.rest())?;
+                if chain2
+                    .versions()
+                    .iter()
+                    .any(|&(_, _, rg)| !bitmap.contains(rg.0))
+                {
+                    return Err(Error::Other(
+                        "corrupt segment: bitemporal chain references a row group not in bitmap"
+                            .into(),
+                    ));
+                }
+                Ok(Self {
+                    bitmap,
+                    chain: VersionChain::new(),
+                    bounds: KeyBounds::new(),
+                    chain2,
+                })
+            }
+            _ => Ok(Self {
                 bitmap: read_bm(bytes)?,
                 chain: VersionChain::new(),
-            })
+                bounds: KeyBounds::new(),
+                chain2: BitemporalChain::new(),
+            }),
         }
     }
 }
 
 pub(crate) struct KeyedEmitter {
     f: Framing,
-    temporal: bool,
+    layout: Layout,
     opts: WriterOptions,
     keys: Vec<Vec<u8>>,
     key_bytes: usize,
@@ -263,7 +326,7 @@ impl KeyedEmitter {
     pub(crate) fn new(header: &SegmentHeader, opts: &WriterOptions) -> Result<Self> {
         Ok(Self {
             f: Framing::start(header)?,
-            temporal: header.layout == Layout::KeyedTemporal,
+            layout: header.layout,
             opts: opts.clone(),
             keys: Vec::new(),
             key_bytes: 0,
@@ -298,7 +361,7 @@ impl KeyedEmitter {
         };
         self.f.note_rg(lo, hi);
         let before = self.values.len();
-        value.encode(self.temporal, &mut self.values)?;
+        value.encode(self.layout, &mut self.values)?;
         self.value_lens.push(len_u32(self.values.len() - before)?);
         self.key_bytes += key.len();
         self.keys.push(key.to_vec());
@@ -523,6 +586,8 @@ impl RangeEmitter {
 struct KeyAcc {
     bitmap: RoaringBitmap,
     versions: VersionBuffer,
+    bounds: KeyBounds,
+    versions2: BitemporalBuffer,
 }
 
 enum BloomAcc {
@@ -544,8 +609,10 @@ enum Acc {
 struct DatasetTypes {
     keys: Vec<DataType>,
     ts: Option<DataType>,
+    known_ts: Option<DataType>,
     recorded_keys: Vec<ColumnType>,
     recorded_ts: Option<ColumnType>,
+    recorded_known_ts: Option<ColumnType>,
 }
 
 /// Builds one segment for one key spec.
@@ -594,7 +661,10 @@ impl SegmentWriter {
     pub fn new(spec: KeySpec, opts: WriterOptions) -> Result<Self> {
         validate_spec(&spec)?;
         let acc = match Layout::for_spec(&spec) {
-            Layout::Keyed | Layout::KeyedTemporal => Acc::Keyed(BTreeMap::new()),
+            Layout::Keyed
+            | Layout::KeyedTemporal
+            | Layout::KeyedBounds
+            | Layout::KeyedTemporal2 => Acc::Keyed(BTreeMap::new()),
             Layout::BloomPerRowGroup => Acc::Bloom(BTreeMap::new()),
             Layout::MinMax => Acc::Range(BTreeMap::new()),
         };
@@ -614,14 +684,17 @@ impl SegmentWriter {
     /// records those types (`key_types`, `ts_type`).
     pub fn for_dataset(spec: KeySpec, schema: &Schema, opts: WriterOptions) -> Result<Self> {
         let mut w = Self::new(spec, opts)?;
-        let (keys, ts) = spec_types(&w.spec, schema)?;
+        let (keys, ts, known_ts) = spec_types(&w.spec, schema)?;
         let recorded_keys = keys.iter().map(ColumnType::of).collect::<Result<_>>()?;
         let recorded_ts = ts.as_ref().map(ColumnType::of).transpose()?;
+        let recorded_known_ts = known_ts.as_ref().map(ColumnType::of).transpose()?;
         w.dataset = Some(DatasetTypes {
             keys,
             ts,
+            known_ts,
             recorded_keys,
             recorded_ts,
+            recorded_known_ts,
         });
         Ok(w)
     }
@@ -678,9 +751,13 @@ impl SegmentWriter {
     /// [`SegmentWriter::insert_version`]; calling this on one is an error.
     /// On error nothing is recorded.
     pub fn insert(&mut self, key: &[u8], rg: RowGroupId) -> Result<()> {
-        if matches!(self.spec, KeySpec::Temporal { .. }) {
+        if matches!(
+            self.spec,
+            KeySpec::Temporal { .. } | KeySpec::Bounds { .. } | KeySpec::Temporal2 { .. }
+        ) {
             return Err(Error::KeySpec(
-                "temporal segments need a timestamp; use insert_version".into(),
+                "temporal/bounds segments need a timestamp; use insert_version, insert_bound, or insert_bitemporal"
+                    .into(),
             ));
         }
         self.check_insertable(rg)?;
@@ -741,6 +818,48 @@ impl SegmentWriter {
             v.versions.push(ts, rg);
             m.insert(key.to_vec(), v);
         }
+        Ok(())
+    }
+
+    /// Records a timestamp bound sample of `key` at `ts` in row group `rg`
+    /// (`KeySpec::Bounds` only). `None` records key membership in `rg` without
+    /// widening the timestamp range.
+    pub fn insert_bound(&mut self, key: &[u8], ts: Option<i64>, rg: RowGroupId) -> Result<()> {
+        let Acc::Keyed(m) = &mut self.acc else {
+            return Err(Error::KeySpec("insert_bound on a non-bounds spec".into()));
+        };
+        if !matches!(self.spec, KeySpec::Bounds { .. }) {
+            return Err(Error::KeySpec("insert_bound on a non-bounds spec".into()));
+        }
+        let v = m.entry(key.to_vec()).or_default();
+        v.bitmap.insert(rg.0);
+        v.bounds.record(rg, ts);
+        Ok(())
+    }
+
+    /// Records a bitemporal version of `key` at `(valid, known)` in row group
+    /// `rg` (`KeySpec::Temporal2` only). Nulls in either clock record key
+    /// membership in `rg` but never enter the version chain (ADR 014).
+    pub fn insert_bitemporal(
+        &mut self,
+        key: &[u8],
+        valid: Option<i64>,
+        known: Option<i64>,
+        rg: RowGroupId,
+    ) -> Result<()> {
+        let Acc::Keyed(m) = &mut self.acc else {
+            return Err(Error::KeySpec(
+                "insert_bitemporal on a non-temporal2 spec".into(),
+            ));
+        };
+        if !matches!(self.spec, KeySpec::Temporal2 { .. }) {
+            return Err(Error::KeySpec(
+                "insert_bitemporal on a non-temporal2 spec".into(),
+            ));
+        }
+        let v = m.entry(key.to_vec()).or_default();
+        v.bitmap.insert(rg.0);
+        v.versions2.push(valid, known, rg);
         Ok(())
     }
 
@@ -840,8 +959,24 @@ impl SegmentWriter {
             .collect::<Result<Vec<_>>>()?;
         let keys = KeyColumns::new(&cols, &dataset.keys)?;
         let ts = match (&self.spec, &dataset.ts) {
-            (KeySpec::Temporal { ts_column, .. }, Some(declared)) => {
+            (
+                KeySpec::Temporal { ts_column, .. } | KeySpec::Bounds { ts_column, .. },
+                Some(declared),
+            ) => {
                 let arr = column(ts_column)?;
+                encoding::check_convertible(arr.data_type(), declared)?;
+                Some((arr, declared.clone()))
+            }
+            (KeySpec::Temporal2 { valid_column, .. }, Some(declared)) => {
+                let arr = column(valid_column)?;
+                encoding::check_convertible(arr.data_type(), declared)?;
+                Some((arr, declared.clone()))
+            }
+            _ => None,
+        };
+        let known = match (&self.spec, &dataset.known_ts) {
+            (KeySpec::Temporal2 { known_column, .. }, Some(declared)) => {
+                let arr = column(known_column)?;
                 encoding::check_convertible(arr.data_type(), declared)?;
                 Some((arr, declared.clone()))
             }
@@ -849,7 +984,8 @@ impl SegmentWriter {
         };
         self.check_insertable(rg)?;
         // Stage the batch; nothing is recorded until every row has converted.
-        let mut staged: Vec<(Vec<u8>, Option<i64>)> = Vec::with_capacity(batch.num_rows());
+        let mut staged: Vec<(Vec<u8>, Option<i64>, Option<i64>)> =
+            Vec::with_capacity(batch.num_rows());
         let mut buf = Vec::new();
         for row in 0..batch.num_rows() {
             if !keys.encode_into(row, &mut buf)? {
@@ -859,15 +995,20 @@ impl SegmentWriter {
                 Some((arr, declared)) => encoding::ts_value_as(arr.as_ref(), row, declared)?,
                 None => None,
             };
-            staged.push((buf.clone(), t));
+            let k = match &known {
+                Some((arr, declared)) => encoding::ts_value_as(arr.as_ref(), row, declared)?,
+                None => None,
+            };
+            staged.push((buf.clone(), t, k));
         }
         // Cannot fail: the spec kind picks the method, and check_insertable
         // has passed for this row group.
-        for (key, t) in &staged {
-            if ts.is_some() {
-                self.insert_version(key, *t, rg)?;
-            } else {
-                self.insert(key, rg)?;
+        for (key, t, k) in &staged {
+            match &self.spec {
+                KeySpec::Temporal { .. } => self.insert_version(key, *t, rg)?,
+                KeySpec::Bounds { .. } => self.insert_bound(key, *t, rg)?,
+                KeySpec::Temporal2 { .. } => self.insert_bitemporal(key, *t, *k, rg)?,
+                _ => self.insert(key, rg)?,
             }
         }
         Ok(())
@@ -880,6 +1021,7 @@ impl SegmentWriter {
         if let Some(d) = &self.dataset {
             header.key_types = Some(d.recorded_keys.clone());
             header.ts_type.clone_from(&d.recorded_ts);
+            header.known_ts_type.clone_from(&d.recorded_known_ts);
         }
         match self.acc {
             Acc::Keyed(m) => {
@@ -888,6 +1030,8 @@ impl SegmentWriter {
                     let v = KeyValue {
                         bitmap: acc.bitmap,
                         chain: acc.versions.finish(),
+                        bounds: acc.bounds,
+                        chain2: acc.versions2.finish(),
                     };
                     e.push(&k, &v)?;
                 }
@@ -961,28 +1105,32 @@ mod tests {
         let bm: RoaringBitmap = [1u32, 7].into_iter().collect();
         let good = serialized(&bm);
         assert_eq!(good[..4], NO_RUN_COOKIE);
-        assert_eq!(KeyValue::decode(&good, false).unwrap().bitmap, bm);
+        assert_eq!(KeyValue::decode(&good, Layout::Keyed).unwrap().bitmap, bm);
         let mut run = good.clone();
         run[0] = 0x3b;
-        assert!(KeyValue::decode(&run, false).is_err(), "run cookie");
+        assert!(KeyValue::decode(&run, Layout::Keyed).is_err(), "run cookie");
         let empty = serialized(&RoaringBitmap::new());
-        assert!(KeyValue::decode(&empty, false).is_err(), "empty bitmap");
+        assert!(
+            KeyValue::decode(&empty, Layout::Keyed).is_err(),
+            "empty bitmap"
+        );
         let mut trailing = good.clone();
         trailing.push(0);
         assert!(
-            KeyValue::decode(&trailing, false).is_err(),
+            KeyValue::decode(&trailing, Layout::Keyed).is_err(),
             "trailing bytes"
         );
         // temporal records: a length-prefixed bitmap, then the chain
         let v = KeyValue {
             bitmap: bm,
             chain: VersionChain::from_versions(vec![(3, RowGroupId(1))]),
+            ..KeyValue::default()
         };
         let mut rec = Vec::new();
-        v.encode(true, &mut rec).unwrap();
-        assert_eq!(KeyValue::decode(&rec, true).unwrap(), v);
+        v.encode(Layout::KeyedTemporal, &mut rec).unwrap();
+        assert_eq!(KeyValue::decode(&rec, Layout::KeyedTemporal).unwrap(), v);
         rec[4] = 0x3b; // the bitmap's cookie, after its u32 length
-        assert!(KeyValue::decode(&rec, true).is_err());
+        assert!(KeyValue::decode(&rec, Layout::KeyedTemporal).is_err());
     }
 
     /// A genuine run-format serialization (cookie `3b 30`): nine containers,
@@ -1014,7 +1162,7 @@ mod tests {
         let bm = RoaringBitmap::deserialize_from(&rec[..]).unwrap();
         assert_eq!(bm.len(), 10);
         assert_eq!(bm.serialized_size(), rec.len());
-        assert!(KeyValue::decode(&rec, false).is_err());
+        assert!(KeyValue::decode(&rec, Layout::Keyed).is_err());
     }
 
     #[test]

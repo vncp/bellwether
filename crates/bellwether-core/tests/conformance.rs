@@ -156,3 +156,27 @@ fn pinned_table_matches_docs_format_md() {
         );
     }
 }
+
+#[test]
+fn sidecar_payload_vectors_match_docs_format_md() {
+    use bellwether_core::{BitemporalChain, KeyBounds};
+    use bellwether_types::RowGroupId;
+
+    let kb = KeyBounds::from_ranges(vec![(RowGroupId(3), 100, 250)]);
+    let mut kb_bytes = Vec::new();
+    kb.write_to(&mut kb_bytes).unwrap();
+    assert_eq!(
+        hex(&kb_bytes),
+        "01 00 00 00 03 00 00 00 64 00 00 00 00 00 00 00 fa 00 00 00 00 00 00 00"
+    );
+    assert_eq!(KeyBounds::read_from(&kb_bytes).unwrap(), kb);
+
+    let bc = BitemporalChain::from_versions(vec![(10, 20, RowGroupId(1))]);
+    let mut bc_bytes = Vec::new();
+    bc.write_to(&mut bc_bytes).unwrap();
+    assert_eq!(
+        hex(&bc_bytes),
+        "01 00 00 00 0a 00 00 00 00 00 00 00 14 00 00 00 00 00 00 00 01 00 00 00"
+    );
+    assert_eq!(BitemporalChain::read_from(&bc_bytes).unwrap(), bc);
+}

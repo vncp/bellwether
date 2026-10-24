@@ -106,6 +106,28 @@ where
         Planner::plan(self, specs, &lookup(keys))
     }
 
+    fn plan_in_window(
+        &self,
+        specs: &[KeySpec],
+        keys: &RunKeys,
+        ts_column: &str,
+        lo: i64,
+        hi: i64,
+    ) -> Result<ScanPlan> {
+        check_key_types(self.schema(), keys)?;
+        Planner::plan(
+            self,
+            specs,
+            &Lookup::KeysInWindow {
+                columns: keys.columns().to_vec(),
+                keys: keys.tuples().map(<[u8]>::to_vec).collect(),
+                ts_column: ts_column.to_string(),
+                lo,
+                hi,
+            },
+        )
+    }
+
     fn with_transient(
         &self,
         transient: &[Arc<TransientIndex>],
@@ -146,6 +168,28 @@ where
         check_key_types(self.planner.schema(), keys)?;
         self.planner
             .plan_with_transient(specs, &lookup(keys), &self.extra)
+    }
+
+    fn plan_in_window(
+        &self,
+        specs: &[KeySpec],
+        keys: &RunKeys,
+        ts_column: &str,
+        lo: i64,
+        hi: i64,
+    ) -> Result<ScanPlan> {
+        check_key_types(self.planner.schema(), keys)?;
+        self.planner.plan_with_transient(
+            specs,
+            &Lookup::KeysInWindow {
+                columns: keys.columns().to_vec(),
+                keys: keys.tuples().map(<[u8]>::to_vec).collect(),
+                ts_column: ts_column.to_string(),
+                lo,
+                hi,
+            },
+            &self.extra,
+        )
     }
 
     fn with_transient(

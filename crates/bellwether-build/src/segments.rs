@@ -45,6 +45,7 @@ pub(crate) struct SpecPlan {
     pub(crate) name: String,
     pub(crate) key_types: Vec<DataType>,
     pub(crate) ts_type: Option<DataType>,
+    pub(crate) known_ts_type: Option<DataType>,
     pub(crate) columns: Vec<String>,
 }
 
@@ -428,6 +429,11 @@ pub(crate) fn measure(plan: &SpecPlan, batch: &RecordBatch) -> Result<(u64, u64)
     let keys = KeyColumns::new(&cols, &plan.key_types)?;
     let ts = match (&plan.spec, &plan.ts_type) {
         (KeySpec::Temporal { ts_column, .. }, Some(dt)) => Some((column(ts_column)?, dt)),
+        (KeySpec::Temporal2 { valid_column, .. }, Some(dt)) => Some((column(valid_column)?, dt)),
+        _ => None,
+    };
+    let known = match (&plan.spec, &plan.known_ts_type) {
+        (KeySpec::Temporal2 { known_column, .. }, Some(dt)) => Some((column(known_column)?, dt)),
         _ => None,
     };
     let mut buf = Vec::new();
@@ -456,11 +462,21 @@ pub(crate) fn measure(plan: &SpecPlan, batch: &RecordBatch) -> Result<(u64, u64)
                 None => buf.push(0),
             }
         }
+        if let Some((arr, dt)) = &known {
+            match encoding::ts_value_as(arr.as_ref(), row, dt)? {
+                Some(t) => {
+                    buf.push(1);
+                    buf.extend_from_slice(&t.to_be_bytes());
+                }
+                None => buf.push(0),
+            }
+        }
         if !seen.contains(buf.as_slice()) {
             seen.insert(buf.clone());
             bytes += match plan.spec {
                 KeySpec::Bloom { .. } => 8,
                 KeySpec::Temporal { .. } => key_len + 8,
+                KeySpec::Bounds { .. } | KeySpec::Temporal2 { .. } => key_len + 16,
                 _ => key_len,
             };
         }
@@ -562,7 +578,7 @@ mod tests {
             .collect();
         let (ts_type, mut columns) = (None, spec.columns().to_vec());
         let ts_type = match &spec {
-            KeySpec::Temporal { ts_column, .. } => {
+            KeySpec::Temporal { ts_column, .. } | KeySpec::Bounds { ts_column, .. } => {
                 columns.push(ts_column.clone());
                 Some(
                     schema
@@ -572,13 +588,37 @@ mod tests {
                         .clone(),
                 )
             }
+            KeySpec::Temporal2 { valid_column, .. } => {
+                columns.push(valid_column.clone());
+                Some(
+                    schema
+                        .field_with_name(valid_column)
+                        .unwrap()
+                        .data_type()
+                        .clone(),
+                )
+            }
             _ => ts_type,
+        };
+        let known_ts_type = match &spec {
+            KeySpec::Temporal2 { known_column, .. } => {
+                columns.push(known_column.clone());
+                Some(
+                    schema
+                        .field_with_name(known_column)
+                        .unwrap()
+                        .data_type()
+                        .clone(),
+                )
+            }
+            _ => None,
         };
         SpecPlan {
             name: spec.name(),
             spec,
             key_types,
             ts_type,
+            known_ts_type,
             columns,
         }
     }

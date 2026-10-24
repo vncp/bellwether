@@ -85,8 +85,13 @@ pub fn servable(spec: &KeySpec, run_columns: &[String]) -> Option<Lookup> {
     if let Some(project) = project {
         return Some(Lookup::Point { project });
     }
-    let prefix = matches!(spec, KeySpec::Exact { .. } | KeySpec::Temporal { .. })
-        && run_columns.len() < p.len()
+    let prefix = matches!(
+        spec,
+        KeySpec::Exact { .. }
+            | KeySpec::Temporal { .. }
+            | KeySpec::Bounds { .. }
+            | KeySpec::Temporal2 { .. }
+    ) && run_columns.len() < p.len()
         && p[..run_columns.len()] == *run_columns;
     prefix.then_some(Lookup::Prefix)
 }
@@ -111,6 +116,20 @@ pub trait PlanSource: Send + Sync {
     /// The plan for one run's keys under `specs` (module docs for the
     /// serving, intersection, and no-pruning rules).
     fn plan(&self, specs: &[KeySpec], keys: &RunKeys) -> Result<ScanPlan>;
+
+    /// The plan for one run's keys intersected with an inclusive time window
+    /// `[lo, hi]` on `ts_column` (in `ts_column`'s dataset unit).
+    fn plan_in_window(
+        &self,
+        specs: &[KeySpec],
+        keys: &RunKeys,
+        ts_column: &str,
+        lo: i64,
+        hi: i64,
+    ) -> Result<ScanPlan> {
+        let _ = (ts_column, lo, hi);
+        self.plan(specs, keys)
+    }
 
     /// This source with hypothetical specs' transient segments added, so
     /// each plans exactly as committed segments of that spec would. A
@@ -538,6 +557,51 @@ impl SegmentPlanner {
         Ok(Some(allowed))
     }
 
+    fn prune_virtual_between(
+        &self,
+        column: &str,
+        lo: &[u8],
+        hi: &[u8],
+    ) -> Result<Option<RoaringBitmap>> {
+        let schema = self.catalog.schema();
+        let Ok(field) = schema.field_with_name(column) else {
+            return Ok(None);
+        };
+        let root = self.root.as_deref();
+        let mut any_virtual = false;
+        let mut matching_files = vec![false; self.catalog.files().len()];
+        for (fi, f) in self.catalog.files().iter().enumerate() {
+            let vcols = extract_virtual_cols(root, &f.path, self.path_template.as_ref())?;
+            let Some(vc) = vcols.iter().find(|v| v.name == column) else {
+                matching_files[fi] = true;
+                continue;
+            };
+            any_virtual = true;
+            let enc = encode_virtual_value(
+                &DefaultCanonical,
+                &f.path,
+                column,
+                &vc.raw,
+                field.data_type(),
+            )?;
+            let (vlo, vhi) = normalize_float_bounds(Some(enc.clone()), Some(enc));
+            matching_files[fi] = match (vlo, vhi) {
+                (Some(vlo), Some(vhi)) => vhi.as_slice() >= lo && vlo.as_slice() <= hi,
+                _ => true,
+            };
+        }
+        if !any_virtual {
+            return Ok(None);
+        }
+        let mut allowed = RoaringBitmap::new();
+        for rg in self.catalog.row_groups() {
+            if matching_files.get(rg.file).copied().unwrap_or(false) {
+                allowed.insert(rg.id.0);
+            }
+        }
+        Ok(Some(allowed))
+    }
+
     fn order_plan(&self, listed: &[&Arc<SpecSegments>], mut plan: ScanPlan) -> Result<ScanPlan> {
         let schema = self.catalog.schema();
         let mut candidates: Vec<&Arc<SpecSegments>> = Vec::new();
@@ -659,6 +723,144 @@ impl PlanSource for SegmentPlanner {
         Ok(with_residual(self.order_plan(&listed, plan)?, keys))
     }
 
+    fn plan_in_window(
+        &self,
+        specs: &[KeySpec],
+        keys: &RunKeys,
+        ts_column: &str,
+        lo: i64,
+        hi: i64,
+    ) -> Result<ScanPlan> {
+        check_key_types(self.catalog.schema(), keys)?;
+        let mut listed = Vec::with_capacity(specs.len());
+        for (i, spec) in specs.iter().enumerate() {
+            if specs[..i].iter().any(|s| s.name() == spec.name()) {
+                return Err(Error::KeySpec(format!(
+                    "key spec {} is listed twice",
+                    spec.name()
+                )));
+            }
+            listed.push(self.listed(spec)?);
+        }
+        let schema = self.catalog.schema();
+        let ts_field = schema.field_with_name(ts_column).map_err(|_| {
+            Error::KeySpec(format!("column {ts_column:?} is not in the dataset schema"))
+        })?;
+        let lo_enc = encode_ts_for_type(lo, ts_field.data_type())?;
+        let hi_enc = encode_ts_for_type(hi, ts_field.data_type())?;
+        let all_pos: Vec<usize> = (0..keys.columns().len()).collect();
+        let residual = Predicate::And {
+            all: vec![
+                Predicate::In {
+                    columns: keys.columns().to_vec(),
+                    values: keys.all_probes(&all_pos),
+                },
+                Predicate::Between {
+                    column: ts_column.to_string(),
+                    lo: lo_enc.clone(),
+                    hi: hi_enc.clone(),
+                },
+            ],
+        };
+        if keys.is_empty() || lo > hi {
+            let mut plan = self.catalog.plan_for(&RoaringBitmap::new())?;
+            plan = self.order_plan(&listed, plan)?;
+            plan.residual = Some(residual);
+            return Ok(plan);
+        }
+        let vpruned = self.prune_virtual_keys(keys)?;
+        let vwindow = self.prune_virtual_between(ts_column, &lo_enc, &hi_enc)?;
+        let mut serving = Vec::with_capacity(specs.len());
+        for (spec, &segments) in specs.iter().zip(&listed) {
+            if let Some(lookup) = servable(spec, keys.columns()) {
+                serving.push((segments.as_ref(), lookup));
+            }
+        }
+        let mut acc: Vec<Option<RoaringBitmap>> = vec![None; keys.len()];
+        for (segments, lookup) in &serving {
+            let cols = match lookup {
+                Lookup::Point { project } => project.clone(),
+                Lookup::Prefix => all_pos.clone(),
+            };
+            for i in 0..keys.len() {
+                let found = segments.lookup(&keys.probes(i, &cols), lookup)?;
+                acc[i] = Some(match acc[i].take() {
+                    Some(x) => x & found,
+                    None => found,
+                });
+            }
+            if let (
+                Lookup::Point { project },
+                KeySpec::Bounds {
+                    ts_column: b_ts, ..
+                },
+            ) = (lookup, &segments.spec)
+            {
+                if b_ts == ts_column {
+                    for i in 0..keys.len() {
+                        let probes = keys.probes(i, project);
+                        let mut bm = RoaringBitmap::new();
+                        for r in &segments.readers {
+                            for (_, b) in r.lookup_bounds(&probes, lo, hi)? {
+                                bm |= b;
+                            }
+                        }
+                        acc[i] = Some(match acc[i].take() {
+                            Some(x) => x & bm,
+                            None => bm,
+                        });
+                    }
+                }
+            }
+        }
+        let mut global_ts: Option<RoaringBitmap> = vwindow;
+        for &segments in &listed {
+            let matches_ts = match &segments.spec {
+                KeySpec::Range { column: c } => c == ts_column,
+                KeySpec::Exact { columns: c }
+                | KeySpec::Temporal { columns: c, .. }
+                | KeySpec::Bounds { columns: c, .. }
+                | KeySpec::Temporal2 { columns: c, .. } => {
+                    c.first().is_some_and(|x| x == ts_column)
+                }
+                KeySpec::Bloom { .. } => false,
+            };
+            if !matches_ts {
+                continue;
+            }
+            let is_range = matches!(segments.spec, KeySpec::Range { .. });
+            let mut found = RoaringBitmap::new();
+            for r in &segments.readers {
+                found |= if is_range {
+                    r.lookup_range(&lo_enc, &hi_enc)?
+                } else {
+                    r.lookup_prefix_range(&lo_enc, &hi_enc)?
+                };
+            }
+            global_ts = Some(match global_ts {
+                Some(x) => x & found,
+                None => found,
+            });
+        }
+        let mut selected = if acc.iter().any(Option::is_some) {
+            acc.into_iter()
+                .flatten()
+                .fold(RoaringBitmap::new(), |u, b| u | b)
+        } else {
+            self.catalog.all_ids()
+        };
+        if let Some(pruned) = vpruned {
+            selected &= pruned;
+        }
+        if let Some(ts_bm) = global_ts {
+            selected &= ts_bm;
+        }
+        let mut plan = self.catalog.plan_for(&selected)?;
+        plan = self.order_plan(&listed, plan)?;
+        plan.residual = Some(residual);
+        Ok(plan)
+    }
+
     fn with_transient(
         &self,
         transient: &[Arc<TransientIndex>],
@@ -697,6 +899,39 @@ fn is_orderable_time_type(dt: &DataType) -> bool {
         DataType::Dictionary(_, v) => is_orderable_time_type(v),
         _ => false,
     }
+}
+
+fn encode_ts_for_type(ts: i64, declared: &DataType) -> Result<Vec<u8>> {
+    use bellwether_core::encoding::{encode_value_as, Value};
+    let val = match declared {
+        DataType::Dictionary(_, v) => return encode_ts_for_type(ts, v),
+        DataType::Date32 => {
+            let d = i32::try_from(ts).map_err(|_| Error::KeySpec("Date32 out of range".into()))?;
+            Value::Date32(d)
+        }
+        DataType::Date64 => Value::Date64(ts),
+        DataType::Time32(u) | DataType::Time64(u) => Value::Time {
+            value: ts,
+            unit: *u,
+        },
+        DataType::Timestamp(u, _) => Value::Timestamp {
+            value: ts,
+            unit: *u,
+        },
+        DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64 => Value::Int(ts),
+        DataType::UInt8 | DataType::UInt16 | DataType::UInt32 | DataType::UInt64 => {
+            let u = u64::try_from(ts).map_err(|_| Error::KeySpec("UInt out of range".into()))?;
+            Value::UInt(u)
+        }
+        other => {
+            return Err(Error::KeySpec(format!(
+                "type {other} cannot order timestamps"
+            )))
+        }
+    };
+    let mut out = Vec::new();
+    encode_value_as(&val, declared, &mut out)?;
+    Ok(out)
 }
 
 /// Refuses keys recorded under another type than the dataset declares for

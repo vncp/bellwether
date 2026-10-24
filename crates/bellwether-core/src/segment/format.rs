@@ -32,6 +32,12 @@ pub enum Layout {
     /// As `Keyed`, and each key's value also carries a version chain and
     /// `max_ts`. Temporal.
     KeyedTemporal,
+    /// As `Keyed`, and each key's value also carries per-row-group
+    /// `(min_ts, max_ts)` bounds (`KeyBounds`). Bounds sidecar.
+    KeyedBounds,
+    /// As `Keyed`, and each key's value also carries a sorted list of
+    /// `(valid, known, rg)` triples (`BitemporalChain`). Temporal2.
+    KeyedTemporal2,
     /// One SBBF per row group over that row group's keys. Bloom.
     BloomPerRowGroup,
     /// Per-row-group `(min, max)`, sorted by `min`, in blocks. Range.
@@ -45,6 +51,8 @@ impl Layout {
         match spec {
             KeySpec::Exact { .. } => Self::Keyed,
             KeySpec::Temporal { .. } => Self::KeyedTemporal,
+            KeySpec::Bounds { .. } => Self::KeyedBounds,
+            KeySpec::Temporal2 { .. } => Self::KeyedTemporal2,
             KeySpec::Bloom { .. } => Self::BloomPerRowGroup,
             KeySpec::Range { .. } => Self::MinMax,
         }
@@ -218,11 +226,13 @@ impl ColumnType {
 }
 
 /// The dataset types a key spec's columns take from a dataset schema: the
-/// key columns in prefix order, and the timestamp column for temporal specs.
+/// key columns in prefix order, the timestamp column for temporal/bounds
+/// specs (or `valid_column` for `Temporal2`), and `known_column` for
+/// `Temporal2`.
 pub(crate) fn spec_types(
     spec: &KeySpec,
     schema: &Schema,
-) -> Result<(Vec<DataType>, Option<DataType>)> {
+) -> Result<(Vec<DataType>, Option<DataType>, Option<DataType>)> {
     let lookup = |column: &str| -> Result<DataType> {
         let dt = schema
             .field_with_name(column)
@@ -237,15 +247,26 @@ pub(crate) fn spec_types(
         .iter()
         .map(|c| lookup(c))
         .collect::<Result<Vec<_>>>()?;
-    let ts = match spec {
-        KeySpec::Temporal { ts_column, .. } => {
+    let (ts, known_ts) = match spec {
+        KeySpec::Temporal { ts_column, .. } | KeySpec::Bounds { ts_column, .. } => {
             let dt = lookup(ts_column)?;
             encoding::check_ts_type(&dt)?;
-            Some(dt)
+            (Some(dt), None)
         }
-        _ => None,
+        KeySpec::Temporal2 {
+            valid_column,
+            known_column,
+            ..
+        } => {
+            let v = lookup(valid_column)?;
+            encoding::check_ts_type(&v)?;
+            let k = lookup(known_column)?;
+            encoding::check_ts_type(&k)?;
+            (Some(v), Some(k))
+        }
+        _ => (None, None),
     };
-    Ok((keys, ts))
+    Ok((keys, ts, known_ts))
 }
 
 /// The JSON header after the preamble. Unknown fields are preserved in
@@ -281,6 +302,10 @@ pub struct SegmentHeader {
     /// together with `key_types` for temporal specs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ts_type: Option<ColumnType>,
+    /// The bitemporal known-time column's dataset type and unit; recorded
+    /// together with `key_types` and `ts_type` for `temporal2` specs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub known_ts_type: Option<ColumnType>,
     /// Fields written by a newer minor writer, preserved verbatim.
     #[serde(flatten)]
     pub extra: serde_json::Map<String, serde_json::Value>,
@@ -300,6 +325,7 @@ impl SegmentHeader {
             codec: CODEC_NONE.to_string(),
             key_types: None,
             ts_type: None,
+            known_ts_type: None,
             extra: serde_json::Map::new(),
         }
     }
@@ -339,18 +365,29 @@ impl SegmentHeader {
                 return Err(corrupt("parquet_plain filters cover exactly one column"));
             }
         }
-        // Recorded types: one per key column, and the ts type exactly when a
-        // temporal spec records key types.
-        let temporal = matches!(self.key_spec, KeySpec::Temporal { .. });
+        // Recorded types: one per key column, `ts_type` for temporal, bounds,
+        // and temporal2 specs, and `known_ts_type` for temporal2 specs.
+        let has_ts = matches!(
+            self.key_spec,
+            KeySpec::Temporal { .. } | KeySpec::Bounds { .. } | KeySpec::Temporal2 { .. }
+        );
+        let has_known = matches!(self.key_spec, KeySpec::Temporal2 { .. });
         match &self.key_types {
             Some(types) if types.len() != self.key_spec.columns().len() => {
                 return Err(corrupt("key_types does not match the key spec's columns"));
             }
-            Some(_) if temporal != self.ts_type.is_some() => {
-                return Err(corrupt("ts_type is recorded exactly for temporal specs"));
+            Some(_) if has_ts != self.ts_type.is_some() => {
+                return Err(corrupt(
+                    "ts_type is recorded exactly for temporal, bounds, and temporal2 specs",
+                ));
             }
-            None if self.ts_type.is_some() => {
-                return Err(corrupt("ts_type without key_types"));
+            Some(_) if has_known != self.known_ts_type.is_some() => {
+                return Err(corrupt(
+                    "known_ts_type is recorded exactly for temporal2 specs",
+                ));
+            }
+            None if self.ts_type.is_some() || self.known_ts_type.is_some() => {
+                return Err(corrupt("ts_type or known_ts_type without key_types"));
             }
             _ => {}
         }

@@ -100,6 +100,36 @@ pub enum LookupKind {
         /// The timestamp column.
         ts_column: String,
     },
+    /// Rows holding the keys within `[lo, hi]` on `ts_column` (`locate --window`
+    /// or `asof --lookback` / `latest --lookback`).
+    Window {
+        /// The window or lookback as given.
+        window: String,
+        /// Lower bound in `ts_column`'s dataset unit.
+        lo: i64,
+        /// Upper bound in `ts_column`'s dataset unit.
+        hi: i64,
+        /// The timestamp or date column.
+        ts_column: String,
+    },
+    /// Bitemporal lookup (`temporal2:key@valid,known`): `latest --known` or
+    /// `asof --valid V --known K`.
+    Bitemporal {
+        /// Optional valid time as given.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        valid: Option<String>,
+        /// Valid time in `valid_column`'s dataset unit.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        valid_ts: Option<i64>,
+        /// Known time as given.
+        known: String,
+        /// Known time in `known_column`'s dataset unit.
+        known_ts: i64,
+        /// Valid-time column.
+        valid_column: String,
+        /// Known-time column.
+        known_column: String,
+    },
 }
 
 /// What [`crate::Engine::locate`], [`crate::Engine::latest`], and

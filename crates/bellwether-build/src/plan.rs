@@ -55,7 +55,7 @@ use arrow::array::{ArrayRef, RecordBatch};
 use arrow::datatypes::{DataType, SchemaRef};
 use bellwether_core::encoding::{self, tag, KeyColumns, Value};
 use bellwether_core::segment::ReadAt;
-use bellwether_core::temporal::{self, VersionChain, VersionHit};
+use bellwether_core::temporal::{self, BitemporalChain, VersionChain, VersionHit};
 use bellwether_core::SegmentReader;
 use bellwether_source::canonical::normalize_float_bounds;
 use bellwether_source::partition::{encode_virtual_value, extract_virtual_cols, PathTemplate};
@@ -115,6 +115,34 @@ pub enum Lookup {
         /// Inclusive upper bound.
         hi: Vec<u8>,
     },
+    /// Rows whose `columns` tuple is one of `keys` AND whose `ts_column` lies
+    /// in `[lo, hi]` (inclusive, in `ts_column`'s dataset unit). Uses per-key
+    /// time bounds (`KeySpec::Bounds`) when available, else a range key on
+    /// `ts_column`, else virtual partition/path values.
+    KeysInWindow {
+        /// Lookup columns.
+        columns: Vec<String>,
+        /// Canonical key tuples.
+        keys: Vec<Vec<u8>>,
+        /// Timestamp or date column.
+        ts_column: String,
+        /// Inclusive lower bound in `ts_column`'s dataset unit.
+        lo: i64,
+        /// Inclusive upper bound in `ts_column`'s dataset unit.
+        hi: i64,
+    },
+    /// Bitemporal lookup (`temporal2:key@valid,known`): `latest --known K` when
+    /// `valid` is `None`, or `asof --valid V --known K` when `valid` is `Some`.
+    Bitemporal {
+        /// Lookup columns.
+        columns: Vec<String>,
+        /// Canonical key tuples.
+        keys: Vec<Vec<u8>>,
+        /// Optional valid-time upper bound (`--valid V`).
+        valid: Option<i64>,
+        /// Known-time upper bound (`--known K`).
+        known: i64,
+    },
 }
 
 /// A key spec whose segments exist only in memory, for example a
@@ -156,7 +184,13 @@ fn serve(spec: &KeySpec, columns: &[String]) -> Option<Serve> {
     if let Some(positions) = positions {
         return Some(Serve::Project(positions));
     }
-    let keyed = matches!(spec, KeySpec::Exact { .. } | KeySpec::Temporal { .. });
+    let keyed = matches!(
+        spec,
+        KeySpec::Exact { .. }
+            | KeySpec::Temporal { .. }
+            | KeySpec::Bounds { .. }
+            | KeySpec::Temporal2 { .. }
+    );
     (keyed && columns.len() < p.len() && p[..columns.len()] == *columns).then_some(Serve::Prefix)
 }
 
@@ -340,6 +374,19 @@ impl<S: StoreExt + ?Sized> Planner<S> {
                 self.plan_temporal(&segs, columns, keys, Some(*ts))
             }
             Lookup::Between { column, lo, hi } => self.plan_between(&segs, column, lo, hi),
+            Lookup::KeysInWindow {
+                columns,
+                keys,
+                ts_column,
+                lo,
+                hi,
+            } => self.plan_keys_in_window(&segs, columns, keys, ts_column, *lo, *hi),
+            Lookup::Bitemporal {
+                columns,
+                keys,
+                valid,
+                known,
+            } => self.plan_bitemporal(&segs, columns, keys, *valid, *known),
         }
     }
 
@@ -467,7 +514,13 @@ impl<S: StoreExt + ?Sized> Planner<S> {
             })
             .collect();
         let mut out = vec![RoaringBitmap::new(); keys.len()];
-        let keyed = matches!(seg.spec, KeySpec::Exact { .. } | KeySpec::Temporal { .. });
+        let keyed = matches!(
+            seg.spec,
+            KeySpec::Exact { .. }
+                | KeySpec::Temporal { .. }
+                | KeySpec::Bounds { .. }
+                | KeySpec::Temporal2 { .. }
+        );
         match (keyed, how) {
             (true, Serve::Project(_)) => {
                 let mut owners: BTreeMap<&[u8], Vec<usize>> = BTreeMap::new();
@@ -736,9 +789,10 @@ impl<S: StoreExt + ?Sized> Planner<S> {
             .iter()
             .filter(|s| match &s.spec {
                 KeySpec::Range { column: c } => c == column,
-                KeySpec::Exact { columns } | KeySpec::Temporal { columns, .. } => {
-                    columns.first().is_some_and(|c| c == column)
-                }
+                KeySpec::Exact { columns }
+                | KeySpec::Temporal { columns, .. }
+                | KeySpec::Bounds { columns, .. }
+                | KeySpec::Temporal2 { columns, .. } => columns.first().is_some_and(|c| c == column),
                 KeySpec::Bloom { .. } => false,
             })
             .collect();
@@ -776,6 +830,302 @@ impl<S: StoreExt + ?Sized> Planner<S> {
             hi,
         };
         self.finish(segs, &selected, residual)
+    }
+
+    fn plan_keys_in_window(
+        &self,
+        segs: &[SpecSegments],
+        columns: &[String],
+        keys: &[Vec<u8>],
+        ts_column: &str,
+        lo: i64,
+        hi: i64,
+    ) -> Result<ScanPlan> {
+        let types = self.column_types(columns)?;
+        let ts_type = self
+            .column_types(std::slice::from_ref(&ts_column.to_string()))?
+            .remove(0)
+            .1;
+        let lo_enc = encode_ts(lo, &ts_type)?;
+        let hi_enc = encode_ts(hi, &ts_type)?;
+        let (keys, spans) = non_null_probes(keys, &types)?;
+        let residual = Predicate::And {
+            all: vec![
+                Predicate::In {
+                    columns: columns.to_vec(),
+                    values: expanded(keys.iter()),
+                },
+                Predicate::Between {
+                    column: ts_column.to_string(),
+                    lo: lo_enc.clone(),
+                    hi: hi_enc.clone(),
+                },
+            ],
+        };
+        if keys.is_empty() || lo > hi {
+            return self.finish(segs, &RoaringBitmap::new(), residual);
+        }
+        let vpruned = self.prune_virtual_keys(columns, &keys, &spans)?;
+        let vwindow = self.prune_virtual_between(ts_column, &lo_enc, &hi_enc)?;
+        let mut acc: Vec<Option<RoaringBitmap>> = vec![None; keys.len()];
+
+        // 1. Key-serving specs (exact, bloom, temporal, bounds, temporal2).
+        let serving: Vec<_> = segs
+            .iter()
+            .filter_map(|s| serve(&s.spec, columns).map(|v| (s, v)))
+            .collect();
+        if !serving.is_empty() {
+            self.intersect(&mut acc, &serving, &keys, &spans)?;
+        }
+
+        // 2. Per-key time bounds sidecar (`KeySpec::Bounds` on `ts_column` serving `columns`).
+        for (seg, how) in &serving {
+            let (Serve::Project(positions), KeySpec::Bounds { ts_column: b_ts, .. }) =
+                (how, &seg.spec)
+            else {
+                continue;
+            };
+            if b_ts != ts_column {
+                continue;
+            }
+            let probes: Vec<Vec<Vec<u8>>> = keys
+                .iter()
+                .zip(&spans)
+                .map(|(k, sp)| zero_variants(&project(k, sp, positions)))
+                .collect();
+            let mut owners: BTreeMap<&[u8], Vec<usize>> = BTreeMap::new();
+            for (i, ps) in probes.iter().enumerate() {
+                for p in ps {
+                    owners.entry(p.as_slice()).or_default().push(i);
+                }
+            }
+            let all: Vec<&[u8]> = owners.keys().copied().collect();
+            let mut per_key_bm = vec![RoaringBitmap::new(); keys.len()];
+            for src in &seg.sources {
+                let r = self.open_segment(&seg.spec, src, false)?;
+                for (probe, bm) in r.lookup_bounds(&all, lo, hi)? {
+                    for &i in owners.get(probe.as_slice()).map_or(&[][..], Vec::as_slice) {
+                        per_key_bm[i] |= &bm;
+                    }
+                }
+            }
+            for (a, b) in acc.iter_mut().zip(per_key_bm) {
+                *a = Some(match a.take() {
+                    Some(x) => x & b,
+                    None => b,
+                });
+            }
+        }
+
+        // 3. Global range specs on `ts_column` (or exact/temporal specs led by `ts_column`).
+        let range_serving: Vec<&SpecSegments> = segs
+            .iter()
+            .filter(|s| match &s.spec {
+                KeySpec::Range { column: c } => c == ts_column,
+                KeySpec::Exact { columns: c }
+                | KeySpec::Temporal { columns: c, .. }
+                | KeySpec::Bounds { columns: c, .. }
+                | KeySpec::Temporal2 { columns: c, .. } => c.first().is_some_and(|x| x == ts_column),
+                KeySpec::Bloom { .. } => false,
+            })
+            .collect();
+        let mut global_ts: Option<RoaringBitmap> = vwindow;
+        for s in &range_serving {
+            let is_range = matches!(s.spec, KeySpec::Range { .. });
+            let mut found = RoaringBitmap::new();
+            for src in &s.sources {
+                let r = self.open_segment(&s.spec, src, is_range)?;
+                found |= if is_range {
+                    r.lookup_range(&lo_enc, &hi_enc)?
+                } else {
+                    r.lookup_prefix_range(&lo_enc, &hi_enc)?
+                };
+            }
+            global_ts = Some(match global_ts {
+                Some(x) => x & found,
+                None => found,
+            });
+        }
+
+        if !segs.is_empty()
+            && serving.is_empty()
+            && range_serving.is_empty()
+            && vpruned.is_none()
+            && global_ts.is_none()
+        {
+            return Err(Error::KeySpec(format!(
+                "none of the key specs {:?} serves a window lookup on {columns:?} and {ts_column:?}",
+                segs.iter().map(|s| s.spec.name()).collect::<Vec<_>>()
+            )));
+        }
+
+        let mut selected = if acc.iter().any(Option::is_some) {
+            acc.into_iter()
+                .flatten()
+                .fold(RoaringBitmap::new(), |u, b| u | b)
+        } else {
+            self.locator.live().clone()
+        };
+        if let Some(pruned) = vpruned {
+            selected &= pruned;
+        }
+        if let Some(ts_bm) = global_ts {
+            selected &= ts_bm;
+        }
+        self.finish(segs, &selected, residual)
+    }
+
+    fn plan_bitemporal(
+        &self,
+        segs: &[SpecSegments],
+        columns: &[String],
+        keys: &[Vec<u8>],
+        valid: Option<i64>,
+        known: i64,
+    ) -> Result<ScanPlan> {
+        let types = self.column_types(columns)?;
+        let (keys, spans) = non_null_probes(keys, &types)?;
+        let keys = keys.as_slice();
+        let vpruned = self.prune_virtual_keys(columns, keys, &spans)?;
+        let serving = Self::serving(segs, columns, vpruned.is_some())?;
+        let mut bitemporal = serving
+            .iter()
+            .filter(|(s, _)| matches!(s.spec, KeySpec::Temporal2 { .. }));
+        let (t, how) = match (bitemporal.next(), bitemporal.next()) {
+            (Some((t, how)), None) => (*t, how),
+            (None, _) => {
+                return Err(Error::KeySpec(format!(
+                    "bitemporal lookup needs a temporal2 key spec serving {columns:?}"
+                )))
+            }
+            (Some(_), Some(_)) => {
+                return Err(Error::KeySpec(
+                    "more than one temporal2 key spec serves this lookup; name one".into(),
+                ))
+            }
+        };
+        let (
+            Serve::Project(positions),
+            KeySpec::Temporal2 {
+                valid_column,
+                known_column,
+                ..
+            },
+        ) = (how, &t.spec)
+        else {
+            return Err(Error::KeySpec(format!(
+                "bitemporal lookup needs every column of {} in the lookup",
+                t.spec.name()
+            )));
+        };
+        let valid_type = self
+            .column_types(std::slice::from_ref(valid_column))?
+            .remove(0)
+            .1;
+        let known_type = self
+            .column_types(std::slice::from_ref(known_column))?
+            .remove(0)
+            .1;
+        let variants: Vec<Vec<Vec<u8>>> = keys
+            .iter()
+            .zip(&spans)
+            .map(|(k, sp)| zero_variants(&project(k, sp, positions)))
+            .collect();
+        let mut probes: Vec<Vec<u8>> = variants.iter().flatten().cloned().collect();
+        probes.sort_unstable();
+        probes.dedup();
+        let readers = t
+            .sources
+            .iter()
+            .map(|src| self.open_segment(&t.spec, src, false))
+            .collect::<Result<Vec<_>>>()?;
+        let hits = self.bitemporal_hits(&readers, &probes, valid, known)?;
+        let winners: Vec<Option<VersionHit>> = variants
+            .iter()
+            .map(|vs| {
+                vs.iter()
+                    .filter_map(|v| hits.get(v))
+                    .fold(None, |acc: Option<VersionHit>, h| {
+                        Some(match acc {
+                            Some(mut a) => {
+                                a.combine(h);
+                                a
+                            }
+                            None => h.clone(),
+                        })
+                    })
+            })
+            .collect();
+        let mut acc: Vec<Option<RoaringBitmap>> = winners
+            .iter()
+            .map(|w| Some(w.as_ref().map(|h| h.row_groups.clone()).unwrap_or_default()))
+            .collect();
+        let others: Vec<(&SpecSegments, Serve)> = serving
+            .iter()
+            .filter(|(s, _)| !std::ptr::eq(*s, t))
+            .map(|(s, h)| (*s, h.clone()))
+            .collect();
+        self.intersect(&mut acc, &others, keys, &spans)?;
+        let mut selected = acc
+            .into_iter()
+            .flatten()
+            .fold(RoaringBitmap::new(), |u, b| u | b);
+        if let Some(pruned) = vpruned {
+            selected &= pruned;
+        }
+        let residual = bitemporal_residual(
+            &t.spec,
+            valid_column,
+            &valid_type,
+            known_column,
+            &known_type,
+            columns,
+            keys,
+            &variants,
+            &winners,
+            valid,
+            known,
+        )?;
+        self.finish(segs, &selected, residual)
+    }
+
+    fn bitemporal_hits<R: ReadAt>(
+        &self,
+        readers: &[SegmentReader<R>],
+        probes: &[Vec<u8>],
+        valid: Option<i64>,
+        known: i64,
+    ) -> Result<BTreeMap<Vec<u8>, VersionHit>> {
+        let raw = temporal::query_bitemporal(readers, probes, valid, Some(known))?;
+        let live = self.locator.live();
+        let mut out = BTreeMap::new();
+        let mut redo = Vec::new();
+        for (key, mut hit) in raw {
+            self.locator.check_known(&hit.row_groups)?;
+            hit.row_groups &= live;
+            if hit.row_groups.is_empty() {
+                redo.push(key);
+            } else {
+                out.insert(key, hit);
+            }
+        }
+        if redo.is_empty() {
+            return Ok(out);
+        }
+        for r in readers {
+            for (key, value) in r.get(&redo)? {
+                self.locator.check_known(&value.bitmap)?;
+                if let Some(h) = live_bitemporal_winner(&value.chain2, live, valid, known) {
+                    match out.get_mut(&key) {
+                        Some(acc) => acc.combine(&h),
+                        None => {
+                            out.insert(key, h);
+                        }
+                    }
+                }
+            }
+        }
+        Ok(out)
     }
 
     // -- the plan --------------------------------------------------------------
@@ -1144,6 +1494,92 @@ fn live_winner(
         }
     }
     best
+}
+
+fn live_bitemporal_winner(
+    chain: &BitemporalChain,
+    live: &RoaringBitmap,
+    max_valid: Option<i64>,
+    max_known: i64,
+) -> Option<VersionHit> {
+    let mut best: Option<VersionHit> = None;
+    for &(v, k, rg) in chain.versions() {
+        if !live.contains(rg.0) || k > max_known || max_valid.is_some_and(|mv| v > mv) {
+            continue;
+        }
+        let hit = VersionHit {
+            ts: v,
+            row_groups: std::iter::once(rg.0).collect(),
+        };
+        match &mut best {
+            Some(b) => b.combine(&hit),
+            None => best = Some(hit),
+        }
+    }
+    best
+}
+
+#[allow(clippy::too_many_arguments)]
+fn bitemporal_residual(
+    spec: &KeySpec,
+    valid_column: &str,
+    valid_type: &DataType,
+    known_column: &str,
+    known_type: &DataType,
+    columns: &[String],
+    keys: &[Vec<u8>],
+    variants: &[Vec<Vec<u8>>],
+    winners: &[Option<VersionHit>],
+    valid: Option<i64>,
+    known: i64,
+) -> Result<Predicate> {
+    let with_version = || {
+        keys.iter()
+            .zip(winners)
+            .filter(|(_, w)| w.is_some())
+            .map(|(k, _)| k)
+    };
+    let mut bounds: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
+    let mut lowest_valid: Option<i64> = None;
+    for (vs, w) in variants.iter().zip(winners) {
+        let Some(h) = w else { continue };
+        lowest_valid = Some(lowest_valid.map_or(h.ts, |l| l.min(h.ts)));
+        let ts = encode_ts(h.ts, valid_type)?;
+        for v in vs {
+            bounds.insert(v.clone(), ts.clone());
+        }
+    }
+    let mut all = vec![
+        Predicate::In {
+            columns: columns.to_vec(),
+            values: expanded(with_version()),
+        },
+        // Known-time bound: non-null known <= K (`Between` from minimum representable
+        // value of `known_type`, or `vec![0x01]` which is strictly greater than the
+        // `0x00` null marker and <= every non-null canonical encoding, up to `known`).
+        Predicate::Between {
+            column: known_column.to_string(),
+            lo: vec![0x01],
+            hi: encode_ts(known, known_type)?,
+        },
+    ];
+    if let (Some(at_v), Some(lo_v)) = (valid, lowest_valid) {
+        all.push(Predicate::Between {
+            column: valid_column.to_string(),
+            lo: encode_ts(lo_v, valid_type)?,
+            hi: encode_ts(at_v, valid_type)?,
+        });
+    }
+    all.push(Predicate::NotOlderThan {
+        columns: spec.columns().to_vec(),
+        ts_column: valid_column.to_string(),
+        bounds: bounds.into_iter().collect(),
+    });
+    all.push(Predicate::LatestPerKey {
+        columns: spec.columns().to_vec(),
+        ts_column: valid_column.to_string(),
+    });
+    Ok(Predicate::And { all })
 }
 
 /// The residual of a latest or asof lookup (see the module docs).

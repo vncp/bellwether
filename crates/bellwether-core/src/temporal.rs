@@ -196,6 +196,294 @@ impl VersionChain {
     }
 }
 
+/// Per-key, per-row-group `[min_ts, max_ts]` bounds stored in a `bounds`
+/// sidecar segment (`KeySpec::Bounds`), sorted ascending by `RowGroupId`.
+///
+/// Rows with a null timestamp do not enter the bounds table (though their row
+/// group is still in the key's bitmap).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct KeyBounds {
+    ranges: Vec<(RowGroupId, i64, i64)>,
+}
+
+impl KeyBounds {
+    /// Empty bounds.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Builds bounds from `(rg, min, max)` entries, merging duplicate row
+    /// groups by hull `[min1.min(min2), max1.max(max2)]`.
+    #[must_use]
+    pub fn from_ranges(mut ranges: Vec<(RowGroupId, i64, i64)>) -> Self {
+        ranges.sort_unstable_by_key(|r| r.0);
+        let mut out: Vec<(RowGroupId, i64, i64)> = Vec::with_capacity(ranges.len());
+        for (rg, lo, hi) in ranges {
+            let (lo, hi) = (lo.min(hi), lo.max(hi));
+            if let Some(last) = out.last_mut() {
+                if last.0 == rg {
+                    last.1 = last.1.min(lo);
+                    last.2 = last.2.max(hi);
+                    continue;
+                }
+            }
+            out.push((rg, lo, hi));
+        }
+        Self { ranges: out }
+    }
+
+    /// Records a timestamp `ts` in row group `rg`.
+    pub fn record(&mut self, rg: RowGroupId, ts: Option<i64>) {
+        let Some(ts) = ts else {
+            return;
+        };
+        match self.ranges.binary_search_by_key(&rg, |r| r.0) {
+            Ok(i) => {
+                self.ranges[i].1 = self.ranges[i].1.min(ts);
+                self.ranges[i].2 = self.ranges[i].2.max(ts);
+            }
+            Err(i) => {
+                self.ranges.insert(i, (rg, ts, ts));
+            }
+        }
+    }
+
+    /// Merges another `KeyBounds` of the same key.
+    pub fn merge(&mut self, other: &Self) {
+        let mut combined = Vec::with_capacity(self.ranges.len() + other.ranges.len());
+        combined.extend_from_slice(&self.ranges);
+        combined.extend_from_slice(&other.ranges);
+        *self = Self::from_ranges(combined);
+    }
+
+    /// Stored `(RowGroupId, min_ts, max_ts)` entries, ascending by row group.
+    #[must_use]
+    pub fn ranges(&self) -> &[(RowGroupId, i64, i64)] {
+        &self.ranges
+    }
+
+    /// Whether no non-null timestamp was recorded.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.ranges.is_empty()
+    }
+
+    /// Row groups whose `[min_ts, max_ts]` for this key overlaps `[lo, hi]`.
+    #[must_use]
+    pub fn overlapping(&self, lo: i64, hi: i64) -> RoaringBitmap {
+        if lo > hi {
+            return RoaringBitmap::new();
+        }
+        self.ranges
+            .iter()
+            .filter(|&&(_, min, max)| max >= lo && min <= hi)
+            .map(|&(rg, _, _)| rg.0)
+            .collect()
+    }
+
+    /// Serialized form: `count u32`, then `count` x (`rg u32`, `min_ts i64`,
+    /// `max_ts i64`), little-endian.
+    pub fn write_to(&self, out: &mut Vec<u8>) -> Result<()> {
+        let n = u32::try_from(self.ranges.len())
+            .map_err(|_| Error::Other("key bounds longer than u32::MAX".into()))?;
+        out.extend_from_slice(&n.to_le_bytes());
+        for &(rg, min, max) in &self.ranges {
+            out.extend_from_slice(&rg.0.to_le_bytes());
+            out.extend_from_slice(&min.to_le_bytes());
+            out.extend_from_slice(&max.to_le_bytes());
+        }
+        Ok(())
+    }
+
+    /// Parses the form written by [`KeyBounds::write_to`].
+    pub fn read_from(bytes: &[u8]) -> Result<Self> {
+        let bad = || Error::Other("corrupt key bounds".into());
+        if bytes.len() < 4 {
+            return Err(bad());
+        }
+        let n = u32::from_le_bytes(bytes[0..4].try_into().map_err(|_| bad())?) as usize;
+        let body = &bytes[4..];
+        if body.len() != n * 20 {
+            return Err(bad());
+        }
+        let mut ranges = Vec::with_capacity(n);
+        for c in body.as_chunks::<20>().0 {
+            let rg = u32::from_le_bytes(c[0..4].try_into().map_err(|_| bad())?);
+            let min = i64::from_le_bytes(c[4..12].try_into().map_err(|_| bad())?);
+            let max = i64::from_le_bytes(c[12..20].try_into().map_err(|_| bad())?);
+            if min > max {
+                return Err(bad());
+            }
+            ranges.push((RowGroupId(rg), min, max));
+        }
+        if !ranges.windows(2).all(|w| w[0].0 < w[1].0) {
+            return Err(bad());
+        }
+        Ok(Self { ranges })
+    }
+}
+
+/// Bitemporal version chain per key (`temporal2:key@valid,known`), storing
+/// distinct `(valid_ts, known_ts, RowGroupId)` triples sorted ascending.
+///
+/// Nulls in either clock never enter the chain (ADR 014).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct BitemporalChain {
+    versions: Vec<(i64, i64, RowGroupId)>,
+}
+
+impl BitemporalChain {
+    /// An empty bitemporal chain.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Builds a chain from arbitrary `(valid, known, rg)` triples: sorts and
+    /// deduplicates once.
+    #[must_use]
+    pub fn from_versions(mut versions: Vec<(i64, i64, RowGroupId)>) -> Self {
+        versions.sort_unstable();
+        versions.dedup();
+        Self { versions }
+    }
+
+    /// Merges another bitemporal chain of the same key in linear time.
+    pub fn merge(&mut self, other: &Self) {
+        let mut out = Vec::with_capacity(self.versions.len() + other.versions.len());
+        let (mut i, mut j) = (0, 0);
+        let (a, b) = (&self.versions, &other.versions);
+        while i < a.len() && j < b.len() {
+            match a[i].cmp(&b[j]) {
+                std::cmp::Ordering::Less => {
+                    out.push(a[i]);
+                    i += 1;
+                }
+                std::cmp::Ordering::Greater => {
+                    out.push(b[j]);
+                    j += 1;
+                }
+                std::cmp::Ordering::Equal => {
+                    out.push(a[i]);
+                    i += 1;
+                    j += 1;
+                }
+            }
+        }
+        out.extend_from_slice(&a[i..]);
+        out.extend_from_slice(&b[j..]);
+        self.versions = out;
+    }
+
+    /// Stored `(valid, known, RowGroupId)` triples, ascending.
+    #[must_use]
+    pub fn versions(&self) -> &[(i64, i64, RowGroupId)] {
+        &self.versions
+    }
+
+    /// Whether the chain has no version with non-null valid and known times.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.versions.is_empty()
+    }
+
+    /// Newest version by valid time among entries with `valid <= max_valid`
+    /// (when `Some`) and `known <= max_known` (when `Some`). Ties on the
+    /// winning valid time (any `known <= max_known`) union their row groups.
+    #[must_use]
+    pub fn query(&self, max_valid: Option<i64>, max_known: Option<i64>) -> Option<VersionHit> {
+        let end = match max_valid {
+            Some(v) => self.versions.partition_point(|t| t.0 <= v),
+            None => self.versions.len(),
+        };
+        let slice = &self.versions[..end];
+        let mut best: Option<VersionHit> = None;
+        for &(v, k, rg) in slice.iter().rev() {
+            if max_known.is_some_and(|mk| k > mk) {
+                continue;
+            }
+            match &mut best {
+                None => {
+                    let mut row_groups = RoaringBitmap::new();
+                    row_groups.insert(rg.0);
+                    best = Some(VersionHit { ts: v, row_groups });
+                }
+                Some(hit) if v == hit.ts => {
+                    hit.row_groups.insert(rg.0);
+                }
+                Some(_) => break,
+            }
+        }
+        best
+    }
+
+    /// Serialized form: `count u32`, then `count` x (`valid i64`, `known i64`,
+    /// `rg u32`), little-endian.
+    pub fn write_to(&self, out: &mut Vec<u8>) -> Result<()> {
+        let n = u32::try_from(self.versions.len())
+            .map_err(|_| Error::Other("bitemporal chain longer than u32::MAX".into()))?;
+        out.extend_from_slice(&n.to_le_bytes());
+        for &(v, k, rg) in &self.versions {
+            out.extend_from_slice(&v.to_le_bytes());
+            out.extend_from_slice(&k.to_le_bytes());
+            out.extend_from_slice(&rg.0.to_le_bytes());
+        }
+        Ok(())
+    }
+
+    /// Parses the form written by [`BitemporalChain::write_to`].
+    pub fn read_from(bytes: &[u8]) -> Result<Self> {
+        let bad = || Error::Other("corrupt bitemporal chain".into());
+        if bytes.len() < 4 {
+            return Err(bad());
+        }
+        let n = u32::from_le_bytes(bytes[0..4].try_into().map_err(|_| bad())?) as usize;
+        let body = &bytes[4..];
+        if body.len() != n * 20 {
+            return Err(bad());
+        }
+        let mut versions = Vec::with_capacity(n);
+        for c in body.as_chunks::<20>().0 {
+            let v = i64::from_le_bytes(c[0..8].try_into().map_err(|_| bad())?);
+            let k = i64::from_le_bytes(c[8..16].try_into().map_err(|_| bad())?);
+            let rg = u32::from_le_bytes(c[16..20].try_into().map_err(|_| bad())?);
+            versions.push((v, k, RowGroupId(rg)));
+        }
+        if !versions.windows(2).all(|w| w[0] < w[1]) {
+            return Err(bad());
+        }
+        Ok(Self { versions })
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub(crate) struct BitemporalBuffer {
+    versions: Vec<(i64, i64, RowGroupId)>,
+    compacted: usize,
+}
+
+impl BitemporalBuffer {
+    pub(crate) fn push(&mut self, valid: Option<i64>, known: Option<i64>, rg: RowGroupId) {
+        let (Some(v), Some(k)) = (valid, known) else {
+            return;
+        };
+        if self.versions.last() == Some(&(v, k, rg)) {
+            return;
+        }
+        self.versions.push((v, k, rg));
+        if self.versions.len() > 2 * self.compacted.max(32) {
+            self.versions.sort_unstable();
+            self.versions.dedup();
+            self.compacted = self.versions.len();
+        }
+    }
+
+    pub(crate) fn finish(self) -> BitemporalChain {
+        BitemporalChain::from_versions(self.versions)
+    }
+}
+
 /// Accumulates versions of one key during a build without quadratic
 /// insertion: appends, skips an immediate repeat, and sorts and deduplicates
 /// whenever the buffer doubles, so memory stays within about twice the
@@ -244,7 +532,10 @@ fn same_spec<R: ReadAt>(segments: &[SegmentReader<R>]) -> Result<()> {
                 h.key_spec.name()
             )));
         }
-        if h.key_types != h0.key_types || h.ts_type != h0.ts_type {
+        if h.key_types != h0.key_types
+            || h.ts_type != h0.ts_type
+            || h.known_ts_type != h0.known_ts_type
+        {
             return Err(Error::KeySpec(format!(
                 "segments of {} recorded under different types",
                 h0.key_spec.name()
@@ -296,6 +587,37 @@ pub fn asof<R: ReadAt, K: AsRef<[u8]>>(
     ts: i64,
 ) -> Result<BTreeMap<Vec<u8>, VersionHit>> {
     fold(segments, |s| s.asof(keys, ts))
+}
+
+
+/// Index-wide bitemporal query (`latest --known` when `valid` is `None`, or
+/// `asof --valid V --known K`) across every segment of a `temporal2` key spec.
+pub fn query_bitemporal<R: ReadAt, K: AsRef<[u8]>>(
+    segments: &[SegmentReader<R>],
+    keys: &[K],
+    valid: Option<i64>,
+    known: Option<i64>,
+) -> Result<BTreeMap<Vec<u8>, VersionHit>> {
+    fold(segments, |s| s.query_bitemporal(keys, valid, known))
+}
+
+/// Index-wide per-key row groups whose `[min_ts, max_ts]` in a `bounds`
+/// sidecar segment overlaps `[lo, hi]`, unioned across all segments of the
+/// `KeySpec::Bounds`.
+pub fn lookup_bounds<R: ReadAt, K: AsRef<[u8]>>(
+    segments: &[SegmentReader<R>],
+    keys: &[K],
+    lo: i64,
+    hi: i64,
+) -> Result<BTreeMap<Vec<u8>, RoaringBitmap>> {
+    same_spec(segments)?;
+    let mut out: BTreeMap<Vec<u8>, RoaringBitmap> = BTreeMap::new();
+    for s in segments {
+        for (k, bm) in s.lookup_bounds(keys, lo, hi)? {
+            *out.entry(k).or_default() |= bm;
+        }
+    }
+    Ok(out)
 }
 
 #[cfg(test)]

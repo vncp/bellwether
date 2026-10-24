@@ -26,4 +26,4 @@ pub mod temporal;
 
 pub use merge::merge;
 pub use segment::{EncodedSegment, SegmentReader, SegmentWriter, WriterOptions};
-pub use temporal::{VersionChain, VersionHit};
+pub use temporal::{BitemporalChain, KeyBounds, VersionChain, VersionHit};
