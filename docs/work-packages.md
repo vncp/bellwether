@@ -14,8 +14,9 @@ One crate, one owner, one interface contract each. WP0 ships first and alone. Af
 | WP6 replay | merged after two review rounds; PlanSource implemented for the build planner |
 | WP5 profile | merged after four review rounds; one shared decision module with the bench |
 | WP8 verify | merged after four review rounds; no false pass over 12,800 chunkings |
-| WP9 facade and cli | merged: why, index, locate, latest, asof, propose, reconcile, fix, receipt, report; profile wiring in progress |
-| Dependency upgrade, WP12 mcp | next, in that order |
+| WP9 facade and cli | merged: why, index, locate, latest, asof, propose, reconcile, fix, receipt, report; profile wired into `why` |
+| Dependency upgrade | in progress |
+| WP12 mcp, WP20 sql | next, in that order |
 | WP13 evolve | after M3 |
 | WP14 counted segments and column bytes, WP15 relational replay, WP16 engine adapters, WP17 CI receipts, WP18 transfer evaluation, WP19 signed receipts | planned 2026-10-24 (ADR 026) |
 | WP20 SQL sources | planned 2026-10-24 (ADR 027); runs right after WP12 |
