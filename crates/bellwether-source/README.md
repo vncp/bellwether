@@ -19,6 +19,7 @@ WP2. Implements `bellwether_types::Source` for Parquet and for CSV / JSON lines,
 | `text::csv_ends_in_quotes(bytes, delimiter)` | csv_core's quoting rules as a scanner: whether a chunk parsed from a record boundary ends inside a quoted field. |
 | `ParquetSource::column_bytes` | Compressed column-chunk bytes per row group and column, ready for the planned `ColumnStats.bytes` field. |
 | `ChunkedTextSource::byte_range(rg)` | A text row group's byte range, ready for the planned `RowGroupMeta.byte_range` field. |
+| `PathTemplate`, `with_path_template` (both sources), `partition` | Virtual columns from Hive-style `name=value` directory components and `--path-template "<pattern>"` (with optional `{col:type}` typing). Reported in `RowGroupMeta.stats` with `min = max = value`, `null_count = 0`, `distinct_count = 1`, `bytes = 0` without reading data pages. |
 
 ## Semantics worth knowing
 
@@ -59,6 +60,7 @@ WP2. Implements `bellwether_types::Source` for Parquet and for CSV / JSON lines,
 - **Discovery.** Recursive and sorted. Names starting with `.` or `_` (such as `_SUCCESS`) are skipped. Parquet lists `*.parquet`, CSV lists `*.csv`, JSON lines lists `*.jsonl` and `*.ndjson`. Without `with_schema`, `schema(root)` uses the first file in sorted order.
 - **`read_columns` returns file-native types.** With `with_schema`, Parquet `read_columns` returns each file's own Arrow types, while `schema(root)` reports dataset types. A consumer that encodes batch values (WP4 keys, WP8 row hashes) must encode them **as the dataset type**, `canonical::encode_as(array, row, dataset_type)`. Otherwise a value from a scale-2 decimal file will not match stats or probes at the dataset's scale 4.
 - **Unknown columns** in `read_columns` return `Error::KeySpec`. The returned batch has exactly the requested columns, in the requested order. An empty request returns a zero-column batch carrying the row count.
+- **Partition values from paths and `--path-template`.** A Hive-style `name=value` directory component (or a `{name}` / `{name:type}` placeholder in a configured `PathTemplate`) becomes a virtual column with `min = max = value` in `RowGroupMeta.stats`. When the column exists in the dataset schema (`with_schema` or the physical file schema), it takes that type; else when the placeholder names a type (`str`, `int`, `uint`, `float`, `bool`, `date`, `ts`), it takes that type; else its type is inferred from the value with the same scalar inference CSV file columns use (`arrow::csv::reader::Format::infer_schema`, plus `YYYY-MM-DD` as `Date32`, falling back to `Utf8`). When `read_columns` requests only virtual columns, constant arrays of length `rg.rows` are synthesized without reading any column chunk. If a file also stores the column physically and its statistics or decoded values disagree with the path value, the file is refused with `Error::Source`. With a `PathTemplate`, any discovered file that does not match the template is refused, listing up to 10 such paths.
 
 ## Guidance for WP4 (build) and other consumers
 

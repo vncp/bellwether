@@ -186,6 +186,10 @@ pub struct BuildOptions {
     /// the first file for a new index. A key column whose type differs from
     /// the manifest's rebuilds that key spec's segments.
     pub schema: Option<SchemaRef>,
+    /// Optional `--path-template` pattern for filename-derived virtual columns.
+    /// Recorded in the manifest's `source.path_template`; a later build with a
+    /// different template is refused.
+    pub path_template: Option<String>,
     /// Worker threads. `None` uses the available parallelism.
     pub threads: Option<usize>,
     /// Cap on the keys one segment accumulates (see the type docs).
@@ -220,6 +224,7 @@ impl Default for BuildOptions {
             fingerprint_policy: None,
             chunk_size: None,
             schema: None,
+            path_template: None,
             threads: None,
             max_segment_keys: DEFAULT_MAX_SEGMENT_KEYS,
             max_segment_bytes: DEFAULT_MAX_SEGMENT_BYTES,
@@ -239,6 +244,7 @@ impl fmt::Debug for BuildOptions {
             .field("fingerprint_policy", &self.fingerprint_policy)
             .field("chunk_size", &self.chunk_size)
             .field("schema", &self.schema.as_ref().map(|s| s.fields().len()))
+            .field("path_template", &self.path_template)
             .field("threads", &self.threads)
             .field("max_segment_keys", &self.max_segment_keys)
             .field("max_segment_bytes", &self.max_segment_bytes)

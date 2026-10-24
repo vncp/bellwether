@@ -120,6 +120,9 @@ pub struct EngineOptions {
     /// in-place patch outside the last 64 KiB that keeps size and mtime. An
     /// existing index keeps its recorded policy; another one is refused.
     pub fingerprint_policy: Option<FingerprintPolicy>,
+    /// Optional `--path-template` pattern for filename-derived virtual columns,
+    /// e.g. `"{day}.parquet"` or `"grouped_daily_us/{day:date}.parquet"`.
+    pub path_template: Option<String>,
     /// A fixed RFC 3339 time used as every record's `created_at` and as
     /// "now" when ages are computed, so two runs over the same inputs write
     /// byte-identical records. `None` uses the system clock.
@@ -250,6 +253,9 @@ impl Engine {
                 Error::Other(format!("the clock {c:?} is not an RFC 3339 time ({e})"))
             })?;
         }
+        if let Some(tpl) = &options.path_template {
+            bellwether_source::PathTemplate::parse(tpl)?;
+        }
         let local_index = local_path(&index)?;
         let engine = Self {
             root,
@@ -274,6 +280,18 @@ impl Engine {
                     "the index at {} indexes {}, not {}; pass that root or another --index",
                     engine.index, m.source.root, engine.root
                 )));
+            }
+            if let (Some(given), Some(rec)) = (
+                engine.options.path_template.as_deref(),
+                m.source.path_template.as_deref(),
+            ) {
+                if given.trim() != rec {
+                    return Err(Error::Source(format!(
+                        "the index at {} was built with --path-template {rec:?}, not {given:?}; \
+                         open it with the same template or build a new index",
+                        engine.index
+                    )));
+                }
             }
         }
         Ok(engine)
@@ -454,24 +472,37 @@ impl Engine {
             Some(p) => recorded_chunk_size(p.manifest())?,
             None => None,
         };
+        let tpl_suffix = self
+            .effective_path_template(pinned)?
+            .map_or_else(String::new, |t| format!(":tpl={}", t.as_str()));
         Ok(match format {
-            SourceFormat::Parquet => "parquet".to_string(),
+            SourceFormat::Parquet => format!("parquet{tpl_suffix}"),
             SourceFormat::Csv {
                 delimiter,
                 has_header,
             } => format!(
-                "csv:delimiter={delimiter}:header={has_header}:chunk={}",
+                "csv:delimiter={delimiter}:header={has_header}:chunk={}{tpl_suffix}",
                 chunk
                     .or(self.options.chunk_size)
                     .unwrap_or(bellwether_source::DEFAULT_CHUNK_SIZE)
             ),
             SourceFormat::JsonLines => format!(
-                "jsonl:chunk={}",
+                "jsonl:chunk={}{tpl_suffix}",
                 chunk
                     .or(self.options.chunk_size)
                     .unwrap_or(bellwether_source::DEFAULT_CHUNK_SIZE)
             ),
         })
+    }
+
+    pub(crate) fn effective_path_template(
+        &self,
+        pinned: Option<&Pinned>,
+    ) -> Result<Option<bellwether_source::PathTemplate>> {
+        let raw = pinned
+            .and_then(|p| p.manifest().source.path_template.as_deref())
+            .or(self.options.path_template.as_deref());
+        raw.map(bellwether_source::PathTemplate::parse).transpose()
     }
 
     pub(crate) fn source(&self, pinned: Option<&Pinned>) -> Result<Box<dyn Source>> {
@@ -487,12 +518,16 @@ impl Engine {
                 None,
             ),
         };
+        let path_template = self.effective_path_template(pinned)?;
         let format = SourceFormat::from_kind(self.options.format.kind());
         Ok(match format.text() {
             None => {
                 let mut s = ParquetSource::new().with_fingerprint_policy(policy);
                 if let Some(schema) = schema {
                     s = s.with_schema(schema);
+                }
+                if let Some(tpl) = path_template {
+                    s = s.with_path_template(tpl);
                 }
                 Box::new(s)
             }
@@ -503,6 +538,9 @@ impl Engine {
                 }
                 if let Some(schema) = schema {
                     s = s.with_schema(schema);
+                }
+                if let Some(tpl) = path_template {
+                    s = s.with_path_template(tpl);
                 }
                 Box::new(s)
             }

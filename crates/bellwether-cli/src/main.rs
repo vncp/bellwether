@@ -76,6 +76,10 @@ pub(crate) struct Global {
     /// in-place patch that keeps size and mtime.
     #[arg(long, global = true, value_enum)]
     fingerprint_policy: Option<PolicyArg>,
+    /// Pattern for filename-derived virtual columns, e.g. "{day}.parquet" or
+    /// "grouped_daily_us/{day:date}.parquet".
+    #[arg(long, global = true, value_name = "PATTERN")]
+    path_template: Option<String>,
     /// A fixed RFC 3339 time for every record's `created_at` and for ages, so
     /// runs are byte-reproducible (testing and audits).
     #[arg(long, global = true, value_name = "RFC3339", hide = true)]
@@ -358,6 +362,7 @@ pub(crate) fn engine(global: &Global, root: &str) -> Result<Engine, Failure> {
                 PolicyArg::Tail64k => bellwether::FingerprintPolicy::Tail64K,
                 PolicyArg::Full => bellwether::FingerprintPolicy::Full,
             }),
+            path_template: global.path_template.clone(),
             clock: global.clock.clone(),
         },
     )?)

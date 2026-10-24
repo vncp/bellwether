@@ -81,6 +81,9 @@ pub struct SourceInfo {
     /// How files are fingerprinted, if configured.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fingerprint_policy: Option<String>,
+    /// Optional `--path-template` pattern for filename-derived virtual columns.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path_template: Option<String>,
     /// Unknown fields (ADR 017).
     #[serde(flatten)]
     pub extra: Extra,

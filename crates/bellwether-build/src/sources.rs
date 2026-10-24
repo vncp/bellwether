@@ -9,7 +9,9 @@ use std::ops::Range;
 
 use arrow::array::RecordBatch;
 use arrow::datatypes::SchemaRef;
-use bellwether_source::{ChunkedTextSource, FingerprintPolicy, LocalFs, ParquetSource, TextFormat};
+use bellwether_source::{
+    ChunkedTextSource, FingerprintPolicy, LocalFs, ParquetSource, PathTemplate, TextFormat,
+};
 use bellwether_types::{Error, FileFingerprint, Result, RowGroupMeta, Source};
 
 use crate::config::SourceKind;
@@ -30,6 +32,7 @@ pub(crate) enum DataSource {
         format: TextFormat,
         schema: SchemaRef,
         policy: FingerprintPolicy,
+        path_template: Option<PathTemplate>,
         by_chunk_size: BTreeMap<u64, ChunkedTextSource<LocalFs>>,
     },
 }
@@ -41,25 +44,31 @@ impl DataSource {
         kind: SourceKind,
         schema: &SchemaRef,
         policy: FingerprintPolicy,
+        path_template: Option<PathTemplate>,
         chunk_sizes: impl IntoIterator<Item = u64>,
     ) -> Self {
         match kind.text_format() {
-            None => Self::Parquet(
-                ParquetSource::new()
+            None => {
+                let mut p = ParquetSource::new()
                     .with_schema(SchemaRef::clone(schema))
-                    .with_fingerprint_policy(policy),
-            ),
+                    .with_fingerprint_policy(policy);
+                if let Some(tpl) = path_template {
+                    p = p.with_path_template(tpl);
+                }
+                Self::Parquet(p)
+            }
             Some(format) => {
                 let mut by_chunk_size = BTreeMap::new();
                 for size in chunk_sizes {
-                    by_chunk_size
-                        .entry(size)
-                        .or_insert_with(|| text_source(format, schema, policy, size));
+                    by_chunk_size.entry(size).or_insert_with(|| {
+                        text_source(format, schema, policy, path_template.clone(), size)
+                    });
                 }
                 Self::Text {
                     format,
                     schema: SchemaRef::clone(schema),
                     policy,
+                    path_template,
                     by_chunk_size,
                 }
             }
@@ -72,12 +81,13 @@ impl DataSource {
             format,
             schema,
             policy,
+            path_template,
             by_chunk_size,
         } = self
         {
-            by_chunk_size
-                .entry(size)
-                .or_insert_with(|| text_source(*format, schema, *policy, size));
+            by_chunk_size.entry(size).or_insert_with(|| {
+                text_source(*format, schema, *policy, path_template.clone(), size)
+            });
         }
     }
 
@@ -177,12 +187,17 @@ fn text_source(
     format: TextFormat,
     schema: &SchemaRef,
     policy: FingerprintPolicy,
+    path_template: Option<PathTemplate>,
     chunk_size: u64,
 ) -> ChunkedTextSource<LocalFs> {
-    ChunkedTextSource::new(format)
+    let mut s = ChunkedTextSource::new(format)
         .with_chunk_size(chunk_size)
         .with_schema(SchemaRef::clone(schema))
-        .with_fingerprint_policy(policy)
+        .with_fingerprint_policy(policy);
+    if let Some(tpl) = path_template {
+        s = s.with_path_template(tpl);
+    }
+    s
 }
 
 /// The schema of the files under `root` as the source infers it: the first
@@ -192,13 +207,22 @@ pub(crate) fn infer_schema(
     kind: SourceKind,
     root: &str,
     policy: FingerprintPolicy,
+    path_template: Option<PathTemplate>,
 ) -> Result<SchemaRef> {
     match kind.text_format() {
-        None => ParquetSource::new()
-            .with_fingerprint_policy(policy)
-            .schema(root),
-        Some(format) => ChunkedTextSource::new(format)
-            .with_fingerprint_policy(policy)
-            .schema(root),
+        None => {
+            let mut s = ParquetSource::new().with_fingerprint_policy(policy);
+            if let Some(tpl) = path_template {
+                s = s.with_path_template(tpl);
+            }
+            s.schema(root)
+        }
+        Some(format) => {
+            let mut s = ChunkedTextSource::new(format).with_fingerprint_policy(policy);
+            if let Some(tpl) = path_template {
+                s = s.with_path_template(tpl);
+            }
+            s.schema(root)
+        }
     }
 }

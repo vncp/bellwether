@@ -195,9 +195,20 @@ impl<'a> Replayer<'a> {
     /// so every run currently reads every row group, and hypothetical specs
     /// are built as transient segments.
     pub fn unindexed(source: &'a dyn Source, root: &str) -> Result<Self> {
+        Self::unindexed_with_template(source, root, None)
+    }
+
+    /// Like [`Replayer::unindexed`], with an optional path template for
+    /// filename-derived virtual columns.
+    pub fn unindexed_with_template(
+        source: &'a dyn Source,
+        root: &str,
+        path_template: Option<bellwether_source::PathTemplate>,
+    ) -> Result<Self> {
         let schema = source.schema(root)?;
         let catalog = Arc::new(Catalog::discover(source, root, schema)?);
-        let planner = SegmentPlanner::new(Arc::clone(&catalog));
+        let planner = SegmentPlanner::new(Arc::clone(&catalog))
+            .with_source_info(Some(root.to_string()), path_template);
         Self::new(source, catalog, Box::new(planner), Vec::new())
     }
 

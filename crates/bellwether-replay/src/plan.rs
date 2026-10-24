@@ -43,8 +43,11 @@ use std::sync::Arc;
 
 use arrow::datatypes::Schema;
 use bellwether_core::segment::{ColumnType, ReadAt, SegmentReader};
+use bellwether_source::canonical::normalize_float_bounds;
+use bellwether_source::partition::{encode_virtual_value, extract_virtual_cols, PathTemplate};
+use bellwether_source::DefaultCanonical;
 use bellwether_store::{Snapshot, StoreExt};
-use bellwether_types::{Error, Hash, KeySpec, Predicate, Result, RunCost, ScanPlan};
+use bellwether_types::{Error, Hash, KeySpec, Predicate, Result, RowGroupId, RunCost, ScanPlan};
 use bytes::Bytes;
 use roaring::RoaringBitmap;
 
@@ -270,6 +273,8 @@ pub struct SegmentPlanner {
     /// Declared specs that are not complete at the pinned sequence, and
     /// why: a plan that lists one is refused.
     incomplete: Vec<(KeySpec, String)>,
+    root: Option<String>,
+    path_template: Option<PathTemplate>,
 }
 
 impl SegmentPlanner {
@@ -280,7 +285,22 @@ impl SegmentPlanner {
             catalog,
             specs: Vec::new(),
             incomplete: Vec::new(),
+            root: None,
+            path_template: None,
         }
+    }
+
+    /// Sets the source root and optional path template for virtual-column
+    /// pruning on unindexed catalogs.
+    #[must_use]
+    pub fn with_source_info(
+        mut self,
+        root: Option<String>,
+        path_template: Option<PathTemplate>,
+    ) -> Self {
+        self.root = root;
+        self.path_template = path_template;
+        self
     }
 
     /// The planner over a pinned snapshot's committed segments: one entry
@@ -307,7 +327,14 @@ impl SegmentPlanner {
             )));
         }
         let live = catalog.all_ids();
-        let mut planner = Self::new(catalog);
+        let root = (!manifest.source.root.is_empty()).then(|| manifest.source.root.clone());
+        let path_template = manifest
+            .source
+            .path_template
+            .as_deref()
+            .map(PathTemplate::parse)
+            .transpose()?;
+        let mut planner = Self::new(catalog).with_source_info(root, path_template);
         for (i, spec) in manifest.schema.key_specs.iter().enumerate() {
             let name = spec.name();
             if manifest.schema.key_specs[..i]
@@ -448,6 +475,67 @@ impl SegmentPlanner {
         }
         Ok(out)
     }
+
+    /// Prunes catalog row groups against virtual columns (Hive `name=value`
+    /// directories or `--path-template`), matching the build planner's
+    /// `prune_virtual_keys`.
+    fn prune_virtual_keys(&self, keys: &RunKeys) -> Result<Option<RoaringBitmap>> {
+        let columns = keys.columns();
+        let schema = self.catalog.schema();
+        let root = self.root.as_deref();
+        let mut any_virtual = false;
+        let mut file_checks: Vec<Vec<(usize, Vec<u8>, Vec<u8>)>> =
+            Vec::with_capacity(self.catalog.files().len());
+        for f in self.catalog.files() {
+            let vcols = extract_virtual_cols(root, &f.path, self.path_template.as_ref())?;
+            let mut checks: Vec<(usize, Vec<u8>, Vec<u8>)> = Vec::new();
+            for (ci, col) in columns.iter().enumerate() {
+                if let Some(vc) = vcols.iter().find(|v| &v.name == col) {
+                    if let Ok(field) = schema.field_with_name(col) {
+                        let enc = encode_virtual_value(
+                            &DefaultCanonical,
+                            &f.path,
+                            col,
+                            &vc.raw,
+                            field.data_type(),
+                        )?;
+                        let (lo, hi) = normalize_float_bounds(Some(enc.clone()), Some(enc));
+                        if let (Some(lo), Some(hi)) = (lo, hi) {
+                            checks.push((ci, lo, hi));
+                        }
+                    }
+                }
+            }
+            if !checks.is_empty() {
+                any_virtual = true;
+            }
+            file_checks.push(checks);
+        }
+        if !any_virtual {
+            return Ok(None);
+        }
+        let mut matching_files = vec![false; file_checks.len()];
+        for (fi, checks) in file_checks.iter().enumerate() {
+            if checks.is_empty() {
+                matching_files[fi] = true;
+                continue;
+            }
+            matching_files[fi] = (0..keys.len()).any(|ti| {
+                checks.iter().all(|(ci, lo, hi)| {
+                    let elem = keys.element(ti, *ci);
+                    elem >= lo.as_slice() && elem <= hi.as_slice()
+                })
+            });
+        }
+        let mut allowed = RoaringBitmap::new();
+        for rg in self.catalog.row_groups() {
+            if matching_files.get(rg.file).copied().unwrap_or(false) {
+                allowed.insert(rg.id.0);
+            }
+        }
+        let _ = RowGroupId(0);
+        Ok(Some(allowed))
+    }
 }
 
 impl PlanSource for SegmentPlanner {
@@ -479,11 +567,10 @@ impl PlanSource for SegmentPlanner {
                 keys,
             ));
         }
+        let vpruned = self.prune_virtual_keys(keys)?;
         if specs.is_empty() {
-            return Ok(with_residual(
-                self.catalog.plan_for(&self.catalog.all_ids())?,
-                keys,
-            ));
+            let selected = vpruned.unwrap_or_else(|| self.catalog.all_ids());
+            return Ok(with_residual(self.catalog.plan_for(&selected)?, keys));
         }
         let mut serving = Vec::with_capacity(specs.len());
         for (spec, segments) in specs.iter().zip(listed) {
@@ -491,14 +578,21 @@ impl PlanSource for SegmentPlanner {
                 serving.push((segments.as_ref(), lookup));
             }
         }
-        if serving.is_empty() {
+        if serving.is_empty() && vpruned.is_none() {
             return Err(Error::KeySpec(format!(
                 "none of {:?} serves keys on {:?}",
                 specs.iter().map(KeySpec::name).collect::<Vec<_>>(),
                 keys.columns()
             )));
         }
-        let selected = Self::select(&serving, keys)?;
+        let mut selected = if serving.is_empty() {
+            self.catalog.all_ids()
+        } else {
+            Self::select(&serving, keys)?
+        };
+        if let Some(pruned) = vpruned {
+            selected &= pruned;
+        }
         Ok(with_residual(self.catalog.plan_for(&selected)?, keys))
     }
 

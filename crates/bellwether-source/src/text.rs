@@ -39,6 +39,10 @@ use parquet::file::reader::ChunkReader;
 use crate::canonical::{Canonical, DefaultCanonical, StatsAccumulator};
 use crate::fingerprint::{fingerprint_with_policy, FingerprintPolicy};
 use crate::parquet_source::has_extension;
+use crate::partition::{
+    apply_virtual_stats, assemble_batch, augment_schema, check_all_match, extract_virtual_cols,
+    PathTemplate, VirtualCol,
+};
 use crate::storage::{LocalFs, Storage};
 use crate::{open_verified, reorder, resolve_columns, BoundedCache};
 
@@ -143,6 +147,8 @@ pub struct ChunkedTextSource<S: Storage = LocalFs> {
     stats_columns: Vec<String>,
     dataset: Option<SchemaRef>,
     policy: FingerprintPolicy,
+    path_template: Option<PathTemplate>,
+    root: Mutex<Option<String>>,
     canonical: Arc<dyn Canonical>,
     layouts: Mutex<BoundedCache<FileFingerprint, Arc<Layout>>>,
     scans: Mutex<BoundedCache<FileFingerprint, Vec<RowGroupMeta>>>,
@@ -182,6 +188,8 @@ impl<S: Storage> ChunkedTextSource<S> {
             stats_columns: Vec::new(),
             dataset: None,
             policy: FingerprintPolicy::Tail64K,
+            path_template: None,
+            root: Mutex::new(None),
             canonical: Arc::new(DefaultCanonical),
             layouts: Mutex::new(BoundedCache::new(TEXT_CACHE_BYTES)),
             scans: Mutex::new(BoundedCache::new(TEXT_CACHE_BYTES)),
@@ -231,6 +239,27 @@ impl<S: Storage> ChunkedTextSource<S> {
         self
     }
 
+
+    /// Sets the path template used to extract filename-derived virtual columns.
+    #[must_use]
+    pub fn with_path_template(mut self, template: PathTemplate) -> Self {
+        self.path_template = Some(template);
+        self
+    }
+
+    /// Optional path template configured on this source.
+    #[must_use]
+    pub fn path_template(&self) -> Option<&PathTemplate> {
+        self.path_template.as_ref()
+    }
+
+    fn known_root(&self) -> Option<String> {
+        lock(&self.root).clone()
+    }
+
+    fn record_root(&self, root: &str) {
+        *lock(&self.root) = Some(root.to_string());
+    }
     /// The configured chunk size.
     #[must_use]
     pub fn chunk_size(&self) -> u64 {
@@ -269,9 +298,10 @@ impl<S: Storage> ChunkedTextSource<S> {
             return Ok(hit);
         }
         let chunks = self.compute_chunks(reader, &file.path, file.size)?;
+        let root = self.known_root();
+        let vcols = extract_virtual_cols(root.as_deref(), &file.path, self.path_template.as_ref())?;
         let schema = if let Some(s) = &self.dataset {
-            self.check_csv_header(reader, &file.path, file.size, s)?;
-            Arc::clone(s)
+            self.usable_physical_schema(reader, &file.path, file.size, s, &vcols)?
         } else if file.size == 0 {
             Arc::new(Schema::empty())
         } else {
@@ -293,39 +323,81 @@ impl<S: Storage> ChunkedTextSource<S> {
     /// CSV maps columns by position. With a supplied schema and a header row,
     /// the header names must equal the schema's names in order, or columns of
     /// the same type would be silently swapped.
-    fn check_csv_header(
+    fn usable_physical_schema(
         &self,
         reader: &S::Reader,
         path: &str,
         size: u64,
         schema: &Schema,
-    ) -> Result<()> {
-        let TextFormat::Csv {
+        vcols: &[VirtualCol],
+    ) -> Result<SchemaRef> {
+        if size == 0 {
+            return Ok(Arc::new(schema.clone()));
+        }
+        let vcol_names: Vec<&str> = vcols.iter().map(|v| v.name.as_str()).collect();
+        if let TextFormat::Csv {
             delimiter,
             has_header: true,
         } = self.format
-        else {
-            return Ok(());
-        };
-        if size == 0 {
-            return Ok(());
-        }
-        let end = Self::after_newline(reader, path, 0, size.min(INFER_HEAD_BYTES))?;
-        let head = get_bytes(reader, path, 0..end)?;
-        let header = arrow::csv::reader::Format::default()
-            .with_header(true)
-            .with_delimiter(delimiter)
-            .infer_schema(Cursor::new(&head[..]), Some(0))
-            .map_err(|e| src_err(path, e))?
-            .0;
-        let got: Vec<&str> = header.fields().iter().map(|f| f.name().as_str()).collect();
-        let want: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
-        if got != want {
+        {
+            let end = Self::after_newline(reader, path, 0, size.min(INFER_HEAD_BYTES))?;
+            let head = get_bytes(reader, path, 0..end)?;
+            let header = arrow::csv::reader::Format::default()
+                .with_header(true)
+                .with_delimiter(delimiter)
+                .infer_schema(Cursor::new(&head[..]), Some(0))
+                .map_err(|e| src_err(path, e))?
+                .0;
+            let got: Vec<&str> = header.fields().iter().map(|f| f.name().as_str()).collect();
+            let want_all: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
+            if got == want_all {
+                return Ok(Arc::new(schema.clone()));
+            }
+            let want_phys: Vec<&str> = schema
+                .fields()
+                .iter()
+                .map(|f| f.name().as_str())
+                .filter(|n| !vcol_names.contains(n))
+                .collect();
+            if !vcol_names.is_empty() && got == want_phys {
+                let fields: Vec<_> = schema
+                    .fields()
+                    .iter()
+                    .filter(|f| !vcol_names.contains(&f.name().as_str()))
+                    .cloned()
+                    .collect();
+                return Ok(Arc::new(Schema::new_with_metadata(
+                    fields,
+                    schema.metadata().clone(),
+                )));
+            }
             return Err(Error::Source(format!(
-                "{path}: CSV header {got:?} does not match the dataset schema {want:?}"
+                "{path}: CSV header {got:?} does not match the dataset schema {want_all:?}"
             )));
         }
-        Ok(())
+        if !vcol_names.is_empty() {
+            let end = if size <= INFER_HEAD_BYTES {
+                size
+            } else {
+                Self::after_newline(reader, path, INFER_HEAD_BYTES - 1, size)?
+            };
+            if let Ok(inferred) = self.infer(reader, path, 0..end) {
+                let in_file: Vec<&str> = inferred.fields().iter().map(|f| f.name().as_str()).collect();
+                let fields: Vec<_> = schema
+                    .fields()
+                    .iter()
+                    .filter(|f| !vcol_names.contains(&f.name().as_str()) || in_file.contains(&f.name().as_str()))
+                    .cloned()
+                    .collect();
+                if fields.len() != schema.fields().len() {
+                    return Ok(Arc::new(Schema::new_with_metadata(
+                        fields,
+                        schema.metadata().clone(),
+                    )));
+                }
+            }
+        }
+        Ok(Arc::new(schema.clone()))
     }
 
     fn compute_chunks(&self, reader: &S::Reader, path: &str, size: u64) -> Result<Vec<Range<u64>>> {
@@ -467,7 +539,20 @@ impl<S: Storage> ChunkedTextSource<S> {
         let reader = open_verified(&self.storage, file, self.policy)?;
         let layout = self.layout_from(file, &reader)?;
         let schema = &layout.schema;
-        let stat_idx = resolve_columns(schema, &self.stats_columns)?;
+        let root = self.known_root();
+        let vcols = extract_virtual_cols(root.as_deref(), &file.path, self.path_template.as_ref())?;
+        let mut phys_stats: Vec<String> = self
+            .stats_columns
+            .iter()
+            .filter(|c| schema.field_with_name(c).is_ok() || !vcols.iter().any(|v| &v.name == *c))
+            .cloned()
+            .collect();
+        for v in &vcols {
+            if schema.field_with_name(&v.name).is_ok() && !phys_stats.contains(&v.name) {
+                phys_stats.push(v.name.clone());
+            }
+        }
+        let stat_idx = resolve_columns(schema, &phys_stats)?;
         let decode = Self::decode_indices(schema, &stat_idx);
         let mut out = Vec::with_capacity(layout.chunks.len());
         for (k, range) in layout.chunks.iter().enumerate() {
@@ -512,6 +597,14 @@ impl<S: Storage> ChunkedTextSource<S> {
                 byte_range: Some((range.start, range.end)),
             });
         }
+        apply_virtual_stats(
+            self.canonical.as_ref(),
+            &file.path,
+            schema,
+            self.dataset.as_ref(),
+            &vcols,
+            &mut out,
+        )?;
         Ok(out)
     }
 }
@@ -561,13 +654,19 @@ pub fn csv_ends_in_quotes(bytes: &[u8], delimiter: u8) -> bool {
 
 impl<S: Storage> Source for ChunkedTextSource<S> {
     fn discover(&self, root: &str) -> Result<Vec<FileFingerprint>> {
+        self.record_root(root);
         let exts = self.format.extensions();
-        self.storage
+        let files: Vec<FileFingerprint> = self
+            .storage
             .list(root)?
             .into_iter()
             .filter(|p| exts.iter().any(|e| has_extension(p, e)))
             .map(|p| fingerprint_with_policy(&self.storage, &p, self.policy))
-            .collect()
+            .collect::<Result<Vec<_>>>()?;
+        if let Some(tpl) = &self.path_template {
+            check_all_match(tpl, Some(root), &files)?;
+        }
+        Ok(files)
     }
 
     fn row_groups(&self, file: &FileFingerprint) -> Result<Vec<RowGroupMeta>> {
@@ -615,7 +714,18 @@ impl<S: Storage> Source for ChunkedTextSource<S> {
                 )));
             }
         }
-        let wanted = resolve_columns(&layout.schema, columns)?;
+        let root = self.known_root();
+        let vcols = extract_virtual_cols(root.as_deref(), path, self.path_template.as_ref())?;
+        let phys_cols: Vec<String> = if vcols.is_empty() {
+            columns.to_vec()
+        } else {
+            columns
+                .iter()
+                .filter(|c| layout.schema.field_with_name(c).is_ok())
+                .cloned()
+                .collect()
+        };
+        let wanted = resolve_columns(&layout.schema, &phys_cols)?;
         let decode = Self::decode_indices(&layout.schema, &wanted);
         let mut batches = Vec::new();
         self.scan_chunk(&reader, path, &layout, idx, decode.clone(), |b| {
@@ -641,15 +751,28 @@ impl<S: Storage> Source for ChunkedTextSource<S> {
                 rg.rows
             )));
         }
-        if columns.is_empty() {
-            let opts = RecordBatchOptions::new().with_row_count(Some(batch.num_rows()));
-            return RecordBatch::try_new_with_options(Arc::new(Schema::empty()), vec![], &opts)
-                .map_err(|e| src_err(path, e));
+        if vcols.is_empty() {
+            if columns.is_empty() {
+                let opts = RecordBatchOptions::new().with_row_count(Some(batch.num_rows()));
+                return RecordBatch::try_new_with_options(Arc::new(Schema::empty()), vec![], &opts)
+                    .map_err(|e| src_err(path, e));
+            }
+            return reorder(&batch, columns);
         }
-        reorder(&batch, columns)
+        assemble_batch(
+            self.canonical.as_ref(),
+            path,
+            batch.num_rows(),
+            columns,
+            &layout.schema,
+            self.dataset.as_ref(),
+            &vcols,
+            Some(&batch),
+        )
     }
 
     fn schema(&self, root: &str) -> Result<SchemaRef> {
+        self.record_root(root);
         if let Some(s) = &self.dataset {
             return Ok(Arc::clone(s));
         }
@@ -662,7 +785,9 @@ impl<S: Storage> Source for ChunkedTextSource<S> {
             .ok_or_else(|| Error::Source(format!("{root}: no {:?} files", self.format)))?;
         let fp = fingerprint_with_policy(&self.storage, &first, self.policy)?;
         let reader = open_verified(&self.storage, &fp, self.policy)?;
-        Ok(Arc::clone(&self.layout_from(&fp, &reader)?.schema))
+        let file_schema = Arc::clone(&self.layout_from(&fp, &reader)?.schema);
+        let vcols = extract_virtual_cols(Some(root), &fp.path, self.path_template.as_ref())?;
+        Ok(augment_schema(&file_schema, None, &vcols))
     }
 }
 

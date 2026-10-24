@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 use arrow::datatypes::{Schema, SchemaRef};
 use bellwether_core::encoding;
 use bellwether_core::segment::{validate_spec, ColumnType};
-use bellwether_source::{FingerprintPolicy, DEFAULT_CHUNK_SIZE};
+use bellwether_source::{FingerprintPolicy, PathTemplate, DEFAULT_CHUNK_SIZE};
 use bellwether_store::{
     commit_with, now_rfc3339, read_manifest, ChunkRange, ColumnDef, CommitOptions, Extra,
     FileEntry, Manifest, RowGroupSpace, RowGroupTombstone, SchemaInfo, SegmentRef, SourceInfo,
@@ -249,7 +249,13 @@ impl<S: StoreExt + ?Sized> Builder<S> {
         let chunk_sizes = base_chunk_sizes(base.as_ref())
             .into_iter()
             .chain(cfg.new_chunk_size.size());
-        let mut sources = DataSource::new(cfg.kind, &cfg.schema, cfg.policy, chunk_sizes);
+        let mut sources = DataSource::new(
+            cfg.kind,
+            &cfg.schema,
+            cfg.policy,
+            cfg.path_template.clone(),
+            chunk_sizes,
+        );
         let discovered = sources.discover(root)?;
         let since = now_rfc3339();
         let observer = opts.observer.as_deref();
@@ -352,6 +358,7 @@ struct Config {
     schema: SchemaRef,
     /// The schema the base manifest records, if any.
     base_schema: Option<SchemaRef>,
+    path_template: Option<PathTemplate>,
     source_info: SourceInfo,
     columns: Vec<ColumnDef>,
 }
@@ -391,6 +398,19 @@ impl Config {
             (Some(p), _) | (None, Some(p)) => p,
             (None, None) => FingerprintPolicy::default(),
         };
+        let recorded_tpl = recorded.and_then(|m| m.source.path_template.as_deref());
+        let tpl_str: Option<String> = match (opts.path_template.as_deref(), recorded_tpl) {
+            (Some(given), Some(rec)) if given.trim() != rec => {
+                return Err(Error::Other(format!(
+                    "the index was built with --path-template {rec:?}, and this build asks for \
+                     {given:?}; build a new index"
+                )))
+            }
+            (Some(given), _) => Some(given.trim().to_string()),
+            (None, Some(rec)) => Some(rec.to_string()),
+            (None, None) => None,
+        };
+        let path_template = tpl_str.as_deref().map(PathTemplate::parse).transpose()?;
         let new_chunk_size = match (kind.text_format(), opts.chunk_size) {
             (None, None) => NewChunkSize::NotText,
             (None, Some(_)) => {
@@ -408,19 +428,23 @@ impl Config {
         let schema = match (&opts.schema, &base_schema) {
             (Some(s), _) => persistable(s)?,
             (None, Some(b)) => SchemaRef::clone(b),
-            (None, None) => persistable(infer_schema(kind, root, policy)?.as_ref())?,
+            (None, None) => persistable(
+                infer_schema(kind, root, policy, path_template.clone())?.as_ref(),
+            )?,
         };
         let columns = schema_to_columns(&schema, base.map_or(&[][..], |m| &m.schema.columns));
         let mut source_info = base.map(|m| m.source.clone()).unwrap_or_default();
         source_info.kind = kind.manifest_kind();
         source_info.root = root.to_string();
         source_info.fingerprint_policy = Some(policy_name(policy).to_string());
+        source_info.path_template = tpl_str;
         Ok(Self {
             kind,
             policy,
             new_chunk_size,
             schema,
             base_schema,
+            path_template,
             source_info,
             columns,
         })

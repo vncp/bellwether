@@ -407,3 +407,39 @@ fn profile_candidates_that_serve_by_point_follow_the_floor() {
     let got: Vec<String> = capped.candidates.iter().map(|c| c.spec.name()).collect();
     assert_eq!(got, ["exact:id,batch", "exact:id"]);
 }
+
+#[test]
+fn why_profiles_virtual_columns_from_hive_paths_and_path_templates() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("hive");
+    for (day, sym, base) in [
+        ("2026-03-01", "AAPL", 0),
+        ("2026-03-01", "MSFT", 10),
+        ("2026-03-02", "AAPL", 20),
+    ] {
+        let p = data
+            .join(format!("day={day}"))
+            .join(format!("symbol={sym}"))
+            .join("part-0.parquet");
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        common::write_file(
+            &p,
+            &[vec![
+                (base + 1, 1, Some(100), "x".to_string()),
+                (base + 2, 1, Some(200), "y".to_string()),
+            ]],
+        );
+    }
+    let r = open(&data).why(&WhyRequest::default()).unwrap();
+    assert!(
+        r.profile
+            .fanout
+            .iter()
+            .any(|e| e.fanout.columns == vec!["symbol".to_string()]),
+        "profiler fanout must include virtual column `symbol`"
+    );
+    assert!(
+        r.profile.ranges.iter().any(|rg| rg.column == "day"),
+        "profiler ranges must include virtual column `day`"
+    );
+}

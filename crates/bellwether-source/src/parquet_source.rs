@@ -18,6 +18,10 @@ use parquet::file::reader::ChunkReader;
 use crate::canonical::{normalize_float_bounds, Canonical, DefaultCanonical};
 use crate::fingerprint::{fingerprint_with_policy, FingerprintPolicy};
 use crate::storage::{LocalFs, Storage};
+use crate::partition::{
+    apply_virtual_stats, assemble_batch, augment_schema, check_all_match, extract_virtual_cols,
+    PathTemplate,
+};
 use crate::{open_verified, reorder, resolve_columns, BoundedCache};
 
 /// File extension [`ParquetSource::discover`] lists.
@@ -44,6 +48,8 @@ pub struct ParquetSource<S: Storage = LocalFs> {
     canonical: Arc<dyn Canonical>,
     dataset: Option<SchemaRef>,
     policy: FingerprintPolicy,
+    path_template: Option<PathTemplate>,
+    root: Mutex<Option<String>>,
     footers: Mutex<FooterCache>,
 }
 
@@ -69,6 +75,8 @@ impl<S: Storage> ParquetSource<S> {
             canonical: Arc::new(DefaultCanonical),
             dataset: None,
             policy: FingerprintPolicy::Tail64K,
+            path_template: None,
+            root: Mutex::new(None),
             footers: Mutex::new(BoundedCache::new(FOOTER_CACHE_BYTES)),
         }
     }
@@ -97,6 +105,30 @@ impl<S: Storage> ParquetSource<S> {
     pub fn with_canonical(mut self, canonical: Arc<dyn Canonical>) -> Self {
         self.canonical = canonical;
         self
+    }
+
+    /// Sets the path template used to extract filename-derived virtual columns.
+    #[must_use]
+    pub fn with_path_template(mut self, template: PathTemplate) -> Self {
+        self.path_template = Some(template);
+        self
+    }
+
+    /// Optional path template configured on this source.
+    #[must_use]
+    pub fn path_template(&self) -> Option<&PathTemplate> {
+        self.path_template.as_ref()
+    }
+
+    fn known_root(&self) -> Option<String> {
+        self.root
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    fn record_root(&self, root: &str) {
+        *self.root.lock().unwrap_or_else(PoisonError::into_inner) = Some(root.to_string());
     }
 
     /// The parsed footer of `file`, from cache or from a verified handle.
@@ -359,12 +391,18 @@ fn column_stats(meta: &ArrowReaderMetadata, name: &str) -> ColumnColumnar {
 
 impl<S: Storage> Source for ParquetSource<S> {
     fn discover(&self, root: &str) -> Result<Vec<FileFingerprint>> {
-        self.storage
+        self.record_root(root);
+        let files: Vec<FileFingerprint> = self
+            .storage
             .list(root)?
             .into_iter()
             .filter(|p| has_extension(p, PARQUET_EXTENSION))
             .map(|p| fingerprint_with_policy(&self.storage, &p, self.policy))
-            .collect()
+            .collect::<Result<Vec<_>>>()?;
+        if let Some(tpl) = &self.path_template {
+            check_all_match(tpl, Some(root), &files)?;
+        }
+        Ok(files)
     }
 
     fn row_groups(&self, file: &FileFingerprint) -> Result<Vec<RowGroupMeta>> {
@@ -422,6 +460,16 @@ impl<S: Storage> Source for ParquetSource<S> {
                 byte_range: None,
             });
         }
+        let root = self.known_root();
+        let vcols = extract_virtual_cols(root.as_deref(), &file.path, self.path_template.as_ref())?;
+        apply_virtual_stats(
+            self.canonical.as_ref(),
+            &file.path,
+            meta.schema().as_ref(),
+            self.dataset.as_ref(),
+            &vcols,
+            &mut out,
+        )?;
         Ok(out)
     }
 
@@ -440,25 +488,67 @@ impl<S: Storage> Source for ParquetSource<S> {
                 md.num_row_groups()
             )));
         }
-        let roots = resolve_columns(meta.schema(), columns)?;
         let rows = usize::try_from(md.row_group(idx).num_rows()).unwrap_or(0);
-        let mask = ProjectionMask::roots(md.file_metadata().schema_descr(), roots);
-        let batches = ParquetRecordBatchReaderBuilder::new_with_metadata(reader, meta)
-            .with_row_groups(vec![idx])
-            .with_projection(mask)
-            .with_batch_size(rows.max(1))
-            .build()
-            .map_err(|e| Error::Source(format!("{}: {e}", rg.file.path)))?;
-        let schema = batches.schema();
-        let batches = batches
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(|e| Error::Source(format!("{}: {e}", rg.file.path)))?;
-        let batch = concat_batches(&schema, &batches)
-            .map_err(|e| Error::Source(format!("{}: {e}", rg.file.path)))?;
-        reorder(&batch, columns)
+        let root = self.known_root();
+        let vcols =
+            extract_virtual_cols(root.as_deref(), &rg.file.path, self.path_template.as_ref())?;
+        if vcols.is_empty() {
+            let roots = resolve_columns(meta.schema(), columns)?;
+            let mask = ProjectionMask::roots(md.file_metadata().schema_descr(), roots);
+            let batches = ParquetRecordBatchReaderBuilder::new_with_metadata(reader, meta)
+                .with_row_groups(vec![idx])
+                .with_projection(mask)
+                .with_batch_size(rows.max(1))
+                .build()
+                .map_err(|e| Error::Source(format!("{}: {e}", rg.file.path)))?;
+            let schema = batches.schema();
+            let batches = batches
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(|e| Error::Source(format!("{}: {e}", rg.file.path)))?;
+            let batch = concat_batches(&schema, &batches)
+                .map_err(|e| Error::Source(format!("{}: {e}", rg.file.path)))?;
+            return reorder(&batch, columns);
+        }
+        let file_schema = meta.schema().clone();
+        let phys_cols: Vec<String> = columns
+            .iter()
+            .filter(|c| file_schema.field_with_name(c).is_ok())
+            .cloned()
+            .collect();
+        let phys_batch = if phys_cols.is_empty() {
+            None
+        } else {
+            let roots = resolve_columns(&file_schema, &phys_cols)?;
+            let mask = ProjectionMask::roots(md.file_metadata().schema_descr(), roots);
+            let batches = ParquetRecordBatchReaderBuilder::new_with_metadata(reader, meta)
+                .with_row_groups(vec![idx])
+                .with_projection(mask)
+                .with_batch_size(rows.max(1))
+                .build()
+                .map_err(|e| Error::Source(format!("{}: {e}", rg.file.path)))?;
+            let schema = batches.schema();
+            let batches = batches
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(|e| Error::Source(format!("{}: {e}", rg.file.path)))?;
+            Some(
+                concat_batches(&schema, &batches)
+                    .map_err(|e| Error::Source(format!("{}: {e}", rg.file.path)))?,
+            )
+        };
+        assemble_batch(
+            self.canonical.as_ref(),
+            &rg.file.path,
+            rows,
+            columns,
+            &file_schema,
+            self.dataset.as_ref(),
+            &vcols,
+            phys_batch.as_ref(),
+        )
     }
 
     fn schema(&self, root: &str) -> Result<SchemaRef> {
+        self.record_root(root);
         if let Some(s) = &self.dataset {
             return Ok(Arc::clone(s));
         }
@@ -469,7 +559,9 @@ impl<S: Storage> Source for ParquetSource<S> {
             .find(|p| has_extension(p, PARQUET_EXTENSION))
             .ok_or_else(|| Error::Source(format!("{root}: no .parquet files")))?;
         let fp = fingerprint_with_policy(&self.storage, &first, self.policy)?;
-        Ok(self.footer(&fp)?.schema().clone())
+        let file_schema = self.footer(&fp)?.schema().clone();
+        let vcols = extract_virtual_cols(Some(root), &fp.path, self.path_template.as_ref())?;
+        Ok(augment_schema(&file_schema, None, &vcols))
     }
 }
 

@@ -287,7 +287,11 @@ impl Engine {
         let current_specs = pinned.as_ref().map(|p| p.specs().0).unwrap_or_default();
         let replayer = match &pinned {
             Some(p) => Replayer::for_snapshot(&*source, &p.snapshot)?,
-            None => Replayer::unindexed(&*source, self.root())?,
+            None => Replayer::unindexed_with_template(
+                &*source,
+                self.root(),
+                self.effective_path_template(None)?,
+            )?,
         };
         let catalog = replayer.catalog();
         let mut dataset = Dataset {

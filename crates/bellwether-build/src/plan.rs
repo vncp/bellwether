@@ -57,7 +57,11 @@ use bellwether_core::encoding::{self, tag, KeyColumns, Value};
 use bellwether_core::segment::ReadAt;
 use bellwether_core::temporal::{self, VersionChain, VersionHit};
 use bellwether_core::SegmentReader;
-use bellwether_source::{fingerprint_with_policy, FingerprintPolicy, LocalFs, ParquetSource};
+use bellwether_source::canonical::normalize_float_bounds;
+use bellwether_source::partition::{encode_virtual_value, extract_virtual_cols, PathTemplate};
+use bellwether_source::{
+    fingerprint_with_policy, DefaultCanonical, FingerprintPolicy, LocalFs, ParquetSource,
+};
 use bellwether_store::{Manifest, Snapshot, StoreExt};
 use bellwether_types::{
     Error, Hash, KeySpec, Predicate, Result, RowGroupId, ScanEntry, ScanPlan, Source,
@@ -163,6 +167,7 @@ pub struct Planner<S: StoreExt + ?Sized> {
     kind: SourceKind,
     policy: FingerprintPolicy,
     parquet: Option<ParquetSource<LocalFs>>,
+    path_template: Option<PathTemplate>,
     locator: Locator,
     verified: Mutex<BTreeSet<usize>>,
 }
@@ -188,11 +193,21 @@ impl<S: StoreExt + ?Sized> Planner<S> {
         let kind = SourceKind::parse(&m.source.kind)?;
         let policy = parse_policy(m.source.fingerprint_policy.as_deref())?;
         let schema = columns_to_schema(&m.schema.columns)?;
+        let path_template = m
+            .source
+            .path_template
+            .as_deref()
+            .map(PathTemplate::parse)
+            .transpose()?;
         let locator = Locator::new(&m.rowgroup_space)?;
         let parquet = (kind == SourceKind::Parquet).then(|| {
-            ParquetSource::new()
+            let mut p = ParquetSource::new()
                 .with_schema(SchemaRef::clone(&schema))
-                .with_fingerprint_policy(policy)
+                .with_fingerprint_policy(policy);
+            if let Some(tpl) = &path_template {
+                p = p.with_path_template(tpl.clone());
+            }
+            p
         });
         Ok(Self {
             snapshot,
@@ -200,6 +215,7 @@ impl<S: StoreExt + ?Sized> Planner<S> {
             kind,
             policy,
             parquet,
+            path_template,
             locator,
             verified: Mutex::new(BTreeSet::new()),
         })
@@ -419,12 +435,13 @@ impl<S: StoreExt + ?Sized> Planner<S> {
     fn serving<'a>(
         segs: &'a [SpecSegments],
         columns: &[String],
+        has_virtual: bool,
     ) -> Result<Vec<(&'a SpecSegments, Serve)>> {
         let serving: Vec<_> = segs
             .iter()
             .filter_map(|s| serve(&s.spec, columns).map(|v| (s, v)))
             .collect();
-        if !segs.is_empty() && serving.is_empty() {
+        if !segs.is_empty() && serving.is_empty() && !has_virtual {
             return Err(Error::KeySpec(format!(
                 "none of the key specs {:?} serves a lookup on {columns:?}",
                 segs.iter().map(|s| s.spec.name()).collect::<Vec<_>>()
@@ -529,18 +546,24 @@ impl<S: StoreExt + ?Sized> Planner<S> {
     ) -> Result<ScanPlan> {
         let types = self.column_types(columns)?;
         let (keys, spans) = non_null_probes(keys, &types)?;
-        let serving = Self::serving(segs, columns)?;
+        let vpruned = self.prune_virtual_keys(columns, &keys, &spans)?;
+        let serving = Self::serving(segs, columns, vpruned.is_some())?;
         let selected = if keys.is_empty() {
             // No key, no row: never a full scan.
             RoaringBitmap::new()
-        } else if segs.is_empty() {
-            self.locator.live().clone()
+        } else if segs.is_empty() || serving.is_empty() {
+            vpruned.unwrap_or_else(|| self.locator.live().clone())
         } else {
             let mut acc = vec![None; keys.len()];
             self.intersect(&mut acc, &serving, &keys, &spans)?;
-            acc.into_iter()
+            let mut unioned = acc
+                .into_iter()
                 .flatten()
-                .fold(RoaringBitmap::new(), |u, b| u | b)
+                .fold(RoaringBitmap::new(), |u, b| u | b);
+            if let Some(pruned) = vpruned {
+                unioned &= pruned;
+            }
+            unioned
         };
         let residual = Predicate::In {
             columns: columns.to_vec(),
@@ -559,7 +582,8 @@ impl<S: StoreExt + ?Sized> Planner<S> {
         let types = self.column_types(columns)?;
         let (keys, spans) = non_null_probes(keys, &types)?;
         let keys = keys.as_slice();
-        let serving = Self::serving(segs, columns)?;
+        let vpruned = self.prune_virtual_keys(columns, keys, &spans)?;
+        let serving = Self::serving(segs, columns, vpruned.is_some())?;
         let mut temporal = serving
             .iter()
             .filter(|(s, _)| matches!(s.spec, KeySpec::Temporal { .. }));
@@ -629,10 +653,13 @@ impl<S: StoreExt + ?Sized> Planner<S> {
             .map(|(s, h)| (*s, h.clone()))
             .collect();
         self.intersect(&mut acc, &others, keys, &spans)?;
-        let selected = acc
+        let mut selected = acc
             .into_iter()
             .flatten()
             .fold(RoaringBitmap::new(), |u, b| u | b);
+        if let Some(pruned) = vpruned {
+            selected &= pruned;
+        }
         let residual = temporal_residual(
             &t.spec, ts_column, &ts_type, columns, keys, &variants, &winners, asof,
         )?;
@@ -715,13 +742,14 @@ impl<S: StoreExt + ?Sized> Planner<S> {
                 KeySpec::Bloom { .. } => false,
             })
             .collect();
-        if !segs.is_empty() && serving.is_empty() {
+        let vrange = self.prune_virtual_between(column, &lo, &hi)?;
+        if !segs.is_empty() && serving.is_empty() && vrange.is_none() {
             return Err(Error::KeySpec(format!(
                 "none of the key specs serves a range lookup on {column:?} (a range spec on it, or an \
                  exact or temporal spec led by it)"
             )));
         }
-        let mut selected: Option<RoaringBitmap> = None;
+        let mut selected: Option<RoaringBitmap> = vrange;
         for s in &serving {
             let range = matches!(s.spec, KeySpec::Range { .. });
             let mut found = RoaringBitmap::new();
@@ -738,10 +766,9 @@ impl<S: StoreExt + ?Sized> Planner<S> {
                 None => found,
             });
         }
-        let selected = if segs.is_empty() {
-            self.locator.live().clone()
-        } else {
-            selected.unwrap_or_default()
+        let selected = match selected {
+            Some(s) => s,
+            None => self.locator.live().clone(),
         };
         let residual = Predicate::Between {
             column: column.to_string(),
@@ -791,6 +818,121 @@ impl<S: StoreExt + ?Sized> Planner<S> {
             entries,
             residual: Some(residual),
         })
+    }
+
+    /// Prunes live row groups against virtual columns (from Hive `name=value`
+    /// directories or `--path-template`) without reading files. Returns `Some`
+    /// when at least one file has a virtual column among `columns`.
+    fn prune_virtual_keys(
+        &self,
+        columns: &[String],
+        keys: &[Vec<u8>],
+        spans: &[Vec<std::ops::Range<usize>>],
+    ) -> Result<Option<RoaringBitmap>> {
+        let m = self.manifest();
+        let root = (!m.source.root.is_empty()).then_some(m.source.root.as_str());
+        let mut any_virtual = false;
+        let mut file_checks: Vec<(Vec<(usize, Vec<u8>, Vec<u8>)>, &[RowGroupId])> =
+            Vec::with_capacity(m.rowgroup_space.files.len());
+        for f in &m.rowgroup_space.files {
+            let vcols =
+                extract_virtual_cols(root, &f.fingerprint.path, self.path_template.as_ref())?;
+            let mut checks: Vec<(usize, Vec<u8>, Vec<u8>)> = Vec::new();
+            for (ci, col) in columns.iter().enumerate() {
+                if let Some(vc) = vcols.iter().find(|v| &v.name == col) {
+                    if let Ok(field) = self.schema.field_with_name(col) {
+                        let enc = encode_virtual_value(
+                            &DefaultCanonical,
+                            &f.fingerprint.path,
+                            col,
+                            &vc.raw,
+                            field.data_type(),
+                        )?;
+                        let (lo, hi) = normalize_float_bounds(Some(enc.clone()), Some(enc));
+                        if let (Some(lo), Some(hi)) = (lo, hi) {
+                            checks.push((ci, lo, hi));
+                        }
+                    }
+                }
+            }
+            if !checks.is_empty() {
+                any_virtual = true;
+            }
+            file_checks.push((checks, &f.rowgroup_ids));
+        }
+        if !any_virtual {
+            return Ok(None);
+        }
+        let mut allowed = RoaringBitmap::new();
+        for (checks, ids) in file_checks {
+            if checks.is_empty() {
+                for id in ids {
+                    allowed.insert(id.0);
+                }
+                continue;
+            }
+            let file_matches = keys.iter().zip(spans).any(|(k, sp)| {
+                checks.iter().all(|(ci, lo, hi)| {
+                    let elem = &k[sp[*ci].clone()];
+                    elem >= lo.as_slice() && elem <= hi.as_slice()
+                })
+            });
+            if file_matches {
+                for id in ids {
+                    allowed.insert(id.0);
+                }
+            }
+        }
+        Ok(Some(allowed & self.locator.live()))
+    }
+
+    /// Prunes live row groups against a virtual column for a `Between` lookup.
+    fn prune_virtual_between(
+        &self,
+        column: &str,
+        lo: &[u8],
+        hi: &[u8],
+    ) -> Result<Option<RoaringBitmap>> {
+        let m = self.manifest();
+        let root = (!m.source.root.is_empty()).then_some(m.source.root.as_str());
+        let Ok(field) = self.schema.field_with_name(column) else {
+            return Ok(None);
+        };
+        let mut any_virtual = false;
+        let mut allowed = RoaringBitmap::new();
+        for f in &m.rowgroup_space.files {
+            let vcols =
+                extract_virtual_cols(root, &f.fingerprint.path, self.path_template.as_ref())?;
+            let Some(vc) = vcols.iter().find(|v| v.name == column) else {
+                for id in &f.rowgroup_ids {
+                    allowed.insert(id.0);
+                }
+                continue;
+            };
+            any_virtual = true;
+            let enc = encode_virtual_value(
+                &DefaultCanonical,
+                &f.fingerprint.path,
+                column,
+                &vc.raw,
+                field.data_type(),
+            )?;
+            let (vlo, vhi) = normalize_float_bounds(Some(enc.clone()), Some(enc));
+            let matches = match (vlo, vhi) {
+                (Some(vlo), Some(vhi)) => vhi.as_slice() >= lo && vlo.as_slice() <= hi,
+                _ => true,
+            };
+            if matches {
+                for id in &f.rowgroup_ids {
+                    allowed.insert(id.0);
+                }
+            }
+        }
+        if any_virtual {
+            Ok(Some(allowed & self.locator.live()))
+        } else {
+            Ok(None)
+        }
     }
 
     /// Compressed bytes of each row group of tracked file `fi`, by
