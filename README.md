@@ -267,13 +267,12 @@ exit 0  (.688599000 s)
 
 An index does not help this workload on this layout: 1,000 random users together touch 27 of the 28 row groups, so even an exact index (the floor: only row groups that hold a queried key) saves 0.08% of the bytes. Rows are not clustered by `UserID`, and that layout, not a missing index, is what the job pays for. The replay's prediction before the index existed (1,485,098,816 bytes) is exactly what the index then planned. The bytes are exact and do not depend on the build; the timings do (most of the 17 s `why` is building a transient `exact:UserID` index over 10,000,000 rows in a debug build). This transcript was taken before the profile was wired into `why`; `why` now also prints the fanout table, the lints, and the profile Evidence it records, and the funnel above is unchanged (the bytes are exact).
 
-```mermaid
-xychart-beta
-    title "ClickBench slice, 1,000 sampled users: row groups a lookup reads (28 exist)"
-    x-axis ["no index", "exact:UserID (floor)"]
-    y-axis "row groups read" 0 --> 30
-    bar [28, 27]
-```
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/assets/clickbench-funnel-dark.svg">
+    <img alt="Funnel for the ClickBench slice: the dataset and the unindexed lookup both touch 28 row groups; the exact UserID index touches 27" src="docs/assets/clickbench-funnel-light.svg" width="960">
+  </picture>
+</p>
 
 ## Status
 
