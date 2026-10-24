@@ -1,0 +1,36 @@
+% Panel: the pruning funnel of one recorded run, one group of bars per
+% strategy. Data: data/funnel.csv; schema in data/README.md.
+\IfFileExists{data/funnel.csv}{%
+  \begingroup\bwdatacatcodes
+  % The rung the run was measured on, for the axis label.
+  \pgfplotstableread{data/funnel.csv}\bwfunneltable
+  \pgfplotstablegetelem{0}{files}\of\bwfunneltable
+  \let\bwfunnelfiles\pgfplotsretval
+  \begin{bwpanel}{4.1cm}
+    \begin{axis}[bw, bw box={4.1cm}{0.95cm}{0.85cm}{0.12cm}{0.62cm},
+        ybar=0pt, bar width=3.6pt, ymode=log, log origin=infty,
+        xmin=-0.55, xmax=4.55, restrict x to domain=-0.5:4.5,
+        xtick={0,...,4}, xmajorgrids=false,
+        xticklabels={{raw\\scan}, {Parquet\\statistics}, {DuckDB}, {Data-\\Fusion},
+          {Bell-\\wether}},
+        xticklabel style={align=center},
+        ylabel={row groups (\bwfunnelfiles\ files)},
+        legend columns=-1, bw bar legend,
+        every axis plot/.append style={draw=white, line width=0.3pt}]
+      \addplot[fill=bwStageA]
+        table[x expr=\bwstrategypos{\thisrow{strategy}}, y=rg_total] {data/funnel.csv};
+      \addlegendentry{corpus}
+      \addplot[fill=bwStageB]
+        table[x expr=\bwstrategypos{\thisrow{strategy}}, y=rg_stats] {data/funnel.csv};
+      \addlegendentry{after statistics}
+      \addplot[fill=bwStageC]
+        table[x expr=\bwstrategypos{\thisrow{strategy}}, y=rg_index] {data/funnel.csv};
+      \addlegendentry{after index}
+    \end{axis}
+  \end{bwpanel}%
+  \endgroup
+}{%
+  \pendingfigure[\scriptsize]{4.1cm}{the pruning funnel of one recorded run,
+    as row groups in the corpus, after statistics, and after the index, per
+    strategy}{funnel}%
+}%

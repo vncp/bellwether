@@ -1,0 +1,47 @@
+[package]
+name = "bellwether-verify"
+description = "Reconciliation for Bellwether: compare two sources by key with latest-by, canonical row hashes, and exact decimal totals, and write the Certificate."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[dependencies]
+bellwether-types = { path = "../bellwether-types" }
+# Canonical encoding (ADR 016): row hashes, key tuples, and dataset-type
+# conversion all go through core's encoder so the bytes match the index.
+bellwether-core = { path = "../bellwether-core" }
+# The catalog digest each side cites, and RFC 3339 timestamps with
+# nanosecond precision for `created_at`.
+bellwether-source = { path = "../bellwether-source" }
+# Certificates and plan Evidence are written only through `Ledger::put`.
+bellwether-ledger = { path = "../bellwether-ledger" }
+# An indexed side is planned through the build crate's plan builder
+# (`IndexPlanner`), pinned to one manifest of the store.
+bellwether-build = { path = "../bellwether-build" }
+bellwether-store = { path = "../bellwether-store" }
+arrow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+xxhash-rust = { workspace = true }
+
+[dev-dependencies]
+parquet = { workspace = true }
+roaring = { workspace = true }
+tempfile = { workspace = true }
+proptest = { workspace = true }
+criterion = { workspace = true }
+# A counting global allocator for tests/real_memory.rs, which measures the
+# real heap peak of a reconcile against its budget (no unsafe code here).
+cap = { version = "0.1.2", features = ["stats"] }
+
+[[bench]]
+name = "reconcile"
+harness = false
+
+[lints]
+workspace = true

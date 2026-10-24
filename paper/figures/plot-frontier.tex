@@ -1,0 +1,39 @@
+% Panel: Pareto frontier evolution, projected onto p50-run and p95-run bytes:
+% the frontier at four generations, lighter for earlier ones, and the
+% baseline. Data: data/frontier.csv; schema in data/README.md.
+\IfFileExists{data/frontier.csv}{%
+  \begingroup\bwdatacatcodes
+  % The generation of each snapshot, for the legend.
+  \pgfplotstableread{data/frontier.csv}\bwfrontiertable
+  \pgfplotstableforeachcolumnelement{snapshot}\of\bwfrontiertable\as\bwsnap{%
+    \pgfplotstablegetelem{\pgfplotstablerow}{generation}\of\bwfrontiertable
+    \expandafter\xdef\csname bwgen\bwsnap\endcsname{\pgfplotsretval}}%
+  \begin{bwpanel}{4.1cm}
+    \begin{axis}[bw, bw box={4.1cm}{0.95cm}{0.85cm}{0.12cm}{0.62cm},
+        xmode=log, ymode=log,
+        xlabel={p50-run bytes}, ylabel={p95-run bytes},
+        legend columns=-1,
+        every axis plot/.append style={mark=*, mark options={solid}}]
+      \addplot[bwA, opacity=0.3, bw only={snapshot}{1}]
+        table[x=p50_bytes, y=p95_bytes] {data/frontier.csv};
+      \addlegendentry{$g{=}\csname bwgen1\endcsname$}
+      \addplot[bwA, opacity=0.53, bw only={snapshot}{2}]
+        table[x=p50_bytes, y=p95_bytes] {data/frontier.csv};
+      \addlegendentry{$\csname bwgen2\endcsname$}
+      \addplot[bwA, opacity=0.77, bw only={snapshot}{3}]
+        table[x=p50_bytes, y=p95_bytes] {data/frontier.csv};
+      \addlegendentry{$\csname bwgen3\endcsname$}
+      \addplot[bwA, bw only={snapshot}{4}]
+        table[x=p50_bytes, y=p95_bytes] {data/frontier.csv};
+      \addlegendentry{$\csname bwgen4\endcsname$}
+      \addplot[bwInk, only marks, mark=star, mark size=2.4pt, line width=0.6pt,
+          bw only={snapshot}{0}]
+        table[x=p50_bytes, y=p95_bytes] {data/frontier.csv};
+      \addlegendentry{baseline $a_0$}
+    \end{axis}
+  \end{bwpanel}%
+  \endgroup
+}{%
+  \pendingfigure[\scriptsize]{4.1cm}{the Pareto frontier at four generations in
+    p50-run and p95-run bytes, with the baseline}{frontier}%
+}%

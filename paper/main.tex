@@ -1,0 +1,104 @@
+% Bellwether paper. Build with `make` or `tectonic main.tex` in this directory,
+% or with `tectonic paper/main.tex` from the repository root.
+%
+% balance=false, pbalance=true: acmart's default end-of-document column
+% balancing (balance.sty) silently drops floats deferred to the last page;
+% pbalance balances the last page without that failure.
+\documentclass[sigconf,nonacm,balance=false,pbalance=true]{acmart}
+
+\usepackage{array}
+\usepackage{tikz}
+\usetikzlibrary{arrows.meta,positioning,calc,shapes.geometric}
+\input{figures/plotstyle}
+\usepackage{newfloat}
+\usepackage{algpseudocode}
+\usepackage{enumitem}
+\usepackage{subcaption}
+
+% Algorithm float declared with newfloat (avoids algorithm.sty).
+\DeclareFloatingEnvironment[name=Algorithm,placement=tbp]{algorithm}
+
+% \todo{...}: a visible margin note marking something the author must check,
+% for example a citation that could not be fully verified against a primary
+% source. Use only in running text (not inside floats, captions, or tables).
+\setlength{\marginparsep}{4pt}
+\setlength{\marginparwidth}{40pt}
+\newcommand{\todo}[1]{\textcolor{red}{\textsuperscript{\textdagger}}%
+  \marginpar{\raggedright\tiny\sffamily\textcolor{red}{TODO: #1}}}
+
+\input{figures/pending}
+
+% References to the project's design documents, which are cited once as
+% \cite{bellwether}: decision records as ADR NNN, other documents by file name.
+\newcommand{\adr}[1]{ADR~#1}
+\newcommand{\doc}[1]{\texttt{#1}}
+\newcommand{\code}[1]{\texttt{#1}}
+\newcommand{\Eq}{\mathrm{Eq}}
+\newcommand{\RG}{\mathcal{G}}
+\newcommand{\pend}{pending}
+% Breakable underscore for long identifiers in narrow columns.
+\newcommand{\us}{\_\allowbreak}
+
+% Let TeX stretch interword space before it overfills a narrow column.
+\setlength{\emergencystretch}{1.5em}
+
+\begin{document}
+
+\title[Bellwether]{Bellwether: Reflective Optimization of Data Pipelines with
+  an Exact Counterfactual Loss and Reconciliation Certificates}
+
+\author{Vincent Pham}
+\affiliation{\institution{Independent}\city{}\country{}}
+
+\begin{abstract}
+Index advisors for relational databases depend on the optimizer's what-if
+interface, which estimates the cost of a hypothetical index. These estimates are
+often wrong: configurations recommended by large language models, which look
+worse by estimated cost, can run faster than an industrial tuner's. Data lakes
+have no optimizer of their own and so no exact what-if interface, which has kept
+both classical and LLM-driven tuning out of the storage tier where much
+analytical data now lives. We observe that this absence is an opportunity.
+Because a lake exposes its files, the I/O cost of a hypothetical index,
+composite key, or plan over those files can be computed exactly, with no
+estimation, by replaying the workload's recorded key sets against file and
+row-group metadata. We present Bellwether, which (i) builds row-group-level
+secondary indexes with composite and temporal keys over Parquet, (ii) provides
+an exact counterfactual what-if interface, (iii) runs a reflective,
+population-based optimizer over plans, physical designs, and whole pipelines,
+using counterfactual attribution as its backward pass, exact finite-difference
+descent for numeric knobs, and Pareto selection across recorded runs, and (iv)
+certifies every change by index-accelerated reconciliation at the pipeline
+output, producing equivalence certificates where SQL provers cannot apply and
+admitting non-local rewrites across step boundaries. A language model proposes;
+only the engine scores, verifies, and applies, and every step is a
+content-addressed record. Evaluation on a synthetic versioned-ledger benchmark
+with planted anti-patterns is pending.
+\end{abstract}
+
+% CCS concepts: placeholder, to be regenerated with the ACM CCS tool
+% (https://dl.acm.org/ccs) before submission.
+\ccsdesc[500]{Information systems~Autonomous database administration}
+\ccsdesc[300]{Information systems~Query optimization}
+\ccsdesc[100]{Information systems~Data access methods}
+
+\keywords{index advisors, what-if analysis, data lakes, Parquet, query
+  rewriting, equivalence verification, reconciliation, LLM agents, reflective
+  optimization, Pareto selection}
+
+\maketitle
+
+\input{sections/introduction}
+\input{sections/related}
+\input{sections/overview}
+\input{sections/whatif}
+\input{sections/certificates}
+\input{sections/evolve}
+\input{sections/implementation}
+\input{sections/evaluation}
+\input{sections/discussion}
+\input{sections/conclusion}
+
+\bibliographystyle{ACM-Reference-Format}
+\bibliography{references}
+
+\end{document}

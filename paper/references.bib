@@ -1,0 +1,551 @@
+% References for the Bellwether paper.
+%
+% Every entry was checked against a fetched primary source (arXiv abstract
+% pages and API, publisher PDFs, Crossref, ACL Anthology, ICLR proceedings,
+% OpenProceedings, GitHub) on 2026-10-23. DBLP's HTTP endpoints were rate
+% limited at the time; some fields come from DBLP's SPARQL endpoint instead.
+% Venues, volumes, and pages appear only where a fetched source states them.
+
+% ---------------------------------------------------------------------------
+% Index advisors, what-if analysis, estimation error
+% ---------------------------------------------------------------------------
+
+@inproceedings{autoadmin1997,
+  publisher = {Morgan Kaufmann},
+  address   = {Athens, Greece},
+  author    = {Surajit Chaudhuri and Vivek R. Narasayya},
+  title     = {{An Efficient, Cost-Driven Index Selection Tool for Microsoft SQL Server}},
+  booktitle = {Proceedings of the 23rd International Conference on Very Large Data Bases (VLDB)},
+  pages     = {146--155},
+  year      = {1997}
+}
+
+@inproceedings{whatif1998,
+  publisher = {ACM},
+  address   = {New York, NY, USA},
+  author    = {Surajit Chaudhuri and Vivek R. Narasayya},
+  title     = {{AutoAdmin ``What-if'' Index Analysis Utility}},
+  booktitle = {Proceedings of the ACM SIGMOD International Conference on Management of Data},
+  pages     = {367--378},
+  year      = {1998},
+  doi       = {10.1145/276304.276337}
+}
+
+@inproceedings{bruno2005relax,
+  publisher = {ACM},
+  address   = {New York, NY, USA},
+  author    = {Nicolas Bruno and Surajit Chaudhuri},
+  title     = {{Automatic Physical Database Tuning: A Relaxation-based Approach}},
+  booktitle = {Proceedings of the ACM SIGMOD International Conference on Management of Data},
+  pages     = {227--238},
+  year      = {2005},
+  doi       = {10.1145/1066157.1066184}
+}
+
+@article{kossmann2020,
+  author  = {Jan Kossmann and Stefan Halfpap and Marcel Jankrift and Rainer Schlosser},
+  title   = {{Magic mirror in my hand, which is the best in the land? An Experimental Evaluation of Index Selection Algorithms}},
+  journal = {Proc. VLDB Endow.},
+  volume  = {13},
+  number  = {11},
+  pages   = {2382--2395},
+  year    = {2020},
+  doi     = {10.14778/3407790.3407832}
+}
+
+@article{leis2015,
+  author  = {Viktor Leis and Andrey Gubichev and Atanas Mirchev and Peter Boncz and Alfons Kemper and Thomas Neumann},
+  title   = {{How Good Are Query Optimizers, Really?}},
+  journal = {Proc. VLDB Endow.},
+  volume  = {9},
+  number  = {3},
+  pages   = {204--215},
+  year    = {2015},
+  doi     = {10.14778/2850583.2850594}
+}
+
+@inproceedings{aimeetsai,
+  publisher = {ACM},
+  address   = {New York, NY, USA},
+  author    = {Bailu Ding and Sudipto Das and Ryan Marcus and Wentao Wu and Surajit Chaudhuri and Vivek R. Narasayya},
+  title     = {{AI Meets AI: Leveraging Query Executions to Improve Index Recommendations}},
+  booktitle = {Proceedings of the 2019 International Conference on Management of Data (SIGMOD)},
+  pages     = {1241--1258},
+  year      = {2019},
+  doi       = {10.1145/3299869.3324957}
+}
+
+@article{dtallm2026,
+  author  = {Xiaoying Wang and Wentao Wu and Vivek R. Narasayya and Surajit Chaudhuri},
+  title   = {{Evaluating the Practical Effectiveness of LLM-Driven Index Tuning on Microsoft SQL Server}},
+  journal = {Proc. VLDB Endow.},
+  volume  = {19},
+  number  = {12},
+  pages   = {4049--4062},
+  year    = {2026},
+  doi     = {10.14778/3827998.3828015}
+}
+
+@misc{llmia,
+  author       = {Xinxin Zhao and Xinmei Huang and Haoyang Li and Jing Zhang and Shuai Wang and Tieying Zhang and Jianjun Chen and Rui Shi and Cuiping Li and Hong Chen},
+  title        = {{LLMIA: An Out-of-the-Box Index Advisor via In-Context Learning with LLMs}},
+  year         = {2026},
+  howpublished = {arXiv:2503.07884},
+}
+
+@misc{amaze,
+  author       = {Zhaodonghui Li and Haitao Yuan and Jiachen Shi and Hao Zhang and Yu Rong and Gao Cong},
+  title        = {{AMAZe: A Multi-Agent Zero-shot Index Advisor for Relational Databases}},
+  year         = {2025},
+  howpublished = {arXiv:2508.16044}
+}
+
+@misc{memtuning,
+  author       = {Zhaoyan Hong and Yishen Sun and Xinyi Zhang and Zhentao Han and Jinhao Dong and Wei Lu and Kai Xu and Liu Tang and Qi Liu and Xiaoyong Du},
+  title        = {{From Blind Search to Memory-Aware Evolution: Efficient DBMS Tuning via Collaborative Diagnosis and Utility-Aware Retrieval}},
+  year         = {2026},
+  howpublished = {arXiv:2607.17841}
+}
+
+% ---------------------------------------------------------------------------
+% LLM query rewriting
+% ---------------------------------------------------------------------------
+
+@article{genrewrite,
+  author  = {Jie Liu and Barzan Mozafari},
+  title   = {{GenRewrite: Query Rewriting via Large Language Models}},
+  journal = {Proc. ACM Manag. Data},
+  volume  = {4},
+  number  = {1},
+  pages   = {70:1--70:26},
+  year    = {2026},
+  doi     = {10.1145/3786684},
+}
+
+@article{llmr2,
+  author  = {Zhaodonghui Li and Haitao Yuan and Huiming Wang and Gao Cong and Lidong Bing},
+  title   = {{LLM-R$^2$: A Large Language Model Enhanced Rule-based Rewrite System for Boosting Query Efficiency}},
+  journal = {Proc. VLDB Endow.},
+  volume  = {18},
+  number  = {1},
+  pages   = {53--65},
+  year    = {2024},
+  doi     = {10.14778/3696435.3696440},
+}
+
+@inproceedings{lithe,
+  address   = {Tampere, Finland},
+  author    = {Sriram Dharwada and Himanshu Devrani and Jayant R. Haritsa and Harish Doraiswamy},
+  title     = {{LITHE: A Query Rewrite Advisor using LLMs}},
+  booktitle = {Proceedings of the 29th International Conference on Extending Database Technology (EDBT)},
+  pages     = {233--246},
+  publisher = {OpenProceedings.org},
+  year      = {2026},
+  doi       = {10.48786/edbt.2026.20},
+}
+
+@misc{quite,
+  author       = {Yuyang Song and Hanxu Yan and Jiale Lao and Yibo Wang and Yufei Li and Yuanchun Zhou and Jianguo Wang and Mingjie Tang},
+  title        = {{QUITE: A Query Rewrite System Beyond Rules with LLM Agents}},
+  year         = {2025},
+  howpublished = {arXiv:2506.07675}
+}
+
+@misc{e3rewrite,
+  author       = {Dongjie Xu and Yue Cui and Weijie Shi and Qingzhi Ma and Hanghui Guo and Jiaming Li and Yao Zhao and Ruiyuan Zhang and Shimin Di and Jia Zhu and Kai Zheng and Jiajie Xu},
+  title        = {{E$^3$-Rewrite: Learning to Rewrite SQL for Executability, Equivalence, and Efficiency}},
+  year         = {2025},
+  howpublished = {arXiv:2508.09023}
+}
+
+@article{resequel,
+  author  = {Saeed Fathollahzadeh and Essam Mansour and Matthias Boehm},
+  title   = {{ReSequel: Robust LLM-assisted Query Rewriting and Optimization using Templatization and Sampling}},
+  journal = {Proc. VLDB Endow.},
+  volume  = {19},
+  number  = {10},
+  pages   = {2880--2893},
+  year    = {2026},
+  doi     = {10.14778/3828612.3828639},
+}
+
+% ---------------------------------------------------------------------------
+% Equivalence verification
+% ---------------------------------------------------------------------------
+
+@inproceedings{cosette,
+  publisher = {www.cidrdb.org},
+  address   = {Chaminade, CA, USA},
+  author    = {Shumo Chu and Chenglong Wang and Konstantin Weitz and Alvin Cheung},
+  title     = {{Cosette: An Automated Prover for SQL}},
+  booktitle = {8th Biennial Conference on Innovative Data Systems Research (CIDR)},
+  year      = {2017},
+  url       = {http://cidrdb.org/cidr2017/papers/p51-chu-cidr17.pdf}
+}
+
+@article{sqlsolver,
+  author  = {Haoran Ding and Zhaoguo Wang and Yicun Yang and Dexin Zhang and Zhenglin Xu and Haibo Chen and Ruzica Piskac and Jinyang Li},
+  title   = {{Proving Query Equivalence Using Linear Integer Arithmetic}},
+  journal = {Proc. ACM Manag. Data},
+  volume  = {1},
+  number  = {4},
+  pages   = {227:1--227:26},
+  year    = {2023},
+  doi     = {10.1145/3626768}
+}
+
+@article{verieql,
+  author  = {Yang He and Pinhan Zhao and Xinyu Wang and Yuepeng Wang},
+  title   = {{VeriEQL: Bounded Equivalence Verification for Complex SQL Queries with Integrity Constraints}},
+  journal = {Proc. ACM Program. Lang.},
+  volume  = {8},
+  number  = {OOPSLA1},
+  pages   = {1071--1099},
+  year    = {2024},
+  doi     = {10.1145/3649849}
+}
+
+@article{qed,
+  author  = {Shuxian Wang and Sicheng Pan and Alvin Cheung},
+  title   = {{QED: A Powerful Query Equivalence Decider for SQL}},
+  journal = {Proc. VLDB Endow.},
+  volume  = {17},
+  number  = {11},
+  pages   = {3602--3614},
+  year    = {2024},
+  doi     = {10.14778/3681954.3682024}
+}
+
+@misc{equitrace,
+  author       = {Chunyu Chen and Xinyi Huang and Zhengjie Miao},
+  title        = {{Building SQL Equivalence Proofs from Query Rewrite Rules}},
+  year         = {2026},
+  howpublished = {arXiv:2610.30100},
+  note         = {Describes the EquiTrace system}
+}
+
+@inproceedings{narasayya2026verify,
+  publisher = {www.cidrdb.org},
+  address   = {Chaminade, CA, USA},
+  author    = {Vivek Narasayya and Surajit Chaudhuri},
+  title     = {{Leveraging Query Optimizers to Verify the Soundness of LLM-based Query Rewrites for Real-World Workloads, and More!}},
+  booktitle = {16th Conference on Innovative Data Systems Research (CIDR)},
+  year      = {2026},
+  url       = {https://www.vldb.org/cidrdb/papers/2026/p33-narasayya.pdf}
+}
+
+% ---------------------------------------------------------------------------
+% Layouts and data skipping
+% ---------------------------------------------------------------------------
+
+@inproceedings{moerkotte1998sma,
+  publisher = {Morgan Kaufmann},
+  address   = {New York, USA},
+  author    = {Guido Moerkotte},
+  title     = {{Small Materialized Aggregates: A Light Weight Index Structure for Data Warehousing}},
+  booktitle = {Proceedings of the 24th International Conference on Very Large Data Bases (VLDB)},
+  pages     = {476--487},
+  year      = {1998},
+  url       = {https://www.vldb.org/conf/1998/p476.pdf}
+}
+
+@inproceedings{sun2014skipping,
+  publisher = {ACM},
+  address   = {New York, NY, USA},
+  author    = {Liwen Sun and Michael J. Franklin and Sanjay Krishnan and Reynold S. Xin},
+  title     = {{Fine-grained Partitioning for Aggressive Data Skipping}},
+  booktitle = {Proceedings of the 2014 ACM SIGMOD International Conference on Management of Data},
+  pages     = {1115--1126},
+  year      = {2014},
+  doi       = {10.1145/2588555.2610515}
+}
+
+@inproceedings{qdtree,
+  publisher = {ACM},
+  address   = {New York, NY, USA},
+  author    = {Zongheng Yang and Badrish Chandramouli and Chi Wang and Johannes Gehrke and Yinan Li and Umar Farooq Minhas and Per-{\AA}ke Larson and Donald Kossmann and Rajeev Acharya},
+  title     = {{Qd-tree: Learning Data Layouts for Big Data Analytics}},
+  booktitle = {Proceedings of the 2020 ACM SIGMOD International Conference on Management of Data},
+  pages     = {193--208},
+  year      = {2020},
+  doi       = {10.1145/3318464.3389770}
+}
+
+@inproceedings{ding2021layouts,
+  publisher = {ACM},
+  address   = {New York, NY, USA},
+  author    = {Jialin Ding and Umar Farooq Minhas and Badrish Chandramouli and Chi Wang and Yinan Li and Ying Li and Donald Kossmann and Johannes Gehrke and Tim Kraska},
+  title     = {{Instance-Optimized Data Layouts for Cloud Analytics Workloads}},
+  booktitle = {Proceedings of the 2021 International Conference on Management of Data (SIGMOD)},
+  pages     = {418--431},
+  year      = {2021},
+  doi       = {10.1145/3448016.3457270}
+}
+
+@article{lrp2025,
+  author    = {Pengju Liu and Pan Cai and Kai Zhong and Cuiping Li and Hong Chen},
+  title     = {{LRP: learned robust data partitioning for efficient processing of large dynamic queries}},
+  journal   = {Frontiers of Computer Science},
+  volume    = {19},
+  number    = {9},
+  pages     = {199607},
+  year      = {2025},
+  doi       = {10.1007/s11704-024-40509-4}
+}
+
+@article{recluster2026,
+  numpages  = {27},
+  author    = {Yipeng Liu and Renfei Zhou and Jiaqi Yan and Huanchen Zhang},
+  title     = {{Workload-Aware Incremental Reclustering in Cloud Data Warehouses}},
+  journal   = {Proc. ACM Manag. Data},
+  volume    = {4},
+  number    = {3},
+  articleno = {250},
+  year      = {2026},
+  doi       = {10.1145/3802127},
+}
+
+% ---------------------------------------------------------------------------
+% Lakes, table formats, lake indexing, filters
+% ---------------------------------------------------------------------------
+
+@inproceedings{lakehouse2021,
+  publisher = {www.cidrdb.org},
+  address   = {Online},
+  author    = {Michael Armbrust and Ali Ghodsi and Reynold Xin and Matei Zaharia},
+  title     = {{Lakehouse: A New Generation of Open Platforms that Unify Data Warehousing and Advanced Analytics}},
+  booktitle = {11th Annual Conference on Innovative Data Systems Research (CIDR)},
+  year      = {2021},
+  url       = {https://www.cidrdb.org/cidr2021/papers/cidr2021_paper17.pdf}
+}
+
+@article{deltalake,
+  author  = {Michael Armbrust and Tathagata Das and Liwen Sun and Burak Yavuz and Shixiong Zhu and Mukul Murthy and Joseph Torres and Herman van Hovell and Adrian Ionescu and Alicja {\L}uszczak and Micha{\l} {\'S}witakowski and Micha{\l} Szafra{\'n}ski and Xiao Li and Takuya Ueshin and Mostafa Mokhtar and Peter Boncz and Ali Ghodsi and Sameer Paranjpye and Pieter Senster and Reynold Xin and Matei Zaharia},
+  title   = {{Delta Lake: High-Performance ACID Table Storage over Cloud Object Stores}},
+  journal = {Proc. VLDB Endow.},
+  volume  = {13},
+  number  = {12},
+  pages   = {3411--3424},
+  year    = {2020},
+  doi     = {10.14778/3415478.3415560}
+}
+
+@misc{icebergspec,
+  author       = {{Apache Software Foundation}},
+  title        = {{Iceberg Table Spec}},
+  year         = {2026},
+  howpublished = {\url{https://iceberg.apache.org/spec/}},
+  note         = {Accessed 2026-10-23}
+}
+
+@misc{parquetbloom,
+  author       = {{Apache Software Foundation}},
+  title        = {{Parquet Bloom Filter}},
+  year         = {2026},
+  howpublished = {\url{https://github.com/apache/parquet-format/blob/master/BloomFilter.md}},
+  note         = {Accessed 2026-10-23}
+}
+
+@inproceedings{putze2007,
+  address   = {Berlin, Heidelberg},
+  author    = {Felix Putze and Peter Sanders and Johannes Singler},
+  title     = {{Cache-, Hash- and Space-Efficient Bloom Filters}},
+  booktitle = {Experimental Algorithms: 6th International Workshop (WEA)},
+  series    = {Lecture Notes in Computer Science},
+  publisher = {Springer},
+  pages     = {108--121},
+  year      = {2007},
+  doi       = {10.1007/978-3-540-72845-0_9}
+}
+
+@article{hyperspace,
+  author  = {Rahul Potharaju and Terry Kim and Eunjin Song and Wentao Wu and Lev Novik and Apoorve Dave and Andrew Fogarty and Pouria Pirzadeh and Vidip Acharya and Gurleen Dhody and Jiying Li and Sinduja Ramanujam and Nicolas Bruno and C{\'e}sar A. Galindo-Legaria and Vivek Narasayya and Surajit Chaudhuri and Anil K. Nori and Tomas Talius and Raghu Ramakrishnan},
+  title   = {{Hyperspace: The Indexing Subsystem of Azure Synapse}},
+  journal = {Proc. VLDB Endow.},
+  volume  = {14},
+  number  = {12},
+  pages   = {3043--3055},
+  year    = {2021},
+  doi     = {10.14778/3476311.3476382}
+}
+
+
+
+@inproceedings{plbf2021,
+  publisher = {OpenReview.net},
+  address   = {Virtual Event},
+  author    = {Kapil Vaidya and Eric Knorr and Michael Mitzenmacher and Tim Kraska},
+  title     = {{Partitioned Learned Bloom Filters}},
+  booktitle = {International Conference on Learning Representations (ICLR)},
+  year      = {2021},
+  url       = {https://openreview.net/forum?id=6BRLOfrMhW}
+}
+
+@misc{plbf2410,
+  author       = {Atsuki Sato and Yusuke Matsui},
+  title        = {{Fast Construction of Partitioned Learned Bloom Filter with Theoretical Guarantees}},
+  year         = {2024},
+  howpublished = {arXiv:2410.13278},
+  note         = {Accepted to The VLDB Journal (2026), per the arXiv record}
+}
+
+@misc{cascadedlbf,
+  author       = {Atsuki Sato and Yusuke Matsui},
+  title        = {{Cascaded Learned Bloom Filter for Optimizing Model-Filter Size Balance and Fast Rejection}},
+  year         = {2025},
+  howpublished = {arXiv:2502.03696}
+}
+
+% ---------------------------------------------------------------------------
+% Text-space optimization of language-model programs
+% ---------------------------------------------------------------------------
+
+@inproceedings{protegi,
+  address   = {Singapore},
+  author    = {Reid Pryzant and Dan Iter and Jerry Li and Yin Tat Lee and Chenguang Zhu and Michael Zeng},
+  title     = {{Automatic Prompt Optimization with ``Gradient Descent'' and Beam Search}},
+  booktitle = {Proceedings of the 2023 Conference on Empirical Methods in Natural Language Processing (EMNLP)},
+  publisher = {Association for Computational Linguistics},
+  pages     = {7957--7968},
+  year      = {2023},
+  doi       = {10.18653/v1/2023.emnlp-main.494}
+}
+
+@misc{textgrad,
+  author       = {Mert Yuksekgonul and Federico Bianchi and Joseph Boen and Sheng Liu and Zhi Huang and Carlos Guestrin and James Zou},
+  title        = {{TextGrad: Automatic ``Differentiation'' via Text}},
+  year         = {2024},
+  howpublished = {arXiv:2406.07496},
+}
+
+@inproceedings{dspy,
+  publisher = {OpenReview.net},
+  address   = {Vienna, Austria},
+  pages     = {54928--54958},
+  author    = {Omar Khattab and Arnav Singhvi and Paridhi Maheshwari and Zhiyuan Zhang and Keshav Santhanam and Sri Vardhamanan and Saiful Haq and Ashutosh Sharma and Thomas T. Joshi and Hanna Moazam and Heather Miller and Matei Zaharia and Christopher Potts},
+  title     = {{DSPy: Compiling Declarative Language Model Calls into Self-Improving Pipelines}},
+  booktitle = {International Conference on Learning Representations (ICLR)},
+  year      = {2024},
+}
+
+@inproceedings{mipro,
+  address   = {Miami, Florida, USA},
+  author    = {Krista Opsahl-Ong and Michael J. Ryan and Josh Purtell and David Broman and Christopher Potts and Matei Zaharia and Omar Khattab},
+  title     = {{Optimizing Instructions and Demonstrations for Multi-Stage Language Model Programs}},
+  booktitle = {Proceedings of the 2024 Conference on Empirical Methods in Natural Language Processing (EMNLP)},
+  publisher = {Association for Computational Linguistics},
+  pages     = {9340--9366},
+  year      = {2024},
+  doi       = {10.18653/v1/2024.emnlp-main.525}
+}
+
+@inproceedings{gepa,
+  publisher = {OpenReview.net},
+  address   = {Rio de Janeiro, Brazil},
+  pages     = {8479--8565},
+  author    = {Lakshya A. Agrawal and Shangyin Tan and Dilara Soylu and Noah Ziems and Rishi Khare and Krista Opsahl-Ong and Arnav Singhvi and Herumb Shandilya and Michael J. Ryan and Meng Jiang and Christopher Potts and Koushik Sen and Alexandros G. Dimakis and Ion Stoica and Dan Klein and Matei Zaharia and Omar Khattab},
+  title     = {{GEPA: Reflective Prompt Evolution Can Outperform Reinforcement Learning}},
+  booktitle = {International Conference on Learning Representations (ICLR)},
+  year      = {2026},
+}
+
+@misc{skillopt,
+  author       = {Yifan Yang and Ziyang Gong and Weiquan Huang and Qihao Yang and Ziwei Zhou and Zisu Huang and Yan Li and Xuemei Gao and Qi Dai and Bei Liu and Kai Qiu and Yuqing Yang and Dongdong Chen and Xue Yang and Chong Luo},
+  title        = {{SkillOpt: Executive Strategy for Self-Evolving Agent Skills}},
+  year         = {2026},
+  howpublished = {arXiv:2605.23904}
+}
+
+% ---------------------------------------------------------------------------
+% Algorithms, data structures, protocols
+% ---------------------------------------------------------------------------
+
+@article{nsga2,
+  author  = {Kalyanmoy Deb and Amrit Pratap and Sameer Agarwal and T. Meyarivan},
+  title   = {{A Fast and Elitist Multiobjective Genetic Algorithm: NSGA-II}},
+  journal = {IEEE Transactions on Evolutionary Computation},
+  volume  = {6},
+  number  = {2},
+  pages   = {182--197},
+  year    = {2002},
+  doi     = {10.1109/4235.996017}
+}
+
+@article{roaring,
+  author  = {Samy Chambi and Daniel Lemire and Owen Kaser and Robert Godin},
+  title   = {{Better bitmap performance with Roaring bitmaps}},
+  journal = {Software: Practice and Experience},
+  volume  = {46},
+  number  = {5},
+  pages   = {709--719},
+  year    = {2016},
+  doi     = {10.1002/spe.2325}
+}
+
+@misc{blake3,
+  author       = {Jack O'Connor and Jean-Philippe Aumasson and Samuel Neves and Zooko Wilcox-O'Hearn},
+  title        = {{BLAKE3: one function, fast everywhere}},
+  year         = {2020},
+  howpublished = {\url{https://github.com/BLAKE3-team/BLAKE3-specs}},
+  note         = {Accessed 2026-10-23}
+}
+
+@misc{xxhash,
+  author       = {Yann Collet},
+  title        = {{xxHash: Extremely fast hash algorithm}},
+  year         = {2026},
+  howpublished = {\url{https://github.com/Cyan4973/xxHash}},
+  note         = {Accessed 2026-10-23}
+}
+
+@misc{mcpspec,
+  author       = {{Model Context Protocol}},
+  title        = {{Model Context Protocol Specification}},
+  year         = {2026},
+  howpublished = {\url{https://modelcontextprotocol.io/specification/2026-07-28}},
+  note         = {Version 2026-07-28. Accessed 2026-10-23}
+}
+
+% ---------------------------------------------------------------------------
+% This project
+% ---------------------------------------------------------------------------
+
+@misc{bellwether,
+  author       = {Vincent Pham},
+  title        = {{Bellwether: Design Documents and Architecture Decision Records}},
+  year         = {2026},
+  howpublished = {\url{https://github.com/vncp/bellwether}},
+  note         = {Directory \texttt{docs/}, including ADR 001 to ADR 025 in \texttt{docs/adr/}, at commit 4e62c95}
+}
+
+@misc{datafusion,
+  author       = {{Apache Software Foundation}},
+  title        = {{Apache DataFusion: an extensible query engine written in Rust}},
+  year         = {2026},
+  howpublished = {\url{https://datafusion.apache.org/}},
+  note         = {Accessed 2026-10-24}
+}
+
+@misc{hudi,
+  author       = {{Apache Software Foundation}},
+  title        = {{Apache Hudi: Indexing}},
+  year         = {2026},
+  howpublished = {\url{https://hudi.apache.org/docs/indexes}},
+  note         = {Accessed 2026-10-24}
+}
+
+@misc{clickhouse,
+  author       = {{ClickHouse, Inc.}},
+  title        = {{ClickHouse: Data Skipping Indexes}},
+  year         = {2026},
+  howpublished = {\url{https://clickhouse.com/docs/optimize/skipping-indexes}},
+  note         = {Accessed 2026-10-24}
+}
+
+@misc{parquetbloom,
+  author       = {{Apache Software Foundation}},
+  title        = {{Parquet Bloom Filter Specification}},
+  year         = {2026},
+  howpublished = {\url{https://github.com/apache/parquet-format/blob/master/BloomFilter.md}},
+  note         = {Accessed 2026-10-24}
+}

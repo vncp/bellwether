@@ -1,0 +1,61 @@
+name: quality
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: "17 6 * * 1"  # weekly, Monday 06:17 UTC
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  layering:
+    name: crate layering is one-way
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: python3 dev/check-layering.py
+
+  supply-chain:
+    name: licenses · advisories · sources
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
+          arguments: --all-features
+
+  docs:
+    name: rustdoc with warnings denied
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo doc --workspace --no-deps --all-features
+        env:
+          RUSTDOCFLAGS: "-D warnings"
+
+  mutants:
+    name: mutation testing (weekly, informational)
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo install cargo-mutants --locked
+      - name: run mutants per crate and publish the survivors
+        run: |
+          cargo mutants --workspace --all-features --timeout 300 --no-shuffle --jobs 2 -o mutants.out || true
+          echo "## Surviving mutants" >> "$GITHUB_STEP_SUMMARY"
+          cat mutants.out/missed.txt >> "$GITHUB_STEP_SUMMARY" 2>/dev/null || echo "none" >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mutants
+          path: mutants.out

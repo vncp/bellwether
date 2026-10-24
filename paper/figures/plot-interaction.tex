@@ -1,0 +1,25 @@
+% Panel: pairwise interaction. I_uv in bytes, summed over search runs, for
+% the nodes of the attribution panel in the same order on both axes; the
+% diagonal is undefined. Data: data/interaction.csv; schema in
+% data/README.md.
+\IfFileExists{data/interaction.csv}{%
+  \begingroup\bwdatacatcodes
+  \bwsymlimit{data/interaction.csv}{i_bytes}%
+  \begin{bwpanel}{4.1cm}
+    \begin{axis}[bw, bw box={4.1cm}{0.2cm}{0.92cm}{0.1cm}{0.75cm},
+        colormap name=bwdiverging, point meta min=-\bwabs, point meta max=\bwabs,
+        bw colorbar,
+        y dir=reverse, xtick distance=1, ytick distance=1,
+        xticklabels={}, yticklabels={},
+        xlabel={$u$, $v$: nodes of (c)}, enlargelimits=false, axis on top,
+        grid=none, unbounded coords=jump,
+        axis background/.style={fill=bwGrid}]
+      \addplot[matrix plot*, point meta=explicit]
+        table[x=v, y=u, meta=i_bytes] {data/interaction.csv};
+    \end{axis}
+  \end{bwpanel}%
+  \endgroup
+}{%
+  \pendingfigure[\scriptsize]{4.1cm}{the pairwise interaction
+    matrix}{interaction}%
+}%

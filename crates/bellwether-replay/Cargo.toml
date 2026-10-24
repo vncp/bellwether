@@ -1,0 +1,38 @@
+[package]
+name = "bellwether-replay"
+description = "Workload recorder and exact replay of current and hypothetical key specs against recorded runs for the Bellwether engine."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[dependencies]
+bellwether-types = { path = "../bellwether-types" }
+bellwether-core = { path = "../bellwether-core" }
+bellwether-source = { path = "../bellwether-source" }
+bellwether-store = { path = "../bellwether-store" }
+bellwether-ledger = { path = "../bellwether-ledger" }
+bellwether-build = { path = "../bellwether-build" }
+arrow = { workspace = true }
+parquet = { workspace = true, features = ["arrow"] }
+roaring = { workspace = true }
+blake3 = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+bytes = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+proptest = { workspace = true }
+criterion = { workspace = true }
+
+[[bench]]
+name = "replay"
+harness = false
+
+[lints]
+workspace = true

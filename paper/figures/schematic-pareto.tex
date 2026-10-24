@@ -1,0 +1,61 @@
+% Schematic; no measured quantities. Left: the evolve loop (Algorithm 1).
+% Right: candidates on two runs, showing why mean selection drops the tail
+% protector B while Pareto selection keeps it. Positions are illustrative
+% only; the axes carry no scale.
+\begin{tikzpicture}[
+    font=\scriptsize,
+    stage/.style={draw, rounded corners=1.5pt, fill=black!4, inner sep=1.5pt,
+                  minimum height=0.62cm, minimum width=0.98cm, align=center},
+    flow/.style={-{Stealth[length=1.4mm]}, semithick},
+  ]
+  % ---- The loop.
+  \node[stage] (sel) at (0.55,2.95) {select\\[-1pt]parent};
+  \node[stage] (rep) at (1.75,2.95) {replay};
+  \node[stage] (att) at (2.95,2.95) {attribute\\[-1pt]$\Delta$, $I$};
+  \node[stage] (pro) at (2.95,1.75) {propose};
+  \node[stage] (gat) at (1.75,1.75) {gate\\[-1pt]$\Eq(a, a_0)$};
+  \node[stage] (upd) at (0.55,1.75) {Pareto\\[-1pt]update};
+  \draw[flow] (sel) -- (rep);
+  \draw[flow] (rep) -- (att);
+  \draw[flow] (att) -- (pro);
+  \draw[flow] (pro) -- (gat);
+  \draw[flow] (gat) -- (upd);
+  \draw[flow] (upd) -- (sel);
+  \draw[flow, densely dotted] (gat.south) -- ++(0,-0.42)
+    node[below, inner sep=1pt] {discard, with reason};
+  \node[text=black!70] at (1.75,2.35) {population $P \ni a_0$};
+
+  % ---- Two runs: cost on the median run against cost on the p95 run.
+  \begin{scope}[shift={(4.3,0.45)}]
+    % Region dominated by the frontier {A, B}.
+    \fill[black!6] (0.6,3.05) -- (0.6,1.7) -- (1.9,1.7) -- (1.9,0.55)
+      -- (4.05,0.55) -- (4.05,3.05) -- cycle;
+    \draw[bwA, thick] (0.6,3.05) -- (0.6,1.7) -- (1.9,1.7) -- (1.9,0.55)
+      -- (4.05,0.55);
+    % Equal mean cost through A: x + y is constant along this line.
+    \draw[bwInk, densely dashed] (0,2.3) -- (2.3,0);
+    \node[rotate=-45, anchor=north, inner sep=1.5pt, text=bwInk]
+      at (1.05,1.25) {equal mean};
+    % Axes, without a scale.
+    \draw[-{Stealth[length=1.4mm]}, bwAxis] (0,0) -- (4.1,0)
+      node[pos=0.5, below, text=bwInk, inner sep=1.5pt] {cost on the median run};
+    \draw[-{Stealth[length=1.4mm]}, bwAxis] (0,0) -- (0,3.15)
+      node[pos=0.5, above, rotate=90, text=bwInk, inner sep=1.5pt]
+      {cost on the p95 run};
+    % Candidates.
+    \node[circle, fill=bwA, inner sep=1.4pt] (A) at (0.6,1.7) {};
+    \node[anchor=south west, inner sep=1.5pt] at (A.north east) {$A$: lowest mean};
+    \node[fill=bwB, inner sep=1.7pt] (B) at (1.9,0.55) {};
+    \node[anchor=south west, inner sep=1.5pt] at (B.north east)
+      {$B$: cheapest p95 run};
+    \node[draw=black!60, fill=white, regular polygon, regular polygon sides=3,
+          inner sep=1.1pt] (C) at (1.3,2.45) {};
+    \node[anchor=west, inner sep=1.5pt] at (C.east) {$C$: dominated by $A$};
+    \node[star, star points=5, star point ratio=2.3, fill=bwInk,
+          inner sep=0.9pt] (a0) at (3.45,2.75) {};
+    \node[anchor=east, inner sep=1.5pt] at (a0.west) {baseline $a_0$};
+    % What each rule keeps.
+    \node[anchor=east, align=right, inner sep=1pt] at (4.05,1.2)
+      {mean keeps $A$ only\\Pareto keeps $A$ and $B$};
+  \end{scope}
+\end{tikzpicture}%

@@ -1,0 +1,350 @@
+# bellwether-replay
+
+Work package WP6. This crate replays recorded runs to answer "what would these runs have read" under:
+
+- the current index
+- a hypothetical key spec
+- a baseline without an index
+- a proposal
+
+Every cost is an exact sum of row-group statistics under a stated plan, never an estimate (ADR 005). The crate owns **invariant 3**: replay is deterministic.
+
+Replay reads very little. The current index costs no data reads at all. A hypothetical spec reads only its key columns, one row group at a time, to build transient segments. Everything else comes from `Source::row_groups`:
+
+- **Parquet:** that is the footers.
+- **CSV and JSON lines:** the first `row_groups` call per file scans each chunk once to count rows and compute statistics, which reads the whole file. Its result is cached by the source.
+
+## What it provides
+
+| Module | Item | Purpose |
+|---|---|---|
+| `workload` | `WorkloadRecorder`, `KeyInput`, `Workload`, `record_bench_workload` | Records each run's key set in the cache under its BLAKE3, plus a `workload.json` manifest. Reads `bellwether-bench`'s workload format directly. |
+| `keys` | `RunKeys`, `RunKeysBuilder` | One run's distinct, non-null key tuples, canonical at the **dataset** types, and their cache payload. |
+| `catalog` | `Catalog` | Every live row group of one manifest version, under the dataset schema. Sizes and statistics come from `Source::row_groups`. Its digest names the data. |
+| `plan` | `PlanSource`, `SegmentPlanner`, `servable` | The plan-building seam, and this crate's implementation of it over core segments. |
+| `build_plan` | `impl PlanSource for bellwether_build::Planner` | The build crate's planner, the one the index answers queries with, behind the same seam. |
+| `transient` | `TransientIndex`, `TransientCache`, `TransientLimits` | A hypothetical spec's segments, built over key reads, and their cache. |
+| `baseline` | `Baseline::{RawScan, ParquetStats}` | Costs without a Bellwether index. |
+| `layout` | `LayoutModel`, `replay_layout` | Layout proposals under a stated model, `exact: false`. |
+| `replay` | `Replayer`, `Scored`, `write_replay` | Pins one manifest, scores proposals, and writes `Replay` records through the ledger. |
+| `report` | `report`, `TemplateSummary` | Per-run rows. Per-template p50/p95/max of keys, files, row groups and bytes. |
+| `attribution` | `Replayer::replace_node`, `Replayer::interaction` | Counterfactual hooks for WP13 (ADR 024). |
+| `error` | `ReplayError` | The refusals a caller must tell apart (below). |
+| `slo` | `REPLAY_RUN_P50_BUDGET` | 5 ms for the p50 run under one cached candidate (`docs/evolve.md` section 12). |
+
+## Workloads
+
+`record(run_id, KeyInput::Batch(&batch) | KeyInput::Parquet(path))` treats every column of the input as a key column.
+
+**Encoding.** Each value is converted to the dataset schema's type and canonically encoded (ADR 016). A `UInt32` file column under a dataset `Int64` encodes with the Int tag. A value that does not convert fails the run, and nothing from it is kept.
+
+**Nulls.** A run tuple that contains a null in any key column is dropped, under ADR 014: a probe containing a null matches nothing, by SQL three-valued logic. The drop is counted in the run's `null_tuples`. The build crate's planner applies the same rule.
+
+**Sorting.** Tuples are sorted and deduplicated.
+
+**Templates.** A run's `template` groups it in reports. Without one it is the run's key-column set, `columns(<key columns>)`. That is a grouping by columns, not by query; a recorder that knows the query or pipeline step a run came from passes it as the template.
+
+**Query kind.** Every run records a `query_kind`. Only `locate` exists today; a workload naming any other kind is refused with `Error::UnknownKind`. `latest` and `asof` are reserved for when their runs can be priced (contract v3 backlog #14).
+
+**Cache entries.** Each run's payload goes to `cache/<blake3>.bin`. The payload is `BWKEYSET`, a version, a JSON header with columns, key types and encoding version, then length-prefixed elements per tuple. A reader refuses all of these:
+
+- a truncated payload
+- out-of-order or duplicate tuples
+- malformed or null elements
+- trailing bytes
+- a newer payload or encoding version (`Error::UnsupportedVersion`)
+
+Every read checks the BLAKE3 of the bytes it got against the hash it asked for, whatever `KeySetSource` served them.
+
+**Workload hash.** The hash is the BLAKE3 of the canonical JSON of the `WorkloadManifest`. The manifest holds the format, the encoding version, and for each run sorted by id:
+
+- id
+- template
+- query kind
+- columns
+- key types
+- key count
+- dropped-null count
+- key-set hash
+
+The same keys therefore hash the same whether they arrive as a batch or a Parquet file, and in any run order. The manifest bytes are stored in the cache under that hash, so a `Replay`'s `workload` hash resolves to everything needed to re-run it.
+
+**`workload.json`.** This is the manifest plus its hash and key-set p50/p95/max. Reading it back recomputes both and refuses a file that disagrees.
+
+**Bench format.** `record_bench_workload` reads `bellwether-bench`'s `workload.json` (`bellwether-bench-workload/1`) in two passes:
+
+1. The first pass writes nothing. It verifies:
+   - every run's hash: BLAKE3 over its sorted `u64` keys as 8 big-endian bytes
+   - every run's key count
+   - every run id's uniqueness
+   - every run file's location inside the corpus
+   - the workload hash: BLAKE3 over the run hashes in order
+   - the corpus id, when `corpus.json` is beside the workload file
+2. The second pass records each run, re-verifying its hash as it reads it again.
+
+A mismatch is a `ReplayError::BenchMismatch` that names the run. A mismatch found in the first pass, even on the last run, leaves the recorder and the key-set sink untouched.
+
+The bench hashes are `u64`-specific. The replay hashes cover canonical encodings of any key type. Both are checked, and they differ by design.
+
+## Plans
+
+`PlanSource` is the surface replay plans through. The build crate's `Planner` implements it (`build_plan`), and so does this crate's `SegmentPlanner`; see "The two planners" below.
+
+```rust
+pub trait PlanSource: Send + Sync {
+    fn manifest_version(&self) -> String;  // sequence string (ADR 020)
+    fn specs(&self) -> Vec<KeySpec>;
+    fn plan(&self, specs: &[KeySpec], keys: &RunKeys) -> Result<ScanPlan>;
+    fn with_transient(&self, t: &[Arc<TransientIndex>]) -> Result<Box<dyn PlanSource + '_>>;
+}
+```
+
+Both planners follow the same rules, and `tests/wp4_planner.rs` holds them to identical plans:
+
+- **Serving.** A spec over columns `P` serves a run keyed on columns `C` in two cases, and no other:
+  - (a) Every column of `P` is in `C`. Each tuple is projected onto `P` in `P`'s order and probed. This applies to exact, temporal and bloom specs, and to range specs, where `P` is one column.
+  - (b) `C` is a strict prefix of `P`, and the spec is exact or temporal. Each tuple becomes a prefix lookup.
+- **Float zero.** A float-zero element expands to both the `+0.0` and `-0.0` encodings.
+- **Intersection.** Specs are intersected per key tuple, then the results are unioned over tuples.
+- **Spec lists.** An empty spec list means a raw scan. A non-empty list in which nothing serves the run is an error.
+- **Committed specs.** A committed spec plans only if it is declared exactly as given and complete at the pinned sequence (ADR 012), with live segments whose row-group ranges cover every live row group. A plan that lists a spec failing this is refused with `Error::KeySpec`, whether or not the spec serves the run; a plan that does not list it is unaffected. Neither planner refuses at construction.
+- **Transient specs.** A transient index covers every live row group by construction. Each of its segments records the row groups it processed, keys or not, in its own bytes (core's `SegmentWriter::set_rowgroup_range`). So a row group whose key columns are all null is covered without holding a key, and the build planner checks coverage from those ranges before taking the segments.
+- **Types.** Keys are refused when recorded under another type than the dataset declares. So is a transient index whose segments record other key or timestamp types. A probe at another decimal scale or time unit would silently miss.
+- **Residual** (ADR 011). Every plan carries `In` over the run's key tuples, with float zeros in both encodings. An empty key set plans zero row groups with an empty `In`.
+- **Row-group ids.**
+  - Tombstoned ids are dropped.
+  - An id that is neither live nor tombstoned is an error.
+- **Committed reads.** Committed segments are read by range through the pinned `Snapshot` (invariant 4, ADR 018).
+
+Replay checks every plan against the catalog before costing it, so a misreported plan is an error, never a wrong number:
+
+- the manifest version matches
+- every file is in the catalog and appears once
+- every row group is live
+- each entry's bytes are the exact sum of its row groups' compressed sizes
+- the totals agree
+
+A run's cost has these parts:
+
+- `files`: the plan's entries
+- `row_groups`: the selected row groups
+- `bytes`: the sum of `RowGroupMeta.bytes` (Parquet `compressed_size()`)
+- `keys`: the distinct tuple count
+
+**Catalog digest.** The digest covers everything replay reads about the data:
+
+- the manifest version
+- the dataset schema
+- every file's fingerprint and row-group ids, with each row group's footer report (rows, bytes, byte range, column statistics)
+- the tombstoned ids
+
+It keys the transient cache together with the full spec and its key and timestamp types. An unindexed folder has manifest version `"0"`, so its digest, not the version, names its data.
+
+## Configurations
+
+`Replayer` pins one manifest version. It is built three ways:
+
+- `for_snapshot`: a committed index
+- `unindexed`: a folder, using `Catalog::discover`
+- `new`: any `PlanSource`
+
+Configurations:
+
+- **Current.** The manifest's declared specs that are complete at the pinned sequence. With none, every run reads every row group. A declared spec that is not complete is not current: the index cannot plan with it yet.
+- **Hypothetical** (`replay_specs`). Any specs. Those the index cannot plan with, including a declared spec that is not complete, are built as transient segments and planned through `PlanSource::with_transient`. A configuration holds every hypothetical index it needs at once, because one plan intersects them.
+- **Unserved runs.** A run that no spec of a configuration serves reads every live row group. The index cannot narrow it.
+- **Key proposal.** The current specs, plus the proposed spec, which replaces a current spec of the same `KeySpec::name`. A proposed spec that serves none of the workload's runs is refused, never reported as "no change".
+- **Layout proposal.** Costs come from the layout model: `exact: false`. The `Replay` names the model in `model`, the statement `LayoutModel::describe` gives (below).
+- **Rewrite proposal.** Refused. Its cost depends on the rewritten plan, and a `RewriteShape` states that plan in prose (contract v3 backlog #2).
+- **Baselines.**
+  - `RawScan` reads every row group.
+  - `ParquetStats` keeps a row group when some key tuple passes, for every key column, two tests: the footer min/max, and the row group's embedded split-block bloom filter (below). A NaN probe is never pruned by range or by a filter.
+
+**`ParquetStats` filter probing.** The filter is probed with the PLAIN value of the key converted to the file column's physical type (ADR 008 amendment):
+
+- **`INT32` and `INT64`:**
+  - integers, unsigned ones as their bit pattern
+  - dates: days, or milliseconds for `INT64`
+  - decimals, rescaled exactly to the file's scale
+  - times and timestamps, converted exactly to the file's unit
+- **`FLOAT` and `DOUBLE`:** IEEE bits. Both zeros are probed.
+- **`BYTE_ARRAY`:** string and binary bytes.
+- **`FIXED_LEN_BYTE_ARRAY`:**
+  - decimals as big-endian two's complement of the column width
+  - `Float16` as two little-endian bytes
+  - fixed binary as its bytes
+
+A value the file column cannot hold fails the probe. A run column whose filter has none of these shapes is refused with `ReplayError::UnprobeableFilter`: `BOOLEAN`, `INT96`, a decimal stored as `BYTE_ARRAY`, or a `Decimal256` dataset column. The baseline is never silently weaker than `docs/benchmark.md` defines it.
+
+The baseline reads its filters once, after verifying each file's fingerprint on the opened handle, and **holds every embedded filter of every run column of every file** for its lifetime.
+
+## The Replay record
+
+`Replay` follows contract v2.1 (`RECORD_VERSION` 2):
+
+- **`inputs`** is the catalog digest. Everything else a replay reads is named elsewhere in the record or derived from what the digest names:
+  - the key sets, by the workload hash
+  - the proposal, by its hash
+  - transient segments, from the data the digest names
+
+  Committed segments are not listed. A manifest version names them within a store, and how an index is split into segments never changes a cost, so listing them would make two equal answers differ. An unindexed folder keeps manifest version `"0"`; its digest tells two folders apart, and one folder before and after a file lands.
+- **`model`** is present exactly when a proposed cost is inexact. That is a layout replay over a workload with runs, and the model is the layout model's statement. A key proposal's replay is exact throughout and names no model. Current costs are always exact.
+
+The ledger enforces these rules on `put`. `write_replay` checks them first, against the proposal it resolves itself.
+
+## Errors
+
+Refusals are `ReplayError` variants, and every refusal happens before anything is written: to the ledger, to the key-set sink, or to a recorder.
+
+| Variant | When |
+|---|---|
+| `RewriteNotScorable` | a Rewrite proposal is scored |
+| `SpecServesNoRun` | a proposed spec serves none of the workload's runs |
+| `ProposalMismatch` | `write_replay` finds a mismatch with the proposal it cites: another body than the scored one (`Scored::body`), no inputs, an inexact current cost, or costs or a model that contradict the proposal's kind |
+| `NotAProposal` | the hash to score is another record kind |
+| `BenchMismatch` | a bench workload does not verify |
+| `ClusterKeysExceeded` | the layout model's cluster-key map passes its cap |
+| `UnprobeableFilter` | the statistics baseline meets a filter it cannot probe exactly |
+
+`ReplayError` converts into the shared `Error` as the variant that fits:
+
+- `LedgerRule` for rewrite, mismatch and not-a-proposal
+- `KeySpec` for a spec that serves no run
+- `Source` for bench and filter problems
+
+`write_replay` resolves the proposal from the ledger itself before writing.
+
+## Layout model, version 1
+
+A layout proposal's costs are computed exactly under these statements; `LayoutModel::describe` names every one:
+
+1. **Sort.** Rows are sorted by `cluster_by`, ascending, nulls first, with ties kept in current order.
+2. **Repack.** The sorted rows are re-packed into row groups of `rows_per_row_group`, and row groups into files of `row_groups_per_file`. The defaults are the current mean sizes, and both are knobs.
+3. **Bytes.** Each row group's bytes are its pro-rata share, by rows, of the dataset's compressed bytes. This is assumed, not measured.
+4. **Reads.** A run reads exactly the row groups holding its keys.
+
+## Determinism (invariant 3)
+
+A `Replay` is a function of five things:
+
+- the manifest version
+- the data the catalog digest names
+- the workload hash
+- the proposal
+- the caller-supplied `created_at`
+
+Runs are replayed in workload order, one at a time, through ordered maps.
+
+"The same data" means the same files. The catalog digest names each file by path, size, mtime and content hash, so the same bytes at another path are other data (`tests/inputs.rs`).
+
+`tests/determinism.rs` writes one corpus, then re-executes its own binary in two modes. The modes differ in:
+
+- committed-segment splitting
+- run recording order
+- transient segment limits
+- cache state
+
+They also differ in store paths and hash seeds. Each child builds the index from scratch in its own store, scores a composite-key proposal over committed segments, writes the `Replay` through the ledger, and emits the record's canonical JSON. The parent requires three things:
+
+- the outputs are byte-equal, inputs included
+- they equal an in-process run with a third limit
+- with the catalog digest masked, they hash to a checked-in golden value. The digest is masked because it names this run's temporary paths and mtimes.
+
+The golden value was last refreshed for contract v2.1 (`RECORD_VERSION` 2 and `inputs`).
+
+## Memory (ADR 018)
+
+**Recording** holds one run's key set and one input batch.
+
+**Replay** holds:
+
+- one run's key set
+- the planner's block indexes and the blocks a lookup touches
+- the cached transient indexes, bounded by `TransientCache`'s byte cap (default 2 GiB, least recently used evicted). The cache is in-process: it lives as long as the `Replayer`, and nothing is written to the store's `cache/`, so a one-shot process rebuilds a candidate's index.
+
+**A transient build** measures each row group's keys before adding them, the way the build crate accounts segments:
+
+- **Exact:** distinct key tuples and their canonical bytes.
+- **Temporal:** distinct `(key, ts)` pairs, plus 8 bytes each.
+- **Bloom:** 8 bytes per distinct key.
+- **Range:** twice the longest key.
+
+While building, it holds:
+
+- one row group's projected key columns
+- one open segment writer, cut before the next row group would take it past `max_segment_rows` rows (default 2^20) or `max_segment_key_bytes` accounted key bytes (default 64 MiB). A single row group larger than a cap gets its own segment.
+- the finished segments. Their bytes, plus the open writer's accounted key bytes, plus the next row group's, are checked against `max_index_bytes` (default 1 GiB) **before** each row group is added. Exceeding the cap is an error, never a partial index.
+
+**The layout model** holds:
+
+- a map of distinct cluster keys, each charged its bytes plus `CLUSTER_KEY_OVERHEAD` (64), capped at `max_cluster_key_bytes` (default 256 MiB). Past the cap it returns `ReplayError::ClusterKeysExceeded`; a partitioned sort is a later addition.
+- one row group's keys per run key-column set
+- its modeled segments, under the same three segment caps
+
+**The statistics baseline** holds every embedded filter of every run column of every file.
+
+`tests/memory.rs` tests these bounds. `tests/current_index.rs` proves two things:
+
+- replaying the current index makes no `read_columns` call
+- a candidate reads only its key columns
+
+The build planner reads footers through its own source, which the test's counting source does not see.
+
+### Memory caps
+
+`max_segment_key_bytes` and `max_index_bytes` cap **accounted** key bytes (the measures above), not resident memory. Measured in debug builds:
+
+- **Open writer.** An open transient segment writer costs about 290 bytes of resident memory per key.
+- **Index cap, u64 keys.** An 8 MiB `max_index_bytes` cap admitted about 900,000 keys, and resident memory peaked near 284 MB, 33 times the cap.
+- **Default caps, u64 keys.** 2 million unique keys peaked near 397 MB for a 90 MB index.
+- **Rows cap.** For narrow keys, `max_segment_rows` (2^20 rows, roughly 300 MB resident) is the bound that takes effect.
+- **Layout map.** `CLUSTER_KEY_OVERHEAD` undercounts the measured resident cost of the cluster-key map by about 15 to 25% for 9-byte keys: resident is about 1.2 times accounted.
+
+A calibrated per-key overhead, shared with the build crate, is a joint follow-up (`docs/contract-v3.md`, entry 32).
+
+## Tests
+
+| File | Covers |
+|---|---|
+| `tests/determinism.rs` | Invariant 3: two processes in different modes over one corpus, byte-identical record, golden hash with the digest masked. |
+| `tests/inputs.rs` | `Replay.inputs`: the same data at two paths gives equal costs and two records; so does one folder before and after a file lands. |
+| `tests/wp4_planner.rs` | A committed index built by the build crate's `Builder`. Every run plans to the same whole `ScanPlan` under each configuration (exact, temporal, composite prefix, range, bloom, range ∩ exact), three ways: WP4 committed, WP4 with this crate's transient segments, and `SegmentPlanner` with them. `for_snapshot` replays equal `SegmentPlanner::from_snapshot`'s. |
+| `tests/null_row_groups.rs` | All-null row groups: covered by every spec kind, recorded in the segments' own bytes, never selected, split-invariant. Two adjacent key-less segments have different bytes. A run of only null tuples plans nothing. Catalogs that differ by one all-null row group are kept apart. |
+| `tests/oracle.rs` | Invariant 1 through replay, on in-test corpora (also a property test over random layouts). The oracle reads the files directly. Exact paths must equal it: exact, temporal, composite prefix, range ∩ exact, and bloom ∩ prefix. Inexact paths must contain it. The per-key intersection of two single-column specs must equal the union over tuples of `oracle(a) ∩ oracle(b)`, and on some run be strictly smaller than the per-run intersection. Every cost must equal the footer sum of its cells, read with the `parquet` crate. `ParquetStats` must equal an independent implementation. |
+| `tests/typed_oracle.rs` | The same, two-sided, on the review's typed corpus: nulls, both zeros, NaN, decimals at two file scales, `u64 ≥ 2^63` and `u32 ≥ 2^31` under embedded filters, strings with NUL. |
+| `tests/baseline_types.rs` | `ParquetStats` on filters of all six physical types (`FLOAT`, `DOUBLE`, `BYTE_ARRAY`, `FIXED_LEN_BYTE_ARRAY`, `INT32`, `INT64`): it contains the oracle and lies inside an independent bloom-only plan. `Decimal256` filters are refused. |
+| `tests/current_index.rs` | Committed and transient segments cost the same. An incomplete spec or a coverage gap refuses only the plans that list it, in both planners. A rewritten file is refused. No column reads for the current index. Proposals through the ledger, with inputs and model. Typed refusals that write nothing, including doctored `Scored` values. A layout replay worked by hand and written with its model. Template reports. Attribution and interaction. |
+| `tests/seam.rs` | The transient cache key (`fpr`, `ts_column`, catalog digest, key types), the seam's type checks, and bloom `fpr` values surviving the segment header's JSON round trip. |
+| `tests/workload.rs` | Identity, cache and `workload.json` round trips, refusal of doctored files, dataset-type encoding, query kind, `run_keys` hash checks, corrupt-input sweeps, and the bench format with each tampering it detects, including a last-run mismatch that writes nothing. |
+| `tests/memory.rs` | Segment caps by rows and key bytes, the index cap including the open writer, the cluster-key cap, and cache bounds and keys. |
+| `tests/bench_corpus.rs` | Needs `BELLWETHER_BENCH_CORPUS`. Baselines equal `results.json`'s `raw_scan` and `parquet_stats` costs run by run. The exact key and range ∩ exact equal the oracle. Every candidate contains the oracle. Transient segments reproduce `expected.json`'s fanouts. |
+| `tests/latency.rs` | The p50-run budget, asserted in optimized builds. CI's "latency budgets" job generates the bench small corpus and runs it with `cargo test --release` and `BELLWETHER_REPLAY_LATENCY_CORPUS`. The same run against a committed index through the build planner is held to the same budget. |
+
+To run the bench-gated tests, generate a corpus with `bellwether-bench`:
+
+```sh
+bench generate --out <dir> --days 4 --files 64 --row-groups-per-file 2 --rows-per-row-group 2000 --entities 640000 --churn 0.1
+bench workload --corpus <dir> --runs 48 --p50 40 --p95 20000 --max 60000
+bench ground-truth --corpus <dir>
+bench run --corpus <dir> --out <dir>/results.json --no-duckdb
+BELLWETHER_BENCH_CORPUS=<dir> cargo test -p bellwether-replay --test bench_corpus
+```
+
+## The two planners
+
+`Replayer::for_snapshot` plans through the build crate's `Planner`, the one the index answers queries with:
+
+- committed specs through `Planner::plan`
+- transient specs through `Planner::plan_with_transient`, from `TransientIndex::segment_bytes()`
+
+It refuses a source whose schema differs from the index's, because keys must encode at the index's types.
+
+`SegmentPlanner` serves `Replayer::unindexed`, and any caller of `Replayer::new`. Its `from_snapshot` gives the same plans over a committed index, which `tests/wp4_planner.rs` checks.
+
+## Contract gaps
+
+The contract v3 backlog in `docs/contract-v3.md` tracks this:
+
+- **Rewrite proposals.** This crate defines no replay for them (backlog #2).
+
+Contract v2.1 closed two gaps: the layout model, through `Replay.model`, and unindexed data identity, through `Replay.inputs`.

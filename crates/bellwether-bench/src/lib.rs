@@ -1,0 +1,115 @@
+//! Benchmark harness for Bellwether (WP10, ADR 018, ADR 019).
+//!
+//! The benchmark design is fixed before any index exists (ADR 019):
+//!
+//! - [`generate`] writes a synthetic versioned ledger as Parquet, partitioned
+//!   by day, with planted anti-patterns. It streams one row group at a time.
+//! - [`workload`] writes recorded incremental key sets whose sizes hit given
+//!   p50, p95, and max targets, each hashed with BLAKE3.
+//! - [`truth`] scans the generated data and writes `expected.json`: the exact
+//!   fanout of every planted anti-pattern the advisor must recover.
+//! - [`harness`] runs every recorded key set through every strategy (raw
+//!   scan, Parquet statistics and bloom filters, DataFusion, DuckDB, and
+//!   later the index) and writes `results.json`.
+//! - [`slo`] asserts the budgets that apply today and names the ones that
+//!   will apply when the index lands.
+//! - [`report`] renders `results.json` as a self-contained HTML page.
+
+#![forbid(unsafe_code)]
+// Benchmark arithmetic converts freely between counts, sizes, and floating
+// point for quantiles and chart coordinates. Every such value is bounded far
+// below the precision limits these lints guard against.
+#![allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_possible_wrap
+)]
+// Product names (DuckDB, SplitMix64) read better without backticks; chart
+// renderers are long, linear SVG emitters; key sets use the std hasher.
+#![allow(
+    clippy::doc_markdown,
+    clippy::too_many_lines,
+    clippy::many_single_char_names,
+    clippy::implicit_hasher
+)]
+#![cfg_attr(test, allow(clippy::unwrap_used))]
+
+pub mod corpus;
+pub mod env;
+pub mod generate;
+pub mod harness;
+pub mod mem;
+pub mod report;
+pub mod results;
+pub mod slo;
+pub mod stats;
+pub mod truth;
+pub mod workload;
+
+use std::path::PathBuf;
+
+/// A lookup key: one `entity_id`. Key sets handed to an
+/// [`harness::IndexUnderTest`] are sorted ascending and deduplicated.
+pub type Key = u64;
+
+/// Errors the benchmark can raise.
+#[derive(Debug, thiserror::Error)]
+pub enum BenchError {
+    /// Filesystem failure, with the path involved.
+    #[error("io error at {path}: {source}")]
+    Io {
+        /// Path being read or written.
+        path: PathBuf,
+        /// Underlying error.
+        source: std::io::Error,
+    },
+    /// Parquet encode or decode failure.
+    #[error("parquet error: {0}")]
+    Parquet(#[from] parquet::errors::ParquetError),
+    /// Arrow failure.
+    #[error("arrow error: {0}")]
+    Arrow(#[from] arrow::error::ArrowError),
+    /// JSON failure.
+    #[error("json error: {0}")]
+    Json(#[from] serde_json::Error),
+    /// Parameters or inputs that make no sense.
+    #[error("invalid input: {0}")]
+    Invalid(String),
+    /// A strategy failed (for example DuckDB returned an error).
+    #[error("strategy {strategy} failed: {message}")]
+    Strategy {
+        /// Strategy name.
+        strategy: String,
+        /// What went wrong.
+        message: String,
+    },
+    /// One or more SLO assertions failed.
+    #[error("SLO assertions failed:\n{0}")]
+    Slo(String),
+}
+
+/// Result alias for the benchmark.
+pub type Result<T> = std::result::Result<T, BenchError>;
+
+/// Attaches a path to an IO error.
+pub(crate) fn io_err(path: impl Into<PathBuf>) -> impl FnOnce(std::io::Error) -> BenchError {
+    let path = path.into();
+    move |source| BenchError::Io { path, source }
+}
+
+/// Writes pretty JSON with a trailing newline, creating parent directories.
+pub(crate) fn write_json<T: serde::Serialize>(path: &std::path::Path, value: &T) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(io_err(parent))?;
+    }
+    let mut bytes = serde_json::to_vec_pretty(value)?;
+    bytes.push(b'\n');
+    std::fs::write(path, bytes).map_err(io_err(path))
+}
+
+/// Reads JSON from a file.
+pub(crate) fn read_json<T: serde::de::DeserializeOwned>(path: &std::path::Path) -> Result<T> {
+    let bytes = std::fs::read(path).map_err(io_err(path))?;
+    Ok(serde_json::from_slice(&bytes)?)
+}

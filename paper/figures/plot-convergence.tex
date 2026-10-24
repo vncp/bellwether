@@ -1,0 +1,35 @@
+% Panel: convergence of evolve. Per generation, the best candidate so far and
+% the generation's median candidate, each as its p95-run bytes (line) and a
+% band from its p50-run to its max-run bytes. Data: data/convergence.csv;
+% schema in data/README.md.
+\IfFileExists{data/convergence.csv}{%
+  \begingroup\bwdatacatcodes
+  \begin{bwpanel}{4.1cm}
+    \begin{axis}[bw, bw box={4.1cm}{0.95cm}{0.85cm}{0.12cm}{0.62cm},
+        ymode=log, xlabel={generation}, ylabel={bytes per run},
+        legend columns=-1]
+      \addplot[name path=bwbestlo, draw=none, mark=none, forget plot]
+        table[x=generation, y=best_p50] {data/convergence.csv};
+      \addplot[name path=bwbesthi, draw=none, mark=none, forget plot]
+        table[x=generation, y=best_max] {data/convergence.csv};
+      \addplot[bwA, fill opacity=0.2, draw=none, forget plot]
+        fill between[of=bwbestlo and bwbesthi];
+      \addplot[name path=bwmedlo, draw=none, mark=none, forget plot]
+        table[x=generation, y=median_p50] {data/convergence.csv};
+      \addplot[name path=bwmedhi, draw=none, mark=none, forget plot]
+        table[x=generation, y=median_max] {data/convergence.csv};
+      \addplot[bwB, fill opacity=0.13, draw=none, forget plot]
+        fill between[of=bwmedlo and bwmedhi];
+      \addplot[bwA, solid, mark=none]
+        table[x=generation, y=best_p95] {data/convergence.csv};
+      \addlegendentry{best so far}
+      \addplot[bwB, dashed, mark=none, unbounded coords=jump]
+        table[x=generation, y=median_p95] {data/convergence.csv};
+      \addlegendentry{median of generation}
+    \end{axis}
+  \end{bwpanel}%
+  \endgroup
+}{%
+  \pendingfigure[\scriptsize]{4.1cm}{the best and the median candidate's cost
+    per generation, with p50, p95, and max run bands}{convergence}%
+}%

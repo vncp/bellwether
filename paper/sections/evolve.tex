@@ -1,0 +1,269 @@
+\section{Evolve: Reflective Optimization with an Exact Loss}\label{sec:evolve}
+
+Evolve is the optimizer of milestone M6, specified in \doc{evolve.md} and
+\adr{021} to \adr{025}. It searches over plans, physical designs, and whole
+pipelines against a recorded workload, with exact replay as its loss and
+reconciliation as a hard constraint.
+
+\subsection{Problem}\label{sec:problem}
+
+A pipeline is a DAG of steps. Each step has a logical plan (a DAG of
+operators), reads from a physical design (the indexes, layout, and numeric
+knobs that exist), and runs many times with different inputs, such as a trigger
+batch of keys or a date window. Let $W = \{r_1, \dots, r_n\}$ be the recorded
+runs, each with its key set, parameters, and executed plan. An artifact $a$ in
+the search space $A$ is a physical design, a plan, a pipeline, or a combination.
+Let $c(a, r_i) \in \mathbb{R}^{m}$ be its exact cost vector on $r_i$, the I/O
+quantities of Equation~\eqref{eq:cost} extended with measured latency when an
+executor is attached; let $m(a)$ be the design's maintenance cost (index bytes
+and build time); and let $\Eq(a, a_0)$ be the equivalence predicate of
+Section~\ref{sec:nonlocal}. The problem is multi-objective and constrained
+(\doc{evolve.md} \S1):
+\begin{equation}\label{eq:problem}
+  \min_{a \in A}\ \big\{ c(a, r_1), \dots, c(a, r_n),\ m(a) \big\}
+  \quad \text{subject to} \quad \Eq(a, a_0).
+\end{equation}
+No scalar objective is used. Selection is Pareto over runs and objectives
+(Section~\ref{sec:pareto}), so a candidate that wins at the median batch and
+loses at the p95 batch cannot eliminate one that protects the tail. The loop
+is borrowed from text-space optimization~\cite{gepa,skillopt,textgrad} and the
+configuration search from physical design~\cite{autoadmin1997}; what is new is
+pairing them with an exact loss and a prover-free constraint (\doc{evolve.md}
+\S2).
+
+\subsection{The loop}\label{sec:theloop}
+\begin{figure}[t]
+  \centering
+  \input{figures/schematic-pareto}
+  \caption{Schematic; no measured quantities. Left: the loop of
+    Algorithm~\ref{alg:evolve}. Right: candidates scored on two runs. $A$ has
+    the lowest mean cost, so mean selection keeps $A$ and drops $B$; $B$ is
+    cheaper on the p95 run, so neither dominates the other and Pareto
+    selection keeps both, $B$ as the tail protector. $A$ dominates $C$, which
+    either rule drops.}
+  \Description{Left, a cycle of small boxes: select parent, replay,
+    attribute, propose, gate, and Pareto update, with an exit labeled discard
+    at the gate. Right, a plot with unnumbered axes, cost on the median run and
+    cost on the p95 run, showing the baseline, candidates A, B, and C, a
+    staircase frontier through A and B over a shaded dominated region, and a
+    dashed line of equal mean cost through A that passes below B.}
+  \label{fig:schematic-pareto}
+\end{figure}
+
+
+Algorithm~\ref{alg:evolve} restates \doc{evolve.md} \S3. The baseline is always
+in the population. A child that fails the gate is discarded with its reason
+recorded; a child that passes is replayed and offered to the frontier. Every
+step writes a ledger record, and a proposer's prompt and completion are stored
+verbatim with the model identifier. Figure~\ref{fig:schematic-pareto} draws the
+loop beside its selection rule.
+
+\begin{algorithm}[t]
+  \caption{Evolve (after \doc{docs/evolve.md} \S3). $W_s$ and $W_h$ are the
+    search and held-out runs. Every computed value is also written to the
+    ledger.}
+  \label{alg:evolve}
+  \small
+  \begin{algorithmic}[1]
+    \Require baseline $a_0$; runs $W_s$, $W_h$; rulebook $\mathcal{B}$;
+      budget; seed
+    \State $P \gets \{a_0\}$ \Comment{the baseline is always a member}
+    \While{budget remains}
+      \State $p \gets \textsc{Select}(P)$ \Comment{frontier, crowding tie-break}
+      \State $\tau \gets \textsc{Replay}(p, W_s)$ \Comment{per run, per operator}
+      \State $(\Delta, I) \gets \textsc{Attribute}(p, \tau)$
+        \Comment{top-$k$ counterfactuals}
+      \State $a \gets \textsc{Propose}(p, \tau, \Delta, I, \mathcal{B})$
+        \Comment{one of three proposers}
+      \If{not $\Eq(a, a_0)$}
+        \State record the discard and its reason; \textbf{continue}
+      \EndIf
+      \State $C \gets \textsc{Replay}(a, W_s)$
+      \State $P \gets \textsc{ParetoUpdate}(P, a, C)$
+    \EndWhile
+    \State $\mathcal{B} \gets \textsc{Distill}(\text{ledger})$, each rule
+      validated on $W_h$
+    \State \Return frontier of $P$, receipts, $\mathcal{B}$
+  \end{algorithmic}
+\end{algorithm}
+
+\subsection{The backward pass: counterfactual attribution}\label{sec:attribution}
+
+\begin{figure}[t]
+  \centering
+  \input{figures/schematic-backward}
+  \caption{Schematic; no measured quantities. The backward pass on a small
+    plan. Solid arrows carry data forward. Each attributed node $v$ carries
+    $\Delta_v = c(a) - c(a \ominus v)$, one exact replay of $a$ with $v$
+    replaced by its best local alternative. The pair $(u, v)$, a key spec and
+    the semi-join, has $I_{uv} \neq 0$: a composite key that pays off only
+    once the semi-join moves, so the two changes are proposed together as a
+    patch set.}
+  \Description{A plan drawn left to right: a key spec feeding a scan, then a
+    window, a semi-join that also takes the trigger keys, an aggregate, and
+    the output. Each node carries a label Delta sub v, and the output carries
+    the cost c of a. A dashed arc between the key spec and the semi-join is
+    labeled I sub uv not equal to zero, propose u and v together. A dashed
+    arrow runs backward under the plan: one exact replay per node.}
+  \label{fig:schematic-backward}
+\end{figure}
+
+A gradient says how much each parameter contributed to the loss. For a plan,
+the analogue is how much each operator, and each design choice that fixed the
+operator's input, contributed to the bytes read. Because replay is exact and
+cheap, this is computed by counterfactual rather than approximated
+(\adr{024}; Figure~\ref{fig:schematic-backward}). For an artifact $a$ and a
+plan node $v$,
+\begin{equation}\label{eq:attr}
+  \Delta_v = c(a) - c(a \ominus v),
+\end{equation}
+where $a \ominus v$ replaces $v$ by its best known local alternative (the rule
+catalog identity that applies there) or ablates it when none exists. For a pair
+of choices $(u, v)$, with $a_u$ denoting $a$ after changing $u$,
+\begin{equation}\label{eq:interaction}
+  I_{uv} = c(a_{uv}) - c(a_u) - c(a_v) + c(a).
+\end{equation}
+Both are evaluated per run. A nonzero $I_{uv}$ means the two choices do not
+compose additively, the signal that they must be proposed together as a patch
+set. Attribution costs one replay per node and the interaction matrix one per
+pair. It is capped at the top $k$ nodes by cost rather than sampled, because
+sampling would reintroduce estimation, and Shapley values over all subsets were
+rejected as exponential (\adr{024}). The design budget for attributing a
+20-node plan is one second (\doc{evolve.md} \S12).
+
+\subsection{Three proposers, and what ``gradient'' means}\label{sec:proposers}
+
+The artifacts are discrete: text, DAGs, and sets. There is no differentiable
+path from a plan to its cost, so calling the loop gradient descent without
+qualification would be inaccurate (\adr{022}). Evolve uses three substitutes
+with one scorer and one gate.
+
+\paragraph{Textual gradients for structure.} For operator order, join strategy,
+keys, and layouts, the proposer is a language model given the parent, its
+per-run trace, its attribution, and the rulebook, and asked for a critique and
+one mutation. The critique is a textual gradient in the sense of
+ProTeGi~\cite{protegi} and TextGrad~\cite{textgrad}, and the mutation is the
+update step. The difference is that the critique is grounded in $\Delta_v$: the
+model is told which operator cost what instead of inferring it. Mutations are
+plan edits that name an identity when one applies (for example,
+\code{semijoin\us before\us window}), so the gate can use a static proof for that
+edit and reconciliation for the rest.
+
+\paragraph{Exact numeric descent for knobs.} Numeric knobs include bloom
+false-positive rates, key-count gates (when to broadcast, push an \code{IN}
+list, or fall back to a shuffle), lookback windows, chunk and segment sizes, and
+partition counts. Cost is a deterministic function of them, so the central
+difference $\big(c(\theta + h e_j) - c(\theta - h e_j)\big)/2h$ has no
+sampling noise, only discretization error, and coordinate descent, pattern
+search, and integer line search apply without variance reduction. This is the
+one part of evolve that is literally gradient-like, and it is limited to knobs.
+Following Section~\ref{sec:exact}, knobs that change what is read from existing
+files (rates, gates, lookbacks) are replayed exactly at every probe, while knobs
+that change the files (partition counts, and chunk sizes for text sources) are
+exact only once each probed point is materialized. Because a proposer's output
+is only a candidate, the scalar that descent follows, such as bytes on one
+template's p95 run, need not match the selection rule: every point descent
+visits is scored on the full objective matrix and gated like any other.
+
+\paragraph{Rule-driven enumeration and deferred surrogates.} The rule catalog's
+detectors produce deterministic candidates, such as the composite key a fanout
+measurement recommends or a bound on an unbounded lookback, so the model is
+never asked to rediscover what measurement already says
+(\doc{rule-catalog.md}). A differentiable surrogate trained on replay data would
+be an estimator; it is admissible only as a proposer, with replay as the
+arbiter, and is deferred (\adr{022}).
+
+\subsection{Sets and pipelines, not calls}\label{sec:sets}
+
+\begin{figure}[t]
+  \centering
+  \input{figures/schematic-pipeline}
+  \caption{Schematic; no measured quantities. The candidate moves step five's
+    semi-join on the trigger keys into step two, as a temporal \emph{latest}
+    lookup (Section~\ref{sec:nonlocal}). The outputs of steps two to four
+    differ, so a per-step check rejects it; the certificate compares only the
+    pipeline outputs, over the touched keys.}
+  \Description{Two rows of five pipeline steps, the baseline above and the
+    candidate below, joined by arrows from step to step. A curved arrow moves
+    the semi-join from step five to step two. Not-equal signs mark the
+    outputs of steps two to four; an equals sign and a certificate mark the
+    two pipeline outputs, compared over the touched keys.}
+  \label{fig:schematic-pipeline}
+\end{figure}
+
+The unit of optimization is never a single call (\adr{023}). Plans are mutated
+as DAGs and scored whole, so interactions inside a plan are captured by
+construction. Physical design is a set-valued configuration of key specs, a
+layout, and knob values, scored by Equation~\eqref{eq:design} against every
+run, with prefix-seek subsumption modeled (Section~\ref{sec:counterfactual})
+and $m(a)$ kept as a separate objective. This is the classical index-selection
+problem~\cite{autoadmin1997,bruno2005relax}, whose weak point was the estimate.
+Search is greedy construction followed by local search with exact scoring,
+seeded by rule-driven candidates and mutated by the model, and interaction terms
+between key specs decide which specs are proposed together. Pipelines are DAGs
+of steps with lineage; cross-step mutations are allowed and gated at the
+pipeline output (Section~\ref{sec:nonlocal}; Figure~\ref{fig:schematic-pipeline}),
+which is what distinguishes optimizing a pipeline from optimizing each of its
+queries.
+
+\subsection{Pareto selection over runs}\label{sec:pareto}
+
+Scalarizing cost, for example as mean bytes over runs, hides the tail. For a
+candidate $a$ let $C(a)$ be its matrix of runs by objectives, together with
+$m(a)$. Candidate $a$ dominates $b$ if it is at least as good in every cell and
+strictly better in one, and the frontier is the set of non-dominated members
+(\doc{evolve.md} \S6). In particular, a candidate that is strictly best on any
+single run survives, which is the rule stated in \adr{021}, and a candidate
+that wins on the mean cannot eliminate one that protects the tail
+(Figure~\ref{fig:schematic-pareto}). Crowding distance,
+as in NSGA-II~\cite{nsga2}, breaks ties when choosing parents so the frontier
+stays spread. Runs are grouped by template (same plan shape, different keys) so
+that the frontier is not dominated by run count, and $m(a)$ is on the frontier,
+so an index that saves bytes read at a large storage cost is visible rather than
+hidden. Because the baseline is always in the population, the frontier never
+regresses below it.
+
+\subsection{Determinism and the ledger}\label{sec:determinism}
+
+A search is pinned to a manifest sequence, a workload hash, a rule catalog
+version, proposer identifiers, and a seed (\doc{evolve.md} \S8). Every
+candidate, score, certificate, attribution, interaction matrix, frontier
+snapshot, model prompt and completion, and rule is a ledger record, and the
+planned contract adds a record kind for each (\code{Candidate},
+\code{Attribution}, \code{Interaction}, \code{Frontier}, \code{ProposerCall},
+\code{Rule}, \code{Rulebook}; \doc{evolve.md} \S10). Model outputs are not assumed to be
+deterministic. Replaying a search from its ledger reuses the stored completions
+and reproduces the frontier byte for byte, which extends invariant~3; a fresh
+search is a new ledger. Budgets for replays, model calls, and wall-clock time
+are explicit, and exhausting one is a recorded terminal state, not an error.
+
+\subsection{The proposer in the threat model}\label{sec:proposerthreat}
+
+Per \doc{evolve.md} \S9, a proposer may be wrong, adversarial, or compromised.
+It can waste budget, propose non-equivalent artifacts, which the gate discards, and
+write misleading rule text, which held-out validation rejects. It cannot score,
+pass the gate, apply, or promote a rule, and a surrogate would inherit the same
+limits. Because the loop invokes a language model as one of its proposers,
+\adr{009}, as amended, states the boundary precisely: the engine
+never consults a model for a score, a verification outcome, or an apply
+decision. A proposer, model or otherwise, is invoked only to produce a Proposal
+through the same path an external agent uses; its prompt and completion are
+ledger records, and nothing it returns is trusted. The engine may host an
+untrusted proposer, but the direction of trust is unchanged.
+
+\subsection{The rulebook and its validation}\label{sec:rulebook}
+
+The frontier answers for one workload; the rulebook is what transfers
+(\doc{evolve.md} \S7). After a search, winning mutations are clustered by
+identity and pattern, and for each cluster the model writes a rule: a detector
+over evidence or plans, an action, an invariant, and the evidence hashes and
+measured gains that justify it. No rule is accepted on the model's word
+(\adr{025}). A rule is promoted only if applying it to held-out runs, excluded
+from the search, reproduces a gain under exact replay and passes the gate.
+Rules carry a confidence derived from that validation, hash links to the
+evidence and receipts that produced them, and their certificates' coverage, and
+a rule whose evidence has drifted is flagged stale. This is the validation gate
+of SkillOpt~\cite{skillopt} applied to rules rather than skills. The rulebook is
+a text artifact that agents read on the next \code{fix}, a learned analogue of
+a hand-written optimization catalog, and it is the subject of the transfer
+experiment in Section~\ref{sec:eval}.

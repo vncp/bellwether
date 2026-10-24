@@ -1,0 +1,9 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 6fff034439bb6861aa70af671c16c47a3cbc5a8c99fc50901fc689f07d171eaa # shrinks to layout = [[[R { id: None, grp: 0, val: None, ts: None }]], [[R { id: None, grp: 0, val: None, ts: None }]]], q = Queries { ids: [], tuples: [], vals: [], asof: 0, between: (0, 0), keys_cap: 1, item_rgs: 1, threads: 1 }
+cc b0dc573e38fe7a5c92018855c3bbbf6eb96b3e12c2df595e9ad9bf94517ea764 # shrinks to layout = [[[R { id: Some(2), grp: 0, val: None, ts: None }], [R { id: None, grp: 0, val: None, ts: None }]]], q = Queries { ids: [2], tuples: [], vals: [], asof: 0, between: (0, 0), keys_cap: 1, item_rgs: 1, threads: 1 }
+cc 6cc325addc224ae46167e0d14aab1ad02ddc1fc8dca926647539092290323e93 # shrinks to layout = [[[R { id: None, grp: 0, val: None, ts: None }], [R { id: None, grp: 0, val: None, ts: None }]]], q = Queries { ids: [], tuples: [(0, 0)], vals: [], asof: 0, between: (0, 0), keys_cap: 1, item_rgs: 1, threads: 1 }

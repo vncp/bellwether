@@ -1,0 +1,942 @@
+{
+  "encoding_version": 1,
+  "text_chunk_size": 64,
+  "files": [
+    {
+      "file": "multi_rg.parquet",
+      "format": "parquet",
+      "size": 2357,
+      "row_groups": [
+        {
+          "index": 0,
+          "rows": 4,
+          "bytes": 265,
+          "stats": [
+            {
+              "column": "id",
+              "min": "028000000000000001",
+              "max": "028000000000000004",
+              "null_count": 0,
+              "distinct_count": null,
+              "has_bloom": false
+            },
+            {
+              "column": "name",
+              "min": "06616e740000",
+              "max": "06646f670000",
+              "null_count": 0,
+              "distinct_count": null,
+              "has_bloom": false
+            },
+            {
+              "column": "amount",
+              "min": "05107fffffffffffffffffffffffffffff06",
+              "max": "05108000000000000000000000000000041a",
+              "null_count": 0,
+              "distinct_count": null,
+              "has_bloom": false
+            }
+          ]
+        },
+        {
+          "index": 1,
+          "rows": 4,
+          "bytes": 265,
+          "stats": [
+            {
+              "column": "id",
+              "min": "028000000000000005",
+              "max": "028000000000000008",
+              "null_count": 0,
+              "distinct_count": null,
+              "has_bloom": false
+            },
+            {
+              "column": "name",
+              "min": "0665656c0000",
+              "max": "0668656e0000",
+              "null_count": 0,
+              "distinct_count": null,
+              "has_bloom": false
+            },
+            {
+              "column": "amount",
+              "min": "05107fffffffffffffffffffffffffffffff",
+              "max": "05108000000000000000000000000001e240",
+              "null_count": 0,
+              "distinct_count": null,
+              "has_bloom": false
+            }
+          ]
+        },
+        {
+          "index": 2,
+          "rows": 2,
+          "bytes": 218,
+          "stats": [
+            {
+              "column": "id",
+              "min": "028000000000000009",
+              "max": "02800000000000000a",
+              "null_count": 0,
+              "distinct_count": null,
+              "has_bloom": false
+            },
+            {
+              "column": "name",
+              "min": "06696269730000",
+              "max": "066a61790000",
+              "null_count": 0,
+              "distinct_count": null,
+              "has_bloom": false
+            },
+            {
+              "column": "amount",
+              "min": "05108000000000000000000000000000002a",
+              "max": "0510800000000000000000000000000003e8",
+              "null_count": 0,
+              "distinct_count": null,
+              "has_bloom": false
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "file": "timestamps.parquet",
+      "format": "parquet",
+      "size": 1595,
+      "row_groups": [
+        {
+          "index": 0,
+          "rows": 3,
+          "bytes": 205,
+          "stats": [
+            {
+              "column": "id",
+              "min": "028000000000000001",
+              "max": "028000000000000003",
+              "null_count": 0,
+              "distinct_count": null,
+              "has_bloom": false
+            },
+            {
+              "column": "ts",
+              "min": "08040380060dd710212000",
+              "max": "08040380060dd8bd486800",
+              "null_count": 0,
+              "distinct_count": null,
+              "has_bloom": false
+            },
+            {
+              "column": "day",
+              "min": "0801058000000000004d0b",
+              "max": "0801058000000000004d0b",
+              "null_count": 0,
+              "distinct_count": null,
+              "has_bloom": false
+            }
+          ]
+        },
+        {
+          "index": 1,
+          "rows": 3,
+          "bytes": 205,
+          "stats": [
+            {
+              "column": "id",
+              "min": "028000000000000004",
+              "max": "028000000000000006",
+              "null_count": 0,
+              "distinct_count": null,
+              "has_bloom": false
+            },
+            {
+              "column": "ts",
+              "min": "08040380060deb2df88000",
+              "max": "08040380060df0356e5800",
+              "null_count": 0,
+              "distinct_count": null,
+              "has_bloom": false
+            },
+            {
+              "column": "day",
+              "min": "0801058000000000004d0c",
+              "max": "0801058000000000004d0c",
+              "null_count": 0,
+              "distinct_count": null,
+              "has_bloom": false
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "file": "nulls.parquet",
+      "format": "parquet",
+      "size": 1602,
+      "row_groups": [
+        {
+          "index": 0,
+          "rows": 5,
+          "bytes": 246,
+          "stats": [
+            {
+              "column": "key",
+              "min": "066b300000",
+              "max": "066b330000",
+              "null_count": 2,
+              "distinct_count": null,
+              "has_bloom": false
+            },
+            {
+              "column": "val",
+              "min": "03000000000000000a",
+              "max": "030000000000000032",
+              "null_count": 0,
+              "distinct_count": null,
+              "has_bloom": false
+            },
+            {
+              "column": "score",
+              "min": "043ffdffffffffffff",
+              "max": "04c023800000000000",
+              "null_count": 1,
+              "distinct_count": null,
+              "has_bloom": false
+            }
+          ]
+        },
+        {
+          "index": 1,
+          "rows": 2,
+          "bytes": 171,
+          "stats": [
+            {
+              "column": "key",
+              "min": null,
+              "max": null,
+              "null_count": 2,
+              "distinct_count": null,
+              "has_bloom": false
+            },
+            {
+              "column": "val",
+              "min": "03000000000000003c",
+              "max": "030000000000000046",
+              "null_count": 0,
+              "distinct_count": null,
+              "has_bloom": false
+            },
+            {
+              "column": "score",
+              "min": "04401fffffffffffff",
+              "max": "04401fffffffffffff",
+              "null_count": 1,
+              "distinct_count": null,
+              "has_bloom": false
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "file": "bloom.parquet",
+      "format": "parquet",
+      "size": 1292,
+      "row_groups": [
+        {
+          "index": 0,
+          "rows": 3,
+          "bytes": 167,
+          "stats": [
+            {
+              "column": "id",
+              "min": "028000000000000064",
+              "max": "028000000000000066",
+              "null_count": 0,
+              "distinct_count": null,
+              "has_bloom": false
+            },
+            {
+              "column": "sku",
+              "min": "06736b752d610000",
+              "max": "06736b752d630000",
+              "null_count": 0,
+              "distinct_count": null,
+              "has_bloom": true
+            }
+          ]
+        },
+        {
+          "index": 1,
+          "rows": 3,
+          "bytes": 167,
+          "stats": [
+            {
+              "column": "id",
+              "min": "028000000000000067",
+              "max": "028000000000000069",
+              "null_count": 0,
+              "distinct_count": null,
+              "has_bloom": false
+            },
+            {
+              "column": "sku",
+              "min": "06736b752d640000",
+              "max": "06736b752d660000",
+              "null_count": 0,
+              "distinct_count": null,
+              "has_bloom": true
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "file": "edge.parquet",
+      "format": "parquet",
+      "size": 2131,
+      "row_groups": [
+        {
+          "index": 0,
+          "rows": 3,
+          "bytes": 338,
+          "stats": [
+            {
+              "column": "f",
+              "min": "043ff7ffffffffffff",
+              "max": "04bff8000000000000",
+              "null_count": 0,
+              "distinct_count": null,
+              "has_bloom": false
+            },
+            {
+              "column": "u",
+              "min": "030000000000000005",
+              "max": "0300000000b2d05e00",
+              "null_count": 0,
+              "distinct_count": null,
+              "has_bloom": false
+            },
+            {
+              "column": "s",
+              "min": "067a656272610000",
+              "max": "06e697a5e69cac0000",
+              "null_count": 0,
+              "distinct_count": null,
+              "has_bloom": false
+            },
+            {
+              "column": "d",
+              "min": "05107fffffffffffffffffffffffffffffff",
+              "max": "05108000009bd30a3c645943dd1690a03a14",
+              "null_count": 0,
+              "distinct_count": null,
+              "has_bloom": false
+            }
+          ]
+        },
+        {
+          "index": 1,
+          "rows": 2,
+          "bytes": 277,
+          "stats": [
+            {
+              "column": "f",
+              "min": null,
+              "max": null,
+              "null_count": 0,
+              "distinct_count": null,
+              "has_bloom": false
+            },
+            {
+              "column": "u",
+              "min": "030000000000000000",
+              "max": "0300000000ffffffff",
+              "null_count": 0,
+              "distinct_count": null,
+              "has_bloom": false
+            },
+            {
+              "column": "s",
+              "min": "066162630000",
+              "max": "06c39c6ec3af636f64650000",
+              "null_count": 0,
+              "distinct_count": null,
+              "has_bloom": false
+            },
+            {
+              "column": "d",
+              "min": "05107ffffffffffffffffffffffffffffffb",
+              "max": "0510cb3b4ca85a86c47a098a223fffffffff",
+              "null_count": 0,
+              "distinct_count": null,
+              "has_bloom": false
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "file": "events.csv",
+      "format": "csv",
+      "size": 390,
+      "row_groups": [
+        {
+          "index": 0,
+          "rows": 2,
+          "bytes": 84,
+          "stats": [
+            {
+              "column": "id",
+              "min": "028000000000000003",
+              "max": "028000000000000007",
+              "null_count": 0,
+              "distinct_count": null,
+              "has_bloom": false
+            },
+            {
+              "column": "name",
+              "min": "06616c7068610000",
+              "max": "0667616d6d610000",
+              "null_count": 0,
+              "distinct_count": null,
+              "has_bloom": false
+            },
+            {
+              "column": "amount",
+              "min": "04400bffffffffffff",
+              "max": "04c00c000000000000",
+              "null_count": 0,
+              "distinct_count": null,
+              "has_bloom": false
+            },
+            {
+              "column": "ts",
+              "min": "08040380060dd710212000",
+              "max": "08040380060dd7e6b4c400",
+              "null_count": 0,
+              "distinct_count": null,
+              "has_bloom": false
+            }
+          ]
+        },
+        {
+          "index": 1,
+          "rows": 3,
+          "bytes": 89,
+          "stats": [
+            {
+              "column": "id",
+              "min": "028000000000000001",
+              "max": "02800000000000000c",
+              "null_count": 0,
+              "distinct_count": null,
+              "has_bloom": false
+            },
+            {
+              "column": "name",
+              "min": "06626574610000",
+              "max": "0664656c74610000",
+              "null_count": 1,
+              "distinct_count": null,
+              "has_bloom": false
+            },
+            {
+              "column": "amount",
+              "min": "048000000000000000",
+              "max": "04c024000000000000",
+              "null_count": 0,
+              "distinct_count": null,
+              "has_bloom": false
+            },
+            {
+              "column": "ts",
+              "min": "08040380060dd8bd486800",
+              "max": "08040380060dec048c2400",
+              "null_count": 0,
+              "distinct_count": null,
+              "has_bloom": false
+            }
+          ]
+        },
+        {
+          "index": 2,
+          "rows": 2,
+          "bytes": 67,
+          "stats": [
+            {
+              "column": "id",
+              "min": "028000000000000004",
+              "max": "02800000000000000f",
+              "null_count": 0,
+              "distinct_count": null,
+              "has_bloom": false
+            },
+            {
+              "column": "name",
+              "min": "06657073696c6f6e0000",
+              "max": "067a6574610000",
+              "null_count": 0,
+              "distinct_count": null,
+              "has_bloom": false
+            },
+            {
+              "column": "amount",
+              "min": "043fe3ffffffffffff",
+              "max": "04c059200000000000",
+              "null_count": 0,
+              "distinct_count": null,
+              "has_bloom": false
+            },
+            {
+              "column": "ts",
+              "min": "08040380060decdb1fc800",
+              "max": "08040380060dff4bcfe000",
+              "null_count": 0,
+              "distinct_count": null,
+              "has_bloom": false
+            }
+          ]
+        },
+        {
+          "index": 3,
+          "rows": 3,
+          "bytes": 89,
+          "stats": [
+            {
+              "column": "id",
+              "min": "028000000000000002",
+              "max": "02800000000000000b",
+              "null_count": 0,
+              "distinct_count": null,
+              "has_bloom": false
+            },
+            {
+              "column": "name",
+              "min": "066574610000",
+              "max": "0674686574610000",
+              "null_count": 1,
+              "distinct_count": null,
+              "has_bloom": false
+            },
+            {
+              "column": "amount",
+              "min": "04bfe0000000000000",
+              "max": "04c020800000000000",
+              "null_count": 0,
+              "distinct_count": null,
+              "has_bloom": false
+            },
+            {
+              "column": "ts",
+              "min": "08040380060e0022638400",
+              "max": "08040380060e1369a74000",
+              "null_count": 0,
+              "distinct_count": null,
+              "has_bloom": false
+            }
+          ]
+        },
+        {
+          "index": 4,
+          "rows": 2,
+          "bytes": 61,
+          "stats": [
+            {
+              "column": "id",
+              "min": "028000000000000006",
+              "max": "028000000000000008",
+              "null_count": 0,
+              "distinct_count": null,
+              "has_bloom": false
+            },
+            {
+              "column": "name",
+              "min": "06696f74610000",
+              "max": "066b617070610000",
+              "null_count": 0,
+              "distinct_count": null,
+              "has_bloom": false
+            },
+            {
+              "column": "amount",
+              "min": "043ff3ffffffffffff",
+              "max": "04bff0000000000000",
+              "null_count": 0,
+              "distinct_count": null,
+              "has_bloom": false
+            },
+            {
+              "column": "ts",
+              "min": "08040380060e14403ae400",
+              "max": "08040380060e1516ce8800",
+              "null_count": 0,
+              "distinct_count": null,
+              "has_bloom": false
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "file": "events.jsonl",
+      "format": "jsonl",
+      "size": 737,
+      "row_groups": [
+        {
+          "index": 0,
+          "rows": 1,
+          "bytes": 64,
+          "stats": [
+            {
+              "column": "id",
+              "min": "028000000000000007",
+              "max": "028000000000000007",
+              "null_count": 0,
+              "distinct_count": null,
+              "has_bloom": false
+            },
+            {
+              "column": "name",
+              "min": "0667616d6d610000",
+              "max": "0667616d6d610000",
+              "null_count": 0,
+              "distinct_count": null,
+              "has_bloom": false
+            },
+            {
+              "column": "amount",
+              "min": "04c00c000000000000",
+              "max": "04c00c000000000000",
+              "null_count": 0,
+              "distinct_count": null,
+              "has_bloom": false
+            },
+            {
+              "column": "ts",
+              "min": "08040380060dd710212000",
+              "max": "08040380060dd710212000",
+              "null_count": 0,
+              "distinct_count": null,
+              "has_bloom": false
+            }
+          ]
+        },
+        {
+          "index": 1,
+          "rows": 1,
+          "bytes": 66,
+          "stats": [
+            {
+              "column": "id",
+              "min": "028000000000000003",
+              "max": "028000000000000003",
+              "null_count": 0,
+              "distinct_count": null,
+              "has_bloom": false
+            },
+            {
+              "column": "name",
+              "min": "06616c7068610000",
+              "max": "06616c7068610000",
+              "null_count": 0,
+              "distinct_count": null,
+              "has_bloom": false
+            },
+            {
+              "column": "amount",
+              "min": "04400bffffffffffff",
+              "max": "04400bffffffffffff",
+              "null_count": 0,
+              "distinct_count": null,
+              "has_bloom": false
+            },
+            {
+              "column": "ts",
+              "min": "08040380060dd7e6b4c400",
+              "max": "08040380060dd7e6b4c400",
+              "null_count": 0,
+              "distinct_count": null,
+              "has_bloom": false
+            }
+          ]
+        },
+        {
+          "index": 2,
+          "rows": 2,
+          "bytes": 111,
+          "stats": [
+            {
+              "column": "id",
+              "min": "028000000000000001",
+              "max": "02800000000000000c",
+              "null_count": 0,
+              "distinct_count": null,
+              "has_bloom": false
+            },
+            {
+              "column": "name",
+              "min": "0664656c74610000",
+              "max": "0664656c74610000",
+              "null_count": 1,
+              "distinct_count": null,
+              "has_bloom": false
+            },
+            {
+              "column": "amount",
+              "min": "048000000000000000",
+              "max": "04c024000000000000",
+              "null_count": 0,
+              "distinct_count": null,
+              "has_bloom": false
+            },
+            {
+              "column": "ts",
+              "min": "08040380060dd8bd486800",
+              "max": "08040380060deb2df88000",
+              "null_count": 0,
+              "distinct_count": null,
+              "has_bloom": false
+            }
+          ]
+        },
+        {
+          "index": 3,
+          "rows": 1,
+          "bytes": 64,
+          "stats": [
+            {
+              "column": "id",
+              "min": "028000000000000009",
+              "max": "028000000000000009",
+              "null_count": 0,
+              "distinct_count": null,
+              "has_bloom": false
+            },
+            {
+              "column": "name",
+              "min": "06626574610000",
+              "max": "06626574610000",
+              "null_count": 0,
+              "distinct_count": null,
+              "has_bloom": false
+            },
+            {
+              "column": "amount",
+              "min": "04c006000000000000",
+              "max": "04c006000000000000",
+              "null_count": 0,
+              "distinct_count": null,
+              "has_bloom": false
+            },
+            {
+              "column": "ts",
+              "min": "08040380060dec048c2400",
+              "max": "08040380060dec048c2400",
+              "null_count": 0,
+              "distinct_count": null,
+              "has_bloom": false
+            }
+          ]
+        },
+        {
+          "index": 4,
+          "rows": 1,
+          "bytes": 68,
+          "stats": [
+            {
+              "column": "id",
+              "min": "028000000000000004",
+              "max": "028000000000000004",
+              "null_count": 0,
+              "distinct_count": null,
+              "has_bloom": false
+            },
+            {
+              "column": "name",
+              "min": "06657073696c6f6e0000",
+              "max": "06657073696c6f6e0000",
+              "null_count": 0,
+              "distinct_count": null,
+              "has_bloom": false
+            },
+            {
+              "column": "amount",
+              "min": "04c059200000000000",
+              "max": "04c059200000000000",
+              "null_count": 0,
+              "distinct_count": null,
+              "has_bloom": false
+            },
+            {
+              "column": "ts",
+              "min": "08040380060decdb1fc800",
+              "max": "08040380060decdb1fc800",
+              "null_count": 0,
+              "distinct_count": null,
+              "has_bloom": false
+            }
+          ]
+        },
+        {
+          "index": 5,
+          "rows": 2,
+          "bytes": 125,
+          "stats": [
+            {
+              "column": "id",
+              "min": "028000000000000002",
+              "max": "02800000000000000f",
+              "null_count": 0,
+              "distinct_count": null,
+              "has_bloom": false
+            },
+            {
+              "column": "name",
+              "min": "066574610000",
+              "max": "067a6574610000",
+              "null_count": 0,
+              "distinct_count": null,
+              "has_bloom": false
+            },
+            {
+              "column": "amount",
+              "min": "043fe3ffffffffffff",
+              "max": "04bfe0000000000000",
+              "null_count": 0,
+              "distinct_count": null,
+              "has_bloom": false
+            },
+            {
+              "column": "ts",
+              "min": "08040380060dff4bcfe000",
+              "max": "08040380060e0022638400",
+              "null_count": 0,
+              "distinct_count": null,
+              "has_bloom": false
+            }
+          ]
+        },
+        {
+          "index": 6,
+          "rows": 2,
+          "bytes": 113,
+          "stats": [
+            {
+              "column": "id",
+              "min": "028000000000000005",
+              "max": "02800000000000000b",
+              "null_count": 0,
+              "distinct_count": null,
+              "has_bloom": false
+            },
+            {
+              "column": "name",
+              "min": "0674686574610000",
+              "max": "0674686574610000",
+              "null_count": 1,
+              "distinct_count": null,
+              "has_bloom": false
+            },
+            {
+              "column": "amount",
+              "min": "04c018000000000000",
+              "max": "04c020800000000000",
+              "null_count": 0,
+              "distinct_count": null,
+              "has_bloom": false
+            },
+            {
+              "column": "ts",
+              "min": "08040380060e00f8f72800",
+              "max": "08040380060e1369a74000",
+              "null_count": 0,
+              "distinct_count": null,
+              "has_bloom": false
+            }
+          ]
+        },
+        {
+          "index": 7,
+          "rows": 1,
+          "bytes": 64,
+          "stats": [
+            {
+              "column": "id",
+              "min": "028000000000000008",
+              "max": "028000000000000008",
+              "null_count": 0,
+              "distinct_count": null,
+              "has_bloom": false
+            },
+            {
+              "column": "name",
+              "min": "06696f74610000",
+              "max": "06696f74610000",
+              "null_count": 0,
+              "distinct_count": null,
+              "has_bloom": false
+            },
+            {
+              "column": "amount",
+              "min": "043ff3ffffffffffff",
+              "max": "043ff3ffffffffffff",
+              "null_count": 0,
+              "distinct_count": null,
+              "has_bloom": false
+            },
+            {
+              "column": "ts",
+              "min": "08040380060e14403ae400",
+              "max": "08040380060e14403ae400",
+              "null_count": 0,
+              "distinct_count": null,
+              "has_bloom": false
+            }
+          ]
+        },
+        {
+          "index": 8,
+          "rows": 1,
+          "bytes": 62,
+          "stats": [
+            {
+              "column": "id",
+              "min": "028000000000000006",
+              "max": "028000000000000006",
+              "null_count": 0,
+              "distinct_count": null,
+              "has_bloom": false
+            },
+            {
+              "column": "name",
+              "min": "066b617070610000",
+              "max": "066b617070610000",
+              "null_count": 0,
+              "distinct_count": null,
+              "has_bloom": false
+            },
+            {
+              "column": "amount",
+              "min": "04bff0000000000000",
+              "max": "04bff0000000000000",
+              "null_count": 0,
+              "distinct_count": null,
+              "has_bloom": false
+            },
+            {
+              "column": "ts",
+              "min": "08040380060e1516ce8800",
+              "max": "08040380060e1516ce8800",
+              "null_count": 0,
+              "distinct_count": null,
+              "has_bloom": false
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

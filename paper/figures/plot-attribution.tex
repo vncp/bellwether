@@ -1,0 +1,25 @@
+% Panel: counterfactual attribution. Delta_v in bytes for each attributed
+% node v of the baseline (rows) on each search run (columns), on a diverging
+% scale centered on zero. Data: data/attribution.csv; schema in
+% data/README.md.
+\IfFileExists{data/attribution.csv}{%
+  \begingroup\bwdatacatcodes
+  \bwsymlimit{data/attribution.csv}{delta_bytes}%
+  \bwmaxint{data/attribution.csv}{op}%
+  \begin{bwpanel}{4.1cm}
+    \begin{axis}[bw, bw box={4.1cm}{1.3cm}{0.92cm}{0.1cm}{0.75cm},
+        colormap name=bwdiverging, point meta min=-\bwabs, point meta max=\bwabs,
+        bw colorbar,
+        y dir=reverse, ytick={0,...,\bwlast},
+        yticklabels from table={data/attribution.csv}{label},
+        xlabel={search run}, enlargelimits=false, axis on top, grid=none,
+        unbounded coords=jump]
+      \addplot[matrix plot*, mesh/ordering=y varies, point meta=explicit]
+        table[x=run, y=op, meta=delta_bytes] {data/attribution.csv};
+    \end{axis}
+  \end{bwpanel}%
+  \endgroup
+}{%
+  \pendingfigure[\scriptsize]{4.1cm}{counterfactual attribution per node and
+    run}{attribution}%
+}%

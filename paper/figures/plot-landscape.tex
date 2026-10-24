@@ -1,0 +1,29 @@
+% Panel: the loss landscape. Exact replay cost on a grid of two numeric knobs,
+% bloom false-positive rate and key-count gate, as a surface in a
+% three-quarter view, with the finite-difference descent path on it.
+% Data: data/landscape.csv (grid) and data/descent.csv (path); schema in
+% data/README.md.
+\IfFileExists{data/landscape.csv}{%
+  \begingroup\bwdatacatcodes
+  \begin{bwpanel}{4.1cm}
+    \begin{axis}[bw, bw box={4.1cm}{0.8cm}{0.65cm}{0.55cm}{0.3cm},
+        view={35}{30}, xmode=log, ymode=log,
+        xlabel={bloom FPR}, ylabel={key-count gate}, zlabel={bytes},
+        colormap name=bwblues,
+        xlabel style={sloped like x axis}, ylabel style={sloped like y axis}]
+      \addplot3[surf, shader=interp, mesh/ordering=y varies]
+        table[x=fpr, y=gate, z=bytes] {data/landscape.csv};
+      \IfFileExists{data/descent.csv}{%
+        \addplot3[bwB, mark=*, mark size=0.9pt, line width=0.7pt]
+          table[x=fpr, y=gate, z=bytes] {data/descent.csv};
+        \addplot3[bwB, only marks, mark=o, mark size=2pt, line width=0.6pt,
+            bw only={step}{0}]
+          table[x=fpr, y=gate, z=bytes] {data/descent.csv};
+      }{}
+    \end{axis}
+  \end{bwpanel}%
+  \endgroup
+}{%
+  \pendingfigure[\scriptsize]{4.1cm}{exact replay cost on a grid of two
+    knobs as a surface, with the descent path}{landscape}%
+}%

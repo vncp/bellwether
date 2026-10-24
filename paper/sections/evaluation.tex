@@ -1,0 +1,407 @@
+\section{Evaluation Methodology}\label{sec:eval}
+
+The benchmark was designed before any implementation existed (\adr{019}), in
+\doc{benchmark.md} for the index and \doc{evolve.md} \S11 for the optimizer.
+A change to the design after the first harness run is recorded in
+\doc{benchmark.md} with a date and a reason, and results from before the change
+are labeled as such. Every dataset is synthetic; no real data is used, and none
+is needed to reproduce a result. No result is reported yet
+(Section~\ref{sec:results}).
+
+\subsection{Questions}\label{sec:questions}
+
+\textbf{Q1}: how many bytes does a keyed lookup read with the index, compared
+with each baseline? \textbf{Q2}: how does lookup latency grow with corpus size?
+\textbf{Q3}: how far is predicted cost from measured cost? Replay is exact by
+design (\adr{005}), so the expected error is zero and any nonzero value is a
+defect. \textbf{Q4}: given a planted anti-pattern, how often does the engine
+recommend the fix an expert would make? \textbf{Q5}: how much does evolve reduce
+cost per run at p50, p95, and max, at what maintenance cost, and with what gain
+per replay and per model call? \textbf{Q6}: how many non-local rewrites does
+evolve find that no local identity could certify, and do their output
+certificates hold? \textbf{Q7}: what gain do promoted rules alone yield on
+held-out query templates? \textbf{Q8}: does Pareto selection protect the p95
+run relative to mean selection?
+
+\subsection{Dataset}\label{sec:dataset}
+
+The generator produces a synthetic versioned ledger: each entity has a true id
+and a series of versions over time. Files are partitioned by day and written in
+arrival order, so a version's location depends on when it arrived, not on its
+entity, which imitates a common lake shape on purpose. Columns are a true id, a
+version timestamp, a batch-stamp column (a high-cardinality value assigned per
+write batch and ordered with time), a partition date, decimal amounts for totals
+checks, and filler columns. The parameters are the number of files, row groups
+per file, rows per row group, entities, churn, days, payload width, the
+presence of the batch-stamp column, the fraction of null timestamps, and a
+seed; the dataset is a pure function of the parameters and the seed. The
+pre-registered corpus ladder is defined by days and files per day: small is 10
+days of 1 file (10 files, 1,000,000 entities), medium is 30 days of 4 files
+(120 files, 1,000,000 entities), and large is 30 days of 32 files (960 files,
+10,000,000 entities). Every rung has 8 row groups per file, 100,000 rows per
+row group, a payload width of 256 bytes, and corpus seed 7
+(\doc{benchmark.md}, amended), so the configuration specifies 8, 96, and 768
+million rows for the three rungs. The small corpus measured 2.1\,GB on disk;
+from the configuration, the medium and large corpora would hold about 30\,GB
+and 240\,GB. The ladder was revised before any harness run because its first
+version, 10, 100, and 1,000 files over 30 days, was inconsistent with the
+generator, which writes at least one file per day. Churn is the fraction of
+entities re-versioned per day, 0.05. Rows per day are fixed by the layout
+(files per day times 8 row groups of 100,000 rows), so from the configuration a
+re-versioned entity would receive about 16, 64, and 51 versions per day on the
+small, medium, and large rungs; the generator records the measured versions per
+entity in its ground truth.
+For evolve, the dataset adds a pipeline of several dependent steps
+(\doc{evolve.md} \S11).
+
+\paragraph{Planted anti-patterns.} A generated dataset may plant one or more
+patterns from the rule catalog and records which ones it planted, as ground
+truth beside the data: \code{batch\us stamp\us key} (consumer workloads join on
+the batch-stamp column), \code{low\us selectivity\us single\us column} (a
+declared single-column key where a composite prunes much better),
+\code{declared\us but\us unused\us key} (a declared key spec that no workload
+uses), and \code{scattered\us time\us column} (timestamps written out of order
+across files).
+The expert fix for each planted pattern is written down before the engine runs,
+as part of the ground truth.
+
+\subsection{Workloads and splits}\label{sec:workloads}
+
+A recorded workload is a list of runs, and each run is a key set. Key-set sizes
+are drawn to hit three points, p50, p95, and max. The other parameters are the
+number of runs, the key skew (uniform or skewed draws from entities), the
+recency bias (how strongly runs prefer recently changed entities), the mix of
+\code{locate}, \code{latest}, and \code{asof} queries, and a seed. The
+pre-registered workload has 200 recorded runs with key-set sizes of 50, 10,000,
+and 100,000 at p50, p95, and max, split by run id into 150 search runs and 50
+held-out runs that never enter the search, with workload seed 11
+(\doc{benchmark.md}, amended; \doc{evolve.md} \S11). Runs are grouped by
+template, and rule transfer is measured on held-out templates (\doc{evolve.md}
+\S7).
+
+\subsection{Baselines}\label{sec:baselines}
+
+For lookups (\adr{019}): a raw scan that reads every row group and filters;
+DuckDB running the same lookup as a query over the same files; Parquet-native
+statistics, which prune with footer minimum and maximum values and any embedded
+bloom filters but no sidecar index; and Apache DataFusion~\cite{datafusion}, a popular Rust engine that prunes with statistics, the page index, and embedded bloom filters. For evolve
+(\doc{evolve.md} \S11): no index; Parquet statistics; DuckDB; DataFusion; an LLM-only
+rewriter without replay, in the shape of GenRewrite~\cite{genrewrite}; and an
+estimate-based advisor that uses a DuckDB or DataFusion cost estimate in place
+of a what-if interface. Each baseline answers the same lookups on the same files
+and must return the same rows as the engine. A baseline that returns different
+rows is a failed run, not a data point (\doc{benchmark.md}).
+
+\subsection{Metrics}\label{sec:metrics}
+
+\emph{Bytes read} is measured: the harness wraps the file reader in a
+byte-counting layer and records the compressed bytes actually fetched for each
+run, alongside the planned bytes computed from row-group statistics
+(\doc{benchmark.md}, amended). \emph{Latency versus corpus size} is the wall
+time per lookup across the corpus ladder, at p50, p95, and max. An engine
+baseline whose planning itself scans key columns, as Apache DataFusion's
+pruning does, reports planning and execution latency separately, and realized
+bytes for every strategy are counted by the harness's own reader, so an
+engine's internal reads count the same way as the index's (\doc{benchmark.md},
+amended).
+\emph{Cost-estimation error} is
+$|\mathit{predicted} - \mathit{measured}| / \mathit{measured}$, where
+\emph{predicted} is the planned bytes and \emph{measured} is the counted bytes. \emph{Expert-fix recovery} is the fraction of planted anti-patterns for
+which the top recommendation equals the recorded expert fix. Peak resident
+memory per operation and observe-tool latency are recorded for the assertions of
+\adr{018} (\doc{benchmark.md}). For evolve (\doc{evolve.md} \S11): cost
+reduction per run at p50, p95, and max, with $m(a)$; blind recovery of planted
+anti-patterns; realized versus predicted cost, zero for evolve by construction
+and measured for the estimate-based baseline; gain per replay and per model
+call; non-local rewrites found and whether their certificates held; transfer
+gain from promoted rules on held-out templates; and p95 cost under Pareto versus
+mean selection.
+
+\paragraph{Planned versus measured bytes.} The realized-versus-predicted figure
+plots the two byte counts against each other. The claim of no estimation error
+means that their difference is zero for every strategy whose plan is executed as
+written; any nonzero difference is reported, not hidden (\doc{benchmark.md},
+amended). Section~\ref{sec:exact} lists the reads that a Replay does not count.
+
+\subsection{Ablations}\label{sec:ablations}
+
+Three ablations isolate the parts of evolve (\doc{evolve.md} \S11). Pareto
+versus mean selection uses the same proposer budget and seed in both arms. The
+attribution ablation replaces the exact per-node differences with the
+proposer's self-reported attribution, holding everything else fixed
+(\doc{benchmark.md}, amended). The gate ablation runs the search with and
+without the gate; in the ungated arm every frontier member is reconciled after
+the search, so the number of non-equivalent candidates the gate would have
+rejected can be reported. That last detail is this paper's operationalization
+and is not yet recorded in \doc{benchmark.md}.
+
+\subsection{Environment and reproducibility}\label{sec:env}
+
+Every result records the commit hash, the \code{rustc} version, the operating
+system, the CPU model, the core count, memory, the storage kind (local disk, or
+an object store and its region), and whether caches were warm or cold. Cold runs
+drop the operating system's page cache before each lookup where the platform
+allows; otherwise the result is labeled warm (\doc{benchmark.md}). A
+configuration file holds every parameter, including seeds, and the harness
+writes one JSON object per baseline and lookup. Charts are rendered from ledger
+records by \code{bellwether report}, never edited by hand and never recomputed
+for display (\doc{evolve.md} \S11), and a search can be replayed from its ledger
+(Section~\ref{sec:determinism}).
+
+\subsection{Results (pending)}\label{sec:results}
+
+No result is reported yet. The harness has so far run only the small rung, on
+one developer machine; no medium or large result exists, and a result shown
+here will name its rung and machine. Tables~\ref{tab:lookup}
+to~\ref{tab:ablation} and
+Figures~\ref{fig:results-lookup} to~\ref{fig:results-loss} are the reporting
+templates. Every table cell reads \emph{pending}. Every figure panel is a
+pgfplots template over one CSV file, whose schema is fixed in
+\doc{paper/data/README.md} and which \code{bellwether report -{}-paper}
+writes from ledger records; a panel draws its file when the file exists and a
+framed placeholder of the same size until then, so no panel is drawn from
+anything but that file.
+
+\begin{table*}[t]
+  \caption{Lookup benchmark (Q1, Q2): bytes read and latency per lookup at the
+    workload's p50, p95, and max key-set sizes, and peak resident memory.
+    Pending: produced by \code{bellwether report} from ledger records.}
+  \label{tab:lookup}
+  \small
+  \begin{tabular}{@{}lccccccc@{}}
+    \toprule
+    & \multicolumn{3}{c}{Bytes read} & \multicolumn{3}{c}{Latency} & Peak \\
+    \cmidrule(lr){2-4} \cmidrule(lr){5-7}
+    Method & p50 & p95 & max & p50 & p95 & max & memory \\
+    \midrule
+    Raw scan                & \pend & \pend & \pend & \pend & \pend & \pend & \pend \\
+    Parquet statistics      & \pend & \pend & \pend & \pend & \pend & \pend & \pend \\
+    DuckDB                  & \pend & \pend & \pend & \pend & \pend & \pend & \pend \\
+    DataFusion              & \pend & \pend & \pend & \pend & \pend & \pend & \pend \\
+    Bellwether index        & \pend & \pend & \pend & \pend & \pend & \pend & \pend \\
+    \bottomrule
+  \end{tabular}
+\end{table*}
+
+\begin{table*}[t]
+  \caption{Evolve against baselines (Q5): bytes read per run at p50, p95, and
+    max, and maintenance cost $m(a)$. Pending: produced by
+    \code{bellwether report} from ledger records.}
+  \label{tab:evolve}
+  \small
+  \begin{tabular}{@{}lccccc@{}}
+    \toprule
+    & \multicolumn{3}{c}{Bytes read per run} & \multicolumn{2}{c}{Maintenance $m(a)$} \\
+    \cmidrule(lr){2-4} \cmidrule(lr){5-6}
+    Method & p50 & p95 & max & Index bytes & Build time \\
+    \midrule
+    No index                          & \pend & \pend & \pend & \pend & \pend \\
+    Parquet statistics                & \pend & \pend & \pend & \pend & \pend \\
+    DataFusion                        & \pend & \pend & \pend & \pend & \pend \\
+    DuckDB                            & \pend & \pend & \pend & \pend & \pend \\
+    LLM-only rewriter (no replay)     & \pend & \pend & \pend & \pend & \pend \\
+    Estimate-based advisor            & \pend & \pend & \pend & \pend & \pend \\
+    Evolve                            & \pend & \pend & \pend & \pend & \pend \\
+    \bottomrule
+  \end{tabular}
+\end{table*}
+
+\begin{table}[t]
+  \caption{Planted anti-patterns (Q4): the after shape from the rule catalog,
+    and whether the top recommendation of \code{fix}, and of evolve run blind,
+    equals the recorded expert fix. Pending.}
+  \label{tab:recovery}
+  \small
+  \begin{tabular}{@{}>{\raggedright\arraybackslash}p{0.36\columnwidth}%
+      >{\raggedright\arraybackslash}p{0.27\columnwidth}cc@{}}
+    \toprule
+    Pattern & Catalog after shape & \code{fix} & Evolve \\
+    \midrule
+    \code{batch\_stamp\_key} & join on the true key & \pend & \pend \\
+    \code{low\_selectivity\_\allowbreak single\_column} & composite key &
+      \pend & \pend \\
+    \code{declared\_but\_\allowbreak unused\_key} & spec removed & \pend &
+      \pend \\
+    \code{scattered\_time\_\allowbreak column} & clustered by time & \pend &
+      \pend \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+\begin{table}[t]
+  \caption{Cost-estimation error (Q3), non-local rewrites (Q6), and rulebook
+    transfer (Q7). Pending.}
+  \label{tab:error}
+  \small
+  \begin{tabular}{@{}>{\raggedright\arraybackslash}p{0.43\columnwidth}ccc@{}}
+    \toprule
+    Cost-estimation error on bytes & p50 & p95 & max \\
+    \midrule
+    Replay, lookups            & \pend & \pend & \pend \\
+    Replay, evolve candidates  & \pend & \pend & \pend \\
+    Estimate-based advisor     & \pend & \pend & \pend \\
+    \midrule
+    Rewrites and rules & \multicolumn{3}{c}{Count} \\
+    \midrule
+    Non-local rewrites that no local identity certifies
+      & \multicolumn{3}{c}{\pend} \\
+    Of these, output certificate held & \multicolumn{3}{c}{\pend} \\
+    Non-equivalent candidates admitted without the gate
+      & \multicolumn{3}{c}{\pend} \\
+    Rules promoted after held-out validation & \multicolumn{3}{c}{\pend} \\
+    \midrule
+    Transfer gain from rules alone & p50 & p95 & max \\
+    \midrule
+    Held-out templates & \pend & \pend & \pend \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+\begin{table}[t]
+  \caption{Ablations (Q5, Q8): p95 bytes per run, gain per replay, and gain per
+    model call. Pending.}
+  \label{tab:ablation}
+  \small
+  \begin{tabular}{@{}lccc@{}}
+    \toprule
+    Variant & p95 bytes & Gain/replay & Gain/call \\
+    \midrule
+    Evolve (full)          & \pend & \pend & \pend \\
+    Mean selection         & \pend & \pend & \pend \\
+    Without attribution    & \pend & \pend & \pend \\
+    Without the gate       & \pend & \pend & \pend \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+\begin{figure*}[t]
+  \centering
+  \begin{subfigure}[t]{0.32\textwidth}
+    \centering
+    \input{figures/plot-funnel}
+    \caption{Pruning funnel of one run (Q1).}
+    \label{fig:funnel}
+  \end{subfigure}\hfill
+  \begin{subfigure}[t]{0.32\textwidth}
+    \centering
+    \input{figures/plot-latency}
+    \caption{Latency versus corpus size (Q2).}
+    \label{fig:latency}
+  \end{subfigure}\hfill
+  \begin{subfigure}[t]{0.32\textwidth}
+    \centering
+    \input{figures/plot-realized}
+    \caption{Realized versus predicted bytes (Q3).}
+    \label{fig:realized}
+  \end{subfigure}
+  \caption{Lookup and exactness. (a)~Row groups in the corpus, left after
+    footer statistics and embedded bloom filters, and left after the sidecar
+    index, for the search run at the workload's p95 key-set size on the
+    largest rung run so far, whose size the axis label gives; a strategy
+    without a stage passes its count through. (b)~Wall time per lookup,
+    planning included: p50, with a band and a whisker up to p95. (c)~Measured
+    against predicted bytes per run, with the line $y = x$; by design, replay
+    lies on it, and a point off it is a defect, not noise. Every panel in
+    Figures~\ref{fig:results-lookup} to~\ref{fig:results-loss} is drawn by
+    pgfplots from a CSV file that \code{bellwether report -{}-paper} writes
+    from ledger records (\doc{paper/data/README.md}); a framed box stands in
+    for a panel whose file does not exist yet.}
+  \Description{Three panels. (a) A grouped bar chart with a logarithmic axis of
+    row groups: for each of five strategies, three bars for the corpus, after
+    statistics, and after the index. (b) A log-log line chart of lookup latency
+    in milliseconds against the number of files, one line per strategy with a
+    shaded band up to the 95th percentile. (c) A log-log scatter plot of
+    measured against predicted bytes per run, one marker style per strategy,
+    with the diagonal. A panel whose data file does not exist is drawn as a
+    framed box that names the file.}
+  \label{fig:results-lookup}
+\end{figure*}
+
+\begin{figure*}[t]
+  \centering
+  \begin{subfigure}[t]{0.32\textwidth}
+    \centering
+    \input{figures/plot-convergence}
+    \caption{Convergence (Q5).}
+    \label{fig:convergence}
+  \end{subfigure}\hfill
+  \begin{subfigure}[t]{0.32\textwidth}
+    \centering
+    \input{figures/plot-frontier}
+    \caption{Frontier evolution (Q8).}
+    \label{fig:frontier}
+  \end{subfigure}\hfill
+  \begin{subfigure}[t]{0.32\textwidth}
+    \centering
+    \input{figures/plot-transfer}
+    \caption{Rulebook transfer (Q7).}
+    \label{fig:transfer}
+  \end{subfigure}
+  \caption{Search. (a)~Per generation, the best candidate so far (least
+    p95-run bytes) and the generation's median candidate; lines are p95-run
+    bytes and bands span p50-run to max-run bytes. (b)~The Pareto frontier at
+    generations $G/4$, $G/2$, $3G/4$, and the last, $G$ (darker is later),
+    projected onto p50-run and p95-run bytes, with the baseline $a_0$; the
+    frontier is over every run and objective, so a member can look dominated
+    in this projection. (c)~Held-out gain of each promoted rule applied alone
+    (bars; error bars span its lowest to highest gain over held-out
+    templates) and of rules $1$ to $i$ applied together (line).}
+  \Description{Three panels. (a) A line chart of bytes per run on a
+    logarithmic axis against generation, with a solid line for the best
+    candidate and a dashed line for the median candidate, each with a shaded
+    band. (b) A log-log plot of p95-run bytes against p50-run bytes showing
+    four connected point sets, drawn lighter for earlier generations, and a
+    star for the baseline. (c) A bar chart of held-out gain in percent per
+    promoted rule with error bars, and a line of cumulative gain. A panel whose
+    data file does not exist is drawn as a framed box that names the file.}
+  \label{fig:results-search}
+\end{figure*}
+
+\begin{figure*}[t]
+  \centering
+  \begin{subfigure}[t]{0.27\textwidth}
+    \centering
+    \input{figures/plot-landscape}
+    \caption{Loss landscape and descent.}
+    \label{fig:landscape}
+  \end{subfigure}\hfill
+  \begin{subfigure}[t]{0.235\textwidth}
+    \centering
+    \input{figures/plot-contour}
+    \caption{The same grid, contours.}
+    \label{fig:contour}
+  \end{subfigure}\hfill
+  \begin{subfigure}[t]{0.29\textwidth}
+    \centering
+    \input{figures/plot-attribution}
+    \caption{Attribution $\Delta_v$.}
+    \label{fig:attribution}
+  \end{subfigure}\hfill
+  \begin{subfigure}[t]{0.165\textwidth}
+    \centering
+    \input{figures/plot-interaction}
+    \caption{Interaction $I_{uv}$.}
+    \label{fig:interaction}
+  \end{subfigure}
+  \caption{The exact loss as an instrument. (a,\,b)~Exact replay bytes, the
+    scalar that descent minimizes, on a grid of bloom false-positive rate and
+    key-count gate, with the finite-difference descent path. This figure is
+    possible only because the loss is exact and cheap enough to evaluate at
+    every grid point; an estimate-based advisor has no such surface to draw.
+    (c)~Attribution $\Delta_v$ (Equation~\eqref{eq:attr}) of the baseline's
+    attributed nodes on each search run; red marks a node that reads more
+    than its alternative would. (d)~Interaction $I_{uv}$
+    (Equation~\eqref{eq:interaction}) summed over search runs; blue marks a
+    pair whose joint change saves more than its two changes do separately,
+    red less, and the diagonal is undefined.}
+  \Description{Four panels. (a) A three-dimensional surface of bytes over two
+    knobs, bloom false-positive rate and key-count gate, both on logarithmic
+    axes, viewed from an oblique angle, with a descent path drawn as a line
+    with markers on the surface. (b) The same grid as a filled contour map with
+    the same path. (c) A heatmap of attribution in bytes with plan nodes as
+    rows and search runs as columns, on a diverging blue-to-red scale. (d) A
+    square heatmap of pairwise interaction in bytes on the same scale. A panel
+    whose data file does not exist is drawn as a framed box that names the
+    file.}
+  \label{fig:results-loss}
+\end{figure*}

@@ -1,0 +1,22 @@
+[package]
+name = "bellwether-ledger"
+description = "Content-addressed, append-only ledger of Bellwether records with write-time trust-boundary rules."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[dependencies]
+bellwether-types = { path = "../bellwether-types" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+bytes = { workspace = true }
+
+[dev-dependencies]
+roaring = { workspace = true }
+
+[lints]
+workspace = true

@@ -1,0 +1,170 @@
+//! The build crate's [`Planner`] as a [`PlanSource`]: the planner the index
+//! itself answers queries with, so replaying a committed index plans every
+//! run exactly as a query would (ADR 011), and a hypothetical spec's
+//! transient segments plan through the same code
+//! (`Planner::plan_with_transient`).
+//!
+//! - [`PlanSource::specs`] is the declared specs complete at the pinned
+//!   sequence (`Planner::completeness`, which recomputes coverage from the
+//!   live segments, ADR 012). An incomplete declared spec is not one the
+//!   index can plan with.
+//! - [`PlanSource::plan`] is `Planner::plan` over a `Lookup::Keys` of the
+//!   run's canonical tuples. The planner refuses a listed spec that is not
+//!   declared exactly or not complete, and nothing else: an incomplete spec
+//!   the plan does not use is no error.
+//! - [`PlanSource::with_transient`] passes each transient index's segment
+//!   bytes as a `TransientSpec`, after checking that the index was built at
+//!   the pinned sequence, that every segment records the dataset's key
+//!   types, and that the row-group ranges its segments record cover every
+//!   live row group of the pinned manifest (a transient segment records the
+//!   row groups it processed, keys or not).
+
+use std::sync::Arc;
+
+use bellwether_build::{Lookup, Planner, TransientSpec};
+use bellwether_store::StoreExt;
+use bellwether_types::{Error, KeySpec, Result, ScanPlan};
+use roaring::RoaringBitmap;
+
+use crate::keys::RunKeys;
+use crate::plan::{check_key_types, PlanSource};
+use crate::transient::TransientIndex;
+
+/// The run's keys as the build planner's lookup: canonical tuples over the
+/// run's columns, at the dataset types.
+fn lookup(keys: &RunKeys) -> Lookup {
+    Lookup::Keys {
+        columns: keys.columns().to_vec(),
+        keys: keys.tuples().map(<[u8]>::to_vec).collect(),
+    }
+}
+
+/// Checks `transient` against `planner`'s pinned manifest (module docs) and
+/// returns each index's segments as a `TransientSpec`.
+fn checked<S>(planner: &Planner<S>, transient: &[Arc<TransientIndex>]) -> Result<Vec<TransientSpec>>
+where
+    S: StoreExt + ?Sized,
+{
+    let sequence = planner.sequence().to_string();
+    let live: RoaringBitmap = planner
+        .manifest()
+        .rowgroup_space
+        .files
+        .iter()
+        .flat_map(|f| f.rowgroup_ids.iter().map(|id| id.0))
+        .collect();
+    let mut out = Vec::with_capacity(transient.len());
+    for t in transient {
+        let name = t.spec().name();
+        if t.manifest_version() != sequence {
+            return Err(Error::Other(format!(
+                "transient index for {name} was built at manifest {}, not the pinned {sequence}",
+                t.manifest_version()
+            )));
+        }
+        let mut covered = RoaringBitmap::new();
+        for r in t.segments().readers() {
+            r.check_dataset(planner.schema())?;
+            if let Some((first, last)) = r.rowgroup_range() {
+                covered.insert_range(first.0..=last.0);
+            }
+        }
+        let gap = &live - &covered;
+        if let Some(first) = gap.min() {
+            return Err(Error::KeySpec(format!(
+                "transient index for {name} covers no segment of live row group {first} ({} \
+                 uncovered) of manifest {sequence}; it was built over another row-group set",
+                gap.len()
+            )));
+        }
+        out.push(TransientSpec {
+            spec: t.spec().clone(),
+            segments: t.segment_bytes(),
+        });
+    }
+    Ok(out)
+}
+
+impl<S> PlanSource for Planner<S>
+where
+    S: StoreExt + ?Sized + Send + Sync,
+{
+    fn manifest_version(&self) -> String {
+        self.sequence().to_string()
+    }
+
+    fn specs(&self) -> Vec<KeySpec> {
+        self.declared_specs()
+            .iter()
+            .filter(|s| self.completeness(s).is_some())
+            .cloned()
+            .collect()
+    }
+
+    fn plan(&self, specs: &[KeySpec], keys: &RunKeys) -> Result<ScanPlan> {
+        check_key_types(self.schema(), keys)?;
+        Planner::plan(self, specs, &lookup(keys))
+    }
+
+    fn with_transient(
+        &self,
+        transient: &[Arc<TransientIndex>],
+    ) -> Result<Box<dyn PlanSource + '_>> {
+        let extra = checked(self, transient)?;
+        Ok(Box::new(WithTransient {
+            planner: self,
+            extra,
+        }))
+    }
+}
+
+/// The build planner with transient specs added.
+struct WithTransient<'a, S: StoreExt + ?Sized> {
+    planner: &'a Planner<S>,
+    extra: Vec<TransientSpec>,
+}
+
+impl<S> PlanSource for WithTransient<'_, S>
+where
+    S: StoreExt + ?Sized + Send + Sync,
+{
+    fn manifest_version(&self) -> String {
+        self.planner.sequence().to_string()
+    }
+
+    fn specs(&self) -> Vec<KeySpec> {
+        let mut out = PlanSource::specs(self.planner);
+        for t in &self.extra {
+            if !out.contains(&t.spec) {
+                out.push(t.spec.clone());
+            }
+        }
+        out
+    }
+
+    fn plan(&self, specs: &[KeySpec], keys: &RunKeys) -> Result<ScanPlan> {
+        check_key_types(self.planner.schema(), keys)?;
+        self.planner
+            .plan_with_transient(specs, &lookup(keys), &self.extra)
+    }
+
+    fn with_transient(
+        &self,
+        transient: &[Arc<TransientIndex>],
+    ) -> Result<Box<dyn PlanSource + '_>> {
+        let mut extra = self.extra.clone();
+        for t in checked(self.planner, transient)? {
+            if extra.iter().any(|e| e.spec == t.spec) {
+                return Err(Error::KeySpec(format!(
+                    "key spec {:?} already has transient segments in this planner",
+                    t.spec
+                )));
+            }
+            extra.push(t);
+        }
+        Ok(Box::new(WithTransient {
+            planner: self.planner,
+            extra,
+        }))
+    }
+}

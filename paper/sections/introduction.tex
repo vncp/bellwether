@@ -1,0 +1,87 @@
+\section{Introduction}\label{sec:intro}
+
+An index advisor chooses indexes for a workload by asking, for each candidate
+configuration, what every query would cost if that configuration existed.
+Relational systems answer with the optimizer's what-if interface, which costs a
+query against hypothetical indexes that are never built~\cite{whatif1998}, and
+advisors search over configurations with that interface as their
+oracle~\cite{autoadmin1997,bruno2005relax,kossmann2020}. The oracle is an
+estimate. Cardinality estimates in industrial optimizers are routinely and
+substantially wrong~\cite{leis2015}, and optimizer estimates often predict that
+an index will help a query that it in fact slows down~\cite{aimeetsai}. A recent
+study on SQL Server found that index configurations recommended by large
+language models, which often look worse than the industrial tuner's under the
+optimizer's estimated cost, in several cases ran faster in actual execution,
+although their quality varied widely~\cite{dtallm2026}. An advisor that ranks by
+estimate can be outperformed by one that ignores the estimate.
+
+Much analytical data now lives as open columnar files, typically Parquet, in
+object storage, read by several engines rather than owned by
+one~\cite{lakehouse2021}. Table formats record per-file statistics for data
+skipping~\cite{deltalake,icebergspec}, and indexing subsystems add secondary
+indexes for particular engines, in one case with what-if analysis over
+hypothetical indexes inside that engine's optimizer~\cite{hyperspace}. The
+storage tier itself has no optimizer, and so no what-if interface that every
+engine reading the files can share, and none that is exact. Classical advisors
+therefore have no engine-independent oracle there, and language-model tuners
+have nothing trustworthy to be scored against.
+
+We observe that this absence is an opportunity. A lake exposes its files. For
+keyed workloads (look up a batch of keys, find the latest version of each key,
+or find the version current at a timestamp), the I/O a run performs under a
+hypothetical index depends on three things that can be recorded or read: the
+run's key set, the row groups that contain each key, and the compressed size of
+each row group. Replaying a recorded workload against row-group metadata
+therefore computes, rather than estimates, the bytes, row groups, and files each
+run would read under a candidate key specification (\adr{005}). We call this an
+exact counterfactual what-if interface. Its exactness is scoped: it covers I/O
+over files that exist, so a hypothetical layout is costed exactly only once it
+is materialized, and costs above the scan come from measured execution
+(Section~\ref{sec:exact}).
+
+An exact oracle also changes what can be trusted from a language model.
+LLM-based rewriters~\cite{genrewrite,llmr2,lithe,quite,e3rewrite,resequel}
+generate candidates that must be scored and checked. Scoring by estimate
+inherits the problem above. Checking with an equivalence
+prover~\cite{cosette,qed,sqlsolver,verieql} covers restricted SQL fragments,
+while pipeline steps are written in Spark, KQL, Scala, and configuration
+(\adr{004}), and many useful changes are not query rewrites at all: an index, a
+layout, a lookback bound. Bellwether therefore gives the model no authority. A
+model may observe and propose; only the engine may measure, verify, and apply
+(\adr{009}). The verifier is reconciliation of the pipeline's output over the
+keys the workload touched (\adr{004}). This paper makes five contributions.
+
+\begin{enumerate}[leftmargin=*,label=\textbf{C\arabic*}]
+  \item \textbf{An exact counterfactual what-if interface for lakes.} Replay
+    of recorded key sets against row-group metadata yields the exact I/O cost of
+    hypothetical key specs (including composite and temporal keys) and plans
+    over existing files; zero estimation error is a falsifiable design property
+    (Section~\ref{sec:whatif}).
+  \item \textbf{Reconciliation certificates.} Index-accelerated reconciliation
+    by latest version, canonical row hash, and exact decimal totals yields
+    certificates with an explicit coverage statement where SQL provers cannot
+    apply; gating at the pipeline output admits non-local rewrites
+    (Section~\ref{sec:cert}).
+  \item \textbf{A hybrid proposer loop.} A reflective, population-based
+    optimizer over plans, designs, and pipelines uses counterfactual attribution
+    as its backward pass, a language model for structure, exact
+    finite-difference descent for knobs, rule-driven enumeration, and Pareto
+    selection across runs (Section~\ref{sec:evolve}).
+  \item \textbf{A validated rulebook.} Distilled rules are promoted only when
+    held-out replay reproduces a gain and the gate passes
+    (Section~\ref{sec:rulebook}).
+  \item \textbf{A trust boundary and a replayable ledger.} Every step is a
+    content-addressed record, nothing a proposer emits is a score, and a search
+    replays from its ledger byte for byte (Sections~\ref{sec:overview}
+    and~\ref{sec:determinism}).
+\end{enumerate}
+
+This paper describes a fixed, documented design~\cite{bellwether} and a system
+under construction; we cite design documents by file name and decision records
+as ADR~001 to ADR~025. The contract, source, and ledger crates are merged, the
+index core and two further crates are in review, and the optimizer is planned
+(Section~\ref{sec:impl}). The evaluation methodology was fixed before any
+implementation (\adr{019}); Section~\ref{sec:eval} reports it in full and marks
+every result as pending. The paper's claims are therefore design properties,
+each tied to a design document or an invariant with a named test, and none is a
+measurement.

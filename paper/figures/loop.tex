@@ -1,0 +1,65 @@
+% The four-stage loop and the trust boundary (docs/architecture.md).
+% Redrawn from docs/assets/loop-light.svg. Used in a figure* environment.
+\begin{tikzpicture}[
+    font=\footnotesize,
+    stage/.style={draw, thick, rounded corners=2pt, text width=3.15cm,
+                  minimum height=2.05cm, align=center, inner sep=3pt},
+    agent/.style={stage, fill=black!4},
+    engine/.style={stage, fill=black!12},
+    rec/.style={draw, rounded corners=1pt, fill=white, inner sep=2.5pt,
+                font=\footnotesize\sffamily},
+    tier/.style={font=\scriptsize\ttfamily, text=black!75},
+    flow/.style={-{Stealth[length=2.2mm]}, thick},
+    walk/.style={-{Stealth[length=1.6mm]}, semithick, black!70},
+    drop/.style={-{Stealth[length=1.6mm]}, semithick, densely dotted},
+  ]
+  % Stages.
+  \node[agent]  (obs) at (0.0,0) {\textbf{1\quad Observe}\\[2pt]
+      agent or human\\ read-only, cache-backed,\\ no network, no writes};
+  \node[agent]  (pro) at (3.75,0) {\textbf{2\quad Propose}\\[2pt]
+      agent or human\\ a candidate change;\\ no score field exists};
+  \node[engine] (sco) at (9.05,0) {\textbf{3\quad Score + verify}\\[2pt]
+      engine only\\ exact replay of recorded\\ runs; reconcile outputs};
+  \node[engine] (app) at (12.8,0) {\textbf{4\quad Apply + attest}\\[2pt]
+      engine only\\ refuses without a passing\\ current Certificate};
+
+  % Interface tiers.
+  \node[tier, above=2pt of obs] {observe.*};
+  \node[tier, above=2pt of pro] {propose.*};
+  \node[tier, above=2pt of sco] {engine internal};
+  \node[tier, above=2pt of app] {apply.* (Certificate id only)};
+
+  % Flow between stages.
+  \draw[flow] (obs) -- (pro);
+  \draw[flow] (pro) -- (sco);
+  \draw[flow] (sco) -- (app);
+
+  % Trust boundary.
+  \draw[dashed, very thick] (6.4,1.55) -- (6.4,-1.85);
+  \node[font=\footnotesize\bfseries, fill=white, inner sep=1pt] at (6.4,1.75)
+      {trust boundary};
+  \node[font=\scriptsize, fill=white, inner sep=1pt, align=center] at (6.4,-1.45)
+      {agent authority ends};
+
+  % Ledger band and the records each stage writes.
+  \node[draw, rounded corners=2pt, fill=black!2, minimum width=16.6cm,
+        minimum height=0.95cm] (ledger) at (6.4,-2.45) {};
+  \node[font=\scriptsize, anchor=north] at (ledger.south)
+      {ledger: append-only; each record is named by the BLAKE3 hash of its canonical JSON};
+  \node[rec] (ev)   at (0.0,-2.45)  {Evidence};
+  \node[rec] (pr)   at (3.75,-2.45) {Proposal};
+  \node[rec] (rp)   at (8.25,-2.45) {Replay};
+  \node[rec] (ce)   at (9.95,-2.45) {Certificate};
+  \node[rec] (rc)   at (12.8,-2.45) {Receipt};
+  \draw[drop] (obs.south) -- (ev.north);
+  \draw[drop] (pro.south) -- (pr.north);
+  \draw[drop] (sco.south) ++(-0.8,0) -- (rp.north);
+  \draw[drop] (sco.south) ++(0.9,0) -- (ce.north);
+  \draw[drop] (app.south) -- (rc.north);
+
+  % Order in which a reviewer walks back from a Receipt.
+  \draw[walk] (rc) -- (ce);
+  \draw[walk] (ce) -- (rp);
+  \draw[walk] (rp) -- (pr);
+  \draw[walk] (pr) -- (ev);
+\end{tikzpicture}

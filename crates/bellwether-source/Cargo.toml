@@ -1,0 +1,26 @@
+[package]
+name = "bellwether-source"
+description = "Source implementations for Bellwether: Parquet row groups and chunked CSV/JSON lines, with file fingerprints."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[dependencies]
+bellwether-types = { path = "../bellwether-types" }
+arrow = { workspace = true, features = ["csv", "json"] }
+parquet = { workspace = true, features = ["arrow"] }
+blake3 = { workspace = true }
+bytes = { workspace = true }
+# The catalog digest serializes its input as canonical JSON.
+serde = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
+serde_json = { workspace = true }
+
+[lints]
+workspace = true

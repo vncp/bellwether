@@ -1,0 +1,113 @@
+\section{System Overview}\label{sec:overview}
+
+Bellwether is a standalone engine for folders of Parquet files; CSV and
+JSON-lines files are read by treating fixed byte-range chunks as row groups, so
+nothing above the source layer sees the difference (\doc{format.md}). It
+explains why a keyed query read more than it returned, proposes a change from
+exact measurement, and attests that the change returns the same rows
+(\doc{architecture.md}). It does not execute queries. It emits a scan plan, a
+superset of the row groups that hold the queried keys together with a residual
+predicate, and an engine such as DuckDB, DataFusion, or Spark reads the rows
+(\adr{011}).
+
+\subsection{The boundary and the loop}\label{sec:loop}
+
+One sentence governs the design (\doc{architecture.md}): \emph{the agent may
+observe and propose; only the engine may measure, verify, and apply; and
+nothing crosses from the first side to the second without a content-addressed
+record of why.} Figure~\ref{fig:loop} shows the four stages.
+(1)~\emph{Observe}: an agent or a human reads Evidence, such as fanout per
+column (the files and row groups one value touches, at p50, p95, and max),
+lints from the rule catalog, a workload summary, or a scan plan; observe tools
+are read-only, cache-backed, make no network calls, and have a 100\,ms budget.
+(2)~\emph{Propose}: the agent writes a Proposal, which is a key specification,
+a layout, or a rewrite described as data (before shape, after shape, invariant).
+The Proposal type has no score field, so a score cannot be injected
+(\doc{threat-model.md}). (3)~\emph{Score and verify}: the engine replays the
+recorded workload under the current configuration and under the proposal and
+writes a Replay of per-run costs (Section~\ref{sec:whatif}); it then builds the
+candidate, runs the job both ways, reconciles the outputs, and writes a
+Certificate (Section~\ref{sec:cert}). (4)~\emph{Apply and attest}: the engine
+refuses unless the Certificate passed and was computed against the current
+manifest, applies the change, and only then writes a Receipt that links the
+chain and records the manifest sequence before and after (invariant~2).
+
+The command-line interface and the Model Context Protocol (MCP)
+server~\cite{mcpspec} share one code path, so humans and agents see identical
+evidence (\adr{010}). MCP tools come in three tiers that follow the stages,
+\code{observe.*}, \code{propose.*}, and \code{apply.*}, and \code{apply.*}
+accepts only a Certificate id.
+
+\begin{figure*}[t]
+  \centering
+  \input{figures/loop}
+  \caption{The four-stage loop and the trust boundary, after
+    \doc{docs/architecture.md}. Stages 1 and 2 are open to an agent; stages 3
+    and 4 run only inside the engine. Every stage writes a record to the
+    ledger. Arrows inside the ledger show the order in which a reviewer walks
+    back from a Receipt to the Evidence it rests on.}
+  \Description{Four boxes in a row: Observe and Propose on the agent side,
+    Score plus verify and Apply plus attest on the engine side, separated by a
+    dashed vertical line labeled trust boundary. Each box writes a record into
+    a ledger band below: Evidence, Proposal, Replay and Certificate, Receipt.}
+  \label{fig:loop}
+\end{figure*}
+
+\subsection{Records, ledger, and threat model}\label{sec:ledger}
+
+Every record is canonical JSON named by the BLAKE3 hash~\cite{blake3} of its
+bytes and stored append-only (\adr{006}); field order is part of the hash, and
+every record carries a version (\doc{format.md}). The current contract,
+implemented as Rust types, has five records: Evidence, Proposal, Replay,
+Certificate, and Receipt, and only the engine writes the last three. Evidence
+and Certificates carry provenance (input hashes, the age of the oldest input, a
+creation time, and the manifest version when one exists; invariant~6), so a
+stale measurement cannot pass as fresh. Because
+records link by hash, a reviewer or a continuous integration gate reads one
+Receipt and can check every step behind it.
+
+The threat model claims that a compromised, confused, or hallucinating agent
+can waste time by proposing bad ideas and can do nothing else
+(\doc{threat-model.md}). No tool accepts a file path to write, a shell command,
+or a query string to execute, because rewrites are data and never code the
+engine runs. The engine never consults a model for a score, a verification
+outcome, or an apply decision (\adr{009}, as amended). Content addressing makes
+tampering detectable but not preventable until records are signed, and an
+attacker with write access to the store is out of scope.
+
+\subsection{Storage, crates, and invariants}\label{sec:storage}
+
+The engine's state lives beside the data: immutable segments named by their
+content hash, a manifest committed by conditional PUT, the ledger, and a
+rebuildable cache (\doc{format.md}, \adr{003}). A writer that loses the
+conditional PUT re-reads the manifest, unions its segments with the winner's,
+and retries, so readers never block (\adr{015}). The manifest carries a
+sequence number that increases by one per commit, and replays and receipts
+reference manifests by it (\adr{020}). Crate dependencies point one way: the
+index core and the source readers know nothing above them
+(Section~\ref{sec:impl}). Table~\ref{tab:invariants} lists the six invariants;
+each is paired with a test that fails if it stops holding
+(\doc{invariants.md}).
+
+\begin{table}[t]
+  \caption{Invariants and the crates that enforce them, from
+    \doc{docs/invariants.md}.}
+  \label{tab:invariants}
+  \small
+  \begin{tabular}{@{}r>{\raggedright\arraybackslash}p{0.62\columnwidth}l@{}}
+    \toprule
+    \# & Invariant & Crate \\
+    \midrule
+    1 & No false negatives in pruning: a row group that holds a queried key is
+        in the scan plan, on every index path. & core \\
+    2 & A Receipt implies a passing Certificate computed against the manifest
+        it was applied to. & ledger \\
+    3 & Replay is deterministic: same manifest, workload, and proposal give a
+        byte-identical Replay. & replay \\
+    4 & Readers see one manifest version while a build commits. & store \\
+    5 & A temporal lookup never returns a superseded row. & core \\
+    6 & Evidence and Certificates carry provenance: inputs, age, and creation
+        time; a Certificate also names its manifest. & ledger, profile \\
+    \bottomrule
+  \end{tabular}
+\end{table}

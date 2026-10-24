@@ -1,0 +1,30 @@
+% Panel: measured versus predicted bytes per run, one marker series per
+% strategy, with the line y = x. Data: data/realized.csv; schema in
+% data/README.md.
+\IfFileExists{data/realized.csv}{%
+  \begingroup\bwdatacatcodes
+  \bwloglimits{data/realized.csv}{predicted_bytes}{realized_bytes}%
+  \begin{bwpanel}{4.1cm}
+    \begin{axis}[bw, bw box={4.1cm}{0.95cm}{0.85cm}{0.12cm}{0.62cm},
+        xmode=log, ymode=log,
+        xmin=\bwlo, xmax=\bwhi, ymin=\bwlo, ymax=\bwhi,
+        xlabel={predicted bytes}, ylabel={measured bytes},
+        legend columns=-1]
+      \addplot[bwAxis, line width=0.5pt, mark=none, forget plot]
+        coordinates {(\bwlo,\bwlo) (\bwhi,\bwhi)};
+      \addplot[bwA, only marks, mark=o, bw only={strategy}{index}]
+        table[x=predicted_bytes, y=realized_bytes] {data/realized.csv};
+      \addlegendentry{replay, lookups}
+      \addplot[bwC, only marks, mark=triangle, bw only={strategy}{evolve}]
+        table[x=predicted_bytes, y=realized_bytes] {data/realized.csv};
+      \addlegendentry{replay, evolve}
+      \addplot[bwB, only marks, mark=square, bw only={strategy}{estimate}]
+        table[x=predicted_bytes, y=realized_bytes] {data/realized.csv};
+      \addlegendentry{estimate}
+    \end{axis}
+  \end{bwpanel}%
+  \endgroup
+}{%
+  \pendingfigure[\scriptsize]{4.1cm}{measured versus predicted bytes per run,
+    per strategy, with the diagonal}{realized}%
+}%

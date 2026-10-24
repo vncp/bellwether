@@ -1,0 +1,22 @@
+% Panel: lookup latency versus corpus size, one line per strategy at p50 with
+% a band to p95. Data: data/latency.csv; schema in data/README.md.
+\IfFileExists{data/latency.csv}{%
+  \begingroup\bwdatacatcodes
+  \begin{bwpanel}{4.1cm}
+    \begin{axis}[bw, bw box={4.1cm}{0.95cm}{0.85cm}{0.12cm}{0.62cm},
+        xmode=log, ymode=log, xmin=7, xmax=1400,
+        xtick={10,120,960}, xticklabels={10,120,960},
+        xlabel={files in corpus}, ylabel={latency per lookup (ms)},
+        legend columns=3]
+      \bwlatencyseries{index}{Bellwether}
+      \bwlatencyseries{stats}{Parquet stats}
+      \bwlatencyseries{datafusion}{DataFusion}
+      \bwlatencyseries{duckdb}{DuckDB}
+      \bwlatencyseries{raw}{raw scan}
+    \end{axis}
+  \end{bwpanel}%
+  \endgroup
+}{%
+  \pendingfigure[\scriptsize]{4.1cm}{lookup latency versus corpus size per
+    strategy, at p50 with a band to p95}{latency}%
+}%

@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 56853d1ddd5e8a8c23e7fae757e1c0ca7c26936f14861778c017131dfa0b0dea # shrinks to layout = [[], [], [], [Row { id: Some(14), tag: Some("a\0"), ts: Some(0) }], [], [], [], [], [], [], [], []], cuts = [13], allowed_mask = 0, id = 14, tag = "a\0"

@@ -1,0 +1,32 @@
+[package]
+name = "bellwether-core"
+description = "Canonical key encoding, split-block bloom filters, segment reader and writer, temporal version chains, and segment merge for the Bellwether engine."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[dependencies]
+bellwether-types = { path = "../bellwether-types" }
+arrow = { workspace = true }
+blake3 = { workspace = true }
+roaring = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+xxhash-rust = { workspace = true }
+
+[dev-dependencies]
+bytes = { workspace = true }
+parquet = { workspace = true }
+proptest = { workspace = true }
+criterion = { workspace = true }
+
+[[bench]]
+name = "lookup"
+harness = false
+
+[lints]
+workspace = true

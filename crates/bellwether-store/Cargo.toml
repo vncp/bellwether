@@ -1,0 +1,29 @@
+[package]
+name = "bellwether-store"
+description = "Store over object_store with per-backend conditional PUT, the manifest commit protocol, snapshots, a content-addressed cache, and GC."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[dependencies]
+bellwether-types = { path = "../bellwether-types" }
+object_store = { workspace = true, features = ["aws", "azure", "gcp"] }
+tokio = { workspace = true }
+futures = { workspace = true }
+bytes = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+fs4 = { workspace = true }
+url = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[lints]
+workspace = true

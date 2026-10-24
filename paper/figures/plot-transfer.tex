@@ -1,0 +1,32 @@
+% Panel: rulebook transfer. Held-out gain of each promoted rule applied
+% alone, with its confidence as error bars, and the gain of rules 1 to i
+% applied together. Data: data/transfer.csv; schema in data/README.md.
+\IfFileExists{data/transfer.csv}{%
+  \begingroup\bwdatacatcodes
+  \begin{bwpanel}{4.1cm}
+    \begin{axis}[bw, bw box={4.1cm}{1.75cm}{0.85cm}{0.12cm}{0.62cm},
+        y dir=reverse, ytick=data, ymajorgrids=false,
+        yticklabels from table={data/transfer.csv}{label},
+        enlarge y limits={abs=0.6},
+        xlabel={held-out gain (\% of bytes)},
+        legend columns=-1]
+      \addplot[xbar, bar width=3.6pt, fill=bwA, draw=none,
+          legend image code/.code={\fill[bwA] (0cm,-0.06cm) rectangle (0.42cm,0.06cm);},
+          error bars/.cd, x dir=both, x explicit,
+          error bar style={bwInk, line width=0.5pt},
+          error mark options={bwInk, rotate=90, mark size=1.4pt}]
+        table[y=rank, x=gain_pct,
+          x error plus expr=\thisrow{hi_pct}-\thisrow{gain_pct},
+          x error minus expr=\thisrow{gain_pct}-\thisrow{lo_pct}]
+        {data/transfer.csv};
+      \addlegendentry{rule alone}
+      \addplot[bwB, mark=*, mark options={solid}]
+        table[y=rank, x=cumulative_pct] {data/transfer.csv};
+      \addlegendentry{rules $1..i$ together}
+    \end{axis}
+  \end{bwpanel}%
+  \endgroup
+}{%
+  \pendingfigure[\scriptsize]{4.1cm}{held-out gain per promoted rule, with its
+    confidence, and the cumulative gain}{transfer}%
+}%

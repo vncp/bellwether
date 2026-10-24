@@ -1,0 +1,67 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/bellwether",
+    "crates/bellwether-bench",
+    "crates/bellwether-build",
+    "crates/bellwether-cli",
+    "crates/bellwether-core",
+    "crates/bellwether-ledger",
+    "crates/bellwether-profile",
+    "crates/bellwether-replay",
+    "crates/bellwether-source",
+    "crates/bellwether-store",
+    "crates/bellwether-types",
+    "crates/bellwether-verify",
+]
+# Crates are added to `members` as their work package lands:
+#   crates/bellwether-mcp
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.80"
+license-file = "LICENSE.md"
+repository = "https://github.com/vncp/bellwether"
+authors = ["Vincent Pham"]
+publish = false  # pre-alpha; flips at the 0.1.0 release together with an SPDX license form
+
+[workspace.dependencies]
+# shared, pinned once here; crates reference them with `workspace = true`
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["float_roundtrip"] }
+thiserror = "1"
+blake3 = "1"
+bytes = "1"
+roaring = "0.10"
+arrow = "53"
+arrow-schema = "53"
+parquet = "53"
+object_store = "0.11"
+xxhash-rust = { version = "0.8", features = ["xxh64", "xxh3"] }
+rayon = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "io-util"] }
+tracing = "0.1"
+futures = "0.3"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+fs4 = { version = "0.13", features = ["sync"] }
+url = "2"
+tempfile = "3"
+proptest = "1"
+criterion = "0.5"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+unwrap_used = "warn"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+module_name_repetitions = "allow"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

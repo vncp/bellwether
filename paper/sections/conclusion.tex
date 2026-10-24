@@ -1,0 +1,12 @@
+\section{Conclusion}\label{sec:conclusion}
+
+Index advisors and language-model tuners are both limited by the estimate they
+score against. A data lake exposes its files, so the I/O cost of a hypothetical
+index, key, or plan over those files can be computed exactly by replaying
+recorded key sets against row-group metadata. Bellwether builds on that
+observation with an exact counterfactual what-if interface, reconciliation
+certificates that admit non-local rewrites, a reflective optimizer whose
+backward pass is counterfactual attribution and whose selection is Pareto over
+recorded runs, a rulebook promoted only by held-out replay, and a boundary under
+which a model proposes and only the engine scores, verifies, and applies. The
+design and the evaluation are fixed; the results are pending.

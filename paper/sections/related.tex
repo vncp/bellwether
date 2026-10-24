@@ -1,0 +1,86 @@
+\section{Background and Related Work}\label{sec:related}
+
+\paragraph{Index advisors and the what-if interface.} AutoAdmin introduced
+cost-driven index selection that stays in step with the
+optimizer~\cite{autoadmin1997} and the what-if interface that costs hypothetical
+indexes without building them~\cite{whatif1998}. Later work replaced bottom-up
+heuristics with a relaxation-based search~\cite{bruno2005relax}, and an
+experimental study compares index selection algorithms~\cite{kossmann2020}. All of them score candidates with optimizer
+estimates. Estimation errors are large and routine~\cite{leis2015}; one
+response replaces optimizer-based plan comparison inside tuners with a
+classifier trained on executions~\cite{aimeetsai}. Language models now act as
+advisors: LLMIA uses in-context demonstrations and database
+feedback~\cite{llmia}, AMAZe coordinates zero-shot agents~\cite{amaze}, and
+EvoTune tunes knobs, query hints, and indexes together with a memory of past
+tuning feedback~\cite{memtuning}. Bellwether addresses a narrower class of
+decisions than a relational advisor, keyed I/O over lake files, and in exchange
+removes the estimate from that class.
+
+\paragraph{LLM query rewriting.} GenRewrite guides a model with natural-language
+rewrite rules and repairs its output in a counterexample-guided
+loop~\cite{genrewrite}. LLM-R\textsuperscript{2} has a model select rules for
+a conventional rule-based rewriter~\cite{llmr2}. LITHE combines prompt
+ensembles, database-aware prompts, and search guided by token probabilities,
+and applies logic-based and statistical checks before it shows a
+rewrite~\cite{lithe}. QUITE coordinates training-free agents with live database
+feedback~\cite{quite}. E3-Rewrite trains a rewriter by reinforcement learning
+with rewards for executability, equivalence, and efficiency~\cite{e3rewrite}.
+ReSequel turns catalog metadata into template-specific rules for the model and
+checks candidate rewrites on sampled data~\cite{resequel}. Each rewrites SQL
+queries individually and judges a rewrite by optimizer estimates, execution, or
+checks on data. Evolve differs in three respects: it searches against a
+recorded workload with a loss that is exact for I/O; it selects by Pareto
+dominance over runs rather than by one score; and its artifacts include
+indexes, layouts, knobs, and multi-step pipelines, gated at the pipeline output.
+
+\paragraph{Equivalence verification.} Cosette combines constraint solving with
+an interactive proof assistant~\cite{cosette}. SQLSolver reduces equivalence to
+linear integer arithmetic extended with unbounded sums~\cite{sqlsolver}.
+VeriEQL proves or refutes bounded equivalence under integrity constraints and
+returns counterexamples~\cite{verieql}. QED decides equivalence under bag
+semantics for a defined fragment~\cite{qed}. EquiTrace builds equivalence
+proofs from an optimizer's rewrite rules~\cite{equitrace}, and Narasayya and
+Chaudhuri use the optimizer's own machinery to check the soundness of LLM-based
+rewrites on real workloads~\cite{narasayya2026verify}. These tools establish
+equivalence for all instances within a SQL fragment. Reconciliation checks one
+property, output equality over a stated key scope, for any language and for
+changes that are not rewrites (Section~\ref{sec:provers}); the two compose.
+
+\paragraph{Layouts and data skipping.} Small materialized aggregates skip blocks
+using per-block summaries~\cite{moerkotte1998sma}. Workload-aware partitioning
+groups tuples so that queries skip blocks~\cite{sun2014skipping}; Qd-tree learns
+a routing tree for records from a workload~\cite{qdtree}; MTO optimizes block
+layouts jointly across tables that are joined~\cite{ding2021layouts}; LRP
+builds partitions that are robust to shifts in the query
+distribution~\cite{lrp2025}; and WAIR reclusters only the micro-partitions that sit
+on query-range boundaries~\cite{recluster2026}. These methods choose layouts.
+Evolve treats a layout as one candidate among keys and knobs, costs it exactly
+once it is materialized, and gates it by reconciliation.
+
+\paragraph{Lake indexing.} Delta Lake records per-file minimum and maximum
+statistics in its log and uses them to skip files~\cite{deltalake}, and
+Iceberg's manifests carry per-file column bounds for scan
+planning~\cite{icebergspec}. Parquet embeds split-block Bloom filters hashed
+with XXH64~\cite{parquetbloom}, a blocked design that follows Putze et
+al.~\cite{putze2007}. Hyperspace builds secondary indexes over lake files for
+Spark in Azure Synapse, and its paper describes what-if analysis and index
+recommendation over hypothetical indexes within that engine's
+optimizer~\cite{hyperspace}. Apache Hudi maintains bloom, record-level, and column-statistics indexes inside its table format~\cite{hudi}, and ClickHouse offers data-skipping indexes (min/max, set, and bloom variants) over granules inside the engine~\cite{clickhouse}; Parquet itself carries a page index and optional bloom filters~\cite{parquetbloom}. Each is coupled to a table format or an engine, none runs over plain files from a single process, and none advises which key to index. Learned Bloom
+filters trade a model for filter space~\cite{plbf2021,plbf2410,cascadedlbf}; they
+are a deferred research direction for Bellwether (\doc{work-packages.md}).
+Bellwether's index kinds are not new. What it adds is an exact what-if interface
+that no single engine owns, certificates, and a boundary between a proposer and
+the engine that scores it.
+
+\paragraph{Text-space optimization.} ProTeGi~\cite{protegi} and
+TextGrad~\cite{textgrad} improve prompts and other text with natural-language
+feedback treated as a gradient. DSPy compiles declarative pipelines of
+language-model calls~\cite{dspy}, and MIPRO optimizes their instructions and
+demonstrations~\cite{mipro}. GEPA evolves prompts by reflection and draws
+candidates from the Pareto frontier of its own attempts~\cite{gepa}. SkillOpt
+edits an agent's skill document and accepts an edit only if it improves a
+held-out validation score~\cite{skillopt}. Evolve borrows the reflective,
+population-based loop, Pareto selection, and the validation gate, and makes
+three substitutions (\adr{021}): an exact replay replaces the benchmark score,
+counterfactual attribution replaces credit assignment inferred by the model,
+and a hard equivalence gate replaces an optional check.

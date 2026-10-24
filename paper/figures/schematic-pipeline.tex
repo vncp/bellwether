@@ -1,0 +1,53 @@
+% Schematic; no measured quantities. Whole-pipeline equivalence: the
+% candidate pushes step five's semi-join on the trigger keys into step two.
+% Intermediate outputs differ; the certificate compares only the pipeline
+% outputs, over the touched keys (Section 5.4).
+\begin{tikzpicture}[
+    font=\scriptsize,
+    st/.style={draw, rounded corners=1.5pt, fill=black!4, inner sep=1pt,
+               minimum height=0.62cm, minimum width=0.6cm, align=center},
+    wide/.style={st, minimum width=1.15cm},
+    moved/.style={wide, draw=bwA, very thick},
+    outn/.style={draw, rounded corners=4pt, fill=white, inner sep=1pt,
+                 minimum height=0.62cm, minimum width=0.62cm},
+    flow/.style={-{Stealth[length=1.3mm]}, semithick},
+  ]
+  % Baseline a_0, above.
+  \node[anchor=east, inner sep=1pt] at (0.4,2.95) {$a_0$};
+  \node[st]    (top1) at (0.75,2.95) {1};
+  \node[wide]  (top2) at (1.95,2.95) {2: latest,\\[-1pt]all keys};
+  \node[st]    (top3) at (3.10,2.95) {3};
+  \node[st]    (top4) at (3.95,2.95) {4};
+  \node[wide]  (top5) at (5.10,2.95) {5: semi-join\\[-1pt]on $K_r$};
+  \node[outn]  (topO) at (6.25,2.95) {$O_0$};
+  % Candidate a, below.
+  \node[anchor=east, inner sep=1pt] at (0.4,1.25) {$a$};
+  \node[st]    (bot1) at (0.75,1.25) {1};
+  \node[moved] (bot2) at (1.95,1.25) {2: latest,\\[-1pt]$K_r$ only};
+  \node[st]    (bot3) at (3.10,1.25) {3};
+  \node[st]    (bot4) at (3.95,1.25) {4};
+  \node[wide]  (bot5) at (5.10,1.25) {5};
+  \node[outn]  (botO) at (6.25,1.25) {$O$};
+  \foreach \r in {top, bot} {
+    \draw[flow] (\r1) -- (\r2);
+    \draw[flow] (\r2) -- (\r3);
+    \draw[flow] (\r3) -- (\r4);
+    \draw[flow] (\r4) -- (\r5);
+    \draw[flow] (\r5) -- (\r O);
+  }
+  % Intermediate outputs differ: a per-step check rejects the candidate.
+  \foreach \x in {2.66,3.52,4.39} {
+    \node[text=bwB, font=\footnotesize] at (\x,2.1) {$\neq$};
+  }
+  \node[text=bwB, anchor=east, inner sep=1pt] at (2.42,2.1) {per step: reject};
+  % Pipeline outputs agree over the touched keys: the certificate passes.
+  \node[text=bwA, font=\footnotesize] at (6.25,2.1) {$=$};
+  \node[draw=bwA, thick, rounded corners=1.5pt, fill=white, inner sep=1.5pt,
+        align=center, anchor=west] at (6.72,2.1)
+    {output\\[-1pt]certificate over\\[-1pt]touched keys:\\[-1pt]pass};
+  % The move.
+  \draw[flow, bwA, thick] (bot5.south) to[out=-155, in=-25]
+    node[pos=0.5, below, inner sep=1.5pt, text=bwInk]
+      {semi-join on the trigger keys $K_r$ pushed from step 5 into step 2}
+    (bot2.south);
+\end{tikzpicture}%

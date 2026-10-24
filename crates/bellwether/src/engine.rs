@@ -1,0 +1,695 @@
+//! [`Engine`]: the data root, the index store, and what every operation
+//! shares (sources, the pinned manifest, the ledger, the cache, the clock).
+
+use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, OnceLock};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use arrow::datatypes::SchemaRef;
+use bellwether_build::{Planner, SourceKind};
+use bellwether_ledger::Ledger;
+use bellwether_source::{
+    fingerprint_with_policy, ChunkedTextSource, FingerprintPolicy, LocalFs, ParquetSource,
+    Storage as _, TextFormat,
+};
+use bellwether_store::{
+    manifest_path, now_rfc3339, parse_rfc3339, Cache, Manifest, ObjectStoreBackend, Snapshot,
+    StoreExt,
+};
+use bellwether_types::{Error, FileFingerprint, Hash, KeySpec, Record, Result, Source};
+use serde::{Deserialize, Serialize};
+
+use crate::results::Written;
+
+/// Where the issue tracker lives, named by every internal-error message.
+pub const ISSUE_TRACKER: &str = "https://github.com/vncp/bellwether/issues";
+
+/// Name of the default index directory inside the data root. Discovery
+/// skips names that start with `.`, so the index is never read as data.
+pub const DEFAULT_INDEX_DIR: &str = ".bellwether";
+
+/// How many times a manifest pin is retried when a commit lands between
+/// reading the manifest's bytes and pinning its snapshot.
+const PIN_ATTEMPTS: usize = 8;
+
+/// The kind of files under the data root.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SourceFormat {
+    /// Parquet files; row groups are the files' own.
+    #[default]
+    Parquet,
+    /// Delimited text; row groups are byte-range chunks.
+    Csv {
+        /// Field delimiter.
+        delimiter: u8,
+        /// Whether each file starts with a header row.
+        has_header: bool,
+    },
+    /// JSON lines; row groups are byte-range chunks.
+    JsonLines,
+}
+
+impl SourceFormat {
+    /// The build crate's source kind.
+    #[must_use]
+    pub fn kind(self) -> SourceKind {
+        match self {
+            Self::Parquet => SourceKind::Parquet,
+            Self::Csv {
+                delimiter,
+                has_header,
+            } => SourceKind::Csv {
+                delimiter,
+                has_header,
+            },
+            Self::JsonLines => SourceKind::JsonLines,
+        }
+    }
+
+    fn from_kind(kind: SourceKind) -> Self {
+        match kind {
+            SourceKind::Parquet => Self::Parquet,
+            SourceKind::Csv {
+                delimiter,
+                has_header,
+            } => Self::Csv {
+                delimiter,
+                has_header,
+            },
+            SourceKind::JsonLines => Self::JsonLines,
+        }
+    }
+
+    fn text(self) -> Option<TextFormat> {
+        match self {
+            Self::Parquet => None,
+            Self::Csv {
+                delimiter,
+                has_header,
+            } => Some(TextFormat::Csv {
+                delimiter,
+                has_header,
+            }),
+            Self::JsonLines => Some(TextFormat::JsonLines),
+        }
+    }
+}
+
+/// How to open an [`Engine`].
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct EngineOptions {
+    /// The index location: a local path or an object-store URL (`s3://`,
+    /// `az://`, `gs://`, `file://`, `memory://`). Default:
+    /// `<root>/.bellwether/`.
+    pub index: Option<String>,
+    /// The kind of files under the data root. An existing index's recorded
+    /// kind must agree.
+    pub format: SourceFormat,
+    /// Chunk size for text files seen for the first time. `None` keeps the
+    /// size the index records, or 64 MiB for a new index.
+    pub chunk_size: Option<u64>,
+    /// The dataset schema, overriding inference from the first file (for
+    /// example when files hold one decimal column at different scales).
+    /// An index records its schema at its first build; afterwards the
+    /// index's schema is used to read and plan.
+    pub schema: Option<SchemaRef>,
+    /// Which bytes a file's fingerprint hashes when an index is first built
+    /// (ADR 013): `Tail64K` (the default) or `Full`, which also detects an
+    /// in-place patch outside the last 64 KiB that keeps size and mtime. An
+    /// existing index keeps its recorded policy; another one is refused.
+    pub fingerprint_policy: Option<FingerprintPolicy>,
+    /// A fixed RFC 3339 time used as every record's `created_at` and as
+    /// "now" when ages are computed, so two runs over the same inputs write
+    /// byte-identical records. `None` uses the system clock.
+    pub clock: Option<String>,
+}
+
+/// The pinned current manifest: its planner, its snapshot, and its content
+/// hash and age, read together so they describe one commit.
+pub(crate) struct Pinned {
+    pub snapshot: Snapshot<ObjectStoreBackend>,
+    pub planner: Planner<ObjectStoreBackend>,
+    /// BLAKE3 of the manifest bytes as stored (the profile's and verify's
+    /// convention).
+    pub hash: Hash,
+    /// Time since the commit that wrote it.
+    pub age: Duration,
+}
+
+impl Pinned {
+    pub fn sequence(&self) -> u64 {
+        self.planner.sequence()
+    }
+
+    pub fn manifest(&self) -> &Manifest {
+        self.planner.manifest()
+    }
+
+    /// Declared specs complete at the pinned sequence, and those that are
+    /// not (ADR 012).
+    pub fn specs(&self) -> (Vec<KeySpec>, Vec<KeySpec>) {
+        self.planner
+            .declared_specs()
+            .iter()
+            .cloned()
+            .partition(|s| self.planner.completeness(s).is_some())
+    }
+
+    pub fn policy(&self) -> Result<FingerprintPolicy> {
+        policy_of(self.manifest())
+    }
+}
+
+pub(crate) fn policy_of(m: &Manifest) -> Result<FingerprintPolicy> {
+    match m.source.fingerprint_policy.as_deref() {
+        None | Some("tail64k") => Ok(FingerprintPolicy::Tail64K),
+        Some("full") => Ok(FingerprintPolicy::Full),
+        Some(other) => Err(Error::UnknownKind {
+            what: "fingerprint policy",
+            found: other.to_string(),
+        }),
+    }
+}
+
+/// The facade over every engine crate. Each operation is a method returning
+/// a typed result that serializes with serde: that value is the CLI's
+/// `--json` output and what the MCP server returns (ADR 010). No method
+/// panics into its caller; an internal panic becomes an error naming the
+/// issue tracker.
+pub struct Engine {
+    root: String,
+    index: String,
+    /// The index location as a local directory, when it is one.
+    local_index: Option<PathBuf>,
+    /// Opened on first use, so an operation that writes nothing never
+    /// creates a local index directory.
+    store: OnceLock<Arc<ObjectStoreBackend>>,
+    options: EngineOptions,
+}
+
+impl std::fmt::Debug for Engine {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Engine")
+            .field("root", &self.root)
+            .field("index", &self.index)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Engine {
+    /// Opens the data under `root` and its index.
+    ///
+    /// `root` is a local directory (or a `file://` URL). The engine
+    /// canonicalizes it the way the build does, so every crate sees one
+    /// spelling. The index lives at `options.index`, by default
+    /// `<root>/.bellwether/`, on any store backend.
+    pub fn open(root: &str, options: EngineOptions) -> Result<Self> {
+        guard(|| Self::open_inner(root, options))
+    }
+
+    fn open_inner(root: &str, options: EngineOptions) -> Result<Self> {
+        let local = match root.split_once("://") {
+            None => root,
+            Some(("file", rest)) => rest,
+            Some((scheme, _)) => {
+                return Err(Error::Source(format!(
+                    "the data root {root:?} is a {scheme}:// URL, but sources read local files \
+                     only in this release; copy or mount the data locally and pass its path \
+                     (the index itself may live on an object store, see --index)"
+                )))
+            }
+        };
+        let canonical = std::fs::canonicalize(local).map_err(|e| {
+            Error::Source(format!(
+                "cannot open the data root {local:?} ({e}); pass an existing directory"
+            ))
+        })?;
+        if !canonical.is_dir() {
+            return Err(Error::Source(format!(
+                "the data root {} is not a directory; pass the folder that holds the files",
+                canonical.display()
+            )));
+        }
+        let root = canonical
+            .to_str()
+            .ok_or_else(|| {
+                Error::Source(format!(
+                    "the data root {} is not valid UTF-8; rename it",
+                    canonical.display()
+                ))
+            })?
+            .to_string();
+        let index = options
+            .index
+            .clone()
+            .unwrap_or_else(|| join_path(&root, DEFAULT_INDEX_DIR));
+        if let Some(c) = &options.clock {
+            parse_rfc3339(c).map_err(|e| {
+                Error::Other(format!("the clock {c:?} is not an RFC 3339 time ({e})"))
+            })?;
+        }
+        let local_index = local_path(&index)?;
+        let engine = Self {
+            root,
+            index,
+            local_index,
+            store: OnceLock::new(),
+            options,
+        };
+        if let Some(m) = engine.manifest()? {
+            let recorded = SourceKind::parse(&m.source.kind)?;
+            if recorded != engine.options.format.kind() {
+                return Err(Error::Source(format!(
+                    "the index at {} was built over {} files, not {}; open it with the same \
+                     format",
+                    engine.index,
+                    m.source.kind,
+                    engine.options.format.kind().manifest_kind()
+                )));
+            }
+            if !m.source.root.is_empty() && m.source.root != engine.root {
+                return Err(Error::Source(format!(
+                    "the index at {} indexes {}, not {}; pass that root or another --index",
+                    engine.index, m.source.root, engine.root
+                )));
+            }
+        }
+        Ok(engine)
+    }
+
+    /// The canonical data root.
+    #[must_use]
+    pub fn root(&self) -> &str {
+        &self.root
+    }
+
+    /// The index location as given or defaulted.
+    #[must_use]
+    pub fn index_location(&self) -> &str {
+        &self.index
+    }
+
+    /// The source format.
+    #[must_use]
+    pub fn format(&self) -> SourceFormat {
+        self.options.format
+    }
+
+    // -- shared internals ----------------------------------------------------
+
+    /// The index store, opened (and, for a local index, its directory
+    /// created) on first use. Creating it is the first write any operation
+    /// makes; if the location is not writable the error names `--index`.
+    pub(crate) fn store(&self) -> Result<&Arc<ObjectStoreBackend>> {
+        if let Some(s) = self.store.get() {
+            return Ok(s);
+        }
+        let unwritable = |e: &dyn std::fmt::Display| {
+            Error::Store(format!(
+                "cannot write the index at {} ({e}); pass a writable location with --index",
+                self.index
+            ))
+        };
+        if let Some(dir) = &self.local_index {
+            std::fs::create_dir_all(dir).map_err(|e| unwritable(&e))?;
+        }
+        let store =
+            Arc::new(ObjectStoreBackend::from_url(&self.index).map_err(|e| unwritable(&e))?);
+        Ok(self.store.get_or_init(|| store))
+    }
+
+    /// The index store if it exists, without creating it: `None` for a local
+    /// index directory that is not there yet.
+    fn existing_store(&self) -> Result<Option<&Arc<ObjectStoreBackend>>> {
+        match &self.local_index {
+            Some(dir) if self.store.get().is_none() && !dir.exists() => Ok(None),
+            _ => self.store().map(Some),
+        }
+    }
+
+    pub(crate) fn ledger(&self) -> Result<Ledger<Arc<ObjectStoreBackend>>> {
+        Ok(Ledger::new(Arc::clone(self.store()?)))
+    }
+
+    pub(crate) fn cache(&self) -> Result<Cache<ObjectStoreBackend>> {
+        Ok(Cache::new(Arc::clone(self.store()?), ""))
+    }
+
+    pub(crate) fn options(&self) -> &EngineOptions {
+        &self.options
+    }
+
+    /// RFC 3339 UTC, the time every record this engine writes carries:
+    /// the fixed clock when one is set.
+    pub(crate) fn now(&self) -> String {
+        self.options.clock.clone().unwrap_or_else(now_rfc3339)
+    }
+
+    /// "Now" in nanoseconds since the epoch, for ages: the fixed clock when
+    /// one is set.
+    pub(crate) fn now_nanos(&self) -> Result<i64> {
+        if let Some(c) = &self.options.clock {
+            return parse_rfc3339(c)?
+                .timestamp_nanos_opt()
+                .ok_or_else(|| Error::Other(format!("the clock {c:?} is out of range")));
+        }
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|e| Error::Other(format!("the system clock is before 1970: {e}")))?;
+        Ok(i64::try_from(now.as_nanos()).unwrap_or(i64::MAX))
+    }
+
+    /// The current manifest, if the folder is indexed.
+    pub(crate) fn manifest(&self) -> Result<Option<Manifest>> {
+        let Some(store) = self.existing_store()? else {
+            return Ok(None);
+        };
+        match store.get_opt(&manifest_path(""))? {
+            None => Ok(None),
+            Some((bytes, _)) => Ok(Some(Manifest::from_slice(&bytes)?)),
+        }
+    }
+
+    /// Pins the current manifest with its content hash, or `None` if the
+    /// folder is not indexed. The bytes hashed and the snapshot pinned are
+    /// the same commit (sequence and nonce agree), retried a few times if a
+    /// commit lands in between.
+    pub(crate) fn pin(&self) -> Result<Option<Pinned>> {
+        let Some(store) = self.existing_store()? else {
+            return Ok(None);
+        };
+        for _ in 0..PIN_ATTEMPTS {
+            let Some((bytes, _)) = store.get_opt(&manifest_path(""))? else {
+                return Ok(None);
+            };
+            let read = Manifest::from_slice(&bytes)?;
+            let snapshot = Snapshot::open(Arc::clone(store), "")?;
+            let pinned = snapshot.manifest();
+            if read.sequence == pinned.sequence && read.commit_nonce == pinned.commit_nonce {
+                let age = commit_age(pinned, self.now_nanos()?)?;
+                let planner = Planner::from_snapshot(snapshot.clone())?;
+                return Ok(Some(Pinned {
+                    snapshot,
+                    planner,
+                    hash: Hash::of(&bytes),
+                    age,
+                }));
+            }
+        }
+        Err(Error::VersionConflict {
+            expected: "a manifest stable while it is pinned".into(),
+            found: format!("{PIN_ATTEMPTS} commits in a row; retry when the writers settle"),
+        })
+    }
+
+    /// Pins the manifest or refuses with what to do.
+    pub(crate) fn pin_required(&self, verb: &str) -> Result<Pinned> {
+        self.pin()?.ok_or_else(|| {
+            Error::KeySpec(format!(
+                "{} is not indexed, so {verb} has no index to plan with; run `bellwether index \
+                 {} --key <spec>` first",
+                self.root, self.root
+            ))
+        })
+    }
+
+    /// A source over the data root, built the way the index was when one
+    /// exists: its dataset schema, its fingerprint policy, and, for text, its
+    /// one recorded chunk size.
+    pub(crate) fn source(&self, pinned: Option<&Pinned>) -> Result<Box<dyn Source>> {
+        let (schema, policy, chunk) = match pinned {
+            Some(p) => (
+                Some(SchemaRef::clone(p.planner.schema())),
+                p.policy()?,
+                recorded_chunk_size(p.manifest())?,
+            ),
+            None => (
+                self.options.schema.clone(),
+                self.options.fingerprint_policy.unwrap_or_default(),
+                None,
+            ),
+        };
+        let format = SourceFormat::from_kind(self.options.format.kind());
+        Ok(match format.text() {
+            None => {
+                let mut s = ParquetSource::new().with_fingerprint_policy(policy);
+                if let Some(schema) = schema {
+                    s = s.with_schema(schema);
+                }
+                Box::new(s)
+            }
+            Some(text) => {
+                let mut s = ChunkedTextSource::new(text).with_fingerprint_policy(policy);
+                if let Some(size) = chunk.or(self.options.chunk_size) {
+                    s = s.with_chunk_size(size);
+                }
+                if let Some(schema) = schema {
+                    s = s.with_schema(schema);
+                }
+                Box::new(s)
+            }
+        })
+    }
+
+    /// Writes a non-receipt record through the ledger and returns it with
+    /// its hash, exactly as stored.
+    pub(crate) fn put(&self, record: Record) -> Result<Written> {
+        let hash = self.ledger()?.put(&record)?;
+        Ok(Written { hash, record })
+    }
+
+    /// Reads a record and its hash.
+    pub(crate) fn get(&self, hash: &Hash) -> Result<Written> {
+        let record = self.ledger()?.get(hash)?;
+        Ok(Written {
+            hash: *hash,
+            record,
+        })
+    }
+}
+
+/// How the folder differs from what the pinned index tracks.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct FolderChanges {
+    /// Files the source discovers that the index does not track.
+    pub untracked: Vec<FileFingerprint>,
+    /// Tracked files whose fingerprint changed (ADR 013).
+    pub changed: Vec<String>,
+    /// Tracked files no longer found.
+    pub missing: Vec<String>,
+}
+
+impl FolderChanges {
+    pub fn is_empty(&self) -> bool {
+        self.untracked.is_empty() && self.changed.is_empty() && self.missing.is_empty()
+    }
+}
+
+/// Lists the folder now and compares it with the pinned manifest's files.
+///
+/// Cheap by design, whatever the fingerprint policy: each data file is
+/// listed and `stat`ed (path, size, and etag or mtime), never read. A size or
+/// etag/mtime that differs from the manifest's is a changed fingerprint by
+/// definition, so no content hash is needed to report it. Only files the
+/// index does not track are fingerprinted (under the index's policy), because
+/// `why` reads their footers. Under the `full` policy this means the folder
+/// check never re-hashes the lake; an in-place patch that keeps a file's
+/// size and mtime is caught where `full` promises it, when the planner
+/// verifies each file it plans against its full-content fingerprint before
+/// reading it.
+pub(crate) fn folder_changes(
+    root: &str,
+    pinned: &Pinned,
+    format: SourceFormat,
+) -> Result<FolderChanges> {
+    let tracked: std::collections::BTreeMap<&str, &FileFingerprint> = pinned
+        .manifest()
+        .rowgroup_space
+        .files
+        .iter()
+        .map(|f| (f.fingerprint.path.as_str(), &f.fingerprint))
+        .collect();
+    let policy = pinned.policy()?;
+    let extensions: &[&str] = match format.text() {
+        None => &["parquet"],
+        Some(text) => text.extensions(),
+    };
+    let fs = LocalFs;
+    let mut found = std::collections::BTreeSet::new();
+    let mut changes = FolderChanges::default();
+    let mut paths: Vec<String> = fs
+        .list(root)?
+        .into_iter()
+        .filter(|p| {
+            Path::new(p)
+                .extension()
+                .and_then(|e| e.to_str())
+                .is_some_and(|e| extensions.iter().any(|x| e.eq_ignore_ascii_case(x)))
+        })
+        .collect();
+    paths.sort();
+    for path in paths {
+        match tracked.get(path.as_str()) {
+            None => changes
+                .untracked
+                .push(fingerprint_with_policy(&fs, &path, policy)?),
+            Some(t) => {
+                let meta = fs.head(&path)?;
+                if meta.size != t.size || meta.etag != t.etag {
+                    changes.changed.push(path.clone());
+                }
+            }
+        }
+        found.insert(path);
+    }
+    changes.missing = tracked
+        .keys()
+        .filter(|p| !found.contains(**p))
+        .map(ToString::to_string)
+        .collect();
+    Ok(changes)
+}
+
+/// The one chunk size an index's text files record, if any. Files recorded
+/// at different sizes cannot share one source; that is refused.
+fn recorded_chunk_size(m: &Manifest) -> Result<Option<u64>> {
+    let mut sizes: Vec<u64> = m
+        .rowgroup_space
+        .files
+        .iter()
+        .filter_map(|f| f.chunk_size)
+        .collect();
+    sizes.sort_unstable();
+    sizes.dedup();
+    match sizes.as_slice() {
+        [] => Ok(None),
+        [one] => Ok(Some(*one)),
+        many => Err(Error::Source(format!(
+            "the index records text files at {} chunk sizes ({many:?}); the facade reads one \
+             chunk size per index, so rebuild the index at one size",
+            many.len()
+        ))),
+    }
+}
+
+/// Time from the commit that wrote `m` to `now_nanos` (zero if the commit's
+/// clock ran ahead).
+pub(crate) fn commit_age(m: &Manifest, now_nanos: i64) -> Result<Duration> {
+    let committed = if m.committed_at.is_empty() {
+        &m.created_at
+    } else {
+        &m.committed_at
+    };
+    let at = parse_rfc3339(committed)?;
+    let at_nanos = at
+        .timestamp_nanos_opt()
+        .ok_or_else(|| Error::Other(format!("commit time {committed} is out of range")))?;
+    Ok(Duration::from_nanos(
+        u64::try_from(now_nanos.saturating_sub(at_nanos)).unwrap_or(0),
+    ))
+}
+
+/// The index location as a local directory, or `None` for an object store.
+fn local_path(index: &str) -> Result<Option<PathBuf>> {
+    let path = match index.split_once("://") {
+        None => index,
+        Some(("file", rest)) => rest,
+        Some(_) => return Ok(None),
+    };
+    std::path::absolute(path)
+        .map(Some)
+        .map_err(|e| Error::Store(format!("cannot resolve the index location {index:?} ({e})")))
+}
+
+fn join_path(root: &str, name: &str) -> String {
+    Path::new(root).join(name).to_string_lossy().into_owned()
+}
+
+/// One column of a schema file.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SchemaColumn {
+    name: String,
+    #[serde(rename = "type")]
+    data_type: String,
+    #[serde(default = "nullable_default")]
+    nullable: bool,
+}
+
+fn nullable_default() -> bool {
+    true
+}
+
+/// Parses a dataset schema for [`EngineOptions::schema`] from JSON: a list
+/// of `{"name": ..., "type": ..., "nullable": ...}` objects in column order,
+/// each `type` spelled as Arrow prints it and as the manifest records it
+/// (`"Int64"`, `"Decimal128(12, 4)"`, `"Timestamp(Microsecond, Some(\"UTC\"))"`).
+/// `nullable` defaults to true.
+pub fn schema_from_json(json: &str) -> Result<SchemaRef> {
+    use std::str::FromStr;
+    let cols: Vec<SchemaColumn> = serde_json::from_str(json).map_err(|e| {
+        Error::Other(format!(
+            "the schema is not a JSON list of {{\"name\", \"type\", \"nullable\"}} objects ({e})"
+        ))
+    })?;
+    let mut seen = std::collections::BTreeSet::new();
+    let fields = cols
+        .into_iter()
+        .map(|c| {
+            if !seen.insert(c.name.clone()) {
+                return Err(Error::Other(format!(
+                    "the schema lists column {:?} twice",
+                    c.name
+                )));
+            }
+            let dt = arrow::datatypes::DataType::from_str(&c.data_type).map_err(|e| {
+                Error::Other(format!(
+                    "column {:?} has type {:?}, which Arrow cannot parse ({e}); spell it as \
+                     Arrow prints it, for example \"Decimal128(12, 4)\"",
+                    c.name, c.data_type
+                ))
+            })?;
+            Ok(arrow::datatypes::Field::new(c.name, dt, c.nullable))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    if fields.is_empty() {
+        return Err(Error::Other("the schema lists no columns".into()));
+    }
+    Ok(Arc::new(arrow::datatypes::Schema::new(fields)))
+}
+
+/// A value that does not fit the dataset type usually means the dataset
+/// schema was inferred from a file that does not represent every file (for
+/// example the first file's decimal scale); the error then says how to
+/// supply the schema.
+pub(crate) fn schema_hint(e: Error) -> Error {
+    const HINT: &str = "; if files differ in decimal scale or time unit, pass the dataset \
+                        schema with --schema <file> (EngineOptions::schema)";
+    let needs = |m: &str| m.contains("not representable in dataset type");
+    match e {
+        Error::Source(m) if needs(&m) => Error::Source(m + HINT),
+        Error::KeySpec(m) if needs(&m) => Error::KeySpec(m + HINT),
+        Error::Other(m) if needs(&m) => Error::Other(m + HINT),
+        other => other,
+    }
+}
+
+/// Runs `f`, turning a panic into an error that names the issue tracker, so
+/// no panic reaches a caller of the facade.
+pub(crate) fn guard<T>(f: impl FnOnce() -> Result<T>) -> Result<T> {
+    match catch_unwind(AssertUnwindSafe(f)) {
+        Ok(r) => r,
+        Err(payload) => {
+            let what = payload
+                .downcast_ref::<&str>()
+                .map(ToString::to_string)
+                .or_else(|| payload.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "unknown panic".to_string());
+            Err(Error::Other(format!(
+                "internal error ({what}); this is a bug, please report it at {ISSUE_TRACKER}"
+            )))
+        }
+    }
+}

@@ -1,0 +1,251 @@
+//! `why` on folders with no index, with and without a workload, and over a
+//! current index that does not serve the workload.
+
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+
+mod common;
+
+use bellwether::types::{Hash, KeySpec, ProposalBody, Record};
+use bellwether::{
+    spec, CandidateOrigin, CulpritReason, Engine, EngineOptions, KeyFile, WhyRequest, Written,
+    ENGINE_PROPOSER,
+};
+use common::{ledger_bytes, ledger_corpus, oracle, write_keys};
+
+fn open(root: &std::path::Path) -> Engine {
+    Engine::open(root.to_str().unwrap(), EngineOptions::default()).unwrap()
+}
+
+fn assert_stored(index: &std::path::Path, w: &Written) {
+    let bytes = serde_json::to_vec(&w.record).unwrap();
+    assert_eq!(Hash::of(&bytes), w.hash);
+    assert_eq!(ledger_bytes(index, &w.hash.to_hex()), bytes);
+}
+
+/// Compressed row-group bytes of every file under `dir`, from the footers.
+fn footer_bytes(dir: &std::path::Path) -> u64 {
+    use parquet::file::reader::{FileReader, SerializedFileReader};
+    let mut total = 0u64;
+    for e in std::fs::read_dir(dir).unwrap() {
+        let p = e.unwrap().path();
+        if p.extension().is_some_and(|x| x == "parquet") {
+            let r = SerializedFileReader::new(std::fs::File::open(&p).unwrap()).unwrap();
+            for rg in r.metadata().row_groups() {
+                total += u64::try_from(rg.compressed_size()).unwrap();
+            }
+        }
+    }
+    total
+}
+
+#[test]
+fn why_reports_an_unindexed_folder_from_its_footers_with_no_workload() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    ledger_corpus(&data, 2, 3, 30, 40);
+    let r = open(&data).why(&WhyRequest::default()).unwrap();
+    assert_eq!(r.sequence, 0);
+    assert!(r.workload.is_none() && r.current.is_none() && r.candidates.is_empty());
+    assert!(r.recommended.is_none() && r.culprit.is_none());
+    assert_eq!(
+        (r.dataset.files, r.dataset.row_groups, r.dataset.rows),
+        (2, 6, 180)
+    );
+    assert_eq!(r.dataset.bytes, footer_bytes(&data));
+    // Nothing was written: no workload, no candidates.
+    assert!(!data.join(".bellwether").join("ledger").exists());
+    // The report round-trips through its JSON exactly (it is the --json
+    // output and the MCP result).
+    let json = serde_json::to_string(&r).unwrap();
+    let back: bellwether::WhyReport = serde_json::from_str(&json).unwrap();
+    assert_eq!(serde_json::to_string(&back).unwrap(), json);
+}
+
+#[test]
+fn why_with_keys_replays_each_candidate_and_the_floor_is_the_oracle() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    ledger_corpus(&data, 3, 4, 25, 400);
+    let keys = [5i64, 77, 123];
+    write_keys(&dir.path().join("k.parquet"), "id", &keys);
+    let request = WhyRequest {
+        keys: Some(KeyFile::new(dir.path().join("k.parquet"))),
+        ..WhyRequest::default()
+    };
+    let r = open(&data).why(&request).unwrap();
+    let index = data.join(".bellwether");
+    let w = r.workload.as_ref().unwrap();
+    assert_eq!(w.runs, 1);
+    assert_eq!(w.columns, vec![vec!["id".to_string()]]);
+    let current = r.current.unwrap();
+    assert_eq!(current.row_groups, 12, "no index: every row group");
+    assert_eq!(current.bytes, r.dataset.bytes);
+    assert_eq!(r.candidates.len(), 1);
+    let floor = &r.candidates[0];
+    assert_eq!(floor.origin, CandidateOrigin::Workload);
+    assert_eq!(
+        floor.spec,
+        KeySpec::Exact {
+            columns: vec!["id".into()]
+        }
+    );
+    assert_eq!(floor.proposed.row_groups, oracle(&data, &keys).len() as u64);
+    for c in &r.candidates {
+        assert_stored(&index, &c.proposal);
+        assert_stored(&index, &c.replay);
+        let Record::Proposal(p) = &c.proposal.record else {
+            panic!()
+        };
+        assert_eq!(p.proposed_by, ENGINE_PROPOSER);
+        assert!(matches!(&p.body, ProposalBody::Key { spec } if *spec == c.spec));
+        let Record::Replay(rp) = &c.replay.record else {
+            panic!()
+        };
+        assert_eq!(rp.proposal, c.proposal.hash);
+        assert_eq!(rp.workload, w.hash);
+        assert_eq!(rp.manifest_version, "0");
+        assert_ne!(rp.inputs.len(), 0, "contract v2.1: inputs");
+        assert_eq!(rp.model, None, "a key replay is exact and names no model");
+        assert!(rp.current.iter().chain(&rp.proposed).all(|c| c.exact));
+    }
+    let rec = r.recommended.as_ref().unwrap();
+    assert_eq!(rec.spec, floor.spec);
+    assert!(rec.proposed.bytes < rec.current.bytes);
+    let culprit = r.culprit.as_ref().unwrap();
+    assert_eq!(culprit.columns, vec!["id".to_string()]);
+    assert_eq!(culprit.reason, CulpritReason::NoIndexServes);
+}
+
+#[test]
+fn why_over_an_index_that_does_not_serve_the_workload() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    ledger_corpus(&data, 2, 4, 25, 300);
+    let e = open(&data);
+    e.index(&[spec::parse("exact:batch").unwrap()]).unwrap();
+    write_keys(&dir.path().join("k.parquet"), "id", &[1, 2]);
+    let r = e
+        .why(&WhyRequest {
+            keys: Some(KeyFile::new(dir.path().join("k.parquet"))),
+            ..WhyRequest::default()
+        })
+        .unwrap();
+    assert_eq!(r.sequence, 1);
+    assert_eq!(r.current_specs.len(), 1);
+    assert_eq!(
+        r.current.unwrap().row_groups,
+        8,
+        "exact:batch cannot narrow id lookups"
+    );
+    for c in &r.candidates {
+        let Record::Replay(rp) = &c.replay.record else {
+            panic!()
+        };
+        assert_eq!(rp.manifest_version, "1");
+    }
+    assert_eq!(r.culprit.unwrap().reason, CulpritReason::NoIndexServes);
+
+    // Once the floor is indexed it is current, not a candidate, and serves.
+    e.index(&[spec::parse("exact:id").unwrap()]).unwrap();
+    let r = e
+        .why(&WhyRequest {
+            keys: Some(KeyFile::new(dir.path().join("k.parquet"))),
+            ..WhyRequest::default()
+        })
+        .unwrap();
+    assert!(r.candidates.is_empty() && r.recommended.is_none());
+    assert!(matches!(
+        r.culprit.unwrap().reason,
+        CulpritReason::ServingSpec { .. }
+    ));
+}
+
+/// Records `runs` (run id, key column, keys) into the engine's cache as one
+/// workload and returns its hash.
+fn record_workload(data: &std::path::Path, runs: &[(&str, &str, Vec<i64>)]) -> Hash {
+    use std::sync::Arc;
+
+    use arrow::array::{ArrayRef, Int64Array, RecordBatch};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use bellwether::types::Source;
+    use bellwether_replay::{KeyInput, WorkloadRecorder};
+    use bellwether_store::{Cache, ObjectStoreBackend};
+
+    let index = data.join(".bellwether");
+    let store = Arc::new(ObjectStoreBackend::from_url(index.to_str().unwrap()).unwrap());
+    let cache = Cache::new(store, "");
+    let root = std::fs::canonicalize(data).unwrap();
+    let schema = bellwether_source::ParquetSource::new()
+        .schema(root.to_str().unwrap())
+        .unwrap();
+    let mut rec = WorkloadRecorder::new(&cache, schema);
+    for (id, column, keys) in runs {
+        let s = Arc::new(Schema::new(vec![Field::new(
+            *column,
+            DataType::Int64,
+            false,
+        )]));
+        let b = RecordBatch::try_new(
+            s,
+            vec![Arc::new(Int64Array::from(keys.clone())) as ArrayRef],
+        )
+        .unwrap();
+        rec.record(id, KeyInput::Batch(&b)).unwrap();
+    }
+    rec.finish().unwrap().hash()
+}
+
+#[test]
+fn the_recommendation_is_the_strictly_cheapest_candidate() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    // id is unique per row; a batch spans two row groups of 25 rows.
+    ledger_corpus(&data, 3, 4, 25, 1_000);
+    let e = open(&data);
+    let hash = record_workload(
+        &data,
+        &[("a", "id", vec![5, 6]), ("b", "batch", vec![0, 1, 2])],
+    );
+    let r = e
+        .why(&WhyRequest {
+            workload: Some(hash),
+            ..WhyRequest::default()
+        })
+        .unwrap();
+    assert_eq!(r.candidates.len(), 2, "exact:batch and exact:id");
+    let cheapest = r
+        .candidates
+        .iter()
+        .min_by_key(|c| c.proposed.bytes)
+        .unwrap();
+    let dearest = r
+        .candidates
+        .iter()
+        .max_by_key(|c| c.proposed.bytes)
+        .unwrap();
+    assert!(cheapest.proposed.bytes < dearest.proposed.bytes);
+    let rec = r.recommended.as_ref().unwrap();
+    assert_eq!(rec.spec, cheapest.spec);
+    assert_eq!(rec.proposed, cheapest.proposed);
+    assert_eq!(rec.current, r.current.unwrap());
+}
+
+#[test]
+fn a_candidate_that_saves_nothing_is_not_recommended() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    ledger_corpus(&data, 3, 4, 25, 1_000);
+    let e = open(&data);
+    // One key in every row group: even the floor reads everything.
+    let keys: Vec<i64> = (0..12).map(|g| g * 25).collect();
+    let hash = record_workload(&data, &[("all", "id", keys)]);
+    let r = e
+        .why(&WhyRequest {
+            workload: Some(hash),
+            ..WhyRequest::default()
+        })
+        .unwrap();
+    assert_eq!(r.candidates.len(), 1);
+    assert_eq!(r.candidates[0].proposed, r.current.unwrap());
+    assert!(r.recommended.is_none(), "equal cost is no saving");
+}

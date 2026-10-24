@@ -1,0 +1,73 @@
+\section{Implementation}\label{sec:impl}
+
+Bellwether is a Rust workspace with one crate per work package
+(\doc{work-packages.md}), each with one owner and one interface contract. The
+contract crate,
+\code{bellwether-types}, defines every record, trait, and format constant and
+contains no logic beyond construction, hashing, and serialization; changing it
+is an architectural decision. Table~\ref{tab:crates} lists the crates and their
+status at the time of writing. Each crate lands by a pull request reviewed
+against the invariants and decision records it owns.
+
+\begin{table}[t]
+  \caption{Crates and their status at the time of writing. \emph{Merged}: on
+    the main branch. \emph{Review}: an open pull request. \emph{Planned}:
+    specified, not yet written.}
+  \label{tab:crates}
+  \small
+  \begin{tabular}{@{}l>{\raggedright\arraybackslash}p{0.53\columnwidth}l@{}}
+    \toprule
+    Crate & Role & Status \\
+    \midrule
+    types & records, traits, format constants & merged \\
+    source & Parquet and chunked text sources; fingerprints & merged \\
+    ledger & content-addressed records; write-time rules & merged \\
+    core & canonical encoding, segments, bloom filters, bitmaps, temporal
+      chains, merge & review \\
+    store & conditional PUT, manifest commits, cache & review \\
+    bench & synthetic ledger, workloads, harness, SLOs & review \\
+    build & discovery, id assignment, segment build, compaction & planned \\
+    profile & fanout, sortedness, lints, candidate composites & planned \\
+    replay & workload recorder; exact replay & planned \\
+    verify & reconciliation; Certificates & planned \\
+    cli, mcp & one shared code path, two interfaces & planned \\
+    evolve & the optimizer of Section~\ref{sec:evolve} & planned \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+\paragraph{Formats.} Storage, record, and encoding formats are versioned from
+the first commit, and each is at version 1 (\doc{format.md}). A binary that
+meets a newer version refuses with a typed error and never downgrades in place
+(\adr{017}). The canonical encoding gives each Arrow type one byte form:
+integers widened to 64 bits big-endian, with the sign bit flipped for signed
+types, floats under a total order with one canonical NaN, decimals rescaled to the schema's declared scale
+(an unrepresentable value is an error, never rounded), escaped and terminated
+strings, and timestamps normalized to UTC in the schema's unit (\adr{016}).
+
+\paragraph{Memory bounds and budgets.} Memory is bounded per operation
+(\adr{018}): a build streams one row group per worker and holds at most one
+segment, whose name is the hash of its bytes; a lookup holds one block index and
+the bitmaps for the keys asked; a replay holds one run's key set. Observe tools
+have a 100\,ms budget (\doc{architecture.md}). For evolve on the medium
+synthetic dataset, the budgets are 5\,ms per replay of one run under one
+candidate, one second to attribute a 20-node plan, one minute per generation of
+16 candidates excluding proposer latency, and one hour for 50 generations
+(\doc{evolve.md} \S12). The harness asserts these budgets; none is a
+measurement.
+
+\paragraph{A preliminary microbenchmark.} The core crate's review branch
+includes a Criterion benchmark of single-key lookup in an exact segment of
+64-bit integer keys held in memory. It reports about 0.2\,\textmu s per lookup
+with $10^4$ keys and about 0.5\,\textmu s with $10^6$ keys. The caveats are
+material: the crate is not merged; the segment is in memory, so storage I/O,
+segment open, and the manifest read are excluded; the key is a single column; no
+machine description accompanies the number, although the benchmark methodology
+requires one for every reported result (\doc{benchmark.md}); and in-memory
+lookup latency is not one of the paper's metrics. We report the number as
+context and draw no conclusion from it.
+
+\paragraph{Interfaces.} Command-line verbs such as \code{why}, \code{fix},
+\code{latest}, \code{asof}, and \code{reconcile}, with \code{evolve} and
+\code{report} for the optimizer, share one code path with the MCP tiers of
+Section~\ref{sec:loop} (\doc{work-packages.md}).

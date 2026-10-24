@@ -1,0 +1,2 @@
+# Fixture bytes are hashed and chunked by offset; never rewrite line endings.
+* -text

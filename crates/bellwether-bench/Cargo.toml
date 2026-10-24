@@ -1,0 +1,52 @@
+[package]
+name = "bellwether-bench"
+description = "Synthetic versioned ledger, recorded workloads, baselines, ground truth, and SLO assertions for Bellwether."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+
+build = "build.rs"
+
+[[bin]]
+name = "bellwether-bench"
+path = "src/main.rs"
+
+[features]
+default = []
+# DuckDB engine baseline (ADR 019). Runs an external `duckdb` CLI (from PATH
+# or $BELLWETHER_DUCKDB); no DuckDB is compiled in, so `--all-features` stays
+# cheap. Without the feature, or without the CLI, the baseline reports
+# "unavailable".
+duckdb = []
+# Apache DataFusion baseline (ADR 019): DataFusion's own Parquet pruning
+# (statistics, page index, bloom filters) as a plan strategy. Pure Rust, no
+# native dependencies; off by default because it adds a large compile.
+datafusion = ["dep:datafusion", "dep:tokio"]
+
+[dependencies]
+bellwether-types = { path = "../bellwether-types" }
+bellwether-source = { path = "../bellwether-source" }
+arrow = { workspace = true }
+parquet = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+blake3 = { workspace = true }
+bytes = { workspace = true }
+roaring = { workspace = true }
+rayon = { workspace = true }
+clap = { version = "4", features = ["derive"] }
+rand = "0.8"
+# The generator's RNG is ChaCha12 by name, seeded from 32 explicit bytes:
+# `StdRng` may change algorithm between rand releases; this does not.
+rand_chacha = "0.3"
+# The 43 line is built against arrow 53, so the workspace keeps one arrow.
+datafusion = { version = "~43", default-features = false, features = ["parquet"], optional = true }
+tokio = { workspace = true, optional = true }
+
+[lints]
+workspace = true

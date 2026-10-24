@@ -1,0 +1,129 @@
+\section{An Exact Counterfactual What-If Interface}\label{sec:whatif}
+
+\subsection{Model}\label{sec:model}
+
+\paragraph{Files and row groups.} A file is identified by a fingerprint (path,
+size, etag or modification time, and a BLAKE3 hash of its last 64\,KiB or,
+under a stricter policy, of the whole file), not by its path, so an in-place
+rewrite is detected as drift (\doc{format.md}). Each
+row group receives a dense 32-bit id at the first sighting of (fingerprint,
+position in file); ids are never reused, and drift tombstones the old ids
+(\adr{013}). Let $\RG$ be the live row-group ids, $f(g)$ the file of row group
+$g$, and $b(g)$ its compressed size from the file footer. For
+$G \subseteq \RG$ let $f(G) = \{ f(g) : g \in G \}$.
+
+\paragraph{Key specs and selections.} A key spec is $\mathsf{Exact}$ or
+$\mathsf{Bloom}$ over a column list (bloom adds a target false-positive rate),
+$\mathsf{Range}$ over one column, or $\mathsf{Temporal}$ over a column list
+with a timestamp column. A composite key is a column list longer than one,
+encoded so that byte order equals typed order and each element is
+self-delimiting, so a probe on a prefix of leading elements seeks every
+extension (\adr{002}, \adr{016}). For a spec $s$ and a probe $k$, the selection $S_s(k) \subseteq \RG$
+is the set of row groups the index returns: for $\mathsf{Exact}$, those holding
+a row whose key starts with $k$; for $\mathsf{Bloom}$, those whose filter
+accepts $k$, a superset of exact membership; for $\mathsf{Range}$, those whose
+minimum and maximum bound the probed value or interval; for $\mathsf{Temporal}$,
+those holding a version of $k$ at its greatest timestamp (\emph{latest}) or at
+the greatest timestamp not after $t$ (\emph{as-of} $t$), ties included
+(\doc{format.md}). Footer statistics and embedded bloom filters alone give a
+baseline selection $S_\varnothing(k)$. Let $T(k)$ be the row groups that must
+be read to answer $k$ exactly. Invariant~1 requires $T(k) \subseteq S_s(k)$ on
+every path. For temporal probes this needs the index-wide maximum timestamp per
+key, consulted before ranking, so a superseded row is never returned even when
+the newest version sits in a row group pruned for another reason
+(invariant~5). Null timestamps rank last and never win (\adr{014}).
+
+\paragraph{Runs and cost.} A recorded run $r$ carries its key set $K_r$, its
+query kind (locate, latest, or as-of), and parameters such as an as-of
+timestamp. Under spec $s$ it reads $G_s(r) = \bigcup_{k \in K_r} S_s(k)$, and
+its cost is the vector of bytes, row groups, and files, which are the fields of
+a \code{RunCost} record:
+\begin{equation}\label{eq:cost}
+  c_s(r) \;=\; \Big( \textstyle\sum_{g \in G_s(r)} b(g),\;\; |G_s(r)|,\;\;
+  |f(G_s(r))| \Big).
+\end{equation}
+A physical design $D$ is a set of specs; let $D_r \subseteq D$ be the specs
+whose leading columns run $r$ binds. Each selection contains $T(k)$, so their
+intersection does too, and the engine intersects bitmaps over the global id
+space (\adr{001}):
+\begin{equation}\label{eq:design}
+  G_D(r) = \textstyle\bigcap_{s \in D_r} G_s(r), \qquad
+  G_D(r) = G_\varnothing(r) \text{ if } D_r = \emptyset .
+\end{equation}
+
+\subsection{Why the cost is exact}\label{sec:exact}
+
+\emph{Design property.} $c_D(r)$ is computed without an estimated quantity.
+$K_r$ is recorded. Each $S_s(k)$ is a deterministic function of the files: key
+membership for exact and temporal specs, filter bits for bloom specs (fixed by
+the canonical encoding and the hash function; \adr{008}, \adr{016}), and footer
+bounds for range specs. $b(g)$ is read from the footer. There is no cardinality
+estimate, cost model, or sampling, and the same workload, manifest, and
+proposal yield a byte-identical Replay (invariant~3). The predicted quantity is
+also the one the plan prescribes: a consumer that executes the scan plan reads
+the row groups in $G_D(r)$ and applies the residual predicate (\adr{011}).
+
+Three boundaries keep the claim precise, and the paper's use of ``exact'' is
+narrowed to them. (1)~\emph{I/O as accounted by row-group metadata}: $b(g)$ is
+a row group's total compressed size, a consumer that projects columns reads a
+subset of it, and per-column chunk sizes are not yet in the statistics type
+(\doc{rule-catalog.md}), so projection savings are outside the exact cost, as
+are reads of footers, segments, and the manifest. (2)~\emph{Files that exist}:
+a hypothetical key spec over existing files is exact, but a hypothetical layout
+changes the row-group statistics, which do not exist until the layout is
+written. Its cost is exact once the layout is materialized, and until then no
+number is reported, because \code{RunCost} has no field for an estimate
+(\doc{rule-catalog.md}, \code{scattered\us time\us column}). (3)~\emph{Scans whose
+key sets are recorded or derived from the run's inputs}, such as trigger keys
+and parameters: costs above the scan (CPU, memory, latency) and scans whose key
+sets depend on unrecorded intermediate results are measured by an attached
+executor through the planned \code{Scorer} trait, not replayed
+(\doc{evolve.md} \S10).
+
+\subsection{Computing a counterfactual}\label{sec:counterfactual}
+
+A counterfactual asks what a recorded run would have read under a design that
+differs from the current one. Range specs and the statistics baseline need only
+footers. For an exact, bloom, or temporal spec that has not been built, replay
+constructs a transient in-memory segment from a projected read of the key
+columns (and the timestamp column for temporal specs), one segment at a time
+(\doc{work-packages.md}, \adr{018}). The read is paid once per column set and
+shared by every run and every candidate over those columns; each run then costs
+one lookup per key, one bitmap union, and one sum.
+
+Prefix seek models subsumption: an exact spec on $(a, b)$ answers a probe on
+$a$ alone, so for runs keyed by $a$ it replaces a spec on $a$. Nulls are handled
+per tuple (\adr{014}, as amended): a tuple is indexed when its leading column is
+non-null, a null in a trailing column is encoded with the null marker so the
+tuple stays prefix-seekable, and a probe containing a null matches nothing, as
+in SQL's three-valued logic. The composite's prefix selection therefore equals
+the single-column selection, including rows whose trailing columns are null, so
+dropping the single-column spec preserves invariant~1.
+
+\subsection{Index structures and complexity}\label{sec:segments}
+
+Segments are immutable and content-addressed, and each indexes one key spec
+over a range of row-group ids (\doc{format.md}). An exact segment stores sorted
+key blocks, a split-block bloom filter per block~\cite{parquetbloom}, and for
+each key a roaring bitmap~\cite{roaring} over global row-group ids
+(\adr{001}). A temporal segment adds, per key, a chain of (timestamp, row group)
+pairs and the key's maximum timestamp. A bloom segment stores one split-block
+filter per row group, the shape Parquet embeds, and records whether a filter
+hashes canonical bytes or Parquet's plain encoding so that a probe is encoded
+to match (\adr{008}, amendment). A range segment stores a minimum and maximum
+per row group. One canonical byte encoding per Arrow type serves ordering,
+bloom hashing, and the row hashing of Section~\ref{sec:cert} (\adr{016}).
+Adding a key spec builds segments over every row group and records completeness
+in the manifest; a query on an incomplete spec fails rather than returning a
+partial answer (\adr{012}).
+
+For a segment with $n$ distinct keys, an exact lookup of key set $K$
+binary-searches the block index, probes one block's filter, and searches that
+block's key directory only if the filter passes, for $O(|K| \log n)$
+comparisons, while holding one block index and the bitmaps of the keys asked
+(\adr{018}). The union is proportional to the bitmaps' containers and the byte
+sum is $O(|G_D(r)|)$. Building a transient segment is one projected pass over
+the key columns, with memory bounded by one segment (\doc{format.md}).
+The design budget for one replay of one run under one candidate is 5\,ms on the
+medium synthetic dataset (\doc{evolve.md} \S12); the harness asserts it, and it
+is a budget, not a measurement.

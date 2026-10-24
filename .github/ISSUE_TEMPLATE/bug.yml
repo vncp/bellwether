@@ -1,0 +1,65 @@
+name: Bug report
+description: Something the engine did that contradicts the docs or an invariant.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Do not paste private data. Reproduce on the synthetic ledger
+        (`bellwether bench generate`) or a small file you can share.
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: Output of `bellwether --version`, or the commit hash.
+    validations:
+      required: true
+  - type: input
+    id: command
+    attributes:
+      label: Command
+      description: The exact command or MCP tool call.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected
+      description: What should have happened, and which doc says so.
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual
+      description: What happened. Include `--json` output if you can.
+      render: text
+    validations:
+      required: true
+  - type: dropdown
+    id: invariant
+    attributes:
+      label: Invariant affected
+      description: See docs/invariants.md. Pick "none" if unsure.
+      options:
+        - none or unsure
+        - 1 No false negatives in pruning
+        - 2 A Receipt implies a passing Certificate
+        - 3 Replay is deterministic
+        - 4 Readers see one manifest version
+        - 5 Stale-version rejection
+        - 6 Evidence carries provenance
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      description: Generator parameters and seed, or a minimal dataset.
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: OS, storage backend (local, S3, ADLS, GCS), Rust version.

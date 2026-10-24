@@ -1,0 +1,82 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  check:
+    name: fmt · clippy · test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - name: fmt
+        run: cargo fmt --all -- --check
+      - name: clippy
+        run: cargo clippy --workspace --all-targets --all-features
+      - name: test
+        run: cargo test --workspace --all-features
+
+  format-compat:
+    name: persisted format v0.1 fixture
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: detect fixture
+        id: fixture
+        run: |
+          if [ -d fixtures/format-v0.1 ]; then echo "present=true" >> "$GITHUB_OUTPUT"; else echo "present=false" >> "$GITHUB_OUTPUT"; fi
+      - uses: dtolnay/rust-toolchain@stable
+        if: steps.fixture.outputs.present == 'true'
+      - uses: Swatinem/rust-cache@v2
+        if: steps.fixture.outputs.present == 'true'
+      - name: current binary must read the frozen v0.1 fixture
+        if: steps.fixture.outputs.present == 'true'
+        run: cargo test --workspace --test '*format_compat*' --all-features
+      - name: skipped
+        if: steps.fixture.outputs.present != 'true'
+        run: echo "no frozen fixture yet (lands at M5); nothing to check"
+
+  slo:
+    name: latency budgets
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: detect bench crate
+        id: bench
+        run: |
+          if [ -d crates/bellwether-bench ]; then echo "present=true" >> "$GITHUB_OUTPUT"; else echo "present=false" >> "$GITHUB_OUTPUT"; fi
+      - uses: dtolnay/rust-toolchain@stable
+        if: steps.bench.outputs.present == 'true'
+      - uses: Swatinem/rust-cache@v2
+        if: steps.bench.outputs.present == 'true'
+      - name: bench harness asserts SLOs
+        if: steps.bench.outputs.present == 'true'
+        run: cargo run -p bellwether-bench --release -- --assert-slo
+      - name: replay asserts its p50-run budget on the bench small corpus
+        if: steps.bench.outputs.present == 'true'
+        run: |
+          cargo run -p bellwether-bench --release -- generate --out benches/out/replay-small \
+            --days 4 --files 64 --row-groups-per-file 2 --rows-per-row-group 2000 \
+            --entities 640000 --churn 0.1
+          cargo run -p bellwether-bench --release -- workload --corpus benches/out/replay-small \
+            --runs 48 --p50 40 --p95 20000 --max 60000
+          BELLWETHER_REPLAY_LATENCY_CORPUS="$GITHUB_WORKSPACE/benches/out/replay-small" \
+            cargo test --release -p bellwether-replay --test latency -- --nocapture --test-threads=1
+      - name: the facade's observe tier (why, no workload) meets 100 ms on replay-small
+        if: steps.bench.outputs.present == 'true'
+        run: |
+          BELLWETHER_OBSERVE_LATENCY_CORPUS="$GITHUB_WORKSPACE/benches/out/replay-small" \
+            cargo test --release -p bellwether --test latency -- --nocapture --test-threads=1
+      - name: skipped
+        if: steps.bench.outputs.present != 'true'
+        run: echo "bench crate not present yet; nothing to assert"

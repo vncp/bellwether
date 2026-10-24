@@ -1,0 +1,38 @@
+\section{Discussion and Limitations}\label{sec:discussion}
+
+\paragraph{Certificates are workload-scoped.} Scoping a certificate to the keys
+a workload touched is what makes non-local rewrites certifiable, and it is the
+main weakness: a change that is wrong only for untouched keys passes. The
+design states the coverage on every Certificate, re-validates rules on held-out
+runs, and records how to communicate the scope to users as an open question
+(\doc{evolve.md} \S13). A full certificate closes the gap at the cost of
+comparing every key.
+
+\paragraph{The attribution cap.} Capping attribution at the top $k$ nodes by
+cost keeps every reported number exact (\adr{024}) at the price of blindness: a
+node outside the top $k$ receives no attribution, and an interaction between a
+cheap node and an expensive one is missed if the cheap node is not attributed.
+
+\paragraph{Rulebook overfitting.} Rules distilled from searches on a synthetic
+ledger with planted patterns may learn the generator. The held-out split
+mitigates this within one generator; a second generator with different patterns
+is the real test, as the design notes (\doc{evolve.md} \S13).
+
+\paragraph{Model nondeterminism.} Model outputs are not reproducible on demand,
+and evolve does not assume they are: replaying a search reuses its recorded
+completions (Section~\ref{sec:determinism}), so reproducibility is a property
+of a recorded search, not of the model.
+
+\paragraph{What Bellwether does not do.} It is not a query engine: it produces a
+scan plan, and DuckDB, DataFusion, Polars, Spark, or user code reads the rows.
+It is not a table format: it never rewrites data or asks for a conversion. It is
+not a database: data that fits a relational system should use that system's
+indexes. It is not an estimator: a cost it cannot compute exactly is labeled,
+never guessed. It is not an autonomous agent: the model proposes, the engine
+scores, verifies, applies, and records, and that direction does not reverse
+(\doc{README.md}; \adr{009}).
+
+\paragraph{Status.} Most of the system is unbuilt and every result is pending.
+A measurement that contradicts a design property, such as a nonzero difference
+between planned and measured bytes for a plan executed as written
+(Section~\ref{sec:metrics}), will be reported as a defect in the design.

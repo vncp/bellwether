@@ -1,0 +1,22 @@
+[package]
+name = "bellwether-types"
+description = "Shared records, traits, and format constants for the Bellwether engine. No logic lives here."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+blake3 = { workspace = true }
+bytes = { workspace = true }
+roaring = { workspace = true, features = ["serde"] }
+arrow = { workspace = true }
+
+[lints]
+workspace = true

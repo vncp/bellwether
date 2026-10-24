@@ -1,0 +1,27 @@
+% Panel: the same grid as data/landscape.csv as a filled contour map, with the
+% descent path. Data: data/landscape.csv and data/descent.csv; schema in
+% data/README.md.
+\IfFileExists{data/landscape.csv}{%
+  \begingroup\bwdatacatcodes
+  \begin{bwpanel}{4.1cm}
+    \begin{axis}[bw, bw box={4.1cm}{0.95cm}{0.92cm}{0.38cm}{0.75cm},
+        view={0}{90}, xmode=log, ymode=log,
+        xlabel={bloom FPR}, ylabel={key-count gate},
+        colormap name=bwblues, enlargelimits=false, axis on top, grid=none,
+        bw colorbar]
+      \addplot3[contour filled={number=8}, mesh/ordering=y varies]
+        table[x=fpr, y=gate, z=bytes] {data/landscape.csv};
+      \IfFileExists{data/descent.csv}{%
+        \addplot3[bwB, mark=*, mark size=0.9pt, line width=0.7pt]
+          table[x=fpr, y=gate, z=bytes] {data/descent.csv};
+        \addplot3[bwB, only marks, mark=o, mark size=2pt, line width=0.6pt,
+            bw only={step}{0}]
+          table[x=fpr, y=gate, z=bytes] {data/descent.csv};
+      }{}
+    \end{axis}
+  \end{bwpanel}%
+  \endgroup
+}{%
+  \pendingfigure[\scriptsize]{4.1cm}{the same grid as a contour map, with
+    the descent path}{landscape}%
+}%

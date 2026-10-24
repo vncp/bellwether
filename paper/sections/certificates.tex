@@ -1,0 +1,100 @@
+\section{Reconciliation Certificates}\label{sec:cert}
+
+Reconciliation is the verifier (\adr{004}). It checks equivalence on data
+rather than on syntax, so it applies to changes that no SQL prover accepts, and
+it states exactly which keys it checked.
+
+\subsection{The verifier}\label{sec:verifier}
+
+Reconciliation compares a left output $L$ (the baseline) with a right output
+$R$ (the candidate) by key. Its parameters are the key columns, an optional
+latest-by column, ignored columns, and group and decimal columns for totals.
+For each key $k$ in a scope $Q$ it takes the latest-version rows of $k$ on each
+side, $L_k$ and $R_k$ (the rows at $k$'s greatest latest-by value; null
+timestamps never win, \adr{014}), and compares them by a row hash $h$: xxh3-128
+from the xxHash family~\cite{xxhash} over the canonical encodings of the
+non-ignored columns in schema order, each preceded by its column name's length
+and bytes, with an explicit null marker (\doc{format.md}, \adr{016}). It also
+sums decimal columns per group exactly, at the dataset's declared scale. The
+Certificate records
+\begin{align*}
+  \mathit{missing\_right} &= |\{ k \in Q : L_k \neq \emptyset,\ R_k = \emptyset \}|,\\
+  \mathit{missing\_left}  &= |\{ k \in Q : L_k = \emptyset,\ R_k \neq \emptyset \}|,\\
+  \mathit{mismatched}     &= |\{ k \in Q : L_k, R_k \neq \emptyset,\
+                              h(L_k) \neq h(R_k) \}|,
+\end{align*}
+the ignored columns, and every group whose totals differ, with both totals at
+the declared scale. It passes if and only if the three counts are zero and no
+totals differ (\doc{agent-loop.md}). The index makes this cheap (\adr{004}):
+the scope of a workload certificate is the set of keys the recorded runs
+touched, and the index locates them to row groups, so running the job both ways
+and reconciling reads the row groups that hold touched keys rather than the
+dataset.
+
+\subsection{Coverage}\label{sec:coverage}
+
+Every Certificate states its coverage: \emph{full} (every key),
+\emph{workload} (the keys of a named recorded workload, with their count), or
+\emph{sampled} (a number of keys and the sampled fraction).
+\emph{Guarantee (design property):} a passing Certificate with scope $Q$
+asserts that for every $k \in Q$ the latest-version rows of $k$ agree on every
+non-ignored column, up to collisions of a 128-bit non-cryptographic hash, and
+that group totals over the compared rows agree exactly. It asserts nothing
+about keys outside $Q$; in the design's words, a Certificate is a statement
+about the keys it covers and nothing more (\doc{agent-loop.md}).
+
+\subsection{Why provers do not apply}\label{sec:provers}
+
+SQL equivalence provers and deciders establish equivalence for all database
+instances, or for all instances up to a bound, within a supported SQL
+fragment~\cite{cosette,qed,sqlsolver,verieql}. Bellwether's changes fall outside
+that setting in three ways (\adr{004}). Pipeline steps are written as Spark
+plans, KQL, Scala, or configuration, which these tools do not accept. Many
+changes are not query rewrites at all: a key spec, a bloom false-positive rate,
+a lookback bound, a layout. And the rewrites with the largest effect often cross
+step boundaries and change intermediate results
+(Section~\ref{sec:nonlocal}). Reconciliation applies to all three because it
+compares outputs; the price is that a Certificate covers the keys it compared,
+not all inputs. The two kinds of evidence compose: where a rule catalog identity
+applies, such as a semi-join on $K$ commuting with a window partitioned by $K$,
+the gate may use the identity for that edit and reconciliation for the rest
+(\doc{evolve.md} \S1, \S4.2). In the current contract a static identity has no
+Certificate path and so cannot reach a Receipt; the planned \code{Verifier}
+trait adds one (\doc{rule-catalog.md}; \doc{evolve.md} \S10).
+
+\subsection{Whole-pipeline equivalence and non-local rewrites}\label{sec:nonlocal}
+
+A pipeline is a DAG of steps with lineage. The rewrites that matter most cross
+step boundaries: push a filter from a late step to an early one, materialize an
+intermediate that two steps share, or remove a deduplication that a later step
+repeats (\doc{evolve.md} \S5.3). Each changes some step's local output, so a
+check that requires equivalence step by step must reject it. Bellwether gates at
+the pipeline output instead: for a candidate $a$ and the baseline $a_0$,
+$\Eq(a, a_0)$ holds when reconciliation of the two pipeline outputs over the
+touched keys passes, and intermediate outputs may differ (\adr{023}).
+
+\emph{Illustration.} Step two of a pipeline reads the full history of a
+versioned table and keeps the newest version of each key; step five semi-joins
+that result with the run's trigger keys. The candidate moves the semi-join into
+step two and answers it with a temporal \emph{latest} lookup. Step two's output
+now holds only the trigger keys, so a per-step check fails, yet step five's
+output is unchanged for every trigger key, which is what the output certificate
+checks. The candidate composes two catalog patterns,
+\code{lookback\us unbounded} and \code{unprefiltered\us window}
+(\doc{rule-catalog.md}), across a step boundary;
+Figure~\ref{fig:schematic-pipeline} draws it.
+
+\subsection{Limits}\label{sec:certlimits}
+
+A non-local rewrite is certified for the keys the workload touched, not for all
+inputs, so a rewrite that is wrong only on untouched keys would pass. How to
+communicate this to a user who later runs an untouched key is an open question
+in the design (\doc{evolve.md} \S13), and it is why a rule must be re-validated
+on held-out runs before promotion (Section~\ref{sec:rulebook}). A sampled
+certificate speaks only for its sample, and ignored columns are not compared,
+which is why the Certificate lists them. The row hash is not cryptographic, so a
+Certificate does not defend against an adversary who can craft colliding rows;
+an attacker with write access to the store is already outside the threat model.
+Data can also drift: each decision records the fanout evidence it depended on,
+and a receipt whose evidence has drifted is flagged stale (\doc{evolve.md}
+\S5.4).

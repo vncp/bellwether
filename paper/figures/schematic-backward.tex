@@ -1,0 +1,39 @@
+% Schematic; no measured quantities. The backward pass on a small plan:
+% every attributed node carries its counterfactual difference Delta, and one
+% pair of choices (u, v) carries a nonzero interaction I_uv.
+\begin{tikzpicture}[
+    font=\scriptsize,
+    op/.style={draw, rounded corners=1.5pt, fill=black!4, inner sep=1.5pt,
+               minimum height=0.66cm, minimum width=1.18cm, align=center},
+    design/.style={op, fill=white, dashed},
+    input/.style={draw=black!55, rounded corners=1.5pt, inner sep=1.5pt,
+                  minimum height=0.5cm, align=center, text=black!80},
+    flow/.style={-{Stealth[length=1.4mm]}, semithick},
+  ]
+  % Operators, forward.
+  \node[op] (scan) at (0.62,1.55) {scan\\[-1pt]$\Delta_{\mathrm{scan}}$};
+  \node[op] (win)  at (2.32,1.55) {window\\[-1pt]$\Delta_{\mathrm{win}}$};
+  \node[op, draw=bwA, very thick] (sj) at (4.02,1.55) {semi-join $v$\\[-1pt]$\Delta_v$};
+  \node[op] (agg)  at (5.72,1.55) {aggregate\\[-1pt]$\Delta_{\mathrm{agg}}$};
+  \node[op, fill=white] (out) at (7.42,1.55) {output\\[-1pt]$c(a)$};
+  \draw[flow] (scan) -- (win);
+  \draw[flow] (win) -- (sj);
+  \draw[flow] (sj) -- (agg);
+  \draw[flow] (agg) -- (out);
+  % Inputs: a design choice and the run's trigger keys.
+  \node[design, draw=bwA, very thick] (key) at (0.62,2.85) {key spec $u$\\[-1pt]$\Delta_u$};
+  \node[input] (trig) at (5.95,2.85) {trigger keys $K_r$};
+  \draw[flow] (key) -- (scan);
+  \draw[flow] (trig.south) -- (sj.north east);
+  % The interaction between u and v.
+  \draw[bwA, densely dashed, thick] (key.east) to[out=0, in=115]
+    (sj.north west);
+  \node[anchor=south west, inner sep=1.5pt, text=bwInk] at (1.35,2.95)
+    {$I_{uv} \neq 0$: propose $u$ and $v$ together};
+  % The backward direction: one exact replay per node.
+  \draw[-{Stealth[length=1.6mm]}, black!55, densely dashed]
+    (7.42,0.95) -- (0.62,0.95);
+  \node[anchor=north, inner sep=1.5pt, align=center] at (4.02,0.92)
+    {backward: per node, one exact replay of $a \ominus v$ ($v$ replaced by its
+     best local alternative)\\$\Delta_v = c(a) - c(a \ominus v)$};
+\end{tikzpicture}%

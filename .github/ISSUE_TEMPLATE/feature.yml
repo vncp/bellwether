@@ -1,0 +1,53 @@
+name: Feature request
+description: Propose a capability, a lint, or a change to a contract.
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        The architecture is fixed by the ADRs in docs/adr/. A request that
+        contradicts one needs a new ADR; say which one below.
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What you are trying to do and what stops you today.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposal
+      description: The change you want, in terms of commands or records.
+    validations:
+      required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - CLI
+        - MCP tools
+        - Lint or rule catalog
+        - Index format or storage
+        - Replay or verification
+        - Benchmark
+        - Docs
+        - Other
+    validations:
+      required: true
+  - type: input
+    id: adrs
+    attributes:
+      label: ADRs and invariants touched
+      description: For example "ADR 011, invariant 1", or "none".
+  - type: checkboxes
+    id: contract
+    attributes:
+      label: Contract
+      options:
+        - label: This changes a type in bellwether-types or the on-disk format.
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered

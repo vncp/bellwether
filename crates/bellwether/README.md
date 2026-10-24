@@ -1,0 +1,79 @@
+# bellwether
+
+Work package WP9. The facade: one `Engine` over every engine crate, and the single code path the CLI and the MCP server share (ADR 010). Every operation is a method that returns a typed result; that result, serialized, is the CLI's `--json` output and what the MCP server returns. No formatting lives here: results carry integers, hashes, and the ledger records each call wrote or read, embedded whole with their hashes (`Written { hash, record }`, where `record` serializes to exactly the bytes at `ledger/<hash>.rec`).
+
+```rust
+use bellwether::{spec, Engine, EngineOptions, KeyFile, WhyRequest};
+
+let engine = Engine::open("./orders", EngineOptions::default())?;           // index at ./orders/.bellwether
+let why = engine.why(&WhyRequest { keys: Some(KeyFile::new("keys.parquet")), ..Default::default() })?;
+engine.index(&[spec::parse("exact:order_id")?])?;                            // one manifest commit
+let plan = engine.locate(&KeyFile::new("keys.parquet"))?;                    // a `plan` Evidence
+println!("{} of {} row groups", plan.planned.row_groups, plan.row_groups_total);
+```
+
+Dependencies today: `types`, `core` (spec validation), `source` (sources, fingerprint policies, the catalog digest), `store` (the index store, manifest, cache), `ledger` (the only write path), `build` (`index`, plans, the apply), `replay` (`why`, `fix`'s score), `verify` (`reconcile`, `fix`'s verify). `profile` joins when WP5 merges; `dev/check-layering.py` already permits it.
+
+## Operations
+
+| Method | What it does | Records written |
+|---|---|---|
+| `Engine::open(root, options)` | Canonicalizes the data root once, the way the build does (a local folder; an object-store data root is refused because sources read local files only), and resolves the index location (default `<root>/.bellwether/`, or any store URL). The index store is opened on first write, so opening writes nothing. An existing index's source kind and root must agree. | none |
+| `why(request)` | The dataset from footer statistics; with a workload (a Parquet key file, a bench workload directory, or a recorded workload hash), a replay (WP6) of the current configuration and each candidate key. Returns the funnel per candidate, the culprit, the recommended key, and every record. | per candidate an engine Proposal and its Replay |
+| `index(specs)` | Build (WP4): declare `specs` in addition to the declared ones and index every live row group, in one manifest commit. Returns the committed sequence, segment counts, and completeness per spec. | none (a manifest commit) |
+| `locate(keys)`, `latest(keys)`, `asof(keys, at)` | First list the folder: a file the index does not track, a tracked file that changed, or one that is gone is refused with an error naming `bellwether index` (invariant 1 over the folder: such a file would be silently left out of the plan). The check reads no file contents, whatever the fingerprint policy: each file is listed and `stat`ed, and a size or etag/mtime that differs from the manifest's is a changed fingerprint by definition. Only untracked files are fingerprinted. Under `full`, an in-place patch that keeps size and mtime passes this check and is caught when the planner verifies the full-content fingerprint of each file it plans. Then plan (WP4) with every declared spec complete at the current sequence; incomplete ones are listed as excluded. A temporal plan whose residual lacks `NotOlderThan` before `LatestPerKey` is refused (invariant 5). `at` converts to the timestamp column's unit exactly or is refused. | a `plan` Evidence citing the manifest's content hash and the key set's hash (the key set is stored in the cache, so the citation resolves) |
+| `propose(body, evidence, by)` | Writes a Proposal (Key, Layout, Rewrite). At least one evidence hash, each resolving to Evidence; key and layout columns must exist; rewrite texts non-empty; the engine's own proposer names (`RESERVED_PROPOSERS`: `engine`, compared trimmed and ignoring case) get a typed refusal (`ProposeResult::Refused`, CLI exit 3) and nothing is written. There is no score field and the facade adds none. | a Proposal |
+| `reconcile(right, request)` | WP8 over the data root (left) and `right`, by key, optional latest-by, ignored columns, exact decimal totals by group, or a deterministic sample. Anchored to this index's manifest when one exists; otherwise the verifier records manifest "0" and cites both sides' catalog digests. CLI exit 1 when it does not pass. | a Certificate (stored even when it fails) |
+| `fix(request)` | Score, verify, apply, attest, in that order and no other (below). | Replay, plan Evidence, Certificate, Receipt, realized Replay |
+| `receipt(hash)` | The ledger's `explain` chain, with MISSING, WRONG KIND, and UNREADABLE flags, and every record that resolved. | none |
+| `report(out)` | One self-contained HTML file (inline SVG and CSS, no scripts, no external resources) from ledger records only: the funnel per receipt, the fanout table per profile Evidence, realized against predicted bytes where a receipt has both. A record that cannot be read (tampered, newer, malformed) is skipped and listed. | none |
+
+## Options
+
+| `EngineOptions` field | CLI | Meaning |
+|---|---|---|
+| `index` | `--index` | The index location; default `<root>/.bellwether/`. |
+| `format`, `chunk_size` | `--format`, `--chunk-size` | Parquet, CSV, or JSON lines; the text chunk size for new files. |
+| `fingerprint_policy` | `--fingerprint-policy tail64k\|full` | Which bytes a file fingerprint hashes when a new index is built (ADR 013). An existing index keeps its recorded policy. |
+| `schema` | `--schema <file>` | The dataset schema, instead of inferring it from the first file in sorted order. Needed when files store a column at different decimal scales or time units; a value that does not fit the inferred type is refused with an error naming `--schema`. The file is a JSON list of `{"name", "type", "nullable"}` with Arrow type spellings, as the manifest records them (`schema_from_json`). |
+| `clock` | `--clock` (hidden) | A fixed RFC 3339 time for every record's `created_at` and for ages, so two runs over the same inputs write byte-identical records. The ADR 010 test runs the CLI and the in-process facade under one clock and compares bytes. |
+
+## `why`
+
+- **Writes.** With no workload, `why` writes nothing: it does not even create the index directory. With a workload it writes the key sets, Proposals, and Replays to the index location; if that location is not writable the error is one line naming `--index`.
+- **Dataset.** Files, live row groups, rows, and bytes come from the replay crate's catalog: the manifest when an index exists, else discovery. Footers only. In an indexed folder, files that landed after the last build are listed in `untracked` and counted in the dataset totals; the costs cover the files the index tracks, so the output says to run `bellwether index` first.
+- **Candidates.** The exact key on each run's own key columns, unless it is already current: the floor, which selects exactly the row groups holding a queried key, the least any row-group index can read for those runs.
+- **Proposals and replays.** Each candidate is written as a Proposal by `engine` and scored by `Replayer::record`, which computes the replay and writes it at once. Every Replay carries `inputs` (the catalog digest) and, being a key replay, no `model` (contract v2.1). Until the profile is wired in, these proposals cite no evidence.
+- **Funnel.** Costs are summed over runs: files, row groups, bytes, each an exact sum of row-group statistics.
+- **Culprit.** The workload's key columns when no current spec serves them (`no_index_serves`), or the serving current spec's columns.
+- **Recommendation.** The candidate with the fewest bytes over all runs (ties: fewer columns, then candidate order), only if it reads fewer bytes than the current configuration.
+- **Workloads.** A key file is recorded as a one-run workload (run id `keys`) in the store's cache; its hash is in the result, and `fix` takes it.
+
+## `fix`
+
+1. **Score.** For a Key proposal, the workload (`--workload <hash>`, which `why` prints) is replayed under the current specs plus the proposed one by `Replayer::record`, computed immediately before the Replay is written: no caller-supplied cost or `Scored` value reaches the ledger. A Rewrite has no defined replay (contract v3 backlog #2) and records `not_scorable`. A Layout is refused (`layout_not_applicable`; layout apply arrives with evolve).
+2. **Verify** against the current manifest (`manifest_before`). Key: the full scan, restricted to the workload's keys (each float key element under both zero encodings, as the planner probes them), is reconciled against a source exposing only the row groups of the hypothetical plan (the union of each run's plan with the proposed spec's transient segments), coverage `Workload`; that plan is written as a `plan` Evidence and cited by the certificate. The verifier lists a file's row groups densely by position, so a row group outside the plan is listed with zero rows and no statistics and reads as an empty batch. Rewrite: the before and after outputs the caller names, coverage `Full`; the rewrite's invariant travels in the proposal the certificate cites and in the result.
+3. **Apply**, behind one gate: the certificate passed, was computed against the current sequence, and, for a Key, still describes the data: the data root's catalog digest (`bellwether_source::catalog::unindexed` over every file and row group now, exactly as the verifier computes the left side) equals the left-side digest the certificate cites (else `certificate_failed`, exit 1, `stale_manifest`, exit 3, or `data_changed`, exit 3: run `fix` again to re-verify). This catches a file that lands or changes without a commit. The build must commit exactly `before + 1`: no commit at all is `nothing_to_apply` (the key is already complete) and any other sequence is `concurrent_commit` (another commit landed first; the build crate has no expected-base precondition, so this is detected, not prevented): the key is built but not attested, and the way forward is `why` again on the same keys, then `fix` on its proposal, which verifies and attests at the current manifest. Both withhold the receipt (exit 3).
+4. **Attest** with `Ledger::put_receipt`. Then the same proposal is replayed at `manifest_after` and that Replay is written: the realized cost, which `report` pairs with the receipt's predicted one. If that replay fails, the receipt stands: the outcome is still `applied` (exit 0) with a `warning`.
+
+On an indexed folder, `fix` first runs the plan-time folder check, so a stale index is refused naming `bellwether index` before any work. A failing certificate writes no receipt and names its counts; `verification` in the result carries the typed outcome, including what each side read. `fix --certificate <hash>` is the apply tier: the gate runs before anything is written, the proposal is re-scored on the workload the certificate covered, then applied and attested. A passing Rewrite is refused at attest (`no_replay`, exit 3): a receipt cites a replay, and rewrites have none yet. `--verify-only` stops after the certificate.
+
+## Arriving with WP5
+
+- **With the profile (WP5):** `why` writes a `profile` Evidence (fanout per column and composite, the statistics-only lints), the profile's measured candidates that serve the workload join the floor, the engine's proposals cite the Evidence, and the culprit rule puts the highest-confidence `batch_stamp_key` or `low_selectivity_single_column` lint on a used column first, with its measured fanout.
+
+## Errors
+
+Every public method returns `Result<_, bellwether_types::Error>`. Messages say what to do. An internal panic is caught at the method boundary and returned as an error naming the issue tracker, so no panic reaches a caller. The crate denies `unwrap` and `expect`.
+
+## Tests
+
+| File | Covers |
+|---|---|
+| `tests/facade.rs` | Root canonicalization and refusals; `locate` equals an oracle reading the files with the `parquet` crate; plan Evidence provenance and stored bytes; temporal residual order and exact instant conversion; proposals cite resolving evidence and carry no score; `receipt` refusals; the report has no script or external reference. |
+| `tests/why.rs` | `why` with no index and no workload (bytes equal the footers'); with a key file, the floor equals the oracle and every Proposal and Replay is stored byte for byte with `inputs` and no `model`; over an index that does not serve the workload, and then over one that does. |
+| `tests/review_probe.rs`, `tests/review_probe2.rs`, `tests/review_receipt.rs` | The PR #22 review's probes, kept: `latest` and `asof` against a decoded oracle (null timestamps, ties, the `Between` and `NotOlderThan` bounds); decimals at three scales and both float zeros; CSV and JSON lines with the index folder never discovered; duplicate columns, empty key files, `file://` and `memory://` indexes; mixed scales refused naming `--schema` and fixed by it; a file added, rewritten, or removed after `index` refused naming `bellwether index`, and reported by `why`; observe writes nothing, an unwritable index names `--index`; tampered and garbage records skipped by `report`; invariant 5 through a pruning spec; a real receipt's chain, records, and intact flag, the no-candidate current cost, and realized against predicted in `report`. |
+| `tests/catalog_digest.rs` | Contract v3 entry 30: replay's catalog digest and `bellwether_source::catalog` agree byte for byte, unindexed, indexed, and after a rewrite retires row groups. |
+| `tests/followups.rs` | Reserved proposer names are refused with a typed refusal; under `full` the folder check compares metadata only and the planner re-hashes the files it plans. |
+| `tests/review_pr23.rs`, `src/fix.rs` unit tests | The PR #23 review's probes, kept: data that changes between `--verify-only` and `--certificate` is refused (`data_changed`), unindexed and indexed, and a stale index at `fix` names `bellwether index`; reconcile anchors; rewrite and layout refusals; a selective key. Through a test seam over the hypothetical plan, an incomplete plan fails the certificate and writes no receipt, the left side reads every row group and cites the data root's digest, a file with no planned row group is absent on the right, and a plan missing the `-0.0` file fails while the real one passes. |
+| `tests/latency.rs` | The observe budget, 100 ms for `why` with no workload, in optimized builds with `BELLWETHER_OBSERVE_LATENCY_CORPUS` set. CI's latency job runs it on `replay-small` (4 days, 64 files, 2 row groups of 2,000 rows), not the pre-registered small rung; each call builds a fresh source, so no footer cache carries over between calls. |

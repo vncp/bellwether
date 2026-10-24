@@ -1,0 +1,200 @@
+% Shared style for every data-driven results panel.
+%
+% Each results panel is a pgfplots template that reads one CSV file in data/,
+% written by `bellwether report --paper` from ledger records; data/README.md
+% fixes the schema of every file. A panel whose file does not exist is drawn
+% as a framed placeholder (figures/pending.tex). Plot and placeholder occupy
+% the same fixed box, so pagination does not change when data arrives.
+\usepackage{pgfplots}
+\usepackage{pgfplotstable}
+\pgfplotsset{compat=1.18}
+\usepgfplotslibrary{colorbrewer,fillbetween}
+
+% Palette. One family, ColorBrewer, checked for color-vision deficiency:
+% categorical slots are Dark2 hues reordered so that adjacent slots stay
+% distinct under protanopia and deuteranopia, and the first three slots stay
+% pairwise distinct, for the scatter plot; every slot has at least 3:1
+% contrast on white. Ordered stages use a one-hue Blues ramp, magnitudes the
+% Blues colormap, and signed quantities the RdBu colormap with blue for fewer
+% bytes and red for more. Every series also has its own marker and dash
+% pattern, so no plot depends on color alone, in print or in grayscale.
+\definecolor{bwA}{HTML}{1B9E77}% teal
+\definecolor{bwB}{HTML}{D95F02}% orange
+\definecolor{bwC}{HTML}{7570B3}% purple
+\definecolor{bwD}{HTML}{A6761D}% brown
+\definecolor{bwE}{HTML}{E7298A}% magenta
+\definecolor{bwStageA}{HTML}{6BAED6}% Blues, light
+\definecolor{bwStageB}{HTML}{2171B5}% Blues, middle
+\definecolor{bwStageC}{HTML}{08306B}% Blues, dark
+\definecolor{bwInk}{HTML}{252525}
+\definecolor{bwGrid}{HTML}{DDDDDD}
+\definecolor{bwAxis}{HTML}{8C8C8C}
+
+% Panel geometry. A panel is \linewidth wide and #1 tall. The axis rectangle
+% sits inside it with margins #2 (left), #3 (bottom), #4 (right), and #5 (top,
+% where the legend or colorbar goes, outside the data area). The bwpanel
+% environment clips everything it draws to the panel, so a long label can
+% never run into a neighboring panel, and fixes its bounding box to the panel.
+\pgfplotsset{
+  bw box/.style n args={5}{
+    scale only axis, anchor=south west, at={(#2,#3)},
+    width=\linewidth-#2-#4, height=#1-#3-#5,
+    legend style={xshift=(#4-#2)/2}},
+}
+% (TikZ stops counting paths toward the picture size after a \clip, which
+% leaves a pgfplots axis with an empty box; the box is fixed at the end
+% anyway, so counting is switched back on.)
+\makeatletter
+\newenvironment{bwpanel}[1]{%
+  \def\bwpanelheight{#1}%
+  \begin{tikzpicture}
+  \clip (0,0) rectangle (\linewidth,#1);
+  \pgf@relevantforpicturesizetrue}{%
+  \pgfresetboundingbox
+  \path[use as bounding box] (0,0) rectangle (\linewidth,\bwpanelheight);
+  \end{tikzpicture}}
+\makeatother
+
+% Tables: comma-separated, header row, and `#` lines for provenance.
+\pgfplotstableset{col sep=comma, comment chars={\#}}
+
+% Axis style shared by every panel: 6pt type, light solid grid, thin gray
+% axis lines, ticks outside on the left and bottom, and the legend above the
+% axis rectangle, outside the data area, so it can never cover a point.
+\pgfplotsset{
+  bw/.style={
+    font=\scriptsize,
+    every tick label/.append style={font=\scriptsize, text=bwInk},
+    every axis label/.append style={font=\scriptsize, text=bwInk},
+    legend style={font=\scriptsize, text=bwInk, draw=none, fill=none,
+      at={(0.5,1)}, anchor=south, inner sep=0.5pt, outer sep=0pt,
+      /tikz/every even column/.append style={column sep=3pt}},
+    legend cell align=left,
+    legend image post style={mark size=1.2pt},
+    legend image code/.code={%
+      \draw[mark repeat=2, mark phase=2, ##1]
+        plot coordinates {(0cm,0cm) (0.2cm,0cm) (0.4cm,0cm)};},
+    grid=major, major grid style={bwGrid, line width=0.3pt},
+    axis line style={bwAxis, line width=0.4pt},
+    tick style={bwAxis, line width=0.4pt},
+    major tick length=2pt, minor tick length=1pt,
+    tick align=outside, tick pos=left,
+    xlabel style={inner sep=1pt}, ylabel style={inner sep=1pt},
+    every axis plot/.append style={line width=0.75pt},
+    mark size=1.2pt,
+    unbounded coords=discard,
+  },
+  % Lookup strategies: one color, marker, and dash pattern each, the same in
+  % every figure.
+  bw index/.style={bwA, solid, mark=*, mark options={solid}},
+  bw stats/.style={bwB, dashed, mark=square*, mark options={solid}},
+  bw datafusion/.style={bwC, dash dot, mark=diamond*, mark options={solid}},
+  bw duckdb/.style={bwD, densely dotted, mark=triangle*, mark options={solid}},
+  bw raw/.style={bwE, loosely dashed, mark=pentagon*, mark options={solid}},
+  % A horizontal colorbar above the axis, 80% of its width, with its tick
+  % scale factor (for example 10^9) to the right of the bar, inside the panel.
+  bw colorbar/.style={
+    colorbar horizontal,
+    colorbar style={at={(0,1.04)}, anchor=south west, height=0.12cm,
+      width=0.8*\pgfkeysvalueof{/pgfplots/parent axis width},
+      xticklabel pos=upper, font=\scriptsize,
+      every x tick scale label/.style={at={(1,0.5)}, anchor=west,
+        inner sep=1.5pt, font=\scriptsize}}},
+  % A compact legend swatch for bars.
+  bw bar legend/.style={legend image code/.code={%
+    \fill[##1, draw=none] (0cm,-0.07cm) rectangle (0.3cm,0.07cm);}},
+  % Keep only the rows whose column #1 equals #2; other rows are discarded.
+  bw only/.style 2 args={
+    x filter/.code={%
+      \edef\bwcell{\thisrow{#1}}\edef\bwwant{#2}%
+      \ifx\bwcell\bwwant\else\def\pgfmathresult{nan}\fi}},
+  % Colormaps. Magnitude: ColorBrewer Blues from its third step, so the low
+  % end stays visible on white. Signed: ColorBrewer RdBu, blue for negative,
+  % near-white at zero, red for positive.
+  /pgfplots/colormap={bwblues}{rgb255=(198,219,239) rgb255=(158,202,225)
+    rgb255=(107,174,214) rgb255=(66,146,198) rgb255=(33,113,181)
+    rgb255=(8,81,156) rgb255=(8,48,107)},
+  /pgfplots/colormap={bwdiverging}{rgb255=(33,102,172) rgb255=(103,169,207)
+    rgb255=(209,229,240) rgb255=(247,247,247) rgb255=(253,219,199)
+    rgb255=(239,138,98) rgb255=(178,24,43)},
+}
+
+% Position of a lookup strategy on a categorical axis, from its key in the
+% data; an unknown key maps outside the axis and is discarded, not an error.
+\makeatletter
+\def\bw@pos@raw{0}\def\bw@pos@stats{1}\def\bw@pos@duckdb{2}%
+\def\bw@pos@datafusion{3}\def\bw@pos@index{4}%
+\newcommand{\bwstrategypos}[1]{%
+  \ifcsname bw@pos@#1\endcsname\csname bw@pos@#1\endcsname\else -100\fi}
+\makeatother
+
+% Labels read from data are typeset literally: while a panel reads its file,
+% _ & $ ^ ~ are ordinary characters (data/README.md lists what a label may
+% not contain).
+\newcommand{\bwdatacatcodes}{%
+  \catcode`\_=12 \catcode`\&=12 \catcode`\$=12 \catcode`\^=12 \catcode`\~=12 }
+
+% \bwloglimits{<file>}{<column>}{<column>} sets \bwlo and \bwhi to half the
+% least and twice the greatest value in the two columns, so that a log-log
+% plot can use one range on both axes and its corner-to-corner line is y = x.
+\newcommand{\bwloglimits}[3]{%
+  \pgfplotstableread{#1}\bwtable
+  \gdef\bwmin{}\gdef\bwmax{}%
+  \pgfplotstableforeachcolumnelement{#2}\of\bwtable\as\bwcell{\bwtrack}%
+  \pgfplotstableforeachcolumnelement{#3}\of\bwtable\as\bwcell{\bwtrack}%
+  \begingroup
+    \pgfkeys{/pgf/fpu=true, /pgf/fpu/output format=sci}%
+    \pgfmathparse{\bwmin/2}\xdef\bwlo{\pgfmathresult}%
+    \pgfmathparse{\bwmax*2}\xdef\bwhi{\pgfmathresult}%
+  \endgroup}
+\newcommand{\bwtrack}{%
+  \begingroup
+    \pgfkeys{/pgf/fpu=true, /pgf/fpu/output format=sci}%
+    \ifx\bwmin\empty
+      \pgfmathparse{\bwcell}\xdef\bwmin{\pgfmathresult}\xdef\bwmax{\pgfmathresult}%
+    \else
+      \pgfmathparse{min(\bwmin,\bwcell)}\xdef\bwmin{\pgfmathresult}%
+      \pgfmathparse{max(\bwmax,\bwcell)}\xdef\bwmax{\pgfmathresult}%
+    \fi
+  \endgroup}
+
+% \bwsymlimit{<file>}{<column>} sets \bwabs to the greatest absolute value in
+% the column, ignoring nan, so that a diverging colormap is centered on zero.
+\newcommand{\bwsymlimit}[2]{%
+  \pgfplotstableread{#1}\bwtable
+  \gdef\bwabs{1}%
+  \pgfplotstableforeachcolumnelement{#2}\of\bwtable\as\bwcell{%
+    \begingroup
+      \pgfkeys{/pgf/fpu=true, /pgf/fpu/output format=sci}%
+      \pgfmathfloatparsenumber{\bwcell}%
+      \pgfmathfloatgetflagstomacro\pgfmathresult\bwflag
+      \ifnum\bwflag<3
+        \pgfmathparse{max(\bwabs,abs(\bwcell))}\xdef\bwabs{\pgfmathresult}%
+      \fi
+    \endgroup}}
+
+% \bwlatencyseries{<strategy key>}{<legend label>}: inside an axis, the p50
+% line of one strategy from data/latency.csv, with a band and a whisker from
+% p50 to p95 (the whisker keeps p95 visible when only one rung exists).
+\newcommand{\bwlatencyseries}[2]{%
+  \addplot[name path=bwlat#1lo, draw=none, mark=none, forget plot,
+    bw only={strategy}{#1}] table[x=files, y=p50_ms] {data/latency.csv};
+  \addplot[name path=bwlat#1hi, draw=none, mark=none, forget plot,
+    bw only={strategy}{#1}] table[x=files, y=p95_ms] {data/latency.csv};
+  \addplot[bw #1, draw=none, mark=none, fill opacity=0.15, forget plot]
+    fill between[of=bwlat#1lo and bwlat#1hi];
+  \addplot[bw #1, bw only={strategy}{#1},
+      error bars/.cd, y dir=plus, y explicit,
+      error bar style={solid, line width=0.4pt}, error mark=none]
+    table[x=files, y=p50_ms, y error plus expr=\thisrow{p95_ms}-\thisrow{p50_ms}]
+    {data/latency.csv};
+  \addlegendentry{#2}}
+
+% \bwmaxint{<file>}{<column>} sets \bwlast to the greatest value in an
+% integer column, for example the last row index of a heatmap, so that its
+% ticks are exactly 0 to \bwlast.
+\newcommand{\bwmaxint}[2]{%
+  \pgfplotstableread{#1}\bwtable
+  \gdef\bwlast{0}%
+  \pgfplotstableforeachcolumnelement{#2}\of\bwtable\as\bwcell{%
+    \ifnum\bwcell>\bwlast\relax\xdef\bwlast{\bwcell}\fi}}

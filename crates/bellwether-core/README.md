@@ -1,0 +1,150 @@
+# bellwether-core
+
+Work package WP1. This crate holds canonical key encoding, split-block bloom filters, the segment writer and reader, temporal version chains, and segment merge. It owns invariants 1 and 5 and implements ADR 001, 002, 008 (with its amendment), 014, 016, 017, and 018.
+
+| Module | What it does |
+|---|---|
+| `encoding` | Canonical memcomparable bytes for every Arrow scalar type, always relative to the dataset type. Provides `KeyColumns` (row-at-a-time key encoding that converts each column to its dataset type and skips null rows), `ts_value_as`, `encode_nullable_as` (row hashing), and `prefix_bound`. |
+| `bloom` | Parquet split-block bloom filter (SBBF), generic over its hash kind: `Sbbf<CanonicalHash>` or `Sbbf<PlainHash>`. The `BloomHash` header value names the kind. |
+| `segment` | `SegmentWriter` (`for_dataset` for Arrow batches), `SegmentReader<R: ReadAt>`, `FileRange`, and `EncodedSegment::path()` = `segments/<blake3>.seg` |
+| `temporal` | `latest` and `asof` across every segment of a key spec, plus `VersionChain`, `VersionHit`, and `is_stale` |
+| `merge` | `merge(&[SegmentReader], &WriterOptions)` |
+
+Tests:
+
+| File | Covers |
+|---|---|
+| `tests/no_false_negatives.rs` | Invariant 1, including files whose decimal scale, decimal width or timestamp unit differs from the dataset's |
+| `tests/temporal_stale_rejection.rs` | Invariant 5 |
+| `tests/encoding_order.rs` | Property tests: typed order, dataset-type conversion, decimal and timestamp rules |
+| `tests/parquet_bloom_compat.rs` | Byte compatibility with the `parquet` crate's filters |
+| `tests/segment_format.rs` | Format rules |
+| `tests/corrupt_sweep.rs` | Every truncation and a byte-flip sweep never panic |
+| `tests/conformance.rs` | The pinned test vectors of `docs/format.md`, through both the scalar and the Arrow encoder paths; the test also requires the document's table to list exactly these vectors |
+
+Benchmark: `cargo bench -p bellwether-core --bench lookup` measures single-key lookup latency against segment size.
+
+## Encoding (`docs/format.md`, encoding version 1)
+
+**The dataset schema decides every byte.** `Source::schema` is the single source of column types. A value read from a file is first converted to its column's dataset type, then encoded.
+
+- Two files holding 1.50 as `Decimal128(10,2)` and 1.500 as `Decimal128(10,3)` encode identically under a dataset `Decimal128(20,3)`.
+- A conversion that would lose information is an error, never a silent miss or a rounding.
+- `SegmentWriter::for_dataset(spec, schema, opts)` carries the dataset types and records them in the segment header (see below). `add_batch` refuses to run without them.
+- `add_batch` is all or nothing. The batch is encoded into a local buffer first, and its keys are recorded only if every row converts. On error nothing from the batch is recorded and the writer stays usable, so a build that skips the row group never publishes part of it.
+
+The byte values below are those of `docs/format.md`, agreed with WP2 (`bellwether-source`), whose statistics encoder has to match byte for byte. `tests/conformance.rs` checks the document's pinned vectors.
+
+| Dataset type | Bytes |
+|---|---|
+| Boolean | `01` then `00`/`01` |
+| Int8..Int64 | `02` then i64 BE, sign bit flipped |
+| UInt8..UInt64 | `03` then u64 BE |
+| Float16..Float64 | `04` then f64 bits with sign-aware flip; one canonical NaN, sorting last; `-0.0 < +0.0` |
+| Decimal128(p,s) | `05 10` then 16 bytes BE, sign bit flipped, at scale `s` |
+| Decimal256(p,s) | `05 20` then 32 bytes BE, sign bit flipped, at scale `s` |
+| Utf8, LargeUtf8, Utf8View | `06` then bytes with `00` escaped as `00 FF`, then terminator `00 00` |
+| Binary variants | `07` then the same escaping |
+| Date32 | `08 01 05` then days |
+| Date64 | `08 02 02` then ms |
+| Time32/Time64(u) | `08 03 <u>` then time of day in unit `u` |
+| Timestamp(u, tz) | `08 04 <u>` then the UTC instant in unit `u` |
+
+Time-unit tags `<u>`: `01` s, `02` ms, `03` µs, `04` ns, `05` day. Every temporal payload is an i64, BE with the sign bit flipped. Times and timestamps keep the dataset unit, so a year-9999 sentinel in a millisecond or microsecond column encodes without overflow. For example, `Timestamp(µs)` 1 encodes as `08 04 03 80 00 00 00 00 00 00 01`.
+
+Conversion rules, file type to dataset type:
+
+- **Tag.** The tag always comes from the dataset type. A `UInt32` file column under a dataset `Int64` encodes with `02`.
+- **Integers.** They convert across widths and signedness, range-checked against the dataset type.
+- **Floats.** They convert across widths. A value not exactly representable in a Float16 or Float32 dataset type is an error, except NaN.
+- **Decimals.** They rescale to the dataset scale. The rescale must be exact and fit the dataset precision. The width (16 or 32 bytes) is the dataset type's.
+- **Times and timestamps.** They convert to the dataset unit: to a finer unit by checked multiplication, to a coarser unit only when the division is exact. The time zone is ignored, because Arrow values are already UTC instants; a value without a zone is taken as UTC.
+- **Dates.** Date32 and Date64 convert into each other exactly.
+- **Strings and binary.** The three string types are interchangeable, and so are the binary types. A `FixedSizeBinary(n)` dataset type requires length `n`. Strings and binary never convert into each other.
+- **Other families.** A conversion across any other families, such as an integer into a decimal, is an error.
+- **Nulls (ADR 014, amended).** Nulls are not indexed per tuple, not per column. A row whose leading key column is null is not indexed. A null in a trailing key column is encoded as the `00` null marker, so the tuple stays prefix-seekable by its leading columns, and a composite key fully replaces its leading single-column key for prefix lookups. A probe tuple that contains a null matches nothing (SQL three-valued logic); `encoding::tuple_has_null` recognizes one. Row hashing (`encode_nullable_as`) uses the same marker.
+
+Duration, Interval, and nested types have no encoding in version 1 and are rejected.
+
+## Bloom filters (ADR 008 amendment)
+
+Structure and sizing are byte-identical to Parquet's embedded filters. `tests/parquet_bloom_compat.rs` writes a file with the `parquet` crate and compares the bitsets byte for byte.
+
+The hash input is not identical:
+
+- Bellwether's filters hash canonical bytes (`CanonicalHash`).
+- Parquet's embedded filters hash the PLAIN physical value (`PlainHash`, built by `bloom::parquet_plain`).
+- The two are distinct types, and `Sbbf<H>` takes only its own kind, so a filter cannot be probed with the wrong hash. The zero-copy probe over a raw bitset, which carries no kind, is crate-private.
+
+Every segment header carries `bloom_hash` (`docs/format.md`):
+
+- `canonical` for keyed and keyed-temporal block filters
+- `canonical` or `parquet_plain` for bloom segments
+- `canonical` for range segments, which have no filters
+
+A missing or unknown value is refused on open.
+
+A bloom segment with `parquet_plain` filters (from `SegmentWriter::insert_filter`) covers one column. It answers only `lookup_hashes::<PlainHash>`, and `lookup` with canonical keys is an error, never a silent miss.
+
+## Segment format (`docs/format.md`, storage version 1)
+
+All integers are little-endian.
+
+```
+preamble   "BWSEGMNT" | storage_version u32 | encoding_version u32 | header_len u32
+header     JSON {storage_version, encoding_version, key_spec, codec, layout, bloom_hash,
+                 key_types?, ts_type?, ..unknown}
+body       blocks (layout-specific)
+index      entries u64 | has_rg u8 | rg_min u32 | rg_max u32 | block_count u32 | entries
+footer     index_offset u64 | index_len u64 | "BWSEGMNT"
+```
+
+- **Versions before JSON.** The versions sit in a fixed binary preamble, so a newer file is refused with `Error::UnsupportedVersion` before the header is parsed (ADR 017). The JSON header repeats them and must agree with the preamble. Unknown header fields are kept in `SegmentHeader::extra`, and merge carries them through when every input agrees, refusing otherwise.
+- **Codec.** The codec is `"none"` in storage version 1, and any other codec is refused.
+- **Recorded types.** A segment built with `for_dataset` records each key column's dataset type (`key_types`) and, for temporal specs, the timestamp column's type and unit (`ts_type`). The spelling is Bellwether's own `ColumnType`, for example `{"type":"decimal128","precision":10,"scale":2}` or `{"type":"timestamp","unit":"millisecond","tz":"UTC"}`, so the frozen format does not depend on Arrow's serde. A dictionary column is recorded as its value type. Keys encoded under different types would split silently, so:
+  - segments whose recorded types differ never merge, and the temporal fold refuses them
+  - `SegmentReader::open_for_dataset` (or `check_dataset`) refuses a segment whose recorded types differ from the dataset schema's, or which records none
+  - a segment written from already-encoded keys (`SegmentWriter::new`) records no types
+- **Merge output versions.** Merge writes its output with this build's storage and encoding versions, whatever versions its inputs carried.
+- **Recorded row-group range.** The index prelude's `has_rg | rg_min | rg_max` is the range of row groups the writer processed, inclusive, when the caller sets it with `SegmentWriter::set_rowgroup_range`. A builder that claims coverage by this range must set it. Otherwise it is the smallest range holding every row group a key references.
+  - With the range set, a segment whose row groups held no keys still records them, and two segments that processed different row groups never share bytes, and so never share an id.
+  - Every referenced row group must lie inside a set range; `finish` refuses otherwise.
+  - Merge records the hull of its inputs' ranges. For inputs that record only their keys' row groups, that is the same range as before.
+- **Footer-located index.** The emitters write blocks in key order as they fill, so merge never builds an in-memory map of its output keys. Opening by range needs four reads: preamble, header, footer, index. Allocations made from on-disk counts are capped by the bytes actually present.
+- **One layout per key-spec kind:**
+  - **Exact.** Sorted key blocks of at most 1024 keys or 64 KiB of key bytes. Each block is written as:
+    1. its value records
+    2. an SBBF over its canonical keys at 1% FPP
+    3. a key directory: `n`, `n+1` end offsets, the key bytes, then `n` × `(value_offset u64, value_len u32)`
+
+    A value is a roaring bitmap over global `RowGroupId`, always in the no-run serialized form (cookie `3a 30 00 00`) and never empty. A reader refuses any other cookie, an empty bitmap, or a bitmap that does not fill its record, so corruption is an error rather than a wrong or empty answer.
+  - **Temporal.** The exact layout, except that each value is a length-prefixed bitmap followed by a version chain: `count u32 | has_max u8 | max_ts i64 | count × (ts i64, rg u32)`, ascending and deduplicated. The bitmap includes row groups whose rows have a null timestamp, because membership is still true. The chain leaves them out, because they never win.
+  - **Bloom.** One SBBF per row group over that row group's distinct keys, sized from the spec's `fpr` with Parquet's formula. Merge ORs the filters of one row group when they are the same size and keeps them as separate entries otherwise, and a lookup unions over them.
+  - **Range.** One `(min, max)` per row group, sorted by `(min, max, rg)`, in blocks of 256 entries. Bounds may come from statistics, which exclude NaN, so a probe that includes the canonical NaN matches every row group. Signed zero follows the Parquet statistics reading rule: a stored minimum of +0.0 is widened to -0.0 and a maximum of -0.0 to +0.0, on write and on merge, so a probe for either zero never prunes a row group holding the other.
+- **Lookups.**
+  - `lookup` takes canonical keys.
+  - `lookup_range` compares full encoded keys.
+  - `lookup_prefix` selects every extension of a leading-column prefix.
+  - `lookup_prefix_range(lo, hi)` selects keys whose leading columns lie between two prefixes, inclusive. This is `Between` on the leading column of a composite key.
+- **Temporal results are index-wide.** `temporal::latest` and `temporal::asof` fold every segment of the key spec with `VersionHit::combine`. `SegmentReader::latest` and `SegmentReader::asof` answer for one segment only. Ties are kept: a `VersionHit { ts, row_groups }` holds every row group with a version at the winning timestamp. A key whose versions all have null timestamps has no `latest`. `ts` and `asof`'s argument are in the dataset column's unit.
+
+## Lookup cost and memory bound (ADR 018)
+
+`SegmentReader::open` holds the header and the block index, which is two keys and five integers per block of up to 1024 keys. A keyed lookup of `k` keys:
+
+1. sorts and deduplicates the keys
+2. binary-searches the block index for each key
+3. probes that block's bloom
+4. binary-searches the block's key directory only when the bloom passes
+
+That is O(k log n). The lookup holds the index, one block at a time, and the bitmaps or version hits for the keys asked. `tests/segment_format.rs::single_key_lookup_reads_one_block_and_one_value` checks this on a 200k-key segment: one present key costs exactly three range reads (bloom, directory, value).
+
+The one-index-plus-one-block bound is a lookup bound. Building is bounded differently (`docs/format.md`, build-side memory):
+
+- `SegmentWriter` holds the segment's distinct keys until `finish`. Version chains are buffered and compacted in amortized O(n log n), never by quadratic insertion.
+- Every writer, merge included, buffers the whole output segment's bytes, because the segment id is the blake3 of those bytes.
+- Merge reads one block per input at a time.
+
+There is no `unsafe` in this crate, so it does not create memory maps itself. A caller can hand `SegmentReader` any `AsRef<[u8]>`, such as a `bytes::Bytes` or a map it created, and the reader borrows ranges from it without copying. `FileRange` reads each range with a positioned read.
+
+Merging segments whose processed ranges are not adjacent records the hull of their ranges, which claims row groups none of the inputs processed. The build crate merges only contiguous groups and takes coverage from the manifest, so it is unaffected; any other caller must merge adjacent ranges only or set the range explicitly after the merge.

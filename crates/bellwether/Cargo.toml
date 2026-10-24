@@ -1,0 +1,39 @@
+[package]
+name = "bellwether"
+description = "The Bellwether facade: one Engine whose every operation returns a typed, serializable result; the single code path the CLI and the MCP server share (ADR 010)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[dependencies]
+bellwether-types = { path = "../bellwether-types" }
+# Key spec validation and the canonical encoder's column types.
+bellwether-core = { path = "../bellwether-core" }
+# Parquet and text sources, fingerprint policies.
+bellwether-source = { path = "../bellwether-source" }
+# The index store (local or object store), the manifest, and the cache.
+bellwether-store = { path = "../bellwether-store" }
+# The only write path for records.
+bellwether-ledger = { path = "../bellwether-ledger" }
+# `index` (Builder) and `locate`/`latest`/`asof` (Planner).
+bellwether-build = { path = "../bellwether-build" }
+# Workloads and exact replay for `why` and `fix`.
+bellwether-replay = { path = "../bellwether-replay" }
+# `reconcile`, and `fix`'s verify stage.
+bellwether-verify = { path = "../bellwether-verify" }
+arrow = { workspace = true }
+parquet = { workspace = true, features = ["arrow"] }
+roaring = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+bytes = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[lints]
+workspace = true

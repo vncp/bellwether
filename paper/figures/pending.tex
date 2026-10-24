@@ -1,0 +1,21 @@
+% Framed placeholder for a results panel whose data does not exist yet.
+% Every results panel is drawn by pgfplots from a CSV file in data/ that
+% `bellwether report --paper` writes from ledger records (data/README.md);
+% until that file exists the panel is drawn as this frame. The frame fills
+% exactly the box the plot will occupy, \linewidth wide and <height> tall, so
+% pagination does not change when the data arrives.
+%
+% Usage: \pendingfigure[<font size>]{<height>}{<what the panel will show>}{<file>}
+% where <file> is the CSV file name in data/ without its extension.
+\newcommand{\pendingfigure}[4][\footnotesize]{%
+  \begin{tikzpicture}
+    \draw[thick, rounded corners=2pt, fill=black!3]
+      (0.4pt,0.4pt) rectangle (\linewidth-0.4pt,#2-0.4pt);
+    \node[text width=\linewidth-14pt, align=center, font=#1]
+      at (0.5\linewidth,0.5*#2)
+      {Figure pending: #3, drawn from \texttt{data/#4.csv}, which
+       \texttt{bellwether report -{}-paper} writes from ledger records};
+    \pgfresetboundingbox
+    \path[use as bounding box] (0,0) rectangle (\linewidth,#2);
+  \end{tikzpicture}%
+}
