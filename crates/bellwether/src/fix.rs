@@ -682,8 +682,8 @@ impl Engine {
     ) -> Result<(Written, Reconciliation)> {
         let before = canonical_dir(&outputs.before)?;
         let after = canonical_dir(&outputs.after)?;
-        let left_source = self.output_source()?;
-        let right_source = self.output_source()?;
+        let left_source = self.output_source(&before)?;
+        let right_source = self.output_source(&after)?;
         let mut spec = ReconcileSpec::new(outputs.key.clone())
             .ignore(outputs.ignore.clone())
             .totals(outputs.totals.clone())
@@ -706,9 +706,10 @@ impl Engine {
         Ok((cert, certified.outcome))
     }
 
-    /// A source for an output folder: the engine's format, schema inferred.
-    pub(crate) fn output_source(&self) -> Result<Box<dyn Source>> {
-        self.source(None)
+    /// A source for an output folder `root`: the engine's format, schema
+    /// inferred, partitioning as the options say, rooted at `root`.
+    pub(crate) fn output_source(&self, root: &str) -> Result<Box<dyn Source>> {
+        self.source_at(None, root)
     }
 
     pub(crate) fn record_certified(

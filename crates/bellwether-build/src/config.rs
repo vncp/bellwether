@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use arrow::array::RecordBatch;
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
-use bellwether_source::{FingerprintPolicy, TextFormat};
+use bellwether_source::{FingerprintPolicy, Partitioning, TextFormat};
 use bellwether_store::{ColumnDef, CommitOptions, Extra};
 use bellwether_types::{Error, FileFingerprint, Result, RowGroupId};
 
@@ -176,6 +176,13 @@ pub struct BuildOptions {
     /// from the manifest's is refused, because it changes every file's
     /// identity.
     pub fingerprint_policy: Option<FingerprintPolicy>,
+    /// Partitioning scheme of the source folder. `None` keeps the scheme the
+    /// manifest records (none for a manifest that records none), or no
+    /// scheme for a new index. [`Partitioning::Hive`] makes every
+    /// `name=value` directory below the data root a column (Parquet only).
+    /// A scheme different from the manifest's is refused, because it
+    /// changes the dataset schema and every row group's statistics.
+    pub partitioning: Option<Partitioning>,
     /// Chunk size for text files seen for the first time. `None` uses the
     /// chunk size the manifest's text files record, or 64 MiB for a new
     /// index. Files already tracked are always read at the chunk size
@@ -218,6 +225,7 @@ impl Default for BuildOptions {
         Self {
             source: SourceKind::Parquet,
             fingerprint_policy: None,
+            partitioning: None,
             chunk_size: None,
             schema: None,
             threads: None,
@@ -237,6 +245,7 @@ impl fmt::Debug for BuildOptions {
         f.debug_struct("BuildOptions")
             .field("source", &self.source)
             .field("fingerprint_policy", &self.fingerprint_policy)
+            .field("partitioning", &self.partitioning)
             .field("chunk_size", &self.chunk_size)
             .field("schema", &self.schema.as_ref().map(|s| s.fields().len()))
             .field("threads", &self.threads)

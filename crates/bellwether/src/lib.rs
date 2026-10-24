@@ -45,7 +45,7 @@ mod why;
 
 pub use bellwether_ledger::RecordKind;
 pub use bellwether_profile::ProfileReport;
-pub use bellwether_source::FingerprintPolicy;
+pub use bellwether_source::{FingerprintPolicy, Partitioning};
 pub use bellwether_types as types;
 pub use bellwether_verify::Reconciliation;
 pub use engine::{

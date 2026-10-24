@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 use arrow::datatypes::{Schema, SchemaRef};
 use bellwether_core::encoding;
 use bellwether_core::segment::{validate_spec, ColumnType};
-use bellwether_source::{FingerprintPolicy, DEFAULT_CHUNK_SIZE};
+use bellwether_source::{FingerprintPolicy, Partitioning, DEFAULT_CHUNK_SIZE};
 use bellwether_store::{
     commit_with, now_rfc3339, read_manifest, ChunkRange, ColumnDef, CommitOptions, Extra,
     FileEntry, Manifest, RowGroupSpace, RowGroupTombstone, SchemaInfo, SegmentRef, SourceInfo,
@@ -249,7 +249,9 @@ impl<S: StoreExt + ?Sized> Builder<S> {
         let chunk_sizes = base_chunk_sizes(base.as_ref())
             .into_iter()
             .chain(cfg.new_chunk_size.size());
-        let mut sources = DataSource::new(cfg.kind, &cfg.schema, cfg.policy, chunk_sizes);
+        let partitions = (cfg.partitioning == Partitioning::Hive).then_some(root);
+        let mut sources =
+            DataSource::new(cfg.kind, &cfg.schema, cfg.policy, chunk_sizes, partitions);
         let discovered = sources.discover(root)?;
         let since = now_rfc3339();
         let observer = opts.observer.as_deref();
@@ -345,6 +347,7 @@ fn canonical_root(root: &str) -> Result<String> {
 struct Config {
     kind: SourceKind,
     policy: FingerprintPolicy,
+    partitioning: Partitioning,
     /// Chunk size for text files seen for the first time; `None` for
     /// Parquet.
     new_chunk_size: NewChunkSize,
@@ -391,6 +394,27 @@ impl Config {
             (Some(p), _) | (None, Some(p)) => p,
             (None, None) => FingerprintPolicy::default(),
         };
+        let recorded_partitioning = recorded
+            .map(|m| Partitioning::parse(m.source.partitioning.as_deref()))
+            .transpose()?;
+        let partitioning = match (opts.partitioning, recorded_partitioning) {
+            (Some(p), Some(r)) if p != r => {
+                return Err(Error::Other(format!(
+                    "the index was built with partitioning {}, and this build asks for {}; a \
+                     partitioning change changes the dataset schema and every row group's \
+                     statistics, so build a new index",
+                    r.manifest_name().unwrap_or("none"),
+                    p.manifest_name().unwrap_or("none")
+                )))
+            }
+            (Some(p), _) | (None, Some(p)) => p,
+            (None, None) => Partitioning::None,
+        };
+        if partitioning == Partitioning::Hive && kind.text_format().is_some() {
+            return Err(Error::Other(
+                "hive partitioning applies to Parquet sources only in this release".into(),
+            ));
+        }
         let new_chunk_size = match (kind.text_format(), opts.chunk_size) {
             (None, None) => NewChunkSize::NotText,
             (None, Some(_)) => {
@@ -408,16 +432,18 @@ impl Config {
         let schema = match (&opts.schema, &base_schema) {
             (Some(s), _) => persistable(s)?,
             (None, Some(b)) => SchemaRef::clone(b),
-            (None, None) => persistable(infer_schema(kind, root, policy)?.as_ref())?,
+            (None, None) => persistable(infer_schema(kind, root, policy, partitioning)?.as_ref())?,
         };
         let columns = schema_to_columns(&schema, base.map_or(&[][..], |m| &m.schema.columns));
         let mut source_info = base.map(|m| m.source.clone()).unwrap_or_default();
         source_info.kind = kind.manifest_kind();
         source_info.root = root.to_string();
         source_info.fingerprint_policy = Some(policy_name(policy).to_string());
+        source_info.partitioning = partitioning.manifest_name().map(str::to_string);
         Ok(Self {
             kind,
             policy,
+            partitioning,
             new_chunk_size,
             schema,
             base_schema,

@@ -11,7 +11,7 @@ use bellwether_build::{Planner, SourceKind};
 use bellwether_ledger::Ledger;
 use bellwether_source::{
     fingerprint_with_policy, ChunkedTextSource, FingerprintPolicy, LocalFs, ParquetSource,
-    Storage as _, TextFormat,
+    Partitioning, Storage as _, TextFormat,
 };
 use bellwether_store::{
     manifest_path, now_rfc3339, parse_rfc3339, Cache, Manifest, ObjectStoreBackend, Snapshot,
@@ -120,6 +120,11 @@ pub struct EngineOptions {
     /// in-place patch outside the last 64 KiB that keeps size and mtime. An
     /// existing index keeps its recorded policy; another one is refused.
     pub fingerprint_policy: Option<FingerprintPolicy>,
+    /// The folder's partitioning scheme when an index is first built, and
+    /// for reads of an unindexed folder: [`Partitioning::Hive`] makes every
+    /// `name=value` directory below the root a column (Parquet only). An
+    /// existing index keeps its recorded scheme; another one is refused.
+    pub partitioning: Option<Partitioning>,
     /// A fixed RFC 3339 time used as every record's `created_at` and as
     /// "now" when ages are computed, so two runs over the same inputs write
     /// byte-identical records. `None` uses the system clock.
@@ -268,6 +273,18 @@ impl Engine {
                     m.source.kind,
                     engine.options.format.kind().manifest_kind()
                 )));
+            }
+            let recorded = Partitioning::parse(m.source.partitioning.as_deref())?;
+            if let Some(asked) = engine.options.partitioning {
+                if asked != recorded {
+                    return Err(Error::Source(format!(
+                        "the index at {} was built with partitioning {}, not {}; open it \
+                         without --partitioning, or build a new index",
+                        engine.index,
+                        recorded.manifest_name().unwrap_or("none"),
+                        asked.manifest_name().unwrap_or("none")
+                    )));
+                }
             }
             if !m.source.root.is_empty() && m.source.root != engine.root {
                 return Err(Error::Source(format!(
@@ -452,7 +469,11 @@ impl Engine {
             Some(p) => recorded_chunk_size(p.manifest())?,
             None => None,
         };
+        let partitioning = self.partitioning(pinned)?;
         Ok(match format {
+            SourceFormat::Parquet if partitioning == Partitioning::Hive => {
+                "parquet:partitioning=hive".to_string()
+            }
             SourceFormat::Parquet => "parquet".to_string(),
             SourceFormat::Csv {
                 delimiter,
@@ -472,7 +493,23 @@ impl Engine {
         })
     }
 
+    /// The partitioning the source is built with: the index's recorded
+    /// scheme when one is pinned, else the option (none by default).
+    pub(crate) fn partitioning(&self, pinned: Option<&Pinned>) -> Result<Partitioning> {
+        match pinned {
+            Some(p) => Partitioning::parse(p.manifest().source.partitioning.as_deref()),
+            None => Ok(self.options.partitioning.unwrap_or_default()),
+        }
+    }
+
     pub(crate) fn source(&self, pinned: Option<&Pinned>) -> Result<Box<dyn Source>> {
+        self.source_at(pinned, &self.root)
+    }
+
+    /// [`Engine::source`] over the folder `root`, which hive partitioning
+    /// reads its `name=value` directories below.
+    pub(crate) fn source_at(&self, pinned: Option<&Pinned>, root: &str) -> Result<Box<dyn Source>> {
+        let partitioning = self.partitioning(pinned)?;
         let (schema, policy, chunk) = match pinned {
             Some(p) => (
                 Some(SchemaRef::clone(p.planner.schema())),
@@ -492,7 +529,15 @@ impl Engine {
                 if let Some(schema) = schema {
                     s = s.with_schema(schema);
                 }
+                if partitioning == Partitioning::Hive {
+                    s = s.with_hive_partitions(root.to_string());
+                }
                 Box::new(s)
+            }
+            Some(_) if partitioning == Partitioning::Hive => {
+                return Err(Error::Source(
+                    "hive partitioning applies to Parquet sources only in this release".into(),
+                ))
             }
             Some(text) => {
                 let mut s = ChunkedTextSource::new(text).with_fingerprint_policy(policy);

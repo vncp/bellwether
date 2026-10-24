@@ -81,6 +81,12 @@ pub struct SourceInfo {
     /// How files are fingerprinted, if configured.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fingerprint_policy: Option<String>,
+    /// Partitioning scheme of the source folder: `"hive"` when `name=value`
+    /// directories are columns (docs/format.md, "Partition columns"), absent
+    /// for none. Added 2026-10-24; a binary that predates it keeps it as an
+    /// unknown field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub partitioning: Option<String>,
     /// Unknown fields (ADR 017).
     #[serde(flatten)]
     pub extra: Extra,

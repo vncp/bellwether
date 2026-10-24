@@ -63,7 +63,7 @@ impl Engine {
             .into_owned();
         let pinned = self.pin()?;
         let left_source = self.source(pinned.as_ref())?;
-        let right_source = self.output_source()?;
+        let right_source = self.output_source(&right)?;
         let mut spec = ReconcileSpec::new(req.key.clone())
             .ignore(req.ignore.clone())
             .totals(req.totals.clone())

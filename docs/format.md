@@ -8,7 +8,9 @@ Versioned from the first commit. `bellwether-types::format::STORAGE_VERSION` is 
   manifest.json                  storage_version, sequence (monotonic, +1 per commit; ADR 020),
                                  created_at (first creation, preserved), committed_at (this commit),
                                  commit_nonce (random u64 per commit attempt; detects an applied write reported as 412),
-                                 source{kind, root, fingerprint_policy?},
+                                 source{kind, root, fingerprint_policy?, partitioning?}
+                                           (partitioning: "hive" when name=value directories are columns; see
+                                            "Partition columns"; absent for none)
                                  schema{columns[{name, data_type, nullable}], key_specs[]}
                                  rowgroup_space{next_id, files[{fingerprint, rowgroup_ids[], chunk_size?, chunks?[{start,end}]}],
                                                 tombstones[{since, rowgroup_ids[]}]}   (retired row-group ids, ADR 013)
@@ -171,3 +173,12 @@ Not part of version 1 and not read by version 1 readers: (1) exact segments may 
 
 The dataset type a reader infers for a column is part of the format, not of the reader. Upgrading a dependency must never change the inferred type of any column that an earlier reader accepted, even when the newer library can read an embedded type hint the older one ignored. When a smarter reader becomes available, the source crate keeps the earlier mapping and the new type is added deliberately, by a dated amendment here, with a conformance vector. Found during the Phase 3 upgrade, where parquet 59 began honouring the Arrow Duration hint on INT64 columns and the INT96 unit hint, which would have broken incremental builds on existing indexes.
 
+## Partition columns (storage version 1, 2026-10-24)
+
+An index built with `--partitioning hive` records `source.partitioning = "hive"` and treats every directory component of a file's path **below the data root** of the form `name=value` as a column of that file: every row of the file has `value` in column `name`. The Parquet source reports it in each row group's statistics with `min = max = value`, zero bytes, and a null count of zero (all rows for a null value), and synthesizes it when the column is read, so the profiler sees it and every planner path prunes on it without reading a data page. An index without the field has no partition columns, and the scheme of an existing index never changes (a different one is refused, because it changes the dataset schema and every row group's statistics). Text sources refuse hive partitioning in this release.
+
+- A component splits at its first `=`. An empty name, an empty value, or a name repeated in one path is refused; the file name never counts; components of the root itself never count.
+- Values are percent-decoded (`%2F` is `/`); a `%` not followed by two hex digits, or a value that does not decode to UTF-8, is refused. `__HIVE_DEFAULT_PARTITION__` is a null.
+- Every file under the root has the same partition columns in the same order, else discovery refuses the folder.
+- **Types.** A column the dataset schema declares takes that type (an exact Arrow cast from the string; a value that does not cast is refused). Otherwise the type is inferred over **every** value under the root, never the first file and never by a dependency's inference: `Int64` if every non-null value is an optional `-` and digits with no leading zero that fit `i64`; else `Date32` if every non-null value is a valid `YYYY-MM-DD`; else `Utf8` (also for a column whose every value is null). `007`, `+7`, `1.5`, `true`, and timestamps stay strings, because they would not print back as written. This table is part of the format (see "Inference stability").
+- A file that also stores the column must agree with its path: each row group's footer bounds both equal the path value with a null count of zero (or, for a null value, a null count equal to the row count). Disagreeing or unknown statistics are refused, never trusted. The stored column is then read from the file.

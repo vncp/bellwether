@@ -57,7 +57,9 @@ use bellwether_core::encoding::{self, tag, KeyColumns, Value};
 use bellwether_core::segment::ReadAt;
 use bellwether_core::temporal::{self, VersionChain, VersionHit};
 use bellwether_core::SegmentReader;
-use bellwether_source::{fingerprint_with_policy, FingerprintPolicy, LocalFs, ParquetSource};
+use bellwether_source::{
+    fingerprint_with_policy, FingerprintPolicy, LocalFs, ParquetSource, Partitioning,
+};
 use bellwether_store::{Manifest, Snapshot, StoreExt};
 use bellwether_types::{
     Error, Hash, KeySpec, Predicate, Result, RowGroupId, ScanEntry, ScanPlan, Source,
@@ -69,6 +71,7 @@ use crate::config::{columns_to_schema, parse_policy, SourceKind};
 use crate::coverage::{completeness, Locator};
 use crate::keys::{encode_ts, project, split_checked, widen_zero_bounds, zero_variants};
 use crate::seg_io::SegmentBytes;
+use crate::sources::parquet_source;
 
 /// What to look up.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -189,11 +192,10 @@ impl<S: StoreExt + ?Sized> Planner<S> {
         let policy = parse_policy(m.source.fingerprint_policy.as_deref())?;
         let schema = columns_to_schema(&m.schema.columns)?;
         let locator = Locator::new(&m.rowgroup_space)?;
-        let parquet = (kind == SourceKind::Parquet).then(|| {
-            ParquetSource::new()
-                .with_schema(SchemaRef::clone(&schema))
-                .with_fingerprint_policy(policy)
-        });
+        let partitioning = Partitioning::parse(m.source.partitioning.as_deref())?;
+        let partitions = (partitioning == Partitioning::Hive).then_some(m.source.root.as_str());
+        let parquet = (kind == SourceKind::Parquet)
+            .then(|| parquet_source(Some(&schema), policy, partitions));
         Ok(Self {
             snapshot,
             schema,

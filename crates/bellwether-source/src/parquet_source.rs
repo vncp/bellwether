@@ -1,10 +1,11 @@
 //! [`ParquetSource`]: real row groups, footer statistics, projected reads.
 
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::collections::BTreeMap;
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 
 use arrow::array::{Array, ArrayRef, RecordBatch, RecordBatchReader, UInt64Array};
 use arrow::compute::concat_batches;
-use arrow::datatypes::{DataType, SchemaRef};
+use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use bellwether_types::{ColumnStats, Error, FileFingerprint, Result, RowGroupMeta, Source};
 use parquet::arrow::arrow_reader::statistics::StatisticsConverter;
 use parquet::arrow::arrow_reader::{
@@ -17,6 +18,7 @@ use parquet::file::reader::ChunkReader;
 
 use crate::canonical::{normalize_float_bounds, Canonical, DefaultCanonical};
 use crate::fingerprint::{fingerprint_with_policy, FingerprintPolicy};
+use crate::partition::{hive_values, infer_column_type, repeat, typed_value, PartitionValue};
 use crate::storage::{LocalFs, Storage};
 use crate::{open_verified, reorder, resolve_columns, BoundedCache};
 
@@ -45,6 +47,11 @@ pub struct ParquetSource<S: Storage = LocalFs> {
     dataset: Option<SchemaRef>,
     policy: FingerprintPolicy,
     footers: Mutex<FooterCache>,
+    /// The data root under hive partitioning (`partition`), or `None`.
+    partition_root: Option<String>,
+    /// Partition column types inferred over every file under the root, for
+    /// a source without a dataset schema; computed once.
+    inferred: OnceLock<std::result::Result<BTreeMap<String, DataType>, String>>,
 }
 
 impl Default for ParquetSource<LocalFs> {
@@ -70,7 +77,86 @@ impl<S: Storage> ParquetSource<S> {
             dataset: None,
             policy: FingerprintPolicy::Tail64K,
             footers: Mutex::new(BoundedCache::new(FOOTER_CACHE_BYTES)),
+            partition_root: None,
+            inferred: OnceLock::new(),
         }
+    }
+
+    /// Turns on hive partitioning under the data root `root` (see
+    /// [`crate::partition`]): each `name=value` directory below `root` is a
+    /// virtual column, reported in every row group's statistics with
+    /// `min = max = value` and synthesized by `read_columns`. `root` must be
+    /// spelled as the discovered paths are (the canonical data root).
+    #[must_use]
+    pub fn with_hive_partitions(mut self, root: impl Into<String>) -> Self {
+        self.partition_root = Some(root.into());
+        self
+    }
+
+    /// The partition columns of `file`, or none without hive partitioning.
+    fn partitions(&self, path: &str) -> Result<Vec<PartitionValue>> {
+        match &self.partition_root {
+            None => Ok(Vec::new()),
+            Some(root) => hive_values(root, path),
+        }
+    }
+
+    /// The type of partition column `p` in a file whose own schema is
+    /// `file_schema`: the dataset schema's when it declares the column,
+    /// `None` (not reported) when a dataset schema is given without it,
+    /// else the file's own type for a column the file also stores, else
+    /// the type inferred over every file under the root
+    /// ([`crate::partition::infer_column_type`]).
+    fn partition_type(&self, p: &PartitionValue, file_schema: &Schema) -> Result<Option<DataType>> {
+        if let Some(ds) = &self.dataset {
+            return Ok(ds
+                .field_with_name(&p.name)
+                .ok()
+                .map(|f| f.data_type().clone()));
+        }
+        if let Ok(f) = file_schema.field_with_name(&p.name) {
+            return Ok(Some(f.data_type().clone()));
+        }
+        self.inferred_types()?
+            .get(&p.name)
+            .cloned()
+            .map(Some)
+            .ok_or_else(|| {
+                Error::Source(format!(
+                    "partition column {} is not among those inferred under {}",
+                    p.name,
+                    self.partition_root.as_deref().unwrap_or("")
+                ))
+            })
+    }
+
+    /// Every partition column's type, inferred over every Parquet file under
+    /// the root (computed once).
+    fn inferred_types(&self) -> Result<&BTreeMap<String, DataType>> {
+        let Some(root) = &self.partition_root else {
+            return Err(Error::Source(
+                "partition types asked for without hive partitioning".into(),
+            ));
+        };
+        self.inferred
+            .get_or_init(|| {
+                let mut values: BTreeMap<String, Vec<Option<String>>> = BTreeMap::new();
+                let paths = self.storage.list(root).map_err(|e| e.to_string())?;
+                for path in paths.iter().filter(|p| has_extension(p, PARQUET_EXTENSION)) {
+                    for v in hive_values(root, path).map_err(|e| e.to_string())? {
+                        values.entry(v.name).or_default().push(v.value);
+                    }
+                }
+                Ok(values
+                    .into_iter()
+                    .map(|(name, vs)| {
+                        let t = infer_column_type(vs.iter().map(Option::as_deref));
+                        (name, t)
+                    })
+                    .collect())
+            })
+            .as_ref()
+            .map_err(|e| Error::Source(e.clone()))
     }
 
     /// Sets the dataset schema. It is returned by `schema(root)`, and its
@@ -148,6 +234,79 @@ impl<S: Storage> ParquetSource<S> {
             .encode(array.as_ref(), i, target)
             .ok()
             .flatten()
+    }
+
+    /// Appends each partition column's statistics to `out` (one entry per
+    /// row group of the file), or checks them against the file's own column
+    /// of the same name: both footer bounds must equal the path value and
+    /// the null count must be zero (all rows, for a null path value).
+    /// Unknown or disagreeing statistics are refused.
+    fn add_partition_stats(
+        &self,
+        file: &FileFingerprint,
+        file_schema: &Schema,
+        out: &mut [RowGroupMeta],
+    ) -> Result<()> {
+        for p in self.partitions(&file.path)? {
+            let Some(target) = self.partition_type(&p, file_schema)? else {
+                continue;
+            };
+            let one = typed_value(&p.name, p.value.as_deref(), &target)?;
+            let encoded = match p.value {
+                Some(_) => Some(
+                    self.canonical
+                        .encode(one.as_ref(), 0, &target)?
+                        .ok_or_else(|| {
+                            Error::Source(format!(
+                                "{}: partition column {} of type {target} has no canonical \
+                                 encoding",
+                                file.path, p.name
+                            ))
+                        })?,
+                ),
+                None => None,
+            };
+            let stored = file_schema.field_with_name(&p.name).is_ok();
+            for rg in out.iter_mut() {
+                if stored {
+                    let s = rg.stats.iter().find(|s| s.column == p.name);
+                    let agrees = s.is_some_and(|s| match &encoded {
+                        Some(v) => {
+                            s.min.as_ref() == Some(v)
+                                && s.max.as_ref() == Some(v)
+                                && s.null_count == Some(0)
+                        }
+                        None => s.null_count == Some(rg.rows),
+                    });
+                    if !agrees {
+                        return Err(Error::Source(format!(
+                            "{}: row group {} stores column {} with statistics {:?}, which do \
+                             not show the value its path gives ({}={}); a file whose path and \
+                             content disagree, or whose statistics cannot show they agree, is \
+                             refused",
+                            file.path,
+                            rg.index_in_file,
+                            p.name,
+                            s.map(|s| (&s.min, &s.max, s.null_count)),
+                            p.name,
+                            p.value.as_deref().unwrap_or(crate::partition::HIVE_NULL)
+                        )));
+                    }
+                } else {
+                    rg.stats.push(ColumnStats {
+                        column: p.name.clone(),
+                        min: encoded.clone(),
+                        max: encoded.clone(),
+                        null_count: Some(if encoded.is_some() { 0 } else { rg.rows }),
+                        distinct_count: None,
+                        has_bloom: false,
+                        // Virtual: reading it costs no bytes.
+                        bytes: Some(0),
+                    });
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Compressed column-chunk bytes per row group, per top-level column, in
@@ -359,10 +518,34 @@ fn column_stats(meta: &ArrowReaderMetadata, name: &str) -> ColumnColumnar {
 
 impl<S: Storage> Source for ParquetSource<S> {
     fn discover(&self, root: &str) -> Result<Vec<FileFingerprint>> {
-        self.storage
+        let files = self
+            .storage
             .list(root)?
             .into_iter()
             .filter(|p| has_extension(p, PARQUET_EXTENSION))
+            .collect::<Vec<_>>();
+        if self.partition_root.is_some() {
+            // One set of partition columns, in one order, under one root: a
+            // file without `day=` beside files with it would have no value
+            // for the column, which is ambiguous.
+            let mut first: Option<(String, Vec<String>)> = None;
+            for p in &files {
+                let names: Vec<String> = self.partitions(p)?.into_iter().map(|v| v.name).collect();
+                match &first {
+                    None => first = Some((p.clone(), names)),
+                    Some((fp, f)) if *f != names => {
+                        return Err(Error::Source(format!(
+                            "{p} has partition columns {names:?}, but {fp} has {f:?}; every \
+                             file under a hive-partitioned root needs the same partition \
+                             directories"
+                        )))
+                    }
+                    Some(_) => {}
+                }
+            }
+        }
+        files
+            .into_iter()
             .map(|p| fingerprint_with_policy(&self.storage, &p, self.policy))
             .collect()
     }
@@ -422,6 +605,7 @@ impl<S: Storage> Source for ParquetSource<S> {
                 byte_range: None,
             });
         }
+        self.add_partition_stats(file, meta.schema(), &mut out)?;
         Ok(out)
     }
 
@@ -440,7 +624,20 @@ impl<S: Storage> Source for ParquetSource<S> {
                 md.num_row_groups()
             )));
         }
-        let roots = resolve_columns(meta.schema(), columns)?;
+        let partitions = self.partitions(&rg.file.path)?;
+        let file_schema = Arc::clone(meta.schema());
+        // Columns the path supplies and the file does not store are
+        // synthesized; only the rest is decoded.
+        let virtual_cols: Vec<&PartitionValue> = partitions
+            .iter()
+            .filter(|p| columns.contains(&p.name) && file_schema.field_with_name(&p.name).is_err())
+            .collect();
+        let stored: Vec<String> = columns
+            .iter()
+            .filter(|c| !virtual_cols.iter().any(|p| &p.name == *c))
+            .cloned()
+            .collect();
+        let roots = resolve_columns(&file_schema, &stored)?;
         let rows = usize::try_from(md.row_group(idx).num_rows()).unwrap_or(0);
         let mask = ProjectionMask::roots(md.file_metadata().schema_descr(), roots);
         let batches = ParquetRecordBatchReaderBuilder::new_with_metadata(reader, meta)
@@ -455,7 +652,44 @@ impl<S: Storage> Source for ParquetSource<S> {
             .map_err(|e| Error::Source(format!("{}: {e}", rg.file.path)))?;
         let batch = concat_batches(&schema, &batches)
             .map_err(|e| Error::Source(format!("{}: {e}", rg.file.path)))?;
-        reorder(&batch, columns)
+        if virtual_cols.is_empty() {
+            return reorder(&batch, columns);
+        }
+        if batch.num_rows() != rows {
+            return Err(Error::Source(format!(
+                "{}: row group {} decoded {} rows, the footer says {rows}",
+                rg.file.path,
+                rg.index_in_file,
+                batch.num_rows()
+            )));
+        }
+        let mut fields = Vec::with_capacity(columns.len());
+        let mut arrays: Vec<ArrayRef> = Vec::with_capacity(columns.len());
+        for c in columns {
+            if let Some(p) = virtual_cols.iter().find(|p| &p.name == c) {
+                let target = self.partition_type(p, &file_schema)?.ok_or_else(|| {
+                    Error::KeySpec(format!(
+                        "column {c:?} is a partition column the dataset schema does not declare"
+                    ))
+                })?;
+                let one = typed_value(&p.name, p.value.as_deref(), &target)?;
+                fields.push(Field::new(c.clone(), target, true));
+                arrays.push(repeat(&one, rows)?);
+            } else {
+                let i = batch
+                    .schema()
+                    .index_of(c)
+                    .map_err(|_| Error::KeySpec(format!("column {c:?} not in decoded batch")))?;
+                fields.push(batch.schema().field(i).clone());
+                arrays.push(Arc::clone(batch.column(i)));
+            }
+        }
+        RecordBatch::try_new_with_options(
+            Arc::new(Schema::new(fields)),
+            arrays,
+            &arrow::array::RecordBatchOptions::new().with_row_count(Some(rows)),
+        )
+        .map_err(|e| Error::Source(format!("{}: {e}", rg.file.path)))
     }
 
     fn schema(&self, root: &str) -> Result<SchemaRef> {
@@ -469,7 +703,29 @@ impl<S: Storage> Source for ParquetSource<S> {
             .find(|p| has_extension(p, PARQUET_EXTENSION))
             .ok_or_else(|| Error::Source(format!("{root}: no .parquet files")))?;
         let fp = fingerprint_with_policy(&self.storage, &first, self.policy)?;
-        Ok(self.footer(&fp)?.schema().clone())
+        let file_schema = self.footer(&fp)?.schema().clone();
+        let partitions = self.partitions(&first)?;
+        if partitions.is_empty() {
+            return Ok(file_schema);
+        }
+        // The file's columns, then each partition column the file does not
+        // store, typed by inference over every file under the root.
+        let inferred = self.inferred_types()?;
+        let mut fields: Vec<Field> = file_schema
+            .fields()
+            .iter()
+            .map(|f| f.as_ref().clone())
+            .collect();
+        for p in &partitions {
+            if file_schema.field_with_name(&p.name).is_err() {
+                let t = inferred.get(&p.name).cloned().unwrap_or(DataType::Utf8);
+                fields.push(Field::new(p.name.clone(), t, true));
+            }
+        }
+        Ok(Arc::new(Schema::new_with_metadata(
+            fields,
+            file_schema.metadata().clone(),
+        )))
     }
 }
 

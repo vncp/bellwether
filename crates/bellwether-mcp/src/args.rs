@@ -7,7 +7,7 @@
 
 use std::path::PathBuf;
 
-use bellwether::{EngineOptions, FingerprintPolicy, SourceFormat};
+use bellwether::{EngineOptions, FingerprintPolicy, Partitioning, SourceFormat};
 use clap::ValueEnum;
 
 use crate::budget::Budget;
@@ -30,6 +30,15 @@ pub enum PolicyArg {
     Tail64k,
     /// BLAKE3 of the whole file.
     Full,
+}
+
+/// How directories carry data.
+#[derive(Clone, Copy, Debug, ValueEnum)]
+pub enum PartitioningArg {
+    /// Paths carry no data.
+    None,
+    /// Hive-style name=value directories are columns.
+    Hive,
 }
 
 /// How the engine opens the data folder. Every flag is global, so the CLI
@@ -62,6 +71,12 @@ pub struct EngineArgs {
     /// in-place patch that keeps size and mtime.
     #[arg(long, global = true, value_enum)]
     pub fingerprint_policy: Option<PolicyArg>,
+    /// How directories carry data: `hive` makes every `name=value`
+    /// directory below the root a column (for example day=2026-01-02), when
+    /// a new index is built or an unindexed folder is read. An existing
+    /// index keeps its recorded scheme.
+    #[arg(long, global = true, value_enum)]
+    pub partitioning: Option<PartitioningArg>,
     /// A fixed RFC 3339 time for every record's `created_at` and for ages, so
     /// runs are byte-reproducible (testing and audits).
     #[arg(long, global = true, value_name = "RFC3339", hide = true)]
@@ -119,6 +134,10 @@ impl EngineArgs {
             fingerprint_policy: self.fingerprint_policy.map(|p| match p {
                 PolicyArg::Tail64k => FingerprintPolicy::Tail64K,
                 PolicyArg::Full => FingerprintPolicy::Full,
+            }),
+            partitioning: self.partitioning.map(|p| match p {
+                PartitioningArg::None => Partitioning::None,
+                PartitioningArg::Hive => Partitioning::Hive,
             }),
             clock: self.clock.clone(),
         })

@@ -9,7 +9,9 @@ use std::ops::Range;
 
 use arrow::array::RecordBatch;
 use arrow::datatypes::SchemaRef;
-use bellwether_source::{ChunkedTextSource, FingerprintPolicy, LocalFs, ParquetSource, TextFormat};
+use bellwether_source::{
+    ChunkedTextSource, FingerprintPolicy, LocalFs, ParquetSource, Partitioning, TextFormat,
+};
 use bellwether_types::{Error, FileFingerprint, Result, RowGroupMeta, Source};
 
 use crate::config::SourceKind;
@@ -36,19 +38,18 @@ pub(crate) enum DataSource {
 
 impl DataSource {
     /// Sources for `kind` under the dataset `schema` and `policy`. For text,
-    /// one source per chunk size in `chunk_sizes`.
+    /// one source per chunk size in `chunk_sizes`. `partitions` is the data
+    /// root under hive partitioning (Parquet only; the build refuses it for
+    /// text before getting here).
     pub(crate) fn new(
         kind: SourceKind,
         schema: &SchemaRef,
         policy: FingerprintPolicy,
         chunk_sizes: impl IntoIterator<Item = u64>,
+        partitions: Option<&str>,
     ) -> Self {
         match kind.text_format() {
-            None => Self::Parquet(
-                ParquetSource::new()
-                    .with_schema(SchemaRef::clone(schema))
-                    .with_fingerprint_policy(policy),
-            ),
+            None => Self::Parquet(parquet_source(Some(schema), policy, partitions)),
             Some(format) => {
                 let mut by_chunk_size = BTreeMap::new();
                 for size in chunk_sizes {
@@ -192,13 +193,30 @@ pub(crate) fn infer_schema(
     kind: SourceKind,
     root: &str,
     policy: FingerprintPolicy,
+    partitioning: Partitioning,
 ) -> Result<SchemaRef> {
+    let partitions = (partitioning == Partitioning::Hive).then_some(root);
     match kind.text_format() {
-        None => ParquetSource::new()
-            .with_fingerprint_policy(policy)
-            .schema(root),
+        None => parquet_source(None, policy, partitions).schema(root),
         Some(format) => ChunkedTextSource::new(format)
             .with_fingerprint_policy(policy)
             .schema(root),
     }
+}
+
+/// A Parquet source under the dataset `schema` (when known), `policy`, and,
+/// with `partitions` set to the data root, hive partitioning.
+pub(crate) fn parquet_source(
+    schema: Option<&SchemaRef>,
+    policy: FingerprintPolicy,
+    partitions: Option<&str>,
+) -> ParquetSource<LocalFs> {
+    let mut s = ParquetSource::new().with_fingerprint_policy(policy);
+    if let Some(schema) = schema {
+        s = s.with_schema(SchemaRef::clone(schema));
+    }
+    if let Some(root) = partitions {
+        s = s.with_hive_partitions(root);
+    }
+    s
 }

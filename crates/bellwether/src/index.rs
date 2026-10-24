@@ -39,6 +39,7 @@ impl Engine {
         options.chunk_size = self.options().chunk_size;
         options.schema.clone_from(&self.options().schema);
         options.fingerprint_policy = self.options().fingerprint_policy;
+        options.partitioning = self.options().partitioning;
         let report =
             Builder::new(Arc::clone(self.store()?), "").build(self.root(), specs, &options)?;
         let pinned = self.pin_required("index")?;

@@ -40,6 +40,7 @@ pub mod canonical;
 pub mod catalog;
 pub mod fingerprint;
 pub mod parquet_source;
+pub mod partition;
 pub mod stats;
 pub mod storage;
 pub mod text;
@@ -57,6 +58,7 @@ pub use fingerprint::{
     drift, fingerprint, fingerprint_with, fingerprint_with_policy, FingerprintPolicy, TAIL_BYTES,
 };
 pub use parquet_source::{load_reader_metadata, ParquetSource};
+pub use partition::Partitioning;
 pub use storage::{LocalFs, ObjectMeta, Storage};
 pub use text::{ChunkedTextSource, TextFormat, DEFAULT_CHUNK_SIZE};
 
