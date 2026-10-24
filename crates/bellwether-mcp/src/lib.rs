@@ -1,0 +1,97 @@
+//! The Bellwether MCP server (WP12): the engine's agent surface over stdio.
+//!
+//! Every tool is one call into the facade ([`bellwether::Engine`]) with no
+//! logic of its own (ADR 010): the text a tool returns is the facade's typed
+//! result serialized exactly as the CLI's `--json` prints it, and the
+//! structured content is an [`Envelope`] carrying the record hashes the
+//! result rests on, any receipt's `explain` chain, a typed [`Refusal`], a
+//! job, and the session budget.
+//!
+//! The trust boundary (ADR 009, `docs/threat-model.md`):
+//!
+//! - `observe.*` reads, and writes Evidence and cache entries only.
+//! - `score.*` asks the engine to score and verify: engine Proposals,
+//!   Replays, plan Evidence, and Certificates, each computed by the engine
+//!   immediately before it is written. It is charged to the session budget.
+//! - `propose.*` writes one Proposal with no score field (the closed input
+//!   schema rejects one, nested fields included), or nothing as a dry run.
+//! - `apply.receipt` takes a certificate hash only; the facade's gate
+//!   refuses a failing certificate, one computed against an older manifest,
+//!   and one whose data changed, before anything is written.
+//!
+//! No tool accepts a path to write, a shell command, or a query string to
+//! execute. Logging goes to stderr; stdout is the protocol channel. Nothing
+//! is read from the environment.
+
+#![forbid(unsafe_code)]
+#![deny(clippy::unwrap_used, clippy::expect_used)]
+
+pub mod budget;
+pub mod envelope;
+pub mod handler;
+pub mod jobs;
+pub mod prompt;
+pub mod refusal;
+pub mod server;
+pub mod tools;
+
+pub use budget::{Budget, BudgetState};
+pub use envelope::{Envelope, Status};
+pub use handler::Handler;
+pub use refusal::{Refusal, RefusalCode};
+pub use server::{Config, Reply, Server};
+
+/// The findings resource: the newest profile Evidence per root.
+pub const FINDINGS: &str = "bellwether://findings";
+/// The receipts resource: every receipt with its chain status.
+pub const RECEIPTS: &str = "bellwether://receipts";
+/// The scorecard resource: per rule id, proposals, certificates, receipts.
+pub const SCORECARD: &str = "bellwether://scorecard";
+
+/// The per-session budget flags, shared by `bellwether-mcp` and
+/// `bellwether mcp`.
+#[derive(Clone, Copy, Debug, clap::Args)]
+pub struct BudgetArgs {
+    /// Replay records this session may cause the engine to write.
+    #[arg(long, value_name = "N", default_value_t = Budget::default().replays)]
+    pub budget_replays: u64,
+    /// Rows the verifier may read in this session, both sides summed.
+    #[arg(long, value_name = "N", default_value_t = Budget::default().rows)]
+    pub budget_rows: u64,
+    /// Wall time this session's tool calls may take, in seconds.
+    #[arg(long, value_name = "SECONDS", default_value_t = Budget::default().seconds)]
+    pub budget_seconds: u64,
+}
+
+impl From<BudgetArgs> for Budget {
+    fn from(a: BudgetArgs) -> Self {
+        Self {
+            replays: a.budget_replays,
+            rows: a.budget_rows,
+            seconds: a.budget_seconds,
+        }
+    }
+}
+
+/// Serves `config` over stdin and stdout until the client disconnects.
+/// The engine is opened first, so a bad data root fails before the
+/// handshake. Diagnostics go to stderr only.
+pub fn serve_stdio(config: &Config) -> Result<(), String> {
+    let server = Server::new(config).map_err(|e| e.to_string())?;
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| format!("cannot start the async runtime ({e})"))?;
+    runtime.block_on(async move {
+        use rmcp::ServiceExt as _;
+        let service = Handler::new(server)
+            .serve(rmcp::transport::stdio())
+            .await
+            .map_err(|e| format!("the MCP handshake failed ({e})"))?;
+        service
+            .waiting()
+            .await
+            .map_err(|e| format!("the MCP server stopped ({e})"))?;
+        Ok(())
+    })
+}

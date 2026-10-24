@@ -122,6 +122,12 @@ enum Command {
     },
     /// Render every receipt and profile from the ledger as one HTML file.
     Report(ReportArgs),
+    /// Read the ledger: the newest findings per root, every receipt with its
+    /// chain status, or the scorecard per rule id (the MCP resources).
+    Ledger {
+        #[command(subcommand)]
+        command: LedgerCommand,
+    },
     #[command(flatten)]
     Verify(verify_cmds::VerifyCommand),
     /// The benchmark (WP10): generate corpora and workloads, run the
@@ -224,6 +230,17 @@ struct ProposeArgs {
     /// What the rewrite must preserve.
     #[arg(long, value_name = "TEXT", requires = "before")]
     invariant: Option<String>,
+}
+
+#[derive(Subcommand)]
+enum LedgerCommand {
+    /// The newest profile Evidence per data root, with its lints and the
+    /// receipts citing it.
+    Findings(RootArg),
+    /// Every receipt, newest first, with its chain status.
+    Receipts(RootArg),
+    /// Per rule id: proposals, certificates passed and failed, receipts.
+    Scorecard(RootArg),
 }
 
 #[derive(Subcommand)]
@@ -414,6 +431,20 @@ fn run(cli: &Cli, out: &Out) -> Result<Outcome, Failure> {
             let r = engine(g, &root.root)?.receipt(&h)?;
             done(&r, human::receipt(&r, out), EXIT_OK)
         }
+        Command::Ledger { command } => match command {
+            LedgerCommand::Findings(root) => {
+                let r = engine(g, &root.root)?.findings()?;
+                done(&r, human::findings(&r, out), EXIT_OK)
+            }
+            LedgerCommand::Receipts(root) => {
+                let r = engine(g, &root.root)?.receipts()?;
+                done(&r, human::receipts(&r, out), EXIT_OK)
+            }
+            LedgerCommand::Scorecard(root) => {
+                let r = engine(g, &root.root)?.scorecard()?;
+                done(&r, human::scorecard(&r, out), EXIT_OK)
+            }
+        },
         Command::Report(a) => {
             let r = engine(g, &a.root.root)?.report(&a.html)?;
             done(&r, human::report(&r, out), EXIT_OK)

@@ -7,6 +7,7 @@ members = [
     "crates/bellwether-cli",
     "crates/bellwether-core",
     "crates/bellwether-ledger",
+    "crates/bellwether-mcp",
     "crates/bellwether-profile",
     "crates/bellwether-replay",
     "crates/bellwether-source",
@@ -14,8 +15,6 @@ members = [
     "crates/bellwether-types",
     "crates/bellwether-verify",
 ]
-# Crates are added to `members` as their work package lands:
-#   crates/bellwether-mcp
 
 [workspace.package]
 version = "0.1.0"
