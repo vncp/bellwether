@@ -90,11 +90,11 @@ impl Unit {
         }
     }
 
-    fn of_parquet(u: &ParquetUnit) -> Self {
+    fn of_parquet(u: ParquetUnit) -> Self {
         match u {
-            ParquetUnit::MILLIS(_) => Self::Milli,
-            ParquetUnit::MICROS(_) => Self::Micro,
-            ParquetUnit::NANOS(_) => Self::Nano,
+            ParquetUnit::MILLIS => Self::Milli,
+            ParquetUnit::MICROS => Self::Micro,
+            ParquetUnit::NANOS => Self::Nano,
         }
     }
 
@@ -168,7 +168,7 @@ enum Conversion {
 /// column `descr`, or why there is none.
 #[allow(clippy::too_many_lines)]
 fn conversion(dataset: &DataType, descr: &ColumnDescriptor) -> Result<Conversion, String> {
-    let logical = descr.logical_type();
+    let logical = descr.logical_type_ref();
     let converted = descr.converted_type();
     let physical = descr.physical_type();
     let shape = || format!("{physical} {logical:?} {converted:?}");
@@ -177,7 +177,7 @@ fn conversion(dataset: &DataType, descr: &ColumnDescriptor) -> Result<Conversion
         d => d,
     };
     let integer = || match &logical {
-        Some(LogicalType::Integer { is_signed, .. }) => Some(*is_signed),
+        Some(LogicalType::Integer(t)) => Some(t.is_signed),
         Some(_) => None,
         None => match converted {
             ConvertedType::NONE
@@ -194,8 +194,8 @@ fn conversion(dataset: &DataType, descr: &ColumnDescriptor) -> Result<Conversion
     };
     let decimal = || -> Option<(i8, u8)> {
         match &logical {
-            Some(LogicalType::Decimal { scale, precision }) => {
-                Some((i8::try_from(*scale).ok()?, u8::try_from(*precision).ok()?))
+            Some(LogicalType::Decimal(d)) => {
+                Some((i8::try_from(d.scale).ok()?, u8::try_from(d.precision).ok()?))
             }
             None if converted == ConvertedType::DECIMAL => Some((
                 i8::try_from(descr.type_scale()).ok()?,
@@ -223,7 +223,7 @@ fn conversion(dataset: &DataType, descr: &ColumnDescriptor) -> Result<Conversion
             PhysicalType::FLOAT => Ok(Conversion::Float),
             PhysicalType::DOUBLE => Ok(Conversion::Double),
             PhysicalType::FIXED_LEN_BYTE_ARRAY
-                if logical == Some(LogicalType::Float16) && descr.type_length() == 2 =>
+                if logical == Some(&LogicalType::Float16) && descr.type_length() == 2 =>
             {
                 Ok(Conversion::Float16)
             }
@@ -291,7 +291,7 @@ fn conversion(dataset: &DataType, descr: &ColumnDescriptor) -> Result<Conversion
         },
         DataType::Date32 | DataType::Date64 => match physical {
             PhysicalType::INT32
-                if logical == Some(LogicalType::Date) || converted == ConvertedType::DATE =>
+                if logical == Some(&LogicalType::Date) || converted == ConvertedType::DATE =>
             {
                 Ok(Conversion::DateDays)
             }
@@ -301,9 +301,9 @@ fn conversion(dataset: &DataType, descr: &ColumnDescriptor) -> Result<Conversion
             _ => none(),
         },
         DataType::Timestamp(_, _) => match (physical, &logical, converted) {
-            (PhysicalType::INT64, Some(LogicalType::Timestamp { unit, .. }), _) => {
+            (PhysicalType::INT64, Some(LogicalType::Timestamp(t)), _) => {
                 Ok(Conversion::Timestamp {
-                    unit: Unit::of_parquet(unit),
+                    unit: Unit::of_parquet(t.unit),
                 })
             }
             (PhysicalType::INT64, None, ConvertedType::TIMESTAMP_MILLIS) => {
@@ -315,19 +315,15 @@ fn conversion(dataset: &DataType, descr: &ColumnDescriptor) -> Result<Conversion
             _ => none(),
         },
         DataType::Time32(_) | DataType::Time64(_) => match (physical, &logical, converted) {
-            (PhysicalType::INT32, Some(LogicalType::Time { unit, .. }), _) => {
-                Ok(Conversion::TimeInt32 {
-                    unit: Unit::of_parquet(unit),
-                })
-            }
+            (PhysicalType::INT32, Some(LogicalType::Time(t)), _) => Ok(Conversion::TimeInt32 {
+                unit: Unit::of_parquet(t.unit),
+            }),
             (PhysicalType::INT32, None, ConvertedType::TIME_MILLIS) => {
                 Ok(Conversion::TimeInt32 { unit: Unit::Milli })
             }
-            (PhysicalType::INT64, Some(LogicalType::Time { unit, .. }), _) => {
-                Ok(Conversion::TimeInt64 {
-                    unit: Unit::of_parquet(unit),
-                })
-            }
+            (PhysicalType::INT64, Some(LogicalType::Time(t)), _) => Ok(Conversion::TimeInt64 {
+                unit: Unit::of_parquet(t.unit),
+            }),
             (PhysicalType::INT64, None, ConvertedType::TIME_MICROS) => {
                 Ok(Conversion::TimeInt64 { unit: Unit::Micro })
             }

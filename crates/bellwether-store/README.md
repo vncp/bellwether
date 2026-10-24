@@ -52,7 +52,7 @@ These `object_store` errors map to `Error::VersionConflict`:
 
 `found` is filled in by a best-effort `head`.
 
-**S3 needs configuration.** `object_store` leaves S3 conditional puts off by default: `conditional_put: None` makes every conditional put return `NotImplemented`. This crate sets `S3ConditionalPut::ETagMatch` unless `aws_conditional_put` is already configured, for example `dynamo:<table>` for stores without native preconditions. AWS S3 has supported `If-None-Match` since 2024-08 and `If-Match` since 2024-11.
+**S3 conditional puts.** `object_store` 0.14 defaults S3 to `S3ConditionalPut::ETagMatch` (0.11 left conditional puts off, so every conditional put returned `NotImplemented`). This crate still sets `ETagMatch` explicitly unless `aws_conditional_put` is already configured, so it does not depend on the default. The only other accepted value is `disabled`, under which every commit after the first fails with `NotImplemented`. The `dynamo:<table>` lock no longer exists upstream, and a store configured with it is refused when it is opened. AWS S3 has supported `If-None-Match` since 2024-08 and `If-Match` since 2024-11.
 
 **S3 needs `s3:ListBucket`.** Without `s3:ListBucket` on the bucket, S3 answers a GET of a missing key with `403 AccessDenied` instead of `404`. The first commit reads `manifest.json` to see whether it exists, so on a fresh index it fails with `Error::Store` (permission denied) instead of creating the manifest. Grant `s3:ListBucket` alongside `s3:GetObject`, `s3:PutObject` and `s3:DeleteObject`. GC's listing needs it anyway.
 

@@ -5,17 +5,11 @@ all-features = true
 [advisories]
 version = 2
 yanked = "deny"
-# Every entry below is transitive through a pinned major version and is
-# removed by the planned upgrade of object_store (0.11 -> current) and
-# arrow/parquet (53 -> current) scheduled at the start of Phase 3
-# (docs/work-packages.md, "Dependency upgrade"). Each is reviewed then.
-ignore = [
-  { id = "RUSTSEC-2026-0194", reason = "quick-xml 0.37 via object_store 0.11; XML DoS only reachable when parsing cloud-store responses; fixed by the object_store upgrade" },
-  { id = "RUSTSEC-2026-0195", reason = "quick-xml 0.37 via object_store 0.11; same path and fix as RUSTSEC-2026-0194" },
-  { id = "RUSTSEC-2025-0134", reason = "rustls-pemfile unmaintained, via object_store 0.11; dropped by the object_store upgrade" },
-  { id = "RUSTSEC-2024-0436", reason = "paste unmaintained, proc-macro via parquet 53; dropped by the arrow/parquet upgrade" },
-  { id = "RUSTSEC-2024-0384", reason = "instant unmaintained, wasm32-only dependency of datafusion-common 43, the line pinned to arrow 53 for the optional bench DataFusion baseline; dropped by the arrow/parquet upgrade" },
-]
+# No advisory is ignored. The Phase 3 dependency upgrade (2026-10-24) removed
+# the five transitive ignores that the arrow 53 / object_store 0.11 /
+# DataFusion 43 pins required; a new ignore needs a dated reason naming the
+# crate that pulls it and the upstream issue.
+ignore = []
 
 [licenses]
 version = 2
@@ -39,6 +33,12 @@ allow = [
   "OpenSSL",
 ]
 confidence-threshold = 0.9
+# webpki-root-certs is Mozilla's CA root bundle (data only), reached through
+# object_store 0.14 -> reqwest 0.13 (rustls) -> rustls-platform-verifier;
+# allowed for that crate alone by the 2026-10-24 dependency upgrade.
+[[licenses.exceptions]]
+crate = "webpki-root-certs"
+allow = ["CDLA-Permissive-2.0"]
 
 [bans]
 multiple-versions = "warn"

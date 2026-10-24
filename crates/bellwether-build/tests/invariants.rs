@@ -97,7 +97,7 @@ fn batch(rows: &[R]) -> RecordBatch {
 /// Writes one Parquet file whose row groups are exactly `groups`.
 fn write_groups(path: &std::path::Path, groups: &[Vec<R>]) {
     let props = WriterProperties::builder()
-        .set_max_row_group_size(1 << 20)
+        .set_max_row_group_row_count(Some(1 << 20))
         .build();
     let mut w =
         ArrowWriter::try_new(std::fs::File::create(path).unwrap(), schema(), Some(props)).unwrap();
@@ -293,7 +293,7 @@ fn invariant5_a_version_in_a_pruned_row_group_still_bounds_older_rows() {
         .unwrap()
     };
     let props = WriterProperties::builder()
-        .set_max_row_group_size(1 << 20)
+        .set_max_row_group_row_count(Some(1 << 20))
         .build();
     let mut w = ArrowWriter::try_new(
         std::fs::File::create(&path).unwrap(),

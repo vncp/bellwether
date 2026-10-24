@@ -60,6 +60,8 @@ file fingerprint = (path, size, etag: Option<String> (object-store etag, else RF
 rowgroup id      = dense u32 assigned at first sighting of (fingerprint, index_in_file); never reused
 ```
 
+**Manifest column types (amendment, 2026-10-24).** `schema.columns[].data_type` is Arrow's `Display` form of the type, which is Arrow-version dependent (contract v3, entry 9). The dependency upgrade to Arrow 59 changed the form of time units: Arrow 53 wrote `Timestamp(Microsecond, Some("UTC"))`, `Timestamp(Second, None)`, `Time64(Nanosecond)` and `Duration(Millisecond)`; Arrow 59 writes `Timestamp(µs, "UTC")`, `Timestamp(s)`, `Time64(ns)` and `Duration(ms)`. Every other type an index can record is spelled the same. Types that carry child fields (lists and list views, structs, maps, unions, run-end encoding, and dictionaries of them) were never recordable, because Arrow 53 could not parse its own display form of them. Arrow 59 can, so the build crate now refuses them explicitly and a dataset with such a column is refused as before. A reader accepts both forms: the build crate's manifest reader rewrites an old temporal spelling itself when Arrow does not accept it, and a test reads every Arrow 53 spelling and an index whose manifest carries them. The first commit by a newer binary rewrites the spelling to the current form; the types, the segments, and the row-group ids do not change.
+
 ## Key specs
 
 `Exact{columns}`, `Bloom{columns, fpr}`, `Range{column}`, `Temporal{columns, ts_column}`. Composite is not a kind; every kind takes a column list and encodes it memcomparably (ADR 002). CSV and JSON lines sources define row groups as fixed byte-range chunks recorded in the manifest, so the rest of the system never knows the difference.
@@ -101,6 +103,18 @@ with the fields in that order. `schema` is the dataset schema, one entry per col
 - **Indexed** (`catalog::indexed`): `manifest_version` is the manifest's `sequence`; `files` are `rowgroup_space.files` in manifest order, each with its row groups in ascending id order (the manifest's ids, the source's reports); `tombstoned` is every id in `rowgroup_space.tombstones`, ascending and distinct.
 - **Unindexed** (`catalog::unindexed`): `manifest_version` is `"0"`, the sequence of a manifest never committed (ADR 020); `files` are the discovered files sorted by path, with ids assigned densely from 0 in file order, then row-group order; `tombstoned` is empty. A certificate over two unindexed folders records manifest version `"0"` and cites both digests.
 
+**Amendment, 2026-10-24 (Arrow 53 to 59).** The `arrow:` fallback spells a type with the display form of the Arrow the binary is built on, and Arrow 59 changed that form for types that carry fields. Every type with a segment-format spelling is unaffected, because its digest entry is `ColumnType` JSON, which is ours; that covers every integer, float, decimal, string, binary, date, time, and timestamp. Parquet-to-Arrow inference is also unchanged (see "Statistics semantics", inference amendment), so a duration column still reads as `Int64` and an INT96 timestamp as `Timestamp(ns)`, and their digests do not move.
+
+The digests that do move are those of data with a list, struct, map, or other field-carrying column, which only the fallback can spell. Checked on Parquet folders written by pyarrow with timestamp, time, date, decimal, string, duration, INT96, and list columns, and on a CSV folder: only the folder with a list column moved. A pyarrow list column named its item field `element`, and its spelling changed:
+- Arrow 53: `arrow:List(Field { name: "element", data_type: Utf8, nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} })`
+- Arrow 59: `arrow:List(Utf8, field: 'element')`
+
+An item field named `item`, the Arrow default, is spelled `arrow:List(Utf8)`. A `Replay` or `Certificate` recorded before the upgrade over such data does not match a digest recomputed after it, and is re-recorded rather than treated as the same data.
+
+The pinned digests in `bellwether_source::catalog`'s tests were refreshed with this amendment; their fixture has a `List(Utf8)` column. The replay crate's tests still check that the two definitions agree byte for byte.
+
+**Downgrade is one-way.** Once a newer binary has committed to an index, a binary built on Arrow 53 refuses that index. The commit rewrites the manifest's type spellings (see "Manifest column types") into a form Arrow 53 does not parse. Strictly, this happens only when the dataset has a time or timestamp column; an index with neither is spelled the same by both. Nothing converts an index back. An index the newer binary has only read stays readable by both.
+
 ## Build-side memory (ADR 018 note)
 
 The lookup bound is one block index plus the bitmaps for the keys asked. The build bound is one segment: a writer holds a segment's distinct keys until the segment is finished, because the segment's name is the hash of its bytes. The build crate therefore caps segment size (keys and bytes) and emits many segments rather than one large one; merge compacts them later.
@@ -110,6 +124,29 @@ The lookup bound is one block index plus the bitmaps for the keys asked. The bui
 Signed zero: a stored or read minimum of +0.0 is widened to -0.0 and a maximum of -0.0 to +0.0 (the Parquet statistics reading rule), so a probe for either zero never prunes a row group holding the other. An equality probe for zero by a plan builder uses both encodings.
 
 `ColumnStats.min`/`max` are bounds, not necessarily attained values; inexact Parquet statistics are accepted. Float bounds exclude NaN by Parquet writer convention; a NaN probe is therefore never pruned by range statistics. Deprecated Parquet `min`/`max` fields are used only when the column's sort order is SIGNED. The dataset schema reported by `Source::schema(root)` is the single source of column types for encoding; a supplied schema overrides inference for text sources.
+
+**Amendment, 2026-10-24 (parquet 53 to 59).** The rules above hold unchanged on the new reader API. Two things changed upstream, and neither relaxes a rule:
+
+- parquet 59 exposes a column order that is present in the footer but unknown to the reader (a later format's `ColumnOrder` union member) as `ColumnOrder::UNKNOWN`. The specification says statistics under an unknown order are ignored. The source therefore uses neither min nor max for such a column, deprecated or not. This is stricter than before, never looser: the column reports unknown bounds, which never prunes.
+- The parquet 59 writer, when used with default properties, truncates byte-array statistics to 64 bytes. It writes a truncated prefix as the minimum and an incremented prefix as the maximum, and marks both inexact. The rule that bounds need not be attained values already covers this. It concerns files written by tools, tests, and the bench generator, not how statistics are read. The writer also no longer writes page-header statistics by default, and it folds Parquet bloom filters down to the smallest size that meets the configured false-positive rate. Neither affects what this reader trusts.
+
+**Inference amendment, 2026-10-24 (parquet 53 to 59).** Parquet-to-Arrow type inference never changes across a dependency upgrade. A column's inferred type is recorded in the manifest and decides its canonical encoding, so the same files must yield the same types.
+
+parquet 59 honours three embedded Arrow schema hints that parquet 53 did not. The source (`bellwether_source::load_reader_metadata`, used for data files and key files alike) keeps parquet 53's type for each:
+
+| Column, as written | parquet 59 reads | The source reads (= parquet 53) |
+|---|---|---|
+| `INT64` with a `Duration` hint (pyarrow and arrow-rs write one for duration arrays) | `Duration(unit)` | `Int64` |
+| `INT96` with a timestamp hint at a unit other than nanoseconds | `Timestamp(unit, tz)` | `Timestamp(ns)`, no zone |
+| `INT96` with a nanosecond timestamp hint and a zone | `Timestamp(ns, tz)` | `Timestamp(ns, tz)`, unchanged |
+| a decimal with a `Decimal32` or `Decimal64` hint | `Decimal32` or `Decimal64` | `Decimal128` at the same precision and scale |
+| any of the above under a `Dictionary` hint (for example pyarrow `dictionary<duration[ms]>`) | `Dictionary(key, value)` | the plain rewritten type (`Int64`, `Timestamp(ns)`, `Decimal128`); parquet 53 dropped a dictionary hint whose value hint did not apply |
+
+For the narrow decimals, parquet 53 actually panicked inside arrow-ipc ("Unexpected decimal bit width 32"). `Decimal128` is what it read without the hint.
+
+A newer reader's type is adopted only deliberately, by a later amendment that names it. Tests pin every row on pyarrow-written files in `fixtures/hints/`.
+
+Two mappings are new and change nothing that parquet 53 read: a Geometry or Geography column reads as `Binary`, and the always-null Unknown logical type reads as `Null` on every physical type.
 
 ## Pinned test vectors (encoding version 1)
 

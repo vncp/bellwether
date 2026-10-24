@@ -408,11 +408,14 @@ impl Storage for RenamingFs {
     }
 }
 
-/// A file written exactly like `multi_rg.parquet` (same batch, same writer
-/// settings) but with ids 101..=110, given the same mtime as `like`. Size
-/// and mtime match, so only the content hash can tell the two apart.
+/// `multi_rg.parquet`'s batch and writer settings, written to `out` by this
+/// build's Parquet writer, with the ids replaced when `ids` is given.
+///
+/// The race probe writes both the original and its lookalike with the same
+/// writer, so the sizes match by construction rather than by the committed
+/// fixture happening to share a writer version with this build.
 #[cfg(unix)]
-fn lookalike(like: &Path, name: &str) -> PathBuf {
+fn write_multi_rg(out: &Path, ids: Option<&[i64]>) {
     let fx = common::parquet_fixtures()
         .into_iter()
         .find(|f| f.name == "multi_rg.parquet")
@@ -422,22 +425,27 @@ fn lookalike(like: &Path, name: &str) -> PathBuf {
         .fields()
         .iter()
         .zip(fx.batch.columns())
-        .map(|(f, c)| {
-            if f.name() == "id" {
-                Arc::new(Int64Array::from((101..=110).collect::<Vec<i64>>())) as ArrayRef
-            } else {
-                Arc::clone(c)
-            }
+        .map(|(f, c)| match (&ids, f.name().as_str()) {
+            (Some(ids), "id") => Arc::new(Int64Array::from(ids.to_vec())) as ArrayRef,
+            _ => Arc::clone(c),
         })
         .collect();
     let batch = RecordBatch::try_new(Arc::clone(&schema), columns).unwrap();
-    let out = scratch(name);
     let props = WriterProperties::builder()
-        .set_max_row_group_size(fx.max_row_group_size)
+        .set_max_row_group_row_count(Some(fx.max_row_group_size))
         .build();
-    let mut w = ArrowWriter::try_new(File::create(&out).unwrap(), schema, Some(props)).unwrap();
+    let mut w = ArrowWriter::try_new(File::create(out).unwrap(), schema, Some(props)).unwrap();
     w.write(&batch).unwrap();
     w.close().unwrap();
+}
+
+/// A file written exactly like `multi_rg.parquet` (same batch, same writer
+/// settings) but with ids 101..=110, given the same mtime as `like`. Size
+/// and mtime match, so only the content hash can tell the two apart.
+#[cfg(unix)]
+fn lookalike(like: &Path, name: &str) -> PathBuf {
+    let out = scratch(name);
+    write_multi_rg(&out, Some(&(101..=110).collect::<Vec<i64>>()));
     let mtime = std::fs::metadata(like).unwrap().modified().unwrap();
     File::options()
         .write(true)
@@ -458,7 +466,7 @@ fn lookalike(like: &Path, name: &str) -> PathBuf {
 fn rename_replace_is_refused_or_never_read() {
     for before_open in [true, false] {
         let p = scratch(&format!("race-{before_open}.parquet"));
-        std::fs::copy(fixture("multi_rg.parquet"), &p).unwrap();
+        write_multi_rg(&p, None);
         let path = path_str(&p);
         let fp = fingerprint(&path).unwrap();
         let swap = Arc::new(Mutex::new(None));
@@ -499,7 +507,7 @@ fn patch_outside_the_tail_full_refuses_tail64k_serves() {
     )])
     .unwrap();
     let props = WriterProperties::builder()
-        .set_max_row_group_size(20_000)
+        .set_max_row_group_row_count(Some(20_000))
         .set_dictionary_enabled(false)
         .set_compression(Compression::UNCOMPRESSED)
         .set_encoding(Encoding::PLAIN)

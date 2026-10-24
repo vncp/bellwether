@@ -520,7 +520,7 @@ fn tiny_corpus() -> (tempfile::TempDir, String, Arc<Schema>) {
     )
     .unwrap();
     let props = WriterProperties::builder()
-        .set_max_row_group_size(4)
+        .set_max_row_group_row_count(Some(4))
         .build();
     let mut w = ArrowWriter::try_new(
         File::create(data.join("part-0.parquet")).unwrap(),

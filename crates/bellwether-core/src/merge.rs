@@ -193,7 +193,7 @@ fn advance<R: ReadAt>(
 }
 
 fn check_bitset_len(bits: &[u8]) -> Result<()> {
-    if bits.is_empty() || bits.len() % BLOCK_BYTES != 0 {
+    if bits.is_empty() || !bits.len().is_multiple_of(BLOCK_BYTES) {
         return Err(Error::Other(format!(
             "corrupt segment: bloom bitset length {}",
             bits.len()

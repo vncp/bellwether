@@ -38,7 +38,7 @@ pub fn corpus(dir: &Path, files: usize, rgs: usize, rows: usize, entities: i64) 
     let mut k: i64 = 0;
     for f in 0..files {
         let props = WriterProperties::builder()
-            .set_max_row_group_size(usize::MAX)
+            .set_max_row_group_row_count(Some(usize::MAX))
             .build();
         let file = File::create(dir.join(format!("part-{f:03}.parquet"))).unwrap();
         let mut w = ArrowWriter::try_new(file, Arc::clone(&schema), Some(props)).unwrap();

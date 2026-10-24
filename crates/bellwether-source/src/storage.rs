@@ -97,7 +97,7 @@ pub fn rfc3339_utc(since_epoch: Duration) -> String {
 
 fn skipped(name: &std::ffi::OsStr) -> bool {
     name.to_str()
-        .map_or(true, |n| n.starts_with('.') || n.starts_with('_'))
+        .is_none_or(|n| n.starts_with('.') || n.starts_with('_'))
 }
 
 fn walk(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {

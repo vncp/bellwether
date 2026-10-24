@@ -154,7 +154,7 @@ An engine baseline's planning phase may itself scan key columns (Apache DataFusi
 
 ### 2026-10-24: advisory ignore for an engine baseline dependency
 
-`deny.toml` ignores RUSTSEC-2024-0384 (`instant`, affecting wasm32 only), pulled in by DataFusion 43 behind the optional `datafusion` feature. It is removed by the Phase 3 dependency upgrade together with the other four ignores.
+`deny.toml` ignores RUSTSEC-2024-0384 (`instant`, affecting wasm32 only), pulled in by DataFusion 43 behind the optional `datafusion` feature. It is removed by the Phase 3 dependency upgrade together with the other four ignores. Removed 2026-10-24: DataFusion 55 no longer depends on `instant`, and `deny.toml` has no ignores.
 
 ### 2026-10-24: gate ablation operationalization
 
@@ -301,7 +301,7 @@ Reason: these are what could be run honestly in the first harness.
     - Latency is DuckDB's own `.timer` query time, and the CLI version is recorded in the `environment` block.
   - How to enable it: it sits behind the `duckdb` feature and is recorded as unavailable otherwise. `--require-duckdb` makes it mandatory.
   - What it reports: files, row groups, and bytes are not observable, so they are recorded as `null`.
-- **Apache DataFusion** is a plan strategy behind the `datafusion` feature: DataFusion 43, pure Rust, no native dependencies. It runs DataFusion's own `ParquetExec` with the lookup predicate, with statistics, page-index, and bloom-filter pruning on (DataFusion's defaults).
+- **Apache DataFusion** is a plan strategy behind the `datafusion` feature: DataFusion 55 (43 until the 2026-10-24 dependency upgrade), pure Rust, no native dependencies. It runs DataFusion's own Parquet scan (a `DataSourceExec` over a `ParquetSource`, the successor of `ParquetExec`) with the lookup predicate, with statistics, page-index, and bloom-filter pruning on (DataFusion's defaults).
   - **The plan** is the set of row groups whose column chunks DataFusion actually read, recorded at its reader.
   - **Granularity:** page-level savings inside a row group are not represented, because plans are row-group granular.
   - **Latency:** the plan time includes DataFusion's projected scan.
@@ -349,3 +349,19 @@ Reason: this records what the first harness emits.
 - **Commands** are `cargo run -p bellwether-bench --release -- <generate|workload|ground-truth|run|report>` with flags. There is no TOML configuration yet; WP9's `bellwether bench` will wrap these commands.
 - **`results.json` is nested:** corpus, then runs, then one result per strategy. Each per-run strategy result is the "(baseline, lookup)" object; the schema is in the crate README.
 - **Earlier numbers.** Numbers quoted in the WP10 pull request before this date are pre-amendment. They come from a layout with 4 files per day and from a harness without measured bytes or row digests.
+
+### 2026-10-24: dependency upgrade (parquet 53 to 59, DataFusion 43 to 55)
+
+Reason: the Phase 3 dependency upgrade moved the Parquet writer and the DataFusion baseline. The generated data did not change.
+
+- **The Parquet-bytes golden was re-pinned.** `GOLDEN_TINY_FILES` (the bytes of `tiny(9)`'s data files) moved from `be2ce957…` to `9436a186…`. The other four goldens are unchanged: `corpus.json`, every decoded value, the workload hash, and the first run's keys. So no row value moved, and this golden is defined over file bytes.
+- **Why the bytes moved.** The parquet 59 writer changed three defaults:
+  - It no longer writes page-header statistics. parquet 53 wrote them at the default page-level statistics.
+  - It truncates byte-array statistics to 64 bytes. parquet 53 did not truncate.
+  - It folds each bloom filter down to the smallest size that still meets the configured false-positive rate. parquet 53 kept the size computed from the NDV.
+- **The small rung was checked against the old writer.** `generate --rung small` was run with the code before and after the upgrade. `corpus.json` is byte-identical. All 80 row groups decode to equal tables with equal row counts. Column chunks are about 0.3 % smaller.
+- **Statistics on the wide `payload` column.** The only statistics that differ are min and max on `payload`, whose values are longer than 64 bytes. They are now truncated bounds, not attained values. `docs/format.md`, "Statistics semantics", covers this: bounds need not be attained.
+- **The generator's `entity_id` bloom filter** keeps its 1 % target false-positive rate, but it can now be smaller than one sized for a row group's distinct values. A statistics or DataFusion baseline that prunes with it therefore sees a false-positive rate up to that target. Before, the rate was usually lower.
+- **The generator's buffered peak** on the small rung rose from 60.2 MB to 64.8 MB, against its 102 MB bound.
+- **The replay crate's determinism golden was re-pinned too.** Its record holds Parquet column-chunk byte counts. Every run's files and row groups are unchanged; only `bytes` moved, about 2 % lower. Re-enabling page-header statistics and turning off truncation in that fixture reproduces the old byte counts exactly. That isolates the cause to the two writer defaults above.
+- **The DataFusion baseline** runs DataFusion 55, the line built on arrow 59. `ParquetExec` became a `DataSourceExec` over a `ParquetSource`. The options are the same (statistics pruning, page index, and bloom filters on read), and so is the recording reader. Byte ranges are now `u64` throughout.

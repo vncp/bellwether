@@ -23,7 +23,7 @@ use common::{mix, nearest_rank, temp_store, u64_batch, MemSource};
 /// Value `v` occurs in row group `r` when a hash of `(v, r)` falls under a
 /// value-specific rate, so fanout varies from one row group to all of them.
 fn occurs(v: u64, r: u64) -> bool {
-    mix(v.wrapping_mul(0x9E37_79B9) ^ r) % (1 + v % 9) == 0
+    mix(v.wrapping_mul(0x9E37_79B9) ^ r).is_multiple_of(1 + v % 9)
 }
 
 const FILES: u64 = 4;

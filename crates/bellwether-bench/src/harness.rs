@@ -739,7 +739,7 @@ pub fn run_corpus(
             note: match p.name() {
                 PARQUET_STATS => Some("footer min/max, then embedded bloom filters".into()),
                 DATAFUSION => Some(
-                    "DataFusion's ParquetExec pruning (statistics, page index, bloom filters); \
+                    "DataFusion's Parquet scan pruning (statistics, page index, bloom filters); \
                      the plan is the row groups it read, and plan_ms includes that scan"
                         .into(),
                 ),
@@ -1302,7 +1302,9 @@ pub mod datafusion_baseline {
     //! Apache DataFusion baseline (ADR 019): DataFusion's own Parquet
     //! pruning as a plan strategy.
     //!
-    //! The strategy runs DataFusion's `ParquetExec` over the corpus with the
+    //! The strategy runs DataFusion's Parquet scan (a `DataSourceExec` over a
+    //! `ParquetSource`, the successor of the earlier `ParquetExec`) over the
+    //! corpus with the
     //! predicate `entity_id IN (keys)`, projected to `entity_id`, with row
     //! group statistics pruning, page-index pruning, and bloom-filter
     //! pruning on (DataFusion's defaults). Every byte range DataFusion asks
@@ -1334,8 +1336,9 @@ pub mod datafusion_baseline {
     use datafusion::config::TableParquetOptions;
     use datafusion::datasource::listing::PartitionedFile;
     use datafusion::datasource::physical_plan::{
-        FileMeta, FileScanConfig, ParquetExec, ParquetFileReaderFactory,
+        FileScanConfigBuilder, ParquetFileReaderFactory, ParquetSource,
     };
+    use datafusion::datasource::source::DataSourceExec;
     use datafusion::error::DataFusionError;
     use datafusion::execution::object_store::ObjectStoreUrl;
     use datafusion::physical_plan::metrics::ExecutionPlanMetricsSet;
@@ -1349,8 +1352,14 @@ pub mod datafusion_baseline {
     use crate::results::DATAFUSION;
     use crate::{BenchError, Key, Result};
 
-    type Log = Arc<Mutex<Vec<(usize, Range<usize>)>>>;
+    use parquet::arrow::arrow_reader::ArrowReaderOptions;
+
+    type Log = Arc<Mutex<Vec<(usize, Range<u64>)>>>;
     type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+
+    /// The corpus position of a file, attached to its `PartitionedFile`.
+    #[derive(Debug, Clone, Copy)]
+    struct FileIndex(usize);
 
     /// Hands DataFusion a recording reader per file.
     #[derive(Debug)]
@@ -1363,15 +1372,13 @@ pub mod datafusion_baseline {
         fn create_reader(
             &self,
             _partition_index: usize,
-            file_meta: FileMeta,
+            file: PartitionedFile,
             _metadata_size_hint: Option<usize>,
             _metrics: &ExecutionPlanMetricsSet,
         ) -> datafusion::error::Result<Box<dyn AsyncFileReader + Send>> {
-            let index = file_meta
-                .extensions
-                .as_ref()
-                .and_then(|e| e.downcast_ref::<usize>())
-                .copied()
+            let index = file
+                .extension::<FileIndex>()
+                .map(|i| i.0)
                 .ok_or_else(|| DataFusionError::Internal("file index missing".into()))?;
             let (path, meta) = self
                 .files
@@ -1396,13 +1403,18 @@ pub mod datafusion_baseline {
     }
 
     impl RecordingReader {
-        fn read(&self, range: Range<usize>) -> parquet::errors::Result<Bytes> {
+        fn read(&self, range: Range<u64>) -> parquet::errors::Result<Bytes> {
             if let Ok(mut log) = self.log.lock() {
                 log.push((self.index, range.clone()));
             }
+            let len = usize::try_from(range.end.saturating_sub(range.start)).map_err(|_| {
+                parquet::errors::ParquetError::General(format!(
+                    "byte range {range:?} does not fit in memory"
+                ))
+            })?;
             let mut file = std::fs::File::open(&self.path)?;
-            file.seek(SeekFrom::Start(range.start as u64))?;
-            let mut buf = vec![0u8; range.end.saturating_sub(range.start)];
+            file.seek(SeekFrom::Start(range.start))?;
+            let mut buf = vec![0u8; len];
             file.read_exact(&mut buf)?;
             Ok(Bytes::from(buf))
         }
@@ -1411,13 +1423,16 @@ pub mod datafusion_baseline {
     impl AsyncFileReader for RecordingReader {
         fn get_bytes(
             &mut self,
-            range: Range<usize>,
+            range: Range<u64>,
         ) -> BoxFuture<'_, parquet::errors::Result<Bytes>> {
             let result = self.read(range);
             Box::pin(std::future::ready(result))
         }
 
-        fn get_metadata(&mut self) -> BoxFuture<'_, parquet::errors::Result<Arc<ParquetMetaData>>> {
+        fn get_metadata<'a>(
+            &'a mut self,
+            _options: Option<&'a ArrowReaderOptions>,
+        ) -> BoxFuture<'a, parquet::errors::Result<Arc<ParquetMetaData>>> {
             Box::pin(std::future::ready(Ok(self.meta.clone())))
         }
     }
@@ -1459,15 +1474,6 @@ pub mod datafusion_baseline {
                 log: log.clone(),
             };
             let file_schema = schema();
-            let mut config =
-                FileScanConfig::new(ObjectStoreUrl::local_filesystem(), file_schema.clone())
-                    .with_projection(Some(vec![COL_ENTITY]));
-            for (i, f) in self.corpus.files.iter().enumerate() {
-                config = config.with_file(
-                    PartitionedFile::new(f.path.display().to_string(), f.fingerprint.size)
-                        .with_extensions(Arc::new(i)),
-                );
-            }
             let ctx = SessionContext::new();
             let df_schema = DFSchema::try_from(file_schema.as_ref().clone())?;
             let expr =
@@ -1477,21 +1483,28 @@ pub mod datafusion_baseline {
             options.global.pruning = true;
             options.global.enable_page_index = true;
             options.global.bloom_filter_on_read = true;
-            let exec = ParquetExec::builder(config)
-                .with_predicate(predicate)
+            let source = ParquetSource::new(file_schema.clone())
                 .with_table_parquet_options(options)
                 .with_parquet_file_reader_factory(Arc::new(factory))
-                .build();
-            self.runtime.block_on(datafusion::physical_plan::collect(
-                Arc::new(exec),
-                ctx.task_ctx(),
-            ))?;
+                .with_predicate(predicate);
+            let mut config =
+                FileScanConfigBuilder::new(ObjectStoreUrl::local_filesystem(), Arc::new(source))
+                    .with_projection_indices(Some(vec![COL_ENTITY]))?;
+            for (i, f) in self.corpus.files.iter().enumerate() {
+                config = config.with_file(
+                    PartitionedFile::new(f.path.display().to_string(), f.fingerprint.size)
+                        .with_extension(FileIndex(i)),
+                );
+            }
+            let exec = DataSourceExec::from_data_source(config.build());
+            self.runtime
+                .block_on(datafusion::physical_plan::collect(exec, ctx.task_ctx()))?;
             let log = log
                 .lock()
                 .map_err(|_| DataFusionError::Internal("range log poisoned".into()))?;
             let fetched = log
                 .iter()
-                .map(|(_, range)| range.end.saturating_sub(range.start) as u64)
+                .map(|(_, range)| range.end.saturating_sub(range.start))
                 .sum();
             if let Ok(mut last) = self.last_plan_bytes.lock() {
                 *last = Some(fetched);
@@ -1501,7 +1514,7 @@ pub mod datafusion_baseline {
                 .filter_map(|(fi, range)| {
                     self.corpus.files[*fi]
                         .reader
-                        .row_group_of(range.start as u64)
+                        .row_group_of(range.start)
                         .map(|rg| (*fi, rg))
                 })
                 .collect())

@@ -60,7 +60,7 @@ fn wide_corpus() -> (tempfile::TempDir, String) {
     let data = dir.path().join("data");
     std::fs::create_dir_all(&data).unwrap();
     let props = WriterProperties::builder()
-        .set_max_row_group_size(WIDE_ROWS)
+        .set_max_row_group_row_count(Some(WIDE_ROWS))
         .build();
     let mut w = ArrowWriter::try_new(
         File::create(data.join("part-0.parquet")).unwrap(),

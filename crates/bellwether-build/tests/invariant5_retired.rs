@@ -50,7 +50,7 @@ fn schema() -> SchemaRef {
 /// One Parquet file whose row groups are exactly `groups` of (id, region, ts).
 fn write(path: &std::path::Path, groups: &[&[(i64, &str, i64)]]) {
     let props = WriterProperties::builder()
-        .set_max_row_group_size(1 << 20)
+        .set_max_row_group_row_count(Some(1 << 20))
         .build();
     let mut w =
         ArrowWriter::try_new(std::fs::File::create(path).unwrap(), schema(), Some(props)).unwrap();

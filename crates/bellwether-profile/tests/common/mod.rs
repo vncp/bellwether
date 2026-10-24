@@ -168,7 +168,7 @@ impl Layout {
                 let path = day_dir.join(format!("part-{global_file:05}.parquet"));
                 global_file += 1;
                 let props = WriterProperties::builder()
-                    .set_max_row_group_size(self.rows_per_rg as usize)
+                    .set_max_row_group_row_count(Some(self.rows_per_rg as usize))
                     .build();
                 let mut w =
                     ArrowWriter::try_new(File::create(&path).unwrap(), schema.clone(), Some(props))

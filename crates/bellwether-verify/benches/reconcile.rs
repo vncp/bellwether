@@ -83,7 +83,7 @@ fn synthetic(dir: &Path, files: u64, groups: u64, rows: u64, entities: u64) {
         ])
         .unwrap();
         let props = WriterProperties::builder()
-            .set_max_row_group_size(usize::try_from(rows).unwrap())
+            .set_max_row_group_row_count(Some(usize::try_from(rows).unwrap()))
             .build();
         let file = std::fs::File::create(data.join(format!("part-{f:05}.parquet"))).unwrap();
         let mut w = ArrowWriter::try_new(file, batch.schema(), Some(props)).unwrap();

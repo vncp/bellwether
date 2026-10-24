@@ -126,7 +126,7 @@ impl Scope {
             Self::Workload { keys, .. } => keys.binary_search_by(|k| k.as_slice().cmp(key)).is_ok(),
             Self::Sampled {
                 seed, threshold, ..
-            } => threshold.map_or(true, |t| xxh3_64_with_seed(key, *seed) < t),
+            } => threshold.is_none_or(|t| xxh3_64_with_seed(key, *seed) < t),
         }
     }
 }
@@ -1086,7 +1086,7 @@ fn fold_row(
         // A null version value never wins (ADR 014).
         return Ok(());
     };
-    if side.newest.map_or(true, |n| ts > n) {
+    if side.newest.is_none_or(|n| ts > n) {
         side.newest = Some(ts);
         side.compared = 0;
         side.sum = 0;

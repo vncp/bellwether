@@ -93,7 +93,7 @@ impl Hll {
         let top = f64::from(counts[(q + 1) as usize]);
         let mut z = m * tau(1.0 - top / m);
         for k in (1..=q as usize).rev() {
-            z = 0.5 * (z + f64::from(counts[k]));
+            z = f64::midpoint(z, f64::from(counts[k]));
         }
         z += m * sigma(f64::from(counts[0]) / m);
         let alpha_inf = 1.0 / (2.0 * std::f64::consts::LN_2);

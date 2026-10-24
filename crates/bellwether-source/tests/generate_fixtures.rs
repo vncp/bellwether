@@ -31,12 +31,13 @@ use parquet::file::reader::{FileReader, SerializedFileReader};
 use parquet::schema::types::ColumnPath;
 
 fn write_parquet(fx: &ParquetFixture) {
-    let mut props = WriterProperties::builder().set_max_row_group_size(fx.max_row_group_size);
+    let mut props =
+        WriterProperties::builder().set_max_row_group_row_count(Some(fx.max_row_group_size));
     for col in &fx.bloom_columns {
         props = props
             .set_column_bloom_filter_enabled(ColumnPath::from(*col), true)
             .set_column_bloom_filter_fpp(ColumnPath::from(*col), 0.01)
-            .set_column_bloom_filter_ndv(ColumnPath::from(*col), 16);
+            .set_column_bloom_filter_max_ndv(ColumnPath::from(*col), 16);
     }
     let file = File::create(fixture(fx.name)).unwrap();
     let mut w = ArrowWriter::try_new(file, fx.batch.schema(), Some(props.build())).unwrap();
@@ -61,10 +62,10 @@ fn independent_stats(fx: &ParquetFixture, offset: usize, len: usize) -> Vec<Expe
                     if is_nan_encoding(&e) {
                         continue;
                     }
-                    if min.as_ref().map_or(true, |m| e < *m) {
+                    if min.as_ref().is_none_or(|m| e < *m) {
                         min = Some(e.clone());
                     }
-                    if max.as_ref().map_or(true, |m| e > *m) {
+                    if max.as_ref().is_none_or(|m| e > *m) {
                         max = Some(e);
                     }
                 }

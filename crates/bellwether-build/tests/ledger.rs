@@ -122,9 +122,9 @@ fn write_day(root: &Path, p: &Params, day: u32) {
     std::fs::create_dir_all(&dir).unwrap();
     let props = WriterProperties::builder()
         .set_column_bloom_filter_enabled(ColumnPath::from("entity_id"), true)
-        .set_column_bloom_filter_ndv(ColumnPath::from("entity_id"), u64::from(p.rows_per_rg))
+        .set_column_bloom_filter_max_ndv(ColumnPath::from("entity_id"), u64::from(p.rows_per_rg))
         .set_column_bloom_filter_fpp(ColumnPath::from("entity_id"), 0.01)
-        .set_max_row_group_size(p.rows_per_rg as usize + 1)
+        .set_max_row_group_row_count(Some(p.rows_per_rg as usize + 1))
         .build();
     for f in 0..p.files_per_day {
         let global = day * p.files_per_day + f;

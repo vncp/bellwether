@@ -69,7 +69,7 @@ impl VersionHit {
 /// timestamp is always stale (ADR 014).
 #[must_use]
 pub fn is_stale(hit: &VersionHit, row_ts: Option<i64>) -> bool {
-    row_ts.map_or(true, |t| t < hit.ts)
+    row_ts.is_none_or(|t| t < hit.ts)
 }
 
 impl VersionChain {
@@ -181,7 +181,7 @@ impl VersionChain {
             return Err(bad());
         }
         let mut versions = Vec::with_capacity(n);
-        for c in body.chunks_exact(12) {
+        for c in body.as_chunks::<12>().0 {
             let ts = i64::from_le_bytes(c[0..8].try_into().map_err(|_| bad())?);
             let rg = u32::from_le_bytes(c[8..12].try_into().map_err(|_| bad())?);
             versions.push((ts, RowGroupId(rg)));

@@ -67,7 +67,7 @@ fn corpus(files: usize) -> tempfile::TempDir {
         )
         .unwrap();
         let props = WriterProperties::builder()
-            .set_max_row_group_size(ROWS_PER_ROW_GROUP)
+            .set_max_row_group_row_count(Some(ROWS_PER_ROW_GROUP))
             .build();
         let path = dir.path().join(format!("part-{f:05}.parquet"));
         let mut w =

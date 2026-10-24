@@ -238,8 +238,8 @@ fn independent_parquet_stats(
             let rgr = reader.get_row_group(rg).unwrap();
             let bloom = rgr.get_column_bloom_filter(0);
             let keep = keys.iter().any(|&k| {
-                range.map_or(true, |(lo, hi)| lo <= k && k <= hi)
-                    && bloom.map_or(true, |f| f.check(&(k as i64)))
+                range.is_none_or(|(lo, hi)| lo <= k && k <= hi)
+                    && bloom.is_none_or(|f| f.check(&(k as i64)))
             });
             if keep {
                 out.insert((path.to_str().unwrap().to_string(), rg as u32));

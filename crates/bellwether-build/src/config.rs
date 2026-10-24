@@ -325,16 +325,112 @@ pub(crate) fn columns_to_schema(columns: &[ColumnDef]) -> Result<SchemaRef> {
                     c.name
                 )));
             }
-            let dt = DataType::from_str(&c.data_type).map_err(|e| {
+            let dt = parse_manifest_type(&c.data_type).map_err(|e| {
                 Error::Other(format!(
                     "manifest column {:?} has data type {:?}, which this Arrow build cannot parse: {e}",
                     c.name, c.data_type
                 ))
             })?;
+            if !recordable(&dt) {
+                return Err(Error::Other(format!(
+                    "manifest column {:?} has data type {:?}, a nested or field-carrying type, which the manifest does not record",
+                    c.name, c.data_type
+                )));
+            }
             Ok(Field::new(c.name.clone(), dt, c.nullable))
         })
         .collect::<Result<Vec<_>>>()?;
     Ok(Arc::new(Schema::new(fields)))
+}
+
+/// Whether the manifest records columns of type `dt`.
+///
+/// Types that carry child fields (lists, list views, structs, maps, unions,
+/// run-end encoding) are refused, at any depth of a dictionary. Before the
+/// 2026-10-24 Arrow upgrade this held implicitly: Arrow 53 printed such a
+/// type with its fields' debug form, which its own parser could not read, so
+/// [`persistable`] refused every dataset with one. Arrow 59 prints a form it
+/// can parse back, so the refusal is now explicit, and a dataset with a
+/// nested column is refused exactly as before.
+pub(crate) fn recordable(dt: &DataType) -> bool {
+    match dt {
+        DataType::List(_)
+        | DataType::LargeList(_)
+        | DataType::FixedSizeList(_, _)
+        | DataType::ListView(_)
+        | DataType::LargeListView(_)
+        | DataType::Struct(_)
+        | DataType::Map(_, _)
+        | DataType::Union(_, _)
+        | DataType::RunEndEncoded(_, _) => false,
+        DataType::Dictionary(k, v) => recordable(k) && recordable(v),
+        _ => true,
+    }
+}
+
+/// A manifest column type: Arrow's `Display` form as this build prints it,
+/// or the form Arrow 53 printed (manifests written before the 2026-10-24
+/// dependency upgrade).
+///
+/// Arrow 59 changed the spelling of time units: `Timestamp(Millisecond,
+/// Some("UTC"))` became `Timestamp(ms, "UTC")`, `Time64(Microsecond)` became
+/// `Time64(µs)`, and `Timestamp(Second, None)` became `Timestamp(s)`. Arrow
+/// 59's own parser still accepts the old form; this reader does not rely on
+/// that, and rewrites the old form itself when Arrow refuses it, so an old
+/// manifest stays readable even if a later Arrow drops the old grammar.
+/// Every other type the manifest can hold is spelled the same by both.
+pub(crate) fn parse_manifest_type(spelled: &str) -> std::result::Result<DataType, String> {
+    match DataType::from_str(spelled) {
+        Ok(dt) => Ok(dt),
+        Err(e) => match legacy_type_spelling(spelled) {
+            Some(rewritten) => DataType::from_str(&rewritten).map_err(|e2| format!("{e}; {e2}")),
+            None => Err(e.to_string()),
+        },
+    }
+}
+
+/// The current spelling of an Arrow 53 temporal type spelling, or `None`
+/// when `spelled` is not one. Covers `Time32`, `Time64`, `Timestamp` and
+/// `Duration`, the types whose display form changed, and a `Dictionary`
+/// whose value type is one of them, at any depth: Arrow 53 spelled
+/// `Dictionary(Int32, Timestamp(Millisecond, Some("UTC")))`.
+pub(crate) fn legacy_type_spelling(spelled: &str) -> Option<String> {
+    let (head, rest) = spelled.split_once('(')?;
+    if head == "Dictionary" {
+        // The key is an integer type, spelled without commas or parentheses.
+        let (key, value) = rest.strip_suffix(')')?.split_once(", ")?;
+        if key.contains('(') {
+            return None;
+        }
+        return Some(format!(
+            "Dictionary({key}, {})",
+            legacy_type_spelling(value)?
+        ));
+    }
+    if !matches!(head, "Time32" | "Time64" | "Timestamp" | "Duration") {
+        return None;
+    }
+    let inner = rest.strip_suffix(')')?;
+    let (unit, tz) = match inner.split_once(", ") {
+        Some((u, tz)) => (u, Some(tz)),
+        None => (inner, None),
+    };
+    let unit = match unit {
+        "Second" => "s",
+        "Millisecond" => "ms",
+        "Microsecond" => "µs",
+        "Nanosecond" => "ns",
+        _ => return None,
+    };
+    match (head, tz) {
+        (_, None) => Some(format!("{head}({unit})")),
+        ("Timestamp", Some("None")) => Some(format!("Timestamp({unit})")),
+        ("Timestamp", Some(tz)) => {
+            let name = tz.strip_prefix("Some(")?.strip_suffix(')')?;
+            Some(format!("Timestamp({unit}, {name})"))
+        }
+        _ => None,
+    }
 }
 
 /// `schema` reduced to what the manifest records (names, types,
@@ -461,6 +557,202 @@ mod tests {
             "Int8",
             "the spelling is Arrow's Display form"
         );
+    }
+
+    /// Every type `persisted_types_round_trip_exactly` pins, with the
+    /// spelling Arrow 53 wrote into manifests before the 2026-10-24 upgrade
+    /// (captured from arrow-schema 53.4.1's `Display`).
+    fn arrow53_spellings() -> Vec<(&'static str, DataType)> {
+        let tz = |s: &str| Some(s.into());
+        vec![
+            ("Boolean", DataType::Boolean),
+            ("Int8", DataType::Int8),
+            ("Int16", DataType::Int16),
+            ("Int32", DataType::Int32),
+            ("Int64", DataType::Int64),
+            ("UInt8", DataType::UInt8),
+            ("UInt16", DataType::UInt16),
+            ("UInt32", DataType::UInt32),
+            ("UInt64", DataType::UInt64),
+            ("Float16", DataType::Float16),
+            ("Float32", DataType::Float32),
+            ("Float64", DataType::Float64),
+            ("Decimal128(10, 2)", DataType::Decimal128(10, 2)),
+            ("Decimal128(38, -3)", DataType::Decimal128(38, -3)),
+            ("Decimal256(76, 10)", DataType::Decimal256(76, 10)),
+            ("Utf8", DataType::Utf8),
+            ("LargeUtf8", DataType::LargeUtf8),
+            ("Utf8View", DataType::Utf8View),
+            ("Binary", DataType::Binary),
+            ("LargeBinary", DataType::LargeBinary),
+            ("BinaryView", DataType::BinaryView),
+            ("FixedSizeBinary(16)", DataType::FixedSizeBinary(16)),
+            ("Date32", DataType::Date32),
+            ("Date64", DataType::Date64),
+            ("Time32(Second)", DataType::Time32(TimeUnit::Second)),
+            (
+                "Time32(Millisecond)",
+                DataType::Time32(TimeUnit::Millisecond),
+            ),
+            (
+                "Time64(Microsecond)",
+                DataType::Time64(TimeUnit::Microsecond),
+            ),
+            ("Time64(Nanosecond)", DataType::Time64(TimeUnit::Nanosecond)),
+            (
+                "Timestamp(Second, None)",
+                DataType::Timestamp(TimeUnit::Second, None),
+            ),
+            (
+                r#"Timestamp(Millisecond, Some("UTC"))"#,
+                DataType::Timestamp(TimeUnit::Millisecond, tz("UTC")),
+            ),
+            (
+                r#"Timestamp(Microsecond, Some("+05:30"))"#,
+                DataType::Timestamp(TimeUnit::Microsecond, tz("+05:30")),
+            ),
+            (
+                r#"Timestamp(Nanosecond, Some("America/New_York"))"#,
+                DataType::Timestamp(TimeUnit::Nanosecond, tz("America/New_York")),
+            ),
+            (
+                "Dictionary(Int32, Utf8)",
+                DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
+            ),
+            (
+                r#"Dictionary(Int32, Timestamp(Millisecond, Some("UTC")))"#,
+                DataType::Dictionary(
+                    Box::new(DataType::Int32),
+                    Box::new(DataType::Timestamp(TimeUnit::Millisecond, tz("UTC"))),
+                ),
+            ),
+            (
+                "Dictionary(Int16, Time64(Nanosecond))",
+                DataType::Dictionary(
+                    Box::new(DataType::Int16),
+                    Box::new(DataType::Time64(TimeUnit::Nanosecond)),
+                ),
+            ),
+            (
+                "Interval(MonthDayNano)",
+                DataType::Interval(IntervalUnit::MonthDayNano),
+            ),
+        ]
+    }
+
+    /// Manifests written by the old release stay readable: each old
+    /// spelling reads back as the type it named, both through the manifest
+    /// reader and through the legacy rewrite alone (so the guarantee does not
+    /// rest on Arrow's parser continuing to accept the old grammar).
+    #[test]
+    fn arrow_53_spellings_read_back_as_the_same_types() {
+        for (old, want) in arrow53_spellings() {
+            assert_eq!(parse_manifest_type(old).unwrap(), want, "{old}");
+            if let Some(rewritten) = legacy_type_spelling(old) {
+                assert_eq!(DataType::from_str(&rewritten).unwrap(), want, "{old}");
+                assert_eq!(rewritten, want.to_string(), "the current spelling");
+            } else {
+                assert_eq!(old, want.to_string(), "{old} is spelled as before");
+            }
+        }
+        let columns: Vec<ColumnDef> = arrow53_spellings()
+            .iter()
+            .enumerate()
+            .map(|(i, (old, _))| ColumnDef {
+                name: format!("c{i}"),
+                data_type: (*old).to_string(),
+                nullable: true,
+                extra: Extra::new(),
+            })
+            .collect();
+        let schema = columns_to_schema(&columns).unwrap();
+        for (f, (old, want)) in schema.fields().iter().zip(arrow53_spellings()) {
+            assert_eq!(f.data_type(), &want, "{old}");
+        }
+    }
+
+    /// Nested and field-carrying types were refused before the Arrow 59
+    /// upgrade (Arrow 53 could not parse its own display form of them), and
+    /// still are, although Arrow 59 now round-trips their spelling.
+    #[test]
+    fn nested_columns_are_refused_as_before_the_upgrade() {
+        use arrow::datatypes::{Fields, UnionFields, UnionMode};
+        let item = |t: DataType| Arc::new(Field::new("item", t, true));
+        let nested = [
+            DataType::new_list(DataType::Int64, true),
+            DataType::LargeList(item(DataType::Utf8)),
+            DataType::FixedSizeList(item(DataType::Float32), 3),
+            DataType::ListView(item(DataType::Int64)),
+            DataType::LargeListView(item(DataType::Int64)),
+            DataType::Struct(Fields::from(vec![Field::new("a", DataType::Int64, true)])),
+            DataType::Map(
+                Arc::new(Field::new(
+                    "entries",
+                    DataType::Struct(Fields::from(vec![
+                        Field::new("keys", DataType::Utf8, false),
+                        Field::new("values", DataType::Int64, true),
+                    ])),
+                    false,
+                )),
+                false,
+            ),
+            DataType::Union(
+                UnionFields::try_new(vec![0], vec![Field::new("a", DataType::Int64, true)])
+                    .unwrap(),
+                UnionMode::Dense,
+            ),
+            DataType::RunEndEncoded(
+                Arc::new(Field::new("run_ends", DataType::Int32, false)),
+                item(DataType::Utf8),
+            ),
+            DataType::Dictionary(
+                Box::new(DataType::Int32),
+                Box::new(DataType::new_list(DataType::Utf8, true)),
+            ),
+        ];
+        for t in nested {
+            assert!(!recordable(&t), "{t}");
+            let schema = Schema::new(vec![
+                Field::new("id", DataType::Int64, false),
+                Field::new("x", t.clone(), true),
+            ]);
+            let err = persistable(&schema).unwrap_err();
+            assert!(matches!(err, Error::Other(_)), "{t}: {err}");
+            let columns = vec![ColumnDef {
+                name: "x".into(),
+                data_type: t.to_string(),
+                nullable: true,
+                extra: Extra::new(),
+            }];
+            assert!(columns_to_schema(&columns).is_err(), "{t}");
+        }
+        for (_, t) in arrow53_spellings() {
+            assert!(recordable(&t), "{t}");
+        }
+    }
+
+    #[test]
+    fn the_legacy_rewrite_is_exact_and_refuses_what_it_does_not_know() {
+        assert_eq!(
+            legacy_type_spelling("Duration(Millisecond)").as_deref(),
+            Some("Duration(ms)")
+        );
+        for not_legacy in [
+            "Int64",
+            "Timestamp(µs)",
+            "Timestamp(Fortnight, None)",
+            "Timestamp(Second, Some(UTC)",
+            "Time64(Microsecond, None)",
+            "Duration(Second, None)",
+            "List(Int64)",
+            "Dictionary(Int32, Utf8)",
+            "Dictionary(Int32, Timestamp(Fortnight, None))",
+            "Dictionary(Timestamp(Second, None), Utf8)",
+        ] {
+            assert_eq!(legacy_type_spelling(not_legacy), None, "{not_legacy}");
+        }
+        assert!(parse_manifest_type("Timestamp(Fortnight, None)").is_err());
+        assert!(parse_manifest_type("NotAType").is_err());
     }
 
     #[test]

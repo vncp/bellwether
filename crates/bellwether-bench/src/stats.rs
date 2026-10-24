@@ -170,7 +170,7 @@ pub fn chacha(words: &[u64]) -> rand_chacha::ChaCha12Rng {
     use rand::SeedableRng as _;
     let base = mix_all(words);
     let mut key = [0u8; 32];
-    for (i, chunk) in key.chunks_exact_mut(8).enumerate() {
+    for (i, chunk) in key.as_chunks_mut::<8>().0.iter_mut().enumerate() {
         chunk.copy_from_slice(&mix64(base ^ (i as u64 + 1)).to_le_bytes());
     }
     rand_chacha::ChaCha12Rng::from_seed(key)

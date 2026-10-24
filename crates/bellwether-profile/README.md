@@ -193,7 +193,7 @@ fanout: files and row groups one value touches, p50 / p95 / max
   (status, payload)           12,000   1 / 1 / 1           1 / 1 / 1           exact
   (entity_id, status)          9,591   1 / 2 / 3           1 / 2 / 3           exact
   (batch_id, status)             932   5 / 8 / 8           5 / 8 / 8           exact
-  not candidates: version_ts (Timestamp(Microsecond, Some("UTC")): a time column, analyzed for range overlap); amount (Decimal128(18, 2): not an identifier type)
+  not candidates: version_ts (Timestamp(µs, "UTC"): a time column, analyzed for range overlap); amount (Decimal128(18, 2): not an identifier type)
 
 ranges
   entity_id              typical overlap 100%  sorted within files   0%

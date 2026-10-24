@@ -1,7 +1,7 @@
 //! [`ObjectStoreBackend`]: the [`Store`] trait over `object_store`, with each
 //! backend's native conditional write, behind a synchronous facade.
 //!
-//! # Conditional-write semantics per backend (verified against `object_store` 0.11.2)
+//! # Conditional-write semantics per backend (verified against `object_store` 0.14.2, 2026-10-24)
 //!
 //! | Backend | `put_if_absent` | `put_if_version` | Version token |
 //! |---|---|---|---|
@@ -11,9 +11,15 @@
 //! | GCS | `PutMode::Create` → `x-goog-if-generation-match: 0` | `PutMode::Update` → `x-goog-if-generation-match: <generation>` | etag + generation |
 //! | Memory (`memory://`) | `PutMode::Create` | `PutMode::Update` on etag | etag |
 //!
-//! S3 conditional writes are off by default in `object_store`; this crate sets
-//! `S3ConditionalPut::ETagMatch` unless the caller configured
-//! `aws_conditional_put` explicitly (for example `dynamo:<table>`).
+//! `object_store` 0.14 defaults S3 to `S3ConditionalPut::ETagMatch` (0.11 left
+//! conditional writes off); this crate still sets it explicitly unless the
+//! caller configured `aws_conditional_put`, so the behaviour does not rest on
+//! the default. The only other value is `disabled`, under which every
+//! `put_if_version` fails with `NotImplemented`; the `DynamoDB` lock
+//! (`dynamo:<table>`) was removed upstream, and a store configured with it is
+//! refused when it is opened. On S3 a conditional update of an absent object
+//! is reported as `Precondition` (0.11 reported `NotFound`); both map to
+//! `VersionConflict` here.
 
 use std::future::Future;
 use std::ops::ControlFlow;
@@ -31,7 +37,8 @@ use object_store::memory::InMemory;
 use object_store::path::Path as ObjPath;
 use object_store::prefix::PrefixStore;
 use object_store::{
-    ObjectMeta, ObjectStore, ObjectStoreScheme, PutMode, PutOptions, PutPayload, UpdateVersion,
+    ObjectMeta, ObjectStore, ObjectStoreExt, ObjectStoreScheme, PutMode, PutOptions, PutPayload,
+    UpdateVersion,
 };
 use url::Url;
 
@@ -504,10 +511,8 @@ impl StoreExt for ObjectStoreBackend {
 
     fn get_range(&self, path: &str, range: std::ops::Range<u64>) -> Result<Option<Bytes>> {
         let location = obj_path(path)?;
-        let start = usize::try_from(range.start).map_err(store_err)?;
-        let end = usize::try_from(range.end).map_err(store_err)?;
         self.block_on(async {
-            match self.inner.get_range(&location, start..end).await {
+            match self.inner.get_range(&location, range).await {
                 Ok(b) => Ok(Some(b)),
                 Err(object_store::Error::NotFound { .. }) => Ok(None),
                 Err(e) => Err(store_err(e)),
@@ -681,12 +686,30 @@ mod tests {
                 .as_deref(),
             Some("etag")
         );
-        let b = s3_builder("s3://bucket/p", [("aws_conditional_put", "dynamo:locks")]).unwrap();
+        let b = s3_builder("s3://bucket/p", [("aws_conditional_put", "disabled")]).unwrap();
         assert_eq!(
             b.get_config_value(&AmazonS3ConfigKey::ConditionalPut)
                 .as_deref(),
-            Some("dynamo:locks")
+            Some("disabled"),
+            "an explicit setting is kept"
         );
+    }
+
+    /// `object_store` 0.14 no longer has the `DynamoDB` lock (`dynamo:<table>`); a
+    /// store configured with it is refused when it is opened, never opened
+    /// without conditional puts.
+    #[test]
+    fn a_removed_conditional_put_mode_is_refused_at_open() {
+        let r = ObjectStoreBackend::from_url_with_options(
+            "s3://bucket/prefix",
+            [
+                ("aws_region", "us-east-1"),
+                ("aws_access_key_id", "x"),
+                ("aws_secret_access_key", "y"),
+                ("aws_conditional_put", "dynamo:locks"),
+            ],
+        );
+        assert!(r.is_err());
     }
 
     #[test]

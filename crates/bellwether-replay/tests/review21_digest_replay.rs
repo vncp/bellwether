@@ -38,7 +38,7 @@ fn write_folder(dir: &std::path::Path) {
     for name in ["b.parquet", "a.parquet"] {
         let f = std::fs::File::create(dir.join(name)).unwrap();
         let props = WriterProperties::builder()
-            .set_max_row_group_size(4)
+            .set_max_row_group_row_count(Some(4))
             .build();
         let mut w = ArrowWriter::try_new(f, batch.schema(), Some(props)).unwrap();
         w.write(&batch).unwrap();

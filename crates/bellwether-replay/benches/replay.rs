@@ -48,7 +48,7 @@ fn bench(c: &mut Criterion) {
         )
         .unwrap();
         let props = WriterProperties::builder()
-            .set_max_row_group_size(ROWS as usize)
+            .set_max_row_group_row_count(Some(ROWS as usize))
             .build();
         let mut w = ArrowWriter::try_new(
             File::create(dir.path().join(format!("part-{f:04}.parquet"))).unwrap(),

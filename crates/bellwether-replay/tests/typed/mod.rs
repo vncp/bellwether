@@ -236,13 +236,13 @@ pub fn write_corpus(files: usize, rgs: usize, rows: usize, seed: u64) -> Corpus 
         )
         .unwrap();
         let mut props = WriterProperties::builder()
-            .set_max_row_group_size(rows)
+            .set_max_row_group_row_count(Some(rows))
             .set_created_by("review-probes".into());
         if f % 2 == 0 {
             for c in ["k_i64", "k_u64", "k_u32", "k_str", "k_f64", "k_dec"] {
                 props = props
                     .set_column_bloom_filter_enabled(ColumnPath::from(c), true)
-                    .set_column_bloom_filter_ndv(ColumnPath::from(c), rows as u64);
+                    .set_column_bloom_filter_max_ndv(ColumnPath::from(c), rows as u64);
             }
         }
         let path = data.join(format!("part-{f:03}.parquet"));

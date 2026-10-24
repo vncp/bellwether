@@ -180,7 +180,7 @@ pub fn true_version(
         .flatten()
         .filter(|r| has_key(r, id, tag))
         .filter_map(|r| r.ts)
-        .filter(|t| bound.map_or(true, |b| *t <= b))
+        .filter(|t| bound.is_none_or(|b| *t <= b))
         .max()?;
     Some((
         max,

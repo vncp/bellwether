@@ -13,6 +13,7 @@ use parquet::arrow::arrow_reader::{
 use parquet::arrow::ProjectionMask;
 use parquet::basic::{ColumnOrder, SortOrder, Type as PhysicalType};
 use parquet::file::metadata::{ParquetMetaData, RowGroupMetaData};
+use parquet::file::reader::ChunkReader;
 
 use crate::canonical::{normalize_float_bounds, Canonical, DefaultCanonical};
 use crate::fingerprint::{fingerprint_with_policy, FingerprintPolicy};
@@ -117,7 +118,7 @@ impl<S: Storage> ParquetSource<S> {
         if let Some(hit) = self.cache().get(file) {
             return Ok(hit);
         }
-        let meta = ArrowReaderMetadata::load(reader, ArrowReaderOptions::new())
+        let meta = load_reader_metadata(reader)
             .map_err(|e| Error::Source(format!("{}: footer: {e}", file.path)))?;
         let size = meta.metadata().memory_size();
         self.cache().insert(file.clone(), meta.clone(), size);
@@ -162,6 +163,96 @@ impl<S: Storage> ParquetSource<S> {
     }
 }
 
+/// A Parquet file's footer and Arrow schema, with the Arrow types inferred
+/// exactly as parquet 53 inferred them: duration-hinted `INT64` columns as
+/// `Int64`, `INT96` timestamps at nanoseconds, and narrow decimals as
+/// `Decimal128`, also when dictionary-encoded (docs/format.md, "Statistics semantics", inference amendment). Every reader of
+/// user Parquet files (data files and key files) goes through this, so a
+/// column has one type whichever path reads it.
+pub fn load_reader_metadata<R: ChunkReader>(
+    reader: &R,
+) -> parquet::errors::Result<ArrowReaderMetadata> {
+    let meta = ArrowReaderMetadata::load(reader, ArrowReaderOptions::new())?;
+    match legacy_inference(&meta) {
+        Some(schema) => ArrowReaderMetadata::try_new(
+            Arc::clone(meta.metadata()),
+            ArrowReaderOptions::new().with_schema(schema),
+        ),
+        None => Ok(meta),
+    }
+}
+
+/// The Arrow type parquet 53 inferred for a top-level primitive column that
+/// parquet 59 now reads as `inferred`, or `None` when the two agree.
+///
+/// Inference must not change across a dependency upgrade: a column's type
+/// is recorded in the manifest and decides its canonical encoding, so an
+/// index built by an older binary must see the same types from the same
+/// files. parquet 59 honours three embedded Arrow schema hints that parquet
+/// 53 ignored; the source keeps 53's mapping for each:
+///
+/// - `Duration(_)` on an `INT64` column (written by pyarrow and arrow-rs for
+///   duration arrays): 53 read `Int64`.
+/// - `Timestamp(unit, tz)` on an `INT96` column with a unit other than
+///   nanoseconds: 53 read `Timestamp(ns, None)` (it took a hint only for the
+///   time zone, and only at the same unit).
+/// - `Decimal32` and `Decimal64` (narrowed from a hint): 53 read
+///   `Decimal128` at the same precision and scale.
+/// - A `Dictionary` whose value type is one of the above: parquet 53 applied
+///   a dictionary hint only when its value hint applied, and otherwise fell
+///   back to the plain type, so it read the rewritten value type itself
+///   (`Int64`, `Timestamp(ns, None)`, `Decimal128`), not a dictionary. A
+///   dictionary whose value type is not rewritten is kept.
+///
+/// A new type is adopted deliberately, with a format amendment, never by a
+/// reader upgrade.
+fn legacy_type(inferred: &DataType, physical: PhysicalType) -> Option<DataType> {
+    use arrow::datatypes::TimeUnit;
+    match (inferred, physical) {
+        (DataType::Duration(_), PhysicalType::INT64) => Some(DataType::Int64),
+        (DataType::Timestamp(unit, _), PhysicalType::INT96) if *unit != TimeUnit::Nanosecond => {
+            Some(DataType::Timestamp(TimeUnit::Nanosecond, None))
+        }
+        (DataType::Decimal32(p, s) | DataType::Decimal64(p, s), _) => {
+            Some(DataType::Decimal128(*p, *s))
+        }
+        (DataType::Dictionary(_, value), _) => legacy_type(value, physical),
+        _ => None,
+    }
+}
+
+/// The file schema with parquet 53's inference restored (see
+/// [`legacy_type`]), or `None` when no column differs.
+fn legacy_inference(meta: &ArrowReaderMetadata) -> Option<SchemaRef> {
+    use arrow::datatypes::{Field, Schema};
+    let schema = meta.schema();
+    let roots = meta.metadata().file_metadata().schema_descr().root_schema();
+    let parquet_fields = roots.get_fields();
+    if parquet_fields.len() != schema.fields().len() {
+        return None;
+    }
+    let mut changed = false;
+    let fields: Vec<Field> = schema
+        .fields()
+        .iter()
+        .zip(parquet_fields)
+        .map(|(f, p)| {
+            let legacy = p
+                .is_primitive()
+                .then(|| legacy_type(f.data_type(), p.get_physical_type()))
+                .flatten();
+            match legacy {
+                Some(t) => {
+                    changed = true;
+                    f.as_ref().clone().with_data_type(t)
+                }
+                None => f.as_ref().clone(),
+            }
+        })
+        .collect();
+    changed.then(|| Arc::new(Schema::new_with_metadata(fields, schema.metadata().clone())))
+}
+
 /// Compressed bytes of each top-level column in row group `rg`.
 fn root_column_bytes(md: &ParquetMetaData, rg: usize, roots: usize) -> Vec<u64> {
     let pschema = md.file_metadata().schema_descr();
@@ -194,23 +285,32 @@ pub fn deprecated_stats_usable(order: SortOrder, physical: PhysicalType) -> bool
 }
 
 /// The sort order of leaf column `leaf`, derived from its logical type when
-/// the file predates column orders.
+/// the file predates column orders. A column order this reader does not
+/// recognize (a later format's union member) has no known order.
 fn leaf_sort_order(md: &ParquetMetaData, leaf: usize) -> SortOrder {
     match md.file_metadata().column_order(leaf) {
         ColumnOrder::TYPE_DEFINED_ORDER(o) => o,
         ColumnOrder::UNDEFINED => {
             let col = md.file_metadata().schema_descr().column(leaf);
-            ColumnOrder::get_sort_order(
-                col.logical_type(),
+            ColumnOrder::sort_order_for_type(
+                col.logical_type_ref(),
                 col.converted_type(),
                 col.physical_type(),
             )
         }
+        ColumnOrder::UNKNOWN => SortOrder::UNDEFINED,
     }
 }
 
 /// Whether row group `rg`'s min/max for `leaf` may be used.
+///
+/// Never under a column order this reader does not recognize: the Parquet
+/// specification says such statistics are ignored, because the order their
+/// bounds were computed in is unknown.
 fn min_max_trusted(md: &ParquetMetaData, rg: &RowGroupMetaData, leaf: usize) -> bool {
+    if md.file_metadata().column_order(leaf) == ColumnOrder::UNKNOWN {
+        return false;
+    }
     match rg.column(leaf).statistics() {
         Some(s) if s.is_min_max_deprecated() => {
             let physical = md
@@ -419,15 +519,15 @@ mod tests {
         use parquet::basic::{ConvertedType, Type};
         // What leaf_sort_order computes for an old file without column orders.
         assert_eq!(
-            ColumnOrder::get_sort_order(None, ConvertedType::UTF8, Type::BYTE_ARRAY),
+            ColumnOrder::sort_order_for_type(None, ConvertedType::UTF8, Type::BYTE_ARRAY),
             SortOrder::UNSIGNED
         );
         assert_eq!(
-            ColumnOrder::get_sort_order(None, ConvertedType::UINT_32, Type::INT32),
+            ColumnOrder::sort_order_for_type(None, ConvertedType::UINT_32, Type::INT32),
             SortOrder::UNSIGNED
         );
         assert_eq!(
-            ColumnOrder::get_sort_order(None, ConvertedType::NONE, Type::INT64),
+            ColumnOrder::sort_order_for_type(None, ConvertedType::NONE, Type::INT64),
             SortOrder::SIGNED
         );
     }
@@ -495,5 +595,27 @@ mod tests {
         assert!(!min_max_trusted(&md, rg, 0), "deprecated UTF8 stats");
         assert!(min_max_trusted(&md, rg, 1), "deprecated INT64 stats");
         assert!(min_max_trusted(&md, rg, 2), "modern UTF8 stats");
+
+        // The same row group under column orders: a type-defined order keeps
+        // the rules above, and an order the reader does not recognize
+        // (parquet 59's `ColumnOrder::UNKNOWN`) trusts no bounds at all,
+        // even modern ones on a signed column.
+        let signed = ColumnOrder::TYPE_DEFINED_ORDER(SortOrder::SIGNED);
+        let unsigned = ColumnOrder::TYPE_DEFINED_ORDER(SortOrder::UNSIGNED);
+        let ordered = |orders: Vec<ColumnOrder>| {
+            let file = FileMetaData::new(1, 1, None, None, Arc::clone(&descr), Some(orders));
+            ParquetMetaData::new(file, md.row_groups().to_vec())
+        };
+        let known = ordered(vec![unsigned, signed, unsigned]);
+        let rg = known.row_group(0);
+        assert!(!min_max_trusted(&known, rg, 0), "deprecated UTF8 stats");
+        assert!(min_max_trusted(&known, rg, 1), "deprecated INT64 stats");
+        assert!(min_max_trusted(&known, rg, 2), "modern UTF8 stats");
+        let unknown = ordered(vec![ColumnOrder::UNKNOWN; 3]);
+        let rg = unknown.row_group(0);
+        for leaf in 0..3 {
+            assert!(!min_max_trusted(&unknown, rg, leaf), "leaf {leaf}");
+            assert_eq!(leaf_sort_order(&unknown, leaf), SortOrder::UNDEFINED);
+        }
     }
 }

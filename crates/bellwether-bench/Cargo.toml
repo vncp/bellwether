@@ -44,8 +44,8 @@ rand = "0.8"
 # The generator's RNG is ChaCha12 by name, seeded from 32 explicit bytes:
 # `StdRng` may change algorithm between rand releases; this does not.
 rand_chacha = "0.3"
-# The 43 line is built against arrow 53, so the workspace keeps one arrow.
-datafusion = { version = "~43", default-features = false, features = ["parquet"], optional = true }
+# The 55 line is built against arrow 59, so the workspace keeps one arrow.
+datafusion = { version = "~55.2", default-features = false, features = ["parquet"], optional = true }
 tokio = { workspace = true, optional = true }
 
 [lints]

@@ -120,7 +120,7 @@ pub fn write_parquet(path: &Path, batch: &RecordBatch, rows_per_rg: usize) {
         std::fs::create_dir_all(dir).unwrap();
     }
     let props = WriterProperties::builder()
-        .set_max_row_group_size(rows_per_rg.max(1))
+        .set_max_row_group_row_count(Some(rows_per_rg.max(1)))
         .build();
     let file = File::create(path).unwrap();
     let mut w = ArrowWriter::try_new(file, batch.schema(), Some(props)).unwrap();

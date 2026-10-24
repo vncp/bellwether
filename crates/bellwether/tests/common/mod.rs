@@ -37,7 +37,7 @@ pub type Row = (i64, i64, Option<i64>, String);
 /// group per entry.
 pub fn write_file(path: &Path, row_groups: &[Vec<Row>]) {
     let props = WriterProperties::builder()
-        .set_max_row_group_size(usize::MAX)
+        .set_max_row_group_row_count(Some(usize::MAX))
         .build();
     let file = File::create(path).unwrap();
     let mut w = ArrowWriter::try_new(file, schema(), Some(props)).unwrap();

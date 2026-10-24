@@ -74,7 +74,7 @@ bench --assert-slo --results benches/out/results.json
 
 ### DataFusion baseline
 
-DataFusion 43 is pure Rust with no native dependencies. It is off by default because it adds a large compile:
+DataFusion 55 (the release line built on arrow 59, the workspace's arrow) is pure Rust with no native dependencies. It is off by default because it adds a large compile:
 
 ```sh
 bench() { cargo run -q -p bellwether-bench --release --features datafusion -- "$@"; }
@@ -190,7 +190,7 @@ Plan entry paths are relative to the corpus root (as in `corpus.json`) or absolu
 |---|---|---|
 | `raw_scan` | plan | Reads every row group. |
 | `parquet_stats` | plan | Parquet-native pruning: footer min/max of `entity_id`, then the row group's embedded bloom filter. |
-| `datafusion` | plan | Apache DataFusion's `ParquetExec` pruning (statistics, page index, bloom filters), behind `--features datafusion`. The plan is the set of row groups whose column chunks DataFusion read. `plan_ms` covers that pruning scan, and its bytes are reported as `plan_bytes_read`; `scan_ms` is the execution. |
+| `datafusion` | plan | Apache DataFusion's Parquet scan pruning (statistics, page index, bloom filters), behind `--features datafusion`. The plan is the set of row groups whose column chunks DataFusion read. `plan_ms` covers that pruning scan, and its bytes are reported as `plan_bytes_read`; `scan_ms` is the execution. |
 | `duckdb` | engine | Runs `read_parquet(...) WHERE entity_id IN (SELECT entity_id FROM read_parquet(run))` through the CLI and aggregates every column. Latency is DuckDB's `.timer` query time. |
 | `index` | plan | Reserved for WP1/WP4. |
 

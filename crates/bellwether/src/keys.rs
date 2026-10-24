@@ -55,7 +55,8 @@ impl KeyFile {
             ))
         };
         let file = File::open(path).map_err(|e| fail(&e))?;
-        let builder = ParquetRecordBatchReaderBuilder::try_new(file).map_err(|e| fail(&e))?;
+        let meta = bellwether_source::load_reader_metadata(&file).map_err(|e| fail(&e))?;
+        let builder = ParquetRecordBatchReaderBuilder::new_with_metadata(file, meta);
         let file_schema = builder.schema().clone();
         let names: Vec<String> = match &self.columns {
             Some(c) => c.clone(),

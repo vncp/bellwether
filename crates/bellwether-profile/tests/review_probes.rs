@@ -280,7 +280,7 @@ fn p3_relabeled_composite_numbers_match_their_column_order() {
     let statuses = ["posted", "settled", "void"];
     for f in 0..2u64 {
         let props = WriterProperties::builder()
-            .set_max_row_group_size(200)
+            .set_max_row_group_row_count(Some(200))
             .build();
         let mut w = ArrowWriter::try_new(
             File::create(dir.join(format!("part-{f}.parquet"))).unwrap(),
@@ -524,7 +524,7 @@ fn p6_auto_selection_keeps_a_string_id_in_tiny_row_groups() {
         Field::new("qty", DataType::UInt64, false),
     ]));
     let props = WriterProperties::builder()
-        .set_max_row_group_size(5)
+        .set_max_row_group_row_count(Some(5))
         .build();
     let mut w = ArrowWriter::try_new(
         File::create(dir.join("part-0.parquet")).unwrap(),
@@ -748,7 +748,7 @@ fn p6b_auto_selection_keeps_a_uuid_text_id() {
         Field::new("qty", DataType::UInt64, false),
     ]));
     let props = WriterProperties::builder()
-        .set_max_row_group_size(2_000)
+        .set_max_row_group_row_count(Some(2_000))
         .build();
     let mut w = ArrowWriter::try_new(
         File::create(dir.join("part-0.parquet")).unwrap(),

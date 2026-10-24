@@ -165,7 +165,7 @@ const GOLDEN_TINY_DECODED: &str =
 /// The Parquet bytes of `tiny(9)`'s data files, in manifest order. Also
 /// changes when the Parquet encoder changes; if only this one moves after a
 /// `parquet` upgrade, re-pin it and say so in the PR.
-const GOLDEN_TINY_FILES: &str = "be2ce95792645a7546fa11bb8559f40eb6a9554ac47a66938d425f58ec1bcdb2";
+const GOLDEN_TINY_FILES: &str = "9436a186f30a41ac1058e086ab2b25d20449eb576573da410ee614dd5705ee3e";
 /// The workload hash of `golden_workload()` on `tiny(9)`.
 const GOLDEN_TINY_WORKLOAD: &str =
     "650ba5c93b3a99279f5b67b6321d9326cdf3d5ea064e35a8cd7ed570161ad990";

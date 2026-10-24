@@ -33,7 +33,7 @@ use parquet::file::properties::WriterProperties;
 
 fn props() -> WriterProperties {
     WriterProperties::builder()
-        .set_max_row_group_size(usize::MAX)
+        .set_max_row_group_row_count(Some(usize::MAX))
         .build()
 }
 

@@ -216,7 +216,7 @@ fn mask(x: u32) -> [u32; 8] {
 pub(crate) fn check_bitset<H: FilterHash>(bitset: &[u8], hash: H) -> bool {
     let hash = hash.raw();
     let num_blocks = bitset.len() / BLOCK_BYTES;
-    if num_blocks == 0 || bitset.len() % BLOCK_BYTES != 0 {
+    if num_blocks == 0 || !bitset.len().is_multiple_of(BLOCK_BYTES) {
         return true;
     }
     let base = block_index(hash, num_blocks) * BLOCK_BYTES;
@@ -259,18 +259,20 @@ impl<H: FilterHash> Sbbf<H> {
     /// Reads a serialized bitset (the bytes after a Parquet bloom header)
     /// whose hashes are of kind `H`.
     pub fn from_bytes(bitset: &[u8]) -> Result<Self> {
-        if bitset.is_empty() || bitset.len() % BLOCK_BYTES != 0 {
+        if bitset.is_empty() || !bitset.len().is_multiple_of(BLOCK_BYTES) {
             return Err(Error::Other(format!(
                 "bloom bitset length {} is not a positive multiple of {BLOCK_BYTES}",
                 bitset.len()
             )));
         }
         let blocks = bitset
-            .chunks_exact(BLOCK_BYTES)
+            .as_chunks::<BLOCK_BYTES>()
+            .0
+            .iter()
             .map(|chunk| {
                 let mut b = [0u32; 8];
-                for (w, bytes) in b.iter_mut().zip(chunk.chunks_exact(4)) {
-                    *w = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+                for (w, bytes) in b.iter_mut().zip(chunk.as_chunks::<4>().0) {
+                    *w = u32::from_le_bytes(*bytes);
                 }
                 b
             })

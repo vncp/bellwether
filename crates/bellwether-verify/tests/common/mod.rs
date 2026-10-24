@@ -89,7 +89,7 @@ pub fn batch_at(rows: &[R], scale: i8) -> RecordBatch {
 pub fn write_batch(dir: &Path, name: &str, batch: &RecordBatch, rows_per_group: usize) {
     let file = std::fs::File::create(dir.join(name)).unwrap();
     let props = WriterProperties::builder()
-        .set_max_row_group_size(rows_per_group.max(1))
+        .set_max_row_group_row_count(Some(rows_per_group.max(1)))
         .build();
     let mut w = ArrowWriter::try_new(file, batch.schema(), Some(props)).unwrap();
     w.write(batch).unwrap();
