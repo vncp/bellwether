@@ -294,8 +294,7 @@ where
         };
         let err = match res {
             Ok(version) => {
-                let _ = store
-                    .put_content_addressed(&manifest_seq_path(root, next.sequence), body);
+                let _ = store.put_content_addressed(&manifest_seq_path(root, next.sequence), body);
                 return Ok(Committed {
                     version,
                     sequence: next.sequence,
@@ -311,8 +310,8 @@ where
         match read_manifest(store, root) {
             Ok(Some((current, version))) if current.commit_nonce == nonce => {
                 tracing::debug!(attempt, error = %err, "manifest CAS reported failure but our write landed");
-                let _ = store
-                    .put_content_addressed(&manifest_seq_path(root, current.sequence), body);
+                let _ =
+                    store.put_content_addressed(&manifest_seq_path(root, current.sequence), body);
                 return Ok(Committed {
                     version,
                     sequence: current.sequence,

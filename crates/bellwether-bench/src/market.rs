@@ -193,8 +193,7 @@ pub fn generate_market(params: &MarketParams, out: &Path) -> Result<MarketManife
         for f_in_day in 0..params.files_per_day {
             let file_path = day_dir.join(format!("part-{global_file:05}.parquet"));
             let file = File::create(&file_path).map_err(io_err(&file_path))?;
-            let mut writer =
-                ArrowWriter::try_new(file, Arc::clone(&schema), Some(props.clone()))?;
+            let mut writer = ArrowWriter::try_new(file, Arc::clone(&schema), Some(props.clone()))?;
 
             for rg in 0..params.row_groups_per_file {
                 let rg_in_day = f_in_day * params.row_groups_per_file + rg;
@@ -273,7 +272,10 @@ fn build_market_row_group(
             (0, day_base_us + (i64::from(rg_in_day) * 1_000_000))
         } else if i + 1 == n {
             // Anchor row near end of day so the row group's global max `valid_ts` is late
-            (0, day_base_us + DAY_US - 1_000_000 - i64::from(rg_in_day) * 1_000)
+            (
+                0,
+                day_base_us + DAY_US - 1_000_000 - i64::from(rg_in_day) * 1_000,
+            )
         } else if i % 4 == 0 {
             // Secondary cohort symbol present in this row group but only at early timestamps
             // (so `exact:symbol` alone matches this row group, while `exact:symbol@valid_ts`
@@ -335,7 +337,11 @@ pub fn generate_market_workload(
     }
     std::fs::create_dir_all(&wdir).map_err(io_err(&wdir))?;
 
-    let key_schema = Arc::new(Schema::new(vec![Field::new("symbol", DataType::Utf8, false)]));
+    let key_schema = Arc::new(Schema::new(vec![Field::new(
+        "symbol",
+        DataType::Utf8,
+        false,
+    )]));
     let total_rgs_per_day = (params.files_per_day * params.row_groups_per_file).max(1);
     let cohort_size = (params.symbols / total_rgs_per_day).max(1);
     let slice_us = DAY_US / i64::from(total_rgs_per_day);

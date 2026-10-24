@@ -14,9 +14,7 @@ use super::format::{
 };
 use crate::bloom::{BloomHash, CanonicalHash, FilterHash, Sbbf};
 use crate::encoding::{self, KeyColumns, NEG_ZERO_KEY, POS_ZERO_KEY};
-use crate::temporal::{
-    BitemporalBuffer, BitemporalChain, KeyBounds, VersionBuffer, VersionChain,
-};
+use crate::temporal::{BitemporalBuffer, BitemporalChain, KeyBounds, VersionBuffer, VersionChain};
 
 /// The bounds a range segment stores for a row group, with the Parquet
 /// statistics reading rule for signed zero applied: a minimum of +0.0 is

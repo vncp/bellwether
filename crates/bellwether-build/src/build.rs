@@ -428,9 +428,9 @@ impl Config {
         let schema = match (&opts.schema, &base_schema) {
             (Some(s), _) => persistable(s)?,
             (None, Some(b)) => SchemaRef::clone(b),
-            (None, None) => persistable(
-                infer_schema(kind, root, policy, path_template.clone())?.as_ref(),
-            )?,
+            (None, None) => {
+                persistable(infer_schema(kind, root, policy, path_template.clone())?.as_ref())?
+            }
         };
         let columns = schema_to_columns(&schema, base.map_or(&[][..], |m| &m.schema.columns));
         let mut source_info = base.map(|m| m.source.clone()).unwrap_or_default();

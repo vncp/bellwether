@@ -229,6 +229,7 @@ impl PathTemplate {
     /// Matches `file_path` against this template, returning captured
     /// `(column_name, raw_value, explicit_type)` tuples when both the segment
     /// structure and any typed placeholder constraints match.
+    #[must_use]
     pub fn extract(
         &self,
         root: Option<&str>,
@@ -442,7 +443,7 @@ fn parse_hive_segment(seg: &str) -> Option<(&str, &str)> {
 fn relative_segments<'a>(root: Option<&str>, file_path: &'a str) -> Vec<&'a str> {
     if let Some(r) = root {
         let r_trimmed = r.trim_end_matches('/');
-        if let Some( stripped) = file_path.strip_prefix(r_trimmed) {
+        if let Some(stripped) = file_path.strip_prefix(r_trimmed) {
             let stripped = stripped.trim_start_matches('/');
             if !stripped.is_empty() {
                 return stripped.split('/').filter(|s| !s.is_empty()).collect();
@@ -521,6 +522,7 @@ fn is_iso_date(s: &str) -> bool {
 
 /// Parses `YYYY-MM-DD` into days since 1970-01-01 (`Date32`).
 #[must_use]
+#[allow(clippy::many_single_char_names)]
 pub fn parse_date32(s: &str) -> Option<i32> {
     let s = s.trim();
     if s.len() != 10 {
@@ -540,7 +542,11 @@ pub fn parse_date32(s: &str) -> Option<i32> {
         4 | 6 | 9 | 11 => 30,
         2 => {
             let leap = (y % 4 == 0 && y % 100 != 0) || (y % 400 == 0);
-            if leap { 29 } else { 28 }
+            if leap {
+                29
+            } else {
+                28
+            }
         }
         _ => 31,
     };
@@ -559,6 +565,7 @@ pub fn parse_date32(s: &str) -> Option<i32> {
 
 /// Parses `raw` as a single-row Arrow [`ArrayRef`] of type `target` (repeated
 /// `rows` times).
+#[allow(clippy::too_many_lines)]
 pub fn synthesize_column(
     path: &str,
     col_name: &str,
@@ -626,7 +633,8 @@ pub fn synthesize_column(
             Arc::new(Float64Array::from(vec![v; rows]))
         }
         DataType::Decimal128(p, s) => {
-            let v = parse_decimal_i128(raw.trim(), *p, *s).ok_or_else(|| err("invalid Decimal128"))?;
+            let v =
+                parse_decimal_i128(raw.trim(), *p, *s).ok_or_else(|| err("invalid Decimal128"))?;
             Arc::new(
                 Decimal128Array::from(vec![v; rows])
                     .with_precision_and_scale(*p, *s)
@@ -634,7 +642,8 @@ pub fn synthesize_column(
             )
         }
         DataType::Decimal256(p, s) => {
-            let v = parse_decimal_i256(raw.trim(), *p, *s).ok_or_else(|| err("invalid Decimal256"))?;
+            let v =
+                parse_decimal_i256(raw.trim(), *p, *s).ok_or_else(|| err("invalid Decimal256"))?;
             Arc::new(
                 Decimal256Array::from(vec![v; rows])
                     .with_precision_and_scale(*p, *s)
@@ -660,9 +669,9 @@ pub fn synthesize_column(
         DataType::Timestamp(unit, tz) => {
             let v = parse_timestamp_in_unit(raw, *unit).ok_or_else(|| err("invalid timestamp"))?;
             let a: ArrayRef = match unit {
-                TimeUnit::Second => {
-                    Arc::new(TimestampSecondArray::from(vec![v; rows]).with_timezone_opt(tz.clone()))
-                }
+                TimeUnit::Second => Arc::new(
+                    TimestampSecondArray::from(vec![v; rows]).with_timezone_opt(tz.clone()),
+                ),
                 TimeUnit::Millisecond => Arc::new(
                     TimestampMillisecondArray::from(vec![v; rows]).with_timezone_opt(tz.clone()),
                 ),
@@ -705,9 +714,11 @@ pub fn encode_virtual_value(
     target: &DataType,
 ) -> Result<Vec<u8>> {
     let arr = synthesize_column(path, col_name, raw, target, 1)?;
-    canonical
-        .encode(arr.as_ref(), 0, target)?
-        .ok_or_else(|| Error::Source(format!("{path}: virtual column {col_name:?} encoded to null")))
+    canonical.encode(arr.as_ref(), 0, target)?.ok_or_else(|| {
+        Error::Source(format!(
+            "{path}: virtual column {col_name:?} encoded to null"
+        ))
+    })
 }
 
 fn parse_timestamp_in_unit(s: &str, unit: TimeUnit) -> Option<i64> {
@@ -929,6 +940,7 @@ pub fn verify_physical_column(
 
 /// Builds a `RecordBatch` for `columns` when some or all of `columns` are
 /// virtual columns and `physical_batch` holds the decoded physical columns.
+#[allow(clippy::too_many_arguments)]
 pub fn assemble_batch(
     canonical: &dyn Canonical,
     file_path: &str,

@@ -732,7 +732,10 @@ mod tests {
         }"#;
         let m = Manifest::from_slice(json.as_bytes()).unwrap();
         assert_eq!(m.segments.len(), 2);
-        assert_eq!(m.unknown_segment_kinds(), vec!["future_sidecar".to_string()]);
+        assert_eq!(
+            m.unknown_segment_kinds(),
+            vec!["future_sidecar".to_string()]
+        );
     }
 
     #[test]

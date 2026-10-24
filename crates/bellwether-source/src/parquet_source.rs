@@ -17,11 +17,11 @@ use parquet::file::reader::ChunkReader;
 
 use crate::canonical::{normalize_float_bounds, Canonical, DefaultCanonical};
 use crate::fingerprint::{fingerprint_with_policy, FingerprintPolicy};
-use crate::storage::{LocalFs, Storage};
 use crate::partition::{
     apply_virtual_stats, assemble_batch, augment_schema, check_all_match, extract_virtual_cols,
     PathTemplate,
 };
+use crate::storage::{LocalFs, Storage};
 use crate::{open_verified, reorder, resolve_columns, BoundedCache};
 
 /// File extension [`ParquetSource::discover`] lists.

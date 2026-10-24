@@ -134,18 +134,16 @@ fn parse_short(s: &str) -> Result<KeySpec> {
         ("exact", None) => Ok(KeySpec::Exact {
             columns: columns(s, cols)?,
         }),
-        ("exact", Some(ts)) if !ts.is_empty() && !ts.contains('@') => Ok(KeySpec::Bounds {
-            columns: columns(s, cols)?,
-            ts_column: ts.to_string(),
-        }),
+        ("exact" | "bounds", Some(ts)) if !ts.is_empty() && !ts.contains('@') => {
+            Ok(KeySpec::Bounds {
+                columns: columns(s, cols)?,
+                ts_column: ts.to_string(),
+            })
+        }
         ("exact", Some(_)) => Err(bad(
             s,
             "an exact spec with time bounds needs a timestamp column after '@', exact:symbol@ts",
         )),
-        ("bounds", Some(ts)) if !ts.is_empty() && !ts.contains('@') => Ok(KeySpec::Bounds {
-            columns: columns(s, cols)?,
-            ts_column: ts.to_string(),
-        }),
         ("bounds", _) => Err(bad(
             s,
             "a bounds spec needs a timestamp column, bounds:symbol@ts",
@@ -195,10 +193,7 @@ fn parse_short(s: &str) -> Result<KeySpec> {
                 ));
             }
             if valid == known {
-                return Err(bad(
-                    s,
-                    "temporal2 valid and known columns must be distinct",
-                ));
+                return Err(bad(s, "temporal2 valid and known columns must be distinct"));
             }
             Ok(KeySpec::Temporal2 {
                 columns: columns(s, cols)?,

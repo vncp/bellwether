@@ -402,11 +402,13 @@ fn builds_over_a_bench_shaped_ledger() {
         .iter()
         .map(|c| c.data_type.clone())
         .collect();
-    let expected: Vec<String> = ledger_schema()
+    let mut expected: Vec<String> = ledger_schema()
         .fields()
         .iter()
         .map(|f| f.data_type().to_string())
         .collect();
+    // Hive `day=YYYY-MM-DD/` directory component is inferred as virtual `day: Date32` (WP21)
+    expected.push(DataType::Date32.to_string());
     assert_eq!(recorded, expected);
     for spec in specs() {
         assert_eq!(completeness(&m, &spec), Some(1), "{}", spec.name());

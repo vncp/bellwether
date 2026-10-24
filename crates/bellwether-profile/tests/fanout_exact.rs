@@ -101,9 +101,11 @@ fn planted_layout_fanout_is_exact_and_every_lint_fires() {
         report.key_columns,
         ["entity_id", "batch_id", "status", "payload"]
     );
-    assert_eq!(report.time_columns, ["version_ts"]);
-    assert_eq!(report.skipped.len(), 1, "{:?}", report.skipped);
+    // Hive `day=YYYY-MM-DD/` directory component is also inferred as a `Date32` time column (WP21)
+    assert_eq!(report.time_columns, ["version_ts", "day"]);
+    assert_eq!(report.skipped.len(), 2, "{:?}", report.skipped);
     assert_eq!(report.skipped[0].column, "version_ts");
+    assert_eq!(report.skipped[1].column, "day");
     assert_eq!(report.rows_total, layout.rows());
     assert_exact(&report, &data, &layout);
 

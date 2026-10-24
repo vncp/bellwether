@@ -312,7 +312,7 @@ impl Engine {
                 self.effective_path_template(None)?,
             )?,
         };
-        let resolved_window = self.resolve_why_window(req, &replayer, &current_specs)?;
+        let resolved_window = Self::resolve_why_window(req, &replayer, &current_specs)?;
         if let Some((ref ts_col, lo, hi)) = resolved_window {
             replayer = replayer.with_window(ts_col.clone(), lo, hi);
         }
@@ -546,9 +546,8 @@ impl Engine {
         let serves = |spec: &KeySpec| run_columns.iter().any(|c| servable(spec, c).is_some());
         let mut chosen: Vec<(KeySpec, CandidateOrigin)> = Vec::new();
         let mut names = BTreeSet::new();
-        let win_ts_col = self
-            .resolve_why_window(req, replayer, &report.current_specs)?
-            .map(|(col, _, _)| col);
+        let win_ts_col =
+            Self::resolve_why_window(req, replayer, &report.current_specs)?.map(|(col, _, _)| col);
         for c in &run_columns {
             let spec = KeySpec::Exact { columns: c.clone() };
             if !current_names.contains(&spec.name()) && names.insert(spec.name()) {
@@ -645,7 +644,6 @@ impl Engine {
     }
 
     fn resolve_why_window(
-        &self,
         req: &WhyRequest,
         replayer: &Replayer<'_>,
         current_specs: &[KeySpec],
@@ -660,12 +658,8 @@ impl Engine {
         }
         let schema = replayer.schema();
         let dummy_manifest = bellwether_store::Manifest::default();
-        let (ts_column, ts_type) = crate::index::resolve_window_ts_column(
-            current_specs,
-            schema,
-            &[],
-            &dummy_manifest,
-        )?;
+        let (ts_column, ts_type) =
+            crate::index::resolve_window_ts_column(current_specs, schema, &[], &dummy_manifest)?;
         if let Some(win) = &req.window {
             let (lo_str, hi_str) = win.split_once("..").ok_or_else(|| {
                 Error::KeySpec(format!(

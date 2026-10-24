@@ -104,6 +104,7 @@ fn decode_hive_oracle(root: &Path) -> Vec<(String, u32, i32, String, i64)> {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn hive_day_symbol_layout_profiles_builds_and_prunes_against_decoded_oracle() {
     let s = Scratch::new();
     let files = [

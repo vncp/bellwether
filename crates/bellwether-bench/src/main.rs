@@ -211,9 +211,7 @@ fn cmd_generate(a: GenerateArgs) -> Result<()> {
             symbols: u32::try_from(a.entities).unwrap_or(200).clamp(10, 50_000),
             restatement_fraction: a.late_fraction,
         };
-        let out = a
-            .out
-            .unwrap_or_else(|| PathBuf::from("benches/out/market"));
+        let out = a.out.unwrap_or_else(|| PathBuf::from("benches/out/market"));
         let manifest = bellwether_bench::market::generate_market(&mparams, &out)?;
         println!(
             "wrote market corpus ({} rows in {} row groups, {} files) to {}",

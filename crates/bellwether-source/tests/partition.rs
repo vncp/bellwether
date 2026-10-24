@@ -25,8 +25,10 @@ use parquet::file::properties::WriterProperties;
 use parquet::file::reader::{ChunkReader, Length};
 
 fn scratch(name: &str) -> PathBuf {
-    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-        .join(format!("bellwether-source-partition-{name}-{}", std::process::id()));
+    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!(
+        "bellwether-source-partition-{name}-{}",
+        std::process::id()
+    ));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     dir
@@ -275,9 +277,7 @@ fn path_and_physical_content_disagreement_is_refused() {
         delimiter: b',',
         has_header: true,
     });
-    let csv_files = csv_source
-        .discover(csv_dir.to_str().unwrap())
-        .unwrap();
+    let csv_files = csv_source.discover(csv_dir.to_str().unwrap()).unwrap();
     let csv_err = csv_source.row_groups(&csv_files[0]).unwrap_err();
     assert!(
         csv_err.to_string().contains("symbol") && csv_err.to_string().contains("AAPL"),

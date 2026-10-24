@@ -227,6 +227,19 @@ There are 14 defects, filed in that document. The two that matter most:
 - `index` refuses any dataset that has a nested column.
 - `fix` will attest a key that its own replay predicts saves nothing.
 
+
+### Time series
+
+For date-partitioned or per-session market-data lakes (`day=YYYY-MM-DD/` directories or `--path-template "{day}.parquet"`), Bellwether extracts partition columns from paths as virtual statistics without reading file bodies, orders plans deterministically when a `range` key exists on a timestamp column, pins snapshots with `--at-manifest <N>`, prunes symbol × window lookups with per-key time bounds (`--key exact:symbol@valid_ts` plus `locate --window A..B` or `asof --at T --lookback 252d`), and resolves point-in-time reads across restatements and late prints with bitemporal chains (`--key temporal2:symbol@valid_ts,known_ts` and `asof --valid V --known K`).
+
+Measured on the synthetic `market` corpus (`bellwether bench generate --market`, 8 trading days, 16 Parquet files, 64 row groups, 25,600 rows, 160 symbols, 5% restatements, debug build on arm64 Darwin):
+
+| Configuration / Query (`run-0000`, 5 symbols, 3h intraday window on `2026-01-01`) | Planned files | Planned row groups | Planned bytes |
+|---|---:|---:|---:|
+| Live dataset | 16 | 64 | 687,712 B |
+| `exact:symbol` + `range:valid_ts` (`locate --window`, `ordered_by: valid_ts`) | 2 | 2 | 21,491 B |
+| `exact:symbol@valid_ts` (`bounds` sidecar + `locate --window`) | 1 | 1 | 10,777 B |
+| `temporal2:symbol@valid_ts,known_ts` (`asof --valid 2026-01-01T08:59:59Z --known 2026-01-01T09:05:00Z`) | 2 | 2 | 21,491 B |
 ## Status
 
 Pre-alpha. The architecture and on-disk format are fixed and documented; the crates are being built against them, each landing by reviewed pull request.

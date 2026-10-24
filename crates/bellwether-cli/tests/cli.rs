@@ -236,6 +236,7 @@ fn ordered_plans_human_output_states_ordered_by_or_unspecified() {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn at_manifest_flag_pins_locate_latest_asof_and_why_in_cli() {
     let dir = tempfile::tempdir().unwrap();
     let data = dir.path().join("data");
@@ -257,11 +258,27 @@ fn at_manifest_flag_pins_locate_latest_asof_and_why_in_cli() {
         0,
     );
     let loc1 = run(
-        &["--json", "--clock", clk, "locate", path(&data), "--keys", path(&kf)],
+        &[
+            "--json",
+            "--clock",
+            clk,
+            "locate",
+            path(&data),
+            "--keys",
+            path(&kf),
+        ],
         0,
     );
     let lat1 = run(
-        &["--json", "--clock", clk, "latest", path(&data), "--keys", path(&kf)],
+        &[
+            "--json",
+            "--clock",
+            clk,
+            "latest",
+            path(&data),
+            "--keys",
+            path(&kf),
+        ],
         0,
     );
     let asof1 = run(
@@ -344,6 +361,7 @@ fn at_manifest_flag_pins_locate_latest_asof_and_why_in_cli() {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn market_corpus_measured_funnel_and_cli_time_series_flags() {
     use bellwether::{spec, Engine, EngineOptions, KeyFile};
     use bellwether_bench::market::{generate_market, MarketParams};

@@ -792,7 +792,9 @@ impl<S: StoreExt + ?Sized> Planner<S> {
                 KeySpec::Exact { columns }
                 | KeySpec::Temporal { columns, .. }
                 | KeySpec::Bounds { columns, .. }
-                | KeySpec::Temporal2 { columns, .. } => columns.first().is_some_and(|c| c == column),
+                | KeySpec::Temporal2 { columns, .. } => {
+                    columns.first().is_some_and(|c| c == column)
+                }
                 KeySpec::Bloom { .. } => false,
             })
             .collect();
@@ -832,6 +834,7 @@ impl<S: StoreExt + ?Sized> Planner<S> {
         self.finish(segs, &selected, residual)
     }
 
+    #[allow(clippy::too_many_lines)]
     fn plan_keys_in_window(
         &self,
         segs: &[SpecSegments],
@@ -880,8 +883,12 @@ impl<S: StoreExt + ?Sized> Planner<S> {
 
         // 2. Per-key time bounds sidecar (`KeySpec::Bounds` on `ts_column` serving `columns`).
         for (seg, how) in &serving {
-            let (Serve::Project(positions), KeySpec::Bounds { ts_column: b_ts, .. }) =
-                (how, &seg.spec)
+            let (
+                Serve::Project(positions),
+                KeySpec::Bounds {
+                    ts_column: b_ts, ..
+                },
+            ) = (how, &seg.spec)
             else {
                 continue;
             };
@@ -925,7 +932,9 @@ impl<S: StoreExt + ?Sized> Planner<S> {
                 KeySpec::Exact { columns: c }
                 | KeySpec::Temporal { columns: c, .. }
                 | KeySpec::Bounds { columns: c, .. }
-                | KeySpec::Temporal2 { columns: c, .. } => c.first().is_some_and(|x| x == ts_column),
+                | KeySpec::Temporal2 { columns: c, .. } => {
+                    c.first().is_some_and(|x| x == ts_column)
+                }
                 KeySpec::Bloom { .. } => false,
             })
             .collect();
@@ -975,6 +984,7 @@ impl<S: StoreExt + ?Sized> Planner<S> {
         self.finish(segs, &selected, residual)
     }
 
+    #[allow(clippy::too_many_lines)]
     fn plan_bitemporal(
         &self,
         segs: &[SpecSegments],
@@ -1130,6 +1140,7 @@ impl<S: StoreExt + ?Sized> Planner<S> {
 
     // -- the plan --------------------------------------------------------------
 
+    #[allow(clippy::type_complexity)]
     fn finish(
         &self,
         segs: &[SpecSegments],
@@ -1222,6 +1233,7 @@ impl<S: StoreExt + ?Sized> Planner<S> {
         Ok(self.timestamp_range_order(&segs)?.map(|(col, _)| col))
     }
 
+    #[allow(clippy::type_complexity)]
     fn timestamp_range_order(
         &self,
         segs: &[SpecSegments],
@@ -1270,6 +1282,7 @@ impl<S: StoreExt + ?Sized> Planner<S> {
     /// Prunes live row groups against virtual columns (from Hive `name=value`
     /// directories or `--path-template`) without reading files. Returns `Some`
     /// when at least one file has a virtual column among `columns`.
+    #[allow(clippy::type_complexity)]
     fn prune_virtual_keys(
         &self,
         columns: &[String],

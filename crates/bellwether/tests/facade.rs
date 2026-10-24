@@ -359,12 +359,11 @@ fn ordered_plans_order_entries_by_timestamp_range_key_against_decoded_files() {
     let mut decoded_mins = Vec::new();
     for entry in &p2.entries {
         let file = std::fs::File::open(&entry.file.path).unwrap();
-        let reader =
-            parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(file)
-                .unwrap()
-                .with_row_groups(entry.row_groups.iter().map(|i| i as usize).collect())
-                .build()
-                .unwrap();
+        let reader = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(file)
+            .unwrap()
+            .with_row_groups(entry.row_groups.iter().map(|i| i as usize).collect())
+            .build()
+            .unwrap();
         let mut min_ts = i64::MAX;
         for batch in reader {
             let b = batch.unwrap();
@@ -572,11 +571,12 @@ fn bounds_sidecar_and_lookback_windows_prune_against_decoded_oracle() {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn bitemporal_temporal2_handles_restatements_and_late_arriving_rows_against_oracle() {
-    use std::sync::Arc;
     use arrow::array::{ArrayRef, Int64Array, RecordBatch, StringArray, TimestampMicrosecondArray};
     use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
     use parquet::arrow::ArrowWriter;
+    use std::sync::Arc;
 
     let dir = tempfile::tempdir().unwrap();
     let data = dir.path().join("bitemporal");
@@ -595,8 +595,7 @@ fn bitemporal_temporal2_handles_restatements_and_late_arriving_rows_against_orac
         ),
         Field::new("val", DataType::Utf8, false),
     ]));
-    let write_bi = |path: &std::path::Path,
-                    rows: &[(i64, Option<i64>, Option<i64>, &str)]| {
+    let write_bi = |path: &std::path::Path, rows: &[(i64, Option<i64>, Option<i64>, &str)]| {
         let b = RecordBatch::try_new(
             Arc::clone(&schema),
             vec![
@@ -604,16 +603,12 @@ fn bitemporal_temporal2_handles_restatements_and_late_arriving_rows_against_orac
                     rows.iter().map(|r| r.0).collect::<Vec<_>>(),
                 )) as ArrayRef,
                 Arc::new(
-                    TimestampMicrosecondArray::from(
-                        rows.iter().map(|r| r.1).collect::<Vec<_>>(),
-                    )
-                    .with_timezone("UTC"),
+                    TimestampMicrosecondArray::from(rows.iter().map(|r| r.1).collect::<Vec<_>>())
+                        .with_timezone("UTC"),
                 ),
                 Arc::new(
-                    TimestampMicrosecondArray::from(
-                        rows.iter().map(|r| r.2).collect::<Vec<_>>(),
-                    )
-                    .with_timezone("UTC"),
+                    TimestampMicrosecondArray::from(rows.iter().map(|r| r.2).collect::<Vec<_>>())
+                        .with_timezone("UTC"),
                 ),
                 Arc::new(StringArray::from(
                     rows.iter().map(|r| r.3).collect::<Vec<_>>(),
@@ -621,9 +616,12 @@ fn bitemporal_temporal2_handles_restatements_and_late_arriving_rows_against_orac
             ],
         )
         .unwrap();
-        let mut w =
-            ArrowWriter::try_new(std::fs::File::create(path).unwrap(), Arc::clone(&schema), None)
-                .unwrap();
+        let mut w = ArrowWriter::try_new(
+            std::fs::File::create(path).unwrap(),
+            Arc::clone(&schema),
+            None,
+        )
+        .unwrap();
         w.write(&b).unwrap();
         w.close().unwrap();
     };

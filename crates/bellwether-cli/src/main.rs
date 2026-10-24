@@ -76,8 +76,8 @@ pub(crate) struct Global {
     /// in-place patch that keeps size and mtime.
     #[arg(long, global = true, value_enum)]
     fingerprint_policy: Option<PolicyArg>,
-    /// Pattern for filename-derived virtual columns, e.g. "{day}.parquet" or
-    /// "grouped_daily_us/{day:date}.parquet".
+    /// Pattern for filename-derived virtual columns, e.g. `"{day}.parquet"` or
+    /// `"grouped_daily_us/{day:date}.parquet"`.
     #[arg(long, global = true, value_name = "PATTERN")]
     path_template: Option<String>,
     /// A fixed RFC 3339 time for every record's `created_at` and for ages, so
@@ -420,6 +420,7 @@ fn key_file(path: &std::path::Path, key: Option<&Vec<String>>) -> KeyFile {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn run(cli: &Cli, out: &Out) -> Result<Outcome, Failure> {
     let g = &cli.global;
     match &cli.command {
@@ -427,8 +428,8 @@ fn run(cli: &Cli, out: &Out) -> Result<Outcome, Failure> {
         Command::Index(a) => {
             let mut specs = Vec::new();
             for s in &a.keys {
-                let parsed = bellwether::spec::parse_many(s)
-                    .map_err(|e| Failure::Usage(e.to_string()))?;
+                let parsed =
+                    bellwether::spec::parse_many(s).map_err(|e| Failure::Usage(e.to_string()))?;
                 specs.extend(parsed);
             }
             let r = engine(g, &a.root.root)?.index(&specs)?;

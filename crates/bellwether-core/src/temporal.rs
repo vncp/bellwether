@@ -589,7 +589,6 @@ pub fn asof<R: ReadAt, K: AsRef<[u8]>>(
     fold(segments, |s| s.asof(keys, ts))
 }
 
-
 /// Index-wide bitemporal query (`latest --known` when `valid` is `None`, or
 /// `asof --valid V --known K`) across every segment of a `temporal2` key spec.
 pub fn query_bitemporal<R: ReadAt, K: AsRef<[u8]>>(

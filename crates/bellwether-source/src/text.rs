@@ -239,7 +239,6 @@ impl<S: Storage> ChunkedTextSource<S> {
         self
     }
 
-
     /// Sets the path template used to extract filename-derived virtual columns.
     #[must_use]
     pub fn with_path_template(mut self, template: PathTemplate) -> Self {
@@ -382,11 +381,18 @@ impl<S: Storage> ChunkedTextSource<S> {
                 Self::after_newline(reader, path, INFER_HEAD_BYTES - 1, size)?
             };
             if let Ok(inferred) = self.infer(reader, path, 0..end) {
-                let in_file: Vec<&str> = inferred.fields().iter().map(|f| f.name().as_str()).collect();
+                let in_file: Vec<&str> = inferred
+                    .fields()
+                    .iter()
+                    .map(|f| f.name().as_str())
+                    .collect();
                 let fields: Vec<_> = schema
                     .fields()
                     .iter()
-                    .filter(|f| !vcol_names.contains(&f.name().as_str()) || in_file.contains(&f.name().as_str()))
+                    .filter(|f| {
+                        !vcol_names.contains(&f.name().as_str())
+                            || in_file.contains(&f.name().as_str())
+                    })
                     .cloned()
                     .collect();
                 if fields.len() != schema.fields().len() {

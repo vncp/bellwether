@@ -39,7 +39,9 @@ impl Engine {
         options.chunk_size = self.options().chunk_size;
         options.schema.clone_from(&self.options().schema);
         options.fingerprint_policy = self.options().fingerprint_policy;
-        options.path_template.clone_from(&self.options().path_template);
+        options
+            .path_template
+            .clone_from(&self.options().path_template);
         let report =
             Builder::new(Arc::clone(self.store()?), "").build(self.root(), specs, &options)?;
         let pinned = self.pin_required("index")?;
@@ -162,6 +164,7 @@ impl Engine {
         .map_err(schema_hint)
     }
 
+    #[allow(clippy::too_many_lines)]
     fn plan_lookup(&self, keys: &KeyFile, mode: Mode<'_>) -> Result<PlanResult> {
         let verb = match mode {
             Mode::Locate { .. } => "locate",
@@ -611,10 +614,8 @@ pub(crate) fn resolve_window_ts_column(
             | KeySpec::Temporal {
                 columns: c,
                 ts_column,
-            } if c.iter().all(|x| columns.contains(x)) => {
-                if !candidates.contains(ts_column) {
-                    candidates.push(ts_column.clone());
-                }
+            } if c.iter().all(|x| columns.contains(x)) && !candidates.contains(ts_column) => {
+                candidates.push(ts_column.clone());
             }
             _ => {}
         }
@@ -676,9 +677,7 @@ pub fn parse_lookback(spec: &str, ts_column: &str, ts_type: &DataType) -> Result
                 .into(),
         ));
     }
-    let unit_start = s
-        .find(|c: char| !c.is_ascii_digit())
-        .unwrap_or(s.len());
+    let unit_start = s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len());
     let (num_str, unit_str) = s.split_at(unit_start);
     let n: i64 = num_str.parse().map_err(|_| {
         Error::KeySpec(format!(
@@ -704,9 +703,9 @@ pub fn parse_lookback(spec: &str, ts_column: &str, ts_type: &DataType) -> Result
             )))
         }
     };
-    let total_secs = n.checked_mul(secs_per_unit).ok_or_else(|| {
-        Error::KeySpec(format!("--lookback {spec:?} overflows 64-bit duration"))
-    })?;
+    let total_secs = n
+        .checked_mul(secs_per_unit)
+        .ok_or_else(|| Error::KeySpec(format!("--lookback {spec:?} overflows 64-bit duration")))?;
     match ts_type {
         DataType::Date32 => {
             if total_secs % 86_400 != 0 {
@@ -719,14 +718,8 @@ pub fn parse_lookback(spec: &str, ts_column: &str, ts_type: &DataType) -> Result
         DataType::Date64 | DataType::Timestamp(TimeUnit::Millisecond, _) => total_secs
             .checked_mul(1_000)
             .ok_or_else(|| Error::KeySpec(format!("--lookback {spec:?} overflows milliseconds"))),
-        DataType::Timestamp(TimeUnit::Second, _) => Ok(total_secs),
-        DataType::Timestamp(TimeUnit::Microsecond, _) => total_secs
-            .checked_mul(1_000_000)
-            .ok_or_else(|| Error::KeySpec(format!("--lookback {spec:?} overflows microseconds"))),
-        DataType::Timestamp(TimeUnit::Nanosecond, _) => total_secs
-            .checked_mul(1_000_000_000)
-            .ok_or_else(|| Error::KeySpec(format!("--lookback {spec:?} overflows nanoseconds"))),
-        DataType::Int8
+        DataType::Timestamp(TimeUnit::Second, _)
+        | DataType::Int8
         | DataType::Int16
         | DataType::Int32
         | DataType::Int64
@@ -734,6 +727,12 @@ pub fn parse_lookback(spec: &str, ts_column: &str, ts_type: &DataType) -> Result
         | DataType::UInt16
         | DataType::UInt32
         | DataType::UInt64 => Ok(total_secs),
+        DataType::Timestamp(TimeUnit::Microsecond, _) => total_secs
+            .checked_mul(1_000_000)
+            .ok_or_else(|| Error::KeySpec(format!("--lookback {spec:?} overflows microseconds"))),
+        DataType::Timestamp(TimeUnit::Nanosecond, _) => total_secs
+            .checked_mul(1_000_000_000)
+            .ok_or_else(|| Error::KeySpec(format!("--lookback {spec:?} overflows nanoseconds"))),
         other => Err(Error::KeySpec(format!(
             "{ts_column} has type {other}, which lookback windows cannot order by"
         ))),
@@ -778,7 +777,10 @@ impl Engine {
 pub(crate) fn decode_ts_from_canonical(bytes: &[u8], ts_type: &DataType) -> Option<i64> {
     match ts_type {
         DataType::Dictionary(_, v) => decode_ts_from_canonical(bytes, v),
-        DataType::Date32 | DataType::Date64 | DataType::Time32(_) | DataType::Time64(_)
+        DataType::Date32
+        | DataType::Date64
+        | DataType::Time32(_)
+        | DataType::Time64(_)
         | DataType::Timestamp(_, _) => {
             if bytes.len() != 11 || bytes[0] != 0x08 {
                 return None;

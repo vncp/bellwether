@@ -150,7 +150,7 @@ fn reads_one_row_group_at_a_time_and_only_key_columns() {
     .unwrap();
     assert_eq!(report.key_columns, ["entity_id", "batch_id", "status"]);
     let skipped: Vec<&str> = report.skipped.iter().map(|s| s.column.as_str()).collect();
-    assert_eq!(skipped, ["version_ts", "payload"]);
+    assert_eq!(skipped, ["version_ts", "payload", "day"]);
     assert!(
         report.skipped[1].reason.contains("bytes per row"),
         "{:?}",

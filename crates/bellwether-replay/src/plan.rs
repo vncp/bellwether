@@ -499,6 +499,7 @@ impl SegmentPlanner {
     /// Prunes catalog row groups against virtual columns (Hive `name=value`
     /// directories or `--path-template`), matching the build planner's
     /// `prune_virtual_keys`.
+    #[allow(clippy::type_complexity)]
     fn prune_virtual_keys(&self, keys: &RunKeys) -> Result<Option<RoaringBitmap>> {
         let columns = keys.columns();
         let schema = self.catalog.schema();
@@ -602,6 +603,7 @@ impl SegmentPlanner {
         Ok(Some(allowed))
     }
 
+    #[allow(clippy::type_complexity)]
     fn order_plan(&self, listed: &[&Arc<SpecSegments>], mut plan: ScanPlan) -> Result<ScanPlan> {
         let schema = self.catalog.schema();
         let mut candidates: Vec<&Arc<SpecSegments>> = Vec::new();
@@ -723,6 +725,7 @@ impl PlanSource for SegmentPlanner {
         Ok(with_residual(self.order_plan(&listed, plan)?, keys))
     }
 
+    #[allow(clippy::too_many_lines, clippy::needless_range_loop)]
     fn plan_in_window(
         &self,
         specs: &[KeySpec],

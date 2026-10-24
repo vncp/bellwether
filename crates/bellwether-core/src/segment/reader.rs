@@ -239,7 +239,10 @@ impl<R: ReadAt> SegmentReader<R> {
         let blocks = claimed as usize;
         let reserve = |min_entry| reserve_hint(u64::from(claimed), index_len as u64, min_entry);
         let index = match header.layout {
-            Layout::Keyed | Layout::KeyedTemporal | Layout::KeyedBounds | Layout::KeyedTemporal2 => {
+            Layout::Keyed
+            | Layout::KeyedTemporal
+            | Layout::KeyedBounds
+            | Layout::KeyedTemporal2 => {
                 let mut v = Vec::with_capacity(reserve(MIN_KEYED_ENTRY));
                 for _ in 0..blocks {
                     v.push(KeyedBlock {

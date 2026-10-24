@@ -20,12 +20,14 @@ Files (Parquet, CSV, or JSON lines) partitioned by date, each file holding rows 
 | Verify a derived dataset | Do my bars, factors, or vendor files agree with the source by key, newest version, row hash, and exact decimal totals? | `bellwether reconcile ./a ./b --key symbol,ts --total volume` | merged |
 | Receipts | A hash-linked proof that an index or rewrite returned the same rows, for review or CI | `bellwether fix`, `receipt show`, `report --html` | merged |
 | Exact what-if pricing | The cost of a hypothetical key before building it, from statistics, with zero estimation error | part of `why` | merged |
-| Partition values from paths | `day=2024-03-01/` directories prune without being read | automatic | building (WP21) |
-| Ordered plans | Row groups returned in time order for per-symbol sequence math | automatic with a timestamp range key | building (WP21) |
-| Pinned snapshots | Run any query against an earlier index state, for reproducible backtests over a growing lake | `--at-manifest N` | building (WP21) |
-| Per-key time bounds | Symbol × window pruning that skips row groups where the symbol exists but outside the window | `--key exact:symbol@ts` | building (WP21) |
-| Bitemporal as-of | What was known at time K about the state at time V: restatements, corrections, late prints, without lookahead | `--key temporal2:symbol@valid,known`, `asof --valid V --known K` | building (WP21) |
-| Market benchmark corpus | A synthetic symbols × days corpus with restatements and late prints, so every claim above has a measured funnel | `bellwether bench generate --market` | building (WP21) |
+| Partition values from paths | `day=2024-03-01/` directories prune without being read | automatic | merged (WP21) |
+| Filename-derived virtual columns | Lakes stored as `<dataset>/<YYYY-MM-DD>.parquet` gain virtual columns (`day`, `symbol`, etc.) without reading file bodies | `--path-template "{day}.parquet"` | merged (WP21) |
+| Lookback windows | Symbol × `[lo, hi]` or `[T - D, T]` window reads across `locate`, `asof`, `latest`, and `why` | `locate --window A..B`, `asof --at T --lookback 252d`, `latest --lookback D` | merged (WP21) |
+| Ordered plans | Row groups returned in time order for per-symbol sequence math | automatic with a timestamp range key | merged (WP21) |
+| Pinned snapshots | Run any query against an earlier index state, for reproducible backtests over a growing lake | `--at-manifest N` | merged (WP21) |
+| Per-key time bounds | Symbol × window pruning that skips row groups where the symbol exists but outside the window | `--key exact:symbol@ts` | merged (WP21) |
+| Bitemporal as-of | What was known at time K about the state at time V: restatements, corrections, late prints, without lookahead | `--key temporal2:symbol@valid,known`, `asof --valid V --known K` | merged (WP21) |
+| Market benchmark corpus | A synthetic symbols × days corpus with restatements and late prints, so every claim above has a measured funnel | `bellwether bench generate --market` | merged (WP21) |
 | Exact counts per key | How many rows these symbols have, per row group, without reading; exact join cardinality between two indexed datasets | storage version 2 | planned (WP14) |
 | Relational cost model | Exact cost of joins, windows, projections, and layouts over indexed data, so pipeline rewrites can be priced and proven | replay over the operator table | planned (WP15) |
 | Pipeline optimizer | Search over plans, keys, layouts, and multi-step pipelines with the exact cost as the loss and reconciliation as the gate | `bellwether evolve` | planned (WP13) |

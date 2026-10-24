@@ -691,7 +691,9 @@ impl Engine {
         options.chunk_size = self.options().chunk_size;
         options.schema.clone_from(&self.options().schema);
         options.fingerprint_policy = self.options().fingerprint_policy;
-        options.path_template.clone_from(&self.options().path_template);
+        options
+            .path_template
+            .clone_from(&self.options().path_template);
         let report = Builder::new(Arc::clone(self.store()?), "").build(
             self.root(),
             std::slice::from_ref(spec),

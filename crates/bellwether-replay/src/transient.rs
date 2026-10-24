@@ -231,6 +231,7 @@ impl TransientIndex {
     /// the catalog carries (module docs for the memory bound). A row group
     /// whose read returns a different row count than its statistics is an
     /// error.
+    #[allow(clippy::too_many_lines)]
     pub fn build(
         source: &dyn Source,
         catalog: &Catalog,

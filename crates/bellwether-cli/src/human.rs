@@ -104,6 +104,7 @@ pub(crate) fn index(r: &IndexResult, out: &Out) -> String {
     s
 }
 
+#[allow(clippy::too_many_lines)]
 pub(crate) fn plan(r: &PlanResult, out: &Out) -> String {
     let mut s = String::new();
     let what = match &r.lookup {
