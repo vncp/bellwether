@@ -349,7 +349,7 @@ proptest! {
         // A tuple whose first element differs falls outside the bound.
         let mut not_ext = encode_tuple(&[Value::Utf8(&other)]).unwrap();
         encode_value(&Value::Int(q), &mut not_ext).unwrap();
-        let inside = not_ext >= lo && hi.as_ref().map_or(true, |h| &not_ext < h);
+        let inside = not_ext >= lo && hi.as_ref().is_none_or(|h| &not_ext < h);
         prop_assert_eq!(inside, other == p);
     }
 }

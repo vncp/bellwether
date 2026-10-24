@@ -15,7 +15,7 @@ One crate, one owner, one interface contract each. WP0 ships first and alone. Af
 | WP5 profile | merged after four review rounds; one shared decision module with the bench |
 | WP8 verify | merged after four review rounds; no false pass over 12,800 chunkings |
 | WP9 facade and cli | merged: why, index, locate, latest, asof, propose, reconcile, fix, receipt, report; profile wired into `why` |
-| Dependency upgrade | in progress |
+| Dependency upgrade | merged: arrow/parquet 59, object_store 0.14, DataFusion 55 (bench feature); `deny.toml` has no advisory ignores |
 | WP12 mcp, WP20 sql | next, in that order |
 | WP13 evolve | after M3 |
 | WP14 counted segments and column bytes, WP15 relational replay, WP16 engine adapters, WP17 CI receipts, WP18 transfer evaluation, WP19 signed receipts | planned 2026-10-24 (ADR 026) |
@@ -84,6 +84,8 @@ One crate, one owner, one interface contract each. WP0 ships first and alone. Af
 ## Dependency upgrade (start of Phase 3)
 
 Before WP8, WP9, and WP12 begin: upgrade `object_store` from 0.11 to the current release and `arrow`/`parquet` from 53 to the current release in one PR, re-run every crate's tests, sweeps, and the conformance test, and remove every advisory ignore in `deny.toml` (quick-xml, rustls-pemfile, paste, and instant from the optional DataFusion baseline). Deferred from Phase 2 so that build, profile, and replay are written against one pinned API.
+
+Done 2026-10-24. Arrow and parquet went to 59, not 60: 60.0.0 was the newest release, but DataFusion 55.2, the newest DataFusion, is built on arrow 59, and the workspace keeps one arrow. object_store went to 0.14.2. The type-spelling, catalog-digest, and statistics amendments are in `format.md`, and the re-pinned Parquet-byte goldens are in `benchmark.md`.
 
 ## Contract v3 backlog
 

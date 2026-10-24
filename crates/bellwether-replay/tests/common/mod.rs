@@ -205,12 +205,12 @@ pub fn write_corpus(spec: &CorpusSpec) -> Corpus {
         )
         .unwrap();
         let mut props = WriterProperties::builder()
-            .set_max_row_group_size(spec.rows_per_row_group)
+            .set_max_row_group_row_count(Some(spec.rows_per_row_group))
             .set_created_by("bellwether-replay tests".into());
         if spec.bloom_every > 0 && f % spec.bloom_every == 0 {
             props = props
                 .set_column_bloom_filter_enabled(ColumnPath::from("entity_id"), true)
-                .set_column_bloom_filter_ndv(
+                .set_column_bloom_filter_max_ndv(
                     ColumnPath::from("entity_id"),
                     spec.rows_per_row_group as u64,
                 );

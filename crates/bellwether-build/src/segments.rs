@@ -279,7 +279,7 @@ fn process_item<S: StoreExt + ?Sized>(ctx: &Ctx<'_, S>, item: &Item) -> Result<I
     let mut out = ItemOut::default();
     let mut current: Option<CurrentFile> = None;
     for task in &item.tasks {
-        if current.as_ref().map_or(true, |c| c.file != task.file) {
+        if current.as_ref().is_none_or(|c| c.file != task.file) {
             current = Some(list_file(ctx, task.file)?);
             out.files_listed += 1;
         }

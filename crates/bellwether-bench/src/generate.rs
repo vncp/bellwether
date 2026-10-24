@@ -223,10 +223,10 @@ fn writer_properties(params: &GenParams) -> WriterProperties {
         // Parquet-native split-block bloom filter on the lookup key, sized
         // for one row group's distinct values (ADR 019 baseline).
         .set_column_bloom_filter_enabled(entity.clone(), true)
-        .set_column_bloom_filter_ndv(entity.clone(), u64::from(params.rows_per_row_group))
+        .set_column_bloom_filter_max_ndv(entity.clone(), u64::from(params.rows_per_row_group))
         .set_column_bloom_filter_fpp(entity, ENTITY_BLOOM_FPP)
         // Row groups are cut explicitly with `flush`, one per batch.
-        .set_max_row_group_size(params.rows_per_row_group as usize + 1)
+        .set_max_row_group_row_count(Some(params.rows_per_row_group as usize + 1))
         .set_created_by(format!("bellwether-bench {}", env!("CARGO_PKG_VERSION")))
         .build()
 }

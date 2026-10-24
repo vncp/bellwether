@@ -615,10 +615,10 @@ impl StatsAccumulator {
                     if is_nan_encoding(&enc) {
                         continue;
                     }
-                    if self.min.as_ref().map_or(true, |m| enc < *m) {
+                    if self.min.as_ref().is_none_or(|m| enc < *m) {
                         self.min = Some(enc.clone());
                     }
-                    if self.max.as_ref().map_or(true, |m| enc > *m) {
+                    if self.max.as_ref().is_none_or(|m| enc > *m) {
                         self.max = Some(enc);
                     }
                 }

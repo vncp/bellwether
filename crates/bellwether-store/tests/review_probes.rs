@@ -783,9 +783,9 @@ const README: &str = include_str!("../README.md");
 fn human(d: Duration) -> String {
     assert_eq!(d.subsec_nanos(), 0, "whole seconds only");
     let s = d.as_secs();
-    let (n, unit) = if s % 3600 == 0 {
+    let (n, unit) = if s.is_multiple_of(3600) {
         (s / 3600, "hour")
-    } else if s % 60 == 0 {
+    } else if s.is_multiple_of(60) {
         (s / 60, "minute")
     } else {
         (s, "second")
@@ -802,7 +802,7 @@ fn thousands(n: usize) -> String {
     let digits = n.to_string();
     let mut out = String::new();
     for (i, c) in digits.chars().enumerate() {
-        if i > 0 && (digits.len() - i) % 3 == 0 {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
             out.push(',');
         }
         out.push(c);

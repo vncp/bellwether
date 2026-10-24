@@ -148,7 +148,7 @@ fn write(dir: &Path, name: &str, rows: &[Row], amt_scale: i8, rg: usize) {
     let batch = RecordBatch::try_new(schema(amt_scale), cols).unwrap();
     let file = std::fs::File::create(dir.join(name)).unwrap();
     let props = WriterProperties::builder()
-        .set_max_row_group_size(rg.max(1))
+        .set_max_row_group_row_count(Some(rg.max(1)))
         .build();
     let mut w = ArrowWriter::try_new(file, batch.schema(), Some(props)).unwrap();
     w.write(&batch).unwrap();

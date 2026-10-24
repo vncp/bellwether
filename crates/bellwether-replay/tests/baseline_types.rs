@@ -147,13 +147,13 @@ fn write() -> (tempfile::TempDir, String) {
             ],
         )
         .unwrap();
-        let mut props = WriterProperties::builder().set_max_row_group_size(ROWS);
+        let mut props = WriterProperties::builder().set_max_row_group_row_count(Some(ROWS));
         for c in [
             "k_f32", "k_fsb", "k_dec30", "k_dec9", "k_date", "k_ts", "k_d256", "k_f64", "k_str",
         ] {
             props = props
                 .set_column_bloom_filter_enabled(ColumnPath::from(c), true)
-                .set_column_bloom_filter_ndv(ColumnPath::from(c), ROWS as u64)
+                .set_column_bloom_filter_max_ndv(ColumnPath::from(c), ROWS as u64)
                 .set_column_bloom_filter_fpp(ColumnPath::from(c), 0.01);
         }
         let mut w = ArrowWriter::try_new(

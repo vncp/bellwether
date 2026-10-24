@@ -56,7 +56,7 @@ use fingerprint::content_hash;
 pub use fingerprint::{
     drift, fingerprint, fingerprint_with, fingerprint_with_policy, FingerprintPolicy, TAIL_BYTES,
 };
-pub use parquet_source::ParquetSource;
+pub use parquet_source::{load_reader_metadata, ParquetSource};
 pub use storage::{LocalFs, ObjectMeta, Storage};
 pub use text::{ChunkedTextSource, TextFormat, DEFAULT_CHUNK_SIZE};
 

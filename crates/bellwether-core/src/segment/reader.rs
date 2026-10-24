@@ -166,7 +166,7 @@ impl<'a> BlockView<'a> {
     fn lower_bound(&self, key: &[u8]) -> Result<usize> {
         let (mut lo, mut hi) = (0, self.n);
         while lo < hi {
-            let mid = (lo + hi) / 2;
+            let mid = usize::midpoint(lo, hi);
             if self.key(mid)? < key {
                 lo = mid + 1;
             } else {
@@ -432,7 +432,7 @@ impl<R: ReadAt> SegmentReader<R> {
             if key > b.last.as_slice() {
                 continue;
             }
-            if cur.as_ref().map_or(true, |c| c.0 != bi) {
+            if cur.as_ref().is_none_or(|c| c.0 != bi) {
                 cur = Some((bi, self.read(b.bloom_off, b.bloom_len)?, None));
             }
             let Some((_, bloom_bits, body)) = cur.as_mut() else {

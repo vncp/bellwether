@@ -10,7 +10,7 @@ Bellwether is built against a fixed architecture. Read `docs/architecture.md` an
 - **No collect-to-driver.** Memory is bounded per operation (ADR 018). A PR that materializes an unbounded set is rejected.
 - **The agent proposes, the engine scores.** Nothing in `observe.*` or `propose.*` may write anything but a Proposal. Nothing in `apply.*` may run without a passing Certificate, and every successful apply writes a Receipt.
 - **Format changes bump a version** and ship a migration and a fixture.
-- **Layering is enforced.** `dev/check-layering.py` fails CI on any crate dependency edge not listed in it; adding an edge is an architectural decision. Supply chain is checked by `cargo deny` (`deny.toml`); rustdoc warnings are denied; mutation testing runs weekly and its survivors are published.
+- **Layering is enforced.** `dev/check-layering.py` fails CI on any crate dependency edge not listed in it; adding an edge is an architectural decision. Supply chain is checked by `cargo deny` (`deny.toml`), which carries no advisory ignores: a new one needs a dated reason naming the crate that pulls it and the upstream issue; rustdoc warnings are denied; mutation testing runs weekly and its survivors are published.
 - **CI must be green**: `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets --all-features` with warnings denied, `cargo test --workspace`.
 
 ## Pull requests

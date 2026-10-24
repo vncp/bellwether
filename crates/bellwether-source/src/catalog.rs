@@ -345,8 +345,19 @@ mod tests {
     }
 
     /// Pinned: changing either is a format change for every replay and
-    /// certificate that cites a catalog.
+    /// certificate that cites a catalog. Re-pinned 2026-10-24 when Arrow 59
+    /// changed the display form of the fixture's `List` column, which the
+    /// digest spells as `arrow:` plus that form (docs/format.md, "Catalog
+    /// digest", amendment of that date).
     const GOLDEN_UNINDEXED: &str =
-        "738ee2b2f58c95d981f7cf3e845df981f83c11f29b729dab2117f6b74bda6b90";
-    const GOLDEN_INDEXED: &str = "572c782431c770f6488a7b41d295993f1872c6fffb5d8cc520a7f712daf80c4b";
+        "2239565ce9f3fb6f2be5bf0eebef1fa0d59ffb83cfd07d3864b65233882efa17";
+    const GOLDEN_INDEXED: &str = "ac22ea4295697791e3da83048f1a7286ea3d7ac25ad6eef7da7bbd885a901e5e";
+
+    /// The fallback spelling the goldens above were computed over. Arrow 53
+    /// spelled this type `List(Field { name: "item", data_type: Utf8,
+    /// nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} })`.
+    #[test]
+    fn the_fallback_spelling_is_arrows_current_display_form() {
+        assert_eq!(schema()[1].1, "arrow:List(Utf8)");
+    }
 }

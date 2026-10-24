@@ -148,7 +148,7 @@ fn planned(plan: &ScanPlan) -> BTreeSet<(String, u32)> {
 
 fn write_groups(path: &Path, schema: &SchemaRef, groups: Vec<Vec<ArrayRef>>) {
     let props = WriterProperties::builder()
-        .set_max_row_group_size(1 << 20)
+        .set_max_row_group_row_count(Some(1 << 20))
         .build();
     let mut w =
         ArrowWriter::try_new(File::create(path).unwrap(), Arc::clone(schema), Some(props)).unwrap();
@@ -648,7 +648,7 @@ fn check_temporal(
             V::T(t) => Some(t),
             _ => None,
         })
-        .filter(|t| limit.map_or(true, |l| *t <= l))
+        .filter(|t| limit.is_none_or(|l| *t <= l))
         .max();
     let mut want_rows = BTreeSet::new();
     let mut want_rgs = BTreeSet::new();

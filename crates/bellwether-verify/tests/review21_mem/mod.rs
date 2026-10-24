@@ -50,7 +50,7 @@ pub fn write(dir: &Path, keys: i64, versions: i64, string_key: bool, edit: Optio
     let file = std::fs::File::create(dir.join("x.parquet")).unwrap();
     let group = 40_000i64;
     let props = WriterProperties::builder()
-        .set_max_row_group_size(usize::try_from(group).unwrap())
+        .set_max_row_group_row_count(Some(usize::try_from(group).unwrap()))
         .build();
     let mut w = ArrowWriter::try_new(file, Arc::clone(&schema), Some(props)).unwrap();
     for v in 0..versions {

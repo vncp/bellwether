@@ -41,7 +41,7 @@ impl<S: StoreExt + ?Sized> Builder<S> {
                 Err(e) if e.kind() == ErrorKind::NotFound => None,
                 _ => Some(fingerprint_with_policy(&LocalFs, path, policy)?),
             };
-            if new.as_ref().map_or(true, |n| drift(&f.fingerprint, n)) {
+            if new.as_ref().is_none_or(|n| drift(&f.fingerprint, n)) {
                 out.push(Drift {
                     path: path.clone(),
                     old: f.fingerprint.clone(),

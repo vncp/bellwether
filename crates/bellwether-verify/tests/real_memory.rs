@@ -35,7 +35,7 @@ fn write(dir: &Path, edit: Option<i64>) {
     ]));
     let file = std::fs::File::create(dir.join("x.parquet")).unwrap();
     let props = WriterProperties::builder()
-        .set_max_row_group_size(usize::try_from(GROUP).unwrap())
+        .set_max_row_group_row_count(Some(usize::try_from(GROUP).unwrap()))
         .build();
     let mut w = ArrowWriter::try_new(file, Arc::clone(&schema), Some(props)).unwrap();
     for start in (0..KEYS).step_by(usize::try_from(GROUP).unwrap()) {

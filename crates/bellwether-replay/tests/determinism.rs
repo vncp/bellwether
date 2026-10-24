@@ -52,8 +52,11 @@ const CHILD_OUT: &str = "BELLWETHER_REPLAY_DETERMINISM_OUT";
 const CHILD_MODE: &str = "BELLWETHER_REPLAY_DETERMINISM_MODE";
 const CHILD_CORPUS: &str = "BELLWETHER_REPLAY_DETERMINISM_CORPUS";
 /// BLAKE3 of the Replay record's canonical JSON for the fixture below, with
-/// the catalog digest's hex replaced by zeros.
-const GOLDEN: &str = "98eadc89e494ab962e54603b43114617f32f370df57d7a9722afe9ecef681ab7";
+/// the catalog digest's hex replaced by zeros. Re-pinned 2026-10-24 for the
+/// parquet 53 -> 59 upgrade: every run's files and row groups are unchanged;
+/// only `bytes` moved, because the new writer omits page-header statistics,
+/// so the fixture's column chunks are smaller (docs/benchmark.md).
+const GOLDEN: &str = "7da78de5e096bc52a472f1ab71cb6e562474ab2f0657f9296dda4874c21e9030";
 
 fn cols(c: &[&str]) -> Vec<String> {
     c.iter().map(|s| (*s).to_string()).collect()

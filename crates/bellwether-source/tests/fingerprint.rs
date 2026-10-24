@@ -183,7 +183,7 @@ fn write_large_parquet(path: &PathBuf) {
     )])
     .unwrap();
     let props = WriterProperties::builder()
-        .set_max_row_group_size(20_000)
+        .set_max_row_group_row_count(Some(20_000))
         .set_compression(Compression::UNCOMPRESSED)
         .set_dictionary_enabled(false)
         .set_encoding(Encoding::PLAIN)

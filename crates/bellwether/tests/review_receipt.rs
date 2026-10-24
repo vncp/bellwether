@@ -26,7 +26,7 @@ fn grouped(n: u64) -> String {
     let s = n.to_string();
     let mut out = String::new();
     for (i, ch) in s.chars().enumerate() {
-        if i > 0 && (s.len() - i) % 3 == 0 {
+        if i > 0 && (s.len() - i).is_multiple_of(3) {
             out.push(',');
         }
         out.push(ch);
@@ -104,7 +104,8 @@ fn probe_receipt_and_report_over_a_real_receipt() {
     }
 
     // R5: with the floor now current it is no candidate, and the current
-    // cost is still computed: the prediction, 2,967 bytes.
+    // cost is still computed: the prediction, 2,661 bytes (2,967 under
+    // parquet 53, whose writer also wrote page-header statistics).
     let w2 = e.why(&req).unwrap();
     assert_eq!(w2.sequence, 2);
     assert!(w2
@@ -112,7 +113,7 @@ fn probe_receipt_and_report_over_a_real_receipt() {
         .iter()
         .all(|c| c.origin == bellwether::CandidateOrigin::Profile));
     assert_eq!(w2.current, Some(cand.proposed), "realized equals predicted");
-    assert_eq!(w2.current.unwrap().bytes, 2_967);
+    assert_eq!(w2.current.unwrap().bytes, 2_661);
 
     // What `fix` writes after a successful apply: the same proposal replayed
     // at manifest_after. `report` pairs it with the receipt.

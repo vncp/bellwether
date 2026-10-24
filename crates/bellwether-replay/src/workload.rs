@@ -553,8 +553,9 @@ fn field_names(schema: &Schema) -> Vec<String> {
 
 fn read_parquet_keys(path: &Path, schema: &Schema) -> Result<(RunKeys, u64)> {
     let file = File::open(path).map_err(|e| Error::Source(format!("{}: {e}", path.display())))?;
-    let reader = ParquetRecordBatchReaderBuilder::try_new(file)
-        .map_err(|e| Error::Source(format!("{}: {e}", path.display())))?
+    let meta = bellwether_source::load_reader_metadata(&file)
+        .map_err(|e| Error::Source(format!("{}: {e}", path.display())))?;
+    let reader = ParquetRecordBatchReaderBuilder::new_with_metadata(file, meta)
         .build()
         .map_err(|e| Error::Source(format!("{}: {e}", path.display())))?;
     let columns = field_names(&reader.schema());
