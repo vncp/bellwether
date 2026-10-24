@@ -155,7 +155,9 @@ impl Store for Probe {
         self.inner.list(p)
     }
     fn delete(&self, p: &str) -> Result<()> {
-        self.fire(&self.before_delete, p);
+        if p.contains("/segments/") {
+            self.fire(&self.before_delete, p);
+        }
         self.inner.delete(p)
     }
 }

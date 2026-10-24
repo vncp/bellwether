@@ -25,6 +25,7 @@ impl Engine {
     }
 
     fn index_inner(&self, specs: &[KeySpec]) -> Result<IndexResult> {
+        self.require_current("index")?;
         if specs.is_empty() && self.manifest()?.is_none() {
             return Err(Error::KeySpec(
                 "a new index needs at least one key spec; pass --key exact:<column> (or \
@@ -96,9 +97,15 @@ impl Engine {
 
     /// Invariant 1 over the folder, not only the index: a file that landed
     /// or changed after the last build would be silently left out of the
-    /// plan, so it is refused.
+    /// plan, so it is refused. A plan pinned to an earlier manifest
+    /// (`--at-manifest`) answers over the files that manifest recorded, so
+    /// files that arrived since are out of scope by design; a recorded file
+    /// that changed or vanished is still refused.
     fn refuse_stale(&self, pinned: &Pinned, verb: &str) -> Result<()> {
-        let changes = folder_changes(self.root(), pinned, self.format())?;
+        let mut changes = folder_changes(self.root(), pinned, self.format())?;
+        if self.options().at_manifest.is_some() {
+            changes.untracked.clear();
+        }
         if changes.is_empty() {
             Ok(())
         } else {

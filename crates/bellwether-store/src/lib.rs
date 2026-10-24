@@ -6,9 +6,10 @@
 //! Layout under an index root (docs/format.md):
 //!
 //! ```text
-//! <root>/manifest.json          committed by conditional PUT
-//! <root>/segments/<blake3>.seg  immutable, content-addressed
-//! <root>/cache/<hash>.bin       rebuildable, with <hash>.meta.json age sidecar
+//! <root>/manifest.json            committed by conditional PUT
+//! <root>/manifests/<20-digit>.json immutable committed manifest history
+//! <root>/segments/<blake3>.seg    immutable, content-addressed
+//! <root>/cache/<hash>.bin         rebuildable, with <hash>.meta.json age sidecar
 //! ```
 //!
 //! Invariant 4 (readers see one manifest version) is held by [`Snapshot`] and
@@ -39,10 +40,10 @@ pub use gc::{
 };
 pub use local::LOCK_TIMEOUT as LOCAL_LOCK_TIMEOUT;
 pub use manifest::{
-    join, manifest_path, now_rfc3339, parse_rfc3339, segment_path, ChunkRange, ColumnDef,
-    DeleteClaim, Extra, FileEntry, Manifest, RowGroupRange, RowGroupSpace, RowGroupTombstone,
-    SchemaInfo, SegmentRef, SegmentTombstone, SourceInfo, CACHE_DIR, MANIFEST_FILE, SEGMENTS_DIR,
-    UNSUPPORTED_SHAPE, UNSUPPORTED_STORAGE,
+    join, manifest_history_path, manifest_path, now_rfc3339, parse_rfc3339, segment_path,
+    ChunkRange, ColumnDef, DeleteClaim, Extra, FileEntry, Manifest, RowGroupRange, RowGroupSpace,
+    RowGroupTombstone, SchemaInfo, SegmentRef, SegmentTombstone, SourceInfo, CACHE_DIR,
+    MANIFESTS_DIR, MANIFEST_FILE, SEGMENTS_DIR, UNSUPPORTED_SHAPE, UNSUPPORTED_STORAGE,
 };
 pub use object_store::ObjectMeta;
-pub use snapshot::Snapshot;
+pub use snapshot::{retained_sequences, Snapshot};

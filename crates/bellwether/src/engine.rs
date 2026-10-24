@@ -14,10 +14,11 @@ use bellwether_source::{
     Partitioning, Storage as _, TextFormat,
 };
 use bellwether_store::{
-    manifest_path, now_rfc3339, parse_rfc3339, Cache, Manifest, ObjectStoreBackend, Snapshot,
-    StoreExt,
+    manifest_history_path, manifest_path, now_rfc3339, parse_rfc3339, retained_sequences, Cache,
+    Manifest, ObjectStoreBackend, Snapshot, StoreExt,
 };
 use bellwether_types::{Error, FileFingerprint, Hash, KeySpec, Record, Result, Source};
+use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 
 use crate::results::Written;
@@ -125,6 +126,14 @@ pub struct EngineOptions {
     /// `name=value` directory below the root a column (Parquet only). An
     /// existing index keeps its recorded scheme; another one is refused.
     pub partitioning: Option<Partitioning>,
+    /// Plan against the committed manifest at this sequence instead of the
+    /// current one (`--at-manifest`), for reproducible lookups over a
+    /// growing folder: `locate`, `latest`, `asof`, and `why` see exactly the
+    /// files, row groups, and segments that sequence recorded. A sequence
+    /// garbage collection has pruned is refused with the retained range
+    /// ([`Error::NotRetained`]). Operations that change the index (`index`,
+    /// `fix`) refuse to run on an engine opened at a manifest.
+    pub at_manifest: Option<u64>,
     /// A fixed RFC 3339 time used as every record's `created_at` and as
     /// "now" when ages are computed, so two runs over the same inputs write
     /// byte-identical records. `None` uses the system clock.
@@ -139,6 +148,8 @@ pub(crate) struct Pinned {
     /// BLAKE3 of the manifest bytes as stored (the profile's and verify's
     /// convention).
     pub hash: Hash,
+    /// The manifest bytes as stored.
+    pub bytes: Bytes,
     /// Time since the commit that wrote it.
     pub age: Duration,
 }
@@ -418,11 +429,23 @@ impl Engine {
     /// Pins the current manifest with its content hash, or `None` if the
     /// folder is not indexed. The bytes hashed and the snapshot pinned are
     /// the same commit (sequence and nonce agree), retried a few times if a
-    /// commit lands in between.
+    /// commit lands in between. With [`EngineOptions::at_manifest`], pins
+    /// that committed sequence instead, or refuses with
+    /// [`Error::NotRetained`].
     pub(crate) fn pin(&self) -> Result<Option<Pinned>> {
         let Some(store) = self.existing_store()? else {
+            if let Some(seq) = self.options.at_manifest {
+                return Err(Error::NotRetained {
+                    index: self.index.clone(),
+                    requested: seq,
+                    retained: Vec::new(),
+                });
+            }
             return Ok(None);
         };
+        if let Some(seq) = self.options.at_manifest {
+            return self.pin_at(store, seq).map(Some);
+        }
         for _ in 0..PIN_ATTEMPTS {
             let Some((bytes, _)) = store.get_opt(&manifest_path(""))? else {
                 return Ok(None);
@@ -437,6 +460,7 @@ impl Engine {
                     snapshot,
                     planner,
                     hash: Hash::of(&bytes),
+                    bytes,
                     age,
                 }));
             }
@@ -445,6 +469,75 @@ impl Engine {
             expected: "a manifest stable while it is pinned".into(),
             found: format!("{PIN_ATTEMPTS} commits in a row; retry when the writers settle"),
         })
+    }
+
+    /// Pins the committed manifest at `seq` from the store's history
+    /// (`manifests/<sequence>.json`), whose bytes are those the commit wrote,
+    /// so its content hash is the one an unpinned lookup at that sequence
+    /// cited.
+    fn pin_at(&self, store: &Arc<ObjectStoreBackend>, seq: u64) -> Result<Pinned> {
+        let refuse = || -> Result<Error> {
+            Ok(Error::NotRetained {
+                index: self.index.clone(),
+                requested: seq,
+                retained: retained_sequences(&**store, "")?,
+            })
+        };
+        let Some(snapshot) = Snapshot::open_at(Arc::clone(store), "", seq)? else {
+            return Err(refuse()?);
+        };
+        let bytes = match store.get_opt(&manifest_history_path("", seq))? {
+            Some((b, _)) => b,
+            // Not backfilled yet: the current manifest is that sequence.
+            None => match store.get_opt(&manifest_path(""))? {
+                Some((b, _)) => b,
+                None => return Err(refuse()?),
+            },
+        };
+        let read = Manifest::from_slice(&bytes)?;
+        let pinned = snapshot.manifest();
+        if read.sequence != pinned.sequence || read.commit_nonce != pinned.commit_nonce {
+            // The current manifest moved on between the two reads, and the
+            // history object is not written yet: ask again.
+            return Err(Error::VersionConflict {
+                expected: format!("manifest sequence {seq}"),
+                found: format!(
+                    "sequence {}; retry, the commit's history copy is being written",
+                    read.sequence
+                ),
+            });
+        }
+        let age = commit_age(pinned, self.now_nanos()?)?;
+        let planner = Planner::from_snapshot(snapshot.clone())?;
+        Ok(Pinned {
+            snapshot,
+            planner,
+            hash: Hash::of(&bytes),
+            bytes,
+            age,
+        })
+    }
+
+    /// The committed manifest sequences this index retains, ascending: each
+    /// can be pinned with [`EngineOptions::at_manifest`]. Empty when the
+    /// folder is not indexed.
+    pub fn retained_manifests(&self) -> Result<Vec<u64>> {
+        guard(|| match self.existing_store()? {
+            None => Ok(Vec::new()),
+            Some(store) => retained_sequences(&**store, ""),
+        })
+    }
+
+    /// Refuses `verb` on an engine opened at a manifest: it changes the
+    /// index, which only ever moves the current manifest forward.
+    pub(crate) fn require_current(&self, verb: &str) -> Result<()> {
+        match self.options.at_manifest {
+            None => Ok(()),
+            Some(seq) => Err(Error::Other(format!(
+                "{verb} changes the index, so it always acts on the current manifest; run it \
+                 without --at-manifest {seq}"
+            ))),
+        }
     }
 
     /// Pins the manifest, or refuses: the folder is not indexed.
@@ -645,6 +738,52 @@ impl Engine {
                 missing,
             })
         })
+    }
+}
+
+/// A source restricted to the files a manifest recorded: `discover` lists
+/// them (by path, as the manifest's fingerprints) instead of the folder, and
+/// every other call goes to the folder's source, which verifies each file
+/// against that fingerprint before reading it. Used when an operation is
+/// pinned to an earlier manifest, so files that arrived later are not part
+/// of its dataset.
+pub(crate) struct SnapshotFiles {
+    inner: Box<dyn Source>,
+    files: Vec<FileFingerprint>,
+}
+
+impl SnapshotFiles {
+    pub(crate) fn new(inner: Box<dyn Source>, manifest: &Manifest) -> Self {
+        let mut files: Vec<FileFingerprint> = manifest
+            .rowgroup_space
+            .files
+            .iter()
+            .map(|f| f.fingerprint.clone())
+            .collect();
+        files.sort_by(|a, b| a.path.cmp(&b.path));
+        Self { inner, files }
+    }
+}
+
+impl Source for SnapshotFiles {
+    fn discover(&self, _root: &str) -> Result<Vec<FileFingerprint>> {
+        Ok(self.files.clone())
+    }
+
+    fn row_groups(&self, file: &FileFingerprint) -> Result<Vec<bellwether_types::RowGroupMeta>> {
+        self.inner.row_groups(file)
+    }
+
+    fn read_columns(
+        &self,
+        rg: &bellwether_types::RowGroupMeta,
+        columns: &[String],
+    ) -> Result<arrow::array::RecordBatch> {
+        self.inner.read_columns(rg, columns)
+    }
+
+    fn schema(&self, root: &str) -> Result<SchemaRef> {
+        self.inner.schema(root)
     }
 }
 

@@ -95,9 +95,10 @@ use bellwether_types::{Hash, Result};
 use crate::backend::{StoreExt, DEFAULT_PAGE_SIZE};
 use crate::commit::{commit_inner, read_manifest, ClaimMode, CommitOptions, Rng, StagedSegments};
 use crate::manifest::{
-    join, now_rfc3339, parse_rfc3339, segment_path, DeleteClaim, Extra, Manifest, SegmentTombstone,
-    SEGMENTS_DIR,
+    join, manifest_history_path, now_rfc3339, parse_rfc3339, segment_path, DeleteClaim, Extra,
+    Manifest, SegmentTombstone, MANIFESTS_DIR, SEGMENTS_DIR,
 };
+use crate::snapshot::history_sequence_of;
 
 /// Default cap on orphans processed per run (ADR 018).
 pub const DEFAULT_MAX_ORPHANS: usize = 10_000;
@@ -160,6 +161,14 @@ pub struct GcReport {
     /// Claimed ids released without being deleted; their tombstones were
     /// restored for a later run.
     pub released_undeleted: usize,
+    /// Historical manifest objects under `manifests/` deleted before segment
+    /// deletion so the retained history remains a contiguous suffix referencing
+    /// only live or still-retained segments.
+    pub manifests_pruned: u64,
+    /// Historical manifest objects under `manifests/` that could not be parsed
+    /// (or whose stored `sequence` disagreed with their filename); counted and
+    /// left untouched rather than deleted blindly.
+    pub unparsable_manifests: u64,
 }
 
 /// Runs GC over the index at `root` with default options.
@@ -200,19 +209,22 @@ pub fn gc_with<S: StoreExt + ?Sized>(
     };
     report.stale_claims_taken_over = claimed.taken_over;
 
-    // Phase 2: delete, fenced.
+    // Phase 2: prune manifest history and delete claimed segments, fenced.
     let mut deleted = BTreeSet::new();
-    let mut first_err = delete_claimed(
-        store,
-        root,
-        &run,
-        &opts,
-        &claimed,
-        &mut deleted,
-        &mut report,
-    )
-    .err();
-
+    let mut first_err =
+        prune_history_before_delete(store, root, &run, &opts, &claimed, &mut report)
+            .and_then(|()| {
+                delete_claimed(
+                    store,
+                    root,
+                    &run,
+                    &opts,
+                    &claimed,
+                    &mut deleted,
+                    &mut report,
+                )
+            })
+            .err();
     // Phase 3: scan for orphans, unless the run must hurry to release.
     let mut orphans = BTreeSet::new();
     if !report.fenced && first_err.is_none() {
@@ -414,6 +426,114 @@ fn claim<S: StoreExt + ?Sized>(
         restore_since,
         taken_over,
     })
+}
+/// Before deleting any claimed segment, prunes manifest history under
+/// `<root>/manifests/` so the retained range stays a contiguous suffix
+/// `[oldest, current]` whose manifests never reference a deleted segment.
+///
+/// Let `D` be the claimed segment ids this run still holds (`still_ours`). Let
+/// `m` be the greatest sequence of any history manifest (with sequence strictly
+/// less than the current manifest's sequence) that references an id in `D`
+/// ([`Manifest::references`]). Every parsable history manifest with
+/// `sequence <= m` is deleted before any segment in `D` is deleted.
+/// `manifest.json` (and the history copy of the current manifest, which cannot
+/// reference a claimed id) is never deleted. Unparsable history objects (or
+/// objects whose parsed `sequence` disagrees with their filename) are counted
+/// in [`GcReport::unparsable_manifests`] and never deleted blindly.
+fn prune_history_before_delete<S: StoreExt + ?Sized>(
+    store: &S,
+    root: &str,
+    run: &Run,
+    opts: &GcOptions,
+    claimed: &Claimed,
+    report: &mut GcReport,
+) -> Result<()> {
+    if claimed.ids.is_empty() {
+        return Ok(());
+    }
+    if run.fenced() {
+        report.fenced = true;
+        return Ok(());
+    }
+    let Some((current, _)) = read_manifest(store, root)? else {
+        return Ok(());
+    };
+    let d: BTreeSet<Hash> = current
+        .deleting
+        .iter()
+        .filter(|c| c.token == run.token && claimed.ids.contains(&c.id))
+        .map(|c| c.id)
+        .collect();
+    if d.is_empty() {
+        return Ok(());
+    }
+    let current_seq = current.sequence;
+    let mut seqs = BTreeSet::new();
+    store.list_pages(&join(root, MANIFESTS_DIR), opts.page_size, &mut |page| {
+        for meta in page {
+            if let Some(seq) = history_sequence_of(meta.location.as_ref()) {
+                if seq < current_seq {
+                    seqs.insert(seq);
+                }
+            }
+        }
+        Ok(ControlFlow::Continue(()))
+    })?;
+    if seqs.is_empty() {
+        return Ok(());
+    }
+    let mut max_referencing: Option<u64> = None;
+    let mut parsable_seqs = Vec::with_capacity(seqs.len());
+    for seq in seqs {
+        if run.fenced() {
+            report.fenced = true;
+            return Ok(());
+        }
+        let hpath = manifest_history_path(root, seq);
+        let Some((bytes, _)) = store.get_opt(&hpath)? else {
+            continue;
+        };
+        match Manifest::from_slice(&bytes) {
+            Ok(m) if m.sequence == seq => {
+                parsable_seqs.push(seq);
+                if d.iter().any(|id| m.references(id)) {
+                    max_referencing = Some(max_referencing.map_or(seq, |prev| prev.max(seq)));
+                }
+            }
+            Ok(m) => {
+                tracing::warn!(
+                    path = %hpath,
+                    expected = seq,
+                    found = m.sequence,
+                    "manifest history object sequence mismatches filename; skipping in GC"
+                );
+                report.unparsable_manifests += 1;
+            }
+            Err(err) => {
+                tracing::warn!(
+                    path = %hpath,
+                    error = %err,
+                    "unparsable manifest history object; skipping in GC"
+                );
+                report.unparsable_manifests += 1;
+            }
+        }
+    }
+    let Some(cutoff) = max_referencing else {
+        return Ok(());
+    };
+    for seq in parsable_seqs {
+        if seq > cutoff {
+            break;
+        }
+        if run.fenced() {
+            report.fenced = true;
+            return Ok(());
+        }
+        store.delete(&manifest_history_path(root, seq))?;
+        report.manifests_pruned += 1;
+    }
+    Ok(())
 }
 
 /// Phase 2: deletes the claimed ids in batches. The manifest is re-read, to

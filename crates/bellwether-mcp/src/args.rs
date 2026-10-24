@@ -139,6 +139,9 @@ impl EngineArgs {
                 PartitioningArg::None => Partitioning::None,
                 PartitioningArg::Hive => Partitioning::Hive,
             }),
+            // Pinning is per lookup (`at_manifest` on the observe tools,
+            // `--at-manifest` on the CLI's lookups), never per session.
+            at_manifest: None,
             clock: self.clock.clone(),
         })
     }

@@ -28,6 +28,8 @@ pub type Extra = Map<String, Value>;
 
 /// File name of the manifest under an index root.
 pub const MANIFEST_FILE: &str = "manifest.json";
+/// Directory of immutable committed manifest history objects under an index root.
+pub const MANIFESTS_DIR: &str = "manifests";
 /// Directory of immutable segments under an index root.
 pub const SEGMENTS_DIR: &str = "segments";
 /// Directory of the rebuildable cache under an index root.
@@ -48,6 +50,13 @@ pub fn join(root: &str, rel: &str) -> String {
 #[must_use]
 pub fn manifest_path(root: &str) -> String {
     join(root, MANIFEST_FILE)
+}
+
+/// Store path of the immutable history manifest for `sequence` under `root`:
+/// `manifests/<sequence as 20-digit zero-padded decimal>.json`.
+#[must_use]
+pub fn manifest_history_path(root: &str, sequence: u64) -> String {
+    join(root, &format!("{MANIFESTS_DIR}/{sequence:020}.json"))
 }
 
 /// Store path of segment `id` under `root`: `segments/<blake3>.seg`.

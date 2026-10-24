@@ -248,14 +248,17 @@ impl Engine {
     /// Runs score → verify → apply → attest for `request.proposal`, or
     /// apply → attest for an earlier `request.certificate` (module docs).
     pub fn fix(&self, request: &FixRequest) -> Result<FixResult> {
-        guard(|| match (&request.proposal, &request.certificate) {
-            (Some(p), None) => self.fix_proposal(p, request),
-            (None, Some(c)) => self.apply_certificate(c, false),
-            _ => Err(Error::Other(
-                "fix takes a proposal (--proposal) or a certificate to apply (--certificate), \
+        guard(|| {
+            self.require_current("fix")?;
+            match (&request.proposal, &request.certificate) {
+                (Some(p), None) => self.fix_proposal(p, request),
+                (None, Some(c)) => self.apply_certificate(c, false),
+                _ => Err(Error::Other(
+                    "fix takes a proposal (--proposal) or a certificate to apply (--certificate), \
                  not both"
-                    .into(),
-            )),
+                        .into(),
+                )),
+            }
         })
     }
 
@@ -267,7 +270,10 @@ impl Engine {
     /// nothing anywhere: no replay, no build, no receipt, and it never
     /// creates the index location.
     pub fn apply_dry_run(&self, certificate: &Hash) -> Result<FixResult> {
-        guard(|| self.apply_certificate(certificate, true))
+        guard(|| {
+            self.require_current("fix")?;
+            self.apply_certificate(certificate, true)
+        })
     }
 
     /// The current [`DataState`]. Reads footers; writes nothing and never

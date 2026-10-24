@@ -182,6 +182,21 @@ pub enum Error {
         /// The dataset's columns, in schema order.
         columns: Vec<String>,
     },
+    /// A lookup pinned to a committed manifest sequence the index does not
+    /// retain: never committed, or pruned by garbage collection (which
+    /// removes every manifest up to the newest one that references a
+    /// segment it deletes, so the retained sequences are one contiguous run
+    /// ending at the current one). Each surface says which sequences to pass
+    /// instead, from `retained`.
+    #[error("{}", not_retained(index, *requested, retained))]
+    NotRetained {
+        /// The index location.
+        index: String,
+        /// The sequence asked for.
+        requested: u64,
+        /// The sequences that can be pinned, ascending (empty: no index).
+        retained: Vec<u64>,
+    },
     /// Serialization failure.
     #[error("serde error: {0}")]
     Serde(#[from] serde_json::Error),
@@ -249,6 +264,22 @@ fn not_indexed(root: &str, operation: &str, needs: Option<&str>) -> String {
         Some(spec) => format!(
             "{root} has no complete {spec} key spec, so {operation} has no index to plan with"
         ),
+    }
+}
+
+fn not_retained(index: &str, seq: u64, retained: &[u64]) -> String {
+    match (retained.first(), retained.last()) {
+        (Some(&oldest), Some(&current)) if seq > current => format!(
+            "manifest sequence {seq} has not been committed in the index at {index}; the current \
+             sequence is {current} and the oldest retained is {oldest}"
+        ),
+        (Some(&oldest), Some(&current)) => format!(
+            "manifest sequence {seq} is no longer retained in the index at {index}: the oldest \
+             retained is {oldest} (current {current}); garbage collection drops a sequence once \
+             it deletes a segment that sequence used, and commits made before this release kept \
+             no copy"
+        ),
+        _ => format!("manifest sequence {seq} cannot be pinned: there is no index at {index}"),
     }
 }
 

@@ -14,9 +14,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use bellwether_store::{
-    claimed_segment, commit, gc, gc_with, manifest_path, read_manifest, segment_path, DeleteClaim,
-    Extra, GcOptions, Manifest, ObjectMeta, ObjectStoreBackend, RowGroupRange, SegmentRef,
-    Snapshot, StagedSegments, StoreExt,
+    claimed_segment, commit, gc, gc_with, manifest_history_path, manifest_path, read_manifest,
+    retained_sequences, segment_path, DeleteClaim, Extra, GcOptions, Manifest, ObjectMeta,
+    ObjectStoreBackend, RowGroupRange, SegmentRef, Snapshot, StagedSegments, StoreExt,
 };
 use bellwether_types::{Error, Hash, Result, Store, StoreVersion};
 use bytes::Bytes;
@@ -112,12 +112,14 @@ impl Store for Hooked {
         self.inner.list(p)
     }
     fn delete(&self, p: &str) -> Result<()> {
-        let hook = self.before_delete.lock().unwrap().take();
-        if let Some(h) = hook {
-            h(&self.inner, p);
-        }
-        if std::mem::take(&mut *self.fail_first_delete.lock().unwrap()) {
-            return Err(Error::Store("delete timed out".into()));
+        if p.contains("/segments/") {
+            let hook = self.before_delete.lock().unwrap().take();
+            if let Some(h) = hook {
+                h(&self.inner, p);
+            }
+            if std::mem::take(&mut *self.fail_first_delete.lock().unwrap()) {
+                return Err(Error::Store("delete timed out".into()));
+            }
         }
         self.inner.delete(p)
     }
@@ -139,9 +141,11 @@ impl StoreExt for Hooked {
         n: usize,
         f: &mut dyn FnMut(&[ObjectMeta]) -> Result<ControlFlow<()>>,
     ) -> Result<()> {
-        let hook = self.before_list.lock().unwrap().take();
-        if let Some(h) = hook {
-            h(&self.inner);
+        if p.ends_with("segments") {
+            let hook = self.before_list.lock().unwrap().take();
+            if let Some(h) = hook {
+                h(&self.inner);
+            }
         }
         self.inner.list_pages(p, n, f)
     }
@@ -592,6 +596,7 @@ fn abandoned_claims_are_taken_over_only_after_the_lease() {
         lease_ms: 0,
         extra: Extra::new(),
     });
+    m.sequence += 1;
     store
         .put_if_version(&manifest_path("idx"), Bytes::from(m.to_vec().unwrap()), &v)
         .unwrap();
@@ -769,4 +774,352 @@ fn gc_pages_and_caps_orphans() {
     assert_eq!((r1.tombstoned, r1.orphans_deferred), (2, 3));
     let r2 = gc_with(&store, "idx", Duration::from_secs(3600), opts).unwrap();
     assert_eq!((r2.tombstoned, r2.orphans_deferred, r2.retained), (2, 1, 2));
+}
+
+#[test]
+fn manifest_history_commit_open_at_backfill_and_gc_pruning() {
+    let dir = tempfile::tempdir().unwrap();
+    let local = Arc::new(ObjectStoreBackend::local(dir.path()).unwrap());
+    let memory = Arc::new(ObjectStoreBackend::memory().unwrap());
+    for (name, store) in [("local", local), ("memory", memory)] {
+        manifest_history_suite(&store, name);
+    }
+}
+
+fn manifest_history_suite(store: &Arc<ObjectStoreBackend>, backend: &str) {
+    let root = "idx";
+    assert_eq!(
+        retained_sequences(&**store, root).unwrap(),
+        Vec::<u64>::new()
+    );
+    assert!(Snapshot::open_at(Arc::clone(store), root, 0)
+        .unwrap()
+        .is_none());
+    assert!(Snapshot::open_at(Arc::clone(store), root, 1)
+        .unwrap()
+        .is_none());
+
+    let mut staged = StagedSegments::new();
+    let s1 = seg(&mut staged, "segment 1", 0);
+    let s2 = seg(&mut staged, "segment 2", 1);
+    let s3 = seg(&mut staged, "segment 3", 2);
+
+    // Commit 1: adds s1.
+    let c1 = commit(&**store, root, &staged, adding(&s1)).unwrap();
+    assert_eq!(c1.sequence, 1);
+    let (m1_bytes, _) = store.get(&manifest_path(root)).unwrap();
+    let (m1, _) = read_manifest(&**store, root).unwrap().unwrap();
+
+    // Commit 2: adds s2 (keeps s1 and s2).
+    let c2 = commit(&**store, root, &staged, adding(&s2)).unwrap();
+    assert_eq!(c2.sequence, 2);
+    let (m2_bytes, _) = store.get(&manifest_path(root)).unwrap();
+
+    // Commit 3: drops s1 and s2, adds s3.
+    let c3 = commit(&**store, root, &staged, |m: &Manifest| {
+        let mut m = m.clone();
+        m.segments.clear();
+        m.add_segment(s3.clone());
+        Ok(m)
+    })
+    .unwrap();
+    assert_eq!(c3.sequence, 3);
+    let (m3_bytes, _) = store.get(&manifest_path(root)).unwrap();
+
+    assert_eq!(
+        retained_sequences(&**store, root).unwrap(),
+        vec![1, 2, 3],
+        "{backend}: retained_sequences after 3 commits"
+    );
+
+    // Every history object is byte-identical to the bytes committed to manifest.json.
+    assert_eq!(
+        store.get(&manifest_history_path(root, 1)).unwrap().0,
+        m1_bytes
+    );
+    assert_eq!(
+        store.get(&manifest_history_path(root, 2)).unwrap().0,
+        m2_bytes
+    );
+    assert_eq!(
+        store.get(&manifest_history_path(root, 3)).unwrap().0,
+        m3_bytes
+    );
+
+    // open_at(1) returns the first manifest and reads its segment; reopen on a
+    // historical snapshot stays pinned to sequence 1.
+    let snap1 = Snapshot::open_at(Arc::clone(store), root, 1)
+        .unwrap()
+        .expect("sequence 1 retained");
+    assert_eq!(snap1.sequence(), 1);
+    assert_eq!(snap1.manifest(), &m1);
+    assert_eq!(snap1.manifest().to_vec().unwrap(), &m1_bytes[..]);
+    assert_eq!(&snap1.read_segment(&s1.id).unwrap()[..], b"segment 1");
+    assert!(snap1.read_segment(&s2.id).is_err());
+    let snap1_reopened = snap1.reopen().unwrap();
+    assert_eq!(snap1_reopened.sequence(), 1);
+    assert_eq!(snap1_reopened.manifest(), &m1);
+
+    // A racing writer that loses CAS writes no history object for its lost attempt.
+    let s4 = seg(&mut staged, "segment 4", 3);
+    let s_abort = seg(&mut staged, "segment abort", 4);
+    let hooked = Hooked::new((**store).clone());
+    let winner_staged = staged.clone();
+    let winner_seg = s4.clone();
+    *hooked.before_cas.lock().unwrap() = Some(Box::new(move |s: &ObjectStoreBackend| {
+        // Interloper wins sequence 4 right before this writer's CAS.
+        commit(s, root, &winner_staged, adding(&winner_seg)).unwrap();
+    }));
+    let mut calls = 0;
+    let err = commit(&hooked, root, &staged, |m: &Manifest| {
+        calls += 1;
+        if calls == 1 {
+            let mut m = m.clone();
+            m.add_segment(s_abort.clone());
+            return Ok(m);
+        }
+        // Abort on rebase so this writer never commits.
+        Err(Error::Other("abort after lost CAS".into()))
+    })
+    .unwrap_err();
+    assert!(matches!(err, Error::Other(_)));
+    assert_eq!(calls, 2);
+    // Sequence 4 in history must be the interloper's (referencing s4, not s_abort),
+    // and no sequence 5 exists.
+    assert_eq!(
+        retained_sequences(&**store, root).unwrap(),
+        vec![1, 2, 3, 4]
+    );
+    let snap4 = Snapshot::open_at(Arc::clone(store), root, 4)
+        .unwrap()
+        .unwrap();
+    assert!(snap4.manifest().references(&s4.id));
+    assert!(!snap4.manifest().references(&s_abort.id));
+    // Backfill after a deleted history object for the current sequence (4):
+    // while absent, open_at(4) and retained_sequences still include sequence 4
+    // from manifest.json; the next commit backfills manifests/00000000000000000004.json
+    // byte-identically to the base manifest.json bytes.
+    let (m4_bytes, _) = store.get(&manifest_path(root)).unwrap();
+    store.delete(&manifest_history_path(root, 4)).unwrap();
+    assert!(!store.exists(&manifest_history_path(root, 4)).unwrap());
+    assert_eq!(
+        retained_sequences(&**store, root).unwrap(),
+        vec![1, 2, 3, 4]
+    );
+    assert_eq!(
+        Snapshot::open_at(Arc::clone(store), root, 4)
+            .unwrap()
+            .unwrap()
+            .sequence(),
+        4
+    );
+    let c5 = commit(&**store, root, &staged, |m: &Manifest| Ok(m.clone())).unwrap();
+    assert_eq!(c5.sequence, 5);
+    assert_eq!(
+        store.get(&manifest_history_path(root, 4)).unwrap().0,
+        m4_bytes,
+        "{backend}: commit 5 backfilled sequence 4 byte-identically"
+    );
+    assert_eq!(
+        retained_sequences(&**store, root).unwrap(),
+        vec![1, 2, 3, 4, 5]
+    );
+
+    // GC deletes s1 and s2 (referenced by sequence 1 and sequence 2, dropped at
+    // sequence 3). History 1 and 2 must be pruned BEFORE segment deletion, while
+    // 3, 4, 5 remain retained.
+    let order_store = HistoryOrderProbe {
+        inner: (**store).clone(),
+        events: Mutex::new(Vec::new()),
+    };
+    let report = gc(&order_store, root, Duration::ZERO).unwrap();
+    assert_eq!(report.deleted, 2);
+    assert_eq!(report.manifests_pruned, 2);
+    assert_eq!(report.unparsable_manifests, 0);
+    let events = order_store.events.lock().unwrap().clone();
+    let last_hist_del = events
+        .iter()
+        .rposition(|p| p.contains("/manifests/"))
+        .expect("history manifests deleted");
+    let first_seg_del = events
+        .iter()
+        .position(|p| p.contains("/segments/"))
+        .expect("segments deleted");
+    assert!(
+        last_hist_del < first_seg_del,
+        "{backend}: history deletion must precede segment deletion: {events:?}"
+    );
+
+    // Sequence 3, 4, 5 remain, plus GC's claim (6) and release (7) commits.
+    assert_eq!(
+        retained_sequences(&**store, root).unwrap(),
+        vec![3, 4, 5, 6, 7]
+    );
+    assert!(Snapshot::open_at(Arc::clone(store), root, 1)
+        .unwrap()
+        .is_none());
+    assert!(Snapshot::open_at(Arc::clone(store), root, 2)
+        .unwrap()
+        .is_none());
+    assert!(
+        snap1.reopen().is_err(),
+        "reopen of pruned historical snapshot fails"
+    );
+    let snap3 = Snapshot::open_at(Arc::clone(store), root, 3)
+        .unwrap()
+        .unwrap();
+    assert_eq!(snap3.sequence(), 3);
+    assert_eq!(&snap3.read_segment(&s3.id).unwrap()[..], b"segment 3");
+    assert!(store.exists(&manifest_path(root)).unwrap());
+}
+
+struct HistoryOrderProbe {
+    inner: ObjectStoreBackend,
+    events: Mutex<Vec<String>>,
+}
+
+impl Store for HistoryOrderProbe {
+    fn get(&self, p: &str) -> Result<(Bytes, StoreVersion)> {
+        self.inner.get(p)
+    }
+    fn put_if_absent(&self, p: &str, b: Bytes) -> Result<StoreVersion> {
+        self.inner.put_if_absent(p, b)
+    }
+    fn put_if_version(&self, p: &str, b: Bytes, e: &StoreVersion) -> Result<StoreVersion> {
+        self.inner.put_if_version(p, b, e)
+    }
+    fn put_content_addressed(&self, p: &str, b: Bytes) -> Result<()> {
+        self.inner.put_content_addressed(p, b)
+    }
+    fn list(&self, p: &str) -> Result<Vec<String>> {
+        self.inner.list(p)
+    }
+    fn delete(&self, p: &str) -> Result<()> {
+        self.events.lock().unwrap().push(p.to_string());
+        self.inner.delete(p)
+    }
+}
+
+impl StoreExt for HistoryOrderProbe {
+    fn get_opt(&self, p: &str) -> Result<Option<(Bytes, StoreVersion)>> {
+        self.inner.get_opt(p)
+    }
+    fn exists(&self, p: &str) -> Result<bool> {
+        self.inner.exists(p)
+    }
+    fn get_range(&self, p: &str, r: std::ops::Range<u64>) -> Result<Option<Bytes>> {
+        self.inner.get_range(p, r)
+    }
+    fn list_pages(
+        &self,
+        p: &str,
+        n: usize,
+        f: &mut dyn FnMut(&[ObjectMeta]) -> Result<ControlFlow<()>>,
+    ) -> Result<()> {
+        self.inner.list_pages(p, n, f)
+    }
+}
+
+#[test]
+fn gc_contiguous_pruning_and_unparsable_history_handling() {
+    let store = Arc::new(ObjectStoreBackend::memory().unwrap());
+    let root = "idx";
+    let mut staged = StagedSegments::new();
+    let s1 = seg(&mut staged, "s1", 0);
+    let s2 = seg(&mut staged, "s2", 1);
+    let s3 = seg(&mut staged, "s3", 2);
+
+    // Seq 1 references s1 (never dropped).
+    commit(&*store, root, &staged, adding(&s1)).unwrap();
+    // Seq 2 adds s2.
+    commit(&*store, root, &staged, adding(&s2)).unwrap();
+    // Seq 3 drops s2, adds s3 (keeps s1 and s3).
+    commit(&*store, root, &staged, |m: &Manifest| {
+        let mut m = m.clone();
+        m.segments.retain(|x| x.id != s2.id);
+        m.add_segment(s3.clone());
+        Ok(m)
+    })
+    .unwrap();
+
+    // Plant an unparsable history object at sequence 00000000000000000001 by
+    // overwriting it via put_content_addressed, plus a staging file in manifests/.
+    // First verify contiguous pruning when seq 2 references s2 (which is deleted):
+    // seq 1 only references s1 (which is still live!), yet because seq 2 <= m=2 is
+    // pruned, seq 1 <= m=2 must also be pruned so retained history is [3].
+    let r = gc(&*store, root, Duration::ZERO).unwrap();
+    assert_eq!(r.deleted, 1);
+    assert_eq!(r.manifests_pruned, 2);
+    // Seq 1 and 2 were pruned; seq 3 plus GC's claim (4) and release (5) remain.
+    assert_eq!(retained_sequences(&*store, root).unwrap(), vec![3, 4, 5]);
+
+    // Now test unparsable history object: plant corrupt JSON at sequence 2 and
+    // delete s3 in seq 6 so GC runs history pruning (claim=7, release=8).
+    store
+        .put_content_addressed(
+            &manifest_history_path(root, 2),
+            Bytes::from_static(b"not valid json"),
+        )
+        .unwrap();
+    store
+        .put_content_addressed(
+            "idx/manifests/00000000000000000002.json#12345678901234567890",
+            Bytes::from_static(b"staging"),
+        )
+        .unwrap();
+    commit(&*store, root, &staged, |m: &Manifest| {
+        let mut m = m.clone();
+        m.segments.retain(|x| x.id != s3.id);
+        Ok(m)
+    })
+    .unwrap();
+
+    let r2 = gc(&*store, root, Duration::ZERO).unwrap();
+    assert_eq!(r2.deleted, 1);
+    assert_eq!(
+        r2.manifests_pruned, 3,
+        "seqs 3, 4, 5 (all referencing s3) pruned"
+    );
+    assert_eq!(
+        r2.unparsable_manifests, 1,
+        "corrupt seq 2 counted and not blindly deleted; staging file ignored"
+    );
+    assert!(store.exists(&manifest_history_path(root, 2)).unwrap());
+    assert!(!store.exists(&manifest_history_path(root, 3)).unwrap());
+    assert!(!store.exists(&manifest_history_path(root, 4)).unwrap());
+    assert!(!store.exists(&manifest_history_path(root, 5)).unwrap());
+    assert!(store.exists(&manifest_history_path(root, 6)).unwrap());
+}
+
+#[test]
+fn a_history_object_that_differs_is_kept_and_never_blocks_a_commit() {
+    let store = Arc::new(ObjectStoreBackend::memory().unwrap());
+    let root = "idx";
+    let staged = StagedSegments::new();
+    commit(&*store, root, &staged, |m: &Manifest| Ok(m.clone())).unwrap();
+    // Rewrite manifests/00000000000000000001.json so its bytes differ from
+    // manifest.json (as if manifest.json had been edited in place).
+    let (mut m1, _) = read_manifest(&*store, root).unwrap().unwrap();
+    m1.commit_nonce ^= 1;
+    let kept = Bytes::from(m1.to_vec().unwrap());
+    store
+        .put_content_addressed(&manifest_history_path(root, 1), kept.clone())
+        .unwrap();
+    let c = commit(&*store, root, &staged, |m: &Manifest| Ok(m.clone())).unwrap();
+    assert_eq!(c.sequence, 2);
+    assert_eq!(store.get(&manifest_history_path(root, 1)).unwrap().0, kept);
+
+    // Also check open_at refuses a history file whose internal sequence != filename sequence.
+    m1.sequence = 99;
+    store
+        .put_content_addressed(
+            &manifest_history_path(root, 1),
+            Bytes::from(m1.to_vec().unwrap()),
+        )
+        .unwrap();
+    let err = Snapshot::open_at(Arc::clone(&store), root, 1).unwrap_err();
+    assert!(
+        matches!(&err, Error::Store(msg) if msg.contains("sequence 99, expected 1")),
+        "{err:?}"
+    );
 }

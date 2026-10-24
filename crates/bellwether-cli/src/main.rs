@@ -142,6 +142,10 @@ struct WhyArgs {
     /// columns.
     #[arg(long, value_name = "N", default_value_t = bellwether::DEFAULT_MAX_CANDIDATES)]
     max_candidates: usize,
+    /// Profile and replay the committed manifest at this sequence instead
+    /// of the current one (the files it recorded, its key specs).
+    #[arg(long, value_name = "SEQUENCE")]
+    at_manifest: Option<u64>,
 }
 
 #[derive(Args)]
@@ -164,6 +168,12 @@ struct LookupArgs {
     /// Key columns to take from the file, comma-separated [default: all].
     #[arg(long, value_name = "COLS", value_delimiter = ',')]
     key: Option<Vec<String>>,
+    /// Plan against the committed manifest at this sequence instead of the
+    /// current one, so a lookup run later over a grown folder reads exactly
+    /// what it read then. Files added since are ignored; the retained
+    /// sequences are listed when one is not.
+    #[arg(long, value_name = "SEQUENCE")]
+    at_manifest: Option<u64>,
 }
 
 #[derive(Args)]
@@ -365,6 +375,12 @@ fn hint(e: &Error) -> Option<String> {
             };
             Some(format!("check {flag}"))
         }
+        Error::NotRetained { retained, .. } => match (retained.first(), retained.last()) {
+            (Some(oldest), Some(current)) => {
+                Some(format!("pass one of {oldest}..={current} to --at-manifest"))
+            }
+            _ => Some("run `bellwether index` first".to_string()),
+        },
         _ => None,
     }
 }
@@ -382,7 +398,20 @@ pub(crate) fn done<T: Serialize>(result: &T, human: String, code: u8) -> Result<
 }
 
 pub(crate) fn engine(global: &Global, root: &str) -> Result<Engine, Failure> {
-    Ok(Engine::open(root, engine_options(global)?)?)
+    engine_at(global, root, None)
+}
+
+/// [`engine`], pinned to the committed manifest at `at_manifest` when given.
+pub(crate) fn engine_at(
+    global: &Global,
+    root: &str,
+    at_manifest: Option<u64>,
+) -> Result<Engine, Failure> {
+    let options = EngineOptions {
+        at_manifest,
+        ..engine_options(global)?
+    };
+    Ok(Engine::open(root, options)?)
 }
 
 /// The engine options the global flags name.
@@ -496,15 +525,15 @@ fn run(cli: &Cli, out: &Out) -> Result<Outcome, Failure> {
     }
 }
 
-/// A plan lookup (`locate`, `latest`, `asof`): the engine and the key
-/// file, handed to `plan`.
+/// A plan lookup (`locate`, `latest`, `asof`): the engine, pinned to
+/// `--at-manifest` when given, and the key file, handed to `plan`.
 fn lookup(
     g: &Global,
     out: &Out,
     args: &LookupArgs,
     plan: impl FnOnce(&Engine, &KeyFile) -> Result<bellwether::PlanResult, Error>,
 ) -> Result<Outcome, Failure> {
-    let engine = engine(g, &args.root.root)?;
+    let engine = engine_at(g, &args.root.root, args.at_manifest)?;
     let result = plan(&engine, &key_file(&args.keys, args.key.as_ref()))?;
     done(&result, human::plan(&result, out), EXIT_OK)
 }
@@ -559,6 +588,6 @@ fn why(g: &Global, out: &Out, a: &WhyArgs) -> Result<Outcome, Failure> {
         columns: a.columns.clone(),
         max_candidates: a.max_candidates,
     };
-    let r = engine(g, &a.root.root)?.why(&request)?;
+    let r = engine_at(g, &a.root.root, a.at_manifest)?.why(&request)?;
     done(&r, human::why(&r, out), EXIT_OK)
 }

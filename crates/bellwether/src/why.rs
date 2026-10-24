@@ -19,7 +19,7 @@ use bellwether_types::{
 };
 use serde::{Deserialize, Serialize};
 
-use crate::engine::{folder_changes, guard, schema_hint, Engine, Pinned};
+use crate::engine::{folder_changes, guard, schema_hint, Engine, Pinned, SnapshotFiles};
 use crate::keys::KeyFile;
 use crate::results::{total, Cost, Written};
 
@@ -286,7 +286,14 @@ impl Engine {
             self.check_columns(&cols.iter().collect::<Vec<_>>())?;
         }
         let pinned = self.pin()?;
-        let source = self.source(pinned.as_ref())?;
+        let folder = self.source(pinned.as_ref())?;
+        // Pinned to an earlier manifest: the dataset is exactly the files
+        // that manifest recorded, for the profile as for the replay.
+        let source: Box<dyn bellwether_types::Source> = match (&pinned, self.options().at_manifest)
+        {
+            (Some(p), Some(_)) => Box::new(SnapshotFiles::new(folder, p.manifest())),
+            _ => folder,
+        };
         let sequence = pinned.as_ref().map_or(0, Pinned::sequence);
         let current_specs = pinned.as_ref().map(|p| p.specs().0).unwrap_or_default();
         let replayer = match &pinned {
@@ -301,7 +308,10 @@ impl Engine {
             bytes: catalog.bytes_total(),
         };
         let mut untracked = Vec::new();
-        if let Some(p) = &pinned {
+        if let Some(p) = pinned
+            .as_ref()
+            .filter(|_| self.options().at_manifest.is_none())
+        {
             for fp in folder_changes(self.root(), p, self.format())?.untracked {
                 for rg in source.row_groups(&fp)? {
                     dataset.row_groups += 1;
@@ -357,18 +367,29 @@ impl Engine {
         } else {
             self.writable_store().map(Arc::clone)
         };
-        let store = if let Some(s) = &writable {
-            Arc::clone(s)
-        } else {
-            // Profile in memory, with the index's manifest when it can be
-            // read, so a read-only index still informs the lints.
-            let memory = Arc::new(ObjectStoreBackend::memory()?);
-            if let Some(existing) = self.existing_store().ok().flatten() {
-                if let Some((bytes, _)) = existing.get_opt("manifest.json")? {
-                    memory.put_if_absent("manifest.json", bytes)?;
-                }
+        let store = match (
+            &writable,
+            pinned.filter(|_| self.options().at_manifest.is_some()),
+        ) {
+            // Pinned to an earlier manifest: the profile reads that
+            // manifest, in memory, so its lints see the specs it declared.
+            (_, Some(p)) => {
+                let memory = Arc::new(ObjectStoreBackend::memory()?);
+                memory.put_if_absent("manifest.json", p.bytes.clone())?;
+                memory
             }
-            memory
+            (Some(s), None) => Arc::clone(s),
+            (None, None) => {
+                // Profile in memory, with the index's manifest when it can
+                // be read, so a read-only index still informs the lints.
+                let memory = Arc::new(ObjectStoreBackend::memory()?);
+                if let Some(existing) = self.existing_store().ok().flatten() {
+                    if let Some((bytes, _)) = existing.get_opt("manifest.json")? {
+                        memory.put_if_absent("manifest.json", bytes)?;
+                    }
+                }
+                memory
+            }
         };
         let mut options = ProfileOptions::for_source(&self.source_config(pinned)?);
         options.columns.clone_from(&req.columns);

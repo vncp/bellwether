@@ -30,6 +30,10 @@ Versioned from the first commit. `bellwether-types::format::STORAGE_VERSION` is 
                                  unknown fields in manifest-owned objects are preserved on rewrite; an unknown KeySpec
                                  kind or an unknown field in KeySpec or FileFingerprint is refused with
                                  Error::UnsupportedVersion (adding one requires a storage_version bump; ADR 017)
+  manifests/<sequence>.json      every committed manifest, byte for byte, named by its sequence as 20 zero-padded
+                                 decimal digits; written with put_if_absent only after the commit's CAS succeeded,
+                                 and backfilled from manifest.json by the next commit if that write failed; never
+                                 overwritten and never blocking a commit; see "Manifest history"
   segments/<blake3>.seg          header{storage_version, encoding_version, key_spec, codec, bloom_hash}
                                  bloom_hash ∈ {"canonical", "parquet_plain"}; readers refuse any other value
                                  exact:    block index of sorted key blocks, one split-block bloom per block,
@@ -186,3 +190,7 @@ An index built with `--partitioning hive` records `source.partitioning = "hive"`
 ## Plan order (2026-10-24)
 
 A plan's entries are one per file and name their row groups as a set, read in ascending index. When a complete range key on a timestamp or date column exists (several: the one on the lookup's own time column), lookups order entries by the smallest row-group minimum among each entry's planned row groups, as the range key's segments record it (no minimum, every value null: last; ties by path), and the result names the column (`ordered_by`) only when reading entries in order, each entry's row groups ascending, visits every planned row group in non-decreasing minimum. Otherwise the result says the order is unspecified and why (two files overlap in time, or a file's own row groups run out of time order). The planned row groups and bytes never depend on the order.
+
+## Manifest history (2026-10-24)
+
+`manifests/<sequence>.json` holds each committed manifest's exact bytes, so a lookup can be planned against an earlier sequence (`--at-manifest N`) and return the plan it returned then, byte for byte. The copy is written with `put_if_absent` after the commit's CAS is known to have succeeded (never for an attempt that lost or whose outcome is unknown); a commit that cannot write it still succeeds, and the next commit backfills the base's copy from `manifest.json`. An existing copy with different bytes is kept and never overwritten (`manifest.json` was rewritten outside the commit protocol); history never blocks a commit. Garbage collection, before deleting any segment, deletes every history manifest at or below the greatest sequence that references a segment it deletes, so the retained sequences are always one contiguous run ending at the current one, and every retained sequence's segments exist. A history object that does not parse, or whose sequence disagrees with its name, is counted and left in place. A pinned lookup refuses a sequence outside the retained run and names the run; an index written before this amendment retains sequences from its first commit by a binary that writes history.
