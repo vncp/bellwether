@@ -303,12 +303,18 @@ pub(crate) fn why(r: &bellwether::WhyReport, out: &Out) -> String {
         bytes: r.dataset.bytes,
     };
     let rows = format!("{} rows", num(r.dataset.rows));
-    if let (Some(w), Some(current)) = (&r.workload, r.current) {
-        let kind_label = match &w.lookup {
-            None | Some(LookupKind::Locate) => None,
-            Some(LookupKind::Latest) => Some("latest".to_string()),
-            Some(LookupKind::Asof { at, .. }) => Some(format!("asof {at}")),
+    let kind_label = r.workload.as_ref().and_then(|w| {
+        let kind = match &w.lookup {
+            None | Some(LookupKind::Locate) => return None,
+            Some(LookupKind::Latest) => "latest".to_string(),
+            Some(LookupKind::Asof { at, .. }) => format!("asof {at}"),
         };
+        Some(match &w.lookback {
+            Some(l) => format!("{kind}, lookback {}", l.given),
+            None => kind,
+        })
+    });
+    if let (Some(w), Some(current)) = (&r.workload, r.current) {
         match &kind_label {
             None => {
                 let _ = writeln!(
@@ -354,9 +360,13 @@ pub(crate) fn why(r: &bellwether::WhyReport, out: &Out) -> String {
             let mut notes = Vec::new();
             match (&c.origin, &c.spec, &kind_label) {
                 (CandidateOrigin::Workload, KeySpec::Temporal { .. }, Some(k)) => {
-                    notes.push(format!(
-                        "floor ({k}): only row groups holding the winning version"
-                    ));
+                    notes.push(if w.lookback.is_some() {
+                        format!(
+                            "floor ({k}): only row groups holding a version in each key's window"
+                        )
+                    } else {
+                        format!("floor ({k}): only row groups holding the winning version")
+                    });
                 }
                 (CandidateOrigin::Workload, _, Some(_)) => {
                     notes.push("floor (locate): only row groups holding a key".to_string());
@@ -434,11 +444,9 @@ pub(crate) fn why(r: &bellwether::WhyReport, out: &Out) -> String {
         let _ = writeln!(s, "\nculprit ({}): {why}{fan}", c.columns.join(", "));
     }
     if let Some(w) = &r.workload {
-        let for_kind = match &w.lookup {
-            None | Some(LookupKind::Locate) => String::new(),
-            Some(LookupKind::Latest) => " (for latest)".to_string(),
-            Some(LookupKind::Asof { at, .. }) => format!(" (for asof {at})"),
-        };
+        let for_kind = kind_label
+            .as_ref()
+            .map_or_else(String::new, |k| format!(" (for {k})"));
         match &r.recommended {
             Some(rec) => {
                 let _ = writeln!(

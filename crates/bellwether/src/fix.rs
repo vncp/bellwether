@@ -57,7 +57,8 @@ pub struct RewriteOutputs {
     pub latest_by: Option<String>,
     /// Columns left out of the row hash (listed on the certificate).
     pub ignore: Vec<String>,
-    /// Decimal columns totalled exactly.
+    /// Columns totalled exactly: `col` (decimal) or `col:dec(S)` (float
+    /// quantized at scale `S`), as `ReconcileRequest::totals`.
     pub totals: Vec<String>,
     /// Columns grouping the totals.
     pub group_by: Vec<String>,
@@ -630,7 +631,7 @@ impl Engine {
         let right_source = self.output_source()?;
         let mut spec = ReconcileSpec::new(outputs.key.clone())
             .ignore(outputs.ignore.clone())
-            .totals(outputs.totals.clone())
+            .with_totals(crate::reconcile::total_columns(&outputs.totals)?)
             .group_by(outputs.group_by.clone());
         if let Some(l) = &outputs.latest_by {
             spec = spec.latest_by(l.clone());

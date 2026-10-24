@@ -3,7 +3,7 @@
 use bellwether_types::{Error, Result};
 use bellwether_verify::{
     CertificateContext, CoverageRequest, ManifestAnchor, Options, ReconcileSpec, Reconciliation,
-    Side,
+    Side, TotalColumn,
 };
 use serde::{Deserialize, Serialize};
 
@@ -20,7 +20,11 @@ pub struct ReconcileRequest {
     pub latest_by: Option<String>,
     /// Columns left out of the row hash; listed on the certificate.
     pub ignore: Vec<String>,
-    /// Decimal columns totalled exactly.
+    /// Columns totalled exactly: `col` for a decimal column, or
+    /// `col:dec(S)` for a float column quantized at scale `S` (each value's
+    /// exact binary value rounded half to even, then summed as an `i128`;
+    /// NaN or infinity is an error naming the key). Quantized totals are
+    /// labeled `col:dec(S)` in the outcome and the certificate.
     pub totals: Vec<String>,
     /// Columns grouping the totals.
     pub group_by: Vec<String>,
@@ -49,16 +53,35 @@ pub struct ReconcileResult {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ReconcileProblem {
-    /// A `totals` column is not a decimal. Totals are exact decimal sums and
-    /// never use floats, so the column must be written as a decimal first.
+    /// A `totals` column is not a decimal, and was not given a quantization
+    /// scale. Totals are exact; a float column is totalled only as
+    /// `col:dec(S)`, each value rounded half to even at scale `S`.
     TotalNotDecimal {
         /// The column.
         column: String,
         /// Its dataset type, as Arrow prints it.
         data_type: String,
-        /// Whether it is a floating-point column (the usual case: cast it to
-        /// a decimal when writing).
+        /// Whether it is a floating-point column (the usual case: total it
+        /// as `col:dec(S)`).
         float: bool,
+    },
+    /// A `totals` entry asks to quantize (`col:dec(S)`) a column that is not
+    /// a float.
+    QuantizeNotFloat {
+        /// The column.
+        column: String,
+        /// Its dataset type, as Arrow prints it.
+        data_type: String,
+        /// The scale asked for.
+        scale: u8,
+    },
+    /// A `totals` entry is neither `col` nor `col:dec(S)` with `S` in
+    /// `0..=38`.
+    TotalSpecInvalid {
+        /// The entry as given.
+        given: String,
+        /// One sentence saying what is wrong and the accepted form.
+        reason: String,
     },
     /// A `totals` column is not in the left side's dataset schema.
     TotalNotFound {
@@ -71,11 +94,13 @@ pub enum ReconcileProblem {
 
 impl Engine {
     /// The usage problems in `request`, checked against the data root's
-    /// dataset schema before any row is read: every `totals` column must be
-    /// a decimal column of the left side, and a memory budget must be
-    /// positive. Empty when the request is well formed. `reconcile` refuses
-    /// the same requests (as engine errors); a caller that tells usage from
-    /// engine failures (the CLI's exit 2 against 4) asks here first.
+    /// dataset schema before any row is read: every `totals` entry must
+    /// parse (`col` or `col:dec(S)`), name a column of the left side, and be
+    /// a decimal column, or a float column quantized with `:dec(S)`; a
+    /// memory budget must be positive. Empty when the request is well
+    /// formed. `reconcile` refuses the same requests (as engine errors); a
+    /// caller that tells usage from engine failures (the CLI's exit 2
+    /// against 4) asks here first.
     pub fn reconcile_problems(&self, request: &ReconcileRequest) -> Result<Vec<ReconcileProblem>> {
         guard(|| {
             let mut out = Vec::new();
@@ -87,19 +112,36 @@ impl Engine {
             }
             let pinned = self.pin()?;
             let schema = self.source(pinned.as_ref())?.schema(self.root())?;
-            for c in &request.totals {
-                match schema.field_with_name(c) {
-                    Err(_) => out.push(ReconcileProblem::TotalNotFound { column: c.clone() }),
-                    Ok(f) => {
-                        let dt = f.data_type();
-                        if !totalable(dt) {
-                            out.push(ReconcileProblem::TotalNotDecimal {
-                                column: c.clone(),
-                                data_type: dt.to_string(),
-                                float: dt.is_floating(),
-                            });
-                        }
+            for given in &request.totals {
+                let t = match TotalColumn::parse(given) {
+                    Ok(t) => t,
+                    Err(reason) => {
+                        out.push(ReconcileProblem::TotalSpecInvalid {
+                            given: given.clone(),
+                            reason,
+                        });
+                        continue;
                     }
+                };
+                let Ok(f) = schema.field_with_name(&t.column) else {
+                    out.push(ReconcileProblem::TotalNotFound { column: t.column });
+                    continue;
+                };
+                let dt = f.data_type();
+                match t.quantize {
+                    None if !totalable(dt) => out.push(ReconcileProblem::TotalNotDecimal {
+                        column: t.column,
+                        data_type: dt.to_string(),
+                        float: floating(dt),
+                    }),
+                    Some(scale) if !floating(dt) => {
+                        out.push(ReconcileProblem::QuantizeNotFloat {
+                            column: t.column,
+                            data_type: dt.to_string(),
+                            scale,
+                        });
+                    }
+                    _ => {}
                 }
             }
             Ok(out)
@@ -134,7 +176,7 @@ impl Engine {
         let right_source = self.output_source()?;
         let mut spec = ReconcileSpec::new(req.key.clone())
             .ignore(req.ignore.clone())
-            .totals(req.totals.clone())
+            .with_totals(total_columns(&req.totals)?)
             .group_by(req.group_by.clone());
         if let Some(l) = &req.latest_by {
             spec = spec.latest_by(l.clone());
@@ -168,8 +210,8 @@ impl Engine {
     }
 }
 
-/// Whether the verifier totals a column of type `dt`: a 128- or 256-bit
-/// decimal, possibly dictionary-encoded.
+/// Whether the verifier totals a column of type `dt` as given: a 128- or
+/// 256-bit decimal, possibly dictionary-encoded.
 fn totalable(dt: &arrow::datatypes::DataType) -> bool {
     use arrow::datatypes::DataType;
     match dt {
@@ -177,4 +219,21 @@ fn totalable(dt: &arrow::datatypes::DataType) -> bool {
         DataType::Dictionary(_, v) => totalable(v),
         _ => false,
     }
+}
+
+/// Whether `dt` is a float, possibly dictionary-encoded: totalled only when
+/// quantized (`col:dec(S)`).
+fn floating(dt: &arrow::datatypes::DataType) -> bool {
+    match dt {
+        arrow::datatypes::DataType::Dictionary(_, v) => floating(v),
+        other => other.is_floating(),
+    }
+}
+
+/// Parses every `--totals` entry (`col` or `col:dec(S)`).
+pub(crate) fn total_columns(given: &[String]) -> Result<Vec<TotalColumn>> {
+    given
+        .iter()
+        .map(|t| TotalColumn::parse(t).map_err(Error::KeySpec))
+        .collect()
 }

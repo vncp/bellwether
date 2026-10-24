@@ -167,7 +167,21 @@ fn committed_and_transient_segments_plan_identically_through_wp4_and_this_crate(
     // File 1 starts at 1_767_225_600_000_000 + 3_600_000_000; an instant at
     // the end of file 1 excludes later files' versions.
     let asof_ts = 1_767_225_600_000_000_i64 + 2 * 3_600_000_000;
-    for query in [RunQuery::Latest, RunQuery::Asof { ts: asof_ts }] {
+    // A lookback window of one hour, ending at each key's newest version or
+    // at the asof instant, plans through the same code in both planners.
+    let hour: i64 = 3_600_000_000;
+    for query in [
+        RunQuery::Latest,
+        RunQuery::Asof { ts: asof_ts },
+        RunQuery::Window {
+            asof: None,
+            lookback: hour,
+        },
+        RunQuery::Window {
+            asof: Some(asof_ts),
+            lookback: hour,
+        },
+    ] {
         let t_keys = MemoryKeySets::new();
         let mut rec = WorkloadRecorder::new(&t_keys, Arc::clone(&corpus.schema));
         for (id, tuples) in &runs {
@@ -200,6 +214,12 @@ fn committed_and_transient_segments_plan_identically_through_wp4_and_this_crate(
                         keys: rk.tuples().map(<[u8]>::to_vec).collect(),
                         ts: *ts,
                     },
+                    RunQuery::Window { asof, lookback } => BuildLookup::Window {
+                        columns: rk.columns().to_vec(),
+                        keys: rk.tuples().map(<[u8]>::to_vec).collect(),
+                        asof: *asof,
+                        lookback: *lookback,
+                    },
                     RunQuery::Locate => unreachable!(),
                 };
                 let build_plan = planner.plan(config, &lookup).unwrap();
@@ -230,7 +250,18 @@ fn committed_and_transient_segments_plan_identically_through_wp4_and_this_crate(
     // transient temporal replay's row-group cells and bytes equal the
     // committed `Planner`'s Latest/AsOf plan after indexing the same spec.
     let unindexed = Replayer::unindexed(&source, &snapshot.manifest().source.root).unwrap();
-    for query in [RunQuery::Latest, RunQuery::Asof { ts: asof_ts }] {
+    for query in [
+        RunQuery::Latest,
+        RunQuery::Asof { ts: asof_ts },
+        RunQuery::Window {
+            asof: None,
+            lookback: hour,
+        },
+        RunQuery::Window {
+            asof: Some(asof_ts),
+            lookback: hour,
+        },
+    ] {
         for run in workload.runs() {
             let rk = workload.run_keys(&keys, run).unwrap();
             let unindexed_plan = unindexed

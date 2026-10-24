@@ -6,7 +6,7 @@ use bellwether::spec::label;
 use bellwether::types::{Coverage, ProposalBody, Record};
 use bellwether::{
     FixOutcome, FixRequest, FixResult, KeyRepr, Mismatch, ReconcileProblem, ReconcileRequest,
-    ReconcileResult, Refusal, RewriteOutputs, Score,
+    ReconcileResult, Refusal, RewriteOutputs, Score, TotalColumn,
 };
 use clap::{Args, Subcommand};
 
@@ -39,7 +39,10 @@ pub(crate) struct CompareArgs {
     /// Columns left out of the row hash, comma-separated.
     #[arg(long, value_name = "COLS", value_delimiter = ',')]
     ignore: Vec<String>,
-    /// Decimal columns totalled exactly, comma-separated.
+    /// Columns totalled exactly, comma-separated: a decimal column as
+    /// `col`, a float column as `col:dec(S)` (each value rounded half to
+    /// even at scale S, then summed exactly; NaN or infinity is an error
+    /// naming the key).
     #[arg(long, value_name = "COLS", value_delimiter = ',')]
     totals: Vec<String>,
     /// Columns grouping the totals, comma-separated.
@@ -61,11 +64,12 @@ pub(crate) struct ReconcileArgs {
     /// Sampling seed.
     #[arg(long, default_value_t = 0, requires = "sample")]
     seed: u64,
-    /// Bytes the comparison state may occupy [default: 268435456, 256 MiB].
-    /// The comparison reads both sides once per pass and makes as many
-    /// passes as it needs to stay inside this budget; a larger budget means
-    /// fewer passes.
-    #[arg(long, value_name = "BYTES")]
+    /// Bytes the comparison state may occupy: bytes, or a whole number with
+    /// a binary unit, K, M, G, or T (512M, 8G) [default: 256M]. The
+    /// comparison reads both sides once per pass and makes as many passes
+    /// as it needs to stay inside this budget; a larger budget means fewer
+    /// passes.
+    #[arg(long, value_name = "BYTES", value_parser = parse_bytes)]
     memory_budget: Option<u64>,
 }
 
@@ -178,28 +182,64 @@ fn problem(p: &ReconcileProblem) -> String {
         ReconcileProblem::TotalNotDecimal {
             column,
             data_type,
-            float,
-        } => {
-            let how = if *float {
-                format!(
-                    "write the column as a decimal first, for example CAST({column} AS \
-                     DECIMAL(18, 2)) in the job that writes the files, and reconcile that copy"
-                )
-            } else {
-                "write the column as a decimal first".to_string()
-            };
-            format!(
-                "--totals needs a decimal column, and {column:?} is {data_type} (totals are exact \
-                 decimal sums and never use floats); {how}"
-            )
-        }
+            float: true,
+        } => format!(
+            "--totals {column:?} is {data_type}, and totals are exact; give it a decimal scale: \
+             --totals {column}:dec(4) rounds each value half to even at 4 decimal places and sums \
+             exactly (pick the scale the data is quoted at)"
+        ),
+        ReconcileProblem::TotalNotDecimal {
+            column, data_type, ..
+        } => format!(
+            "--totals needs a decimal column, or a float column as {column}:dec(<scale>), and \
+             {column:?} is {data_type}; write the column as a decimal first"
+        ),
+        ReconcileProblem::QuantizeNotFloat {
+            column,
+            data_type,
+            scale,
+        } => format!(
+            "--totals {column}:dec({scale}) quantizes a float column, and {column:?} is \
+             {data_type}; pass --totals {column} for a decimal column, or write it as a decimal \
+             first"
+        ),
+        ReconcileProblem::TotalSpecInvalid { reason, .. } => reason.clone(),
         ReconcileProblem::TotalNotFound { column } => {
             format!("--totals names {column:?}, which is not a column of the left folder")
         }
         ReconcileProblem::ZeroMemoryBudget => {
-            "--memory-budget must be a positive number of bytes".to_string()
+            "--memory-budget must be positive, for example 512M or 8G".to_string()
         }
     }
+}
+
+/// `--memory-budget`: bytes, or a whole number with a binary unit, `K`,
+/// `M`, `G`, or `T` (also `KiB`..`TiB`): `8G` is 8 × 2^30 bytes.
+pub(crate) fn parse_bytes(given: &str) -> Result<u64, String> {
+    let g = given.trim();
+    let split = g.find(|c: char| !c.is_ascii_digit()).unwrap_or(g.len());
+    let (digits, unit) = g.split_at(split);
+    let shift = match unit {
+        "" | "B" => 0,
+        "K" | "k" | "KiB" => 10,
+        "M" | "m" | "MiB" => 20,
+        "G" | "g" | "GiB" => 30,
+        "T" | "t" | "TiB" => 40,
+        _ => {
+            return Err(format!(
+                "{given:?} is not a byte count; write bytes (268435456) or a whole number with a \
+                 binary unit, K, M, G, or T (512M, 8G; 1G is 2^30 bytes)"
+            ))
+        }
+    };
+    let n: u64 = digits.parse().map_err(|_| {
+        format!(
+            "{given:?} is not a byte count; write bytes (268435456) or a whole number with a \
+             binary unit, K, M, G, or T (512M, 8G)"
+        )
+    })?;
+    n.checked_mul(1u64 << shift)
+        .ok_or_else(|| format!("{given:?} is more bytes than fit in 64 bits"))
 }
 
 /// A key as a tuple of its rendered elements.
@@ -220,6 +260,63 @@ fn coverage(c: &Coverage) -> String {
             format!("sampled, {} keys ({fraction})", num(*keys))
         }
         Coverage::StaticProof { identity } => format!("static proof {identity}"),
+    }
+}
+
+/// The exact totals, with one line per quantized float column saying how
+/// its values were rounded.
+fn totals_human(s: &mut String, o: &bellwether::Reconciliation) {
+    if o.totals.is_empty() {
+        return;
+    }
+    let _ = writeln!(s, "\n  exact totals, left and right");
+    let mut quantized: Vec<TotalColumn> = Vec::new();
+    for t in &o.totals {
+        if let Ok(
+            q @ TotalColumn {
+                quantize: Some(_), ..
+            },
+        ) = TotalColumn::parse(&t.column)
+        {
+            if !quantized.contains(&q) {
+                quantized.push(q);
+            }
+        }
+    }
+    for q in &quantized {
+        let _ = writeln!(
+            s,
+            "    {}: each float value's exact binary value rounded half to even at {} decimal places, then summed exactly",
+            q.label(),
+            q.quantize.unwrap_or_default()
+        );
+    }
+    for t in o.totals.iter().take(HUMAN_TOTALS) {
+        let g: Vec<String> = t
+            .group
+            .values
+            .iter()
+            .map(|(c, v)| format!("{c}={}", v.as_deref().unwrap_or("null")))
+            .collect();
+        let (l, rt) = (t.left.render(), t.right.render());
+        let verdict = if l == rt { "equal" } else { "DIFFER" };
+        let _ = writeln!(
+            s,
+            "    {:<16} {:<28} {l:>24} {rt:>24}  {verdict}",
+            t.column,
+            if g.is_empty() {
+                "all rows".to_string()
+            } else {
+                g.join(", ")
+            }
+        );
+    }
+    if o.totals.len() > HUMAN_TOTALS {
+        let _ = writeln!(
+            s,
+            "    ... {} more groups in --json",
+            o.totals.len() - HUMAN_TOTALS
+        );
     }
 }
 
@@ -274,36 +371,7 @@ fn reconcile_human(r: &ReconcileResult, out: &Out) -> String {
             let _ = writeln!(s, "    {what:<22} {}", key(k));
         }
     }
-    if !o.totals.is_empty() {
-        let _ = writeln!(s, "\n  exact totals, left and right");
-        for t in o.totals.iter().take(HUMAN_TOTALS) {
-            let g: Vec<String> = t
-                .group
-                .values
-                .iter()
-                .map(|(c, v)| format!("{c}={}", v.as_deref().unwrap_or("null")))
-                .collect();
-            let (l, rt) = (t.left.render(), t.right.render());
-            let verdict = if l == rt { "equal" } else { "DIFFER" };
-            let _ = writeln!(
-                s,
-                "    {:<16} {:<28} {l:>24} {rt:>24}  {verdict}",
-                t.column,
-                if g.is_empty() {
-                    "all rows".to_string()
-                } else {
-                    g.join(", ")
-                }
-            );
-        }
-        if o.totals.len() > HUMAN_TOTALS {
-            let _ = writeln!(
-                s,
-                "    ... {} more groups in --json",
-                o.totals.len() - HUMAN_TOTALS
-            );
-        }
-    }
+    totals_human(&mut s, o);
     let m = &o.memory;
     let _ = writeln!(
         s,

@@ -45,7 +45,7 @@ use std::sync::Arc;
 use arrow::datatypes::{DataType, Schema};
 use bellwether_core::encoding::{self, Value};
 use bellwether_core::segment::{ColumnType, ReadAt, SegmentReader};
-use bellwether_core::temporal::{self, VersionChain, VersionHit};
+use bellwether_core::temporal::{self, VersionChain, VersionHit, WindowHit};
 use bellwether_store::{Snapshot, StoreExt};
 use bellwether_types::{Error, Hash, KeySpec, Predicate, Result, RunCost, ScanPlan};
 use bytes::Bytes;
@@ -92,15 +92,16 @@ pub fn servable(spec: &KeySpec, run_columns: &[String]) -> Option<Lookup> {
 
 /// Whether `spec` serves a run of query kind `query` keyed on `run_columns`.
 ///
-/// Point (`locate`) runs use [`servable`] (projection or prefix). `latest`
-/// and `asof` runs need a temporal spec whose columns are all in
-/// `run_columns` (`Lookup::Point`); other specs that serve `run_columns` also
-/// participate by per-key intersection when paired with one temporal spec.
+/// Point (`locate`) runs use [`servable`] (projection or prefix). `latest`,
+/// `asof`, and lookback window runs need a temporal spec whose columns are
+/// all in `run_columns` (`Lookup::Point`); other specs that serve
+/// `run_columns` also participate by per-key intersection when paired with
+/// one temporal spec.
 #[must_use]
 pub fn serves_query(spec: &KeySpec, run_columns: &[String], query: &RunQuery) -> bool {
     match query {
         RunQuery::Locate => servable(spec, run_columns).is_some(),
-        RunQuery::Latest | RunQuery::Asof { .. } => match spec {
+        RunQuery::Latest | RunQuery::Asof { .. } | RunQuery::Window { .. } => match spec {
             KeySpec::Temporal { .. } => {
                 matches!(servable(spec, run_columns), Some(Lookup::Point { .. }))
             }
@@ -476,18 +477,19 @@ impl SegmentPlanner {
         Ok(out)
     }
 
-    /// Plans a `latest` or `asof` run over `serving`, following the build
-    /// planner's temporal rules (`bellwether_build::Planner::plan_temporal`):
-    /// exactly one serving temporal spec with every column in `keys`,
-    /// cross-segment winner per key (recomputed over live row groups when the
-    /// winner lies in retired ones, invariant 5), per-key intersection with
-    /// any other serving specs, and the `NotOlderThan` / `LatestPerKey`
-    /// residual.
+    /// Plans a `latest`, `asof`, or lookback window run over `serving`,
+    /// following the build planner's temporal rules
+    /// (`bellwether_build::Planner::plan_temporal`): exactly one serving
+    /// temporal spec with every column in `keys`, cross-segment winner per
+    /// key (recomputed over live row groups when the winner lies in retired
+    /// ones, invariant 5) or every live version in the key's window, per-key
+    /// intersection with any other serving specs, and the `NotOlderThan` /
+    /// `LatestPerKey` residual, or the window's.
     fn plan_temporal(
         &self,
         serving: &[(&SpecSegments, Lookup)],
         keys: &RunKeys,
-        asof: Option<i64>,
+        query: &RunQuery,
     ) -> Result<ScanPlan> {
         let mut temporal = serving
             .iter()
@@ -524,30 +526,22 @@ impl SegmentPlanner {
             .clone();
         let variants: Vec<Vec<Vec<u8>>> =
             (0..keys.len()).map(|i| keys.probes(i, project)).collect();
-        let mut probes: Vec<Vec<u8>> = variants.iter().flatten().cloned().collect();
-        probes.sort_unstable();
-        probes.dedup();
-        let hits = self.temporal_hits(&t.readers, &probes, asof)?;
-        let winners: Vec<Option<VersionHit>> = variants
-            .iter()
-            .map(|vs| {
-                vs.iter()
-                    .filter_map(|v| hits.get(v))
-                    .fold(None, |acc: Option<VersionHit>, h| {
-                        Some(match acc {
-                            Some(mut a) => {
-                                a.combine(h);
-                                a
-                            }
-                            None => h.clone(),
-                        })
-                    })
-            })
-            .collect();
-        let mut acc: Vec<Option<RoaringBitmap>> = winners
-            .iter()
-            .map(|w| Some(w.as_ref().map(|h| h.row_groups.clone()).unwrap_or_default()))
-            .collect();
+        let asof = query.asof_ts();
+        let (selection, mut acc) = if let RunQuery::Window { asof, lookback } = query {
+            let windows = self.windows(&t.readers, &variants, &ts_type, *asof, *lookback)?;
+            let acc: Vec<Option<RoaringBitmap>> = windows
+                .iter()
+                .map(|w| Some(w.as_ref().map(|h| h.row_groups.clone()).unwrap_or_default()))
+                .collect();
+            (Selection::Windows(windows), acc)
+        } else {
+            let winners = self.winners(&t.readers, &variants, asof)?;
+            let acc: Vec<Option<RoaringBitmap>> = winners
+                .iter()
+                .map(|w| Some(w.as_ref().map(|h| h.row_groups.clone()).unwrap_or_default()))
+                .collect();
+            (Selection::Winners(winners), acc)
+        };
         let all_cols: Vec<usize> = (0..keys.columns().len()).collect();
         for (seg, lookup) in serving {
             if std::ptr::eq(*seg, t) {
@@ -569,12 +563,107 @@ impl SegmentPlanner {
             .into_iter()
             .flatten()
             .fold(RoaringBitmap::new(), |u, b| u | b);
-        let residual = temporal_residual(
-            &t.spec, ts_column, &ts_type, keys, &variants, &winners, asof,
-        )?;
+        let residual = match &selection {
+            Selection::Winners(winners) => {
+                temporal_residual(&t.spec, ts_column, &ts_type, keys, &variants, winners, asof)?
+            }
+            Selection::Windows(windows) => window_residual(
+                &t.spec,
+                ts_column,
+                &ts_type,
+                keys,
+                &variants,
+                windows,
+                asof,
+                query.lookback().unwrap_or(0),
+            )?,
+        };
         let mut plan = self.catalog.plan_for(&selected)?;
         plan.residual = Some(residual);
         Ok(plan)
+    }
+
+    /// Each key's index-wide winning version (latest, or at `asof`), its
+    /// zero variants' hits folded into one, as the build planner does.
+    fn winners(
+        &self,
+        readers: &[SegmentReader<SegmentBytes>],
+        variants: &[Vec<Vec<u8>>],
+        asof: Option<i64>,
+    ) -> Result<Vec<Option<VersionHit>>> {
+        let mut probes: Vec<Vec<u8>> = variants.iter().flatten().cloned().collect();
+        probes.sort_unstable();
+        probes.dedup();
+        let hits = self.temporal_hits(readers, &probes, asof)?;
+        Ok(variants
+            .iter()
+            .map(|vs| {
+                vs.iter()
+                    .filter_map(|v| hits.get(v))
+                    .fold(None, |acc: Option<VersionHit>, h| {
+                        Some(match acc {
+                            Some(mut a) => {
+                                a.combine(h);
+                                a
+                            }
+                            None => h.clone(),
+                        })
+                    })
+            })
+            .collect())
+    }
+
+    /// Every row-group id a stored bitmap or chain names must be live or
+    /// tombstoned in the pinned manifest.
+    fn check_known(&self, bm: &RoaringBitmap) -> Result<()> {
+        for id in bm {
+            if self.catalog.get(id).is_none() && !self.catalog.is_tombstoned(id) {
+                return Err(Error::Other(format!(
+                    "row-group id {id} is neither live nor tombstoned in manifest {}",
+                    self.catalog.manifest_version()
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Each key's lookback window, as the build planner computes it
+    /// (`bellwether_build::Lookup::Window`): from every segment's version
+    /// chains, counting only live row groups.
+    fn windows(
+        &self,
+        readers: &[SegmentReader<SegmentBytes>],
+        variants: &[Vec<Vec<u8>>],
+        ts_type: &DataType,
+        asof: Option<i64>,
+        lookback: i64,
+    ) -> Result<Vec<Option<WindowHit>>> {
+        if lookback < 0 {
+            return Err(Error::KeySpec(format!(
+                "a lookback window cannot be negative ({lookback})"
+            )));
+        }
+        let mut probes: Vec<&Vec<u8>> = variants.iter().flatten().collect();
+        probes.sort_unstable();
+        probes.dedup();
+        let chains = temporal::chains(readers, &probes)?;
+        for chain in chains.values() {
+            self.check_known(&chain.versions().iter().map(|(_, rg)| rg.0).collect())?;
+        }
+        let floor = encoding::ts_min(ts_type)?;
+        let live = self.catalog.all_ids();
+        Ok(variants
+            .iter()
+            .map(|vs| {
+                temporal::window(
+                    vs.iter().filter_map(|v| chains.get(v)),
+                    &live,
+                    asof,
+                    lookback,
+                    floor,
+                )
+            })
+            .collect())
     }
 
     fn temporal_hits(
@@ -588,17 +677,7 @@ impl SegmentPlanner {
             Some(ts) => temporal::asof(readers, probes, ts)?,
         };
         let live = self.catalog.all_ids();
-        let check_known = |bm: &RoaringBitmap| -> Result<()> {
-            for id in bm {
-                if self.catalog.get(id).is_none() && !self.catalog.is_tombstoned(id) {
-                    return Err(Error::Other(format!(
-                        "row-group id {id} is neither live nor tombstoned in manifest {}",
-                        self.catalog.manifest_version()
-                    )));
-                }
-            }
-            Ok(())
-        };
+        let check_known = |bm: &RoaringBitmap| self.check_known(bm);
         let mut out = BTreeMap::new();
         let mut redo = Vec::new();
         for (key, mut hit) in raw {
@@ -653,7 +732,7 @@ impl PlanSource for SegmentPlanner {
             }
             listed.push(self.listed(spec)?);
         }
-        if !matches!(query, RunQuery::Locate) && specs.is_empty() {
+        if query.is_temporal() && specs.is_empty() {
             return Err(Error::KeySpec(format!(
                 "latest and asof need a temporal key spec serving {:?}",
                 keys.columns()
@@ -689,8 +768,9 @@ impl PlanSource for SegmentPlanner {
                 let selected = Self::select(&serving, keys)?;
                 Ok(with_residual(self.catalog.plan_for(&selected)?, keys))
             }
-            RunQuery::Latest => self.plan_temporal(&serving, keys, None),
-            RunQuery::Asof { ts } => self.plan_temporal(&serving, keys, Some(*ts)),
+            RunQuery::Latest | RunQuery::Asof { .. } | RunQuery::Window { .. } => {
+                self.plan_temporal(&serving, keys, query)
+            }
         }
     }
 
@@ -805,6 +885,65 @@ fn encode_ts(ts: i64, declared: &DataType) -> Result<Vec<u8>> {
     let mut out = Vec::with_capacity(11);
     encoding::encode_value_as(&value, declared, &mut out)?;
     Ok(out)
+}
+
+/// Per key, what a temporal run selected: its winning version, or its
+/// lookback window.
+enum Selection {
+    Winners(Vec<Option<VersionHit>>),
+    Windows(Vec<Option<WindowHit>>),
+}
+
+/// The residual of a lookback window run, as the build planner writes it:
+/// `In` over the keys with a live version in their window, then `Between`
+/// `[asof − lookback, asof]` for an asof window, or `NotOlderThan` with each
+/// key's `newest − lookback` otherwise.
+#[allow(clippy::too_many_arguments)]
+fn window_residual(
+    spec: &KeySpec,
+    ts_column: &str,
+    ts_type: &DataType,
+    keys: &RunKeys,
+    variants: &[Vec<Vec<u8>>],
+    windows: &[Option<WindowHit>],
+    asof: Option<i64>,
+    lookback: i64,
+) -> Result<Predicate> {
+    let all_cols: Vec<usize> = (0..keys.columns().len()).collect();
+    let mut in_values: Vec<Vec<u8>> = (0..keys.len())
+        .zip(windows)
+        .filter(|(_, w)| w.is_some())
+        .flat_map(|(i, _)| keys.probes(i, &all_cols))
+        .collect();
+    in_values.sort_unstable();
+    in_values.dedup();
+    let mut all = vec![Predicate::In {
+        columns: keys.columns().to_vec(),
+        values: in_values,
+    }];
+    if let Some(at) = asof {
+        let lo = at.saturating_sub(lookback).max(encoding::ts_min(ts_type)?);
+        all.push(Predicate::Between {
+            column: ts_column.to_string(),
+            lo: encode_ts(lo, ts_type)?,
+            hi: encode_ts(at, ts_type)?,
+        });
+    } else {
+        let mut bounds: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
+        for (vs, w) in variants.iter().zip(windows) {
+            let Some(w) = w else { continue };
+            let lo = encode_ts(w.lo, ts_type)?;
+            for v in vs {
+                bounds.insert(v.clone(), lo.clone());
+            }
+        }
+        all.push(Predicate::NotOlderThan {
+            columns: spec.columns().to_vec(),
+            ts_column: ts_column.to_string(),
+            bounds: bounds.into_iter().collect(),
+        });
+    }
+    Ok(Predicate::And { all })
 }
 
 fn temporal_residual(

@@ -102,6 +102,18 @@ pub enum LookupKind {
     },
 }
 
+/// A lookback window on a `latest` or `asof` lookup: every version of each
+/// key in `[end − length, end]`, `end` being the asof instant or, for
+/// `latest`, the key's newest version.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Lookback {
+    /// The window as given (`252d`, `36h`; an integer for an integer
+    /// timestamp column or a recorded workload).
+    pub given: String,
+    /// The window's length in the timestamp column's dataset unit.
+    pub length: i64,
+}
+
 /// What [`crate::Engine::locate`], [`crate::Engine::latest`], and
 /// [`crate::Engine::asof`] planned. The plan itself is the `plan` Evidence.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

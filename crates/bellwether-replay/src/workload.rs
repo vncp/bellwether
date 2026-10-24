@@ -94,6 +94,18 @@ pub enum RunQuery {
         /// The instant, in the timestamp column's dataset unit.
         ts: i64,
     },
+    /// Every version of each key in a lookback window: `[asof − lookback,
+    /// asof]` when `asof` is set ([`QUERY_KIND_ASOF`]), else `[newest −
+    /// lookback, newest]` per key, `newest` being the key's newest version
+    /// ([`QUERY_KIND_LATEST`]). Both bounds inclusive, in the timestamp
+    /// column's dataset unit.
+    Window {
+        /// The asof instant, or `None` to end each key's window at its
+        /// newest version.
+        asof: Option<i64>,
+        /// The window's length, `>= 0`.
+        lookback: i64,
+    },
 }
 
 impl RunQuery {
@@ -102,18 +114,36 @@ impl RunQuery {
     pub fn kind_str(&self) -> &'static str {
         match self {
             Self::Locate => QUERY_KIND_LOCATE,
-            Self::Latest => QUERY_KIND_LATEST,
-            Self::Asof { .. } => QUERY_KIND_ASOF,
+            Self::Latest | Self::Window { asof: None, .. } => QUERY_KIND_LATEST,
+            Self::Asof { .. } | Self::Window { asof: Some(_), .. } => QUERY_KIND_ASOF,
         }
     }
 
-    /// The `asof` instant when this is [`RunQuery::Asof`].
+    /// The `asof` instant when this is [`RunQuery::Asof`] or an asof
+    /// [`RunQuery::Window`].
     #[must_use]
     pub fn asof_ts(&self) -> Option<i64> {
         match self {
             Self::Asof { ts } => Some(*ts),
+            Self::Window { asof, .. } => *asof,
             Self::Locate | Self::Latest => None,
         }
+    }
+
+    /// The lookback window's length when this is a [`RunQuery::Window`].
+    #[must_use]
+    pub fn lookback(&self) -> Option<i64> {
+        match self {
+            Self::Window { lookback, .. } => Some(*lookback),
+            Self::Locate | Self::Latest | Self::Asof { .. } => None,
+        }
+    }
+
+    /// Whether this asks for versions (`latest`, `asof`, or a window), so
+    /// only a temporal key spec can plan it.
+    #[must_use]
+    pub fn is_temporal(&self) -> bool {
+        !matches!(self, Self::Locate)
     }
 }
 
@@ -135,6 +165,12 @@ pub struct RecordedRun {
     /// identical bytes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub asof: Option<i64>,
+    /// For a [`RunQuery::Window`] run: the lookback window's length in the
+    /// timestamp column's dataset unit. Absent (`None`, omitted in JSON)
+    /// otherwise, so existing workload manifests serialize and hash to
+    /// identical bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lookback: Option<i64>,
     /// Key columns, in tuple order.
     pub columns: Vec<String>,
     /// The dataset type each key column was encoded at.
@@ -148,24 +184,46 @@ pub struct RecordedRun {
 }
 
 impl RecordedRun {
-    /// The typed query kind of this run, or an error if `query_kind` and
-    /// `asof` disagree or name an unknown kind.
+    /// The typed query kind of this run, or an error if `query_kind`,
+    /// `asof`, and `lookback` disagree or name an unknown kind.
     pub fn query(&self) -> Result<RunQuery> {
-        match (self.query_kind.as_str(), self.asof) {
-            (QUERY_KIND_LOCATE, None) => Ok(RunQuery::Locate),
-            (QUERY_KIND_LATEST, None) => Ok(RunQuery::Latest),
-            (QUERY_KIND_ASOF, Some(ts)) => Ok(RunQuery::Asof { ts }),
-            (QUERY_KIND_LOCATE | QUERY_KIND_LATEST, Some(_)) => Err(Error::Other(format!(
-                "run {:?} has query_kind {:?} but sets asof",
-                self.run_id, self.query_kind
-            ))),
-            (QUERY_KIND_ASOF, None) => Err(Error::Other(format!(
-                "run {:?} has query_kind \"asof\" without an asof timestamp",
+        let point = match (self.query_kind.as_str(), self.asof) {
+            (QUERY_KIND_LOCATE, None) => RunQuery::Locate,
+            (QUERY_KIND_LATEST, None) => RunQuery::Latest,
+            (QUERY_KIND_ASOF, Some(ts)) => RunQuery::Asof { ts },
+            (QUERY_KIND_LOCATE | QUERY_KIND_LATEST, Some(_)) => {
+                return Err(Error::Other(format!(
+                    "run {:?} has query_kind {:?} but sets asof",
+                    self.run_id, self.query_kind
+                )))
+            }
+            (QUERY_KIND_ASOF, None) => {
+                return Err(Error::Other(format!(
+                    "run {:?} has query_kind \"asof\" without an asof timestamp",
+                    self.run_id
+                )))
+            }
+            (other, _) => {
+                return Err(Error::UnknownKind {
+                    what: "query kind",
+                    found: other.to_string(),
+                })
+            }
+        };
+        match (point, self.lookback) {
+            (q, None) => Ok(q),
+            (RunQuery::Locate, Some(_)) => Err(Error::Other(format!(
+                "run {:?} has query_kind \"locate\" but sets a lookback; a lookback window \
+                 applies to latest and asof runs",
                 self.run_id
             ))),
-            (other, _) => Err(Error::UnknownKind {
-                what: "query kind",
-                found: other.to_string(),
+            (_, Some(l)) if l < 0 => Err(Error::Other(format!(
+                "run {:?} has a negative lookback {l}",
+                self.run_id
+            ))),
+            (q, Some(lookback)) => Ok(RunQuery::Window {
+                asof: q.asof_ts(),
+                lookback,
             }),
         }
     }
@@ -581,6 +639,11 @@ impl<'a> WorkloadRecorder<'a> {
             }
             KeyInput::Parquet(path) => read_parquet_keys(path, &self.schema)?,
         };
+        if query.lookback().is_some_and(|l| l < 0) {
+            return Err(Error::Other(format!(
+                "run {run_id:?}: a lookback window cannot be negative"
+            )));
+        }
         let payload = built.to_payload()?;
         let key_set = Hash::of(&payload);
         let columns = built.columns().to_vec();
@@ -593,6 +656,7 @@ impl<'a> WorkloadRecorder<'a> {
                 ),
                 query_kind: query.kind_str().to_string(),
                 asof: query.asof_ts(),
+                lookback: query.lookback(),
                 key_types: built.key_types().to_vec(),
                 columns,
                 keys: built.len() as u64,

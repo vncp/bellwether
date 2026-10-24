@@ -170,6 +170,86 @@ pub(crate) fn finalize(sum: Wide, wide: bool, scale: i8) -> Option<ExactTotal> {
     Some(ExactTotal { unscaled, scale })
 }
 
+/// Why a float could not be quantized ([`quantize`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum QuantizeError {
+    /// NaN or an infinity: no decimal value.
+    NotFinite,
+    /// The rounded value times `10^scale` does not fit an `i128`.
+    TooLarge,
+    /// The scale is above [`crate::MAX_QUANTIZE_SCALE`].
+    ScaleTooLarge,
+}
+
+impl fmt::Display for QuantizeError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::NotFinite => "NaN and infinity have no decimal value",
+            Self::TooLarge => "the value at this scale does not fit a 128-bit decimal",
+            Self::ScaleTooLarge => "the scale is above 38, the most a 128-bit decimal holds",
+        })
+    }
+}
+
+/// `round_half_even(value × 10^scale)` from `value`'s exact binary value,
+/// as an `i128`: the integer at `scale` a decimal column would store. No
+/// float arithmetic is involved; `value = m × 2^e` is expanded exactly and
+/// the rounding is decided on integers, so a tie (`0.125` at scale 2) goes
+/// to the even neighbor (`0.12`) and a value just below a tie never rounds
+/// up. `-0.0` quantizes to `0`.
+pub fn quantize(value: f64, scale: u8) -> Result<i128, QuantizeError> {
+    if !value.is_finite() {
+        return Err(QuantizeError::NotFinite);
+    }
+    if scale > crate::spec::MAX_QUANTIZE_SCALE {
+        return Err(QuantizeError::ScaleTooLarge);
+    }
+    let bits = value.to_bits();
+    let negative = bits >> 63 == 1;
+    let exp_bits = i32::try_from((bits >> 52) & 0x7ff).unwrap_or(0);
+    let fraction = bits & ((1u64 << 52) - 1);
+    // value = mantissa × 2^exponent exactly.
+    let (mantissa, exponent) = if exp_bits == 0 {
+        (fraction, -1074)
+    } else {
+        (fraction | (1u64 << 52), exp_bits - 1075)
+    };
+    if mantissa == 0 {
+        return Ok(0);
+    }
+    let pow = i256::from_i128(10).wrapping_pow(u32::from(scale));
+    // mantissa < 2^53 and 10^scale < 2^127, so scaled < 2^180: exact in an
+    // i256.
+    let scaled = i256::from_i128(i128::from(mantissa)).wrapping_mul(pow);
+    let magnitude = if exponent >= 0 {
+        // mantissa ≥ 2^52, so an exponent ≥ 75 puts the value at or above
+        // 2^127.
+        if exponent >= 75 {
+            return Err(QuantizeError::TooLarge);
+        }
+        scaled << u8::try_from(exponent).map_err(|_| QuantizeError::TooLarge)?
+    } else {
+        let shift = exponent.unsigned_abs();
+        if shift > 200 {
+            // scaled < 2^180 < 2^(shift − 1): below half of one unit, so 0.
+            i256::ZERO
+        } else {
+            let shift = u8::try_from(shift).map_err(|_| QuantizeError::TooLarge)?;
+            let quotient = scaled >> shift;
+            let remainder = scaled.wrapping_sub(quotient << shift);
+            let half = i256::ONE << (shift - 1);
+            let odd = quotient.as_i128() & 1 == 1;
+            if remainder > half || (remainder == half && odd) {
+                quotient.wrapping_add(i256::ONE)
+            } else {
+                quotient
+            }
+        }
+    };
+    let magnitude = magnitude.to_i128().ok_or(QuantizeError::TooLarge)?;
+    Ok(if negative { -magnitude } else { magnitude })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -242,5 +322,97 @@ mod tests {
         let mut merged = w(a);
         merged.merge(&w(b));
         assert_eq!(merged, forward);
+    }
+
+    /// The oracle: Rust's exact decimal expansion of `v` (formatting with
+    /// an explicit precision prints the exact binary value; an f64 has at
+    /// most 1,074 fractional digits), rounded half to even by digits.
+    fn by_digits(v: f64, scale: u8) -> Result<i128, QuantizeError> {
+        if !v.is_finite() {
+            return Err(QuantizeError::NotFinite);
+        }
+        let s = format!("{:.1100}", v.abs());
+        let (int, frac) = s.split_once('.').unwrap();
+        let (kept, rest) = frac.split_at(usize::from(scale));
+        let digits = format!("{int}{kept}");
+        let mut q: i128 = digits
+            .trim_start_matches('0')
+            .parse::<i128>()
+            .or_else(|e| {
+                if digits.trim_start_matches('0').is_empty() {
+                    Ok(0)
+                } else {
+                    Err(e)
+                }
+            })
+            .map_err(|_| QuantizeError::TooLarge)?;
+        let first = rest.as_bytes()[0];
+        let tail_nonzero = rest[1..].bytes().any(|b| b != b'0');
+        let up = first > b'5' || (first == b'5' && (tail_nonzero || q % 2 == 1));
+        if up {
+            q = q.checked_add(1).ok_or(QuantizeError::TooLarge)?;
+        }
+        Ok(if v.is_sign_negative() { -q } else { q })
+    }
+
+    #[test]
+    fn quantization_rounds_the_exact_value_half_to_even() {
+        // exact ties go to the even neighbor
+        assert_eq!(quantize(0.125, 2), Ok(12));
+        assert_eq!(quantize(0.375, 2), Ok(38));
+        assert_eq!(quantize(2.5, 0), Ok(2));
+        assert_eq!(quantize(3.5, 0), Ok(4));
+        assert_eq!(quantize(-2.5, 0), Ok(-2));
+        // 0.35 is 0.34999999999999997779…: not a tie, rounds down; 2.675 is
+        // 2.67499999999999982236431605997495353221893310546875
+        assert_eq!(quantize(0.35, 1), Ok(3));
+        assert_eq!(quantize(2.675, 2), Ok(267));
+        // 1.0000000000000002 at scale 15 is 1000000000000000.2…
+        assert_eq!(
+            quantize(1.000_000_000_000_000_2, 15),
+            Ok(1_000_000_000_000_000)
+        );
+        assert_eq!(quantize(-0.0, 4), Ok(0));
+        assert_eq!(quantize(f64::MIN_POSITIVE / 4.0, 38), Ok(0));
+        assert_eq!(quantize(123_456.789, 4), Ok(1_234_567_890));
+        assert_eq!(quantize(f64::NAN, 4), Err(QuantizeError::NotFinite));
+        assert_eq!(
+            quantize(f64::NEG_INFINITY, 4),
+            Err(QuantizeError::NotFinite)
+        );
+        assert_eq!(quantize(1e38, 4), Err(QuantizeError::TooLarge));
+        assert_eq!(quantize(f64::MAX, 0), Err(QuantizeError::TooLarge));
+        assert_eq!(quantize(1.0, 39), Err(QuantizeError::ScaleTooLarge));
+        // 2^126 fits, 2^127 does not
+        assert_eq!(quantize(2f64.powi(126), 0), Ok(1i128 << 126));
+        assert_eq!(quantize(2f64.powi(127), 0), Err(QuantizeError::TooLarge));
+        assert_eq!(quantize(-(2f64.powi(126)), 0), Ok(-(1i128 << 126)));
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(4096))]
+
+        /// Every f64 (normal, subnormal, huge, tiny) at every scale agrees
+        /// with the digit-string oracle.
+        #[test]
+        fn quantization_matches_the_exact_decimal_expansion(
+            bits in proptest::prelude::any::<u64>(),
+            scale in 0u8..=38,
+        ) {
+            let v = f64::from_bits(bits);
+            proptest::prop_assert_eq!(quantize(v, scale), by_digits(v, scale));
+        }
+
+        /// Values with few digits, where ties and near-ties live.
+        #[test]
+        fn quantization_matches_on_short_decimals(
+            units in -10_000_000i64..10_000_000,
+            exp in 0i32..9,
+            scale in 0u8..=8,
+        ) {
+            #[allow(clippy::cast_precision_loss)]
+            let v = units as f64 / 10f64.powi(exp);
+            proptest::prop_assert_eq!(quantize(v, scale), by_digits(v, scale));
+        }
     }
 }

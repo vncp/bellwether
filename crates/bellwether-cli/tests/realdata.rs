@@ -201,8 +201,9 @@ fn defect_5_memory_budget_sets_the_passes_and_both_outputs_report_them() {
     assert_eq!(zero.status.code(), Some(2));
 }
 
-/// Defect 6: `--totals` on a float column is a usage error (exit 2, one
-/// line saying to cast); a passing run over a decimal prints the totals.
+/// Defect 6 (as superseded by strategy request 4): `--totals` on a bare
+/// float column is a usage error (exit 2, one line showing the `:dec(S)`
+/// form); a passing run over a decimal prints the totals.
 #[test]
 fn defect_6_float_totals_are_a_usage_error_and_decimal_totals_are_printed() {
     let dir = tempfile::tempdir().unwrap();
@@ -224,8 +225,8 @@ fn defect_6_float_totals_are_a_usage_error_and_decimal_totals_are_printed() {
     assert_eq!(out.status.code(), Some(2));
     let err = String::from_utf8(out.stderr).unwrap();
     assert_eq!(err.trim_end().lines().count(), 1, "{err}");
-    assert!(err.contains("--totals needs a decimal column"), "{err}");
-    assert!(err.contains("CAST(fare AS DECIMAL"), "{err}");
+    assert!(err.contains("--totals \"fare\" is Float64"), "{err}");
+    assert!(err.contains("--totals fare:dec(4)"), "{err}");
     assert!(!err.contains("key spec error"), "{err}");
     let human = run(
         &[
@@ -1070,4 +1071,432 @@ fn defect_11_dot_json_files_are_sniffed_for_json_lines() {
         err.contains(".jsonl, .ndjson, and .json files whose first byte is"),
         "{err}"
     );
+}
+
+/// Brute force over the taxi-shaped files: the row groups holding a version
+/// of zone `pu` in `1..=4` whose `pickup_ts` (µs) lies in the zone's window
+/// `[hi − lookback, hi]`, `hi` being `asof` or the zone's newest version,
+/// and their exact compressed bytes from the Parquet footers.
+fn window_oracle(dir: &Path, asof: Option<i64>, lookback: i64) -> (u64, u64) {
+    use arrow::array::AsArray;
+    use arrow::datatypes::{Int64Type, TimestampMicrosecondType};
+    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+    let mut cells: Vec<(u64, Vec<(i64, i64)>)> = Vec::new();
+    let mut files: Vec<_> = std::fs::read_dir(dir)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|p| p.extension().is_some_and(|e| e == "parquet"))
+        .collect();
+    files.sort();
+    for f in files {
+        let b = ParquetRecordBatchReaderBuilder::try_new(File::open(&f).unwrap()).unwrap();
+        let meta = b.metadata().clone();
+        for rg in 0..meta.num_row_groups() {
+            let bytes = u64::try_from(meta.row_group(rg).compressed_size()).unwrap();
+            let reader = ParquetRecordBatchReaderBuilder::try_new(File::open(&f).unwrap())
+                .unwrap()
+                .with_row_groups(vec![rg])
+                .build()
+                .unwrap();
+            let mut rows = Vec::new();
+            for batch in reader {
+                let batch = batch.unwrap();
+                let pu = batch.column(0).as_primitive::<Int64Type>();
+                let ts = batch.column(1).as_primitive::<TimestampMicrosecondType>();
+                rows.extend((0..batch.num_rows()).map(|i| (pu.value(i), ts.value(i))));
+            }
+            cells.push((bytes, rows));
+        }
+    }
+    let newest = |z: i64| {
+        cells
+            .iter()
+            .flat_map(|(_, r)| r.iter())
+            .filter(|(p, _)| *p == z)
+            .map(|(_, t)| *t)
+            .max()
+            .unwrap()
+    };
+    let (mut row_groups, mut bytes) = (0, 0);
+    for (b, rows) in &cells {
+        let hit = rows.iter().any(|(z, t)| {
+            let hi = asof.unwrap_or_else(|| newest(*z));
+            hi - lookback <= *t && *t <= hi
+        });
+        if hit {
+            row_groups += 1;
+            bytes += b;
+        }
+    }
+    (row_groups, bytes)
+}
+
+/// Strategy request 3: `why --mode locate|latest|asof` with `--at` and
+/// `--lookback` prices each candidate under the stated lookup through the
+/// replay crate's temporal path. A lookback window reads every row group
+/// holding a version of a key in `[end − N, end]`, which the brute-force
+/// oracle confirms to the byte; inconsistent combinations are usage errors.
+#[test]
+fn request_3_why_mode_prices_latest_and_asof_lookback_windows() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("taxi");
+    taxi_shaped(&data);
+    let kf = dir.path().join("pu.parquet");
+    keys(&kf, "pu", &[1, 2, 3, 4]);
+    let why = |extra: &[&str]| -> WhyReport {
+        let mut args = vec!["--json", "why", path(&data), "--from", path(&kf)];
+        args.extend_from_slice(extra);
+        typed(&run(&args, 0))
+    };
+    let temporal = KeySpec::Temporal {
+        columns: vec!["pu".into()],
+        ts_column: "pickup_ts".into(),
+    };
+    let floor = |r: &WhyReport| {
+        r.candidates
+            .iter()
+            .find(|c| c.spec == temporal)
+            .map(|c| c.proposed)
+            .expect("the temporal floor is priced")
+    };
+
+    // --mode latest is what --latest-by alone infers: the same workload.
+    let inferred = why(&["--latest-by", "pickup_ts"]);
+    let latest = why(&["--mode", "latest", "--latest-by", "pickup_ts"]);
+    assert_eq!(
+        latest.workload.as_ref().unwrap().hash,
+        inferred.workload.as_ref().unwrap().hash
+    );
+    assert_eq!(floor(&latest).row_groups, 2);
+    // --mode locate prices point lookups: every zone is in every row group.
+    let locate = why(&["--mode", "locate"]);
+    assert_eq!(locate.workload.as_ref().unwrap().query_kind, "locate");
+    assert!(locate.recommended.is_none());
+
+    // latest with a 30 s lookback: each zone's versions in [newest − 30 s,
+    // newest] live in 3 row groups, where the newest alone lives in 2.
+    let window = why(&[
+        "--mode",
+        "latest",
+        "--latest-by",
+        "pickup_ts",
+        "--lookback",
+        "30s",
+    ]);
+    let w = window.workload.as_ref().unwrap();
+    assert_eq!(w.query_kind, "latest");
+    assert_eq!(
+        w.lookback,
+        Some(bellwether::Lookback {
+            given: "30s".into(),
+            length: 30_000_000,
+        })
+    );
+    let (rgs, bytes) = window_oracle(&data, None, 30_000_000);
+    assert_eq!(rgs, 3);
+    assert_eq!(
+        (floor(&window).row_groups, floor(&window).bytes),
+        (rgs, bytes)
+    );
+    let rec = window.recommended.as_ref().expect("the window prunes");
+    assert_eq!(rec.spec, temporal);
+    assert_eq!(rec.lookback, w.lookback);
+    assert_ne!(w.hash, latest.workload.as_ref().unwrap().hash);
+
+    // asof at 30 s with a 20 s lookback: versions in [10 s, 30 s].
+    let at = "1970-01-01T00:00:30Z";
+    let asof = why(&[
+        "--mode",
+        "asof",
+        "--latest-by",
+        "pickup_ts",
+        "--at",
+        at,
+        "--lookback",
+        "20s",
+    ]);
+    let (rgs, bytes) = window_oracle(&data, Some(30_000_000), 20_000_000);
+    assert_eq!(rgs, 3);
+    assert_eq!((floor(&asof).row_groups, floor(&asof).bytes), (rgs, bytes));
+    let w = asof.workload.as_ref().unwrap();
+    assert_eq!(w.query_kind, "asof");
+    assert!(matches!(
+        w.lookup,
+        Some(LookupKind::Asof { ts: 30_000_000, .. })
+    ));
+    // A recorded window workload replays as recorded under --workload with
+    // the same options; other options are refused, not relabeled.
+    let replay = |lookback: &str, code: i32| {
+        run(
+            &[
+                "--json",
+                "why",
+                path(&data),
+                "--workload",
+                &w.hash.to_hex(),
+                "--latest-by",
+                "pickup_ts",
+                "--at",
+                at,
+                "--lookback",
+                lookback,
+            ],
+            code,
+        )
+    };
+    let again: WhyReport = typed(&replay("20s", 0));
+    assert_eq!(floor(&again), floor(&asof));
+    assert_eq!(again.workload.as_ref().unwrap().hash, w.hash);
+    replay("10s", 4);
+
+    let human = run(
+        &[
+            "why",
+            path(&data),
+            "--from",
+            path(&kf),
+            "--mode",
+            "asof",
+            "--latest-by",
+            "pickup_ts",
+            "--at",
+            at,
+            "--lookback",
+            "20s",
+        ],
+        0,
+    );
+    assert!(
+        human.contains(&format!("funnel: 1 run(s) (asof {at}, lookback 20s)")),
+        "{human}"
+    );
+    assert!(
+        human.contains("only row groups holding a version in each key's window"),
+        "{human}"
+    );
+
+    // Inconsistent combinations are usage errors (exit 2) naming the fix.
+    let usage = |extra: &[&str], says: &str| {
+        let mut args = vec!["why", path(&data), "--from", path(&kf)];
+        args.extend_from_slice(extra);
+        let out = bw().args(&args).output().unwrap();
+        assert_eq!(out.status.code(), Some(2), "{extra:?}");
+        let err = String::from_utf8(out.stderr).unwrap();
+        assert!(err.contains(says), "{extra:?}: {err}");
+    };
+    usage(
+        &["--mode", "asof", "--latest-by", "pickup_ts"],
+        "pass --at <instant>",
+    );
+    usage(&["--mode", "latest"], "pass --latest-by <column>");
+    usage(
+        &["--mode", "locate", "--latest-by", "pickup_ts"],
+        "--mode locate prices point lookups",
+    );
+    usage(
+        &["--mode", "latest", "--latest-by", "pickup_ts", "--at", at],
+        "pass --mode asof",
+    );
+    usage(
+        &["--latest-by", "pickup_ts", "--lookback", "3x"],
+        "--lookback 252d",
+    );
+    // A length that is not a whole number of the column's unit is refused,
+    // never rounded: an integer column takes a bare integer.
+    let out = bw()
+        .args([
+            "why",
+            path(&data),
+            "--from",
+            path(&kf),
+            "--latest-by",
+            "pu",
+            "--lookback",
+            "1d",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(4));
+    let err = String::from_utf8(out.stderr).unwrap();
+    assert!(err.contains("is an integer column"), "{err}");
+
+    // Indexed, the build planner prices the current temporal key's window:
+    // the same rows and bytes as the oracle.
+    run(&["index", path(&data), "--key", "temporal:pu@pickup_ts"], 0);
+    let indexed = why(&["--latest-by", "pickup_ts", "--lookback", "30s"]);
+    let current = indexed.current.unwrap();
+    assert_eq!(
+        (current.row_groups, current.bytes),
+        window_oracle(&data, None, 30_000_000)
+    );
+}
+
+/// `(id, fare)` rows with `fare` a Float64 (`None` is a null).
+fn fares(dir: &Path, values: &[Option<f64>]) {
+    let ids: Vec<i64> = (0..i64::try_from(values.len()).unwrap()).collect();
+    table(
+        &dir.join("part-0.parquet"),
+        vec![
+            ("id", Arc::new(Int64Array::from(ids)) as ArrayRef),
+            ("fare", Arc::new(Float64Array::from(values.to_vec()))),
+        ],
+    );
+}
+
+/// Strategy request 4: `--totals fare:dec(2)` totals a Float64 column by
+/// exact quantization: each value's exact binary value rounded half to
+/// even at scale 2, summed as an `i128`. The spec is printed and recorded
+/// in the certificate's `totals_delta` labels; NaN is an error naming the
+/// key; a bare float stays a usage error showing the `:dec(S)` form.
+#[test]
+fn request_4_float_totals_by_exact_quantization() {
+    let dir = tempfile::tempdir().unwrap();
+    let side = |name: &str, values: &[Option<f64>]| {
+        let d = dir.path().join(name);
+        fares(&d, values);
+        d
+    };
+    // 0.125 is a tie (to 0.12), 0.375 a tie (to 0.38), and 2.675 is
+    // 2.67499999999999982236431605997495353221893310546875 (to 2.67): 3.17.
+    // Summing the floats first and rounding the sum gives 3.18.
+    let values = [Some(0.125), Some(0.375), Some(2.675), None];
+    let left = side("left", &values);
+    let right = side("right", &values);
+    let args = |r: &Path, totals: &str| -> Vec<String> {
+        [
+            "reconcile",
+            path(&left),
+            path(r),
+            "--key",
+            "id",
+            "--totals",
+            totals,
+        ]
+        .iter()
+        .map(ToString::to_string)
+        .collect()
+    };
+    let json = |r: &Path, totals: &str, code: i32| -> ReconcileResult {
+        let mut a = vec!["--json".to_string()];
+        a.extend(args(r, totals));
+        typed(&run(
+            &a.iter().map(String::as_str).collect::<Vec<_>>(),
+            code,
+        ))
+    };
+    let pass = json(&right, "fare:dec(2)", 0);
+    let t = &pass.outcome.totals[0];
+    assert_eq!(t.column, "fare:dec(2)");
+    assert_eq!(
+        (t.left.render(), t.right.render()),
+        ("3.17".into(), "3.17".into())
+    );
+    assert_eq!(t.left.scale, 2);
+    let human = run(
+        &args(&right, "fare:dec(2)")
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        0,
+    );
+    assert!(
+        human.contains(
+            "fare:dec(2): each float value's exact binary value rounded half to even at 2 decimal places"
+        ),
+        "{human}"
+    );
+    assert!(human.contains("3.17"), "{human}");
+
+    // One cent apart: the certificate fails and its totals_delta label
+    // records the quantization spec.
+    let off = side("off", &[Some(0.125), Some(0.385), Some(2.675), None]);
+    let fail = json(&off, "fare:dec(2)", 1);
+    let Record::Certificate(c) = &fail.certificate.record else {
+        panic!("{:?}", fail.certificate.record)
+    };
+    let (label, l, r) = &c.body.totals_delta[0];
+    assert!(label.contains(r#""column":"fare:dec(2)""#), "{label}");
+    assert_eq!((l.as_str(), r.as_str()), ("3.17", "3.18"));
+
+    // NaN or infinity is an error naming the key (exit 4).
+    let nan = side("nan", &[Some(0.125), Some(f64::NAN), Some(2.675), None]);
+    let out = bw().args(args(&nan, "fare:dec(2)")).output().unwrap();
+    assert_eq!(out.status.code(), Some(4));
+    let err = String::from_utf8(out.stderr).unwrap();
+    assert!(err.contains("key (id=1) has NaN in \"fare\""), "{err}");
+    assert!(err.contains("fare:dec(2) cannot total"), "{err}");
+
+    // Usage errors (exit 2): a bare float shows the :dec(S) form; :dec on a
+    // decimal, and a malformed scale, say what to write.
+    let usage = |totals: &str, says: &str| {
+        let out = bw().args(args(&right, totals)).output().unwrap();
+        assert_eq!(out.status.code(), Some(2), "{totals}");
+        let err = String::from_utf8(out.stderr).unwrap();
+        assert_eq!(err.trim_end().lines().count(), 1, "{err}");
+        assert!(err.contains(says), "{totals}: {err}");
+    };
+    usage("fare", "--totals fare:dec(4)");
+    usage("fare:dec(x)", "write for example volume:dec(4)");
+    usage("fare:dec(39)", "a scale from 0 to 38");
+    usage("id:dec(2)", "quantizes a float column");
+}
+
+/// Strategy request 5: `--memory-budget` takes binary units (`8G`, `512M`)
+/// as well as bytes; a malformed value is a usage error naming the forms.
+#[test]
+fn request_5_memory_budget_takes_human_units() {
+    let dir = tempfile::tempdir().unwrap();
+    let (left, right) = (dir.path().join("left"), dir.path().join("right"));
+    corpus(&left, 1, 2, 20, 40);
+    corpus(&right, 1, 2, 20, 40);
+    let budget = |given: &str| -> u64 {
+        let r: ReconcileResult = typed(&run(
+            &[
+                "--json",
+                "reconcile",
+                path(&left),
+                path(&right),
+                "--key",
+                "id",
+                "--memory-budget",
+                given,
+            ],
+            0,
+        ));
+        r.outcome.memory.budget_bytes
+    };
+    assert_eq!(budget("268435456"), 268_435_456);
+    assert_eq!(budget("512M"), 512 << 20);
+    assert_eq!(budget("8G"), 8 << 30);
+    assert_eq!(budget("64KiB"), 64 << 10);
+    for bad in ["8GB", "1.5G", "-1", "G", "99999999999T"] {
+        let out = bw()
+            .args([
+                "reconcile",
+                path(&left),
+                path(&right),
+                "--key",
+                "id",
+                &format!("--memory-budget={bad}"),
+            ])
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(2), "{bad}");
+        let err = String::from_utf8(out.stderr).unwrap();
+        assert!(err.contains("--memory-budget"), "{bad}: {err}");
+    }
+    let out = bw()
+        .args([
+            "reconcile",
+            path(&left),
+            path(&right),
+            "--key",
+            "id",
+            "--memory-budget",
+            "8GB",
+        ])
+        .output()
+        .unwrap();
+    let err = String::from_utf8(out.stderr).unwrap();
+    assert!(err.contains("binary unit, K, M, G, or T"), "{err}");
 }

@@ -50,6 +50,12 @@ fn lookup(keys: &RunKeys, query: &RunQuery) -> Lookup {
             keys: tuples,
             ts: *ts,
         },
+        RunQuery::Window { asof, lookback } => Lookup::Window {
+            columns,
+            keys: tuples,
+            asof: *asof,
+            lookback: *lookback,
+        },
     }
 }
 

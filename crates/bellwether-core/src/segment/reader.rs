@@ -662,7 +662,7 @@ impl<R: ReadAt> SegmentReader<R> {
         Ok(())
     }
 
-    fn require_temporal(&self) -> Result<()> {
+    pub(crate) fn require_temporal(&self) -> Result<()> {
         if self.header.layout == Layout::KeyedTemporal {
             Ok(())
         } else {

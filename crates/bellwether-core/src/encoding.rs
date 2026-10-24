@@ -865,6 +865,26 @@ pub fn check_ts_type(dt: &DataType) -> Result<()> {
     }
 }
 
+/// The smallest ordering value (in the unit [`ts_value_as`] returns) a
+/// `ts_column` of dataset type `dt` can hold: the lower clamp of a lookback
+/// window, so the window's bound always encodes at the column's type.
+pub fn ts_min(dt: &DataType) -> Result<i64> {
+    check_ts_type(dt)?;
+    Ok(match dt {
+        DataType::Dictionary(_, v) => return ts_min(v),
+        DataType::Int8 => i8::MIN.into(),
+        DataType::Int16 => i16::MIN.into(),
+        DataType::Int32 | DataType::Date32 => i32::MIN.into(),
+        DataType::UInt8
+        | DataType::UInt16
+        | DataType::UInt32
+        | DataType::UInt64
+        | DataType::Time32(_)
+        | DataType::Time64(_) => 0,
+        _ => i64::MIN,
+    })
+}
+
 /// Reads the ordering value of a temporal `ts_column` at `row`, converted to
 /// the dataset type `declared`. `None` for null; nulls rank last and never
 /// win (ADR 014).

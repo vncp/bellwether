@@ -129,6 +129,8 @@ Either probe silently misses. **Callers must encode probes with the typed encode
 | `Keys` | `In` over the lookup columns |
 | `Latest` | `And[In, NotOlderThan, LatestPerKey]` |
 | `AsOf` | `And[In, Between(ts ≤ asof), NotOlderThan, LatestPerKey]` |
+| `Window` with `asof` | `And[In, Between(asof − lookback ≤ ts ≤ asof)]` |
+| `Window` without | `And[In, NotOlderThan(newest − lookback per key)]` |
 | `Between` | `Between` |
 
 Details:
@@ -138,6 +140,7 @@ Details:
   - a `Between` bound of +0.0 below or -0.0 above is widened (`docs/format.md`, statistics semantics).
 - `NotOlderThan` carries each key's index-wide winning timestamp from every segment of the temporal spec. A stale row in a planned row group is dropped even when the newest version lives in a row group another spec pruned (invariant 5).
 - `In` for `Latest` and `AsOf` lists only keys that have a version. A key whose versions all have null timestamps has no latest (ADR 014).
+- `Window` returns every version of each key in its lookback window, so it has no `LatestPerKey`. The window comes from every segment's version chains over live row groups (core `temporal::chains` and `temporal::window`): with `asof`, `[asof − lookback, asof]` for every key; without, `[newest − lookback, newest]` per key, `newest` being the key's newest live version. The lower bound is clamped to the smallest value the timestamp column holds. The plan holds every live row group with a version of a key in its window, intersected per key with any other serving spec; `In` lists only keys with a version in their window. `tests/invariants.rs` checks windows against decoded rows over random layouts.
 
 ## Memory (ADR 018)
 

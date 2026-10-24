@@ -30,13 +30,13 @@ use crate::outcome::{
 use crate::planner::{ManifestIdentity, SidePlanner};
 use crate::render::render_tuple;
 use crate::rowhash::{check_probe, hex, push_hashed_column};
-use crate::schema::{class, Plan};
+use crate::schema::{class, Plan, TotalCol};
 use crate::spec::{CoverageRequest, Options, ReconcileSpec, MAX_PASSES};
 use crate::state::{
     charge_heap, heap, release_heap, table_peak, Contrib, Examples, GroupError, Groups, KeyState,
     Meter, MeteredMap, Overflow, SideState,
 };
-use crate::totals::{finalize, ExactTotal, Wide};
+use crate::totals::{finalize, quantize, ExactTotal, Wide};
 
 /// Seed of the key-space partition hash. Fixed: the partition never
 /// depends on the caller's sampling seed.
@@ -1029,8 +1029,21 @@ fn read_row_group(
         let gid = match a.groups.as_mut() {
             Some(groups) => {
                 for (slot, t) in scratch.values.iter_mut().zip(&plan.totals) {
-                    *slot = decimal_at(cols[t.proj], row, &types[t.proj], &mut scratch.decimal)
-                        .map_err(|e| locate(t.proj, &e))?;
+                    *slot = if t.quantize {
+                        quantized_at(cols[t.proj], row, t).map_err(|(value, why)| {
+                            Abort::Error(VerifyError::Quantize {
+                                side: SIDE_NAMES[s],
+                                file: rg.file.path.clone(),
+                                row_group: rg.index_in_file,
+                                total: t.name.clone(),
+                                key: key_label(&scratch.key, plan, s),
+                                value: format!("{value} in {:?} ({why})", plan.projection[t.proj]),
+                            })
+                        })?
+                    } else {
+                        decimal_at(cols[t.proj], row, &types[t.proj], &mut scratch.decimal)
+                            .map_err(|e| locate(t.proj, &e))?
+                    };
                 }
                 scratch.group.clear();
                 for &i in &plan.group {
@@ -1399,6 +1412,36 @@ fn decimal_at(
         }
         _ => Err(bad()),
     }
+}
+
+/// A float total's value quantized at its scale, or the value as printed
+/// and why it cannot be totalled.
+fn quantized_at(
+    array: &dyn Array,
+    row: usize,
+    t: &TotalCol,
+) -> std::result::Result<Option<i256>, (String, String)> {
+    let v = match encoding::value_at(array, row) {
+        Ok(None) => return Ok(None),
+        Ok(Some(encoding::Value::Float(v))) => v,
+        Ok(Some(_)) => return Err((String::new(), "not a float".into())),
+        Err(e) => return Err((String::new(), e.to_string())),
+    };
+    let scale = u8::try_from(t.scale).map_err(|_| (v.to_string(), "negative scale".into()))?;
+    quantize(v, scale)
+        .map(|q| Some(i256::from_i128(q)))
+        .map_err(|e| (v.to_string(), e.to_string()))
+}
+
+/// A key for messages: `(col=value, ...)` from its canonical bytes.
+fn key_label(key: &[u8], plan: &Plan, side: usize) -> String {
+    let names = plan.key.iter().map(|&i| plan.projection[i].as_str());
+    let values = render_tuple(key, &plan.key_types(side)).unwrap_or_default();
+    let parts: Vec<String> = names
+        .zip(values.into_iter().chain(std::iter::repeat(None)))
+        .map(|(n, v)| format!("{n}={}", v.as_deref().unwrap_or("null")))
+        .collect();
+    format!("({})", parts.join(", "))
 }
 
 /// The batch must be the requested columns of the whole row group.
