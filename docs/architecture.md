@@ -64,3 +64,64 @@ flowchart LR
 Dependency arrows point one way, and `dev/check-layering.py` fails CI on any edge not listed there. `core` and `source` know nothing above them. `cli` and `mcp` hold no engine logic: both call the `bellwether` facade, so a typed result serialized by the CLI's `--json` is byte for byte what an MCP tool returns.
 
 See `invariants.md`, `threat-model.md`, `format.md`, `work-packages.md`, `agent-loop.md`, `rule-catalog.md`, `benchmark.md`, and `adr/`.
+
+## Diagrams for implementers
+
+### How `fix` proves a change
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant U as Agent or human
+    participant E as Engine (facade)
+    participant R as Replay
+    participant V as Verify
+    participant B as Build + Store
+    participant L as Ledger
+    U->>E: fix(proposal, workload)
+    E->>R: replay workload under the proposal
+    R-->>E: exact bytes per run
+    E->>L: Replay record
+    E->>V: reconcile full scan vs planned scan over every touched key
+    V-->>E: pass or fail (by key, newest version, row hash, exact totals)
+    E->>L: Certificate
+    alt certificate failed, or data or manifest changed since verification
+        E-->>U: refusal (exit 1 or 3), nothing applied, no receipt
+    else certificate passed against the current data
+        E->>B: build the index, commit the manifest (conditional PUT)
+        B-->>E: manifest before → after
+        E->>L: Receipt linking evidence, proposal, replay, certificate
+        E-->>U: receipt hash
+    end
+```
+
+### From files to a plan
+
+```mermaid
+flowchart LR
+    F["Parquet / CSV / JSON lines"] -->|"footers and<br/>statistics only"| P["Profile<br/>fanout per column · lints<br/>(batch stamp used as a key?)"]
+    P --> C["Candidate keys"]
+    C -->|"replay recorded<br/>query keys"| X["Exact cost<br/>per candidate, per run"]
+    X --> K["Index<br/>immutable segments:<br/>sorted keys · bloom filters · bitmaps of row groups<br/>+ one small manifest"]
+    K --> PL["Scan plan<br/>files · row groups · exact bytes<br/>+ residual predicate"]
+    PL --> ENG["Your engine reads the rows<br/>DuckDB · DataFusion · Polars · Spark"]
+    style K fill:#e8f1ff,stroke:#2f6fed,color:#000
+    style PL fill:#e9f8ef,stroke:#1f9d55,color:#000
+```
+
+### Crate graph
+
+```mermaid
+flowchart TB
+    CLI["bellwether-cli"] --> FAC["bellwether (facade)<br/>Engine: why · index · locate · fix · reconcile · report"]
+    MCP["bellwether-mcp (M4)"] --> FAC
+    FAC --> PROF["profile"] & REP["replay"] & VER["verify"] & BLD["build"]
+    PROF & REP & VER & BLD --> LED["ledger"]
+    PROF & REP & VER & BLD --> CORE["core<br/>encoding · segments · blooms · temporal"]
+    PROF & REP & VER & BLD --> SRC["source<br/>Parquet · text · fingerprints · catalog"]
+    PROF & REP & VER & BLD --> STO["store<br/>object stores · manifest commits · GC"]
+    LED & CORE & SRC & STO --> TY["types (the contract)"]
+    style TY fill:#f3f0ff,stroke:#6f4bd8,color:#000
+    style FAC fill:#e8f1ff,stroke:#2f6fed,color:#000
+```
+

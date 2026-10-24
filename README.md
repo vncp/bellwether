@@ -20,17 +20,12 @@ Bellwether is a standalone index and query advisor for Parquet lakes, written in
 
 ## In one minute
 
-```mermaid
-flowchart LR
-    A["📁 A folder of Parquet or CSV<br/>(millions of files, no index)"] --> W["<b>bellwether why</b><br/>which column is a real key?<br/>exact bytes each index would save"]
-    W --> F["<b>bellwether fix</b><br/>score → verify → apply → attest"]
-    F --> R["🧾 Receipt<br/>hash-linked proof the change<br/>returned the same rows"]
-    F --> I["📇 Index<br/>locate · latest · asof<br/>in milliseconds over plain files"]
-    style W fill:#e8f1ff,stroke:#2f6fed,color:#000
-    style F fill:#e8f1ff,stroke:#2f6fed,color:#000
-    style R fill:#e9f8ef,stroke:#1f9d55,color:#000
-    style I fill:#e9f8ef,stroke:#1f9d55,color:#000
-```
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/assets/three-steps-dark.svg">
+    <img alt="Three steps: ask with bellwether why, fix with bellwether fix, get a receipt and an index" src="docs/assets/three-steps-light.svg" width="1000">
+  </picture>
+</p>
 
 Jobs over a data lake routinely read a thousand times more than they return, because nobody knows which column a real index should be on, and nobody can prove a faster version of the job returns the same rows. Bellwether answers both questions from the files' own statistics: the cost of any candidate index is computed exactly, never estimated, and every applied change ends in a receipt a reviewer or a CI gate can check.
 
@@ -38,70 +33,14 @@ Jobs over a data lake routinely read a thousand times more than they return, bec
 
 An agent (or a person) may **observe** and **propose**. Only the engine may **score**, **verify**, and **apply**. The boundary is enforced by the record types, not by a prompt: a proposal has no score field, and a receipt cannot be written without a certificate that passed.
 
-```mermaid
-flowchart LR
-    subgraph AGENT["🤖 Agent or human · may observe and propose"]
-        direction TB
-        O["1 · Observe<br/><i>why, profile, locate</i>"] -->|"writes <b>Evidence</b>"| P["2 · Propose<br/><i>a key, a layout, a rewrite</i><br/>no score field exists"]
-    end
-    subgraph ENGINE["⚙️ Engine only · scores, verifies, applies"]
-        direction TB
-        S["3 · Score + verify<br/><i>exact replay · reconcile</i>"] -->|"writes <b>Replay</b>, <b>Certificate</b>"| AP["4 · Apply + attest<br/><i>build index · commit manifest</i>"]
-    end
-    P -->|"writes <b>Proposal</b>"| S
-    AP -->|"writes <b>Receipt</b>"| L[("📒 Ledger<br/>content-addressed,<br/>append-only")]
-    O -.-> L
-    P -.-> L
-    S -.-> L
-    style AGENT fill:#fff7e6,stroke:#d98b00,color:#000
-    style ENGINE fill:#e9f8ef,stroke:#1f9d55,color:#000
-    style L fill:#f3f0ff,stroke:#6f4bd8,color:#000
-```
-
 ## How `fix` proves a change
 
-```mermaid
-sequenceDiagram
-    autonumber
-    participant U as Agent or human
-    participant E as Engine (facade)
-    participant R as Replay
-    participant V as Verify
-    participant B as Build + Store
-    participant L as Ledger
-    U->>E: fix(proposal, workload)
-    E->>R: replay workload under the proposal
-    R-->>E: exact bytes per run
-    E->>L: Replay record
-    E->>V: reconcile full scan vs planned scan over every touched key
-    V-->>E: pass or fail (by key, newest version, row hash, exact totals)
-    E->>L: Certificate
-    alt certificate failed, or data or manifest changed since verification
-        E-->>U: refusal (exit 1 or 3), nothing applied, no receipt
-    else certificate passed against the current data
-        E->>B: build the index, commit the manifest (conditional PUT)
-        B-->>E: manifest before → after
-        E->>L: Receipt linking evidence, proposal, replay, certificate
-        E-->>U: receipt hash
-    end
-```
-
+In order, every time: **score** the proposal by exact replay, **verify** that the old and new way return the same rows over every key the workload touched, **apply** by building the index and committing the manifest, then **attest** with a receipt. 
 The order never changes: score, verify, apply, attest. The engine recomputes the replay and the data's fingerprint itself immediately before using them, so a caller cannot supply a cost, a verdict, or a stale certificate.
 
 ## From files to a plan
 
-```mermaid
-flowchart LR
-    F["Parquet / CSV / JSON lines"] -->|"footers and<br/>statistics only"| P["Profile<br/>fanout per column · lints<br/>(batch stamp used as a key?)"]
-    P --> C["Candidate keys"]
-    C -->|"replay recorded<br/>query keys"| X["Exact cost<br/>per candidate, per run"]
-    X --> K["Index<br/>immutable segments:<br/>sorted keys · bloom filters · bitmaps of row groups<br/>+ one small manifest"]
-    K --> PL["Scan plan<br/>files · row groups · exact bytes<br/>+ residual predicate"]
-    PL --> ENG["Your engine reads the rows<br/>DuckDB · DataFusion · Polars · Spark"]
-    style K fill:#e8f1ff,stroke:#2f6fed,color:#000
-    style PL fill:#e9f8ef,stroke:#1f9d55,color:#000
-```
-
+Footers and statistics in, scan plan out: profile the columns, replay your recorded keys against each candidate index for an exact cost, build immutable index segments plus one small manifest, and hand your engine a list of files and row groups with a residual predicate. 
 Nothing above the file layer is format-specific: a text file's fixed byte-range chunks play the role of Parquet row groups, and a SQL table is a planned source.
 
 ## Highlights
@@ -276,22 +215,6 @@ An index does not help this workload on this layout: 1,000 random users together
 
 ## Status
 
-```mermaid
-timeline
-    title Milestones
-    section Done
-        M1 : why with no index
-        M2 : index · locate · latest · asof
-        M3 : fix writes a receipt
-    section Next
-        M4 : MCP server, agent loop end to end
-        M5 : format frozen with a fixture
-        M6 : evolve and report
-    section Later
-        M7 : SQL source · engine adapters · CI receipts
-        M8 : relational cost model · rule transfer · signed receipts
-```
-
 Pre-alpha. The architecture and on-disk format are fixed and documented; the crates are being built against them, each landing by reviewed pull request.
 
 - [x] Contract crate, architecture, invariants, threat model, format, 27 decision records
@@ -322,20 +245,6 @@ cargo install --git https://github.com/vncp/bellwether bellwether-cli
 ## Architecture at a glance
 
 Twelve crates, dependencies pointing one way, enforced by a script in CI. The CLI and the MCP server hold no engine logic: both call the `bellwether` facade, so what the CLI prints as `--json` is byte for byte what an agent receives.
-
-```mermaid
-flowchart TB
-    CLI["bellwether-cli"] --> FAC["bellwether (facade)<br/>Engine: why · index · locate · fix · reconcile · report"]
-    MCP["bellwether-mcp (M4)"] --> FAC
-    FAC --> PROF["profile"] & REP["replay"] & VER["verify"] & BLD["build"]
-    PROF & REP & VER & BLD --> LED["ledger"]
-    PROF & REP & VER & BLD --> CORE["core<br/>encoding · segments · blooms · temporal"]
-    PROF & REP & VER & BLD --> SRC["source<br/>Parquet · text · fingerprints · catalog"]
-    PROF & REP & VER & BLD --> STO["store<br/>object stores · manifest commits · GC"]
-    LED & CORE & SRC & STO --> TY["types (the contract)"]
-    style TY fill:#f3f0ff,stroke:#6f4bd8,color:#000
-    style FAC fill:#e8f1ff,stroke:#2f6fed,color:#000
-```
 
 On disk: immutable `segments/` named by content hash, one `manifest.json` advanced by conditional PUT with a sequence number, an append-only `ledger/` of hash-named records, and a rebuildable `cache/`.
 
