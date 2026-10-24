@@ -16,24 +16,24 @@ Three questions the engine answers, and the verb each ships under:
 
 ## The loop
 
-```
-  bellwether-cli ────────── one shared code path ────────── bellwether-mcp
-  why · fix · asof · receipt                            observe.* propose.* apply.*
-        │                                                        │
-  ┌─────┴──────────────────┐     TRUST BOUNDARY    ┌─────────────┴───────────────┐
-  │ 1 OBSERVE   2 PROPOSE  │ ╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌ │ 3 SCORE+VERIFY  4 APPLY+ATTEST│
-  │ read-only   candidate  │  agent authority ends │ exact replay    refuses w/o   │
-  │ <100ms      score = ∅  │                       │ reconcile→Cert  Certificate   │
-  └─────┬──────────────────┘                       └─────────────┬───────────────┘
-        │ reads                                         writes   │ builds
-  ┌─────────┬─────────┬─────────┬─────────┬─────────┬─────────┐
-  │ profile │ replay  │ verify  │ ledger  │  core   │ source  │   deps point one way →
-  └─────────┴─────────┴─────────┴─────────┴─────────┴─────────┘
-           store · object_store · conditional-PUT · snapshot isolation
-  ┌───────────┬──────────────┬────────────┬────────────┐
-  │ segments/ │ manifest.json│  ledger/   │   cache/   │
-  │ immutable │ CAS commit   │ hash-linked│ rebuildable│
-  └───────────┴──────────────┴────────────┴────────────┘
+```mermaid
+flowchart LR
+    subgraph AGENT["🤖 Agent or human · may observe and propose"]
+        direction TB
+        O["1 · Observe<br/><i>why, profile, locate</i>"] -->|"writes <b>Evidence</b>"| P["2 · Propose<br/><i>a key, a layout, a rewrite</i><br/>no score field exists"]
+    end
+    subgraph ENGINE["⚙️ Engine only · scores, verifies, applies"]
+        direction TB
+        S["3 · Score + verify<br/><i>exact replay · reconcile</i>"] -->|"writes <b>Replay</b>, <b>Certificate</b>"| AP["4 · Apply + attest<br/><i>build index · commit manifest</i>"]
+    end
+    P -->|"writes <b>Proposal</b>"| S
+    AP -->|"writes <b>Receipt</b>"| L[("📒 Ledger<br/>content-addressed,<br/>append-only")]
+    O -.-> L
+    P -.-> L
+    S -.-> L
+    style AGENT fill:#fff7e6,stroke:#d98b00,color:#000
+    style ENGINE fill:#e9f8ef,stroke:#1f9d55,color:#000
+    style L fill:#f3f0ff,stroke:#6f4bd8,color:#000
 ```
 
 | Stage | Who | Record written | Rule |
