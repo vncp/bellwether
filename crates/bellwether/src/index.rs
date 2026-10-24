@@ -152,6 +152,22 @@ impl Engine {
         .map_err(schema_hint)
     }
 
+    /// The bitemporal as-of: per key, the newest row by valid time among
+    /// rows known at or before `known` and valid at or before `valid`, ties
+    /// on valid time going to the later known time, through the one
+    /// complete `temporal2` sidecar serving the key columns. Either bound
+    /// may be omitted (unbounded); `latest --known K` is `valid = None`. A
+    /// null in either clock never wins (ADR 014). The residual carries both
+    /// bounds, `NotOlderThan` on each clock, then `LatestPerKey`.
+    pub fn asof_bitemporal(
+        &self,
+        keys: &KeyFile,
+        valid: Option<&str>,
+        known: Option<&str>,
+    ) -> Result<PlanResult> {
+        guard(|| self.plan_lookup(keys, Mode::Bitemporal { valid, known })).map_err(schema_hint)
+    }
+
     /// Invariant 1 over the folder, not only the index: a file that landed
     /// or changed after the last build would be silently left out of the
     /// plan, so it is refused. A plan pinned to an earlier manifest
@@ -173,8 +189,8 @@ impl Engine {
     fn plan_lookup(&self, keys: &KeyFile, mode: Mode<'_>) -> Result<PlanResult> {
         let verb = match mode {
             Mode::Locate | Mode::Window { .. } => "locate",
-            Mode::Latest => "latest",
-            Mode::Asof(_) => "asof",
+            Mode::Latest | Mode::Bitemporal { valid: None, .. } => "latest",
+            Mode::Asof(_) | Mode::Bitemporal { .. } => "asof",
         };
         let pinned = self.pin_required(verb)?;
         self.refuse_stale(&pinned, verb)?;
@@ -211,6 +227,9 @@ impl Engine {
                 to,
                 ts_column,
             } => window_lookup(&pinned, &specs, &columns, tuples, from, to, ts_column)?,
+            Mode::Bitemporal { valid, known } => {
+                self.bitemporal_lookup(&pinned, &columns, tuples, valid, known)?
+            }
         };
         let (plan, order) = pinned.planner.plan_ordered(&specs, &lookup).map_err(|e| {
             if specs.is_empty() && !excluded.is_empty() {
@@ -219,7 +238,10 @@ impl Engine {
                 e
             }
         })?;
-        if matches!(kind, LookupKind::Latest | LookupKind::Asof { .. }) {
+        if matches!(
+            kind,
+            LookupKind::Latest | LookupKind::Asof { .. } | LookupKind::Bitemporal { .. }
+        ) {
             check_temporal_residual(&plan)?;
         }
         let sidecars: Vec<String> = pinned
@@ -263,6 +285,79 @@ impl Engine {
             evidence,
         })
     }
+
+    /// The bitemporal lookup on `columns` through the one complete
+    /// `temporal2` sidecar serving them, with both bounds converted to their
+    /// columns' units exactly.
+    fn bitemporal_lookup(
+        &self,
+        pinned: &Pinned,
+        columns: &[String],
+        tuples: Vec<Vec<u8>>,
+        valid: Option<&str>,
+        known: Option<&str>,
+    ) -> Result<(Lookup, LookupKind)> {
+        let probe = Lookup::Bitemporal {
+            columns: columns.to_vec(),
+            keys: Vec::new(),
+            valid: None,
+            known: None,
+        };
+        let def = match pinned.planner.sidecars_for(&probe).as_slice() {
+            [one] => one.clone(),
+            [] => {
+                return Err(Error::KeySpec(format!(
+                    "no complete temporal2 sidecar serves a lookup on ({}); declare one with \
+                     `bellwether index {} --key temporal2:{}@<valid>,<known>`",
+                    columns.join(", "),
+                    self.root(),
+                    columns.join(",")
+                )))
+            }
+            many => {
+                return Err(Error::KeySpec(format!(
+                    "several temporal2 sidecars serve a lookup on ({}): {}; pass a key file with \
+                     exactly the key columns of one (--key)",
+                    columns.join(", "),
+                    many.iter()
+                        .map(SidecarDef::name)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )))
+            }
+        };
+        let (valid_column, known_column) =
+            (def.time_columns[0].clone(), def.time_columns[1].clone());
+        let in_unit = |at: Option<&str>, column: &str| -> Result<Option<i64>> {
+            at.map(|a| {
+                let t = pinned
+                    .planner
+                    .column_types(&[column.to_string()])?
+                    .remove(0)
+                    .1;
+                instant_in_unit(a, column, &t)
+            })
+            .transpose()
+        };
+        let valid_ts = in_unit(valid, &valid_column)?;
+        let known_ts = in_unit(known, &known_column)?;
+        Ok((
+            Lookup::Bitemporal {
+                columns: columns.to_vec(),
+                keys: tuples,
+                valid: valid_ts,
+                known: known_ts,
+            },
+            LookupKind::Bitemporal {
+                valid: valid.map(str::to_string),
+                known: known.map(str::to_string),
+                valid_ts,
+                known_ts,
+                valid_column,
+                known_column,
+            },
+        ))
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -274,6 +369,10 @@ enum Mode<'a> {
         from: &'a str,
         to: &'a str,
         ts_column: Option<&'a str>,
+    },
+    Bitemporal {
+        valid: Option<&'a str>,
+        known: Option<&'a str>,
     },
 }
 

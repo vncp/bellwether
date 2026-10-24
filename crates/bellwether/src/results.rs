@@ -129,6 +129,22 @@ pub enum LookupKind {
         /// The time column.
         ts_column: String,
     },
+    /// Per key, the newest row by valid time among rows known by `known`
+    /// and valid by `valid` (each unbounded when absent).
+    Bitemporal {
+        /// The valid-time bound as given.
+        valid: Option<String>,
+        /// The known-time bound as given.
+        known: Option<String>,
+        /// `valid` in the valid column's dataset unit.
+        valid_ts: Option<i64>,
+        /// `known` in the known column's dataset unit.
+        known_ts: Option<i64>,
+        /// The valid-time column.
+        valid_column: String,
+        /// The known-time column.
+        known_column: String,
+    },
 }
 
 /// What [`crate::Engine::locate`], [`crate::Engine::latest`], and

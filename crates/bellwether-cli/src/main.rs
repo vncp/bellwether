@@ -72,9 +72,11 @@ enum Command {
     /// Plan which files and row groups hold the keys (in a time window with
     /// --from and --to).
     Locate(LocateArgs),
-    /// Plan the newest version of each key.
-    Latest(LookupArgs),
-    /// Plan the version of each key current at an instant.
+    /// Plan the newest version of each key (newest valid version known by
+    /// an instant with --known).
+    Latest(LatestArgs),
+    /// Plan the version of each key current at an instant (--at), or the
+    /// bitemporal version valid at --valid as known at --known.
     Asof(AsofArgs),
     /// Record a proposal (a key, a layout, or a rewrite) citing evidence.
     Propose(ProposeArgs),
@@ -196,13 +198,30 @@ struct LocateArgs {
 }
 
 #[derive(Args)]
+struct LatestArgs {
+    #[command(flatten)]
+    lookup: LookupArgs,
+    /// Bitemporal: the newest valid version among rows known at or before
+    /// this instant (needs a temporal2 key).
+    #[arg(long, value_name = "INSTANT")]
+    known: Option<String>,
+}
+
+#[derive(Args)]
+#[command(group(clap::ArgGroup::new("instant").required(true).multiple(true).args(["at", "valid", "known"])))]
 struct AsofArgs {
     #[command(flatten)]
     lookup: LookupArgs,
     /// The instant: RFC 3339, a date (YYYY-MM-DD), or an integer in the
     /// timestamp column's unit.
+    #[arg(long, value_name = "INSTANT", conflicts_with_all = ["valid", "known"])]
+    at: Option<String>,
+    /// Bitemporal: the valid-time instant (needs a temporal2 key).
     #[arg(long, value_name = "INSTANT")]
-    at: String,
+    valid: Option<String>,
+    /// Bitemporal: the known-time instant; rows learned later are ignored.
+    #[arg(long, value_name = "INSTANT")]
+    known: Option<String>,
 }
 
 #[derive(Args)]
@@ -475,8 +494,14 @@ fn run(cli: &Cli, out: &Out) -> Result<Outcome, Failure> {
             (Some(from), Some(to)) => e.locate_window(keys, from, to, a.ts.as_deref()),
             _ => e.locate(keys),
         }),
-        Command::Latest(a) => lookup(g, out, a, |e, keys| e.latest(keys)),
-        Command::Asof(a) => lookup(g, out, &a.lookup, |e, keys| e.asof(keys, &a.at)),
+        Command::Latest(a) => lookup(g, out, &a.lookup, |e, keys| match &a.known {
+            Some(known) => e.asof_bitemporal(keys, None, Some(known)),
+            None => e.latest(keys),
+        }),
+        Command::Asof(a) => lookup(g, out, &a.lookup, |e, keys| match &a.at {
+            Some(at) => e.asof(keys, at),
+            None => e.asof_bitemporal(keys, a.valid.as_deref(), a.known.as_deref()),
+        }),
         Command::Propose(a) => propose(g, out, a),
         Command::Receipt {
             command: ReceiptCommand::Show { root, hash: h },

@@ -131,6 +131,24 @@ fn lookup_label(lookup: &LookupKind) -> String {
             hi,
             ts_column,
         } => format!("locate {ts_column} in [{from}, {to}] ({lo}..={hi})"),
+        LookupKind::Bitemporal {
+            valid,
+            known,
+            valid_ts,
+            known_ts,
+            valid_column,
+            known_column,
+        } => {
+            let bound = |given: &Option<String>, ts: &Option<i64>, column: &str| match (given, ts) {
+                (Some(g), Some(t)) => format!("{column} <= {g} ({t})"),
+                _ => format!("{column} unbounded"),
+            };
+            format!(
+                "bitemporal {}, {}",
+                bound(valid, valid_ts, valid_column),
+                bound(known, known_ts, known_column)
+            )
+        }
     }
 }
 

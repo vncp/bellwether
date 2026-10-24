@@ -72,7 +72,9 @@ use arrow::array::{ArrayRef, RecordBatch};
 use arrow::datatypes::{DataType, SchemaRef};
 use bellwether_core::encoding::{self, tag, KeyColumns, Value};
 use bellwether_core::segment::ReadAt;
-use bellwether_core::sidecar::{SidecarDef, SidecarKind, SidecarReader};
+use bellwether_core::sidecar::{
+    bitemporal_winner, BitemporalHit, SidecarDef, SidecarKind, SidecarReader, Triple,
+};
 use bellwether_core::temporal::{self, VersionChain, VersionHit};
 use bellwether_core::SegmentReader;
 use bellwether_source::{
@@ -150,6 +152,21 @@ pub enum Lookup {
         lo: i64,
         /// Inclusive upper bound, in the column's unit.
         hi: i64,
+    },
+    /// Per key, the newest row by valid time among rows known at or before
+    /// `known` and valid at or before `valid` (ties on valid time broken by
+    /// the greater known time), through the one complete `temporal2`
+    /// sidecar serving `columns`. `None` leaves that clock unbounded.
+    Bitemporal {
+        /// Lookup columns; they must include every key column of the
+        /// sidecar.
+        columns: Vec<String>,
+        /// Canonical key tuples.
+        keys: Vec<Vec<u8>>,
+        /// Upper bound on valid time, in the valid column's unit.
+        valid: Option<i64>,
+        /// Upper bound on known time, in the known column's unit.
+        known: Option<i64>,
     },
 }
 
@@ -311,13 +328,16 @@ impl<S: StoreExt + ?Sized> Planner<S> {
 
     /// The complete sidecars that take part in planning `lookup`: for a
     /// window, every complete `bounds` sidecar whose key columns the lookup
-    /// names and whose time column is the window's.
+    /// names and whose time column is the window's; for a bitemporal
+    /// lookup, every complete `temporal2` sidecar whose key columns the
+    /// lookup names (the plan refuses unless there is exactly one).
     #[must_use]
     pub fn sidecars_for(&self, lookup: &Lookup) -> Vec<SidecarDef> {
         let (kind, columns, time) = match lookup {
             Lookup::Window {
                 columns, ts_column, ..
             } => (SidecarKind::Bounds, columns, Some(ts_column)),
+            Lookup::Bitemporal { columns, .. } => (SidecarKind::Bitemporal, columns, None),
             _ => return Vec::new(),
         };
         self.declared_sidecars()
@@ -444,9 +464,14 @@ impl<S: StoreExt + ?Sized> Planner<S> {
             ),
             [one] => Ok(one),
             many => {
+                let bitemporal = self.sidecars_for(lookup);
                 let own = match lookup {
                     Lookup::Between { column, .. } => Some(column.as_str()),
                     Lookup::Window { ts_column, .. } => Some(ts_column.as_str()),
+                    Lookup::Bitemporal { .. } => bitemporal
+                        .first()
+                        .and_then(|d| d.time_columns.first())
+                        .map(String::as_str),
                     Lookup::Latest { columns, .. } | Lookup::AsOf { columns, .. } => {
                         specs.iter().find_map(|s| match s {
                             KeySpec::Temporal {
@@ -595,6 +620,15 @@ impl<S: StoreExt + ?Sized> Planner<S> {
             } => {
                 let sidecars = self.sidecars_for(lookup);
                 self.plan_window(&segs, &sidecars, columns, keys, ts_column, *lo, *hi)
+            }
+            Lookup::Bitemporal {
+                columns,
+                keys,
+                valid,
+                known,
+            } => {
+                let sidecars = self.sidecars_for(lookup);
+                self.plan_bitemporal(&sidecars, columns, keys, *valid, *known)
             }
         }
     }
@@ -1176,6 +1210,120 @@ impl<S: StoreExt + ?Sized> Planner<S> {
         self.finish(&selected, residual)
     }
 
+    /// The bitemporal as-of (see [`Lookup::Bitemporal`]).
+    fn plan_bitemporal(
+        &self,
+        sidecars: &[SidecarDef],
+        columns: &[String],
+        keys: &[Vec<u8>],
+        valid: Option<i64>,
+        known: Option<i64>,
+    ) -> Result<ScanPlan> {
+        let def = match sidecars {
+            [one] => one,
+            [] => {
+                return Err(Error::KeySpec(format!(
+                    "a bitemporal lookup needs a complete temporal2 sidecar on key columns the \
+                     lookup names ({}); declare temporal2:<key>@<valid>,<known> with \
+                     `bellwether index --key`",
+                    columns.join(", ")
+                )))
+            }
+            many => {
+                return Err(Error::KeySpec(format!(
+                    "more than one temporal2 sidecar serves a lookup on {}: {}; look up with \
+                     exactly the key columns of one",
+                    columns.join(", "),
+                    many.iter()
+                        .map(SidecarDef::name)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )))
+            }
+        };
+        let types = self.column_types(columns)?;
+        let (keys, spans) = non_null_probes(keys, &types)?;
+        let (valid_col, known_col) = match def.time_columns.as_slice() {
+            [v, k] => (v.clone(), k.clone()),
+            _ => {
+                return Err(Error::Other(format!(
+                    "{} has no two time columns",
+                    def.name()
+                )))
+            }
+        };
+        let valid_type = self
+            .column_types(std::slice::from_ref(&valid_col))?
+            .remove(0)
+            .1;
+        let known_type = self
+            .column_types(std::slice::from_ref(&known_col))?
+            .remove(0)
+            .1;
+        let positions: Vec<usize> = def
+            .columns
+            .iter()
+            .map(|c| columns.iter().position(|x| x == c))
+            .collect::<Option<_>>()
+            .ok_or_else(|| Error::Other(format!("{} does not serve {columns:?}", def.name())))?;
+        let variants: Vec<Vec<Vec<u8>>> = keys
+            .iter()
+            .zip(&spans)
+            .map(|(k, sp)| zero_variants(&project(k, sp, &positions)))
+            .collect();
+        let mut probes: Vec<Vec<u8>> = variants.iter().flatten().cloned().collect();
+        probes.sort_unstable();
+        probes.dedup();
+        // Every live version of every probe, from every segment
+        // (index-wide, so a winner in a row group another spec would prune
+        // still bounds the residual; invariant 5).
+        let live = self.locator.live();
+        let mut triples: BTreeMap<Vec<u8>, Vec<Triple>> = BTreeMap::new();
+        for seg in self.sidecar_segments(def) {
+            let r = self.open_sidecar(def, seg)?;
+            for (key, ts) in r.triples(&probes)? {
+                let ids: RoaringBitmap = ts.iter().map(|t| t.rg.0).collect();
+                self.locator.check_known(&ids)?;
+                triples
+                    .entry(key)
+                    .or_default()
+                    .extend(ts.into_iter().filter(|t| live.contains(t.rg.0)));
+            }
+        }
+        let winners: Vec<Option<BitemporalHit>> = variants
+            .iter()
+            .map(|vs| {
+                bitemporal_winner(
+                    vs.iter().filter_map(|v| triples.get(v)).flatten(),
+                    valid,
+                    known,
+                )
+            })
+            .collect();
+        let selected = winners
+            .iter()
+            .flatten()
+            .fold(RoaringBitmap::new(), |u, h| u | &h.row_groups);
+        let residual = bitemporal_residual(
+            def,
+            columns,
+            &keys,
+            &variants,
+            &winners,
+            &Clock {
+                column: valid_col,
+                dtype: valid_type,
+                bound: valid,
+            },
+            &Clock {
+                column: known_col,
+                dtype: known_type,
+                bound: known,
+            },
+        )?;
+        self.finish(&selected, residual)
+    }
+
     // -- the plan --------------------------------------------------------------
 
     fn finish(&self, selected: &RoaringBitmap, residual: Predicate) -> Result<ScanPlan> {
@@ -1267,6 +1415,86 @@ impl<S: StoreExt + ?Sized> Planner<S> {
 
 /// The order key of a row-group minimum: `None` (every value null) last.
 type Rank = (bool, Option<Vec<u8>>);
+
+/// One clock of a bitemporal lookup: its column, dataset type, and bound.
+struct Clock {
+    column: String,
+    dtype: DataType,
+    bound: Option<i64>,
+}
+
+/// The residual of a bitemporal lookup (`docs/format.md`, "Sidecar
+/// kinds"): `In` over keys with a winner, both clocks bounded, then
+/// `NotOlderThan` on valid and on known per key, then `LatestPerKey`.
+fn bitemporal_residual(
+    def: &SidecarDef,
+    columns: &[String],
+    keys: &[Vec<u8>],
+    variants: &[Vec<Vec<u8>>],
+    winners: &[Option<BitemporalHit>],
+    valid: &Clock,
+    known: &Clock,
+) -> Result<Predicate> {
+    let with_version = keys
+        .iter()
+        .zip(winners)
+        .filter(|(_, w)| w.is_some())
+        .map(|(k, _)| k);
+    let mut all = vec![Predicate::In {
+        columns: columns.to_vec(),
+        values: expanded(with_version),
+    }];
+    let hits: Vec<&BitemporalHit> = winners.iter().flatten().collect();
+    if let (Some(lo_v), Some(hi_v), Some(lo_k), Some(hi_k)) = (
+        hits.iter().map(|h| h.valid).min(),
+        hits.iter().map(|h| h.valid).max(),
+        hits.iter().map(|h| h.known).min(),
+        hits.iter().map(|h| h.known).max(),
+    ) {
+        // Rows valid after `valid`, or known after `known`, never qualify;
+        // without a bound, no qualifying row lies beyond the newest winner.
+        all.push(Predicate::Between {
+            column: valid.column.clone(),
+            lo: encode_ts(lo_v, &valid.dtype)?,
+            hi: encode_ts(valid.bound.unwrap_or(hi_v), &valid.dtype)?,
+        });
+        all.push(Predicate::Between {
+            column: known.column.clone(),
+            lo: encode_ts(lo_k, &known.dtype)?,
+            hi: encode_ts(known.bound.unwrap_or(hi_k), &known.dtype)?,
+        });
+    }
+    let mut valid_bounds: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
+    let mut known_bounds: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
+    for (vs, w) in variants.iter().zip(winners) {
+        let Some(h) = w else { continue };
+        let (v, k) = (
+            encode_ts(h.valid, &valid.dtype)?,
+            encode_ts(h.known, &known.dtype)?,
+        );
+        for x in vs {
+            valid_bounds.insert(x.clone(), v.clone());
+            known_bounds.insert(x.clone(), k.clone());
+        }
+    }
+    // Filters first, then the newest valid time per key, then the newest
+    // known time among rows at that valid time (contract-v3 entry 11).
+    all.push(Predicate::NotOlderThan {
+        columns: def.columns.clone(),
+        ts_column: valid.column.clone(),
+        bounds: valid_bounds.into_iter().collect(),
+    });
+    all.push(Predicate::NotOlderThan {
+        columns: def.columns.clone(),
+        ts_column: known.column.clone(),
+        bounds: known_bounds.into_iter().collect(),
+    });
+    all.push(Predicate::LatestPerKey {
+        columns: def.columns.clone(),
+        ts_column: valid.column.clone(),
+    });
+    Ok(Predicate::And { all })
+}
 
 /// Probes and, for each, the byte spans of its elements.
 type Probes = (Vec<Vec<u8>>, Vec<Vec<std::ops::Range<usize>>>);
