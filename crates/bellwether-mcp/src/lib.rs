@@ -73,25 +73,45 @@ impl From<BudgetArgs> for Budget {
     }
 }
 
+/// Why [`serve_stdio`] stopped with an error.
+#[derive(Debug)]
+pub enum ServeError {
+    /// The engine could not open the data folder (before the handshake).
+    Open(bellwether::types::Error),
+    /// The async runtime, the handshake, or the transport failed.
+    Transport(String),
+}
+
+impl std::fmt::Display for ServeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Open(e) => write!(f, "{e}"),
+            Self::Transport(m) => f.write_str(m),
+        }
+    }
+}
+
+impl std::error::Error for ServeError {}
+
 /// Serves `config` over stdin and stdout until the client disconnects.
 /// The engine is opened first, so a bad data root fails before the
 /// handshake. Diagnostics go to stderr only.
-pub fn serve_stdio(config: &Config) -> Result<(), String> {
-    let server = Server::new(config).map_err(|e| e.to_string())?;
+pub fn serve_stdio(config: &Config) -> Result<(), ServeError> {
+    let server = Server::new(config).map_err(ServeError::Open)?;
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
-        .map_err(|e| format!("cannot start the async runtime ({e})"))?;
+        .map_err(|e| ServeError::Transport(format!("cannot start the async runtime ({e})")))?;
     runtime.block_on(async move {
         use rmcp::ServiceExt as _;
         let service = Handler::new(server)
             .serve(rmcp::transport::stdio())
             .await
-            .map_err(|e| format!("the MCP handshake failed ({e})"))?;
+            .map_err(|e| ServeError::Transport(format!("the MCP handshake failed ({e})")))?;
         service
             .waiting()
             .await
-            .map_err(|e| format!("the MCP server stopped ({e})"))?;
+            .map_err(|e| ServeError::Transport(format!("the MCP server stopped ({e})")))?;
         Ok(())
     })
 }

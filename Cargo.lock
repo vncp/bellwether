@@ -489,6 +489,7 @@ dependencies = [
  "assert_cmd",
  "bellwether",
  "bellwether-bench",
+ "bellwether-mcp",
  "clap",
  "parquet",
  "serde",

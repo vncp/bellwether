@@ -136,14 +136,23 @@ enum Command {
         #[command(subcommand)]
         command: bench::BenchCommand,
     },
-    /// Serve the engine over MCP (arrives with WP12).
-    Mcp,
+    /// Serve the engine over MCP on stdin and stdout, bound to one data
+    /// folder (the same server as `bellwether-mcp`).
+    Mcp(McpArgs),
 }
 
 #[derive(Args)]
 pub(crate) struct RootArg {
     /// The folder of data files.
     pub(crate) root: String,
+}
+
+#[derive(Args)]
+struct McpArgs {
+    #[command(flatten)]
+    root: RootArg,
+    #[command(flatten)]
+    budget: bellwether_mcp::BudgetArgs,
 }
 
 #[derive(Args)]
@@ -320,12 +329,18 @@ fn main() -> ExitCode {
             eprintln!("bellwether: {e}");
             ExitCode::from(EXIT_ENGINE)
         }
+        Err(Failure::Server(msg)) => {
+            eprintln!("bellwether: {msg}");
+            ExitCode::from(EXIT_ENGINE)
+        }
     }
 }
 
 pub(crate) enum Failure {
     Usage(String),
     Engine(Error),
+    /// The MCP server's transport failed after the engine opened.
+    Server(String),
 }
 
 impl From<Error> for Failure {
@@ -347,6 +362,11 @@ pub(crate) fn done<T: Serialize>(result: &T, human: String, code: u8) -> Result<
 }
 
 pub(crate) fn engine(global: &Global, root: &str) -> Result<Engine, Failure> {
+    Ok(Engine::open(root, engine_options(global)?)?)
+}
+
+/// The engine options the global flags name.
+fn engine_options(global: &Global) -> Result<EngineOptions, Failure> {
     let format = match global.format {
         FormatArg::Parquet => SourceFormat::Parquet,
         FormatArg::Csv => SourceFormat::Csv {
@@ -364,20 +384,17 @@ pub(crate) fn engine(global: &Global, root: &str) -> Result<Engine, Failure> {
             Some(bellwether::schema_from_json(&text)?)
         }
     };
-    Ok(Engine::open(
-        root,
-        EngineOptions {
-            index: global.index.clone(),
-            format,
-            chunk_size: global.chunk_size,
-            schema,
-            fingerprint_policy: global.fingerprint_policy.map(|p| match p {
-                PolicyArg::Tail64k => bellwether::FingerprintPolicy::Tail64K,
-                PolicyArg::Full => bellwether::FingerprintPolicy::Full,
-            }),
-            clock: global.clock.clone(),
-        },
-    )?)
+    Ok(EngineOptions {
+        index: global.index.clone(),
+        format,
+        chunk_size: global.chunk_size,
+        schema,
+        fingerprint_policy: global.fingerprint_policy.map(|p| match p {
+            PolicyArg::Tail64k => bellwether::FingerprintPolicy::Tail64K,
+            PolicyArg::Full => bellwether::FingerprintPolicy::Full,
+        }),
+        clock: global.clock.clone(),
+    })
 }
 
 pub(crate) fn hash(s: &str, what: &str) -> Result<Hash, Failure> {
@@ -477,9 +494,19 @@ fn run(cli: &Cli, out: &Out) -> Result<Outcome, Failure> {
             };
             done(&w, human, code)
         }
-        Command::Mcp => Err(Failure::Usage(
-            "the MCP server arrives with WP12 (bellwether-mcp); until then use the CLI".into(),
-        )),
+        Command::Mcp(a) => {
+            let config = bellwether_mcp::Config {
+                root: a.root.root.clone(),
+                engine: engine_options(g)?,
+                budget: a.budget.into(),
+            };
+            // stdout is the protocol channel: nothing else is printed there.
+            match bellwether_mcp::serve_stdio(&config) {
+                Ok(()) => Ok(Outcome::Done(String::new(), String::new(), EXIT_OK)),
+                Err(bellwether_mcp::ServeError::Open(e)) => Err(Failure::Engine(e)),
+                Err(bellwether_mcp::ServeError::Transport(m)) => Err(Failure::Server(m)),
+            }
+        }
     }
 }
 

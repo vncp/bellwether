@@ -1,6 +1,6 @@
 [package]
 name = "bellwether-cli"
-description = "The bellwether command: why, index, locate, latest, asof, propose, receipt show, report; formatting and argument parsing over the facade only."
+description = "The bellwether command: why, index, locate, latest, asof, propose, fix, receipt show, report, ledger, mcp; formatting and argument parsing over the facade only."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -20,6 +20,8 @@ doc = false
 bellwether = { path = "../bellwether" }
 # The `bench` subcommand only (and the end-to-end tests' planted corpus).
 bellwether-bench = { path = "../bellwether-bench" }
+# The `mcp` subcommand only: `bellwether mcp` is `bellwether-mcp`.
+bellwether-mcp = { path = "../bellwether-mcp" }
 clap = { version = "4", features = ["derive"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
