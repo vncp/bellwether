@@ -103,16 +103,14 @@ fn why_with_keys_replays_each_candidate_and_the_floor_is_the_oracle() {
     let current = r.current.unwrap();
     assert_eq!(current.row_groups, 12, "no index: every row group");
     assert_eq!(current.bytes, r.dataset.bytes);
-    // The floor first, then the profile's composites that serve the run
-    // (exact:id,batch and exact:id,payload serve an id lookup by prefix).
+    // Only the floor: exact:id,batch and exact:id,payload serve an id lookup
+    // only by prefix, so they select at least the floor's row groups and are
+    // not replayed; the rest serve no run.
     let floor = &r.candidates[0];
-    assert!(r.candidates[1..]
-        .iter()
-        .all(|c| c.origin == CandidateOrigin::Profile && c.spec.columns()[0] == "id"));
     let names = |v: &mut dyn Iterator<Item = &KeySpec>| v.map(KeySpec::name).collect::<Vec<_>>();
     assert_eq!(
         names(&mut r.candidates.iter().map(|c| &c.spec)),
-        ["exact:id", "exact:id,batch", "exact:id,payload"]
+        ["exact:id"]
     );
     assert_eq!(
         names(&mut r.not_serving.iter()),
@@ -335,4 +333,77 @@ fn why_on_a_read_only_index_profiles_in_memory_with_its_manifest() {
     assert_eq!(profiled, vec![vec!["id".to_string()]]);
     let after = std::fs::read_dir(index.join("ledger")).map_or(0, Iterator::count);
     assert_eq!(after, before, "nothing recorded");
+}
+
+/// A run keyed on (id, batch): the floor is exact:id,batch, and the
+/// profile's single columns id and batch serve it by point lookup, so they
+/// are replayed as profile candidates after the floor, each citing the
+/// Evidence; keys on payload serve no run.
+#[test]
+fn profile_candidates_that_serve_by_point_follow_the_floor() {
+    use std::sync::Arc;
+
+    use arrow::array::{ArrayRef, Int64Array, RecordBatch};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use parquet::arrow::ArrowWriter;
+
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    ledger_corpus(&data, 3, 4, 25, 400);
+    let kf = dir.path().join("k.parquet");
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("batch", DataType::Int64, false),
+    ]));
+    let b = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(Int64Array::from(vec![5i64, 77])) as ArrayRef,
+            Arc::new(Int64Array::from(vec![0i64, 1])),
+        ],
+    )
+    .unwrap();
+    let mut w = ArrowWriter::try_new(std::fs::File::create(&kf).unwrap(), schema, None).unwrap();
+    w.write(&b).unwrap();
+    w.close().unwrap();
+    let r = open(&data)
+        .why(&WhyRequest {
+            keys: Some(KeyFile::new(&kf)),
+            ..WhyRequest::default()
+        })
+        .unwrap();
+    let got: Vec<(String, CandidateOrigin)> = r
+        .candidates
+        .iter()
+        .map(|c| (c.spec.name(), c.origin))
+        .collect();
+    assert_eq!(
+        got,
+        [
+            ("exact:id,batch".to_string(), CandidateOrigin::Workload),
+            ("exact:id".to_string(), CandidateOrigin::Profile),
+            ("exact:batch".to_string(), CandidateOrigin::Profile),
+        ]
+    );
+    let names: Vec<String> = r.not_serving.iter().map(KeySpec::name).collect();
+    assert_eq!(
+        names,
+        ["exact:payload", "exact:id,payload", "exact:batch,payload"]
+    );
+    for c in &r.candidates {
+        let Record::Proposal(p) = &c.proposal.record else {
+            panic!()
+        };
+        assert_eq!(p.evidence, vec![r.evidence.hash.unwrap()]);
+    }
+    // max_candidates caps the profile's candidates, never the floor.
+    let capped = open(&data)
+        .why(&WhyRequest {
+            keys: Some(KeyFile::new(&kf)),
+            max_candidates: 1,
+            ..WhyRequest::default()
+        })
+        .unwrap();
+    let got: Vec<String> = capped.candidates.iter().map(|c| c.spec.name()).collect();
+    assert_eq!(got, ["exact:id,batch", "exact:id"]);
 }

@@ -408,9 +408,9 @@ pub(crate) fn why(r: &bellwether::WhyReport, out: &Out) -> String {
         (None, note) => {
             let _ = writeln!(
                 s,
-                "  evidence  not recorded: {}",
+                "  evidence  {}",
                 note.as_deref()
-                    .unwrap_or("pass a writable location with --index")
+                    .unwrap_or("not recorded; pass a writable location with --index")
             );
         }
     }

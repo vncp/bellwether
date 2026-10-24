@@ -11,7 +11,7 @@ use std::sync::Arc;
 use bellwether_profile::{ProfileOptions, ProfileReport};
 
 use bellwether_replay::{
-    record_bench_workload, servable, KeyInput, Replayer, Workload, WorkloadRecorder,
+    record_bench_workload, servable, KeyInput, Lookup, Replayer, Workload, WorkloadRecorder,
 };
 use bellwether_store::{Cache, ObjectStoreBackend, StoreExt};
 use bellwether_types::{
@@ -333,7 +333,7 @@ impl Engine {
         } else {
             None
         };
-        report.culprit = culprit(&report, workload.as_ref());
+        report.culprit = culprit(&report.current_specs, &report.profile, workload.as_ref());
         Ok(report)
     }
 
@@ -397,8 +397,8 @@ impl Engine {
                 hash: None,
                 evidence,
                 note: Some(format!(
-                    "the profile Evidence was not recorded: the index location {} is not \
-                     writable; pass a writable location with --index to record it",
+                    "not recorded: the index location {} is not writable; pass a writable \
+                     location with --index to record it",
                     self.index_location()
                 )),
             }
@@ -436,6 +436,8 @@ impl Engine {
         recorder.finish()
     }
 
+    // One linear pass: choose the candidates, then write and score each.
+    #[allow(clippy::too_many_lines)]
     fn replay_candidates(
         &self,
         report: &mut WhyReport,
@@ -465,6 +467,17 @@ impl Engine {
         });
         let current_names: BTreeSet<String> =
             report.current_specs.iter().map(KeySpec::name).collect();
+        // How a measured key serves the workload: by point lookup on some
+        // run, only by prefix of a run's columns, or not at all. A key that
+        // serves only by prefix is a composite led by a run's whole key, so
+        // it selects at least the row groups the exact key on that run's
+        // columns (the floor, a candidate or current) selects: it can never
+        // read less, and is not replayed.
+        let point = |spec: &KeySpec| {
+            run_columns
+                .iter()
+                .any(|c| matches!(servable(spec, c), Some(Lookup::Point { .. })))
+        };
         let serves = |spec: &KeySpec| run_columns.iter().any(|c| servable(spec, c).is_some());
         let mut chosen: Vec<(KeySpec, CandidateOrigin)> = Vec::new();
         let mut names = BTreeSet::new();
@@ -484,6 +497,9 @@ impl Engine {
             }
             if !serves(&spec) {
                 report.not_serving.push(spec);
+                continue;
+            }
+            if !point(&spec) {
                 continue;
             }
             if from_profile < req.max_candidates {
@@ -566,17 +582,19 @@ fn fanout_of(profile: &ProfileReport, columns: &[String]) -> Option<Fanout> {
 }
 
 /// The culprit rule documented on [`Engine::why`].
-fn culprit(report: &WhyReport, workload: Option<&Workload>) -> Option<Culprit> {
-    let mut used: BTreeSet<&String> = report
-        .current_specs
+fn culprit(
+    current_specs: &[KeySpec],
+    profile: &ProfileReport,
+    workload: Option<&Workload>,
+) -> Option<Culprit> {
+    let mut used: BTreeSet<&String> = current_specs
         .iter()
         .flat_map(|s| s.columns().iter())
         .collect();
     if let Some(w) = workload {
         used.extend(w.runs().iter().flat_map(|r| r.columns.iter()));
     }
-    let lint = report
-        .profile
+    let lint = profile
         .lints
         .iter()
         .filter_map(|l| {
@@ -590,7 +608,7 @@ fn culprit(report: &WhyReport, workload: Option<&Workload>) -> Option<Culprit> {
     if let Some((_, l)) = lint {
         return Some(Culprit {
             columns: l.columns.clone(),
-            fanout: fanout_of(&report.profile, &l.columns),
+            fanout: fanout_of(profile, &l.columns),
             reason: CulpritReason::Lint {
                 rule: l.rule.clone(),
                 confidence: l.confidence,
@@ -599,20 +617,115 @@ fn culprit(report: &WhyReport, workload: Option<&Workload>) -> Option<Culprit> {
         });
     }
     let columns = workload?.runs().first()?.columns.clone();
-    let serving = report
-        .current_specs
+    let serving = current_specs
         .iter()
         .find(|s| servable(s, &columns).is_some());
     Some(match serving {
         None => Culprit {
-            fanout: fanout_of(&report.profile, &columns),
+            fanout: fanout_of(profile, &columns),
             columns,
             reason: CulpritReason::NoIndexServes,
         },
         Some(spec) => Culprit {
             columns: spec.columns().to_vec(),
-            fanout: fanout_of(&report.profile, spec.columns()),
+            fanout: fanout_of(profile, spec.columns()),
             reason: CulpritReason::ServingSpec { spec: spec.clone() },
         },
     })
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+    use bellwether_types::Lint;
+
+    fn lint(rule: &str, column: &str, confidence: f64) -> Lint {
+        Lint {
+            rule: rule.into(),
+            columns: vec![column.into()],
+            message: format!("{rule} on {column}"),
+            confidence,
+            site: None,
+        }
+    }
+
+    fn profile(lints: Vec<Lint>) -> ProfileReport {
+        ProfileReport {
+            root: "/data".into(),
+            files_total: 1,
+            row_groups_total: 1,
+            rows_total: 1,
+            key_columns: Vec::new(),
+            skipped: Vec::new(),
+            time_columns: Vec::new(),
+            fanout: Vec::new(),
+            ranges: Vec::new(),
+            time_scatter: Vec::new(),
+            lints,
+            workload: None,
+            manifest: None,
+            inputs: Vec::new(),
+            memory: bellwether_profile::MemoryReport::default(),
+        }
+    }
+
+    fn exact(c: &str) -> KeySpec {
+        KeySpec::Exact {
+            columns: vec![c.into()],
+        }
+    }
+
+    fn named(c: &Culprit) -> (String, String) {
+        let CulpritReason::Lint { rule, .. } = &c.reason else {
+            panic!("{c:?}")
+        };
+        (rule.clone(), c.columns[0].clone())
+    }
+
+    /// The highest-confidence culprit lint wins; a lint on a column nothing
+    /// uses, or of another rule, never does.
+    #[test]
+    fn the_highest_confidence_culprit_lint_on_a_used_column_wins() {
+        let used = [exact("stamp"), exact("tenant")];
+        let p = profile(vec![
+            lint("batch_stamp_key", "stamp", 0.6),
+            lint("low_selectivity_single_column", "tenant", 0.9),
+            lint("batch_stamp_key", "unused", 1.0),
+            lint("scattered_time_column", "tenant", 1.0),
+        ]);
+        let c = culprit(&used, &p, None).unwrap();
+        assert_eq!(
+            named(&c),
+            ("low_selectivity_single_column".into(), "tenant".into())
+        );
+        let p = profile(vec![
+            lint("batch_stamp_key", "stamp", 0.9),
+            lint("low_selectivity_single_column", "tenant", 0.6),
+        ]);
+        assert_eq!(
+            named(&culprit(&used, &p, None).unwrap()),
+            ("batch_stamp_key".into(), "stamp".into())
+        );
+    }
+
+    /// At equal confidence the rule catalog order decides: `batch_stamp_key`
+    /// before `low_selectivity_single_column`, whichever is listed first.
+    #[test]
+    fn equal_confidence_culprit_lints_follow_the_rule_catalog_order() {
+        let used = [exact("stamp"), exact("tenant")];
+        for lints in [
+            vec![
+                lint("low_selectivity_single_column", "tenant", 0.8),
+                lint("batch_stamp_key", "stamp", 0.8),
+            ],
+            vec![
+                lint("batch_stamp_key", "stamp", 0.8),
+                lint("low_selectivity_single_column", "tenant", 0.8),
+            ],
+        ] {
+            let c = culprit(&used, &profile(lints), None).unwrap();
+            assert_eq!(named(&c), ("batch_stamp_key".into(), "stamp".into()));
+        }
+    }
 }

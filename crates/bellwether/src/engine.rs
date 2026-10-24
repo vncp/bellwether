@@ -328,18 +328,20 @@ impl Engine {
             return None;
         };
         if let Some(dir) = &self.local_index {
-            let probe = dir.join(format!(".write-probe-{}", std::process::id()));
-            match std::fs::OpenOptions::new()
+            // A name no earlier run can have left behind (process id and a
+            // per-call random nonce), created exclusively: only this call's
+            // own successful create counts as proof, and it is removed.
+            use std::hash::{BuildHasher, Hasher};
+            let nonce = std::collections::hash_map::RandomState::new()
+                .build_hasher()
+                .finish();
+            let probe = dir.join(format!(".write-probe-{}-{nonce:016x}", std::process::id()));
+            std::fs::OpenOptions::new()
                 .write(true)
                 .create_new(true)
                 .open(&probe)
-            {
-                Ok(_) => {
-                    let _ = std::fs::remove_file(&probe);
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
-                Err(_) => return None,
-            }
+                .ok()?;
+            std::fs::remove_file(&probe).ok()?;
         }
         Some(store)
     }
