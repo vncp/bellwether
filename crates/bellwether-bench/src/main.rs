@@ -102,6 +102,10 @@ struct GenerateArgs {
         "churn", "days", "payload_bytes", "late_fraction",
     ])]
     rung: Option<RungArg>,
+    /// Generate the time-series `market` corpus (symbols × days × intraday
+    /// rows, with restatements and late prints, Hive `day=` directories).
+    #[arg(long, conflicts_with = "rung")]
+    market: bool,
     /// Print what the corpus would contain and exit without writing.
     #[arg(long)]
     dry_run: bool,
@@ -197,6 +201,29 @@ fn finish_slo(results: &Results, mode: Mode) -> Result<()> {
 }
 
 fn cmd_generate(a: GenerateArgs) -> Result<()> {
+    if a.market {
+        let mparams = bellwether_bench::market::MarketParams {
+            seed: a.seed,
+            days: a.days,
+            files_per_day: (a.files / a.days.max(1)).max(1),
+            row_groups_per_file: a.row_groups_per_file,
+            rows_per_row_group: a.rows_per_row_group,
+            symbols: u32::try_from(a.entities).unwrap_or(200).clamp(10, 50_000),
+            restatement_fraction: a.late_fraction,
+        };
+        let out = a
+            .out
+            .unwrap_or_else(|| PathBuf::from("benches/out/market"));
+        let manifest = bellwether_bench::market::generate_market(&mparams, &out)?;
+        println!(
+            "wrote market corpus ({} rows in {} row groups, {} files) to {}",
+            manifest.rows_total,
+            manifest.row_groups_total,
+            manifest.files_total,
+            out.display()
+        );
+        return Ok(());
+    }
     let params = match a.rung {
         Some(r) => GenParams::rung(r.rung()),
         None => GenParams {

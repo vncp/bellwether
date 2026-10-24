@@ -342,3 +342,123 @@ fn at_manifest_flag_pins_locate_latest_asof_and_why_in_cli() {
     assert_eq!(lat_pinned, lat1);
     assert_eq!(asof_pinned, asof1);
 }
+
+#[test]
+fn market_corpus_measured_funnel_and_cli_time_series_flags() {
+    use bellwether::{spec, Engine, EngineOptions, KeyFile};
+    use bellwether_bench::market::{generate_market, MarketParams};
+
+    let dir = tempfile::tempdir().unwrap();
+    let params = MarketParams {
+        seed: 42,
+        days: 8,
+        files_per_day: 2,
+        row_groups_per_file: 4,
+        rows_per_row_group: 400,
+        symbols: 160,
+        restatement_fraction: 0.05,
+    };
+    let manifest = generate_market(&params, dir.path()).unwrap();
+    assert_eq!(manifest.files_total, 16);
+    assert_eq!(manifest.row_groups_total, 64);
+    assert_eq!(manifest.rows_total, 25_600);
+
+    let data = dir.path().join("data");
+    let run0 = KeyFile {
+        path: dir.path().join("workload/run-0000.parquet"),
+        columns: Some(vec!["symbol".into()]),
+    };
+
+    // 1. Index with exact:symbol + range:valid_ts (Hive `day=` virtual column is pruned directly from path without needing range:day)
+    let eng = Engine::open(path(&data), EngineOptions::default()).unwrap();
+    eng.index(&[
+        spec::parse("exact:symbol").unwrap(),
+        spec::parse("range:valid_ts").unwrap(),
+    ])
+    .unwrap();
+    let p_exact = eng
+        .locate_window(&run0, "2026-01-01T03:00:00Z..2026-01-01T05:59:59Z")
+        .unwrap();
+    assert_eq!(p_exact.ordered_by.as_deref(), Some("valid_ts"));
+    // 2. Add bounds sidecar (`exact:symbol@valid_ts`): prunes further than `exact:symbol` + `range:valid_ts`
+    let expanded = spec::parse_many("exact:symbol@valid_ts").unwrap();
+    eng.index(&expanded).unwrap();
+    let p_bounds = eng
+        .locate_window(&run0, "2026-01-01T03:00:00Z..2026-01-01T05:59:59Z")
+        .unwrap();
+    assert!(p_bounds.planned.row_groups > 0);
+    assert!(
+        p_bounds.planned.row_groups < p_exact.planned.row_groups,
+        "bounds sidecar must prune strictly more row groups than exact+range ({} vs {})",
+        p_bounds.planned.row_groups,
+        p_exact.planned.row_groups
+    );
+    assert!(p_bounds.planned.bytes < p_exact.planned.bytes);
+
+    // 3. Add bitemporal `temporal2:symbol@valid_ts,known_ts`
+    let eng = Engine::open(path(&data), EngineOptions::default()).unwrap();
+    eng.index(&[spec::parse("temporal2:symbol@valid_ts,known_ts").unwrap()])
+        .unwrap();
+    let p_bi = eng
+        .asof_with(
+            &run0,
+            None,
+            Some("2026-01-01T08:59:59Z"),
+            Some("2026-01-01T09:05:00Z"),
+            None,
+        )
+        .unwrap();
+    assert!(p_bi.planned.row_groups > 0);
+    assert!(p_bi.planned.row_groups < p_bi.row_groups_total);
+
+    // 4. Verify CLI `--window`, `--valid`/`--known`, and `--lookback` end to end
+    let clk = "2026-06-01T00:00:00Z";
+    let cli_win = run(
+        &[
+            "--json",
+            "--clock",
+            clk,
+            "locate",
+            path(&data),
+            "--keys",
+            path(&run0.path),
+            "--window",
+            "2026-01-01T03:00:00Z..2026-01-01T05:59:59Z",
+        ],
+        0,
+    );
+    let cli_win_res: bellwether::PlanResult = serde_json::from_str(&cli_win).unwrap();
+    assert_eq!(cli_win_res.planned.row_groups, p_bounds.planned.row_groups);
+    assert_eq!(cli_win_res.planned.bytes, p_bounds.planned.bytes);
+
+    let cli_bi = run(
+        &[
+            "--json",
+            "--clock",
+            clk,
+            "asof",
+            path(&data),
+            "--keys",
+            path(&run0.path),
+            "--valid",
+            "2026-01-01T08:59:59Z",
+            "--known",
+            "2026-01-01T09:05:00Z",
+        ],
+        0,
+    );
+    let cli_bi_res: bellwether::PlanResult = serde_json::from_str(&cli_bi).unwrap();
+    assert_eq!(cli_bi_res.planned.row_groups, p_bi.planned.row_groups);
+
+    eprintln!(
+        "MARKET FUNNEL (debug): live={} rgs ({} files), exact+range={} rgs ({} B), exact+bounds={} rgs ({} B), temporal2_bitemporal={} rgs ({} B)",
+        p_exact.row_groups_total,
+        p_exact.files_total,
+        p_exact.planned.row_groups,
+        p_exact.planned.bytes,
+        p_bounds.planned.row_groups,
+        p_bounds.planned.bytes,
+        p_bi.planned.row_groups,
+        p_bi.planned.bytes,
+    );
+}

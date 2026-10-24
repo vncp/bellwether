@@ -66,6 +66,10 @@ pub(crate) struct GenerateArgs {
     #[arg(long, value_enum, conflicts_with_all = ["seed", "files", "row_groups_per_file",
         "rows_per_row_group", "entities", "churn", "days", "payload_bytes", "late_fraction"])]
     rung: Option<RungArg>,
+    /// Generate the time-series `market` corpus (symbols × days × intraday
+    /// rows, with restatements and late prints, Hive `day=` directories).
+    #[arg(long, conflicts_with = "rung")]
+    market: bool,
     /// RNG seed.
     #[arg(long, default_value_t = 42)]
     seed: u64,
@@ -168,6 +172,25 @@ fn file_hash(path: &Path) -> Result<Option<Hash>, Error> {
 pub(crate) fn run(cmd: &BenchCommand) -> Result<Wrote, Error> {
     let (what, path, failed) = match cmd {
         BenchCommand::Generate(a) => {
+            if a.market {
+                let mparams = bellwether_bench::market::MarketParams {
+                    seed: a.seed,
+                    days: a.days,
+                    files_per_day: (a.files / a.days.max(1)).max(1),
+                    row_groups_per_file: a.row_groups_per_file,
+                    rows_per_row_group: a.rows_per_row_group,
+                    symbols: u32::try_from(a.entities).unwrap_or(200).clamp(10, 50_000),
+                    restatement_fraction: a.late_fraction,
+                };
+                bellwether_bench::market::generate_market(&mparams, &a.out)
+                    .map_err(|e| bench_err(&e))?;
+                return Ok(Wrote {
+                    what: "market corpus",
+                    path: a.out.join("market-corpus.json").display().to_string(),
+                    blake3: file_hash(&a.out.join("market-corpus.json"))?,
+                    failed: Vec::new(),
+                });
+            }
             let params = match a.rung {
                 Some(RungArg::Small) => GenParams::rung(Rung::Small),
                 Some(RungArg::Medium) => GenParams::rung(Rung::Medium),

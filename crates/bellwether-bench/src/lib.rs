@@ -39,6 +39,7 @@ pub mod corpus;
 pub mod env;
 pub mod generate;
 pub mod harness;
+pub mod market;
 pub mod mem;
 pub mod report;
 pub mod results;
