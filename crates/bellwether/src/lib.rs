@@ -46,13 +46,13 @@ pub use bellwether_ledger::RecordKind;
 pub use bellwether_profile::ProfileReport;
 pub use bellwether_source::FingerprintPolicy;
 pub use bellwether_types as types;
-pub use bellwether_verify::Reconciliation;
+pub use bellwether_verify::{ExactTotal, GroupTotal, KeyRepr, Mismatch, Reconciliation};
 pub use engine::{
     schema_from_json, Engine, EngineOptions, SourceFormat, DEFAULT_INDEX_DIR, ISSUE_TRACKER,
 };
 pub use fix::{FixOutcome, FixRequest, FixResult, Refusal, RewriteOutputs, Score};
 pub use keys::KeyFile;
-pub use reconcile::{ReconcileRequest, ReconcileResult};
+pub use reconcile::{ReconcileProblem, ReconcileRequest, ReconcileResult};
 pub use results::{
     ChainLink, Cost, IndexResult, LinkStatus, LookupKind, PlanResult, ProposeRefusal,
     ProposeResult, ReceiptResult, ReportResult, SpecState, Written,
@@ -60,5 +60,5 @@ pub use results::{
 pub use why::{
     Candidate, CandidateOrigin, Culprit, CulpritReason, Dataset, ProfileEvidence, Recommendation,
     WhyReport, WhyRequest, WorkloadInfo, DEFAULT_MAX_CANDIDATES, ENGINE_PROPOSER,
-    RESERVED_PROPOSERS,
+    LAYOUT_BOUND_FRACTION, RESERVED_PROPOSERS,
 };

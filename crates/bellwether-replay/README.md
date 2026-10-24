@@ -44,7 +44,7 @@ Replay reads very little. The current index costs no data reads at all. A hypoth
 
 **Templates.** A run's `template` groups it in reports. Without one it is the run's key-column set, `columns(<key columns>)`. That is a grouping by columns, not by query; a recorder that knows the query or pipeline step a run came from passes it as the template.
 
-**Query kind.** Every run records a `query_kind`. Only `locate` exists today; a workload naming any other kind is refused with `Error::UnknownKind`. `latest` and `asof` are reserved for when their runs can be priced (contract v3 backlog #14).
+**Query kind.** Every run records a `query_kind` (`locate`, `latest`, or `asof`; `asof` runs also carry `asof`, the instant in the timestamp column's dataset unit, omitted for `locate` and `latest` so existing hashes stay stable). A workload naming any other kind is refused with `Error::UnknownKind` (contract v3 backlog #14).
 
 **Cache entries.** Each run's payload goes to `cache/<blake3>.bin`. The payload is `BWKEYSET`, a version, a JSON header with columns, key types and encoding version, then length-prefixed elements per tuple. A reader refuses all of these:
 
@@ -60,7 +60,7 @@ Every read checks the BLAKE3 of the bytes it got against the hash it asked for, 
 
 - id
 - template
-- query kind
+- query kind (and `asof` instant when `query_kind == "asof"`)
 - columns
 - key types
 - key count
@@ -94,7 +94,10 @@ The bench hashes are `u64`-specific. The replay hashes cover canonical encodings
 pub trait PlanSource: Send + Sync {
     fn manifest_version(&self) -> String;  // sequence string (ADR 020)
     fn specs(&self) -> Vec<KeySpec>;
-    fn plan(&self, specs: &[KeySpec], keys: &RunKeys) -> Result<ScanPlan>;
+    fn plan(&self, specs: &[KeySpec], keys: &RunKeys) -> Result<ScanPlan> {
+        self.plan_query(specs, keys, &RunQuery::Locate)
+    }
+    fn plan_query(&self, specs: &[KeySpec], keys: &RunKeys, query: &RunQuery) -> Result<ScanPlan>;
     fn with_transient(&self, t: &[Arc<TransientIndex>]) -> Result<Box<dyn PlanSource + '_>>;
 }
 ```

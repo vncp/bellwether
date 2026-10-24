@@ -249,9 +249,10 @@ impl<S: StoreExt + ?Sized> Planner<S> {
                 if !seen.insert(c) {
                     return Err(Error::KeySpec(format!("lookup lists column {c:?} twice")));
                 }
-                let f = self.schema.field_with_name(c).map_err(|_| {
-                    Error::KeySpec(format!("column {c:?} is not in the dataset schema"))
-                })?;
+                let f = self
+                    .schema
+                    .field_with_name(c)
+                    .map_err(|_| Error::KeySpec(encoding::not_in_schema(&self.schema, c)))?;
                 Ok((c.clone(), f.data_type().clone()))
             })
             .collect()

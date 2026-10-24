@@ -39,6 +39,7 @@ impl Engine {
         options.chunk_size = self.options().chunk_size;
         options.schema.clone_from(&self.options().schema);
         options.fingerprint_policy = self.options().fingerprint_policy;
+        options.exclude = self.excluded();
         let report =
             Builder::new(Arc::clone(self.store()?), "").build(self.root(), specs, &options)?;
         let pinned = self.pin_required("index")?;
@@ -103,7 +104,7 @@ impl Engine {
         // Invariant 1 over the folder, not only the index: a file that
         // landed or changed after the last build would be silently left out
         // of the plan, so it is refused.
-        let changes = folder_changes(self.root(), &pinned, self.format())?;
+        let changes = folder_changes(self.root(), &pinned, self.format(), &self.excluded())?;
         if !changes.is_empty() {
             return Err(stale_index(self.root(), verb, &changes));
         }
@@ -324,7 +325,7 @@ fn check_temporal_residual(plan: &ScanPlan) -> Result<()> {
 /// `at` in `ts_type`'s unit, exactly: an integer is taken as already in the
 /// unit; an RFC 3339 instant (or a `YYYY-MM-DD` date) is converted, and a
 /// remainder below the unit is an error, never rounded.
-fn instant_in_unit(at: &str, ts_column: &str, ts_type: &DataType) -> Result<i64> {
+pub(crate) fn instant_in_unit(at: &str, ts_column: &str, ts_type: &DataType) -> Result<i64> {
     let at = at.trim();
     if let Ok(n) = at.parse::<i64>() {
         return Ok(n);

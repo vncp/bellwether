@@ -66,11 +66,7 @@ pub(crate) fn class(dt: &DataType) -> Result<Class> {
         DataType::Date64 => Class::Date64,
         DataType::Time32(u) | DataType::Time64(u) => Class::Time(*u),
         DataType::Timestamp(u, _) => Class::Timestamp(*u),
-        other => {
-            return Err(VerifyError::Schema(format!(
-                "type {other} has no canonical encoding in encoding version 1"
-            )))
-        }
+        other => return Err(VerifyError::Schema(encoding::no_encoding(other))),
     })
 }
 

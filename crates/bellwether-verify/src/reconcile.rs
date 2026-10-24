@@ -102,6 +102,9 @@ impl std::fmt::Debug for Side<'_> {
 pub struct Reconciler {
     spec: ReconcileSpec,
     options: Options,
+    /// The `created_at` of every record this reconciler builds, when the
+    /// caller owns the clock ([`Reconciler::created_at`]).
+    created_at: Option<String>,
 }
 
 /// What the key scope is, resolved.
@@ -275,7 +278,30 @@ impl Reconciler {
         if options.memory_budget == 0 {
             return Err(VerifyError::Budget("the memory budget is zero".into()));
         }
-        Ok(Self { spec, options })
+        Ok(Self {
+            spec,
+            options,
+            created_at: None,
+        })
+    }
+
+    /// Stamps every record this reconciler builds (the certificate and any
+    /// `plan` Evidence) with `created_at` instead of this crate's clock, so
+    /// a caller that writes several records in one operation gives them one
+    /// clock and one format. It must be RFC 3339; the ledger refuses
+    /// anything else.
+    #[must_use]
+    pub fn created_at(mut self, created_at: impl Into<String>) -> Self {
+        self.created_at = Some(created_at.into());
+        self
+    }
+
+    /// The time to stamp a record with: the caller's, else now.
+    pub(crate) fn stamp(&self) -> Result<String> {
+        match &self.created_at {
+            Some(c) => Ok(c.clone()),
+            None => now_rfc3339(),
+        }
     }
 
     /// The spec.
@@ -325,7 +351,8 @@ impl Reconciler {
                     if passes > MAX_PASSES {
                         return Err(VerifyError::Budget(format!(
                             "the comparison state does not fit in {} bytes even at {MAX_PASSES} \
-                             passes; raise Options::memory_budget",
+                             passes; raise the memory budget (`--memory-budget` on the CLI, \
+                             `Options::memory_budget` here)",
                             self.options.memory_budget
                         )));
                     }
@@ -359,6 +386,7 @@ impl Reconciler {
                 &scope,
                 &self.spec,
                 indexed[s].as_mut(),
+                &self.stamp()?,
             )?;
             let counted = count_rows(sides[s].source, &set, integer_key(&plan, &self.spec))?;
             let (row_groups, rows) = (counted.row_groups, counted.rows);
@@ -771,6 +799,7 @@ fn read_set(
     scope: &Scope,
     spec: &ReconcileSpec,
     indexed: Option<&mut Indexed>,
+    created_at: &str,
 ) -> Result<(ReadSet, SidePath)> {
     let (Scope::Workload { keys, .. }, Some(ix), Some(planner)) = (scope, indexed, side.planner)
     else {
@@ -781,7 +810,7 @@ fn read_set(
     let plan = planner.plan_keys(&spec.key_columns, keys)?;
     let selected = resolve_plan(side.source, files, &plan, &ix.manifest, s)?;
     let path_counts = (plan.row_groups_selected, plan.row_groups_total);
-    let evidence = plan_evidence(plan, &ix.manifest, ix.taken)?;
+    let evidence = plan_evidence(plan, &ix.manifest, ix.taken, created_at);
     let hash = Record::Evidence(evidence.clone()).hash()?;
     ix.plan = Some((evidence, hash));
     Ok((
@@ -1045,7 +1074,8 @@ fn intern(groups: &mut Groups, meter: &mut Meter, group: &[u8]) -> std::result::
         Err(GroupError::Overflow) => Err(Abort::Overflow),
         Err(GroupError::TooMany(n)) => Err(Abort::Error(VerifyError::Budget(format!(
             "group_by produced over {n} groups, whose totals exceed half of the memory budget; \
-             raise Options::memory_budget or group more coarsely"
+             raise the memory budget (`--memory-budget` on the CLI, `Options::memory_budget` here) or \
+             group more coarsely"
         )))),
     }
 }
@@ -1544,23 +1574,31 @@ fn resolve_plan(
 }
 
 /// The `plan` Evidence that records which row groups a planned side read.
-fn plan_evidence(plan: ScanPlan, m: &ManifestIdentity, taken: Instant) -> Result<Evidence> {
-    Ok(Evidence {
+fn plan_evidence(
+    plan: ScanPlan,
+    m: &ManifestIdentity,
+    taken: Instant,
+    created_at: &str,
+) -> Evidence {
+    Evidence {
         record_version: format::RECORD_VERSION,
         provenance: Provenance {
             inputs: vec![m.hash],
             oldest_input_age: m.age + taken.elapsed(),
             manifest_version: Some(m.sequence.to_string()),
-            created_at: now_rfc3339()?,
+            created_at: created_at.to_string(),
         },
         body: EvidenceBody::Plan { plan },
-    })
+    }
 }
 
-/// The current time, RFC 3339 UTC with nanoseconds.
+/// The current time, RFC 3339 UTC with millisecond precision: the format
+/// every other record writer uses (`2026-10-24T21:03:02.069Z`).
 pub(crate) fn now_rfc3339() -> Result<String> {
     let since = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(|e| VerifyError::Engine(bellwether_types::Error::Other(format!("clock: {e}"))))?;
-    Ok(bellwether_source::storage::rfc3339_utc(since))
+    // `rfc3339_utc` prints nine fractional digits; keep three.
+    let nanos = bellwether_source::storage::rfc3339_utc(since);
+    Ok(format!("{}Z", &nanos[..nanos.len() - 7]))
 }

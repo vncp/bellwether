@@ -29,13 +29,27 @@ use roaring::RoaringBitmap;
 use crate::keys::RunKeys;
 use crate::plan::{check_key_types, PlanSource};
 use crate::transient::TransientIndex;
+use crate::workload::RunQuery;
 
-/// The run's keys as the build planner's lookup: canonical tuples over the
-/// run's columns, at the dataset types.
-fn lookup(keys: &RunKeys) -> Lookup {
-    Lookup::Keys {
-        columns: keys.columns().to_vec(),
-        keys: keys.tuples().map(<[u8]>::to_vec).collect(),
+/// The run's keys and query kind as the build planner's lookup: canonical
+/// tuples over the run's columns, at the dataset types.
+fn lookup(keys: &RunKeys, query: &RunQuery) -> Lookup {
+    let columns = keys.columns().to_vec();
+    let tuples: Vec<Vec<u8>> = keys.tuples().map(<[u8]>::to_vec).collect();
+    match query {
+        RunQuery::Locate => Lookup::Keys {
+            columns,
+            keys: tuples,
+        },
+        RunQuery::Latest => Lookup::Latest {
+            columns,
+            keys: tuples,
+        },
+        RunQuery::Asof { ts } => Lookup::AsOf {
+            columns,
+            keys: tuples,
+            ts: *ts,
+        },
     }
 }
 
@@ -101,9 +115,9 @@ where
             .collect()
     }
 
-    fn plan(&self, specs: &[KeySpec], keys: &RunKeys) -> Result<ScanPlan> {
+    fn plan_query(&self, specs: &[KeySpec], keys: &RunKeys, query: &RunQuery) -> Result<ScanPlan> {
         check_key_types(self.schema(), keys)?;
-        Planner::plan(self, specs, &lookup(keys))
+        Planner::plan(self, specs, &lookup(keys, query))
     }
 
     fn with_transient(
@@ -142,10 +156,10 @@ where
         out
     }
 
-    fn plan(&self, specs: &[KeySpec], keys: &RunKeys) -> Result<ScanPlan> {
+    fn plan_query(&self, specs: &[KeySpec], keys: &RunKeys, query: &RunQuery) -> Result<ScanPlan> {
         check_key_types(self.planner.schema(), keys)?;
         self.planner
-            .plan_with_transient(specs, &lookup(keys), &self.extra)
+            .plan_with_transient(specs, &lookup(keys, query), &self.extra)
     }
 
     fn with_transient(

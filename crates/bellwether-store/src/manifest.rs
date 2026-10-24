@@ -62,6 +62,13 @@ pub fn now_rfc3339() -> String {
     chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
 }
 
+/// `s`, an RFC 3339 timestamp, in [`now_rfc3339`]'s format: UTC with
+/// millisecond precision (anything finer is truncated). Every record a
+/// caller stamps with this format shares one spelling.
+pub fn rfc3339_millis(s: &str) -> Result<String> {
+    Ok(parse_rfc3339(s)?.to_rfc3339_opts(chrono::SecondsFormat::Millis, true))
+}
+
 /// Parses an RFC 3339 timestamp written by [`now_rfc3339`].
 pub fn parse_rfc3339(s: &str) -> Result<chrono::DateTime<chrono::Utc>> {
     chrono::DateTime::parse_from_rfc3339(s)

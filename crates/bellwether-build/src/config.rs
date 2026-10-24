@@ -209,6 +209,11 @@ pub struct BuildOptions {
     pub remove_unlisted: bool,
     /// Retry policy of the manifest commit.
     pub commit: CommitOptions,
+    /// Directories under the root whose files are never data: the index
+    /// location when it lies inside the data root, whose own `.json` files
+    /// would otherwise pass for JSON lines. Absolute, as the root's files
+    /// are listed. Text sources only.
+    pub exclude: Vec<String>,
     /// Instrumentation hook.
     pub observer: Option<Arc<dyn BuildObserver>>,
 }
@@ -227,6 +232,7 @@ impl Default for BuildOptions {
             max_restarts: DEFAULT_MAX_RESTARTS,
             remove_unlisted: false,
             commit: CommitOptions::default(),
+            exclude: Vec::new(),
             observer: None,
         }
     }
@@ -245,6 +251,7 @@ impl fmt::Debug for BuildOptions {
             .field("max_segment_row_groups", &self.max_segment_row_groups)
             .field("max_restarts", &self.max_restarts)
             .field("remove_unlisted", &self.remove_unlisted)
+            .field("exclude", &self.exclude)
             .field("observer", &self.observer.is_some())
             .finish_non_exhaustive()
     }
@@ -314,6 +321,14 @@ pub(crate) fn schema_to_columns(schema: &Schema, old: &[ColumnDef]) -> Vec<Colum
 
 /// Parses manifest columns back into an Arrow schema. A type string Arrow
 /// cannot parse, or a duplicate column name, is an error.
+///
+/// Nested columns (structs, lists, maps, unions, run-end encoding) are
+/// recorded by their Arrow spelling like any other column, so a dataset
+/// with one can be indexed on its flat columns. Only a key column needs a
+/// canonical encoding, and the build refuses a nested key column by name
+/// (`plan_specs`). Before the 2026-10-24 Arrow upgrade every nested column
+/// was refused here, implicitly: Arrow 53 printed a nested type with its
+/// fields' debug form, which its own parser could not read.
 pub(crate) fn columns_to_schema(columns: &[ColumnDef]) -> Result<SchemaRef> {
     let mut seen = std::collections::BTreeSet::new();
     let fields = columns
@@ -327,45 +342,16 @@ pub(crate) fn columns_to_schema(columns: &[ColumnDef]) -> Result<SchemaRef> {
             }
             let dt = parse_manifest_type(&c.data_type).map_err(|e| {
                 Error::Other(format!(
-                    "manifest column {:?} has data type {:?}, which this Arrow build cannot parse: {e}",
+                    "the manifest records column {:?} with the type `{}`, which this build of \
+                     Arrow cannot read ({e}); the manifest was written by a build this one \
+                     cannot read, so re-index the folder with this build",
                     c.name, c.data_type
                 ))
             })?;
-            if !recordable(&dt) {
-                return Err(Error::Other(format!(
-                    "manifest column {:?} has data type {:?}, a nested or field-carrying type, which the manifest does not record",
-                    c.name, c.data_type
-                )));
-            }
             Ok(Field::new(c.name.clone(), dt, c.nullable))
         })
         .collect::<Result<Vec<_>>>()?;
     Ok(Arc::new(Schema::new(fields)))
-}
-
-/// Whether the manifest records columns of type `dt`.
-///
-/// Types that carry child fields (lists, list views, structs, maps, unions,
-/// run-end encoding) are refused, at any depth of a dictionary. Before the
-/// 2026-10-24 Arrow upgrade this held implicitly: Arrow 53 printed such a
-/// type with its fields' debug form, which its own parser could not read, so
-/// [`persistable`] refused every dataset with one. Arrow 59 prints a form it
-/// can parse back, so the refusal is now explicit, and a dataset with a
-/// nested column is refused exactly as before.
-pub(crate) fn recordable(dt: &DataType) -> bool {
-    match dt {
-        DataType::List(_)
-        | DataType::LargeList(_)
-        | DataType::FixedSizeList(_, _)
-        | DataType::ListView(_)
-        | DataType::LargeListView(_)
-        | DataType::Struct(_)
-        | DataType::Map(_, _)
-        | DataType::Union(_, _)
-        | DataType::RunEndEncoded(_, _) => false,
-        DataType::Dictionary(k, v) => recordable(k) && recordable(v),
-        _ => true,
-    }
 }
 
 /// A manifest column type: Arrow's `Display` form as this build prints it,
@@ -439,18 +425,22 @@ pub(crate) fn legacy_type_spelling(spelled: &str) -> Option<String> {
 /// build and every later one see the same schema.
 pub(crate) fn persistable(schema: &Schema) -> Result<SchemaRef> {
     let columns = schema_to_columns(schema, &[]);
-    let back = columns_to_schema(&columns)?;
-    for (a, b) in schema.fields().iter().zip(back.fields()) {
-        if a.data_type() != b.data_type() {
+    for (f, c) in schema.fields().iter().zip(&columns) {
+        let back = parse_manifest_type(&c.data_type);
+        if back.as_ref().ok() != Some(f.data_type()) {
+            let read = match back {
+                Ok(b) => format!("it reads back as `{b}`"),
+                Err(e) => format!("Arrow cannot read its spelling back: {e}"),
+            };
             return Err(Error::Other(format!(
-                "column {:?} has type {}, which does not survive the manifest's type spelling (read back as {})",
-                a.name(),
-                a.data_type(),
-                b.data_type()
+                "column {:?} has a type the manifest cannot record exactly ({read}); index a \
+                 copy of the data without that column, or with the column's nested field \
+                 metadata removed if it has any (Arrow's type spelling does not carry it)",
+                f.name(),
             )));
         }
     }
-    Ok(back)
+    columns_to_schema(&columns)
 }
 
 #[cfg(test)]
@@ -671,11 +661,13 @@ mod tests {
         }
     }
 
-    /// Nested and field-carrying types were refused before the Arrow 59
-    /// upgrade (Arrow 53 could not parse its own display form of them), and
-    /// still are, although Arrow 59 now round-trips their spelling.
+    /// Nested and field-carrying columns are recorded by their Arrow
+    /// spelling and read back as the same type (defect 1 of the 2026-10-24
+    /// real-data run: they were refused, so no dataset with one could be
+    /// indexed). One whose nested fields carry metadata, which the spelling
+    /// drops, is refused with a sentence naming the column.
     #[test]
-    fn nested_columns_are_refused_as_before_the_upgrade() {
+    fn nested_columns_round_trip_through_the_manifest() {
         use arrow::datatypes::{Fields, UnionFields, UnionMode};
         let item = |t: DataType| Arc::new(Field::new("item", t, true));
         let nested = [
@@ -684,7 +676,10 @@ mod tests {
             DataType::FixedSizeList(item(DataType::Float32), 3),
             DataType::ListView(item(DataType::Int64)),
             DataType::LargeListView(item(DataType::Int64)),
-            DataType::Struct(Fields::from(vec![Field::new("a", DataType::Int64, true)])),
+            DataType::Struct(Fields::from(vec![
+                Field::new("id", DataType::Int64, true),
+                Field::new("name", DataType::Utf8, false),
+            ])),
             DataType::Map(
                 Arc::new(Field::new(
                     "entries",
@@ -711,24 +706,29 @@ mod tests {
             ),
         ];
         for t in nested {
-            assert!(!recordable(&t), "{t}");
             let schema = Schema::new(vec![
                 Field::new("id", DataType::Int64, false),
                 Field::new("x", t.clone(), true),
             ]);
-            let err = persistable(&schema).unwrap_err();
-            assert!(matches!(err, Error::Other(_)), "{t}: {err}");
-            let columns = vec![ColumnDef {
-                name: "x".into(),
-                data_type: t.to_string(),
-                nullable: true,
-                extra: Extra::new(),
-            }];
-            assert!(columns_to_schema(&columns).is_err(), "{t}");
+            let back = persistable(&schema).unwrap_or_else(|e| panic!("{t}: {e}"));
+            assert_eq!(back.field(1).data_type(), &t);
+            let columns = schema_to_columns(&schema, &[]);
+            let read = columns_to_schema(&columns).unwrap();
+            assert_eq!(read.field(1).data_type(), &t);
         }
-        for (_, t) in arrow53_spellings() {
-            assert!(recordable(&t), "{t}");
-        }
+        let tagged = Field::new("id", DataType::Int64, true).with_metadata(
+            [("PARQUET:field_id".to_string(), "7".to_string())]
+                .into_iter()
+                .collect(),
+        );
+        let schema = Schema::new(vec![Field::new(
+            "repo",
+            DataType::Struct(Fields::from(vec![tagged])),
+            true,
+        )]);
+        let err = persistable(&schema).unwrap_err().to_string();
+        assert!(err.contains("column \"repo\""), "{err}");
+        assert!(!err.contains("Field {"), "no Debug output: {err}");
     }
 
     #[test]

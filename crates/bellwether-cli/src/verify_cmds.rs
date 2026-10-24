@@ -5,8 +5,8 @@ use std::fmt::Write as _;
 use bellwether::spec::label;
 use bellwether::types::{Coverage, ProposalBody, Record};
 use bellwether::{
-    FixOutcome, FixRequest, FixResult, ReconcileRequest, ReconcileResult, Refusal, RewriteOutputs,
-    Score,
+    FixOutcome, FixRequest, FixResult, KeyRepr, Mismatch, ReconcileProblem, ReconcileRequest,
+    ReconcileResult, Refusal, RewriteOutputs, Score,
 };
 use clap::{Args, Subcommand};
 
@@ -19,7 +19,9 @@ use crate::{
 #[derive(Subcommand)]
 pub(crate) enum VerifyCommand {
     /// Prove two folders agree, by key, latest version, and exact decimal
-    /// totals; writes a Certificate.
+    /// totals; writes a Certificate. The summary names the first 10
+    /// mismatching keys (every one is in --json), prints the exact totals,
+    /// and says how many passes the comparison made over each side.
     Reconcile(ReconcileArgs),
     /// Score, verify, apply, and attest a proposal (or apply a certificate);
     /// ends with a receipt hash, or a refusal.
@@ -59,7 +61,20 @@ pub(crate) struct ReconcileArgs {
     /// Sampling seed.
     #[arg(long, default_value_t = 0, requires = "sample")]
     seed: u64,
+    /// Bytes the comparison state may occupy [default: 268435456, 256 MiB].
+    /// The comparison reads both sides once per pass and makes as many
+    /// passes as it needs to stay inside this budget; a larger budget means
+    /// fewer passes.
+    #[arg(long, value_name = "BYTES")]
+    memory_budget: Option<u64>,
 }
+
+/// How many mismatching keys the human summary names; `--json` carries
+/// every example the verifier kept (`outcome.mismatches`).
+pub(crate) const HUMAN_MISMATCHES: usize = 10;
+/// How many group totals the human summary prints; `--json` carries all of
+/// them (`outcome.totals`).
+pub(crate) const HUMAN_TOTALS: usize = 20;
 
 #[derive(Args)]
 pub(crate) struct FixArgs {
@@ -77,6 +92,10 @@ pub(crate) struct FixArgs {
     /// Score and verify only; apply nothing.
     #[arg(long)]
     verify_only: bool,
+    /// Go on with a key proposal whose replay predicts no saving on the
+    /// workload; without it fix refuses with `nothing_to_gain` (exit 3).
+    #[arg(long)]
+    allow_no_gain: bool,
     /// A rewrite's output before the rewrite (a folder).
     #[arg(long, value_name = "DIR", requires = "after_output")]
     before_output: Option<String>,
@@ -97,8 +116,13 @@ pub(crate) fn run(g: &Global, out: &Out, cmd: &VerifyCommand) -> Result<Outcome,
                 totals: a.compare.totals.clone(),
                 group_by: a.compare.group_by.clone(),
                 sample: a.sample.map(|f| (f, a.seed)),
+                memory_budget: a.memory_budget,
             };
-            let r = engine(g, &a.left)?.reconcile(&a.right, &request)?;
+            let e = engine(g, &a.left)?;
+            if let Some(p) = e.reconcile_problems(&request)?.first() {
+                return Err(Failure::Usage(problem(p)));
+            }
+            let r = e.reconcile(&a.right, &request)?;
             let code = if r.outcome.pass { EXIT_OK } else { EXIT_FAILED };
             done(&r, reconcile_human(&r, out), code)
         }
@@ -133,6 +157,7 @@ pub(crate) fn run(g: &Global, out: &Out, cmd: &VerifyCommand) -> Result<Outcome,
                     .transpose()?,
                 rewrite,
                 verify_only: a.verify_only,
+                allow_no_gain: a.allow_no_gain,
             };
             let r = engine(g, &a.root.root)?.fix(&request)?;
             let code = match &r.outcome {
@@ -147,6 +172,46 @@ pub(crate) fn run(g: &Global, out: &Out, cmd: &VerifyCommand) -> Result<Outcome,
     }
 }
 
+/// One line saying what to change in the request.
+fn problem(p: &ReconcileProblem) -> String {
+    match p {
+        ReconcileProblem::TotalNotDecimal {
+            column,
+            data_type,
+            float,
+        } => {
+            let how = if *float {
+                format!(
+                    "write the column as a decimal first, for example CAST({column} AS \
+                     DECIMAL(18, 2)) in the job that writes the files, and reconcile that copy"
+                )
+            } else {
+                "write the column as a decimal first".to_string()
+            };
+            format!(
+                "--totals needs a decimal column, and {column:?} is {data_type} (totals are exact \
+                 decimal sums and never use floats); {how}"
+            )
+        }
+        ReconcileProblem::TotalNotFound { column } => {
+            format!("--totals names {column:?}, which is not a column of the left folder")
+        }
+        ReconcileProblem::ZeroMemoryBudget => {
+            "--memory-budget must be a positive number of bytes".to_string()
+        }
+    }
+}
+
+/// A key as a tuple of its rendered elements.
+fn key(k: &KeyRepr) -> String {
+    let v: Vec<&str> = k
+        .values
+        .iter()
+        .map(|v| v.as_deref().unwrap_or("null"))
+        .collect();
+    format!("({})", v.join(", "))
+}
+
 fn coverage(c: &Coverage) -> String {
     match c {
         Coverage::Full => "full".into(),
@@ -158,6 +223,7 @@ fn coverage(c: &Coverage) -> String {
     }
 }
 
+#[allow(clippy::many_single_char_names)]
 fn reconcile_human(r: &ReconcileResult, out: &Out) -> String {
     let mut s = String::new();
     let o = &r.outcome;
@@ -183,6 +249,76 @@ fn reconcile_human(r: &ReconcileResult, out: &Out) -> String {
     );
     if !o.ignored_columns.is_empty() {
         let _ = writeln!(s, "  not compared: {}", o.ignored_columns.join(", "));
+    }
+    let per_key: Vec<(&str, &KeyRepr)> = o
+        .mismatches
+        .iter()
+        .filter_map(|m| match m {
+            Mismatch::MissingOnLeft { key, .. } => Some(("missing on the left", key)),
+            Mismatch::MissingOnRight { key, .. } => Some(("missing on the right", key)),
+            Mismatch::RowHashDiffers { key, .. } => Some(("rows differ", key)),
+            Mismatch::NoComparableVersion { key, .. } => Some(("no comparable version", key)),
+            Mismatch::TotalDiffers { .. } => None,
+        })
+        .collect();
+    let per_key_total = c.mismatched + c.missing_left + c.missing_right;
+    if per_key_total > 0 {
+        let shown = per_key.len().min(HUMAN_MISMATCHES);
+        let _ = writeln!(
+            s,
+            "\n  first {shown} of {} mismatching keys ({}): every kept example is in --json",
+            num(per_key_total),
+            o.key_columns.join(", ")
+        );
+        for (what, k) in per_key.iter().take(HUMAN_MISMATCHES) {
+            let _ = writeln!(s, "    {what:<22} {}", key(k));
+        }
+    }
+    if !o.totals.is_empty() {
+        let _ = writeln!(s, "\n  exact totals, left and right");
+        for t in o.totals.iter().take(HUMAN_TOTALS) {
+            let g: Vec<String> = t
+                .group
+                .values
+                .iter()
+                .map(|(c, v)| format!("{c}={}", v.as_deref().unwrap_or("null")))
+                .collect();
+            let (l, rt) = (t.left.render(), t.right.render());
+            let verdict = if l == rt { "equal" } else { "DIFFER" };
+            let _ = writeln!(
+                s,
+                "    {:<16} {:<28} {l:>24} {rt:>24}  {verdict}",
+                t.column,
+                if g.is_empty() {
+                    "all rows".to_string()
+                } else {
+                    g.join(", ")
+                }
+            );
+        }
+        if o.totals.len() > HUMAN_TOTALS {
+            let _ = writeln!(
+                s,
+                "    ... {} more groups in --json",
+                o.totals.len() - HUMAN_TOTALS
+            );
+        }
+    }
+    let m = &o.memory;
+    let _ = writeln!(
+        s,
+        "\n  read {} pass(es) over each side under a {}-byte state budget ({} restarts): {} rows read on the left, {} on the right",
+        m.passes,
+        num(m.budget_bytes),
+        m.restarts,
+        num(m.rows_read[0]),
+        num(m.rows_read[1])
+    );
+    if m.passes > 1 {
+        let _ = writeln!(
+            s,
+            "  each pass reads both sides again; a larger --memory-budget makes fewer passes"
+        );
     }
     let _ = writeln!(s, "\ncertificate {}", r.certificate.hash);
     s
@@ -317,6 +453,15 @@ fn fix_human(r: &FixResult, out: &Out) -> String {
                 Refusal::NoReplay { .. } => {
                     "the rewrite verified, but a receipt cites a replay and rewrites have none yet (contract v3 backlog #2)".into()
                 }
+                Refusal::NothingToGain {
+                    replay,
+                    current_bytes,
+                    proposed_bytes,
+                } => format!(
+                    "nothing_to_gain: replay {replay} predicts no saving on this workload ({} bytes now, {} with the proposal), so nothing was verified or applied (`bellwether why` says \"recommended: none\" for the same reason); pass --allow-no-gain to go on anyway",
+                    num(*current_bytes),
+                    num(*proposed_bytes)
+                ),
             };
             let _ = writeln!(s, "  refused: {why}");
         }

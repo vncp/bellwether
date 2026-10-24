@@ -379,6 +379,8 @@ fn a_key_that_is_already_complete_is_refused_never_attested() {
     );
     let proposal = p.trim().trim_start_matches("proposal ").to_string();
     let before = sequence(&index);
+    // The key is current, so its replay predicts no saving: the gain gate
+    // refuses first, citing that replay ...
     let out = run(
         &[
             "--json",
@@ -388,6 +390,31 @@ fn a_key_that_is_already_complete_is_refused_never_attested() {
             &proposal,
             "--workload",
             &workload.to_hex(),
+        ],
+        3,
+    );
+    let r: FixResult = typed(&out);
+    assert!(
+        matches!(
+            r.outcome,
+            FixOutcome::Refused {
+                refusal: Refusal::NothingToGain { .. }
+            }
+        ),
+        "{:?}",
+        r.outcome
+    );
+    // ... and past the gate the apply finds nothing to do.
+    let out = run(
+        &[
+            "--json",
+            "fix",
+            path(&data),
+            "--proposal",
+            &proposal,
+            "--workload",
+            &workload.to_hex(),
+            "--allow-no-gain",
         ],
         3,
     );

@@ -55,11 +55,27 @@ pub(crate) fn heading(out: &Out, s: &str) -> String {
     }
 }
 
+/// The narrowest label column of the funnel.
+const MIN_FUNNEL_LABEL: usize = 34;
+/// The narrowest label column of the `index` table.
+const MIN_SPEC_LABEL: usize = 40;
+
+/// A label column's width: the longest label, at least `min`, so a long
+/// spec label never pushes the numbers out of their columns.
+pub(crate) fn label_width<'a>(labels: impl IntoIterator<Item = &'a str>, min: usize) -> usize {
+    labels
+        .into_iter()
+        .map(|l| l.chars().count())
+        .max()
+        .unwrap_or(0)
+        .max(min)
+}
+
 /// One funnel row: label, files, row groups, bytes (exact and rounded).
-pub(crate) fn funnel_row(s: &mut String, name: &str, c: &Cost, note: &str) {
+pub(crate) fn funnel_row(s: &mut String, w: usize, name: &str, c: &Cost, note: &str) {
     let _ = writeln!(
         s,
-        "  {name:<34} {:>9} {:>12} {:>18} {:>10}  {note}",
+        "  {name:<w$} {:>9} {:>12} {:>18} {:>10}  {note}",
         num(c.files),
         num(c.row_groups),
         num(c.bytes),
@@ -67,10 +83,10 @@ pub(crate) fn funnel_row(s: &mut String, name: &str, c: &Cost, note: &str) {
     );
 }
 
-pub(crate) fn funnel_header(s: &mut String) {
+pub(crate) fn funnel_header(s: &mut String, w: usize) {
     let _ = writeln!(
         s,
-        "  {:<34} {:>9} {:>12} {:>18} {:>10}",
+        "  {:<w$} {:>9} {:>12} {:>18} {:>10}",
         "", "files", "row groups", "bytes", ""
     );
 }
@@ -93,12 +109,14 @@ pub(crate) fn index(r: &IndexResult, out: &Out) -> String {
         num(r.segments_written),
         num(r.segments)
     );
-    let _ = writeln!(s, "\n  {:<40} {:>14}", "key spec", "complete at");
-    for spec in &r.specs {
+    let labels: Vec<String> = r.specs.iter().map(|x| label(&x.spec)).collect();
+    let w = label_width(labels.iter().map(String::as_str), MIN_SPEC_LABEL);
+    let _ = writeln!(s, "\n  {:<w$} {:>14}", "key spec", "complete at");
+    for (spec, name) in r.specs.iter().zip(&labels) {
         let at = spec
             .complete_at
             .map_or_else(|| "incomplete".to_string(), |n| n.to_string());
-        let _ = writeln!(s, "  {:<40} {at:>14}", label(&spec.spec));
+        let _ = writeln!(s, "  {name:<w$} {at:>14}");
     }
     let _ = writeln!(s, "\nmanifest {}", r.manifest);
     s
@@ -252,6 +270,7 @@ fn quantiles(v: &[f64; 3]) -> String {
 // records.
 #[allow(clippy::too_many_lines)]
 pub(crate) fn why(r: &bellwether::WhyReport, out: &Out) -> String {
+    use bellwether::types::KeySpec;
     use bellwether::{CandidateOrigin, CulpritReason};
     let mut s = String::new();
     let state = if r.sequence == 0 {
@@ -285,40 +304,96 @@ pub(crate) fn why(r: &bellwether::WhyReport, out: &Out) -> String {
     };
     let rows = format!("{} rows", num(r.dataset.rows));
     if let (Some(w), Some(current)) = (&r.workload, r.current) {
-        let _ = writeln!(
-            s,
-            "funnel: {} run(s), keys p50/p95/max {}/{}/{}; exact sums of row-group statistics, summed over runs",
-            num(w.runs),
-            num(w.keys_p50_p95_max[0]),
-            num(w.keys_p50_p95_max[1]),
-            num(w.keys_p50_p95_max[2])
-        );
-        funnel_header(&mut s);
-        funnel_row(&mut s, "dataset", &dataset, &rows);
+        let kind_label = match &w.lookup {
+            None | Some(LookupKind::Locate) => None,
+            Some(LookupKind::Latest) => Some("latest".to_string()),
+            Some(LookupKind::Asof { at, .. }) => Some(format!("asof {at}")),
+        };
+        match &kind_label {
+            None => {
+                let _ = writeln!(
+                    s,
+                    "funnel: {} run(s), keys p50/p95/max {}/{}/{}; exact sums of row-group statistics, summed over runs",
+                    num(w.runs),
+                    num(w.keys_p50_p95_max[0]),
+                    num(w.keys_p50_p95_max[1]),
+                    num(w.keys_p50_p95_max[2])
+                );
+            }
+            Some(k) => {
+                let _ = writeln!(
+                    s,
+                    "funnel: {} run(s) ({k}), keys p50/p95/max {}/{}/{}; exact sums of row-group statistics, summed over runs",
+                    num(w.runs),
+                    num(w.keys_p50_p95_max[0]),
+                    num(w.keys_p50_p95_max[1]),
+                    num(w.keys_p50_p95_max[2])
+                );
+            }
+        }
+        let labels: Vec<String> = r.candidates.iter().map(|c| label(&c.spec)).collect();
+        let w_col = label_width(labels.iter().map(String::as_str), MIN_FUNNEL_LABEL);
+        funnel_header(&mut s, w_col);
+        funnel_row(&mut s, w_col, "dataset", &dataset, &rows);
         let current_name = if r.current_specs.is_empty() {
             "current (no index)"
         } else {
             "current"
         };
-        funnel_row(&mut s, current_name, &current, "");
+        let current_note = match (&kind_label, r.current_locate) {
+            (Some(_), Some(loc)) => format!(
+                "a point lookup (locate) would read {} row groups, {} bytes ({})",
+                num(loc.row_groups),
+                num(loc.bytes),
+                size(loc.bytes)
+            ),
+            _ => String::new(),
+        };
+        funnel_row(&mut s, w_col, current_name, &current, &current_note);
         for c in &r.candidates {
             let mut notes = Vec::new();
-            match c.origin {
-                CandidateOrigin::Workload => notes.push("floor: only row groups holding a key"),
-                CandidateOrigin::Profile => notes.push("profile candidate"),
+            match (&c.origin, &c.spec, &kind_label) {
+                (CandidateOrigin::Workload, KeySpec::Temporal { .. }, Some(k)) => {
+                    notes.push(format!(
+                        "floor ({k}): only row groups holding the winning version"
+                    ));
+                }
+                (CandidateOrigin::Workload, _, Some(_)) => {
+                    notes.push("floor (locate): only row groups holding a key".to_string());
+                }
+                (CandidateOrigin::Workload, _, None) => {
+                    notes.push("floor: only row groups holding a key".to_string());
+                }
+                (CandidateOrigin::Profile, _, _) => {
+                    notes.push("profile candidate".to_string());
+                }
+            }
+            if let (Some(_), Some(loc)) = (&kind_label, c.locate) {
+                notes.push(format!(
+                    "locate would read {} row groups, {} bytes ({})",
+                    num(loc.row_groups),
+                    num(loc.bytes),
+                    size(loc.bytes)
+                ));
             }
             if r.recommended.as_ref().is_some_and(|x| x.spec == c.spec) {
-                notes.push("recommended");
+                notes.push("recommended".to_string());
             }
-            funnel_row(&mut s, &label(&c.spec), &c.proposed, &notes.join(", "));
+            funnel_row(
+                &mut s,
+                w_col,
+                &label(&c.spec),
+                &c.proposed,
+                &notes.join(", "),
+            );
         }
     } else {
         let _ = writeln!(
             s,
             "funnel: no workload; pass --from <keys.parquet> to replay a run under each candidate key"
         );
-        funnel_header(&mut s);
-        funnel_row(&mut s, "dataset", &dataset, &rows);
+        funnel_header(&mut s, MIN_FUNNEL_LABEL);
+        funnel_row(&mut s, MIN_FUNNEL_LABEL, "dataset", &dataset, &rows);
     }
     if let Some(c) = &r.culprit {
         let fan = c.fanout.as_ref().map_or_else(String::new, |f| {
@@ -336,16 +411,39 @@ pub(crate) fn why(r: &bellwether::WhyReport, out: &Out) -> String {
             CulpritReason::NoIndexServes => {
                 "no index serves this lookup, so it reads every row group".to_string()
             }
+            CulpritReason::Layout {
+                least_row_groups,
+                row_groups,
+                lowest_fanout,
+            } => {
+                let lowest = lowest_fanout.as_ref().map_or_else(String::new, |f| {
+                    format!(
+                        "; the lowest-fanout column, {}, touches {} row groups per value (p50 / p95 / max)",
+                        f.columns.join(", "),
+                        quantiles(&f.row_groups_per_value)
+                    )
+                });
+                format!(
+                    "the layout, not a missing index: every candidate, the floor included, reads at least {} of the {} row groups the runs span, because each value is spread over nearly every row group, so no index helps, and only files rewritten clustered by the lookup columns would prune{lowest}",
+                    num(*least_row_groups),
+                    num(*row_groups)
+                )
+            }
             CulpritReason::ServingSpec { spec } => format!("the serving key {}", label(spec)),
         };
         let _ = writeln!(s, "\nculprit ({}): {why}{fan}", c.columns.join(", "));
     }
     if let Some(w) = &r.workload {
+        let for_kind = match &w.lookup {
+            None | Some(LookupKind::Locate) => String::new(),
+            Some(LookupKind::Latest) => " (for latest)".to_string(),
+            Some(LookupKind::Asof { at, .. }) => format!(" (for asof {at})"),
+        };
         match &r.recommended {
             Some(rec) => {
                 let _ = writeln!(
                     s,
-                    "recommended: {} reads {} bytes ({}) instead of {} ({})",
+                    "recommended{for_kind}: {} reads {} bytes ({}) instead of {} ({})",
                     label(&rec.spec),
                     num(rec.proposed.bytes),
                     size(rec.proposed.bytes),
@@ -361,7 +459,7 @@ pub(crate) fn why(r: &bellwether::WhyReport, out: &Out) -> String {
             None => {
                 let _ = writeln!(
                     s,
-                    "recommended: none; no candidate reads fewer bytes than the current configuration"
+                    "recommended{for_kind}: none; no candidate reads fewer bytes than the current configuration"
                 );
             }
         }
@@ -386,6 +484,12 @@ pub(crate) fn why(r: &bellwether::WhyReport, out: &Out) -> String {
             quantiles(&f.row_groups_per_value),
             if f.sampled { "sampled" } else { "exact" }
         );
+    }
+    if !r.profile.skipped.is_empty() {
+        let _ = writeln!(s, "  not candidates:");
+        for k in &r.profile.skipped {
+            let _ = writeln!(s, "    {}: {}", k.column, k.reason);
+        }
     }
     if !r.profile.lints.is_empty() {
         let _ = writeln!(s, "\nlints");

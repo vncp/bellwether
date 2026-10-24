@@ -157,6 +157,14 @@ struct WhyArgs {
     /// A workload recorded earlier, by its hash.
     #[arg(long, value_name = "HASH", conflicts_with = "from")]
     workload: Option<String>,
+    /// Timestamp (or date, time, or integer version) column for temporal
+    /// pricing (`latest`, or `asof` when `--at` is also given).
+    #[arg(long, value_name = "COL", conflicts_with = "bench_workload")]
+    latest_by: Option<String>,
+    /// The instant for `asof` pricing (with `--latest-by`): RFC 3339, a date
+    /// (YYYY-MM-DD), or an integer in the timestamp column's unit.
+    #[arg(long, value_name = "INSTANT", requires = "latest_by")]
+    at: Option<String>,
     /// Candidate key columns for the profile, comma-separated [default:
     /// every id-like column].
     #[arg(long, value_name = "COLS", value_delimiter = ',')]
@@ -490,6 +498,12 @@ fn propose(g: &Global, out: &Out, a: &ProposeArgs) -> Result<Outcome, Failure> {
 }
 
 fn why(g: &Global, out: &Out, a: &WhyArgs) -> Result<Outcome, Failure> {
+    if a.latest_by.is_some() && a.from.is_none() && a.workload.is_none() {
+        return Err(Failure::Usage(
+            "--latest-by requires a workload: pass --from <keys.parquet> (or --workload <hash>)"
+                .into(),
+        ));
+    }
     let request = bellwether::WhyRequest {
         keys: a.from.as_ref().map(|p| key_file(p, a.key.as_ref())),
         bench_workload: a.bench_workload.clone(),
@@ -498,6 +512,8 @@ fn why(g: &Global, out: &Out, a: &WhyArgs) -> Result<Outcome, Failure> {
             .as_deref()
             .map(|w| hash(w, "workload"))
             .transpose()?,
+        latest_by: a.latest_by.clone(),
+        at: a.at.clone(),
         columns: a.columns.clone(),
         max_candidates: a.max_candidates,
     };

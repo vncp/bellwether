@@ -39,10 +39,13 @@
 //!   groups with an empty `In`.
 
 use std::borrow::Cow;
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use arrow::datatypes::Schema;
+use arrow::datatypes::{DataType, Schema};
+use bellwether_core::encoding::{self, Value};
 use bellwether_core::segment::{ColumnType, ReadAt, SegmentReader};
+use bellwether_core::temporal::{self, VersionChain, VersionHit};
 use bellwether_store::{Snapshot, StoreExt};
 use bellwether_types::{Error, Hash, KeySpec, Predicate, Result, RunCost, ScanPlan};
 use bytes::Bytes;
@@ -51,7 +54,7 @@ use roaring::RoaringBitmap;
 use crate::catalog::Catalog;
 use crate::keys::RunKeys;
 use crate::transient::TransientIndex;
-
+use crate::workload::RunQuery;
 /// How a key spec serves a run's keys ([`servable`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Lookup {
@@ -87,6 +90,25 @@ pub fn servable(spec: &KeySpec, run_columns: &[String]) -> Option<Lookup> {
     prefix.then_some(Lookup::Prefix)
 }
 
+/// Whether `spec` serves a run of query kind `query` keyed on `run_columns`.
+///
+/// Point (`locate`) runs use [`servable`] (projection or prefix). `latest`
+/// and `asof` runs need a temporal spec whose columns are all in
+/// `run_columns` (`Lookup::Point`); other specs that serve `run_columns` also
+/// participate by per-key intersection when paired with one temporal spec.
+#[must_use]
+pub fn serves_query(spec: &KeySpec, run_columns: &[String], query: &RunQuery) -> bool {
+    match query {
+        RunQuery::Locate => servable(spec, run_columns).is_some(),
+        RunQuery::Latest | RunQuery::Asof { .. } => match spec {
+            KeySpec::Temporal { .. } => {
+                matches!(servable(spec, run_columns), Some(Lookup::Point { .. }))
+            }
+            _ => servable(spec, run_columns).is_some(),
+        },
+    }
+}
+
 /// The surface replay plans through. The build crate's planner implements it
 /// ([`crate::build_plan`]); [`SegmentPlanner`] implements it over core
 /// segments.
@@ -104,10 +126,15 @@ pub trait PlanSource: Send + Sync {
     /// The key specs this source can plan with.
     fn specs(&self) -> Vec<KeySpec>;
 
-    /// The plan for one run's keys under `specs` (module docs for the
-    /// serving, intersection, and no-pruning rules).
-    fn plan(&self, specs: &[KeySpec], keys: &RunKeys) -> Result<ScanPlan>;
+    /// The plan for one `locate` run's keys under `specs` (module docs for
+    /// the serving, intersection, and no-pruning rules).
+    fn plan(&self, specs: &[KeySpec], keys: &RunKeys) -> Result<ScanPlan> {
+        self.plan_query(specs, keys, &RunQuery::Locate)
+    }
 
+    /// The plan for one run's keys under `specs` and `query` (`locate`,
+    /// `latest`, or `asof`).
+    fn plan_query(&self, specs: &[KeySpec], keys: &RunKeys, query: &RunQuery) -> Result<ScanPlan>;
     /// This source with hypothetical specs' transient segments added, so
     /// each plans exactly as committed segments of that spec would. A
     /// transient index covers every live row group of the pinned catalog,
@@ -448,6 +475,159 @@ impl SegmentPlanner {
         }
         Ok(out)
     }
+
+    /// Plans a `latest` or `asof` run over `serving`, following the build
+    /// planner's temporal rules (`bellwether_build::Planner::plan_temporal`):
+    /// exactly one serving temporal spec with every column in `keys`,
+    /// cross-segment winner per key (recomputed over live row groups when the
+    /// winner lies in retired ones, invariant 5), per-key intersection with
+    /// any other serving specs, and the `NotOlderThan` / `LatestPerKey`
+    /// residual.
+    fn plan_temporal(
+        &self,
+        serving: &[(&SpecSegments, Lookup)],
+        keys: &RunKeys,
+        asof: Option<i64>,
+    ) -> Result<ScanPlan> {
+        let mut temporal = serving
+            .iter()
+            .filter(|(s, _)| matches!(s.spec, KeySpec::Temporal { .. }));
+        let (t, how) = match (temporal.next(), temporal.next()) {
+            (Some((t, how)), None) => (*t, how),
+            (None, _) => {
+                return Err(Error::KeySpec(format!(
+                    "latest and asof need a temporal key spec serving {:?}",
+                    keys.columns()
+                )))
+            }
+            (Some(_), Some(_)) => {
+                return Err(Error::KeySpec(
+                    "more than one temporal key spec serves this lookup; name one".into(),
+                ))
+            }
+        };
+        let (Lookup::Point { project }, KeySpec::Temporal { ts_column, .. }) = (how, &t.spec)
+        else {
+            return Err(Error::KeySpec(format!(
+                "latest and asof need every column of {} in the lookup",
+                t.spec.name()
+            )));
+        };
+        let ts_type = self
+            .catalog
+            .schema()
+            .field_with_name(ts_column)
+            .map_err(|_| {
+                Error::KeySpec(format!("column {ts_column:?} is not in the dataset schema"))
+            })?
+            .data_type()
+            .clone();
+        let variants: Vec<Vec<Vec<u8>>> =
+            (0..keys.len()).map(|i| keys.probes(i, project)).collect();
+        let mut probes: Vec<Vec<u8>> = variants.iter().flatten().cloned().collect();
+        probes.sort_unstable();
+        probes.dedup();
+        let hits = self.temporal_hits(&t.readers, &probes, asof)?;
+        let winners: Vec<Option<VersionHit>> = variants
+            .iter()
+            .map(|vs| {
+                vs.iter()
+                    .filter_map(|v| hits.get(v))
+                    .fold(None, |acc: Option<VersionHit>, h| {
+                        Some(match acc {
+                            Some(mut a) => {
+                                a.combine(h);
+                                a
+                            }
+                            None => h.clone(),
+                        })
+                    })
+            })
+            .collect();
+        let mut acc: Vec<Option<RoaringBitmap>> = winners
+            .iter()
+            .map(|w| Some(w.as_ref().map(|h| h.row_groups.clone()).unwrap_or_default()))
+            .collect();
+        let all_cols: Vec<usize> = (0..keys.columns().len()).collect();
+        for (seg, lookup) in serving {
+            if std::ptr::eq(*seg, t) {
+                continue;
+            }
+            let cols = match lookup {
+                Lookup::Point { project } => project.as_slice(),
+                Lookup::Prefix => all_cols.as_slice(),
+            };
+            for (i, a) in acc.iter_mut().enumerate() {
+                let found = seg.lookup(&keys.probes(i, cols), lookup)?;
+                *a = Some(match a.take() {
+                    Some(prev) => prev & found,
+                    None => found,
+                });
+            }
+        }
+        let selected = acc
+            .into_iter()
+            .flatten()
+            .fold(RoaringBitmap::new(), |u, b| u | b);
+        let residual = temporal_residual(
+            &t.spec, ts_column, &ts_type, keys, &variants, &winners, asof,
+        )?;
+        let mut plan = self.catalog.plan_for(&selected)?;
+        plan.residual = Some(residual);
+        Ok(plan)
+    }
+
+    fn temporal_hits(
+        &self,
+        readers: &[SegmentReader<SegmentBytes>],
+        probes: &[Vec<u8>],
+        asof: Option<i64>,
+    ) -> Result<BTreeMap<Vec<u8>, VersionHit>> {
+        let raw = match asof {
+            None => temporal::latest(readers, probes)?,
+            Some(ts) => temporal::asof(readers, probes, ts)?,
+        };
+        let live = self.catalog.all_ids();
+        let check_known = |bm: &RoaringBitmap| -> Result<()> {
+            for id in bm {
+                if self.catalog.get(id).is_none() && !self.catalog.is_tombstoned(id) {
+                    return Err(Error::Other(format!(
+                        "row-group id {id} is neither live nor tombstoned in manifest {}",
+                        self.catalog.manifest_version()
+                    )));
+                }
+            }
+            Ok(())
+        };
+        let mut out = BTreeMap::new();
+        let mut redo = Vec::new();
+        for (key, mut hit) in raw {
+            check_known(&hit.row_groups)?;
+            hit.row_groups &= &live;
+            if hit.row_groups.is_empty() {
+                redo.push(key);
+            } else {
+                out.insert(key, hit);
+            }
+        }
+        if redo.is_empty() {
+            return Ok(out);
+        }
+        for r in readers {
+            for (key, value) in r.get(&redo)? {
+                check_known(&value.bitmap)?;
+                if let Some(h) = live_winner(&value.chain, &live, asof) {
+                    match out.get_mut(&key) {
+                        Some(acc) => acc.combine(&h),
+                        None => {
+                            out.insert(key, h);
+                        }
+                    }
+                }
+            }
+        }
+        Ok(out)
+    }
 }
 
 impl PlanSource for SegmentPlanner {
@@ -459,7 +639,7 @@ impl PlanSource for SegmentPlanner {
         self.specs.iter().map(|s| s.spec.clone()).collect()
     }
 
-    fn plan(&self, specs: &[KeySpec], keys: &RunKeys) -> Result<ScanPlan> {
+    fn plan_query(&self, specs: &[KeySpec], keys: &RunKeys, query: &RunQuery) -> Result<ScanPlan> {
         check_key_types(self.catalog.schema(), keys)?;
         // Every listed spec must be plannable, whether or not it serves
         // these keys, as in the build crate's planner.
@@ -473,17 +653,11 @@ impl PlanSource for SegmentPlanner {
             }
             listed.push(self.listed(spec)?);
         }
-        if keys.is_empty() {
-            return Ok(with_residual(
-                self.catalog.plan_for(&RoaringBitmap::new())?,
-                keys,
-            ));
-        }
-        if specs.is_empty() {
-            return Ok(with_residual(
-                self.catalog.plan_for(&self.catalog.all_ids())?,
-                keys,
-            ));
+        if !matches!(query, RunQuery::Locate) && specs.is_empty() {
+            return Err(Error::KeySpec(format!(
+                "latest and asof need a temporal key spec serving {:?}",
+                keys.columns()
+            )));
         }
         let mut serving = Vec::with_capacity(specs.len());
         for (spec, segments) in specs.iter().zip(listed) {
@@ -491,15 +665,33 @@ impl PlanSource for SegmentPlanner {
                 serving.push((segments.as_ref(), lookup));
             }
         }
-        if serving.is_empty() {
+        if !specs.is_empty() && serving.is_empty() {
             return Err(Error::KeySpec(format!(
                 "none of {:?} serves keys on {:?}",
                 specs.iter().map(KeySpec::name).collect::<Vec<_>>(),
                 keys.columns()
             )));
         }
-        let selected = Self::select(&serving, keys)?;
-        Ok(with_residual(self.catalog.plan_for(&selected)?, keys))
+        match query {
+            RunQuery::Locate => {
+                if keys.is_empty() {
+                    return Ok(with_residual(
+                        self.catalog.plan_for(&RoaringBitmap::new())?,
+                        keys,
+                    ));
+                }
+                if specs.is_empty() {
+                    return Ok(with_residual(
+                        self.catalog.plan_for(&self.catalog.all_ids())?,
+                        keys,
+                    ));
+                }
+                let selected = Self::select(&serving, keys)?;
+                Ok(with_residual(self.catalog.plan_for(&selected)?, keys))
+            }
+            RunQuery::Latest => self.plan_temporal(&serving, keys, None),
+            RunQuery::Asof { ts } => self.plan_temporal(&serving, keys, Some(*ts)),
+        }
     }
 
     fn with_transient(
@@ -542,7 +734,7 @@ pub(crate) fn check_key_types(schema: &Schema, keys: &RunKeys) -> Result<()> {
             .data_type();
         if &ColumnType::of(declared)? != recorded {
             return Err(Error::KeySpec(format!(
-                "keys on {c:?} were encoded as {recorded:?}, but the dataset declares {declared}"
+                "keys on {c:?} were encoded as {recorded}, but the dataset declares {declared}; re-read the keys"
             )));
         }
     }
@@ -559,6 +751,110 @@ fn with_residual(mut plan: ScanPlan, keys: &RunKeys) -> ScanPlan {
         values: keys.all_probes(&all),
     });
     plan
+}
+
+fn live_winner(
+    chain: &VersionChain,
+    live: &RoaringBitmap,
+    asof: Option<i64>,
+) -> Option<VersionHit> {
+    let mut best: Option<VersionHit> = None;
+    for &(ts, rg) in chain.versions() {
+        if !live.contains(rg.0) || asof.is_some_and(|a| ts > a) {
+            continue;
+        }
+        let hit = VersionHit {
+            ts,
+            row_groups: std::iter::once(rg.0).collect(),
+        };
+        match &mut best {
+            Some(b) => b.combine(&hit),
+            None => best = Some(hit),
+        }
+    }
+    best
+}
+
+fn encode_ts(ts: i64, declared: &DataType) -> Result<Vec<u8>> {
+    let value = match declared {
+        DataType::Timestamp(unit, _) => Value::Timestamp {
+            value: ts,
+            unit: *unit,
+        },
+        DataType::Time32(unit) | DataType::Time64(unit) => Value::Time {
+            value: ts,
+            unit: *unit,
+        },
+        DataType::Date32 => Value::Date32(
+            i32::try_from(ts)
+                .map_err(|_| Error::KeySpec(format!("{ts} days is out of range for Date32")))?,
+        ),
+        DataType::Date64 => Value::Date64(ts),
+        DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64 => Value::Int(ts),
+        DataType::UInt8 | DataType::UInt16 | DataType::UInt32 | DataType::UInt64 => Value::UInt(
+            u64::try_from(ts)
+                .map_err(|_| Error::KeySpec(format!("{ts} is out of range for {declared}")))?,
+        ),
+        DataType::Dictionary(_, v) => return encode_ts(ts, v),
+        other => {
+            return Err(Error::KeySpec(format!(
+                "ts_column of type {other} cannot order versions"
+            )))
+        }
+    };
+    let mut out = Vec::with_capacity(11);
+    encoding::encode_value_as(&value, declared, &mut out)?;
+    Ok(out)
+}
+
+fn temporal_residual(
+    spec: &KeySpec,
+    ts_column: &str,
+    ts_type: &DataType,
+    keys: &RunKeys,
+    variants: &[Vec<Vec<u8>>],
+    winners: &[Option<VersionHit>],
+    asof: Option<i64>,
+) -> Result<Predicate> {
+    let all_cols: Vec<usize> = (0..keys.columns().len()).collect();
+    let mut in_values: Vec<Vec<u8>> = (0..keys.len())
+        .zip(winners)
+        .filter(|(_, w)| w.is_some())
+        .flat_map(|(i, _)| keys.probes(i, &all_cols))
+        .collect();
+    in_values.sort_unstable();
+    in_values.dedup();
+    let mut bounds: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
+    let mut lowest: Option<i64> = None;
+    for (vs, w) in variants.iter().zip(winners) {
+        let Some(h) = w else { continue };
+        lowest = Some(lowest.map_or(h.ts, |l| l.min(h.ts)));
+        let ts = encode_ts(h.ts, ts_type)?;
+        for v in vs {
+            bounds.insert(v.clone(), ts.clone());
+        }
+    }
+    let mut all = vec![Predicate::In {
+        columns: keys.columns().to_vec(),
+        values: in_values,
+    }];
+    if let (Some(at), Some(lo)) = (asof, lowest) {
+        all.push(Predicate::Between {
+            column: ts_column.to_string(),
+            lo: encode_ts(lo, ts_type)?,
+            hi: encode_ts(at, ts_type)?,
+        });
+    }
+    all.push(Predicate::NotOlderThan {
+        columns: spec.columns().to_vec(),
+        ts_column: ts_column.to_string(),
+        bounds: bounds.into_iter().collect(),
+    });
+    all.push(Predicate::LatestPerKey {
+        columns: spec.columns().to_vec(),
+        ts_column: ts_column.to_string(),
+    });
+    Ok(Predicate::And { all })
 }
 
 #[cfg(test)]

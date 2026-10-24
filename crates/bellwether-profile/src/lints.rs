@@ -6,6 +6,7 @@
 //! | `low_selectivity_single_column` | the median value of `C` touches at least [`LOW_SELECTIVITY_MIN_FRACTION`] of all row groups, some id-like `O` that is not a batch stamp makes the composite's p95 at most half of that median, and `C` is not a batch stamp (a batch stamp is not a key at all) |
 //! | `scattered_time_column` | a date or timestamp column's overlap depth is at least `SCATTER_MIN_DEPTH` and its sortedness below `SCATTER_MAX_SORTEDNESS` (`bellwether_source::stats`) |
 //! | `declared_but_unused_key` | a manifest declares a key spec and a recorded workload exists whose runs never supply the spec's leading column |
+//! | `no_discriminating_column` | the dataset has at least 2 row groups and every measured key, single column or composite, has a median value touching at least [`NO_DISCRIMINATING_MIN_FRACTION`] of all row groups: the layout, not a missing index, sets the cost of a lookup |
 //!
 //! The two decisions the benchmark also makes are not reimplemented here:
 //! `batch_stamp_key` is `bellwether_source::stats::batch_stamp` and
@@ -62,6 +63,9 @@ pub const LOW_SELECTIVITY_SINGLE_COLUMN: &str = "low_selectivity_single_column";
 pub const SCATTERED_TIME_COLUMN: &str = "scattered_time_column";
 /// Rule id: a declared key spec no recorded run uses.
 pub const DECLARED_BUT_UNUSED_KEY: &str = "declared_but_unused_key";
+/// Rule id: no measured key prunes, because every value is spread over
+/// nearly every row group.
+pub const NO_DISCRIMINATING_COLUMN: &str = "no_discriminating_column";
 
 /// Confidence of a high finding.
 pub const HIGH: f64 = 0.9;
@@ -77,6 +81,10 @@ pub const BATCH_HIGH_FILES_RATIO: f64 = 0.5;
 pub const LOW_SELECTIVITY_MIN_FRACTION: f64 = 0.5;
 /// `low_selectivity_single_column`: median over the composite's p95.
 pub const LOW_SELECTIVITY_MIN_RATIO_OVER_COMPOSITE: f64 = 2.0;
+/// `no_discriminating_column`: the least median row groups per value, over
+/// every measured key, as a fraction of all row groups. At three quarters a
+/// point lookup on the best key still reads three row groups in four.
+pub const NO_DISCRIMINATING_MIN_FRACTION: f64 = 0.75;
 
 /// Everything the detectors read.
 #[derive(Clone, Copy, Debug)]
@@ -93,6 +101,10 @@ pub struct LintInputs<'a> {
     pub row_groups: &'a [RowGroupMeta],
     /// The recorded workload, if any.
     pub workload: Option<&'a WorkloadSummary>,
+    /// The columns lookups supply: the recorded workload's key columns and
+    /// any the caller names ([`crate::ProfileOptions::supplied_columns`],
+    /// for example a key file's). Empty when nothing says.
+    pub supplied: &'a [String],
     /// The manifest, if the folder is indexed.
     pub manifest: Option<&'a ManifestInfo>,
     /// Rows in the dataset.
@@ -106,6 +118,7 @@ pub fn run(inputs: &LintInputs<'_>) -> Result<Vec<Lint>> {
     lints.extend(low_selectivity(inputs, &stamps));
     lints.extend(scattered_time(inputs));
     lints.extend(declared_but_unused(inputs));
+    lints.extend(no_discriminating(inputs));
     Ok(lints)
 }
 
@@ -125,9 +138,13 @@ fn pair<'a>(inputs: &LintInputs<'a>, a: &str, b: &str) -> Option<&'a FanoutEntry
 }
 
 fn supplied(inputs: &LintInputs<'_>, column: &str) -> bool {
-    inputs
-        .workload
-        .is_some_and(|w| w.key_columns.iter().any(|c| c == column))
+    inputs.supplied.iter().any(|c| c == column)
+}
+
+/// Whether anything says which columns lookups supply: a recorded workload,
+/// or supplied columns from a key file.
+fn informed(inputs: &LintInputs<'_>) -> bool {
+    inputs.workload.is_some() || !inputs.supplied.is_empty()
 }
 
 /// `candidates` (`(partner, composite)`, in schema order) in the shared
@@ -159,10 +176,10 @@ fn label(columns: &[String]) -> String {
     format!("({})", columns.join(", "))
 }
 
-/// The clause stating a composite order's assumption when no workload says
-/// which columns lookups supply.
+/// The clause stating a composite order's assumption when neither a
+/// workload nor a key file says which columns lookups supply.
 fn order_assumption(inputs: &LintInputs<'_>, composite: &[String]) -> String {
-    if inputs.workload.is_some() {
+    if informed(inputs) {
         String::new()
     } else {
         format!(
@@ -307,7 +324,7 @@ fn low_selectivity(inputs: &LintInputs<'_>, stamps: &[String]) -> Vec<Lint> {
         let sampled = f.sampled || comp.fanout.sampled;
         let confidence = if sampled {
             LOW
-        } else if inputs.workload.is_none() {
+        } else if !informed(inputs) {
             MEDIUM
         } else if supplied(inputs, name) && supplied(inputs, other) {
             HIGH
@@ -394,4 +411,52 @@ fn declared_but_unused(inputs: &LintInputs<'_>) -> Vec<Lint> {
         });
     }
     out
+}
+
+/// `no_discriminating_column`: the measured key with the lowest median row
+/// groups per value (ties: lower p95, then fewer columns, then measured
+/// order) still touches nearly every row group, so no key prunes and the
+/// layout, not a missing index, decides what a lookup reads. Names that
+/// lowest-fanout key. One row group has nothing to prune and never fires.
+fn no_discriminating(inputs: &LintInputs<'_>) -> Option<Lint> {
+    let best = inputs.entries.iter().min_by(|a, b| {
+        let (fa, fb) = (&a.fanout, &b.fanout);
+        fa.row_groups_per_value[0]
+            .total_cmp(&fb.row_groups_per_value[0])
+            .then(fa.row_groups_per_value[1].total_cmp(&fb.row_groups_per_value[1]))
+            .then(fa.columns.len().cmp(&fb.columns.len()))
+    })?;
+    let f = &best.fanout;
+    if f.row_groups_total < 2 {
+        return None;
+    }
+    #[allow(clippy::cast_precision_loss)]
+    let fraction = f.row_groups_per_value[0] / f.row_groups_total as f64;
+    if fraction < NO_DISCRIMINATING_MIN_FRACTION {
+        return None;
+    }
+    let sampled = inputs.entries.iter().any(|e| e.fanout.sampled);
+    let name = if f.columns.len() == 1 {
+        f.columns[0].clone()
+    } else {
+        label(&f.columns)
+    };
+    Some(Lint {
+        rule: NO_DISCRIMINATING_COLUMN.into(),
+        columns: f.columns.clone(),
+        message: format!(
+            "No measured key prunes: the most selective, {name}, has a median value in {} of {} \
+             row groups ({:.0}%), and every other column and pair measured touches at least as \
+             many, so the values are spread over nearly every row group. The layout, not a \
+             missing index, sets what a point lookup reads: an exact index on any of these keys \
+             still reads nearly every row group, and only files rewritten clustered by the \
+             column lookups supply would prune. A newest-version lookup can still prune by \
+             time; price it with `bellwether why --from <keys> --latest-by <time column>`.",
+            fmt_count(f.row_groups_per_value[0]),
+            f.row_groups_total,
+            fraction * 100.0,
+        ),
+        confidence: if sampled { LOW } else { HIGH },
+        site: None,
+    })
 }

@@ -249,7 +249,13 @@ impl<S: StoreExt + ?Sized> Builder<S> {
         let chunk_sizes = base_chunk_sizes(base.as_ref())
             .into_iter()
             .chain(cfg.new_chunk_size.size());
-        let mut sources = DataSource::new(cfg.kind, &cfg.schema, cfg.policy, chunk_sizes);
+        let mut sources = DataSource::new(
+            cfg.kind,
+            &cfg.schema,
+            cfg.policy,
+            &opts.exclude,
+            chunk_sizes,
+        );
         let discovered = sources.discover(root)?;
         let since = now_rfc3339();
         let observer = opts.observer.as_deref();
@@ -408,7 +414,7 @@ impl Config {
         let schema = match (&opts.schema, &base_schema) {
             (Some(s), _) => persistable(s)?,
             (None, Some(b)) => SchemaRef::clone(b),
-            (None, None) => persistable(infer_schema(kind, root, policy)?.as_ref())?,
+            (None, None) => persistable(infer_schema(kind, root, policy, &opts.exclude)?.as_ref())?,
         };
         let columns = schema_to_columns(&schema, base.map_or(&[][..], |m| &m.schema.columns));
         let mut source_info = base.map(|m| m.source.clone()).unwrap_or_default();
@@ -528,11 +534,7 @@ fn plan_specs(specs: &[KeySpec], schema: &Schema) -> Result<Vec<SpecPlan>> {
         schema
             .field_with_name(c)
             .map(|f| f.data_type().clone())
-            .map_err(|_| {
-                Error::KeySpec(format!(
-                    "key spec column {c:?} is not in the dataset schema"
-                ))
-            })
+            .map_err(|_| Error::KeySpec(format!("key spec {}", encoding::not_in_schema(schema, c))))
     };
     let mut names = BTreeSet::new();
     specs
