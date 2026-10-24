@@ -309,3 +309,36 @@ Every check reads per-run data, never `summary`. Each has three outcomes: PASS, 
 - the planted-pattern table and fanout histograms from the ground truth.
 
 Hovering a mark shows a native tooltip, and each chart has a table view. Light and dark themes follow `prefers-color-scheme`.
+
+## Bitemporal `market` corpus (WP21)
+
+`bellwether_bench::market` (and `bellwether bench market` in the CLI) generates a deterministic synthetic bitemporal market trade corpus so every WP21 time-series capability gets a measured funnel:
+
+```sh
+bellwether bench market --out benches/out/market-small --rung small
+```
+
+**Layout and schema.** Files are written under `<out>/data/day=YYYY-MM-DD/part-NNNN.parquet` (Hive directory partitioning; no `day` column inside the Parquet files) with five non-null columns:
+
+| Column | Type | Role |
+|---|---|---|
+| `symbol` | `Utf8` | Symbol identifier (`S0001..=S{symbols:04}`). |
+| `ts` | `Timestamp(µs, "UTC")` | Event / valid time (within trading hours `14:30:00..21:00:00` UTC). |
+| `known_at` | `Timestamp(µs, "UTC")` | Knowledge / transaction time (`ts + 0..=500 ms` for on-time prints; 1–3 days later for late prints and restatements). |
+| `price` | `Float64` | Trade price (`10.00..=500.00`). |
+| `size` | `Int64` | Share quantity (`1..=10,000`). |
+
+- Within each partition day `day=YYYY-MM-DD` (the row's `known_at` day), rows are sorted by `(symbol, ts, known_at)` and cut across `files_per_day` files and row groups of `rows_per_row_group` rows so each symbol's rows straddle row groups.
+- **Late prints** (`late_fraction`): arrive 1–3 days after their `ts` day and live in their `known_at` day's partition. Late arrivals whose `known_at` day falls beyond the corpus's last day are **dropped** (never clamped).
+- **Restatements** (`restatement_fraction`): emit both the original on-time print on its `ts` day and a corrected row with the same `(symbol, ts)`, a different `price`, and `known_at` 1–3 days later in that later day's partition (dropped if beyond the last day).
+
+**Presets (`MarketRung`).**
+
+| Rung | `seed` | `symbols` | `days` | `start` | `files_per_day` | `rows_per_row_group` | `prints_per_symbol_per_day` | `restatement_fraction` | `late_fraction` |
+|---|---|---|---|---|---|---|---|---|---|
+| `Small` | `21` | `50` | `10` | `2026-01-01` | `2` | `500` | `200` | `0.05` | `0.05` |
+| `Medium` | `21` | `200` | `30` | `2026-01-01` | `4` | `2000` | `300` | `0.05` | `0.05` |
+
+**Workload and ground truth.** `generate_market` also writes:
+- `<out>/workload/market.json` and single-column `symbol` key files `<out>/workload/keys/qNNNN.parquet` covering `window` queries (1-hour intraday, 1-day, and 5-day windows across symbol sets of 1, 10, and 50), bitemporal `asof` queries (including `K` before and after restatements and late arrivals), and `latest_known` queries.
+- `<out>/workload/truth.json`: exact ground truth computed directly from the generator's in-memory rows (for `window`: `matching_row_groups`, `matching_rows`, `symbol_row_groups`, `ts_overlap_row_groups`, and `partition_days_touched`; for `asof` and `latest_known`: per-symbol winning `(ts, known_at, price)` and every `(file, row_group)` holding it).
