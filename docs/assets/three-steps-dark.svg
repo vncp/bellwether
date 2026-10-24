@@ -1,25 +1,27 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 250" width="1000" height="250" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif">
-<rect width="1000" height="250" fill="#0d1117"/>
-<rect x="25" y="30" width="300" height="190" rx="14" fill="#0d1117" stroke="#58a6ff" stroke-width="2"/>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 260" width="1000" height="260" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif">
+<rect width="1000" height="260" fill="#0d1117"/>
+<rect x="25" y="30" width="300" height="200" rx="14" fill="#0d1117" stroke="#58a6ff" stroke-width="2"/>
 <circle cx="55" cy="64" r="16" fill="#58a6ff"/><text x="55" y="69" fill="#0d1117" font-size="15" font-weight="700" text-anchor="middle">1</text>
 <text x="81" y="70" fill="#e6edf3" font-size="20" font-weight="700">Ask</text>
-<text x="47" y="106" fill="#58a6ff" font-size="13" font-family="SFMono-Regular,Menlo,Consolas,monospace">bellwether why ./data/</text>
-<text x="47" y="134" fill="#8b949e" font-size="13.5">Which column is a real key, and exactly</text>
-<text x="47" y="153" fill="#8b949e" font-size="13.5">how many bytes each index would save on</text>
-<text x="47" y="172" fill="#8b949e" font-size="13.5">your recorded queries.</text>
-<path d="M333 125 L367 125" stroke="#8b949e" stroke-width="2"/><path d="M361 118 L369 125 L361 132" fill="none" stroke="#8b949e" stroke-width="2"/>
-<rect x="375" y="30" width="300" height="190" rx="14" fill="#0d1117" stroke="#d29922" stroke-width="2"/>
+<text x="47" y="106" fill="#58a6ff" font-size="12.5" font-family="SFMono-Regular,Menlo,Consolas,monospace">bellwether why ./data/</text>
+<text x="47" y="134" fill="#8b949e" font-size="13">Which column is a real key, and</text>
+<text x="47" y="153" fill="#8b949e" font-size="13">exactly how many bytes each index</text>
+<text x="47" y="172" fill="#8b949e" font-size="13">would save on your recorded</text>
+<text x="47" y="191" fill="#8b949e" font-size="13">queries.</text>
+<path d="M333 130 L367 130" stroke="#8b949e" stroke-width="2"/><path d="M361 123 L369 130 L361 137" fill="none" stroke="#8b949e" stroke-width="2"/>
+<rect x="375" y="30" width="300" height="200" rx="14" fill="#0d1117" stroke="#d29922" stroke-width="2"/>
 <circle cx="405" cy="64" r="16" fill="#d29922"/><text x="405" y="69" fill="#0d1117" font-size="15" font-weight="700" text-anchor="middle">2</text>
 <text x="431" y="70" fill="#e6edf3" font-size="20" font-weight="700">Fix</text>
-<text x="397" y="106" fill="#d29922" font-size="13" font-family="SFMono-Regular,Menlo,Consolas,monospace">bellwether fix ./data/ --proposal …</text>
-<text x="397" y="134" fill="#8b949e" font-size="13.5">Scores, verifies the same rows come back,</text>
-<text x="397" y="153" fill="#8b949e" font-size="13.5">builds the index, and only then applies.</text>
-<path d="M683 125 L717 125" stroke="#8b949e" stroke-width="2"/><path d="M711 118 L719 125 L711 132" fill="none" stroke="#8b949e" stroke-width="2"/>
-<rect x="725" y="30" width="300" height="190" rx="14" fill="#0d1117" stroke="#3fb950" stroke-width="2"/>
+<text x="397" y="106" fill="#d29922" font-size="12.5" font-family="SFMono-Regular,Menlo,Consolas,monospace">bellwether fix ./data/ --proposal …</text>
+<text x="397" y="134" fill="#8b949e" font-size="13">Scores, verifies the same rows</text>
+<text x="397" y="153" fill="#8b949e" font-size="13">come back, builds the index, and</text>
+<text x="397" y="172" fill="#8b949e" font-size="13">only then applies.</text>
+<path d="M683 130 L717 130" stroke="#8b949e" stroke-width="2"/><path d="M711 123 L719 130 L711 137" fill="none" stroke="#8b949e" stroke-width="2"/>
+<rect x="725" y="30" width="300" height="200" rx="14" fill="#0d1117" stroke="#3fb950" stroke-width="2"/>
 <circle cx="755" cy="64" r="16" fill="#3fb950"/><text x="755" y="69" fill="#0d1117" font-size="15" font-weight="700" text-anchor="middle">3</text>
 <text x="781" y="70" fill="#e6edf3" font-size="20" font-weight="700">Proof</text>
-<text x="747" y="106" fill="#3fb950" font-size="13" font-family="SFMono-Regular,Menlo,Consolas,monospace">receipt + index</text>
-<text x="747" y="134" fill="#8b949e" font-size="13.5">A hash-linked receipt a reviewer or CI can</text>
-<text x="747" y="153" fill="#8b949e" font-size="13.5">check, and lookups in milliseconds over</text>
-<text x="747" y="172" fill="#8b949e" font-size="13.5">plain files.</text>
+<text x="747" y="106" fill="#3fb950" font-size="12.5" font-family="SFMono-Regular,Menlo,Consolas,monospace">receipt + index</text>
+<text x="747" y="134" fill="#8b949e" font-size="13">A hash-linked receipt a reviewer</text>
+<text x="747" y="153" fill="#8b949e" font-size="13">or CI can check, and lookups in</text>
+<text x="747" y="172" fill="#8b949e" font-size="13">milliseconds over plain files.</text>
 </svg>
