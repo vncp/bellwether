@@ -189,6 +189,17 @@ pub enum FixOutcome {
     },
     /// Verified; `verify_only` was set, nothing applied.
     Verified,
+    /// A dry run of the apply tier ([`Engine::apply_dry_run`]): the gate
+    /// passed and the proposal kind can be applied; nothing was written.
+    /// The real apply may still be refused if the data or the manifest
+    /// changes first, or if its commit is not `expected`.
+    WouldApply {
+        /// The current manifest sequence, which the certificate was
+        /// computed against.
+        sequence: u64,
+        /// The sequence the apply's one commit must produce.
+        expected: u64,
+    },
     /// Stopped without a receipt.
     Refused {
         /// Why.
@@ -226,7 +237,7 @@ impl Engine {
     pub fn fix(&self, request: &FixRequest) -> Result<FixResult> {
         guard(|| match (&request.proposal, &request.certificate) {
             (Some(p), None) => self.fix_proposal(p, request),
-            (None, Some(c)) => self.apply_certificate(c),
+            (None, Some(c)) => self.apply_certificate(c, false),
             _ => Err(Error::Other(
                 "fix takes a proposal (--proposal) or a certificate to apply (--certificate), \
                  not both"
@@ -235,8 +246,39 @@ impl Engine {
         })
     }
 
+    /// The apply tier as a dry run: resolves `certificate` and its proposal
+    /// and runs the gate `fix --certificate` runs before anything is written
+    /// (passing, current manifest sequence, and for a key the data still the
+    /// data certified), then the proposal-kind refusals. Returns
+    /// [`FixOutcome::WouldApply`] or the same refusal or error, and writes
+    /// nothing anywhere: no replay, no build, no receipt, and it never
+    /// creates the index location.
+    pub fn apply_dry_run(&self, certificate: &Hash) -> Result<FixResult> {
+        guard(|| self.apply_certificate(certificate, true))
+    }
+
+    /// Reads a record. With `existing_only`, never creates the index
+    /// location: an absent one holds no record.
+    fn read(&self, hash: &Hash, existing_only: bool) -> Result<Written> {
+        if !existing_only {
+            return self.get(hash);
+        }
+        let Some(store) = self.existing_store()? else {
+            return Err(Error::NotFound(*hash));
+        };
+        let record = bellwether_ledger::Ledger::new(Arc::clone(store)).get(hash)?;
+        Ok(Written {
+            hash: *hash,
+            record,
+        })
+    }
+
     fn proposal(&self, hash: &Hash) -> Result<(Written, Proposal)> {
-        let w = self.get(hash).map_err(|e| match e {
+        self.proposal_read(hash, false)
+    }
+
+    fn proposal_read(&self, hash: &Hash, existing_only: bool) -> Result<(Written, Proposal)> {
+        let w = self.read(hash, existing_only).map_err(|e| match e {
             Error::NotFound(h) => Error::Other(format!(
                 "proposal {h} is not in the ledger at {}; pass a hash `bellwether propose` or \
                  `bellwether why` printed",
@@ -249,10 +291,13 @@ impl Engine {
                 let p = p.clone();
                 Ok((w, p))
             }
-            _ => Err(Error::LedgerRule(format!(
-                "{hash} is {}, not a proposal; pass a proposal hash",
-                w.kind().with_article()
-            ))),
+            _ => Err(Error::WrongKind {
+                hash: *hash,
+                expected: "a proposal".into(),
+                found: w.kind().with_article().into(),
+                next: "pass a proposal hash `bellwether propose` or `bellwether why` printed"
+                    .into(),
+            }),
         }
     }
 
@@ -372,14 +417,15 @@ impl Engine {
 
     /// Apply and attest a certificate written earlier: every check runs
     /// before anything is written, and the replay is recomputed now.
-    fn apply_certificate(&self, cert_hash: &Hash) -> Result<FixResult> {
-        let w = self.get(cert_hash)?;
+    fn apply_certificate(&self, cert_hash: &Hash, dry_run: bool) -> Result<FixResult> {
+        let w = self.read(cert_hash, dry_run)?;
         let Record::Certificate(certificate) = &w.record else {
-            return Err(Error::LedgerRule(format!(
-                "{cert_hash} is {}, not a certificate; pass the certificate hash `bellwether fix \
-                 --verify-only` printed",
-                w.kind().with_article()
-            )));
+            return Err(Error::WrongKind {
+                hash: *cert_hash,
+                expected: "a certificate".into(),
+                found: w.kind().with_article().into(),
+                next: "pass the certificate hash `bellwether fix --verify-only` printed".into(),
+            });
         };
         let certificate = certificate.clone();
         let proposal_hash = certificate.proposal.ok_or_else(|| {
@@ -388,7 +434,7 @@ impl Engine {
                  is nothing to apply"
             ))
         })?;
-        let (written, proposal) = self.proposal(&proposal_hash)?;
+        let (written, proposal) = self.proposal_read(&proposal_hash, dry_run)?;
         let certified = certificate
             .provenance
             .manifest_version
@@ -424,12 +470,18 @@ impl Engine {
                     certificate: *cert_hash,
                 });
             }
+            ProposalBody::Key { .. } if dry_run => {
+                if !matches!(certificate.coverage, Coverage::Workload { .. }) {
+                    return Err(not_workload_covered(cert_hash));
+                }
+                result.outcome = FixOutcome::WouldApply {
+                    sequence: before,
+                    expected: before.saturating_add(1),
+                };
+            }
             ProposalBody::Key { spec } => {
                 let Coverage::Workload { workload, .. } = &certificate.coverage else {
-                    return Err(Error::LedgerRule(format!(
-                        "certificate {cert_hash} does not cover a recorded workload, so the key \
-                         proposal it verified cannot be re-scored on the keys it checked"
-                    )));
+                    return Err(not_workload_covered(cert_hash));
                 };
                 let pinned = self.pin()?;
                 let source = self.source(pinned.as_ref())?;
@@ -838,6 +890,13 @@ fn advance(before: u64, committed: Option<u64>) -> std::result::Result<u64, Refu
 
 fn refused(refusal: Refusal) -> FixOutcome {
     FixOutcome::Refused { refusal }
+}
+
+fn not_workload_covered(cert_hash: &Hash) -> Error {
+    Error::LedgerRule(format!(
+        "certificate {cert_hash} does not cover a recorded workload, so the key proposal it \
+         verified cannot be re-scored on the keys it checked"
+    ))
 }
 
 fn cert_of(w: &Written) -> Result<&Certificate> {

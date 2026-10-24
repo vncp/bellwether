@@ -483,7 +483,8 @@ fn propose(g: &Global, out: &Out, a: &ProposeArgs) -> Result<Outcome, Failure> {
         .collect::<Result<Vec<_>, _>>()?;
     let r = engine(g, &a.root.root)?.propose(body, &evidence, &a.by)?;
     let code = match r {
-        bellwether::ProposeResult::Written { .. } => EXIT_OK,
+        bellwether::ProposeResult::Written { .. }
+        | bellwether::ProposeResult::WouldWrite { .. } => EXIT_OK,
         bellwether::ProposeResult::Refused { .. } => EXIT_REFUSED,
     };
     done(&r, human::propose(&r, out), code)

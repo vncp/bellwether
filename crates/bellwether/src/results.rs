@@ -149,15 +149,23 @@ pub enum ProposeResult {
         /// Why.
         refusal: ProposeRefusal,
     },
+    /// A dry run ([`crate::Engine::propose_dry_run`]): every check passed
+    /// and this is the Proposal that would be written, with the hash the
+    /// ledger would name it by. Nothing was written; the hash does not
+    /// resolve.
+    WouldWrite {
+        /// The Proposal that would be written.
+        proposal: Box<Written>,
+    },
 }
 
 impl ProposeResult {
-    /// The Proposal written, if any.
+    /// The Proposal written, if any (never for a dry run).
     #[must_use]
     pub fn proposal(&self) -> Option<&Written> {
         match self {
             Self::Written { proposal } => Some(proposal),
-            Self::Refused { .. } => None,
+            Self::Refused { .. } | Self::WouldWrite { .. } => None,
         }
     }
 }

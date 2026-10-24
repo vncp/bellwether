@@ -201,6 +201,10 @@ fn tail(p: &str, w: usize) -> String {
 pub(crate) fn propose(r: &ProposeResult, _out: &Out) -> String {
     match r {
         ProposeResult::Written { proposal } => format!("proposal {}\n", proposal.hash),
+        // The CLI never asks for a dry run; the MCP server does.
+        ProposeResult::WouldWrite { proposal } => {
+            format!("dry run: would write proposal {}\n", proposal.hash)
+        }
         ProposeResult::Refused {
             refusal: bellwether::ProposeRefusal::ReservedProposer { name },
         } => format!(

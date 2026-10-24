@@ -232,8 +232,10 @@ pub(crate) fn stale_index(root: &str, verb: &str, c: &FolderChanges) -> Error {
             .file_name()
             .map_or_else(|| p.to_string(), |n| n.to_string_lossy().into_owned())
     };
+    // One source for the lists the message names and the typed fields carry.
+    let (untracked, changed, missing) = c.paths();
     let mut parts = Vec::new();
-    let list = |paths: Vec<String>| {
+    let list = |paths: &[String]| {
         let shown: Vec<String> = paths.iter().take(5).map(|p| name(p)).collect();
         let more = paths.len().saturating_sub(5);
         if more > 0 {
@@ -242,32 +244,38 @@ pub(crate) fn stale_index(root: &str, verb: &str, c: &FolderChanges) -> Error {
             shown.join(", ")
         }
     };
-    if !c.untracked.is_empty() {
+    if !untracked.is_empty() {
         parts.push(format!(
             "{} new file(s) the index does not cover ({})",
-            c.untracked.len(),
-            list(c.untracked.iter().map(|f| f.path.clone()).collect())
+            untracked.len(),
+            list(&untracked)
         ));
     }
-    if !c.changed.is_empty() {
+    if !changed.is_empty() {
         parts.push(format!(
             "{} changed file(s) ({})",
-            c.changed.len(),
-            list(c.changed.clone())
+            changed.len(),
+            list(&changed)
         ));
     }
-    if !c.missing.is_empty() {
+    if !missing.is_empty() {
         parts.push(format!(
             "{} removed file(s) ({})",
-            c.missing.len(),
-            list(c.missing.clone())
+            missing.len(),
+            list(&missing)
         ));
     }
-    Error::KeySpec(format!(
+    let message = format!(
         "{root} has {} since its index was built, so {verb} could miss rows (invariant 1); run \
          `bellwether index {root}` first",
         parts.join(" and ")
-    ))
+    );
+    Error::StaleIndex {
+        untracked,
+        changed,
+        missing,
+        message,
+    }
 }
 
 /// The timestamp column of the one complete temporal spec whose columns are

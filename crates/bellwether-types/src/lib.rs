@@ -92,6 +92,35 @@ pub enum Error {
     /// The underlying store could not be read or written.
     #[error("store error: {0}")]
     Store(String),
+    /// The data folder changed since its index was built: files the index
+    /// does not track, tracked files whose fingerprint changed, or tracked
+    /// files that are gone. A lookup or apply over it could miss rows
+    /// (invariant 1), so it is refused; re-index first. The lists are the
+    /// data root's paths, sorted; `message` says what to do.
+    #[error("{message}")]
+    StaleIndex {
+        /// Files under the root the index does not track.
+        untracked: Vec<String>,
+        /// Tracked files whose fingerprint changed (ADR 013).
+        changed: Vec<String>,
+        /// Tracked files no longer found.
+        missing: Vec<String>,
+        /// The whole message, naming the command to run.
+        message: String,
+    },
+    /// A hash resolved to a record of another kind than the operation takes
+    /// (for example a proposal hash where a certificate is applied).
+    #[error("{hash} is {found}, not {expected}; {next}")]
+    WrongKind {
+        /// The hash given.
+        hash: Hash,
+        /// The kind the operation takes, with its article ("a certificate").
+        expected: String,
+        /// The kind found, with its article ("a proposal").
+        found: String,
+        /// What to pass instead.
+        next: String,
+    },
     /// Serialization failure.
     #[error("serde error: {0}")]
     Serde(#[from] serde_json::Error),
