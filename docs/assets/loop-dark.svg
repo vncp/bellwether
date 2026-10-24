@@ -1,44 +1,35 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 230" width="960" height="230" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="13">
-  <defs>
-    <marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#9198a1"/></marker>
-    <marker id="b" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#f0767e"/></marker>
-  </defs>
-  <text x="120" y="28" text-anchor="middle" fill="#9198a1" font-size="11" letter-spacing="2">AGENT MAY</text>
-  <text x="640" y="28" text-anchor="middle" fill="#9198a1" font-size="11" letter-spacing="2">ONLY THE ENGINE MAY</text>
-
-  <rect x="20" y="44" width="200" height="110" rx="6" fill="#161b22" stroke="#9198a1"/>
-  <text x="120" y="72" text-anchor="middle" fill="#e6edf3" font-weight="600">1 · observe</text>
-  <text x="120" y="96" text-anchor="middle" fill="#9198a1">why · profile · locate</text>
-  <text x="120" y="114" text-anchor="middle" fill="#9198a1">fanout, exact replay</text>
-  <text x="120" y="132" text-anchor="middle" fill="#5fd3c4">→ Evidence</text>
-
-  <rect x="250" y="44" width="200" height="110" rx="6" fill="#161b22" stroke="#9198a1"/>
-  <text x="350" y="72" text-anchor="middle" fill="#e6edf3" font-weight="600">2 · propose</text>
-  <text x="350" y="96" text-anchor="middle" fill="#9198a1">a key, a layout, a rewrite</text>
-  <text x="350" y="114" text-anchor="middle" fill="#9198a1">no score field exists</text>
-  <text x="350" y="132" text-anchor="middle" fill="#5fd3c4">→ Proposal</text>
-
-  <line x1="480" y1="36" x2="480" y2="196" stroke="#f0767e" stroke-width="2" stroke-dasharray="6 5"/>
-  <text x="480" y="216" text-anchor="middle" fill="#f0767e" font-size="11" font-weight="600" letter-spacing="1">TRUST BOUNDARY</text>
-
-  <rect x="510" y="44" width="200" height="110" rx="6" fill="#161b22" stroke="#f0767e"/>
-  <text x="610" y="72" text-anchor="middle" fill="#e6edf3" font-weight="600">3 · score + verify</text>
-  <text x="610" y="96" text-anchor="middle" fill="#9198a1">replay recorded keys: exact bytes</text>
-  <text x="610" y="114" text-anchor="middle" fill="#9198a1">reconcile: same rows?</text>
-  <text x="610" y="132" text-anchor="middle" fill="#5fd3c4">→ Replay, Certificate</text>
-
-  <rect x="740" y="44" width="200" height="110" rx="6" fill="#161b22" stroke="#f0767e"/>
-  <text x="840" y="72" text-anchor="middle" fill="#e6edf3" font-weight="600">4 · apply + attest</text>
-  <text x="840" y="96" text-anchor="middle" fill="#9198a1">refuses without a passing</text>
-  <text x="840" y="114" text-anchor="middle" fill="#9198a1">certificate; hash-links the chain</text>
-  <text x="840" y="132" text-anchor="middle" fill="#5fd3c4">→ Receipt</text>
-
-  <line x1="220" y1="99" x2="248" y2="99" stroke="#9198a1" stroke-width="1.5" marker-end="url(#a)"/>
-  <line x1="450" y1="99" x2="508" y2="99" stroke="#f0767e" stroke-width="1.5" marker-end="url(#b)"/>
-  <line x1="710" y1="99" x2="738" y2="99" stroke="#9198a1" stroke-width="1.5" marker-end="url(#a)"/>
-
-  <text x="120" y="182" text-anchor="middle" fill="#9198a1" font-size="11.5">read-only · ms · from cache</text>
-  <text x="350" y="182" text-anchor="middle" fill="#9198a1" font-size="11.5">the agent may say anything here</text>
-  <text x="610" y="182" text-anchor="middle" fill="#9198a1" font-size="11.5">deterministic given pinned inputs</text>
-  <text x="840" y="182" text-anchor="middle" fill="#9198a1" font-size="11.5">the only record a human reads</text>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1255 250" width="1255" height="250" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12.5">
+<rect width="1255" height="250" fill="#0d1117"/>
+<defs><marker id="m" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#9198a1"/></marker></defs>
+<line x1="596" y1="48" x2="596" y2="215" stroke="#f0767e" stroke-width="2" stroke-dasharray="6 6"/>
+<text x="596" y="238" text-anchor="middle" fill="#f0767e" font-size="11" letter-spacing="2" font-weight="700">TRUST BOUNDARY</text>
+<text x="290" y="30" text-anchor="middle" fill="#9198a1" font-size="11" letter-spacing="2">AGENT MAY</text>
+<text x="914" y="30" text-anchor="middle" fill="#9198a1" font-size="11" letter-spacing="2">ONLY THE ENGINE MAY</text>
+<rect x="20" y="50" width="237" height="118" rx="10" fill="#0d1117" stroke="#30363d" stroke-width="1.5"/>
+<text x="139" y="78" text-anchor="middle" fill="#e6edf3" font-weight="700">1 · observe</text>
+<text x="139" y="102" text-anchor="middle" fill="#9198a1">why · profile · locate</text>
+<text x="139" y="120" text-anchor="middle" fill="#9198a1">fanout, exact replay</text>
+<text x="139" y="154" text-anchor="middle" fill="#79c0ff">→ Evidence</text>
+<text x="139" y="192" text-anchor="middle" fill="#9198a1" font-size="11">read-only · ms · from cache</text>
+<line x1="259" y1="109.0" x2="288" y2="109.0" stroke="#9198a1" stroke-width="1.5" marker-end="url(#m)"/>
+<rect x="291" y="50" width="268" height="118" rx="10" fill="#0d1117" stroke="#30363d" stroke-width="1.5"/>
+<text x="425" y="78" text-anchor="middle" fill="#e6edf3" font-weight="700">2 · propose</text>
+<text x="425" y="102" text-anchor="middle" fill="#9198a1">a key, a layout, a rewrite</text>
+<text x="425" y="120" text-anchor="middle" fill="#9198a1">no score field exists</text>
+<text x="425" y="154" text-anchor="middle" fill="#79c0ff">→ Proposal</text>
+<text x="425" y="192" text-anchor="middle" fill="#9198a1" font-size="11">the agent may say anything here</text>
+<line x1="562" y1="109.0" x2="610" y2="109.0" stroke="#9198a1" stroke-width="1.5" marker-end="url(#m)"/>
+<rect x="614" y="50" width="284" height="118" rx="10" fill="#0d1117" stroke="#f0767e" stroke-width="1.5"/>
+<text x="755" y="78" text-anchor="middle" fill="#e6edf3" font-weight="700">3 · score + verify</text>
+<text x="755" y="102" text-anchor="middle" fill="#9198a1">replay recorded keys: exact bytes</text>
+<text x="755" y="120" text-anchor="middle" fill="#9198a1">reconcile: same rows?</text>
+<text x="755" y="154" text-anchor="middle" fill="#79c0ff">→ Replay, Certificate</text>
+<text x="755" y="192" text-anchor="middle" fill="#9198a1" font-size="11">deterministic given pinned inputs</text>
+<line x1="899" y1="109.0" x2="928" y2="109.0" stroke="#9198a1" stroke-width="1.5" marker-end="url(#m)"/>
+<rect x="931" y="50" width="284" height="118" rx="10" fill="#0d1117" stroke="#f0767e" stroke-width="1.5"/>
+<text x="1073" y="78" text-anchor="middle" fill="#e6edf3" font-weight="700">4 · apply + attest</text>
+<text x="1073" y="102" text-anchor="middle" fill="#9198a1">refuses without a passing</text>
+<text x="1073" y="120" text-anchor="middle" fill="#9198a1">certificate; hash-links the chain</text>
+<text x="1073" y="154" text-anchor="middle" fill="#79c0ff">→ Receipt</text>
+<text x="1073" y="192" text-anchor="middle" fill="#9198a1" font-size="11">the only record a human reads</text>
 </svg>

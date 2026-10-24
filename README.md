@@ -14,7 +14,7 @@ Bellwether is a standalone index and query advisor for Parquet lakes, written in
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="docs/assets/loop-dark.svg">
-    <img alt="The four-stage loop: observe and propose on the agent side, score+verify and apply+attest on the engine side, separated by a trust boundary" src="docs/assets/loop-light.svg" width="960">
+    <img alt="The four-stage loop: observe and propose on the agent side, score+verify and apply+attest on the engine side, separated by a trust boundary" src="docs/assets/loop-light.svg" width="1255">
   </picture>
 </p>
 
@@ -23,7 +23,7 @@ Bellwether is a standalone index and query advisor for Parquet lakes, written in
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="docs/assets/three-steps-dark.svg">
-    <img alt="Three steps: ask with bellwether why, fix with bellwether fix, get a receipt and an index" src="docs/assets/three-steps-light.svg" width="1000">
+    <img alt="Three steps: ask with bellwether why, fix with bellwether fix, get a receipt and an index" src="docs/assets/three-steps-light.svg" width="1050">
   </picture>
 </p>
 

@@ -1,5 +1,5 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 260" width="1000" height="260" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif">
-<rect width="1000" height="260" fill="#ffffff"/>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1050 260" width="1050" height="260" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif">
+<rect width="1050" height="260" fill="#ffffff"/>
 <rect x="25" y="30" width="300" height="200" rx="14" fill="#ffffff" stroke="#0969da" stroke-width="2"/>
 <circle cx="55" cy="64" r="16" fill="#0969da"/><text x="55" y="69" fill="#ffffff" font-size="15" font-weight="700" text-anchor="middle">1</text>
 <text x="81" y="70" fill="#1f2328" font-size="20" font-weight="700">Ask</text>
