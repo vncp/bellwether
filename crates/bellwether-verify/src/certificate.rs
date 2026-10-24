@@ -44,6 +44,11 @@ pub struct CertificateContext {
     pub manifest: Option<ManifestAnchor>,
     /// Further inputs, cited in order after this crate's own.
     pub inputs: Vec<AgedInput>,
+    /// A fixed RFC 3339 time (the facade's `--clock`): the certificate's
+    /// `created_at`, and "now" for its ages, so no time elapsed during the
+    /// run is added to an input's age. Two runs over the same inputs then
+    /// make byte-identical certificates. `None` uses the system clock.
+    pub clock: Option<String>,
 }
 
 /// A reconciliation with its certificate, ready to record.
@@ -89,7 +94,10 @@ impl Reconciler {
             }
         }
         let exec = self.execute(left, right)?;
-        let created_at = now_rfc3339()?;
+        let created_at = match &ctx.clock {
+            Some(c) => c.clone(),
+            None => now_rfc3339()?,
+        };
         let now = Instant::now();
         build(exec, ctx, handed, now, created_at)
     }
@@ -114,8 +122,14 @@ pub(crate) fn build(
     let sequence = manifest_version(&exec.manifests, ctx.manifest.as_ref())?;
     let mut inputs: Vec<Hash> = Vec::new();
     let mut oldest = Duration::ZERO;
+    // Under a fixed clock "now" does not advance, so nothing elapses.
+    let fixed = ctx.clock.is_some();
     let mut cite = |hash: Hash, age: Duration, at: Instant| {
-        let age = age + now.saturating_duration_since(at);
+        let age = if fixed {
+            age
+        } else {
+            age + now.saturating_duration_since(at)
+        };
         oldest = oldest.max(age);
         if !inputs.contains(&hash) {
             inputs.push(hash);

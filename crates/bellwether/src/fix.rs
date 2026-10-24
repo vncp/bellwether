@@ -26,7 +26,7 @@ use arrow::array::RecordBatch;
 use arrow::datatypes::SchemaRef;
 use bellwether_build::{BuildOptions, Builder};
 use bellwether_replay::{proposed_specs, Replayer, Workload};
-use bellwether_store::{Cache, ObjectStoreBackend};
+use bellwether_store::{parse_rfc3339, Cache, ObjectStoreBackend};
 use bellwether_types::{
     format, Certificate, Coverage, Error, Evidence, EvidenceBody, FileFingerprint, Hash, KeySpec,
     Proposal, ProposalBody, Provenance, Receipt, Record, Result, RowGroupMeta, ScanEntry, ScanPlan,
@@ -596,9 +596,13 @@ impl Engine {
             selected,
             schema: SchemaRef::clone(replayer.schema()),
         };
-        let workload_age = cache
-            .get_cached(&workload.hash())?
-            .map_or(Duration::ZERO, |(_, age)| age);
+        // Under a fixed clock the workload's age is measured to that clock,
+        // so two runs over the same inputs certify the same bytes.
+        let cached = match &self.options().clock {
+            Some(c) => cache.get_cached_at(&workload.hash(), parse_rfc3339(c)?)?,
+            None => cache.get_cached(&workload.hash())?,
+        };
+        let workload_age = cached.map_or(Duration::ZERO, |(_, age)| age);
         let spec = ReconcileSpec::new(columns).coverage(CoverageRequest::Workload(WorkloadKeys {
             workload: workload.hash(),
             age: workload_age,
@@ -611,6 +615,7 @@ impl Engine {
                 hash: plan_evidence.hash,
                 age: Duration::ZERO,
             }],
+            clock: self.options().clock.clone(),
         };
         let root = self.root();
         let left = Side::new(source, root);
@@ -642,6 +647,7 @@ impl Engine {
             proposal: Some(*proposal),
             manifest: pinned.map(anchor),
             inputs: Vec::new(),
+            clock: self.options().clock.clone(),
         };
         let certified = Reconciler::new(spec, Options::default())?.certify(
             &Side::new(&*left_source, &before),

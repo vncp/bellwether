@@ -82,6 +82,7 @@ impl Engine {
                 age: p.age,
             }),
             inputs: Vec::new(),
+            clock: self.options().clock.clone(),
         };
         let certified = Reconciler::new(spec, Options::default())?.certify(
             &Side::new(&*left_source, self.root()),

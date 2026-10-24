@@ -40,7 +40,7 @@ Dependencies today: `types`, `core` (spec validation), `source` (sources, finger
 | `format`, `chunk_size` | `--format`, `--chunk-size` | Parquet, CSV, or JSON lines; the text chunk size for new files. |
 | `fingerprint_policy` | `--fingerprint-policy tail64k\|full` | Which bytes a file fingerprint hashes when a new index is built (ADR 013). An existing index keeps its recorded policy. |
 | `schema` | `--schema <file>` | The dataset schema, instead of inferring it from the first file in sorted order. Needed when files store a column at different decimal scales or time units; a value that does not fit the inferred type is refused with an error naming `--schema`. The file is a JSON list of `{"name", "type", "nullable"}` with Arrow type spellings, as the manifest records them (`schema_from_json`). |
-| `clock` | `--clock` (hidden) | A fixed RFC 3339 time for every record's `created_at` and for ages, so two runs over the same inputs write byte-identical records. The ADR 010 test runs the CLI and the in-process facade under one clock and compares bytes. |
+| `clock` | `--clock` (hidden) | A fixed RFC 3339 time for every record's `created_at` and for ages, so two runs over the same inputs write byte-identical records, certificates included (the verifier's `CertificateContext::clock`; the workload's cache age is measured to the clock). The ADR 010 test runs the CLI and the in-process facade under one clock and compares bytes. |
 
 ## `why`
 
