@@ -662,6 +662,18 @@ impl<R: ReadAt> SegmentReader<R> {
         Ok(())
     }
 
+    /// Every `(row group, min, max)` of a range segment, ascending by
+    /// `(min, max, rg)` as stored; an error for any other layout.
+    #[allow(clippy::type_complexity)]
+    pub fn range_entries(&self) -> Result<Vec<(RowGroupId, Vec<u8>, Vec<u8>)>> {
+        let mut out = Vec::new();
+        self.for_each_range_entry(|min, max, rg| {
+            out.push((RowGroupId(rg), min.to_vec(), max.to_vec()));
+            Ok(())
+        })?;
+        Ok(out)
+    }
+
     pub(crate) fn require_temporal(&self) -> Result<()> {
         if self.header.layout == Layout::KeyedTemporal {
             Ok(())
@@ -722,8 +734,10 @@ impl<R: ReadAt> SegmentReader<R> {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use crate::segment::{SegmentWriter, WriterOptions};
 
     #[test]
     fn reserve_hint_caps_a_corrupt_block_count_by_the_index_bytes() {
@@ -739,5 +753,40 @@ mod tests {
         assert_eq!(reserve_hint(0, 360, MIN_KEYED_ENTRY), 0);
         // a degenerate entry size never divides by zero
         assert_eq!(reserve_hint(7, 360, 0), 0);
+    }
+
+    #[test]
+    fn range_entries_returns_sorted_bounds_and_refuses_other_layouts() {
+        let mut w = SegmentWriter::new(
+            KeySpec::Range {
+                column: "ts".into(),
+            },
+            WriterOptions::default(),
+        )
+        .unwrap();
+        w.insert_min_max(RowGroupId(3), b"b", b"d").unwrap();
+        w.insert_min_max(RowGroupId(1), b"a", b"c").unwrap();
+        w.insert_min_max(RowGroupId(2), b"b", b"c").unwrap();
+        let r = SegmentReader::open(w.finish().unwrap().bytes).unwrap();
+        assert_eq!(
+            r.range_entries().unwrap(),
+            vec![
+                (RowGroupId(1), b"a".to_vec(), b"c".to_vec()),
+                (RowGroupId(2), b"b".to_vec(), b"c".to_vec()),
+                (RowGroupId(3), b"b".to_vec(), b"d".to_vec()),
+            ]
+        );
+
+        let exact = SegmentWriter::new(
+            KeySpec::Exact {
+                columns: vec!["k".into()],
+            },
+            WriterOptions::default(),
+        )
+        .unwrap()
+        .finish()
+        .unwrap();
+        let er = SegmentReader::open(exact.bytes).unwrap();
+        assert!(er.range_entries().is_err());
     }
 }

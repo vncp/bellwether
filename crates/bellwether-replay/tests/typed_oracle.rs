@@ -280,7 +280,12 @@ fn invariant_1_two_sided_on_the_typed_corpus_with_footer_bytes() {
     let corpus = typed::write_corpus(6, 3, 40, 2026);
     let schema = typed::dataset_schema();
     let source = ParquetSource::new().with_schema(Arc::clone(&schema));
-    let replayer = Replayer::unindexed(&source, &corpus.data).unwrap();
+    let replayer = Replayer::unindexed(
+        &source,
+        &corpus.data,
+        &bellwether_source::Partitioning::None,
+    )
+    .unwrap();
     let footer = typed::footer_bytes(&corpus);
     let keys = MemoryKeySets::new();
     let mut rec = WorkloadRecorder::new(&keys, Arc::clone(&schema));
@@ -340,7 +345,7 @@ fn invariant_1_two_sided_on_the_typed_corpus_with_footer_bytes() {
             FingerprintPolicy::Tail64K,
         )
         .unwrap();
-        let plan = stats.plan(&rk).unwrap();
+        let plan = stats.plan(&rk, None).unwrap();
         let got = cells(&plan);
         let missing: Vec<&Cell> = oracle.difference(&got).collect();
         if !missing.is_empty() {
@@ -387,7 +392,12 @@ fn unsigned_keys_above_the_signed_range_pass_their_embedded_filters() {
     let corpus = typed::write_corpus(6, 3, 40, 2026);
     let schema = typed::dataset_schema();
     let source = ParquetSource::new().with_schema(Arc::clone(&schema));
-    let replayer = Replayer::unindexed(&source, &corpus.data).unwrap();
+    let replayer = Replayer::unindexed(
+        &source,
+        &corpus.data,
+        &bellwether_source::Partitioning::None,
+    )
+    .unwrap();
     let keys = MemoryKeySets::new();
     let mut rec = WorkloadRecorder::new(&keys, Arc::clone(&schema));
     let u64s = [(1u64 << 63) + 5, u64::MAX];
@@ -450,7 +460,7 @@ fn unsigned_keys_above_the_signed_range_pass_their_embedded_filters() {
             FingerprintPolicy::Tail64K,
         )
         .unwrap();
-        let got = cells(&stats.plan(&rk).unwrap());
+        let got = cells(&stats.plan(&rk, None).unwrap());
         let missing: Vec<&Cell> = oracle.difference(&got).collect();
         assert!(missing.is_empty(), "{col}: ParquetStats misses {missing:?}");
         assert!(

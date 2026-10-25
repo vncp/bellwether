@@ -4,7 +4,7 @@
 use std::collections::BTreeSet;
 use std::time::Duration;
 
-use bellwether_types::Hash;
+use bellwether_types::{Hash, Predicate};
 
 use crate::error::{Result, VerifyError};
 
@@ -157,6 +157,16 @@ pub struct ReconcileSpec {
     pub group_by: Vec<String>,
     /// How much of the key space to compare.
     pub coverage: CoverageRequest,
+    /// Which rows of the covered keys are compared, when not all of them:
+    /// a row is compared on either side when any of these predicates keeps
+    /// it. Each has the form of a lookup scan plan's residual (ADR 011),
+    /// evaluated on canonical bytes at the dataset types with SQL nulls (a
+    /// null never satisfies `In`, `Between`, or a listed key's
+    /// `NotOlderThan`). `LatestPerKey` keeps every row here: it is the
+    /// version rule, which is [`ReconcileSpec::latest_by`]. Rows no
+    /// predicate keeps are read and skipped on both sides. `None` compares
+    /// every row.
+    pub row_filter: Option<Vec<Predicate>>,
 }
 
 impl ReconcileSpec {
@@ -175,6 +185,7 @@ impl ReconcileSpec {
             total_columns: Vec::new(),
             group_by: Vec::new(),
             coverage: CoverageRequest::Full,
+            row_filter: None,
         }
     }
 
@@ -238,6 +249,14 @@ impl ReconcileSpec {
         self
     }
 
+    /// Compares only the rows that at least one of `residuals` keeps
+    /// ([`ReconcileSpec::row_filter`]).
+    #[must_use]
+    pub fn rows_where(mut self, residuals: Vec<Predicate>) -> Self {
+        self.row_filter = Some(residuals);
+        self
+    }
+
     /// Checks the rules that need no schema: non-empty and distinct column
     /// lists, a key column is never ignored, the version column is not a key
     /// column, and the coverage request is one this crate runs.
@@ -277,6 +296,11 @@ impl ReconcileSpec {
                     "latest_by column {ts:?} is also a key column"
                 )));
             }
+        }
+        if self.row_filter.as_ref().is_some_and(Vec::is_empty) {
+            return Err(VerifyError::InvalidSpec(
+                "a row filter with no predicate would compare nothing".into(),
+            ));
         }
         match &self.coverage {
             CoverageRequest::Full => {}

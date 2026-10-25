@@ -10,7 +10,8 @@ use std::time::{Duration, Instant};
 use arrow::datatypes::{Schema, SchemaRef};
 use bellwether_core::encoding;
 use bellwether_core::segment::{validate_spec, ColumnType};
-use bellwether_source::{FingerprintPolicy, DEFAULT_CHUNK_SIZE};
+use bellwether_core::sidecar::SidecarDef;
+use bellwether_source::{FingerprintPolicy, Partitioning, DEFAULT_CHUNK_SIZE};
 use bellwether_store::{
     commit_with, now_rfc3339, read_manifest, ChunkRange, ColumnDef, CommitOptions, Extra,
     FileEntry, Manifest, RowGroupSpace, RowGroupTombstone, SchemaInfo, SegmentRef, SourceInfo,
@@ -26,6 +27,7 @@ use crate::config::{
 use crate::coverage::{completeness, completeness_map, covered, live_ids, Locator};
 use crate::segments::{self, Ctx, FileRow, SpecPlan};
 use crate::sources::{infer_schema, DataSource};
+use crate::target::{decl_of, declared_sidecars, declared_targets, def_of, unknown_kind, Target};
 
 /// Most key specs one index may declare.
 pub const MAX_KEY_SPECS: usize = 64;
@@ -245,7 +247,8 @@ impl<S: StoreExt + ?Sized> Builder<S> {
         }
         let cfg = Config::resolve(base.as_ref(), root, opts)?;
         let declared = declared_specs(base.as_ref(), key_specs, opts.remove_unlisted)?;
-        let specs = plan_specs(&declared, &cfg.schema)?;
+        let sidecars = declared_sidecar_defs(base.as_ref(), &opts.sidecars, opts.remove_unlisted)?;
+        let specs = plan_specs(&declared, &sidecars, &cfg.schema)?;
         let chunk_sizes = base_chunk_sizes(base.as_ref())
             .into_iter()
             .chain(cfg.new_chunk_size.size());
@@ -255,7 +258,9 @@ impl<S: StoreExt + ?Sized> Builder<S> {
             cfg.policy,
             &opts.exclude,
             chunk_sizes,
-        );
+            root,
+            &cfg.partitioning,
+        )?;
         let discovered = sources.discover(root)?;
         let since = now_rfc3339();
         let observer = opts.observer.as_deref();
@@ -302,14 +307,7 @@ impl<S: StoreExt + ?Sized> Builder<S> {
             planned_schema: base.as_ref().map(|m| m.schema.clone()).unwrap_or_default(),
             planned_source: base.as_ref().map(|m| m.source.clone()).unwrap_or_default(),
             source: cfg.source_info.clone(),
-            schema: SchemaInfo {
-                columns: cfg.columns.clone(),
-                key_specs: specs.iter().map(|p| p.spec.clone()).collect(),
-                extra: base
-                    .as_ref()
-                    .map(|m| m.schema.extra.clone())
-                    .unwrap_or_default(),
-            },
+            schema: schema_info(base.as_ref(), &cfg, &declared, &sidecars),
             space: files.space.clone(),
             keep: &work.keep,
             replaced: &work.replaced,
@@ -351,6 +349,7 @@ fn canonical_root(root: &str) -> Result<String> {
 struct Config {
     kind: SourceKind,
     policy: FingerprintPolicy,
+    partitioning: Partitioning,
     /// Chunk size for text files seen for the first time; `None` for
     /// Parquet.
     new_chunk_size: NewChunkSize,
@@ -397,6 +396,23 @@ impl Config {
             (Some(p), _) | (None, Some(p)) => p,
             (None, None) => FingerprintPolicy::default(),
         };
+        let recorded_partitioning = recorded
+            .map(|m| Partitioning::parse(m.source.partitioning.as_deref()))
+            .transpose()?;
+        let partitioning = match (&opts.partitioning, recorded_partitioning) {
+            (Some(p), Some(r)) if *p != r => {
+                return Err(Error::Other(format!(
+                    "the index was built with partitioning {}, and this build asks for {}; a \
+                     partitioning change changes the dataset schema and every row group's \
+                     statistics, so build a new index",
+                    r.label(),
+                    p.label()
+                )))
+            }
+            (Some(p), _) => p.clone(),
+            (None, Some(p)) => p,
+            (None, None) => Partitioning::None,
+        };
         let new_chunk_size = match (kind.text_format(), opts.chunk_size) {
             (None, None) => NewChunkSize::NotText,
             (None, Some(_)) => {
@@ -414,16 +430,20 @@ impl Config {
         let schema = match (&opts.schema, &base_schema) {
             (Some(s), _) => persistable(s)?,
             (None, Some(b)) => SchemaRef::clone(b),
-            (None, None) => persistable(infer_schema(kind, root, policy, &opts.exclude)?.as_ref())?,
+            (None, None) => persistable(
+                infer_schema(kind, root, policy, &partitioning, &opts.exclude)?.as_ref(),
+            )?,
         };
         let columns = schema_to_columns(&schema, base.map_or(&[][..], |m| &m.schema.columns));
         let mut source_info = base.map(|m| m.source.clone()).unwrap_or_default();
         source_info.kind = kind.manifest_kind();
         source_info.root = root.to_string();
         source_info.fingerprint_policy = Some(policy_name(policy).to_string());
+        source_info.partitioning = partitioning.manifest_name();
         Ok(Self {
             kind,
             policy,
+            partitioning,
             new_chunk_size,
             schema,
             base_schema,
@@ -522,12 +542,76 @@ fn declared_specs(
     Ok(out)
 }
 
-/// Validates the declared key specs against the dataset schema.
-fn plan_specs(specs: &[KeySpec], schema: &Schema) -> Result<Vec<SpecPlan>> {
-    if specs.len() > MAX_KEY_SPECS {
+/// The schema this build commits: the dataset columns, the declared key
+/// specs and sidecars, the base's declarations of sidecar kinds this binary
+/// does not know (kept unchanged, as their segments are), and the base's
+/// unknown fields.
+fn schema_info(
+    base: Option<&Manifest>,
+    cfg: &Config,
+    declared: &[KeySpec],
+    sidecars: &[SidecarDef],
+) -> SchemaInfo {
+    SchemaInfo {
+        columns: cfg.columns.clone(),
+        key_specs: declared.to_vec(),
+        sidecars: sidecars
+            .iter()
+            .map(decl_of)
+            .chain(base.iter().flat_map(|m| {
+                m.schema
+                    .sidecars
+                    .iter()
+                    .filter(|d| def_of(d).is_none())
+                    .cloned()
+            }))
+            .collect(),
+        extra: base.map(|m| m.schema.extra.clone()).unwrap_or_default(),
+    }
+}
+
+/// The sidecars a build declares, by the rules of [`declared_specs`]:
+/// `given`, plus, unless `remove_unlisted`, every sidecar the base declares
+/// under another name (a given one under an existing name replaces it).
+fn declared_sidecar_defs(
+    base: Option<&Manifest>,
+    given: &[SidecarDef],
+    remove_unlisted: bool,
+) -> Result<Vec<SidecarDef>> {
+    let mut names = BTreeSet::new();
+    for d in given {
+        if !names.insert(d.name()) {
+            return Err(Error::KeySpec(format!(
+                "the sidecar {} is given twice",
+                d.name()
+            )));
+        }
+    }
+    if remove_unlisted {
+        return Ok(given.to_vec());
+    }
+    let mut out: Vec<SidecarDef> = base.map(declared_sidecars).unwrap_or_default();
+    for d in given {
+        if !out.iter().any(|o| o.name() == d.name()) {
+            out.push(d.clone());
+        }
+    }
+    Ok(out)
+}
+
+/// Validates the declared key specs and sidecars against the dataset
+/// schema: key specs first, in declaration order, then sidecars.
+fn plan_specs(
+    specs: &[KeySpec],
+    sidecars: &[SidecarDef],
+    schema: &Schema,
+) -> Result<Vec<SpecPlan>> {
+    if specs.len() + sidecars.len() > MAX_KEY_SPECS {
         return Err(Error::KeySpec(format!(
-            "{} key specs declared; at most {MAX_KEY_SPECS} are supported",
-            specs.len()
+            "{} key specs and {} sidecars declared; at most {MAX_KEY_SPECS} together are \
+             supported",
+            specs.len(),
+            sidecars.len()
         )));
     }
     let column_type = |c: &str| {
@@ -537,7 +621,7 @@ fn plan_specs(specs: &[KeySpec], schema: &Schema) -> Result<Vec<SpecPlan>> {
             .map_err(|_| Error::KeySpec(format!("key spec {}", encoding::not_in_schema(schema, c))))
     };
     let mut names = BTreeSet::new();
-    specs
+    let mut out: Vec<SpecPlan> = specs
         .iter()
         .map(|spec| {
             validate_spec(spec)?;
@@ -572,14 +656,43 @@ fn plan_specs(specs: &[KeySpec], schema: &Schema) -> Result<Vec<SpecPlan>> {
                 _ => None,
             };
             Ok(SpecPlan {
-                spec: spec.clone(),
+                target: Target::Key(spec.clone()),
                 name,
                 key_types,
                 ts_type,
+                time_types: Vec::new(),
                 columns,
             })
         })
-        .collect()
+        .collect::<Result<_>>()?;
+    for def in sidecars {
+        def.validate()?;
+        let name = def.name();
+        if !names.insert(name.clone()) {
+            return Err(Error::KeySpec(format!(
+                "the sidecar {name} is declared twice"
+            )));
+        }
+        let key_types = def.key_types(schema)?;
+        let time_types = def.time_types(schema)?;
+        for t in key_types.iter().chain(&time_types) {
+            ColumnType::of(t).map_err(|e| Error::KeySpec(format!("{name}: {e}")))?;
+        }
+        out.push(SpecPlan {
+            target: Target::Sidecar(def.clone()),
+            name,
+            key_types,
+            ts_type: None,
+            time_types,
+            columns: def
+                .columns
+                .iter()
+                .chain(&def.time_columns)
+                .cloned()
+                .collect(),
+        });
+    }
+    Ok(out)
 }
 
 // ---------------------------------------------------------------------------
@@ -769,14 +882,11 @@ struct WorkPlan {
     removed: Vec<String>,
 }
 
-/// Whether any key or timestamp column of `spec` has a different recorded
-/// type under `new` than under `old` (as segment headers record them).
-fn types_differ(old: &Schema, new: &Schema, spec: &KeySpec) -> bool {
-    let mut cols: Vec<&str> = spec.columns().iter().map(String::as_str).collect();
-    if let KeySpec::Temporal { ts_column, .. } = spec {
-        cols.push(ts_column);
-    }
-    cols.iter().any(|c| {
+/// Whether any column of `target` whose type its segments record (key
+/// columns, a temporal timestamp, a sidecar's time columns) has a different
+/// recorded type under `new` than under `old`.
+fn types_differ(old: &Schema, new: &Schema, target: &Target) -> bool {
+    target.typed_columns().iter().any(|c| {
         let recorded = |s: &Schema| {
             s.field_with_name(c)
                 .ok()
@@ -801,13 +911,14 @@ fn plan_work(
         keep: BTreeSet::new(),
         removed: Vec::new(),
     };
+    let base_targets = base.map(declared_targets).unwrap_or_default();
     for p in specs {
-        let old = base.and_then(|m| m.schema.key_specs.iter().find(|s| s.name() == p.name));
+        let old = base_targets.iter().find(|t| t.name() == p.name);
         let types_changed = match &cfg.base_schema {
-            Some(bs) => types_differ(bs, &cfg.schema, &p.spec),
+            Some(bs) => types_differ(bs, &cfg.schema, &p.target),
             None => old.is_some(),
         };
-        let replaced = old != Some(&p.spec) || types_changed;
+        let replaced = old != Some(&p.target) || types_changed;
         let needed = match base {
             Some(m) if !replaced => live - &covered(m, &p.name),
             _ => live.clone(),
@@ -819,16 +930,12 @@ fn plan_work(
             work.keep.insert(p.name.clone());
         }
     }
-    if let Some(m) = base {
-        let declared: BTreeSet<&str> = specs.iter().map(|p| p.name.as_str()).collect();
-        work.removed = m
-            .schema
-            .key_specs
-            .iter()
-            .map(KeySpec::name)
-            .filter(|n| !declared.contains(n.as_str()))
-            .collect();
-    }
+    let declared: BTreeSet<&str> = specs.iter().map(|p| p.name.as_str()).collect();
+    work.removed = base_targets
+        .iter()
+        .map(Target::name)
+        .filter(|n| !declared.contains(n.as_str()))
+        .collect();
     work
 }
 
@@ -843,7 +950,7 @@ fn is_noop(
     let Some(m) = base else {
         return Ok(false);
     };
-    let declared: Vec<KeySpec> = specs.iter().map(|p| p.spec.clone()).collect();
+    let declared: Vec<Target> = specs.iter().map(|p| p.target.clone()).collect();
     let unchanged = files.counts.new == 0
         && files.counts.changed == 0
         && files.counts.removed == 0
@@ -852,8 +959,10 @@ fn is_noop(
         && work.removed.is_empty()
         && m.source == cfg.source_info
         && m.schema.columns == cfg.columns
-        && m.schema.key_specs == declared
-        && m.segments.iter().all(|s| work.keep.contains(&s.key_spec));
+        && declared_targets(m) == declared
+        && m.segments
+            .iter()
+            .all(|s| unknown_kind(s) || work.keep.contains(&s.key_spec));
     Ok(
         unchanged
             && completeness_map(m, m, &declared, &BTreeSet::new())? == m.key_spec_completeness,
@@ -905,20 +1014,22 @@ impl Delta<'_> {
         next.source = self.source.clone();
         next.schema = self.schema.clone();
         next.rowgroup_space = self.space.clone();
-        next.segments.retain(|s| self.keep.contains(&s.key_spec));
+        // Segments of kinds this binary does not know are kept unchanged.
+        next.segments
+            .retain(|s| unknown_kind(s) || self.keep.contains(&s.key_spec));
         for seg in self.added {
             next.add_segment(seg.clone());
         }
-        let map = completeness_map(m, &next, &self.schema.key_specs, self.replaced)?;
-        if let Some(missing) = self
-            .schema
-            .key_specs
-            .iter()
-            .map(KeySpec::name)
-            .find(|n| !map.contains_key(n))
-        {
+        let targets = declared_targets(&next);
+        let map = completeness_map(m, &next, &targets, self.replaced)?;
+        if let Some(missing) = targets.iter().find(|t| !map.contains_key(&t.name())) {
+            let what = match missing {
+                Target::Key(_) => "key spec",
+                Target::Sidecar(_) => "sidecar",
+            };
             return Err(Error::Other(format!(
-                "the build would leave key spec {missing} incomplete; nothing was committed"
+                "the build would leave {what} {} incomplete; nothing was committed",
+                missing.name()
             )));
         }
         next.key_spec_completeness = map;

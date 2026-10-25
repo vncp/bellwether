@@ -36,6 +36,13 @@
 //!   dataset column) is refused with [`ReplayError::UnprobeableFilter`]: the
 //!   baseline is never silently weaker than its definition.
 //!
+//! A window run ([`crate::RunWindow`]) is read by both baselines only where
+//! its time column can hold a row of the window: `ParquetStats` also skips a
+//! row group whose footer min/max for that column (known, canonical bytes)
+//! lie wholly outside the window, as a Parquet reader's range predicate
+//! would; `RawScan` still reads every live row group. The residual is then
+//! `And[In, Between]` on the time column.
+//!
 //! Filters are read when the baseline is built, from local files whose
 //! fingerprint is verified on the opened handle first, and are held for the
 //! baseline's lifetime: every embedded filter of every run column of every
@@ -48,7 +55,7 @@ use std::collections::BTreeMap;
 use arrow::datatypes::{i256, ArrowPrimitiveType, DataType, Float16Type, Schema};
 use bellwether_core::encoding::NAN_KEY;
 use bellwether_source::{FingerprintPolicy, LocalFs, Storage};
-use bellwether_types::{ColumnStats, Error, FileFingerprint, Hash, Predicate, ScanPlan};
+use bellwether_types::{ColumnStats, Error, FileFingerprint, Hash, ScanPlan};
 use parquet::basic::{ConvertedType, LogicalType, TimeUnit as ParquetUnit, Type as PhysicalType};
 use parquet::bloom_filter::Sbbf;
 use parquet::data_type::ByteArray;
@@ -61,6 +68,8 @@ use roaring::RoaringBitmap;
 use crate::catalog::Catalog;
 use crate::error::{ReplayError, ReplayResult};
 use crate::keys::RunKeys;
+use crate::plan::{with_residual, EncodedWindow};
+use crate::workload::RunWindow;
 
 /// A configuration without a Bellwether index.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -706,29 +715,43 @@ impl<'a> BaselinePlanner<'a> {
         self.kind
     }
 
-    /// The plan for one run's keys, with the `In` residual over them. An
-    /// empty key set reads nothing.
-    pub fn plan(&self, keys: &RunKeys) -> ReplayResult<ScanPlan> {
+    /// The plan for one run's keys (in `window`, for a window run), with
+    /// the `In` residual over them (and `Between` on the window's column).
+    /// An empty key set reads nothing.
+    pub fn plan(&self, keys: &RunKeys, window: Option<&RunWindow>) -> ReplayResult<ScanPlan> {
+        let window = window
+            .map(|w| EncodedWindow::new(self.catalog.schema(), w))
+            .transpose()?;
         let all: Vec<usize> = (0..keys.columns().len()).collect();
         let selected = if keys.is_empty() {
             RoaringBitmap::new()
         } else {
             match self.kind {
                 Baseline::RawScan => self.catalog.all_ids(),
-                Baseline::ParquetStats => self.stats_selection(keys, &all)?,
+                Baseline::ParquetStats => self.stats_selection(keys, &all, window.as_ref())?,
             }
         };
-        let mut plan = self.catalog.plan_for(&selected)?;
-        plan.residual = Some(Predicate::In {
-            columns: keys.columns().to_vec(),
-            values: keys.all_probes(&all),
-        });
-        Ok(plan)
+        let plan = self.catalog.plan_for(&selected)?;
+        Ok(with_residual(plan, keys, window.as_ref()))
     }
 
-    fn stats_selection(&self, keys: &RunKeys, all: &[usize]) -> ReplayResult<RoaringBitmap> {
+    fn stats_selection(
+        &self,
+        keys: &RunKeys,
+        all: &[usize],
+        window: Option<&EncodedWindow>,
+    ) -> ReplayResult<RoaringBitmap> {
         let mut selected = RoaringBitmap::new();
         for (pos, rg) in self.catalog.row_groups().iter().enumerate() {
+            if let Some(w) = window {
+                let outside = stats_of(&rg.meta.stats, &w.window.ts_column).is_some_and(|s| {
+                    matches!((&s.min, &s.max), (Some(lo), Some(hi))
+                        if hi.as_slice() < w.lo.as_slice() || lo.as_slice() > w.hi.as_slice())
+                });
+                if outside {
+                    continue;
+                }
+            }
             let stats: Vec<Option<&ColumnStats>> = keys
                 .columns()
                 .iter()

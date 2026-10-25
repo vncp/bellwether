@@ -10,10 +10,12 @@
 //! dataset schema (`with_schema`), and every value is then rescaled exactly
 //! or refused.
 
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
+use arrow::array::Array;
 use arrow::datatypes::{DataType, Schema, TimeUnit};
 use bellwether_core::encoding;
+use bellwether_types::Predicate;
 
 use crate::error::{Result, VerifyError};
 use crate::spec::ReconcileSpec;
@@ -112,6 +114,138 @@ pub(crate) struct Plan {
     pub hashed_names: Vec<String>,
     /// Ignored columns, sorted, as recorded on the certificate.
     pub ignored: Vec<String>,
+    /// The row filter ([`ReconcileSpec::row_filter`]), over projection
+    /// indices: a row is compared when any of these keeps it.
+    pub filter: Option<Vec<RowTest>>,
+}
+
+/// One residual predicate over projection indices, with its canonical
+/// operands ([`ReconcileSpec::row_filter`]).
+#[derive(Clone, Debug)]
+pub(crate) enum RowTest {
+    /// Keeps every row (`LatestPerKey`: the version rule, not a row test).
+    All,
+    /// The tuple of `cols` is one of `values`.
+    In {
+        cols: Vec<usize>,
+        values: HashSet<Vec<u8>>,
+    },
+    /// The value of `col` is in `[lo, hi]`.
+    Between {
+        col: usize,
+        lo: Vec<u8>,
+        hi: Vec<u8>,
+    },
+    /// A row whose `cols` tuple has a bound keeps a `ts` value at or above
+    /// it; other rows are kept.
+    NotOlderThan {
+        cols: Vec<usize>,
+        ts: usize,
+        bounds: HashMap<Vec<u8>, Vec<u8>>,
+    },
+    /// Every test keeps the row.
+    And(Vec<RowTest>),
+}
+
+impl RowTest {
+    fn compile(p: &Predicate, index: &dyn Fn(&str) -> usize) -> Self {
+        let cols = |c: &[String]| c.iter().map(|c| index(c)).collect();
+        match p {
+            Predicate::In { columns, values } => Self::In {
+                cols: cols(columns),
+                values: values.iter().cloned().collect(),
+            },
+            Predicate::Between { column, lo, hi } => Self::Between {
+                col: index(column),
+                lo: lo.clone(),
+                hi: hi.clone(),
+            },
+            Predicate::NotOlderThan {
+                columns,
+                ts_column,
+                bounds,
+            } => Self::NotOlderThan {
+                cols: cols(columns),
+                ts: index(ts_column),
+                bounds: bounds.iter().cloned().collect(),
+            },
+            Predicate::LatestPerKey { .. } => Self::All,
+            Predicate::And { all } => {
+                Self::And(all.iter().map(|p| Self::compile(p, index)).collect())
+            }
+        }
+    }
+
+    /// Whether this test keeps row `row` of `cols` (projected, at `types`);
+    /// `buf` is scratch.
+    pub(crate) fn keeps(
+        &self,
+        cols: &[&dyn Array],
+        types: &[DataType],
+        row: usize,
+        buf: &mut Vec<u8>,
+    ) -> bellwether_types::Result<bool> {
+        // The canonical tuple of `idx` into `buf`; false when one is null.
+        let tuple = |idx: &[usize], buf: &mut Vec<u8>| -> bellwether_types::Result<bool> {
+            buf.clear();
+            for &i in idx {
+                if !encoding::encode_array_value_as(cols[i], row, &types[i], buf)? {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        };
+        Ok(match self {
+            Self::All => true,
+            Self::In { cols: idx, values } => tuple(idx, buf)? && values.contains(buf.as_slice()),
+            Self::Between { col, lo, hi } => {
+                tuple(std::slice::from_ref(col), buf)?
+                    && lo.as_slice() <= buf.as_slice()
+                    && buf.as_slice() <= hi.as_slice()
+            }
+            Self::NotOlderThan {
+                cols: idx,
+                ts,
+                bounds,
+            } => {
+                if !tuple(idx, buf)? {
+                    return Ok(true);
+                }
+                let Some(bound) = bounds.get(buf.as_slice()) else {
+                    return Ok(true);
+                };
+                tuple(std::slice::from_ref(ts), buf)? && buf.as_slice() >= bound.as_slice()
+            }
+            Self::And(all) => {
+                for t in all {
+                    if !t.keeps(cols, types, row, buf)? {
+                        return Ok(false);
+                    }
+                }
+                true
+            }
+        })
+    }
+}
+
+/// The columns `p` reads.
+fn predicate_columns<'p>(p: &'p Predicate, out: &mut Vec<&'p String>) {
+    match p {
+        Predicate::In { columns, .. } => out.extend(columns),
+        Predicate::Between { column, .. } => out.push(column),
+        Predicate::NotOlderThan {
+            columns, ts_column, ..
+        } => {
+            out.extend(columns);
+            out.push(ts_column);
+        }
+        Predicate::LatestPerKey { .. } => {}
+        Predicate::And { all } => {
+            for q in all {
+                predicate_columns(q, out);
+            }
+        }
+    }
 }
 
 impl Plan {
@@ -187,6 +321,12 @@ impl Plan {
                 quantize: t.quantize.is_some(),
             });
         }
+        let filter = spec.row_filter.as_ref().map(|residuals| {
+            residuals
+                .iter()
+                .map(|p| RowTest::compile(p, &index))
+                .collect()
+        });
         Ok(Self {
             key: spec.key_columns.iter().map(|c| index(c)).collect(),
             latest_by,
@@ -195,6 +335,7 @@ impl Plan {
             group: spec.group_by.iter().map(|c| index(c)).collect(),
             hashed_names,
             ignored: ignored.into_iter().cloned().collect(),
+            filter,
             projection,
             types,
         })
@@ -256,8 +397,9 @@ fn compared_columns(
 }
 
 /// The columns to read: the hashed ones plus every column the spec uses by
-/// role (the version, totals, and groups may be ignored columns), in the
-/// left schema's order. Role columns must exist on both sides.
+/// role (the version, totals, groups, and row filter may be ignored
+/// columns), in the left schema's order. Role columns must exist on both
+/// sides.
 fn projection(
     spec: &ReconcileSpec,
     left: &Schema,
@@ -265,12 +407,17 @@ fn projection(
     hashed: &[String],
 ) -> Result<Vec<String>> {
     let mut needed: HashSet<&str> = hashed.iter().map(String::as_str).collect();
+    let mut filtered: Vec<&String> = Vec::new();
+    for p in spec.row_filter.iter().flatten() {
+        predicate_columns(p, &mut filtered);
+    }
     for c in spec
         .key_columns
         .iter()
         .chain(spec.latest_by.iter())
         .chain(spec.total_columns.iter().map(|t| &t.column))
         .chain(&spec.group_by)
+        .chain(filtered)
     {
         for (side, schema) in [("left", left), ("right", right)] {
             if schema.field_with_name(c).is_err() {

@@ -144,7 +144,12 @@ fn replay_of_the_p50_run_under_one_candidate_meets_the_budget() {
         ..CorpusSpec::default()
     });
     let source = corpus.source();
-    let replayer = Replayer::unindexed(&source, &corpus.data).unwrap();
+    let replayer = Replayer::unindexed(
+        &source,
+        &corpus.data,
+        &bellwether_source::Partitioning::None,
+    )
+    .unwrap();
     let runs = common::entity_runs(&corpus, 24, 17);
     let (keys, workload) = common::record(&["entity_id"], &runs);
     let spec = KeySpec::Exact {
@@ -175,7 +180,12 @@ fn replay_on_a_bench_corpus_meets_the_budget() {
     };
     let corpus = Path::new(&dir);
     let source = ParquetSource::new();
-    let replayer = Replayer::unindexed(&source, corpus.join("data").to_str().unwrap()).unwrap();
+    let replayer = Replayer::unindexed(
+        &source,
+        corpus.join("data").to_str().unwrap(),
+        &bellwether_source::Partitioning::None,
+    )
+    .unwrap();
     let keys = MemoryKeySets::new();
     let mut rec = WorkloadRecorder::new(&keys, replayer.schema().clone());
     record_bench_workload(&mut rec, &corpus.join("workload.json")).unwrap();

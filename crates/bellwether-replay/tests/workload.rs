@@ -119,7 +119,12 @@ fn keys_encode_at_the_dataset_type_and_a_mismatch_is_refused_at_replay() {
     // Replayed against a dataset that declares UInt64: refused, not guessed.
     let corpus = common::write_corpus(&common::CorpusSpec::default());
     let source = corpus.source();
-    let replayer = Replayer::unindexed(&source, &corpus.data).unwrap();
+    let replayer = Replayer::unindexed(
+        &source,
+        &corpus.data,
+        &bellwether_source::Partitioning::None,
+    )
+    .unwrap();
     let err = replayer.replay_specs(&[], &w, &keys).unwrap_err();
     assert!(
         matches!(&err, Error::KeySpec(m) if m.contains("re-record")),

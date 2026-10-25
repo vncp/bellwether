@@ -165,8 +165,9 @@ pub enum Error {
     /// wrong in words that name no surface's flag.
     #[error("{reason}")]
     InvalidArgument {
-        /// The request field: `by`, `evidence`, `at`, `keys`, `key_columns`,
-        /// `cluster_by`, `shape`, `workload`, `rewrite`.
+        /// The request field: `by`, `evidence`, `at`, `window`, `valid`,
+        /// `known`, `keys`, `key_columns`, `cluster_by`, `shape`, `workload`,
+        /// `rewrite`, `lookback`, `latest_by`.
         field: &'static str,
         /// What is wrong with it, and what a usable value looks like.
         reason: String,
@@ -181,6 +182,21 @@ pub enum Error {
         root: String,
         /// The dataset's columns, in schema order.
         columns: Vec<String>,
+    },
+    /// A lookup pinned to a committed manifest sequence the index does not
+    /// retain: never committed, or pruned by garbage collection (which
+    /// removes every manifest up to the newest one that references a
+    /// segment it deletes, so the retained sequences are one contiguous run
+    /// ending at the current one). Each surface says which sequences to pass
+    /// instead, from `retained`.
+    #[error("{}", not_retained(index, *requested, retained))]
+    NotRetained {
+        /// The index location.
+        index: String,
+        /// The sequence asked for.
+        requested: u64,
+        /// The sequences that can be pinned, ascending (empty: no index).
+        retained: Vec<u64>,
     },
     /// Serialization failure.
     #[error("serde error: {0}")]
@@ -249,6 +265,23 @@ fn not_indexed(root: &str, operation: &str, needs: Option<&str>) -> String {
         Some(spec) => format!(
             "{root} has no complete {spec} key spec, so {operation} has no index to plan with"
         ),
+    }
+}
+
+fn not_retained(index: &str, seq: u64, retained: &[u64]) -> String {
+    match (retained.first(), retained.last()) {
+        // Sequences start at 1, so 0 was never committed either.
+        (Some(&oldest), Some(&current)) if seq > current || seq == 0 => format!(
+            "manifest sequence {seq} has not been committed in the index at {index}; the current \
+             sequence is {current} and the oldest retained is {oldest}"
+        ),
+        (Some(&oldest), Some(&current)) => format!(
+            "manifest sequence {seq} is no longer retained in the index at {index}: the oldest \
+             retained is {oldest} (current {current}); garbage collection drops a sequence once \
+             it deletes a segment that sequence used, and commits made before this release kept \
+             no copy"
+        ),
+        _ => format!("manifest sequence {seq} cannot be pinned: there is no index at {index}"),
     }
 }
 
@@ -1022,6 +1055,37 @@ mod tests {
             manifest_version: Some("v1".into()),
             created_at: "2026-10-24T00:00:00Z".into(),
         }
+    }
+
+    #[test]
+    fn not_retained_states_whether_the_sequence_was_ever_committed() {
+        let msg = |requested| {
+            Error::NotRetained {
+                index: "/d/.bellwether".into(),
+                requested,
+                retained: vec![3, 4, 5],
+            }
+            .to_string()
+        };
+        assert!(msg(9).contains("has not been committed"), "{}", msg(9));
+        assert!(msg(0).contains("has not been committed"), "{}", msg(0));
+        assert!(msg(2).contains("no longer retained"), "{}", msg(2));
+        for m in [msg(9), msg(0), msg(2)] {
+            assert!(
+                m.contains("oldest retained is 3") && !m.contains("--"),
+                "{m}"
+            );
+        }
+        let unindexed = Error::NotRetained {
+            index: "/d/.bellwether".into(),
+            requested: 1,
+            retained: Vec::new(),
+        }
+        .to_string();
+        assert!(
+            unindexed.contains("there is no index at /d/.bellwether"),
+            "{unindexed}"
+        );
     }
 
     #[test]

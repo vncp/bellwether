@@ -27,7 +27,7 @@ fn main() -> ExitCode {
     let args = Args::parse();
     let engine = match args.engine.options() {
         Ok(o) => o,
-        Err(e @ OptionsError::SchemaFile(_)) => {
+        Err(e @ OptionsError::Usage(_)) => {
             eprintln!("bellwether-mcp: {e}");
             return ExitCode::from(2);
         }

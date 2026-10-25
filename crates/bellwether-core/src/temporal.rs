@@ -301,7 +301,7 @@ pub fn asof<R: ReadAt, K: AsRef<[u8]>>(
 /// Every version of each key across every segment of one temporal key spec:
 /// the segments' chains merged. Keys absent from every segment are absent.
 /// Holds the chains of the keys asked plus one segment's lookup state at a
-/// time; for lookback windows ([`window`]), which need every version in a
+/// time; for lookback windows ([`lookback`]), which need every version in a
 /// range, not one winner.
 pub fn chains<R: ReadAt, K: AsRef<[u8]>>(
     segments: &[SegmentReader<R>],
@@ -318,13 +318,13 @@ pub fn chains<R: ReadAt, K: AsRef<[u8]>>(
     Ok(out)
 }
 
-/// One key's versions in a lookback window: the window's inclusive bounds
+/// One key's versions in its lookback window: the window's inclusive bounds
 /// and every row group holding a version inside it.
 #[derive(Clone, Debug, PartialEq)]
-pub struct WindowHit {
+pub struct LookbackHit {
     /// Inclusive lower bound, in the timestamp column's unit.
     pub lo: i64,
-    /// Inclusive upper bound: the asof instant, or the key's newest version.
+    /// Inclusive upper bound: the key's newest live version.
     pub hi: i64,
     /// Row groups holding a version with `lo <= ts <= hi`.
     pub row_groups: RoaringBitmap,
@@ -332,29 +332,25 @@ pub struct WindowHit {
 
 /// The lookback window of one key over `chains` (every chain of the key,
 /// for example each zero variant's), counting only versions in `live` row
-/// groups. With `asof`, the window is `[asof − lookback, asof]`; without,
-/// `[newest − lookback, newest]` where `newest` is the key's newest live
-/// version. The lower bound never goes below `floor`, the smallest value
-/// the timestamp column's type holds. `None` when no live version falls in
-/// the window (or, without `asof`, when the key has no live version).
+/// groups: `[newest − lookback, newest]`, where `newest` is the key's
+/// newest live version. The lower bound never goes below `floor`, the
+/// smallest value the timestamp column's type holds. `None` when the key
+/// has no live version. A window ending at a fixed instant is no lookback
+/// of a key's own: it is a plain time window on the timestamp column.
 #[must_use]
-pub fn window<'a>(
+pub fn lookback<'a>(
     chains: impl Iterator<Item = &'a VersionChain> + Clone,
     live: &RoaringBitmap,
-    asof: Option<i64>,
     lookback: i64,
     floor: i64,
-) -> Option<WindowHit> {
+) -> Option<LookbackHit> {
     let in_live = |(_, rg): &&(i64, RowGroupId)| live.contains(rg.0);
-    let hi = match asof {
-        Some(at) => at,
-        None => chains
-            .clone()
-            .flat_map(|c| c.versions().iter())
-            .filter(in_live)
-            .map(|(ts, _)| *ts)
-            .max()?,
-    };
+    let hi = chains
+        .clone()
+        .flat_map(|c| c.versions().iter())
+        .filter(in_live)
+        .map(|(ts, _)| *ts)
+        .max()?;
     let lo = hi.saturating_sub(lookback).max(floor);
     let row_groups: RoaringBitmap = chains
         .flat_map(|c| c.versions().iter())
@@ -362,7 +358,7 @@ pub fn window<'a>(
         .filter(|(ts, _)| (lo..=hi).contains(ts))
         .map(|(_, rg)| rg.0)
         .collect();
-    (!row_groups.is_empty()).then_some(WindowHit { lo, hi, row_groups })
+    Some(LookbackHit { lo, hi, row_groups })
 }
 
 #[cfg(test)]
@@ -439,7 +435,7 @@ mod tests {
     }
 
     #[test]
-    fn a_window_holds_every_live_version_in_range() {
+    fn a_lookback_holds_every_live_version_of_the_key_in_range() {
         let a = VersionChain::from_versions(vec![
             (1, RowGroupId(0)),
             (5, RowGroupId(1)),
@@ -448,18 +444,17 @@ mod tests {
         ]);
         let b = VersionChain::from_versions(vec![(6, RowGroupId(4)), (10, RowGroupId(5))]);
         let live: RoaringBitmap = [0u32, 1, 2, 3, 4].into_iter().collect();
-        let rgs = |w: WindowHit| (w.lo, w.hi, w.row_groups.iter().collect::<Vec<_>>());
-        // latest: newest live version is 9 (10 lives in a retired row group)
-        let w = window([&a, &b].into_iter(), &live, None, 3, i64::MIN).unwrap();
+        let rgs = |w: LookbackHit| (w.lo, w.hi, w.row_groups.iter().collect::<Vec<_>>());
+        // the newest live version is 9 (10 lives in a retired row group)
+        let w = lookback([&a, &b].into_iter(), &live, 3, i64::MIN).unwrap();
         assert_eq!(rgs(w), (6, 9, vec![2, 3, 4]));
-        // asof 6, lookback 1: versions 5 and 6
-        let w = window([&a, &b].into_iter(), &live, Some(6), 1, i64::MIN).unwrap();
-        assert_eq!(rgs(w), (5, 6, vec![1, 4]));
+        // a zero lookback holds the newest version only
+        let w = lookback([&a].into_iter(), &live, 0, i64::MIN).unwrap();
+        assert_eq!(rgs(w), (9, 9, vec![3]));
         // the floor clamps the lower bound
-        let w = window([&a].into_iter(), &live, Some(2), 10, 0).unwrap();
-        assert_eq!(rgs(w), (0, 2, vec![0]));
-        // nothing in range, or nothing live
-        assert!(window([&a].into_iter(), &live, Some(4), 2, i64::MIN).is_none());
-        assert!(window([&b].into_iter(), &RoaringBitmap::new(), None, 9, i64::MIN).is_none());
+        let w = lookback([&a].into_iter(), &live, 100, 0).unwrap();
+        assert_eq!(rgs(w), (0, 9, vec![0, 1, 2, 3]));
+        // nothing live
+        assert!(lookback([&b].into_iter(), &RoaringBitmap::new(), 9, i64::MIN).is_none());
     }
 }

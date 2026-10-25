@@ -8,7 +8,8 @@ use std::sync::Arc;
 
 use arrow::array::RecordBatch;
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
-use bellwether_source::{FingerprintPolicy, TextFormat};
+use bellwether_core::sidecar::SidecarDef;
+use bellwether_source::{FingerprintPolicy, Partitioning, TextFormat};
 use bellwether_store::{ColumnDef, CommitOptions, Extra};
 use bellwether_types::{Error, FileFingerprint, Result, RowGroupId};
 
@@ -176,6 +177,21 @@ pub struct BuildOptions {
     /// from the manifest's is refused, because it changes every file's
     /// identity.
     pub fingerprint_policy: Option<FingerprintPolicy>,
+    /// Partitioning scheme of the source folder. `None` keeps the scheme the
+    /// manifest records (none for a manifest that records none), or no
+    /// scheme for a new index. [`Partitioning::Hive`] makes every
+    /// `name=value` directory below the data root a column, and
+    /// [`Partitioning::Template`] every placeholder of a path template
+    /// (Parquet only). A scheme different from the manifest's (another
+    /// template included) is refused, because it changes the dataset schema
+    /// and every row group's statistics.
+    pub partitioning: Option<Partitioning>,
+    /// Sidecars to declare beside the key specs (per-key time bounds,
+    /// bitemporal versions; `bellwether_core::sidecar`), in addition to those
+    /// the manifest declares (or instead of them, with `remove_unlisted`).
+    /// Each is built over every live row group it does not cover yet, like a
+    /// key spec, and recorded complete only when it covers all of them.
+    pub sidecars: Vec<SidecarDef>,
     /// Chunk size for text files seen for the first time. `None` uses the
     /// chunk size the manifest's text files record, or 64 MiB for a new
     /// index. Files already tracked are always read at the chunk size
@@ -223,6 +239,8 @@ impl Default for BuildOptions {
         Self {
             source: SourceKind::Parquet,
             fingerprint_policy: None,
+            partitioning: None,
+            sidecars: Vec::new(),
             chunk_size: None,
             schema: None,
             threads: None,
@@ -243,6 +261,8 @@ impl fmt::Debug for BuildOptions {
         f.debug_struct("BuildOptions")
             .field("source", &self.source)
             .field("fingerprint_policy", &self.fingerprint_policy)
+            .field("partitioning", &self.partitioning)
+            .field("sidecars", &self.sidecars)
             .field("chunk_size", &self.chunk_size)
             .field("schema", &self.schema.as_ref().map(|s| s.fields().len()))
             .field("threads", &self.threads)

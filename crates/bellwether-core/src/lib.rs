@@ -8,22 +8,28 @@
 //! - [`temporal`]: per-key version chains, `latest` and `asof` (invariant 5,
 //!   ADR 014).
 //! - [`merge`](mod@merge): merge N segments of one key spec into one.
+//! - [`sidecar`]: `bounds` and `temporal2` sidecar segments.
 //!
 //! Invariants owned here: 1 (no false negatives in pruning,
 //! `tests/no_false_negatives.rs`) and 5 (stale-version rejection,
 //! `tests/temporal_stale_rejection.rs`).
 //!
 //! Memory bound (ADR 018): a lookup holds one segment's block index, one
-//! block at a time, and the bitmaps or version hits for the keys asked.
-
+//! block at a time, and the bitmaps, version hits, bounds, or triples for the
+//! keys asked.
 #![forbid(unsafe_code)]
 
 pub mod bloom;
 pub mod encoding;
 pub mod merge;
 pub mod segment;
+pub mod sidecar;
 pub mod temporal;
 
 pub use merge::merge;
 pub use segment::{EncodedSegment, SegmentReader, SegmentWriter, WriterOptions};
+pub use sidecar::{
+    bitemporal_winner, BitemporalHit, EncodedSidecar, RgBounds, SidecarDef, SidecarHeader,
+    SidecarKind, SidecarReader, SidecarWriter, Triple,
+};
 pub use temporal::{VersionChain, VersionHit};

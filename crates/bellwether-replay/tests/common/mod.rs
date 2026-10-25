@@ -526,6 +526,7 @@ pub fn build_index(
                 key_spec: spec.name(),
                 rowgroup_range: RowGroupRange::new(lo, hi),
                 bytes,
+                kind: None,
                 extra: Extra::new(),
             });
         }
@@ -547,11 +548,13 @@ pub fn build_index(
             kind: "parquet".into(),
             root: corpus.data.clone(),
             fingerprint_policy: None,
+            partitioning: None,
             extra: Extra::new(),
         };
         m.schema = SchemaInfo {
             columns: columns.clone(),
             key_specs: specs.to_vec(),
+            sidecars: Vec::new(),
             extra: Extra::new(),
         };
         m.rowgroup_space = RowGroupSpace {

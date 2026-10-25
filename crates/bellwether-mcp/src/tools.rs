@@ -59,6 +59,13 @@ pub struct ObserveLocate {
     /// Key columns to take from the file, in tuple order; default: all.
     #[serde(default)]
     pub key_columns: Option<Vec<String>>,
+    /// Plan against the committed manifest at this sequence (a plan's
+    /// `sequence`) instead of the current one, so a lookup repeated over a
+    /// grown folder reads exactly what it read then: files indexed since are
+    /// ignored. Default: the current manifest. A sequence the index no
+    /// longer retains is refused with `not_retained`.
+    #[serde(default)]
+    pub at_manifest: Option<u64>,
 }
 
 /// `observe.asof`: the version of each key current at an instant.
@@ -73,6 +80,13 @@ pub struct ObserveAsof {
     /// The instant: RFC 3339, a date (YYYY-MM-DD), or an integer in the
     /// timestamp column's unit.
     pub at: String,
+    /// Plan against the committed manifest at this sequence (a plan's
+    /// `sequence`) instead of the current one, so a lookup repeated over a
+    /// grown folder reads exactly what it read then: files indexed since are
+    /// ignored. Default: the current manifest. A sequence the index no
+    /// longer retains is refused with `not_retained`.
+    #[serde(default)]
+    pub at_manifest: Option<u64>,
 }
 
 /// `score.why`: replay a workload under every candidate key. Writes engine
@@ -261,15 +275,17 @@ pub fn catalog() -> Vec<ToolDef> {
             "observe.locate",
             Tier::Observe,
             true,
-            "Plan which files and row groups hold the keys in a Parquet key file. Writes the \
-             plan Evidence and the key set to the cache only.",
+            "Plan which files and row groups hold the keys in a Parquet key file, against the \
+             current manifest or a committed one (at_manifest). Writes the plan Evidence and \
+             the key set to the cache only.",
         ),
         def::<ObserveAsof>(
             "observe.asof",
             Tier::Observe,
             true,
-            "Plan the version of each key current at an instant. Writes the plan Evidence and \
-             the key set to the cache only.",
+            "Plan the version of each key current at an instant, against the current manifest \
+             or a committed one (at_manifest). Writes the plan Evidence and the key set to the \
+             cache only.",
         ),
         def::<ScoreWhy>(
             "score.why",

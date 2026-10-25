@@ -367,7 +367,8 @@ fn paths(data: &str) -> Vec<std::path::PathBuf> {
 fn every_physical_type_is_probed_inside_the_bloom_only_plan() {
     let (_dir, data) = write();
     let source = ParquetSource::new().with_schema(schema());
-    let replayer = Replayer::unindexed(&source, &data).unwrap();
+    let replayer =
+        Replayer::unindexed(&source, &data, &bellwether_source::Partitioning::None).unwrap();
     let files = paths(&data);
     let total = replayer.catalog().len();
     let keys = MemoryKeySets::new();
@@ -395,7 +396,7 @@ fn every_physical_type_is_probed_inside_the_bloom_only_plan() {
         for (i, vs) in sets.iter().enumerate() {
             let run = workload.run(&format!("{c}-{i}")).unwrap();
             let rk = workload.run_keys(&keys, run).unwrap();
-            let got = common::cells(&stats.plan(&rk).unwrap());
+            let got = common::cells(&stats.plan(&rk, None).unwrap());
             let want = oracle(&files, c, vs);
             let blooms = bloom_only(&files, c, vs);
             let missing: Vec<_> = want.difference(&got).collect();
@@ -421,7 +422,8 @@ fn every_physical_type_is_probed_inside_the_bloom_only_plan() {
 fn a_filter_the_baseline_cannot_probe_is_refused() {
     let (_dir, data) = write();
     let source = ParquetSource::new().with_schema(schema());
-    let replayer = Replayer::unindexed(&source, &data).unwrap();
+    let replayer =
+        Replayer::unindexed(&source, &data, &bellwether_source::Partitioning::None).unwrap();
     let err = BaselinePlanner::parquet_stats(
         replayer.catalog(),
         &["k_d256".to_string()],

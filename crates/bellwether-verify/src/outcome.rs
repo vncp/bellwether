@@ -2,7 +2,7 @@
 //! formatting beyond exact renderings of keys and decimals, so the facade
 //! can serialize it for `--json` or render it for a terminal.
 
-use bellwether_types::{Coverage, Hash};
+use bellwether_types::{Coverage, Hash, Predicate};
 use serde::{Deserialize, Serialize};
 
 use crate::totals::ExactTotal;
@@ -246,6 +246,10 @@ pub struct Reconciliation {
     pub key_columns: Vec<String>,
     /// The version column, if any.
     pub latest_by: Option<String>,
+    /// The row filter, when only some rows of the covered keys were
+    /// compared ([`crate::ReconcileSpec::row_filter`]). Absent otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub row_filter: Option<Vec<Predicate>>,
     /// Hashed columns, in hash order.
     pub hashed_columns: Vec<String>,
     /// Columns left out of the row hash, sorted.

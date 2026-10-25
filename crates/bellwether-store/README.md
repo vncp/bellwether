@@ -13,10 +13,10 @@ It owns invariant 4 ("readers see one manifest version") and implements ADRs 003
 ```text
 <root>/manifest.json            committed by conditional PUT
 <root>/manifest.json.lock#0     local backend only: flock target, never deleted, never read, hidden from listings
+<root>/manifests/<20-digit>.json immutable committed manifest history (byte-identical to manifest.json at that sequence)
 <root>/segments/<blake3>.seg    immutable, content-addressed
 <root>/cache/<hash>.bin         rebuildable payload
 <root>/cache/<hash>.meta.json   sidecar: created_at, payload_blake3
-```
 
 ## Backends
 
@@ -80,10 +80,10 @@ These `object_store` errors map to `Error::VersionConflict`:
 - `committed_at`
 - `commit_nonce`
 - `source`
-- `schema{columns, key_specs}`
+- `schema{columns, key_specs, sidecars?[{kind, columns, time_columns}]}`
 - `rowgroup_space{next_id, files[{fingerprint, rowgroup_ids, chunk_size?, chunks?}], tombstones[{since, rowgroup_ids}]}`
 - `key_spec_completeness{name -> sequence}`
-- `segments[{id, key_spec, rowgroup_range{start, end}, bytes}]`
+- `segments[{id, kind?, key_spec, rowgroup_range{start, end}, bytes}]`
 - `segment_tombstones[{id, since}]`
 - `deleting[{id, claimed_at, token, lease_ms}]`
 
@@ -91,7 +91,8 @@ These `object_store` errors map to `Error::VersionConflict`:
 
 **Forward compatibility (ADR 017).** There are two rules, depending on who owns the type:
 
-- **Manifest-owned structs** have a `#[serde(flatten)] extra` map, so a newer binary's fields survive a rewrite. These are every struct in `manifest.rs`: `Manifest`, `SourceInfo`, `SchemaInfo`, `ColumnDef`, `RowGroupSpace`, `FileEntry`, `ChunkRange`, `RowGroupTombstone`, `SegmentRef`, `RowGroupRange`, `SegmentTombstone` and `DeleteClaim`. A fixture test checks the round trip with unknown keys at every one of these levels.
+- **Manifest-owned structs** have a `#[serde(flatten)] extra` map, so a newer binary's fields survive a rewrite. These are every struct in `manifest.rs`: `Manifest`, `SourceInfo`, `SchemaInfo`, `SidecarDecl`, `ColumnDef`, `RowGroupSpace`, `FileEntry`, `ChunkRange`, `RowGroupTombstone`, `SegmentRef`, `RowGroupRange`, `SegmentTombstone` and `DeleteClaim`. A fixture test checks the round trip with unknown keys at every one of these levels.
+- **Sidecar declarations and segment kinds.** Sidecars are declared in `schema.sidecars` (`SidecarDecl { kind, columns, time_columns }`, named `{kind}:{columns}@{time_columns}`) and their segments set `SegmentRef.kind` (`"bounds"`, `"temporal2"`, or a future kind; absent means an ordinary key-spec segment) and `SegmentRef.key_spec` to the sidecar's name. `Manifest::key_spec_segments(name)` yields only segments with `kind == None` and `key_spec == name`; `Manifest::sidecar_segments(kind, name)` yields sidecar segments of that kind and name. A manifest listing a segment or sidecar declaration whose `kind` is not in `KNOWN_SEGMENT_KINDS` still opens: `Manifest::unknown_segment_kinds()` returns the sorted distinct unknown kinds, `key_spec_segments` never yields them, and rewrites preserve both entries byte-for-byte.
 - **Types-owned structs** (`FileFingerprint`, `KeySpec`) live in `bellwether-types` and get no extra map, so the contract stays additive. Instead:
   - Adding a `KeySpec` kind, or a field to either type, requires a `storage_version` bump.
   - `Manifest::from_slice` pre-scans the raw JSON. If it finds an unknown kind, or an unknown field in either type, it refuses with `Error::UnsupportedVersion { what: "key-spec or fingerprint shape in storage" }` (`UNSUPPORTED_SHAPE`). That beats a serde error, and it never silently drops the field on rewrite.
@@ -127,6 +128,7 @@ Per attempt:
    - If it carries this attempt's `commit_nonce`, the write landed and only the response was lost: a retried request answered 412, a timeout after the write, a failed fsync after the rename. Return success without re-applying `f`. An applied write is never reported as failed, which apply-then-attest depends on.
    - Otherwise, on `VersionConflict`, back off (5 ms doubling to 500 ms, times a factor in [0.5, 1.5)) and go to step 1. `f` is re-applied to the winner's manifest, which for additive segment lists is a union (`add_segment` is idempotent by id). Attempts are capped at 32 (`CommitOptions`).
    - On any other error, return it. If the re-read itself fails too, the outcome is unknown and the CAS error is returned; a later read shows whether `f`'s effect landed.
+9. Write the committed manifest bytes to `<root>/manifests/<sequence as 20-digit zero-padded decimal>.json` with `put_if_absent`. This happens only after the CAS is known to have succeeded (step 7, or step 8's nonce self-win check) — never for an attempt that lost or whose outcome is unknown. Before committing on top of an existing base at sequence `N`, `commit` also checks `manifests/<N>.json` and backfills the exact bytes read from `manifest.json` if absent. History never blocks a commit: an existing history object with different bytes (`manifest.json` rewritten outside the commit protocol at the same sequence) is kept, never overwritten, and a warning is logged; if the post-CAS history write fails, `commit` logs a warning and still returns `Ok` because the commit itself landed, and the next commit backfills the missing history object.
 
 `f` must be **idempotent** and depend only on its input. If a third writer commits between the applied write and the re-read, the self-win goes undetected and `f` is applied once more on top. Idempotence makes that harmless.
 
@@ -143,11 +145,12 @@ The commit returns `sequence`. That is the identity callers record in `key_spec_
 
 `Snapshot::read_segment_range(id, range)` serves block-index and bitmap reads without loading a whole segment (ADR 018). It refuses the same ids, but a partial read cannot be checked against the content hash. `Snapshot::sequence()` is the pinned manifest's identity.
 
-The view changes only through `Snapshot::reopen()`. Two things guarantee this:
+The view of a snapshot opened with `Snapshot::open` changes only through `Snapshot::reopen()`. Two things guarantee this:
 
 - segments are immutable and content-addressed
 - GC deletes only claimed segments, and only after retention
 
+**Pinned historical snapshots (`Snapshot::open_at` and `retained_sequences`).** `Snapshot::open_at(store, root, sequence)` opens the committed manifest at `sequence` from `manifests/<20-digit>.json` (or from `manifest.json` when `sequence` is the current manifest and its history object has not been backfilled yet), returning `Ok(None)` when `sequence` is not retained and `Err` if the stored manifest's `sequence` disagrees with the requested one. Calling `reopen()` on a historical snapshot re-opens the same `sequence`. `retained_sequences(store, root)` returns the ascending list of sequences currently openable with `open_at`.
 `tests/snapshot_isolation.rs` contains:
 
 - **a stress test**: commits run while a reader uses a pinned snapshot; its view never changes.
@@ -171,7 +174,7 @@ The view changes only through `Snapshot::reopen()`. Two things guarantee this:
 Each run draws a random nonzero **token** and works in four phases:
 
 1. **Claim.** One commit moves every unreferenced segment whose tombstone is older than `retention` from `segment_tombstones` into `deleting`, stamped with the run's time, token and lease. It also takes over abandoned claims by re-stamping them. The claim set is recomputed from the winner's manifest on every rebase, so an id the winner re-referenced is never claimed. Claims already carrying the run's token count as its own, so a claim commit that landed but was reported as failed is not orphaned.
-2. **Delete, fenced.** Files are deleted only after the claim CAS succeeds, in batches of `delete_batch` (default 64).
+2. **Delete, fenced.** Files are deleted only after the claim CAS succeeds, in batches of `delete_batch` (default 64). Before deleting any claimed segment, GC prunes `manifests/`: let `D` be the claimed segment ids this run holds and `m` the greatest sequence among history manifests (`sequence < current.sequence`) that reference any id in `D` (`Manifest::references`); GC deletes every parsable history manifest with `sequence <= m` (`GcReport::manifests_pruned`), so the retained history is always a contiguous suffix `[oldest, current]` and never references a deleted segment. `manifest.json` is never deleted. Unparsable history objects (or objects whose stored `sequence` disagrees with their filename) are counted in `GcReport::unparsable_manifests` and left untouched rather than deleted blindly.
    - **Fence.** Immediately before each delete, the run checks whether half its lease has elapsed since just before the claim was stamped, on **either** clock. If so it stops (`fenced`). The two clocks are needed because they fail differently:
      - The monotonic clock (`Instant`) excludes host sleep: `CLOCK_UPTIME_RAW` on macOS, and `CLOCK_MONOTONIC` on Linux excludes suspend too. A holder that slept longer than its lease would otherwise wake with an almost-zero fence.
      - The wall clock includes the sleep. A forward wall-clock step only stops a run early, which is safe.

@@ -129,9 +129,10 @@ Either probe silently misses. **Callers must encode probes with the typed encode
 | `Keys` | `In` over the lookup columns |
 | `Latest` | `And[In, NotOlderThan, LatestPerKey]` |
 | `AsOf` | `And[In, Between(ts ≤ asof), NotOlderThan, LatestPerKey]` |
-| `Window` with `asof` | `And[In, Between(asof − lookback ≤ ts ≤ asof)]` |
-| `Window` without | `And[In, NotOlderThan(newest − lookback per key)]` |
+| `Lookback` | `And[In, NotOlderThan(newest − lookback per key)]` |
 | `Between` | `Between` |
+| `Window` (also an `asof` lookback, the window `[asof − lookback, asof]`) | `And[In, Between(ts in window)]` |
+| `Bitemporal` | `And[In, Between(valid), Between(known), NotOlderThan(valid), NotOlderThan(known), LatestPerKey(valid)]` |
 
 Details:
 
@@ -140,7 +141,14 @@ Details:
   - a `Between` bound of +0.0 below or -0.0 above is widened (`docs/format.md`, statistics semantics).
 - `NotOlderThan` carries each key's index-wide winning timestamp from every segment of the temporal spec. A stale row in a planned row group is dropped even when the newest version lives in a row group another spec pruned (invariant 5).
 - `In` for `Latest` and `AsOf` lists only keys that have a version. A key whose versions all have null timestamps has no latest (ADR 014).
-- `Window` returns every version of each key in its lookback window, so it has no `LatestPerKey`. The window comes from every segment's version chains over live row groups (core `temporal::chains` and `temporal::window`): with `asof`, `[asof − lookback, asof]` for every key; without, `[newest − lookback, newest]` per key, `newest` being the key's newest live version. The lower bound is clamped to the smallest value the timestamp column holds. The plan holds every live row group with a version of a key in its window, intersected per key with any other serving spec; `In` lists only keys with a version in their window. `tests/invariants.rs` checks windows against decoded rows over random layouts.
+- `Lookback` returns every version of each key in its own window `[newest − lookback, newest]`, `newest` being the key's newest live version, so it has no `LatestPerKey`; its residual is `In` (keys with a version) then `NotOlderThan` with each key's window start. The versions come from the one temporal spec on the key columns, through every segment's version chains over live row groups (core `temporal::chains` and `temporal::lookback`); with none, from the one complete `bounds` sidecar on them, whose per-row-group maxima over live row groups give each key's newest time and whose ranges keep the row groups reaching into its window (`Planner::lookback_column` names the column either way). The lower bound is clamped to the smallest value the timestamp column holds. The plan is intersected per key with any other serving spec. A window ending at a fixed instant (`asof --lookback`) is a `Lookup::Window`. `tests/invariants.rs` checks lookbacks against decoded rows over random layouts, and `tests/windows.rs` both sources against decoded files.
+
+**Time series (WP21).**
+
+- **Sidecars.** `BuildOptions::sidecars` declares `bellwether_core::sidecar` definitions beside the key specs: `bounds` (per key, per row group, the min and max of a time column over the key's rows there; `exact:symbol@ts` on the command line) and `temporal2` (per key, the `(valid, known, row group)` triples). They are recorded in `schema.sidecars`, their segments carry `segments[].kind`, and they are built, covered, and recorded complete exactly as key specs are (`sidecar_completeness`). Compaction does not merge sidecar segments. A segment or declaration of a kind this binary does not know is kept unchanged by builds and never planned with (`docs/format.md`, "Segment kinds").
+- **`Lookup::Window`.** Keys in `[lo, hi]` of a time column (its dataset unit): the key specs serving the key columns, intersected with the range specs on the time column, intersected per key with every complete `bounds` sidecar on that column, which keeps a row group only when that key's own time range there overlaps the window. An incomplete sidecar is not used; the plan is then a superset, never short (`tests/bounds.rs`, against decoded files, sentinels and nulls included).
+- **`Lookup::Bitemporal`.** Through the one complete `temporal2` sidecar serving the key columns: per key, the greatest valid time at or before `valid` among versions known at or before `known` (either unbounded), then the greatest known time; the plan holds exactly the live row groups of each winner, ties kept (`tests/bitemporal.rs`). Retired row groups never win.
+- **Order.** `Planner::plan_ordered` plans the same row groups and orders entries by a timestamp range key's row-group minimum, returning `PlanOrder::Ordered` only when that order holds for every planned row group (`tests/ordered.rs`).
 
 ## Memory (ADR 018)
 

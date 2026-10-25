@@ -45,7 +45,8 @@ use bytes::Bytes;
 
 use crate::backend::StoreExt;
 use crate::manifest::{
-    manifest_path, now_rfc3339, segment_path, Manifest, SegmentTombstone, UNSUPPORTED_STORAGE,
+    manifest_history_path, manifest_path, now_rfc3339, segment_path, Manifest, SegmentTombstone,
+    UNSUPPORTED_STORAGE,
 };
 
 /// The typed refusal for referencing a claimed segment (contract v2
@@ -143,9 +144,65 @@ pub fn read_manifest<S: StoreExt + ?Sized>(
     store: &S,
     root: &str,
 ) -> Result<Option<(Manifest, StoreVersion)>> {
+    Ok(read_manifest_raw(store, root)?.map(|(m, v, _)| (m, v)))
+}
+
+/// Reads and parses the manifest under `root` along with the exact raw bytes
+/// stored at `manifest.json`, or `None` if there is none.
+pub(crate) fn read_manifest_raw<S: StoreExt + ?Sized>(
+    store: &S,
+    root: &str,
+) -> Result<Option<(Manifest, StoreVersion, Bytes)>> {
     match store.get_opt(&manifest_path(root))? {
         None => Ok(None),
-        Some((bytes, version)) => Ok(Some((Manifest::from_slice(&bytes)?, version))),
+        Some((bytes, version)) => Ok(Some((Manifest::from_slice(&bytes)?, version, bytes))),
+    }
+}
+
+/// Backfill: before committing on a base at sequence N, if `manifests/N` is
+/// absent, writes the exact bytes read from `manifest.json`. History never
+/// blocks a commit: an object that exists with different bytes
+/// (`manifest.json` was rewritten outside the commit protocol, at the same
+/// sequence) keeps the bytes that were committed, and a failed write is
+/// retried by the next commit.
+fn backfill_history<S: StoreExt + ?Sized>(store: &S, root: &str, sequence: u64, bytes: &Bytes) {
+    if let Err(hist_err) = ensure_history_object(store, root, sequence, bytes) {
+        tracing::warn!(
+            sequence,
+            error = %hist_err,
+            "manifest history backfill skipped; the committed history object is kept"
+        );
+    }
+}
+
+/// Writes `bytes` to `manifests/<sequence as 20-digit zero-padded decimal>.json`
+/// with `put_if_absent`. If the history object already exists with identical
+/// bytes, succeeds; if it exists with different bytes, fails with
+/// [`Error::Store`] (never overwrites).
+pub(crate) fn ensure_history_object<S: StoreExt + ?Sized>(
+    store: &S,
+    root: &str,
+    sequence: u64,
+    bytes: &Bytes,
+) -> Result<()> {
+    if sequence == 0 {
+        return Ok(());
+    }
+    let hpath = manifest_history_path(root, sequence);
+    match store.put_if_absent(&hpath, bytes.clone()) {
+        Ok(_) => Ok(()),
+        Err(Error::VersionConflict { .. }) => match store.get_opt(&hpath)? {
+            Some((existing, _)) if existing == *bytes => Ok(()),
+            Some(_) => Err(Error::Store(format!(
+                "manifest history object {hpath} already exists with different bytes; \
+                 refusing to overwrite immutable history"
+            ))),
+            None => Err(Error::Store(format!(
+                "manifest history object {hpath} reported a conflict on creation, \
+                 then disappeared; retry the operation"
+            ))),
+        },
+        Err(e) => Err(e),
     }
 }
 
@@ -224,9 +281,9 @@ where
         if attempt > 0 {
             std::thread::sleep(rng.backoff(attempt, &opts));
         }
-        let base = read_manifest(store, root)?;
+        let base = read_manifest_raw(store, root)?;
         let empty;
-        let base_manifest = if let Some((m, _)) = &base {
+        let base_manifest = if let Some((m, _, _)) = &base {
             m
         } else {
             empty = Manifest::new();
@@ -262,19 +319,35 @@ where
         }
         reconcile_tombstones(base_manifest, &mut next);
 
+        if let Some((m, _, base_bytes)) = &base {
+            backfill_history(store, root, m.sequence, base_bytes);
+        }
         ensure_segments_present(store, root, staged, base_manifest, &next)?;
 
         let body = Bytes::from(next.to_vec()?);
         let res = match &base {
-            None => store.put_if_absent(&path, body),
-            Some((_, version)) => store.put_if_version(&path, body, version),
+            None => store.put_if_absent(&path, body.clone()),
+            Some((_, version, _)) => store.put_if_version(&path, body.clone(), version),
         };
         let err = match res {
             Ok(version) => {
+                // The CAS succeeded: record the committed manifest in immutable
+                // history. A post-CAS history write failure must not report the
+                // commit as failed (the commit already landed); the next commit
+                // backfills the missing history object from `manifest.json`, and
+                // `Snapshot::open_at` / `retained_sequences` include the current
+                // `manifest.json` even while its history object is absent.
+                if let Err(hist_err) = ensure_history_object(store, root, next.sequence, &body) {
+                    tracing::warn!(
+                        sequence = next.sequence,
+                        error = %hist_err,
+                        "manifest CAS succeeded but writing manifest history failed; the next commit will backfill it"
+                    );
+                }
                 return Ok(Committed {
                     version,
                     sequence: next.sequence,
-                })
+                });
             }
             Err(e) => e,
         };
@@ -286,6 +359,13 @@ where
         match read_manifest(store, root) {
             Ok(Some((current, version))) if current.commit_nonce == nonce => {
                 tracing::debug!(attempt, error = %err, "manifest CAS reported failure but our write landed");
+                if let Err(hist_err) = ensure_history_object(store, root, current.sequence, &body) {
+                    tracing::warn!(
+                        sequence = current.sequence,
+                        error = %hist_err,
+                        "manifest CAS landed (detected via nonce) but writing manifest history failed; the next commit will backfill it"
+                    );
+                }
                 return Ok(Committed {
                     version,
                     sequence: current.sequence,
@@ -411,6 +491,7 @@ mod tests {
     fn seg(id: Hash, n: u32) -> SegmentRef {
         SegmentRef {
             id,
+            kind: None,
             key_spec: "exact:id".into(),
             rowgroup_range: RowGroupRange::new(n, n + 1),
             bytes: 1,
@@ -619,6 +700,8 @@ mod tests {
         AppliedThenError,
         /// Not applied, reported as a non-conflict error.
         ErrorNotApplied,
+        /// CAS succeeds, then the post-CAS history `put_if_absent` fails.
+        HistoryWriteFailed,
     }
 
     struct Faulty {
@@ -647,10 +730,23 @@ mod tests {
             self.inner.get(p)
         }
         fn put_if_absent(&self, p: &str, b: Bytes) -> Result<StoreVersion> {
+            if p.contains("manifests/") && !self.inner.exists(p).unwrap_or(false) {
+                let mut guard = self.fault.lock().unwrap();
+                if *guard == Fault::HistoryWriteFailed {
+                    *guard = Fault::None;
+                    return Err(Error::Store("history write failed".into()));
+                }
+            }
             self.inner.put_if_absent(p, b)
         }
         fn put_if_version(&self, p: &str, b: Bytes, e: &StoreVersion) -> Result<StoreVersion> {
-            let fault = std::mem::replace(&mut *self.fault.lock().unwrap(), Fault::None);
+            let mut guard = self.fault.lock().unwrap();
+            let fault = if *guard == Fault::HistoryWriteFailed {
+                Fault::None
+            } else {
+                std::mem::replace(&mut *guard, Fault::None)
+            };
+            drop(guard);
             if fault == Fault::ErrorNotApplied {
                 return Err(Error::Store("timed out".into()));
             }
@@ -661,7 +757,7 @@ mod tests {
                     found: v.0,
                 }),
                 Fault::AppliedThenError => Err(Error::Store("timed out".into())),
-                Fault::None | Fault::ErrorNotApplied => Ok(v),
+                Fault::None | Fault::ErrorNotApplied | Fault::HistoryWriteFailed => Ok(v),
             }
         }
         fn put_content_addressed(&self, p: &str, b: Bytes) -> Result<()> {
@@ -720,6 +816,10 @@ mod tests {
         let (m, v) = read_manifest(&store, "").unwrap().unwrap();
         assert_eq!(m.rowgroup_space.next_id, 1);
         assert_eq!(c.version, v);
+        assert_eq!(
+            store.get(&manifest_history_path("", 2)).unwrap().0,
+            store.get(&manifest_path("")).unwrap().0
+        );
     }
 
     /// Requirement for apply-then-attest: a write that landed is never
@@ -737,6 +837,10 @@ mod tests {
         let (m, v) = read_manifest(&store, "").unwrap().unwrap();
         assert_eq!((m.sequence, m.rowgroup_space.next_id), (2, 1));
         assert_eq!(c.version, v);
+        assert_eq!(
+            store.get(&manifest_history_path("", 2)).unwrap().0,
+            store.get(&manifest_path("")).unwrap().0
+        );
     }
 
     #[test]
@@ -751,6 +855,30 @@ mod tests {
         assert_eq!(calls, 1, "a non-conflict error is not retried");
         let (m, _) = read_manifest(&store, "").unwrap().unwrap();
         assert_eq!((m.sequence, m.rowgroup_space.next_id), (1, 0));
+        assert!(!store.exists(&manifest_history_path("", 2)).unwrap());
+    }
+
+    #[test]
+    fn history_write_failure_after_cas_does_not_fail_commit_and_next_commit_backfills() {
+        let store = Faulty::new(Fault::None, false);
+        let staged = StagedSegments::new();
+        commit(&store, "", &staged, |m| Ok(m.clone())).unwrap();
+        store.arm(Fault::HistoryWriteFailed);
+        let mut calls = 0;
+        let c2 = commit(&store, "", &staged, bump_next_id(&mut calls)).unwrap();
+        assert_eq!(c2.sequence, 2);
+        assert_eq!(calls, 1);
+        assert!(!store.exists(&manifest_history_path("", 2)).unwrap());
+        let (m2_bytes, _) = store.get(&manifest_path("")).unwrap();
+
+        // Next commit backfills sequence 2 byte-identically before committing sequence 3.
+        let c3 = commit(&store, "", &staged, bump_next_id(&mut calls)).unwrap();
+        assert_eq!(c3.sequence, 3);
+        assert_eq!(
+            store.get(&manifest_history_path("", 2)).unwrap().0,
+            m2_bytes
+        );
+        assert!(store.exists(&manifest_history_path("", 3)).unwrap());
     }
 
     /// Staged bytes are uploaded even when `exists` claims the file is there

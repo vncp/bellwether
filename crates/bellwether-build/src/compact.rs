@@ -14,7 +14,8 @@ use bytes::Bytes;
 
 use crate::build::Builder;
 use crate::config::{columns_to_schema, CompactOptions};
-use crate::coverage::completeness_map;
+use crate::coverage::{completeness_map, segment_of};
+use crate::target::declared_targets;
 
 /// What a compaction did.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -104,7 +105,7 @@ impl<S: StoreExt + ?Sized> Builder<S> {
         for spec in &m.schema.key_specs {
             let name = spec.name();
             let mut segs: Vec<&SegmentRef> =
-                m.segments.iter().filter(|s| s.key_spec == name).collect();
+                m.segments.iter().filter(|s| segment_of(s, &name)).collect();
             segs.sort_by_key(|s| (s.rowgroup_range.start, s.rowgroup_range.end, s.id));
             groups.extend(plan_groups(spec, &segs, options));
         }
@@ -152,6 +153,7 @@ impl<S: StoreExt + ?Sized> Builder<S> {
                     key_spec: g.spec.name(),
                     rowgroup_range: RowGroupRange::new(start, end),
                     bytes,
+                    kind: None,
                     extra: Extra::new(),
                 },
             });
@@ -219,9 +221,9 @@ fn apply_merges(
     // coverage before and after anyway, refuse to publish if they differ,
     // and record the recomputed map (which also drops an entry another
     // writer left for a spec that is not complete).
-    let declared = &next.schema.key_specs;
-    let before = completeness_map(cur, cur, declared, &BTreeSet::new())?;
-    let after = completeness_map(cur, &next, declared, &BTreeSet::new())?;
+    let declared = declared_targets(&next);
+    let before = completeness_map(cur, cur, &declared, &BTreeSet::new())?;
+    let after = completeness_map(cur, &next, &declared, &BTreeSet::new())?;
     if before != after {
         return Err(Error::Other(format!(
             "compaction would change key-spec completeness from {before:?} to {after:?}; nothing was committed"
@@ -242,6 +244,7 @@ mod tests {
             key_spec: "exact:id".into(),
             rowgroup_range: RowGroupRange::new(start, end),
             bytes,
+            kind: None,
             extra: Extra::new(),
         }
     }

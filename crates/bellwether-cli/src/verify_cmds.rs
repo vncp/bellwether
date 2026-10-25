@@ -3,7 +3,7 @@
 use std::fmt::Write as _;
 
 use bellwether::spec::label;
-use bellwether::types::{Coverage, ProposalBody, Record};
+use bellwether::types::{Coverage, Predicate, ProposalBody, Record};
 use bellwether::{
     FixOutcome, FixRequest, FixResult, KeyRepr, Mismatch, ReconcileProblem, ReconcileRequest,
     ReconcileResult, Refusal, RewriteOutputs, Score, TotalColumn,
@@ -272,6 +272,36 @@ fn coverage(c: &Coverage) -> String {
     }
 }
 
+/// What a row filter keeps, in words: one phrase per kind of test.
+fn rows_asked(filter: &[Predicate]) -> String {
+    fn walk(p: &Predicate, out: &mut Vec<String>) {
+        let phrase = match p {
+            Predicate::Between { column, .. } => format!("{column} within the lookup's bounds"),
+            Predicate::NotOlderThan { ts_column, .. } => {
+                format!("{ts_column} within each key's lookback from its newest time in the data")
+            }
+            Predicate::LatestPerKey { ts_column, .. } => {
+                format!("the newest version by {ts_column}")
+            }
+            Predicate::In { .. } => "the workload's keys".to_string(),
+            Predicate::And { all } => {
+                for q in all {
+                    walk(q, out);
+                }
+                return;
+            }
+        };
+        if !out.contains(&phrase) {
+            out.push(phrase);
+        }
+    }
+    let mut out = Vec::new();
+    for p in filter {
+        walk(p, &mut out);
+    }
+    out.join("; ")
+}
+
 /// The exact totals, with one line per quantized float column saying how
 /// its values were rounded.
 fn totals_human(s: &mut String, o: &bellwether::Reconciliation) {
@@ -459,6 +489,14 @@ fn fix_human(r: &FixResult, out: &Out) -> String {
                 short(&c.hash)
             );
         }
+    }
+    if let Some(filter) = r.verification.as_ref().and_then(|v| v.row_filter.as_ref()) {
+        let _ = writeln!(
+            s,
+            "            rows compared: those the lookups ask for ({}), bounded by the workload \
+             and the data, not by the index",
+            rows_asked(filter)
+        );
     }
     if let Some(inv) = &r.invariant {
         let _ = writeln!(s, "            invariant checked: {inv}");

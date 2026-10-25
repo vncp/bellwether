@@ -9,6 +9,7 @@ Work package WP1. This crate holds canonical key encoding, split-block bloom fil
 | `segment` | `SegmentWriter` (`for_dataset` for Arrow batches), `SegmentReader<R: ReadAt>`, `FileRange`, and `EncodedSegment::path()` = `segments/<blake3>.seg` |
 | `temporal` | `latest` and `asof` across every segment of a key spec, plus `VersionChain`, `VersionHit`, and `is_stale` |
 | `merge` | `merge(&[SegmentReader], &WriterOptions)` |
+| `sidecar` | `bounds` and `temporal2` sidecar segment writer (`SidecarWriter`), reader (`SidecarReader<R: ReadAt>`), `bitemporal_winner`, and `measure` |
 
 Tests:
 
@@ -21,6 +22,8 @@ Tests:
 | `tests/segment_format.rs` | Format rules |
 | `tests/corrupt_sweep.rs` | Every truncation and a byte-flip sweep never panic |
 | `tests/conformance.rs` | The pinned test vectors of `docs/format.md`, through both the scalar and the Arrow encoder paths; the test also requires the document's table to list exactly these vectors |
+| `tests/sidecar_conformance.rs` | Pinned byte and record conformance for `bounds` and `temporal2` sidecar segments, `measure`, `add_batch` atomicity, and corruption sweeps |
+| `tests/sidecar_oracle.rs` | Oracle property tests for `bounds`, `temporal2`, and `bitemporal_winner` across row groups, nulls, composite keys, and sentinel timestamps |
 
 Benchmark: `cargo bench -p bellwether-core --bench lookup` measures single-key lookup latency against segment size.
 
@@ -148,3 +151,24 @@ The one-index-plus-one-block bound is a lookup bound. Building is bounded differ
 There is no `unsafe` in this crate, so it does not create memory maps itself. A caller can hand `SegmentReader` any `AsRef<[u8]>`, such as a `bytes::Bytes` or a map it created, and the reader borrows ranges from it without copying. `FileRange` reads each range with a positioned read.
 
 Merging segments whose processed ranges are not adjacent records the hull of their ranges, which claims row groups none of the inputs processed. The build crate merges only contiguous groups and takes coverage from the manifest, so it is unaffected; any other caller must merge adjacent ranges only or set the range explicitly after the merge.
+
+## Sidecar segment format (`docs/format.md`, storage version 1)
+
+Sidecar segments (`segments/<blake3>.seg`, magic `"BWSIDECR"`) store per-key timestamp metadata in two kinds:
+
+- `bounds` (`SidecarKind::Bounds`, named `bounds:<cols>@<ts>`): per key, per row group holding the key with a non-null timestamp, the inclusive `[min, max]` of `ts` over that key's rows in that row group.
+- `temporal2` (`SidecarKind::Bitemporal`, named `temporal2:<cols>@<valid>,<known>`): per key, the sorted distinct `(valid, known, rg)` triples over rows where neither clock is null (ADR 014). `bitemporal_winner` selects, among triples with `known <= known_at` and `valid <= valid_at`, the greatest `valid`, breaking ties by greatest `known`, and keeps every row group holding that `(valid, known)`.
+
+All integers are little-endian and `i64` values are two's complement:
+
+```
+preamble  magic "BWSIDECR" | storage_version u32 | encoding_version u32 | header_len u32
+header    JSON {storage_version, encoding_version, kind, columns, time_columns, codec:"none", key_types?, time_types?, ..unknown}
+body      blocks of <= 1024 keys or 64 KiB of key bytes; block = n u32 | n x (key_len u32 | key | count u32 | count x record)
+          bounds record    = rg u32 | min i64 | max i64        (strictly ascending rg, min <= max)
+          temporal2 record = valid i64 | known i64 | rg u32    (strictly ascending (valid, known, rg))
+index     entries u64 | has_rg u8 | rg_min u32 | rg_max u32 | block_count u32 | block_count x (first_key | last_key | off u64 | len u32 | n u32)
+footer    index_offset u64 | index_len u64 | magic "BWSIDECR"
+```
+
+Sidecar memory bound (ADR 018): a lookup holds the block index, one block at a time, and the results for the keys asked; `SidecarWriter` holds every distinct `(key, rg)` (for `bounds`) or `(key, valid, known, rg)` (for `temporal2`) until `finish`, and the build crate caps segment size with `sidecar::measure`.

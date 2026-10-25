@@ -46,6 +46,8 @@ pub enum RefusalCode {
     StaleIndex,
     /// The lookup needs an index the folder does not have.
     NotIndexed,
+    /// The pinned manifest sequence is not retained.
+    NotRetained,
     /// The hash is a record of another kind.
     WrongKind,
     /// The hash is not in the ledger.
@@ -84,7 +86,7 @@ pub enum RefusalCode {
 
 impl RefusalCode {
     /// Every code, in `AGENTS.md` order.
-    pub const ALL: [Self; 29] = [
+    pub const ALL: [Self; 30] = [
         Self::CertificateFailed,
         Self::StaleManifest,
         Self::DataChanged,
@@ -97,6 +99,7 @@ impl RefusalCode {
         Self::NoWorkload,
         Self::StaleIndex,
         Self::NotIndexed,
+        Self::NotRetained,
         Self::WrongKind,
         Self::NotFound,
         Self::InvalidInput,
@@ -132,6 +135,7 @@ impl RefusalCode {
             Self::NoWorkload => "no_workload",
             Self::StaleIndex => "stale_index",
             Self::NotIndexed => "not_indexed",
+            Self::NotRetained => "not_retained",
             Self::WrongKind => "wrong_kind",
             Self::NotFound => "not_found",
             Self::InvalidInput => "invalid_input",
@@ -169,8 +173,8 @@ impl RefusalCode {
             }
             Self::NothingToApply => "the key is already complete; there is nothing to attest",
             Self::NothingToGain => {
-                "the replay predicts no saving on this workload; propose another key, or pass \
-                 allow_no_gain only if the human asks for it anyway"
+                "the replay predicts no saving on this workload; propose another key, or tell the \
+                 human: only the human can continue, with `bellwether fix --allow-no-gain`"
             }
             Self::LayoutNotApplicable => {
                 "layout proposals cannot be applied in this release; propose a key or a rewrite"
@@ -190,6 +194,10 @@ impl RefusalCode {
             Self::NotIndexed => {
                 "ask the human to index the data folder with a key spec (`bellwether index`), \
                  then call the tool again"
+            }
+            Self::NotRetained => {
+                "pass in `at_manifest` a sequence the index retains (`fields.oldest` to \
+                 `fields.current`), or omit it to plan against the current manifest"
             }
             Self::WrongKind => {
                 "pass the hash of the kind the tool takes, as an earlier step printed it"
@@ -306,6 +314,17 @@ fn typed_next(e: &Error) -> Option<String> {
             "fix `{field}` as the message says, then call the tool again (with `wait: true` if \
              the arguments themselves are unchanged)"
         )),
+        Error::NotRetained { retained, .. } => match (retained.first(), retained.last()) {
+            (Some(oldest), Some(current)) => Some(format!(
+                "pass in `at_manifest` one of {oldest}..={current}, or omit it to plan against \
+                 the current manifest"
+            )),
+            _ => Some(
+                "the folder is not indexed, so there is no manifest to pin: omit `at_manifest`, \
+                 or ask the human to index the data folder (`bellwether index`)"
+                    .into(),
+            ),
+        },
         _ => None,
     }
 }
@@ -358,6 +377,19 @@ pub fn from_error(e: &Error) -> Refusal {
         Error::InvalidArgument { field, .. } => {
             (RefusalCode::InvalidArgument, json!({ "field": field }))
         }
+        Error::NotRetained {
+            index,
+            requested,
+            retained,
+        } => (
+            RefusalCode::NotRetained,
+            json!({
+                "index": index,
+                "requested": requested,
+                "oldest": retained.first(),
+                "current": retained.last(),
+            }),
+        ),
         Error::NotFound(h) => (RefusalCode::NotFound, json!({ "hash": h })),
         Error::LedgerRule(_) => (RefusalCode::LedgerRule, json!({})),
         Error::KeySpec(_) => (RefusalCode::InvalidSpec, json!({})),
@@ -520,9 +552,23 @@ mod tests {
 
     use super::*;
 
-    /// No `next` line or message built here names a CLI flag.
+    /// No `next` line or message built here names a CLI flag for the agent
+    /// to pass. `nothing_to_gain`'s names one only as the human's own CLI
+    /// command: no tool takes it, so an agent cannot override the gate.
     fn no_flags(r: &Refusal) {
-        assert!(!r.next.contains("--"), "{r:?}");
+        if r.code == RefusalCode::NothingToGain {
+            nothing_to_gain_is_the_human_s(r.next.as_str());
+        } else {
+            assert!(!r.next.contains("--"), "{r:?}");
+        }
+    }
+
+    fn nothing_to_gain_is_the_human_s(next: &str) {
+        assert!(
+            next.contains("only the human can continue, with `bellwether fix --allow-no-gain`")
+                && !next.contains("allow_no_gain"),
+            "{next}"
+        );
     }
 
     #[test]
@@ -616,6 +662,14 @@ mod tests {
                 },
                 RefusalCode::InvalidSpec,
             ),
+            (
+                Error::NotRetained {
+                    index: "/d/.bellwether".into(),
+                    requested: 1,
+                    retained: vec![3, 4, 5],
+                },
+                RefusalCode::NotRetained,
+            ),
         ];
         for (e, code) in &cases {
             let r = from_error(e);
@@ -640,11 +694,28 @@ mod tests {
         assert_eq!(f(14)["field"], "at");
         assert_eq!(f(17)["column"], "nope");
         assert_eq!(f(17)["columns"], json!(["id", "ts"]));
+        assert_eq!(f(18)["requested"], 1);
+        assert_eq!(f(18)["oldest"], 3);
+        assert_eq!(f(18)["current"], 5);
         // Next lines name the MCP field to fix.
         assert!(from_error(&cases[10].0).next.contains("`certificate`"));
         assert!(from_error(&cases[11].0).next.contains("`workload`"));
         assert!(from_error(&cases[12].0).next.contains("`workload`"));
         assert!(from_error(&cases[14].0).next.contains("`at`"));
+        assert!(from_error(&cases[18].0)
+            .next
+            .contains("`at_manifest` one of 3..=5"));
+        let unindexed = from_error(&Error::NotRetained {
+            index: "/d/.bellwether".into(),
+            requested: 2,
+            retained: Vec::new(),
+        });
+        assert_eq!(unindexed.fields["oldest"], Value::Null);
+        assert!(
+            unindexed.next.contains("omit `at_manifest`"),
+            "{unindexed:?}"
+        );
+        no_flags(&unindexed);
         let rewrite = from_error(&Error::NoWorkload {
             proposal: "rewrite",
             field: "rewrite",
@@ -763,7 +834,11 @@ mod tests {
     fn codes_serialize_as_their_names() {
         for c in RefusalCode::ALL {
             assert_eq!(serde_json::to_value(c).unwrap(), c.as_str());
-            assert!(!c.next().contains("--"), "{c:?}");
+            if c == RefusalCode::NothingToGain {
+                nothing_to_gain_is_the_human_s(c.next());
+            } else {
+                assert!(!c.next().contains("--"), "{c:?}");
+            }
         }
     }
 }

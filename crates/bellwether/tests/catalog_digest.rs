@@ -66,7 +66,8 @@ fn replay_and_source_catalog_digests_agree() {
 
     // Unindexed: replay's discover catalog against source's `unindexed`.
     let source = ParquetSource::new();
-    let replayer = Replayer::unindexed(&source, root).unwrap();
+    let replayer =
+        Replayer::unindexed(&source, root, &bellwether_source::Partitioning::None).unwrap();
     let schema = source.schema(root).unwrap();
     let files: Vec<(FileFingerprint, Vec<RowGroupMeta>)> = source
         .discover(root)

@@ -49,6 +49,17 @@ pub struct SpecState {
     pub complete_at: Option<u64>,
 }
 
+/// A sidecar (per-key time bounds, bitemporal versions) by its manifest
+/// name, and the manifest sequence at which it became complete, or `None`
+/// while it is incomplete.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SidecarState {
+    /// The sidecar's name: `bounds:symbol@ts`, `temporal2:id@valid,known`.
+    pub sidecar: String,
+    /// Completeness sequence.
+    pub complete_at: Option<u64>,
+}
+
 /// What [`crate::Engine::index`] did.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct IndexResult {
@@ -67,6 +78,11 @@ pub struct IndexResult {
     pub segments_written: u64,
     /// Every declared spec with its completeness.
     pub specs: Vec<SpecState>,
+    /// Every declared sidecar this binary knows, with its completeness.
+    pub sidecars: Vec<SidecarState>,
+    /// Segment or sidecar kinds the manifest lists that this binary does
+    /// not know: kept unchanged by builds, never used to plan.
+    pub unknown_segment_kinds: Vec<String>,
     /// Files seen for the first time.
     pub files_new: u64,
     /// Tracked files whose fingerprint changed (ADR 013).
@@ -100,13 +116,65 @@ pub enum LookupKind {
         /// The timestamp column.
         ts_column: String,
     },
+    /// Rows of the keys whose time column lies in `[lo, hi]`.
+    Window {
+        /// The window's start as given.
+        from: String,
+        /// The window's end as given.
+        to: String,
+        /// `from` in the time column's dataset unit.
+        lo: i64,
+        /// `to` in the time column's dataset unit.
+        hi: i64,
+        /// The time column.
+        ts_column: String,
+    },
+    /// The rows of the keys in a lookback window: `asof --at T --lookback
+    /// N` reads the window `[T - N, T]` on the time column; `latest
+    /// --lookback N` reads each key's own window `[newest - N, newest]`,
+    /// `newest` being that key's newest time (index-wide, live row groups
+    /// only).
+    Lookback {
+        /// The instant as given (`asof`), or `None` (`latest`).
+        at: Option<String>,
+        /// The lookback as given (`252d`).
+        lookback: String,
+        /// The lookback in calendar seconds (`d` is 86,400 s, `w` 7 days),
+        /// or `None` for a bare integer in an integer column's unit.
+        lookback_seconds: Option<i64>,
+        /// `asof`: the window's end in the time column's dataset unit.
+        /// `None` for `latest`, where each key's window ends at its own
+        /// newest time.
+        end: Option<i64>,
+        /// `asof`: the window's start in that unit (`end` minus the
+        /// lookback, clamped to the column's range). `None` for `latest`.
+        lo: Option<i64>,
+        /// The time column.
+        ts_column: String,
+    },
+    /// Per key, the newest row by valid time among rows known by `known`
+    /// and valid by `valid` (each unbounded when absent).
+    Bitemporal {
+        /// The valid-time bound as given.
+        valid: Option<String>,
+        /// The known-time bound as given.
+        known: Option<String>,
+        /// `valid` in the valid column's dataset unit.
+        valid_ts: Option<i64>,
+        /// `known` in the known column's dataset unit.
+        known_ts: Option<i64>,
+        /// The valid-time column.
+        valid_column: String,
+        /// The known-time column.
+        known_column: String,
+    },
 }
 
 /// A lookback window on a `latest` or `asof` lookup: every version of each
 /// key in `[end − length, end]`, `end` being the asof instant or, for
 /// `latest`, the key's newest version.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Lookback {
+pub struct LookbackWindow {
     /// The window as given (`252d`, `36h`; an integer for an integer
     /// timestamp column or a recorded workload).
     pub given: String,
@@ -135,12 +203,25 @@ pub struct PlanResult {
     pub specs: Vec<KeySpec>,
     /// Declared specs left out because they are not complete (ADR 012).
     pub excluded_incomplete: Vec<KeySpec>,
+    /// The complete sidecars the plan used (per-key time bounds for a
+    /// window, the bitemporal sidecar for a bitemporal lookup), by name.
+    pub sidecars: Vec<String>,
+    /// For a window or lookback, the time column when the index's
+    /// partitioning (hive directories or a path template) gives it from
+    /// each file's path, so files outside the window were pruned by path.
+    pub path_values: Option<String>,
     /// Live files the plan chose from.
     pub files_total: u64,
     /// Live row groups the plan chose from.
     pub row_groups_total: u64,
     /// What the plan reads.
     pub planned: Cost,
+    /// The timestamp or date column whose row-group minimum orders the
+    /// plan's entries (read in order, each entry's row groups ascending),
+    /// when that order holds; `None` when the order is unspecified.
+    pub ordered_by: Option<String>,
+    /// Why the order is unspecified, when it is.
+    pub unordered_reason: Option<String>,
     /// The `plan` Evidence.
     pub evidence: Written,
 }

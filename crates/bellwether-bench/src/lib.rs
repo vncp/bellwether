@@ -14,6 +14,9 @@
 //! - [`slo`] asserts the budgets that apply today and names the ones that
 //!   will apply when the index lands.
 //! - [`report`] renders `results.json` as a self-contained HTML page.
+//! - [`market`] writes a deterministic synthetic bitemporal market trade corpus
+//!   (`symbol`, `ts`, `known_at`, `price`, `size`), time-series workloads
+//!   (`window`, `asof`, `latest_known`), and exact ground truth (`truth.json`).
 
 #![forbid(unsafe_code)]
 // Benchmark arithmetic converts freely between counts, sizes, and floating
@@ -39,6 +42,7 @@ pub mod corpus;
 pub mod env;
 pub mod generate;
 pub mod harness;
+pub mod market;
 pub mod mem;
 pub mod report;
 pub mod results;

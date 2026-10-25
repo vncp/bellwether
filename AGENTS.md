@@ -67,13 +67,14 @@ line. No refusal is prose only.
 | `data_changed` | Files changed after verification. Call `score.verify` again. |
 | `concurrent_commit` | Another commit landed during the apply; the key is built but not attested. Tell the human. |
 | `nothing_to_apply` | The key is already complete; there is nothing to apply or attest. |
-| `nothing_to_gain` | The proposal's replay predicts no saving on the workload; `fields` has `replay`, `current_bytes`, `proposed_bytes`. Nothing but the Replay was written. Propose another key; go on (`allow_no_gain`) only if the human asks. |
+| `nothing_to_gain` | The proposal's replay predicts no saving on the workload; `fields` has `replay`, `current_bytes`, `proposed_bytes`. Nothing but the Replay was written. Propose another key; only the human can continue, with `bellwether fix --allow-no-gain` (no tool takes it). |
 | `layout_not_applicable` | Layout proposals cannot be applied in this release. |
 | `no_replay` | A rewrite verified but cannot be attested yet (rewrites have no replay). |
 | `reserved_proposer` | The name in `by` is reserved for the engine. Pass your own name. |
 | `no_workload` | Scoring needs input that was not given: `keys` or a recorded `workload` for `score.why`, `workload` for a key proposal, `rewrite` outputs for a rewrite; `fields.field` names it. |
 | `stale_index` | Files landed, changed, or vanished since the index was built; `fields` lists them. Ask the human to run `bellwether index`. |
 | `not_indexed` | The lookup needs an index the folder does not have (none at all, or no complete key spec of the kind it plans with, in `fields.needs`). Ask the human to index the folder. |
+| `not_retained` | The lookup was pinned with `at_manifest` to a sequence the index does not retain (never committed, or pruned by garbage collection); `fields.oldest` and `fields.current` bound the sequences you may pass (both null when the folder is not indexed). Pass one of them, or omit `at_manifest`. |
 | `wrong_kind` | The hash is a record of another kind than the tool takes; `fields.field` names the argument. Pass the hash the earlier step printed. |
 | `not_found` | The hash is not in this ledger (or, for a workload, the cache); `fields.kind` and `fields.field` say which argument. |
 | `invalid_input` | The arguments do not match the tool's schema (an unknown field such as `score` included). |

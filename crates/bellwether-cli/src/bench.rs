@@ -6,6 +6,9 @@ use std::path::{Path, PathBuf};
 use bellwether::types::{Error, Hash};
 use bellwether_bench::corpus::{GenParams, Rung};
 use bellwether_bench::harness::{run_all, DuckDbMode, RunOptions, ScanFault};
+use bellwether_bench::market::{
+    generate_market, parse_ymd, MarketParams, MarketRung, MarketSummary,
+};
 use bellwether_bench::report::write_report;
 use bellwether_bench::results::Results;
 use bellwether_bench::slo::{assert_slo, Mode};
@@ -44,6 +47,8 @@ pub(crate) enum BenchCommand {
         #[arg(long)]
         results: PathBuf,
     },
+    /// Write the synthetic bitemporal market trade corpus, workload, and ground truth.
+    Market(MarketArgs),
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -54,6 +59,52 @@ pub(crate) enum RungArg {
     Medium,
     /// 30 days, 960 files, 10,000,000 entities.
     Large,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+pub(crate) enum MarketRungArg {
+    /// 50 symbols × 10 days, 2 files/day, 500 rows/row group, 200 prints/symbol/day.
+    Small,
+    /// 200 symbols × 30 days, 4 files/day, 2,000 rows/row group, 300 prints/symbol/day.
+    Medium,
+}
+
+#[derive(Args)]
+pub(crate) struct MarketArgs {
+    /// Output directory for the market corpus (`data/` and `workload/`).
+    #[arg(long)]
+    out: PathBuf,
+    /// A preset rung (`small` or `medium`); sets default corpus parameters
+    /// (individual flags still override when given).
+    #[arg(long, value_enum)]
+    rung: Option<MarketRungArg>,
+    /// RNG seed.
+    #[arg(long)]
+    seed: Option<u64>,
+    /// Number of symbols (`S0001..`).
+    #[arg(long)]
+    symbols: Option<u32>,
+    /// Number of partition days.
+    #[arg(long)]
+    days: Option<u32>,
+    /// First partition date (`YYYY-MM-DD`).
+    #[arg(long)]
+    start: Option<String>,
+    /// Parquet files per day partition.
+    #[arg(long)]
+    files_per_day: Option<u32>,
+    /// Target rows per row group.
+    #[arg(long)]
+    rows_per_row_group: Option<u32>,
+    /// Base prints per symbol per day.
+    #[arg(long)]
+    prints_per_symbol_per_day: Option<u32>,
+    /// Fraction of on-time prints that also produce a corrected restatement row 1–3 days later.
+    #[arg(long)]
+    restatement_fraction: Option<f64>,
+    /// Fraction of base prints that arrive 1–3 days late.
+    #[arg(long)]
+    late_fraction: Option<f64>,
 }
 
 #[derive(Args)]
@@ -148,6 +199,9 @@ pub(crate) struct Wrote {
     pub blake3: Option<Hash>,
     /// SLO checks that failed (`assert-slo` only).
     pub failed: Vec<String>,
+    /// Market corpus summary (`market` only).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub market: Option<MarketSummary>,
 }
 
 fn bench_err(e: &bellwether_bench::BenchError) -> Error {
@@ -166,7 +220,7 @@ fn file_hash(path: &Path) -> Result<Option<Hash>, Error> {
 
 /// Runs one benchmark subcommand. Returns what it wrote.
 pub(crate) fn run(cmd: &BenchCommand) -> Result<Wrote, Error> {
-    let (what, path, failed) = match cmd {
+    let (what, path, failed, market) = match cmd {
         BenchCommand::Generate(a) => {
             let params = match a.rung {
                 Some(RungArg::Small) => GenParams::rung(Rung::Small),
@@ -186,7 +240,7 @@ pub(crate) fn run(cmd: &BenchCommand) -> Result<Wrote, Error> {
             };
             params.validate().map_err(|e| bench_err(&e))?;
             bellwether_bench::generate::generate(&params, &a.out).map_err(|e| bench_err(&e))?;
-            ("corpus", a.out.join("corpus.json"), Vec::new())
+            ("corpus", a.out.join("corpus.json"), Vec::new(), None)
         }
         BenchCommand::Workload(a) => {
             let params = if a.preregistered {
@@ -201,11 +255,16 @@ pub(crate) fn run(cmd: &BenchCommand) -> Result<Wrote, Error> {
                 }
             };
             generate_workload(&a.corpus, &params).map_err(|e| bench_err(&e))?;
-            ("workload", a.corpus.join("workload.json"), Vec::new())
+            ("workload", a.corpus.join("workload.json"), Vec::new(), None)
         }
         BenchCommand::GroundTruth { corpus } => {
             write_ground_truth(corpus).map_err(|e| bench_err(&e))?;
-            ("ground truth", corpus.join("expected.json"), Vec::new())
+            (
+                "ground truth",
+                corpus.join("expected.json"),
+                Vec::new(),
+                None,
+            )
         }
         BenchCommand::Run(a) => {
             let roots: Vec<&Path> = a.corpus.iter().map(PathBuf::as_path).collect();
@@ -219,11 +278,11 @@ pub(crate) fn run(cmd: &BenchCommand) -> Result<Wrote, Error> {
                 fault: ScanFault::None,
             };
             run_all(&roots, &a.out, &options).map_err(|e| bench_err(&e))?;
-            ("results", a.out.clone(), Vec::new())
+            ("results", a.out.clone(), Vec::new(), None)
         }
         BenchCommand::Report { results, out } => {
             write_report(results, out).map_err(|e| bench_err(&e))?;
-            ("report", out.clone(), Vec::new())
+            ("report", out.clone(), Vec::new(), None)
         }
         BenchCommand::AssertSlo { results } => {
             let bytes = std::fs::read(results)
@@ -233,13 +292,70 @@ pub(crate) fn run(cmd: &BenchCommand) -> Result<Wrote, Error> {
                 Ok(_) => Vec::new(),
                 Err(e) => vec![e.to_string()],
             };
-            ("slo", results.clone(), failed)
+            ("slo", results.clone(), failed, None)
         }
+        BenchCommand::Market(a) => return market(a),
     };
     Ok(Wrote {
         what,
         path: path.display().to_string(),
         blake3: file_hash(&path)?,
         failed,
+        market,
+    })
+}
+
+/// `bench market`: the rung's parameters, each flag given overriding one.
+fn market(a: &MarketArgs) -> Result<Wrote, Error> {
+    let mut params = match a.rung.unwrap_or(MarketRungArg::Small) {
+        MarketRungArg::Small => MarketParams::rung(MarketRung::Small),
+        MarketRungArg::Medium => MarketParams::rung(MarketRung::Medium),
+    };
+    if let Some(v) = a.seed {
+        params.seed = v;
+    }
+    if let Some(v) = a.symbols {
+        params.symbols = v;
+    }
+    if let Some(v) = a.days {
+        params.days = v;
+    }
+    if let Some(s) = &a.start {
+        params.start = parse_ymd(s).map_err(|e| bench_err(&e))?;
+    }
+    if let Some(v) = a.files_per_day {
+        params.files_per_day = v;
+    }
+    if let Some(v) = a.rows_per_row_group {
+        params.rows_per_row_group = v;
+    }
+    if let Some(v) = a.prints_per_symbol_per_day {
+        params.prints_per_symbol_per_day = v;
+    }
+    if let Some(v) = a.restatement_fraction {
+        params.restatement_fraction = v;
+    }
+    if let Some(v) = a.late_fraction {
+        params.late_fraction = v;
+    }
+    params.validate().map_err(|e| bench_err(&e))?;
+    let summary = generate_market(&a.out, &params).map_err(|e| bench_err(&e))?;
+    let where_summary = format!(
+        "{} ({} files, {} row groups, {} rows, {} restatements, {} late prints, {} bytes)",
+        a.out.display(),
+        summary.files,
+        summary.row_groups,
+        summary.rows,
+        summary.restatements,
+        summary.late_prints,
+        summary.bytes,
+    );
+    let truth_path = a.out.join("workload").join("truth.json");
+    Ok(Wrote {
+        what: "market corpus",
+        path: where_summary,
+        blake3: file_hash(&truth_path)?,
+        failed: Vec::new(),
+        market: Some(summary),
     })
 }

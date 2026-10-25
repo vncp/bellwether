@@ -110,25 +110,105 @@ pub(crate) fn index(r: &IndexResult, out: &Out) -> String {
         num(r.segments)
     );
     let labels: Vec<String> = r.specs.iter().map(|x| label(&x.spec)).collect();
-    let w = label_width(labels.iter().map(String::as_str), MIN_SPEC_LABEL);
-    let _ = writeln!(s, "\n  {:<w$} {:>14}", "key spec", "complete at");
+    let w = label_width(
+        labels
+            .iter()
+            .map(String::as_str)
+            .chain(r.sidecars.iter().map(|sc| sc.sidecar.as_str())),
+        MIN_SPEC_LABEL,
+    );
+    let heading = if r.sidecars.is_empty() {
+        "key spec"
+    } else {
+        "key spec or sidecar"
+    };
+    let _ = writeln!(s, "\n  {heading:<w$} {:>14}", "complete at");
     for (spec, name) in r.specs.iter().zip(&labels) {
         let at = spec
             .complete_at
             .map_or_else(|| "incomplete".to_string(), |n| n.to_string());
         let _ = writeln!(s, "  {name:<w$} {at:>14}");
     }
+    for sc in &r.sidecars {
+        let at = sc
+            .complete_at
+            .map_or_else(|| "incomplete".to_string(), |n| n.to_string());
+        let _ = writeln!(s, "  {:<w$} {at:>14}", sc.sidecar);
+    }
+    if !r.unknown_segment_kinds.is_empty() {
+        let _ = writeln!(
+            s,
+            "\n  segments of kinds this binary does not know ({}) are kept unchanged and not \
+             used; a newer bellwether reads them",
+            r.unknown_segment_kinds.join(", ")
+        );
+    }
     let _ = writeln!(s, "\nmanifest {}", r.manifest);
     s
 }
 
-pub(crate) fn plan(r: &PlanResult, out: &Out) -> String {
-    let mut s = String::new();
-    let what = match &r.lookup {
+/// What a plan looked up, for its heading.
+fn lookup_label(lookup: &LookupKind) -> String {
+    match lookup {
         LookupKind::Locate => "locate".to_string(),
         LookupKind::Latest => "latest".to_string(),
         LookupKind::Asof { at, ts, ts_column } => format!("asof {at} ({ts_column} = {ts})"),
-    };
+        LookupKind::Window {
+            from,
+            to,
+            lo,
+            hi,
+            ts_column,
+        } => format!("locate {ts_column} in [{from}, {to}] ({lo}..={hi})"),
+        LookupKind::Lookback {
+            at,
+            lookback,
+            lookback_seconds,
+            end,
+            lo,
+            ts_column,
+        } => {
+            let span = match lookback_seconds {
+                Some(secs) => format!(
+                    "{lookback} = {} calendar seconds",
+                    num(u64::try_from(*secs).unwrap_or(0))
+                ),
+                None => format!("{lookback} in {ts_column}'s unit"),
+            };
+            match (at, end, lo) {
+                (Some(at), Some(e), Some(l)) => {
+                    format!("lookback {span} on {ts_column}, ending at {at} ({l}..={e})")
+                }
+                _ => format!(
+                    "lookback {span} on {ts_column}, each key's window ending at its own newest \
+                     {ts_column}"
+                ),
+            }
+        }
+        LookupKind::Bitemporal {
+            valid,
+            known,
+            valid_ts,
+            known_ts,
+            valid_column,
+            known_column,
+        } => {
+            let bound = |given: &Option<String>, ts: &Option<i64>, column: &str| match (given, ts) {
+                (Some(g), Some(t)) => format!("{column} <= {g} ({t})"),
+                _ => format!("{column} unbounded"),
+            };
+            format!(
+                "bitemporal {}, {}",
+                bound(valid, valid_ts, valid_column),
+                bound(known, known_ts, known_column)
+            )
+        }
+    }
+}
+
+pub(crate) fn plan(r: &PlanResult, out: &Out) -> String {
+    let mut s = String::new();
+    let what = lookup_label(&r.lookup);
     let _ = writeln!(
         s,
         "{}",
@@ -181,9 +261,31 @@ pub(crate) fn plan(r: &PlanResult, out: &Out) -> String {
             specs.join(", ")
         }
     );
+    if !r.sidecars.is_empty() {
+        let _ = writeln!(s, "  sidecars: {}", r.sidecars.join(", "));
+    }
+    if let Some(c) = &r.path_values {
+        let _ = writeln!(
+            s,
+            "  path values: {c} comes from each file's path, so files outside the window are \
+             skipped without reading them"
+        );
+    }
     if !r.excluded_incomplete.is_empty() {
         let ex: Vec<String> = r.excluded_incomplete.iter().map(label).collect();
         let _ = writeln!(s, "  not used, incomplete: {}", ex.join(", "));
+    }
+    match (&r.ordered_by, &r.unordered_reason) {
+        (Some(c), _) => {
+            let _ = writeln!(
+                s,
+                "  order: by {c} (each row group's minimum, files below in reading order)"
+            );
+        }
+        (None, Some(why)) => {
+            let _ = writeln!(s, "  order: unspecified; {why}");
+        }
+        (None, None) => {}
     }
     if let Record::Evidence(e) = &r.evidence.record {
         if let EvidenceBody::Plan { plan } = &e.body {
@@ -309,9 +411,10 @@ pub(crate) fn why(r: &bellwether::WhyReport, out: &Out) -> String {
     let rows = format!("{} rows", num(r.dataset.rows));
     let kind_label = r.workload.as_ref().and_then(|w| {
         let kind = match &w.lookup {
-            None | Some(LookupKind::Locate) => return None,
             Some(LookupKind::Latest) => "latest".to_string(),
             Some(LookupKind::Asof { at, .. }) => format!("asof {at}"),
+            // `why` prices locate (in a window or not), latest, or asof.
+            _ => return None,
         };
         Some(match &w.lookback {
             Some(l) => format!("{kind}, lookback {}", l.given),
@@ -340,6 +443,14 @@ pub(crate) fn why(r: &bellwether::WhyReport, out: &Out) -> String {
                     num(w.keys_p50_p95_max[2])
                 );
             }
+        }
+        for win in &w.windows {
+            let _ = writeln!(
+                s,
+                "  window: rows with {} in {}..={} (the column's unit); every cost below plans \
+                 that window",
+                win.ts_column, win.lo, win.hi
+            );
         }
         let labels: Vec<String> = r.candidates.iter().map(|c| label(&c.spec)).collect();
         let w_col = label_width(labels.iter().map(String::as_str), MIN_FUNNEL_LABEL);
@@ -375,8 +486,16 @@ pub(crate) fn why(r: &bellwether::WhyReport, out: &Out) -> String {
                 (CandidateOrigin::Workload, _, Some(_)) => {
                     notes.push("floor (locate): only row groups holding a key".to_string());
                 }
-                (CandidateOrigin::Workload, _, None) => {
+                (CandidateOrigin::Workload, _, None) if w.windows.is_empty() => {
                     notes.push("floor: only row groups holding a key".to_string());
+                }
+                (CandidateOrigin::Workload, _, None) => {
+                    notes.push("exact key on the run's columns".to_string());
+                }
+                (CandidateOrigin::Window, _, _) => {
+                    notes.push(
+                        "version chains: only row groups with a version in the window".to_string(),
+                    );
                 }
                 (CandidateOrigin::Profile, _, _) => {
                     notes.push("profile candidate".to_string());
@@ -422,9 +541,15 @@ pub(crate) fn why(r: &bellwether::WhyReport, out: &Out) -> String {
             CulpritReason::Lint {
                 rule, confidence, ..
             } => format!("lint {rule} (confidence {confidence:.2})"),
-            CulpritReason::NoIndexServes => {
-                "no index serves this lookup, so it reads every row group".to_string()
-            }
+            CulpritReason::NoIndexServes => match r.current {
+                Some(cur) if cur.row_groups < r.dataset.row_groups => format!(
+                    "no key index serves this lookup; only the time window narrows it, to {} of \
+                     {} row groups",
+                    num(cur.row_groups),
+                    num(r.dataset.row_groups)
+                ),
+                _ => "no index serves this lookup, so it reads every row group".to_string(),
+            },
             CulpritReason::Layout {
                 least_row_groups,
                 row_groups,

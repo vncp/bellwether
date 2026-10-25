@@ -220,7 +220,7 @@ pub(crate) fn widen_zero_bounds(lo: &[u8], hi: &[u8]) -> (Vec<u8>, Vec<u8>) {
 /// `ts_value_as` reports it, under the timestamp column's dataset type: a
 /// timestamp or time in the column's unit, days for `Date32`, milliseconds
 /// for `Date64`, or the integer itself for an integer column.
-pub(crate) fn encode_ts(ts: i64, declared: &DataType) -> Result<Vec<u8>> {
+pub fn encode_ts(ts: i64, declared: &DataType) -> Result<Vec<u8>> {
     let value = match declared {
         DataType::Timestamp(unit, _) => Value::Timestamp {
             value: ts,

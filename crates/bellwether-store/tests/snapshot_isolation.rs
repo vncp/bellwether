@@ -22,6 +22,7 @@ fn segment(staged: &mut StagedSegments, n: u32) -> SegmentRef {
     let id = staged.stage(Bytes::from(body));
     SegmentRef {
         id,
+        kind: None,
         key_spec: "exact:id".into(),
         rowgroup_range: RowGroupRange::new(n, n + 1),
         bytes: 64 * 1024,

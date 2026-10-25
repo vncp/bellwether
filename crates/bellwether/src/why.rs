@@ -13,7 +13,7 @@ use bellwether_core::encoding::check_ts_type;
 use bellwether_profile::{ProfileOptions, ProfileReport};
 use bellwether_replay::{
     proposed_specs, record_bench_workload, servable, serves_query, KeyInput, Lookup, Replayer,
-    RunQuery, Workload, WorkloadRecorder, QUERY_KIND_LOCATE,
+    RunQuery, RunWindow, Workload, WorkloadRecorder, QUERY_KIND_LOCATE,
 };
 use bellwether_store::{Cache, ObjectStoreBackend, StoreExt};
 use bellwether_types::{
@@ -21,10 +21,12 @@ use bellwether_types::{
 };
 use serde::{Deserialize, Serialize};
 
-use crate::engine::{folder_changes, guard, schema_hint, Engine, Pinned};
-use crate::index::{instant_in_unit, lookback_in_unit};
+use crate::engine::{folder_changes, guard, schema_hint, Engine, Pinned, SnapshotFiles};
+use crate::index::{instant_in_unit, no_time_column};
 use crate::keys::KeyFile;
-use crate::results::{total, Cost, Lookback, LookupKind, Written};
+use crate::lookback::Lookback;
+use crate::results::{total, Cost, LookbackWindow, LookupKind, Written};
+use crate::spec::label;
 
 /// Who the engine's own candidate proposals are by.
 pub const ENGINE_PROPOSER: &str = "engine";
@@ -37,6 +39,17 @@ pub const RESERVED_PROPOSERS: &[&str] = &[ENGINE_PROPOSER];
 /// Default cap on the profile's candidates `why` replays beyond the
 /// workload's own key columns.
 pub const DEFAULT_MAX_CANDIDATES: usize = 8;
+
+/// A time window the runs `why` records look their keys up in
+/// (`--window FROM..TO`): both ends inclusive, each an RFC 3339 instant, a
+/// date, or an integer in the time column's unit.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TimeWindow {
+    /// The start as given.
+    pub from: String,
+    /// The end as given.
+    pub to: String,
+}
 
 /// The share of the row groups a workload's runs span that every priced
 /// configuration, the floor included, must read for `why` to name the
@@ -107,6 +120,19 @@ pub struct WhyRequest {
     /// column.
     #[serde(default)]
     pub lookback: Option<String>,
+    /// Record the runs of `keys` or `bench_workload` as window runs: each
+    /// looks its keys up in this window, and every cost is the window's
+    /// plan (pruned by the time column as `locate --window` is). Prices
+    /// `locate` lookups only; a lookback on `latest` or `asof` is
+    /// `lookback`.
+    pub window: Option<TimeWindow>,
+    /// The window's time column; `None` takes the one a window lookup
+    /// would ([`crate::Engine::locate_window`]). With `at` and `lookback`
+    /// instead of `window`, it is the column `asof --at --lookback --ts`
+    /// plans on: the run is recorded as the window `[at − lookback, at]`
+    /// on it, measured in its unit, so it must be `latest_by` too
+    /// ([`WhyRequest::asof_window_column`]).
+    pub ts_column: Option<String>,
     /// Candidate key columns for the profile; `None` selects every id-like
     /// column.
     pub columns: Option<Vec<String>>,
@@ -125,6 +151,8 @@ impl Default for WhyRequest {
             latest_by: None,
             at: None,
             lookback: None,
+            window: None,
+            ts_column: None,
             columns: None,
             max_candidates: DEFAULT_MAX_CANDIDATES,
         }
@@ -132,6 +160,17 @@ impl Default for WhyRequest {
 }
 
 impl WhyRequest {
+    /// The time column named for an `asof` lookback (`ts_column` with `at`
+    /// and `lookback` and no `window`): the run is priced as the window
+    /// `asof --at --lookback --ts` plans, recorded as a window run.
+    #[must_use]
+    pub fn asof_window_column(&self) -> Option<&str> {
+        match (&self.window, &self.at, &self.lookback, &self.ts_column) {
+            (None, Some(_), Some(_), Some(c)) => Some(c),
+            _ => None,
+        }
+    }
+
     /// The lookup this request prices: `mode`, or the one `at` and
     /// `latest_by` imply. An inconsistent combination (`latest` or `asof`
     /// without `latest_by`, `asof` without `at`, `latest` with `at`,
@@ -141,18 +180,7 @@ impl WhyRequest {
     /// can tell a usage error from an engine failure before any work.
     pub fn lookup_mode(&self) -> std::result::Result<LookupMode, String> {
         if let Some(l) = &self.lookback {
-            let l = l.trim();
-            let digits = l.trim_end_matches(['s', 'm', 'h', 'd', 'w']);
-            if digits.is_empty()
-                || !digits.bytes().all(|b| b.is_ascii_digit())
-                || l.len() > digits.len() + 1
-            {
-                return Err(format!(
-                    "--lookback {l:?} is not a whole number with a unit; write for example \
-                     --lookback 252d (units: s, m, h, d, w; calendar time, not trading days), or \
-                     a bare integer for an integer timestamp column"
-                ));
-            }
+            Lookback::parse(l).map_err(|e| e.to_string())?;
         }
         let inferred = if self.at.is_some() {
             LookupMode::Asof
@@ -239,13 +267,16 @@ pub struct WorkloadInfo {
     /// recorded window workload). Absent (`None`, omitted in JSON) for
     /// lookups of one version per key.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub lookback: Option<Lookback>,
+    pub lookback: Option<LookbackWindow>,
     /// The distinct key-column sets the runs look up by.
     pub columns: Vec<Vec<String>>,
     /// Distinct keys per run at nearest-rank p50, p95, max.
     pub keys_p50_p95_max: [u64; 3],
     /// Input rows dropped because their tuple held a null (ADR 014).
     pub null_tuples: u64,
+    /// The distinct windows of its window runs, in the time column's unit
+    /// (empty when every run is a plain key lookup).
+    pub windows: Vec<RunWindow>,
 }
 
 /// The whole dataset, from footer statistics: the replay crate's catalog
@@ -270,6 +301,10 @@ pub enum CandidateOrigin {
     /// the row groups that hold a queried key, the least any row-group
     /// index can read for these runs (the floor).
     Workload,
+    /// A temporal key on a window run's key columns and its window's time
+    /// column: its version chains keep only the row groups holding a
+    /// version of a key inside the window.
+    Window,
     /// A column or composite the profile measured that serves the workload.
     Profile,
 }
@@ -315,7 +350,7 @@ pub struct Recommendation {
     /// The lookback window of a `latest` or `asof` lookup, when priced with
     /// `--lookback`. Absent (`None`, omitted in JSON) otherwise.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub lookback: Option<Lookback>,
+    pub lookback: Option<LookbackWindow>,
     /// Summed over runs, under the current configuration.
     pub current: Cost,
     /// Summed over runs, with this key.
@@ -467,37 +502,21 @@ impl Engine {
     }
 
     fn why_inner(&self, req: &WhyRequest) -> Result<WhyReport> {
-        let given = [
-            req.keys.is_some(),
-            req.bench_workload.is_some(),
-            req.workload.is_some(),
-        ];
-        if given.iter().filter(|g| **g).count() > 1 {
-            return Err(Error::InvalidArgument {
-                field: "workload",
-                reason: "give one workload: a key file, a bench workload directory, or a \
-                         recorded workload hash, not several"
-                    .into(),
-            });
-        }
-        if let Some(cols) = &req.columns {
-            self.check_columns(&cols.iter().collect::<Vec<_>>())?;
-        }
-        let mode = req.lookup_mode().map_err(Error::KeySpec)?;
-        if mode != LookupMode::Locate && req.keys.is_none() && req.workload.is_none() {
-            return Err(Error::KeySpec(
-                "--latest-by prices a workload's keys under latest or asof lookups; pass --from \
-                 <keys.parquet> (or --workload <hash>)"
-                    .into(),
-            ));
-        }
+        let has_workload = self.check_why_request(req)?;
         let pinned = self.pin()?;
-        let source = self.source(pinned.as_ref())?;
+        let folder = self.source(pinned.as_ref())?;
+        // Pinned to an earlier manifest: the dataset is exactly the files
+        // that manifest recorded, for the profile as for the replay.
+        let source: Box<dyn bellwether_types::Source> = match (&pinned, self.options().at_manifest)
+        {
+            (Some(p), Some(_)) => Box::new(SnapshotFiles::new(folder, p.manifest())),
+            _ => folder,
+        };
         let sequence = pinned.as_ref().map_or(0, Pinned::sequence);
         let current_specs = pinned.as_ref().map(|p| p.specs().0).unwrap_or_default();
         let replayer = match &pinned {
             Some(p) => Replayer::for_snapshot(&*source, &p.snapshot)?,
-            None => Replayer::unindexed(&*source, self.root())?,
+            None => Replayer::unindexed(&*source, self.root(), &self.partitioning(None)?)?,
         };
         let resolved_temporal = resolve_temporal(req, replayer.schema())?;
         let catalog = replayer.catalog();
@@ -509,7 +528,10 @@ impl Engine {
             bytes: catalog.bytes_total(),
         };
         let mut untracked = Vec::new();
-        if let Some(p) = &pinned {
+        if let Some(p) = pinned
+            .as_ref()
+            .filter(|_| self.options().at_manifest.is_none())
+        {
             for fp in folder_changes(self.root(), p, self.format(), &self.excluded())?.untracked {
                 for rg in source.row_groups(&fp)? {
                     dataset.row_groups += 1;
@@ -520,7 +542,6 @@ impl Engine {
                 untracked.push(fp.path);
             }
         }
-        let has_workload = given.iter().any(|g| *g);
         let (profile, evidence) = self.profile(req, &*source, pinned.as_ref(), has_workload)?;
         let mut report = WhyReport {
             root: self.root().to_string(),
@@ -541,7 +562,7 @@ impl Engine {
         let workload = if has_workload {
             let cache = self.cache()?;
             let (workload, temporal) =
-                self.record_workload(req, &replayer, &cache, resolved_temporal)?;
+                self.record_workload(req, pinned.as_ref(), &replayer, &cache, resolved_temporal)?;
             self.replay_candidates(
                 &mut report,
                 &replayer,
@@ -561,6 +582,78 @@ impl Engine {
         Ok(report)
     }
 
+    /// Refuses a `why` request whose flags contradict each other, before any
+    /// work. Returns whether it carries a workload.
+    fn check_why_request(&self, req: &WhyRequest) -> Result<bool> {
+        let given = [
+            req.keys.is_some(),
+            req.bench_workload.is_some(),
+            req.workload.is_some(),
+        ];
+        if given.iter().filter(|g| **g).count() > 1 {
+            return Err(Error::InvalidArgument {
+                field: "workload",
+                reason: "give one workload: a key file, a bench workload directory, or a \
+                         recorded workload hash, not several"
+                    .into(),
+            });
+        }
+        if let Some(cols) = &req.columns {
+            self.check_columns(&cols.iter().collect::<Vec<_>>())?;
+        }
+        let mode = req.lookup_mode().map_err(Error::KeySpec)?;
+        if req.window.is_some() && !(given[0] || given[1]) {
+            return Err(Error::Other(
+                "a window (--window) applies to the runs why records: give a key file (--from) or \
+                 a bench workload (--bench-workload); a recorded workload (--workload) keeps the \
+                 windows it was recorded with"
+                    .into(),
+            ));
+        }
+        if req.window.is_some() && mode != LookupMode::Locate {
+            return Err(Error::KeySpec(
+                "--window prices point lookups in a time window; a latest or asof lookup takes a \
+                 lookback instead: pass --latest-by <column> --lookback <length> (and --at \
+                 <instant> for asof) without --window"
+                    .into(),
+            ));
+        }
+        if let Some(ts) = req.asof_window_column() {
+            if req.keys.is_none() {
+                return Err(Error::Other(
+                    "--ts with --at and --lookback records the key file's run as that window: \
+                     give a key file (--from); a recorded workload (--workload) is priced as it \
+                     was recorded"
+                        .into(),
+                ));
+            }
+            if req.latest_by.as_deref().map(str::trim) != Some(ts.trim()) {
+                return Err(Error::InvalidArgument {
+                    field: "latest_by",
+                    reason: format!(
+                        "--ts {ts} plans the window on {ts}, so --at and --lookback are measured \
+                         in its unit, as `bellwether asof --ts {ts}` measures them; pass \
+                         --latest-by {ts} --ts {ts}"
+                    ),
+                });
+            }
+        } else if let (None, Some(ts)) = (&req.window, &req.ts_column) {
+            return Err(Error::Other(format!(
+                "--ts names a window's time column; give the window too (--window), or price \
+                 `asof --at --lookback --ts {ts}` with --latest-by {ts} --at <instant> \
+                 --lookback <length>"
+            )));
+        }
+        if mode != LookupMode::Locate && req.keys.is_none() && req.workload.is_none() {
+            return Err(Error::KeySpec(
+                "--latest-by prices a workload's keys under latest or asof lookups; pass --from \
+                 <keys.parquet> (or --workload <hash>)"
+                    .into(),
+            ));
+        }
+        Ok(given.iter().any(|g| *g))
+    }
+
     /// Profiles the data root and builds its Evidence, recording it when the
     /// index location is writable. With a workload, an unwritable location
     /// is refused (the store's one-line error naming `--index`), since the
@@ -577,18 +670,29 @@ impl Engine {
         } else {
             self.writable_store().map(Arc::clone)
         };
-        let store = if let Some(s) = &writable {
-            Arc::clone(s)
-        } else {
-            // Profile in memory, with the index's manifest when it can be
-            // read, so a read-only index still informs the lints.
-            let memory = Arc::new(ObjectStoreBackend::memory()?);
-            if let Some(existing) = self.existing_store().ok().flatten() {
-                if let Some((bytes, _)) = existing.get_opt("manifest.json")? {
-                    memory.put_if_absent("manifest.json", bytes)?;
-                }
+        let store = match (
+            &writable,
+            pinned.filter(|_| self.options().at_manifest.is_some()),
+        ) {
+            // Pinned to an earlier manifest: the profile reads that
+            // manifest, in memory, so its lints see the specs it declared.
+            (_, Some(p)) => {
+                let memory = Arc::new(ObjectStoreBackend::memory()?);
+                memory.put_if_absent("manifest.json", p.bytes.clone())?;
+                memory
             }
-            memory
+            (Some(s), None) => Arc::clone(s),
+            (None, None) => {
+                // Profile in memory, with the index's manifest when it can
+                // be read, so a read-only index still informs the lints.
+                let memory = Arc::new(ObjectStoreBackend::memory()?);
+                if let Some(existing) = self.existing_store().ok().flatten() {
+                    if let Some((bytes, _)) = existing.get_opt("manifest.json")? {
+                        memory.put_if_absent("manifest.json", bytes)?;
+                    }
+                }
+                memory
+            }
         };
         let mut options = ProfileOptions::for_source(&self.source_config(pinned)?);
         options.columns.clone_from(&req.columns);
@@ -651,6 +755,7 @@ impl Engine {
     fn record_workload(
         &self,
         req: &WhyRequest,
+        pinned: Option<&Pinned>,
         replayer: &Replayer<'_>,
         cache: &Cache<ObjectStoreBackend>,
         resolved: Option<ResolvedTemporal>,
@@ -697,7 +802,7 @@ impl Engine {
             };
             return Ok((w, temporal));
         }
-        let mut recorder = WorkloadRecorder::new(cache, std::sync::Arc::clone(replayer.schema()));
+        let recorder = WorkloadRecorder::new(cache, std::sync::Arc::clone(replayer.schema()));
         if let Some(keys) = &req.keys {
             let batch = keys.read()?;
             if let Some(t) = &resolved {
@@ -711,9 +816,21 @@ impl Engine {
                     }
                 }
             }
-            let query = resolved.as_ref().map_or(RunQuery::Locate, |t| t.query);
+            let columns: Vec<String> = batch
+                .schema()
+                .fields()
+                .iter()
+                .map(|f| f.name().clone())
+                .collect();
+            let mut recorder = self.windowed(recorder, req, pinned, replayer, &columns)?;
+            let query = resolved
+                .as_ref()
+                .map_or(RunQuery::Locate, |t| t.query.clone());
             recorder.record_query("keys", KeyInput::Batch(&batch), query, None)?;
-        } else if let Some(dir) = &req.bench_workload {
+            return Ok((recorder.finish()?, resolved));
+        }
+        let mut recorder = self.windowed(recorder, req, pinned, replayer, &[])?;
+        if let Some(dir) = &req.bench_workload {
             let file = if dir.is_dir() {
                 dir.join("workload.json")
             } else {
@@ -722,6 +839,82 @@ impl Engine {
             record_bench_workload(&mut recorder, &file).map_err(Error::from)?;
         }
         Ok((recorder.finish()?, resolved))
+    }
+
+    /// `recorder`, recording window runs when the request gives a window:
+    /// its time column (`--ts`, else the one a window lookup on `columns`
+    /// would take) and both bounds in that column's unit. With `--ts`,
+    /// `--at`, and `--lookback` instead, the window is the one `asof --at
+    /// --lookback --ts` plans: `[max(at − lookback, floor), at]` on `--ts`.
+    fn windowed<'r>(
+        &self,
+        recorder: WorkloadRecorder<'r>,
+        req: &WhyRequest,
+        pinned: Option<&Pinned>,
+        replayer: &Replayer<'_>,
+        columns: &[String],
+    ) -> Result<WorkloadRecorder<'r>> {
+        if let (Some(c), Some(at), Some(lookback)) =
+            (req.asof_window_column(), &req.at, &req.lookback)
+        {
+            let ty = replayer
+                .schema()
+                .field_with_name(c)
+                .map_err(|_| {
+                    Error::KeySpec(format!(
+                        "the window's time column {c:?} is not in the dataset; name one with --ts"
+                    ))
+                })?
+                .data_type()
+                .clone();
+            let hi = instant_in_unit("at", at, c, &ty)?;
+            let n = Lookback::parse(lookback)?.in_unit(c, &ty)?;
+            let lo = hi
+                .saturating_sub(n)
+                .max(bellwether_core::encoding::ts_min(&ty)?);
+            return recorder.in_window(RunWindow {
+                ts_column: c.to_string(),
+                lo,
+                hi,
+            });
+        }
+        let Some(window) = &req.window else {
+            return Ok(recorder);
+        };
+        let schema = replayer.schema();
+        let ts_column = if let Some(c) = &req.ts_column {
+            c.clone()
+        } else if let Some(p) = pinned {
+            p.planner
+                .window_column(&p.specs().0, columns)?
+                .ok_or_else(|| no_time_column(columns))?
+        } else {
+            let first = replayer.catalog().files().first().map(|f| f.path.as_str());
+            let partition =
+                bellwether_build::partition_columns(&self.partitioning(None)?, self.root(), first)?;
+            bellwether_build::default_window_column(schema, &[], Vec::new(), partition, columns)?
+                .ok_or_else(|| no_time_column(columns))?
+        };
+        let ty = schema
+            .field_with_name(&ts_column)
+            .map_err(|_| {
+                Error::KeySpec(format!(
+                    "the window's time column {ts_column:?} is not in the dataset; name one with \
+                     --ts"
+                ))
+            })?
+            .data_type()
+            .clone();
+        let TimeWindow { from, to } = window;
+        let lo = instant_in_unit("window", from, &ts_column, &ty)?;
+        let hi = instant_in_unit("window", to, &ts_column, &ty)?;
+        if lo > hi {
+            return Err(Error::Other(format!(
+                "the window starts at {from} ({ts_column} = {lo}) after it ends at {to} ({hi}); \
+                 give the start first"
+            )));
+        }
+        recorder.in_window(RunWindow { ts_column, lo, hi })
     }
 
     // One linear pass: choose the candidates, then write and score each.
@@ -747,6 +940,12 @@ impl Engine {
                 workload.runs().iter().map(|r| r.columns.clone()).collect();
             set.into_iter().collect()
         };
+        let mut windows: Vec<RunWindow> = Vec::new();
+        for w in workload.runs().iter().filter_map(|r| r.window.as_ref()) {
+            if !windows.contains(w) {
+                windows.push(w.clone());
+            }
+        }
         if let Some(t) = &temporal {
             for cols in &run_columns {
                 if cols.contains(&t.ts_column) {
@@ -756,6 +955,7 @@ impl Engine {
                         t.ts_column
                     )));
                 }
+                check_planned_column(replayer, cols, t)?;
             }
         }
         let query_kind = temporal
@@ -775,9 +975,12 @@ impl Engine {
             columns: run_columns.clone(),
             keys_p50_p95_max: workload.keys_p50_p95_max(),
             null_tuples: workload.runs().iter().map(|r| r.null_tuples).sum(),
+            windows,
         });
-        let current_names: BTreeSet<String> =
-            report.current_specs.iter().map(KeySpec::name).collect();
+        // Candidates are told apart by their full spec, time column included,
+        // so `temporal:symbol@day` is offered beside a current
+        // `temporal:symbol@ts`.
+        let current_names: BTreeSet<String> = report.current_specs.iter().map(label).collect();
         // How a measured key serves the workload: by point lookup on some
         // run, only by prefix of a run's columns, or not at all. A key that
         // serves only by prefix is a composite led by a run's whole key, so
@@ -798,15 +1001,39 @@ impl Engine {
                     columns: c.clone(),
                     ts_column: t.ts_column.clone(),
                 };
-                if !current_names.contains(&spec.name()) && names.insert(spec.name()) {
+                if !current_names.contains(&label(&spec)) && names.insert(label(&spec)) {
                     chosen.push((spec, CandidateOrigin::Workload));
                 }
             }
         }
         for c in &run_columns {
             let spec = KeySpec::Exact { columns: c.clone() };
-            if !current_names.contains(&spec.name()) && names.insert(spec.name()) {
+            if !current_names.contains(&label(&spec)) && names.insert(label(&spec)) {
                 chosen.push((spec, CandidateOrigin::Workload));
+            }
+        }
+        // A window run: the temporal key on its key columns and the
+        // window's time column, whose version chains prune by time per key.
+        let windowed: BTreeSet<(Vec<String>, String)> = workload
+            .runs()
+            .iter()
+            .filter_map(|r| {
+                r.window
+                    .as_ref()
+                    .map(|w| (r.columns.clone(), w.ts_column.clone()))
+            })
+            .collect();
+        for (columns, ts_column) in windowed {
+            let orderable = replayer
+                .schema()
+                .field_with_name(&ts_column)
+                .is_ok_and(|f| bellwether_core::encoding::check_ts_type(f.data_type()).is_ok());
+            if !orderable || columns.contains(&ts_column) {
+                continue;
+            }
+            let spec = KeySpec::Temporal { columns, ts_column };
+            if !current_names.contains(&label(&spec)) && names.insert(label(&spec)) {
+                chosen.push((spec, CandidateOrigin::Window));
             }
         }
         let mut from_profile = 0usize;
@@ -816,8 +1043,8 @@ impl Engine {
                 columns: cols.clone(),
             };
             if !serves(&exact_spec) {
-                if !current_names.contains(&exact_spec.name())
-                    && !names.contains(&exact_spec.name())
+                if !current_names.contains(&label(&exact_spec))
+                    && !names.contains(&label(&exact_spec))
                 {
                     report.not_serving.push(exact_spec);
                 }
@@ -832,21 +1059,21 @@ impl Engine {
                         columns: cols.clone(),
                         ts_column: t.ts_column.clone(),
                     };
-                    if !current_names.contains(&tspec.name())
-                        && !names.contains(&tspec.name())
+                    if !current_names.contains(&label(&tspec))
+                        && !names.contains(&label(&tspec))
                         && from_profile < req.max_candidates
                     {
-                        names.insert(tspec.name());
+                        names.insert(label(&tspec));
                         chosen.push((tspec, CandidateOrigin::Profile));
                         from_profile += 1;
                     }
                 }
             }
-            if !current_names.contains(&exact_spec.name())
-                && !names.contains(&exact_spec.name())
+            if !current_names.contains(&label(&exact_spec))
+                && !names.contains(&label(&exact_spec))
                 && from_profile < req.max_candidates
             {
-                names.insert(exact_spec.name());
+                names.insert(label(&exact_spec));
                 chosen.push((exact_spec, CandidateOrigin::Profile));
                 from_profile += 1;
             }
@@ -869,7 +1096,10 @@ impl Engine {
                 // A recorded locate workload replayed with --latest-by: score
                 // against a synthetic temporal view of the same runs, or
                 // score directly when the workload already records the query.
-                let tw = with_query(workload, &temporal.map(|t| t.query).unwrap_or_default())?;
+                let tw = with_query(
+                    workload,
+                    &temporal.map(|t| t.query.clone()).unwrap_or_default(),
+                )?;
                 replayer
                     .record(&ledger, &proposal.hash, &tw, cache, &self.now())
                     .map_err(Error::from)?
@@ -949,11 +1179,13 @@ impl Engine {
 }
 
 /// A run's lookup in words, for refusals: `locate`, `latest`, `asof at 30`,
-/// or either with `, lookback 3600` (in the timestamp column's unit).
+/// either with `, lookback 3600` (in the timestamp column's unit), or
+/// `window 10..=20 of ts`.
 fn describe(q: &RunQuery) -> String {
-    let base = match q.asof_ts() {
-        Some(ts) => format!("asof at {ts}"),
-        None => q.kind_str().to_string(),
+    let base = match (q.asof_ts(), q.window()) {
+        (Some(ts), _) => format!("asof at {ts}"),
+        (None, Some(w)) => format!("window {}..={} of {}", w.lo, w.hi, w.ts_column),
+        (None, None) => q.kind_str().to_string(),
     };
     match q.lookback() {
         Some(l) => format!("{base}, lookback {l}"),
@@ -1097,7 +1329,48 @@ struct ResolvedTemporal {
     ts_column: String,
     query: RunQuery,
     lookup: LookupKind,
-    lookback: Option<Lookback>,
+    lookback: Option<LookbackWindow>,
+}
+
+/// Refuses `--latest-by` when the current configuration plans `t`'s lookups
+/// on runs keyed on `cols` by another time column (a serving temporal key's,
+/// or for a lookback the per-key bounds' or window's): `at` and the lookback
+/// are measured in `--latest-by`'s unit, so the prices would not be what the
+/// lookup verb reads. The typed invalid argument `latest_by`, naming both
+/// columns and the flag to pass.
+fn check_planned_column(
+    replayer: &Replayer<'_>,
+    cols: &[String],
+    t: &ResolvedTemporal,
+) -> Result<()> {
+    let current = replayer.current_specs();
+    let Some(planned) = replayer
+        .planned_time_column(current, cols, &t.query)?
+        .filter(|c| *c != t.ts_column)
+    else {
+        return Ok(());
+    };
+    let temporal = current.iter().find(|s| {
+        matches!(s, KeySpec::Temporal { ts_column, .. } if *ts_column == planned)
+            && matches!(servable(s, cols), Some(Lookup::Point { .. }))
+    });
+    let source = match (temporal, &t.query) {
+        (Some(s), _) => format!("its temporal key {}", label(s)),
+        (None, RunQuery::Lookback { asof: None, .. }) => "its per-key bounds".to_string(),
+        (None, _) => "the time column a window on these keys takes".to_string(),
+    };
+    let verb = t.query.kind_str();
+    Err(Error::InvalidArgument {
+        field: "latest_by",
+        reason: format!(
+            "the index plans {verb} lookups on ({}) by {planned} ({source}), not by {}, so \
+             prices measured on {} would not be what `bellwether {verb}` reads; pass \
+             --latest-by {planned}",
+            cols.join(", "),
+            t.ts_column,
+            t.ts_column
+        ),
+    })
 }
 
 /// Validates `req.latest_by` (with `req.at` and `req.lookback`) against the
@@ -1136,7 +1409,7 @@ fn resolve_temporal(req: &WhyRequest, schema: &Schema) -> Result<Option<Resolved
     let (query, lookup) = match &req.at {
         None => (RunQuery::Latest, LookupKind::Latest),
         Some(at) => {
-            let ts = instant_in_unit(at, ts_column, ts_type)?;
+            let ts = instant_in_unit("at", at, ts_column, ts_type)?;
             (
                 RunQuery::Asof { ts },
                 LookupKind::Asof {
@@ -1149,18 +1422,26 @@ fn resolve_temporal(req: &WhyRequest, schema: &Schema) -> Result<Option<Resolved
     };
     let lookback = match &req.lookback {
         None => None,
-        Some(given) => Some(Lookback {
-            given: given.trim().to_string(),
-            length: lookback_in_unit(given, ts_column, ts_type)?,
-        }),
+        Some(given) => {
+            let lb = Lookback::parse(given)?;
+            Some(LookbackWindow {
+                given: lb.as_given().to_string(),
+                length: lb.in_unit(ts_column, ts_type)?,
+            })
+        }
     };
     let query = match &lookback {
         None => query,
-        Some(l) => RunQuery::Window {
+        Some(l) => RunQuery::Lookback {
             asof: query.asof_ts(),
             lookback: l.length,
         },
     };
+    // With --ts, the run is the window `asof --at --lookback --ts` plans,
+    // recorded as a window run (`Engine::windowed`), not a temporal lookup.
+    if req.asof_window_column().is_some() {
+        return Ok(None);
+    }
     Ok(Some(ResolvedTemporal {
         ts_column: ts_column.to_string(),
         query,
@@ -1180,7 +1461,9 @@ fn infer_workload_temporal(
         return Ok(None);
     };
     let query = first.query()?;
-    if matches!(query, RunQuery::Locate) {
+    // A window run reads every row of its keys in a fixed window: no
+    // version is chosen, so there is no temporal lookup to infer.
+    if matches!(query, RunQuery::Locate | RunQuery::Window(_)) {
         return Ok(None);
     }
     let ts_column = current_specs
@@ -1205,7 +1488,7 @@ fn infer_workload_temporal(
             ts_column: ts_column.clone(),
         },
     };
-    let lookback = query.lookback().map(|length| Lookback {
+    let lookback = query.lookback().map(|length| LookbackWindow {
         given: length.to_string(),
         length,
     });

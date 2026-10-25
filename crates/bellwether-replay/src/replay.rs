@@ -59,6 +59,7 @@
 //! lookup touches, and the cached transient indexes (bounded by
 //! [`TransientCache`]'s byte cap).
 
+use std::borrow::Cow;
 use std::ops::Deref;
 use std::sync::Arc;
 
@@ -66,7 +67,7 @@ use arrow::datatypes::{Schema, SchemaRef};
 use bellwether_build::Planner;
 use bellwether_core::segment::validate_spec;
 use bellwether_ledger::{rfc3339::is_rfc3339, Ledger};
-use bellwether_source::FingerprintPolicy;
+use bellwether_source::{FingerprintPolicy, Partitioning};
 use bellwether_store::{Snapshot, StoreExt};
 use bellwether_types::format::RECORD_VERSION;
 use bellwether_types::{
@@ -78,7 +79,9 @@ use crate::catalog::Catalog;
 use crate::error::{ReplayError, ReplayResult};
 use crate::keys::RunKeys;
 use crate::layout::{replay_layout, LayoutModel, LayoutReplay};
-use crate::plan::{run_cost, serves_query, PlanSource, SegmentPlanner};
+use crate::plan::{
+    lookback_window, planned_time_column, run_cost, serves_query, PlanSource, SegmentPlanner,
+};
 use crate::transient::{CacheStats, TransientCache, TransientIndex, TransientLimits};
 use crate::workload::{KeySetSource, RunQuery, Workload};
 
@@ -193,11 +196,18 @@ impl<'a> Replayer<'a> {
     /// A replayer over an unindexed folder (`Catalog::discover`, manifest
     /// version `"0"`, data named by the catalog digest): no current specs,
     /// so every run currently reads every row group, and hypothetical specs
-    /// are built as transient segments.
-    pub fn unindexed(source: &'a dyn Source, root: &str) -> Result<Self> {
+    /// are built as transient segments. `partitioning` is the scheme
+    /// `source` reads `root`'s paths under, so a window on a partition
+    /// column prunes by path as an index would.
+    pub fn unindexed(
+        source: &'a dyn Source,
+        root: &str,
+        partitioning: &Partitioning,
+    ) -> Result<Self> {
         let schema = source.schema(root)?;
         let catalog = Arc::new(Catalog::discover(source, root, schema)?);
-        let planner = SegmentPlanner::new(Arc::clone(&catalog));
+        let planner =
+            SegmentPlanner::new(Arc::clone(&catalog)).with_partitioning(root, partitioning.clone());
         Self::new(source, catalog, Box::new(planner), Vec::new())
     }
 
@@ -276,8 +286,12 @@ impl<'a> Replayer<'a> {
     }
 
     /// The specs of `specs` that serve `keys` under `query`, and the verified
-    /// plan over them (every row group when none serves, or when a temporal
-    /// run has no serving temporal spec).
+    /// plan over them: every row group when none serves, or when a
+    /// temporal run has no time column to plan on
+    /// ([`planned_time_column`]: the serving temporal spec's, else, for a
+    /// lookback, the planner's per-key bounds or window column, as the
+    /// lookup verbs take it). An `asof` lookback run is planned as its
+    /// window on that column.
     fn verified_plan(
         &self,
         planner: &dyn PlanSource,
@@ -286,25 +300,50 @@ impl<'a> Replayer<'a> {
         query: &RunQuery,
     ) -> Result<ScanPlan> {
         check_types(&self.catalog, keys)?;
-        let mut serving: Vec<KeySpec> = specs
-            .iter()
-            .filter(|s| serves_query(s, keys.columns(), query))
-            .cloned()
-            .collect();
-        if !matches!(query, RunQuery::Locate)
-            && !serving
-                .iter()
-                .any(|s| matches!(s, KeySpec::Temporal { .. }))
-        {
-            serving.clear();
-        }
-        let plan = if !matches!(query, RunQuery::Locate) && serving.is_empty() {
-            planner.plan_query(&[], keys, &RunQuery::Locate)?
-        } else {
-            planner.plan_query(&serving, keys, query)?
+        let column = planned_time_column(planner, specs, keys.columns(), query)?;
+        let query = match (query, column) {
+            (
+                RunQuery::Lookback {
+                    asof: Some(at),
+                    lookback,
+                },
+                Some(ts),
+            ) => Some(Cow::Owned(RunQuery::Window(lookback_window(
+                self.catalog.schema(),
+                ts,
+                *at,
+                *lookback,
+            )?))),
+            (q, column) if !q.is_temporal() || column.is_some() => Some(Cow::Borrowed(q)),
+            _ => None,
+        };
+        let plan = match query {
+            Some(q) => {
+                let serving: Vec<KeySpec> = specs
+                    .iter()
+                    .filter(|s| serves_query(s, keys.columns(), &q))
+                    .cloned()
+                    .collect();
+                planner.plan_query(&serving, keys, &q)?
+            }
+            None => planner.plan_query(&[], keys, &RunQuery::Locate)?,
         };
         self.catalog.verify_plan(&plan)?;
         Ok(plan)
+    }
+
+    /// The time column `query` is planned on for a run keyed on
+    /// `run_columns` under `specs` ([`planned_time_column`]), so a caller
+    /// can check that it measures the run's instants and lengths on the
+    /// column the plan uses.
+    pub fn planned_time_column(
+        &self,
+        specs: &[KeySpec],
+        run_columns: &[String],
+        query: &RunQuery,
+    ) -> Result<Option<String>> {
+        let planner = self.planner_for(specs)?;
+        planned_time_column(planner.as_ref(), specs, run_columns, query)
     }
 
     /// The exact cost of one ad hoc `locate` key set under `specs`.
@@ -342,7 +381,8 @@ impl<'a> Replayer<'a> {
     }
 
     /// Every run's exact cost under `specs`, in workload order, each run
-    /// planned under its recorded query kind (`locate`, `latest`, or `asof`).
+    /// planned under its recorded query kind (`locate`, `latest`, `asof`, a
+    /// lookback, or `window`).
     pub fn replay_specs(
         &self,
         specs: &[KeySpec],
@@ -419,7 +459,7 @@ impl<'a> Replayer<'a> {
             .map(|run| {
                 let rk = workload.run_keys(keys, run)?;
                 check_types(&self.catalog, &rk)?;
-                let plan = planner.plan(&rk)?;
+                let plan = planner.plan(&rk, run.window.as_ref())?;
                 self.catalog.verify_plan(&plan)?;
                 Ok(run_cost(&run.run_id, rk.len() as u64, &plan, true))
             })
@@ -461,6 +501,15 @@ impl<'a> Replayer<'a> {
                 (self.replay_specs(&specs, workload, keys)?, None)
             }
             ProposalBody::Layout { cluster_by } => {
+                if let Some(run) = workload.runs().iter().find(|r| r.window.is_some()) {
+                    return Err(Error::Other(format!(
+                        "a layout proposal is priced by a model of key lookups, and run {:?} \
+                         looks its keys up in a time window; score it against a workload of \
+                         locate runs (record one with `bellwether why --from` and no window)",
+                        run.run_id
+                    ))
+                    .into());
+                }
                 let model = LayoutModel::defaults(cluster_by, &self.catalog);
                 let lr = replay_layout(
                     self.source,

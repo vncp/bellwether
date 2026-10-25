@@ -49,7 +49,12 @@ fn exact(c: &[&str]) -> KeySpec {
 fn check_entity_runs(spec: &CorpusSpec, runs: usize, seed: u64) -> usize {
     let corpus = common::write_corpus(spec);
     let source = corpus.source();
-    let replayer = Replayer::unindexed(&source, &corpus.data).unwrap();
+    let replayer = Replayer::unindexed(
+        &source,
+        &corpus.data,
+        &bellwether_source::Partitioning::None,
+    )
+    .unwrap();
     let runs = common::entity_runs(&corpus, runs, seed);
     let (keys, workload) = common::record(&["entity_id"], &runs);
     let bloom = KeySpec::Bloom {
@@ -126,7 +131,12 @@ fn every_spec_family_contains_the_oracle_and_exact_paths_equal_it() {
 fn composite_runs_intersect_single_column_specs_per_key() {
     let corpus = common::write_corpus(&CorpusSpec::default());
     let source = corpus.source();
-    let replayer = Replayer::unindexed(&source, &corpus.data).unwrap();
+    let replayer = Replayer::unindexed(
+        &source,
+        &corpus.data,
+        &bellwether_source::Partitioning::None,
+    )
+    .unwrap();
     // Runs over (entity_id, batch_id): real pairs and recombined ones, so
     // the per-key intersection matters.
     let pairs: Vec<Vec<Val>> = common::distinct_tuples(&corpus, &["entity_id", "batch_id"])
@@ -257,7 +267,12 @@ fn parquet_stats_baseline_equals_an_independent_implementation() {
         ..CorpusSpec::default()
     });
     let source = corpus.source();
-    let replayer = Replayer::unindexed(&source, &corpus.data).unwrap();
+    let replayer = Replayer::unindexed(
+        &source,
+        &corpus.data,
+        &bellwether_source::Partitioning::None,
+    )
+    .unwrap();
     let runs = common::entity_runs(&corpus, 16, 3);
     let (keys, workload) = common::record(&["entity_id"], &runs);
     let stats = replayer

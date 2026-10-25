@@ -81,7 +81,8 @@ fn the_same_data_at_two_paths_gives_equal_costs_and_two_records() {
     let (ledger, proposal, keys, workload) = setup();
     let mut written = Vec::new();
     for folder in [a.data.as_str(), copy.path().to_str().unwrap()] {
-        let replayer = Replayer::unindexed(&source, folder).unwrap();
+        let replayer =
+            Replayer::unindexed(&source, folder, &bellwether_source::Partitioning::None).unwrap();
         let (h, scored) = replayer
             .record(&ledger, &proposal, &workload, &keys, AT)
             .unwrap();
@@ -105,20 +106,28 @@ fn a_folder_before_and_after_a_file_lands_gives_two_records() {
     let corpus = typed::write_corpus(6, 3, 40, 8);
     let source = ParquetSource::new().with_schema(typed::dataset_schema());
     let (ledger, proposal, keys, workload) = setup();
-    let before = Replayer::unindexed(&source, &corpus.data)
-        .unwrap()
-        .record(&ledger, &proposal, &workload, &keys, AT)
-        .unwrap();
+    let before = Replayer::unindexed(
+        &source,
+        &corpus.data,
+        &bellwether_source::Partitioning::None,
+    )
+    .unwrap()
+    .record(&ledger, &proposal, &workload, &keys, AT)
+    .unwrap();
     let extra = typed::write_corpus(6, 3, 40, 9);
     std::fs::copy(
         &extra.files()[0],
         Path::new(&corpus.data).join("part-900.parquet"),
     )
     .unwrap();
-    let after = Replayer::unindexed(&source, &corpus.data)
-        .unwrap()
-        .record(&ledger, &proposal, &workload, &keys, AT)
-        .unwrap();
+    let after = Replayer::unindexed(
+        &source,
+        &corpus.data,
+        &bellwether_source::Partitioning::None,
+    )
+    .unwrap()
+    .record(&ledger, &proposal, &workload, &keys, AT)
+    .unwrap();
     assert_eq!(before.1.replay.manifest_version, "0");
     assert_eq!(after.1.replay.manifest_version, "0");
     assert_ne!(before.1.replay.inputs, after.1.replay.inputs);

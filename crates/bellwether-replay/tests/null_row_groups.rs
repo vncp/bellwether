@@ -119,9 +119,13 @@ fn all_null_row_groups_are_covered_never_selected_and_split_invariant() {
         let name = spec.name();
         let mut by_limits = Vec::new();
         for limits in [TransientLimits::default(), one_per_rg] {
-            let replayer = Replayer::unindexed(&source, &corpus.data)
-                .unwrap()
-                .with_limits(limits);
+            let replayer = Replayer::unindexed(
+                &source,
+                &corpus.data,
+                &bellwether_source::Partitioning::None,
+            )
+            .unwrap()
+            .with_limits(limits);
             let catalog = replayer.catalog();
             let idx = replayer.transient(spec).unwrap();
             assert_eq!(idx.covered(), catalog.all_ids(), "{name}: coverage");
@@ -200,7 +204,12 @@ fn all_null_row_groups_are_covered_never_selected_and_split_invariant() {
 fn a_run_of_only_null_tuples_has_no_keys_and_plans_nothing() {
     let corpus = corpus();
     let source = corpus.source();
-    let replayer = Replayer::unindexed(&source, &corpus.data).unwrap();
+    let replayer = Replayer::unindexed(
+        &source,
+        &corpus.data,
+        &bellwether_source::Partitioning::None,
+    )
+    .unwrap();
     let keys = MemoryKeySets::new();
     let mut rec = WorkloadRecorder::new(&keys, Arc::clone(&corpus.schema));
     let batch = RecordBatch::try_from_iter(vec![(

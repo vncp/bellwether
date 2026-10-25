@@ -28,6 +28,8 @@ pub type Extra = Map<String, Value>;
 
 /// File name of the manifest under an index root.
 pub const MANIFEST_FILE: &str = "manifest.json";
+/// Directory of immutable committed manifest history objects under an index root.
+pub const MANIFESTS_DIR: &str = "manifests";
 /// Directory of immutable segments under an index root.
 pub const SEGMENTS_DIR: &str = "segments";
 /// Directory of the rebuildable cache under an index root.
@@ -48,6 +50,13 @@ pub fn join(root: &str, rel: &str) -> String {
 #[must_use]
 pub fn manifest_path(root: &str) -> String {
     join(root, MANIFEST_FILE)
+}
+
+/// Store path of the immutable history manifest for `sequence` under `root`:
+/// `manifests/<sequence as 20-digit zero-padded decimal>.json`.
+#[must_use]
+pub fn manifest_history_path(root: &str, sequence: u64) -> String {
+    join(root, &format!("{MANIFESTS_DIR}/{sequence:020}.json"))
 }
 
 /// Store path of segment `id` under `root`: `segments/<blake3>.seg`.
@@ -88,6 +97,12 @@ pub struct SourceInfo {
     /// How files are fingerprinted, if configured.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fingerprint_policy: Option<String>,
+    /// Partitioning scheme of the source folder: `"hive"` when `name=value`
+    /// directories are columns (docs/format.md, "Partition columns"), absent
+    /// for none. Added 2026-10-24; a binary that predates it keeps it as an
+    /// unknown field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub partitioning: Option<String>,
     /// Unknown fields (ADR 017).
     #[serde(flatten)]
     pub extra: Extra,
@@ -109,7 +124,46 @@ pub struct ColumnDef {
     pub extra: Extra,
 }
 
-/// Dataset schema and declared key specs.
+/// A sidecar segment declaration in `schema.sidecars`.
+///
+/// Sidecar kinds (such as `"bounds"` or `"temporal2"`) live in a manifest-owned
+/// list rather than `bellwether_types::KeySpec`, so a binary that predates a
+/// sidecar kind can still open the manifest, preserve the declaration on
+/// rewrite, and report the unknown kind via [`Manifest::unknown_segment_kinds`].
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SidecarDecl {
+    /// Sidecar kind, for example `"bounds"` or `"temporal2"`.
+    pub kind: String,
+    /// Key columns in tuple order.
+    #[serde(default)]
+    pub columns: Vec<String>,
+    /// Timestamp column(s) the sidecar indexes over.
+    #[serde(default)]
+    pub time_columns: Vec<String>,
+    /// Unknown fields (ADR 017).
+    #[serde(flatten)]
+    pub extra: Extra,
+}
+
+impl SidecarDecl {
+    /// Canonical sidecar name, stored in [`SegmentRef::key_spec`] for segments
+    /// of this sidecar: `{kind}:{columns joined by ','}@{time_columns joined by ','}`.
+    #[must_use]
+    pub fn name(&self) -> String {
+        format!(
+            "{}:{}@{}",
+            self.kind,
+            self.columns.join(","),
+            self.time_columns.join(",")
+        )
+    }
+}
+
+/// Segment kinds this build understands in [`SegmentRef::kind`] and
+/// [`SidecarDecl::kind`].
+pub const KNOWN_SEGMENT_KINDS: [&str; 2] = ["bounds", "temporal2"];
+
+/// Dataset schema, declared key specs, and declared sidecars.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct SchemaInfo {
     /// Columns in schema order.
@@ -118,6 +172,9 @@ pub struct SchemaInfo {
     /// Declared key specs.
     #[serde(default)]
     pub key_specs: Vec<KeySpec>,
+    /// Declared sidecar specs.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sidecars: Vec<SidecarDecl>,
     /// Unknown fields (ADR 017).
     #[serde(flatten)]
     pub extra: Extra,
@@ -214,7 +271,12 @@ impl RowGroupRange {
 pub struct SegmentRef {
     /// blake3 of the segment bytes; also its file name.
     pub id: Hash,
-    /// Name of the key spec the segment indexes ([`KeySpec::name`]).
+    /// Sidecar segment kind (`"bounds"`, `"temporal2"`, or a future kind), or
+    /// `None` for an ordinary key-spec segment.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    /// Name of the key spec ([`KeySpec::name`]) when `kind` is `None`, or the
+    /// sidecar's [`SidecarDecl::name`] when `kind` is `Some`.
     pub key_spec: String,
     /// Row groups covered.
     pub rowgroup_range: RowGroupRange,
@@ -423,6 +485,47 @@ impl Manifest {
         if !self.references(&seg.id) {
             self.segments.push(seg);
         }
+    }
+
+    /// Sorted distinct kinds appearing in [`Self::segments`] (`kind: Some(_)`)
+    /// or [`SchemaInfo::sidecars`] that are not in [`KNOWN_SEGMENT_KINDS`].
+    #[must_use]
+    pub fn unknown_segment_kinds(&self) -> Vec<String> {
+        let mut out = BTreeSet::new();
+        for seg in &self.segments {
+            if let Some(k) = seg.kind.as_deref() {
+                if !KNOWN_SEGMENT_KINDS.contains(&k) {
+                    out.insert(k.to_string());
+                }
+            }
+        }
+        for decl in &self.schema.sidecars {
+            let k = decl.kind.as_str();
+            if !KNOWN_SEGMENT_KINDS.contains(&k) {
+                out.insert(decl.kind.clone());
+            }
+        }
+        out.into_iter().collect()
+    }
+
+    /// Live ordinary key-spec segments (`kind == None`) for the key spec named
+    /// `name`. Never yields sidecar segments, even if a sidecar's `key_spec`
+    /// string matches `name`.
+    pub fn key_spec_segments<'a>(&'a self, name: &'a str) -> impl Iterator<Item = &'a SegmentRef> {
+        self.segments
+            .iter()
+            .filter(move |s| s.kind.is_none() && s.key_spec == name)
+    }
+
+    /// Live sidecar segments of `kind` for the sidecar named `name`.
+    pub fn sidecar_segments<'a>(
+        &'a self,
+        kind: &'a str,
+        name: &'a str,
+    ) -> impl Iterator<Item = &'a SegmentRef> {
+        self.segments
+            .iter()
+            .filter(move |s| s.kind.as_deref() == Some(kind) && s.key_spec == name)
     }
 }
 
@@ -674,9 +777,186 @@ mod tests {
     }
 
     #[test]
+    fn legacy_manifest_without_kind_or_sidecars_serializes_byte_identically() {
+        let mut m = Manifest::from_slice(WITH_UNKNOWN.as_bytes()).unwrap();
+        assert_eq!(m.schema.sidecars, Vec::<SidecarDecl>::new());
+        assert!(m.segments.iter().all(|s| s.kind.is_none()));
+        assert_eq!(m.unknown_segment_kinds(), Vec::<String>::new());
+        // Clear the synthetic future_* extras to test a plain pre-WP21 manifest.
+        m.extra.clear();
+        m.source.extra.clear();
+        m.schema.extra.clear();
+        m.schema.columns[0].extra.clear();
+        m.rowgroup_space.extra.clear();
+        m.rowgroup_space.files[0].extra.clear();
+        m.rowgroup_space.files[0].chunks.as_mut().unwrap()[0]
+            .extra
+            .clear();
+        m.rowgroup_space.tombstones[0].extra.clear();
+        m.segments[0].extra.clear();
+        m.segments[0].rowgroup_range.extra.clear();
+        m.segment_tombstones[0].extra.clear();
+        m.deleting[0].extra.clear();
+
+        let bytes = m.to_vec().unwrap();
+        let s = std::str::from_utf8(&bytes).unwrap();
+        assert!(
+            !s.contains("\"sidecars\""),
+            "empty sidecars must be omitted"
+        );
+        assert!(
+            !s.contains("\"kind\": \"bounds\"") && !s.contains("\"kind\": null"),
+            "absent SegmentRef.kind must be omitted"
+        );
+        let reparsed = Manifest::from_slice(&bytes).unwrap();
+        assert_eq!(m, reparsed);
+        assert_eq!(bytes, reparsed.to_vec().unwrap());
+    }
+
+    #[test]
+    fn sidecar_declarations_and_unknown_segment_kinds_round_trip() {
+        let decl_bounds = SidecarDecl {
+            kind: "bounds".into(),
+            columns: vec!["symbol".into(), "venue".into()],
+            time_columns: vec!["ts".into()],
+            extra: Extra::new(),
+        };
+        assert_eq!(decl_bounds.name(), "bounds:symbol,venue@ts");
+
+        let decl_t2 = SidecarDecl {
+            kind: "temporal2".into(),
+            columns: vec!["symbol".into()],
+            time_columns: vec!["valid".into(), "known".into()],
+            extra: Extra::new(),
+        };
+        assert_eq!(decl_t2.name(), "temporal2:symbol@valid,known");
+
+        let raw = r#"{
+          "storage_version": 1,
+          "sequence": 3,
+          "created_at": "2026-10-23T00:00:00.000Z",
+          "committed_at": "2026-10-24T00:00:00.000Z",
+          "commit_nonce": 42,
+          "source": {"kind": "parquet", "root": "data"},
+          "schema": {
+            "columns": [
+              {"name": "symbol", "data_type": "Utf8", "nullable": false},
+              {"name": "ts", "data_type": "Int64", "nullable": false}
+            ],
+            "key_specs": [{"kind": "exact", "columns": ["symbol"]}],
+            "sidecars": [
+              {"kind": "bounds", "columns": ["symbol"], "time_columns": ["ts"]},
+              {"kind": "counts", "columns": ["symbol"], "time_columns": ["ts"], "future_decl": 9}
+            ]
+          },
+          "rowgroup_space": {"next_id": 1, "files": [], "tombstones": []},
+          "key_spec_completeness": {"exact:symbol": 3},
+          "segments": [
+            {
+              "id": "1111111111111111111111111111111111111111111111111111111111111111",
+              "key_spec": "exact:symbol",
+              "rowgroup_range": {"start": 0, "end": 1},
+              "bytes": 10
+            },
+            {
+              "id": "2222222222222222222222222222222222222222222222222222222222222222",
+              "kind": "bounds",
+              "key_spec": "bounds:symbol@ts",
+              "rowgroup_range": {"start": 0, "end": 1},
+              "bytes": 20
+            },
+            {
+              "id": "3333333333333333333333333333333333333333333333333333333333333333",
+              "kind": "counts",
+              "key_spec": "exact:symbol",
+              "rowgroup_range": {"start": 0, "end": 1},
+              "bytes": 30,
+              "future_seg": true
+            }
+          ],
+          "segment_tombstones": [],
+          "deleting": []
+        }"#;
+
+        let m = Manifest::from_slice(raw.as_bytes()).unwrap();
+        assert_eq!(m.unknown_segment_kinds(), vec!["counts".to_string()]);
+
+        // key_spec_segments never yields a segment with kind != None, even when
+        // its key_spec equals a declared KeySpec's name ("exact:symbol").
+        let ks_ids: Vec<Hash> = m.key_spec_segments("exact:symbol").map(|s| s.id).collect();
+        assert_eq!(ks_ids, vec![m.segments[0].id]);
+
+        let bounds_ids: Vec<Hash> = m
+            .sidecar_segments("bounds", "bounds:symbol@ts")
+            .map(|s| s.id)
+            .collect();
+        assert_eq!(bounds_ids, vec![m.segments[1].id]);
+
+        let counts_ids: Vec<Hash> = m
+            .sidecar_segments("counts", "exact:symbol")
+            .map(|s| s.id)
+            .collect();
+        assert_eq!(counts_ids, vec![m.segments[2].id]);
+
+        // Round-trip preserves both the unknown sidecar declaration and segment
+        // byte-for-byte once in canonical form.
+        let canonical = m.to_vec().unwrap();
+        let m2 = Manifest::from_slice(&canonical).unwrap();
+        assert_eq!(m, m2);
+        assert_eq!(canonical, m2.to_vec().unwrap());
+        let v1: Value = serde_json::from_str(raw).unwrap();
+        let v2: Value = serde_json::from_slice(&canonical).unwrap();
+        assert_eq!(v1, v2);
+    }
+
+    /// Ported from the Argon WP21 implementation: a manifest a newer
+    /// writer committed with a segment of a kind this binary does not know
+    /// opens, and the kind is reported, never an error.
+    #[test]
+    fn manifest_listing_unknown_segment_kind_still_opens_and_reports_it() {
+        let raw = r#"{
+          "storage_version": 1,
+          "sequence": 2,
+          "created_at": "2026-10-23T00:00:00.000Z",
+          "committed_at": "2026-10-24T00:00:00.000Z",
+          "commit_nonce": 7,
+          "source": {"kind": "parquet", "root": "data"},
+          "schema": {
+            "columns": [{"name": "symbol", "data_type": "Utf8", "nullable": false}],
+            "key_specs": [{"kind": "exact", "columns": ["symbol"]}]
+          },
+          "rowgroup_space": {"next_id": 1, "files": [], "tombstones": []},
+          "key_spec_completeness": {"exact:symbol": 2},
+          "segments": [
+            {
+              "id": "2222222222222222222222222222222222222222222222222222222222222222",
+              "key_spec": "future_sidecar:symbol",
+              "kind": "future_sidecar:v9",
+              "rowgroup_range": {"start": 0, "end": 1},
+              "bytes": 10
+            }
+          ]
+        }"#;
+        let m = Manifest::from_slice(raw.as_bytes()).unwrap();
+        assert_eq!(
+            m.unknown_segment_kinds(),
+            vec!["future_sidecar:v9".to_string()]
+        );
+        assert_eq!(m.segments.len(), 1);
+    }
+
+    #[test]
     fn paths() {
         assert_eq!(manifest_path(""), "manifest.json");
         assert_eq!(manifest_path("/idx/"), "idx/manifest.json");
+        assert_eq!(
+            manifest_history_path("idx", 1),
+            "idx/manifests/00000000000000000001.json"
+        );
+        assert_eq!(
+            manifest_history_path("", 42),
+            "manifests/00000000000000000042.json"
+        );
         let id = Hash::of(b"x");
         assert_eq!(
             segment_path("idx", &id),

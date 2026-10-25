@@ -167,17 +167,26 @@ fn committed_and_transient_segments_plan_identically_through_wp4_and_this_crate(
     // File 1 starts at 1_767_225_600_000_000 + 3_600_000_000; an instant at
     // the end of file 1 excludes later files' versions.
     let asof_ts = 1_767_225_600_000_000_i64 + 2 * 3_600_000_000;
-    // A lookback window of one hour, ending at each key's newest version or
-    // at the asof instant, plans through the same code in both planners.
+    // A lookback of one hour, ending at each key's newest version (per key,
+    // through the version chains) or at the asof instant (the plain window
+    // on the temporal spec's timestamp), plans through the same code in
+    // both planners.
     let hour: i64 = 3_600_000_000;
+    let KeySpec::Temporal {
+        ts_column: temporal_ts,
+        ..
+    } = &temporal_spec
+    else {
+        unreachable!("specs[1] is temporal")
+    };
     for query in [
         RunQuery::Latest,
         RunQuery::Asof { ts: asof_ts },
-        RunQuery::Window {
+        RunQuery::Lookback {
             asof: None,
             lookback: hour,
         },
-        RunQuery::Window {
+        RunQuery::Lookback {
             asof: Some(asof_ts),
             lookback: hour,
         },
@@ -188,7 +197,7 @@ fn committed_and_transient_segments_plan_identically_through_wp4_and_this_crate(
             rec.record_query(
                 id,
                 KeyInput::Batch(&common::key_batch(&["entity_id"], tuples)),
-                query,
+                query.clone(),
                 None,
             )
             .unwrap();
@@ -214,13 +223,25 @@ fn committed_and_transient_segments_plan_identically_through_wp4_and_this_crate(
                         keys: rk.tuples().map(<[u8]>::to_vec).collect(),
                         ts: *ts,
                     },
-                    RunQuery::Window { asof, lookback } => BuildLookup::Window {
+                    RunQuery::Lookback {
+                        asof: None,
+                        lookback,
+                    } => BuildLookup::Lookback {
                         columns: rk.columns().to_vec(),
                         keys: rk.tuples().map(<[u8]>::to_vec).collect(),
-                        asof: *asof,
                         lookback: *lookback,
                     },
-                    RunQuery::Locate => unreachable!(),
+                    RunQuery::Lookback {
+                        asof: Some(at),
+                        lookback,
+                    } => BuildLookup::Window {
+                        columns: rk.columns().to_vec(),
+                        keys: rk.tuples().map(<[u8]>::to_vec).collect(),
+                        ts_column: temporal_ts.clone(),
+                        lo: at - lookback,
+                        hi: *at,
+                    },
+                    RunQuery::Locate | RunQuery::Window(_) => unreachable!(),
                 };
                 let build_plan = planner.plan(config, &lookup).unwrap();
                 let committed = PlanSource::plan_query(&planner, config, &rk, &query).unwrap();
@@ -249,15 +270,20 @@ fn committed_and_transient_segments_plan_identically_through_wp4_and_this_crate(
     // Unindexed folder (`Catalog::discover`, manifest version "0"): the
     // transient temporal replay's row-group cells and bytes equal the
     // committed `Planner`'s Latest/AsOf plan after indexing the same spec.
-    let unindexed = Replayer::unindexed(&source, &snapshot.manifest().source.root).unwrap();
+    let unindexed = Replayer::unindexed(
+        &source,
+        &snapshot.manifest().source.root,
+        &bellwether_source::Partitioning::None,
+    )
+    .unwrap();
     for query in [
         RunQuery::Latest,
         RunQuery::Asof { ts: asof_ts },
-        RunQuery::Window {
+        RunQuery::Lookback {
             asof: None,
             lookback: hour,
         },
-        RunQuery::Window {
+        RunQuery::Lookback {
             asof: Some(asof_ts),
             lookback: hour,
         },

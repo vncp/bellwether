@@ -69,11 +69,14 @@ enum Command {
     Why(WhyArgs),
     /// Build or update the index for one or more key specs.
     Index(IndexArgs),
-    /// Plan which files and row groups hold the keys.
-    Locate(LookupArgs),
-    /// Plan the newest version of each key.
-    Latest(LookupArgs),
-    /// Plan the version of each key current at an instant.
+    /// Plan which files and row groups hold the keys (in a time window with
+    /// --from and --to).
+    Locate(LocateArgs),
+    /// Plan the newest version of each key (newest valid version known by
+    /// an instant with --known).
+    Latest(LatestArgs),
+    /// Plan the version of each key current at an instant (--at), or the
+    /// bitemporal version valid at --valid as known at --known.
     Asof(AsofArgs),
     /// Record a proposal (a key, a layout, or a rewrite) citing evidence.
     Propose(ProposeArgs),
@@ -163,6 +166,25 @@ struct WhyArgs {
     /// columns.
     #[arg(long, value_name = "N", default_value_t = bellwether::DEFAULT_MAX_CANDIDATES)]
     max_candidates: usize,
+    /// Profile and replay the committed manifest at this sequence instead
+    /// of the current one (the files it recorded, its key specs).
+    #[arg(long, value_name = "SEQUENCE")]
+    at_manifest: Option<u64>,
+    /// Price the runs as point lookups in this time window, START..END,
+    /// both inclusive (as `locate --window`). A latest or asof lookup takes
+    /// --lookback instead.
+    #[arg(
+        long,
+        value_name = "START..END",
+        conflicts_with_all = ["latest_by", "workload"]
+    )]
+    window: Option<String>,
+    /// The window's time column [default: the one a window lookup would
+    /// take]. With --at and --lookback instead of --window, the column
+    /// `asof --at --lookback --ts` plans on: the run is priced as that
+    /// window (pass the same column to --latest-by).
+    #[arg(long = "ts", value_name = "COLUMN")]
+    ts: Option<String>,
 }
 
 /// `why --mode`.
@@ -187,8 +209,9 @@ impl From<ModeArg> for bellwether::LookupMode {
 struct IndexArgs {
     #[command(flatten)]
     root: RootArg,
-    /// A key spec: exact:a,b  temporal:id@ts  bloom:a@0.01  range:ts.
-    /// Repeat for several.
+    /// A key spec: exact:a,b  temporal:id@ts  bloom:a@0.01  range:ts; with
+    /// per-key time bounds exact:a@ts or bloom:a@0.01@ts; or a bitemporal
+    /// key temporal2:id@valid,known. Repeat for several.
     #[arg(long = "key", value_name = "SPEC")]
     keys: Vec<String>,
 }
@@ -203,16 +226,78 @@ struct LookupArgs {
     /// Key columns to take from the file, comma-separated [default: all].
     #[arg(long, value_name = "COLS", value_delimiter = ',')]
     key: Option<Vec<String>>,
+    /// Plan against the committed manifest at this sequence instead of the
+    /// current one, so a lookup run later over a grown folder reads exactly
+    /// what it read then. Files added since are ignored; the retained
+    /// sequences are listed when one is not.
+    #[arg(long, value_name = "SEQUENCE")]
+    at_manifest: Option<u64>,
 }
 
 #[derive(Args)]
+#[command(group(clap::ArgGroup::new("range").multiple(false).args(["from", "window"])))]
+struct LocateArgs {
+    #[command(flatten)]
+    lookup: LookupArgs,
+    /// Window start (inclusive): RFC 3339, a date (YYYY-MM-DD), or an
+    /// integer in the time column's unit.
+    #[arg(long, value_name = "INSTANT", requires = "to")]
+    from: Option<String>,
+    /// Window end (inclusive), as --from.
+    #[arg(long, value_name = "INSTANT", requires = "from")]
+    to: Option<String>,
+    /// The window as START..END, both inclusive (the same as --from START
+    /// --to END), for example 2026-01-01..2026-03-01.
+    #[arg(long, value_name = "START..END")]
+    window: Option<String>,
+    /// The window's time column [default: the one per-key bounds, a
+    /// timestamp range key, a temporal key, or a date partition column
+    /// names].
+    #[arg(long = "ts", value_name = "COLUMN")]
+    ts: Option<String>,
+}
+
+#[derive(Args)]
+struct LatestArgs {
+    #[command(flatten)]
+    lookup: LookupArgs,
+    /// Bitemporal: the newest valid version among rows known at or before
+    /// this instant (needs a temporal2 key).
+    #[arg(long, value_name = "INSTANT", conflicts_with = "lookback")]
+    known: Option<String>,
+    /// Every row of the keys in the N before their newest version (one
+    /// window ending at the newest timestamp among the keys, through their
+    /// temporal key): a whole number and a calendar unit, s, m, h, d (24
+    /// hours of UTC), or w (7 days), for example 252d; no trading days.
+    #[arg(long, value_name = "N")]
+    lookback: Option<String>,
+}
+
+#[derive(Args)]
+#[command(group(clap::ArgGroup::new("instant").required(true).multiple(true).args(["at", "valid", "known"])))]
 struct AsofArgs {
     #[command(flatten)]
     lookup: LookupArgs,
     /// The instant: RFC 3339, a date (YYYY-MM-DD), or an integer in the
     /// timestamp column's unit.
+    #[arg(long, value_name = "INSTANT", conflicts_with_all = ["valid", "known"])]
+    at: Option<String>,
+    /// Every row of the keys from --at minus N to --at (instead of the one
+    /// version current at --at): a whole number and a calendar unit, s, m,
+    /// h, d (24 hours of UTC), or w (7 days), for example 252d; no trading
+    /// days.
+    #[arg(long, value_name = "N", requires = "at")]
+    lookback: Option<String>,
+    /// The lookback's time column [default: the temporal key's timestamp,
+    /// else the one a window would take].
+    #[arg(long = "ts", value_name = "COLUMN", requires = "lookback")]
+    ts: Option<String>,
+    /// Bitemporal: the valid-time instant (needs a temporal2 key).
     #[arg(long, value_name = "INSTANT")]
-    at: String,
+    valid: Option<String>,
+    /// Bitemporal: the known-time instant; rows learned later are ignored.
+    #[arg(long, value_name = "INSTANT")]
+    known: Option<String>,
 }
 
 #[derive(Args)]
@@ -349,7 +434,17 @@ pub(crate) enum Failure {
 
 impl From<Error> for Failure {
     fn from(e: Error) -> Self {
-        Self::Engine(e)
+        match e {
+            // An argument only the data can judge (a lookback against its
+            // time column's unit, `--latest-by` against the column the
+            // index plans on) is still the caller's to fix: a usage error,
+            // whose message names the value to pass.
+            Error::InvalidArgument {
+                field: "lookback" | "latest_by",
+                ..
+            } => Self::Usage(e.to_string()),
+            e => Self::Engine(e),
+        }
     }
 }
 
@@ -394,6 +489,9 @@ fn hint(e: &Error) -> Option<String> {
                 "by" => "--by",
                 "evidence" => "--evidence",
                 "at" => "--at",
+                "window" => "--window (or --from and --to)",
+                "valid" => "--valid",
+                "known" => "--known",
                 "keys" => "--from or --keys",
                 "key_columns" => "--key",
                 "cluster_by" => "--layout",
@@ -404,6 +502,12 @@ fn hint(e: &Error) -> Option<String> {
             };
             Some(format!("check {flag}"))
         }
+        Error::NotRetained { retained, .. } => match (retained.first(), retained.last()) {
+            (Some(oldest), Some(current)) => {
+                Some(format!("pass one of {oldest}..={current} to --at-manifest"))
+            }
+            _ => Some("run `bellwether index` first".to_string()),
+        },
         _ => None,
     }
 }
@@ -421,13 +525,43 @@ pub(crate) fn done<T: Serialize>(result: &T, human: String, code: u8) -> Result<
 }
 
 pub(crate) fn engine(global: &Global, root: &str) -> Result<Engine, Failure> {
-    Ok(Engine::open(root, engine_options(global)?)?)
+    engine_at(global, root, None)
+}
+
+/// [`engine`], pinned to the committed manifest at `at_manifest` when given.
+pub(crate) fn engine_at(
+    global: &Global,
+    root: &str,
+    at_manifest: Option<u64>,
+) -> Result<Engine, Failure> {
+    let options = EngineOptions {
+        at_manifest,
+        ..engine_options(global)?
+    };
+    let engine = Engine::open(root, options)?;
+    // A sequence the index never committed (or pruned) is a usage error
+    // naming the committed range, before any lookup runs.
+    if let Some(seq) = at_manifest {
+        let retained = engine.retained_manifests()?;
+        if !retained.contains(&seq) {
+            let e = Error::NotRetained {
+                index: engine.index_location().to_string(),
+                requested: seq,
+                retained,
+            };
+            return Err(Failure::Usage(match hint(&e) {
+                Some(h) => format!("{e}; {h}"),
+                None => e.to_string(),
+            }));
+        }
+    }
+    Ok(engine)
 }
 
 /// The engine options the global flags name.
 fn engine_options(global: &Global) -> Result<EngineOptions, Failure> {
     global.engine.options().map_err(|e| match e {
-        OptionsError::SchemaFile(m) => Failure::Usage(m),
+        OptionsError::Usage(m) => Failure::Usage(m),
         OptionsError::Engine(e) => Failure::Engine(e),
     })
 }
@@ -453,27 +587,31 @@ fn run(cli: &Cli, out: &Out) -> Result<Outcome, Failure> {
     match &cli.command {
         Command::Why(a) => why(g, out, a),
         Command::Index(a) => {
-            let specs = a
+            let declared = a
                 .keys
                 .iter()
-                .map(|s| bellwether::spec::parse(s))
+                .map(|s| bellwether::spec::parse_declaration(s))
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(|e| Failure::Usage(e.to_string()))?;
-            let r = engine(g, &a.root.root)?.index(&specs)?;
+            let r = engine(g, &a.root.root)?.index_declared(&declared)?;
             done(&r, human::index(&r, out), EXIT_OK)
         }
-        Command::Locate(a) => {
-            let r = engine(g, &a.root.root)?.locate(&key_file(&a.keys, a.key.as_ref()))?;
-            done(&r, human::plan(&r, out), EXIT_OK)
-        }
+        Command::Locate(a) => locate(g, out, a),
         Command::Latest(a) => {
-            let r = engine(g, &a.root.root)?.latest(&key_file(&a.keys, a.key.as_ref()))?;
-            done(&r, human::plan(&r, out), EXIT_OK)
+            check_lookback(a.lookback.as_deref())?;
+            lookup(g, out, &a.lookup, |e, keys| match (&a.known, &a.lookback) {
+                (Some(known), _) => e.asof_bitemporal(keys, None, Some(known)),
+                (None, Some(n)) => e.latest_lookback(keys, n),
+                (None, None) => e.latest(keys),
+            })
         }
         Command::Asof(a) => {
-            let l = &a.lookup;
-            let r = engine(g, &l.root.root)?.asof(&key_file(&l.keys, l.key.as_ref()), &a.at)?;
-            done(&r, human::plan(&r, out), EXIT_OK)
+            check_lookback(a.lookback.as_deref())?;
+            lookup(g, out, &a.lookup, |e, keys| match (&a.at, &a.lookback) {
+                (Some(at), Some(n)) => e.asof_lookback(keys, at, n, a.ts.as_deref()),
+                (Some(at), None) => e.asof(keys, at),
+                (None, _) => e.asof_bitemporal(keys, a.valid.as_deref(), a.known.as_deref()),
+            })
         }
         Command::Propose(a) => propose(g, out, a),
         Command::Receipt {
@@ -545,6 +683,19 @@ fn run(cli: &Cli, out: &Out) -> Result<Outcome, Failure> {
     }
 }
 
+/// A plan lookup (`locate`, `latest`, `asof`): the engine, pinned to
+/// `--at-manifest` when given, and the key file, handed to `plan`.
+fn lookup(
+    g: &Global,
+    out: &Out,
+    args: &LookupArgs,
+    plan: impl FnOnce(&Engine, &KeyFile) -> Result<bellwether::PlanResult, Error>,
+) -> Result<Outcome, Failure> {
+    let engine = engine_at(g, &args.root.root, args.at_manifest)?;
+    let result = plan(&engine, &key_file(&args.keys, args.key.as_ref()))?;
+    done(&result, human::plan(&result, out), EXIT_OK)
+}
+
 fn propose(g: &Global, out: &Out, a: &ProposeArgs) -> Result<Outcome, Failure> {
     let body = if let Some(k) = &a.key {
         ProposalBody::Key {
@@ -583,7 +734,87 @@ fn propose(g: &Global, out: &Out, a: &ProposeArgs) -> Result<Outcome, Failure> {
     done(&r, human::propose(&r, out), code)
 }
 
+/// `locate`, in a window when one is given; a reversed window is a usage
+/// error naming the flag that gave it.
+fn locate(g: &Global, out: &Out, a: &LocateArgs) -> Result<Outcome, Failure> {
+    let window = match (&a.window, &a.from, &a.to) {
+        (Some(w), _, _) => {
+            Some(bellwether::split_window(w).map_err(|e| Failure::Usage(e.to_string()))?)
+        }
+        (None, Some(from), Some(to)) => Some((from.as_str(), to.as_str())),
+        _ => None,
+    };
+    if let Some((from, to)) = window {
+        if bellwether::window_reversed(from, to) {
+            let given = if a.window.is_some() {
+                format!("--window {from}..{to}")
+            } else {
+                format!("--from {from} --to {to}")
+            };
+            return Err(Failure::Usage(format!(
+                "{given} starts after it ends; give the start first, START..END"
+            )));
+        }
+    }
+    if window.is_none() && a.ts.is_some() {
+        return Err(Failure::Usage(
+            "--ts names a window's time column; give the window with --window START..END (or \
+             --from and --to)"
+                .into(),
+        ));
+    }
+    lookup(g, out, &a.lookup, |e, keys| match window {
+        Some((from, to)) => e.locate_window(keys, from, to, a.ts.as_deref()),
+        None => e.locate(keys),
+    })
+}
+
+/// A malformed `--lookback` is a usage error (exit 2), refused before any
+/// engine work.
+fn check_lookback(lookback: Option<&str>) -> Result<(), Failure> {
+    match lookback {
+        Some(n) => bellwether::Lookback::parse(n)
+            .map(|_| ())
+            .map_err(|e| Failure::Usage(e.to_string())),
+        None => Ok(()),
+    }
+}
+
 fn why(g: &Global, out: &Out, a: &WhyArgs) -> Result<Outcome, Failure> {
+    check_lookback(a.lookback.as_deref())?;
+    let window = a
+        .window
+        .as_deref()
+        .map(|w| {
+            let (from, to) =
+                bellwether::split_window(w).map_err(|e| Failure::Usage(e.to_string()))?;
+            if bellwether::window_reversed(from, to) {
+                return Err(Failure::Usage(format!(
+                    "--window {w} starts after it ends; give the start first, START..END"
+                )));
+            }
+            Ok(bellwether::TimeWindow {
+                from: from.to_string(),
+                to: to.to_string(),
+            })
+        })
+        .transpose()?;
+    if let (None, Some(ts)) = (&window, &a.ts) {
+        if a.at.is_none() || a.lookback.is_none() {
+            return Err(Failure::Usage(format!(
+                "--ts names a window's time column; give the window with --window START..END, or \
+                 price `asof --at --lookback --ts {ts}` with --latest-by {ts} --at <instant> \
+                 --lookback <length>"
+            )));
+        }
+        if a.from.is_none() {
+            return Err(Failure::Usage(
+                "--ts with --at and --lookback records the key file's run as that window; pass \
+                 --from <keys.parquet>"
+                    .into(),
+            ));
+        }
+    }
     let request = bellwether::WhyRequest {
         keys: a.from.as_ref().map(|p| key_file(p, a.key.as_ref())),
         bench_workload: a.bench_workload.clone(),
@@ -596,6 +827,8 @@ fn why(g: &Global, out: &Out, a: &WhyArgs) -> Result<Outcome, Failure> {
         latest_by: a.latest_by.clone(),
         at: a.at.clone(),
         lookback: a.lookback.clone(),
+        window,
+        ts_column: a.ts.clone(),
         columns: a.columns.clone(),
         max_candidates: a.max_candidates,
     };
@@ -606,6 +839,14 @@ fn why(g: &Global, out: &Out, a: &WhyArgs) -> Result<Outcome, Failure> {
             mode.as_str()
         )));
     }
-    let r = engine(g, &a.root.root)?.why(&request)?;
+    if request.window.is_some() && mode != bellwether::LookupMode::Locate {
+        return Err(Failure::Usage(
+            "--window prices point lookups in a time window; a latest or asof lookup takes \
+             --lookback instead (--latest-by <column> --lookback <length>, and --at <instant> \
+             for asof)"
+                .into(),
+        ));
+    }
+    let r = engine_at(g, &a.root.root, a.at_manifest)?.why(&request)?;
     done(&r, human::why(&r, out), EXIT_OK)
 }

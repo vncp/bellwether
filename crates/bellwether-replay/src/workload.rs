@@ -26,8 +26,12 @@
 //! A run's template groups it in reports. Without one, the template is the
 //! run's key-column set, `columns(<key columns>)`: a grouping by columns, not
 //! by query; pass the query or pipeline step a run came from to group by
-//! that. Every run records a query kind (`locate`, `latest`, or `asof`;
-//! contract v3 backlog #14), and a workload naming another kind is refused.
+//! that. Every run records a query kind: `locate`, `latest`, or `asof`
+//! (contract v3 backlog #14), the latter two optionally with a lookback
+//! window, or `window` (the rows of its keys whose time column lies in the
+//! run's [`RunWindow`], which only a window run records). A workload naming
+//! another kind is refused. A recorder made [`WorkloadRecorder::in_window`]
+//! records every `locate` run as a window run.
 //!
 //! # The bench workload format
 //!
@@ -79,9 +83,26 @@ pub const QUERY_KIND_LATEST: &str = "latest";
 /// The query kind of a recorded run that looks up the version of each key
 /// current at an instant (`asof`).
 pub const QUERY_KIND_ASOF: &str = "asof";
+/// The query kind of a recorded run that looks keys up in a time window
+/// (`window`, [`RunWindow`]).
+pub const QUERY_KIND_WINDOW: &str = "window";
+
+/// The time window of a `window` run: the rows of its keys whose
+/// `ts_column` lies in `[lo, hi]`, both inclusive and in the column's
+/// dataset unit (days for `Date32`, milliseconds for `Date64`, the
+/// timestamp's own unit, an integer column's value itself).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunWindow {
+    /// The time column.
+    pub ts_column: String,
+    /// Inclusive lower bound.
+    pub lo: i64,
+    /// Inclusive upper bound.
+    pub hi: i64,
+}
 
 /// What a recorded run asked of the index.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub enum RunQuery {
     /// Every row holding a key ([`QUERY_KIND_LOCATE`]).
     #[default]
@@ -98,52 +119,70 @@ pub enum RunQuery {
     /// asof]` when `asof` is set ([`QUERY_KIND_ASOF`]), else `[newest −
     /// lookback, newest]` per key, `newest` being the key's newest version
     /// ([`QUERY_KIND_LATEST`]). Both bounds inclusive, in the timestamp
-    /// column's dataset unit.
-    Window {
+    /// column's dataset unit. With `asof`, it is the window
+    /// `[asof − lookback, asof]` on the serving temporal spec's timestamp
+    /// column, planned as a [`RunQuery::Window`] is.
+    Lookback {
         /// The asof instant, or `None` to end each key's window at its
         /// newest version.
         asof: Option<i64>,
         /// The window's length, `>= 0`.
         lookback: i64,
     },
+    /// The rows of the keys whose time column lies in a fixed window
+    /// ([`QUERY_KIND_WINDOW`]).
+    Window(RunWindow),
 }
 
 impl RunQuery {
-    /// The `query_kind` tag (`locate`, `latest`, or `asof`).
+    /// The `query_kind` tag (`locate`, `latest`, `asof`, or `window`).
     #[must_use]
     pub fn kind_str(&self) -> &'static str {
         match self {
             Self::Locate => QUERY_KIND_LOCATE,
-            Self::Latest | Self::Window { asof: None, .. } => QUERY_KIND_LATEST,
-            Self::Asof { .. } | Self::Window { asof: Some(_), .. } => QUERY_KIND_ASOF,
+            Self::Latest | Self::Lookback { asof: None, .. } => QUERY_KIND_LATEST,
+            Self::Asof { .. } | Self::Lookback { asof: Some(_), .. } => QUERY_KIND_ASOF,
+            Self::Window(_) => QUERY_KIND_WINDOW,
         }
     }
 
     /// The `asof` instant when this is [`RunQuery::Asof`] or an asof
-    /// [`RunQuery::Window`].
+    /// [`RunQuery::Lookback`].
     #[must_use]
     pub fn asof_ts(&self) -> Option<i64> {
         match self {
             Self::Asof { ts } => Some(*ts),
-            Self::Window { asof, .. } => *asof,
-            Self::Locate | Self::Latest => None,
+            Self::Lookback { asof, .. } => *asof,
+            Self::Locate | Self::Latest | Self::Window(_) => None,
         }
     }
 
-    /// The lookback window's length when this is a [`RunQuery::Window`].
+    /// The lookback window's length when this is a [`RunQuery::Lookback`].
     #[must_use]
     pub fn lookback(&self) -> Option<i64> {
         match self {
-            Self::Window { lookback, .. } => Some(*lookback),
-            Self::Locate | Self::Latest | Self::Asof { .. } => None,
+            Self::Lookback { lookback, .. } => Some(*lookback),
+            Self::Locate | Self::Latest | Self::Asof { .. } | Self::Window(_) => None,
         }
     }
 
-    /// Whether this asks for versions (`latest`, `asof`, or a window), so
+    /// The fixed window of a [`RunQuery::Window`].
+    #[must_use]
+    pub fn window(&self) -> Option<&RunWindow> {
+        match self {
+            Self::Window(w) => Some(w),
+            _ => None,
+        }
+    }
+
+    /// Whether this asks for versions (`latest`, `asof`, or a lookback), so
     /// only a temporal key spec can plan it.
     #[must_use]
     pub fn is_temporal(&self) -> bool {
-        !matches!(self, Self::Locate)
+        matches!(
+            self,
+            Self::Latest | Self::Asof { .. } | Self::Lookback { .. }
+        )
     }
 }
 
@@ -157,7 +196,7 @@ pub struct RecordedRun {
     /// recorders that know the query or pipeline step pass it instead.
     pub template: String,
     /// What the run asked of the index: [`QUERY_KIND_LOCATE`],
-    /// [`QUERY_KIND_LATEST`], or [`QUERY_KIND_ASOF`].
+    /// [`QUERY_KIND_LATEST`], [`QUERY_KIND_ASOF`], or [`QUERY_KIND_WINDOW`].
     pub query_kind: String,
     /// For [`QUERY_KIND_ASOF`] runs: the instant in the timestamp column's
     /// dataset unit. Absent (`None`, omitted in JSON) for `locate` and
@@ -165,7 +204,7 @@ pub struct RecordedRun {
     /// identical bytes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub asof: Option<i64>,
-    /// For a [`RunQuery::Window`] run: the lookback window's length in the
+    /// For a [`RunQuery::Lookback`] run: the lookback window's length in the
     /// timestamp column's dataset unit. Absent (`None`, omitted in JSON)
     /// otherwise, so existing workload manifests serialize and hash to
     /// identical bytes.
@@ -181,12 +220,40 @@ pub struct RecordedRun {
     pub null_tuples: u64,
     /// BLAKE3 of the key-set payload stored in the cache.
     pub key_set: Hash,
+    /// The window of a `window` run; absent (and not serialized, so a
+    /// `locate` run hashes as before) otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub window: Option<RunWindow>,
 }
 
 impl RecordedRun {
     /// The typed query kind of this run, or an error if `query_kind`,
-    /// `asof`, and `lookback` disagree or name an unknown kind.
+    /// `asof`, `lookback`, and `window` disagree or name an unknown kind.
     pub fn query(&self) -> Result<RunQuery> {
+        if self.query_kind == QUERY_KIND_WINDOW {
+            return match (&self.window, self.asof, self.lookback) {
+                (Some(w), None, None) if !w.ts_column.is_empty() && w.lo <= w.hi => {
+                    Ok(RunQuery::Window(w.clone()))
+                }
+                (Some(w), None, None) => Err(Error::Other(format!(
+                    "run {:?} records the window {}..{} of {:?}; a window names its time \
+                     column and starts at or before its end",
+                    self.run_id, w.lo, w.hi, w.ts_column
+                ))),
+                _ => Err(Error::Other(format!(
+                    "run {:?} is a window run; it records exactly one window and no asof or \
+                     lookback",
+                    self.run_id
+                ))),
+            };
+        }
+        if self.window.is_some() {
+            return Err(Error::Other(format!(
+                "run {:?} has query_kind {:?} but records a window; only a window run records \
+                 one",
+                self.run_id, self.query_kind
+            )));
+        }
         let point = match (self.query_kind.as_str(), self.asof) {
             (QUERY_KIND_LOCATE, None) => RunQuery::Locate,
             (QUERY_KIND_LATEST, None) => RunQuery::Latest,
@@ -221,7 +288,7 @@ impl RecordedRun {
                 "run {:?} has a negative lookback {l}",
                 self.run_id
             ))),
-            (q, Some(lookback)) => Ok(RunQuery::Window {
+            (q, Some(lookback)) => Ok(RunQuery::Lookback {
                 asof: q.asof_ts(),
                 lookback,
             }),
@@ -548,6 +615,7 @@ pub struct WorkloadRecorder<'a> {
     sink: &'a dyn KeySetSink,
     schema: SchemaRef,
     runs: BTreeMap<String, RecordedRun>,
+    window: Option<RunWindow>,
 }
 
 impl std::fmt::Debug for WorkloadRecorder<'_> {
@@ -572,11 +640,33 @@ impl<'a> WorkloadRecorder<'a> {
             sink,
             schema,
             runs: BTreeMap::new(),
+            window: None,
         }
     }
 
-    /// Records a [`RunQuery::Locate`] run `run_id` with the default template,
-    /// the run's key-column set.
+    /// This recorder, recording every `locate` run as a `window` run over
+    /// `window` ([`QUERY_KIND_WINDOW`]). The time column must be in the
+    /// dataset schema and the window must not end before it starts.
+    pub fn in_window(mut self, window: RunWindow) -> Result<Self> {
+        if self.schema.field_with_name(&window.ts_column).is_err() {
+            return Err(Error::KeySpec(format!(
+                "the window's time column {:?} is not in the dataset schema",
+                window.ts_column
+            )));
+        }
+        if window.lo > window.hi {
+            return Err(Error::Other(format!(
+                "the window {}..{} of {} ends before it starts",
+                window.lo, window.hi, window.ts_column
+            )));
+        }
+        self.window = Some(window);
+        Ok(self)
+    }
+
+    /// Records a [`RunQuery::Locate`] run `run_id` (a [`RunQuery::Window`]
+    /// run in a recorder made [`WorkloadRecorder::in_window`]) with the
+    /// default template, the run's key-column set.
     pub fn record(&mut self, run_id: &str, keys: KeyInput<'_>) -> Result<&RecordedRun> {
         self.record_with_template(run_id, keys, None)
     }
@@ -644,6 +734,17 @@ impl<'a> WorkloadRecorder<'a> {
                 "run {run_id:?}: a lookback window cannot be negative"
             )));
         }
+        // A recorder made `in_window` records its locate runs as window runs.
+        let query = match (query, &self.window) {
+            (RunQuery::Locate, Some(w)) => RunQuery::Window(w.clone()),
+            (q, None) => q,
+            (q, Some(_)) => {
+                return Err(Error::Other(format!(
+                    "run {run_id:?}: a recorder in a window records locate runs only, not {}",
+                    q.kind_str()
+                )))
+            }
+        };
         let payload = built.to_payload()?;
         let key_set = Hash::of(&payload);
         let columns = built.columns().to_vec();
@@ -662,6 +763,7 @@ impl<'a> WorkloadRecorder<'a> {
                 keys: built.len() as u64,
                 null_tuples,
                 key_set,
+                window: query.window().cloned(),
             },
             payload,
         })

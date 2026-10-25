@@ -5,8 +5,9 @@
 //!    never accepts a caller's cost.
 //! 2. **Verify**, against the current manifest (`manifest_before`). A Key
 //!    proposal: reconcile (WP8) the full scan, restricted to the workload's
-//!    keys, against a source exposing only the row groups the hypothetical
-//!    plan selects (coverage `Workload`). A Rewrite: reconcile the before and
+//!    keys (and, for an `asof`, lookback, or window run, to the rows it asks
+//!    for, bounded by the workload and the data, never by the index), against a source exposing only the row groups
+//!    the hypothetical plan selects (coverage `Workload`). A Rewrite: reconcile the before and
 //!    after outputs the caller names (coverage `Full`). A Layout proposal is
 //!    refused: layout apply arrives with evolve.
 //! 3. **Apply**, only if the certificate passed and was computed against the
@@ -24,13 +25,14 @@ use std::time::Duration;
 
 use arrow::array::RecordBatch;
 use arrow::datatypes::SchemaRef;
+use bellwether_build::encode_ts;
 use bellwether_build::{BuildOptions, Builder};
-use bellwether_replay::{proposed_specs, Replayer, RunQuery, Workload};
+use bellwether_replay::{proposed_specs, Catalog, Replayer, RunKeys, RunQuery, Workload};
 use bellwether_store::{parse_rfc3339, Cache, ObjectStoreBackend};
 use bellwether_types::{
     format, Certificate, Coverage, Error, Evidence, EvidenceBody, FileFingerprint, Hash, HashKind,
-    KeySpec, Proposal, ProposalBody, Provenance, Receipt, Record, Result, RowGroupMeta, ScanEntry,
-    ScanPlan, Source,
+    KeySpec, Predicate, Proposal, ProposalBody, Provenance, Receipt, Record, Result, RowGroupMeta,
+    ScanEntry, ScanPlan, Source,
 };
 use bellwether_verify::{
     AgedInput, CertificateContext, CoverageRequest, ManifestAnchor, Options, ReconcileSpec,
@@ -279,14 +281,17 @@ impl Engine {
     /// Runs score → verify → apply → attest for `request.proposal`, or
     /// apply → attest for an earlier `request.certificate` (module docs).
     pub fn fix(&self, request: &FixRequest) -> Result<FixResult> {
-        guard(|| match (&request.proposal, &request.certificate) {
-            (Some(p), None) => self.fix_proposal(p, request),
-            (None, Some(c)) => self.apply_certificate(c, false, request.allow_no_gain),
-            _ => Err(Error::Other(
-                "fix takes a proposal (--proposal) or a certificate to apply (--certificate), \
+        guard(|| {
+            self.require_current("fix")?;
+            match (&request.proposal, &request.certificate) {
+                (Some(p), None) => self.fix_proposal(p, request),
+                (None, Some(c)) => self.apply_certificate(c, false, request.allow_no_gain),
+                _ => Err(Error::Other(
+                    "fix takes a proposal (--proposal) or a certificate to apply (--certificate), \
                  not both"
-                    .into(),
-            )),
+                        .into(),
+                )),
+            }
         })
     }
 
@@ -298,7 +303,10 @@ impl Engine {
     /// nothing anywhere: no replay, no build, no receipt, and it never
     /// creates the index location.
     pub fn apply_dry_run(&self, certificate: &Hash) -> Result<FixResult> {
-        guard(|| self.apply_certificate(certificate, true, false))
+        guard(|| {
+            self.require_current("fix")?;
+            self.apply_certificate(certificate, true, false)
+        })
     }
 
     /// The current [`DataState`]. Reads footers; writes nothing and never
@@ -663,12 +671,12 @@ impl Engine {
         // plus the proposed one (transient segments for the latter), united.
         let mut selected: BTreeMap<String, (FileFingerprint, RoaringBitmap)> = BTreeMap::new();
         let mut keys: Vec<Vec<u8>> = Vec::new();
-        let mut queries = Vec::with_capacity(runs.len());
+        let mut asked: Vec<AskedRun> = Vec::with_capacity(runs.len());
         for run in runs {
             let rk = workload.run_keys(cache, run)?;
             let query = run.query()?;
             let plan = replayer.plan_of_query(&specs, &rk, &query)?;
-            for e in plan.entries {
+            for e in &plan.entries {
                 selected
                     .entry(e.file.path.clone())
                     .or_insert_with(|| (e.file.clone(), RoaringBitmap::new()))
@@ -678,23 +686,20 @@ impl Engine {
             // SQL equality matches a row stored under either zero.
             let all: Vec<usize> = (0..rk.columns().len()).collect();
             keys.extend(rk.all_probes(&all));
-            queries.push(query);
+            let column = replayer.planned_time_column(&specs, rk.columns(), &query)?;
+            asked.push(AskedRun {
+                keys: rk,
+                query,
+                column,
+                residual: plan.residual,
+            });
         }
         keys.sort_unstable();
         keys.dedup();
         #[cfg(test)]
         test_seam::apply(&mut selected);
         let union = union_plan(replayer, &selected)?;
-        let plan_evidence = self.put(Record::Evidence(Evidence {
-            record_version: format::RECORD_VERSION,
-            provenance: Provenance {
-                inputs: vec![replayer.catalog().digest(), workload.hash()],
-                oldest_input_age: Duration::ZERO,
-                manifest_version: Some(replayer.manifest_version()),
-                created_at: self.now(),
-            },
-            body: EvidenceBody::Plan { plan: union },
-        }))?;
+        let plan_evidence = self.plan_evidence(replayer, workload, union)?;
         let planned = PlannedSource {
             inner: source,
             selected,
@@ -708,7 +713,7 @@ impl Engine {
         };
         let workload_age = cached.map_or(Duration::ZERO, |(_, age)| age);
         let ignored = unhashable(replayer.schema(), &columns);
-        let mut rec_spec =
+        let rec_spec =
             ReconcileSpec::new(columns)
                 .ignore(ignored)
                 .coverage(CoverageRequest::Workload(WorkloadKeys {
@@ -716,11 +721,7 @@ impl Engine {
                     age: workload_age,
                     keys,
                 }));
-        if let KeySpec::Temporal { ts_column, .. } = spec {
-            if queries.iter().all(|q| matches!(q, RunQuery::Latest)) {
-                rec_spec = rec_spec.latest_by(ts_column.clone());
-            }
-        }
+        let rec_spec = rows_asked(source, replayer.catalog(), &asked, rec_spec)?;
         let ctx = CertificateContext {
             proposal: Some(*proposal),
             manifest: pinned.map(anchor),
@@ -740,6 +741,26 @@ impl Engine {
         Ok((plan_evidence, cert, certified.outcome))
     }
 
+    /// Writes `plan` as the `plan` Evidence verify reads under: it cites the
+    /// catalog digest and the workload.
+    fn plan_evidence(
+        &self,
+        replayer: &Replayer<'_>,
+        workload: &Workload,
+        plan: ScanPlan,
+    ) -> Result<Written> {
+        self.put(Record::Evidence(Evidence {
+            record_version: format::RECORD_VERSION,
+            provenance: Provenance {
+                inputs: vec![replayer.catalog().digest(), workload.hash()],
+                oldest_input_age: Duration::ZERO,
+                manifest_version: Some(replayer.manifest_version()),
+                created_at: self.now(),
+            },
+            body: EvidenceBody::Plan { plan },
+        }))
+    }
+
     /// Stage 2 for a Rewrite proposal: the caller's before and after outputs.
     fn verify_rewrite(
         &self,
@@ -749,8 +770,8 @@ impl Engine {
     ) -> Result<(Written, Reconciliation)> {
         let before = canonical_dir(&outputs.before)?;
         let after = canonical_dir(&outputs.after)?;
-        let left_source = self.output_source()?;
-        let right_source = self.output_source()?;
+        let left_source = self.output_source(&before)?;
+        let right_source = self.output_source(&after)?;
         let mut spec = ReconcileSpec::new(outputs.key.clone())
             .ignore(outputs.ignore.clone())
             .with_totals(crate::reconcile::total_columns(&outputs.totals)?)
@@ -779,9 +800,10 @@ impl Engine {
         Ok(Reconciler::new(spec, options)?.created_at(self.now()))
     }
 
-    /// A source for an output folder: the engine's format, schema inferred.
-    pub(crate) fn output_source(&self) -> Result<Box<dyn Source>> {
-        self.source(None)
+    /// A source for an output folder `root`: the engine's format, schema
+    /// inferred, partitioning as the options say, rooted at `root`.
+    pub(crate) fn output_source(&self, root: &str) -> Result<Box<dyn Source>> {
+        self.source_at(None, root)
     }
 
     pub(crate) fn record_certified(
@@ -1072,7 +1094,7 @@ fn replayer<'a>(
 ) -> Result<Replayer<'a>> {
     match pinned {
         Some(p) => Replayer::for_snapshot(source, &p.snapshot),
-        None => Replayer::unindexed(source, engine.root()),
+        None => Replayer::unindexed(source, engine.root(), &engine.partitioning(None)?),
     }
 }
 
@@ -1091,6 +1113,199 @@ fn unhashable(schema: &arrow::datatypes::Schema, keys: &[String]) -> Vec<String>
         .map(|f| f.name().clone())
         .filter(|n| !keys.contains(n))
         .collect()
+}
+
+/// One run as verify compares it: its keys, its lookup, the time column the
+/// lookup is planned on (`Replayer::planned_time_column`; `None` when no
+/// index can plan it, so the run reads every row group), and its plan's
+/// residual, read only for which columns key a lookback's windows.
+struct AskedRun {
+    keys: RunKeys,
+    query: RunQuery,
+    column: Option<String>,
+    residual: Option<Predicate>,
+}
+
+/// `spec` comparing only the rows the runs ask for, every bound taken from
+/// the workload and the data on the left side, never from the index under
+/// test: a window's ends and an `asof`'s instant (and lookback) are the
+/// run's own, and a `latest` lookback's window `[newest − N, newest]` is
+/// built from each key's newest time in `source` (the left side, every
+/// live row group of `catalog`). A row is compared, on both sides, when
+/// some run keeps it: one of the run's keys, within its window. Locate and
+/// plain `latest` runs keep every row of their keys, and `latest` and
+/// `asof` compare the newest kept version per key (`latest_by`). An index
+/// whose bounds disagree with the data plans other row groups than these
+/// windows need, so its certificate fails.
+fn rows_asked(
+    source: &dyn Source,
+    catalog: &Catalog,
+    runs: &[AskedRun],
+    mut spec: ReconcileSpec,
+) -> Result<ReconcileSpec> {
+    let schema = catalog.schema();
+    let ty = |c: &str| -> Result<arrow::datatypes::DataType> {
+        Ok(schema
+            .field_with_name(c)
+            .map_err(|_| Error::KeySpec(format!("column {c:?} is not in the dataset")))?
+            .data_type()
+            .clone())
+    };
+    let mut narrowed = false;
+    let mut filter = Vec::with_capacity(runs.len());
+    for run in runs {
+        let all: Vec<usize> = (0..run.keys.columns().len()).collect();
+        let mut tests = vec![Predicate::In {
+            columns: run.keys.columns().to_vec(),
+            values: run.keys.all_probes(&all),
+        }];
+        let between = |c: &str, lo: i64, hi: i64| -> Result<Predicate> {
+            let t = ty(c)?;
+            let floor = bellwether_core::encoding::ts_min(&t)?;
+            Ok(Predicate::Between {
+                column: c.to_string(),
+                lo: encode_ts(lo.max(floor), &t)?,
+                hi: encode_ts(hi, &t)?,
+            })
+        };
+        match (&run.query, &run.column) {
+            (RunQuery::Window(w), _) => tests.push(between(&w.ts_column, w.lo, w.hi)?),
+            (RunQuery::Asof { ts }, Some(c)) => tests.push(between(c, i64::MIN, *ts)?),
+            (
+                RunQuery::Lookback {
+                    asof: Some(at),
+                    lookback,
+                },
+                Some(c),
+            ) => tests.push(between(c, at.saturating_sub(*lookback), *at)?),
+            (
+                RunQuery::Lookback {
+                    asof: None,
+                    lookback,
+                },
+                Some(c),
+            ) => tests.extend(newest_windows(source, catalog, run, c, *lookback)?),
+            _ => {
+                filter.push(Predicate::And { all: tests });
+                continue;
+            }
+        }
+        narrowed = true;
+        filter.push(Predicate::And { all: tests });
+    }
+    if narrowed {
+        spec = spec.rows_where(filter);
+    }
+    // One version per key, by the one column every run ranks versions on.
+    let mut versioned = runs.iter().map(|r| match (&r.query, &r.column) {
+        (RunQuery::Latest | RunQuery::Asof { .. }, Some(c)) => Some(c),
+        _ => None,
+    });
+    if let Some(Some(first)) = versioned.next() {
+        if versioned.all(|c| c == Some(first)) {
+            spec = spec.latest_by(first.clone());
+        }
+    }
+    Ok(spec)
+}
+
+/// A `latest` lookback run's per-key windows `[newest − lookback, newest]`
+/// on `ts_column`, keyed by the columns the planner keys its windows by
+/// (the residual's `NotOlderThan` columns; the run's columns otherwise),
+/// with each key's newest time read from every live row group of `source`:
+/// `In` over the keys that have a non-null time and `NotOlderThan` at each
+/// window's start. Memory: one time per looked-up key (ADR 018).
+fn newest_windows(
+    source: &dyn Source,
+    catalog: &Catalog,
+    run: &AskedRun,
+    ts_column: &str,
+    lookback: i64,
+) -> Result<Vec<Predicate>> {
+    fn key_columns(p: &Predicate) -> Option<&Vec<String>> {
+        match p {
+            Predicate::NotOlderThan { columns, .. } => Some(columns),
+            Predicate::And { all } => all.iter().find_map(key_columns),
+            _ => None,
+        }
+    }
+    let columns = run
+        .residual
+        .as_ref()
+        .and_then(key_columns)
+        .cloned()
+        .unwrap_or_else(|| run.keys.columns().to_vec());
+    let positions = run.keys.positions(&columns).ok_or_else(|| {
+        Error::Other(format!(
+            "the lookback's key columns {columns:?} are not all among the run's {:?}",
+            run.keys.columns()
+        ))
+    })?;
+    let wanted: std::collections::HashSet<Vec<u8>> =
+        run.keys.all_probes(&positions).into_iter().collect();
+    let schema = catalog.schema();
+    let types: Vec<arrow::datatypes::DataType> = columns
+        .iter()
+        .chain(std::iter::once(&ts_column.to_string()))
+        .map(|c| {
+            schema
+                .field_with_name(c)
+                .map(|f| f.data_type().clone())
+                .map_err(|_| Error::KeySpec(format!("column {c:?} is not in the dataset")))
+        })
+        .collect::<Result<_>>()?;
+    let mut read: Vec<String> = columns.clone();
+    read.push(ts_column.to_string());
+    let n = columns.len();
+    let mut newest: BTreeMap<Vec<u8>, i64> = BTreeMap::new();
+    let mut key = Vec::new();
+    for rg in catalog.row_groups() {
+        let batch = source.read_columns(&rg.meta, &read)?;
+        'rows: for row in 0..batch.num_rows() {
+            key.clear();
+            for (i, t) in types[..n].iter().enumerate() {
+                if !bellwether_core::encoding::encode_array_value_as(
+                    batch.column(i).as_ref(),
+                    row,
+                    t,
+                    &mut key,
+                )? {
+                    continue 'rows;
+                }
+            }
+            if !wanted.contains(&key) {
+                continue;
+            }
+            if let Some(t) =
+                bellwether_core::encoding::ts_value_as(batch.column(n).as_ref(), row, &types[n])?
+            {
+                let e = newest.entry(key.clone()).or_insert(t);
+                *e = (*e).max(t);
+            }
+        }
+    }
+    let ts_type = &types[n];
+    let floor = bellwether_core::encoding::ts_min(ts_type)?;
+    let bounds = newest
+        .iter()
+        .map(|(k, t)| {
+            Ok((
+                k.clone(),
+                encode_ts(t.saturating_sub(lookback).max(floor), ts_type)?,
+            ))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(vec![
+        Predicate::In {
+            columns: columns.clone(),
+            values: newest.into_keys().collect(),
+        },
+        Predicate::NotOlderThan {
+            columns,
+            ts_column: ts_column.to_string(),
+            bounds,
+        },
+    ])
 }
 
 pub(crate) fn load_workload(
@@ -1566,6 +1781,519 @@ mod tests {
                 expected: 4,
                 committed: 6
             })
+        );
+    }
+
+    /// Nine one-day row groups (2026-01-01 to 2026-01-09; three files of
+    /// three), four prints each. `A` trades on even days only, so a key or
+    /// time index prunes; `B` every day.
+    fn daily(data: &Path) {
+        use std::sync::Arc;
+
+        use arrow::array::{ArrayRef, Date32Array, Int64Array, StringArray};
+        use arrow::array::{RecordBatch, TimestampMicrosecondArray};
+        use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
+        use parquet::arrow::ArrowWriter;
+        use parquet::file::properties::WriterProperties;
+
+        const FIRST: i32 = 20_454; // 2026-01-01
+        std::fs::create_dir_all(data).unwrap();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("symbol", DataType::Utf8, false),
+            Field::new(
+                "ts",
+                DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+                false,
+            ),
+            Field::new("day", DataType::Date32, false),
+            Field::new("v", DataType::Int64, false),
+        ]));
+        for f in 0..3 {
+            let props = WriterProperties::builder()
+                .set_max_row_group_row_count(Some(4))
+                .build();
+            let file = std::fs::File::create(data.join(format!("part-{f}.parquet"))).unwrap();
+            let mut w = ArrowWriter::try_new(file, Arc::clone(&schema), Some(props)).unwrap();
+            for r in 0..3 {
+                let d = FIRST + f * 3 + r;
+                let syms = if (d - FIRST) % 2 == 0 {
+                    ["A", "B", "A", "B"]
+                } else {
+                    ["B", "B", "B", "B"]
+                };
+                let ts: Vec<i64> = (0..4)
+                    .map(|i| i64::from(d) * 86_400_000_000 + i * 1_000_000 + 1)
+                    .collect();
+                let b = RecordBatch::try_new(
+                    Arc::clone(&schema),
+                    vec![
+                        Arc::new(StringArray::from(syms.to_vec())) as ArrayRef,
+                        Arc::new(TimestampMicrosecondArray::from(ts).with_timezone("UTC")),
+                        Arc::new(Date32Array::from(vec![d; 4])),
+                        Arc::new(Int64Array::from(vec![i64::from(d); 4])),
+                    ],
+                )
+                .unwrap();
+                w.write(&b).unwrap();
+                w.flush().unwrap();
+            }
+            w.close().unwrap();
+        }
+    }
+
+    /// `fix` on the key `why` recommends verifies and applies under every
+    /// lookup kind: verification compares the rows each run asks for (its
+    /// plan's residual on both sides), not every row of its keys. A plan
+    /// that misses a row group holding a row inside the window still fails.
+    #[test]
+    #[allow(clippy::too_many_lines, clippy::many_single_char_names)]
+    fn fix_applies_why_s_recommendation_under_every_lookup_kind() {
+        use crate::TimeWindow;
+
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("base");
+        daily(&base);
+        let kf = dir.path().join("k.parquet");
+        {
+            use std::sync::Arc;
+
+            use arrow::array::{ArrayRef, RecordBatch, StringArray};
+            use arrow::datatypes::{DataType, Field, Schema};
+            use parquet::arrow::ArrowWriter;
+            let ks = Arc::new(Schema::new(vec![Field::new(
+                "symbol",
+                DataType::Utf8,
+                false,
+            )]));
+            let kb = RecordBatch::try_new(
+                Arc::clone(&ks),
+                vec![Arc::new(StringArray::from(vec!["A"])) as ArrayRef],
+            )
+            .unwrap();
+            let mut w =
+                ArrowWriter::try_new(std::fs::File::create(&kf).unwrap(), ks, None).unwrap();
+            w.write(&kb).unwrap();
+            w.close().unwrap();
+        }
+        let s = |v: &str| Some(v.to_string());
+        let window = |from: &str, to: &str| {
+            Some(TimeWindow {
+                from: from.into(),
+                to: to.into(),
+            })
+        };
+        let cases: Vec<(&str, WhyRequest, bool)> = vec![
+            ("locate", WhyRequest::default(), false),
+            (
+                "latest",
+                WhyRequest {
+                    latest_by: s("ts"),
+                    ..WhyRequest::default()
+                },
+                false,
+            ),
+            (
+                "asof",
+                WhyRequest {
+                    latest_by: s("ts"),
+                    at: s("2026-01-06"),
+                    ..WhyRequest::default()
+                },
+                true,
+            ),
+            (
+                "latest lookback",
+                WhyRequest {
+                    latest_by: s("ts"),
+                    lookback: s("2d"),
+                    ..WhyRequest::default()
+                },
+                true,
+            ),
+            (
+                "asof lookback",
+                WhyRequest {
+                    latest_by: s("ts"),
+                    at: s("2026-01-06"),
+                    lookback: s("2d"),
+                    ..WhyRequest::default()
+                },
+                true,
+            ),
+            (
+                "window --ts day",
+                WhyRequest {
+                    window: window("2026-01-03", "2026-01-05"),
+                    ts_column: s("day"),
+                    ..WhyRequest::default()
+                },
+                true,
+            ),
+            (
+                "asof lookback --ts ts",
+                WhyRequest {
+                    latest_by: s("ts"),
+                    at: s("2026-01-06"),
+                    lookback: s("2d"),
+                    ts_column: s("ts"),
+                    ..WhyRequest::default()
+                },
+                true,
+            ),
+        ];
+        for (i, (name, req, filtered)) in cases.into_iter().enumerate() {
+            let data = dir.path().join(format!("d{i}"));
+            std::fs::create_dir_all(&data).unwrap();
+            for f in 0..3 {
+                let n = format!("part-{f}.parquet");
+                std::fs::copy(base.join(&n), data.join(&n)).unwrap();
+            }
+            let e = Engine::open(data.to_str().unwrap(), EngineOptions::default()).unwrap();
+            let w = e
+                .why(&WhyRequest {
+                    keys: Some(KeyFile::new(&kf)),
+                    ..req
+                })
+                .unwrap();
+            let rec = w
+                .recommended
+                .as_ref()
+                .unwrap_or_else(|| panic!("{name}: no rec"));
+            let wl = w.workload.as_ref().unwrap().hash;
+            if name == "window --ts day" {
+                // A plan missing the 2026-01-03 row group (part-0's only
+                // one in the window), which holds A's rows inside the
+                // window, fails the certificate.
+                test_seam::set(|sel| {
+                    sel.retain(|p, _| !p.ends_with("part-0.parquet"));
+                });
+                let bad = fix_key(&e, rec.proposal, wl, true);
+                test_seam::clear();
+                assert!(
+                    matches!(
+                        bad.outcome,
+                        FixOutcome::Refused {
+                            refusal: Refusal::CertificateFailed { .. }
+                        }
+                    ),
+                    "{name}: {:?}",
+                    bad.outcome
+                );
+            }
+            let r = fix_key(&e, rec.proposal, wl, false);
+            assert!(
+                matches!(r.outcome, FixOutcome::Applied { .. }),
+                "{name}: {:?} {:?}",
+                r.outcome,
+                r.verification
+            );
+            let v = r.verification.unwrap();
+            assert!(v.pass, "{name}");
+            assert_eq!(v.row_filter.is_some(), filtered, "{name}");
+            // The certificate cites the union plan; the filter comes from
+            // the workload (cited by its coverage) and the left side's data.
+            let Some(Written {
+                record: Record::Certificate(c),
+                ..
+            }) = &r.certificate
+            else {
+                panic!("{name}: no certificate")
+            };
+            let plans = c
+                .provenance
+                .inputs
+                .iter()
+                .filter(|h| {
+                    matches!(
+                        e.ledger().unwrap().get(h),
+                        Ok(Record::Evidence(Evidence {
+                            body: EvidenceBody::Plan { .. },
+                            ..
+                        }))
+                    )
+                })
+                .count();
+            assert_eq!(plans, 1, "{name}");
+        }
+    }
+
+    /// How [`plant_bounds`] corrupts `A`'s bounds in its newest row group
+    /// (2026-01-09, part-2 row group 2).
+    #[derive(Clone, Copy, Debug)]
+    enum Plant {
+        /// Dropped: the index's newest time for `A` is two days too old.
+        TooOld,
+        /// Its maximum raised five days: the index's newest is too new.
+        TooNew,
+    }
+
+    /// Commits per-key bounds for the [`daily`] corpus over `e`'s index in
+    /// place of the ones `index` built, `A`'s corrupted by `plant`.
+    #[allow(
+        clippy::many_single_char_names,
+        clippy::cast_possible_wrap,
+        clippy::default_trait_access
+    )]
+    fn plant_bounds(e: &Engine, plant: Option<Plant>) {
+        use bellwether_core::encoding::{encode_value_as, Value};
+        use bellwether_core::sidecar::{SidecarDef, SidecarKind, SidecarWriter};
+        use bellwether_store::{commit, RowGroupRange, SegmentRef, StagedSegments};
+        use bellwether_types::RowGroupId;
+
+        const FIRST: i64 = 20_454;
+        const DAY: i64 = 86_400_000_000;
+        let store = e.store().unwrap();
+        let m = bellwether_store::Snapshot::open(Arc::clone(store), "")
+            .unwrap()
+            .manifest()
+            .clone();
+        let def = SidecarDef {
+            kind: SidecarKind::Bounds,
+            columns: vec!["symbol".into()],
+            time_columns: vec!["ts".into()],
+        };
+        let schema = e.pin().unwrap().unwrap().planner.schema().clone();
+        let mut w = SidecarWriter::for_dataset(def.clone(), &schema).unwrap();
+        let enc = |s: &str| {
+            let mut out = Vec::new();
+            encode_value_as(&Value::Utf8(s), &arrow::datatypes::DataType::Utf8, &mut out).unwrap();
+            out
+        };
+        let (mut lo_id, mut hi_id) = (u32::MAX, 0);
+        for f in &m.rowgroup_space.files {
+            let name = file_name(&f.fingerprint.path);
+            let fi: i64 = name["part-".len()..name.len() - ".parquet".len()]
+                .parse()
+                .unwrap();
+            for (r, id) in f.rowgroup_ids.iter().enumerate() {
+                lo_id = lo_id.min(id.0);
+                hi_id = hi_id.max(id.0);
+                let d = fi * 3 + r as i64;
+                let t = |i: i64| (FIRST + d) * DAY + i * 1_000_000 + 1;
+                if d % 2 == 0 {
+                    let (lo, mut hi) = (t(0), t(2));
+                    match (plant, d) {
+                        (Some(Plant::TooOld), 8) => {}
+                        (Some(Plant::TooNew), 8) => {
+                            hi += 5 * DAY;
+                            w.insert_bounds(&enc("A"), *id, lo, hi).unwrap();
+                        }
+                        _ => w.insert_bounds(&enc("A"), *id, lo, hi).unwrap(),
+                    }
+                    w.insert_bounds(&enc("B"), *id, t(1), t(3)).unwrap();
+                } else {
+                    w.insert_bounds(&enc("B"), *id, t(0), t(3)).unwrap();
+                }
+            }
+        }
+        w.set_rowgroup_range(RowGroupId(lo_id)..RowGroupId(hi_id + 1))
+            .unwrap();
+        let seg = w.finish().unwrap();
+        let mut staged = StagedSegments::new();
+        staged.stage(bytes::Bytes::from(seg.bytes.clone()));
+        commit(&**store, "", &staged, |cur| {
+            let mut next = cur.clone();
+            next.segments
+                .retain(|s| s.kind.as_deref() != Some("bounds"));
+            next.segments.push(SegmentRef {
+                id: seg.id,
+                kind: Some("bounds".into()),
+                key_spec: def.name(),
+                rowgroup_range: RowGroupRange {
+                    start: RowGroupId(lo_id),
+                    end: RowGroupId(hi_id + 1),
+                    extra: Default::default(),
+                },
+                bytes: seg.bytes.len() as u64,
+                extra: Default::default(),
+            });
+            Ok(next)
+        })
+        .unwrap();
+    }
+
+    /// Verify takes a `latest` lookback's per-key windows from the data,
+    /// not from the index under test: a bounds sidecar whose newest time
+    /// for `A` is too old, or too new, plans other row groups than A's
+    /// window in the data needs, and the certificate fails. With correct
+    /// bounds the same steps pass.
+    #[test]
+    #[allow(clippy::cast_possible_wrap)]
+    fn a_bounds_sidecar_that_disagrees_with_the_data_fails_verification() {
+        use std::sync::Arc;
+
+        use arrow::array::{ArrayRef, RecordBatch, StringArray};
+        use arrow::datatypes::{DataType, Field, Schema};
+        use parquet::arrow::ArrowWriter;
+
+        let dir = tempfile::tempdir().unwrap();
+        let kf = dir.path().join("k.parquet");
+        let ks = Arc::new(Schema::new(vec![Field::new(
+            "symbol",
+            DataType::Utf8,
+            false,
+        )]));
+        let kb = RecordBatch::try_new(
+            Arc::clone(&ks),
+            vec![Arc::new(StringArray::from(vec!["A"])) as ArrayRef],
+        )
+        .unwrap();
+        let mut w = ArrowWriter::try_new(std::fs::File::create(&kf).unwrap(), ks, None).unwrap();
+        w.write(&kb).unwrap();
+        w.close().unwrap();
+        for plant in [None, Some(Plant::TooOld), Some(Plant::TooNew)] {
+            let data = dir.path().join(format!("{plant:?}"));
+            daily(&data);
+            let e = Engine::open(data.to_str().unwrap(), EngineOptions::default()).unwrap();
+            e.index_declared(&[crate::spec::parse_declaration("exact:symbol@ts").unwrap()])
+                .unwrap();
+            plant_bounds(&e, plant);
+            let why = e
+                .why(&WhyRequest {
+                    keys: Some(KeyFile::new(&kf)),
+                    latest_by: Some("ts".into()),
+                    lookback: Some("2d".into()),
+                    ..WhyRequest::default()
+                })
+                .unwrap();
+            let wl = why.workload.as_ref().unwrap().hash;
+            let ev = why.evidence.hash.unwrap();
+            // A bloom key beside the exact one: the lookback still plans
+            // through the (planted) bounds sidecar.
+            let crate::ProposeResult::Written { proposal } = e
+                .propose(
+                    ProposalBody::Key {
+                        spec: crate::spec::parse("bloom:symbol@0.01").unwrap(),
+                    },
+                    &[ev],
+                    "test",
+                )
+                .unwrap()
+            else {
+                panic!("not written")
+            };
+            let r = fix_key(&e, proposal.hash, wl, true);
+            let v = r.verification.as_ref().unwrap();
+            match plant {
+                None => assert!(
+                    matches!(r.outcome, FixOutcome::Verified) && v.pass,
+                    "{:?}",
+                    r.outcome
+                ),
+                Some(_) => assert!(
+                    matches!(
+                        r.outcome,
+                        FixOutcome::Refused {
+                            refusal: Refusal::CertificateFailed { mismatched: 1, .. }
+                        }
+                    ),
+                    "{plant:?}: {:?} {v:?}",
+                    r.outcome
+                ),
+            }
+        }
+    }
+
+    /// The boundary of an `asof` lookback: `A` has rows at exactly
+    /// `T − 2d`, at `T − 1d`, and at `T + 1d`, each in its own file. Priced
+    /// with `--at T --lookback 2d`, the recommended key's plan holds the
+    /// first two; a plan missing the row at exactly `T − 2d` (the window's
+    /// inclusive start) fails the certificate, and the real plan passes.
+    #[test]
+    fn a_plan_missing_the_row_at_the_lookback_start_fails_verification() {
+        use std::sync::Arc;
+
+        use arrow::array::TimestampMicrosecondArray;
+        use arrow::array::{ArrayRef, Int64Array, RecordBatch, StringArray};
+        use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
+        use parquet::arrow::ArrowWriter;
+
+        const DAY: i64 = 86_400_000_000;
+        // 2026-01-05T00:00:00Z in microseconds.
+        const T: i64 = 20_458 * DAY;
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("data");
+        std::fs::create_dir_all(&data).unwrap();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("symbol", DataType::Utf8, false),
+            Field::new(
+                "ts",
+                DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+                false,
+            ),
+            Field::new("v", DataType::Int64, false),
+        ]));
+        for (name, sym, ts) in [
+            ("a-start.parquet", "A", T - 2 * DAY),
+            ("b-inside.parquet", "A", T - DAY),
+            ("c-after.parquet", "A", T + DAY),
+            ("d-other.parquet", "B", T - DAY),
+        ] {
+            let b = RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(StringArray::from(vec![sym])) as ArrayRef,
+                    Arc::new(TimestampMicrosecondArray::from(vec![ts]).with_timezone("UTC")),
+                    Arc::new(Int64Array::from(vec![ts])),
+                ],
+            )
+            .unwrap();
+            let f = std::fs::File::create(data.join(name)).unwrap();
+            let mut w = ArrowWriter::try_new(f, Arc::clone(&schema), None).unwrap();
+            w.write(&b).unwrap();
+            w.close().unwrap();
+        }
+        let kf = dir.path().join("k.parquet");
+        let ks = Arc::new(Schema::new(vec![Field::new(
+            "symbol",
+            DataType::Utf8,
+            false,
+        )]));
+        let kb = RecordBatch::try_new(
+            Arc::clone(&ks),
+            vec![Arc::new(StringArray::from(vec!["A"])) as ArrayRef],
+        )
+        .unwrap();
+        let mut w = ArrowWriter::try_new(std::fs::File::create(&kf).unwrap(), ks, None).unwrap();
+        w.write(&kb).unwrap();
+        w.close().unwrap();
+        let e = Engine::open(data.to_str().unwrap(), EngineOptions::default()).unwrap();
+        let why = e
+            .why(&WhyRequest {
+                keys: Some(KeyFile::new(&kf)),
+                latest_by: Some("ts".into()),
+                at: Some("2026-01-05T00:00:00Z".into()),
+                lookback: Some("2d".into()),
+                ..WhyRequest::default()
+            })
+            .unwrap();
+        let rec = why.recommended.as_ref().expect("a recommendation");
+        let wl = why.workload.as_ref().unwrap().hash;
+        test_seam::set(|sel| {
+            assert!(
+                sel.keys().any(|p| p.ends_with("a-start.parquet")),
+                "{sel:?}"
+            );
+            sel.retain(|p, _| !p.ends_with("a-start.parquet"));
+        });
+        let bad = fix_key(&e, rec.proposal, wl, true);
+        test_seam::clear();
+        assert!(
+            matches!(
+                bad.outcome,
+                FixOutcome::Refused {
+                    refusal: Refusal::CertificateFailed { .. }
+                }
+            ),
+            "{:?} {:?}",
+            bad.outcome,
+            bad.verification
+        );
+        let ok = fix_key(&e, rec.proposal, wl, true);
+        assert!(
+            matches!(ok.outcome, FixOutcome::Verified),
+            "{:?}",
+            ok.outcome
         );
     }
 }

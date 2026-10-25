@@ -168,12 +168,14 @@ fn tuple(id: i64, grp: u8) -> Vec<u8> {
     [enc_i64(id), enc_str(&format!("g{grp}"))].concat()
 }
 
-/// Plans a lookback window over `t = temporal:id@ts` (with `specs`) and
-/// checks it against the definition: the rows of the looked-up keys whose
-/// `ts` lies in `[hi − lookback, hi]`, `hi` being `asof` or the key's newest
-/// version anywhere. Every row group holding such a row is planned
-/// (invariant 1), and the residual over the planned rows returns exactly
-/// those rows.
+/// Plans a lookback over `t = temporal:id@ts` (with `specs`) and checks it
+/// against the definition: the rows of the looked-up keys whose `ts` lies
+/// in `[hi − lookback, hi]`, `hi` being `asof` or the key's newest version
+/// anywhere. Without `asof` it is the per-key [`Lookup::Lookback`]; with
+/// one it is the plain [`Lookup::Window`] `[asof − lookback, asof]` on
+/// `ts`, which `asof --lookback` plans. Every row group holding such a row
+/// is planned (invariant 1), and the residual over the planned rows returns
+/// exactly those rows.
 fn check_window(
     p: &bellwether_build::Planner<bellwether_store::ObjectStoreBackend>,
     rows: &[Row],
@@ -183,11 +185,19 @@ fn check_window(
     asof: Option<i64>,
     lookback: i64,
 ) {
-    let lookup = Lookup::Window {
-        columns: columns.to_vec(),
-        keys: keys.to_vec(),
-        asof,
-        lookback,
+    let lookup = match asof {
+        None => Lookup::Lookback {
+            columns: columns.to_vec(),
+            keys: keys.to_vec(),
+            lookback,
+        },
+        Some(at) => Lookup::Window {
+            columns: columns.to_vec(),
+            keys: keys.to_vec(),
+            ts_column: "ts".into(),
+            lo: at - lookback,
+            hi: at,
+        },
     };
     let plan = p.plan(specs, &lookup).unwrap();
     // The generator's timestamps are 0..30, so decode by table.
