@@ -184,7 +184,14 @@ def external_cpu():
                 return True
             pid, seen = procs[pid][0], seen + 1
         return False
-    return sum(cpu for pid, (_, cpu) in procs.items() if not mine(pid)) / 100.0
+    names = {}
+    for line in subprocess.run(["ps", "-Ao", "pid=,comm="], capture_output=True, text=True).stdout.splitlines():
+        f = line.split(None, 1)
+        if len(f) == 2:
+            names[int(f[0])] = f[1].strip()
+    ext = [(cpu, names.get(pid, str(pid))) for pid, (_, cpu) in procs.items() if not mine(pid) and cpu > 0]
+    ext.sort(reverse=True)
+    return sum(c for c, _ in ext) / 100.0, [f"{n} {c:.0f}%" for c, n in ext[:5]]
 
 
 class Perf:
@@ -215,13 +222,15 @@ class Perf:
             self.sections[name] = {"started_at": self.env["started_at"], "commit": self.env["commit"],
                                    "commit_dirty": self.env["commit_dirty"], "load_avg_1m_start": load}
             self.load_max = load
-            self.ext_max = external_cpu()
+            self.ext_max, self.ext_top = external_cpu()
             self.load_stop = threading.Event()
 
             def watch():
                 while not self.load_stop.wait(5):
                     self.load_max = max(self.load_max, os.getloadavg()[0])
-                    self.ext_max = max(self.ext_max, external_cpu())
+                    cores, top = external_cpu()
+                    if cores > self.ext_max:
+                        self.ext_max, self.ext_top = cores, top
             self.load_thread = threading.Thread(target=watch, daemon=True)
             self.load_thread.start()
         else:
@@ -231,9 +240,10 @@ class Perf:
             self.sections[name]["load_avg_1m_end"] = load
             self.sections[name]["load_avg_1m_max"] = round(max(self.load_max, load), 2)
             self.sections[name]["external_cpu_cores_max"] = round(self.ext_max, 2)
+            self.sections[name]["external_top_at_max"] = self.ext_top
             if self.ext_max > self.a.max_load:
                 say(f"WARNING: {name}: processes outside this run used up to {self.ext_max:.1f} cores "
-                    f"(limit {self.a.max_load}); rerun this section on a quiet machine before publishing it")
+                    f"(limit {self.a.max_load}; at the peak: {', '.join(self.ext_top)}); rerun this section on a quiet machine before publishing it")
         self.env["sections"] = self.sections
 
     def sample(self, mid, values, **extra):
