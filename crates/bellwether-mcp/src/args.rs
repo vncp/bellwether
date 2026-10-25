@@ -163,6 +163,9 @@ impl EngineArgs {
             // `--at-manifest` on the CLI's lookups), never per session.
             at_manifest: None,
             clock: self.clock.clone(),
+            // Builds use the available parallelism; the CLI's `index
+            // --threads` sets it per call.
+            threads: None,
         })
     }
 }

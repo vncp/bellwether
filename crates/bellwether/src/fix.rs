@@ -893,6 +893,7 @@ impl Engine {
         options.schema.clone_from(&self.options().schema);
         options.fingerprint_policy = self.options().fingerprint_policy;
         options.exclude = self.excluded();
+        options.threads = self.options().threads;
         let report = Builder::new(Arc::clone(self.store()?), "").build(
             self.root(),
             std::slice::from_ref(spec),

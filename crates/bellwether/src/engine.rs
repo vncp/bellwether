@@ -141,6 +141,10 @@ pub struct EngineOptions {
     /// "now" when ages are computed, so two runs over the same inputs write
     /// byte-identical records. `None` uses the system clock.
     pub clock: Option<String>,
+    /// Worker threads for builds (`index`, and the apply step of `fix`).
+    /// `None` uses the available parallelism. The segments a build writes
+    /// do not depend on it.
+    pub threads: Option<usize>,
 }
 
 /// The pinned current manifest: its planner, its snapshot, and its content

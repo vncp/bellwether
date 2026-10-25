@@ -65,6 +65,7 @@ impl Engine {
             .clone_from(&self.options().partitioning);
         options.sidecars = declared.iter().filter_map(|d| d.sidecar.clone()).collect();
         options.exclude = self.excluded();
+        options.threads = self.options().threads;
         let report =
             Builder::new(Arc::clone(self.store()?), "").build(self.root(), &specs, &options)?;
         let pinned = self.pin_required("index")?;
