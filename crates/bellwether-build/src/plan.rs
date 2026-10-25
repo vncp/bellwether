@@ -137,10 +137,18 @@ pub enum Lookup {
     },
     /// Rows whose `columns` tuple is one of `keys` and whose `ts_column`
     /// lies in `[lo, hi]`, both in the column's dataset unit (as
-    /// [`Lookup::AsOf`] takes its instant). Served by the key specs on
-    /// `columns`, intersected with range specs on `ts_column` and with every
+    /// [`Lookup::AsOf`] takes its instant). Every source that can bound the
+    /// window takes part, and their sets are intersected per key (each is a
+    /// superset of the row groups holding a matching row, so the
+    /// intersection is too): the key specs on `columns`; range specs on
+    /// `ts_column` (or exact and temporal specs led by it); the version
+    /// chains of a temporal spec on `columns@ts_column`, which keep only the
+    /// row groups holding a version of the key inside the window; every
     /// complete `bounds` sidecar on `columns@ts_column`, which keeps a row
-    /// group only when the key's own time range there overlaps the window.
+    /// group only when the key's own time range there overlaps the window;
+    /// and, when the manifest's partitioning makes `ts_column` a column of
+    /// every file (hive directories or a path template), the files whose
+    /// path value lies in the window.
     Window {
         /// Lookup columns.
         columns: Vec<String>,
@@ -267,9 +275,8 @@ impl<S: StoreExt + ?Sized> Planner<S> {
         let schema = columns_to_schema(&m.schema.columns)?;
         let locator = Locator::new(&m.rowgroup_space)?;
         let partitioning = Partitioning::parse(m.source.partitioning.as_deref())?;
-        let partitions = (partitioning == Partitioning::Hive).then_some(m.source.root.as_str());
         let parquet = (kind == SourceKind::Parquet)
-            .then(|| parquet_source(Some(&schema), policy, partitions));
+            .then(|| parquet_source(Some(&schema), policy, &m.source.root, &partitioning));
         Ok(Self {
             snapshot,
             schema,
@@ -1141,7 +1148,13 @@ impl<S: StoreExt + ?Sized> Planner<S> {
             .filter_map(|s| serve(&s.spec, columns).map(|v| (s, v)))
             .collect();
         let window = self.column_range(segs, ts_column, &lo_enc, &hi_enc)?;
-        if !segs.is_empty() && serving.is_empty() && window.is_none() && sidecars.is_empty() {
+        let by_path = self.path_window(ts_column, &ts_type, lo, hi)?;
+        if !segs.is_empty()
+            && serving.is_empty()
+            && window.is_none()
+            && sidecars.is_empty()
+            && by_path.is_none()
+        {
             return Err(Error::KeySpec(format!(
                 "none of the key specs {:?} serves a lookup on {columns:?} in a window of \
                  {ts_column:?}; declare exact:{}@{ts_column} or a range spec on {ts_column}",
@@ -1149,15 +1162,40 @@ impl<S: StoreExt + ?Sized> Planner<S> {
                 columns.join(",")
             )));
         }
+        let narrow = |acc: &mut [Option<RoaringBitmap>], with: &RoaringBitmap| {
+            for a in acc {
+                *a = Some(match a.take() {
+                    Some(x) => x & with,
+                    None => with.clone(),
+                });
+            }
+        };
         let mut acc: Vec<Option<RoaringBitmap>> = vec![None; keys.len()];
         self.intersect(&mut acc, &serving, &keys, &spans)?;
         if let Some(w) = &window {
-            for a in &mut acc {
-                *a = Some(match a.take() {
-                    Some(x) => x & w,
-                    None => w.clone(),
-                });
+            narrow(&mut acc, w);
+        }
+        // Partition or path-template values of the time column: a file's
+        // every row has its path's value, so a file outside the window holds
+        // no row of it.
+        if let Some(p) = &by_path {
+            narrow(&mut acc, p);
+        }
+        // A temporal spec on the window's own time column lists every
+        // version of each key with its row group: per key, only the row
+        // groups holding a version inside the window stay.
+        for (t, how) in &serving {
+            let (KeySpec::Temporal { ts_column: tc, .. }, Serve::Project(positions)) =
+                (&t.spec, how)
+            else {
+                continue;
+            };
+            if tc != ts_column {
+                continue;
             }
+            let variants = key_variants(&keys, &spans, positions);
+            let inside = self.chain_window(t, &variants, lo, hi)?;
+            narrow_per_key(&mut acc, &variants, &inside);
         }
         // Each bounds sidecar keeps, per key, exactly the row groups where
         // that key's own non-null times reach into the window. A row group
@@ -1171,43 +1209,178 @@ impl<S: StoreExt + ?Sized> Planner<S> {
                 .ok_or_else(|| {
                     Error::Other(format!("{} does not serve {columns:?}", def.name()))
                 })?;
-            let variants: Vec<Vec<Vec<u8>>> = keys
-                .iter()
-                .zip(&spans)
-                .map(|(k, sp)| zero_variants(&project(k, sp, &positions)))
-                .collect();
-            let mut probes: Vec<Vec<u8>> = variants.iter().flatten().cloned().collect();
-            probes.sort_unstable();
-            probes.dedup();
-            let mut inside: BTreeMap<Vec<u8>, RoaringBitmap> = BTreeMap::new();
-            for seg in self.sidecar_segments(def) {
-                let r = self.open_sidecar(def, seg)?;
-                for (key, bounds) in r.bounds(&probes)? {
-                    let e = inside.entry(key).or_default();
-                    for b in bounds.iter().filter(|b| b.overlaps(lo, hi)) {
-                        e.insert(b.rg.0);
-                    }
-                }
-            }
-            for (a, vs) in acc.iter_mut().zip(&variants) {
-                let mine = vs
-                    .iter()
-                    .filter_map(|v| inside.get(v))
-                    .fold(RoaringBitmap::new(), |u, b| u | b);
-                *a = Some(match a.take() {
-                    Some(x) => x & mine,
-                    None => mine,
-                });
-            }
+            let variants = key_variants(&keys, &spans, &positions);
+            let inside = self.bounds_window(def, &variants, lo, hi)?;
+            narrow_per_key(&mut acc, &variants, &inside);
         }
         let selected = if segs.is_empty() && sidecars.is_empty() {
-            self.locator.live().clone()
+            match &by_path {
+                Some(p) => self.locator.live() & p,
+                None => self.locator.live().clone(),
+            }
         } else {
             acc.into_iter()
                 .flatten()
                 .fold(RoaringBitmap::new(), |u, b| u | b)
         };
         self.finish(&selected, residual)
+    }
+
+    /// Per probe of `variants`, the row groups where the temporal spec `t`
+    /// records a version inside `[lo, hi]` (its version chains, every
+    /// segment).
+    fn chain_window(
+        &self,
+        t: &SpecSegments,
+        variants: &[Vec<Vec<u8>>],
+        lo: i64,
+        hi: i64,
+    ) -> Result<BTreeMap<Vec<u8>, RoaringBitmap>> {
+        let probes = sorted_probes(variants);
+        let mut inside: BTreeMap<Vec<u8>, RoaringBitmap> = BTreeMap::new();
+        for src in &t.sources {
+            let r = self.open_segment(&t.spec, src, false)?;
+            for (key, value) in r.get(&probes)? {
+                self.locator.check_known(&value.bitmap)?;
+                let e = inside.entry(key).or_default();
+                for &(ts, rg) in value.chain.versions() {
+                    if lo <= ts && ts <= hi {
+                        e.insert(rg.0);
+                    }
+                }
+            }
+        }
+        Ok(inside)
+    }
+
+    /// Per probe of `variants`, the row groups where the bounds sidecar
+    /// `def` records the key's own time range overlapping `[lo, hi]`.
+    fn bounds_window(
+        &self,
+        def: &SidecarDef,
+        variants: &[Vec<Vec<u8>>],
+        lo: i64,
+        hi: i64,
+    ) -> Result<BTreeMap<Vec<u8>, RoaringBitmap>> {
+        let probes = sorted_probes(variants);
+        let mut inside: BTreeMap<Vec<u8>, RoaringBitmap> = BTreeMap::new();
+        for seg in self.sidecar_segments(def) {
+            let r = self.open_sidecar(def, seg)?;
+            for (key, bounds) in r.bounds(&probes)? {
+                let e = inside.entry(key).or_default();
+                for b in bounds.iter().filter(|b| b.overlaps(lo, hi)) {
+                    e.insert(b.rg.0);
+                }
+            }
+        }
+        Ok(inside)
+    }
+
+    /// The live row groups whose file's path gives `ts_column` a value in
+    /// `[lo, hi]` (in the column's unit), when the manifest's partitioning
+    /// makes `ts_column` a column of every file (hive directories or a path
+    /// template); `None` when it does not. A null path value is in no
+    /// window (ADR 014).
+    fn path_window(
+        &self,
+        ts_column: &str,
+        ts_type: &DataType,
+        lo: i64,
+        hi: i64,
+    ) -> Result<Option<RoaringBitmap>> {
+        let m = self.manifest();
+        let scheme = Partitioning::parse(m.source.partitioning.as_deref())?;
+        let files = &m.rowgroup_space.files;
+        let Some(inside) = bellwether_source::partition::paths_in_window(
+            &scheme,
+            &m.source.root,
+            files.iter().map(|f| f.fingerprint.path.as_str()),
+            ts_column,
+            ts_type,
+            lo,
+            hi,
+        )?
+        else {
+            return Ok(None);
+        };
+        let mut out = RoaringBitmap::new();
+        for (f, _) in files.iter().zip(inside).filter(|(_, i)| *i) {
+            out.extend(f.rowgroup_ids.iter().map(|id| id.0));
+        }
+        out &= self.locator.live();
+        Ok(Some(out))
+    }
+
+    /// The column whose path values prune `lookup` (see
+    /// [`Lookup::Window`]): the window's time column when the manifest's
+    /// partitioning makes it a column of every file, else `None`.
+    pub fn path_column_for(&self, lookup: &Lookup) -> Result<Option<String>> {
+        let Lookup::Window { ts_column, .. } = lookup else {
+            return Ok(None);
+        };
+        let ts_type = self
+            .column_types(std::slice::from_ref(ts_column))?
+            .remove(0)
+            .1;
+        Ok(self
+            .path_window(ts_column, &ts_type, i64::MIN, i64::MAX)?
+            .map(|_| ts_column.clone()))
+    }
+
+    /// The newest timestamp among the versions of `keys` (over `columns`),
+    /// index-wide over live row groups (invariant 5), through the one
+    /// complete temporal spec of `specs` serving `columns`: the end of a
+    /// `latest --lookback` window. `None` when no key has a non-null
+    /// timestamp (ADR 014).
+    pub fn newest_version(
+        &self,
+        specs: &[KeySpec],
+        columns: &[String],
+        keys: &[Vec<u8>],
+    ) -> Result<Option<i64>> {
+        let segs = self.resolve(specs, &[])?;
+        let types = self.column_types(columns)?;
+        let (keys, spans) = non_null_probes(keys, &types)?;
+        let serving = Self::serving(&segs, columns)?;
+        let mut temporal = serving
+            .iter()
+            .filter(|(s, _)| matches!(s.spec, KeySpec::Temporal { .. }));
+        let (t, positions) = match (temporal.next(), temporal.next()) {
+            (Some((t, Serve::Project(p))), None) => (*t, p),
+            (Some((t, Serve::Prefix)), None) => {
+                return Err(Error::KeySpec(format!(
+                    "latest needs every column of {} in the lookup",
+                    t.spec.name()
+                )))
+            }
+            (None, _) => {
+                return Err(Error::KeySpec(format!(
+                    "latest needs a temporal key spec serving {columns:?}"
+                )))
+            }
+            (Some(_), Some(_)) => {
+                return Err(Error::KeySpec(
+                    "more than one temporal key spec serves this lookup; name one".into(),
+                ))
+            }
+        };
+        let mut probes: Vec<Vec<u8>> = keys
+            .iter()
+            .zip(&spans)
+            .flat_map(|(k, sp)| zero_variants(&project(k, sp, positions)))
+            .collect();
+        probes.sort_unstable();
+        probes.dedup();
+        let readers = t
+            .sources
+            .iter()
+            .map(|src| self.open_segment(&t.spec, src, false))
+            .collect::<Result<Vec<_>>>()?;
+        Ok(self
+            .temporal_hits(&readers, &probes, None)?
+            .values()
+            .map(|h| h.ts)
+            .max())
     }
 
     /// The bitemporal as-of (see [`Lookup::Bitemporal`]).
@@ -1525,6 +1698,45 @@ fn expanded<'a>(keys: impl Iterator<Item = &'a Vec<u8>>) -> Vec<Vec<u8>> {
     out.sort_unstable();
     out.dedup();
     out
+}
+
+/// Every zero variant of each key's projection onto `positions`.
+fn key_variants(
+    keys: &[Vec<u8>],
+    spans: &[Vec<std::ops::Range<usize>>],
+    positions: &[usize],
+) -> Vec<Vec<Vec<u8>>> {
+    keys.iter()
+        .zip(spans)
+        .map(|(k, sp)| zero_variants(&project(k, sp, positions)))
+        .collect()
+}
+
+/// Every variant of `variants`, sorted and deduplicated.
+fn sorted_probes(variants: &[Vec<Vec<u8>>]) -> Vec<Vec<u8>> {
+    let mut probes: Vec<Vec<u8>> = variants.iter().flatten().cloned().collect();
+    probes.sort_unstable();
+    probes.dedup();
+    probes
+}
+
+/// Narrows each key's row groups in `acc` to the union of what `inside`
+/// holds for its variants (variants are one key under SQL equality).
+fn narrow_per_key(
+    acc: &mut [Option<RoaringBitmap>],
+    variants: &[Vec<Vec<u8>>],
+    inside: &BTreeMap<Vec<u8>, RoaringBitmap>,
+) {
+    for (a, vs) in acc.iter_mut().zip(variants) {
+        let mine = vs
+            .iter()
+            .filter_map(|v| inside.get(v))
+            .fold(RoaringBitmap::new(), |u, b| u | b);
+        *a = Some(match a.take() {
+            Some(x) => x & mine,
+            None => mine,
+        });
+    }
 }
 
 /// The newest version in `chain` held by a live row group (and, for asof,

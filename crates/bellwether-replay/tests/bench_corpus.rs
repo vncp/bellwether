@@ -48,7 +48,12 @@ fn read_json(path: &Path) -> Option<Value> {
 
 fn setup<'a>(source: &'a ParquetSource, corpus: &Path) -> (Replayer<'a>, MemoryKeySets, Workload) {
     let data = corpus.join("data");
-    let replayer = Replayer::unindexed(source, data.to_str().unwrap()).unwrap();
+    let replayer = Replayer::unindexed(
+        source,
+        data.to_str().unwrap(),
+        &bellwether_source::Partitioning::None,
+    )
+    .unwrap();
     let keys = MemoryKeySets::new();
     let mut rec = WorkloadRecorder::new(&keys, replayer.schema().clone());
     let summary = record_bench_workload(&mut rec, &corpus.join("workload.json")).unwrap();

@@ -37,12 +37,22 @@
 //! - **Residual** (ADR 011). Every plan carries `In` over the run's key
 //!   tuples (float zeros in both encodings); an empty key set plans zero row
 //!   groups with an empty `In`.
+//! - **Windows.** A `window` run ([`RunWindow`]) also prunes by its time
+//!   column, as the build planner's `Lookup::Window` does: specs serving
+//!   that column ([`serves_window`]: a range spec on it, or an exact or
+//!   temporal spec led by it), the version chains of a temporal spec on
+//!   the run's key columns and that time column, and the values the
+//!   folder's partitioning gives the column from file paths
+//!   ([`SegmentPlanner::with_partitioning`]); each set is intersected per
+//!   key tuple. Its residual is `And[In, Between]` on the time column.
 
 use std::borrow::Cow;
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
-use arrow::datatypes::Schema;
+use arrow::datatypes::{DataType, Schema};
 use bellwether_core::segment::{ColumnType, ReadAt, SegmentReader};
+use bellwether_source::Partitioning;
 use bellwether_store::{Snapshot, StoreExt};
 use bellwether_types::{Error, Hash, KeySpec, Predicate, Result, RunCost, ScanPlan};
 use bytes::Bytes;
@@ -51,6 +61,7 @@ use roaring::RoaringBitmap;
 use crate::catalog::Catalog;
 use crate::keys::RunKeys;
 use crate::transient::TransientIndex;
+use crate::workload::RunWindow;
 
 /// How a key spec serves a run's keys ([`servable`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -87,6 +98,38 @@ pub fn servable(spec: &KeySpec, run_columns: &[String]) -> Option<Lookup> {
     prefix.then_some(Lookup::Prefix)
 }
 
+/// Whether `spec` bounds a window on `ts_column` by itself: a range spec
+/// on it, or an exact or temporal spec led by it (a prefix range).
+#[must_use]
+pub fn serves_window(spec: &KeySpec, ts_column: &str) -> bool {
+    match spec {
+        KeySpec::Range { column } => column == ts_column,
+        KeySpec::Exact { columns } | KeySpec::Temporal { columns, .. } => {
+            columns.first().is_some_and(|c| c == ts_column)
+        }
+        KeySpec::Bloom { .. } => false,
+    }
+}
+
+/// The specs of `specs` that take part in planning a run on `run_columns`
+/// (in `window`, if any): those serving its keys ([`servable`]) and, for a
+/// window, those serving its time column ([`serves_window`]).
+#[must_use]
+pub fn serving_run(
+    specs: &[KeySpec],
+    run_columns: &[String],
+    window: Option<&RunWindow>,
+) -> Vec<KeySpec> {
+    specs
+        .iter()
+        .filter(|s| {
+            servable(s, run_columns).is_some()
+                || window.is_some_and(|w| serves_window(s, &w.ts_column))
+        })
+        .cloned()
+        .collect()
+}
+
 /// The surface replay plans through. The build crate's planner implements it
 /// ([`crate::build_plan`]); [`SegmentPlanner`] implements it over core
 /// segments.
@@ -104,9 +147,15 @@ pub trait PlanSource: Send + Sync {
     /// The key specs this source can plan with.
     fn specs(&self) -> Vec<KeySpec>;
 
-    /// The plan for one run's keys under `specs` (module docs for the
-    /// serving, intersection, and no-pruning rules).
-    fn plan(&self, specs: &[KeySpec], keys: &RunKeys) -> Result<ScanPlan>;
+    /// The plan for one run's keys under `specs`, in `window` for a window
+    /// run (module docs for the serving, intersection, no-pruning, and
+    /// window rules).
+    fn plan(
+        &self,
+        specs: &[KeySpec],
+        keys: &RunKeys,
+        window: Option<&RunWindow>,
+    ) -> Result<ScanPlan>;
 
     /// This source with hypothetical specs' transient segments added, so
     /// each plans exactly as committed segments of that spec would. A
@@ -270,6 +319,9 @@ pub struct SegmentPlanner {
     /// Declared specs that are not complete at the pinned sequence, and
     /// why: a plan that lists one is refused.
     incomplete: Vec<(KeySpec, String)>,
+    /// The data root and the partitioning its paths are read under, for
+    /// window runs on a partition column.
+    partitioning: Option<(String, Partitioning)>,
 }
 
 impl SegmentPlanner {
@@ -280,7 +332,19 @@ impl SegmentPlanner {
             catalog,
             specs: Vec::new(),
             incomplete: Vec::new(),
+            partitioning: None,
         }
+    }
+
+    /// This planner reading partition values from the catalog's file paths
+    /// under `root` with `scheme`, so a window on a partition column prunes
+    /// by path as the build planner does. The catalog's statistics already
+    /// carry those values; this only tells the planner which column the
+    /// paths bound.
+    #[must_use]
+    pub fn with_partitioning(mut self, root: &str, scheme: Partitioning) -> Self {
+        self.partitioning = (!scheme.is_none()).then(|| (root.to_string(), scheme));
+        self
     }
 
     /// The planner over a pinned snapshot's committed segments: one entry
@@ -448,6 +512,139 @@ impl SegmentPlanner {
         }
         Ok(out)
     }
+
+    /// The selected row-group ids for a window run (module docs): per key
+    /// tuple, the intersection of what the specs serving its keys return,
+    /// the row groups of its versions inside the window in a temporal spec
+    /// on the window's column, the specs serving the window's column, and
+    /// the files whose path value lies in the window; then the union.
+    fn select_window(
+        &self,
+        specs: &[KeySpec],
+        listed: &[&Arc<SpecSegments>],
+        keys: &RunKeys,
+        w: &EncodedWindow,
+    ) -> Result<RoaringBitmap> {
+        let RunWindow { ts_column, lo, hi } = &w.window;
+        let by_path = self.path_window(w)?;
+        if specs.is_empty() {
+            let all = self.catalog.all_ids();
+            return Ok(match by_path {
+                Some(p) => all & p,
+                None => all,
+            });
+        }
+        let all_columns: Vec<usize> = (0..keys.columns().len()).collect();
+        let mut serving: Vec<(&SpecSegments, Lookup)> = Vec::new();
+        let mut ranged: Option<RoaringBitmap> = None;
+        for (spec, segments) in specs.iter().zip(listed) {
+            if let Some(lookup) = servable(spec, keys.columns()) {
+                serving.push((segments.as_ref(), lookup));
+            }
+            if serves_window(spec, ts_column) {
+                let mut found = RoaringBitmap::new();
+                for r in segments.readers() {
+                    found |= match spec {
+                        KeySpec::Range { .. } => r.lookup_range(&w.lo, &w.hi)?,
+                        _ => r.lookup_prefix_range(&w.lo, &w.hi)?,
+                    };
+                }
+                ranged = Some(match ranged {
+                    Some(x) => x & found,
+                    None => found,
+                });
+            }
+        }
+        if serving.is_empty() && ranged.is_none() && by_path.is_none() {
+            return Err(Error::KeySpec(format!(
+                "none of {:?} serves keys on {:?} in a window of {ts_column:?}",
+                specs.iter().map(KeySpec::name).collect::<Vec<_>>(),
+                keys.columns()
+            )));
+        }
+        let mut out = RoaringBitmap::new();
+        for i in 0..keys.len() {
+            let mut acc: Option<RoaringBitmap> = None;
+            let mut narrow = |with: RoaringBitmap| {
+                acc = Some(match acc.take() {
+                    Some(x) => x & with,
+                    None => with,
+                });
+            };
+            for (segments, lookup) in &serving {
+                let cols = match lookup {
+                    Lookup::Point { project } => project.clone(),
+                    Lookup::Prefix => all_columns.clone(),
+                };
+                let probes = keys.probes(i, &cols);
+                narrow(segments.lookup(&probes, lookup)?);
+                // A temporal spec on the window's column: only the row
+                // groups holding a version inside the window.
+                if let (KeySpec::Temporal { ts_column: tc, .. }, Lookup::Point { .. }) =
+                    (segments.spec(), lookup)
+                {
+                    if tc == ts_column {
+                        let mut inside = RoaringBitmap::new();
+                        for r in segments.readers() {
+                            for value in r.get(&probes)?.values() {
+                                for &(ts, rg) in value.chain.versions() {
+                                    if *lo <= ts && ts <= *hi {
+                                        inside.insert(rg.0);
+                                    }
+                                }
+                            }
+                        }
+                        narrow(inside);
+                    }
+                }
+            }
+            if let Some(r) = &ranged {
+                narrow(r.clone());
+            }
+            if let Some(p) = &by_path {
+                narrow(p.clone());
+            }
+            if let Some(a) = acc {
+                out |= a;
+            }
+        }
+        Ok(out)
+    }
+
+    /// The catalog's row groups whose file's path gives the window's column
+    /// a value inside it, when the partitioning makes that column a column
+    /// of every file; `None` otherwise.
+    fn path_window(&self, w: &EncodedWindow) -> Result<Option<RoaringBitmap>> {
+        let Some((root, scheme)) = &self.partitioning else {
+            return Ok(None);
+        };
+        let files = self.catalog.files();
+        let Some(inside) = bellwether_source::partition::paths_in_window(
+            scheme,
+            root,
+            files.iter().map(|f| f.path.as_str()),
+            &w.window.ts_column,
+            &w.ty,
+            w.window.lo,
+            w.window.hi,
+        )?
+        else {
+            return Ok(None);
+        };
+        let keep: BTreeSet<usize> = inside
+            .iter()
+            .enumerate()
+            .filter_map(|(i, k)| k.then_some(i))
+            .collect();
+        Ok(Some(
+            self.catalog
+                .row_groups()
+                .iter()
+                .filter(|rg| keep.contains(&rg.file))
+                .map(|rg| rg.id.0)
+                .collect(),
+        ))
+    }
 }
 
 impl PlanSource for SegmentPlanner {
@@ -459,8 +656,16 @@ impl PlanSource for SegmentPlanner {
         self.specs.iter().map(|s| s.spec.clone()).collect()
     }
 
-    fn plan(&self, specs: &[KeySpec], keys: &RunKeys) -> Result<ScanPlan> {
+    fn plan(
+        &self,
+        specs: &[KeySpec],
+        keys: &RunKeys,
+        window: Option<&RunWindow>,
+    ) -> Result<ScanPlan> {
         check_key_types(self.catalog.schema(), keys)?;
+        let window = window
+            .map(|w| EncodedWindow::new(self.catalog.schema(), w))
+            .transpose()?;
         // Every listed spec must be plannable, whether or not it serves
         // these keys, as in the build crate's planner.
         let mut listed = Vec::with_capacity(specs.len());
@@ -477,12 +682,22 @@ impl PlanSource for SegmentPlanner {
             return Ok(with_residual(
                 self.catalog.plan_for(&RoaringBitmap::new())?,
                 keys,
+                window.as_ref(),
+            ));
+        }
+        if let Some(w) = &window {
+            let selected = self.select_window(specs, &listed, keys, w)?;
+            return Ok(with_residual(
+                self.catalog.plan_for(&selected)?,
+                keys,
+                Some(w),
             ));
         }
         if specs.is_empty() {
             return Ok(with_residual(
                 self.catalog.plan_for(&self.catalog.all_ids())?,
                 keys,
+                None,
             ));
         }
         let mut serving = Vec::with_capacity(specs.len());
@@ -499,7 +714,7 @@ impl PlanSource for SegmentPlanner {
             )));
         }
         let selected = Self::select(&serving, keys)?;
-        Ok(with_residual(self.catalog.plan_for(&selected)?, keys))
+        Ok(with_residual(self.catalog.plan_for(&selected)?, keys, None))
     }
 
     fn with_transient(
@@ -549,14 +764,65 @@ pub(crate) fn check_key_types(schema: &Schema, keys: &RunKeys) -> Result<()> {
     Ok(())
 }
 
+/// A run's window with both bounds encoded at the time column's dataset
+/// type.
+pub(crate) struct EncodedWindow {
+    pub(crate) window: RunWindow,
+    pub(crate) ty: DataType,
+    pub(crate) lo: Vec<u8>,
+    pub(crate) hi: Vec<u8>,
+}
+
+impl EncodedWindow {
+    /// `window` at `schema`'s type for its time column, which must be a
+    /// column a time window can bound (a timestamp, date, time, or
+    /// integer).
+    pub(crate) fn new(schema: &Schema, window: &RunWindow) -> Result<Self> {
+        let ty = schema
+            .field_with_name(&window.ts_column)
+            .map_err(|_| {
+                Error::KeySpec(format!(
+                    "the window's time column {:?} is not in the dataset",
+                    window.ts_column
+                ))
+            })?
+            .data_type()
+            .clone();
+        bellwether_core::encoding::check_ts_type(&ty)?;
+        Ok(Self {
+            lo: bellwether_build::encode_ts(window.lo, &ty)?,
+            hi: bellwether_build::encode_ts(window.hi, &ty)?,
+            window: window.clone(),
+            ty,
+        })
+    }
+}
+
 /// `plan` with the residual that makes it row-exact (ADR 011): the run's key
-/// tuples, float zeros in both encodings. An empty key set gives an empty
-/// `In` and no row groups.
-fn with_residual(mut plan: ScanPlan, keys: &RunKeys) -> ScanPlan {
+/// tuples, float zeros in both encodings, and for a window run `Between` on
+/// its time column. An empty key set gives an empty `In` and no row groups.
+pub(crate) fn with_residual(
+    mut plan: ScanPlan,
+    keys: &RunKeys,
+    window: Option<&EncodedWindow>,
+) -> ScanPlan {
     let all: Vec<usize> = (0..keys.columns().len()).collect();
-    plan.residual = Some(Predicate::In {
+    let keyed = Predicate::In {
         columns: keys.columns().to_vec(),
         values: keys.all_probes(&all),
+    };
+    plan.residual = Some(match window {
+        None => keyed,
+        Some(w) => Predicate::And {
+            all: vec![
+                keyed,
+                Predicate::Between {
+                    column: w.window.ts_column.clone(),
+                    lo: w.lo.clone(),
+                    hi: w.hi.clone(),
+                },
+            ],
+        },
     });
     plan
 }

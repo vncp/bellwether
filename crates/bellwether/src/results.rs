@@ -129,6 +129,28 @@ pub enum LookupKind {
         /// The time column.
         ts_column: String,
     },
+    /// Rows of the keys whose time column lies in the lookback window
+    /// `[end - lookback, end]`: `asof --at T --lookback N` ends at `T`;
+    /// `latest --lookback N` ends at the newest timestamp among the
+    /// requested keys' versions (index-wide, live row groups only).
+    Lookback {
+        /// The instant as given (`asof`), or `None` (`latest`).
+        at: Option<String>,
+        /// The lookback as given (`252d`).
+        lookback: String,
+        /// The lookback in calendar seconds (`d` is 86,400 s, `w` 7 days),
+        /// or `None` for a bare integer in an integer column's unit.
+        lookback_seconds: Option<i64>,
+        /// The window's end in the time column's dataset unit; `None` when
+        /// `latest` found no requested key with a non-null timestamp (the
+        /// plan is then empty).
+        end: Option<i64>,
+        /// The window's start in that unit (`end` minus the lookback,
+        /// clamped to the column's range); `None` with `end`.
+        lo: Option<i64>,
+        /// The time column.
+        ts_column: String,
+    },
     /// Per key, the newest row by valid time among rows known by `known`
     /// and valid by `valid` (each unbounded when absent).
     Bitemporal {
@@ -171,6 +193,10 @@ pub struct PlanResult {
     /// The complete sidecars the plan used (per-key time bounds for a
     /// window, the bitemporal sidecar for a bitemporal lookup), by name.
     pub sidecars: Vec<String>,
+    /// For a window or lookback, the time column when the index's
+    /// partitioning (hive directories or a path template) gives it from
+    /// each file's path, so files outside the window were pruned by path.
+    pub path_values: Option<String>,
     /// Live files the plan chose from.
     pub files_total: u64,
     /// Live row groups the plan chose from.

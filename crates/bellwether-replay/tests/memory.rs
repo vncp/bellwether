@@ -94,7 +94,7 @@ fn wide_keys_cut_segments_by_key_bytes_and_the_open_writer_counts_toward_the_cap
         columns: cols(&["k_wide"]),
     };
     // Rows never reach their cap; key bytes cut after every row group.
-    let by_bytes = Replayer::unindexed(&source, &data)
+    let by_bytes = Replayer::unindexed(&source, &data, &bellwether_source::Partitioning::None)
         .unwrap()
         .with_limits(TransientLimits {
             max_segment_key_bytes: WIDE_RG_BYTES + WIDE_RG_BYTES / 2,
@@ -103,7 +103,7 @@ fn wide_keys_cut_segments_by_key_bytes_and_the_open_writer_counts_toward_the_cap
     let idx = by_bytes.transient(&spec).unwrap();
     assert_eq!(idx.stats().segments, WIDE_RGS as u64);
     assert_eq!(idx.stats().largest_segment_key_bytes, WIDE_RG_BYTES);
-    let one = Replayer::unindexed(&source, &data).unwrap();
+    let one = Replayer::unindexed(&source, &data, &bellwether_source::Partitioning::None).unwrap();
     assert_eq!(one.transient(&spec).unwrap().stats().segments, 1);
     assert_eq!(
         one.transient(&spec)
@@ -114,7 +114,7 @@ fn wide_keys_cut_segments_by_key_bytes_and_the_open_writer_counts_toward_the_cap
     );
     // An index cap smaller than two row groups' keys stops the build before
     // the open writer takes the second, not at the first finished segment.
-    let capped = Replayer::unindexed(&source, &data)
+    let capped = Replayer::unindexed(&source, &data, &bellwether_source::Partitioning::None)
         .unwrap()
         .with_limits(TransientLimits {
             max_index_bytes: WIDE_RG_BYTES + WIDE_RG_BYTES / 2,
@@ -129,7 +129,7 @@ fn the_layout_models_cluster_key_map_is_capped_with_a_typed_error() {
     let (_dir, data) = wide_corpus();
     let source = ParquetSource::new().with_schema(wide_schema());
     let cap = 100_000;
-    let replayer = Replayer::unindexed(&source, &data)
+    let replayer = Replayer::unindexed(&source, &data, &bellwether_source::Partitioning::None)
         .unwrap()
         .with_limits(TransientLimits {
             max_cluster_key_bytes: cap,
@@ -174,7 +174,7 @@ fn the_layout_models_cluster_key_map_is_capped_with_a_typed_error() {
         other => panic!("expected ClusterKeysExceeded, got {other}"),
     }
     // Under the default cap the same layout is costed.
-    let ok = Replayer::unindexed(&source, &data)
+    let ok = Replayer::unindexed(&source, &data, &bellwether_source::Partitioning::None)
         .unwrap()
         .score(
             &Hash::of(b"layout"),
@@ -198,14 +198,23 @@ fn segment_caps_bound_the_open_writer_and_never_change_a_cost() {
     };
     let runs = common::entity_runs(&corpus, 10, 2);
     let (keys, workload) = common::record(&["entity_id"], &runs);
-    let one = Replayer::unindexed(&source, &corpus.data).unwrap();
+    let one = Replayer::unindexed(
+        &source,
+        &corpus.data,
+        &bellwether_source::Partitioning::None,
+    )
+    .unwrap();
     let rows_per_rg = corpus.spec.rows_per_row_group as u64;
-    let many = Replayer::unindexed(&source, &corpus.data)
-        .unwrap()
-        .with_limits(TransientLimits {
-            max_segment_rows: rows_per_rg + 1,
-            ..TransientLimits::default()
-        });
+    let many = Replayer::unindexed(
+        &source,
+        &corpus.data,
+        &bellwether_source::Partitioning::None,
+    )
+    .unwrap()
+    .with_limits(TransientLimits {
+        max_segment_rows: rows_per_rg + 1,
+        ..TransientLimits::default()
+    });
     source.clear();
     let a = one
         .replay_specs(std::slice::from_ref(&spec), &workload, &keys)
@@ -236,13 +245,17 @@ fn segment_caps_bound_the_open_writer_and_never_change_a_cost() {
 fn exceeding_the_index_byte_cap_is_an_error_not_a_partial_index() {
     let corpus = common::write_corpus(&CorpusSpec::default());
     let source = corpus.source();
-    let replayer = Replayer::unindexed(&source, &corpus.data)
-        .unwrap()
-        .with_limits(TransientLimits {
-            max_segment_rows: 100,
-            max_index_bytes: 4096,
-            ..TransientLimits::default()
-        });
+    let replayer = Replayer::unindexed(
+        &source,
+        &corpus.data,
+        &bellwether_source::Partitioning::None,
+    )
+    .unwrap()
+    .with_limits(TransientLimits {
+        max_segment_rows: 100,
+        max_index_bytes: 4096,
+        ..TransientLimits::default()
+    });
     let err = replayer
         .transient(&KeySpec::Exact {
             columns: cols(&["entity_id"]),
@@ -264,7 +277,12 @@ fn the_cache_is_bounded_by_bytes_and_keyed_by_the_full_spec() {
         fpr: 0.01,
     };
     assert_eq!(a.name(), b.name());
-    let sizer = Replayer::unindexed(&source, &corpus.data).unwrap();
+    let sizer = Replayer::unindexed(
+        &source,
+        &corpus.data,
+        &bellwether_source::Partitioning::None,
+    )
+    .unwrap();
     let size_a = sizer.transient(&a).unwrap().bytes();
     let size_b = sizer.transient(&b).unwrap().bytes();
     assert_ne!(size_a, size_b, "two specs of one name, two indexes");
@@ -272,9 +290,13 @@ fn the_cache_is_bounded_by_bytes_and_keyed_by_the_full_spec() {
 
     // A cap that holds the larger index but not both.
     let cap = size_a.max(size_b) + 1;
-    let r = Replayer::unindexed(&source, &corpus.data)
-        .unwrap()
-        .with_cache_bytes(cap);
+    let r = Replayer::unindexed(
+        &source,
+        &corpus.data,
+        &bellwether_source::Partitioning::None,
+    )
+    .unwrap()
+    .with_cache_bytes(cap);
     r.transient(&a).unwrap();
     r.transient(&b).unwrap();
     let s = r.cache_stats().unwrap();
@@ -291,9 +313,13 @@ fn the_cache_is_bounded_by_bytes_and_keyed_by_the_full_spec() {
     );
 
     // An index larger than the whole cap is returned and not kept.
-    let tiny = Replayer::unindexed(&source, &corpus.data)
-        .unwrap()
-        .with_cache_bytes(16);
+    let tiny = Replayer::unindexed(
+        &source,
+        &corpus.data,
+        &bellwether_source::Partitioning::None,
+    )
+    .unwrap()
+    .with_cache_bytes(16);
     let idx = tiny.transient(&a).unwrap();
     assert!(idx.bytes() > 16);
     let s = tiny.cache_stats().unwrap();

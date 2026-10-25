@@ -60,7 +60,12 @@ fn bench(c: &mut Criterion) {
         w.close().unwrap();
     }
     let source = ParquetSource::new().with_schema(Arc::clone(&schema));
-    let replayer = Replayer::unindexed(&source, dir.path().to_str().unwrap()).unwrap();
+    let replayer = Replayer::unindexed(
+        &source,
+        dir.path().to_str().unwrap(),
+        &bellwether_source::Partitioning::None,
+    )
+    .unwrap();
     let mut b = RunKeysBuilder::new(&["entity_id".to_string()], &schema).unwrap();
     let keys: Vec<u64> = (0..50).map(|i| mix(i) % ENTITIES).collect();
     b.push_batch(

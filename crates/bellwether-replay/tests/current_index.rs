@@ -76,7 +76,12 @@ fn committed_segments_cost_exactly_what_transient_ones_do() {
     let committed = Replayer::for_snapshot(&source, &snapshot).unwrap();
     assert_eq!(committed.manifest_version(), "1");
     assert_eq!(committed.current_specs(), specs().as_slice());
-    let transient = Replayer::unindexed(&source, &corpus.data).unwrap();
+    let transient = Replayer::unindexed(
+        &source,
+        &corpus.data,
+        &bellwether_source::Partitioning::None,
+    )
+    .unwrap();
     let runs = common::entity_runs(&corpus, 16, 4);
     let (keys, workload) = common::record(&["entity_id"], &runs);
     // Each spec alone, and the whole configuration: entity runs are served
@@ -152,15 +157,15 @@ fn an_incomplete_spec_or_a_coverage_gap_refuses_only_the_plans_that_list_it() {
         let rk = workload.run_keys(&keys, &workload.runs()[0]).unwrap();
         let listing = vec![all[0].clone(), bad.clone()];
         for (planner, name) in [(&wp4 as &dyn PlanSource, "build"), (&ours, "replay")] {
-            let err = planner.plan(&listing, &rk).unwrap_err();
+            let err = planner.plan(&listing, &rk, None).unwrap_err();
             assert!(
                 matches!(&err, Error::KeySpec(m) if m.contains(why)),
                 "{name}: {err}"
             );
         }
         assert_eq!(
-            PlanSource::plan(&wp4, &all[..1], &rk).unwrap(),
-            ours.plan(&all[..1], &rk).unwrap()
+            PlanSource::plan(&wp4, &all[..1], &rk, None).unwrap(),
+            ours.plan(&all[..1], &rk, None).unwrap()
         );
         // Named in a configuration, the incomplete spec is built
         // transiently and costed like any hypothetical spec.
@@ -336,7 +341,12 @@ fn a_key_proposal_is_scored_and_written_through_the_ledger() {
 fn irrelevant_specs_and_rewrites_are_refused() {
     let corpus = common::write_corpus(&CorpusSpec::default());
     let source = corpus.source();
-    let replayer = Replayer::unindexed(&source, &corpus.data).unwrap();
+    let replayer = Replayer::unindexed(
+        &source,
+        &corpus.data,
+        &bellwether_source::Partitioning::None,
+    )
+    .unwrap();
     let runs = common::entity_runs(&corpus, 4, 1);
     let (keys, workload) = common::record(&["entity_id"], &runs);
     let p = Hash::of(b"p");
@@ -386,7 +396,12 @@ fn irrelevant_specs_and_rewrites_are_refused() {
 fn refusals_are_typed_and_write_nothing() {
     let corpus = common::write_corpus(&CorpusSpec::default());
     let source = corpus.source();
-    let replayer = Replayer::unindexed(&source, &corpus.data).unwrap();
+    let replayer = Replayer::unindexed(
+        &source,
+        &corpus.data,
+        &bellwether_source::Partitioning::None,
+    )
+    .unwrap();
     let runs = common::entity_runs(&corpus, 6, 2);
     let (keys, workload) = common::record(&["entity_id"], &runs);
     let store = Arc::new(ObjectStoreBackend::memory().unwrap());
@@ -538,7 +553,8 @@ fn tiny_corpus() -> (tempfile::TempDir, String, Arc<Schema>) {
 fn a_layout_proposal_is_costed_and_written_under_its_named_model() {
     let (_dir, data, schema) = tiny_corpus();
     let source = ParquetSource::new().with_schema(Arc::clone(&schema));
-    let replayer = Replayer::unindexed(&source, &data).unwrap();
+    let replayer =
+        Replayer::unindexed(&source, &data, &bellwether_source::Partitioning::None).unwrap();
     let keys = MemoryKeySets::new();
     let mut rec = WorkloadRecorder::new(&keys, Arc::clone(&schema));
     for (id, ks) in [
@@ -618,7 +634,12 @@ fn a_layout_proposal_is_costed_and_written_under_its_named_model() {
 fn reports_group_runs_by_template_with_nearest_rank_quantiles() {
     let corpus = common::write_corpus(&CorpusSpec::default());
     let source = corpus.source();
-    let replayer = Replayer::unindexed(&source, &corpus.data).unwrap();
+    let replayer = Replayer::unindexed(
+        &source,
+        &corpus.data,
+        &bellwether_source::Partitioning::None,
+    )
+    .unwrap();
     let runs = common::entity_runs(&corpus, 9, 12);
     let keys = MemoryKeySets::new();
     let mut rec = WorkloadRecorder::new(&keys, Arc::clone(&corpus.schema));
@@ -672,7 +693,12 @@ fn reports_group_runs_by_template_with_nearest_rank_quantiles() {
 fn attribution_hooks_return_exact_counterfactual_deltas() {
     let corpus = common::write_corpus(&CorpusSpec::default());
     let source = corpus.source();
-    let replayer = Replayer::unindexed(&source, &corpus.data).unwrap();
+    let replayer = Replayer::unindexed(
+        &source,
+        &corpus.data,
+        &bellwether_source::Partitioning::None,
+    )
+    .unwrap();
     let runs = common::entity_runs(&corpus, 8, 21);
     let (keys, workload) = common::record(&["entity_id"], &runs);
     let range = KeySpec::Range {

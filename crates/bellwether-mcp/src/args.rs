@@ -7,7 +7,7 @@
 
 use std::path::PathBuf;
 
-use bellwether::{EngineOptions, FingerprintPolicy, Partitioning, SourceFormat};
+use bellwether::{EngineOptions, FingerprintPolicy, Partitioning, PathTemplate, SourceFormat};
 use clap::ValueEnum;
 
 use crate::budget::Budget;
@@ -77,6 +77,20 @@ pub struct EngineArgs {
     /// index keeps its recorded scheme.
     #[arg(long, global = true, value_enum)]
     pub partitioning: Option<PartitioningArg>,
+    /// File paths carry data: the path of every file below the root, with
+    /// {name} or {name:type} placeholders (type str, int, or date) whose
+    /// values become columns, for example `{day:date}.parquet` or
+    /// `grouped_daily_us/{symbol:str}/{day:date}.parquet`. Every file must
+    /// match (up to 10 that do not are named). Recorded with a new index
+    /// like --partitioning, which it replaces; an existing index refuses
+    /// another template.
+    #[arg(
+        long,
+        global = true,
+        value_name = "PATTERN",
+        conflicts_with = "partitioning"
+    )]
+    pub path_template: Option<String>,
     /// A fixed RFC 3339 time for every record's `created_at` and for ages, so
     /// runs are byte-reproducible (testing and audits).
     #[arg(long, global = true, value_name = "RFC3339", hide = true)]
@@ -86,8 +100,9 @@ pub struct EngineArgs {
 /// Why [`EngineArgs::options`] failed.
 #[derive(Debug)]
 pub enum OptionsError {
-    /// The `--schema` file could not be read (a usage error).
-    SchemaFile(String),
+    /// A flag's value cannot be used: the `--schema` file could not be
+    /// read, or the `--path-template` is malformed (a usage error).
+    Usage(String),
     /// The schema file was read but is not a dataset schema.
     Engine(bellwether::types::Error),
 }
@@ -95,7 +110,7 @@ pub enum OptionsError {
 impl std::fmt::Display for OptionsError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::SchemaFile(m) => f.write_str(m),
+            Self::Usage(m) => f.write_str(m),
             Self::Engine(e) => write!(f, "{e}"),
         }
     }
@@ -104,7 +119,8 @@ impl std::fmt::Display for OptionsError {
 impl std::error::Error for OptionsError {}
 
 impl EngineArgs {
-    /// The engine options these flags name; reads the `--schema` file.
+    /// The engine options these flags name; reads the `--schema` file and
+    /// parses the `--path-template`.
     pub fn options(&self) -> Result<EngineOptions, OptionsError> {
         let format = match self.format {
             FormatArg::Parquet => SourceFormat::Parquet,
@@ -118,7 +134,7 @@ impl EngineArgs {
             None => None,
             Some(p) => {
                 let text = std::fs::read_to_string(p).map_err(|e| {
-                    OptionsError::SchemaFile(format!(
+                    OptionsError::Usage(format!(
                         "cannot read the schema file {} ({e})",
                         p.display()
                     ))
@@ -135,10 +151,14 @@ impl EngineArgs {
                 PolicyArg::Tail64k => FingerprintPolicy::Tail64K,
                 PolicyArg::Full => FingerprintPolicy::Full,
             }),
-            partitioning: self.partitioning.map(|p| match p {
-                PartitioningArg::None => Partitioning::None,
-                PartitioningArg::Hive => Partitioning::Hive,
-            }),
+            partitioning: match (&self.path_template, self.partitioning) {
+                (Some(t), _) => Some(Partitioning::Template(
+                    PathTemplate::parse(t).map_err(|e| OptionsError::Usage(e.to_string()))?,
+                )),
+                (None, Some(PartitioningArg::None)) => Some(Partitioning::None),
+                (None, Some(PartitioningArg::Hive)) => Some(Partitioning::Hive),
+                (None, None) => None,
+            },
             // Pinning is per lookup (`at_manifest` on the observe tools,
             // `--at-manifest` on the CLI's lookups), never per session.
             at_manifest: None,

@@ -46,5 +46,6 @@ pub use config::{
     DEFAULT_MAX_SEGMENT_BYTES, DEFAULT_MAX_SEGMENT_KEYS, DEFAULT_MAX_SEGMENT_ROW_GROUPS,
 };
 pub use coverage::{completeness, sidecar_completeness};
+pub use keys::encode_ts;
 pub use plan::{Lookup, PlanOrder, Planner, TransientSpec};
 pub use verify::Drift;

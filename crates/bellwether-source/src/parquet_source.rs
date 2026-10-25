@@ -18,7 +18,7 @@ use parquet::file::reader::ChunkReader;
 
 use crate::canonical::{normalize_float_bounds, Canonical, DefaultCanonical};
 use crate::fingerprint::{fingerprint_with_policy, FingerprintPolicy};
-use crate::partition::{hive_values, infer_column_type, repeat, typed_value, PartitionValue};
+use crate::partition::{infer_column_type, repeat, typed_value, PartitionValue, Partitioning};
 use crate::storage::{LocalFs, Storage};
 use crate::{open_verified, reorder, resolve_columns, BoundedCache};
 
@@ -47,8 +47,9 @@ pub struct ParquetSource<S: Storage = LocalFs> {
     dataset: Option<SchemaRef>,
     policy: FingerprintPolicy,
     footers: Mutex<FooterCache>,
-    /// The data root under hive partitioning (`partition`), or `None`.
-    partition_root: Option<String>,
+    /// The data root and its partitioning scheme (`partition`), or `None`
+    /// when paths carry no data.
+    partition_root: Option<(String, Partitioning)>,
     /// Partition column types inferred over every file under the root, for
     /// a source without a dataset schema; computed once.
     inferred: OnceLock<std::result::Result<BTreeMap<String, DataType>, String>>,
@@ -82,31 +83,33 @@ impl<S: Storage> ParquetSource<S> {
         }
     }
 
-    /// Turns on hive partitioning under the data root `root` (see
-    /// [`crate::partition`]): each `name=value` directory below `root` is a
-    /// virtual column, reported in every row group's statistics with
-    /// `min = max = value` and synthesized by `read_columns`. `root` must be
+    /// Turns on partitioning under the data root `root` (see
+    /// [`crate::partition`]): under [`Partitioning::Hive`] each `name=value`
+    /// directory below `root`, under [`Partitioning::Template`] each
+    /// placeholder, is a virtual column, reported in every row group's
+    /// statistics with `min = max = value` and synthesized by
+    /// `read_columns`. [`Partitioning::None`] turns it off. `root` must be
     /// spelled as the discovered paths are (the canonical data root).
     #[must_use]
-    pub fn with_hive_partitions(mut self, root: impl Into<String>) -> Self {
-        self.partition_root = Some(root.into());
+    pub fn with_partitioning(mut self, root: impl Into<String>, scheme: Partitioning) -> Self {
+        self.partition_root = (!scheme.is_none()).then(|| (root.into(), scheme));
         self
     }
 
-    /// The partition columns of `file`, or none without hive partitioning.
+    /// The partition columns of `file`, or none without partitioning.
     fn partitions(&self, path: &str) -> Result<Vec<PartitionValue>> {
         match &self.partition_root {
             None => Ok(Vec::new()),
-            Some(root) => hive_values(root, path),
+            Some((root, scheme)) => scheme.values(root, path),
         }
     }
 
     /// The type of partition column `p` in a file whose own schema is
     /// `file_schema`: the dataset schema's when it declares the column,
     /// `None` (not reported) when a dataset schema is given without it,
-    /// else the file's own type for a column the file also stores, else
-    /// the type inferred over every file under the root
-    /// ([`crate::partition::infer_column_type`]).
+    /// else the file's own type for a column the file also stores, else the
+    /// type a template placeholder declares, else the type inferred over
+    /// every file under the root ([`crate::partition::infer_column_type`]).
     fn partition_type(&self, p: &PartitionValue, file_schema: &Schema) -> Result<Option<DataType>> {
         if let Some(ds) = &self.dataset {
             return Ok(ds
@@ -125,32 +128,44 @@ impl<S: Storage> ParquetSource<S> {
                 Error::Source(format!(
                     "partition column {} is not among those inferred under {}",
                     p.name,
-                    self.partition_root.as_deref().unwrap_or("")
+                    self.partition_root.as_ref().map_or("", |(r, _)| r.as_str())
                 ))
             })
     }
 
-    /// Every partition column's type, inferred over every Parquet file under
-    /// the root (computed once).
+    /// Every partition column's type over every Parquet file under the
+    /// root (computed once): a template placeholder's declared type, else
+    /// the type inferred from every value.
     fn inferred_types(&self) -> Result<&BTreeMap<String, DataType>> {
-        let Some(root) = &self.partition_root else {
+        let Some((root, scheme)) = &self.partition_root else {
             return Err(Error::Source(
-                "partition types asked for without hive partitioning".into(),
+                "partition types asked for without partitioning".into(),
             ));
         };
         self.inferred
             .get_or_init(|| {
                 let mut values: BTreeMap<String, Vec<Option<String>>> = BTreeMap::new();
-                let paths = self.storage.list(root).map_err(|e| e.to_string())?;
-                for path in paths.iter().filter(|p| has_extension(p, PARQUET_EXTENSION)) {
-                    for v in hive_values(root, path).map_err(|e| e.to_string())? {
+                let paths: Vec<String> = self
+                    .storage
+                    .list(root)
+                    .map_err(|e| e.to_string())?
+                    .into_iter()
+                    .filter(|p| has_extension(p, PARQUET_EXTENSION))
+                    .collect();
+                for file in scheme
+                    .values_of_all(root, &paths)
+                    .map_err(|e| e.to_string())?
+                {
+                    for v in file {
                         values.entry(v.name).or_default().push(v.value);
                     }
                 }
                 Ok(values
                     .into_iter()
                     .map(|(name, vs)| {
-                        let t = infer_column_type(vs.iter().map(Option::as_deref));
+                        let t = scheme
+                            .declared_type(&name)
+                            .unwrap_or_else(|| infer_column_type(vs.iter().map(Option::as_deref)));
                         (name, t)
                     })
                     .collect())
@@ -524,15 +539,17 @@ impl<S: Storage> Source for ParquetSource<S> {
             .into_iter()
             .filter(|p| has_extension(p, PARQUET_EXTENSION))
             .collect::<Vec<_>>();
-        if self.partition_root.is_some() {
+        if let Some((root, scheme)) = &self.partition_root {
             // One set of partition columns, in one order, under one root: a
             // file without `day=` beside files with it would have no value
-            // for the column, which is ambiguous.
-            let mut first: Option<(String, Vec<String>)> = None;
-            for p in &files {
-                let names: Vec<String> = self.partitions(p)?.into_iter().map(|v| v.name).collect();
+            // for the column, which is ambiguous. Under a template, every
+            // file that does not match is named at once (up to ten).
+            let all = scheme.values_of_all(root, &files)?;
+            let mut first: Option<(&String, Vec<&str>)> = None;
+            for (p, values) in files.iter().zip(&all) {
+                let names: Vec<&str> = values.iter().map(|v| v.name.as_str()).collect();
                 match &first {
-                    None => first = Some((p.clone(), names)),
+                    None => first = Some((p, names)),
                     Some((fp, f)) if *f != names => {
                         return Err(Error::Source(format!(
                             "{p} has partition columns {names:?}, but {fp} has {f:?}; every \
@@ -704,13 +721,16 @@ impl<S: Storage> Source for ParquetSource<S> {
             .ok_or_else(|| Error::Source(format!("{root}: no .parquet files")))?;
         let fp = fingerprint_with_policy(&self.storage, &first, self.policy)?;
         let file_schema = self.footer(&fp)?.schema().clone();
-        let partitions = self.partitions(&first)?;
-        if partitions.is_empty() {
+        if self.partition_root.is_none() {
             return Ok(file_schema);
         }
-        // The file's columns, then each partition column the file does not
-        // store, typed by inference over every file under the root.
+        // Typing first checks every file under the root, so a template
+        // refusal names every file that does not match.
         let inferred = self.inferred_types()?;
+        let partitions = self.partitions(&first)?;
+        // The file's columns, then each partition column the file does not
+        // store, typed as its placeholder declares or by inference over
+        // every file under the root.
         let mut fields: Vec<Field> = file_schema
             .fields()
             .iter()

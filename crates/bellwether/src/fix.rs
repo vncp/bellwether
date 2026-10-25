@@ -1005,7 +1005,7 @@ fn replayer<'a>(
 ) -> Result<Replayer<'a>> {
     match pinned {
         Some(p) => Replayer::for_snapshot(source, &p.snapshot),
-        None => Replayer::unindexed(source, engine.root()),
+        None => Replayer::unindexed(source, engine.root(), &engine.partitioning(None)?),
     }
 }
 

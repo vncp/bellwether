@@ -307,6 +307,8 @@ impl Server {
                     keys: a.keys.map(|k| key_file(k, a.key_columns)),
                     bench_workload: None,
                     workload: a.workload,
+                    window: None,
+                    ts_column: None,
                     columns: a.columns,
                     max_candidates: a
                         .max_candidates

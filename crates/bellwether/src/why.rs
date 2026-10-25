@@ -11,7 +11,8 @@ use std::sync::Arc;
 use bellwether_profile::{ProfileOptions, ProfileReport};
 
 use bellwether_replay::{
-    record_bench_workload, servable, KeyInput, Lookup, Replayer, Workload, WorkloadRecorder,
+    record_bench_workload, servable, KeyInput, Lookup, Replayer, RunWindow, Workload,
+    WorkloadRecorder,
 };
 use bellwether_store::{Cache, ObjectStoreBackend, StoreExt};
 use bellwether_types::{
@@ -20,7 +21,11 @@ use bellwether_types::{
 use serde::{Deserialize, Serialize};
 
 use crate::engine::{folder_changes, guard, schema_hint, Engine, Pinned, SnapshotFiles};
+use crate::index::{
+    bounds_time_columns, default_window_column, instant_in_unit, partition_columns,
+};
 use crate::keys::KeyFile;
+use crate::lookback::{window_start, Lookback};
 use crate::results::{total, Cost, Written};
 
 /// Who the engine's own candidate proposals are by.
@@ -35,6 +40,28 @@ pub const RESERVED_PROPOSERS: &[&str] = &[ENGINE_PROPOSER];
 /// workload's own key columns.
 pub const DEFAULT_MAX_CANDIDATES: usize = 8;
 
+/// A time window the runs `why` records look their keys up in.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum TimeWindow {
+    /// `--window FROM..TO`: both ends inclusive, each an RFC 3339 instant,
+    /// a date, or an integer in the time column's unit.
+    Range {
+        /// The start as given.
+        from: String,
+        /// The end as given.
+        to: String,
+    },
+    /// `--at T --lookback N`: from `T - N` to `T`, both inclusive
+    /// ([`crate::Lookback`]: calendar units, no trading days).
+    Lookback {
+        /// The end as given.
+        at: String,
+        /// The lookback as given.
+        lookback: String,
+    },
+}
+
 /// What `why` looks at. With no workload, `why` reports the dataset and its
 /// profile.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -47,6 +74,13 @@ pub struct WhyRequest {
     pub bench_workload: Option<PathBuf>,
     /// A workload recorded earlier, by its hash (it must be in the cache).
     pub workload: Option<Hash>,
+    /// Record the runs of `keys` or `bench_workload` as window runs: each
+    /// looks its keys up in this window, and every cost is the window's
+    /// plan (pruned by the time column as `locate --window` is).
+    pub window: Option<TimeWindow>,
+    /// The window's time column; `None` takes the one a window lookup
+    /// would ([`crate::Engine::locate_window`]).
+    pub ts_column: Option<String>,
     /// Candidate key columns for the profile; `None` selects every id-like
     /// column.
     pub columns: Option<Vec<String>>,
@@ -61,6 +95,8 @@ impl Default for WhyRequest {
             keys: None,
             bench_workload: None,
             workload: None,
+            window: None,
+            ts_column: None,
             columns: None,
             max_candidates: DEFAULT_MAX_CANDIDATES,
         }
@@ -95,6 +131,9 @@ pub struct WorkloadInfo {
     pub keys_p50_p95_max: [u64; 3],
     /// Input rows dropped because their tuple held a null (ADR 014).
     pub null_tuples: u64,
+    /// The distinct windows of its window runs, in the time column's unit
+    /// (empty when every run is a plain key lookup).
+    pub windows: Vec<RunWindow>,
 }
 
 /// The whole dataset, from footer statistics: the replay crate's catalog
@@ -119,6 +158,10 @@ pub enum CandidateOrigin {
     /// the row groups that hold a queried key, the least any row-group
     /// index can read for these runs (the floor).
     Workload,
+    /// A temporal key on a window run's key columns and its window's time
+    /// column: its version chains keep only the row groups holding a
+    /// version of a key inside the window.
+    Window,
     /// A column or composite the profile measured that serves the workload.
     Profile,
 }
@@ -285,6 +328,21 @@ impl Engine {
         if let Some(cols) = &req.columns {
             self.check_columns(&cols.iter().collect::<Vec<_>>())?;
         }
+        if req.window.is_some() && !(given[0] || given[1]) {
+            return Err(Error::Other(
+                "a window (--window, or --at with --lookback) applies to the runs why records: \
+                 give a key file (--from) or a bench workload (--bench-workload); a recorded \
+                 workload (--workload) keeps the windows it was recorded with"
+                    .into(),
+            ));
+        }
+        if req.window.is_none() && req.ts_column.is_some() {
+            return Err(Error::Other(
+                "--ts names a window's time column; give the window too (--window, or --at with \
+                 --lookback)"
+                    .into(),
+            ));
+        }
         let pinned = self.pin()?;
         let folder = self.source(pinned.as_ref())?;
         // Pinned to an earlier manifest: the dataset is exactly the files
@@ -298,7 +356,7 @@ impl Engine {
         let current_specs = pinned.as_ref().map(|p| p.specs().0).unwrap_or_default();
         let replayer = match &pinned {
             Some(p) => Replayer::for_snapshot(&*source, &p.snapshot)?,
-            None => Replayer::unindexed(&*source, self.root())?,
+            None => Replayer::unindexed(&*source, self.root(), &self.partitioning(None)?)?,
         };
         let catalog = replayer.catalog();
         let mut dataset = Dataset {
@@ -341,7 +399,7 @@ impl Engine {
         };
         let workload = if has_workload {
             let cache = self.cache()?;
-            let workload = self.record_workload(req, &replayer, &cache)?;
+            let workload = self.record_workload(req, pinned.as_ref(), &replayer, &cache)?;
             self.replay_candidates(&mut report, &replayer, &workload, &cache, req)?;
             Some(workload)
         } else {
@@ -434,17 +492,28 @@ impl Engine {
     fn record_workload(
         &self,
         req: &WhyRequest,
+        pinned: Option<&Pinned>,
         replayer: &Replayer<'_>,
         cache: &Cache<ObjectStoreBackend>,
     ) -> Result<Workload> {
         if let Some(h) = &req.workload {
             return crate::fix::load_workload(self, cache, h);
         }
-        let mut recorder = WorkloadRecorder::new(cache, std::sync::Arc::clone(replayer.schema()));
+        let recorder = WorkloadRecorder::new(cache, std::sync::Arc::clone(replayer.schema()));
         if let Some(keys) = &req.keys {
             let batch = keys.read()?;
+            let columns: Vec<String> = batch
+                .schema()
+                .fields()
+                .iter()
+                .map(|f| f.name().clone())
+                .collect();
+            let mut recorder = self.windowed(recorder, req, pinned, replayer, &columns)?;
             recorder.record("keys", KeyInput::Batch(&batch))?;
-        } else if let Some(dir) = &req.bench_workload {
+            return recorder.finish();
+        }
+        let mut recorder = self.windowed(recorder, req, pinned, replayer, &[])?;
+        if let Some(dir) = &req.bench_workload {
             let file = if dir.is_dir() {
                 dir.join("workload.json")
             } else {
@@ -453,6 +522,63 @@ impl Engine {
             record_bench_workload(&mut recorder, &file).map_err(Error::from)?;
         }
         recorder.finish()
+    }
+
+    /// `recorder`, recording window runs when the request gives a window:
+    /// its time column (`--ts`, else the one a window lookup on `columns`
+    /// would take) and both bounds in that column's unit.
+    fn windowed<'r>(
+        &self,
+        recorder: WorkloadRecorder<'r>,
+        req: &WhyRequest,
+        pinned: Option<&Pinned>,
+        replayer: &Replayer<'_>,
+        columns: &[String],
+    ) -> Result<WorkloadRecorder<'r>> {
+        let Some(window) = &req.window else {
+            return Ok(recorder);
+        };
+        let schema = replayer.schema();
+        let ts_column = if let Some(c) = &req.ts_column {
+            c.clone()
+        } else {
+            let (specs, bounded) = match pinned {
+                Some(p) => (p.specs().0, bounds_time_columns(p, columns)),
+                None => (Vec::new(), Vec::new()),
+            };
+            let first = replayer.catalog().files().first().map(|f| f.path.as_str());
+            let partition = partition_columns(&self.partitioning(pinned)?, self.root(), first)?;
+            default_window_column(schema, &specs, bounded, partition, columns)?
+        };
+        let ty = schema
+            .field_with_name(&ts_column)
+            .map_err(|_| {
+                Error::KeySpec(format!(
+                    "the window's time column {ts_column:?} is not in the dataset; name one with \
+                     --ts"
+                ))
+            })?
+            .data_type()
+            .clone();
+        let (lo, hi) = match window {
+            TimeWindow::Range { from, to } => {
+                let lo = instant_in_unit("window", from, &ts_column, &ty)?;
+                let hi = instant_in_unit("window", to, &ts_column, &ty)?;
+                if lo > hi {
+                    return Err(Error::Other(format!(
+                        "the window starts at {from} ({ts_column} = {lo}) after it ends at {to} \
+                         ({hi}); give the start first"
+                    )));
+                }
+                (lo, hi)
+            }
+            TimeWindow::Lookback { at, lookback } => {
+                let lb = Lookback::parse(lookback)?;
+                let end = instant_in_unit("at", at, &ts_column, &ty)?;
+                (window_start(end, lb.in_unit(&ts_column, &ty)?, &ty), end)
+            }
+        };
+        recorder.in_window(RunWindow { ts_column, lo, hi })
     }
 
     // One linear pass: choose the candidates, then write and score each.
@@ -477,12 +603,19 @@ impl Engine {
                 workload.runs().iter().map(|r| r.columns.clone()).collect();
             set.into_iter().collect()
         };
+        let mut windows: Vec<RunWindow> = Vec::new();
+        for w in workload.runs().iter().filter_map(|r| r.window.as_ref()) {
+            if !windows.contains(w) {
+                windows.push(w.clone());
+            }
+        }
         report.workload = Some(WorkloadInfo {
             hash: workload.hash(),
             runs: workload.runs().len() as u64,
             columns: run_columns.clone(),
             keys_p50_p95_max: workload.keys_p50_p95_max(),
             null_tuples: workload.runs().iter().map(|r| r.null_tuples).sum(),
+            windows,
         });
         let current_names: BTreeSet<String> =
             report.current_specs.iter().map(KeySpec::name).collect();
@@ -504,6 +637,30 @@ impl Engine {
             let spec = KeySpec::Exact { columns: c.clone() };
             if !current_names.contains(&spec.name()) && names.insert(spec.name()) {
                 chosen.push((spec, CandidateOrigin::Workload));
+            }
+        }
+        // A window run: the temporal key on its key columns and the
+        // window's time column, whose version chains prune by time per key.
+        let windowed: BTreeSet<(Vec<String>, String)> = workload
+            .runs()
+            .iter()
+            .filter_map(|r| {
+                r.window
+                    .as_ref()
+                    .map(|w| (r.columns.clone(), w.ts_column.clone()))
+            })
+            .collect();
+        for (columns, ts_column) in windowed {
+            let orderable = replayer
+                .schema()
+                .field_with_name(&ts_column)
+                .is_ok_and(|f| bellwether_core::encoding::check_ts_type(f.data_type()).is_ok());
+            if !orderable || columns.contains(&ts_column) {
+                continue;
+            }
+            let spec = KeySpec::Temporal { columns, ts_column };
+            if !current_names.contains(&spec.name()) && names.insert(spec.name()) {
+                chosen.push((spec, CandidateOrigin::Window));
             }
         }
         let mut from_profile = 0usize;

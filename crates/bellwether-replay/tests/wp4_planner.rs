@@ -106,9 +106,9 @@ fn committed_and_transient_segments_plan_identically_through_wp4_and_this_crate(
         let ours_transient = segment_planner.with_transient(&transients).unwrap();
         for run in workload.runs() {
             let rk = workload.run_keys(&keys, run).unwrap();
-            let committed = PlanSource::plan(&planner, config, &rk).unwrap();
-            let via_wp4 = wp4_transient.plan(config, &rk).unwrap();
-            let via_ours = ours_transient.plan(config, &rk).unwrap();
+            let committed = PlanSource::plan(&planner, config, &rk, None).unwrap();
+            let via_wp4 = wp4_transient.plan(config, &rk, None).unwrap();
+            let via_ours = ours_transient.plan(config, &rk, None).unwrap();
             let what = format!(
                 "{:?} {}",
                 config.iter().map(KeySpec::name).collect::<Vec<_>>(),

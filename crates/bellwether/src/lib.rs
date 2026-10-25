@@ -35,6 +35,7 @@ mod fix;
 mod index;
 mod keys;
 mod ledger_views;
+mod lookback;
 mod propose;
 mod receipt;
 mod reconcile;
@@ -45,7 +46,7 @@ mod why;
 
 pub use bellwether_ledger::RecordKind;
 pub use bellwether_profile::ProfileReport;
-pub use bellwether_source::{FingerprintPolicy, Partitioning};
+pub use bellwether_source::{FingerprintPolicy, Partitioning, PathTemplate};
 pub use bellwether_types as types;
 pub use bellwether_verify::Reconciliation;
 pub use engine::{
@@ -57,6 +58,7 @@ pub use keys::KeyFile;
 pub use ledger_views::{
     Finding, FindingsResult, ReceiptEntry, ReceiptsResult, RuleScore, ScorecardResult, UNATTRIBUTED,
 };
+pub use lookback::{split_window, Lookback};
 pub use reconcile::{ReconcileRequest, ReconcileResult};
 pub use results::{
     ChainLink, Cost, IndexResult, LinkStatus, LookupKind, PlanResult, ProposeRefusal,
@@ -64,6 +66,6 @@ pub use results::{
 };
 pub use why::{
     Candidate, CandidateOrigin, Culprit, CulpritReason, Dataset, ProfileEvidence, Recommendation,
-    WhyReport, WhyRequest, WorkloadInfo, DEFAULT_MAX_CANDIDATES, ENGINE_PROPOSER,
+    TimeWindow, WhyReport, WhyRequest, WorkloadInfo, DEFAULT_MAX_CANDIDATES, ENGINE_PROPOSER,
     RESERVED_PROPOSERS,
 };

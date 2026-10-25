@@ -9,7 +9,8 @@ Versioned from the first commit. `bellwether-types::format::STORAGE_VERSION` is 
                                  created_at (first creation, preserved), committed_at (this commit),
                                  commit_nonce (random u64 per commit attempt; detects an applied write reported as 412),
                                  source{kind, root, fingerprint_policy?, partitioning?}
-                                           (partitioning: "hive" when name=value directories are columns; see
+                                           (partitioning: "hive" when name=value directories are columns,
+                                            "template:<pattern>" when a path template's placeholders are; see
                                             "Partition columns"; absent for none)
                                  schema{columns[{name, data_type, nullable}], key_specs[],
                                         sidecars?[{kind, columns[], time_columns[]}]}   (see "Sidecar kinds")
@@ -186,6 +187,8 @@ The dataset type a reader infers for a column is part of the format, not of the 
 ## Partition columns (storage version 1, 2026-10-24)
 
 An index built with `--partitioning hive` records `source.partitioning = "hive"` and treats every directory component of a file's path **below the data root** of the form `name=value` as a column of that file: every row of the file has `value` in column `name`. The Parquet source reports it in each row group's statistics with `min = max = value`, zero bytes, and a null count of zero (all rows for a null value), and synthesizes it when the column is read, so the profiler sees it and every planner path prunes on it without reading a data page. An index without the field has no partition columns, and the scheme of an existing index never changes (a different one is refused, because it changes the dataset schema and every row group's statistics). Text sources refuse hive partitioning in this release.
+
+**Path templates.** An index built with `--path-template "<pattern>"` records `source.partitioning = "template:<pattern>"`, the pattern exactly as given, so another template is another scheme and is refused. The pattern is the path of every data file below the root, `/`-separated, with `{name}` or `{name:type}` placeholders (`str`, `int`, or `date`; `{{` and `}}` are literal braces). A placeholder matches one or more characters other than `/` that its type accepts (`date` is exactly a valid `YYYY-MM-DD`, `int` the integers of the inference table). The whole path must match in exactly one way: a file that matches in none, or in more than one, is refused, and discovery names up to ten such files and counts the rest. Each placeholder is then a partition column exactly as a hive directory is (statistics `min = max = value`, zero bytes, synthesized on read, a stored column of the same name must agree), typed by the dataset schema when it declares the column, else by the placeholder's type, else by the inference table over every value. A template has no null spelling. A binary from before templates reads `"template:..."` as an unknown partitioning and refuses the index, never misreading it. Windows on a partition column prune by path values (`docs/time-series-capabilities.md`).
 
 - A component splits at its first `=`. An empty name, an empty value, or a name repeated in one path is refused; the file name never counts; components of the root itself never count.
 - Values are percent-decoded (`%2F` is `/`); a `%` not followed by two hex digits, or a value that does not decode to UTF-8, is refused. `__HIVE_DEFAULT_PARTITION__` is a null.

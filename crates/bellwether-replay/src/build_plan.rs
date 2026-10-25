@@ -9,9 +9,10 @@
 //!   live segments, ADR 012). An incomplete declared spec is not one the
 //!   index can plan with.
 //! - [`PlanSource::plan`] is `Planner::plan` over a `Lookup::Keys` of the
-//!   run's canonical tuples. The planner refuses a listed spec that is not
-//!   declared exactly or not complete, and nothing else: an incomplete spec
-//!   the plan does not use is no error.
+//!   run's canonical tuples, or a `Lookup::Window` for a window run. The
+//!   planner refuses a listed spec that is not declared exactly or not
+//!   complete, and nothing else: an incomplete spec the plan does not use
+//!   is no error.
 //! - [`PlanSource::with_transient`] passes each transient index's segment
 //!   bytes as a `TransientSpec`, after checking that the index was built at
 //!   the pinned sequence, that every segment records the dataset's key
@@ -29,13 +30,22 @@ use roaring::RoaringBitmap;
 use crate::keys::RunKeys;
 use crate::plan::{check_key_types, PlanSource};
 use crate::transient::TransientIndex;
+use crate::workload::RunWindow;
 
 /// The run's keys as the build planner's lookup: canonical tuples over the
-/// run's columns, at the dataset types.
-fn lookup(keys: &RunKeys) -> Lookup {
-    Lookup::Keys {
-        columns: keys.columns().to_vec(),
-        keys: keys.tuples().map(<[u8]>::to_vec).collect(),
+/// run's columns, at the dataset types, in the run's window if it has one.
+fn lookup(keys: &RunKeys, window: Option<&RunWindow>) -> Lookup {
+    let columns = keys.columns().to_vec();
+    let keys = keys.tuples().map(<[u8]>::to_vec).collect();
+    match window {
+        None => Lookup::Keys { columns, keys },
+        Some(w) => Lookup::Window {
+            columns,
+            keys,
+            ts_column: w.ts_column.clone(),
+            lo: w.lo,
+            hi: w.hi,
+        },
     }
 }
 
@@ -101,9 +111,14 @@ where
             .collect()
     }
 
-    fn plan(&self, specs: &[KeySpec], keys: &RunKeys) -> Result<ScanPlan> {
+    fn plan(
+        &self,
+        specs: &[KeySpec],
+        keys: &RunKeys,
+        window: Option<&RunWindow>,
+    ) -> Result<ScanPlan> {
         check_key_types(self.schema(), keys)?;
-        Planner::plan(self, specs, &lookup(keys))
+        Planner::plan(self, specs, &lookup(keys, window))
     }
 
     fn with_transient(
@@ -142,10 +157,15 @@ where
         out
     }
 
-    fn plan(&self, specs: &[KeySpec], keys: &RunKeys) -> Result<ScanPlan> {
+    fn plan(
+        &self,
+        specs: &[KeySpec],
+        keys: &RunKeys,
+        window: Option<&RunWindow>,
+    ) -> Result<ScanPlan> {
         check_key_types(self.planner.schema(), keys)?;
         self.planner
-            .plan_with_transient(specs, &lookup(keys), &self.extra)
+            .plan_with_transient(specs, &lookup(keys, window), &self.extra)
     }
 
     fn with_transient(

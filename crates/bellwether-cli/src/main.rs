@@ -149,6 +149,26 @@ struct WhyArgs {
     /// of the current one (the files it recorded, its key specs).
     #[arg(long, value_name = "SEQUENCE")]
     at_manifest: Option<u64>,
+    /// Price the runs as lookups in this time window, START..END, both
+    /// inclusive (as `locate --window`).
+    #[arg(long, value_name = "START..END", conflicts_with_all = ["at", "workload"])]
+    window: Option<String>,
+    /// With --lookback: the end of the window the runs are priced in.
+    #[arg(
+        long,
+        value_name = "INSTANT",
+        requires = "lookback",
+        conflicts_with = "workload"
+    )]
+    at: Option<String>,
+    /// With --at: price the runs as lookups from --at minus N to --at (as
+    /// `asof --at --lookback`): s, m, h, d (24 hours of UTC), or w (7 days).
+    #[arg(long, value_name = "N", requires = "at")]
+    lookback: Option<String>,
+    /// The window's time column [default: the one a window lookup would
+    /// take].
+    #[arg(long = "ts", value_name = "COLUMN")]
+    ts: Option<String>,
 }
 
 #[derive(Args)]
@@ -181,6 +201,7 @@ struct LookupArgs {
 }
 
 #[derive(Args)]
+#[command(group(clap::ArgGroup::new("range").multiple(false).args(["from", "window"])))]
 struct LocateArgs {
     #[command(flatten)]
     lookup: LookupArgs,
@@ -191,9 +212,14 @@ struct LocateArgs {
     /// Window end (inclusive), as --from.
     #[arg(long, value_name = "INSTANT", requires = "from")]
     to: Option<String>,
-    /// The window's time column [default: the one per-key bounds or
-    /// timestamp range key names].
-    #[arg(long = "ts", value_name = "COLUMN", requires = "from")]
+    /// The window as START..END, both inclusive (the same as --from START
+    /// --to END), for example 2026-01-01..2026-03-01.
+    #[arg(long, value_name = "START..END")]
+    window: Option<String>,
+    /// The window's time column [default: the one per-key bounds, a
+    /// timestamp range key, a temporal key, or a date partition column
+    /// names].
+    #[arg(long = "ts", value_name = "COLUMN")]
     ts: Option<String>,
 }
 
@@ -203,8 +229,14 @@ struct LatestArgs {
     lookup: LookupArgs,
     /// Bitemporal: the newest valid version among rows known at or before
     /// this instant (needs a temporal2 key).
-    #[arg(long, value_name = "INSTANT")]
+    #[arg(long, value_name = "INSTANT", conflicts_with = "lookback")]
     known: Option<String>,
+    /// Every row of the keys in the N before their newest version (one
+    /// window ending at the newest timestamp among the keys, through their
+    /// temporal key): a whole number and a calendar unit, s, m, h, d (24
+    /// hours of UTC), or w (7 days), for example 252d; no trading days.
+    #[arg(long, value_name = "N")]
+    lookback: Option<String>,
 }
 
 #[derive(Args)]
@@ -216,6 +248,16 @@ struct AsofArgs {
     /// timestamp column's unit.
     #[arg(long, value_name = "INSTANT", conflicts_with_all = ["valid", "known"])]
     at: Option<String>,
+    /// Every row of the keys from --at minus N to --at (instead of the one
+    /// version current at --at): a whole number and a calendar unit, s, m,
+    /// h, d (24 hours of UTC), or w (7 days), for example 252d; no trading
+    /// days.
+    #[arg(long, value_name = "N", requires = "at")]
+    lookback: Option<String>,
+    /// The lookback's time column [default: the temporal key's timestamp,
+    /// else the one a window would take].
+    #[arg(long = "ts", value_name = "COLUMN", requires = "lookback")]
+    ts: Option<String>,
     /// Bitemporal: the valid-time instant (needs a temporal2 key).
     #[arg(long, value_name = "INSTANT")]
     valid: Option<String>,
@@ -403,6 +445,9 @@ fn hint(e: &Error) -> Option<String> {
                 "by" => "--by",
                 "evidence" => "--evidence",
                 "at" => "--at",
+                "window" => "--window (or --from and --to)",
+                "valid" => "--valid",
+                "known" => "--known",
                 "keys" => "--from or --keys",
                 "key_columns" => "--key",
                 "cluster_by" => "--layout",
@@ -455,7 +500,7 @@ pub(crate) fn engine_at(
 /// The engine options the global flags name.
 fn engine_options(global: &Global) -> Result<EngineOptions, Failure> {
     global.engine.options().map_err(|e| match e {
-        OptionsError::SchemaFile(m) => Failure::Usage(m),
+        OptionsError::Usage(m) => Failure::Usage(m),
         OptionsError::Engine(e) => Failure::Engine(e),
     })
 }
@@ -490,18 +535,42 @@ fn run(cli: &Cli, out: &Out) -> Result<Outcome, Failure> {
             let r = engine(g, &a.root.root)?.index_declared(&declared)?;
             done(&r, human::index(&r, out), EXIT_OK)
         }
-        Command::Locate(a) => lookup(g, out, &a.lookup, |e, keys| match (&a.from, &a.to) {
-            (Some(from), Some(to)) => e.locate_window(keys, from, to, a.ts.as_deref()),
-            _ => e.locate(keys),
-        }),
-        Command::Latest(a) => lookup(g, out, &a.lookup, |e, keys| match &a.known {
-            Some(known) => e.asof_bitemporal(keys, None, Some(known)),
-            None => e.latest(keys),
-        }),
-        Command::Asof(a) => lookup(g, out, &a.lookup, |e, keys| match &a.at {
-            Some(at) => e.asof(keys, at),
-            None => e.asof_bitemporal(keys, a.valid.as_deref(), a.known.as_deref()),
-        }),
+        Command::Locate(a) => {
+            let window = match (&a.window, &a.from, &a.to) {
+                (Some(w), _, _) => {
+                    Some(bellwether::split_window(w).map_err(|e| Failure::Usage(e.to_string()))?)
+                }
+                (None, Some(from), Some(to)) => Some((from.as_str(), to.as_str())),
+                _ => None,
+            };
+            if window.is_none() && a.ts.is_some() {
+                return Err(Failure::Usage(
+                    "--ts names a window's time column; give the window with --window \
+                     START..END (or --from and --to)"
+                        .into(),
+                ));
+            }
+            lookup(g, out, &a.lookup, |e, keys| match window {
+                Some((from, to)) => e.locate_window(keys, from, to, a.ts.as_deref()),
+                None => e.locate(keys),
+            })
+        }
+        Command::Latest(a) => {
+            check_lookback(a.lookback.as_deref())?;
+            lookup(g, out, &a.lookup, |e, keys| match (&a.known, &a.lookback) {
+                (Some(known), _) => e.asof_bitemporal(keys, None, Some(known)),
+                (None, Some(n)) => e.latest_lookback(keys, n),
+                (None, None) => e.latest(keys),
+            })
+        }
+        Command::Asof(a) => {
+            check_lookback(a.lookback.as_deref())?;
+            lookup(g, out, &a.lookup, |e, keys| match (&a.at, &a.lookback) {
+                (Some(at), Some(n)) => e.asof_lookback(keys, at, n, a.ts.as_deref()),
+                (Some(at), None) => e.asof(keys, at),
+                (None, _) => e.asof_bitemporal(keys, a.valid.as_deref(), a.known.as_deref()),
+            })
+        }
         Command::Propose(a) => propose(g, out, a),
         Command::Receipt {
             command: ReceiptCommand::Show { root, hash: h },
@@ -623,7 +692,41 @@ fn propose(g: &Global, out: &Out, a: &ProposeArgs) -> Result<Outcome, Failure> {
     done(&r, human::propose(&r, out), code)
 }
 
+/// A malformed `--lookback` is a usage error (exit 2), refused before any
+/// engine work.
+fn check_lookback(lookback: Option<&str>) -> Result<(), Failure> {
+    match lookback {
+        Some(n) => bellwether::Lookback::parse(n)
+            .map(|_| ())
+            .map_err(|e| Failure::Usage(e.to_string())),
+        None => Ok(()),
+    }
+}
+
 fn why(g: &Global, out: &Out, a: &WhyArgs) -> Result<Outcome, Failure> {
+    check_lookback(a.lookback.as_deref())?;
+    let window = match (&a.window, &a.at, &a.lookback) {
+        (Some(w), _, _) => {
+            let (from, to) =
+                bellwether::split_window(w).map_err(|e| Failure::Usage(e.to_string()))?;
+            Some(bellwether::TimeWindow::Range {
+                from: from.to_string(),
+                to: to.to_string(),
+            })
+        }
+        (None, Some(at), Some(lookback)) => Some(bellwether::TimeWindow::Lookback {
+            at: at.clone(),
+            lookback: lookback.clone(),
+        }),
+        _ => None,
+    };
+    if window.is_none() && a.ts.is_some() {
+        return Err(Failure::Usage(
+            "--ts names a window's time column; give the window with --window START..END (or \
+             --at and --lookback)"
+                .into(),
+        ));
+    }
     let request = bellwether::WhyRequest {
         keys: a.from.as_ref().map(|p| key_file(p, a.key.as_ref())),
         bench_workload: a.bench_workload.clone(),
@@ -632,6 +735,8 @@ fn why(g: &Global, out: &Out, a: &WhyArgs) -> Result<Outcome, Failure> {
             .as_deref()
             .map(|w| hash(w, "workload"))
             .transpose()?,
+        window,
+        ts_column: a.ts.clone(),
         columns: a.columns.clone(),
         max_candidates: a.max_candidates,
     };

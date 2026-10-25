@@ -136,6 +136,35 @@ fn lookup_label(lookup: &LookupKind) -> String {
             hi,
             ts_column,
         } => format!("locate {ts_column} in [{from}, {to}] ({lo}..={hi})"),
+        LookupKind::Lookback {
+            at,
+            lookback,
+            lookback_seconds,
+            end,
+            lo,
+            ts_column,
+        } => {
+            let span = match lookback_seconds {
+                Some(secs) => format!(
+                    "{lookback} = {} calendar seconds",
+                    num(u64::try_from(*secs).unwrap_or(0))
+                ),
+                None => format!("{lookback} in {ts_column}'s unit"),
+            };
+            let ends = match at {
+                Some(at) => format!("ending at {at}"),
+                None => "ending at the keys' newest version".to_string(),
+            };
+            match (end, lo) {
+                (Some(e), Some(l)) => {
+                    format!("lookback {span} on {ts_column}, {ends} ({l}..={e})")
+                }
+                _ => format!(
+                    "lookback {span} on {ts_column}, {ends}: no key has a non-null {ts_column}, so \
+                     the window is empty"
+                ),
+            }
+        }
         LookupKind::Bitemporal {
             valid,
             known,
@@ -214,6 +243,13 @@ pub(crate) fn plan(r: &PlanResult, out: &Out) -> String {
     );
     if !r.sidecars.is_empty() {
         let _ = writeln!(s, "  sidecars: {}", r.sidecars.join(", "));
+    }
+    if let Some(c) = &r.path_values {
+        let _ = writeln!(
+            s,
+            "  path values: {c} comes from each file's path, so files outside the window are \
+             skipped without reading them"
+        );
     }
     if !r.excluded_incomplete.is_empty() {
         let ex: Vec<String> = r.excluded_incomplete.iter().map(label).collect();
@@ -361,6 +397,14 @@ pub(crate) fn why(r: &bellwether::WhyReport, out: &Out) -> String {
             num(w.keys_p50_p95_max[1]),
             num(w.keys_p50_p95_max[2])
         );
+        for win in &w.windows {
+            let _ = writeln!(
+                s,
+                "  window: rows with {} in {}..={} (the column's unit); every cost below plans \
+                 that window",
+                win.ts_column, win.lo, win.hi
+            );
+        }
         funnel_header(&mut s);
         funnel_row(&mut s, "dataset", &dataset, &rows);
         let current_name = if r.current_specs.is_empty() {
@@ -372,7 +416,13 @@ pub(crate) fn why(r: &bellwether::WhyReport, out: &Out) -> String {
         for c in &r.candidates {
             let mut notes = Vec::new();
             match c.origin {
-                CandidateOrigin::Workload => notes.push("floor: only row groups holding a key"),
+                CandidateOrigin::Workload if w.windows.is_empty() => {
+                    notes.push("floor: only row groups holding a key");
+                }
+                CandidateOrigin::Workload => notes.push("exact key on the run's columns"),
+                CandidateOrigin::Window => {
+                    notes.push("version chains: only row groups with a version in the window");
+                }
                 CandidateOrigin::Profile => notes.push("profile candidate"),
             }
             if r.recommended.as_ref().is_some_and(|x| x.spec == c.spec) {
@@ -401,9 +451,15 @@ pub(crate) fn why(r: &bellwether::WhyReport, out: &Out) -> String {
             CulpritReason::Lint {
                 rule, confidence, ..
             } => format!("lint {rule} (confidence {confidence:.2})"),
-            CulpritReason::NoIndexServes => {
-                "no index serves this lookup, so it reads every row group".to_string()
-            }
+            CulpritReason::NoIndexServes => match r.current {
+                Some(cur) if cur.row_groups < r.dataset.row_groups => format!(
+                    "no key index serves this lookup; only the time window narrows it, to {} of \
+                     {} row groups",
+                    num(cur.row_groups),
+                    num(r.dataset.row_groups)
+                ),
+                _ => "no index serves this lookup, so it reads every row group".to_string(),
+            },
             CulpritReason::ServingSpec { spec } => format!("the serving key {}", label(spec)),
         };
         let _ = writeln!(s, "\nculprit ({}): {why}{fan}", c.columns.join(", "));

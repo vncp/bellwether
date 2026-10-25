@@ -21,7 +21,7 @@ use arrow::array::{
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use bellwether_source::canonical::{encode_temporal, encode_utf8};
 use bellwether_source::partition::parse_date;
-use bellwether_source::ParquetSource;
+use bellwether_source::{ParquetSource, Partitioning};
 use bellwether_types::Source;
 use parquet::arrow::ArrowWriter;
 use parquet::file::properties::{EnabledStatistics, WriterProperties};
@@ -104,7 +104,7 @@ fn partition_values_become_exact_statistics_and_nothing_is_read() {
     let dir = tempfile::tempdir().unwrap();
     let root = canonical_root(&dir);
     let files = layout(Path::new(&root));
-    let source = ParquetSource::new().with_hive_partitions(root.clone());
+    let source = ParquetSource::new().with_partitioning(root.clone(), Partitioning::Hive);
 
     // The inferred dataset schema: the file's columns, then the partition
     // columns in path order, typed by the fixed table.
@@ -124,7 +124,7 @@ fn partition_values_become_exact_statistics_and_nothing_is_read() {
     assert_eq!(discovered.len(), files.len());
     let typed = ParquetSource::new()
         .with_schema(Arc::clone(&schema))
-        .with_hive_partitions(root.clone());
+        .with_partitioning(root.clone(), Partitioning::Hive);
     for fp in &discovered {
         let (_, day, sym) = files.iter().find(|f| f.0 == fp.path).unwrap();
         let rgs = typed.row_groups(fp).unwrap();
@@ -179,7 +179,7 @@ fn the_dataset_schema_types_partition_values_or_refuses_them() {
     let dir = tempfile::tempdir().unwrap();
     let root = canonical_root(&dir);
     let files = layout(Path::new(&root));
-    let source = ParquetSource::new().with_hive_partitions(root.clone());
+    let source = ParquetSource::new().with_partitioning(root.clone(), Partitioning::Hive);
     let fp = source.discover(&root).unwrap().remove(0);
     let (_, day, _) = files.iter().find(|f| f.0 == fp.path).unwrap();
 
@@ -193,7 +193,7 @@ fn the_dataset_schema_types_partition_values_or_refuses_them() {
     ]));
     let rgs = ParquetSource::new()
         .with_schema(as_text)
-        .with_hive_partitions(root.clone())
+        .with_partitioning(root.clone(), Partitioning::Hive)
         .row_groups(&fp)
         .unwrap();
     let d = rgs[0].stats.iter().find(|s| s.column == "day").unwrap();
@@ -206,7 +206,7 @@ fn the_dataset_schema_types_partition_values_or_refuses_them() {
     ]));
     let err = ParquetSource::new()
         .with_schema(as_int)
-        .with_hive_partitions(root.clone())
+        .with_partitioning(root.clone(), Partitioning::Hive)
         .row_groups(&fp)
         .unwrap_err();
     assert!(err.to_string().contains("symbol="), "{err}");
@@ -216,7 +216,7 @@ fn the_dataset_schema_types_partition_values_or_refuses_them() {
     let without = Arc::new(Schema::new(vec![Field::new("ts", ts_type(), false)]));
     let rgs = ParquetSource::new()
         .with_schema(without)
-        .with_hive_partitions(root.clone())
+        .with_partitioning(root.clone(), Partitioning::Hive)
         .row_groups(&fp)
         .unwrap();
     assert!(rgs[0]
@@ -266,7 +266,7 @@ fn a_file_whose_path_and_content_disagree_is_refused() {
     let root = canonical_root(&dir);
     let agree = Path::new(&root).join("symbol=AAPL/a.parquet");
     write_with_symbol(&agree, &["AAPL", "AAPL"], true);
-    let source = ParquetSource::new().with_hive_partitions(root.clone());
+    let source = ParquetSource::new().with_partitioning(root.clone(), Partitioning::Hive);
     let fp = source.discover(&root).unwrap().remove(0);
     let rgs = source.row_groups(&fp).unwrap();
     // The stored column is kept once, not duplicated.
@@ -287,7 +287,7 @@ fn a_file_whose_path_and_content_disagree_is_refused() {
         let d2 = tempfile::tempdir().unwrap();
         let r2 = canonical_root(&d2);
         write_with_symbol(&Path::new(&r2).join(name), symbols, stats);
-        let s2 = ParquetSource::new().with_hive_partitions(r2.clone());
+        let s2 = ParquetSource::new().with_partitioning(r2.clone(), Partitioning::Hive);
         let fp = s2.discover(&r2).unwrap().remove(0);
         let err = s2.row_groups(&fp).unwrap_err();
         assert!(err.to_string().contains("disagree"), "{name}: {err}");
@@ -303,7 +303,7 @@ fn discovery_refuses_mixed_partition_sets_and_ignores_the_root_s_own_components(
     let root = Path::new(&base).join("env=prod").join("trades");
     write_file(&root.join("day=2026-01-02/a.parquet"), 1, 2, 0);
     let root = root.to_str().unwrap().to_string();
-    let source = ParquetSource::new().with_hive_partitions(root.clone());
+    let source = ParquetSource::new().with_partitioning(root.clone(), Partitioning::Hive);
     let schema = source.schema(&root).unwrap();
     assert!(schema.field_with_name("env").is_err());
     assert!(schema.field_with_name("day").is_ok());
@@ -324,7 +324,7 @@ fn a_null_partition_value_is_a_null() {
         4,
         0,
     );
-    let source = ParquetSource::new().with_hive_partitions(root.clone());
+    let source = ParquetSource::new().with_partitioning(root.clone(), Partitioning::Hive);
     let fp = source.discover(&root).unwrap().remove(0);
     let rgs = source.row_groups(&fp).unwrap();
     let v = rgs[0].stats.iter().find(|s| s.column == "venue").unwrap();
@@ -350,7 +350,7 @@ fn a_column_is_typed_by_every_value_under_the_root_not_the_first_file() {
         2,
         0,
     );
-    let source = ParquetSource::new().with_hive_partitions(root.clone());
+    let source = ParquetSource::new().with_partitioning(root.clone(), Partitioning::Hive);
     let schema = source.schema(&root).unwrap();
     assert_eq!(
         schema.field_with_name("symbol").unwrap().data_type(),
@@ -370,7 +370,7 @@ fn a_column_is_typed_by_every_value_under_the_root_not_the_first_file() {
     let r2 = canonical_root(&d2);
     write_file(&Path::new(&r2).join("n=7/a.parquet"), 1, 2, 0);
     write_file(&Path::new(&r2).join("n=-3/b.parquet"), 1, 2, 0);
-    let s2 = ParquetSource::new().with_hive_partitions(r2.clone());
+    let s2 = ParquetSource::new().with_partitioning(r2.clone(), Partitioning::Hive);
     assert_eq!(
         s2.schema(&r2)
             .unwrap()

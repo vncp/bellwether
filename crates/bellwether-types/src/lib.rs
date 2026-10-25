@@ -165,8 +165,9 @@ pub enum Error {
     /// wrong in words that name no surface's flag.
     #[error("{reason}")]
     InvalidArgument {
-        /// The request field: `by`, `evidence`, `at`, `keys`, `key_columns`,
-        /// `cluster_by`, `shape`, `workload`, `rewrite`.
+        /// The request field: `by`, `evidence`, `at`, `window`, `valid`,
+        /// `known`, `keys`, `key_columns`, `cluster_by`, `shape`, `workload`,
+        /// `rewrite`.
         field: &'static str,
         /// What is wrong with it, and what a usable value looks like.
         reason: String,

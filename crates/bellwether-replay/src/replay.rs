@@ -66,7 +66,7 @@ use arrow::datatypes::{DataType, Schema, SchemaRef};
 use bellwether_build::Planner;
 use bellwether_core::segment::validate_spec;
 use bellwether_ledger::{rfc3339::is_rfc3339, Ledger};
-use bellwether_source::FingerprintPolicy;
+use bellwether_source::{FingerprintPolicy, Partitioning};
 use bellwether_store::{Snapshot, StoreExt};
 use bellwether_types::format::RECORD_VERSION;
 use bellwether_types::{
@@ -78,9 +78,9 @@ use crate::catalog::Catalog;
 use crate::error::{ReplayError, ReplayResult};
 use crate::keys::RunKeys;
 use crate::layout::{replay_layout, LayoutModel, LayoutReplay};
-use crate::plan::{run_cost, servable, PlanSource, SegmentPlanner};
+use crate::plan::{run_cost, servable, serving_run, PlanSource, SegmentPlanner};
 use crate::transient::{CacheStats, TransientCache, TransientIndex, TransientLimits};
-use crate::workload::{KeySetSource, Workload};
+use crate::workload::{KeySetSource, RunWindow, Workload};
 
 /// Default byte cap of a replayer's transient cache: 2 GiB.
 pub const DEFAULT_CACHE_BYTES: u64 = 2 << 30;
@@ -193,11 +193,18 @@ impl<'a> Replayer<'a> {
     /// A replayer over an unindexed folder (`Catalog::discover`, manifest
     /// version `"0"`, data named by the catalog digest): no current specs,
     /// so every run currently reads every row group, and hypothetical specs
-    /// are built as transient segments.
-    pub fn unindexed(source: &'a dyn Source, root: &str) -> Result<Self> {
+    /// are built as transient segments. `partitioning` is the scheme
+    /// `source` reads `root`'s paths under, so a window on a partition
+    /// column prunes by path as an index would.
+    pub fn unindexed(
+        source: &'a dyn Source,
+        root: &str,
+        partitioning: &Partitioning,
+    ) -> Result<Self> {
         let schema = source.schema(root)?;
         let catalog = Arc::new(Catalog::discover(source, root, schema)?);
-        let planner = SegmentPlanner::new(Arc::clone(&catalog));
+        let planner =
+            SegmentPlanner::new(Arc::clone(&catalog)).with_partitioning(root, partitioning.clone());
         Self::new(source, catalog, Box::new(planner), Vec::new())
     }
 
@@ -275,21 +282,18 @@ impl<'a> Replayer<'a> {
         self.planner.with_transient(&extra)
     }
 
-    /// The specs of `specs` that serve `keys`, and the verified plan over
-    /// them (every row group when none serves).
+    /// The specs of `specs` that serve `keys` (in `window`, if any), and the
+    /// verified plan over them (every row group when none serves).
     fn verified_plan(
         &self,
         planner: &dyn PlanSource,
         specs: &[KeySpec],
         keys: &RunKeys,
+        window: Option<&RunWindow>,
     ) -> Result<ScanPlan> {
         check_types(&self.catalog, keys)?;
-        let serving: Vec<KeySpec> = specs
-            .iter()
-            .filter(|s| servable(s, keys.columns()).is_some())
-            .cloned()
-            .collect();
-        let plan = planner.plan(&serving, keys)?;
+        let serving = serving_run(specs, keys.columns(), window);
+        let plan = planner.plan(&serving, keys, window)?;
         self.catalog.verify_plan(&plan)?;
         Ok(plan)
     }
@@ -297,17 +301,18 @@ impl<'a> Replayer<'a> {
     /// The exact cost of one ad hoc key set under `specs`.
     pub fn cost_of_keys(&self, specs: &[KeySpec], run_id: &str, keys: &RunKeys) -> Result<RunCost> {
         let planner = self.planner_for(specs)?;
-        let plan = self.verified_plan(planner.as_ref(), specs, keys)?;
+        let plan = self.verified_plan(planner.as_ref(), specs, keys, None)?;
         Ok(run_cost(run_id, keys.len() as u64, &plan, true))
     }
 
     /// The plan for one ad hoc key set under `specs`, as costed.
     pub fn plan_of_keys(&self, specs: &[KeySpec], keys: &RunKeys) -> Result<ScanPlan> {
         let planner = self.planner_for(specs)?;
-        self.verified_plan(planner.as_ref(), specs, keys)
+        self.verified_plan(planner.as_ref(), specs, keys, None)
     }
 
-    /// Every run's exact cost under `specs`, in workload order.
+    /// Every run's exact cost under `specs`, in workload order; a window
+    /// run is planned in its window.
     pub fn replay_specs(
         &self,
         specs: &[KeySpec],
@@ -320,7 +325,7 @@ impl<'a> Replayer<'a> {
             .iter()
             .map(|run| {
                 let rk = workload.run_keys(keys, run)?;
-                let plan = self.verified_plan(planner.as_ref(), specs, &rk)?;
+                let plan = self.verified_plan(planner.as_ref(), specs, &rk, run.window.as_ref())?;
                 Ok(run_cost(&run.run_id, rk.len() as u64, &plan, true))
             })
             .collect()
@@ -361,7 +366,7 @@ impl<'a> Replayer<'a> {
             .map(|run| {
                 let rk = workload.run_keys(keys, run)?;
                 check_types(&self.catalog, &rk)?;
-                let plan = planner.plan(&rk)?;
+                let plan = planner.plan(&rk, run.window.as_ref())?;
                 self.catalog.verify_plan(&plan)?;
                 Ok(run_cost(&run.run_id, rk.len() as u64, &plan, true))
             })
@@ -403,6 +408,15 @@ impl<'a> Replayer<'a> {
                 (self.replay_specs(&specs, workload, keys)?, None)
             }
             ProposalBody::Layout { cluster_by } => {
+                if let Some(run) = workload.runs().iter().find(|r| r.window.is_some()) {
+                    return Err(Error::Other(format!(
+                        "a layout proposal is priced by a model of key lookups, and run {:?} \
+                         looks its keys up in a time window; score it against a workload of \
+                         locate runs (record one with `bellwether why --from` and no window)",
+                        run.run_id
+                    ))
+                    .into());
+                }
                 let model = LayoutModel::defaults(cluster_by, &self.catalog);
                 let lr = replay_layout(
                     self.source,

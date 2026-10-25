@@ -180,9 +180,11 @@ pub struct BuildOptions {
     /// Partitioning scheme of the source folder. `None` keeps the scheme the
     /// manifest records (none for a manifest that records none), or no
     /// scheme for a new index. [`Partitioning::Hive`] makes every
-    /// `name=value` directory below the data root a column (Parquet only).
-    /// A scheme different from the manifest's is refused, because it
-    /// changes the dataset schema and every row group's statistics.
+    /// `name=value` directory below the data root a column, and
+    /// [`Partitioning::Template`] every placeholder of a path template
+    /// (Parquet only). A scheme different from the manifest's (another
+    /// template included) is refused, because it changes the dataset schema
+    /// and every row group's statistics.
     pub partitioning: Option<Partitioning>,
     /// Sidecars to declare beside the key specs (per-key time bounds,
     /// bitemporal versions; `bellwether_core::sidecar`), in addition to those

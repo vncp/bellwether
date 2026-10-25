@@ -26,9 +26,12 @@
 //! A run's template groups it in reports. Without one, the template is the
 //! run's key-column set, `columns(<key columns>)`: a grouping by columns, not
 //! by query; pass the query or pipeline step a run came from to group by
-//! that. Every run records a query kind; only `locate` exists today, and a
-//! workload naming another kind is refused (`latest` and `asof` runs are
-//! reserved for when the format can price them, contract v3 backlog #14).
+//! that. Every run records a query kind: `locate` (the rows of its keys) or
+//! `window` (the rows of its keys whose time column lies in the run's
+//! [`RunWindow`], which only a window run records). A workload naming
+//! another kind is refused (`latest` and `asof` runs are reserved for when
+//! the format can price them, contract v3 backlog #14). A recorder made
+//! [`WorkloadRecorder::in_window`] records every run as a window run.
 //!
 //! # The bench workload format
 //!
@@ -71,9 +74,25 @@ const WORKLOAD_FORMAT_PREFIX: &str = "bellwether-replay-workload/";
 /// Format tag of `bellwether-bench`'s `workload.json`.
 pub const BENCH_WORKLOAD_FORMAT: &str = "bellwether-bench-workload/1";
 const BENCH_WORKLOAD_FORMAT_PREFIX: &str = "bellwether-bench-workload/";
-/// The query kind of a recorded run that looks keys up (`locate`), the only
-/// kind replay prices today.
+/// The query kind of a recorded run that looks keys up (`locate`).
 pub const QUERY_KIND_LOCATE: &str = "locate";
+/// The query kind of a recorded run that looks keys up in a time window
+/// (`window`, [`RunWindow`]).
+pub const QUERY_KIND_WINDOW: &str = "window";
+
+/// The time window of a `window` run: the rows of its keys whose
+/// `ts_column` lies in `[lo, hi]`, both inclusive and in the column's
+/// dataset unit (days for `Date32`, milliseconds for `Date64`, the
+/// timestamp's own unit, an integer column's value itself).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunWindow {
+    /// The time column.
+    pub ts_column: String,
+    /// Inclusive lower bound.
+    pub lo: i64,
+    /// Inclusive upper bound.
+    pub hi: i64,
+}
 
 /// One recorded run.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -84,8 +103,8 @@ pub struct RecordedRun {
     /// set, `columns(<key columns>)`: a grouping by columns, not by query;
     /// recorders that know the query or pipeline step pass it instead.
     pub template: String,
-    /// What the run asked of the index: [`QUERY_KIND_LOCATE`] today, with
-    /// `latest` and `asof` reserved.
+    /// What the run asked of the index: [`QUERY_KIND_LOCATE`] or
+    /// [`QUERY_KIND_WINDOW`], with `latest` and `asof` reserved.
     pub query_kind: String,
     /// Key columns, in tuple order.
     pub columns: Vec<String>,
@@ -97,6 +116,10 @@ pub struct RecordedRun {
     pub null_tuples: u64,
     /// BLAKE3 of the key-set payload stored in the cache.
     pub key_set: Hash,
+    /// The window of a `window` run; absent (and not serialized, so a
+    /// `locate` run hashes as before) otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub window: Option<RunWindow>,
 }
 
 /// The canonical workload manifest; its JSON's BLAKE3 is the workload hash.
@@ -163,11 +186,36 @@ impl Workload {
                     "a recorded run needs an id and a template".into(),
                 ));
             }
-            if run.query_kind != QUERY_KIND_LOCATE {
-                return Err(Error::UnknownKind {
-                    what: "query kind",
-                    found: run.query_kind.clone(),
-                });
+            match (run.query_kind.as_str(), &run.window) {
+                (QUERY_KIND_LOCATE, None) => {}
+                (QUERY_KIND_WINDOW, Some(w)) => {
+                    if w.ts_column.is_empty() || w.lo > w.hi {
+                        return Err(Error::Other(format!(
+                            "run {:?} records the window {}..{} of {:?}; a window names its \
+                             time column and starts at or before its end",
+                            run.run_id, w.lo, w.hi, w.ts_column
+                        )));
+                    }
+                }
+                (QUERY_KIND_LOCATE | QUERY_KIND_WINDOW, _) => {
+                    return Err(Error::Other(format!(
+                        "run {:?} is a {} run {} a window; a window run records exactly one \
+                         and a locate run none",
+                        run.run_id,
+                        run.query_kind,
+                        if run.window.is_some() {
+                            "with"
+                        } else {
+                            "without"
+                        }
+                    )))
+                }
+                (other, _) => {
+                    return Err(Error::UnknownKind {
+                        what: "query kind",
+                        found: other.to_string(),
+                    })
+                }
             }
             if i > 0 && manifest.runs[i - 1].run_id >= run.run_id {
                 return Err(Error::Other(format!(
@@ -423,6 +471,7 @@ pub struct WorkloadRecorder<'a> {
     sink: &'a dyn KeySetSink,
     schema: SchemaRef,
     runs: BTreeMap<String, RecordedRun>,
+    window: Option<RunWindow>,
 }
 
 impl std::fmt::Debug for WorkloadRecorder<'_> {
@@ -447,7 +496,28 @@ impl<'a> WorkloadRecorder<'a> {
             sink,
             schema,
             runs: BTreeMap::new(),
+            window: None,
         }
+    }
+
+    /// This recorder, recording every run as a `window` run over `window`
+    /// ([`QUERY_KIND_WINDOW`]). The time column must be in the dataset
+    /// schema and the window must not end before it starts.
+    pub fn in_window(mut self, window: RunWindow) -> Result<Self> {
+        if self.schema.field_with_name(&window.ts_column).is_err() {
+            return Err(Error::KeySpec(format!(
+                "the window's time column {:?} is not in the dataset schema",
+                window.ts_column
+            )));
+        }
+        if window.lo > window.hi {
+            return Err(Error::Other(format!(
+                "the window {}..{} of {} ends before it starts",
+                window.lo, window.hi, window.ts_column
+            )));
+        }
+        self.window = Some(window);
+        Ok(self)
     }
 
     /// Records run `run_id` with the default template, the run's key-column
@@ -510,12 +580,18 @@ impl<'a> WorkloadRecorder<'a> {
                     || format!("columns({})", columns.join(",")),
                     ToString::to_string,
                 ),
-                query_kind: QUERY_KIND_LOCATE.to_string(),
+                query_kind: if self.window.is_some() {
+                    QUERY_KIND_WINDOW
+                } else {
+                    QUERY_KIND_LOCATE
+                }
+                .to_string(),
                 key_types: built.key_types().to_vec(),
                 columns,
                 keys: built.len() as u64,
                 null_tuples,
                 key_set,
+                window: self.window.clone(),
             },
             payload,
         })

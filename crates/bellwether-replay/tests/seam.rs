@@ -34,7 +34,12 @@ fn a_changed_fpr_or_ts_column_is_a_miss() {
     let corpus = typed::write_corpus(6, 3, 40, 3);
     let schema = typed::dataset_schema();
     let source = ParquetSource::new().with_schema(Arc::clone(&schema));
-    let r = Replayer::unindexed(&source, &corpus.data).unwrap();
+    let r = Replayer::unindexed(
+        &source,
+        &corpus.data,
+        &bellwether_source::Partitioning::None,
+    )
+    .unwrap();
     let t1 = KeySpec::Temporal {
         columns: cols(&["k_i64"]),
         ts_column: "ts".into(),
@@ -146,7 +151,7 @@ fn key_types_are_part_of_the_cache_key_and_the_seam_refuses_a_mismatch() {
     let honest = planner
         .with_transient(&[at_scale_4])
         .unwrap()
-        .plan(std::slice::from_ref(&spec), &rk4)
+        .plan(std::slice::from_ref(&spec), &rk4, None)
         .unwrap();
     assert!(honest.row_groups_selected > 0);
     // Keys encoded at scale 4 are refused by a scale-3 planner.
@@ -155,7 +160,7 @@ fn key_types_are_part_of_the_cache_key_and_the_seam_refuses_a_mismatch() {
     let err = p3
         .with_transient(&[at_scale_3])
         .unwrap()
-        .plan(std::slice::from_ref(&spec), &rk4)
+        .plan(std::slice::from_ref(&spec), &rk4, None)
         .unwrap_err();
     assert!(
         matches!(&err, Error::KeySpec(m) if m.contains("dataset declares")),
@@ -186,7 +191,12 @@ fn bloom_fpr_survives_the_segment_header_round_trip() {
     }
     let corpus = typed::write_corpus(6, 3, 40, 3);
     let source = ParquetSource::new().with_schema(typed::dataset_schema());
-    let r = Replayer::unindexed(&source, &corpus.data).unwrap();
+    let r = Replayer::unindexed(
+        &source,
+        &corpus.data,
+        &bellwether_source::Partitioning::None,
+    )
+    .unwrap();
     for fpr in [1.0 / 3.0, 0.07, 0.9f64.powi(37)] {
         let spec = KeySpec::Bloom {
             columns: cols(&["k_i64"]),
