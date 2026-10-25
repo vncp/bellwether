@@ -178,6 +178,9 @@ impl EngineArgs {
             // the CLI gives them per command.
             signing_key: None,
             trusted_keys: None,
+            // Builds use the available parallelism; the CLI's `index
+            // --threads` sets it per call.
+            threads: None,
         })
     }
 
