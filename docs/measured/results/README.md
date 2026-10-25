@@ -11,7 +11,7 @@ committed results render.
 | File | Written by | Rendered as |
 |---|---|---|
 | `showcase.json` | [`scripts/showcase.sh`](../../../scripts/showcase.sh) | README "Results"; `results-bytes`, `results-replay`, `results-latency`, `results-reconcile`; the tables of [2026-10-25-showcase.md](../2026-10-25-showcase.md) |
-| any other `<source>.json` | its own script | one chart per numeric metric, `results-<source>-<metric>-{light,dark}.svg`, and a table for the block `results:<source>` wherever that marker appears |
+| any other `<source>.json` | its own script | the charts it declares (below), `results-<source>-<name>-{light,dark}.svg`, and a table of every row for the block `results:<source>` wherever that marker appears |
 
 ## Schema
 
@@ -46,6 +46,20 @@ Every row carries all ten fields:
 - `value`: a number, or a string or boolean for records (a receipt hash, a `fix` outcome, whether two answers matched). Only numbers are charted.
 - `exactness`: `exact` when the value cannot change between runs on the same data (footer sums, plans, counts, hashes); `measured` when it is a timing or a profiler reading.
 - `machine`, `build`, `date`: where, with what, and when (UTC date). `build` names the binary that produced the value (a Bellwether release build and its commit, DuckDB's version, or `footer statistics (no engine)`).
+
+Rows may carry more fields; the renderer ignores them (`showcase.json` adds `notes`: the machine's 1-minute load average when a `measured` value was taken).
+
+Optional top-level `charts` declares the charts a source wants, one per metric:
+
+```json
+"charts": [
+  {"name": "lookup-latency", "metric": "lookup_p50_ms_warm", "title": "Warm lookup, p50",
+   "takeaway": "One sentence in plain language, written by the script from its own numbers.",
+   "sides": ["duckdb", "bellwether-end-to-end"], "log": true}
+]
+```
+
+`sides` (bar order) and `log` are optional; by default every side is drawn and the scale is logarithmic when the values span more than 30x. A chart groups bars by `dataset`, then `query`.
 
 Optional top-level `datasets` maps a dataset id to `{"name", "label", …}`; `name` is the short form charts use.
 

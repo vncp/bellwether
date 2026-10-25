@@ -483,14 +483,29 @@ SHOWCASE_CHARTS = {
 
 # ---- generic charts and tables for other sources ------------------------------
 def generic_outputs(source, res):
-    charts, numeric = {}, {}
-    for r in res.rows:
-        if isinstance(r["value"], (int, float)) and not isinstance(r["value"], bool):
-            numeric.setdefault((r["metric"], r["unit"]), []).append(r)
-    for (metric, unit), rows in sorted(numeric.items()):
-        sides = []
+    """The charts a source declares in its top-level `charts` list.
+
+    Each entry: {"name", "metric", "title", "takeaway"}, optionally "sides"
+    (which sides, in bar order; default all) and "log" (default: log scale when
+    the values span more than 30x). The takeaway is written by the source's
+    script from its own numbers.
+    """
+    charts = {}
+    for spec in res.doc.get("charts", []):
+        metric = spec["metric"]
+        rows = [
+            r for r in res.rows
+            if r["metric"] == metric and isinstance(r["value"], (int, float)) and not isinstance(r["value"], bool)
+        ]
+        if not rows:
+            sys.exit(f"{source}.json: chart {spec['name']!r} names metric {metric!r}, which no numeric row has")
+        units = {r["unit"] for r in rows}
+        if len(units) != 1:
+            sys.exit(f"{source}.json: metric {metric!r} has several units ({', '.join(sorted(units))}); use one")
+        unit = units.pop()
+        sides = list(spec.get("sides") or [])
         for r in rows:
-            if r["side"] not in sides:
+            if not spec.get("sides") and r["side"] not in sides:
                 sides.append(r["side"])
         keys = []
         for r in rows:
@@ -500,26 +515,28 @@ def generic_outputs(source, res):
         idx = {(r["dataset"], r["query"], r["side"]): r["value"] for r in rows}
         groups, last = [], None
         for ds, q in keys:
+            text = res.queries.get(q, {}).get("text", q) if isinstance(res.queries.get(q), dict) else q
             groups.append(
                 {
-                    "header": ds if ds != last else None,
-                    "label": q,
+                    "header": res.dataset_name(ds) if ds != last else None,
+                    "label": text,
                     "sub": "",
                     "bars": [(idx.get((ds, q, sd)), "") for sd in sides],
                 }
             )
             last = ds
         vals = [v for v in idx.values() if v and v > 0]
-        log = bool(vals) and max(vals) / min(vals) > 30
-        fmt = human_bytes if unit == "bytes" else human_ms if unit == "ms" else (lambda v, u=unit: f"{v:,.4g} {u}")
+        log = spec.get("log", bool(vals) and max(vals) / min(vals) > 30)
+        fmt = human_bytes if unit == "bytes" else human_ms if unit == "ms" else human_rate if unit == "rows/s" else (
+            lambda v, u=unit: f"{v:,.4g} {u}"
+        )
         palette = ["duckdb", "bw", "full", "pred", "bw2"]
         series = [(sd, palette[i % len(palette)]) for i, sd in enumerate(sides)]
         prov = Results({"rows": rows}).provenance_line()
-        name = f"results-{source}-{re.sub('[^a-z0-9]+', '-', metric.lower()).strip('-')}"
+        name = f"results-{source}-{re.sub('[^a-z0-9]+', '-', spec['name'].lower()).strip('-')}"
         for theme in THEMES:
             charts[f"{name}-{theme}.svg"] = hbar_chart(
-                theme, f"{source}: {metric} ({unit})", f"{metric} per question and side, from docs/measured/results/{source}.json.",
-                prov, groups, series, fmt, log=log,
+                theme, spec["title"], spec["takeaway"], f"{metric} ({unit}). {prov}", groups, series, fmt, log=log
             )
     return charts
 
