@@ -717,6 +717,77 @@ fn following_the_stale_manifest_next_line_ends_in_a_receipt() {
     }
 }
 
+/// The same for `data_changed`: a file lands without a commit, so the
+/// manifest sequence is unchanged and only the data's catalog digest tells
+/// the retry apart. Following the next line literally (the same
+/// `score.verify` again, as a job) gives a new job and a new certificate,
+/// and the apply ends in a receipt.
+#[test]
+fn following_the_data_changed_next_line_ends_in_a_receipt() {
+    for clock in CLOCKS {
+        let f = folder();
+        let srv = server_at(&f.data, Budget::default(), clock);
+        let sc = json(&ok(
+            &srv,
+            "score.why",
+            json!({"keys": s(&f.keys), "wait": true}),
+        ));
+        let wl = sc["workload"]["hash"].as_str().unwrap().to_string();
+        let cand = sc["candidates"][0]["proposal"]["hash"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let verify = json!({"proposal": cand, "workload": wl});
+        let job = |args: Value, tool: &str| {
+            let r = srv.call(tool, args);
+            assert_eq!(r.envelope.status, Status::Running, "{tool} is a job");
+            let id = r.envelope.job.unwrap().id;
+            (id.clone(), finish(&srv, &id))
+        };
+        let (first_id, first) = job(verify.clone(), "score.verify");
+        let stale = json(&first)["certificate"]["hash"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let sequence = srv.engine().state().unwrap().sequence;
+        write_file(
+            &f.data.join("part-777.parquet"),
+            &[vec![(5, 1, Some(1), "late".into())]],
+        );
+        assert_eq!(
+            srv.engine().state().unwrap().sequence,
+            sequence,
+            "no commit"
+        );
+        let (_, r) = job(json!({"certificate": stale}), "apply.receipt");
+        refused_as("apply after a file landed", &r, "data_changed");
+        let next = &refusal(&r).next;
+        assert!(
+            next.contains("score.verify") && next.contains("apply.receipt"),
+            "{next}"
+        );
+        // Exactly as the next line says: the same score.verify call again.
+        let (again_id, again) = job(verify, "score.verify");
+        assert_ne!(
+            again_id, first_id,
+            "[clock={clock:?}] the stored job came back"
+        );
+        let fresh = json(&again)["certificate"]["hash"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert_ne!(
+            fresh, stale,
+            "[clock={clock:?}] the stale certificate came back"
+        );
+        let (_, applied) = job(json!({"certificate": fresh}), "apply.receipt");
+        assert!(!applied.is_error(), "{}", applied.text);
+        let v = json(&applied);
+        assert_eq!(v["outcome"]["kind"], "applied", "[clock={clock:?}]");
+        assert!(v["outcome"]["receipt"]["hash"].is_string());
+    }
+}
+
 /// `invalid_spec` for a column the dataset lacks carries the column and the
 /// dataset's columns, from `observe.why` and the propose tools alike.
 #[test]
