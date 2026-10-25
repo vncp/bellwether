@@ -223,6 +223,8 @@ class Perf:
                                    "commit_dirty": self.env["commit_dirty"], "load_avg_1m_start": load}
             self.load_max = load
             self.ext_max, self.ext_top = external_cpu()
+            say(f"section {name}: load {load}, outside this run {self.ext_max:.1f} cores "
+                f"({', '.join(self.ext_top[:3])})")
             self.load_stop = threading.Event()
 
             def watch():
@@ -784,12 +786,36 @@ def reconcile_once(p, name, left, right, args, budget):
 
 def section_reconcile(p, ledger):
     for name, left, right, args, what in reconcile_pairs(p, ledger):
+        if name.split("-")[0] not in p.a.reconcile_datasets and name not in p.a.reconcile_datasets:
+            say(f"reconcile: {name} not selected (--reconcile-datasets)")
+            continue
         say(f"reconcile: {name}")
         results = {}
-        for label, b in BUDGETS:
+        one_pass_ms = None
+        # Largest budget first: its single pass predicts what the smaller
+        # budgets cost, and one whose predicted wall time is past the cap is
+        # recorded as not run rather than run for hours.
+        for label, b in reversed(BUDGETS):
+            if one_pass_ms and name in results.get("_need", {}):
+                need = results["_need"][name]
+                predicted = math.ceil(need / b)
+                if predicted * one_pass_ms > p.a.reconcile_cap_s * 1000:
+                    p.context[f"reconcile/{name}/{label}"] = {
+                        "not_run": f"about {predicted} passes at {label} (the one-pass state is "
+                                   f"{need / 2**20:,.0f} MiB as budgeted), about "
+                                   f"{predicted * one_pass_ms / 60000:,.0f} min; past the "
+                                   f"{p.a.reconcile_cap_s // 60} min cap", "what": what}
+                    say(f"  {label:>5}: not run, about {predicted} passes, "
+                        f"{predicted * one_pass_ms / 60000:,.0f} min")
+                    continue
             ms, v, mem, peak, cmd = reconcile_once(p, name, left, right, args, label)
             rows = [s["rows"] for s in v["outcome"]["sides"]]
             results[label] = (mem["passes"], b)
+            if mem["passes"] == 1 and one_pass_ms is None:
+                one_pass_ms = ms
+                # Budget the planner needs for one pass is at least the
+                # state it held; the bisection below measures the real need.
+                results["_need"] = {name: mem["peak_state_bytes"]}
             common = dict(dataset=name, query="reconcile", budget=label, command=cmd)
             p.metric(f"reconcile/{name}/{label}/wall", round(ms, 1), "ms", "lower", metric="wall", **common)
             p.metric(f"reconcile/{name}/{label}/rows-per-s-per-side", round(rows[0] / (ms / 1000)),
@@ -805,16 +831,20 @@ def section_reconcile(p, ledger):
             say(f"  {label:>5}: {ms:9.0f} ms  passes {mem['passes']:4d}  meter peak "
                 f"{mem['peak_state_bytes'] / 2**20:8.1f} MiB  RSS {peak / 2**20:7.0f} MiB  "
                 f"{rows[0] / (ms / 1000):10.0f} rows/s/side")
-        # The smallest budget with one pass, by bisection on MiB.
-        ones = [b for _, (passes, b) in results.items() if passes == 1]
-        more = [b for _, (passes, b) in results.items() if passes > 1]
+        results.pop("_need", None)
+        # The smallest budget with one pass, by bisection on MiB, between the
+        # one-pass run's state (a budget below what one pass holds cannot be
+        # one pass) and the smallest listed budget that gave one pass.
+        ones = [b for passes, b in results.values() if passes == 1]
         if not ones:
-            p.context[f"reconcile/{name}/smallest-one-pass"] = "more than one pass at 8G"
+            p.context[f"reconcile/{name}/smallest-one-pass"] = "more than one pass at every budget run"
             continue
         hi = min(ones) >> 20
-        lo = (max([b for b in more if b < min(ones)], default=1 << 20) >> 20)
+        more = [b for passes, b in results.values() if passes > 1 and b < min(ones)]
+        floor = p.context[f"reconcile/{name}/{[l for l, b in BUDGETS if b == min(ones)][0]}"]["memory"]["peak_state_bytes"]
+        lo = max([b >> 20 for b in more] + [max(1, floor >> 20) - 1])
         probes = []
-        while hi - lo > max(1, hi // 20):
+        while hi - lo > max(1, hi // 10):
             mid = (lo + hi) // 2
             _, _, mem, _, _ = reconcile_once(p, name, left, right, args, f"{mid}M")
             probes.append((mid, mem["passes"], mem["peak_state_bytes"]))
@@ -822,12 +852,13 @@ def section_reconcile(p, ledger):
                 hi = mid
             else:
                 lo = mid
-        _, _, mem, _, cmd = reconcile_once(p, name, left, right, args, f"{hi}M")
+        mem = next((m for b, ps, m in [(x[0], x[1], {"peak_state_bytes": x[2]}) for x in probes] if b == hi), None)
         p.metric(f"reconcile/{name}/smallest-one-pass-budget", hi << 20, "bytes", "none",
-                 dataset=name, metric="smallest budget with passes == 1 (within 5%)", command=cmd)
-        p.context[f"reconcile/{name}/smallest-one-pass"] = {"budget_mib": hi, "probes": probes,
-                                                             "memory_at_budget": mem}
-        say(f"  smallest one-pass budget: {hi} MiB (meter peak there {mem['peak_state_bytes'] / 2**20:.1f} MiB)")
+                 dataset=name, metric="smallest budget with passes == 1 (within 10%)")
+        p.context[f"reconcile/{name}/smallest-one-pass"] = {
+            "budget_mib": hi, "probes": probes, "bounds_mib": [lo, hi],
+            "memory_at_budget": mem or p.context[f"reconcile/{name}/{[l for l, b in BUDGETS if b == min(ones)][0]}"]["memory"]}
+        say(f"  smallest one-pass budget: {hi} MiB (bisection to 10%, probes {probes})")
 
 
 # ---------------------------------------------------------------- latency
@@ -1059,6 +1090,10 @@ def main():
                     help="keep the other sections' results in an existing <out>/perf.json")
     ap.add_argument("--max-load", type=float, default=3.0,
                     help="warn when processes outside this run use more cores than this during a section")
+    ap.add_argument("--reconcile-datasets", default="ledger,replay,taxi",
+                    help="which reconcile pairs to run: ledger, replay, taxi")
+    ap.add_argument("--reconcile-cap-s", type=int, default=900,
+                    help="skip a budget whose predicted wall time is past this many seconds")
     ap.add_argument("--warm", type=int, default=20)
     ap.add_argument("--cold", type=int, default=5)
     ap.add_argument("--build-reps", type=int, default=3)
@@ -1068,6 +1103,7 @@ def main():
     ap.add_argument("--build-label", default="release (thin LTO, codegen-units 1, line-table debug info)")
     a = ap.parse_args()
     a.key_sets = [int(x) for x in a.key_sets.split(",")]
+    a.reconcile_datasets = a.reconcile_datasets.split(",")
     a.bin = os.path.realpath(a.bin)
     a.work = os.path.realpath(a.work)
     os.makedirs(a.work, exist_ok=True)

@@ -106,17 +106,23 @@ class Doc:
                        f"pass: {first['pass']}\n")
             out.append("| budget | wall (s) | rows / s per side | passes | meter peak (MiB) | peak RSS (MiB) |")
             out.append("|---|---:|---:|---:|---:|---:|")
+            skipped = []
             for b in ("64M", "256M", "1G", "8G"):
                 w = self.v(f"reconcile/{ds}/{b}/wall")
                 if w is None:
+                    nr = self.c.get(f"reconcile/{ds}/{b}", {}).get("not_run")
+                    if nr:
+                        skipped.append(f"{b}: not run, {nr}")
                     continue
                 out.append(f"| {b} | {w / 1000:,.1f} | {self.v(f'reconcile/{ds}/{b}/rows-per-s-per-side'):,} | "
                            f"{self.v(f'reconcile/{ds}/{b}/passes')} | {mib(self.v(f'reconcile/{ds}/{b}/meter-peak'))} | "
                            f"{mib(self.v(f'reconcile/{ds}/{b}/peak-rss'))} |")
+            if skipped:
+                out.append("\n" + "; ".join(skipped) + ".")
             one = self.c.get(f"reconcile/{ds}/smallest-one-pass")
             if isinstance(one, dict):
                 mem = one["memory_at_budget"]
-                out.append(f"\nSmallest budget with one pass (bisection to 5%): **{one['budget_mib']} MiB**; the "
+                out.append(f"\nSmallest budget with one pass (bisection to 10%): **{one['budget_mib']} MiB**; the "
                            f"meter's peak at that budget was {mib(mem['peak_state_bytes'])} MiB, so the pass "
                            f"count needs {one['budget_mib'] / (mem['peak_state_bytes'] / 2**20):.2f}x the state it "
                            f"then holds. Probes (MiB, passes, meter peak MiB): "
