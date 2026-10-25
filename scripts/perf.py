@@ -36,6 +36,7 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -192,9 +193,23 @@ class Perf:
             self.env = {**environment(self.a), "sections": self.sections}
             self.sections[name] = {"started_at": self.env["started_at"], "commit": self.env["commit"],
                                    "commit_dirty": self.env["commit_dirty"], "load_avg_1m_start": load}
+            self.load_max = load
+            self.load_stop = threading.Event()
+
+            def watch():
+                while not self.load_stop.wait(5):
+                    self.load_max = max(self.load_max, os.getloadavg()[0])
+            self.load_thread = threading.Thread(target=watch, daemon=True)
+            self.load_thread.start()
         else:
+            self.load_stop.set()
+            self.load_thread.join()
             self.sections[name]["finished_at"] = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
             self.sections[name]["load_avg_1m_end"] = load
+            self.sections[name]["load_avg_1m_max"] = round(max(self.load_max, load), 2)
+            if self.load_max > self.a.max_load:
+                say(f"WARNING: {name}: the 1-minute load average reached {self.load_max:.1f} (limit "
+                    f"{self.a.max_load}); rerun this section on a quiet machine before publishing it")
         self.env["sections"] = self.sections
 
     def sample(self, mid, values, **extra):
@@ -1008,6 +1023,8 @@ def main():
                     help="small corpora only (replay-small, the quick corpus, market defaults); no profiles")
     ap.add_argument("--merge", action="store_true",
                     help="keep the other sections' results in an existing <out>/perf.json")
+    ap.add_argument("--max-load", type=float, default=3.0,
+                    help="warn when the 1-minute load average exceeds this during a section")
     ap.add_argument("--warm", type=int, default=20)
     ap.add_argument("--cold", type=int, default=5)
     ap.add_argument("--build-reps", type=int, default=3)
