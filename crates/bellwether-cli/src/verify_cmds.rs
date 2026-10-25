@@ -12,7 +12,8 @@ use clap::{Args, Subcommand};
 
 use crate::human::{heading, num, short, size};
 use crate::{
-    done, engine, hash, Failure, Global, Out, Outcome, RootArg, EXIT_FAILED, EXIT_OK, EXIT_REFUSED,
+    done, engine, engine_keyed, hash, Failure, Global, Out, Outcome, RootArg, EXIT_FAILED, EXIT_OK,
+    EXIT_REFUSED,
 };
 
 /// Commands that write certificates.
@@ -108,6 +109,12 @@ pub(crate) struct FixArgs {
     after_output: Option<String>,
     #[command(flatten)]
     compare: CompareArgs,
+    /// Sign the receipt and the certificate this run writes (a verify-only
+    /// run: its passing certificate) with this key: the seed file
+    /// `bellwether keys generate` wrote, readable by its owner only. A
+    /// path, never key bytes.
+    #[arg(long, value_name = "FILE", env = "BELLWETHER_SIGNING_KEY")]
+    signing_key: Option<std::path::PathBuf>,
 }
 
 pub(crate) fn run(g: &Global, out: &Out, cmd: &VerifyCommand) -> Result<Outcome, Failure> {
@@ -163,7 +170,10 @@ pub(crate) fn run(g: &Global, out: &Out, cmd: &VerifyCommand) -> Result<Outcome,
                 verify_only: a.verify_only,
                 allow_no_gain: a.allow_no_gain,
             };
-            let r = engine(g, &a.root.root)?.fix(&request)?;
+            // The key is read before anything is scored: a key that cannot
+            // be used is a usage error, not a receipt without a signature.
+            let key = crate::keys_cmds::signing_key(a.signing_key.as_deref())?;
+            let r = engine_keyed(g, &a.root.root, key, None)?.fix(&request)?;
             let code = match &r.outcome {
                 FixOutcome::Applied { .. }
                 | FixOutcome::Verified
@@ -431,6 +441,26 @@ fn reconcile_human(r: &ReconcileResult, out: &Out) -> String {
     s
 }
 
+/// What `fix` signed, or that `what` is unsigned.
+fn signed_line(s: &mut String, r: &FixResult, what: &str) {
+    let Some(first) = r.signatures.first() else {
+        let _ = writeln!(
+            s,
+            "            {what} unsigned (no --signing-key; `bellwether keys generate --out \
+             <path>` makes a key)"
+        );
+        return;
+    };
+    let kinds: Vec<&str> = r.signatures.iter().map(|x| x.kind.as_str()).collect();
+    let _ = writeln!(
+        s,
+        "            signed the {} with key {} at {}",
+        kinds.join(" and the "),
+        short(&first.key_id),
+        first.signed_at
+    );
+}
+
 // One linear screen, a line per stage.
 #[allow(clippy::too_many_lines)]
 fn fix_human(r: &FixResult, out: &Out) -> String {
@@ -515,6 +545,7 @@ fn fix_human(r: &FixResult, out: &Out) -> String {
                 );
             }
             let _ = writeln!(s, "  4 attest  receipt {}", receipt.hash);
+            signed_line(&mut s, r, "receipt");
             if let Some(r) = realized {
                 if let Record::Replay(rp) = &r.record {
                     let bytes: u64 = rp.current.iter().map(|c| c.bytes).sum();
@@ -533,6 +564,7 @@ fn fix_human(r: &FixResult, out: &Out) -> String {
         }
         FixOutcome::Verified => {
             let _ = writeln!(s, "  3 apply   not run (--verify-only)");
+            signed_line(&mut s, r, "certificate");
         }
         // The CLI never asks for a dry run; the MCP server does.
         FixOutcome::WouldApply { sequence, expected } => {

@@ -19,7 +19,7 @@
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
-use bellwether_ledger::{parse_record_path, LEDGER_PREFIX};
+use bellwether_ledger::{parse_record_path, Verdict, LEDGER_PREFIX};
 use bellwether_types::Store as _;
 use bellwether_types::{
     Certificate, Coverage, Error, Evidence, EvidenceBody, Hash, Proposal, ProposalBody, Receipt,
@@ -40,6 +40,15 @@ struct ReceiptView {
     replay: Option<Replay>,
     certificate: Option<Certificate>,
     realized: Option<(Hash, Cost)>,
+    /// With trusted keys: the receipt's verdict, and the certificate's
+    /// (`None` when the certificate could not be read).
+    signature: Option<(Verdict, Option<Verdict>)>,
+}
+
+impl ReceiptView {
+    fn signed(&self) -> bool {
+        matches!(&self.signature, Some((r, Some(c))) if r.is_signed() && c.is_signed())
+    }
 }
 
 impl Engine {
@@ -100,6 +109,7 @@ impl Engine {
                     .max_by(|a, b| a.1.created_at.cmp(&b.1.created_at).then(a.0.cmp(&b.0)))
                     .map(|(h, r)| (*h, total(&r.current)))
             });
+            let signature = self.verdicts(&ledger, &h, &receipt, certificate.is_some())?;
             receipts.push(ReceiptView {
                 hash: h,
                 receipt,
@@ -107,6 +117,7 @@ impl Engine {
                 replay,
                 certificate,
                 realized,
+                signature,
             });
         }
         receipts.sort_by(|a, b| {
@@ -148,7 +159,43 @@ impl Engine {
             evidence: evidence.iter().map(|(h, _)| *h).collect(),
             realized: receipts.iter().filter(|r| r.realized.is_some()).count() as u64,
             unreadable,
+            signed: self.signed_count(&receipts),
         })
+    }
+
+    /// With trusted keys: how many receipts are signed (receipt and
+    /// certificate).
+    fn signed_count(&self, receipts: &[ReceiptView]) -> Option<u64> {
+        self.options()
+            .trusted_keys
+            .as_ref()
+            .map(|_| receipts.iter().filter(|r| r.signed()).count() as u64)
+    }
+
+    /// With trusted keys: the receipt's verdict and, when its certificate
+    /// was read, the certificate's. A certificate that cannot be verified
+    /// (unreadable) has none; a store failure is an error.
+    fn verdicts(
+        &self,
+        ledger: &bellwether_ledger::Ledger<std::sync::Arc<bellwether_store::ObjectStoreBackend>>,
+        hash: &Hash,
+        receipt: &Receipt,
+        certificate_read: bool,
+    ) -> Result<Option<(Verdict, Option<Verdict>)>> {
+        let Some(t) = &self.options().trusted_keys else {
+            return Ok(None);
+        };
+        let on_receipt = ledger.verify_against(hash, t)?;
+        let on_certificate = if certificate_read {
+            match ledger.verify_against(&receipt.certificate, t) {
+                Ok(v) => Some(v),
+                Err(Error::Store(m)) => return Err(Error::Store(m)),
+                Err(_) => None,
+            }
+        } else {
+            None
+        };
+        Ok(Some((on_receipt, on_certificate)))
     }
 }
 
@@ -292,6 +339,19 @@ fn render_receipt(h: &mut String, r: &ReceiptView) {
             num(c.body.mismatched),
             num(c.body.missing_left),
             num(c.body.missing_right)
+        );
+    }
+    if let Some((on_receipt, on_certificate)) = &r.signature {
+        let class = if r.signed() { "pass" } else { "fail" };
+        let cert = on_certificate.as_ref().map_or_else(
+            || "not readable, so not verified".to_string(),
+            ToString::to_string,
+        );
+        let _ = write!(
+            h,
+            "<p>Signatures: <span class=\"{class}\">receipt {}; certificate {}</span>.</p>",
+            esc(&on_receipt.to_string()),
+            esc(&cert)
         );
     }
     let Some(replay) = &r.replay else {

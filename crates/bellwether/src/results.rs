@@ -4,7 +4,7 @@
 //! every ledger record a command wrote or read is embedded whole, with its
 //! hash, exactly as the ledger stores it ([`Written`]).
 
-use bellwether_ledger::RecordKind;
+use bellwether_ledger::{RecordKind, SignatureStatus, Verdict};
 use bellwether_types::{Hash, KeySpec, Record};
 use serde::{Deserialize, Serialize};
 
@@ -308,6 +308,16 @@ pub struct ChainLink {
     pub status: LinkStatus,
     /// Key facts, as ordered `(name, value)` pairs.
     pub facts: Vec<(String, String)>,
+    /// For the receipt and its certificate, when they resolved: every
+    /// signature object beside the record, each verified on its own (ADR
+    /// 029). Absent for the other links and for flagged ones.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signatures: Option<Vec<SignatureStatus>>,
+    /// For the receipt and its certificate, when the engine was given
+    /// trusted keys: those signatures folded against them (`signed`,
+    /// `untrusted`, `unsigned`, or `invalid`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verdict: Option<Verdict>,
 }
 
 /// What [`crate::Engine::receipt`] found: the chain behind a receipt, with
@@ -324,6 +334,11 @@ pub struct ReceiptResult {
     pub chain: Vec<ChainLink>,
     /// Every link's record that resolved, in chain order.
     pub records: Vec<Written>,
+    /// With trusted keys: whether the receipt and its certificate are both
+    /// signed by a trusted key within its window. `None` without trusted
+    /// keys. A receipt alone does not count: a certificate planted in the
+    /// store and applied would otherwise ride on a signed receipt.
+    pub signed: Option<bool>,
 }
 
 /// Costs summed over runs.
@@ -353,4 +368,8 @@ pub struct ReportResult {
     pub realized: u64,
     /// Records this build could not read, listed and skipped.
     pub unreadable: Vec<Hash>,
+    /// With trusted keys: how many of `receipts` are signed (the receipt
+    /// and its certificate, each by a trusted key in its window). `None`
+    /// without trusted keys.
+    pub signed: Option<u64>,
 }

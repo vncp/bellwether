@@ -10,7 +10,7 @@
 //! leaves exactly the CLI's record.
 
 use bellwether::types::Hash;
-use bellwether::{LinkStatus, ReceiptResult};
+use bellwether::{LinkStatus, ReceiptResult, RecordKind, SignatureStatus};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -54,6 +54,25 @@ pub struct Link {
     pub status: String,
 }
 
+/// One signature object beside a receipt or its certificate (ADR 029),
+/// verified on its own.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct Signature {
+    /// The record signed.
+    pub record: Hash,
+    /// `receipt` or `certificate`.
+    pub kind: String,
+    /// The signing key's id (BLAKE3 of its public key).
+    pub key_id: Hash,
+    /// `valid` (verifies under its own public key; whether that key is
+    /// trusted is `verdict`'s question) or `invalid`.
+    pub status: String,
+    /// When it was signed, for a valid signature.
+    pub signed_at: Option<String>,
+    /// Why it is invalid, for an invalid one.
+    pub reason: Option<String>,
+}
+
 /// A receipt's `explain` chain.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct Chain {
@@ -63,10 +82,70 @@ pub struct Chain {
     pub intact: bool,
     /// Evidence, proposal, replay, certificate, receipt.
     pub links: Vec<Link>,
+    /// Every signature beside the receipt and its certificate.
+    pub signatures: Vec<Signature>,
+    /// With the server's `--trusted-keys`: `signed` when the receipt and
+    /// its certificate are each signed by a trusted key within its window;
+    /// otherwise the worse of the two, `invalid` (a signature does not
+    /// verify), `untrusted` (signed, but by no trusted key in its window),
+    /// or `unsigned`. Absent without trusted keys.
+    pub verdict: Option<String>,
 }
 
 impl From<&ReceiptResult> for Chain {
     fn from(r: &ReceiptResult) -> Self {
+        let signatures = r
+            .chain
+            .iter()
+            .filter(|l| matches!(l.kind, RecordKind::Receipt | RecordKind::Certificate))
+            .flat_map(|l| {
+                l.signatures.iter().flatten().map(|s| match s {
+                    SignatureStatus::Valid {
+                        key_id, signed_at, ..
+                    } => Signature {
+                        record: l.hash,
+                        kind: l.kind.as_str().to_string(),
+                        key_id: *key_id,
+                        status: "valid".to_string(),
+                        signed_at: Some(signed_at.clone()),
+                        reason: None,
+                    },
+                    SignatureStatus::Invalid { key_id, reason } => Signature {
+                        record: l.hash,
+                        kind: l.kind.as_str().to_string(),
+                        key_id: *key_id,
+                        status: "invalid".to_string(),
+                        signed_at: None,
+                        reason: Some(reason.to_string()),
+                    },
+                })
+            })
+            .collect();
+        let verdict = r.signed.map(|signed| {
+            if signed {
+                return "signed".to_string();
+            }
+            // The worse of the receipt's and the certificate's; a link
+            // with no verdict (a flagged certificate) is unsigned.
+            let rank = |w: &str| match w {
+                "invalid" => 3,
+                "untrusted" => 2,
+                "unsigned" => 1,
+                _ => 0,
+            };
+            [RecordKind::Receipt, RecordKind::Certificate]
+                .iter()
+                .map(|k| {
+                    r.chain
+                        .iter()
+                        .find(|l| l.kind == *k)
+                        .and_then(|l| l.verdict.as_ref())
+                        .map_or("unsigned", |v| v.word())
+                })
+                .max_by_key(|w| rank(w))
+                .unwrap_or("unsigned")
+                .to_string()
+        });
         Self {
             receipt: r.receipt,
             intact: r.intact,
@@ -85,6 +164,8 @@ impl From<&ReceiptResult> for Chain {
                     .to_string(),
                 })
                 .collect(),
+            signatures,
+            verdict,
         }
     }
 }

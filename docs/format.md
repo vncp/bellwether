@@ -61,6 +61,13 @@ Versioned from the first commit. `bellwether-types::format::STORAGE_VERSION` is 
                                            "Sidecar kinds"
   ledger/<blake3>.rec            Record (Evidence | Proposal | Replay | Certificate | Receipt), canonical JSON
                                  Receipt.certificate must resolve and have pass == true
+  ledger/<blake3>.sig.<key id>.json
+                                 a detached ed25519 signature over the Receipt or Certificate named <blake3>
+                                 (ADR 029): canonical JSON {signature_version: 1, record, kind, alg: "ed25519",
+                                 key_id (blake3 of the public key), public_key, signed_at (RFC 3339 UTC ms), sig};
+                                 signs "bellwether-signature-v1\0" ‖ kind ‖ 0x00 ‖ record hash (32 bytes) ‖ signed_at.
+                                 Outside manifests and segments, not a record: record readers skip the name, so it
+                                 is not a storage-version or record-version matter
   cache/<input-hash>.bin         footer stats, fanout tables, recorded workload key sets
                                  rebuildable; carries age; never cited without its hash
   cache/<input-hash>.meta.json   sidecar {created_at (RFC 3339), payload_blake3}; written after the .bin; an entry whose

@@ -55,6 +55,20 @@ already holds.
 | apply | `apply.receipt` | Replay, the index commit, Receipt; nothing with `dry_run` or on a refusal, unless another commit lands during the apply (`concurrent_commit`: the key is built, the receipt withheld) |
 | jobs | `jobs.start`, `jobs.status`, `jobs.result` | whatever the started tool writes |
 
+## Signatures in `chains[]`
+
+Each receipt chain in a result's envelope lists `signatures`: one entry per
+signature object beside the receipt or its certificate, with `status`
+`valid` (it verifies under its own public key) or `invalid` (with a
+`reason`). When the server runs with `--trusted-keys`, the chain also has a
+`verdict`: `signed` (the receipt and its certificate are each signed by a
+trusted key within its window), `untrusted` (signed, but by no trusted key
+in its window), `unsigned` (no signature), or `invalid` (a signature does not
+verify). Without `--trusted-keys` there is no verdict. You cannot sign
+anything: the engine signs only what `score.verify` and `apply.receipt`
+wrote, and only when the server was started with `--signing-key`. Quote the
+verdict as given; never call an `untrusted` or `unsigned` chain signed.
+
 ## Refusal codes
 
 Every refusal carries `code`, the facts you need to act, and one `next`

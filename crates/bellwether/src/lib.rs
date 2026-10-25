@@ -41,10 +41,14 @@ mod receipt;
 mod reconcile;
 mod report;
 mod results;
+mod signing;
 pub mod spec;
 mod why;
 
-pub use bellwether_ledger::RecordKind;
+pub use bellwether_ledger::{
+    InvalidReason, InvalidSignature, OutsideWindow, PublicKey, RecordKind, SignatureStatus,
+    SignedBy, SigningKey, TrustedKey, TrustedKeys, Verdict,
+};
 pub use bellwether_profile::ProfileReport;
 pub use bellwether_source::{FingerprintPolicy, Partitioning, PathTemplate};
 pub use bellwether_types as types;
@@ -55,7 +59,9 @@ pub use engine::{
     schema_from_json, Engine, EngineOptions, FolderStatus, SourceFormat, DEFAULT_INDEX_DIR,
     ISSUE_TRACKER,
 };
-pub use fix::{DataState, FixOutcome, FixRequest, FixResult, Refusal, RewriteOutputs, Score};
+pub use fix::{
+    DataState, FixOutcome, FixRequest, FixResult, Refusal, RewriteOutputs, Score, SignatureWritten,
+};
 pub use keys::KeyFile;
 pub use ledger_views::{
     Finding, FindingsResult, ReceiptEntry, ReceiptsResult, RuleScore, ScorecardResult, UNATTRIBUTED,
@@ -65,6 +71,10 @@ pub use reconcile::{ReconcileProblem, ReconcileRequest, ReconcileResult};
 pub use results::{
     ChainLink, Cost, IndexResult, LinkStatus, LookbackWindow, LookupKind, PlanResult,
     ProposeRefusal, ProposeResult, ReceiptResult, ReportResult, SidecarState, SpecState, Written,
+};
+pub use signing::{
+    generate_key, load_signing_key, load_trusted_keys, public_path, read_public_key, trust_key,
+    GeneratedKey, PublicKeyFile, TrustEntry, TrustResult,
 };
 pub use why::{
     Candidate, CandidateOrigin, Culprit, CulpritReason, Dataset, LookupMode, ProfileEvidence,

@@ -10,6 +10,7 @@
 
 mod bench;
 mod human;
+mod keys_cmds;
 mod verify_cmds;
 
 use std::io::{IsTerminal, Write};
@@ -101,6 +102,12 @@ enum Command {
         #[command(subcommand)]
         command: bench::BenchCommand,
     },
+    /// Signing keys: generate one, show a public key's id, or add a public
+    /// key to a trust file (ADR 029).
+    Keys {
+        #[command(subcommand)]
+        command: keys_cmds::KeysCommand,
+    },
     /// Serve the engine over MCP on stdin and stdout, bound to one data
     /// folder (the same server as `bellwether-mcp`).
     Mcp(McpArgs),
@@ -118,6 +125,8 @@ struct McpArgs {
     root: RootArg,
     #[command(flatten)]
     budget: bellwether_mcp::BudgetArgs,
+    #[command(flatten)]
+    keys: bellwether_mcp::KeyArgs,
 }
 
 #[derive(Args)]
@@ -332,8 +341,14 @@ enum LedgerCommand {
     /// The newest profile Evidence per data root, with its lints and the
     /// receipts citing it.
     Findings(RootArg),
-    /// Every receipt, newest first, with its chain status.
-    Receipts(RootArg),
+    /// Every receipt, newest first, with its chain status (and, with
+    /// --trusted-keys, whether it is signed).
+    Receipts {
+        #[command(flatten)]
+        root: RootArg,
+        #[command(flatten)]
+        trust: keys_cmds::TrustArg,
+    },
     /// Per rule id: proposals, certificates passed and failed, receipts.
     Scorecard(RootArg),
 }
@@ -341,12 +356,18 @@ enum LedgerCommand {
 #[derive(Subcommand)]
 enum ReceiptCommand {
     /// Walk a receipt back through its certificate, replay, proposal, and
-    /// evidence.
+    /// evidence, with the signatures beside the receipt and the certificate.
     Show {
         #[command(flatten)]
         root: RootArg,
         /// The receipt hash.
         hash: String,
+        #[command(flatten)]
+        trust: keys_cmds::TrustArg,
+        /// Exit 1 unless the receipt and its certificate are each signed by
+        /// a key in --trusted-keys, within the key's window.
+        #[arg(long)]
+        require_signature: bool,
     },
 }
 
@@ -357,6 +378,8 @@ struct ReportArgs {
     /// Output file, or an existing directory (gets report.html).
     #[arg(long, value_name = "PATH")]
     html: PathBuf,
+    #[command(flatten)]
+    trust: keys_cmds::TrustArg,
 }
 
 /// How output is shaped.
@@ -440,7 +463,9 @@ impl From<Error> for Failure {
             // index plans on) is still the caller's to fix: a usage error,
             // whose message names the value to pass.
             Error::InvalidArgument {
-                field: "lookback" | "latest_by",
+                field:
+                    "lookback" | "latest_by" | "signing_key" | "trusted_keys" | "public_key" | "out"
+                    | "name" | "valid_from" | "revoked_at",
                 ..
             } => Self::Usage(e.to_string()),
             e => Self::Engine(e),
@@ -558,6 +583,23 @@ pub(crate) fn engine_at(
     Ok(engine)
 }
 
+/// [`engine`] with a signing key (`fix`) or trusted keys (`receipt show`,
+/// `ledger receipts`, `report`), loaded by the caller before the engine
+/// opens.
+pub(crate) fn engine_keyed(
+    global: &Global,
+    root: &str,
+    signing_key: Option<bellwether::SigningKey>,
+    trusted_keys: Option<bellwether::TrustedKeys>,
+) -> Result<Engine, Failure> {
+    let options = EngineOptions {
+        signing_key,
+        trusted_keys,
+        ..engine_options(global)?
+    };
+    Ok(Engine::open(root, options)?)
+}
+
 /// The engine options the global flags name.
 fn engine_options(global: &Global) -> Result<EngineOptions, Failure> {
     global.engine.options().map_err(|e| match e {
@@ -615,19 +657,21 @@ fn run(cli: &Cli, out: &Out) -> Result<Outcome, Failure> {
         }
         Command::Propose(a) => propose(g, out, a),
         Command::Receipt {
-            command: ReceiptCommand::Show { root, hash: h },
-        } => {
-            let h = hash(h, "receipt")?;
-            let r = engine(g, &root.root)?.receipt(&h)?;
-            done(&r, human::receipt(&r, out), EXIT_OK)
-        }
+            command:
+                ReceiptCommand::Show {
+                    root,
+                    hash: h,
+                    trust,
+                    require_signature,
+                },
+        } => keys_cmds::receipt_show(g, out, &root.root, h, trust, *require_signature),
         Command::Ledger { command } => match command {
             LedgerCommand::Findings(root) => {
                 let r = engine(g, &root.root)?.findings()?;
                 done(&r, human::findings(&r, out), EXIT_OK)
             }
-            LedgerCommand::Receipts(root) => {
-                let r = engine(g, &root.root)?.receipts()?;
+            LedgerCommand::Receipts { root, trust } => {
+                let r = engine_keyed(g, &root.root, None, trust.load()?)?.receipts()?;
                 done(&r, human::receipts(&r, out), EXIT_OK)
             }
             LedgerCommand::Scorecard(root) => {
@@ -636,7 +680,7 @@ fn run(cli: &Cli, out: &Out) -> Result<Outcome, Failure> {
             }
         },
         Command::Report(a) => {
-            let r = engine(g, &a.root.root)?.report(&a.html)?;
+            let r = engine_keyed(g, &a.root.root, None, a.trust.load()?)?.report(&a.html)?;
             done(&r, human::report(&r, out), EXIT_OK)
         }
         Command::Verify(c) => verify_cmds::run(g, out, c),
@@ -667,19 +711,29 @@ fn run(cli: &Cli, out: &Out) -> Result<Outcome, Failure> {
             };
             done(&w, human, code)
         }
-        Command::Mcp(a) => {
-            let config = bellwether_mcp::Config {
-                root: a.root.root.clone(),
-                engine: engine_options(g)?,
-                budget: a.budget.into(),
-            };
-            // stdout is the protocol channel: nothing else is printed there.
-            match bellwether_mcp::serve_stdio(&config) {
-                Ok(()) => Ok(Outcome::Done(String::new(), String::new(), EXIT_OK)),
-                Err(bellwether_mcp::ServeError::Open(e)) => Err(Failure::Engine(e)),
-                Err(bellwether_mcp::ServeError::Transport(m)) => Err(Failure::Server(m)),
-            }
-        }
+        Command::Keys { command } => keys_cmds::run(g, command),
+        Command::Mcp(a) => mcp(g, a),
+    }
+}
+
+/// `bellwether mcp`: the same server as `bellwether-mcp`, with the same
+/// flags, signing and trust included.
+fn mcp(g: &Global, a: &McpArgs) -> Result<Outcome, Failure> {
+    let mut engine = engine_options(g)?;
+    a.keys.apply(&mut engine).map_err(|e| match e {
+        OptionsError::Usage(m) => Failure::Usage(m),
+        OptionsError::Engine(e) => Failure::Engine(e),
+    })?;
+    let config = bellwether_mcp::Config {
+        root: a.root.root.clone(),
+        engine,
+        budget: a.budget.into(),
+    };
+    // stdout is the protocol channel: nothing else is printed there.
+    match bellwether_mcp::serve_stdio(&config) {
+        Ok(()) => Ok(Outcome::Done(String::new(), String::new(), EXIT_OK)),
+        Err(bellwether_mcp::ServeError::Open(e)) => Err(Failure::Engine(e)),
+        Err(bellwether_mcp::ServeError::Transport(m)) => Err(Failure::Server(m)),
     }
 }
 

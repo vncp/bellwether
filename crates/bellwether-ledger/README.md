@@ -7,10 +7,11 @@ Owns **invariant 2** (a Receipt implies a passing Certificate) and **invariant 6
 ## Layout
 
 ```
-ledger/<blake3>.rec    canonical JSON of bellwether_types::Record
+ledger/<blake3>.rec                  canonical JSON of bellwether_types::Record
+ledger/<blake3>.sig.<key id>.json    a detached ed25519 signature over that record (receipts and certificates only)
 ```
 
-The name is `Record::hash()`, which is BLAKE3 over `serde_json::to_vec(&record)`, written as lowercase hex. The file holds exactly those bytes. `record_path` and `parse_record_path` are exact inverses: a name with uppercase hex is not a ledger record, and `list` skips it.
+The name is `Record::hash()`, which is BLAKE3 over `serde_json::to_vec(&record)`, written as lowercase hex. The file holds exactly those bytes. `record_path` and `parse_record_path` are exact inverses: a name with uppercase hex is not a ledger record, and `list` skips it. A signature object is not a record: `parse_record_path` does not accept its name, so `list`, `list_unreadable`, and `explain` never see it as one (ADR 029).
 
 ## API
 
@@ -24,9 +25,46 @@ The name is `Record::hash()`, which is BLAKE3 over `serde_json::to_vec(&record)`
 | `kind(&Hash) -> RecordKind` | Reads the header only. |
 | `list(RecordKind) -> impl Iterator<Item = Result<Hash>>` | Lazy. Reads each record's header as the iterator advances. Skips records this build cannot read. |
 | `list_unreadable() -> impl Iterator<Item = Result<Hash>>` | The records `list` skips: a newer record version or an unknown kind. |
-| `explain(&Hash) -> Chain` | Walks a receipt's chain. `Chain::render()` (or `Display`) gives the terminal text. `Chain` is `Serialize` for `--json`. A bad link is flagged, never an error. |
+| `explain(&Hash) -> Chain` | Walks a receipt's chain. `Chain::render()` (or `Display`) gives the terminal text. `Chain` is `Serialize` for `--json`. A bad link is flagged, never an error. The receipt and certificate links carry their `signatures`. |
+| `explain_verified(&Hash, &TrustedKeys) -> Chain` | `explain`, plus each of those two links' `verdict`; the rendering adds `sig=valid(<name>)`, `sig=untrusted(<id prefix>)`, `sig=none`, or `sig=INVALID` to their lines. |
+| `sign(&Hash, &SigningKey, signed_at) -> SignaturePath` | Writes the detached signature object with `put_if_absent`. See "Signatures". |
+| `signatures(&Hash) -> Vec<SignatureStatus>` | Every signature object beside a record, each verified on its own: `Valid { key_id, public_key, signed_at }` or `Invalid { key_id, reason }`. Never a panic on a corrupt object. Writes nothing. |
+| `verify_against(&Hash, &TrustedKeys) -> Verdict` | `signatures` folded against a reader's trust set. Writes nothing. |
 
-`put` and `put_receipt` are the only write paths. There is no delete.
+`put`, `put_receipt`, and `sign` are the only write paths. There is no delete.
+
+## Signatures (ADR 029)
+
+A signature is a detached object beside the record, never a record kind or a field, so no record's bytes, hash, or `record_version` change. The object is canonical JSON, fields in this order:
+
+```json
+{"signature_version":1,"record":"<64 hex>","kind":"receipt","alg":"ed25519","key_id":"<64 hex>","public_key":"<64 hex>","signed_at":"2026-10-25T12:00:00.000Z","sig":"<128 hex>"}
+```
+
+`key_id` is BLAKE3 of the 32 public-key bytes. The signed message (`signature_message`) is
+
+```
+b"bellwether-signature-v1\0" ‖ kind ‖ 0x00 ‖ record hash (32 bytes) ‖ signed_at
+```
+
+so a signature cannot be moved to another record, another kind, or another time, and no other protocol's signature verifies here. The record's bytes are bound by its hash. Several keys may sign one record, one object each.
+
+**`sign`** refuses, writing nothing: a `signed_at` that is not RFC 3339 UTC with milliseconds; a hash that is not a stored, readable Receipt or Certificate; a Receipt that `put_receipt` would refuse now (rules 11 to 18 re-run against the stored chain, with the receipt's own `manifest_after` standing in for the current sequence, since the upper bound was checked when it was written); a Certificate that `put` would refuse now (rules 8 to 10). Signing again with the same key is idempotent only when the bytes are identical (ed25519 is deterministic); a differing object is refused, never overwritten.
+
+**`SigningKey`** is built from a 32-byte seed and never gives it back: no call returns secret key material (two `compile_fail` doctests pin that), its `Debug` shows the key id only, and only the public half is written.
+
+**Verification.** A signature object is `Invalid` when it is malformed (not JSON, a missing, mistyped, or unknown field, or not in canonical form), has a newer `signature_version` (`newer`), names another record than the one it is filed beside (`record_mismatch`), names another kind than the stored record's (`kind_mismatch`), has a key id that is not its file name's or its public key's (`key_id_mismatch`), names an algorithm other than ed25519, or does not verify (`bad_signature`, checked with `verify_strict`). A record whose own bytes do not match its name is the ledger's tamper error before any signature is looked at.
+
+**Verdicts** (`verify_against`, `Verdict::of`), against a `TrustedKeys` set the reader supplies (never stored in the ledger):
+
+| Verdict | When |
+|---|---|
+| `Signed { by, key_id, signed_at }` | a key in the trust set signed it, with `signed_at` in the key's window `[valid_from, revoked_at)`, and every object beside it verifies |
+| `Untrusted { key_ids, outside_window }` | every object verifies, but none is by a trusted key within its window; `outside_window` names the trusted keys that signed outside theirs, with the window |
+| `Unsigned` | no signature object beside the record |
+| `Invalid { invalid, signed }` | at least one object does not verify; reported even when a trusted key also signed (`signed`), never hidden by it |
+
+The public key an object carries proves only that the object is self-consistent; it never makes a record `Signed` on its own.
 
 ## Write-time rules
 
@@ -88,7 +126,7 @@ A certificate with `pass == false` is a legitimate record and is stored. So is a
 
 - **The ledger cannot tell engine writes from agent writes.** Every record arrives through the same `put`. Invariant 2 therefore holds only if Certificate and Replay writes are gated above this crate. The MCP tiers expose Proposal writes only (threat model), and only the engine's score and verify stages may call `put` with a Replay or Certificate. Anyone holding a `Ledger` can fabricate a whole chain of plausible records.
 - **`current_manifest` is supplied by the caller.** The ledger trusts the caller to pass the manifest sequence that is current when the receipt is written. It does not read the manifest itself. Rule 16, which ties the certificate and the replay to `manifest_before`, does not depend on this value.
-- **Store access is out of scope.** An attacker with write access to the store can plant records that never passed these rules. Content addressing makes that detectable but not preventable; signing comes later. `explain` flags such links instead of trusting them.
+- **Store access.** An attacker with write access to the store can plant records that never passed these rules. Content addressing makes that detectable but not preventable; `explain` flags such links instead of trusting them. A signature from a key the reader trusts (ADR 029) is what such an attacker cannot produce, so a gate that requires one refuses a planted chain; `sign` itself re-runs the rules before it signs.
 
 ## Append-only: no delete, no GC
 
@@ -138,7 +176,8 @@ The hashes below are illustrative.
 
   A valid chain is then accepted.
 - `tests/provenance_required.rs` (invariant 6): Evidence and Certificate provenance.
-- `tests/write_paths.rs`: a store that counts mutations proves that reads and refused writes never write, and nothing ever deletes.
+- `tests/write_paths.rs`: a store that counts mutations proves that reads, verification, and refused writes never write, `sign` writes exactly one object, and nothing ever deletes.
+- `tests/signatures.rs` (ADR 029): a valid chain signed and `Signed`; altered record bytes (the tamper error wins, `UNREADABLE` in `explain`); a moved signature, verbatim (`record_mismatch`) and re-addressed (`bad_signature`); an edited kind, `signed_at`, or key; one flipped bit of `sig`; an untrusted key; a revoked or not-yet-valid key (`Untrusted`, with its window); an unsigned receipt; a `signature_version: 2` object; an invalid signature beside a trusted one; `sign` refusing a Proposal, Evidence, Replay, an absent hash, and a planted chain `put_receipt` would refuse; an every-byte corruption sweep (every single-byte flip and every truncation is `Invalid`, never a panic); an independent oracle for the message bytes and the signature.
 - `tests/ledger.rs`:
   - content addressing and idempotence, and lowercase-only names
   - tamper detection
