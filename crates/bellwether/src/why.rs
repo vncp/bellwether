@@ -637,12 +637,12 @@ impl Engine {
                     ),
                 });
             }
-        } else if req.window.is_none() && req.ts_column.is_some() {
-            return Err(Error::Other(
+        } else if let (None, Some(ts)) = (&req.window, &req.ts_column) {
+            return Err(Error::Other(format!(
                 "--ts names a window's time column; give the window too (--window), or price \
-                 `asof --at --lookback --ts` with --at and --lookback"
-                    .into(),
-            ));
+                 `asof --at --lookback --ts {ts}` with --latest-by {ts} --at <instant> \
+                 --lookback <length>"
+            )));
         }
         if mode != LookupMode::Locate && req.keys.is_none() && req.workload.is_none() {
             return Err(Error::KeySpec(

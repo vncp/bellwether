@@ -268,6 +268,7 @@ struct Scratch {
     decimal: Vec<u8>,
     group: Vec<u8>,
     values: Vec<Option<i256>>,
+    filter: Vec<u8>,
 }
 
 impl Reconciler {
@@ -535,7 +536,7 @@ impl Reconciler {
             groups.free(&mut a.meter);
             totals = result?;
         }
-        nothing_compared(&prep.scope, a.seen, a.unsampled)?;
+        nothing_compared(&prep.scope, a.seen, a.unsampled, prep.plan.filter.is_some())?;
         let coverage = realized_coverage(&prep.scope, &mut a.counts, a.seen, a.unsampled);
         let c = &a.counts;
         let pass = c.missing_left == 0
@@ -554,6 +555,7 @@ impl Reconciler {
                 totals,
                 key_columns: self.spec.key_columns.clone(),
                 latest_by: self.spec.latest_by.clone(),
+                row_filter: self.spec.row_filter.clone(),
                 hashed_columns: prep.plan.hashed_names.clone(),
                 ignored_columns: prep.plan.ignored.clone(),
                 sides: prep.reports,
@@ -1016,6 +1018,9 @@ fn read_row_group(
             }
             continue;
         }
+        if !filter_keeps(plan, &cols, s, rg, row, &mut scratch.filter)? {
+            continue;
+        }
         let ts = match plan.latest_by {
             Some(i) => encoding::ts_value_as(cols[i], row, &types[i]).map_err(|e| locate(i, &e))?,
             None => None,
@@ -1070,6 +1075,36 @@ fn read_row_group(
         )?;
     }
     Ok(())
+}
+
+/// Whether the row filter keeps row `row` (every row without one): some
+/// residual keeps it ([`crate::ReconcileSpec::row_filter`]).
+fn filter_keeps(
+    plan: &Plan,
+    cols: &[&dyn Array],
+    s: usize,
+    rg: &RowGroupMeta,
+    row: usize,
+    buf: &mut Vec<u8>,
+) -> std::result::Result<bool, VerifyError> {
+    let Some(tests) = &plan.filter else {
+        return Ok(true);
+    };
+    for t in tests {
+        let kept =
+            t.keeps(cols, &plan.types[s], row, buf)
+                .map_err(|e| VerifyError::Unrepresentable {
+                    side: SIDE_NAMES[s],
+                    file: rg.file.path.clone(),
+                    row_group: rg.index_in_file,
+                    column: "(row filter)".into(),
+                    detail: e.to_string(),
+                })?;
+        if kept {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// One in-scope row, encoded.
@@ -1234,9 +1269,17 @@ fn render_examples(examples: Vec<(Box<[u8]>, Example)>, key_types: &[DataType]) 
 
 /// Refuses a scoped coverage that compared no key while there was data to
 /// compare: a workload none of whose keys exists on either side, or a
-/// sample that selected none of the keys present.
-fn nothing_compared(scope: &Scope, seen: u64, unsampled: u64) -> Result<()> {
+/// sample that selected none of the keys present. With a row filter
+/// (`filtered`), a key is compared only when a row of it is kept.
+fn nothing_compared(scope: &Scope, seen: u64, unsampled: u64, filtered: bool) -> Result<()> {
     match scope {
+        Scope::Workload { keys, .. } if seen == 0 && filtered => {
+            Err(VerifyError::NothingCompared(format!(
+                "none of the {} workload keys has a row the lookups ask for (the row filter keeps \
+                 none) on either side, so there is nothing to verify",
+                keys.len()
+            )))
+        }
         Scope::Workload { keys, .. } if seen == 0 => Err(VerifyError::NothingCompared(format!(
             "none of the {} workload keys is on either side; check that they are encoded at \
              the dataset types (decimal scale is not visible in the bytes)",

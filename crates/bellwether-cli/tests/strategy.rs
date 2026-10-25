@@ -719,6 +719,37 @@ fn why_takes_ts_for_an_asof_lookback_as_asof_does() {
     assert_eq!(why["current"]["bytes"], plan["planned"]["bytes"]);
     assert_eq!(why["current"]["row_groups"], plan["planned"]["row_groups"]);
     assert_eq!(why["workload"]["windows"][0]["ts_column"], "ts");
+    // The window starts exactly at at − 2d, where AAPL has a print
+    // (2026-03-03, alone with MSFT in its row group).
+    let lo = (FIRST_DAY + 1) * US_PER_DAY + 1;
+    assert!(rows.iter().any(|r| r.2 == "AAPL" && r.3 == lo));
+    assert_eq!(why["workload"]["windows"][0]["lo"], lo);
+    assert_eq!(
+        why["workload"]["windows"][0]["hi"],
+        (FIRST_DAY + 3) * US_PER_DAY + 1
+    );
+    // The temporal candidate on ts predicts what `asof --ts ts` plans once
+    // it is built: AAPL's version at exactly at − 2d keeps its row group.
+    let predicted = why["candidates"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["spec"]["kind"] == "temporal" && c["spec"]["ts_column"] == "ts")
+        .unwrap()["proposed"]
+        .clone();
+    run(&["index", r, "--key", "temporal:symbol@ts"], 0);
+    let plan = json(&run(
+        &[
+            &["asof", r, "--keys", k, "--ts", "ts"][..],
+            &lookback,
+            &["--json"],
+        ]
+        .concat(),
+        0,
+    ));
+    assert_eq!(planned(&plan, &root), want);
+    assert_eq!(predicted["bytes"], plan["planned"]["bytes"]);
+    assert_eq!(predicted["row_groups"], plan["planned"]["row_groups"]);
     // --ts and --latest-by name one column; --ts needs a key file and the
     // asof lookback (or a window).
     for (args, says) in [
@@ -731,8 +762,12 @@ fn why_takes_ts_for_an_asof_lookback_as_asof_does() {
             "pass --latest-by ts --ts ts",
         ),
         (
+            vec!["why", r, "--from", k, "--ts", "ts"],
+            "with --latest-by ts --at <instant> --lookback <length>",
+        ),
+        (
             vec!["why", r, "--from", k, "--latest-by", "ts", "--ts", "ts"],
-            "--at <instant> --lookback <length>",
+            "with --latest-by ts --at <instant> --lookback <length>",
         ),
     ] {
         let out = bw().args(&args).output().unwrap();

@@ -799,13 +799,13 @@ fn why(g: &Global, out: &Out, a: &WhyArgs) -> Result<Outcome, Failure> {
             })
         })
         .transpose()?;
-    if window.is_none() && a.ts.is_some() {
+    if let (None, Some(ts)) = (&window, &a.ts) {
         if a.at.is_none() || a.lookback.is_none() {
-            return Err(Failure::Usage(
+            return Err(Failure::Usage(format!(
                 "--ts names a window's time column; give the window with --window START..END, or \
-                 price `asof --at --lookback --ts` with --at <instant> --lookback <length>"
-                    .into(),
-            ));
+                 price `asof --at --lookback --ts {ts}` with --latest-by {ts} --at <instant> \
+                 --lookback <length>"
+            )));
         }
         if a.from.is_none() {
             return Err(Failure::Usage(
