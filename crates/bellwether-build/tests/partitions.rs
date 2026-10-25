@@ -187,7 +187,7 @@ fn an_index_built_without_partitioning_refuses_to_switch() {
 }
 
 #[test]
-fn hive_partitioning_is_refused_for_text_sources() {
+fn hive_partitioning_gives_text_sources_their_path_columns() {
     let s = Scratch::new();
     std::fs::create_dir_all(s.path("day=2026-01-02")).unwrap();
     std::fs::write(s.path("day=2026-01-02/a.csv"), "id\n1\n").unwrap();
@@ -195,8 +195,13 @@ fn hive_partitioning_is_refused_for_text_sources() {
         partitioning: Some(Partitioning::Hive),
         ..BuildOptions::new(SourceKind::csv())
     };
-    let err = builder(&memory_store())
-        .build(&s.root_str(), &[exact(&["id"])], &opts)
-        .unwrap_err();
-    assert!(err.to_string().contains("Parquet sources only"), "{err}");
+    let store = memory_store();
+    builder(&store)
+        .build(&s.root_str(), &[exact(&["id"]), exact(&["day"])], &opts)
+        .unwrap();
+    let p = planner(&store);
+    assert_eq!(
+        p.column_types(&cols(&["day"])).unwrap()[0].1,
+        arrow::datatypes::DataType::Date32
+    );
 }

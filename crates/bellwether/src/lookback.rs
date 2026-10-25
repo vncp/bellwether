@@ -160,6 +160,29 @@ pub(crate) fn window_start(end: i64, n: i64, ty: &DataType) -> i64 {
     end.saturating_sub(n).max(min)
 }
 
+/// Whether a window's start lies after its end, judged where both ends are
+/// the same kind of value (two integers, or two instants or dates), so a
+/// reversed window is a usage error before any lookup runs. Ends of mixed
+/// kinds are judged later, in the time column's unit.
+#[must_use]
+pub fn window_reversed(from: &str, to: &str) -> bool {
+    let instant = |s: &str| {
+        let s = s.trim();
+        let full = if s.len() == 10 && s.as_bytes().get(4) == Some(&b'-') {
+            format!("{s}T00:00:00Z")
+        } else {
+            s.to_string()
+        };
+        bellwether_store::parse_rfc3339(&full)
+            .ok()
+            .and_then(|t| t.timestamp_nanos_opt())
+    };
+    match (from.trim().parse::<i64>(), to.trim().parse::<i64>()) {
+        (Ok(a), Ok(b)) => a > b,
+        _ => matches!((instant(from), instant(to)), (Some(a), Some(b)) if a > b),
+    }
+}
+
 /// Splits a window `A..B` into its two ends, each non-empty; `..` appears
 /// in no instant, date, or integer, so the split is unambiguous.
 pub fn split_window(text: &str) -> Result<(&str, &str)> {

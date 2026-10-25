@@ -692,7 +692,15 @@ fn lookback_lookup(
     let lb = Lookback::parse(lookback)?;
     let ts_column = match (at, ts_column) {
         (_, Some(c)) => c.to_string(),
-        (None, None) => serving_temporal(root, verb, specs, columns)?,
+        // `latest`: the temporal key's timestamp, else the one time column
+        // of the complete per-key bounds sidecars on the keys.
+        (None, None) => match serving_temporal(root, verb, specs, columns) {
+            Ok(ts) => ts,
+            Err(e) => match bounds_time_columns(pinned, columns).as_slice() {
+                [one] => one.clone(),
+                _ => return Err(e),
+            },
+        },
         (Some(_), None) => {
             let temporal: Vec<&String> = specs
                 .iter()
@@ -719,7 +727,12 @@ fn lookback_lookup(
     let n = lb.in_unit(&ts_column, &ts_type)?;
     let end = match at {
         Some(a) => Some(instant_in_unit("at", a, &ts_column, &ts_type)?),
-        None => pinned.planner.newest_version(specs, columns, &tuples)?,
+        None if is_temporal_ts(specs, columns, &ts_column) => {
+            pinned.planner.newest_version(specs, columns, &tuples)?
+        }
+        None => pinned
+            .planner
+            .newest_by_bounds(columns, &tuples, &ts_column)?,
     };
     // No key has a version: an empty window (no row), never a full scan.
     let (lo, hi) = end.map_or((1, 0), |e| (window_start(e, n, &ts_type), e));
@@ -830,6 +843,13 @@ fn not_complete_yet(root: &str, operation: &'static str, excluded: &[KeySpec]) -
                 .join(", "),
         ),
     }
+}
+
+/// Whether `ts_column` is the timestamp of the one temporal spec serving
+/// `columns`.
+fn is_temporal_ts(specs: &[KeySpec], columns: &[String], ts_column: &str) -> bool {
+    // Only whether one serves matters; the refusal's root and verb are unused.
+    serving_temporal("", "latest", specs, columns).is_ok_and(|t| t == ts_column)
 }
 
 /// The timestamp column of the one complete temporal spec whose columns are

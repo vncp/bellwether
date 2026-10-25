@@ -54,6 +54,11 @@ fn lake(root: &Path) -> Vec<(String, u64, String, i64)> {
         if i < 2 {
             rows.push(("NVDA", day * US_PER_DAY + 3));
         }
+        if i == 1 {
+            // Two NVDA prints in one row group: the per-key bounds hold a
+            // min and a max that differ.
+            rows.insert(3, ("NVDA", day * US_PER_DAY + 9));
+        }
         rows.push(("MSFT", day * US_PER_DAY + 4));
         let date = format!("2026-03-{:02}", 2 + i);
         let file = root.join(format!("daily/{date}.parquet"));
@@ -390,4 +395,138 @@ fn an_unindexed_why_prices_a_window_as_the_index_then_plans_it() {
     ));
     assert_eq!(plan["planned"]["bytes"], exact["bytes"]);
     assert_eq!(plan["planned"]["row_groups"], exact["row_groups"]);
+}
+
+/// Ported from the Argon WP21 implementation: partition values for CSV and
+/// JSON lines files. Oracle: the rows the test wrote.
+#[test]
+fn a_csv_lake_takes_its_day_from_the_file_name() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("lake");
+    // (file, symbol) of every row; one chunk (row group 0) per small file.
+    let mut rows: Vec<(String, String)> = Vec::new();
+    for i in 0..5 {
+        let name = format!("daily/2026-03-{:02}.csv", 2 + i);
+        let mut text = String::from("symbol,close\n");
+        for sym in ["AAPL", "MSFT"].iter().take(if i % 2 == 0 { 2 } else { 1 }) {
+            text.push_str(&[*sym, ",", &i.to_string(), "\n"].concat());
+            rows.push((name.clone(), (*sym).to_string()));
+        }
+        std::fs::create_dir_all(root.join("daily")).unwrap();
+        std::fs::write(root.join(&name), text).unwrap();
+    }
+    let r = path(&root);
+    let keys = dir.path().join("keys.parquet");
+    symbols(&keys, &["MSFT"]);
+    let k = path(&keys);
+    let t = "daily/{day:date}.csv";
+    run(
+        &[
+            "index",
+            r,
+            "--format",
+            "csv",
+            "--path-template",
+            t,
+            "--key",
+            "exact:day",
+            "--key",
+            "exact:symbol",
+        ],
+        0,
+    );
+    let v = json(&run(
+        &[
+            "locate",
+            r,
+            "--format",
+            "csv",
+            "--keys",
+            k,
+            "--window",
+            "2026-03-03..2026-03-04",
+            "--ts",
+            "day",
+            "--json",
+        ],
+        0,
+    ));
+    assert_eq!(v["path_values"], "day");
+    let want: BTreeSet<(String, u64)> = rows
+        .iter()
+        .filter(|(f, s)| s == "MSFT" && (f.contains("03-03") || f.contains("03-04")))
+        .map(|(f, _)| (f.clone(), 0))
+        .collect();
+    assert_eq!(planned(&v, &root), want);
+    assert_eq!(want.len(), 1, "MSFT trades on even sessions only");
+    // A CSV file the template does not describe is named.
+    std::fs::write(root.join("daily/notes.csv"), "symbol,close\nX,1\n").unwrap();
+    let out = bw()
+        .args(["index", r, "--format", "csv", "--key", "exact:symbol"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(4));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("daily/notes.csv"));
+}
+
+/// `latest --lookback` without a temporal key ends at each key's newest
+/// time from the per-key bounds sidecar (never a row group's or the
+/// dataset's maximum).
+#[test]
+fn latest_lookback_through_per_key_bounds() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("lake");
+    let rows = lake(&root);
+    let r = path(&root);
+    let keys = dir.path().join("keys.parquet");
+    // NVDA's history ends on the second session; MSFT's runs to the fifth.
+    symbols(&keys, &["NVDA"]);
+    let k = path(&keys);
+    run(
+        &[
+            "index",
+            r,
+            "--path-template",
+            TEMPLATE,
+            "--key",
+            "exact:symbol@ts",
+        ],
+        0,
+    );
+    let v = json(&run(
+        &["latest", r, "--keys", k, "--lookback", "1d", "--json"],
+        0,
+    ));
+    let newest = rows
+        .iter()
+        .filter(|x| x.2 == "NVDA")
+        .map(|x| x.3)
+        .max()
+        .unwrap();
+    assert_eq!(v["lookup"]["end"], newest);
+    assert_eq!(
+        planned(&v, &root),
+        truth(&rows, &["NVDA"], newest - US_PER_DAY, newest)
+    );
+    assert!(!planned(&v, &root).is_empty());
+    // Reversed windows and uncommitted sequences are usage errors.
+    let out = bw()
+        .args([
+            "locate",
+            r,
+            "--keys",
+            k,
+            "--window",
+            "2026-03-04..2026-03-03",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("--window"));
+    let out = bw()
+        .args(["locate", r, "--keys", k, "--at-manifest", "9"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&out.stderr).contains('1'));
 }

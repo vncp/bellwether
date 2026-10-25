@@ -1327,6 +1327,55 @@ impl<S: StoreExt + ?Sized> Planner<S> {
             .map(|_| ts_column.clone()))
     }
 
+    /// The newest non-null `ts_column` time among `keys` (over `columns`)
+    /// in live row groups, from the complete per-key bounds sidecar on
+    /// `columns@ts_column` (each key's own maximum per row group, never a
+    /// row group's or the dataset's): the end of a `latest --lookback`
+    /// window without a temporal key. `None` when no key has a non-null
+    /// time. Ported from the Argon WP21 implementation's idea; its
+    /// dataset-wide footer maximum is not used.
+    pub fn newest_by_bounds(
+        &self,
+        columns: &[String],
+        keys: &[Vec<u8>],
+        ts_column: &str,
+    ) -> Result<Option<i64>> {
+        let probe = Lookup::Window {
+            columns: columns.to_vec(),
+            keys: Vec::new(),
+            ts_column: ts_column.to_string(),
+            lo: 0,
+            hi: 0,
+        };
+        let Some(def) = self.sidecars_for(&probe).into_iter().next() else {
+            return Err(Error::KeySpec(format!(
+                "latest --lookback needs each key's newest time: declare a temporal key \
+                 `temporal:{c}@{ts_column}` or per-key bounds `exact:{c}@{ts_column}`",
+                c = columns.join(",")
+            )));
+        };
+        let types = self.column_types(columns)?;
+        let (keys, spans) = non_null_probes(keys, &types)?;
+        let positions: Vec<usize> = def
+            .columns
+            .iter()
+            .map(|c| columns.iter().position(|x| x == c))
+            .collect::<Option<_>>()
+            .ok_or_else(|| Error::Other(format!("{} does not serve {columns:?}", def.name())))?;
+        let probes = sorted_probes(&key_variants(&keys, &spans, &positions));
+        let live = self.locator.live();
+        let mut newest: Option<i64> = None;
+        for seg in self.sidecar_segments(&def) {
+            let r = self.open_sidecar(&def, seg)?;
+            for bounds in r.bounds(&probes)?.values() {
+                for b in bounds.iter().filter(|b| live.contains(b.rg.0)) {
+                    newest = Some(newest.map_or(b.max, |n| n.max(b.max)));
+                }
+            }
+        }
+        Ok(newest)
+    }
+
     /// The newest timestamp among the versions of `keys` (over `columns`),
     /// index-wide over live row groups (invariant 5), through the one
     /// complete temporal spec of `specs` serving `columns`: the end of a

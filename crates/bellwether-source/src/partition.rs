@@ -182,6 +182,31 @@ impl Partitioning {
             _ => None,
         }
     }
+
+    /// The partition columns this scheme gives the files under `root`: a
+    /// template's placeholders, or the `name=value` directories of the
+    /// first file listed under it (every file has the same ones; discovery
+    /// checks).
+    pub fn column_names(&self, root: &str) -> Result<Vec<String>> {
+        use crate::storage::{LocalFs, Storage};
+        Ok(match self {
+            Self::None => Vec::new(),
+            Self::Template(t) => t.names().map(str::to_string).collect(),
+            Self::Hive => match LocalFs.list(root)?.first() {
+                Some(p) => hive_values(root, p)?.into_iter().map(|v| v.name).collect(),
+                None => Vec::new(),
+            },
+        })
+    }
+}
+
+/// An error's message without the `source error:` prefix a re-wrap into
+/// [`Error::Source`] would add again.
+pub(crate) fn plain(e: Error) -> String {
+    match e {
+        Error::Source(m) => m,
+        other => other.to_string(),
+    }
 }
 
 /// `path` relative to `root` for messages, or `path` itself when it is not

@@ -566,11 +566,8 @@ impl Engine {
             None => None,
         };
         let partitioning = self.partitioning(pinned)?;
-        Ok(match format {
-            SourceFormat::Parquet => match partitioning.manifest_name() {
-                Some(scheme) => format!("parquet:partitioning={scheme}"),
-                None => "parquet".to_string(),
-            },
+        let base = match format {
+            SourceFormat::Parquet => "parquet".to_string(),
             SourceFormat::Csv {
                 delimiter,
                 has_header,
@@ -586,6 +583,10 @@ impl Engine {
                     .or(self.options.chunk_size)
                     .unwrap_or(bellwether_source::DEFAULT_CHUNK_SIZE)
             ),
+        };
+        Ok(match partitioning.manifest_name() {
+            Some(scheme) => format!("{base}:partitioning={scheme}"),
+            None => base,
         })
     }
 
@@ -629,21 +630,29 @@ impl Engine {
                 }
                 Box::new(s)
             }
-            Some(_) if !partitioning.is_none() => {
-                return Err(Error::Source(format!(
-                    "partitioning ({}) applies to Parquet sources only in this release",
-                    partitioning.label()
-                )))
-            }
             Some(text) => {
                 let mut s = ChunkedTextSource::new(text).with_fingerprint_policy(policy);
                 if let Some(size) = chunk.or(self.options.chunk_size) {
                     s = s.with_chunk_size(size);
                 }
-                if let Some(schema) = schema {
-                    s = s.with_schema(schema);
+                if let Some(schema) = &schema {
+                    // The files hold the dataset schema without the
+                    // partition columns their paths give.
+                    s = s.with_schema(bellwether_source::physical_schema(
+                        schema,
+                        &partitioning.column_names(root)?,
+                    ));
                 }
-                Box::new(s)
+                if partitioning.is_none() {
+                    Box::new(s)
+                } else {
+                    Box::new(bellwether_source::Partitioned::new(
+                        s,
+                        root,
+                        partitioning,
+                        schema,
+                    ))
+                }
             }
         })
     }

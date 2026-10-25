@@ -58,7 +58,7 @@ pub use keys::KeyFile;
 pub use ledger_views::{
     Finding, FindingsResult, ReceiptEntry, ReceiptsResult, RuleScore, ScorecardResult, UNATTRIBUTED,
 };
-pub use lookback::{split_window, Lookback};
+pub use lookback::{split_window, window_reversed, Lookback};
 pub use reconcile::{ReconcileRequest, ReconcileResult};
 pub use results::{
     ChainLink, Cost, IndexResult, LinkStatus, LookupKind, PlanResult, ProposeRefusal,

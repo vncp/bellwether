@@ -10,7 +10,8 @@ use std::ops::Range;
 use arrow::array::RecordBatch;
 use arrow::datatypes::SchemaRef;
 use bellwether_source::{
-    ChunkedTextSource, FingerprintPolicy, LocalFs, ParquetSource, Partitioning, TextFormat,
+    physical_schema, ChunkedTextSource, FingerprintPolicy, LocalFs, ParquetSource, Partitioned,
+    Partitioning, TextFormat,
 };
 use bellwether_types::{Error, FileFingerprint, Result, RowGroupMeta, Source};
 
@@ -30,17 +31,23 @@ pub(crate) enum DataSource {
     Parquet(Box<ParquetSource<LocalFs>>),
     Text {
         format: TextFormat,
+        /// The dataset schema, partition columns included.
         schema: SchemaRef,
+        /// What the files hold: the dataset schema without the partition
+        /// columns.
+        physical: SchemaRef,
         policy: FingerprintPolicy,
-        by_chunk_size: BTreeMap<u64, ChunkedTextSource<LocalFs>>,
+        root: String,
+        partitioning: Partitioning,
+        by_chunk_size: BTreeMap<u64, Partitioned<ChunkedTextSource<LocalFs>>>,
     },
 }
 
 impl DataSource {
     /// Sources for `kind` under the dataset `schema` and `policy`. For text,
     /// one source per chunk size in `chunk_sizes`. `partitioning` is the
-    /// scheme of the data `root` (Parquet only; the build refuses one for
-    /// text before getting here).
+    /// scheme of the data `root`; text files read the dataset schema without
+    /// its partition columns, which the paths supply.
     pub(crate) fn new(
         kind: SourceKind,
         schema: &SchemaRef,
@@ -48,8 +55,8 @@ impl DataSource {
         chunk_sizes: impl IntoIterator<Item = u64>,
         root: &str,
         partitioning: &Partitioning,
-    ) -> Self {
-        match kind.text_format() {
+    ) -> Result<Self> {
+        Ok(match kind.text_format() {
             None => Self::Parquet(Box::new(parquet_source(
                 Some(schema),
                 policy,
@@ -57,20 +64,22 @@ impl DataSource {
                 partitioning,
             ))),
             Some(format) => {
-                let mut by_chunk_size = BTreeMap::new();
-                for size in chunk_sizes {
-                    by_chunk_size
-                        .entry(size)
-                        .or_insert_with(|| text_source(format, schema, policy, size));
-                }
-                Self::Text {
+                let physical = physical_schema(schema, &partitioning.column_names(root)?);
+                let mut out = Self::Text {
                     format,
                     schema: SchemaRef::clone(schema),
+                    physical,
                     policy,
-                    by_chunk_size,
+                    root: root.to_string(),
+                    partitioning: partitioning.clone(),
+                    by_chunk_size: BTreeMap::new(),
+                };
+                for size in chunk_sizes {
+                    out.ensure_chunk_size(size);
                 }
+                out
             }
-        }
+        })
     }
 
     /// Adds a text source for `size` if there is none yet.
@@ -78,17 +87,25 @@ impl DataSource {
         if let Self::Text {
             format,
             schema,
+            physical,
             policy,
+            root,
+            partitioning,
             by_chunk_size,
         } = self
         {
-            by_chunk_size
-                .entry(size)
-                .or_insert_with(|| text_source(*format, schema, *policy, size));
+            by_chunk_size.entry(size).or_insert_with(|| {
+                Partitioned::new(
+                    text_source(*format, physical, *policy, size),
+                    root.clone(),
+                    partitioning.clone(),
+                    Some(SchemaRef::clone(schema)),
+                )
+            });
         }
     }
 
-    fn text(&self, chunk_size: Option<u64>) -> Result<&ChunkedTextSource<LocalFs>> {
+    fn text(&self, chunk_size: Option<u64>) -> Result<&Partitioned<ChunkedTextSource<LocalFs>>> {
         let Self::Text { by_chunk_size, .. } = self else {
             return Err(Error::Other("not a text source".into()));
         };
@@ -150,7 +167,7 @@ impl DataSource {
                 })
             }
             Self::Text { .. } => {
-                let chunks = self.text(chunk_size)?.chunk_ranges(file)?;
+                let chunks = self.text(chunk_size)?.inner().chunk_ranges(file)?;
                 Ok(FileLayout {
                     row_groups: chunks.len(),
                     chunks: Some(chunks),
@@ -203,9 +220,13 @@ pub(crate) fn infer_schema(
 ) -> Result<SchemaRef> {
     match kind.text_format() {
         None => parquet_source(None, policy, root, partitioning).schema(root),
-        Some(format) => ChunkedTextSource::new(format)
-            .with_fingerprint_policy(policy)
-            .schema(root),
+        Some(format) => Partitioned::new(
+            ChunkedTextSource::new(format).with_fingerprint_policy(policy),
+            root,
+            partitioning.clone(),
+            None,
+        )
+        .schema(root),
     }
 }
 

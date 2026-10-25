@@ -259,7 +259,7 @@ impl<S: StoreExt + ?Sized> Builder<S> {
             chunk_sizes,
             root,
             &cfg.partitioning,
-        );
+        )?;
         let discovered = sources.discover(root)?;
         let since = now_rfc3339();
         let observer = opts.observer.as_deref();
@@ -412,12 +412,6 @@ impl Config {
             (None, Some(p)) => p,
             (None, None) => Partitioning::None,
         };
-        if !partitioning.is_none() && kind.text_format().is_some() {
-            return Err(Error::Other(format!(
-                "partitioning ({}) applies to Parquet sources only in this release",
-                partitioning.label()
-            )));
-        }
         let new_chunk_size = match (kind.text_format(), opts.chunk_size) {
             (None, None) => NewChunkSize::NotText,
             (None, Some(_)) => {

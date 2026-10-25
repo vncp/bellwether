@@ -494,7 +494,24 @@ pub(crate) fn engine_at(
         at_manifest,
         ..engine_options(global)?
     };
-    Ok(Engine::open(root, options)?)
+    let engine = Engine::open(root, options)?;
+    // A sequence the index never committed (or pruned) is a usage error
+    // naming the committed range, before any lookup runs.
+    if let Some(seq) = at_manifest {
+        let retained = engine.retained_manifests()?;
+        if !retained.contains(&seq) {
+            let e = Error::NotRetained {
+                index: engine.index_location().to_string(),
+                requested: seq,
+                retained,
+            };
+            return Err(Failure::Usage(match hint(&e) {
+                Some(h) => format!("{e}; {h}"),
+                None => e.to_string(),
+            }));
+        }
+    }
+    Ok(engine)
 }
 
 /// The engine options the global flags name.
@@ -535,26 +552,7 @@ fn run(cli: &Cli, out: &Out) -> Result<Outcome, Failure> {
             let r = engine(g, &a.root.root)?.index_declared(&declared)?;
             done(&r, human::index(&r, out), EXIT_OK)
         }
-        Command::Locate(a) => {
-            let window = match (&a.window, &a.from, &a.to) {
-                (Some(w), _, _) => {
-                    Some(bellwether::split_window(w).map_err(|e| Failure::Usage(e.to_string()))?)
-                }
-                (None, Some(from), Some(to)) => Some((from.as_str(), to.as_str())),
-                _ => None,
-            };
-            if window.is_none() && a.ts.is_some() {
-                return Err(Failure::Usage(
-                    "--ts names a window's time column; give the window with --window \
-                     START..END (or --from and --to)"
-                        .into(),
-                ));
-            }
-            lookup(g, out, &a.lookup, |e, keys| match window {
-                Some((from, to)) => e.locate_window(keys, from, to, a.ts.as_deref()),
-                None => e.locate(keys),
-            })
-        }
+        Command::Locate(a) => locate(g, out, a),
         Command::Latest(a) => {
             check_lookback(a.lookback.as_deref())?;
             lookup(g, out, &a.lookup, |e, keys| match (&a.known, &a.lookback) {
@@ -690,6 +688,41 @@ fn propose(g: &Global, out: &Out, a: &ProposeArgs) -> Result<Outcome, Failure> {
         bellwether::ProposeResult::Refused { .. } => EXIT_REFUSED,
     };
     done(&r, human::propose(&r, out), code)
+}
+
+/// `locate`, in a window when one is given; a reversed window is a usage
+/// error naming the flag that gave it.
+fn locate(g: &Global, out: &Out, a: &LocateArgs) -> Result<Outcome, Failure> {
+    let window = match (&a.window, &a.from, &a.to) {
+        (Some(w), _, _) => {
+            Some(bellwether::split_window(w).map_err(|e| Failure::Usage(e.to_string()))?)
+        }
+        (None, Some(from), Some(to)) => Some((from.as_str(), to.as_str())),
+        _ => None,
+    };
+    if let Some((from, to)) = window {
+        if bellwether::window_reversed(from, to) {
+            let given = if a.window.is_some() {
+                format!("--window {from}..{to}")
+            } else {
+                format!("--from {from} --to {to}")
+            };
+            return Err(Failure::Usage(format!(
+                "{given} starts after it ends; give the start first, START..END"
+            )));
+        }
+    }
+    if window.is_none() && a.ts.is_some() {
+        return Err(Failure::Usage(
+            "--ts names a window's time column; give the window with --window START..END (or \
+             --from and --to)"
+                .into(),
+        ));
+    }
+    lookup(g, out, &a.lookup, |e, keys| match window {
+        Some((from, to)) => e.locate_window(keys, from, to, a.ts.as_deref()),
+        None => e.locate(keys),
+    })
 }
 
 /// A malformed `--lookback` is a usage error (exit 2), refused before any

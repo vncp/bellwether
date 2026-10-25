@@ -41,6 +41,7 @@ pub mod catalog;
 pub mod fingerprint;
 pub mod parquet_source;
 pub mod partition;
+pub mod partitioned;
 pub mod stats;
 pub mod storage;
 pub mod text;
@@ -59,6 +60,7 @@ pub use fingerprint::{
 };
 pub use parquet_source::{load_reader_metadata, ParquetSource};
 pub use partition::{Partitioning, PathTemplate};
+pub use partitioned::{physical_schema, Partitioned};
 pub use storage::{LocalFs, ObjectMeta, Storage};
 pub use text::{ChunkedTextSource, TextFormat, DEFAULT_CHUNK_SIZE};
 

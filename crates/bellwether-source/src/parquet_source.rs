@@ -148,13 +148,13 @@ impl<S: Storage> ParquetSource<S> {
                 let paths: Vec<String> = self
                     .storage
                     .list(root)
-                    .map_err(|e| e.to_string())?
+                    .map_err(crate::partition::plain)?
                     .into_iter()
                     .filter(|p| has_extension(p, PARQUET_EXTENSION))
                     .collect();
                 for file in scheme
                     .values_of_all(root, &paths)
-                    .map_err(|e| e.to_string())?
+                    .map_err(crate::partition::plain)?
                 {
                     for v in file {
                         values.entry(v.name).or_default().push(v.value);
@@ -294,15 +294,31 @@ impl<S: Storage> ParquetSource<S> {
                         None => s.null_count == Some(rg.rows),
                     });
                     if !agrees {
+                        let why = match s {
+                            None => "has no statistics for it".to_string(),
+                            Some(s) if s.min.is_none() || s.max.is_none() => {
+                                "has no trusted min/max for it".to_string()
+                            }
+                            Some(s) if s.min != s.max => {
+                                "holds more than one value of it (its min and max differ)"
+                                    .to_string()
+                            }
+                            Some(s) if s.min != encoded => {
+                                "holds another value of it than the path's".to_string()
+                            }
+                            Some(s) => format!(
+                                "has {} null(s) in it",
+                                s.null_count
+                                    .map_or("an unknown number of".into(), |n| n.to_string())
+                            ),
+                        };
                         return Err(Error::Source(format!(
-                            "{}: row group {} stores column {} with statistics {:?}, which do \
-                             not show the value its path gives ({}={}); a file whose path and \
-                             content disagree, or whose statistics cannot show they agree, is \
-                             refused",
+                            "{}: row group {} stores column {} and {why}, so it does not show the \
+                             value its path gives ({}={}); a file whose path and content \
+                             disagree, or whose statistics cannot show they agree, is refused",
                             file.path,
                             rg.index_in_file,
                             p.name,
-                            s.map(|s| (&s.min, &s.max, s.null_count)),
                             p.name,
                             p.value.as_deref().unwrap_or(crate::partition::HIVE_NULL)
                         )));

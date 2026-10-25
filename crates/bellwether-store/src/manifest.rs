@@ -902,6 +902,42 @@ mod tests {
         assert_eq!(v1, v2);
     }
 
+    /// Ported from the Argon WP21 implementation: a manifest a newer
+    /// writer committed with a segment of a kind this binary does not know
+    /// opens, and the kind is reported, never an error.
+    #[test]
+    fn manifest_listing_unknown_segment_kind_still_opens_and_reports_it() {
+        let raw = r#"{
+          "storage_version": 1,
+          "sequence": 2,
+          "created_at": "2026-10-23T00:00:00.000Z",
+          "committed_at": "2026-10-24T00:00:00.000Z",
+          "commit_nonce": 7,
+          "source": {"kind": "parquet", "root": "data"},
+          "schema": {
+            "columns": [{"name": "symbol", "data_type": "Utf8", "nullable": false}],
+            "key_specs": [{"kind": "exact", "columns": ["symbol"]}]
+          },
+          "rowgroup_space": {"next_id": 1, "files": [], "tombstones": []},
+          "key_spec_completeness": {"exact:symbol": 2},
+          "segments": [
+            {
+              "id": "2222222222222222222222222222222222222222222222222222222222222222",
+              "key_spec": "future_sidecar:symbol",
+              "kind": "future_sidecar:v9",
+              "rowgroup_range": {"start": 0, "end": 1},
+              "bytes": 10
+            }
+          ]
+        }"#;
+        let m = Manifest::from_slice(raw.as_bytes()).unwrap();
+        assert_eq!(
+            m.unknown_segment_kinds(),
+            vec!["future_sidecar:v9".to_string()]
+        );
+        assert_eq!(m.segments.len(), 1);
+    }
+
     #[test]
     fn paths() {
         assert_eq!(manifest_path(""), "manifest.json");
