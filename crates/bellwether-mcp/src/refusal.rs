@@ -173,8 +173,8 @@ impl RefusalCode {
             }
             Self::NothingToApply => "the key is already complete; there is nothing to attest",
             Self::NothingToGain => {
-                "the replay predicts no saving on this workload; propose another key, or pass \
-                 allow_no_gain only if the human asks for it anyway"
+                "the replay predicts no saving on this workload; propose another key, or tell the \
+                 human: only the human can continue, with `bellwether fix --allow-no-gain`"
             }
             Self::LayoutNotApplicable => {
                 "layout proposals cannot be applied in this release; propose a key or a rewrite"
@@ -552,9 +552,23 @@ mod tests {
 
     use super::*;
 
-    /// No `next` line or message built here names a CLI flag.
+    /// No `next` line or message built here names a CLI flag for the agent
+    /// to pass. `nothing_to_gain`'s names one only as the human's own CLI
+    /// command: no tool takes it, so an agent cannot override the gate.
     fn no_flags(r: &Refusal) {
-        assert!(!r.next.contains("--"), "{r:?}");
+        if r.code == RefusalCode::NothingToGain {
+            nothing_to_gain_is_the_human_s(r.next.as_str());
+        } else {
+            assert!(!r.next.contains("--"), "{r:?}");
+        }
+    }
+
+    fn nothing_to_gain_is_the_human_s(next: &str) {
+        assert!(
+            next.contains("only the human can continue, with `bellwether fix --allow-no-gain`")
+                && !next.contains("allow_no_gain"),
+            "{next}"
+        );
     }
 
     #[test]
@@ -820,7 +834,11 @@ mod tests {
     fn codes_serialize_as_their_names() {
         for c in RefusalCode::ALL {
             assert_eq!(serde_json::to_value(c).unwrap(), c.as_str());
-            assert!(!c.next().contains("--"), "{c:?}");
+            if c == RefusalCode::NothingToGain {
+                nothing_to_gain_is_the_human_s(c.next());
+            } else {
+                assert!(!c.next().contains("--"), "{c:?}");
+            }
         }
     }
 }

@@ -79,7 +79,9 @@ use crate::catalog::Catalog;
 use crate::error::{ReplayError, ReplayResult};
 use crate::keys::RunKeys;
 use crate::layout::{replay_layout, LayoutModel, LayoutReplay};
-use crate::plan::{asof_lookback_window, run_cost, serves_query, PlanSource, SegmentPlanner};
+use crate::plan::{
+    lookback_window, planned_time_column, run_cost, serves_query, PlanSource, SegmentPlanner,
+};
 use crate::transient::{CacheStats, TransientCache, TransientIndex, TransientLimits};
 use crate::workload::{KeySetSource, RunQuery, Workload};
 
@@ -284,10 +286,12 @@ impl<'a> Replayer<'a> {
     }
 
     /// The specs of `specs` that serve `keys` under `query`, and the verified
-    /// plan over them (every row group when none serves, or when a temporal
-    /// run has no serving temporal spec). An `asof` lookback run is planned
-    /// as its window on the serving temporal spec's timestamp column
-    /// ([`asof_lookback_window`]).
+    /// plan over them: every row group when none serves, or when a
+    /// temporal run has no time column to plan on
+    /// ([`planned_time_column`]: the serving temporal spec's, else, for a
+    /// lookback, the planner's per-key bounds or window column, as the
+    /// lookup verbs take it). An `asof` lookback run is planned as its
+    /// window on that column.
     fn verified_plan(
         &self,
         planner: &dyn PlanSource,
@@ -296,36 +300,50 @@ impl<'a> Replayer<'a> {
         query: &RunQuery,
     ) -> Result<ScanPlan> {
         check_types(&self.catalog, keys)?;
-        let query = match query {
-            RunQuery::Lookback {
-                asof: Some(at),
-                lookback,
-            } => {
-                asof_lookback_window(self.catalog.schema(), specs, keys.columns(), *at, *lookback)?
-                    .map(|w| Cow::Owned(RunQuery::Window(w)))
-            }
-            q => Some(Cow::Borrowed(q)),
+        let column = planned_time_column(planner, specs, keys.columns(), query)?;
+        let query = match (query, column) {
+            (
+                RunQuery::Lookback {
+                    asof: Some(at),
+                    lookback,
+                },
+                Some(ts),
+            ) => Some(Cow::Owned(RunQuery::Window(lookback_window(
+                self.catalog.schema(),
+                ts,
+                *at,
+                *lookback,
+            )?))),
+            (q, column) if !q.is_temporal() || column.is_some() => Some(Cow::Borrowed(q)),
+            _ => None,
         };
-        let serving: Vec<KeySpec> = query.as_ref().map_or_else(Vec::new, |q| {
-            specs
-                .iter()
-                .filter(|s| serves_query(s, keys.columns(), q))
-                .cloned()
-                .collect()
-        });
         let plan = match query {
-            Some(q)
-                if !q.is_temporal()
-                    || serving
-                        .iter()
-                        .any(|s| matches!(s, KeySpec::Temporal { .. })) =>
-            {
+            Some(q) => {
+                let serving: Vec<KeySpec> = specs
+                    .iter()
+                    .filter(|s| serves_query(s, keys.columns(), &q))
+                    .cloned()
+                    .collect();
                 planner.plan_query(&serving, keys, &q)?
             }
-            _ => planner.plan_query(&[], keys, &RunQuery::Locate)?,
+            None => planner.plan_query(&[], keys, &RunQuery::Locate)?,
         };
         self.catalog.verify_plan(&plan)?;
         Ok(plan)
+    }
+
+    /// The time column `query` is planned on for a run keyed on
+    /// `run_columns` under `specs` ([`planned_time_column`]), so a caller
+    /// can check that it measures the run's instants and lengths on the
+    /// column the plan uses.
+    pub fn planned_time_column(
+        &self,
+        specs: &[KeySpec],
+        run_columns: &[String],
+        query: &RunQuery,
+    ) -> Result<Option<String>> {
+        let planner = self.planner_for(specs)?;
+        planned_time_column(planner.as_ref(), specs, run_columns, query)
     }
 
     /// The exact cost of one ad hoc `locate` key set under `specs`.

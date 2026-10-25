@@ -339,6 +339,72 @@ fn lookback_windows_on_a_path_template_lake() {
         0,
     );
     assert!(human.contains("window: rows with ts in"), "{human}");
+
+    // The index's temporal key is on ts: `why --latest-by day` would measure
+    // the lookback and the instant in days and plan them on ts, so it is a
+    // usage error naming both columns and the flag to pass.
+    for extra in [
+        &["--lookback", "2d"][..],
+        &["--at", "2026-03-05", "--lookback", "2d"],
+        &[],
+        &["--at", "2026-03-05"],
+    ] {
+        let mut args = vec!["why", r, "--from", k, "--latest-by", "day"];
+        args.extend_from_slice(extra);
+        let out = bw().args(&args).output().unwrap();
+        assert_eq!(out.status.code(), Some(2), "{extra:?}");
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            err.contains("by ts (its temporal key temporal:symbol@ts), not by day")
+                && err.contains("pass --latest-by ts"),
+            "{extra:?}: {err}"
+        );
+    }
+    // With --latest-by ts the current cost is what the verbs plan.
+    let latest = json(&run(
+        &["latest", r, "--keys", k, "--lookback", "36h", "--json"],
+        0,
+    ));
+    let why = json(&run(
+        &[
+            "why",
+            r,
+            "--from",
+            k,
+            "--latest-by",
+            "ts",
+            "--lookback",
+            "36h",
+            "--json",
+        ],
+        0,
+    ));
+    assert_eq!(why["current"]["bytes"], latest["planned"]["bytes"]);
+    // A window on day offers the temporal key on day beside the current one
+    // on ts: candidates differ by their time column.
+    let why = json(&run(
+        &[
+            "why",
+            r,
+            "--from",
+            k,
+            "--window",
+            "2026-03-03..2026-03-04",
+            "--ts",
+            "day",
+            "--json",
+        ],
+        0,
+    ));
+    assert!(
+        why["candidates"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|c| c["spec"]["kind"] == "temporal" && c["spec"]["ts_column"] == "day"),
+        "{}",
+        why["candidates"]
+    );
 }
 
 #[test]
@@ -510,6 +576,56 @@ fn latest_lookback_through_per_key_bounds() {
     assert!(
         !nvda.is_empty() && nvda.is_subset(&want),
         "NVDA keeps its own window"
+    );
+    // `why` prices the current configuration through the same per-key
+    // bounds, never as a full scan: its current cost is what `latest` and
+    // `asof` plan, so a temporal key that would read the same is no gain.
+    let why = |extra: &[&str]| {
+        let mut args = vec!["why", r, "--from", k, "--latest-by", "ts"];
+        args.extend_from_slice(extra);
+        args.push("--json");
+        json(&run(&args, 0))
+    };
+    let w = why(&["--lookback", "1d"]);
+    assert_eq!(w["current"]["bytes"], v["planned"]["bytes"]);
+    assert_eq!(w["current"]["row_groups"], v["planned"]["row_groups"]);
+    let at = (FIRST_DAY + 3) * US_PER_DAY + 1;
+    let asof = json(&run(
+        &[
+            "asof",
+            r,
+            "--keys",
+            k,
+            "--at",
+            &at.to_string(),
+            "--lookback",
+            "2d",
+            "--json",
+        ],
+        0,
+    ));
+    let w = why(&["--at", &at.to_string(), "--lookback", "2d"]);
+    assert_eq!(w["current"]["bytes"], asof["planned"]["bytes"]);
+    assert_eq!(w["current"]["row_groups"], asof["planned"]["row_groups"]);
+    // The bounds measure ts: a lookback in day's unit is refused.
+    let out = bw()
+        .args([
+            "why",
+            r,
+            "--from",
+            k,
+            "--latest-by",
+            "day",
+            "--lookback",
+            "2d",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("by ts (its per-key bounds), not by day") && err.contains("--latest-by ts"),
+        "{err}"
     );
     // Reversed windows and uncommitted sequences are usage errors.
     let out = bw()

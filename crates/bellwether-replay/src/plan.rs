@@ -46,9 +46,11 @@
 //!   ([`SegmentPlanner::with_partitioning`]); each set is intersected per
 //!   key tuple. Its residual is `And[In, Between]` on the time column. An
 //!   `asof` lookback run is planned as the window `[asof − lookback, asof]`
-//!   on the timestamp column of the temporal spec serving its keys
-//!   ([`asof_lookback_window`]); a `latest` lookback run is per key, from
-//!   that spec's version chains.
+//!   on the column [`planned_time_column`] gives (the timestamp of the
+//!   temporal spec serving its keys, else the planner's
+//!   [`PlanSource::window_column`]); a `latest` lookback run is per key,
+//!   from that spec's version chains (or, through the build planner,
+//!   per-key bounds: [`PlanSource::lookback_column`]).
 
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
@@ -142,23 +144,13 @@ pub fn serves_query(spec: &KeySpec, run_columns: &[String], query: &RunQuery) ->
     }
 }
 
-/// The fixed window an `asof` lookback run is: `[max(at − lookback, floor),
-/// at]` on the timestamp column of the one temporal spec of `specs` whose
-/// columns are all in `run_columns`, `floor` being the smallest value that
-/// column's type holds. `None` when no temporal spec serves the run; more
-/// than one is an error, as for `asof`.
-pub fn asof_lookback_window(
-    schema: &Schema,
+/// The timestamp column of the one temporal spec of `specs` whose columns
+/// are all in `run_columns`; `None` when there is none, and more than one
+/// is an error, as for `latest` and `asof`.
+pub fn serving_temporal_column(
     specs: &[KeySpec],
     run_columns: &[String],
-    at: i64,
-    lookback: i64,
-) -> Result<Option<RunWindow>> {
-    if lookback < 0 {
-        return Err(Error::KeySpec(format!(
-            "a lookback window cannot be negative ({lookback})"
-        )));
-    }
+) -> Result<Option<String>> {
     let mut temporal = specs.iter().filter_map(|s| match s {
         KeySpec::Temporal { ts_column, .. }
             if matches!(servable(s, run_columns), Some(Lookup::Point { .. })) =>
@@ -167,21 +159,88 @@ pub fn asof_lookback_window(
         }
         _ => None,
     });
-    let ts_column = match (temporal.next(), temporal.next()) {
-        (None, _) => return Ok(None),
-        (Some(ts), None) => ts,
-        (Some(_), Some(_)) => {
-            return Err(Error::KeySpec(
-                "more than one temporal key spec serves this lookup; name one".into(),
-            ))
+    match (temporal.next(), temporal.next()) {
+        (None, _) => Ok(None),
+        (Some(ts), None) => Ok(Some(ts.clone())),
+        (Some(_), Some(_)) => Err(Error::KeySpec(
+            "more than one temporal key spec serves this lookup; name one".into(),
+        )),
+    }
+}
+
+/// The time column `query` is planned on for a run keyed on `run_columns`
+/// under `specs` through `planner`, by the rules the lookup verbs use:
+/// `latest` and `asof` take the serving temporal spec's
+/// ([`serving_temporal_column`]); a `latest` lookback the planner's
+/// [`PlanSource::lookback_column`]; an `asof` lookback the serving temporal
+/// spec's, else the planner's [`PlanSource::window_column`]. `None` for
+/// `locate` and window runs, and when nothing can plan the query (the run
+/// then reads every row group).
+pub fn planned_time_column(
+    planner: &dyn PlanSource,
+    specs: &[KeySpec],
+    run_columns: &[String],
+    query: &RunQuery,
+) -> Result<Option<String>> {
+    if let Some(lookback) = query.lookback() {
+        check_lookback(lookback)?;
+    }
+    match query {
+        RunQuery::Locate | RunQuery::Window(_) => Ok(None),
+        RunQuery::Latest | RunQuery::Asof { .. } => serving_temporal_column(specs, run_columns),
+        RunQuery::Lookback { asof: None, .. } => planner.lookback_column(specs, run_columns),
+        RunQuery::Lookback { asof: Some(_), .. } => {
+            match serving_temporal_column(specs, run_columns)? {
+                Some(ts) => Ok(Some(ts)),
+                None => planner.window_column(specs, run_columns),
+            }
         }
-    };
-    let floor = encoding::ts_min(&ts_type(schema, ts_column)?)?;
-    Ok(Some(RunWindow {
-        ts_column: ts_column.clone(),
+    }
+}
+
+/// The fixed window an `asof` lookback run is: `[max(at − lookback, floor),
+/// at]` on the timestamp column of the one temporal spec of `specs` whose
+/// columns are all in `run_columns` ([`serving_temporal_column`]), `floor`
+/// being the smallest value that column's type holds. `None` when no
+/// temporal spec serves the run.
+pub fn asof_lookback_window(
+    schema: &Schema,
+    specs: &[KeySpec],
+    run_columns: &[String],
+    at: i64,
+    lookback: i64,
+) -> Result<Option<RunWindow>> {
+    check_lookback(lookback)?;
+    serving_temporal_column(specs, run_columns)?
+        .map(|ts_column| lookback_window(schema, ts_column, at, lookback))
+        .transpose()
+}
+
+/// A lookback window's length is not negative.
+fn check_lookback(lookback: i64) -> Result<()> {
+    if lookback < 0 {
+        return Err(Error::KeySpec(format!(
+            "a lookback window cannot be negative ({lookback})"
+        )));
+    }
+    Ok(())
+}
+
+/// The window `[max(at − lookback, floor), at]` on `ts_column`, `floor`
+/// being the smallest value its type holds.
+pub(crate) fn lookback_window(
+    schema: &Schema,
+    ts_column: String,
+    at: i64,
+    lookback: i64,
+) -> Result<RunWindow> {
+    check_lookback(lookback)?;
+    let floor = encoding::ts_min(&ts_type(schema, &ts_column)?)?;
+    Ok(RunWindow {
+        ts_column,
         lo: at.saturating_sub(lookback).max(floor),
         hi: at,
-    }))
+    })
 }
 
 /// `query` as a planner plans it under `specs`: an `asof` lookback run is
@@ -243,6 +302,25 @@ pub trait PlanSource: Send + Sync {
     /// The plan for one run's keys under `specs` and `query` (`locate`,
     /// `latest`, or `asof`).
     fn plan_query(&self, specs: &[KeySpec], keys: &RunKeys, query: &RunQuery) -> Result<ScanPlan>;
+
+    /// The time column a `latest` lookback run on `run_columns` measures
+    /// each key's window on under `specs`: the serving temporal spec's
+    /// ([`serving_temporal_column`], the default), or another source of each
+    /// key's versions the planner has (the build planner's complete per-key
+    /// bounds sidecar, `Planner::lookback_column`). `None` when it cannot
+    /// plan the run.
+    fn lookback_column(&self, specs: &[KeySpec], run_columns: &[String]) -> Result<Option<String>> {
+        serving_temporal_column(specs, run_columns)
+    }
+
+    /// The time column an `asof` lookback window on `run_columns` takes
+    /// when no temporal spec of `specs` serves the run, as a window lookup
+    /// with no column named does (the build planner's
+    /// `Planner::window_column`). `None`, the default, plans no window.
+    fn window_column(&self, _specs: &[KeySpec], _run_columns: &[String]) -> Result<Option<String>> {
+        Ok(None)
+    }
+
     /// This source with hypothetical specs' transient segments added, so
     /// each plans exactly as committed segments of that spec would. A
     /// transient index covers every live row group of the pinned catalog,

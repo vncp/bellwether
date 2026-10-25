@@ -38,6 +38,16 @@ enum Unit {
 }
 
 impl Unit {
+    /// Largest first, so the first that divides a length is the largest it
+    /// is whole in.
+    const ALL: [Self; 5] = [
+        Self::Week,
+        Self::Day,
+        Self::Hour,
+        Self::Minute,
+        Self::Second,
+    ];
+
     fn seconds(self) -> i64 {
         match self {
             Self::Second => 1,
@@ -47,48 +57,106 @@ impl Unit {
             Self::Week => 7 * 86_400,
         }
     }
+
+    fn suffix(self) -> &'static str {
+        match self {
+            Self::Second => "s",
+            Self::Minute => "m",
+            Self::Hour => "h",
+            Self::Day => "d",
+            Self::Week => "w",
+        }
+    }
+
+    fn plural(self) -> &'static str {
+        match self {
+            Self::Second => "seconds",
+            Self::Minute => "minutes",
+            Self::Hour => "hours",
+            Self::Day => "days",
+            Self::Week => "weeks",
+        }
+    }
+
+    fn parse(suffix: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|u| u.suffix() == suffix)
+    }
 }
 
 const UNITS: &str = "s (seconds), m (minutes), h (hours), d (calendar days of 24 hours, UTC), or \
                      w (7 days); months, years, and trading days are not units, because their \
                      length varies (a trading-day calendar is out of scope)";
 
+/// A lookback that cannot be used: the typed invalid argument `lookback`.
+fn refuse(reason: String) -> Error {
+    Error::InvalidArgument {
+        field: "lookback",
+        reason,
+    }
+}
+
+/// `seconds` as a lookback in the largest unit it is whole in (`36h`).
+fn whole_lookback(seconds: i128) -> String {
+    let unit = Unit::ALL
+        .into_iter()
+        .find(|u| seconds % i128::from(u.seconds()) == 0)
+        .unwrap_or(Unit::Second);
+    format!("{}{}", seconds / i128::from(unit.seconds()), unit.suffix())
+}
+
+/// `num / den` (both non-negative) as a decimal when it has at most four
+/// decimal places (`1.5`), else `None`.
+fn short_decimal(num: i128, den: i128) -> Option<String> {
+    let whole = num / den;
+    let scaled = (num % den) * 10_000;
+    if scaled % den != 0 {
+        return None;
+    }
+    let frac = format!("{:04}", scaled / den);
+    Some(format!("{whole}.{}", frac.trim_end_matches('0')))
+}
+
 impl Lookback {
     /// Parses `252d`, `90m`, `2w`, or a bare `5` (module docs). The number
-    /// is a non-negative whole number.
+    /// is a non-negative whole number; anything else is the typed invalid
+    /// argument `lookback`, with a lookback to pass instead.
     pub fn parse(text: &str) -> Result<Self> {
         let t = text.trim();
         let split = t.find(|c: char| !c.is_ascii_digit()).unwrap_or(t.len());
         let (digits, unit) = t.split_at(split);
+        if let Some(frac) = unit
+            .strip_prefix('.')
+            .filter(|f| f.starts_with(|c: char| c.is_ascii_digit()))
+        {
+            return Err(refuse(fractional(t, digits, frac)));
+        }
         if digits.is_empty() {
-            return Err(Error::Other(format!(
+            return Err(refuse(format!(
                 "--lookback {text:?} does not start with a whole number; write a whole number and \
                  a unit, for example --lookback 252d, the unit one of {UNITS}; or a bare whole \
                  number for an integer time column"
             )));
         }
-        let amount: i64 = digits.parse().map_err(|_| {
-            Error::Other(format!("--lookback {text:?} is too large for a lookback"))
-        })?;
         let unit = match unit {
             "" => None,
-            "s" => Some(Unit::Second),
-            "m" => Some(Unit::Minute),
-            "h" => Some(Unit::Hour),
-            "d" => Some(Unit::Day),
-            "w" => Some(Unit::Week),
-            other => {
-                return Err(Error::Other(format!(
-                    "--lookback {text:?} has the unit {other:?}; write a whole number and a unit, \
-                     for example --lookback 252d, the unit one of {UNITS}"
-                )))
-            }
+            other => Some(Unit::parse(other).ok_or_else(|| {
+                refuse(format!(
+                    "--lookback {text:?} has the unit {other:?}; write a whole number and a \
+                     unit, for example --lookback 252d, the unit one of {UNITS}"
+                ))
+            })?),
         };
-        if let Some(u) = unit {
-            amount.checked_mul(u.seconds()).ok_or_else(|| {
-                Error::Other(format!("--lookback {text:?} is too large for a lookback"))
+        let longest = i64::MAX / unit.map_or(1, Unit::seconds);
+        let amount = digits
+            .parse::<i64>()
+            .ok()
+            .filter(|a| *a <= longest)
+            .ok_or_else(|| {
+                refuse(format!(
+                    "--lookback {text:?} is too long; the longest lookback is {longest}{}",
+                    unit.map_or("", Unit::suffix)
+                ))
             })?;
-        }
         Ok(Self {
             text: t.to_string(),
             amount,
@@ -109,7 +177,8 @@ impl Lookback {
     }
 
     /// The lookback in `ty`'s unit, for the time column `column` (module
-    /// docs): exact, or an error when it is not a whole number of the unit.
+    /// docs): exact, or the typed invalid argument `lookback` when it is not
+    /// a whole number of the unit or longer than the column can measure.
     pub(crate) fn in_unit(&self, column: &str, ty: &DataType) -> Result<i64> {
         if let DataType::Dictionary(_, v) = ty {
             return self.in_unit(column, v);
@@ -128,38 +197,114 @@ impl Lookback {
             _ => None,
         };
         let integer = ty.is_integer();
+        let text = &self.text;
         match (self.seconds(), nanos_per_unit) {
             (Some(secs), Some(per)) => {
                 let nanos = i128::from(secs) * 1_000_000_000;
                 if nanos % per != 0 {
-                    return Err(Error::KeySpec(format!(
-                        "--lookback {:?} is not a whole number of {column}'s unit ({ty}); give \
-                         a length that is, for example in days for a date column",
-                        self.text
-                    )));
+                    return Err(refuse(self.not_whole(column, ty, nanos, per)));
                 }
                 i64::try_from(nanos / per).map_err(|_| {
-                    Error::KeySpec(format!(
-                        "--lookback {:?} is out of range for {column} ({ty})",
-                        self.text
+                    // The unit is set: `seconds` is `Some`.
+                    let unit = self.unit.unwrap_or(Unit::Second);
+                    let longest =
+                        i128::from(i64::MAX) * per / (i128::from(unit.seconds()) * 1_000_000_000);
+                    refuse(format!(
+                        "--lookback {text:?} is longer than {column} ({ty}) can measure; the \
+                         longest lookback on it is {longest}{s}: pass --lookback {longest}{s} or \
+                         less",
+                        s = unit.suffix()
                     ))
                 })
             }
             (None, None) if integer => Ok(self.amount),
-            (Some(_), None) if integer => Err(Error::KeySpec(format!(
-                "{column} is an integer column ({ty}) with no time unit, so --lookback {:?} \
-                 cannot be converted to it; give the lookback as a bare whole number in its unit",
-                self.text
+            (Some(secs), None) if integer => Err(refuse(format!(
+                "{column} is an integer column ({ty}) with no time unit, so --lookback {text:?} \
+                 cannot be converted to it; give the lookback as a bare whole number in its own \
+                 unit, for example --lookback {secs} if {column} counts seconds"
             ))),
-            (None, Some(_)) => Err(Error::KeySpec(format!(
-                "--lookback {:?} has no unit, and {column} is a {ty} column; add a unit: {UNITS}",
-                self.text
+            (None, Some(_)) => Err(refuse(format!(
+                "--lookback {text:?} has no unit, and {column} is a {ty} column; add a unit, for \
+                 example --lookback {text}d, the unit one of {UNITS}"
             ))),
             _ => Err(Error::KeySpec(format!(
                 "{column} has type {ty}, which a time window cannot bound; use a timestamp, \
                  date, or integer column"
             ))),
         }
+    }
+
+    /// Why a lookback of `nanos` is not a whole number of `per`, the
+    /// column's unit in nanoseconds, with the two lookbacks around it.
+    fn not_whole(&self, column: &str, ty: &DataType, nanos: i128, per: i128) -> String {
+        let text = &self.text;
+        let lower = nanos / per;
+        // Every lookback is whole seconds, so a unit it is not a whole
+        // number of is longer than a second: a day, for a date column.
+        let Some(unit) = Unit::ALL
+            .into_iter()
+            .find(|u| i128::from(u.seconds()) * 1_000_000_000 == per)
+        else {
+            return format!(
+                "--lookback {text:?} is not a whole number of {column}'s unit ({ty}); a \
+                 lookback on it is never rounded"
+            );
+        };
+        let (s, plural) = (unit.suffix(), unit.plural());
+        let size = short_decimal(nanos, per).map_or_else(
+            || format!("between {lower} and {} {plural}", lower + 1),
+            |d| format!("{d} {plural}"),
+        );
+        format!(
+            "--lookback {text:?} is {size}, and {column} ({ty}) counts whole {plural}, so a \
+             lookback on it is a whole number of {plural}, never rounded: pass --lookback \
+             {lower}{s} or --lookback {}{s}",
+            lower + 1
+        )
+    }
+}
+
+/// Why `text`, the decimal `digits.frac` (with an optional unit after
+/// `frac`'s digits), is not a lookback, with the whole lookback to pass.
+fn fractional(text: &str, digits: &str, frac: &str) -> String {
+    let split = frac
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(frac.len());
+    let (frac, suffix) = frac.split_at(split);
+    let unit = Unit::parse(suffix);
+    let head = format!("--lookback {text:?} is not a whole number; a lookback is a whole number");
+    // The length in seconds (bare units without a unit) as `num / den`;
+    // `None` when it overflows.
+    let exact = || -> Option<(i128, i128)> {
+        let den = 10_i128.checked_pow(u32::try_from(frac.len()).ok()?)?;
+        let whole: i128 = if digits.is_empty() {
+            0
+        } else {
+            digits.parse().ok()?
+        };
+        let num = whole
+            .checked_mul(den)?
+            .checked_add(frac.parse::<i128>().ok()?)?
+            .checked_mul(i128::from(unit.map_or(1, Unit::seconds)))?;
+        Some((num, den))
+    };
+    match (suffix, unit, exact()) {
+        ("", _, Some((num, den))) => format!(
+            "{head}, bare for an integer time column: pass --lookback {} or --lookback {}",
+            num / den,
+            num / den + 1
+        ),
+        (_, Some(_), Some((num, den))) if num % den == 0 => format!(
+            "{head} and a unit: pass --lookback {}, the same length",
+            whole_lookback(num / den)
+        ),
+        (_, Some(_), Some((num, den))) => format!(
+            "{head} and a unit, and the smallest unit is a second: pass --lookback {} or \
+             --lookback {}",
+            whole_lookback(num / den),
+            whole_lookback(num / den + 1)
+        ),
+        _ => format!("{head} and a unit, for example --lookback 252d, the unit one of {UNITS}"),
     }
 }
 
@@ -232,6 +377,42 @@ mod tests {
         }
         let e = Lookback::parse("252td").unwrap_err().to_string();
         assert!(e.contains("trading"), "{e}");
+        // Every refusal is the typed invalid argument `lookback`.
+        for bad in ["", "1.5d", "3mo", "99999999999999999999d"] {
+            assert!(
+                matches!(
+                    Lookback::parse(bad),
+                    Err(Error::InvalidArgument {
+                        field: "lookback",
+                        ..
+                    })
+                ),
+                "{bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_fractional_lookback_is_not_a_whole_number_and_names_the_same_length() {
+        let e = |t: &str| Lookback::parse(t).unwrap_err().to_string();
+        for (given, pass) in [
+            ("1.5d", "pass --lookback 36h, the same length"),
+            ("0.5h", "pass --lookback 30m, the same length"),
+            ("2.0w", "pass --lookback 2w, the same length"),
+            ("1.25s", "pass --lookback 1s or --lookback 2s"),
+            ("2.5", "pass --lookback 2 or --lookback 3"),
+        ] {
+            let msg = e(given);
+            assert!(msg.contains("is not a whole number"), "{msg}");
+            assert!(msg.contains(pass), "{given}: {msg}");
+            assert!(!msg.contains("has the unit"), "{msg}");
+        }
+        assert!(e("1.5x").contains("is not a whole number"));
+        let msg = e("99999999999999999999d");
+        assert!(
+            msg.contains("the longest lookback is 106751991167300d"),
+            "{msg}"
+        );
     }
 
     #[test]
@@ -240,14 +421,40 @@ mod tests {
         let d = Lookback::parse("1d").unwrap();
         assert_eq!(d.in_unit("ts", &us).unwrap(), 86_400_000_000);
         assert_eq!(d.in_unit("day", &DataType::Date32).unwrap(), 1);
-        // Not a whole number of days: refused, never rounded.
-        for partial in ["36h", "23h", "1s"] {
-            let e = Lookback::parse(partial)
+        // Not a whole number of days: refused, never rounded, with the two
+        // lookbacks around it.
+        for (partial, size, pass) in [
+            ("36h", "is 1.5 days", "pass --lookback 1d or --lookback 2d"),
+            ("6h", "is 0.25 days", "pass --lookback 0d or --lookback 1d"),
+            (
+                "23h",
+                "is between 0 and 1 days",
+                "pass --lookback 0d or --lookback 1d",
+            ),
+            (
+                "1s",
+                "is between 0 and 1 days",
+                "pass --lookback 0d or --lookback 1d",
+            ),
+        ] {
+            let err = Lookback::parse(partial)
                 .unwrap()
                 .in_unit("day", &DataType::Date32)
-                .unwrap_err()
-                .to_string();
-            assert!(e.contains("not a whole number of day's unit"), "{e}");
+                .unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    Error::InvalidArgument {
+                        field: "lookback",
+                        ..
+                    }
+                ),
+                "{err:?}"
+            );
+            let e = err.to_string();
+            assert!(e.contains(size), "{e}");
+            assert!(e.contains("counts whole days"), "{e}");
+            assert!(e.contains(pass), "{e}");
         }
         assert_eq!(d.in_unit("d64", &DataType::Date64).unwrap(), 86_400_000);
         let dict = DataType::Dictionary(Box::new(DataType::Int32), Box::new(us.clone()));
@@ -259,14 +466,32 @@ mod tests {
                 .unwrap(),
             5
         );
-        assert!(d.in_unit("v", &DataType::Int64).is_err());
-        assert!(Lookback::parse("5").unwrap().in_unit("ts", &us).is_err());
+        let e = d.in_unit("v", &DataType::Int64).unwrap_err().to_string();
+        assert!(
+            e.contains("for example --lookback 86400 if v counts seconds"),
+            "{e}"
+        );
+        let e = Lookback::parse("5")
+            .unwrap()
+            .in_unit("ts", &us)
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("for example --lookback 5d"), "{e}");
         assert!(d.in_unit("s", &DataType::Utf8).is_err());
+        // Longer than the column can measure: the longest is named.
         let ns = DataType::Timestamp(TimeUnit::Nanosecond, None);
-        assert!(Lookback::parse("9999999w")
+        let e = Lookback::parse("9999999w")
             .unwrap()
             .in_unit("ts", &ns)
-            .is_err());
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("the longest lookback on it is 15250w"), "{e}");
+        let e = Lookback::parse("99999999w")
+            .unwrap()
+            .in_unit("ts", &us)
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("pass --lookback 15250284w or less"), "{e}");
     }
 
     #[test]

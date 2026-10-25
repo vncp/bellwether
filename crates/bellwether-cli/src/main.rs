@@ -432,7 +432,17 @@ pub(crate) enum Failure {
 
 impl From<Error> for Failure {
     fn from(e: Error) -> Self {
-        Self::Engine(e)
+        match e {
+            // An argument only the data can judge (a lookback against its
+            // time column's unit, `--latest-by` against the column the
+            // index plans on) is still the caller's to fix: a usage error,
+            // whose message names the value to pass.
+            Error::InvalidArgument {
+                field: "lookback" | "latest_by",
+                ..
+            } => Self::Usage(e.to_string()),
+            e => Self::Engine(e),
+        }
     }
 }
 

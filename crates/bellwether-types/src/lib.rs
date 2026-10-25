@@ -167,7 +167,7 @@ pub enum Error {
     InvalidArgument {
         /// The request field: `by`, `evidence`, `at`, `window`, `valid`,
         /// `known`, `keys`, `key_columns`, `cluster_by`, `shape`, `workload`,
-        /// `rewrite`.
+        /// `rewrite`, `lookback`, `latest_by`.
         field: &'static str,
         /// What is wrong with it, and what a usable value looks like.
         reason: String,

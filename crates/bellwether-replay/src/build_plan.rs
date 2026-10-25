@@ -138,6 +138,14 @@ where
         Planner::plan(self, specs, &lookup(keys, &query))
     }
 
+    fn lookback_column(&self, specs: &[KeySpec], run_columns: &[String]) -> Result<Option<String>> {
+        Planner::lookback_column(self, specs, run_columns)
+    }
+
+    fn window_column(&self, specs: &[KeySpec], run_columns: &[String]) -> Result<Option<String>> {
+        Planner::window_column(self, specs, run_columns)
+    }
+
     fn with_transient(
         &self,
         transient: &[Arc<TransientIndex>],
@@ -179,6 +187,14 @@ where
         let query = planned_query(self.planner.schema(), specs, keys.columns(), query)?;
         self.planner
             .plan_with_transient(specs, &lookup(keys, &query), &self.extra)
+    }
+
+    fn lookback_column(&self, specs: &[KeySpec], run_columns: &[String]) -> Result<Option<String>> {
+        self.planner.lookback_column(specs, run_columns)
+    }
+
+    fn window_column(&self, specs: &[KeySpec], run_columns: &[String]) -> Result<Option<String>> {
+        self.planner.window_column(specs, run_columns)
     }
 
     fn with_transient(

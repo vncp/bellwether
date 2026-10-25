@@ -7,6 +7,7 @@
     missing_docs,
     clippy::cast_possible_wrap,
     clippy::cast_sign_loss,
+    clippy::cast_possible_truncation,
     clippy::similar_names,
     clippy::too_many_lines,
     clippy::many_single_char_names
@@ -355,4 +356,154 @@ fn an_incomplete_sidecar_is_not_used_and_unknown_kinds_are_kept_and_ignored() {
     let plan = p.plan(&specs, &l).unwrap();
     let got = apply_residual(plan.residual.as_ref().unwrap(), planned_rows(&plan, &all));
     assert_eq!(got.len(), 2);
+}
+
+/// splitmix64, so each seed's corpus is the same on every run.
+struct Rng(u64);
+
+impl Rng {
+    fn below(&mut self, n: u64) -> u64 {
+        self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = self.0;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        (z ^ (z >> 31)) % n
+    }
+}
+
+const SYMS: [&str; 5] = ["A", "B", "C", "D", "OLD"];
+const US: i64 = 1_000_000;
+
+/// Three files of three row groups of ten rows, each row group holding
+/// two symbols, so keys share row groups; `OLD`'s prints stop at 15 s,
+/// every other symbol's run to 60 s, so keys sharing a row group have
+/// different newest times. One print in twelve has no time.
+fn shared_corpus(s: &Scratch, seed: u64) {
+    let mut rng = Rng(seed);
+    for f in 0..3 {
+        let mut rows: Vec<Print> = Vec::new();
+        for _ in 0..3 {
+            let a = SYMS[rng.below(5) as usize];
+            let b = SYMS[rng.below(5) as usize];
+            for _ in 0..10 {
+                let sym = if rng.below(2) == 0 { a } else { b };
+                let ts = if rng.below(12) == 0 {
+                    None
+                } else if sym == "OLD" {
+                    Some(rng.below(16) as i64 * US)
+                } else {
+                    Some(rng.below(61) as i64 * US)
+                };
+                rows.push((Some(sym), ts));
+            }
+        }
+        write(s, &format!("part-{f}.parquet"), &rows, 10);
+    }
+}
+
+/// Through per-key bounds alone, a `latest` lookback plans exactly the row
+/// groups holding a version of a key no older than that key's own newest
+/// time minus the lookback: a row group's per-key maximum is at most the
+/// key's newest time, so its range reaches the window exactly when its
+/// newest print is in it. Keys share row groups and have different newest
+/// times, so taking a key's newest time from anything but its own maxima
+/// (the row group's maximum across the looked-up keys, as a footer
+/// statistic would give) loses row groups; the check below proves this
+/// corpus can tell.
+#[test]
+fn a_bounds_lookback_plans_exactly_each_key_s_own_window() {
+    const KEY_SETS: [&[&str]; 6] = [
+        &["A"],
+        &["OLD"],
+        &["A", "OLD"],
+        &["B", "C", "ZZZ"],
+        &["A", "B", "C", "D", "OLD"],
+        &["D"],
+    ];
+    let mut sensitive = 0;
+    let mut pruned = 0;
+    for seed in 1..=6 {
+        let s = Scratch::new();
+        shared_corpus(&s, seed);
+        let mut all = Vec::new();
+        for f in 0..3 {
+            all.extend(parquet_rows(
+                &s.path(&format!("part-{f}.parquet")),
+                &schema(),
+            ));
+        }
+        let bounds = key_bounds(&all);
+        let store = memory_store();
+        let specs = [exact(&["symbol"])];
+        builder(&store)
+            .build(&s.root_str(), &specs, &opts(true))
+            .unwrap();
+        let p = planner(&store);
+        let live = holding(&all, |_| true);
+        for keys in KEY_SETS {
+            let encoded: Vec<Vec<u8>> = keys.iter().map(|k| enc_str(k)).collect();
+            let newest = |k: &Vec<u8>| {
+                bounds
+                    .iter()
+                    .filter(|((key, _, _), _)| key == k)
+                    .map(|(_, (_, hi))| *hi)
+                    .max()
+            };
+            // The newest time a footer-like maximum gives `k`: over its row
+            // groups, the greatest maximum of any looked-up key there.
+            let looked_up = &encoded;
+            let footer_newest = |k: &Vec<u8>| {
+                bounds
+                    .keys()
+                    .filter(|(key, _, _)| key == k)
+                    .flat_map(|(_, path, rg)| {
+                        bounds
+                            .iter()
+                            .filter(move |((key, p2, r2), _)| {
+                                looked_up.contains(key) && p2 == path && r2 == rg
+                            })
+                            .map(|(_, (_, hi))| *hi)
+                    })
+                    .max()
+            };
+            for secs in 0..=62 {
+                for d in [-1, 0, 1] {
+                    let n = secs * US + d;
+                    if n < 0 {
+                        continue;
+                    }
+                    let within = |hi: &dyn Fn(&Vec<u8>) -> Option<i64>| {
+                        holding(&all, |r| {
+                            let (Some(k), Some(t)) = (r.get("symbol"), ts_us(r)) else {
+                                return false;
+                            };
+                            encoded.contains(k)
+                                && hi(k).is_some_and(|h| h.saturating_sub(n) <= t && t <= h)
+                        })
+                    };
+                    let want = within(&newest);
+                    if within(&footer_newest) != want {
+                        sensitive += 1;
+                    }
+                    let plan = p
+                        .plan(
+                            &specs,
+                            &Lookup::Lookback {
+                                columns: cols(&["symbol"]),
+                                keys: encoded.clone(),
+                                lookback: n,
+                            },
+                        )
+                        .unwrap();
+                    assert_eq!(plan_rgs(&plan), want, "seed {seed} {keys:?} lookback {n}");
+                    pruned += live.len() - want.len();
+                }
+            }
+        }
+    }
+    assert!(pruned > 0, "the lookbacks pruned nothing");
+    assert!(
+        sensitive > 0,
+        "no case where a footer-like newest time would plan other row groups"
+    );
 }

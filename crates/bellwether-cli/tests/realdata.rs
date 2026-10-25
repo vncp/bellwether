@@ -1314,24 +1314,21 @@ fn request_3_why_mode_prices_latest_and_asof_lookback_windows() {
         &["--latest-by", "pickup_ts", "--lookback", "3x"],
         "--lookback 252d",
     );
-    // A length that is not a whole number of the column's unit is refused,
-    // never rounded: an integer column takes a bare integer.
-    let out = bw()
-        .args([
-            "why",
-            path(&data),
-            "--from",
-            path(&kf),
-            "--latest-by",
-            "pu",
-            "--lookback",
-            "1d",
-        ])
-        .output()
-        .unwrap();
-    assert_eq!(out.status.code(), Some(4));
-    let err = String::from_utf8(out.stderr).unwrap();
-    assert!(err.contains("is an integer column"), "{err}");
+    // A length that is not a whole number of the column's unit, or longer
+    // than it can measure, is a usage error with a lookback to pass, never
+    // rounded: an integer column takes a bare integer.
+    usage(
+        &["--latest-by", "pu", "--lookback", "1d"],
+        "for example --lookback 86400 if pu counts seconds",
+    );
+    usage(
+        &["--latest-by", "pickup_ts", "--lookback", "99999999w"],
+        "the longest lookback on it is 15250284w",
+    );
+    usage(
+        &["--latest-by", "pickup_ts", "--lookback", "1.5d"],
+        "is not a whole number",
+    );
 
     // Indexed, the build planner prices the current temporal key's window:
     // the same rows and bytes as the oracle.

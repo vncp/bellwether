@@ -22,12 +22,11 @@ use bellwether_types::{
 use serde::{Deserialize, Serialize};
 
 use crate::engine::{folder_changes, guard, schema_hint, Engine, Pinned, SnapshotFiles};
-use crate::index::{
-    bounds_time_columns, default_window_column, instant_in_unit, partition_columns,
-};
+use crate::index::{instant_in_unit, no_time_column};
 use crate::keys::KeyFile;
 use crate::lookback::Lookback;
 use crate::results::{total, Cost, LookbackWindow, LookupKind, Written};
+use crate::spec::label;
 
 /// Who the engine's own candidate proposals are by.
 pub const ENGINE_PROPOSER: &str = "engine";
@@ -823,14 +822,16 @@ impl Engine {
         let schema = replayer.schema();
         let ts_column = if let Some(c) = &req.ts_column {
             c.clone()
+        } else if let Some(p) = pinned {
+            p.planner
+                .window_column(&p.specs().0, columns)?
+                .ok_or_else(|| no_time_column(columns))?
         } else {
-            let (specs, bounded) = match pinned {
-                Some(p) => (p.specs().0, bounds_time_columns(p, columns)),
-                None => (Vec::new(), Vec::new()),
-            };
             let first = replayer.catalog().files().first().map(|f| f.path.as_str());
-            let partition = partition_columns(&self.partitioning(pinned)?, self.root(), first)?;
-            default_window_column(schema, &specs, bounded, partition, columns)?
+            let partition =
+                bellwether_build::partition_columns(&self.partitioning(None)?, self.root(), first)?;
+            bellwether_build::default_window_column(schema, &[], Vec::new(), partition, columns)?
+                .ok_or_else(|| no_time_column(columns))?
         };
         let ty = schema
             .field_with_name(&ts_column)
@@ -892,6 +893,7 @@ impl Engine {
                         t.ts_column
                     )));
                 }
+                check_planned_column(replayer, cols, t)?;
             }
         }
         let query_kind = temporal
@@ -913,8 +915,10 @@ impl Engine {
             null_tuples: workload.runs().iter().map(|r| r.null_tuples).sum(),
             windows,
         });
-        let current_names: BTreeSet<String> =
-            report.current_specs.iter().map(KeySpec::name).collect();
+        // Candidates are told apart by their full spec, time column included,
+        // so `temporal:symbol@day` is offered beside a current
+        // `temporal:symbol@ts`.
+        let current_names: BTreeSet<String> = report.current_specs.iter().map(label).collect();
         // How a measured key serves the workload: by point lookup on some
         // run, only by prefix of a run's columns, or not at all. A key that
         // serves only by prefix is a composite led by a run's whole key, so
@@ -935,14 +939,14 @@ impl Engine {
                     columns: c.clone(),
                     ts_column: t.ts_column.clone(),
                 };
-                if !current_names.contains(&spec.name()) && names.insert(spec.name()) {
+                if !current_names.contains(&label(&spec)) && names.insert(label(&spec)) {
                     chosen.push((spec, CandidateOrigin::Workload));
                 }
             }
         }
         for c in &run_columns {
             let spec = KeySpec::Exact { columns: c.clone() };
-            if !current_names.contains(&spec.name()) && names.insert(spec.name()) {
+            if !current_names.contains(&label(&spec)) && names.insert(label(&spec)) {
                 chosen.push((spec, CandidateOrigin::Workload));
             }
         }
@@ -966,7 +970,7 @@ impl Engine {
                 continue;
             }
             let spec = KeySpec::Temporal { columns, ts_column };
-            if !current_names.contains(&spec.name()) && names.insert(spec.name()) {
+            if !current_names.contains(&label(&spec)) && names.insert(label(&spec)) {
                 chosen.push((spec, CandidateOrigin::Window));
             }
         }
@@ -977,8 +981,8 @@ impl Engine {
                 columns: cols.clone(),
             };
             if !serves(&exact_spec) {
-                if !current_names.contains(&exact_spec.name())
-                    && !names.contains(&exact_spec.name())
+                if !current_names.contains(&label(&exact_spec))
+                    && !names.contains(&label(&exact_spec))
                 {
                     report.not_serving.push(exact_spec);
                 }
@@ -993,21 +997,21 @@ impl Engine {
                         columns: cols.clone(),
                         ts_column: t.ts_column.clone(),
                     };
-                    if !current_names.contains(&tspec.name())
-                        && !names.contains(&tspec.name())
+                    if !current_names.contains(&label(&tspec))
+                        && !names.contains(&label(&tspec))
                         && from_profile < req.max_candidates
                     {
-                        names.insert(tspec.name());
+                        names.insert(label(&tspec));
                         chosen.push((tspec, CandidateOrigin::Profile));
                         from_profile += 1;
                     }
                 }
             }
-            if !current_names.contains(&exact_spec.name())
-                && !names.contains(&exact_spec.name())
+            if !current_names.contains(&label(&exact_spec))
+                && !names.contains(&label(&exact_spec))
                 && from_profile < req.max_candidates
             {
-                names.insert(exact_spec.name());
+                names.insert(label(&exact_spec));
                 chosen.push((exact_spec, CandidateOrigin::Profile));
                 from_profile += 1;
             }
@@ -1264,6 +1268,47 @@ struct ResolvedTemporal {
     query: RunQuery,
     lookup: LookupKind,
     lookback: Option<LookbackWindow>,
+}
+
+/// Refuses `--latest-by` when the current configuration plans `t`'s lookups
+/// on runs keyed on `cols` by another time column (a serving temporal key's,
+/// or for a lookback the per-key bounds' or window's): `at` and the lookback
+/// are measured in `--latest-by`'s unit, so the prices would not be what the
+/// lookup verb reads. The typed invalid argument `latest_by`, naming both
+/// columns and the flag to pass.
+fn check_planned_column(
+    replayer: &Replayer<'_>,
+    cols: &[String],
+    t: &ResolvedTemporal,
+) -> Result<()> {
+    let current = replayer.current_specs();
+    let Some(planned) = replayer
+        .planned_time_column(current, cols, &t.query)?
+        .filter(|c| *c != t.ts_column)
+    else {
+        return Ok(());
+    };
+    let temporal = current.iter().find(|s| {
+        matches!(s, KeySpec::Temporal { ts_column, .. } if *ts_column == planned)
+            && matches!(servable(s, cols), Some(Lookup::Point { .. }))
+    });
+    let source = match (temporal, &t.query) {
+        (Some(s), _) => format!("its temporal key {}", label(s)),
+        (None, RunQuery::Lookback { asof: None, .. }) => "its per-key bounds".to_string(),
+        (None, _) => "the time column a window on these keys takes".to_string(),
+    };
+    let verb = t.query.kind_str();
+    Err(Error::InvalidArgument {
+        field: "latest_by",
+        reason: format!(
+            "the index plans {verb} lookups on ({}) by {planned} ({source}), not by {}, so \
+             prices measured on {} would not be what `bellwether {verb}` reads; pass \
+             --latest-by {planned}",
+            cols.join(", "),
+            t.ts_column,
+            t.ts_column
+        ),
+    })
 }
 
 /// Validates `req.latest_by` (with `req.at` and `req.lookback`) against the

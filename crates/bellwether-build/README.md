@@ -129,10 +129,9 @@ Either probe silently misses. **Callers must encode probes with the typed encode
 | `Keys` | `In` over the lookup columns |
 | `Latest` | `And[In, NotOlderThan, LatestPerKey]` |
 | `AsOf` | `And[In, Between(ts ≤ asof), NotOlderThan, LatestPerKey]` |
-| `Window` with `asof` | `And[In, Between(asof − lookback ≤ ts ≤ asof)]` |
-| `Window` without | `And[In, NotOlderThan(newest − lookback per key)]` |
+| `Lookback` | `And[In, NotOlderThan(newest − lookback per key)]` |
 | `Between` | `Between` |
-| `Window` | `And[In, Between(ts in window)]` |
+| `Window` (also an `asof` lookback, the window `[asof − lookback, asof]`) | `And[In, Between(ts in window)]` |
 | `Bitemporal` | `And[In, Between(valid), Between(known), NotOlderThan(valid), NotOlderThan(known), LatestPerKey(valid)]` |
 
 Details:

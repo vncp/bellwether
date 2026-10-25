@@ -6,8 +6,7 @@ use std::sync::Arc;
 use arrow::datatypes::{DataType, TimeUnit};
 use bellwether_build::{BuildOptions, Builder, Lookup, PlanOrder};
 use bellwether_core::encoding;
-use bellwether_core::sidecar::{SidecarDef, SidecarKind};
-use bellwether_source::Partitioning;
+use bellwether_core::sidecar::SidecarDef;
 use bellwether_store::parse_rfc3339;
 use bellwether_types::{
     format, Error, Evidence, EvidenceBody, KeySpec, Predicate, Provenance, Record, Result, ScanPlan,
@@ -555,120 +554,19 @@ fn window_lookup(
 }
 
 /// The time column of a window lookup on `columns` when none is named
-/// ([`default_window_column`] over the pinned index).
+/// (`bellwether_build::default_window_column` over the pinned index), or
+/// [`no_time_column`].
 fn window_column(pinned: &Pinned, specs: &[KeySpec], columns: &[String]) -> Result<String> {
-    let m = pinned.manifest();
-    let scheme = Partitioning::parse(m.source.partitioning.as_deref())?;
-    let first = m
-        .rowgroup_space
-        .files
-        .first()
-        .map(|f| f.fingerprint.path.as_str());
-    let partition = partition_columns(&scheme, &m.source.root, first)?;
-    default_window_column(
-        pinned.planner.schema(),
-        specs,
-        bounds_time_columns(pinned, columns),
-        partition,
-        columns,
-    )
-}
-
-/// The time columns of the complete per-key bounds sidecars on `columns`.
-pub(crate) fn bounds_time_columns(pinned: &Pinned, columns: &[String]) -> Vec<String> {
     pinned
         .planner
-        .declared_sidecars()
-        .into_iter()
-        .filter(|d| {
-            d.kind == SidecarKind::Bounds
-                && d.columns.iter().all(|c| columns.contains(c))
-                && pinned.planner.sidecar_completeness(d).is_some()
-        })
-        .map(|d| d.time_columns[0].clone())
-        .collect()
+        .window_column(specs, columns)?
+        .ok_or_else(|| no_time_column(columns))
 }
 
-/// The partition columns `scheme` gives the files under `root`: a
-/// template's placeholders, or the `name=value` directories of `first`, one
-/// file's path (every file has the same ones).
-pub(crate) fn partition_columns(
-    scheme: &Partitioning,
-    root: &str,
-    first: Option<&str>,
-) -> Result<Vec<String>> {
-    Ok(match (scheme, first) {
-        (Partitioning::Template(t), _) => t.names().map(str::to_string).collect(),
-        (Partitioning::Hive, Some(path)) => scheme
-            .values(root, path)?
-            .into_iter()
-            .map(|v| v.name)
-            .collect(),
-        _ => Vec::new(),
-    })
-}
-
-/// The time column of a window on `columns` when none is named: the one
-/// time column of the complete per-key bounds sidecars on those columns
-/// (`bounded`), else of the range specs on a timestamp or date column,
-/// else of the temporal specs on those columns, else of the partition
-/// columns (hive directories or path-template placeholders) of a timestamp
-/// or date type. Several at the first level that has any is an error asking
-/// for `--ts`.
-pub(crate) fn default_window_column(
-    schema: &arrow::datatypes::Schema,
-    specs: &[KeySpec],
-    bounded: Vec<String>,
-    partition: Vec<String>,
-    columns: &[String],
-) -> Result<String> {
-    let is_time = |c: &String| {
-        schema.field_with_name(c).is_ok_and(|f| {
-            matches!(
-                f.data_type(),
-                DataType::Timestamp(..) | DataType::Date32 | DataType::Date64
-            )
-        })
-    };
-    let ranged: Vec<String> = specs
-        .iter()
-        .filter_map(|s| match s {
-            KeySpec::Range { column } => Some(column.clone()),
-            _ => None,
-        })
-        .collect();
-    let temporal: Vec<String> = specs
-        .iter()
-        .filter_map(|s| match s {
-            KeySpec::Temporal {
-                columns: c,
-                ts_column,
-            } if c.iter().all(|x| columns.contains(x)) => Some(ts_column.clone()),
-            _ => None,
-        })
-        .collect();
-    let levels = [
-        ("per-key bounds", bounded),
-        ("range keys", ranged),
-        ("temporal keys", temporal),
-        ("partition columns", partition),
-    ];
-    for (what, found) in levels {
-        let mut found: Vec<String> = found.into_iter().filter(|c| is_time(c)).collect();
-        found.sort();
-        found.dedup();
-        match found.as_slice() {
-            [] => {}
-            [one] => return Ok(one.clone()),
-            many => {
-                return Err(Error::KeySpec(format!(
-                    "{what} exist on several time columns ({}); name one with --ts",
-                    many.join(", ")
-                )))
-            }
-        }
-    }
-    Err(Error::KeySpec(format!(
+/// The refusal of a window lookup on `columns` with no time column named
+/// and none to take: it lists what gives one.
+pub(crate) fn no_time_column(columns: &[String]) -> Error {
+    Error::KeySpec(format!(
         "a window lookup on ({}) needs a time column: declare per-key bounds with `--key \
          exact:{}@<ts>`, a range key `--key range:<ts>`, or a temporal key `--key \
          temporal:{}@<ts>`, take the time from file paths (--partitioning hive or \
@@ -676,7 +574,7 @@ pub(crate) fn default_window_column(
         columns.join(", "),
         columns.join(","),
         columns.join(",")
-    )))
+    ))
 }
 
 /// The lookback lookup on `columns` (see [`Engine::asof_lookback`] and
