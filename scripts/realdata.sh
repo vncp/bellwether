@@ -54,24 +54,10 @@ fi
 BW=$BELLWETHER
 
 # ---- downloads (verified against Content-Length) ----------------------------
-size() { if [ -f "$1" ]; then wc -c <"$1" | tr -d ' '; else echo 0; fi; }
-fetch() { # fetch URL DEST
-  local want have
-  want=$(curl -sSfI "$1" | tr -d '\r' | awk 'tolower($1)=="content-length:" {print $2}' | tail -1)
-  have=$(size "$2")
-  [ -n "$want" ] && [ "$have" = "$want" ] && return 0
-  curl -sSfL --retry 3 -o "$2.part" "$1" || { echo "download failed: $1" >&2; exit 1; }
-  have=$(size "$2.part")
-  [ "$have" = "$want" ] || { echo "truncated: $1 ($have of $want bytes)" >&2; exit 1; }
-  mv "$2.part" "$2"
-}
-for m in $TAXI_MONTHS; do
-  fetch "https://d37ci6vzurychx.cloudfront.net/trip-data/yellow_tripdata_2024-$m.parquet" \
-    "$DL/taxi/yellow_tripdata_2024-$m.parquet"
-done
-for h in $GH_HOURS; do
-  fetch "https://data.gharchive.org/2024-01-01-$h.json.gz" "$DL/gh/2024-01-01-$h.json.gz"
-done
+# shellcheck source=datasets.sh
+. "$REPO/scripts/datasets.sh"
+bw_fetch_taxi "$DL" "$TAXI_MONTHS"
+bw_fetch_gh "$DL" "$GH_HOURS"
 
 # ---- datasets ----------------------------------------------------------------
 cd "$W" || exit 1
@@ -79,14 +65,7 @@ rm -rf taxi taxi_duck taxi_duck_mut taxi_dec taxi_dec_duck gh ghfix1000 ghfix10 
 mkdir -p taxi taxi_duck taxi_duck_mut taxi_dec taxi_dec_duck gh ghjson ghnested keys
 cp "$DL"/taxi/*.parquet taxi/
 
-# GH Archive is nested JSON (repo.id, actor.id). Flattened by DuckDB to one
-# Parquet file per hour, DuckDB's default writer settings, timestamps in UTC.
-for h in $GH_HOURS; do
-  f=$(printf '%02d' "$h")
-  duckdb -no-agent -c "SET TimeZone='UTC'; COPY (SELECT repo.id AS repo_id, actor.id AS actor_id, type, created_at
-    FROM read_json('$DL/gh/2024-01-01-$h.json.gz', format='newline_delimited', maximum_object_size=100000000))
-    TO 'gh/2024-01-01-$f.parquet' (FORMAT PARQUET)" >/dev/null
-done
+bw_flatten_gh "$DL" gh "$GH_HOURS"
 cp -r gh ghfix1000
 cp -r gh ghfix10
 # Probes of the raw nested data: hour 0 as JSON lines (named .json, then

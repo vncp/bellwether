@@ -171,7 +171,7 @@ class Svg:
         a = f' text-anchor="{anchor}"' if anchor else ""
         wt = f' font-weight="{weight}"' if weight else ""
         self.parts.append(
-            f'<text x="{f1(x)}" y="{f1(y)}" fill="{self.t[color]}" font-size="{size}"{a}{wt}>{esc(s)}</text>'
+            f'<text x="{f1(x)}" y="{f1(y)}" fill="{self.t[color]}" font-size="{size}"{a}{wt}>{esc(s.replace("`", ""))}</text>'
         )
 
     def rich(self, x, y, strong, rest, size=13):
@@ -242,10 +242,11 @@ def hbar_chart(theme, title, takeaway, subtitle, groups, series, fmt, log=True, 
     t = THEMES[theme]
     label_right, x0, x1 = 430, 442, width - 220
     bar_h, gap, group_gap, header_h = 11, 3, 16, 26
-    take = wrap(takeaway, 128)
+    take = wrap(takeaway, 138)
+    subs = wrap(subtitle, 176)
     y = 34
-    body = []
-    head_h = 34 + 22 * len(take) + 20 + 30
+    legend_y = 34 + 24 + 22 * len(take) + 16 * len(subs) + 8
+    head_h = legend_y + 26
     gh = len(series) * bar_h + (len(series) - 1) * gap
     group_h = max(gh, 30) + group_gap
     n_headers = sum(1 for g in groups if g.get("header"))
@@ -255,11 +256,10 @@ def hbar_chart(theme, title, takeaway, subtitle, groups, series, fmt, log=True, 
     s.text(24, y, title, size=18, weight="600")
     for i, line in enumerate(take):
         s.text(24, y + 24 + 22 * i, line, size=15)
-    y = y + 24 + 22 * len(take)
-    s.text(24, y, subtitle, size=12, color="muted")
-    # legend
-    lx = 24
-    ly = y + 22
+    y = y + 24 + 22 * len(take) - 4
+    for i, line in enumerate(subs):
+        s.text(24, y + 16 * i, line, size=12, color="muted")
+    lx, ly = 24, legend_y
     for name, color in series:
         s.rect(lx, ly - 10, 12, 12, color, rx=2)
         s.text(lx + 18, ly, name, size=13)
@@ -327,14 +327,14 @@ def bytes_chart(res, theme):
             (res.v(q, "duckdb-on-plan", "bytes"), f"{rg('duckdb-on-plan')} row groups"),
         ]
 
-    bars.sub = lambda q: f"{commas(res.v(q, 'duckdb', 'rows_returned'))} {res.queries[q].get('noun', 'rows')} returned"
+    bars.sub = lambda q: f"{returned(res, q)} returned"
     best = max(qids, key=lambda q: res.v(q, "duckdb", "bytes") / max(res.v(q, "duckdb-on-plan", "bytes"), 1))
     m = res.queries[best]
     take = (
-        f"Finding {commas(res.v(best, 'duckdb', 'rows_returned'))} {m.get('noun', 'rows')} ({m['text']}) read "
-        f"{human_bytes(res.v(best, 'duckdb-on-plan', 'bytes'))} with Bellwether's plan instead of "
-        f"{human_bytes(res.v(best, 'duckdb', 'bytes'))} with DuckDB alone; {same_count(res, qids)} of {len(qids)} "
-        "questions read the same either way, because DuckDB's own statistics already prune or the keys sit in every row group."
+        f"For {m['text']} ({returned(res, best)}), DuckDB read {human_bytes(res.v(best, 'duckdb-on-plan', 'bytes'))} "
+        f"following Bellwether's plan instead of {human_bytes(res.v(best, 'duckdb', 'bytes'))} on its own; "
+        f"{same_count(res, qids)} of {len(qids)} questions read about the same either way, because DuckDB's own "
+        "statistics already prune or the keys sit in nearly every row group."
     )
     sub = (
         "Bytes and row groups read per question. Full scan: footer sums. DuckDB and Bellwether: DuckDB's profiler; "
@@ -349,6 +349,14 @@ def bytes_chart(res, theme):
         [("full scan", "full"), ("DuckDB alone", "duckdb"), ("DuckDB on Bellwether's plan", "bw")],
         human_bytes,
     )
+
+
+def returned(res, q):
+    n = res.v(q, "duckdb", "rows_returned")
+    noun = res.queries[q].get("noun", "rows")
+    if n == 1 and noun.endswith("s"):
+        noun = noun[:-1]
+    return f"{commas(n)} {noun}"
 
 
 def same_count(res, qids):
@@ -404,7 +412,9 @@ def latency_chart(res, theme):
         plan, onp = res.v(q, "bellwether-plan", "wall_ms"), res.v(q, "duckdb-on-plan", "wall_ms")
         return [
             (res.v(q, "duckdb", "wall_ms"), ""),
-            (res.v(q, "bellwether+duckdb", "wall_ms"), f"plan {human_ms(plan)} + query {human_ms(onp)}"),
+            (res.v(q, "bellwether+duckdb", "wall_ms"),
+             f"plan {human_ms(plan)} + query {human_ms(onp)}" if res.v(q, "bellwether", "fix") != "refused: nothing_to_gain"
+             else "no plan: fix refused, every row group read"),
         ]
 
     faster = [q for q in qids if res.v(q, "bellwether+duckdb", "wall_ms") < res.v(q, "duckdb", "wall_ms")]
@@ -473,6 +483,12 @@ def reconcile_chart(res, theme):
     )
 
 
+CHART_IDS = {
+    "results-bytes": lookups,
+    "results-replay": replay_ids,
+    "results-latency": lookups,
+    "results-reconcile": lambda res: res.ids({"reconcile"}),
+}
 SHOWCASE_CHARTS = {
     "results-bytes": bytes_chart,
     "results-replay": replay_chart,
@@ -591,6 +607,8 @@ def why_text(res, q):
         return f"no key can help: the keys sit in every row group (`fix` refused, {outcome.split(': ', 1)[-1]})"
     if fixed_rg == full_rg:
         return "no key can help: the keys sit in every row group"
+    if fixed_rg >= 0.9 * full_rg:
+        return f"no key can help much: the keys sit in {fixed_rg} of {full_rg} row groups"
     if plan_rg >= duck_rg:
         return f"DuckDB's min/max statistics already prune as well as `{key}`"
     if duck_rg == full_rg:
@@ -601,13 +619,21 @@ def why_text(res, q):
 def readme_block(res):
     qids = lookups(res)
     planted = [q for q in res.ids({"reconcile"}) if res.queries[q].get("planted")]
+    datasets = []
+    for q in qids:
+        if res.queries[q]["dataset"] not in datasets:
+            datasets.append(res.queries[q]["dataset"])
+    synthetic = sum(1 for d in datasets if "synthetic" in res.dataset_name(d).lower())
+    same = all(res.v(q, "duckdb-on-plan", "same_answer") is True for q in qids)
     parts = [
         "<!-- Generated by scripts/render_charts.py from docs/measured/results/showcase.json; do not edit by hand. -->",
         "",
-        f"{len(qids)} questions people ask of four datasets (three public, one synthetic), each answered three ways on the same files: "
-        "a full scan, DuckDB alone (its own min/max pruning), and DuckDB reading only the row groups Bellwether planned after "
-        "`bellwether why` recommended a key and `bellwether fix` verified, applied, and attested it. Both DuckDB answers are "
-        "fingerprinted and must match; they did on every question. `rg` is row groups.",
+        f"{len(qids)} questions people ask of {len(datasets)} datasets ({len(datasets) - synthetic} public, {synthetic} synthetic), "
+        "each answered three ways on the same files: a full scan, DuckDB alone (its own min/max pruning), and DuckDB reading only "
+        "the row groups Bellwether planned after `bellwether why` recommended a key and `bellwether fix` verified, applied, and "
+        "attested it. Both DuckDB answers are fingerprinted and must match"
+        + ("; they did on every question." if same else "; see the measured page for the questions where they did not.")
+        + " `rg` is row groups.",
         "",
         headline(res),
         "",
@@ -643,7 +669,7 @@ def detail_block(res):
         rows.append(
             f"| `{q}`: {res.queries[q]['text']} | {cell('full-scan')} | {cell('duckdb')} | {cell('bellwether-unindexed')} | "
             f"{cell('bellwether-fixed')} | {cell('duckdb-on-plan')} | "
-            f"{'yes, ' + commas(res.v(q, 'duckdb', 'rows_returned')) + ' rows' if res.v(q, 'duckdb-on-plan', 'same_answer') else 'NO'} |"
+            f"{'yes, ' + returned(res, q) if res.v(q, 'duckdb-on-plan', 'same_answer') else 'NO'} |"
         )
     rows += ["", "Bytes (row groups). Full scan and Bellwether columns are exact footer sums; DuckDB columns are its profiler's "
              "`total_bytes_read` and `total_row_groups_scanned`, which include footer reads.", "",
@@ -664,7 +690,11 @@ def detail_block(res):
              "| Question | DuckDB alone | `why` | `fix` | Lookup plan | DuckDB on the plan | Plan + DuckDB on the plan |",
              "|---|---:|---:|---:|---:|---:|---:|"]
     for q in qids:
-        ms = lambda side: human_ms(res.v(q, side, "wall_ms")) if res.v(q, side, "wall_ms") is not None else "–"
+        refused = (res.v(q, "bellwether", "fix") or "").startswith("refused")
+        ms = lambda side: (
+            "– (no index)" if side == "bellwether-plan" and refused
+            else human_ms(res.v(q, side, "wall_ms")) if res.v(q, side, "wall_ms") is not None else "–"
+        )
         rows.append(
             f"| `{q}` | {ms('duckdb')} | {ms('bellwether-why')} | {ms('bellwether-fix')} | {ms('bellwether-plan')} | "
             f"{ms('duckdb-on-plan')} | {ms('bellwether+duckdb')} |"
@@ -709,6 +739,8 @@ def outputs():
         res = Results(doc)
         if source == "showcase":
             for name, fn in SHOWCASE_CHARTS.items():
+                if not CHART_IDS[name](res):
+                    continue
                 for theme in THEMES:
                     files[os.path.join(ASSETS, f"{name}-{theme}.svg")] = fn(res, theme)
             blocks["showcase-headline"] = readme_block(res)
