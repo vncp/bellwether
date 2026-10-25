@@ -295,16 +295,21 @@ def hbar_chart(theme, title, takeaway, subtitle, groups, series, fmt, log=True, 
 
 
 # ---- the showcase charts ----------------------------------------------------------------
-def showcase_groups(res, qids, bars_fn):
+def showcase_groups(res, qids, bars_fn, by_dataset=True):
+    """One group per question: under dataset headings in the given order, or
+    (by_dataset=False) with the dataset named on the question's second line."""
     groups, last_ds = [], None
     for q in qids:
         meta = res.queries[q]
         ds = meta["dataset"]
+        sub = bars_fn.sub(q) if hasattr(bars_fn, "sub") else ""
+        if not by_dataset:
+            sub = f"{res.dataset_name(ds)} · {sub}" if sub else res.dataset_name(ds)
         groups.append(
             {
-                "header": res.dataset_name(ds) if ds != last_ds else None,
+                "header": res.dataset_name(ds) if by_dataset and ds != last_ds else None,
                 "label": meta["text"],
-                "sub": bars_fn.sub(q) if hasattr(bars_fn, "sub") else "",
+                "sub": sub,
                 "bars": bars_fn(q),
             }
         )
@@ -316,36 +321,57 @@ def lookups(res):
     return [q for q in res.ids() if res.queries[q].get("kind") != "reconcile"]
 
 
+def reduction(res, q):
+    """How many times fewer bytes DuckDB read on Bellwether's plan than alone."""
+    return res.v(q, "duckdb", "bytes") / max(res.v(q, "duckdb-on-plan", "bytes"), 1)
+
+
+def wins(res):
+    """Questions where the plan read at least 5% fewer bytes than DuckDB alone,
+    biggest reduction first."""
+    return sorted((q for q in lookups(res) if reduction(res, q) >= 1.05), key=lambda q: -reduction(res, q))
+
+
+def no_gain(res):
+    """The rest, in the order they were asked."""
+    w = set(wins(res))
+    return [q for q in lookups(res) if q not in w]
+
+
+def by_impact(res):
+    return wins(res) + no_gain(res)
+
+
 def bytes_chart(res, theme):
-    qids = lookups(res)
+    qids = wins(res)
 
     def bars(q):
         rg = lambda side: res.v(q, side, "row_groups")
         return [
             (res.v(q, "full-scan", "bytes"), f"{rg('full-scan')} row groups"),
             (res.v(q, "duckdb", "bytes"), f"{rg('duckdb')} row groups"),
-            (res.v(q, "duckdb-on-plan", "bytes"), f"{rg('duckdb-on-plan')} row groups"),
+            (res.v(q, "duckdb-on-plan", "bytes"), f"{rg('duckdb-on-plan')} row groups · {ratio(res.v(q, 'duckdb', 'bytes'), res.v(q, 'duckdb-on-plan', 'bytes'))} fewer"),
         ]
 
     bars.sub = lambda q: f"{returned(res, q)} returned"
-    best = max(qids, key=lambda q: res.v(q, "duckdb", "bytes") / max(res.v(q, "duckdb-on-plan", "bytes"), 1))
+    best = qids[0]
     m = res.queries[best]
     take = (
-        f"For {m['text']} ({returned(res, best)}), DuckDB read {human_bytes(res.v(best, 'duckdb-on-plan', 'bytes'))} "
-        f"following Bellwether's plan instead of {human_bytes(res.v(best, 'duckdb', 'bytes'))} on its own; "
-        f"{same_count(res, qids)} of {len(qids)} questions read about the same either way, because DuckDB's own "
-        "statistics already prune or the keys sit in nearly every row group."
+        f"For {m['text']} ({res.dataset_name(m['dataset'])}, {returned(res, best)}), DuckDB read "
+        f"{human_bytes(res.v(best, 'duckdb-on-plan', 'bytes'))} following Bellwether's plan instead of "
+        f"{human_bytes(res.v(best, 'duckdb', 'bytes'))} on its own; the plan read less on {len(qids)} of "
+        f"{len(lookups(res))} questions, shown here biggest reduction first."
     )
     sub = (
-        "Bytes and row groups read per question. Full scan: footer sums. DuckDB and Bellwether: DuckDB's profiler; "
-        "Bellwether = the same SQL on the plan's row groups. " + res.provenance_line(qids)
+        "Bytes and row groups read per question. Full scan: footer sums. DuckDB alone and on the plan: DuckDB's profiler, "
+        "the same SQL, the plan's row groups selected by row number. " + res.provenance_line(qids)
     )
     return hbar_chart(
         theme,
         "Bytes read to answer each question",
         take,
         sub,
-        showcase_groups(res, qids, bars),
+        showcase_groups(res, qids, bars, by_dataset=False),
         [("full scan", "full"), ("DuckDB alone", "duckdb"), ("DuckDB on Bellwether's plan", "bw")],
         human_bytes,
     )
@@ -369,8 +395,9 @@ def same_count(res, qids):
 
 
 def replay_ids(res):
-    """Questions whose key `fix` applied: a prediction and a realized plan."""
-    return [q for q in lookups(res) if res.v(q, "bellwether", "fix") == "applied"]
+    """Questions whose key `fix` applied (a prediction and a realized plan),
+    biggest reduction first."""
+    return [q for q in by_impact(res) if res.v(q, "bellwether", "fix") == "applied"]
 
 
 def replay_chart(res, theme):
@@ -399,14 +426,25 @@ def replay_chart(res, theme):
         "Predicted by replay vs planned after fix",
         take,
         sub,
-        showcase_groups(res, qids, bars),
+        showcase_groups(res, qids, bars, by_dataset=False),
         [("predicted before the index", "pred"), ("planned after fix", "bw")],
         human_bytes,
     )
 
 
-def latency_chart(res, theme):
+def latency_takeaway(res):
     qids = lookups(res)
+    faster = [q for q in qids if res.v(q, "bellwether+duckdb", "wall_ms") < res.v(q, "duckdb", "wall_ms")]
+    best = max(qids, key=lambda q: res.v(q, "duckdb", "wall_ms") / res.v(q, "bellwether+duckdb", "wall_ms"))
+    return (
+        f"Planning first and then reading only the planned row groups was faster than DuckDB alone on {len(faster)} of "
+        f"{len(qids)} questions (best: {res.queries[best]['text']}, {human_ms(res.v(best, 'bellwether+duckdb', 'wall_ms'))} "
+        f"instead of {human_ms(res.v(best, 'duckdb', 'wall_ms'))}); on small or already-pruned questions the planning step costs more than it saves."
+    )
+
+
+def latency_chart(res, theme):
+    qids = by_impact(res)
 
     def bars(q):
         plan, onp = res.v(q, "bellwether-plan", "wall_ms"), res.v(q, "duckdb-on-plan", "wall_ms")
@@ -417,13 +455,7 @@ def latency_chart(res, theme):
              else "no plan: fix refused, every row group read"),
         ]
 
-    faster = [q for q in qids if res.v(q, "bellwether+duckdb", "wall_ms") < res.v(q, "duckdb", "wall_ms")]
-    best = max(qids, key=lambda q: res.v(q, "duckdb", "wall_ms") / res.v(q, "bellwether+duckdb", "wall_ms"))
-    take = (
-        f"Planning first and then reading only the planned row groups was faster than DuckDB alone on {len(faster)} of "
-        f"{len(qids)} questions (best: {res.queries[best]['text']}, {human_ms(res.v(best, 'bellwether+duckdb', 'wall_ms'))} "
-        f"instead of {human_ms(res.v(best, 'duckdb', 'wall_ms'))}); on small or already-pruned questions the planning step costs more than it saves."
-    )
+    take = latency_takeaway(res)
     sub = (
         "Median of 3 warm runs. DuckDB: the profiler's query time. Bellwether: the lookup verb's wall time (whole process) "
         "plus DuckDB's query time on the plan. " + res.provenance_line(qids)
@@ -433,9 +465,26 @@ def latency_chart(res, theme):
         "Time to answer each question",
         take,
         sub,
-        showcase_groups(res, qids, bars),
+        showcase_groups(res, qids, bars, by_dataset=False),
         [("DuckDB alone", "duckdb"), ("Bellwether plan + DuckDB on the plan", "bw")],
         human_ms,
+    )
+
+
+def reconcile_takeaway(res):
+    qids = res.ids({"reconcile"})
+    planted = [q for q in qids if res.queries[q].get("planted")]
+    found = [q for q in planted if res.v(q, "bellwether", "differing_keys") == 1]
+    big = max(qids, key=lambda q: res.v(q, "bellwether", "rows_compared"))
+    bwr, dkr = res.v(big, "bellwether", "rows_per_s"), res.v(big, "duckdb", "rows_per_s")
+    cmp = (
+        f"DuckDB's EXCEPT ALL is {dkr / bwr:.1f}× faster on the same files and writes no certificate"
+        if dkr > bwr
+        else f"{bwr / dkr:.1f}× DuckDB's EXCEPT ALL on the same files"
+    )
+    return (
+        f"Bellwether compared {commas(res.v(big, 'bellwether', 'rows_compared'))} rows at {human_rate(bwr)} "
+        f"and named the planted change in {len(found)} of {len(planted)} planted runs; {cmp}."
     )
 
 
@@ -454,19 +503,7 @@ def reconcile_chart(res, theme):
         ]
 
     bars.sub = lambda q: f"{commas(res.v(q, 'bellwether', 'rows_compared'))} rows, both sides"
-    planted = [q for q in qids if res.queries[q].get("planted")]
-    found = [q for q in planted if res.v(q, "bellwether", "differing_keys") == 1]
-    big = max(qids, key=lambda q: res.v(q, "bellwether", "rows_compared"))
-    bwr, dkr = res.v(big, "bellwether", "rows_per_s"), res.v(big, "duckdb", "rows_per_s")
-    cmp = (
-        f"DuckDB's EXCEPT ALL is {dkr / bwr:.1f}× faster on the same files and writes no certificate"
-        if dkr > bwr
-        else f"{bwr / dkr:.1f}× DuckDB's EXCEPT ALL on the same files"
-    )
-    take = (
-        f"Bellwether compared {commas(res.v(big, 'bellwether', 'rows_compared'))} rows at {human_rate(bwr)} "
-        f"and named the planted change in {len(found)} of {len(planted)} planted runs; {cmp}."
-    )
+    take = reconcile_takeaway(res)
     sub = (
         "Rows read from both sides per second, one cold-cache-free run each, default 256 MiB memory budget. "
         + res.provenance_line(qids)
@@ -484,7 +521,7 @@ def reconcile_chart(res, theme):
 
 
 CHART_IDS = {
-    "results-bytes": lookups,
+    "results-bytes": wins,
     "results-replay": replay_ids,
     "results-latency": lookups,
     "results-reconcile": lambda res: res.ids({"reconcile"}),
@@ -578,10 +615,9 @@ def picture(name, alt, width=1000, prefix=""):
     )
 
 
-def headline(res):
-    qids = lookups(res)
+def headline(res, qids, how="How", bold=True):
     out = [
-        "| Dataset | Question | Rows | Full scan | DuckDB alone | DuckDB on Bellwether's plan | Fewer bytes than DuckDB | Why |",
+        f"| Dataset | Question | Rows | DuckDB alone | DuckDB on Bellwether's plan | Fewer bytes | Full scan | {how} |",
         "|---|---|---:|---:|---:|---:|---:|---|",
     ]
     for q in qids:
@@ -590,8 +626,9 @@ def headline(res):
         frg, drg, prg = res.v(q, "full-scan", "row_groups"), res.v(q, "duckdb", "row_groups"), res.v(q, "duckdb-on-plan", "row_groups")
         out.append(
             f"| {res.dataset_name(m['dataset'])} | {m['text']} | {commas(res.v(q, 'duckdb', 'rows_returned'))} | "
-            f"{human_bytes(full)} ({frg} rg) | {human_bytes(duck)} ({drg} rg) | {human_bytes(plan)} ({prg} rg) | "
-            f"{ratio(duck, plan)} | {why_text(res, q)} |"
+            f"{human_bytes(duck)} ({drg} rg) | {'**' if bold else ''}{human_bytes(plan)} ({prg} rg){'**' if bold else ''} | "
+            f"{ratio(duck, plan)} | "
+            f"{human_bytes(full)} ({frg} rg) | {why_text(res, q)} |"
         )
     return "\n".join(out)
 
@@ -616,9 +653,41 @@ def why_text(res, q):
     return f"DuckDB prunes to {duck_rg}; `{key}` plans {fixed_rg} of {full_rg} row groups"
 
 
+def reconcile_table(res):
+    out = [
+        "| Run | Rows, both sides | `bellwether reconcile` | Found | Certificate | DuckDB `EXCEPT ALL`, both ways | Found |",
+        "|---|---:|---:|---|---|---:|---|",
+    ]
+    for q in res.ids({"reconcile"}):
+        k, r = res.v(q, "bellwether", "differing_keys"), res.v(q, "duckdb", "differing_rows")
+        out.append(
+            f"| {res.queries[q]['text']} | {commas(res.v(q, 'bellwether', 'rows_compared'))} | "
+            f"{human_ms(res.v(q, 'bellwether', 'wall_ms'))} | {k} differing key{'s' if k != 1 else ''}"
+            f"{', pass' if res.v(q, 'bellwether', 'pass') else ', fail'} | `{res.v(q, 'bellwether', 'certificate')[:12]}` | "
+            f"{human_ms(res.v(q, 'duckdb', 'wall_ms'))} | {r} differing row{'s' if r != 1 else ''} |"
+        )
+    return "\n".join(out)
+
+
+def no_gain_text(res, qids):
+    refused = [q for q in qids if (res.v(q, "bellwether", "fix") or "").startswith("refused")]
+    pruned = [q for q in qids if q not in refused and res.v(q, "duckdb", "row_groups") < res.v(q, "full-scan", "row_groups")]
+    text = (
+        "Bellwether measures this before anything is built: `why` prices every candidate key by exact replay over the "
+        "footers and recommends none when none reads less, and `fix` refuses to attest a key whose replay saves nothing "
+        f"(`nothing_to_gain`), as it did on {len(refused)} of these {len(qids)} questions."
+    )
+    if pruned:
+        text += (
+            " Where the data is already sorted by the key, DuckDB's own min/max statistics prune as well as any index, "
+            "and the table says so."
+        )
+    return text + " The cause is the layout (the keys sit in nearly every row group), not a missing index."
+
+
 def readme_block(res):
     qids = lookups(res)
-    planted = [q for q in res.ids({"reconcile"}) if res.queries[q].get("planted")]
+    top, rest = wins(res), no_gain(res)
     datasets = []
     for q in qids:
         if res.queries[q]["dataset"] not in datasets:
@@ -629,15 +698,15 @@ def readme_block(res):
         "<!-- Generated by scripts/render_charts.py from docs/measured/results/showcase.json; do not edit by hand. -->",
         "",
         f"{len(qids)} questions people ask of {len(datasets)} datasets ({len(datasets) - synthetic} public, {synthetic} synthetic), "
-        "each answered three ways on the same files: a full scan, DuckDB alone (its own min/max pruning), and DuckDB reading only "
-        "the row groups Bellwether planned after `bellwether why` recommended a key and `bellwether fix` verified, applied, and "
-        "attested it. Both DuckDB answers are fingerprinted and must match"
+        "each answered on the same files by DuckDB alone (with its own min/max pruning) and by DuckDB reading only the row "
+        "groups Bellwether planned after `bellwether why` recommended a key and `bellwether fix` verified, applied, and "
+        "attested it. Both answers are fingerprinted and must match"
         + ("; they did on every question." if same else "; see the measured page for the questions where they did not.")
-        + " `rg` is row groups.",
+        + f" Here are the {len(top)} where the plan read less, biggest reduction first (`rg` is row groups):",
         "",
-        headline(res),
+        headline(res, top),
         "",
-        f"<sub>{res.provenance_line(qids)} Bytes for full scan and plans are exact footer sums; DuckDB bytes are its profiler's "
+        f"<sub>{res.provenance_line(qids)} Full-scan and plan bytes are exact footer sums; DuckDB bytes are its profiler's "
         "`total_bytes_read`. Every number is a row of "
         "[`docs/measured/results/showcase.json`](docs/measured/results/showcase.json).</sub>",
         "",
@@ -645,17 +714,28 @@ def readme_block(res):
         "",
         picture("results-replay", "Bytes predicted by replay before the index existed, against bytes planned after fix", 1000),
         "",
-        picture("results-latency", "Time per question: DuckDB alone against Bellwether's plan plus DuckDB on the plan", 1000),
-        "",
     ]
-    if planted:
-        q = planted[0]
-        parts.append(
-            f"Reconcile found the planted change in every planted run "
-            f"({commas(res.v(q, 'bellwether', 'rows_compared'))} rows in {human_ms(res.v(q, 'bellwether', 'wall_ms'))} for "
-            f"{res.queries[q]['text']}); the throughput chart and every per-question number (predicted, realized, receipts, "
-            f"timings, the SQL) are on [the measured page]({MEASURED_PAGE})."
-        )
+    recs = res.ids({"reconcile"})
+    if recs:
+        parts += [
+            f"**Reconcile.** {reconcile_takeaway(res)}",
+            "",
+            reconcile_table(res),
+            "",
+        ]
+    parts += [
+        f"**Time.** {latency_takeaway(res)} Per-question times, the reconcile throughput chart, receipts, and the SQL: "
+        f"[the measured page]({MEASURED_PAGE}).",
+    ]
+    if rest:
+        parts += [
+            "",
+            "### When an index can't help, and how Bellwether tells you",
+            "",
+            no_gain_text(res, rest),
+            "",
+            headline(res, rest, how="Why not", bold=False),
+        ]
     return "\n".join(parts)
 
 
