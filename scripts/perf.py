@@ -172,8 +172,30 @@ class Perf:
         self.cache = Cache()
         self.metrics = []
         self.context = {}
+        self.sections = {}
         os.makedirs(a.out, exist_ok=True)
+        old = os.path.join(a.out, "perf.json")
+        if a.merge and os.path.exists(old):
+            # Keep what other sections measured; replace what this run measures.
+            doc = json.load(open(old))
+            mine = tuple(p for s in a.run_sections for p in SECTION_PREFIXES[s])
+            self.metrics = [m for m in doc["metrics"] if not m["id"].startswith(mine)]
+            self.context = {k: v for k, v in doc["context"].items() if not k.startswith(mine)}
+            self.sections = doc["environment"].get("sections", {})
         self.samples = open(os.path.join(a.out, "samples.jsonl"), "a")
+
+    def section(self, name, start):
+        """Records when a section ran, at which commit, and the machine's
+        load around it."""
+        load = round(os.getloadavg()[0], 2)
+        if start:
+            self.env = {**environment(self.a), "sections": self.sections}
+            self.sections[name] = {"started_at": self.env["started_at"], "commit": self.env["commit"],
+                                   "commit_dirty": self.env["commit_dirty"], "load_avg_1m_start": load}
+        else:
+            self.sections[name]["finished_at"] = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            self.sections[name]["load_avg_1m_end"] = load
+        self.env["sections"] = self.sections
 
     def sample(self, mid, values, **extra):
         self.samples.write(json.dumps({"id": mid, "values": values, **extra}) + "\n")
@@ -360,6 +382,16 @@ def charts(rows, start=None):
                          + (" (the CLI figure includes process start)." if ("replay-small", "why-no-workload", "bellwether-cli") in obs else ".")),
         })
     return out
+
+
+# What each section owns in perf.json (metric ids and context keys).
+SECTION_PREFIXES = {
+    "lookups": ("lookup/", "process/", "dataset/", "skipped"),
+    "build": ("build/",),
+    "reconcile": ("reconcile/",),
+    "latency": ("replay/", "observe/", "mcp/", "why/", "resident/"),
+    "profiles": ("profile/",),
+}
 
 
 # --------------------------------------------------------------- datasets
@@ -974,6 +1006,8 @@ def main():
     ap.add_argument("--sections", default="lookups,build,reconcile,latency,profiles")
     ap.add_argument("--ci", action="store_true",
                     help="small corpora only (replay-small, the quick corpus, market defaults); no profiles")
+    ap.add_argument("--merge", action="store_true",
+                    help="keep the other sections' results in an existing <out>/perf.json")
     ap.add_argument("--warm", type=int, default=20)
     ap.add_argument("--cold", type=int, default=5)
     ap.add_argument("--build-reps", type=int, default=3)
@@ -989,6 +1023,10 @@ def main():
     sections = set(a.sections.split(","))
     if a.ci:
         sections -= {"profiles"}
+    unknown = sections - set(SECTION_PREFIXES)
+    if unknown:
+        sys.exit(f"unknown sections {sorted(unknown)}; choose from {sorted(SECTION_PREFIXES)}")
+    a.run_sections = sorted(sections)
     p = Perf(a)
     say(f"machine: {p.env['machine']}\nbuild: {p.env['build']}, {p.env['rustc']}, commit "
         f"{p.env['commit']}{' (dirty)' if p.env['commit_dirty'] else ''}\ncold: {p.cache.label}")
@@ -1002,23 +1040,19 @@ def main():
                                                       "2000", "--entities", "640000", "--churn", "0.1"])
     ledger = None if a.ci else ledger_dataset(p, "ledger-small", ["--rung", "small"])
 
-    if "lookups" in sections:
-        section_lookups(p, [d for d in (mdef, mkt10, gh) if d])
-        p.write()
-    if "build" in sections:
-        section_build(p, [d for d in (replay_small if a.ci else ledger, mdef, mkt10) if d])
-        p.write()
-    if "reconcile" in sections:
-        section_reconcile(p, replay_small if a.ci else ledger)
-        p.write()
-    if "latency" in sections:
-        section_latency(p, replay_small, ledger)
-        p.write()
-    if "profiles" in sections:
-        section_profiles(p, mkt10, ledger)
-        p.write()
-    p.env["finished_at"] = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    p.write()
+    runs = [
+        ("lookups", lambda: section_lookups(p, [d for d in (mdef, mkt10, gh) if d])),
+        ("build", lambda: section_build(p, [d for d in (replay_small if a.ci else ledger, mdef, mkt10) if d])),
+        ("reconcile", lambda: section_reconcile(p, replay_small if a.ci else ledger)),
+        ("latency", lambda: section_latency(p, replay_small, ledger)),
+        ("profiles", lambda: section_profiles(p, mkt10, ledger)),
+    ]
+    for name, run in runs:
+        if name in sections:
+            p.section(name, start=True)
+            run()
+            p.section(name, start=False)
+            p.write()
 
 
 if __name__ == "__main__":
