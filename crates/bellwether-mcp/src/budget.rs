@@ -358,4 +358,46 @@ mod tests {
         assert_eq!(m.state().reserved, Spent::default());
         assert_eq!(m.state().spent.replays, 1);
     }
+
+    /// A charged call that arrives while another holds the reservation
+    /// waits for it (reporting `Waited` before anything else), and is then
+    /// checked against what the first call spent: one replay on a
+    /// one-replay meter refuses it on `replays`. Deterministic: the held
+    /// reservation settles only after the waiter has reported waiting.
+    #[test]
+    fn a_charged_call_waits_for_the_held_reservation_then_is_refused() {
+        use std::sync::mpsc;
+
+        #[derive(Debug, PartialEq)]
+        enum Event {
+            Waited,
+            Done(Result<(), &'static str>),
+        }
+        let m = Meter::new(Budget {
+            replays: 1,
+            ..Budget::default()
+        });
+        let held = m.admit(true, || panic!("the first call waited")).unwrap();
+        let (tx, rx) = mpsc::channel();
+        std::thread::scope(|scope| {
+            let meter = &m;
+            scope.spawn(move || {
+                let waited = tx.clone();
+                let r = meter.admit(true, move || waited.send(Event::Waited).unwrap());
+                tx.send(Event::Done(r.map(|_| ()).map_err(|e| e.dimension)))
+                    .unwrap();
+            });
+            // Nothing settles until the waiter has said it waits.
+            assert_eq!(rx.recv().unwrap(), Event::Waited);
+            assert!(
+                rx.recv_timeout(Duration::from_millis(50)).is_err(),
+                "admitted while the reservation was held"
+            );
+            held.settle(Some(&replays(1)), Duration::ZERO);
+            assert_eq!(rx.recv().unwrap(), Event::Done(Err("replays")));
+        });
+        let s = m.state();
+        assert_eq!(s.spent.replays, 1);
+        assert_eq!(s.reserved, Spent::default());
+    }
 }

@@ -2193,4 +2193,107 @@ mod tests {
             }
         }
     }
+
+    /// The boundary of an `asof` lookback: `A` has rows at exactly
+    /// `T − 2d`, at `T − 1d`, and at `T + 1d`, each in its own file. Priced
+    /// with `--at T --lookback 2d`, the recommended key's plan holds the
+    /// first two; a plan missing the row at exactly `T − 2d` (the window's
+    /// inclusive start) fails the certificate, and the real plan passes.
+    #[test]
+    fn a_plan_missing_the_row_at_the_lookback_start_fails_verification() {
+        use std::sync::Arc;
+
+        use arrow::array::TimestampMicrosecondArray;
+        use arrow::array::{ArrayRef, Int64Array, RecordBatch, StringArray};
+        use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
+        use parquet::arrow::ArrowWriter;
+
+        const DAY: i64 = 86_400_000_000;
+        // 2026-01-05T00:00:00Z in microseconds.
+        const T: i64 = 20_458 * DAY;
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("data");
+        std::fs::create_dir_all(&data).unwrap();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("symbol", DataType::Utf8, false),
+            Field::new(
+                "ts",
+                DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+                false,
+            ),
+            Field::new("v", DataType::Int64, false),
+        ]));
+        for (name, sym, ts) in [
+            ("a-start.parquet", "A", T - 2 * DAY),
+            ("b-inside.parquet", "A", T - DAY),
+            ("c-after.parquet", "A", T + DAY),
+            ("d-other.parquet", "B", T - DAY),
+        ] {
+            let b = RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(StringArray::from(vec![sym])) as ArrayRef,
+                    Arc::new(TimestampMicrosecondArray::from(vec![ts]).with_timezone("UTC")),
+                    Arc::new(Int64Array::from(vec![ts])),
+                ],
+            )
+            .unwrap();
+            let f = std::fs::File::create(data.join(name)).unwrap();
+            let mut w = ArrowWriter::try_new(f, Arc::clone(&schema), None).unwrap();
+            w.write(&b).unwrap();
+            w.close().unwrap();
+        }
+        let kf = dir.path().join("k.parquet");
+        let ks = Arc::new(Schema::new(vec![Field::new(
+            "symbol",
+            DataType::Utf8,
+            false,
+        )]));
+        let kb = RecordBatch::try_new(
+            Arc::clone(&ks),
+            vec![Arc::new(StringArray::from(vec!["A"])) as ArrayRef],
+        )
+        .unwrap();
+        let mut w = ArrowWriter::try_new(std::fs::File::create(&kf).unwrap(), ks, None).unwrap();
+        w.write(&kb).unwrap();
+        w.close().unwrap();
+        let e = Engine::open(data.to_str().unwrap(), EngineOptions::default()).unwrap();
+        let why = e
+            .why(&WhyRequest {
+                keys: Some(KeyFile::new(&kf)),
+                latest_by: Some("ts".into()),
+                at: Some("2026-01-05T00:00:00Z".into()),
+                lookback: Some("2d".into()),
+                ..WhyRequest::default()
+            })
+            .unwrap();
+        let rec = why.recommended.as_ref().expect("a recommendation");
+        let wl = why.workload.as_ref().unwrap().hash;
+        test_seam::set(|sel| {
+            assert!(
+                sel.keys().any(|p| p.ends_with("a-start.parquet")),
+                "{sel:?}"
+            );
+            sel.retain(|p, _| !p.ends_with("a-start.parquet"));
+        });
+        let bad = fix_key(&e, rec.proposal, wl, true);
+        test_seam::clear();
+        assert!(
+            matches!(
+                bad.outcome,
+                FixOutcome::Refused {
+                    refusal: Refusal::CertificateFailed { .. }
+                }
+            ),
+            "{:?} {:?}",
+            bad.outcome,
+            bad.verification
+        );
+        let ok = fix_key(&e, rec.proposal, wl, true);
+        assert!(
+            matches!(ok.outcome, FixOutcome::Verified),
+            "{:?}",
+            ok.outcome
+        );
+    }
 }
