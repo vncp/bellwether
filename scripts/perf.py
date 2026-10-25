@@ -207,7 +207,10 @@ class Perf:
         if a.merge and os.path.exists(old):
             # Keep what other sections measured; replace what this run measures.
             doc = json.load(open(old))
-            mine = tuple(p for s in a.run_sections for p in SECTION_PREFIXES[s])
+            mine = tuple(p for s in a.run_sections if s != "reconcile" for p in SECTION_PREFIXES[s])
+            if "reconcile" in a.run_sections:
+                # Only the pairs this run reconciles are replaced.
+                mine += tuple(f"reconcile/{RECONCILE_NAMES[d]}/" for d in a.reconcile_datasets)
             self.metrics = [m for m in doc["metrics"] if not m["id"].startswith(mine)]
             self.context = {k: v for k, v in doc["context"].items() if not k.startswith(mine)}
             self.sections = doc["environment"].get("sections", {})
@@ -434,6 +437,8 @@ def charts(rows, start=None):
         })
     return out
 
+
+RECONCILE_NAMES = {"ledger": "ledger-small", "replay": "replay-small", "taxi": "taxi"}
 
 # What each section owns in perf.json (metric ids and context keys).
 SECTION_PREFIXES = {
