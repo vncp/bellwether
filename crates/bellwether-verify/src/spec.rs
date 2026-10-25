@@ -159,7 +159,7 @@ pub struct ReconcileSpec {
     pub coverage: CoverageRequest,
     /// Which rows of the covered keys are compared, when not all of them:
     /// a row is compared on either side when any of these predicates keeps
-    /// it. Each is the residual of one lookup's scan plan (ADR 011),
+    /// it. Each has the form of a lookup scan plan's residual (ADR 011),
     /// evaluated on canonical bytes at the dataset types with SQL nulls (a
     /// null never satisfies `In`, `Between`, or a listed key's
     /// `NotOlderThan`). `LatestPerKey` keeps every row here: it is the

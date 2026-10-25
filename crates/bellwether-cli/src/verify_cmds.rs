@@ -278,7 +278,7 @@ fn rows_asked(filter: &[Predicate]) -> String {
         let phrase = match p {
             Predicate::Between { column, .. } => format!("{column} within the lookup's bounds"),
             Predicate::NotOlderThan { ts_column, .. } => {
-                format!("{ts_column} no older than each key's bound")
+                format!("{ts_column} within each key's lookback from its newest time in the data")
             }
             Predicate::LatestPerKey { ts_column, .. } => {
                 format!("the newest version by {ts_column}")
@@ -493,8 +493,8 @@ fn fix_human(r: &FixResult, out: &Out) -> String {
     if let Some(filter) = r.verification.as_ref().and_then(|v| v.row_filter.as_ref()) {
         let _ = writeln!(
             s,
-            "            rows compared: those the lookups ask for ({}), from each run's plan \
-             residual, which the certificate cites",
+            "            rows compared: those the lookups ask for ({}), bounded by the workload \
+             and the data, not by the index",
             rows_asked(filter)
         );
     }
