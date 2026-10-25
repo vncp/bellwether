@@ -74,6 +74,11 @@ fn refused_as(label: &str, r: &Reply, expected: &str) {
 /// one-replay budget: the first is admitted and reserves the budget, the
 /// rest wait for it to settle and are then refused, as if run one at a
 /// time. At most one call runs past the limit.
+///
+/// Only final outcomes are asserted: a call returns its job, still running
+/// or (when the job thread already settled, as a quickly refused job can)
+/// done; how far a job got when its call returned is scheduling, not
+/// behaviour.
 #[test]
 fn concurrent_jobs_cannot_overrun_the_budget() {
     let one = Budget {
@@ -88,8 +93,18 @@ fn concurrent_jobs_cannot_overrun_the_budget() {
             "score.why",
             json!({"keys": s(&f.keys), "max_candidates": n}),
         );
-        assert_eq!(r.envelope.status, Status::Running);
-        ids.push(r.envelope.job.unwrap().id);
+        assert!(
+            matches!(r.envelope.status, Status::Running | Status::Ok),
+            "{:?}",
+            r.envelope.status
+        );
+        let job = r.envelope.job.unwrap();
+        assert_eq!(
+            job.state == JobState::Done,
+            r.envelope.status == Status::Ok,
+            "{job:?}"
+        );
+        ids.push(job.id);
     }
     let mut ran = 0;
     for id in &ids {
@@ -102,6 +117,11 @@ fn concurrent_jobs_cannot_overrun_the_budget() {
         }
     }
     assert_eq!(ran, 1, "calls that ran past a one-replay budget");
+    assert_eq!(
+        ids.iter().collect::<std::collections::BTreeSet<_>>().len(),
+        8,
+        "one job per distinct call"
+    );
     let state = srv.budget();
     assert_eq!(state.reserved, bellwether_mcp::budget::Spent::default());
     assert!(state.spent.replays >= 1);
