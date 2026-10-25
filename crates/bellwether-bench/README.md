@@ -342,3 +342,17 @@ bellwether bench market --out benches/out/market-small --rung small
 **Workload and ground truth.** `generate_market` also writes:
 - `<out>/workload/market.json` and single-column `symbol` key files `<out>/workload/keys/qNNNN.parquet` covering `window` queries (1-hour intraday, 1-day, and 5-day windows across symbol sets of 1, 10, and 50), bitemporal `asof` queries (including `K` before and after restatements and late arrivals), and `latest_known` queries.
 - `<out>/workload/truth.json`: exact ground truth computed directly from the generator's in-memory rows (for `window`: `matching_row_groups`, `matching_rows`, `symbol_row_groups`, `ts_overlap_row_groups`, and `partition_days_touched`; for `asof` and `latest_known`: per-symbol winning `(ts, known_at, price)` and every `(file, row_group)` holding it).
+
+## Reading planned row groups (`bellwether bench read`, WP22)
+
+`bellwether_bench::perf` reads row groups through the harness's byte-counting reader, for the release measurements of [`scripts/perf.sh`](../../scripts/perf.sh):
+
+```sh
+bellwether locate data/ --keys keys.parquet --json > plan.json
+bellwether bench read --plan plan.json --json   # the plan's row groups
+bellwether bench read --all data/ --json        # every row group: the full scan
+```
+
+- **What it reads.** Every column of every named row group (the plan inside a lookup's `--json` output, `evidence.record.body.plan.entries`, or every row group of every `.parquet` file under a folder, skipping directories that start with `.`), files opened and row groups read in parallel on the rayon pool. Rows are decoded but not filtered to the keys.
+- **What it reports** (`read` in the JSON): `files`, `row_groups`, `rows`, `bytes_fetched` and `bytes_consumed` (counted inside the reader, as in `results.json`), `footer_ms` (parsing the footers of the files read), `read_ms`, and `total_ms`.
+- **Refusals.** JSON without a plan is refused, naming the output to pass; one of `--plan` or `--all` is required.
