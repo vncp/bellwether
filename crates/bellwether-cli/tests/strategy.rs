@@ -648,3 +648,96 @@ fn latest_lookback_through_per_key_bounds() {
     assert_eq!(out.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&out.stderr).contains('1'));
 }
+
+/// Range keys on two time columns leave `asof --at --lookback` without one
+/// window column: the verb and `why` both refuse and name `--ts`, and
+/// following that on `why` prices exactly what `asof ... --ts` plans.
+#[test]
+fn why_takes_ts_for_an_asof_lookback_as_asof_does() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("lake");
+    let rows = lake(&root);
+    let r = path(&root);
+    let keys = dir.path().join("keys.parquet");
+    symbols(&keys, &["NVDA", "AAPL"]);
+    let k = path(&keys);
+    run(
+        &[
+            "index",
+            r,
+            "--path-template",
+            TEMPLATE,
+            "--key",
+            "exact:symbol",
+            "--key",
+            "range:ts",
+            "--key",
+            "range:day",
+        ],
+        0,
+    );
+    let at = ((FIRST_DAY + 3) * US_PER_DAY + 1).to_string();
+    let lookback = ["--at", &at, "--lookback", "2d"];
+    for args in [
+        [&["asof", r, "--keys", k][..], &lookback].concat(),
+        [&["why", r, "--from", k, "--latest-by", "ts"][..], &lookback].concat(),
+    ] {
+        let out = bw().args(&args).output().unwrap();
+        assert_ne!(out.status.code(), Some(0), "{args:?}");
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            err.contains("several time columns (day, ts); name one with --ts"),
+            "{args:?}: {err}"
+        );
+    }
+    // Following it: `why --ts ts` prices the window `asof --ts ts` plans.
+    let plan = json(&run(
+        &[
+            &["asof", r, "--keys", k, "--ts", "ts"][..],
+            &lookback,
+            &["--json"],
+        ]
+        .concat(),
+        0,
+    ));
+    let want = truth(
+        &rows,
+        &["NVDA", "AAPL"],
+        (FIRST_DAY + 1) * US_PER_DAY + 1,
+        (FIRST_DAY + 3) * US_PER_DAY + 1,
+    );
+    assert_eq!(planned(&plan, &root), want);
+    let why = json(&run(
+        &[
+            &["why", r, "--from", k, "--latest-by", "ts", "--ts", "ts"][..],
+            &lookback,
+            &["--json"],
+        ]
+        .concat(),
+        0,
+    ));
+    assert_eq!(why["current"]["bytes"], plan["planned"]["bytes"]);
+    assert_eq!(why["current"]["row_groups"], plan["planned"]["row_groups"]);
+    assert_eq!(why["workload"]["windows"][0]["ts_column"], "ts");
+    // --ts and --latest-by name one column; --ts needs a key file and the
+    // asof lookback (or a window).
+    for (args, says) in [
+        (
+            [
+                &["why", r, "--from", k, "--latest-by", "day", "--ts", "ts"][..],
+                &lookback,
+            ]
+            .concat(),
+            "pass --latest-by ts --ts ts",
+        ),
+        (
+            vec!["why", r, "--from", k, "--latest-by", "ts", "--ts", "ts"],
+            "--at <instant> --lookback <length>",
+        ),
+    ] {
+        let out = bw().args(&args).output().unwrap();
+        assert_eq!(out.status.code(), Some(2), "{args:?}");
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(err.contains(says), "{args:?}: {err}");
+    }
+}

@@ -127,7 +127,11 @@ pub struct WhyRequest {
     /// `lookback`.
     pub window: Option<TimeWindow>,
     /// The window's time column; `None` takes the one a window lookup
-    /// would ([`crate::Engine::locate_window`]).
+    /// would ([`crate::Engine::locate_window`]). With `at` and `lookback`
+    /// instead of `window`, it is the column `asof --at --lookback --ts`
+    /// plans on: the run is recorded as the window `[at − lookback, at]`
+    /// on it, measured in its unit, so it must be `latest_by` too
+    /// ([`WhyRequest::asof_window_column`]).
     pub ts_column: Option<String>,
     /// Candidate key columns for the profile; `None` selects every id-like
     /// column.
@@ -156,6 +160,17 @@ impl Default for WhyRequest {
 }
 
 impl WhyRequest {
+    /// The time column named for an `asof` lookback (`ts_column` with `at`
+    /// and `lookback` and no `window`): the run is priced as the window
+    /// `asof --at --lookback --ts` plans, recorded as a window run.
+    #[must_use]
+    pub fn asof_window_column(&self) -> Option<&str> {
+        match (&self.window, &self.at, &self.lookback, &self.ts_column) {
+            (None, Some(_), Some(_), Some(c)) => Some(c),
+            _ => None,
+        }
+    }
+
     /// The lookup this request prices: `mode`, or the one `at` and
     /// `latest_by` imply. An inconsistent combination (`latest` or `asof`
     /// without `latest_by`, `asof` without `at`, `latest` with `at`,
@@ -603,9 +618,30 @@ impl Engine {
                     .into(),
             ));
         }
-        if req.window.is_none() && req.ts_column.is_some() {
+        if let Some(ts) = req.asof_window_column() {
+            if req.keys.is_none() {
+                return Err(Error::Other(
+                    "--ts with --at and --lookback records the key file's run as that window: \
+                     give a key file (--from); a recorded workload (--workload) is priced as it \
+                     was recorded"
+                        .into(),
+                ));
+            }
+            if req.latest_by.as_deref().map(str::trim) != Some(ts.trim()) {
+                return Err(Error::InvalidArgument {
+                    field: "latest_by",
+                    reason: format!(
+                        "--ts {ts} plans the window on {ts}, so --at and --lookback are measured \
+                         in its unit, as `bellwether asof --ts {ts}` measures them; pass \
+                         --latest-by {ts} --ts {ts}"
+                    ),
+                });
+            }
+        } else if req.window.is_none() && req.ts_column.is_some() {
             return Err(Error::Other(
-                "--ts names a window's time column; give the window too (--window)".into(),
+                "--ts names a window's time column; give the window too (--window), or price \
+                 `asof --at --lookback --ts` with --at and --lookback"
+                    .into(),
             ));
         }
         if mode != LookupMode::Locate && req.keys.is_none() && req.workload.is_none() {
@@ -807,7 +843,9 @@ impl Engine {
 
     /// `recorder`, recording window runs when the request gives a window:
     /// its time column (`--ts`, else the one a window lookup on `columns`
-    /// would take) and both bounds in that column's unit.
+    /// would take) and both bounds in that column's unit. With `--ts`,
+    /// `--at`, and `--lookback` instead, the window is the one `asof --at
+    /// --lookback --ts` plans: `[max(at − lookback, floor), at]` on `--ts`.
     fn windowed<'r>(
         &self,
         recorder: WorkloadRecorder<'r>,
@@ -816,6 +854,30 @@ impl Engine {
         replayer: &Replayer<'_>,
         columns: &[String],
     ) -> Result<WorkloadRecorder<'r>> {
+        if let (Some(c), Some(at), Some(lookback)) =
+            (req.asof_window_column(), &req.at, &req.lookback)
+        {
+            let ty = replayer
+                .schema()
+                .field_with_name(c)
+                .map_err(|_| {
+                    Error::KeySpec(format!(
+                        "the window's time column {c:?} is not in the dataset; name one with --ts"
+                    ))
+                })?
+                .data_type()
+                .clone();
+            let hi = instant_in_unit("at", at, c, &ty)?;
+            let n = Lookback::parse(lookback)?.in_unit(c, &ty)?;
+            let lo = hi
+                .saturating_sub(n)
+                .max(bellwether_core::encoding::ts_min(&ty)?);
+            return recorder.in_window(RunWindow {
+                ts_column: c.to_string(),
+                lo,
+                hi,
+            });
+        }
         let Some(window) = &req.window else {
             return Ok(recorder);
         };
@@ -1375,6 +1437,11 @@ fn resolve_temporal(req: &WhyRequest, schema: &Schema) -> Result<Option<Resolved
             lookback: l.length,
         },
     };
+    // With --ts, the run is the window `asof --at --lookback --ts` plans,
+    // recorded as a window run (`Engine::windowed`), not a temporal lookup.
+    if req.asof_window_column().is_some() {
+        return Ok(None);
+    }
     Ok(Some(ResolvedTemporal {
         ts_column: ts_column.to_string(),
         query,

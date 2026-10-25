@@ -180,7 +180,9 @@ struct WhyArgs {
     )]
     window: Option<String>,
     /// The window's time column [default: the one a window lookup would
-    /// take].
+    /// take]. With --at and --lookback instead of --window, the column
+    /// `asof --at --lookback --ts` plans on: the run is priced as that
+    /// window (pass the same column to --latest-by).
     #[arg(long = "ts", value_name = "COLUMN")]
     ts: Option<String>,
 }
@@ -798,9 +800,20 @@ fn why(g: &Global, out: &Out, a: &WhyArgs) -> Result<Outcome, Failure> {
         })
         .transpose()?;
     if window.is_none() && a.ts.is_some() {
-        return Err(Failure::Usage(
-            "--ts names a window's time column; give the window with --window START..END".into(),
-        ));
+        if a.at.is_none() || a.lookback.is_none() {
+            return Err(Failure::Usage(
+                "--ts names a window's time column; give the window with --window START..END, or \
+                 price `asof --at --lookback --ts` with --at <instant> --lookback <length>"
+                    .into(),
+            ));
+        }
+        if a.from.is_none() {
+            return Err(Failure::Usage(
+                "--ts with --at and --lookback records the key file's run as that window; pass \
+                 --from <keys.parquet>"
+                    .into(),
+            ));
+        }
     }
     let request = bellwether::WhyRequest {
         keys: a.from.as_ref().map(|p| key_file(p, a.key.as_ref())),
