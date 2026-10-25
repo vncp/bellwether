@@ -16,7 +16,7 @@ Add the server to the agent's MCP configuration (the `mcpServers` block most cli
 
 Then ask the agent to run the prompt `diagnose_slow_query`. The prompt is [`AGENTS.md`](../../AGENTS.md) at the repository root, embedded at build time: the loop in order, every refusal code, and what the agent may never do.
 
-Flags: `--index <PATH|URL>` (default `<ROOT>/.bellwether`), `--format parquet|csv|jsonl`, `--chunk-size`, `--schema <file>`, `--fingerprint-policy`, and the session budget `--budget-replays N` (default 256), `--budget-rows N` (default 2,000,000,000), `--budget-seconds N` (default 3,600). `bellwether mcp` takes the same flags from the same definitions (`bellwether_mcp::args`), so the two open a folder the same way (an unindexed CSV or JSON lines folder falls back to `--schema`, `--chunk-size`, and `--fingerprint-policy`). Exit codes: 0 when the client disconnects; 2 usage (including a `--schema` file that cannot be read); 4 the engine could not open the folder (before the handshake, nothing on stdout) or the transport failed.
+Flags: `--index <PATH|URL>` (default `<ROOT>/.bellwether`), `--format parquet|csv|jsonl`, `--chunk-size`, `--schema <file>`, `--fingerprint-policy`, `--partitioning none|hive` or `--path-template <PATTERN>`, and the session budget `--budget-replays N` (default 256), `--budget-rows N` (default 2,000,000,000), `--budget-seconds N` (default 3,600). `bellwether mcp` takes the same flags from the same definitions (`bellwether_mcp::args`), so the two open a folder the same way (an unindexed CSV or JSON lines folder falls back to `--schema`, `--chunk-size`, and `--fingerprint-policy`, and an unindexed partitioned folder to `--partitioning` or `--path-template`). Exit codes: 0 when the client disconnects; 2 usage (including a `--schema` file that cannot be read or a malformed `--path-template`); 4 the engine could not open the folder (before the handshake, nothing on stdout) or the transport failed.
 
 ## Tools
 
@@ -24,7 +24,7 @@ Flags: `--index <PATH|URL>` (default `<ROOT>/.bellwether`), `--format parquet|cs
 |---|---|---|---|
 |observe|`observe.why` (no keys)|`why` without a workload|the profile Evidence, cache entries|
 |observe|`observe.profile`|`findings`|nothing|
-|observe|`observe.locate`, `observe.asof`|`locate`, `asof`|the `plan` Evidence, cache entries|
+|observe|`observe.locate`, `observe.asof`|`locate`, `asof`; with `at_manifest`, on an engine opened at that committed manifest (`EngineOptions::at_manifest`, the CLI's `--at-manifest`)|the `plan` Evidence, cache entries|
 |score|`score.why` (keys or a workload hash)|`why` with a workload|engine Proposals and Replays|
 |score|`score.verify`|`fix` with `verify_only`|Replay, plan Evidence, Certificate|
 |propose|`propose.key`, `propose.layout`, `propose.rewrite`|`propose`, or `propose_dry_run` with `dry_run`|one Proposal, or nothing|

@@ -86,6 +86,10 @@ fn failed(e: &Error) -> Done {
 
 struct Inner {
     engine: Engine,
+    /// The data folder and how the engine opens it, for a lookup pinned to
+    /// a committed manifest (`at_manifest`).
+    root: String,
+    options: EngineOptions,
     budget: Meter,
     jobs: Mutex<Jobs>,
 }
@@ -115,6 +119,8 @@ impl Server {
         Ok(Self {
             inner: Arc::new(Inner {
                 engine,
+                root: config.root.clone(),
+                options: config.engine.clone(),
                 budget: Meter::new(config.budget),
                 jobs: Mutex::new(Jobs::new()),
             }),
@@ -125,6 +131,23 @@ impl Server {
     #[must_use]
     pub fn engine(&self) -> &Engine {
         &self.inner.engine
+    }
+
+    /// The engine a lookup plans with: the session's, or, with
+    /// `at_manifest`, one opened at that committed manifest sequence (its
+    /// lookups refuse a sequence the index does not retain).
+    fn lookup_engine(&self, at_manifest: Option<u64>) -> bellwether::types::Result<Option<Engine>> {
+        at_manifest
+            .map(|seq| {
+                Engine::open(
+                    &self.inner.root,
+                    EngineOptions {
+                        at_manifest: Some(seq),
+                        ..self.inner.options.clone()
+                    },
+                )
+            })
+            .transpose()
     }
 
     /// The session budget now.
@@ -282,14 +305,30 @@ impl Server {
             },
             "observe.locate" => {
                 let a = parse!(ObserveLocate);
-                match e.locate(&key_file(a.keys, a.key_columns)) {
+                let pinned = match self.lookup_engine(a.at_manifest) {
+                    Ok(p) => p,
+                    Err(err) => return failed(&err),
+                };
+                match pinned
+                    .as_ref()
+                    .unwrap_or(e)
+                    .locate(&key_file(a.keys, a.key_columns))
+                {
                     Ok(r) => done(&r, None),
                     Err(err) => failed(&err),
                 }
             }
             "observe.asof" => {
                 let a = parse!(ObserveAsof);
-                match e.asof(&key_file(a.keys, a.key_columns), &a.at) {
+                let pinned = match self.lookup_engine(a.at_manifest) {
+                    Ok(p) => p,
+                    Err(err) => return failed(&err),
+                };
+                match pinned
+                    .as_ref()
+                    .unwrap_or(e)
+                    .asof(&key_file(a.keys, a.key_columns), &a.at)
+                {
                     Ok(r) => done(&r, None),
                     Err(err) => failed(&err),
                 }

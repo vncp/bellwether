@@ -192,8 +192,9 @@ fn the_binary_takes_the_shared_engine_and_budget_flags() {
         flags += 1;
     }
     assert_eq!(
-        flags, 8,
-        "index, format, chunk-size, schema, fingerprint-policy, 3 budgets"
+        flags, 10,
+        "index, format, chunk-size, schema, fingerprint-policy, partitioning, path-template, 3 \
+         budgets"
     );
 
     let dir = tempfile::tempdir().unwrap();
@@ -212,4 +213,15 @@ fn the_binary_takes_the_shared_engine_and_budget_flags() {
     assert_eq!(out.stdout, [] as [u8; 0]);
     let err = String::from_utf8(out.stderr).unwrap();
     assert!(err.contains("cannot read the schema file"), "{err}");
+
+    // So is a malformed path template, before the engine opens.
+    let out = std::process::Command::new(EXE)
+        .args(["--path-template", "{day:date", data.to_str().unwrap()])
+        .stdin(std::process::Stdio::null())
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    assert_eq!(out.stdout, [] as [u8; 0]);
+    let err = String::from_utf8(out.stderr).unwrap();
+    assert!(err.starts_with("bellwether-mcp: "), "{err}");
 }

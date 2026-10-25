@@ -15,7 +15,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use bellwether::types::{EvidenceBody, Record, ScanPlan};
+use bellwether::types::{Error, EvidenceBody, Record, ScanPlan};
 use bellwether::{spec, Engine, EngineOptions, KeyFile, PlanResult, WhyRequest};
 use bellwether_build::{Builder, CompactOptions};
 use bellwether_store::ObjectStoreBackend;
@@ -155,10 +155,21 @@ fn a_pinned_lookup_returns_the_earlier_plan_byte_for_byte() {
         .to_string();
     assert!(err.contains("current manifest"), "{err}");
 
-    // A sequence never committed names the retained range.
-    let err = open(&data, Some(9)).locate(&kf).unwrap_err().to_string();
+    // A sequence never committed is the typed refusal carrying the
+    // retained range, and its message names the current and oldest.
+    let err = open(&data, Some(9)).locate(&kf).unwrap_err();
     assert!(
-        err.contains("has not been committed") && err.contains("1..=2"),
+        matches!(
+            &err,
+            Error::NotRetained { requested: 9, retained, .. } if retained == &[1, 2]
+        ),
+        "{err:?}"
+    );
+    let err = err.to_string();
+    assert!(
+        err.contains("has not been committed")
+            && err.contains("current sequence is 2")
+            && err.contains("oldest retained is 1"),
         "{err}"
     );
 }

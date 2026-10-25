@@ -248,21 +248,53 @@ fn every_tool_with_a_cli_counterpart_returns_the_cli_json_line() {
 
     // observe.locate = locate (after the apply built the index); observe.asof
     // = asof (after a temporal key is built).
-    both(
+    let located = both(
         &srv,
         "observe.locate",
         json!({"keys": k}),
         &["locate", d, "--keys", k],
         0,
     );
+    let applied_at = located["sequence"].as_u64().unwrap();
     cli(&["index", d, "--key", "temporal:id@ts"], 0);
     let at = "1970-01-01T00:01:00Z";
-    both(
+    let asof = both(
         &srv,
         "observe.asof",
         json!({"keys": k, "at": at}),
         &["asof", d, "--keys", k, "--at", at],
         0,
+    );
+    let current = asof["sequence"].as_u64().unwrap();
+    assert!(current > applied_at, "{current} {applied_at}");
+
+    // observe.locate with at_manifest = locate --at-manifest: pinned to the
+    // sequence before the temporal key, both plan that sequence, and the
+    // plan is the one returned then.
+    let seq = applied_at.to_string();
+    let pinned = both(
+        &srv,
+        "observe.locate",
+        json!({"keys": k, "at_manifest": applied_at}),
+        &["locate", d, "--keys", k, "--at-manifest", &seq],
+        0,
+    );
+    assert_eq!(pinned["sequence"], applied_at);
+    assert_eq!(pinned["planned"], located["planned"]);
+    assert_eq!(pinned["evidence"], located["evidence"]);
+    // A sequence never committed: the server refuses with `not_retained`,
+    // naming the range to pass instead.
+    let unretained = srv.call(
+        "observe.locate",
+        json!({"keys": k, "at_manifest": current + 5}),
+    );
+    let refusal = unretained.envelope.refusal.as_ref().unwrap();
+    assert_eq!(refusal.code.as_str(), "not_retained", "{refusal:?}");
+    assert_eq!(refusal.fields["requested"], current + 5);
+    assert_eq!(refusal.fields["current"], current);
+    assert!(
+        refusal.next.contains(&format!("..={current}")),
+        "{refusal:?}"
     );
 
     // observe.profile = ledger findings; the resources = ledger *.
@@ -440,7 +472,7 @@ fn bellwether_mcp_takes_the_shared_engine_and_budget_flags() {
         assert!(help.contains(&long), "{long} missing from:\n{help}");
         flags += 1;
     }
-    assert_eq!(flags, 8);
+    assert_eq!(flags, 10);
 }
 
 /// `bellwether mcp <root>` is the same server: a handshake and one tool

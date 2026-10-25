@@ -125,7 +125,7 @@ pub struct EngineOptions {
     /// for reads of an unindexed folder: [`Partitioning::Hive`] makes every
     /// `name=value` directory below the root a column, and
     /// [`Partitioning::Template`] every placeholder of a path template such
-    /// as `{day:date}.parquet` (Parquet only). The index records it in
+    /// as `{day:date}.parquet`, for every source format. The index records it in
     /// `source.partitioning`; an existing index keeps its recorded scheme,
     /// and another one (a changed template included) is refused.
     pub partitioning: Option<Partitioning>,

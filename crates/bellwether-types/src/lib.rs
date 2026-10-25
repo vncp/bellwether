@@ -270,7 +270,8 @@ fn not_indexed(root: &str, operation: &str, needs: Option<&str>) -> String {
 
 fn not_retained(index: &str, seq: u64, retained: &[u64]) -> String {
     match (retained.first(), retained.last()) {
-        (Some(&oldest), Some(&current)) if seq > current => format!(
+        // Sequences start at 1, so 0 was never committed either.
+        (Some(&oldest), Some(&current)) if seq > current || seq == 0 => format!(
             "manifest sequence {seq} has not been committed in the index at {index}; the current \
              sequence is {current} and the oldest retained is {oldest}"
         ),
@@ -1054,6 +1055,37 @@ mod tests {
             manifest_version: Some("v1".into()),
             created_at: "2026-10-24T00:00:00Z".into(),
         }
+    }
+
+    #[test]
+    fn not_retained_states_whether_the_sequence_was_ever_committed() {
+        let msg = |requested| {
+            Error::NotRetained {
+                index: "/d/.bellwether".into(),
+                requested,
+                retained: vec![3, 4, 5],
+            }
+            .to_string()
+        };
+        assert!(msg(9).contains("has not been committed"), "{}", msg(9));
+        assert!(msg(0).contains("has not been committed"), "{}", msg(0));
+        assert!(msg(2).contains("no longer retained"), "{}", msg(2));
+        for m in [msg(9), msg(0), msg(2)] {
+            assert!(
+                m.contains("oldest retained is 3") && !m.contains("--"),
+                "{m}"
+            );
+        }
+        let unindexed = Error::NotRetained {
+            index: "/d/.bellwether".into(),
+            requested: 1,
+            retained: Vec::new(),
+        }
+        .to_string();
+        assert!(
+            unindexed.contains("there is no index at /d/.bellwether"),
+            "{unindexed}"
+        );
     }
 
     #[test]
