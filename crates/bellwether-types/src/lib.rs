@@ -40,10 +40,10 @@ pub mod format {
 
 /// The error type shared across the engine. Variants are deliberately coarse;
 /// crates attach detail in the message and may wrap with their own types.
-/// Non-exhaustive: a new variant is not a breaking change for a crate that
-/// matches on it, which must handle the rest.
+/// Deliberately exhaustive (the crates are `publish = false`): a new variant
+/// must fail to compile where errors map to codes (`bellwether-mcp`'s
+/// `refusal.rs`), never fall through to a generic one.
 #[derive(Debug, thiserror::Error)]
-#[non_exhaustive]
 pub enum Error {
     /// A persisted structure declares a format version newer than this binary
     /// understands. The engine never downgrades in place (ADR 017).

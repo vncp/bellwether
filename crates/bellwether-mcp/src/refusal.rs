@@ -1,11 +1,9 @@
 //! Machine-actionable refusals (WP12 addition 10): every refusal carries a
 //! stable `code`, the facts an agent needs to act, and one `next` line.
 //!
-//! Codes come from the facade's typed refusals (exhaustive matches, so a new
-//! variant fails to compile here) and typed errors. `bellwether::types::Error`
-//! is `#[non_exhaustive]`, so a variant this crate does not know yet is
-//! `engine_error` until it is mapped; `refusal::tests` lists every variant
-//! with its code. Nothing is classified by reading a message.
+//! Codes come from the facade's typed refusals and typed errors by
+//! exhaustive matches, so a new variant fails to compile here rather than
+//! falling through to a guess. Nothing is classified by reading a message.
 //! A `next` line names MCP tools and fields, never a CLI flag: the facade's
 //! typed errors carry the field or the record kind, and the line is built
 //! from that here.
@@ -380,8 +378,8 @@ pub fn from_error(e: &Error) -> Refusal {
         ),
         Error::Source(_) => (RefusalCode::SourceError, json!({})),
         Error::Store(_) => (RefusalCode::StoreError, json!({})),
-        // `Serde`, `Other`, and any variant added later.
-        _ => (RefusalCode::EngineError, json!({})),
+        // No wildcard arm: a new `Error` variant must fail to compile here.
+        Error::Serde(_) | Error::Other(_) => (RefusalCode::EngineError, json!({})),
     };
     let mut r = Refusal::new(code, message, fields);
     if let Some(next) = typed_next(e) {
