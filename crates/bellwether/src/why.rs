@@ -275,11 +275,15 @@ impl Engine {
             req.workload.is_some(),
         ];
         if given.iter().filter(|g| **g).count() > 1 {
-            return Err(Error::Other(
-                "give one workload: a key file (--from), a bench workload directory \
-                 (--bench-workload), or a recorded workload hash (--workload)"
+            return Err(Error::InvalidArgument {
+                field: "workload",
+                reason: "give one workload: a key file, a bench workload directory, or a \
+                         recorded workload hash, not several"
                     .into(),
-            ));
+            });
+        }
+        if let Some(cols) = &req.columns {
+            self.check_columns(&cols.iter().collect::<Vec<_>>())?;
         }
         let pinned = self.pin()?;
         let source = self.source(pinned.as_ref())?;
@@ -413,13 +417,7 @@ impl Engine {
         cache: &Cache<ObjectStoreBackend>,
     ) -> Result<Workload> {
         if let Some(h) = &req.workload {
-            return Workload::load(cache, h).map_err(|e| {
-                Error::Other(format!(
-                    "workload {h} is not in the cache at {} ({e}); record it again with \
-                     `bellwether why --from <keys.parquet>`",
-                    self.index_location()
-                ))
-            });
+            return crate::fix::load_workload(self, cache, h);
         }
         let mut recorder = WorkloadRecorder::new(cache, std::sync::Arc::clone(replayer.schema()));
         if let Some(keys) = &req.keys {

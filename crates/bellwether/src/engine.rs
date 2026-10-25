@@ -430,14 +430,12 @@ impl Engine {
         })
     }
 
-    /// Pins the manifest or refuses with what to do.
-    pub(crate) fn pin_required(&self, verb: &str) -> Result<Pinned> {
-        self.pin()?.ok_or_else(|| {
-            Error::KeySpec(format!(
-                "{} is not indexed, so {verb} has no index to plan with; run `bellwether index \
-                 {} --key <spec>` first",
-                self.root, self.root
-            ))
+    /// Pins the manifest, or refuses: the folder is not indexed.
+    pub(crate) fn pin_required(&self, operation: &'static str) -> Result<Pinned> {
+        self.pin()?.ok_or_else(|| Error::NotIndexed {
+            root: self.root.clone(),
+            operation,
+            needs: None,
         })
     }
 
@@ -540,6 +538,68 @@ pub(crate) struct FolderChanges {
 impl FolderChanges {
     pub fn is_empty(&self) -> bool {
         self.untracked.is_empty() && self.changed.is_empty() && self.missing.is_empty()
+    }
+
+    /// The untracked, changed, and missing paths: the one source of the
+    /// lists both [`FolderStatus`] and the stale-index error carry.
+    pub fn paths(&self) -> (Vec<String>, Vec<String>, Vec<String>) {
+        (
+            self.untracked.iter().map(|f| f.path.clone()).collect(),
+            self.changed.clone(),
+            self.missing.clone(),
+        )
+    }
+}
+
+/// What [`Engine::folder_status`] found: how the data folder differs from
+/// what its index tracks. The same lists a stale-index refusal
+/// ([`bellwether_types::Error::StaleIndex`]) carries.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FolderStatus {
+    /// The canonical data root.
+    pub root: String,
+    /// The current manifest sequence, or `None` for a folder never indexed
+    /// (every list is then empty: there is nothing to be stale against).
+    pub sequence: Option<u64>,
+    /// Files under the root the index does not track, sorted.
+    pub untracked: Vec<String>,
+    /// Tracked files whose size or etag/mtime changed (ADR 013), sorted.
+    pub changed: Vec<String>,
+    /// Tracked files no longer found, sorted.
+    pub missing: Vec<String>,
+}
+
+impl FolderStatus {
+    /// Whether a lookup or an apply would be refused as stale.
+    #[must_use]
+    pub fn is_stale(&self) -> bool {
+        !(self.untracked.is_empty() && self.changed.is_empty() && self.missing.is_empty())
+    }
+}
+
+impl Engine {
+    /// Lists the folder and compares it with the index, the same check
+    /// `locate`, `latest`, `asof`, and `fix` run first. Reads no file
+    /// contents except to fingerprint untracked files, and writes nothing
+    /// (it never creates the index location).
+    pub fn folder_status(&self) -> Result<FolderStatus> {
+        guard(|| {
+            let Some(pinned) = self.pin()? else {
+                return Ok(FolderStatus {
+                    root: self.root.clone(),
+                    ..FolderStatus::default()
+                });
+            };
+            let (untracked, changed, missing) =
+                folder_changes(self.root(), &pinned, self.format())?.paths();
+            Ok(FolderStatus {
+                root: self.root.clone(),
+                sequence: Some(pinned.sequence()),
+                untracked,
+                changed,
+                missing,
+            })
+        })
     }
 }
 

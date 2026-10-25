@@ -136,7 +136,9 @@ pub(crate) fn run(g: &Global, out: &Out, cmd: &VerifyCommand) -> Result<Outcome,
             };
             let r = engine(g, &a.root.root)?.fix(&request)?;
             let code = match &r.outcome {
-                FixOutcome::Applied { .. } | FixOutcome::Verified => EXIT_OK,
+                FixOutcome::Applied { .. }
+                | FixOutcome::Verified
+                | FixOutcome::WouldApply { .. } => EXIT_OK,
                 FixOutcome::Refused {
                     refusal: Refusal::CertificateFailed { .. },
                 } => EXIT_FAILED,
@@ -283,6 +285,13 @@ fn fix_human(r: &FixResult, out: &Out) -> String {
         FixOutcome::Verified => {
             let _ = writeln!(s, "  3 apply   not run (--verify-only)");
         }
+        // The CLI never asks for a dry run; the MCP server does.
+        FixOutcome::WouldApply { sequence, expected } => {
+            let _ = writeln!(
+                s,
+                "  3 apply   dry run: would commit {expected} over {sequence}; nothing written"
+            );
+        }
         FixOutcome::Refused { refusal } => {
             let why = match refusal {
                 Refusal::CertificateFailed {
@@ -309,7 +318,7 @@ fn fix_human(r: &FixResult, out: &Out) -> String {
                     "the data changed after the certificate was computed (its catalog digest differs), so the certificate no longer describes it; run fix again to re-verify".into()
                 }
                 Refusal::NothingToApply { sequence } => format!(
-                    "applying changed nothing (the key is already complete at sequence {sequence}); no receipt"
+                    "the key is already complete at sequence {sequence}, so applying it changes nothing; no receipt"
                 ),
                 Refusal::LayoutNotApplicable => {
                     "layout proposals are applied by evolve, which has not landed".into()

@@ -3,11 +3,11 @@
 
 use bellwether_ledger::RecordKind;
 use bellwether_types::{
-    format, Error, Hash, KeySpec, Proposal, ProposalBody, Record, Result, RewriteShape,
+    format, Error, Hash, HashKind, KeySpec, Proposal, ProposalBody, Record, Result, RewriteShape,
 };
 
 use crate::engine::{guard, Engine};
-use crate::results::{ProposeRefusal, ProposeResult};
+use crate::results::{ProposeRefusal, ProposeResult, Written};
 use crate::why::RESERVED_PROPOSERS;
 
 impl Engine {
@@ -24,7 +24,23 @@ impl Engine {
         evidence: &[Hash],
         proposed_by: &str,
     ) -> Result<ProposeResult> {
-        guard(|| self.propose_inner(body, evidence, proposed_by))
+        guard(|| self.propose_inner(body, evidence, proposed_by, true))
+    }
+
+    /// Runs every check [`Engine::propose`] runs and returns the Proposal it
+    /// would write, with the hash it would have
+    /// ([`ProposeResult::WouldWrite`]), or the same refusal or error, and
+    /// writes nothing anywhere: it never creates the index location, and it
+    /// reads the ledger only if it exists. `created_at` is this engine's
+    /// clock now, so a later real write has the same hash only under a fixed
+    /// clock.
+    pub fn propose_dry_run(
+        &self,
+        body: ProposalBody,
+        evidence: &[Hash],
+        proposed_by: &str,
+    ) -> Result<ProposeResult> {
+        guard(|| self.propose_inner(body, evidence, proposed_by, false))
     }
 
     fn propose_inner(
@@ -32,11 +48,13 @@ impl Engine {
         body: ProposalBody,
         evidence: &[Hash],
         proposed_by: &str,
+        write: bool,
     ) -> Result<ProposeResult> {
         if proposed_by.trim().is_empty() {
-            return Err(Error::Other(
-                "a proposal needs a proposer; pass --by <agent or user name>".into(),
-            ));
+            return Err(Error::InvalidArgument {
+                field: "by",
+                reason: "a proposal needs a proposer: an agent or user name".into(),
+            });
         }
         let name = proposed_by.trim();
         if RESERVED_PROPOSERS
@@ -51,30 +69,39 @@ impl Engine {
             });
         }
         if evidence.is_empty() {
-            return Err(Error::Other(
-                "a proposal must cite at least one Evidence hash; run `bellwether why` and cite \
-                 the evidence hash it prints with --evidence"
+            return Err(Error::InvalidArgument {
+                field: "evidence",
+                reason: "a proposal must cite at least one Evidence hash, such as the profile \
+                         Evidence of this data folder"
                     .into(),
-            ));
+            });
         }
-        let ledger = self.ledger()?;
+        let not_found = |h: &Hash| Error::RecordNotFound {
+            kind: HashKind::Evidence,
+            hash: *h,
+            place: format!("the ledger at {}", self.index_location()),
+        };
+        // A dry run never creates the index location: with no ledger yet,
+        // no evidence can resolve.
+        let ledger = if write {
+            self.ledger()?
+        } else {
+            match self.existing_store()? {
+                Some(store) => bellwether_ledger::Ledger::new(std::sync::Arc::clone(store)),
+                None => return Err(not_found(&evidence[0])),
+            }
+        };
         for h in evidence {
             match ledger.kind(h) {
                 Ok(RecordKind::Evidence) => {}
                 Ok(other) => {
-                    return Err(Error::LedgerRule(format!(
-                        "{h} is {}, not an evidence record; cite the evidence hash `bellwether \
-                         why` printed",
-                        other.with_article()
-                    )))
+                    return Err(Error::WrongKind {
+                        hash: *h,
+                        expected: HashKind::Evidence,
+                        found: other.with_article().into(),
+                    })
                 }
-                Err(Error::NotFound(_)) => {
-                    return Err(Error::Other(format!(
-                        "evidence {h} is not in the ledger at {}; cite a hash `bellwether why` \
-                         printed for this index",
-                        self.index_location()
-                    )))
-                }
+                Err(Error::NotFound(_)) => return Err(not_found(h)),
                 Err(e) => return Err(e),
             }
         }
@@ -86,8 +113,19 @@ impl Engine {
             created_at: self.now(),
             body,
         };
+        let record = Record::Proposal(proposal);
+        if !write {
+            // The hash the ledger would name it by: BLAKE3 of its canonical
+            // bytes, exactly as `Ledger::put` computes it.
+            return Ok(ProposeResult::WouldWrite {
+                proposal: Box::new(Written {
+                    hash: Hash::of_record(&record)?,
+                    record,
+                }),
+            });
+        }
         Ok(ProposeResult::Written {
-            proposal: Box::new(self.put(Record::Proposal(proposal))?),
+            proposal: Box::new(self.put(record)?),
         })
     }
 
@@ -103,9 +141,10 @@ impl Engine {
             }
             ProposalBody::Layout { cluster_by } => {
                 if cluster_by.is_empty() {
-                    return Err(Error::KeySpec(
-                        "a layout proposal clusters by at least one column".into(),
-                    ));
+                    return Err(Error::InvalidArgument {
+                        field: "cluster_by",
+                        reason: "a layout proposal clusters by at least one column".into(),
+                    });
                 }
                 self.check_columns(&cluster_by.iter().collect::<Vec<_>>())
             }
@@ -113,22 +152,19 @@ impl Engine {
         }
     }
 
-    fn check_columns(&self, cols: &[&String]) -> Result<()> {
+    /// Every column in `cols` is in the dataset, or [`Error::UnknownColumn`]
+    /// naming the first that is not and the columns there are.
+    pub(crate) fn check_columns(&self, cols: &[&String]) -> Result<()> {
         let pinned = self.pin()?;
         let source = self.source(pinned.as_ref())?;
         let schema = source.schema(self.root())?;
         for c in cols {
             if schema.field_with_name(c).is_err() {
-                return Err(Error::KeySpec(format!(
-                    "column {c:?} is not in the dataset under {}; propose over its columns ({})",
-                    self.root(),
-                    schema
-                        .fields()
-                        .iter()
-                        .map(|f| f.name().as_str())
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                )));
+                return Err(Error::UnknownColumn {
+                    column: (*c).clone(),
+                    root: self.root().to_string(),
+                    columns: schema.fields().iter().map(|f| f.name().clone()).collect(),
+                });
             }
         }
         Ok(())
@@ -142,10 +178,13 @@ fn check_shape(shape: &RewriteShape) -> Result<()> {
         ("invariant", &shape.invariant),
     ] {
         if v.trim().is_empty() {
-            return Err(Error::Other(format!(
-                "a rewrite proposal needs a non-empty {name}; describe the current shape, the \
-                 target shape, and the invariant the rewrite preserves"
-            )));
+            return Err(Error::InvalidArgument {
+                field: "shape",
+                reason: format!(
+                    "a rewrite proposal needs a non-empty {name}; describe the current shape, \
+                     the target shape, and the invariant the rewrite preserves"
+                ),
+            });
         }
     }
     Ok(())

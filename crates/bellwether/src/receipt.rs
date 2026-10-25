@@ -3,7 +3,7 @@
 //! resolved.
 
 use bellwether_ledger::LinkStatus as LedgerStatus;
-use bellwether_types::{Error, Hash, Result};
+use bellwether_types::{Error, Hash, HashKind, Result};
 
 use crate::engine::{guard, Engine};
 use crate::results::{ChainLink, LinkStatus, ReceiptResult};
@@ -18,10 +18,11 @@ impl Engine {
 
     fn receipt_inner(&self, hash: &Hash) -> Result<ReceiptResult> {
         let chain = self.ledger()?.explain(hash).map_err(|e| match e {
-            Error::NotFound(h) => Error::Other(format!(
-                "receipt {h} is not in the ledger at {}; pass a hash `bellwether fix` printed",
-                self.index_location()
-            )),
+            Error::NotFound(h) if h == *hash => Error::RecordNotFound {
+                kind: HashKind::Receipt,
+                hash: h,
+                place: format!("the ledger at {}", self.index_location()),
+            },
             other => other,
         })?;
         let mut links = Vec::with_capacity(chain.links.len());

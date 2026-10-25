@@ -201,6 +201,10 @@ fn tail(p: &str, w: usize) -> String {
 pub(crate) fn propose(r: &ProposeResult, _out: &Out) -> String {
     match r {
         ProposeResult::Written { proposal } => format!("proposal {}\n", proposal.hash),
+        // The CLI never asks for a dry run; the MCP server does.
+        ProposeResult::WouldWrite { proposal } => {
+            format!("dry run: would write proposal {}\n", proposal.hash)
+        }
         ProposeResult::Refused {
             refusal: bellwether::ProposeRefusal::ReservedProposer { name },
         } => format!(
@@ -438,4 +442,106 @@ pub(crate) fn report(r: &ReportResult, _out: &Out) -> String {
         r.realized,
         r.evidence.len()
     )
+}
+
+fn unreadable_line(s: &mut String, unreadable: &[Hash]) {
+    if !unreadable.is_empty() {
+        let shown: Vec<String> = unreadable.iter().map(short).collect();
+        let _ = writeln!(
+            s,
+            "  {} record(s) this build cannot read, skipped: {}",
+            unreadable.len(),
+            shown.join(" ")
+        );
+    }
+}
+
+pub(crate) fn findings(r: &bellwether::FindingsResult, out: &Out) -> String {
+    let mut s = String::new();
+    let _ = writeln!(
+        s,
+        "{}",
+        heading(out, &format!("findings: {} root(s)", r.findings.len()))
+    );
+    for f in &r.findings {
+        let Record::Evidence(e) = &f.evidence.record else {
+            continue;
+        };
+        let _ = writeln!(
+            s,
+            "  {}  evidence {}  {}",
+            f.root,
+            short(&f.evidence.hash),
+            e.provenance.created_at
+        );
+        if let EvidenceBody::Profile { lints, .. } = &e.body {
+            for l in lints {
+                let _ = writeln!(
+                    s,
+                    "    {:<30} ({})  {:.2}  {}",
+                    l.rule,
+                    l.columns.join(", "),
+                    l.confidence,
+                    l.message
+                );
+            }
+        }
+        for h in &f.receipts {
+            let _ = writeln!(s, "    receipt {}", short(h));
+        }
+    }
+    unreadable_line(&mut s, &r.unreadable);
+    s
+}
+
+pub(crate) fn receipts(r: &bellwether::ReceiptsResult, out: &Out) -> String {
+    let mut s = String::new();
+    let _ = writeln!(
+        s,
+        "{}",
+        heading(out, &format!("receipts: {}", r.receipts.len()))
+    );
+    for e in &r.receipts {
+        let Record::Receipt(rc) = &e.receipt.record else {
+            continue;
+        };
+        let state = if e.intact {
+            "every link present"
+        } else {
+            "LINKS FLAGGED"
+        };
+        let _ = writeln!(
+            s,
+            "  {}  {}  manifest {} -> {}  {state}",
+            short(&e.receipt.hash),
+            rc.created_at,
+            rc.manifest_before,
+            rc.manifest_after
+        );
+    }
+    unreadable_line(&mut s, &r.unreadable);
+    s
+}
+
+pub(crate) fn scorecard(r: &bellwether::ScorecardResult, out: &Out) -> String {
+    let mut s = String::new();
+    let _ = writeln!(s, "{}", heading(out, "scorecard"));
+    let _ = writeln!(
+        s,
+        "  {:<32} {:>9} {:>8} {:>8} {:>8}",
+        "rule", "proposals", "passed", "failed", "receipts"
+    );
+    for row in &r.rules {
+        let _ = writeln!(
+            s,
+            "  {:<32} {:>9} {:>8} {:>8} {:>8}",
+            row.rule,
+            num(row.proposals),
+            num(row.certificates_passed),
+            num(row.certificates_failed),
+            num(row.receipts)
+        );
+    }
+    unreadable_line(&mut s, &r.unreadable);
+    s
 }

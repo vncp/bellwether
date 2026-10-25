@@ -1,0 +1,43 @@
+[package]
+name = "bellwether-mcp"
+description = "The Bellwether MCP server: observe, score, propose, apply, and jobs tools, three ledger resources, and one prompt, each a thin envelope over the facade (ADR 009, ADR 010)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "bellwether-mcp"
+path = "src/main.rs"
+# Documented by its --help and the crate README; rustdoc for the binary
+# would collide with the library of the same name.
+doc = false
+
+[dependencies]
+# The one engine surface (ADR 010).
+bellwether = { path = "../bellwether" }
+# The contract, with its JSON Schema derives: tool schemas come from it.
+bellwether-types = { path = "../bellwether-types", features = ["schema"] }
+# The official MCP Rust SDK, pinned exactly; stdio transport only.
+rmcp = { version = "=3.7.0", default-features = false, features = ["server", "transport-io"] }
+schemars = { workspace = true }
+# Validates tool arguments against the closed schemas before they are
+# deserialized; no remote reference resolution (no network).
+jsonschema = { version = "=0.60.1", default-features = false }
+serde = { workspace = true }
+serde_json = { workspace = true }
+blake3 = { workspace = true }
+tokio = { workspace = true, features = ["io-std"] }
+clap = { version = "4", features = ["derive"] }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+proptest = { workspace = true }
+arrow = { workspace = true }
+parquet = { workspace = true, features = ["arrow"] }
+
+[lints]
+workspace = true

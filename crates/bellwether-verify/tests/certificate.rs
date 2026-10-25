@@ -54,6 +54,45 @@ fn catalog(dir: &std::path::Path) -> Hash {
     bellwether_source::catalog::unindexed(&identity(&schema), &files).unwrap()
 }
 
+/// Under a fixed clock the certificate's `created_at` is the clock, no run
+/// time is added to any input's age, and two runs over the same inputs make
+/// byte-identical certificates (the facade's `--clock`, ADR 010).
+#[test]
+fn a_fixed_clock_makes_certificates_byte_identical() {
+    let (l, r) = dirs();
+    let rows = ledger(20, 2);
+    write(l.path(), "x.parquet", &rows, 9);
+    write(r.path(), "x.parquet", &rows, 13);
+    let (ls, rs) = (ParquetSource::new(), ParquetSource::new());
+    let (lr, rr) = (root(l.path()), root(r.path()));
+    let clock = "2026-10-24T12:00:00.000Z";
+    let ctx = CertificateContext {
+        manifest: Some(anchor(7, Duration::from_secs(5))),
+        inputs: vec![AgedInput {
+            hash: Hash::of(b"extra"),
+            age: Duration::from_millis(1),
+        }],
+        clock: Some(clock.to_string()),
+        ..CertificateContext::default()
+    };
+    let run = || {
+        Reconciler::new(ReconcileSpec::new(["id"]), Options::default())
+            .unwrap()
+            .certify(&Side::new(&ls, &lr), &Side::new(&rs, &rr), &ctx)
+            .unwrap()
+            .certificate
+    };
+    let a = run();
+    std::thread::sleep(Duration::from_millis(20));
+    let b = run();
+    assert_eq!(a.provenance.created_at, clock);
+    assert_eq!(a.provenance.oldest_input_age, Duration::from_secs(5));
+    assert_eq!(
+        serde_json::to_vec(&a).unwrap(),
+        serde_json::to_vec(&b).unwrap()
+    );
+}
+
 #[test]
 fn a_passing_certificate_fills_every_field_and_reaches_the_ledger() {
     let (l, r) = dirs();
@@ -73,6 +112,7 @@ fn a_passing_certificate_fills_every_field_and_reaches_the_ledger() {
             hash: Hash::of(b"extra"),
             age: Duration::from_millis(1),
         }],
+        clock: None,
     };
     let certified = Reconciler::new(spec, Options::default())
         .unwrap()
@@ -243,6 +283,7 @@ fn the_ledger_refuses_a_certificate_for_an_unknown_proposal() {
         proposal: Some(Hash::of(b"no such proposal")),
         manifest: Some(anchor(1, Duration::ZERO)),
         inputs: vec![],
+        clock: None,
     };
     let certified = Reconciler::new(ReconcileSpec::new(["id"]), Options::default())
         .unwrap()

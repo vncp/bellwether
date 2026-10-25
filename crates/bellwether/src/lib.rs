@@ -34,6 +34,7 @@ mod engine;
 mod fix;
 mod index;
 mod keys;
+mod ledger_views;
 mod propose;
 mod receipt;
 mod reconcile;
@@ -48,10 +49,14 @@ pub use bellwether_source::FingerprintPolicy;
 pub use bellwether_types as types;
 pub use bellwether_verify::Reconciliation;
 pub use engine::{
-    schema_from_json, Engine, EngineOptions, SourceFormat, DEFAULT_INDEX_DIR, ISSUE_TRACKER,
+    schema_from_json, Engine, EngineOptions, FolderStatus, SourceFormat, DEFAULT_INDEX_DIR,
+    ISSUE_TRACKER,
 };
-pub use fix::{FixOutcome, FixRequest, FixResult, Refusal, RewriteOutputs, Score};
+pub use fix::{DataState, FixOutcome, FixRequest, FixResult, Refusal, RewriteOutputs, Score};
 pub use keys::KeyFile;
+pub use ledger_views::{
+    Finding, FindingsResult, ReceiptEntry, ReceiptsResult, RuleScore, ScorecardResult, UNATTRIBUTED,
+};
 pub use reconcile::{ReconcileRequest, ReconcileResult};
 pub use results::{
     ChainLink, Cost, IndexResult, LinkStatus, LookupKind, PlanResult, ProposeRefusal,

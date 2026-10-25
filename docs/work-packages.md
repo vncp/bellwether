@@ -16,7 +16,7 @@ One crate, one owner, one interface contract each. WP0 ships first and alone. Af
 | WP8 verify | merged after four review rounds; no false pass over 12,800 chunkings |
 | WP9 facade and cli | merged: why, index, locate, latest, asof, propose, reconcile, fix, receipt, report; profile wired into `why` |
 | Dependency upgrade | merged: arrow/parquet 59, object_store 0.14, DataFusion 55 (bench feature); `deny.toml` has no advisory ignores |
-| WP12 mcp | in progress |
+| WP12 mcp | merged: observe, score, propose, apply, and jobs tools; resources; the prompt generated from `AGENTS.md`; typed refusals, dry runs, per-session budgets; ADR 010 against the CLI |
 | WP20 sql | next |
 | WP13 evolve | after M3 |
 | WP14 counted segments and column bytes, WP15 relational replay, WP16 engine adapters, WP17 CI receipts, WP18 transfer evaluation, WP19 signed receipts | planned 2026-10-24 (ADR 026) |
@@ -53,7 +53,7 @@ One crate, one owner, one interface contract each. WP0 ships first and alone. Af
 |---|---|---|---|
 | WP8 | `bellwether-verify` | reconcile two sources by key with latest-by, row hash per ADR 016, exact decimal totals by group; scoped mode over a recorded workload with coverage statement; `Certificate` records | ADR 004, 016 |
 | WP9 | `bellwether` (facade) and `bellwether-cli` | the facade: `Engine::open`, every operation as a typed serde result, `fix` as score → verify (certificate against `manifest_before`, a Key proposal verified by reconciling the full scan against a `Source` over the hypothetical plan) → apply → attest; the CLI: `why`, `index`, `locate`, `latest`, `asof`, `reconcile`, `propose`, `fix`, `receipt show`, `report`, `bench`; human and `--json` output everywhere; terminal funnel and fanout table; HTML report with inline SVG rendered from ledger records | ADR 010, 017 |
-| WP12 | `bellwether-mcp` | after WP9; tools in three tiers (`observe.why/profile/locate/asof`, `propose.key/layout/rewrite`, `apply.receipt`); resources (findings, receipts, scorecard); a "diagnose a slow query" prompt; typed schemas generated from `bellwether-types` through an off-by-default `schema` feature (non-semantic); single static binary; observe-tool latency budget enforced | ADR 009, 010; threat model |
+| WP12 | `bellwether-mcp` | after WP9; tools in tiers (`observe.why/profile/locate/asof`; `score.why/verify`, engine-scored; `propose.key/layout/rewrite`; `apply.receipt`; `jobs.start/status/result`); resources (findings, receipts, scorecard); a "diagnose a slow query" prompt generated from `AGENTS.md`; typed schemas generated from `bellwether-types` through an off-by-default `schema` feature (non-semantic); refusal codes; dry runs; per-session budgets; single static binary; observe-tool latency budget enforced | ADR 009, 010; threat model |
 
 ## Row 4 · after M3
 

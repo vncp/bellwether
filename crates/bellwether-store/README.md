@@ -157,7 +157,7 @@ The view changes only through `Snapshot::reopen()`. Two things guarantee this:
 
 ## Cache
 
-`Cache::put_cached(input_hash, bytes)` writes `cache/<hash>.bin` and then the `cache/<hash>.meta.json` sidecar, `{created_at, payload_blake3}`. `Cache::get_cached(input_hash) -> Result<Option<(Bytes, Duration)>>` returns the payload and its age. A missing or unparsable sidecar, or one that disagrees with the payload, counts as a miss. Store I/O errors are returned as errors, not hidden as misses.
+`Cache::put_cached(input_hash, bytes)` writes `cache/<hash>.bin` and then the `cache/<hash>.meta.json` sidecar, `{created_at, payload_blake3}`. `Cache::get_cached(input_hash) -> Result<Option<(Bytes, Duration)>>` returns the payload and its age; `Cache::get_cached_at(input_hash, now)` measures the age to a caller's fixed clock instead (zero when the entry is newer). A missing or unparsable sidecar, or one that disagrees with the payload, counts as a miss. Store I/O errors are returned as errors, not hidden as misses.
 
 ## Garbage collection (ADR 013): claim, delete, scan, release
 

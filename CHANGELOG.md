@@ -6,6 +6,7 @@ All notable changes are documented here. The format follows Keep a Changelog; ve
 
 ### Added
 
+- `bellwether-mcp` (WP12): the MCP server over stdio (`bellwether-mcp`, and `bellwether mcp` with the same flags from one definition), tools in observe, score, propose, apply, and jobs tiers over the facade, each tool's text the CLI's `--json` line (ADR 010). Refusals carry a stable code, facts, and a `next` line in MCP field names; the facade's typed errors (`RecordNotFound`, `WrongKind`, `NoWorkload`, `NotIndexed`, `InvalidArgument`) name the argument to fix. Per-session budgets admit score and apply calls one at a time by reservation; a job id always names one result; a key already complete is refused before it is scored, so the apply dry run and the apply agree and the refusal writes nothing.
 - `bellwether` (the facade, WP9): one `Engine` whose operations (`why`, `index`, `locate`, `latest`, `asof`, `propose`, `reconcile`, `fix`, `receipt`, `report`) return typed results that are the CLI's `--json` output and what the MCP server returns (ADR 010).
 - `why` profiles the data (WP5): fanout, lints, and a `profile` Evidence, recorded where the index location is writable and returned unrecorded otherwise; the profile's serving candidates join the floor, every engine Proposal cites the Evidence, and the culprit names a batch-stamp or low-selectivity lint first, with its fanout.
 - `bellwether-cli` (WP9): the `bellwether` binary over the facade, with human and `--json` output, the exit-code contract, and `bench` over the benchmark crate.
