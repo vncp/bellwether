@@ -166,6 +166,27 @@ class Cache:
 # ---------------------------------------------------------------- results
 
 
+def external_cpu():
+    """Cores busy in processes that are not this run or its children (the
+    load average also counts this run's own worker threads)."""
+    out = subprocess.run(["ps", "-Ao", "pid=,ppid=,pcpu="], capture_output=True, text=True).stdout
+    procs = {}
+    for line in out.splitlines():
+        f = line.split()
+        if len(f) == 3:
+            procs[int(f[0])] = (int(f[1]), float(f[2]))
+    me = os.getpid()
+
+    def mine(pid):
+        seen = 0
+        while pid in procs and pid > 1 and seen < 64:
+            if pid == me:
+                return True
+            pid, seen = procs[pid][0], seen + 1
+        return False
+    return sum(cpu for pid, (_, cpu) in procs.items() if not mine(pid)) / 100.0
+
+
 class Perf:
     def __init__(self, a):
         self.a = a
@@ -194,11 +215,13 @@ class Perf:
             self.sections[name] = {"started_at": self.env["started_at"], "commit": self.env["commit"],
                                    "commit_dirty": self.env["commit_dirty"], "load_avg_1m_start": load}
             self.load_max = load
+            self.ext_max = external_cpu()
             self.load_stop = threading.Event()
 
             def watch():
                 while not self.load_stop.wait(5):
                     self.load_max = max(self.load_max, os.getloadavg()[0])
+                    self.ext_max = max(self.ext_max, external_cpu())
             self.load_thread = threading.Thread(target=watch, daemon=True)
             self.load_thread.start()
         else:
@@ -207,9 +230,10 @@ class Perf:
             self.sections[name]["finished_at"] = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
             self.sections[name]["load_avg_1m_end"] = load
             self.sections[name]["load_avg_1m_max"] = round(max(self.load_max, load), 2)
-            if self.load_max > self.a.max_load:
-                say(f"WARNING: {name}: the 1-minute load average reached {self.load_max:.1f} (limit "
-                    f"{self.a.max_load}); rerun this section on a quiet machine before publishing it")
+            self.sections[name]["external_cpu_cores_max"] = round(self.ext_max, 2)
+            if self.ext_max > self.a.max_load:
+                say(f"WARNING: {name}: processes outside this run used up to {self.ext_max:.1f} cores "
+                    f"(limit {self.a.max_load}); rerun this section on a quiet machine before publishing it")
         self.env["sections"] = self.sections
 
     def sample(self, mid, values, **extra):
@@ -1024,7 +1048,7 @@ def main():
     ap.add_argument("--merge", action="store_true",
                     help="keep the other sections' results in an existing <out>/perf.json")
     ap.add_argument("--max-load", type=float, default=3.0,
-                    help="warn when the 1-minute load average exceeds this during a section")
+                    help="warn when processes outside this run use more cores than this during a section")
     ap.add_argument("--warm", type=int, default=20)
     ap.add_argument("--cold", type=int, default=5)
     ap.add_argument("--build-reps", type=int, default=3)
