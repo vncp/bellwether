@@ -40,7 +40,10 @@ pub mod format {
 
 /// The error type shared across the engine. Variants are deliberately coarse;
 /// crates attach detail in the message and may wrap with their own types.
+/// Non-exhaustive: a new variant is not a breaking change for a crate that
+/// matches on it, which must handle the rest.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum Error {
     /// A persisted structure declares a format version newer than this binary
     /// understands. The engine never downgrades in place (ADR 017).
@@ -167,6 +170,17 @@ pub enum Error {
         field: &'static str,
         /// What is wrong with it, and what a usable value looks like.
         reason: String,
+    },
+    /// A column the caller named is not in the dataset (a key spec's, a
+    /// layout's, or a profile's candidate column).
+    #[error("column {column:?} is not in the dataset under {root}; its columns are {}", .columns.join(", "))]
+    UnknownColumn {
+        /// The column named.
+        column: String,
+        /// The data root.
+        root: String,
+        /// The dataset's columns, in schema order.
+        columns: Vec<String>,
     },
     /// Serialization failure.
     #[error("serde error: {0}")]

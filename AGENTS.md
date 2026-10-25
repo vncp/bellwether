@@ -27,8 +27,9 @@ fail if the two differ.
    `rewrite` for a rewrite). The engine replays the workload, reconciles the
    plan against a full scan, and writes a Certificate, passing or failing. A
    long run returns a job id; poll `jobs.status` and read `jobs.result`.
-   Calling the same request again returns the same job, and once it has
-   finished, its stored result; pass `wait: true` to run it again now.
+   Calling the same request again in the same state returns the same job,
+   and once it has finished, its stored result; after a commit or a data
+   change it runs again. Pass `wait: true` to run it again now.
 5. **Apply.** Call `apply.receipt` with the certificate hash, after an
    optional `dry_run: true`, which runs the same checks and gives the same
    answer. The engine refuses unverified applies: a failing certificate, a

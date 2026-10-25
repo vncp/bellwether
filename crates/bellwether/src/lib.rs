@@ -52,7 +52,7 @@ pub use engine::{
     schema_from_json, Engine, EngineOptions, FolderStatus, SourceFormat, DEFAULT_INDEX_DIR,
     ISSUE_TRACKER,
 };
-pub use fix::{FixOutcome, FixRequest, FixResult, Refusal, RewriteOutputs, Score};
+pub use fix::{DataState, FixOutcome, FixRequest, FixResult, Refusal, RewriteOutputs, Score};
 pub use keys::KeyFile;
 pub use ledger_views::{
     Finding, FindingsResult, ReceiptEntry, ReceiptsResult, RuleScore, ScorecardResult, UNATTRIBUTED,

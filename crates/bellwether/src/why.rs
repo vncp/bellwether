@@ -282,6 +282,9 @@ impl Engine {
                     .into(),
             });
         }
+        if let Some(cols) = &req.columns {
+            self.check_columns(&cols.iter().collect::<Vec<_>>())?;
+        }
         let pinned = self.pin()?;
         let source = self.source(pinned.as_ref())?;
         let sequence = pinned.as_ref().map_or(0, Pinned::sequence);

@@ -1,11 +1,16 @@
 //! Long operations as jobs (WP12 addition 9). A job id is the BLAKE3 of the
-//! request (the tool name and its arguments, keys sorted, `wait` left out),
-//! so starting the same request again returns the same job, running or
+//! request (the tool name and its arguments, keys sorted, `wait` left out)
+//! and of the state its result depends on (the current manifest sequence and
+//! the data root's catalog digest, `bellwether::DataState`). Starting the
+//! same request in the same state returns the same job, running or
 //! finished, rather than a second run, and an id always names one result:
 //! calling the tool again directly with a finished job's request returns
-//! that job's stored result. Jobs live for the session; to run a request
-//! again now, call it with `wait: true`, which runs in the call and is not
-//! a job.
+//! that job's stored result. After a commit or a data change the same
+//! arguments are a new job, so a retry that a refusal's `next` line asks
+//! for (`stale_manifest`, `data_changed`, `version_conflict`, a re-index)
+//! runs again. Jobs live for the session; to run a request again in an
+//! unchanged state, call it with `wait: true`, which runs in the call and
+//! is not a job.
 //!
 //! Which calls become jobs is a static rule, not a timer, so a result never
 //! depends on how fast the machine is: `score.*` and `apply.receipt` run as
@@ -36,7 +41,7 @@ pub enum JobState {
 /// A job, as the envelope reports it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct JobInfo {
-    /// The job id: 64 hex characters, the hash of the request.
+    /// The job id: 64 hex characters, the hash of the request and state.
     pub id: String,
     /// The tool it runs.
     pub tool: String,

@@ -231,6 +231,19 @@ pub struct FixResult {
     pub outcome: FixOutcome,
 }
 
+/// What scoring, verifying, and applying depend on now: the current
+/// manifest sequence and the data root's catalog digest. Two calls with the
+/// same request in the same state compute the same thing; a commit or a
+/// file that lands, changes, or goes changes the state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DataState {
+    /// The current manifest sequence (0 with no index).
+    pub sequence: u64,
+    /// The data root's catalog digest, as a certificate's left side cites
+    /// it.
+    pub data: Hash,
+}
+
 impl Engine {
     /// Runs score → verify → apply → attest for `request.proposal`, or
     /// apply → attest for an earlier `request.certificate` (module docs).
@@ -255,6 +268,19 @@ impl Engine {
     /// creates the index location.
     pub fn apply_dry_run(&self, certificate: &Hash) -> Result<FixResult> {
         guard(|| self.apply_certificate(certificate, true))
+    }
+
+    /// The current [`DataState`]. Reads footers; writes nothing and never
+    /// creates the index location.
+    pub fn state(&self) -> Result<DataState> {
+        guard(|| {
+            let pinned = self.pin()?;
+            let data = data_digest(self.root(), &*self.source(pinned.as_ref())?)?;
+            Ok(DataState {
+                sequence: pinned.as_ref().map_or(0, Pinned::sequence),
+                data,
+            })
+        })
     }
 
     /// Reads the record `hash` names, given as `kind`. With

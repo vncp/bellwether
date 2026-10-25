@@ -658,6 +658,95 @@ fn in_band_apply_refusals_through_the_tool_write_nothing() {
     }
 }
 
+/// An agent that follows the `stale_manifest` next line literally ("call
+/// score.verify again on the proposal, then apply.receipt with the new
+/// certificate"), with the same arguments and as jobs, ends with a receipt:
+/// the commit changed the state, so the repeated `score.verify` is a new
+/// job with a new certificate, not the stored stale one.
+#[test]
+fn following_the_stale_manifest_next_line_ends_in_a_receipt() {
+    for clock in CLOCKS {
+        let f = folder();
+        let srv = server_at(&f.data, Budget::default(), clock);
+        let sc = json(&ok(
+            &srv,
+            "score.why",
+            json!({"keys": s(&f.keys), "wait": true}),
+        ));
+        let wl = sc["workload"]["hash"].as_str().unwrap().to_string();
+        let cand = sc["candidates"][0]["proposal"]["hash"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let verify = json!({"proposal": cand, "workload": wl});
+        let job = |args: Value, tool: &str| {
+            let r = srv.call(tool, args);
+            assert_eq!(r.envelope.status, Status::Running, "{tool} is a job");
+            finish(&srv, &r.envelope.job.unwrap().id)
+        };
+        let first = job(verify.clone(), "score.verify");
+        let stale = json(&first)["certificate"]["hash"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        srv.engine()
+            .index(&[bellwether::spec::parse("exact:payload").unwrap()])
+            .unwrap();
+        let r = job(json!({"certificate": stale}), "apply.receipt");
+        refused_as("apply a stale certificate", &r, "stale_manifest");
+        let next = &refusal(&r).next;
+        assert!(
+            next.contains("score.verify") && next.contains("apply.receipt"),
+            "{next}"
+        );
+        // Exactly as the next line says: the same score.verify call again.
+        let again = job(verify, "score.verify");
+        let fresh = json(&again)["certificate"]["hash"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert_ne!(
+            fresh, stale,
+            "[clock={clock:?}] the stale certificate came back"
+        );
+        let applied = job(json!({"certificate": fresh}), "apply.receipt");
+        assert!(!applied.is_error(), "{}", applied.text);
+        let v = json(&applied);
+        assert_eq!(v["outcome"]["kind"], "applied", "[clock={clock:?}]");
+        assert!(v["outcome"]["receipt"]["hash"].is_string());
+    }
+}
+
+/// `invalid_spec` for a column the dataset lacks carries the column and the
+/// dataset's columns, from `observe.why` and the propose tools alike.
+#[test]
+fn invalid_spec_names_the_column_and_the_columns() {
+    let f = folder();
+    let srv = server(&f.data);
+    let e = ev(&srv);
+    for (tool, args) in [
+        ("observe.why", json!({"columns": ["nope"]})),
+        (
+            "propose.key",
+            json!({"spec": {"kind": "exact", "columns": ["nope"]}, "evidence": [e], "by": "a"}),
+        ),
+        (
+            "propose.layout",
+            json!({"cluster_by": ["nope"], "evidence": [e], "by": "a"}),
+        ),
+    ] {
+        let r = srv.call(tool, args);
+        refused_as(tool, &r, "invalid_spec");
+        let fields = &refusal(&r).fields;
+        assert_eq!(fields["column"], "nope", "{tool}");
+        assert_eq!(
+            fields["columns"],
+            json!(["id", "batch", "ts", "payload"]),
+            "{tool}"
+        );
+    }
+}
+
 /// Every object schema in every tool input is closed, and a score smuggled
 /// through `jobs.start` or into any key-spec variant is `invalid_input`
 /// and writes nothing.

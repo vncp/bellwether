@@ -415,12 +415,24 @@ impl Server {
                 ),
             );
         }
-        let mut key = args.clone();
-        if let Value::Object(m) = &mut key {
+        let mut request = args.clone();
+        if let Value::Object(m) = &mut request {
             // `wait` changes how the result is delivered, not what runs.
             m.remove("wait");
         }
-        let id = job_id(tool, &key);
+        // The state the result depends on is part of the request: after a
+        // commit or a data change the same arguments are a new job, so
+        // retrying as a refusal's `next` line says runs again rather than
+        // returning the stale result. An unreadable state is `null`; the
+        // tool's own call then reports why.
+        let state = self
+            .inner
+            .engine
+            .state()
+            .ok()
+            .and_then(|s| serde_json::to_value(s).ok())
+            .unwrap_or(Value::Null);
+        let id = job_id(tool, &json!({ "request": request, "state": state }));
         {
             let mut jobs = lock(&self.inner.jobs);
             if let Some(j) = jobs.get(&id) {

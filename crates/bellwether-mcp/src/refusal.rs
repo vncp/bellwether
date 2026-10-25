@@ -1,9 +1,11 @@
 //! Machine-actionable refusals (WP12 addition 10): every refusal carries a
 //! stable `code`, the facts an agent needs to act, and one `next` line.
 //!
-//! Codes come from the facade's typed refusals and typed errors by
-//! exhaustive matches, so a new variant fails to compile here rather than
-//! falling through to a guess. Nothing is classified by reading a message.
+//! Codes come from the facade's typed refusals (exhaustive matches, so a new
+//! variant fails to compile here) and typed errors. `bellwether::types::Error`
+//! is `#[non_exhaustive]`, so a variant this crate does not know yet is
+//! `engine_error` until it is mapped; `refusal::tests` lists every variant
+//! with its code. Nothing is classified by reading a message.
 //! A `next` line names MCP tools and fields, never a CLI flag: the facade's
 //! typed errors carry the field or the record kind, and the line is built
 //! from that here.
@@ -201,11 +203,11 @@ impl RefusalCode {
             Self::SourceError => "check the data files named in the message, or ask the human",
             Self::StoreError => "check the index location named in the message, or ask the human",
             Self::LedgerRule => "read the message; pass the record the tool expects",
-            Self::VersionConflict => "retry once",
+            Self::VersionConflict => "retry once, with `wait: true`",
             Self::UnsupportedVersion | Self::UnknownKind => {
                 "ask the human to upgrade bellwether; this build cannot read the index"
             }
-            Self::SegmentClaimed => "retry later",
+            Self::SegmentClaimed => "retry later, with `wait: true`",
             Self::EngineError => "read the message; it says what to do",
         }
     }
@@ -295,7 +297,8 @@ fn typed_next(e: &Error) -> Option<String> {
             ))
         }
         Error::InvalidArgument { field, .. } => Some(format!(
-            "fix `{field}` as the message says, then call the tool again"
+            "fix `{field}` as the message says, then call the tool again (with `wait: true` if \
+             the arguments themselves are unchanged)"
         )),
         _ => None,
     }
@@ -352,6 +355,12 @@ pub fn from_error(e: &Error) -> Refusal {
         Error::NotFound(h) => (RefusalCode::NotFound, json!({ "hash": h })),
         Error::LedgerRule(_) => (RefusalCode::LedgerRule, json!({})),
         Error::KeySpec(_) => (RefusalCode::InvalidSpec, json!({})),
+        Error::UnknownColumn {
+            column, columns, ..
+        } => (
+            RefusalCode::InvalidSpec,
+            json!({ "column": column, "columns": columns }),
+        ),
         Error::UnknownKind { what, found } => (
             RefusalCode::UnknownKind,
             json!({ "what": what, "found": found }),
@@ -371,7 +380,8 @@ pub fn from_error(e: &Error) -> Refusal {
         ),
         Error::Source(_) => (RefusalCode::SourceError, json!({})),
         Error::Store(_) => (RefusalCode::StoreError, json!({})),
-        Error::Serde(_) | Error::Other(_) => (RefusalCode::EngineError, json!({})),
+        // `Serde`, `Other`, and any variant added later.
+        _ => (RefusalCode::EngineError, json!({})),
     };
     let mut r = Refusal::new(code, message, fields);
     if let Some(next) = typed_next(e) {
@@ -576,6 +586,14 @@ mod tests {
             ),
             (Error::Serde(serde), RefusalCode::EngineError),
             (Error::Other("o".into()), RefusalCode::EngineError),
+            (
+                Error::UnknownColumn {
+                    column: "nope".into(),
+                    root: "/d".into(),
+                    columns: vec!["id".into(), "ts".into()],
+                },
+                RefusalCode::InvalidSpec,
+            ),
         ];
         for (e, code) in &cases {
             let r = from_error(e);
@@ -598,6 +616,8 @@ mod tests {
         assert_eq!(f(12)["field"], "workload");
         assert_eq!(f(13)["operation"], "locate");
         assert_eq!(f(14)["field"], "at");
+        assert_eq!(f(17)["column"], "nope");
+        assert_eq!(f(17)["columns"], json!(["id", "ts"]));
         // Next lines name the MCP field to fix.
         assert!(from_error(&cases[10].0).next.contains("`certificate`"));
         assert!(from_error(&cases[11].0).next.contains("`workload`"));

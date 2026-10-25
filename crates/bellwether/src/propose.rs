@@ -152,22 +152,19 @@ impl Engine {
         }
     }
 
-    fn check_columns(&self, cols: &[&String]) -> Result<()> {
+    /// Every column in `cols` is in the dataset, or [`Error::UnknownColumn`]
+    /// naming the first that is not and the columns there are.
+    pub(crate) fn check_columns(&self, cols: &[&String]) -> Result<()> {
         let pinned = self.pin()?;
         let source = self.source(pinned.as_ref())?;
         let schema = source.schema(self.root())?;
         for c in cols {
             if schema.field_with_name(c).is_err() {
-                return Err(Error::KeySpec(format!(
-                    "column {c:?} is not in the dataset under {}; propose over its columns ({})",
-                    self.root(),
-                    schema
-                        .fields()
-                        .iter()
-                        .map(|f| f.name().as_str())
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                )));
+                return Err(Error::UnknownColumn {
+                    column: (*c).clone(),
+                    root: self.root().to_string(),
+                    columns: schema.fields().iter().map(|f| f.name().clone()).collect(),
+                });
             }
         }
         Ok(())
