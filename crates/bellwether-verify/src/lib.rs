@@ -14,7 +14,12 @@
 //!   and canonical value, in the shared schema order ([`row_hash`]).
 //!   `ignored_columns` are left out and recorded on the certificate.
 //! - **Totals.** Decimal columns summed exactly at the dataset scale, per
-//!   group, as scaled integers ([`ExactTotal`]); overflow is an error.
+//!   group, as scaled integers ([`ExactTotal`]); overflow is an error. A
+//!   float column is totalled only when quantized at an explicit scale
+//!   ([`TotalColumn::quantize`], `--totals volume:dec(4)`): each value's
+//!   exact binary value rounded half to even at that scale ([`quantize`]),
+//!   then summed exactly; a NaN or infinite value is an error naming its
+//!   key.
 //! - **Coverage.** Every key, the keys of a recorded workload, or a
 //!   deterministic sample. Never a static proof.
 //!
@@ -56,7 +61,7 @@ pub use planner::{ManifestIdentity, SidePlanner};
 pub use reconcile::{Reconciler, Side, PARTITION_SEED};
 pub use rowhash::{push_hashed_column, row_hash};
 pub use spec::{
-    CoverageRequest, Options, ReconcileSpec, WorkloadKeys, DEFAULT_MAX_EXAMPLES,
-    DEFAULT_MEMORY_BUDGET, MAX_PASSES,
+    CoverageRequest, Options, ReconcileSpec, TotalColumn, WorkloadKeys, DEFAULT_MAX_EXAMPLES,
+    DEFAULT_MEMORY_BUDGET, MAX_PASSES, MAX_QUANTIZE_SCALE,
 };
-pub use totals::{ExactTotal, TotalValue};
+pub use totals::{quantize, ExactTotal, QuantizeError, TotalValue};

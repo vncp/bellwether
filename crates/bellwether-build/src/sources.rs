@@ -30,17 +30,20 @@ pub(crate) enum DataSource {
         format: TextFormat,
         schema: SchemaRef,
         policy: FingerprintPolicy,
+        exclude: Vec<String>,
         by_chunk_size: BTreeMap<u64, ChunkedTextSource<LocalFs>>,
     },
 }
 
 impl DataSource {
     /// Sources for `kind` under the dataset `schema` and `policy`. For text,
-    /// one source per chunk size in `chunk_sizes`.
+    /// one source per chunk size in `chunk_sizes`, each skipping the
+    /// directories in `exclude` ([`crate::BuildOptions::exclude`]).
     pub(crate) fn new(
         kind: SourceKind,
         schema: &SchemaRef,
         policy: FingerprintPolicy,
+        exclude: &[String],
         chunk_sizes: impl IntoIterator<Item = u64>,
     ) -> Self {
         match kind.text_format() {
@@ -54,12 +57,13 @@ impl DataSource {
                 for size in chunk_sizes {
                     by_chunk_size
                         .entry(size)
-                        .or_insert_with(|| text_source(format, schema, policy, size));
+                        .or_insert_with(|| text_source(format, schema, policy, exclude, size));
                 }
                 Self::Text {
                     format,
                     schema: SchemaRef::clone(schema),
                     policy,
+                    exclude: exclude.to_vec(),
                     by_chunk_size,
                 }
             }
@@ -72,12 +76,13 @@ impl DataSource {
             format,
             schema,
             policy,
+            exclude,
             by_chunk_size,
         } = self
         {
             by_chunk_size
                 .entry(size)
-                .or_insert_with(|| text_source(*format, schema, *policy, size));
+                .or_insert_with(|| text_source(*format, schema, *policy, exclude, size));
         }
     }
 
@@ -177,12 +182,16 @@ fn text_source(
     format: TextFormat,
     schema: &SchemaRef,
     policy: FingerprintPolicy,
+    exclude: &[String],
     chunk_size: u64,
 ) -> ChunkedTextSource<LocalFs> {
-    ChunkedTextSource::new(format)
-        .with_chunk_size(chunk_size)
-        .with_schema(SchemaRef::clone(schema))
-        .with_fingerprint_policy(policy)
+    exclude.iter().fold(
+        ChunkedTextSource::new(format)
+            .with_chunk_size(chunk_size)
+            .with_schema(SchemaRef::clone(schema))
+            .with_fingerprint_policy(policy),
+        |s, d| s.with_excluded(d.clone()),
+    )
 }
 
 /// The schema of the files under `root` as the source infers it: the first
@@ -192,13 +201,18 @@ pub(crate) fn infer_schema(
     kind: SourceKind,
     root: &str,
     policy: FingerprintPolicy,
+    exclude: &[String],
 ) -> Result<SchemaRef> {
     match kind.text_format() {
         None => ParquetSource::new()
             .with_fingerprint_policy(policy)
             .schema(root),
-        Some(format) => ChunkedTextSource::new(format)
-            .with_fingerprint_policy(policy)
+        Some(format) => exclude
+            .iter()
+            .fold(
+                ChunkedTextSource::new(format).with_fingerprint_policy(policy),
+                |s, d| s.with_excluded(d.clone()),
+            )
             .schema(root),
     }
 }

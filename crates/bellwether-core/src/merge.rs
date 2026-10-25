@@ -89,8 +89,15 @@ fn merged_header<R: ReadAt>(inputs: &[SegmentReader<R>]) -> Result<SegmentHeader
         }
         if h.key_types != h0.key_types || h.ts_type != h0.ts_type {
             return Err(Error::KeySpec(format!(
-                "cannot merge segments whose recorded types differ: {:?} (ts {:?}) and {:?} (ts {:?})",
-                h0.key_types, h0.ts_type, h.key_types, h.ts_type
+                "cannot merge segments whose recorded types differ: {} and {}",
+                crate::segment::types(
+                    h0.key_types.as_deref().unwrap_or_default(),
+                    h0.ts_type.as_ref()
+                ),
+                crate::segment::types(
+                    h.key_types.as_deref().unwrap_or_default(),
+                    h.ts_type.as_ref()
+                ),
             )));
         }
         if h.extra != h0.extra {

@@ -17,6 +17,7 @@ use super::format::{
     check_versions, corrupt, spec_types, ColumnType, Cursor, Layout, ReadAt, SegmentHeader,
     FOOTER_LEN, MAGIC, PREAMBLE_LEN,
 };
+use super::types;
 use super::writer::KeyValue;
 use crate::bloom::{check_bitset, BloomHash, CanonicalHash, FilterHash};
 use crate::encoding::{prefix_bound, tuple_has_null, NAN_KEY};
@@ -322,12 +323,11 @@ impl<R: ReadAt> SegmentReader<R> {
         };
         if have_keys != &want_keys || self.header.ts_type != want_ts {
             return Err(Error::KeySpec(format!(
-                "segment for {} was encoded under key types {:?} (ts {:?}); the dataset declares {:?} (ts {:?})",
+                "segment for {} was encoded under key types {}; the dataset declares {}; \
+                 re-index the folder",
                 self.header.key_spec.name(),
-                have_keys,
-                self.header.ts_type,
-                want_keys,
-                want_ts
+                types(have_keys, self.header.ts_type.as_ref()),
+                types(&want_keys, want_ts.as_ref()),
             )));
         }
         Ok(())
@@ -662,7 +662,7 @@ impl<R: ReadAt> SegmentReader<R> {
         Ok(())
     }
 
-    fn require_temporal(&self) -> Result<()> {
+    pub(crate) fn require_temporal(&self) -> Result<()> {
         if self.header.layout == Layout::KeyedTemporal {
             Ok(())
         } else {

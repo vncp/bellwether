@@ -43,6 +43,32 @@ impl KeyFile {
         self
     }
 
+    /// The key column names in tuple order, read from the footer alone when
+    /// the caller did not name them.
+    pub(crate) fn column_names(&self) -> Result<Vec<String>> {
+        if let Some(c) = &self.columns {
+            return Ok(c.clone());
+        }
+        let path = &self.path;
+        let fail = |e: &dyn std::fmt::Display| Error::InvalidArgument {
+            field: "keys",
+            reason: format!(
+                "cannot read the key file {} ({e}); pass a Parquet file whose columns are the \
+                 key columns",
+                path.display()
+            ),
+        };
+        let file = File::open(path).map_err(|e| fail(&e))?;
+        let meta = bellwether_source::load_reader_metadata(&file).map_err(|e| fail(&e))?;
+        let builder = ParquetRecordBatchReaderBuilder::new_with_metadata(file, meta);
+        Ok(builder
+            .schema()
+            .fields()
+            .iter()
+            .map(|f| f.name().clone())
+            .collect())
+    }
+
     /// The key columns as one batch holding exactly them, in tuple order.
     /// Memory: the key set, which a run holds anyway (ADR 018).
     pub(crate) fn read(&self) -> Result<RecordBatch> {

@@ -1,14 +1,14 @@
 //! `why` on folders with no index, with and without a workload, and over a
 //! current index that does not serve the workload.
 
-#![allow(clippy::unwrap_used, clippy::expect_used)]
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::too_many_lines)]
 
 mod common;
 
 use bellwether::types::{EvidenceBody, Hash, KeySpec, ProposalBody, Record};
 use bellwether::{
-    spec, CandidateOrigin, CulpritReason, Engine, EngineOptions, KeyFile, WhyRequest, Written,
-    ENGINE_PROPOSER,
+    spec, CandidateOrigin, CulpritReason, Engine, EngineOptions, FixOutcome, FixRequest, KeyFile,
+    LookupKind, WhyRequest, Written, ENGINE_PROPOSER,
 };
 use common::{ledger_bytes, ledger_corpus, oracle, write_keys};
 
@@ -406,4 +406,131 @@ fn profile_candidates_that_serve_by_point_follow_the_floor() {
         .unwrap();
     let got: Vec<String> = capped.candidates.iter().map(|c| c.spec.name()).collect();
     assert_eq!(got, ["exact:id,batch", "exact:id"]);
+}
+
+#[test]
+fn why_with_latest_by_prices_temporal_and_locate_and_equals_latest_and_asof_plans() {
+    use std::fs::File;
+    use std::sync::Arc;
+
+    use arrow::array::{ArrayRef, Int64Array, RecordBatch, TimestampMicrosecondArray};
+    use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
+    use parquet::arrow::ArrowWriter;
+    use parquet::file::properties::WriterProperties;
+
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    std::fs::create_dir_all(&data).unwrap();
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("pu", DataType::Int64, false),
+        Field::new(
+            "pickup_ts",
+            DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+            false,
+        ),
+    ]));
+    // 4 row groups across 2 files; every key 1..=3 is in every row group,
+    // while the newest versions live only in the last row group of file 1.
+    for (name, rgs) in [
+        (
+            "f0.parquet",
+            [
+                vec![(1i64, 1_000_000i64), (2, 1_000_000), (3, 1_000_000)],
+                vec![(1, 2_000_000), (2, 2_000_000), (3, 2_000_000)],
+            ],
+        ),
+        (
+            "f1.parquet",
+            [
+                vec![(1, 3_000_000), (2, 3_000_000), (3, 3_000_000)],
+                vec![(1, 9_000_000), (2, 9_000_000), (3, 9_000_000)],
+            ],
+        ),
+    ] {
+        let props = WriterProperties::builder()
+            .set_max_row_group_row_count(Some(3))
+            .build();
+        let mut w = ArrowWriter::try_new(
+            File::create(data.join(name)).unwrap(),
+            Arc::clone(&schema),
+            Some(props),
+        )
+        .unwrap();
+        for rg in rgs {
+            let pu: Vec<i64> = rg.iter().map(|r| r.0).collect();
+            let ts: Vec<i64> = rg.iter().map(|r| r.1).collect();
+            let b = RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(Int64Array::from(pu)) as ArrayRef,
+                    Arc::new(TimestampMicrosecondArray::from(ts).with_timezone("UTC")),
+                ],
+            )
+            .unwrap();
+            w.write(&b).unwrap();
+            w.flush().unwrap();
+        }
+        w.close().unwrap();
+    }
+    let kf = dir.path().join("k.parquet");
+    write_keys(&kf, "pu", &[1, 2, 3]);
+    let e = open(&data);
+
+    let locate_why = e
+        .why(&WhyRequest {
+            keys: Some(KeyFile::new(&kf)),
+            ..WhyRequest::default()
+        })
+        .unwrap();
+    assert!(locate_why.recommended.is_none());
+
+    let latest_why = e
+        .why(&WhyRequest {
+            keys: Some(KeyFile::new(&kf)),
+            latest_by: Some("pickup_ts".into()),
+            ..WhyRequest::default()
+        })
+        .unwrap();
+    let rec = latest_why.recommended.as_ref().unwrap();
+    assert_eq!(
+        rec.spec,
+        KeySpec::Temporal {
+            columns: vec!["pu".into()],
+            ts_column: "pickup_ts".into(),
+        }
+    );
+    assert_eq!(rec.lookup, LookupKind::Latest);
+    assert_eq!(rec.proposed.row_groups, 1);
+    assert_eq!(latest_why.candidates[0].locate.unwrap().row_groups, 4);
+
+    let at = "1970-01-01T00:00:02Z";
+    let asof_why = e
+        .why(&WhyRequest {
+            keys: Some(KeyFile::new(&kf)),
+            latest_by: Some("pickup_ts".into()),
+            at: Some(at.into()),
+            ..WhyRequest::default()
+        })
+        .unwrap();
+    let asof_rec = asof_why.recommended.as_ref().unwrap();
+    assert_eq!(asof_rec.proposed.row_groups, 1);
+
+    let fixed = e
+        .fix(&FixRequest {
+            proposal: Some(rec.proposal),
+            workload: Some(latest_why.workload.as_ref().unwrap().hash),
+            ..FixRequest::default()
+        })
+        .unwrap();
+    assert!(matches!(fixed.outcome, FixOutcome::Applied { .. }));
+
+    let latest_plan = e.latest(&KeyFile::new(&kf)).unwrap();
+    assert_eq!(latest_plan.planned, rec.proposed);
+    let asof_plan = e.asof(&KeyFile::new(&kf), at).unwrap();
+    assert_eq!(asof_plan.planned, asof_rec.proposed);
+    let locate_plan = e.locate(&KeyFile::new(&kf)).unwrap();
+    assert_eq!(
+        locate_plan.planned,
+        latest_why.candidates[0].locate.unwrap()
+    );
 }

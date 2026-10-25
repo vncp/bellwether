@@ -8,7 +8,7 @@ use bellwether_types::{format, CertBody, Certificate, Evidence, Hash, Provenance
 
 use crate::error::{Result, VerifyError};
 use crate::outcome::{Mismatch, Reconciliation};
-use crate::reconcile::{now_rfc3339, Execution, Reconciler, Side};
+use crate::reconcile::{Execution, Reconciler, Side};
 
 /// The manifest a certificate is anchored to when no side is indexed (for
 /// example a Key proposal verified by reconciling a full scan against a
@@ -96,7 +96,7 @@ impl Reconciler {
         let exec = self.execute(left, right)?;
         let created_at = match &ctx.clock {
             Some(c) => c.clone(),
-            None => now_rfc3339()?,
+            None => self.stamp()?,
         };
         let now = Instant::now();
         build(exec, ctx, handed, now, created_at)

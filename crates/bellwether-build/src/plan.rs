@@ -46,6 +46,13 @@
 //!   timestamp, then `LatestPerKey`, in that order. The bound comes from
 //!   every segment of the temporal spec, so a row superseded by a version in
 //!   a row group another spec pruned is still dropped (invariant 5);
+//! - lookback windows: `In` over `C` restricted to keys with a live version
+//!   in their window, then the window itself: `Between` on the timestamp
+//!   column from `asof − lookback` to `asof`, or, without an asof instant,
+//!   `NotOlderThan` with each key's `newest − lookback` (`newest` is the
+//!   key's newest live version, so nothing newer is live). No
+//!   `LatestPerKey`: every version in the window is returned. The plan
+//!   holds every live row group with a version of a key in its window;
 //! - range lookups: `Between`, widened for signed zero.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -55,7 +62,7 @@ use arrow::array::{ArrayRef, RecordBatch};
 use arrow::datatypes::{DataType, SchemaRef};
 use bellwether_core::encoding::{self, tag, KeyColumns, Value};
 use bellwether_core::segment::ReadAt;
-use bellwether_core::temporal::{self, VersionChain, VersionHit};
+use bellwether_core::temporal::{self, VersionChain, VersionHit, WindowHit};
 use bellwether_core::SegmentReader;
 use bellwether_source::{fingerprint_with_policy, FingerprintPolicy, LocalFs, ParquetSource};
 use bellwether_store::{Manifest, Snapshot, StoreExt};
@@ -100,6 +107,23 @@ pub enum Lookup {
         /// The instant, in the timestamp column's dataset unit (days for
         /// `Date32`, the integer itself for an integer column).
         ts: i64,
+    },
+    /// Every version of each key in a lookback window, per the one temporal
+    /// spec that serves `columns`: `[asof − lookback, asof]` with `asof`,
+    /// else `[newest − lookback, newest]` with each key's own newest live
+    /// version. Bounds inclusive, in the timestamp column's dataset unit;
+    /// the lower bound is clamped to the smallest value the column holds.
+    Window {
+        /// Lookup columns; they must include every column of the temporal
+        /// spec.
+        columns: Vec<String>,
+        /// Canonical key tuples.
+        keys: Vec<Vec<u8>>,
+        /// The asof instant, or `None` to end each key's window at its
+        /// newest version.
+        asof: Option<i64>,
+        /// The window's length, `>= 0`.
+        lookback: i64,
     },
     /// Rows whose `column` lies in `[lo, hi]`, both canonical encodings of
     /// one value of the column's dataset type.
@@ -249,9 +273,10 @@ impl<S: StoreExt + ?Sized> Planner<S> {
                 if !seen.insert(c) {
                     return Err(Error::KeySpec(format!("lookup lists column {c:?} twice")));
                 }
-                let f = self.schema.field_with_name(c).map_err(|_| {
-                    Error::KeySpec(format!("column {c:?} is not in the dataset schema"))
-                })?;
+                let f = self
+                    .schema
+                    .field_with_name(c)
+                    .map_err(|_| Error::KeySpec(encoding::not_in_schema(&self.schema, c)))?;
                 Ok((c.clone(), f.data_type().clone()))
             })
             .collect()
@@ -319,10 +344,26 @@ impl<S: StoreExt + ?Sized> Planner<S> {
         let segs = self.resolve(specs, extra)?;
         match lookup {
             Lookup::Keys { columns, keys } => self.plan_keys(&segs, columns, keys),
-            Lookup::Latest { columns, keys } => self.plan_temporal(&segs, columns, keys, None),
-            Lookup::AsOf { columns, keys, ts } => {
-                self.plan_temporal(&segs, columns, keys, Some(*ts))
+            Lookup::Latest { columns, keys } => {
+                self.plan_temporal(&segs, columns, keys, Versions::Latest)
             }
+            Lookup::AsOf { columns, keys, ts } => {
+                self.plan_temporal(&segs, columns, keys, Versions::Asof(*ts))
+            }
+            Lookup::Window {
+                columns,
+                keys,
+                asof,
+                lookback,
+            } => self.plan_temporal(
+                &segs,
+                columns,
+                keys,
+                Versions::Window {
+                    asof: *asof,
+                    lookback: *lookback,
+                },
+            ),
             Lookup::Between { column, lo, hi } => self.plan_between(&segs, column, lo, hi),
         }
     }
@@ -554,7 +595,7 @@ impl<S: StoreExt + ?Sized> Planner<S> {
         segs: &[SpecSegments],
         columns: &[String],
         keys: &[Vec<u8>],
-        asof: Option<i64>,
+        versions: Versions,
     ) -> Result<ScanPlan> {
         let types = self.column_types(columns)?;
         let (keys, spans) = non_null_probes(keys, &types)?;
@@ -593,17 +634,79 @@ impl<S: StoreExt + ?Sized> Planner<S> {
             .zip(&spans)
             .map(|(k, sp)| zero_variants(&project(k, sp, positions)))
             .collect();
-        let mut probes: Vec<Vec<u8>> = variants.iter().flatten().cloned().collect();
-        probes.sort_unstable();
-        probes.dedup();
         let readers = t
             .sources
             .iter()
             .map(|src| self.open_segment(&t.spec, src, false))
             .collect::<Result<Vec<_>>>()?;
-        let hits = self.temporal_hits(&readers, &probes, asof)?;
-        // Variants are one key under SQL equality: fold their hits.
-        let winners: Vec<Option<VersionHit>> = variants
+        let (selection, mut acc) = match versions {
+            Versions::Latest | Versions::Asof(_) => {
+                let winners = self.winners(&readers, &variants, versions.asof())?;
+                let acc: Vec<Option<RoaringBitmap>> = winners
+                    .iter()
+                    .map(|w| Some(w.as_ref().map(|h| h.row_groups.clone()).unwrap_or_default()))
+                    .collect();
+                (Selection::Winners(winners), acc)
+            }
+            Versions::Window { asof, lookback } => {
+                let windows = self.windows(&readers, &variants, &ts_type, asof, lookback)?;
+                let acc = windows
+                    .iter()
+                    .map(|w| Some(w.as_ref().map(|h| h.row_groups.clone()).unwrap_or_default()))
+                    .collect();
+                (Selection::Windows(windows), acc)
+            }
+        };
+        let others: Vec<(&SpecSegments, Serve)> = serving
+            .iter()
+            .filter(|(s, _)| !std::ptr::eq(*s, t))
+            .map(|(s, h)| (*s, h.clone()))
+            .collect();
+        self.intersect(&mut acc, &others, keys, &spans)?;
+        let selected = acc
+            .into_iter()
+            .flatten()
+            .fold(RoaringBitmap::new(), |u, b| u | b);
+        let residual = match &selection {
+            Selection::Winners(winners) => temporal_residual(
+                &t.spec,
+                ts_column,
+                &ts_type,
+                columns,
+                keys,
+                &variants,
+                winners,
+                versions.asof(),
+            )?,
+            Selection::Windows(windows) => window_residual(
+                &t.spec,
+                ts_column,
+                &ts_type,
+                columns,
+                keys,
+                &variants,
+                windows,
+                versions.asof(),
+                versions.lookback(),
+            )?,
+        };
+        self.finish(&selected, residual)
+    }
+
+    /// Each key's index-wide winning version (latest, or at `asof`): every
+    /// zero variant of the key's projection is probed, and the variants'
+    /// hits fold into one, since they are one key under SQL equality.
+    fn winners<R: ReadAt>(
+        &self,
+        readers: &[SegmentReader<R>],
+        variants: &[Vec<Vec<u8>>],
+        asof: Option<i64>,
+    ) -> Result<Vec<Option<VersionHit>>> {
+        let mut probes: Vec<Vec<u8>> = variants.iter().flatten().cloned().collect();
+        probes.sort_unstable();
+        probes.dedup();
+        let hits = self.temporal_hits(readers, &probes, asof)?;
+        Ok(variants
             .iter()
             .map(|vs| {
                 vs.iter()
@@ -618,25 +721,47 @@ impl<S: StoreExt + ?Sized> Planner<S> {
                         })
                     })
             })
-            .collect();
-        let mut acc: Vec<Option<RoaringBitmap>> = winners
+            .collect())
+    }
+
+    /// Each key's lookback window (module docs) from the version chains of
+    /// every segment of the spec, counting only live row groups; a chain
+    /// naming a row group the manifest never assigned is an error.
+    fn windows<R: ReadAt>(
+        &self,
+        readers: &[SegmentReader<R>],
+        variants: &[Vec<Vec<u8>>],
+        ts_type: &DataType,
+        asof: Option<i64>,
+        lookback: i64,
+    ) -> Result<Vec<Option<WindowHit>>> {
+        if lookback < 0 {
+            return Err(Error::KeySpec(format!(
+                "a lookback window cannot be negative ({lookback})"
+            )));
+        }
+        let mut probes: Vec<&Vec<u8>> = variants.iter().flatten().collect();
+        probes.sort_unstable();
+        probes.dedup();
+        let chains = temporal::chains(readers, &probes)?;
+        for chain in chains.values() {
+            let ids: RoaringBitmap = chain.versions().iter().map(|(_, rg)| rg.0).collect();
+            self.locator.check_known(&ids)?;
+        }
+        let floor = encoding::ts_min(ts_type)?;
+        let live = self.locator.live();
+        Ok(variants
             .iter()
-            .map(|w| Some(w.as_ref().map(|h| h.row_groups.clone()).unwrap_or_default()))
-            .collect();
-        let others: Vec<(&SpecSegments, Serve)> = serving
-            .iter()
-            .filter(|(s, _)| !std::ptr::eq(*s, t))
-            .map(|(s, h)| (*s, h.clone()))
-            .collect();
-        self.intersect(&mut acc, &others, keys, &spans)?;
-        let selected = acc
-            .into_iter()
-            .flatten()
-            .fold(RoaringBitmap::new(), |u, b| u | b);
-        let residual = temporal_residual(
-            &t.spec, ts_column, &ts_type, columns, keys, &variants, &winners, asof,
-        )?;
-        self.finish(&selected, residual)
+            .map(|vs| {
+                temporal::window(
+                    vs.iter().filter_map(|v| chains.get(v)),
+                    live,
+                    asof,
+                    lookback,
+                    floor,
+                )
+            })
+            .collect())
     }
 
     /// Index-wide newest version per probe, from core's cross-segment
@@ -893,6 +1018,88 @@ fn live_winner(
         }
     }
     best
+}
+
+/// Which versions of each key a temporal lookup asks for.
+#[derive(Clone, Copy)]
+enum Versions {
+    Latest,
+    Asof(i64),
+    Window { asof: Option<i64>, lookback: i64 },
+}
+
+impl Versions {
+    fn asof(self) -> Option<i64> {
+        match self {
+            Self::Latest => None,
+            Self::Asof(ts) => Some(ts),
+            Self::Window { asof, .. } => asof,
+        }
+    }
+
+    fn lookback(self) -> i64 {
+        match self {
+            Self::Window { lookback, .. } => lookback,
+            Self::Latest | Self::Asof(_) => 0,
+        }
+    }
+}
+
+/// Per key, what a temporal lookup selected: its winning version, or its
+/// lookback window.
+enum Selection {
+    Winners(Vec<Option<VersionHit>>),
+    Windows(Vec<Option<WindowHit>>),
+}
+
+/// The residual of a lookback window lookup (see the module docs).
+#[allow(clippy::too_many_arguments)]
+fn window_residual(
+    spec: &KeySpec,
+    ts_column: &str,
+    ts_type: &DataType,
+    columns: &[String],
+    keys: &[Vec<u8>],
+    variants: &[Vec<Vec<u8>>],
+    windows: &[Option<WindowHit>],
+    asof: Option<i64>,
+    lookback: i64,
+) -> Result<Predicate> {
+    let with_window = keys
+        .iter()
+        .zip(windows)
+        .filter(|(_, w)| w.is_some())
+        .map(|(k, _)| k);
+    let mut all = vec![Predicate::In {
+        columns: columns.to_vec(),
+        values: expanded(with_window),
+    }];
+    if let Some(at) = asof {
+        // One window for every key: `[at − lookback, at]`.
+        let lo = at.saturating_sub(lookback).max(encoding::ts_min(ts_type)?);
+        all.push(Predicate::Between {
+            column: ts_column.to_string(),
+            lo: encode_ts(lo, ts_type)?,
+            hi: encode_ts(at, ts_type)?,
+        });
+    } else {
+        // Each key's own window ends at its newest live version, so only
+        // the lower bound needs stating.
+        let mut bounds: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
+        for (vs, w) in variants.iter().zip(windows) {
+            let Some(w) = w else { continue };
+            let lo = encode_ts(w.lo, ts_type)?;
+            for v in vs {
+                bounds.insert(v.clone(), lo.clone());
+            }
+        }
+        all.push(Predicate::NotOlderThan {
+            columns: spec.columns().to_vec(),
+            ts_column: ts_column.to_string(),
+            bounds: bounds.into_iter().collect(),
+        });
+    }
+    Ok(Predicate::And { all })
 }
 
 /// The residual of a latest or asof lookup (see the module docs).

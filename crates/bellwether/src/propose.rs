@@ -137,7 +137,23 @@ impl Engine {
                 if let KeySpec::Temporal { ts_column, .. } = spec {
                     cols.push(ts_column);
                 }
-                self.check_columns(&cols)
+                let schema = self.check_columns(&cols)?;
+                // A key column needs a canonical encoding: refuse a nested
+                // one now, with the sentence `index` gives, not at `fix`.
+                for c in spec.columns() {
+                    let dt = schema
+                        .field_with_name(c)
+                        .map_err(|e| Error::KeySpec(e.to_string()))?
+                        .data_type();
+                    if bellwether_core::encoding::check_supported(dt).is_err() {
+                        return Err(Error::KeySpec(format!(
+                            "{}: key column {c:?}: {}",
+                            spec.name(),
+                            bellwether_core::encoding::no_encoding(dt)
+                        )));
+                    }
+                }
+                Ok(())
             }
             ProposalBody::Layout { cluster_by } => {
                 if cluster_by.is_empty() {
@@ -147,19 +163,27 @@ impl Engine {
                     });
                 }
                 self.check_columns(&cluster_by.iter().collect::<Vec<_>>())
+                    .map(|_| ())
             }
             ProposalBody::Rewrite { shape } => check_shape(shape),
         }
     }
 
     /// Every column in `cols` is in the dataset, or [`Error::UnknownColumn`]
-    /// naming the first that is not and the columns there are.
-    pub(crate) fn check_columns(&self, cols: &[&String]) -> Result<()> {
+    /// naming the first that is not and the columns there are. Returns the
+    /// dataset schema.
+    pub(crate) fn check_columns(&self, cols: &[&String]) -> Result<arrow::datatypes::SchemaRef> {
         let pinned = self.pin()?;
         let source = self.source(pinned.as_ref())?;
         let schema = source.schema(self.root())?;
         for c in cols {
             if schema.field_with_name(c).is_err() {
+                // A field path into a nested column gets the reason and the
+                // next step (flatten first), not the column list.
+                let why = bellwether_core::encoding::not_in_schema(&schema, c);
+                if why.contains("nested") {
+                    return Err(Error::KeySpec(why));
+                }
                 return Err(Error::UnknownColumn {
                     column: (*c).clone(),
                     root: self.root().to_string(),
@@ -167,7 +191,7 @@ impl Engine {
                 });
             }
         }
-        Ok(())
+        Ok(schema)
     }
 }
 

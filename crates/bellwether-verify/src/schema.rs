@@ -66,25 +66,27 @@ pub(crate) fn class(dt: &DataType) -> Result<Class> {
         DataType::Date64 => Class::Date64,
         DataType::Time32(u) | DataType::Time64(u) => Class::Time(*u),
         DataType::Timestamp(u, _) => Class::Timestamp(*u),
-        other => {
-            return Err(VerifyError::Schema(format!(
-                "type {other} has no canonical encoding in encoding version 1"
-            )))
-        }
+        other => return Err(VerifyError::Schema(encoding::no_encoding(other))),
     })
 }
 
-/// A decimal total column.
+/// A total column: a decimal at its dataset scale, or a float quantized at
+/// an explicit scale.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct TotalCol {
-    /// Column name.
+    /// The label totals and certificates name it by: the column, or
+    /// `col:dec(S)` when quantized.
     pub name: String,
     /// Index into [`Plan::projection`].
     pub proj: usize,
-    /// `true` for Decimal256 (an `i256` total), `false` for Decimal128.
+    /// `true` for Decimal256 (an `i256` total), `false` for Decimal128 and
+    /// quantized floats.
     pub wide: bool,
-    /// The dataset scale every total is expressed at.
+    /// The scale every total is expressed at: the dataset scale, or the
+    /// quantization scale.
     pub scale: i8,
+    /// Whether this is a float column quantized at `scale`.
+    pub quantize: bool,
 }
 
 /// The columns a reconcile reads and how it uses them, resolved against
@@ -142,20 +144,47 @@ impl Plan {
             None => None,
         };
         let mut totals = Vec::with_capacity(spec.total_columns.len());
-        for c in &spec.total_columns {
+        for t in &spec.total_columns {
+            let c = &t.column;
             let i = index(c);
-            let Class::Decimal { wide, scale } = class(&types[0][i])? else {
-                return Err(VerifyError::InvalidSpec(format!(
-                    "total column {c:?} is {}, not a decimal; totals are exact decimal sums and \
-                     never use floats",
-                    types[0][i]
-                )));
+            let (wide, scale) = match (class(&types[0][i])?, t.quantize) {
+                (Class::Decimal { wide, scale }, None) => (wide, scale),
+                (Class::Float, None) => {
+                    return Err(VerifyError::InvalidSpec(format!(
+                        "total column {c:?} is {}, and totals are exact; quantize it at an \
+                         explicit scale, for example {c}:dec(4) (each value rounded half to \
+                         even at 4 decimal places, then summed exactly)",
+                        types[0][i]
+                    )))
+                }
+                (Class::Float, Some(s)) => (
+                    false,
+                    i8::try_from(s).map_err(|_| {
+                        VerifyError::InvalidSpec(format!("{}: scale out of range", t.label()))
+                    })?,
+                ),
+                (Class::Decimal { .. }, Some(_)) => {
+                    return Err(VerifyError::InvalidSpec(format!(
+                        "total column {c:?} is {}, a decimal summed exactly at its own scale; \
+                         drop :dec(..) from {}",
+                        types[0][i],
+                        t.label()
+                    )))
+                }
+                _ => {
+                    return Err(VerifyError::InvalidSpec(format!(
+                        "total column {c:?} is {}, not a decimal or a float; totals are exact \
+                         decimal sums",
+                        types[0][i]
+                    )))
+                }
             };
             totals.push(TotalCol {
-                name: c.clone(),
+                name: t.label(),
                 proj: i,
                 wide,
                 scale,
+                quantize: t.quantize.is_some(),
             });
         }
         Ok(Self {
@@ -240,7 +269,7 @@ fn projection(
         .key_columns
         .iter()
         .chain(spec.latest_by.iter())
-        .chain(&spec.total_columns)
+        .chain(spec.total_columns.iter().map(|t| &t.column))
         .chain(&spec.group_by)
     {
         for (side, schema) in [("left", left), ("right", right)] {

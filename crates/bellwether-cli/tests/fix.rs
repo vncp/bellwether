@@ -397,6 +397,8 @@ fn a_key_that_is_already_complete_is_refused_never_attested() {
     let proposal = p.trim().trim_start_matches("proposal ").to_string();
     let before = sequence(&index);
     let stored = objects(&index);
+    // The key is complete, which is checked before scoring: nothing to do,
+    // even with the gain gate off.
     let out = run(
         &[
             "--json",
@@ -406,6 +408,7 @@ fn a_key_that_is_already_complete_is_refused_never_attested() {
             &proposal,
             "--workload",
             &workload.to_hex(),
+            "--allow-no-gain",
         ],
         3,
     );

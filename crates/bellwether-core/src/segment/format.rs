@@ -208,12 +208,65 @@ impl ColumnType {
                 unit: (*u).into(),
                 tz: tz.as_ref().map(ToString::to_string),
             },
-            other => {
-                return Err(Error::Other(format!(
-                    "type {other} has no canonical encoding in encoding version 1"
-                )))
-            }
+            other => return Err(Error::Other(encoding::no_encoding(other))),
         })
+    }
+}
+
+/// Key types and an optional timestamp type as one phrase for an error
+/// message: `(Int64, Utf8)` or `(Int64) with ts Timestamp(µs, "UTC")`.
+#[must_use]
+pub fn types(keys: &[ColumnType], ts: Option<&ColumnType>) -> String {
+    let k: Vec<String> = keys.iter().map(ToString::to_string).collect();
+    match ts {
+        Some(t) => format!("({}) with ts {t}", k.join(", ")),
+        None => format!("({})", k.join(", ")),
+    }
+}
+
+/// The type as a reader of an error message expects it: Arrow's names
+/// (`Int64`, `Decimal128(10, 2)`, `Timestamp(µs, "UTC")`), never the Rust
+/// debug form.
+impl std::fmt::Display for ColumnType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let unit = |u: &RecordedUnit| match u {
+            RecordedUnit::Second => "s",
+            RecordedUnit::Millisecond => "ms",
+            RecordedUnit::Microsecond => "µs",
+            RecordedUnit::Nanosecond => "ns",
+        };
+        match self {
+            Self::Boolean => f.write_str("Boolean"),
+            Self::Int8 => f.write_str("Int8"),
+            Self::Int16 => f.write_str("Int16"),
+            Self::Int32 => f.write_str("Int32"),
+            Self::Int64 => f.write_str("Int64"),
+            Self::UInt8 => f.write_str("UInt8"),
+            Self::UInt16 => f.write_str("UInt16"),
+            Self::UInt32 => f.write_str("UInt32"),
+            Self::UInt64 => f.write_str("UInt64"),
+            Self::Float16 => f.write_str("Float16"),
+            Self::Float32 => f.write_str("Float32"),
+            Self::Float64 => f.write_str("Float64"),
+            Self::Decimal128 { precision, scale } => write!(f, "Decimal128({precision}, {scale})"),
+            Self::Decimal256 { precision, scale } => write!(f, "Decimal256({precision}, {scale})"),
+            Self::Utf8 => f.write_str("Utf8"),
+            Self::LargeUtf8 => f.write_str("LargeUtf8"),
+            Self::Utf8View => f.write_str("Utf8View"),
+            Self::Binary => f.write_str("Binary"),
+            Self::LargeBinary => f.write_str("LargeBinary"),
+            Self::BinaryView => f.write_str("BinaryView"),
+            Self::FixedSizeBinary { size } => write!(f, "FixedSizeBinary({size})"),
+            Self::Date32 => f.write_str("Date32"),
+            Self::Date64 => f.write_str("Date64"),
+            Self::Time32 { unit: u } => write!(f, "Time32({})", unit(u)),
+            Self::Time64 { unit: u } => write!(f, "Time64({})", unit(u)),
+            Self::Timestamp { unit: u, tz: None } => write!(f, "Timestamp({})", unit(u)),
+            Self::Timestamp {
+                unit: u,
+                tz: Some(tz),
+            } => write!(f, "Timestamp({}, {tz:?})", unit(u)),
+        }
     }
 }
 

@@ -61,7 +61,8 @@ pub use error::{ReplayError, ReplayResult};
 pub use keys::{RunKeys, RunKeysBuilder};
 pub use layout::{replay_layout, LayoutModel, LayoutReplay, LAYOUT_MODEL_VERSION};
 pub use plan::{
-    run_cost, servable, Lookup, PlanSource, RangeRead, SegmentBytes, SegmentPlanner, SpecSegments,
+    run_cost, servable, serves_query, Lookup, PlanSource, RangeRead, SegmentBytes, SegmentPlanner,
+    SpecSegments,
 };
 pub use replay::{proposed_specs, write_replay, Replayer, Scored, DEFAULT_CACHE_BYTES};
 pub use report::{
@@ -73,6 +74,6 @@ pub use transient::{
 };
 pub use workload::{
     record_bench_workload, BenchWorkloadSummary, KeyInput, KeySetSink, KeySetSource, MemoryKeySets,
-    RecordedRun, Workload, WorkloadFile, WorkloadManifest, WorkloadRecorder, BENCH_WORKLOAD_FORMAT,
-    QUERY_KIND_LOCATE, WORKLOAD_FORMAT,
+    RecordedRun, RunQuery, Workload, WorkloadFile, WorkloadManifest, WorkloadRecorder,
+    BENCH_WORKLOAD_FORMAT, QUERY_KIND_ASOF, QUERY_KIND_LATEST, QUERY_KIND_LOCATE, WORKLOAD_FORMAT,
 };

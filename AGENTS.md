@@ -67,6 +67,7 @@ line. No refusal is prose only.
 | `data_changed` | Files changed after verification. Call `score.verify` again. |
 | `concurrent_commit` | Another commit landed during the apply; the key is built but not attested. Tell the human. |
 | `nothing_to_apply` | The key is already complete; there is nothing to apply or attest. |
+| `nothing_to_gain` | The proposal's replay predicts no saving on the workload; `fields` has `replay`, `current_bytes`, `proposed_bytes`. Nothing but the Replay was written. Propose another key; go on (`allow_no_gain`) only if the human asks. |
 | `layout_not_applicable` | Layout proposals cannot be applied in this release. |
 | `no_replay` | A rewrite verified but cannot be attested yet (rewrites have no replay). |
 | `reserved_proposer` | The name in `by` is reserved for the engine. Pass your own name. |

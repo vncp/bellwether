@@ -134,6 +134,27 @@ struct WhyArgs {
     /// A workload recorded earlier, by its hash.
     #[arg(long, value_name = "HASH", conflicts_with = "from")]
     workload: Option<String>,
+    /// The lookup the keys are priced under: `locate` (rows holding a key),
+    /// `latest` (each key's newest version), or `asof` (the version current
+    /// at --at) [default: asof with --at, latest with --latest-by, else
+    /// locate].
+    #[arg(long, value_enum, value_name = "MODE")]
+    mode: Option<ModeArg>,
+    /// Timestamp (or date, time, or integer version) column that orders
+    /// versions, for `latest` and `asof` pricing.
+    #[arg(long, value_name = "COL", conflicts_with = "bench_workload")]
+    latest_by: Option<String>,
+    /// The instant for `asof` pricing (with `--latest-by`): RFC 3339, a date
+    /// (YYYY-MM-DD), or an integer in the timestamp column's unit.
+    #[arg(long, value_name = "INSTANT", requires = "latest_by")]
+    at: Option<String>,
+    /// Price every version in a window instead of one per key: the
+    /// versions in [at − N, at] (asof) or [newest − N, newest] (latest). A
+    /// whole number with a calendar unit: s, m, h, d, or w (252d, 36h;
+    /// trading-day calendars are out of scope); a bare integer for an
+    /// integer timestamp column.
+    #[arg(long, value_name = "N", requires = "latest_by")]
+    lookback: Option<String>,
     /// Candidate key columns for the profile, comma-separated [default:
     /// every id-like column].
     #[arg(long, value_name = "COLS", value_delimiter = ',')]
@@ -142,6 +163,24 @@ struct WhyArgs {
     /// columns.
     #[arg(long, value_name = "N", default_value_t = bellwether::DEFAULT_MAX_CANDIDATES)]
     max_candidates: usize,
+}
+
+/// `why --mode`.
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum ModeArg {
+    Locate,
+    Latest,
+    Asof,
+}
+
+impl From<ModeArg> for bellwether::LookupMode {
+    fn from(m: ModeArg) -> Self {
+        match m {
+            ModeArg::Locate => Self::Locate,
+            ModeArg::Latest => Self::Latest,
+            ModeArg::Asof => Self::Asof,
+        }
+    }
 }
 
 #[derive(Args)]
@@ -553,9 +592,20 @@ fn why(g: &Global, out: &Out, a: &WhyArgs) -> Result<Outcome, Failure> {
             .as_deref()
             .map(|w| hash(w, "workload"))
             .transpose()?,
+        mode: a.mode.map(Into::into),
+        latest_by: a.latest_by.clone(),
+        at: a.at.clone(),
+        lookback: a.lookback.clone(),
         columns: a.columns.clone(),
         max_candidates: a.max_candidates,
     };
+    let mode = request.lookup_mode().map_err(Failure::Usage)?;
+    if mode != bellwether::LookupMode::Locate && a.from.is_none() && a.workload.is_none() {
+        return Err(Failure::Usage(format!(
+            "--mode {} prices a workload's keys; pass --from <keys.parquet> (or --workload <hash>)",
+            mode.as_str()
+        )));
+    }
     let r = engine(g, &a.root.root)?.why(&request)?;
     done(&r, human::why(&r, out), EXIT_OK)
 }

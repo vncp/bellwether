@@ -241,14 +241,14 @@ An index does not help this workload on this layout: 1,000 random users together
 On 2026-10-24, every CLI verb was run in a release build, on the same machine, against data nobody here generated: six months of NYC yellow-taxi trips (20,332,093 rows) and 12 hours of GH Archive events (1,768,515 rows, flattened from nested JSON by DuckDB). [`scripts/realdata.sh`](scripts/realdata.sh) reproduces the run, downloads included. The verbatim transcript and the defect list are in [docs/measured/2026-10-24-realdata.md](docs/measured/2026-10-24-realdata.md).
 
 - **No wrong number turned up.** On both datasets, `why`'s predicted bytes equalled `locate`'s planned bytes. Both GitHub exact plans and all six `latest` and `asof` plans equalled an oracle that reads the rows with DuckDB, down to the row group.
-- **Taxi, by pickup zone: no index can help, and the tool says so.** All 262 zones appear in all 22 row groups, so even an exact index reads 341,861,576 of 341,861,576 bytes, and `why` recommends nothing. `latest` per zone on the same index needs only 6 of the 22 row groups (94.4 MB), which `why` cannot see.
-- **`reconcile` checked a 20-million-row rewrite.** It proved the DuckDB rewrite of the taxi files identical (182 s). With one `tip_amount` changed, it failed with exit 1, but only the `--json` output names the key that differs.
+- **Taxi, by pickup zone: no index can help, and the tool says so.** All 262 zones appear in all 22 row groups, so even an exact index reads 341,861,576 of 341,861,576 bytes, and `why` recommends nothing. `latest` per zone on the same index needs only 6 of the 22 row groups (94.4 MB), which `why` could not see then; `why --from <keys> --latest-by <time column>` now prices it.
+- **`reconcile` checked a 20-million-row rewrite.** It proved the DuckDB rewrite of the taxi files identical (182 s). With one `tip_amount` changed, it failed with exit 1, but only the `--json` output named the key that differs; the human output now names the first 10.
 - **Ten GitHub repositories: the full loop worked.** `why` predicted 5,190,369 of 12,817,897 bytes, and `fix` verified, applied, and attested the index; `locate` then planned exactly 5,190,369 bytes.
 
-There are 14 defects, filed in that document. The two that matter most:
+The run found 14 defects, filed in that document, and all 14 are fixed since, each with a regression test (`crates/bellwether-cli/tests/realdata.rs`). The two that mattered most:
 
-- `index` refuses any dataset that has a nested column.
-- `fix` will attest a key that its own replay predicts saves nothing.
+- `index` refused any dataset that has a nested column. Nested columns are now recorded and skipped as key candidates; a nested key column is refused by name.
+- `fix` attested a key that its own replay predicted saves nothing. It now refuses with `nothing_to_gain` (exit 3) unless `--allow-no-gain`.
 
 ## Status
 

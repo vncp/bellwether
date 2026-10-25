@@ -26,9 +26,8 @@
 //! A run's template groups it in reports. Without one, the template is the
 //! run's key-column set, `columns(<key columns>)`: a grouping by columns, not
 //! by query; pass the query or pipeline step a run came from to group by
-//! that. Every run records a query kind; only `locate` exists today, and a
-//! workload naming another kind is refused (`latest` and `asof` runs are
-//! reserved for when the format can price them, contract v3 backlog #14).
+//! that. Every run records a query kind (`locate`, `latest`, or `asof`;
+//! contract v3 backlog #14), and a workload naming another kind is refused.
 //!
 //! # The bench workload format
 //!
@@ -71,9 +70,82 @@ const WORKLOAD_FORMAT_PREFIX: &str = "bellwether-replay-workload/";
 /// Format tag of `bellwether-bench`'s `workload.json`.
 pub const BENCH_WORKLOAD_FORMAT: &str = "bellwether-bench-workload/1";
 const BENCH_WORKLOAD_FORMAT_PREFIX: &str = "bellwether-bench-workload/";
-/// The query kind of a recorded run that looks keys up (`locate`), the only
-/// kind replay prices today.
+/// The query kind of a recorded run that looks up every row holding a key
+/// (`locate`).
 pub const QUERY_KIND_LOCATE: &str = "locate";
+/// The query kind of a recorded run that looks up the newest version of each
+/// key (`latest`).
+pub const QUERY_KIND_LATEST: &str = "latest";
+/// The query kind of a recorded run that looks up the version of each key
+/// current at an instant (`asof`).
+pub const QUERY_KIND_ASOF: &str = "asof";
+
+/// What a recorded run asked of the index.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum RunQuery {
+    /// Every row holding a key ([`QUERY_KIND_LOCATE`]).
+    #[default]
+    Locate,
+    /// The newest version of each key ([`QUERY_KIND_LATEST`]).
+    Latest,
+    /// The version of each key current at `ts`, in the timestamp column's
+    /// dataset unit ([`QUERY_KIND_ASOF`]).
+    Asof {
+        /// The instant, in the timestamp column's dataset unit.
+        ts: i64,
+    },
+    /// Every version of each key in a lookback window: `[asof − lookback,
+    /// asof]` when `asof` is set ([`QUERY_KIND_ASOF`]), else `[newest −
+    /// lookback, newest]` per key, `newest` being the key's newest version
+    /// ([`QUERY_KIND_LATEST`]). Both bounds inclusive, in the timestamp
+    /// column's dataset unit.
+    Window {
+        /// The asof instant, or `None` to end each key's window at its
+        /// newest version.
+        asof: Option<i64>,
+        /// The window's length, `>= 0`.
+        lookback: i64,
+    },
+}
+
+impl RunQuery {
+    /// The `query_kind` tag (`locate`, `latest`, or `asof`).
+    #[must_use]
+    pub fn kind_str(&self) -> &'static str {
+        match self {
+            Self::Locate => QUERY_KIND_LOCATE,
+            Self::Latest | Self::Window { asof: None, .. } => QUERY_KIND_LATEST,
+            Self::Asof { .. } | Self::Window { asof: Some(_), .. } => QUERY_KIND_ASOF,
+        }
+    }
+
+    /// The `asof` instant when this is [`RunQuery::Asof`] or an asof
+    /// [`RunQuery::Window`].
+    #[must_use]
+    pub fn asof_ts(&self) -> Option<i64> {
+        match self {
+            Self::Asof { ts } => Some(*ts),
+            Self::Window { asof, .. } => *asof,
+            Self::Locate | Self::Latest => None,
+        }
+    }
+
+    /// The lookback window's length when this is a [`RunQuery::Window`].
+    #[must_use]
+    pub fn lookback(&self) -> Option<i64> {
+        match self {
+            Self::Window { lookback, .. } => Some(*lookback),
+            Self::Locate | Self::Latest | Self::Asof { .. } => None,
+        }
+    }
+
+    /// Whether this asks for versions (`latest`, `asof`, or a window), so
+    /// only a temporal key spec can plan it.
+    #[must_use]
+    pub fn is_temporal(&self) -> bool {
+        !matches!(self, Self::Locate)
+    }
+}
 
 /// One recorded run.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -84,9 +156,21 @@ pub struct RecordedRun {
     /// set, `columns(<key columns>)`: a grouping by columns, not by query;
     /// recorders that know the query or pipeline step pass it instead.
     pub template: String,
-    /// What the run asked of the index: [`QUERY_KIND_LOCATE`] today, with
-    /// `latest` and `asof` reserved.
+    /// What the run asked of the index: [`QUERY_KIND_LOCATE`],
+    /// [`QUERY_KIND_LATEST`], or [`QUERY_KIND_ASOF`].
     pub query_kind: String,
+    /// For [`QUERY_KIND_ASOF`] runs: the instant in the timestamp column's
+    /// dataset unit. Absent (`None`, omitted in JSON) for `locate` and
+    /// `latest` runs, so existing workload manifests serialize and hash to
+    /// identical bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub asof: Option<i64>,
+    /// For a [`RunQuery::Window`] run: the lookback window's length in the
+    /// timestamp column's dataset unit. Absent (`None`, omitted in JSON)
+    /// otherwise, so existing workload manifests serialize and hash to
+    /// identical bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lookback: Option<i64>,
     /// Key columns, in tuple order.
     pub columns: Vec<String>,
     /// The dataset type each key column was encoded at.
@@ -97,6 +181,52 @@ pub struct RecordedRun {
     pub null_tuples: u64,
     /// BLAKE3 of the key-set payload stored in the cache.
     pub key_set: Hash,
+}
+
+impl RecordedRun {
+    /// The typed query kind of this run, or an error if `query_kind`,
+    /// `asof`, and `lookback` disagree or name an unknown kind.
+    pub fn query(&self) -> Result<RunQuery> {
+        let point = match (self.query_kind.as_str(), self.asof) {
+            (QUERY_KIND_LOCATE, None) => RunQuery::Locate,
+            (QUERY_KIND_LATEST, None) => RunQuery::Latest,
+            (QUERY_KIND_ASOF, Some(ts)) => RunQuery::Asof { ts },
+            (QUERY_KIND_LOCATE | QUERY_KIND_LATEST, Some(_)) => {
+                return Err(Error::Other(format!(
+                    "run {:?} has query_kind {:?} but sets asof",
+                    self.run_id, self.query_kind
+                )))
+            }
+            (QUERY_KIND_ASOF, None) => {
+                return Err(Error::Other(format!(
+                    "run {:?} has query_kind \"asof\" without an asof timestamp",
+                    self.run_id
+                )))
+            }
+            (other, _) => {
+                return Err(Error::UnknownKind {
+                    what: "query kind",
+                    found: other.to_string(),
+                })
+            }
+        };
+        match (point, self.lookback) {
+            (q, None) => Ok(q),
+            (RunQuery::Locate, Some(_)) => Err(Error::Other(format!(
+                "run {:?} has query_kind \"locate\" but sets a lookback; a lookback window \
+                 applies to latest and asof runs",
+                self.run_id
+            ))),
+            (_, Some(l)) if l < 0 => Err(Error::Other(format!(
+                "run {:?} has a negative lookback {l}",
+                self.run_id
+            ))),
+            (q, Some(lookback)) => Ok(RunQuery::Window {
+                asof: q.asof_ts(),
+                lookback,
+            }),
+        }
+    }
 }
 
 /// The canonical workload manifest; its JSON's BLAKE3 is the workload hash.
@@ -163,12 +293,7 @@ impl Workload {
                     "a recorded run needs an id and a template".into(),
                 ));
             }
-            if run.query_kind != QUERY_KIND_LOCATE {
-                return Err(Error::UnknownKind {
-                    what: "query kind",
-                    found: run.query_kind.clone(),
-                });
-            }
+            run.query()?;
             if i > 0 && manifest.runs[i - 1].run_id >= run.run_id {
                 return Err(Error::Other(format!(
                     "workload runs must be sorted by id without duplicates; {:?} follows {:?}",
@@ -450,24 +575,37 @@ impl<'a> WorkloadRecorder<'a> {
         }
     }
 
-    /// Records run `run_id` with the default template, the run's key-column
-    /// set.
+    /// Records a [`RunQuery::Locate`] run `run_id` with the default template,
+    /// the run's key-column set.
     pub fn record(&mut self, run_id: &str, keys: KeyInput<'_>) -> Result<&RecordedRun> {
         self.record_with_template(run_id, keys, None)
     }
 
-    /// Records run `run_id`: encodes its keys at the dataset types, drops
-    /// null tuples (counting them), sorts and deduplicates, stores the
-    /// payload in the cache under its BLAKE3, and returns the run's record.
-    /// A repeated run id is refused before anything is written.
+    /// Records a [`RunQuery::Locate`] run `run_id`: encodes its keys at the
+    /// dataset types, drops null tuples (counting them), sorts and
+    /// deduplicates, stores the payload in the cache under its BLAKE3, and
+    /// returns the run's record. A repeated run id is refused before anything
+    /// is written.
     pub fn record_with_template(
         &mut self,
         run_id: &str,
         keys: KeyInput<'_>,
         template: Option<&str>,
     ) -> Result<&RecordedRun> {
+        self.record_query(run_id, keys, RunQuery::Locate, template)
+    }
+
+    /// Records run `run_id` with query kind `query` (`locate`, `latest`, or
+    /// `asof`) and optional `template`.
+    pub fn record_query(
+        &mut self,
+        run_id: &str,
+        keys: KeyInput<'_>,
+        query: RunQuery,
+        template: Option<&str>,
+    ) -> Result<&RecordedRun> {
         self.check_new(run_id)?;
-        let prepared = self.prepare(run_id, keys, template)?;
+        let prepared = self.prepare(run_id, keys, query, template)?;
         self.sink
             .put(&prepared.run.key_set, Bytes::from(prepared.payload))?;
         Ok(self.runs.entry(run_id.to_string()).or_insert(prepared.run))
@@ -488,6 +626,7 @@ impl<'a> WorkloadRecorder<'a> {
         &self,
         run_id: &str,
         keys: KeyInput<'_>,
+        query: RunQuery,
         template: Option<&str>,
     ) -> Result<Prepared> {
         let (built, null_tuples) = match keys {
@@ -500,6 +639,11 @@ impl<'a> WorkloadRecorder<'a> {
             }
             KeyInput::Parquet(path) => read_parquet_keys(path, &self.schema)?,
         };
+        if query.lookback().is_some_and(|l| l < 0) {
+            return Err(Error::Other(format!(
+                "run {run_id:?}: a lookback window cannot be negative"
+            )));
+        }
         let payload = built.to_payload()?;
         let key_set = Hash::of(&payload);
         let columns = built.columns().to_vec();
@@ -510,7 +654,9 @@ impl<'a> WorkloadRecorder<'a> {
                     || format!("columns({})", columns.join(",")),
                     ToString::to_string,
                 ),
-                query_kind: QUERY_KIND_LOCATE.to_string(),
+                query_kind: query.kind_str().to_string(),
+                asof: query.asof_ts(),
+                lookback: query.lookback(),
                 key_types: built.key_types().to_vec(),
                 columns,
                 keys: built.len() as u64,
@@ -712,7 +858,7 @@ pub fn record_bench_workload(
             vec![Arc::new(UInt64Array::from(keys)) as ArrayRef],
         )
         .map_err(|e| bench_err(Some(&run.run_id), e.to_string()))?;
-        let p = recorder.prepare(&run.run_id, KeyInput::Batch(&batch), None)?;
+        let p = recorder.prepare(&run.run_id, KeyInput::Batch(&batch), RunQuery::Locate, None)?;
         recorder.sink.put(&p.run.key_set, Bytes::from(p.payload))?;
         prepared.push(p.run);
     }
@@ -779,13 +925,14 @@ fn read_bench_keys(path: &Path, run_id: &str) -> ReplayResult<(String, Vec<u64>)
         return Err(bench_err(
             Some(run_id),
             format!(
-                "{}: a bench run file holds one UInt64 key column, found {:?}",
+                "{}: a bench run file holds one UInt64 key column, found {}",
                 path.display(),
                 schema
                     .fields()
                     .iter()
-                    .map(|f| (f.name().as_str(), f.data_type().to_string()))
+                    .map(|f| format!("{:?} ({})", f.name(), f.data_type()))
                     .collect::<Vec<_>>()
+                    .join(", ")
             ),
         ));
     }

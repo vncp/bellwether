@@ -168,6 +168,69 @@ fn tuple(id: i64, grp: u8) -> Vec<u8> {
     [enc_i64(id), enc_str(&format!("g{grp}"))].concat()
 }
 
+/// Plans a lookback window over `t = temporal:id@ts` (with `specs`) and
+/// checks it against the definition: the rows of the looked-up keys whose
+/// `ts` lies in `[hi − lookback, hi]`, `hi` being `asof` or the key's newest
+/// version anywhere. Every row group holding such a row is planned
+/// (invariant 1), and the residual over the planned rows returns exactly
+/// those rows.
+fn check_window(
+    p: &bellwether_build::Planner<bellwether_store::ObjectStoreBackend>,
+    rows: &[Row],
+    specs: &[bellwether_types::KeySpec],
+    columns: &[String],
+    keys: &[Vec<u8>],
+    asof: Option<i64>,
+    lookback: i64,
+) {
+    let lookup = Lookup::Window {
+        columns: columns.to_vec(),
+        keys: keys.to_vec(),
+        asof,
+        lookback,
+    };
+    let plan = p.plan(specs, &lookup).unwrap();
+    // The generator's timestamps are 0..30, so decode by table.
+    let ts = |r: &Row| {
+        r.get("ts")
+            .and_then(|b| (-1..64).find(|t| enc_ts(*t) == *b))
+    };
+    let id_c = cols(&["id"]);
+    let mut newest: std::collections::BTreeMap<Vec<u8>, i64> = std::collections::BTreeMap::new();
+    for r in rows {
+        if let (Some(k), Some(t)) = (r.tuple(&id_c), ts(r)) {
+            let e = newest.entry(k).or_insert(t);
+            *e = (*e).max(t);
+        }
+    }
+    let keys: std::collections::BTreeSet<&Vec<u8>> = keys.iter().collect();
+    let want = sorted(
+        rows.iter()
+            .filter(|r| r.tuple(columns).is_some_and(|k| keys.contains(&k)))
+            .filter(|r| {
+                let (Some(k), Some(t)) = (r.tuple(&id_c), ts(r)) else {
+                    return false;
+                };
+                let Some(hi) = asof.or_else(|| newest.get(&k).copied()) else {
+                    return false;
+                };
+                hi - lookback <= t && t <= hi
+            })
+            .cloned()
+            .collect(),
+    );
+    let missing: Vec<_> = holding(&want, |_| true)
+        .difference(&plan_rgs(&plan))
+        .cloned()
+        .collect();
+    assert!(missing.is_empty(), "missing row groups: {missing:?}");
+    let got = sorted(apply_residual(
+        plan.residual.as_ref().unwrap(),
+        planned_rows(&plan, rows),
+    ));
+    assert_eq!(got, want, "window residual over the planned rows");
+}
+
 proptest! {
     #![proptest_config(ProptestConfig { cases: 32, ..ProptestConfig::default() })]
 
@@ -257,6 +320,15 @@ proptest! {
         let at = Some((q.asof, enc_ts(q.asof)));
         check_latest(&p, &rows, std::slice::from_ref(&t), &id_c, &ids, &id_c, "ts", at.clone());
         check_latest(&p, &rows, &[t.clone(), bloom(&["grp"])], &idg, &tuples, &id_c, "ts", at);
+
+        // lookback windows: every version of each key in the window, no
+        // matter which other spec prunes
+        for lookback in [0, 4, 40] {
+            check_window(&p, &rows, std::slice::from_ref(&t), &id_c, &ids, None, lookback);
+            check_window(&p, &rows, std::slice::from_ref(&t), &id_c, &ids, Some(q.asof), lookback);
+            check_window(&p, &rows, &[t.clone(), bloom(&["grp"])], &idg, &tuples, None, lookback);
+            check_window(&p, &rows, &[t.clone(), exact(&["id", "grp"])], &idg, &tuples, Some(q.asof), lookback);
+        }
     }
 }
 

@@ -14,8 +14,8 @@ use bellwether_source::{
     Storage as _, TextFormat,
 };
 use bellwether_store::{
-    manifest_path, now_rfc3339, parse_rfc3339, Cache, Manifest, ObjectStoreBackend, Snapshot,
-    StoreExt,
+    manifest_path, now_rfc3339, parse_rfc3339, rfc3339_millis, Cache, Manifest, ObjectStoreBackend,
+    Snapshot, StoreExt,
 };
 use bellwether_types::{Error, FileFingerprint, Hash, KeySpec, Record, Result, Source};
 use serde::{Deserialize, Serialize};
@@ -245,10 +245,14 @@ impl Engine {
             .index
             .clone()
             .unwrap_or_else(|| join_path(&root, DEFAULT_INDEX_DIR));
+        let mut options = options;
         if let Some(c) = &options.clock {
-            parse_rfc3339(c).map_err(|e| {
+            // One spelling for every record: the system clock's, UTC with
+            // milliseconds.
+            let normalized = rfc3339_millis(c).map_err(|e| {
                 Error::Other(format!("the clock {c:?} is not an RFC 3339 time ({e})"))
             })?;
+            options.clock = Some(normalized);
         }
         let local_index = local_path(&index)?;
         let engine = Self {
@@ -367,8 +371,9 @@ impl Engine {
         &self.options
     }
 
-    /// RFC 3339 UTC, the time every record this engine writes carries:
-    /// the fixed clock when one is set.
+    /// RFC 3339 UTC with millisecond precision, the time every record this
+    /// engine writes carries (each record kind, certificates included): the
+    /// fixed clock when one is set, normalized to the same format.
     pub(crate) fn now(&self) -> String {
         self.options.clock.clone().unwrap_or_else(now_rfc3339)
     }
@@ -496,6 +501,9 @@ impl Engine {
             }
             Some(text) => {
                 let mut s = ChunkedTextSource::new(text).with_fingerprint_policy(policy);
+                for dir in self.excluded() {
+                    s = s.with_excluded(dir);
+                }
                 if let Some(size) = chunk.or(self.options.chunk_size) {
                     s = s.with_chunk_size(size);
                 }
@@ -591,7 +599,7 @@ impl Engine {
                 });
             };
             let (untracked, changed, missing) =
-                folder_changes(self.root(), &pinned, self.format())?.paths();
+                folder_changes(self.root(), &pinned, self.format(), &self.excluded())?.paths();
             Ok(FolderStatus {
                 root: self.root.clone(),
                 sequence: Some(pinned.sequence()),
@@ -619,6 +627,7 @@ pub(crate) fn folder_changes(
     root: &str,
     pinned: &Pinned,
     format: SourceFormat,
+    exclude: &[String],
 ) -> Result<FolderChanges> {
     let tracked: std::collections::BTreeMap<&str, &FileFingerprint> = pinned
         .manifest()
@@ -628,10 +637,7 @@ pub(crate) fn folder_changes(
         .map(|f| (f.fingerprint.path.as_str(), &f.fingerprint))
         .collect();
     let policy = pinned.policy()?;
-    let extensions: &[&str] = match format.text() {
-        None => &["parquet"],
-        Some(text) => text.extensions(),
-    };
+    let text = format.text();
     let fs = LocalFs;
     let mut found = std::collections::BTreeSet::new();
     let mut changes = FolderChanges::default();
@@ -639,18 +645,34 @@ pub(crate) fn folder_changes(
         .list(root)?
         .into_iter()
         .filter(|p| {
-            Path::new(p)
+            !exclude.iter().any(|d| {
+                p.strip_prefix(d.as_str())
+                    .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
+            })
+        })
+        .filter(|p| match &text {
+            None => Path::new(p)
                 .extension()
                 .and_then(|e| e.to_str())
-                .is_some_and(|e| extensions.iter().any(|x| e.eq_ignore_ascii_case(x)))
+                .is_some_and(|e| e.eq_ignore_ascii_case("parquet")),
+            Some(t) => t.candidate(p),
         })
         .collect();
     paths.sort();
     for path in paths {
         match tracked.get(path.as_str()) {
-            None => changes
-                .untracked
-                .push(fingerprint_with_policy(&fs, &path, policy)?),
+            None => {
+                // A `.json` file counts only when its content is JSON lines,
+                // as discovery decides.
+                if let Some(t) = &text {
+                    if !t.accepts(&fs, &path)? {
+                        continue;
+                    }
+                }
+                changes
+                    .untracked
+                    .push(fingerprint_with_policy(&fs, &path, policy)?);
+            }
             Some(t) => {
                 let meta = fs.head(&path)?;
                 if meta.size != t.size || meta.etag != t.etag {
@@ -705,6 +727,41 @@ pub(crate) fn commit_age(m: &Manifest, now_nanos: i64) -> Result<Duration> {
     Ok(Duration::from_nanos(
         u64::try_from(now_nanos.saturating_sub(at_nanos)).unwrap_or(0),
     ))
+}
+
+impl Engine {
+    /// Directories under the data root whose files are never data: the
+    /// index location, when it is local and lies inside the root (its own
+    /// `.json` files would otherwise pass for JSON lines). Spelled as the
+    /// root's listed files are: the canonical root, then the index's path
+    /// below it.
+    pub(crate) fn excluded(&self) -> Vec<String> {
+        let Some(dir) = &self.local_index else {
+            return Vec::new();
+        };
+        // The index may not exist yet: resolve its nearest existing
+        // ancestor, then append the rest.
+        let mut existing = dir.as_path();
+        let mut rest = Vec::new();
+        let resolved = loop {
+            if let Ok(c) = std::fs::canonicalize(existing) {
+                break rest.iter().rev().fold(c, |p: PathBuf, r| p.join(r));
+            }
+            match (existing.parent(), existing.file_name()) {
+                (Some(parent), Some(name)) => {
+                    rest.push(name.to_os_string());
+                    existing = parent;
+                }
+                _ => return Vec::new(),
+            }
+        };
+        match resolved.strip_prefix(&self.root) {
+            Ok(below) if !below.as_os_str().is_empty() => {
+                vec![resolved.to_string_lossy().into_owned()]
+            }
+            _ => Vec::new(),
+        }
+    }
 }
 
 /// The index location as a local directory, or `None` for an object store.

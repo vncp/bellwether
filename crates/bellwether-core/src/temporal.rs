@@ -298,6 +298,73 @@ pub fn asof<R: ReadAt, K: AsRef<[u8]>>(
     fold(segments, |s| s.asof(keys, ts))
 }
 
+/// Every version of each key across every segment of one temporal key spec:
+/// the segments' chains merged. Keys absent from every segment are absent.
+/// Holds the chains of the keys asked plus one segment's lookup state at a
+/// time; for lookback windows ([`window`]), which need every version in a
+/// range, not one winner.
+pub fn chains<R: ReadAt, K: AsRef<[u8]>>(
+    segments: &[SegmentReader<R>],
+    keys: &[K],
+) -> Result<BTreeMap<Vec<u8>, VersionChain>> {
+    same_spec(segments)?;
+    let mut out: BTreeMap<Vec<u8>, VersionChain> = BTreeMap::new();
+    for s in segments {
+        s.require_temporal()?;
+        for (k, v) in s.get(keys)? {
+            out.entry(k).or_default().merge(&v.chain);
+        }
+    }
+    Ok(out)
+}
+
+/// One key's versions in a lookback window: the window's inclusive bounds
+/// and every row group holding a version inside it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct WindowHit {
+    /// Inclusive lower bound, in the timestamp column's unit.
+    pub lo: i64,
+    /// Inclusive upper bound: the asof instant, or the key's newest version.
+    pub hi: i64,
+    /// Row groups holding a version with `lo <= ts <= hi`.
+    pub row_groups: RoaringBitmap,
+}
+
+/// The lookback window of one key over `chains` (every chain of the key,
+/// for example each zero variant's), counting only versions in `live` row
+/// groups. With `asof`, the window is `[asof − lookback, asof]`; without,
+/// `[newest − lookback, newest]` where `newest` is the key's newest live
+/// version. The lower bound never goes below `floor`, the smallest value
+/// the timestamp column's type holds. `None` when no live version falls in
+/// the window (or, without `asof`, when the key has no live version).
+#[must_use]
+pub fn window<'a>(
+    chains: impl Iterator<Item = &'a VersionChain> + Clone,
+    live: &RoaringBitmap,
+    asof: Option<i64>,
+    lookback: i64,
+    floor: i64,
+) -> Option<WindowHit> {
+    let in_live = |(_, rg): &&(i64, RowGroupId)| live.contains(rg.0);
+    let hi = match asof {
+        Some(at) => at,
+        None => chains
+            .clone()
+            .flat_map(|c| c.versions().iter())
+            .filter(in_live)
+            .map(|(ts, _)| *ts)
+            .max()?,
+    };
+    let lo = hi.saturating_sub(lookback).max(floor);
+    let row_groups: RoaringBitmap = chains
+        .flat_map(|c| c.versions().iter())
+        .filter(in_live)
+        .filter(|(ts, _)| (lo..=hi).contains(ts))
+        .map(|(_, rg)| rg.0)
+        .collect();
+    (!row_groups.is_empty()).then_some(WindowHit { lo, hi, row_groups })
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
@@ -369,5 +436,30 @@ mod tests {
             row_groups: [0u32].into_iter().collect(),
         });
         assert_eq!(a.ts, 9);
+    }
+
+    #[test]
+    fn a_window_holds_every_live_version_in_range() {
+        let a = VersionChain::from_versions(vec![
+            (1, RowGroupId(0)),
+            (5, RowGroupId(1)),
+            (7, RowGroupId(2)),
+            (9, RowGroupId(3)),
+        ]);
+        let b = VersionChain::from_versions(vec![(6, RowGroupId(4)), (10, RowGroupId(5))]);
+        let live: RoaringBitmap = [0u32, 1, 2, 3, 4].into_iter().collect();
+        let rgs = |w: WindowHit| (w.lo, w.hi, w.row_groups.iter().collect::<Vec<_>>());
+        // latest: newest live version is 9 (10 lives in a retired row group)
+        let w = window([&a, &b].into_iter(), &live, None, 3, i64::MIN).unwrap();
+        assert_eq!(rgs(w), (6, 9, vec![2, 3, 4]));
+        // asof 6, lookback 1: versions 5 and 6
+        let w = window([&a, &b].into_iter(), &live, Some(6), 1, i64::MIN).unwrap();
+        assert_eq!(rgs(w), (5, 6, vec![1, 4]));
+        // the floor clamps the lower bound
+        let w = window([&a].into_iter(), &live, Some(2), 10, 0).unwrap();
+        assert_eq!(rgs(w), (0, 2, vec![0]));
+        // nothing in range, or nothing live
+        assert!(window([&a].into_iter(), &live, Some(4), 2, i64::MIN).is_none());
+        assert!(window([&b].into_iter(), &RoaringBitmap::new(), None, 9, i64::MIN).is_none());
     }
 }

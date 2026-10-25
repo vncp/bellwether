@@ -25,7 +25,7 @@ use std::time::Duration;
 use arrow::array::RecordBatch;
 use arrow::datatypes::SchemaRef;
 use bellwether_build::{BuildOptions, Builder};
-use bellwether_replay::{proposed_specs, Replayer, Workload};
+use bellwether_replay::{proposed_specs, Replayer, RunQuery, Workload};
 use bellwether_store::{parse_rfc3339, Cache, ObjectStoreBackend};
 use bellwether_types::{
     format, Certificate, Coverage, Error, Evidence, EvidenceBody, FileFingerprint, Hash, HashKind,
@@ -57,7 +57,8 @@ pub struct RewriteOutputs {
     pub latest_by: Option<String>,
     /// Columns left out of the row hash (listed on the certificate).
     pub ignore: Vec<String>,
-    /// Decimal columns totalled exactly.
+    /// Columns totalled exactly: `col` (decimal) or `col:dec(S)` (float
+    /// quantized at scale `S`), as `ReconcileRequest::totals`.
     pub totals: Vec<String>,
     /// Columns grouping the totals.
     pub group_by: Vec<String>,
@@ -79,6 +80,11 @@ pub struct FixRequest {
     pub rewrite: Option<RewriteOutputs>,
     /// Stop after the certificate: score and verify, apply nothing.
     pub verify_only: bool,
+    /// Go on with a Key proposal whose replay predicts no saving on the
+    /// workload (proposed bytes not below current bytes). Without it such a
+    /// proposal is refused right after the score ([`Refusal::NothingToGain`]).
+    #[serde(default)]
+    pub allow_no_gain: bool,
 }
 
 /// The score stage's outcome.
@@ -169,6 +175,31 @@ pub enum Refusal {
         /// The passing certificate.
         certificate: Hash,
     },
+    /// The Key proposal's replay predicts no saving on the workload: summed
+    /// over its runs, the proposal reads at least as many bytes as the
+    /// current configuration (the measure `why` recommends by). Refused
+    /// right after the score, before the verify, so nothing but the Replay
+    /// is written; `allow_no_gain` goes on anyway. A verify-only run is
+    /// not gated (it applies nothing); applying its certificate is. CLI
+    /// exit 3.
+    NothingToGain {
+        /// The Replay that predicts it.
+        replay: Hash,
+        /// Bytes under the current configuration, summed over runs.
+        current_bytes: u64,
+        /// Bytes with the proposal, summed over runs.
+        proposed_bytes: u64,
+    },
+}
+
+/// The gain gate: a refusal when the proposal reads no fewer bytes than the
+/// current configuration and the caller did not allow it.
+fn no_gain(replay: &Hash, current: &Cost, proposed: &Cost, allow: bool) -> Option<Refusal> {
+    (!allow && proposed.bytes >= current.bytes).then_some(Refusal::NothingToGain {
+        replay: *replay,
+        current_bytes: current.bytes,
+        proposed_bytes: proposed.bytes,
+    })
 }
 
 /// The apply stage's outcome.
@@ -250,7 +281,7 @@ impl Engine {
     pub fn fix(&self, request: &FixRequest) -> Result<FixResult> {
         guard(|| match (&request.proposal, &request.certificate) {
             (Some(p), None) => self.fix_proposal(p, request),
-            (None, Some(c)) => self.apply_certificate(c, false),
+            (None, Some(c)) => self.apply_certificate(c, false, request.allow_no_gain),
             _ => Err(Error::Other(
                 "fix takes a proposal (--proposal) or a certificate to apply (--certificate), \
                  not both"
@@ -267,7 +298,7 @@ impl Engine {
     /// nothing anywhere: no replay, no build, no receipt, and it never
     /// creates the index location.
     pub fn apply_dry_run(&self, certificate: &Hash) -> Result<FixResult> {
-        guard(|| self.apply_certificate(certificate, true))
+        guard(|| self.apply_certificate(certificate, true, false))
     }
 
     /// The current [`DataState`]. Reads footers; writes nothing and never
@@ -337,7 +368,7 @@ impl Engine {
         let pinned = self.pin()?;
         if let Some(p) = &pinned {
             // A stale index is refused with what to do, before any work.
-            let changes = folder_changes(self.root(), p, self.format())?;
+            let changes = folder_changes(self.root(), p, self.format(), &self.excluded())?;
             if !changes.is_empty() {
                 return Err(stale_index(self.root(), "fix", &changes));
             }
@@ -379,11 +410,23 @@ impl Engine {
                 // 1. Score.
                 let replay = self.score(&replayer, hash, &workload, &cache)?;
                 let replay_hash = replay.0.hash;
+                // A verify-only run applies nothing, so it is not gated; applying
+                // its certificate later re-scores and is.
+                let gate = no_gain(
+                    &replay_hash,
+                    &replay.1,
+                    &replay.2,
+                    req.allow_no_gain || req.verify_only,
+                );
                 result.score = Some(Score::Replayed {
                     replay: Box::new(replay.0),
                     current: replay.1,
                     proposed: replay.2,
                 });
+                if let Some(r) = gate {
+                    result.outcome = refused(r);
+                    return Ok(result);
+                }
                 // 2. Verify.
                 let (plan, cert, verification) = self.verify_key(
                     hash,
@@ -450,7 +493,12 @@ impl Engine {
 
     /// Apply and attest a certificate written earlier: every check runs
     /// before anything is written, and the replay is recomputed now.
-    fn apply_certificate(&self, cert_hash: &Hash, dry_run: bool) -> Result<FixResult> {
+    fn apply_certificate(
+        &self,
+        cert_hash: &Hash,
+        dry_run: bool,
+        allow_no_gain: bool,
+    ) -> Result<FixResult> {
         let w = self.read(cert_hash, HashKind::Certificate, dry_run)?;
         let Record::Certificate(certificate) = &w.record else {
             return Err(Error::WrongKind {
@@ -531,11 +579,16 @@ impl Engine {
                 let (replay, current_cost, proposed_cost) =
                     self.score(&replayer, &proposal_hash, &workload, &cache)?;
                 let replay_hash = replay.hash;
+                let gate = no_gain(&replay_hash, &current_cost, &proposed_cost, allow_no_gain);
                 result.score = Some(Score::Replayed {
                     replay: Box::new(replay),
                     current: current_cost,
                     proposed: proposed_cost,
                 });
+                if let Some(r) = gate {
+                    result.outcome = refused(r);
+                    return Ok(result);
+                }
                 result.outcome = self.apply_and_attest(
                     &proposal,
                     &proposal_hash,
@@ -610,9 +663,11 @@ impl Engine {
         // plus the proposed one (transient segments for the latter), united.
         let mut selected: BTreeMap<String, (FileFingerprint, RoaringBitmap)> = BTreeMap::new();
         let mut keys: Vec<Vec<u8>> = Vec::new();
+        let mut queries = Vec::with_capacity(runs.len());
         for run in runs {
             let rk = workload.run_keys(cache, run)?;
-            let plan = replayer.plan_of_keys(&specs, &rk)?;
+            let query = run.query()?;
+            let plan = replayer.plan_of_query(&specs, &rk, &query)?;
             for e in plan.entries {
                 selected
                     .entry(e.file.path.clone())
@@ -623,6 +678,7 @@ impl Engine {
             // SQL equality matches a row stored under either zero.
             let all: Vec<usize> = (0..rk.columns().len()).collect();
             keys.extend(rk.all_probes(&all));
+            queries.push(query);
         }
         keys.sort_unstable();
         keys.dedup();
@@ -651,11 +707,20 @@ impl Engine {
             None => cache.get_cached(&workload.hash())?,
         };
         let workload_age = cached.map_or(Duration::ZERO, |(_, age)| age);
-        let spec = ReconcileSpec::new(columns).coverage(CoverageRequest::Workload(WorkloadKeys {
-            workload: workload.hash(),
-            age: workload_age,
-            keys,
-        }));
+        let ignored = unhashable(replayer.schema(), &columns);
+        let mut rec_spec =
+            ReconcileSpec::new(columns)
+                .ignore(ignored)
+                .coverage(CoverageRequest::Workload(WorkloadKeys {
+                    workload: workload.hash(),
+                    age: workload_age,
+                    keys,
+                }));
+        if let KeySpec::Temporal { ts_column, .. } = spec {
+            if queries.iter().all(|q| matches!(q, RunQuery::Latest)) {
+                rec_spec = rec_spec.latest_by(ts_column.clone());
+            }
+        }
         let ctx = CertificateContext {
             proposal: Some(*proposal),
             manifest: pinned.map(anchor),
@@ -668,7 +733,9 @@ impl Engine {
         let root = self.root();
         let left = Side::new(source, root);
         let right = Side::new(&planned, root);
-        let certified = Reconciler::new(spec, Options::default())?.certify(&left, &right, &ctx)?;
+        let certified = self
+            .reconciler(rec_spec, Options::default())?
+            .certify(&left, &right, &ctx)?;
         let cert = self.record_certified(&certified)?;
         Ok((plan_evidence, cert, certified.outcome))
     }
@@ -686,7 +753,7 @@ impl Engine {
         let right_source = self.output_source()?;
         let mut spec = ReconcileSpec::new(outputs.key.clone())
             .ignore(outputs.ignore.clone())
-            .totals(outputs.totals.clone())
+            .with_totals(crate::reconcile::total_columns(&outputs.totals)?)
             .group_by(outputs.group_by.clone());
         if let Some(l) = &outputs.latest_by {
             spec = spec.latest_by(l.clone());
@@ -697,13 +764,19 @@ impl Engine {
             inputs: Vec::new(),
             clock: self.options().clock.clone(),
         };
-        let certified = Reconciler::new(spec, Options::default())?.certify(
+        let certified = self.reconciler(spec, Options::default())?.certify(
             &Side::new(&*left_source, &before),
             &Side::new(&*right_source, &after),
             &ctx,
         )?;
         let cert = self.record_certified(&certified)?;
         Ok((cert, certified.outcome))
+    }
+
+    /// A reconciler whose records carry this engine's clock, like every
+    /// other record the engine writes.
+    pub(crate) fn reconciler(&self, spec: ReconcileSpec, options: Options) -> Result<Reconciler> {
+        Ok(Reconciler::new(spec, options)?.created_at(self.now()))
     }
 
     /// A source for an output folder: the engine's format, schema inferred.
@@ -797,6 +870,7 @@ impl Engine {
         options.chunk_size = self.options().chunk_size;
         options.schema.clone_from(&self.options().schema);
         options.fingerprint_policy = self.options().fingerprint_policy;
+        options.exclude = self.excluded();
         let report = Builder::new(Arc::clone(self.store()?), "").build(
             self.root(),
             std::slice::from_ref(spec),
@@ -1004,6 +1078,21 @@ fn replayer<'a>(
 
 /// The recorded workload `hash`: absent is [`Error::RecordNotFound`];
 /// present but unreadable names the workload and the cause.
+/// Columns with no canonical encoding (nested struct, list, map, ...),
+/// minus `keys`: they cannot be row-hashed, and a key fix changes which row
+/// groups are read, not any value, so the key verification leaves them out
+/// (listed on the certificate) rather than refusing every lake that holds
+/// one. Ported from the Argon defects implementation.
+fn unhashable(schema: &arrow::datatypes::Schema, keys: &[String]) -> Vec<String> {
+    schema
+        .fields()
+        .iter()
+        .filter(|f| bellwether_core::encoding::check_supported(f.data_type()).is_err())
+        .map(|f| f.name().clone())
+        .filter(|n| !keys.contains(n))
+        .collect()
+}
+
 pub(crate) fn load_workload(
     engine: &Engine,
     cache: &Cache<ObjectStoreBackend>,
@@ -1349,8 +1438,28 @@ mod tests {
         // The key is built: the current configuration serves it.
         let specs = e.pin().unwrap().unwrap().specs().0;
         assert!(specs.iter().any(|s| s.name() == "exact:id"), "{specs:?}");
-        // A retry cannot attest it.
+        // A retry cannot attest it: the key is complete now, which is
+        // checked before the gain gate ...
         let again = fix_key(&e, p, wl, false);
+        assert!(
+            matches!(
+                again.outcome,
+                FixOutcome::Refused {
+                    refusal: Refusal::NothingToApply { .. }
+                }
+            ),
+            "{:?}",
+            again.outcome
+        );
+        // ... and with the gain gate off the apply finds nothing to do.
+        let again = e
+            .fix(&FixRequest {
+                proposal: Some(p),
+                workload: Some(wl),
+                allow_no_gain: true,
+                ..FixRequest::default()
+            })
+            .unwrap();
         assert_eq!(
             again.outcome,
             FixOutcome::Refused {

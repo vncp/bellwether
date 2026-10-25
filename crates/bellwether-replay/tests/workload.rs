@@ -15,8 +15,8 @@ use arrow::datatypes::{DataType, Field, Schema};
 use bellwether_core::segment::ColumnType;
 use bellwether_replay::{
     record_bench_workload, KeyInput, KeySetSink, KeySetSource, MemoryKeySets, ReplayError,
-    ReplayResult, Replayer, RunKeys, RunKeysBuilder, Workload, WorkloadFile, WorkloadRecorder,
-    QUERY_KIND_LOCATE,
+    ReplayResult, Replayer, RunKeys, RunKeysBuilder, RunQuery, Workload, WorkloadFile,
+    WorkloadRecorder, QUERY_KIND_ASOF, QUERY_KIND_LATEST, QUERY_KIND_LOCATE,
 };
 use bellwether_store::{Cache, ObjectStoreBackend};
 use bellwether_types::{Error, Hash};
@@ -378,15 +378,41 @@ fn a_bench_mismatch_on_the_last_run_writes_nothing() {
 }
 
 #[test]
-fn a_workload_naming_an_unknown_query_kind_is_refused() {
+fn a_workload_accepts_locate_latest_and_asof_and_refuses_unknown_query_kinds() {
     let keys = MemoryKeySets::new();
     let mut rec = WorkloadRecorder::new(&keys, schema(DataType::UInt64));
-    rec.record("r", KeyInput::Batch(&u64_batch(&[Some(1)])))
+    rec.record("r0", KeyInput::Batch(&u64_batch(&[Some(1)])))
         .unwrap();
+    rec.record_query(
+        "r1",
+        KeyInput::Batch(&u64_batch(&[Some(2)])),
+        RunQuery::Latest,
+        None,
+    )
+    .unwrap();
+    rec.record_query(
+        "r2",
+        KeyInput::Batch(&u64_batch(&[Some(3)])),
+        RunQuery::Asof { ts: 100 },
+        None,
+    )
+    .unwrap();
     let w = rec.finish().unwrap();
     assert_eq!(w.runs()[0].query_kind, QUERY_KIND_LOCATE);
+    assert_eq!(w.runs()[0].asof, None);
+    assert_eq!(w.runs()[1].query_kind, QUERY_KIND_LATEST);
+    assert_eq!(w.runs()[1].asof, None);
+    assert_eq!(w.runs()[2].query_kind, QUERY_KIND_ASOF);
+    assert_eq!(w.runs()[2].asof, Some(100));
+    let json = serde_json::to_value(w.manifest()).unwrap();
+    assert!(
+        json["runs"][0].get("asof").is_none(),
+        "locate omits asof so existing hashes stay stable"
+    );
+    assert!(json["runs"][1].get("asof").is_none());
+    assert_eq!(json["runs"][2]["asof"], json!(100));
     let mut manifest = w.manifest().clone();
-    manifest.runs[0].query_kind = "latest".into();
+    manifest.runs[0].query_kind = "between".into();
     assert!(matches!(
         Workload::new(manifest),
         Err(Error::UnknownKind {
@@ -394,6 +420,13 @@ fn a_workload_naming_an_unknown_query_kind_is_refused() {
             ..
         })
     ));
+    // asof without ts, or locate/latest with ts, is refused.
+    let mut no_ts = w.manifest().clone();
+    no_ts.runs[2].asof = None;
+    assert!(Workload::new(no_ts).is_err());
+    let mut stray_ts = w.manifest().clone();
+    stray_ts.runs[0].asof = Some(1);
+    assert!(Workload::new(stray_ts).is_err());
 }
 
 /// A source that serves other bytes than it was asked for.

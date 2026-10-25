@@ -39,6 +39,7 @@ impl Engine {
         options.chunk_size = self.options().chunk_size;
         options.schema.clone_from(&self.options().schema);
         options.fingerprint_policy = self.options().fingerprint_policy;
+        options.exclude = self.excluded();
         let report =
             Builder::new(Arc::clone(self.store()?), "").build(self.root(), specs, &options)?;
         let pinned = self.pin_required("index")?;
@@ -103,7 +104,7 @@ impl Engine {
         // Invariant 1 over the folder, not only the index: a file that
         // landed or changed after the last build would be silently left out
         // of the plan, so it is refused.
-        let changes = folder_changes(self.root(), &pinned, self.format())?;
+        let changes = folder_changes(self.root(), &pinned, self.format(), &self.excluded())?;
         if !changes.is_empty() {
             return Err(stale_index(self.root(), verb, &changes));
         }
@@ -354,7 +355,7 @@ fn check_temporal_residual(plan: &ScanPlan) -> Result<()> {
 /// `at` in `ts_type`'s unit, exactly: an integer is taken as already in the
 /// unit; an RFC 3339 instant (or a `YYYY-MM-DD` date) is converted, and a
 /// remainder below the unit is an error, never rounded.
-fn instant_in_unit(at: &str, ts_column: &str, ts_type: &DataType) -> Result<i64> {
+pub(crate) fn instant_in_unit(at: &str, ts_column: &str, ts_type: &DataType) -> Result<i64> {
     let at = at.trim();
     if let Ok(n) = at.parse::<i64>() {
         return Ok(n);
@@ -421,6 +422,83 @@ fn instant_in_unit(at: &str, ts_column: &str, ts_type: &DataType) -> Result<i64>
     })
 }
 
+/// A lookback window's length in `ts_type`'s unit, exactly. `given` is a
+/// whole number followed by a calendar unit, `s`, `m`, `h`, `d`, or `w`
+/// (seconds, minutes, hours, days of 86,400 seconds, weeks of 7 days;
+/// trading-day calendars are out of scope); for an integer column, a bare
+/// integer in its unit. A length that is not a whole number of the column's
+/// unit (`1h` on a date column) is an error, never rounded.
+pub(crate) fn lookback_in_unit(given: &str, ts_column: &str, ts_type: &DataType) -> Result<i64> {
+    let given = given.trim();
+    if let DataType::Dictionary(_, v) = ts_type {
+        return lookback_in_unit(given, ts_column, v);
+    }
+    let integer_column = ts_type.is_integer();
+    let usage = || {
+        if integer_column {
+            Error::KeySpec(format!(
+                "--lookback {given:?}: {ts_column} is an integer column ({ts_type}), so the \
+                 lookback is a whole number in its unit, for example --lookback 100"
+            ))
+        } else {
+            Error::KeySpec(format!(
+                "--lookback {given:?} is not a whole number with a unit; write for example \
+                 --lookback 252d (units: s, m, h, d, w; calendar time, not trading days)"
+            ))
+        }
+    };
+    if integer_column {
+        return given
+            .parse::<u64>()
+            .ok()
+            .and_then(|n| i64::try_from(n).ok())
+            .ok_or_else(usage);
+    }
+    let split = given
+        .find(|c: char| !c.is_ascii_digit())
+        .ok_or_else(usage)?;
+    let (digits, unit) = given.split_at(split);
+    let n: i128 = digits.parse().map_err(|_| usage())?;
+    let unit_nanos: i128 = match unit {
+        "s" => 1_000_000_000,
+        "m" => 60 * 1_000_000_000,
+        "h" => 3_600 * 1_000_000_000,
+        "d" => 86_400 * 1_000_000_000,
+        "w" => 7 * 86_400 * 1_000_000_000,
+        _ => return Err(usage()),
+    };
+    let per_unit: i128 = match ts_type {
+        DataType::Timestamp(u, _) | DataType::Time32(u) | DataType::Time64(u) => match u {
+            TimeUnit::Second => 1_000_000_000,
+            TimeUnit::Millisecond => 1_000_000,
+            TimeUnit::Microsecond => 1_000,
+            TimeUnit::Nanosecond => 1,
+        },
+        DataType::Date64 => 1_000_000,
+        DataType::Date32 => 86_400 * 1_000_000_000,
+        other => {
+            return Err(Error::KeySpec(format!(
+                "{ts_column} has type {other}, which a lookback window cannot measure; use a \
+                 timestamp, date, time, or integer column"
+            )))
+        }
+    };
+    let nanos = n
+        .checked_mul(unit_nanos)
+        .ok_or_else(|| Error::KeySpec(format!("--lookback {given:?} is out of range")))?;
+    if nanos % per_unit != 0 {
+        return Err(Error::KeySpec(format!(
+            "--lookback {given:?} is not a whole number of {ts_column}'s unit ({ts_type}); give a \
+             length that is, for example in days for a date column"
+        )));
+    }
+    i64::try_from(nanos / per_unit).map_err(|_| {
+        Error::KeySpec(format!(
+            "--lookback {given:?} is out of range for {ts_column} ({ts_type})"
+        ))
+    })
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
@@ -479,5 +557,28 @@ mod tests {
         assert!(instant_in_unit("yesterday", "ts", &us).is_err());
         assert!(instant_in_unit("2026-01-01T00:00:00Z", "v", &DataType::Int64).is_err());
         assert!(instant_in_unit("2026-01-01T00:00:00Z", "v", &DataType::Utf8).is_err());
+    }
+
+    #[test]
+    fn lookbacks_convert_exactly_or_are_refused() {
+        let us = DataType::Timestamp(TimeUnit::Microsecond, None);
+        let ms = DataType::Timestamp(TimeUnit::Millisecond, None);
+        assert_eq!(
+            lookback_in_unit("252d", "ts", &us).unwrap(),
+            252 * 86_400_000_000
+        );
+        assert_eq!(lookback_in_unit("2w", "d", &DataType::Date32).unwrap(), 14);
+        assert_eq!(lookback_in_unit("48h", "d", &DataType::Date32).unwrap(), 2);
+        assert_eq!(lookback_in_unit("90m", "ts", &ms).unwrap(), 5_400_000);
+        assert_eq!(lookback_in_unit("0s", "ts", &ms).unwrap(), 0);
+        assert_eq!(lookback_in_unit("7", "v", &DataType::Int32).unwrap(), 7);
+        // not a whole number of days, no unit, a unit on an integer column,
+        // an unknown unit, a sign, and an overflow are refused
+        assert!(lookback_in_unit("1h", "d", &DataType::Date32).is_err());
+        assert!(lookback_in_unit("30", "ts", &us).is_err());
+        assert!(lookback_in_unit("7d", "v", &DataType::Int64).is_err());
+        assert!(lookback_in_unit("3y", "ts", &us).is_err());
+        assert!(lookback_in_unit("-1d", "ts", &us).is_err());
+        assert!(lookback_in_unit("99999999999999999999w", "ts", &us).is_err());
     }
 }

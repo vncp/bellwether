@@ -65,6 +65,29 @@ pub enum VerifyError {
         /// Key column name.
         column: String,
     },
+    /// A float total quantized at a scale (`col:dec(S)`) met a value it
+    /// cannot total: NaN, an infinity, or one whose quantized integer does
+    /// not fit an `i128`. Located to the side, file, row group, and key.
+    #[error(
+        "{side} side, {file} row group {row_group}: key {key} has {value}, which {total} cannot \
+         total; filter or fill such rows before reconciling, or leave the column out of --totals"
+    )]
+    Quantize {
+        /// `"left"` or `"right"`.
+        side: &'static str,
+        /// File path.
+        file: String,
+        /// Row group index within the file.
+        row_group: u32,
+        /// The total spec, `col:dec(S)`.
+        total: String,
+        /// The key, rendered `(col=value, ...)`.
+        key: String,
+        /// The value as Rust prints it, its column, and why it cannot be
+        /// totalled: `NaN in "volume" (NaN and infinity have no decimal
+        /// value)`.
+        value: String,
+    },
     /// The coverage compared no key although there was something to
     /// compare: every supplied workload key is absent from both sides (a
     /// key encoded at another decimal scale looks like this), or a sample

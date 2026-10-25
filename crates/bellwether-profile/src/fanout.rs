@@ -26,7 +26,9 @@ use std::collections::BTreeSet;
 
 use arrow::array::ArrayRef;
 use arrow::datatypes::{DataType, SchemaRef};
-use bellwether_core::encoding::{check_supported, encode_array_value_as, tag};
+use bellwether_core::encoding::{
+    check_supported, encode_array_value_as, nested_kind, not_in_schema, tag,
+};
 use bellwether_types::{Error, Fanout, Result, RowGroupMeta, Source};
 use serde::{Deserialize, Serialize};
 use xxhash_rust::xxh3::xxh3_128_with_seed;
@@ -132,7 +134,7 @@ fn could_be_payload(dt: &DataType) -> bool {
 fn field<'a>(schema: &'a SchemaRef, name: &str) -> Result<&'a arrow::datatypes::Field> {
     schema
         .field_with_name(name)
-        .map_err(|_| Error::KeySpec(format!("column {name:?} not in the dataset schema")))
+        .map_err(|_| Error::KeySpec(not_in_schema(schema, name)))
 }
 
 /// Explicit key columns, validated, with their schema positions.
@@ -170,7 +172,12 @@ fn auto_columns(
     let mut skipped = Vec::new();
     for (i, f) in schema.fields().iter().enumerate() {
         let dt = f.data_type();
-        let reason = if is_time_type(dt) {
+        let reason = if let Some(kind) = nested_kind(dt) {
+            Some(format!(
+                "a nested {kind} column, not a key candidate; flatten a field into its own \
+                 column to profile it"
+            ))
+        } else if is_time_type(dt) {
             Some(format!("{dt}: a time column, analyzed for range overlap"))
         } else if !is_id_like(dt) {
             Some(format!("{dt}: not an identifier type"))
