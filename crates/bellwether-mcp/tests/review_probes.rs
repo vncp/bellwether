@@ -20,8 +20,8 @@ use std::path::{Path, PathBuf};
 use bellwether_mcp::jobs::JobState;
 use bellwether_mcp::{Budget, Reply, Server, Status};
 use common::{
-    delta, finish, json, ledger_corpus, objects, ok, server, server_at, server_with, write_keys,
-    CLOCKS,
+    delta, finish, json, ledger_corpus, objects, ok, server, server_at, server_with, write_file,
+    write_keys, CLOCKS,
 };
 use serde_json::{json, Value};
 
@@ -572,6 +572,89 @@ fn apply_dry_run_and_apply_agree_on_a_built_key_and_write_nothing() {
             "[clock={clock:?}] a refused apply wrote {kinds:?} {other:?}"
         );
         assert_eq!(srv.budget().spent.replays, spent, "no replay was charged");
+    }
+}
+
+/// The in-band apply refusals through the tool: a passing rewrite
+/// certificate is `no_replay`, a key certificate whose data changed after
+/// verification is `data_changed`, and a layout proposal is
+/// `layout_not_applicable`. The applies write nothing, dry run or not,
+/// under a fixed clock and the system clock.
+#[test]
+fn in_band_apply_refusals_through_the_tool_write_nothing() {
+    for clock in CLOCKS {
+        let f = folder();
+        let srv = server_at(&f.data, Budget::default(), clock);
+        let e = ev(&srv);
+        let (b, a) = (f.dir.path().join("before"), f.dir.path().join("after"));
+        ledger_corpus(&b, 1, 1, 10, 10);
+        ledger_corpus(&a, 1, 1, 10, 10);
+        let rw = json(&ok(
+            &srv,
+            "propose.rewrite",
+            json!({"shape": {"before": "b", "after": "a", "invariant": "same"}, "evidence": [e], "by": "x"}),
+        ))["proposal"]["hash"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let v = ok(
+            &srv,
+            "score.verify",
+            json!({"proposal": rw, "wait": true, "rewrite": {"before": s(&b), "after": s(&a), "key": ["id"]}}),
+        );
+        let cert_rw = json(&v)["certificate"]["hash"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let sc = json(&ok(
+            &srv,
+            "score.why",
+            json!({"keys": s(&f.keys), "wait": true}),
+        ));
+        let wl = sc["workload"]["hash"].as_str().unwrap().to_string();
+        let cand = sc["candidates"][0]["proposal"]["hash"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let v = ok(
+            &srv,
+            "score.verify",
+            json!({"proposal": cand, "workload": wl, "wait": true}),
+        );
+        let cert_key = json(&v)["certificate"]["hash"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        write_file(
+            &f.data.join("part-999.parquet"),
+            &[vec![(1, 1, Some(1), "late".into())]],
+        );
+        let before = objects(f.dir.path());
+        for dry in [true, false] {
+            let r = srv.call(
+                "apply.receipt",
+                json!({"certificate": cert_rw, "dry_run": dry, "wait": true}),
+            );
+            refused_as("apply a passing rewrite", &r, "no_replay");
+            assert_eq!(refusal(&r).fields["certificate"], cert_rw.as_str());
+            let r = srv.call(
+                "apply.receipt",
+                json!({"certificate": cert_key, "dry_run": dry, "wait": true}),
+            );
+            refused_as("apply after the data changed", &r, "data_changed");
+            assert_eq!(refusal(&r).fields["certificate"], cert_key.as_str());
+        }
+        assert_eq!(objects(f.dir.path()), before, "[clock={clock:?}]");
+        let lp = json(&ok(
+            &srv,
+            "propose.layout",
+            json!({"cluster_by": ["batch"], "evidence": [e], "by": "a"}),
+        ))["proposal"]["hash"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let r = srv.call("score.verify", json!({"proposal": lp, "wait": true}));
+        refused_as("verify a layout", &r, "layout_not_applicable");
     }
 }
 
