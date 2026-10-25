@@ -589,12 +589,26 @@ impl Engine {
         let workload_age = cache
             .get_cached(&workload.hash())?
             .map_or(Duration::ZERO, |(_, age)| age);
+        // Columns with no canonical encoding (nested struct, list, map, ...)
+        // cannot be row-hashed; a key fix changes which row groups are read,
+        // not any value, so they are left out (and listed on the
+        // certificate) rather than refusing every lake that holds one.
+        let ignored: Vec<String> = replayer
+            .schema()
+            .fields()
+            .iter()
+            .filter(|f| bellwether_core::encoding::check_supported(f.data_type()).is_err())
+            .map(|f| f.name().clone())
+            .filter(|n| !columns.contains(n))
+            .collect();
         let mut rec_spec =
-            ReconcileSpec::new(columns).coverage(CoverageRequest::Workload(WorkloadKeys {
-                workload: workload.hash(),
-                age: workload_age,
-                keys,
-            }));
+            ReconcileSpec::new(columns)
+                .ignore(ignored)
+                .coverage(CoverageRequest::Workload(WorkloadKeys {
+                    workload: workload.hash(),
+                    age: workload_age,
+                    keys,
+                }));
         if let KeySpec::Temporal { ts_column, .. } = spec {
             if queries.iter().all(|q| matches!(q, RunQuery::Latest)) {
                 rec_spec = rec_spec.latest_by(ts_column.clone());

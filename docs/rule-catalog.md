@@ -233,11 +233,15 @@ of 22 row groups, and no rule said so (defect 8 of
 
 - **id**: `no_discriminating_column`
 - **Detector**: from statistics alone. The dataset has at least 2 row
-  groups, and the measured key with the lowest median `row_groups_per_value`
-  (ties: lower p95, then fewer columns), over every single column and
-  composite the profile measured, still touches at least 0.75 of
-  `row_groups_total` (`NO_DISCRIMINATING_MIN_FRACTION`). The lint names that
-  lowest-fanout key. At this threshold `low_selectivity_single_column`
+  groups, and the single column with the lowest median
+  `row_groups_per_value` (ties: lower p95), over every single column the
+  profile measured, still touches at least 0.75 of `row_groups_total`
+  (`NO_DISCRIMINATING_MIN_FRACTION`). The lint names that lowest-fanout
+  column. Composites are not searched: a pair is selective because its
+  combinations are rare (on taxi, `PULocationID, DOLocationID` has a median
+  of 6 of 22 row groups while each column alone touches 20 or more), which
+  says nothing about how one column is laid out, and the advice is to
+  cluster by one column. At this threshold `low_selectivity_single_column`
   cannot fire on the same profile: its composite's p95 is at most half of
   the single column's median, so at most 0.5.
 - **Estimator**: the lowest median fanout over `row_groups_total`. Bytes:

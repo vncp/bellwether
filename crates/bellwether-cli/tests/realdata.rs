@@ -332,7 +332,17 @@ fn taxi_shaped(dir: &Path) {
         for g in groups {
             let pu: Vec<i64> = g.iter().map(|r| r.0).collect();
             let ts: Vec<i64> = g.iter().map(|r| r.1).collect();
-            let notes: Vec<String> = g.iter().map(|(p, t)| format!("z{p}@{t}")).collect();
+            // Later trips carry longer notes, so row groups holding
+            // different versions differ in bytes, not only in which.
+            let notes: Vec<String> = g
+                .iter()
+                .map(|(p, t)| {
+                    format!(
+                        "z{p}@{t}{}",
+                        "x".repeat(usize::try_from(t / 1_000_000).unwrap())
+                    )
+                })
+                .collect();
             let batch = RecordBatch::try_new(
                 Arc::clone(&schema),
                 vec![
@@ -464,6 +474,9 @@ fn defect_9_why_latest_by_prices_temporal_lookups_and_matches_latest_and_asof_pl
         }
     );
     assert_eq!(asof_rec.proposed.row_groups, 2);
+    // The asof winners live in other row groups than the latest winners, of
+    // other sizes: an asof priced as latest would not match.
+    assert_ne!(asof_rec.proposed.bytes, rec.proposed.bytes);
     let human_asof = run(
         &[
             "why",
@@ -1469,7 +1482,9 @@ fn request_5_memory_budget_takes_human_units() {
     assert_eq!(budget("512M"), 512 << 20);
     assert_eq!(budget("8G"), 8 << 30);
     assert_eq!(budget("64KiB"), 64 << 10);
-    for bad in ["8GB", "1.5G", "-1", "G", "99999999999T"] {
+    assert_eq!(budget("8GB"), 8 << 30);
+    assert_eq!(budget("8 g"), 8 << 30);
+    for bad in ["8X", "1.5G", "-1", "G", "99999999999T"] {
         let out = bw()
             .args([
                 "reconcile",
@@ -1493,10 +1508,234 @@ fn request_5_memory_budget_takes_human_units() {
             "--key",
             "id",
             "--memory-budget",
-            "8GB",
+            "8X",
         ])
         .output()
         .unwrap();
     let err = String::from_utf8(out.stderr).unwrap();
     assert!(err.contains("binary unit, K, M, G, or T"), "{err}");
+}
+
+/// Four one-row-group files of ten rows, ids 0..40 in order, with a struct,
+/// a list, and a map column beside the flat `id`.
+fn nested_lake(dir: &Path) {
+    use arrow::array::{Int64Builder, ListArray, MapBuilder, StringBuilder};
+    use arrow::datatypes::Int64Type;
+    for f in 0..4i64 {
+        let ids: Vec<i64> = (f * 10..f * 10 + 10).collect();
+        let repo = StructArray::from(vec![(
+            Arc::new(Field::new("id", DataType::Int64, true)),
+            Arc::new(Int64Array::from_iter_values(ids.iter().map(|k| k / 4))) as ArrayRef,
+        )]);
+        let tags = ListArray::from_iter_primitive::<Int64Type, _, _>(
+            ids.iter().map(|k| Some(vec![Some(*k), Some(k + 1)])),
+        );
+        let mut labels = MapBuilder::new(None, StringBuilder::new(), Int64Builder::new());
+        for k in &ids {
+            labels.keys().append_value(format!("k{k}"));
+            labels.values().append_value(*k);
+            labels.append(true).unwrap();
+        }
+        table(
+            &dir.join(format!("part-{f}.parquet")),
+            vec![
+                ("id", Arc::new(Int64Array::from(ids)) as ArrayRef),
+                ("repo", Arc::new(repo)),
+                ("tags", Arc::new(tags)),
+                ("labels", Arc::new(labels.finish())),
+            ],
+        );
+    }
+}
+
+/// Bake-off port (from the Argon defects implementation): `fix` leaves
+/// columns with no canonical encoding out of the row hash, so a flat key on
+/// a lake with struct, list, and map columns verifies and is applied; and
+/// `propose` refuses a nested key column with the nested-column sentence.
+#[test]
+fn fix_applies_a_flat_key_on_a_lake_with_nested_columns_and_propose_refuses_a_nested_key() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("lake");
+    nested_lake(&data);
+    let kf = dir.path().join("k.parquet");
+    keys(&kf, "id", &[3, 17]);
+    let why: WhyReport = typed(&run(
+        &["--json", "why", path(&data), "--from", path(&kf)],
+        0,
+    ));
+    let rec = why
+        .recommended
+        .as_ref()
+        .expect("exact:id prunes 4 files to 2");
+    let fix: FixResult = typed(&run(
+        &[
+            "--json",
+            "fix",
+            path(&data),
+            "--proposal",
+            &rec.proposal.to_hex(),
+            "--workload",
+            &why.workload.as_ref().unwrap().hash.to_hex(),
+        ],
+        0,
+    ));
+    assert!(
+        matches!(fix.outcome, FixOutcome::Applied { .. }),
+        "{:?}",
+        fix.outcome
+    );
+    let Some(bellwether::Written {
+        record: Record::Certificate(c),
+        ..
+    }) = &fix.certificate
+    else {
+        panic!("{:?}", fix.certificate)
+    };
+    assert_eq!(c.body.ignored_columns, vec!["labels", "repo", "tags"]);
+
+    let evidence = why.evidence.hash.unwrap().to_hex();
+    let out = bw()
+        .args([
+            "propose",
+            path(&data),
+            "--evidence",
+            &evidence,
+            "--by",
+            "test",
+            "--key",
+            "exact:repo",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(4));
+    let err = String::from_utf8(out.stderr).unwrap();
+    assert!(err.contains("key column \"repo\""), "{err}");
+    assert!(
+        err.contains("nested struct column cannot be a key"),
+        "{err}"
+    );
+    assert!(!err.contains("Field {"), "{err}");
+}
+
+/// Defect 14 (port): `docs/agent-loop.md` no longer says the engine that
+/// writes the records does not exist.
+#[test]
+fn defect_14_agent_loop_doc_drops_the_stale_status_line() {
+    let doc = std::fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/agent-loop.md"),
+    )
+    .unwrap();
+    assert!(!doc.contains("the engine that writes them does not yet"));
+}
+
+/// Defect 4 on the apply tier: `fix --certificate` re-scores and refuses a
+/// proposal whose replay saves nothing, unless `--allow-no-gain`.
+#[test]
+fn defect_4_fix_certificate_refuses_a_proposal_that_saves_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    corpus(&data, 2, 3, 20, 100);
+    let kf = dir.path().join("k.parquet");
+    keys(&kf, "id", &[1, 25, 45, 65, 85]);
+    let why: WhyReport = typed(&run(
+        &["--json", "why", path(&data), "--from", path(&kf)],
+        0,
+    ));
+    let workload = why.workload.unwrap().hash.to_hex();
+    let p = run(
+        &[
+            "propose",
+            path(&data),
+            "--evidence",
+            &why.evidence.hash.unwrap().to_hex(),
+            "--by",
+            "test",
+            "--key",
+            "exact:id",
+        ],
+        0,
+    );
+    let proposal = p.trim().trim_start_matches("proposal ").to_string();
+    let verified: FixResult = typed(&run(
+        &[
+            "--json",
+            "fix",
+            path(&data),
+            "--proposal",
+            &proposal,
+            "--workload",
+            &workload,
+            "--verify-only",
+            "--allow-no-gain",
+        ],
+        0,
+    ));
+    let cert = verified.certificate.expect("verified").hash.to_hex();
+    let refused: FixResult = typed(&run(
+        &["--json", "fix", path(&data), "--certificate", &cert],
+        3,
+    ));
+    assert!(
+        matches!(
+            refused.outcome,
+            FixOutcome::Refused {
+                refusal: Refusal::NothingToGain { .. }
+            }
+        ),
+        "{:?}",
+        refused.outcome
+    );
+    let applied: FixResult = typed(&run(
+        &[
+            "--json",
+            "fix",
+            path(&data),
+            "--certificate",
+            &cert,
+            "--allow-no-gain",
+        ],
+        0,
+    ));
+    assert!(
+        matches!(applied.outcome, FixOutcome::Applied { .. }),
+        "{:?}",
+        applied.outcome
+    );
+}
+
+/// Defect 11: a `.json` file that is not JSON lines beside JSON lines files
+/// is refused by name with the accepted extensions, never silently dropped.
+#[test]
+fn defect_11_a_non_json_lines_dot_json_beside_data_is_refused_by_name() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("mixed");
+    nested_jsonl(&data.join("a.jsonl"), 5);
+    std::fs::write(data.join("arr.json"), "[{\"id\": 1}]\n").unwrap();
+    let out = bw()
+        .args(["--format", "jsonl", "why", path(&data)])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(4));
+    let err = String::from_utf8(out.stderr).unwrap();
+    assert!(err.contains("arr.json"), "{err}");
+    assert!(err.contains("is not JSON lines"), "{err}");
+    assert!(err.contains(".jsonl, .ndjson"), "{err}");
+}
+
+/// Defect 7 wording: when one value sits in few row groups but the keys
+/// together cover them all, the culprit says so instead of claiming each
+/// value is spread over nearly every row group.
+#[test]
+fn defect_7_layout_culprit_says_the_keys_together_cover_the_row_groups() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    corpus(&data, 2, 3, 20, 100);
+    let kf = dir.path().join("k.parquet");
+    keys(&kf, "id", &[1, 25, 45, 65, 85]);
+    let human = run(&["why", path(&data), "--from", path(&kf)], 0);
+    assert!(
+        human.contains("the requested keys together cover nearly every row group"),
+        "{human}"
+    );
+    assert!(!human.contains("each value is spread"), "{human}");
 }

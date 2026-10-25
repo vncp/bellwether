@@ -433,8 +433,26 @@ pub(crate) fn why(r: &bellwether::WhyReport, out: &Out) -> String {
                         quantiles(&f.row_groups_per_value)
                     )
                 });
+                // A value spread over nearly every row group, or many values
+                // each in a few row groups that together cover them all: the
+                // sentence must state the one the fanout shows.
+                #[allow(clippy::cast_precision_loss)]
+                let spread = lowest_fanout.as_ref().is_none_or(|f| {
+                    f.row_groups_per_value[0]
+                        >= bellwether::LAYOUT_BOUND_FRACTION * f.row_groups_total as f64
+                });
+                let because = if spread {
+                    "because each value is spread over nearly every row group".to_string()
+                } else {
+                    let col = lowest_fanout
+                        .as_ref()
+                        .map_or_else(String::new, |f| f.columns.join(", "));
+                    format!(
+                        "because the requested keys together cover nearly every row group: one value sits in few row groups, but the files are not clustered by {col}"
+                    )
+                };
                 format!(
-                    "the layout, not a missing index: every candidate, the floor included, reads at least {} of the {} row groups the runs span, because each value is spread over nearly every row group, so no index helps, and only files rewritten clustered by the lookup columns would prune{lowest}",
+                    "the layout, not a missing index: every candidate, the floor included, reads at least {} of the {} row groups the runs span, {because}, so no index helps, and only files rewritten clustered by the lookup columns would prune{lowest}",
                     num(*least_row_groups),
                     num(*row_groups)
                 )

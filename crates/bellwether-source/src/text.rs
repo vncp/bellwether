@@ -747,10 +747,28 @@ pub fn csv_ends_in_quotes(bytes: &[u8], delimiter: u8) -> bool {
 impl<S: Storage> Source for ChunkedTextSource<S> {
     fn discover(&self, root: &str) -> Result<Vec<FileFingerprint>> {
         let mut out = Vec::new();
+        // A sniffed `.json` file that is not JSON lines is refused by name,
+        // never silently left out of the dataset beside the files read.
+        let mut not_lines = Vec::new();
         for p in self.storage.list(root)? {
             if self.accepts(&p)? {
                 out.push(fingerprint_with_policy(&self.storage, &p, self.policy)?);
+            } else if self.format.candidate(&p) && !self.is_excluded(&p) {
+                not_lines.push(p);
             }
+        }
+        if let Some(first) = not_lines.first() {
+            return Err(Error::Source(format!(
+                "{first}{}: a .json file here is not JSON lines (its first line is not one JSON \
+                 object), so it cannot be read with the other files; this format reads {}. Move \
+                 it out of the folder, or convert it to one JSON object per line",
+                if not_lines.len() > 1 {
+                    format!(" and {} more", not_lines.len() - 1)
+                } else {
+                    String::new()
+                },
+                self.format.accepted()
+            )));
         }
         Ok(out)
     }

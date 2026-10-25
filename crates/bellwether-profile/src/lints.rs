@@ -6,7 +6,7 @@
 //! | `low_selectivity_single_column` | the median value of `C` touches at least [`LOW_SELECTIVITY_MIN_FRACTION`] of all row groups, some id-like `O` that is not a batch stamp makes the composite's p95 at most half of that median, and `C` is not a batch stamp (a batch stamp is not a key at all) |
 //! | `scattered_time_column` | a date or timestamp column's overlap depth is at least `SCATTER_MIN_DEPTH` and its sortedness below `SCATTER_MAX_SORTEDNESS` (`bellwether_source::stats`) |
 //! | `declared_but_unused_key` | a manifest declares a key spec and a recorded workload exists whose runs never supply the spec's leading column |
-//! | `no_discriminating_column` | the dataset has at least 2 row groups and every measured key, single column or composite, has a median value touching at least [`NO_DISCRIMINATING_MIN_FRACTION`] of all row groups: the layout, not a missing index, sets the cost of a lookup |
+//! | `no_discriminating_column` | the dataset has at least 2 row groups and every measured single column (composites are not searched) has a median value touching at least [`NO_DISCRIMINATING_MIN_FRACTION`] of all row groups: the layout, not a missing index, sets the cost of a lookup |
 //!
 //! The two decisions the benchmark also makes are not reimplemented here:
 //! `batch_stamp_key` is `bellwether_source::stats::batch_stamp` and
@@ -82,7 +82,7 @@ pub const LOW_SELECTIVITY_MIN_FRACTION: f64 = 0.5;
 /// `low_selectivity_single_column`: median over the composite's p95.
 pub const LOW_SELECTIVITY_MIN_RATIO_OVER_COMPOSITE: f64 = 2.0;
 /// `no_discriminating_column`: the least median row groups per value, over
-/// every measured key, as a fraction of all row groups. At three quarters a
+/// every measured single column, as a fraction of all row groups. At three quarters a
 /// point lookup on the best key still reads three row groups in four.
 pub const NO_DISCRIMINATING_MIN_FRACTION: f64 = 0.75;
 
@@ -118,7 +118,7 @@ pub fn run(inputs: &LintInputs<'_>) -> Result<Vec<Lint>> {
     lints.extend(low_selectivity(inputs, &stamps));
     lints.extend(scattered_time(inputs));
     lints.extend(declared_but_unused(inputs));
-    lints.extend(no_discriminating(inputs));
+    lints.extend(no_discriminating(inputs.entries));
     Ok(lints)
 }
 
@@ -413,19 +413,25 @@ fn declared_but_unused(inputs: &LintInputs<'_>) -> Vec<Lint> {
     out
 }
 
-/// `no_discriminating_column`: the measured key with the lowest median row
-/// groups per value (ties: lower p95, then fewer columns, then measured
-/// order) still touches nearly every row group, so no key prunes and the
-/// layout, not a missing index, decides what a lookup reads. Names that
-/// lowest-fanout key. One row group has nothing to prune and never fires.
-fn no_discriminating(inputs: &LintInputs<'_>) -> Option<Lint> {
-    let best = inputs.entries.iter().min_by(|a, b| {
-        let (fa, fb) = (&a.fanout, &b.fanout);
-        fa.row_groups_per_value[0]
-            .total_cmp(&fb.row_groups_per_value[0])
-            .then(fa.row_groups_per_value[1].total_cmp(&fb.row_groups_per_value[1]))
-            .then(fa.columns.len().cmp(&fb.columns.len()))
-    })?;
+/// `no_discriminating_column`: the measured single column with the lowest
+/// median row groups per value (ties: lower p95, then measured order) still
+/// touches nearly every row group, so no column prunes and the layout, not
+/// a missing index, decides what a lookup reads. Names that lowest-fanout
+/// column. Composites are not searched: a rare pair says nothing about how
+/// one column is laid out. One row group has nothing to prune and never fires.
+fn no_discriminating(entries: &[FanoutEntry]) -> Option<Lint> {
+    // Single columns only: a pair is selective because its combinations
+    // are rare, which says nothing about how one column's values are laid
+    // out, and the advice is to cluster by one column.
+    let best = entries
+        .iter()
+        .filter(|e| e.fanout.columns.len() == 1)
+        .min_by(|a, b| {
+            let (fa, fb) = (&a.fanout, &b.fanout);
+            fa.row_groups_per_value[0]
+                .total_cmp(&fb.row_groups_per_value[0])
+                .then(fa.row_groups_per_value[1].total_cmp(&fb.row_groups_per_value[1]))
+        })?;
     let f = &best.fanout;
     if f.row_groups_total < 2 {
         return None;
@@ -435,19 +441,15 @@ fn no_discriminating(inputs: &LintInputs<'_>) -> Option<Lint> {
     if fraction < NO_DISCRIMINATING_MIN_FRACTION {
         return None;
     }
-    let sampled = inputs.entries.iter().any(|e| e.fanout.sampled);
-    let name = if f.columns.len() == 1 {
-        f.columns[0].clone()
-    } else {
-        label(&f.columns)
-    };
+    let sampled = entries.iter().any(|e| e.fanout.sampled);
+    let name = &f.columns[0];
     Some(Lint {
         rule: NO_DISCRIMINATING_COLUMN.into(),
         columns: f.columns.clone(),
         message: format!(
-            "No measured key prunes: the most selective, {name}, has a median value in {} of {} \
-             row groups ({:.0}%), and every other column and pair measured touches at least as \
-             many, so the values are spread over nearly every row group. The layout, not a \
+            "No measured column prunes: the most selective, {name}, has a median value in {} of {} \
+             row groups ({:.0}%), and every other single column measured touches at least as \
+             many, so each column's values are spread over nearly every row group. The layout, not a \
              missing index, sets what a point lookup reads: an exact index on any of these keys \
              still reads nearly every row group, and only files rewritten clustered by the \
              column lookups supply would prune. A newest-version lookup can still prune by \
@@ -459,4 +461,54 @@ fn no_discriminating(inputs: &LintInputs<'_>) -> Option<Lint> {
         confidence: if sampled { LOW } else { HIGH },
         site: None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::fanout::SampleInfo;
+    use bellwether_types::Fanout;
+
+    fn entry(columns: &[&str], p50: f64) -> FanoutEntry {
+        FanoutEntry {
+            fanout: Fanout {
+                columns: columns.iter().map(|c| (*c).to_string()).collect(),
+                distinct: 100,
+                sampled: false,
+                files_per_value: [1.0; 3],
+                row_groups_per_value: [p50, p50, p50],
+                files_total: 1,
+                row_groups_total: 22,
+            },
+            sample: SampleInfo {
+                retained: 100,
+                admission_bound: String::new(),
+                rate: 1.0,
+                hll_estimate: 100,
+                distinct_source: DistinctSource::Exact,
+                quantile_rank_error: None,
+                peak_entries: 0,
+                peak_capacity: 0,
+                high_water: 0,
+                capped_at_rows: false,
+            },
+        }
+    }
+
+    /// The taxi shape: each column touches 20 or more of 22 row groups, a
+    /// rare pair touches 6. The pair does not silence the lint, which names
+    /// the lowest-fanout single column; a selective column does.
+    #[test]
+    fn no_discriminating_column_searches_single_columns_only() {
+        let taxi = [
+            entry(&["PULocationID"], 20.0),
+            entry(&["DOLocationID"], 21.0),
+            entry(&["PULocationID", "DOLocationID"], 6.0),
+        ];
+        let lint = no_discriminating(&taxi).expect("fires on the taxi shape");
+        assert_eq!(lint.columns, vec!["PULocationID".to_string()]);
+        assert!(lint.message.contains("20 of 22"), "{}", lint.message);
+        let selective = [entry(&["id"], 1.0), entry(&["DOLocationID"], 21.0)];
+        assert!(no_discriminating(&selective).is_none());
+    }
 }

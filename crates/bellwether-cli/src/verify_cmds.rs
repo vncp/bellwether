@@ -214,17 +214,24 @@ fn problem(p: &ReconcileProblem) -> String {
 }
 
 /// `--memory-budget`: bytes, or a whole number with a binary unit, `K`,
-/// `M`, `G`, or `T` (also `KiB`..`TiB`): `8G` is 8 × 2^30 bytes.
+/// `M`, `G`, or `T`, optionally spaced and suffixed `B` or `iB`, in any
+/// case (`8G`, `8 GB`, `512MiB`): every unit is binary, so `8G` is
+/// 8 × 2^30 bytes.
 pub(crate) fn parse_bytes(given: &str) -> Result<u64, String> {
     let g = given.trim();
     let split = g.find(|c: char| !c.is_ascii_digit()).unwrap_or(g.len());
     let (digits, unit) = g.split_at(split);
+    let unit = unit.trim().to_ascii_uppercase();
+    let unit = unit
+        .strip_suffix("IB")
+        .or_else(|| unit.strip_suffix('B'))
+        .unwrap_or(&unit);
     let shift = match unit {
-        "" | "B" => 0,
-        "K" | "k" | "KiB" => 10,
-        "M" | "m" | "MiB" => 20,
-        "G" | "g" | "GiB" => 30,
-        "T" | "t" | "TiB" => 40,
+        "" => 0,
+        "K" => 10,
+        "M" => 20,
+        "G" => 30,
+        "T" => 40,
         _ => {
             return Err(format!(
                 "{given:?} is not a byte count; write bytes (268435456) or a whole number with a \
