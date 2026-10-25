@@ -250,6 +250,23 @@ The run found 14 defects, filed in that document, and all 14 are fixed since, ea
 - `index` refused any dataset that has a nested column. Nested columns are now recorded and skipped as key candidates; a nested key column is refused by name.
 - `fix` attested a key that its own replay predicted saves nothing. It now refuses with `nothing_to_gain` (exit 3) unless `--allow-no-gain`.
 
+## Tables as sources
+
+A SQL table reads like a folder (ADR 027, `bellwether-source-sql`): SQLite in process, DuckDB, Postgres, and Flight SQL through ADBC, SQL Server through ODBC. Reconcile a table against the files it came from, ask `why` a lookup over it is slow (every cost measured, and labeled so), and `fix` verifies a key and names the `CREATE INDEX` a human runs: the engine changes nothing in a database and writes no receipt for it.
+
+```bash
+# the table against the Parquet files it was loaded from: a certificate naming both
+bellwether reconcile 'sql://duckdb/main.trips?db=taxi.duckdb&range=tpep_pickup_datetime&units=24' ./taxi/ \
+    --key VendorID,tpep_pickup_datetime,PULocationID,fare_amount --totals fare_amount:dec(2) --index ./ledger
+# why these lookups read what they read in the table, costs measured
+bellwether why 'sql://duckdb/main.trips?db=taxi.duckdb&range=tpep_pickup_datetime&units=24' \
+    --from keys/taxi_pu.parquet --index ./ledger
+# reproduce the measured run over 20 million NYC taxi rows in DuckDB and SQLite
+scripts/sql-demo.sh
+```
+
+Results: [`docs/measured/results/sql.json`](docs/measured/results/sql.json), written by [`scripts/sql-demo.sh`](scripts/sql-demo.sh). Which numbers over a table are counts, bounds, or measured: [the crate README](crates/bellwether-source-sql/README.md).
+
 ## Time series
 
 For folders of market data (partitioned by date, many symbols per file), five additions, all additive to storage version 1 ([format](docs/format.md), [capabilities and status](docs/time-series-capabilities.md)):

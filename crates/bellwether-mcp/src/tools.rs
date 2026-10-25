@@ -119,7 +119,7 @@ pub struct ScoreWhy {
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct RewriteOutputs {
-    /// The output before the rewrite (a folder of files).
+    /// The output before the rewrite (a folder of files; never a table).
     pub before: String,
     /// The output after it.
     pub after: String,

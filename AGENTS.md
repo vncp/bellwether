@@ -70,6 +70,7 @@ line. No refusal is prose only.
 | `nothing_to_gain` | The proposal's replay predicts no saving on the workload; `fields` has `replay`, `current_bytes`, `proposed_bytes`. Nothing but the Replay was written. Propose another key; only the human can continue, with `bellwether fix --allow-no-gain` (no tool takes it). |
 | `layout_not_applicable` | Layout proposals cannot be applied in this release. |
 | `no_replay` | A rewrite verified but cannot be attested yet (rewrites have no replay). |
+| `attest_only` | The proposal verified and its target is a table (`sql://`): the engine applies nothing to a table and writes no receipt. `fields.run` lists what a human runs (a `CREATE INDEX` per table, or the rewrite to deploy). Report the certificate and `fields.run` to the human. |
 | `reserved_proposer` | The name in `by` is reserved for the engine. Pass your own name. |
 | `no_workload` | Scoring needs input that was not given: `keys` or a recorded `workload` for `score.why`, `workload` for a key proposal, `rewrite` outputs for a rewrite; `fields.field` names it. |
 | `stale_index` | Files landed, changed, or vanished since the index was built; `fields` lists them. Ask the human to run `bellwether index`. |
@@ -84,7 +85,9 @@ line. No refusal is prose only.
 | `job_not_found` | No job has that id in this session. |
 | `job_running` | The job has not finished; poll `jobs.status`. |
 | `unknown_tool` | No tool has that name. |
-| `source_error` | A data file could not be read. |
+| `source_error` | A data file or table could not be read. |
+| `source_changed` | A table changed during a run that held no snapshot (`fields.units` lists the units); nothing was recorded. Call the tool again when the table is quiet. |
+| `not_a_folder` | The data root is a table and the tool needs a folder of files (lookups, index builds). Over a table use `observe.why`, `observe.profile`, `score.why`, and `score.verify`. |
 | `store_error` | The index store could not be read or written. |
 | `ledger_rule` | The ledger refused a record or a link (for example a certificate that verified no proposal). |
 | `version_conflict` | A concurrent writer won a commit race. Retry once. |

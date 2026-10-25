@@ -198,12 +198,47 @@ pub enum Error {
         /// The sequences that can be pinned, ascending (empty: no index).
         retained: Vec<u64>,
     },
+    /// A table changed during a run that held no snapshot (ADR 027): a
+    /// unit's identity read when the run ended differs from the one read
+    /// when it began, or a unit appeared or vanished. The run's answer
+    /// would mix two states of the table, so it is refused, never returned
+    /// as a partial answer. `units` are the unit paths that changed
+    /// (`sql://<engine>/<schema>.<table>/<unit>`, sorted); `message` says
+    /// what to do.
+    #[error("{message}")]
+    SourceChanged {
+        /// The data root (`sql://<engine>/<tables>`).
+        root: String,
+        /// The units whose identity changed, appeared, or vanished.
+        units: Vec<String>,
+        /// The whole message, naming what to do.
+        message: String,
+    },
+    /// The operation needs a folder of files and the data root is a table
+    /// (`sql://`): the engine builds no index inside a database and applies
+    /// nothing to one (ADR 027). Reconcile, `why`, and `fix` (verify and
+    /// attest-only) work over a table.
+    #[error("{}", not_a_folder(root, operation))]
+    NotAFolder {
+        /// The data root (`sql://<engine>/<tables>`).
+        root: String,
+        /// The operation refused (`index`, `locate`, ...).
+        operation: &'static str,
+    },
     /// Serialization failure.
     #[error("serde error: {0}")]
     Serde(#[from] serde_json::Error),
     /// Anything else.
     #[error("{0}")]
     Other(String),
+}
+
+fn not_a_folder(root: &str, operation: &str) -> String {
+    format!(
+        "{root} is a table, and {operation} needs a folder of files: the engine builds no index \
+         inside a database (ADR 027); reconcile, why, and fix (verify, then a refusal naming what \
+         to run) work over a table"
+    )
 }
 
 /// Result alias used throughout the engine.

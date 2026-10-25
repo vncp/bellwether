@@ -19,6 +19,16 @@ jobs:
         with:
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
+      - name: install libduckdb (the DuckDB tests read DuckDB through its ADBC driver, libduckdb itself)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/libduckdb" && cd "$RUNNER_TEMP/libduckdb"
+          gh release download v2.0.0 --repo duckdb/duckdb --pattern 'duckdb-shared-libs-linux-amd64.tar.gz'
+          tar -xzf duckdb-shared-libs-linux-amd64.tar.gz libduckdb.so
+          echo "BELLWETHER_DUCKDB_DRIVER=$RUNNER_TEMP/libduckdb/libduckdb.so" >> "$GITHUB_ENV"
+      - name: install the ODBC driver manager (the `odbc` feature of bellwether-source-sql links it)
+        run: sudo apt-get update && sudo apt-get install -y unixodbc-dev
       - name: fmt
         run: cargo fmt --all -- --check
       - name: clippy

@@ -108,7 +108,9 @@ enum Command {
 
 #[derive(Args)]
 pub(crate) struct RootArg {
-    /// The folder of data files.
+    /// The folder of data files, or a table:
+    /// sql://<engine>/<schema>.<table>?db=<connection> (why, fix, and the
+    /// MCP server only; needs --index).
     pub(crate) root: String,
 }
 
@@ -847,6 +849,16 @@ fn why(g: &Global, out: &Out, a: &WhyArgs) -> Result<Outcome, Failure> {
                 .into(),
         ));
     }
-    let r = engine_at(g, &a.root.root, a.at_manifest)?.why(&request)?;
-    done(&r, human::why(&r, out), EXIT_OK)
+    let e = engine_at(g, &a.root.root, a.at_manifest)?;
+    let r = e.why(&request)?;
+    let fix_command = if e.is_table() {
+        format!(
+            "bellwether fix '{}' --index {}",
+            a.root.root,
+            e.index_location()
+        )
+    } else {
+        format!("bellwether fix {}", r.root)
+    };
+    done(&r, human::why(&r, out, &fix_command), EXIT_OK)
 }

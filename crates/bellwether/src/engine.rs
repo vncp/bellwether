@@ -3,7 +3,7 @@
 
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use arrow::datatypes::SchemaRef;
@@ -13,6 +13,7 @@ use bellwether_source::{
     fingerprint_with_policy, ChunkedTextSource, FingerprintPolicy, LocalFs, ParquetSource,
     Partitioning, Storage as _, TextFormat,
 };
+use bellwether_source_sql::{is_sql_root, SqlOptions, SqlSource, SqlUrl, TableRun};
 use bellwether_store::{
     manifest_history_path, manifest_path, now_rfc3339, parse_rfc3339, retained_sequences,
     rfc3339_millis, Cache, Manifest, ObjectStoreBackend, Snapshot, StoreExt,
@@ -206,6 +207,12 @@ pub struct Engine {
     /// creates a local index directory.
     store: OnceLock<Arc<ObjectStoreBackend>>,
     options: EngineOptions,
+    /// The data root as given, when it is a table (`sql://`, ADR 027): the
+    /// connection parameters stay here and never reach a record.
+    table: Option<String>,
+    /// Every table source this engine opened that is still alive, so the
+    /// run can end each before anything is recorded (`finish_tables`).
+    tables_open: Mutex<Vec<Weak<SqlSource>>>,
 }
 
 impl std::fmt::Debug for Engine {
@@ -229,6 +236,9 @@ impl Engine {
     }
 
     fn open_inner(root: &str, options: EngineOptions) -> Result<Self> {
+        if is_sql_root(root) {
+            return Self::open_table(root, options);
+        }
         let local = match root.split_once("://") {
             None => root,
             Some(("file", rest)) => rest,
@@ -280,6 +290,8 @@ impl Engine {
             local_index,
             store: OnceLock::new(),
             options,
+            table: None,
+            tables_open: Mutex::new(Vec::new()),
         };
         if let Some(m) = engine.manifest()? {
             let recorded = SourceKind::parse(&m.source.kind)?;
@@ -312,6 +324,142 @@ impl Engine {
             }
         }
         Ok(engine)
+    }
+
+    /// [`Engine::open`] over a table root (`sql://`, ADR 027). There is no
+    /// folder to hold an index, so the ledger's location must be given
+    /// (`--index`); options that describe files are refused.
+    fn open_table(root: &str, options: EngineOptions) -> Result<Self> {
+        let url = SqlUrl::parse(root)?;
+        let refuse = |flag: &str| {
+            Err(Error::InvalidArgument {
+                field: "root",
+                reason: format!(
+                    "{} is a table, and {flag} describes a folder of files; leave it out",
+                    url.root()
+                ),
+            })
+        };
+        if options.partitioning.is_some() {
+            return refuse("the partitioning");
+        }
+        if options.fingerprint_policy.is_some() {
+            return refuse("the fingerprint policy");
+        }
+        if options.chunk_size.is_some() {
+            return refuse("the chunk size");
+        }
+        if options.format != SourceFormat::default() {
+            return refuse("the file format");
+        }
+        if options.at_manifest.is_some() {
+            return Err(Error::NotAFolder {
+                root: url.root(),
+                operation: "pinning a manifest",
+            });
+        }
+        let Some(index) = options.index.clone() else {
+            return Err(Error::InvalidArgument {
+                field: "index",
+                reason: format!(
+                    "{} is a table, so there is no folder to hold the ledger; give the index                      location where certificates and evidence are written",
+                    url.root()
+                ),
+            });
+        };
+        let mut options = options;
+        if let Some(c) = &options.clock {
+            let normalized = rfc3339_millis(c).map_err(|e| {
+                Error::Other(format!("the clock {c:?} is not an RFC 3339 time ({e})"))
+            })?;
+            options.clock = Some(normalized);
+        }
+        let engine = Self {
+            root: url.root(),
+            local_index: local_path(&index)?,
+            index,
+            store: OnceLock::new(),
+            options,
+            table: Some(root.to_string()),
+            tables_open: Mutex::new(Vec::new()),
+        };
+        if let Some(m) = engine.manifest()? {
+            return Err(Error::Source(format!(
+                "the index at {} indexes {}, not the table {}; pass another --index",
+                engine.index, m.source.root, engine.root
+            )));
+        }
+        Ok(engine)
+    }
+
+    /// The data root as given, when it is a table (with its connection
+    /// parameters: never recorded).
+    pub(crate) fn table_url(&self) -> Option<&str> {
+        self.table.as_deref()
+    }
+
+    /// Whether the data root is a table (`sql://`).
+    #[must_use]
+    pub fn is_table(&self) -> bool {
+        self.table.is_some()
+    }
+
+    /// Refuses `operation` on a table root: it needs a folder of files.
+    pub(crate) fn require_folder(&self, operation: &'static str) -> Result<()> {
+        if self.is_table() {
+            return Err(Error::NotAFolder {
+                root: self.root.clone(),
+                operation,
+            });
+        }
+        Ok(())
+    }
+
+    /// Opens a table source over `url` (a `sql://` root) with `schema` as
+    /// its dataset types where given, and registers it so the run ends it
+    /// before anything is recorded.
+    pub(crate) fn open_table_source(
+        &self,
+        url: &str,
+        schema: Option<SchemaRef>,
+    ) -> Result<Arc<SqlSource>> {
+        let src = Arc::new(SqlSource::connect(
+            url,
+            SqlOptions {
+                schema,
+                ..SqlOptions::default()
+            },
+        )?);
+        let mut open = self
+            .tables_open
+            .lock()
+            .map_err(|_| Error::Other("the open-table list is poisoned".into()))?;
+        open.retain(|w| w.strong_count() > 0);
+        open.push(Arc::downgrade(&src));
+        Ok(src)
+    }
+
+    /// Ends the run over every table source still open (ADR 027): one held
+    /// a snapshot, or each unit's identity is re-read and a change refused
+    /// ([`Error::SourceChanged`]). Called before every record a run over a
+    /// table writes, and when it returns. The reports, by root.
+    pub(crate) fn finish_tables(&self) -> Result<Vec<TableRun>> {
+        let open: Vec<Arc<SqlSource>> = {
+            let mut open = self
+                .tables_open
+                .lock()
+                .map_err(|_| Error::Other("the open-table list is poisoned".into()))?;
+            open.retain(|w| w.strong_count() > 0);
+            open.iter().filter_map(Weak::upgrade).collect()
+        };
+        let mut runs = Vec::with_capacity(open.len());
+        for s in open {
+            let run = s.finish()?;
+            if run.units > 0 && !runs.contains(&run) {
+                runs.push(run);
+            }
+        }
+        Ok(runs)
     }
 
     /// The canonical data root.
@@ -565,6 +713,10 @@ impl Engine {
     /// [`Engine::source`] builds: `parquet`, or the text format and its
     /// effective chunk size.
     pub(crate) fn source_config(&self, pinned: Option<&Pinned>) -> Result<String> {
+        if let Some(t) = &self.table {
+            let url = SqlUrl::parse(t)?;
+            return Ok(format!("sql:{}{}", url.engine, url.unit_config()));
+        }
         let format = SourceFormat::from_kind(self.options.format.kind());
         let chunk = match pinned {
             Some(p) => recorded_chunk_size(p.manifest())?,
@@ -611,6 +763,14 @@ impl Engine {
     /// [`Engine::source`] over the folder `root`, which partitioning reads
     /// the paths below.
     pub(crate) fn source_at(&self, pinned: Option<&Pinned>, root: &str) -> Result<Box<dyn Source>> {
+        if let Some(t) = self.table.as_ref().filter(|_| root == self.root) {
+            let src = self.open_table_source(t, self.options.schema.clone())?;
+            return Ok(Box::new(TableSource(src)));
+        }
+        if is_sql_root(root) {
+            let src = self.open_table_source(root, None)?;
+            return Ok(Box::new(TableSource(src)));
+        }
         let partitioning = self.partitioning(pinned)?;
         let (schema, policy, chunk) = match pinned {
             Some(p) => (
@@ -957,6 +1117,32 @@ impl Engine {
             }
             _ => Vec::new(),
         }
+    }
+}
+
+/// A table source as a boxed `Source`, kept alive by the engine's
+/// registry only weakly: dropping the box ends the source.
+pub(crate) struct TableSource(pub Arc<SqlSource>);
+
+impl Source for TableSource {
+    fn discover(&self, root: &str) -> Result<Vec<FileFingerprint>> {
+        self.0.discover(root)
+    }
+
+    fn row_groups(&self, file: &FileFingerprint) -> Result<Vec<bellwether_types::RowGroupMeta>> {
+        self.0.row_groups(file)
+    }
+
+    fn read_columns(
+        &self,
+        rg: &bellwether_types::RowGroupMeta,
+        columns: &[String],
+    ) -> Result<arrow::array::RecordBatch> {
+        self.0.read_columns(rg, columns)
+    }
+
+    fn schema(&self, root: &str) -> Result<SchemaRef> {
+        self.0.schema(root)
     }
 }
 

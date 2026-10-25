@@ -27,6 +27,9 @@ bellwether-profile = { path = "../bellwether-profile" }
 bellwether-replay = { path = "../bellwether-replay" }
 # `reconcile`, and `fix`'s verify stage.
 bellwether-verify = { path = "../bellwether-verify" }
+# Tables as sources (`sql://` roots, ADR 027): reconcile, why, and fix
+# (verify, then an attest-only refusal) over a table.
+bellwether-source-sql = { path = "../bellwether-source-sql" }
 arrow = { workspace = true }
 parquet = { workspace = true, features = ["arrow"] }
 roaring = { workspace = true }
@@ -34,8 +37,14 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 bytes = { workspace = true }
 
+[features]
+# SQL Server tables through ODBC (links the system ODBC driver manager).
+odbc = ["bellwether-source-sql/odbc"]
+
 [dev-dependencies]
 tempfile = { workspace = true }
+# Writes the SQLite tables the table tests read.
+rusqlite = { version = "0.41", features = ["bundled"] }
 
 [lints]
 workspace = true

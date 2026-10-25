@@ -47,6 +47,7 @@ mod why;
 pub use bellwether_ledger::RecordKind;
 pub use bellwether_profile::ProfileReport;
 pub use bellwether_source::{FingerprintPolicy, Partitioning, PathTemplate};
+pub use bellwether_source_sql::{is_sql_root, EngineKind, TableRun, MEASURED_PLAN, MEASURED_WALL};
 pub use bellwether_types as types;
 pub use bellwether_verify::{
     ExactTotal, GroupTotal, KeyRepr, Mismatch, Reconciliation, TotalColumn,

@@ -375,7 +375,10 @@ fn quantiles(v: &[f64; 3]) -> String {
 // One linear screen: state, funnel, culprit, recommendation, fanout, lints,
 // records.
 #[allow(clippy::too_many_lines)]
-pub(crate) fn why(r: &bellwether::WhyReport, out: &Out) -> String {
+/// `fix_command` is how to call `fix` on this root: the folder, or for a
+/// table the root as given with its `--index` (a table root has no default
+/// index location).
+pub(crate) fn why(r: &bellwether::WhyReport, out: &Out, fix_command: &str) -> String {
     use bellwether::types::KeySpec;
     use bellwether::{CandidateOrigin, CulpritReason};
     let mut s = String::new();
@@ -394,6 +397,21 @@ pub(crate) fn why(r: &bellwether::WhyReport, out: &Out) -> String {
         )
     };
     let _ = writeln!(s, "{}", heading(out, &format!("why {}: {state}", r.root)));
+    crate::verify_cmds::tables_human(&mut s, &r.tables);
+    let basis = match (&r.model, r.exact) {
+        (Some(model), false) => format!(
+            "{model}: bytes are the logical bytes the engine's aggregates report, not exact \
+             (units and rows are exact counts), and no replay is recorded"
+        ),
+        _ => "exact sums of row-group statistics".to_string(),
+    };
+    if !r.exact {
+        let _ = writeln!(s, "  costs over a table are {basis}");
+    }
+    let basis = match (&r.model, r.exact) {
+        (Some(model), false) => format!("{model} (not exact)"),
+        _ => basis,
+    };
     if !r.untracked.is_empty() {
         let _ = writeln!(
             s,
@@ -426,7 +444,7 @@ pub(crate) fn why(r: &bellwether::WhyReport, out: &Out) -> String {
             None => {
                 let _ = writeln!(
                     s,
-                    "funnel: {} run(s), keys p50/p95/max {}/{}/{}; exact sums of row-group statistics, summed over runs",
+                    "funnel: {} run(s), keys p50/p95/max {}/{}/{}; {basis}, summed over runs",
                     num(w.runs),
                     num(w.keys_p50_p95_max[0]),
                     num(w.keys_p50_p95_max[1]),
@@ -436,7 +454,7 @@ pub(crate) fn why(r: &bellwether::WhyReport, out: &Out) -> String {
             Some(k) => {
                 let _ = writeln!(
                     s,
-                    "funnel: {} run(s) ({k}), keys p50/p95/max {}/{}/{}; exact sums of row-group statistics, summed over runs",
+                    "funnel: {} run(s) ({k}), keys p50/p95/max {}/{}/{}; {basis}, summed over runs",
                     num(w.runs),
                     num(w.keys_p50_p95_max[0]),
                     num(w.keys_p50_p95_max[1]),
@@ -605,11 +623,21 @@ pub(crate) fn why(r: &bellwether::WhyReport, out: &Out) -> String {
                     num(rec.current.bytes),
                     size(rec.current.bytes)
                 );
-                let _ = writeln!(
-                    s,
-                    "  apply it: bellwether fix {} --proposal {} --workload {}",
-                    r.root, rec.proposal, w.hash
-                );
+                if r.tables.is_empty() {
+                    let _ = writeln!(
+                        s,
+                        "  apply it: {fix_command} --proposal {} --workload {}",
+                        rec.proposal, w.hash
+                    );
+                } else {
+                    let _ = writeln!(
+                        s,
+                        "  verify it: {fix_command} --proposal {} --workload {}\n  (attest-only: \
+                         fix verifies and writes the certificate; the engine changes nothing in a \
+                         table, so it names the statement a human runs)",
+                        rec.proposal, w.hash
+                    );
+                }
             }
             None => {
                 let _ = writeln!(
@@ -679,9 +707,14 @@ pub(crate) fn why(r: &bellwether::WhyReport, out: &Out) -> String {
     for c in &r.candidates {
         let _ = writeln!(
             s,
-            "  proposal  {}  replay {}  {}",
+            "  proposal  {}  replay {}{}  {}",
             c.proposal.hash,
             short(&c.replay.hash),
+            if r.exact {
+                ""
+            } else {
+                " (measured, not recorded)"
+            },
             label(&c.spec)
         );
     }

@@ -28,6 +28,7 @@ use arrow::datatypes::SchemaRef;
 use bellwether_build::encode_ts;
 use bellwether_build::{BuildOptions, Builder};
 use bellwether_replay::{proposed_specs, Catalog, Replayer, RunKeys, RunQuery, Workload};
+use bellwether_source_sql::{is_sql_root, SqlUrl, MEASURED_PLAN};
 use bellwether_store::{parse_rfc3339, Cache, ObjectStoreBackend};
 use bellwether_types::{
     format, Certificate, Coverage, Error, Evidence, EvidenceBody, FileFingerprint, Hash, HashKind,
@@ -101,6 +102,20 @@ pub enum Score {
         current: Cost,
         /// Summed over runs, under the proposal.
         proposed: Cost,
+    },
+    /// Over a table (ADR 027): a Replay computed now with every cost
+    /// measured (`exact: false`, `model` named) and not recorded, since the
+    /// ledger keeps only exact current costs (ADR 005). Nothing is applied
+    /// to a table, so no gain gate runs.
+    Measured {
+        /// The Replay as it would be stored, with the hash it would have.
+        replay: Box<Written>,
+        /// Summed over runs, under the current configuration (measured).
+        current: Cost,
+        /// Summed over runs, under the proposal (measured).
+        proposed: Cost,
+        /// The cost model: `measured: engine plan statistics`.
+        model: String,
     },
     /// The proposal kind has no defined replay.
     NotScorable {
@@ -176,6 +191,20 @@ pub enum Refusal {
     NoReplay {
         /// The passing certificate.
         certificate: Hash,
+    },
+    /// The proposal verified, and its target is a table (ADR 027): the
+    /// engine creates no index inside a database and deploys no job, so
+    /// apply is attest-only. The passing certificate is written; no
+    /// Receipt is, because a Receipt attests an apply the engine made.
+    /// `run` is what a human (or a CI gate) runs to apply it. CLI exit 3.
+    AttestOnly {
+        /// The passing certificate.
+        certificate: Hash,
+        /// The table root the proposal targets.
+        target: String,
+        /// The statements to run (a key: one `CREATE INDEX` per table) or
+        /// the query to deploy (a rewrite: its `after` text).
+        run: Vec<String>,
     },
     /// The Key proposal's replay predicts no saving on the workload: summed
     /// over its runs, the proposal reads at least as many bytes as the
@@ -416,24 +445,38 @@ impl Engine {
                 let cache = self.cache()?;
                 let workload = load_workload(self, &cache, &workload_hash)?;
                 // 1. Score.
-                let replay = self.score(&replayer, hash, &workload, &cache)?;
-                let replay_hash = replay.0.hash;
-                // A verify-only run applies nothing, so it is not gated; applying
-                // its certificate later re-scores and is.
-                let gate = no_gain(
-                    &replay_hash,
-                    &replay.1,
-                    &replay.2,
-                    req.allow_no_gain || req.verify_only,
-                );
-                result.score = Some(Score::Replayed {
-                    replay: Box::new(replay.0),
-                    current: replay.1,
-                    proposed: replay.2,
-                });
-                if let Some(r) = gate {
-                    result.outcome = refused(r);
-                    return Ok(result);
+                let mut replay_hash = None;
+                if self.is_table() {
+                    let (h, scored) = measured_score(self, &replayer, hash, &workload, &cache)?;
+                    result.score = Some(Score::Measured {
+                        current: total(&scored.replay.current),
+                        proposed: total(&scored.replay.proposed),
+                        model: MEASURED_PLAN.to_string(),
+                        replay: Box::new(Written {
+                            hash: h,
+                            record: Record::Replay(scored.replay),
+                        }),
+                    });
+                } else {
+                    let replay = self.score(&replayer, hash, &workload, &cache)?;
+                    replay_hash = Some(replay.0.hash);
+                    // A verify-only run applies nothing, so it is not gated;
+                    // applying its certificate later re-scores and is.
+                    let gate = no_gain(
+                        &replay.0.hash,
+                        &replay.1,
+                        &replay.2,
+                        req.allow_no_gain || req.verify_only,
+                    );
+                    result.score = Some(Score::Replayed {
+                        replay: Box::new(replay.0),
+                        current: replay.1,
+                        proposed: replay.2,
+                    });
+                    if let Some(r) = gate {
+                        result.outcome = refused(r);
+                        return Ok(result);
+                    }
                 }
                 // 2. Verify.
                 let (plan, cert, verification) = self.verify_key(
@@ -456,6 +499,11 @@ impl Engine {
                 if req.verify_only {
                     return Ok(result);
                 }
+                let Some(replay_hash) = replay_hash else {
+                    // A table: attest-only (ADR 027).
+                    result.outcome = refused(self.attest_only(&cert.hash, &proposal.body)?);
+                    return Ok(result);
+                };
                 // 3 and 4, behind the trust-boundary gate.
                 result.outcome = match self.gate(&cert.hash, &certificate, true)? {
                     Err(r) => refused(r),
@@ -487,9 +535,12 @@ impl Engine {
                 result.verification = Some(verification);
                 let certificate = cert_of(&cert)?.clone();
                 result.certificate = Some(cert.clone());
+                let table =
+                    self.is_table() || is_sql_root(&outputs.before) || is_sql_root(&outputs.after);
                 result.outcome = match failed(&cert.hash, &certificate) {
                     Some(r) => refused(r),
                     None if req.verify_only => FixOutcome::Verified,
+                    None if table => refused(self.attest_only(&cert.hash, &proposal.body)?),
                     None => refused(Refusal::NoReplay {
                         certificate: cert.hash,
                     }),
@@ -501,6 +552,7 @@ impl Engine {
 
     /// Apply and attest a certificate written earlier: every check runs
     /// before anything is written, and the replay is recomputed now.
+    #[allow(clippy::too_many_lines)]
     fn apply_certificate(
         &self,
         cert_hash: &Hash,
@@ -551,6 +603,14 @@ impl Engine {
         match &proposal.body {
             ProposalBody::Layout { .. } => {
                 result.outcome = refused(Refusal::LayoutNotApplicable);
+            }
+            // A table: the gate passed, and the engine applies nothing to a
+            // table (ADR 027).
+            body if self.is_table() => {
+                if let ProposalBody::Rewrite { shape } = body {
+                    result.invariant = Some(shape.invariant.clone());
+                }
+                result.outcome = refused(self.attest_only(cert_hash, body)?);
             }
             ProposalBody::Rewrite { shape } => {
                 result.invariant = Some(shape.invariant.clone());
@@ -609,6 +669,27 @@ impl Engine {
             }
         }
         Ok(result)
+    }
+
+    /// The attest-only refusal for a proposal over a table (ADR 027): what
+    /// a human runs to apply it.
+    fn attest_only(&self, certificate: &Hash, body: &ProposalBody) -> Result<Refusal> {
+        let target = self.root().to_string();
+        let run = match body {
+            ProposalBody::Key { spec } => match self.table_url() {
+                Some(url) => SqlUrl::parse(url)?.create_index_statements(spec.columns()),
+                None => Vec::new(),
+            },
+            ProposalBody::Rewrite { shape } => vec![shape.after.clone()],
+            ProposalBody::Layout { cluster_by } => {
+                vec![format!("recluster the table by {}", cluster_by.join(", "))]
+            }
+        };
+        Ok(Refusal::AttestOnly {
+            certificate: *certificate,
+            target,
+            run,
+        })
     }
 
     /// Stage 1: the replay, computed now and written now.
@@ -768,8 +849,16 @@ impl Engine {
         outputs: &RewriteOutputs,
         pinned: Option<&Pinned>,
     ) -> Result<(Written, Reconciliation)> {
-        let before = canonical_dir(&outputs.before)?;
-        let after = canonical_dir(&outputs.after)?;
+        let side = |p: &str| -> Result<(String, String)> {
+            if is_sql_root(p) {
+                Ok((p.to_string(), SqlUrl::parse(p)?.root()))
+            } else {
+                let c = canonical_dir(p)?;
+                Ok((c.clone(), c))
+            }
+        };
+        let (before, before_root) = side(&outputs.before)?;
+        let (after, after_root) = side(&outputs.after)?;
         let left_source = self.output_source(&before)?;
         let right_source = self.output_source(&after)?;
         let mut spec = ReconcileSpec::new(outputs.key.clone())
@@ -786,8 +875,8 @@ impl Engine {
             clock: self.options().clock.clone(),
         };
         let certified = self.reconciler(spec, Options::default())?.certify(
-            &Side::new(&*left_source, &before),
-            &Side::new(&*right_source, &after),
+            &Side::new(&*left_source, &before_root),
+            &Side::new(&*right_source, &after_root),
             &ctx,
         )?;
         let cert = self.record_certified(&certified)?;
@@ -810,6 +899,9 @@ impl Engine {
         &self,
         certified: &bellwether_verify::Certified,
     ) -> Result<Written> {
+        // A run over a table ends before its certificate is written: a
+        // table that changed without a snapshot is refused, never certified.
+        self.finish_tables()?;
         let hash = bellwether_verify::record(&self.ledger()?, certified)?;
         Ok(Written {
             hash,
@@ -935,6 +1027,45 @@ impl Engine {
             warning,
         })
     }
+}
+
+/// Scores `proposal` on `workload` without recording the Replay: over a
+/// table (ADR 027) every cost, current and proposed, is measured, so each
+/// is marked inexact and the Replay names [`MEASURED_PLAN`]. The ledger
+/// keeps only replays whose current costs are exact (ADR 005), so a
+/// measured one is returned, hashed as it would be stored, and never
+/// stored: nothing measured is ever recorded as exact.
+pub(crate) fn measured_score(
+    engine: &Engine,
+    replayer: &Replayer<'_>,
+    proposal: &Hash,
+    workload: &Workload,
+    cache: &Cache<ObjectStoreBackend>,
+) -> Result<(Hash, bellwether_replay::Scored)> {
+    let body = match engine.get(proposal)?.record {
+        Record::Proposal(p) => p.body,
+        _ => {
+            return Err(Error::WrongKind {
+                hash: *proposal,
+                expected: HashKind::Proposal,
+                found: "another record".into(),
+            })
+        }
+    };
+    let mut scored = replayer
+        .score(proposal, &body, workload, cache, &engine.now())
+        .map_err(Error::from)?;
+    mark_measured(&mut scored.replay);
+    let hash = Record::Replay(scored.replay.clone()).hash()?;
+    Ok((hash, scored))
+}
+
+/// Marks every cost of `replay` measured and names the model.
+pub(crate) fn mark_measured(replay: &mut bellwether_types::Replay) {
+    for c in replay.current.iter_mut().chain(replay.proposed.iter_mut()) {
+        c.exact = false;
+    }
+    replay.model = Some(MEASURED_PLAN.to_string());
 }
 
 /// The data root's catalog digest as the verifier computes a scanned side's

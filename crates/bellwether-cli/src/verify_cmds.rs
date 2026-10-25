@@ -18,8 +18,8 @@ use crate::{
 /// Commands that write certificates.
 #[derive(Subcommand)]
 pub(crate) enum VerifyCommand {
-    /// Prove two folders agree, by key, latest version, and exact decimal
-    /// totals; writes a Certificate. The summary names the first 10
+    /// Prove two folders, or a table (sql://...) and a folder, agree, by
+    /// key, latest version, and exact decimal totals; writes a Certificate. The summary names the first 10
     /// mismatching keys (every one is in --json), prints the exact totals,
     /// and says how many passes the comparison made over each side.
     Reconcile(ReconcileArgs),
@@ -52,9 +52,10 @@ pub(crate) struct CompareArgs {
 
 #[derive(Args)]
 pub(crate) struct ReconcileArgs {
-    /// The left folder (its index and ledger are used).
+    /// The left folder (its index and ledger are used), or a table:
+    /// sql://<engine>/<schema>.<table>?db=<connection> (needs --index).
     left: String,
-    /// The right folder.
+    /// The right folder, or a table (sql://...).
     right: String,
     #[command(flatten)]
     compare: CompareArgs,
@@ -100,7 +101,7 @@ pub(crate) struct FixArgs {
     /// workload; without it fix refuses with `nothing_to_gain` (exit 3).
     #[arg(long)]
     allow_no_gain: bool,
-    /// A rewrite's output before the rewrite (a folder).
+    /// A rewrite's output before the rewrite (a folder or a sql:// table).
     #[arg(long, value_name = "DIR", requires = "after_output")]
     before_output: Option<String>,
     /// A rewrite's output after it.
@@ -427,8 +428,31 @@ fn reconcile_human(r: &ReconcileResult, out: &Out) -> String {
             "  each pass reads both sides again; a larger --memory-budget makes fewer passes"
         );
     }
+    tables_human(&mut s, &r.tables);
     let _ = writeln!(s, "\ncertificate {}", r.certificate.hash);
     s
+}
+
+/// One line per table a run read (ADR 027): its units and rows, and the
+/// snapshot it held or the identity re-read that stood in for one.
+pub(crate) fn tables_human(s: &mut String, tables: &[bellwether::TableRun]) {
+    for t in tables {
+        let held = match &t.snapshot {
+            Some(snap) => format!("read inside {snap}"),
+            None if t.rechecked => {
+                "no snapshot held: every unit's identity re-read at the end, unchanged".into()
+            }
+            None => "no snapshot held".into(),
+        };
+        let _ = writeln!(
+            s,
+            "  table {}: {} rows in {} units ({}), {held}",
+            t.root,
+            num(t.rows),
+            num(t.units),
+            t.units_by
+        );
+    }
 }
 
 // One linear screen, a line per stage.
@@ -464,6 +488,23 @@ fn fix_human(r: &FixResult, out: &Out) -> String {
             let _ = writeln!(
                 s,
                 "  1 score   {:>10} -> {:>10} bytes over the workload ({} -> {} row groups), replay {}",
+                size(current.bytes),
+                size(proposed.bytes),
+                num(current.row_groups),
+                num(proposed.row_groups),
+                short(&replay.hash)
+            );
+        }
+        Some(Score::Measured {
+            replay,
+            current,
+            proposed,
+            model,
+        }) => {
+            let _ = writeln!(
+                s,
+                "  1 score   {:>10} -> {:>10} bytes over the workload ({} -> {} units), {model}: \
+                 not exact, so replay {} is not recorded",
                 size(current.bytes),
                 size(proposed.bytes),
                 num(current.row_groups),
@@ -574,6 +615,18 @@ fn fix_human(r: &FixResult, out: &Out) -> String {
                 }
                 Refusal::NoReplay { .. } => {
                     "the rewrite verified, but a receipt cites a replay and rewrites have none yet (contract v3 backlog #2)".into()
+                }
+                Refusal::AttestOnly { target, run, .. } => {
+                    let mut why = format!(
+                        "attest-only: the certificate passed, and {target} is a table, so the \
+                         engine applies nothing and writes no receipt (ADR 027). To apply it, a \
+                         human runs:"
+                    );
+                    for r in run {
+                        why.push_str("\n    ");
+                        why.push_str(r);
+                    }
+                    why
                 }
                 Refusal::NothingToGain {
                     replay,

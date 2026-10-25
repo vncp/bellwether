@@ -38,6 +38,9 @@ pub enum RefusalCode {
     LayoutNotApplicable,
     /// A rewrite cannot be attested yet.
     NoReplay,
+    /// The proposal verified and targets a table: the engine applies
+    /// nothing to a table; a human runs what `fields.run` lists.
+    AttestOnly,
     /// The proposer name is reserved for the engine.
     ReservedProposer,
     /// Scoring needs keys, a workload, or rewrite outputs.
@@ -68,6 +71,10 @@ pub enum RefusalCode {
     UnknownTool,
     /// A data file could not be read.
     SourceError,
+    /// A table changed during a run that held no snapshot.
+    SourceChanged,
+    /// The operation needs a folder of files and the data root is a table.
+    NotAFolder,
     /// The index store could not be read or written.
     StoreError,
     /// The ledger refused a record or a link.
@@ -86,7 +93,7 @@ pub enum RefusalCode {
 
 impl RefusalCode {
     /// Every code, in `AGENTS.md` order.
-    pub const ALL: [Self; 30] = [
+    pub const ALL: [Self; 33] = [
         Self::CertificateFailed,
         Self::StaleManifest,
         Self::DataChanged,
@@ -95,6 +102,7 @@ impl RefusalCode {
         Self::NothingToGain,
         Self::LayoutNotApplicable,
         Self::NoReplay,
+        Self::AttestOnly,
         Self::ReservedProposer,
         Self::NoWorkload,
         Self::StaleIndex,
@@ -110,6 +118,8 @@ impl RefusalCode {
         Self::JobRunning,
         Self::UnknownTool,
         Self::SourceError,
+        Self::SourceChanged,
+        Self::NotAFolder,
         Self::StoreError,
         Self::LedgerRule,
         Self::VersionConflict,
@@ -131,6 +141,7 @@ impl RefusalCode {
             Self::NothingToGain => "nothing_to_gain",
             Self::LayoutNotApplicable => "layout_not_applicable",
             Self::NoReplay => "no_replay",
+            Self::AttestOnly => "attest_only",
             Self::ReservedProposer => "reserved_proposer",
             Self::NoWorkload => "no_workload",
             Self::StaleIndex => "stale_index",
@@ -146,6 +157,8 @@ impl RefusalCode {
             Self::JobRunning => "job_running",
             Self::UnknownTool => "unknown_tool",
             Self::SourceError => "source_error",
+            Self::SourceChanged => "source_changed",
+            Self::NotAFolder => "not_a_folder",
             Self::StoreError => "store_error",
             Self::LedgerRule => "ledger_rule",
             Self::VersionConflict => "version_conflict",
@@ -182,6 +195,10 @@ impl RefusalCode {
             Self::NoReplay => {
                 "rewrites cannot be attested yet; report the passing certificate to the human"
             }
+            Self::AttestOnly => {
+                "report the passing certificate and the statements in `fields.run` to the human; \
+                 the engine applies nothing to a table, so a human or a CI gate runs them"
+            }
             Self::ReservedProposer => "pass your own agent name in `by`",
             Self::NoWorkload => {
                 "pass `keys` (a Parquet key file) or a recorded `workload` hash for a key, or the \
@@ -214,7 +231,17 @@ impl RefusalCode {
             Self::JobNotFound => "pass a job id jobs.start or a tool returned in this session",
             Self::JobRunning => "poll jobs.status until the job is done, then call jobs.result",
             Self::UnknownTool => "call one of the tools the server lists",
-            Self::SourceError => "check the data files named in the message, or ask the human",
+            Self::SourceError => {
+                "check the data source (files or table) named in the message, or ask the human"
+            }
+            Self::SourceChanged => {
+                "call the tool again when the table is quiet; the table changed during the run \
+                 and nothing was recorded"
+            }
+            Self::NotAFolder => {
+                "over a table use observe.why, observe.profile, score.why, and score.verify; \
+                 lookups and index builds need a folder of files"
+            }
             Self::StoreError => "check the index location named in the message, or ask the human",
             Self::LedgerRule => "read the message; pass the record the tool expects",
             Self::VersionConflict => "retry once, with `wait: true`",
@@ -331,6 +358,7 @@ fn typed_next(e: &Error) -> Option<String> {
 
 /// A facade error as a refusal, by its variant.
 #[must_use]
+#[allow(clippy::too_many_lines)]
 pub fn from_error(e: &Error) -> Refusal {
     let message = e.to_string();
     let (code, fields) = match e {
@@ -417,6 +445,14 @@ pub fn from_error(e: &Error) -> Refusal {
             json!({ "expected": expected, "found": found }),
         ),
         Error::Source(_) => (RefusalCode::SourceError, json!({})),
+        Error::SourceChanged { root, units, .. } => (
+            RefusalCode::SourceChanged,
+            json!({ "root": root, "units": units }),
+        ),
+        Error::NotAFolder { root, operation } => (
+            RefusalCode::NotAFolder,
+            json!({ "root": root, "operation": operation }),
+        ),
         Error::Store(_) => (RefusalCode::StoreError, json!({})),
         // No wildcard arm: a new `Error` variant must fail to compile here.
         Error::Serde(_) | Error::Other(_) => (RefusalCode::EngineError, json!({})),
@@ -444,6 +480,7 @@ pub fn from_propose(r: &ProposeRefusal) -> Refusal {
 /// stage ran in this call (`apply.receipt` re-checks a stored certificate,
 /// which carries counts only).
 #[must_use]
+#[allow(clippy::too_many_lines)]
 pub fn from_fix(r: &FixRefusal, verification: Option<&Reconciliation>) -> Refusal {
     match r {
         FixRefusal::CertificateFailed {
@@ -536,6 +573,18 @@ pub fn from_fix(r: &FixRefusal, verification: Option<&Reconciliation>) -> Refusa
             RefusalCode::LayoutNotApplicable,
             "layout proposals cannot be applied in this release",
             json!({}),
+        ),
+        FixRefusal::AttestOnly {
+            certificate,
+            target,
+            run,
+        } => Refusal::new(
+            RefusalCode::AttestOnly,
+            format!(
+                "certificate {certificate} passed; {target} is a table, so the engine applies \
+                 nothing and writes no receipt (ADR 027)"
+            ),
+            json!({ "certificate": certificate, "target": target, "run": run }),
         ),
         FixRefusal::NoReplay { certificate } => Refusal::new(
             RefusalCode::NoReplay,

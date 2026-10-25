@@ -21,6 +21,8 @@ use bellwether_types::{
 };
 use serde::{Deserialize, Serialize};
 
+use bellwether_source_sql::{TableRun, MEASURED_PLAN};
+
 use crate::engine::{folder_changes, guard, schema_hint, Engine, Pinned, SnapshotFiles};
 use crate::index::{instant_in_unit, no_time_column};
 use crate::keys::KeyFile;
@@ -452,6 +454,32 @@ pub struct WhyReport {
     pub recommended: Option<Recommendation>,
     /// The culprit, with a workload.
     pub culprit: Option<Culprit>,
+    /// Whether every byte count above is a sum of footer statistics
+    /// (`true`, omitted in JSON), or measured (`false`): over a table (ADR
+    /// 027) the bytes are the logical bytes the engine's aggregates report,
+    /// so the dataset, every cost, and every candidate's Replay are
+    /// measured, `model` names how, and no Replay is recorded (the ledger
+    /// keeps only exact current costs, ADR 005). Counts of units and rows
+    /// are exact either way.
+    #[serde(default = "exact_default", skip_serializing_if = "is_exact")]
+    pub exact: bool,
+    /// The cost model when `exact` is false: `measured: engine plan
+    /// statistics`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// Each table read (ADR 027): its units, rows, and the snapshot held or
+    /// the identity re-read that stood in for one. Omitted for a folder.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tables: Vec<TableRun>,
+}
+
+fn exact_default() -> bool {
+    true
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn is_exact(e: &bool) -> bool {
+    *e
 }
 
 impl Engine {
@@ -558,6 +586,9 @@ impl Engine {
             not_serving: Vec::new(),
             recommended: None,
             culprit: None,
+            exact: true,
+            model: None,
+            tables: Vec::new(),
         };
         let workload = if has_workload {
             let cache = self.cache()?;
@@ -579,6 +610,11 @@ impl Engine {
             .as_ref()
             .and_then(|w| layout_culprit(&report, w, indexed_row_groups))
             .or_else(|| culprit(&report.current_specs, &report.profile, workload.as_ref()));
+        if self.is_table() {
+            report.exact = false;
+            report.model = Some(MEASURED_PLAN.to_string());
+            report.tables = self.finish_tables()?;
+        }
         Ok(report)
     }
 
@@ -730,6 +766,8 @@ impl Engine {
         // Every record this engine writes carries the engine's clock.
         evidence.provenance.created_at = self.now();
         let out = if writable.is_some() {
+            // A run over a table ends before anything is recorded.
+            self.finish_tables()?;
             let hash = self.ledger()?.put(&Record::Evidence(evidence.clone()))?;
             ProfileEvidence {
                 recorded: true,
@@ -1087,7 +1125,27 @@ impl Engine {
                 created_at: self.now(),
                 body: ProposalBody::Key { spec: spec.clone() },
             }))?;
-            let (replay_hash, scored) = if temporal.is_some()
+            let (replay_hash, scored) = if self.is_table() {
+                // Over a table every cost is measured: scored, marked so,
+                // and not recorded (ADR 027; the ledger keeps exact current
+                // costs only, ADR 005).
+                let tw;
+                let w = if temporal.is_some()
+                    && workload
+                        .runs()
+                        .iter()
+                        .all(|r| matches!(r.query(), Ok(RunQuery::Locate)))
+                {
+                    tw = with_query(
+                        workload,
+                        &temporal.map(|t| t.query.clone()).unwrap_or_default(),
+                    )?;
+                    &tw
+                } else {
+                    workload
+                };
+                crate::fix::measured_score(self, replayer, &proposal.hash, w, cache)?
+            } else if temporal.is_some()
                 && workload
                     .runs()
                     .iter()
