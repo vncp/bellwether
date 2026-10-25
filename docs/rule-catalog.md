@@ -5,9 +5,10 @@ One entry per lint the profiler raises. A lint is a `Lint` record inside an
 catalog is the skeleton WP5 implements against; entries change by pull
 request, and a new rule id is never reused for a different pattern.
 
-Status (2026-10-24): the four statistics rules (`batch_stamp_key`,
+Status (2026-10-24): the five statistics rules (`batch_stamp_key`,
 `low_selectivity_single_column`, `declared_but_unused_key`,
-`scattered_time_column`) are implemented in `bellwether-profile` (WP5), with
+`scattered_time_column`, `no_discriminating_column`) are implemented in
+`bellwether-profile` (WP5), with
 the detectors and thresholds stated in their entries below. Two decisions
 are defined once in `bellwether_source::stats` and called by both the
 profiler and the benchmark's ground truth: `overlap_depth` decides
@@ -222,6 +223,41 @@ added.
   dataset before and after re-clustering.
 - **Confidence rubric**: high with a workload of range queries on this
   column. Medium from statistics alone.
+
+### no_discriminating_column
+
+Added 2026-10-24 after the first real-data run, where a time-ordered taxi
+dataset produced a fanout table in which every candidate touched 20 to 22
+of 22 row groups, and no rule said so (defect 8 of
+[`measured/2026-10-24-realdata.md`](measured/2026-10-24-realdata.md)).
+
+- **id**: `no_discriminating_column`
+- **Detector**: from statistics alone. The dataset has at least 2 row
+  groups, and the single column with the lowest median
+  `row_groups_per_value` (ties: lower p95), over every single column the
+  profile measured, still touches at least 0.75 of `row_groups_total`
+  (`NO_DISCRIMINATING_MIN_FRACTION`). The lint names that lowest-fanout
+  column. Composites are not searched: a pair is selective because its
+  combinations are rare (on taxi, `PULocationID, DOLocationID` has a median
+  of 6 of 22 row groups while each column alone touches 20 or more), which
+  says nothing about how one column is laid out, and the advice is to
+  cluster by one column. At this threshold `low_selectivity_single_column`
+  cannot fire on the same profile: its composite's p95 is at most half of
+  the single column's median, so at most 0.5.
+- **Estimator**: the lowest median fanout over `row_groups_total`. Bytes:
+  replay of any exact key reads at least that share of the row groups, so
+  the saving an index can offer is bounded by one minus it. With a workload,
+  `why` states the same verdict as its culprit (`layout`), from the replayed
+  candidates themselves: every candidate, the floor included, reads at least
+  0.75 of the row groups the runs span (`LAYOUT_BOUND_FRACTION`).
+- **Guidance template**: file `<writer job>`, step `<the write>`. Before:
+  `written in arrival (often time) order`. After: `clustered by the column
+  lookups supply`, or no index at all. Invariant: `the multiset of rows is
+  unchanged`.
+- **Verification method**: reconcile over touched keys, comparing the
+  dataset before and after re-clustering.
+- **Confidence rubric**: high when every fanout it rests on is exact; low
+  when any is sampled.
 
 ### unprefiltered_window
 

@@ -39,19 +39,22 @@ pub(crate) enum DataSource {
         policy: FingerprintPolicy,
         root: String,
         partitioning: Partitioning,
+        exclude: Vec<String>,
         by_chunk_size: BTreeMap<u64, Partitioned<ChunkedTextSource<LocalFs>>>,
     },
 }
 
 impl DataSource {
     /// Sources for `kind` under the dataset `schema` and `policy`. For text,
-    /// one source per chunk size in `chunk_sizes`. `partitioning` is the
-    /// scheme of the data `root`; text files read the dataset schema without
-    /// its partition columns, which the paths supply.
+    /// one source per chunk size in `chunk_sizes`, each skipping the
+    /// directories in `exclude` ([`crate::BuildOptions::exclude`]).
+    /// `partitioning` is the scheme of the data `root`; text files read the
+    /// dataset schema without its partition columns, which the paths supply.
     pub(crate) fn new(
         kind: SourceKind,
         schema: &SchemaRef,
         policy: FingerprintPolicy,
+        exclude: &[String],
         chunk_sizes: impl IntoIterator<Item = u64>,
         root: &str,
         partitioning: &Partitioning,
@@ -72,6 +75,7 @@ impl DataSource {
                     policy,
                     root: root.to_string(),
                     partitioning: partitioning.clone(),
+                    exclude: exclude.to_vec(),
                     by_chunk_size: BTreeMap::new(),
                 };
                 for size in chunk_sizes {
@@ -91,12 +95,13 @@ impl DataSource {
             policy,
             root,
             partitioning,
+            exclude,
             by_chunk_size,
         } = self
         {
             by_chunk_size.entry(size).or_insert_with(|| {
                 Partitioned::new(
-                    text_source(*format, physical, *policy, size),
+                    text_source(*format, physical, *policy, exclude, size),
                     root.clone(),
                     partitioning.clone(),
                     Some(SchemaRef::clone(schema)),
@@ -201,12 +206,16 @@ fn text_source(
     format: TextFormat,
     schema: &SchemaRef,
     policy: FingerprintPolicy,
+    exclude: &[String],
     chunk_size: u64,
 ) -> ChunkedTextSource<LocalFs> {
-    ChunkedTextSource::new(format)
-        .with_chunk_size(chunk_size)
-        .with_schema(SchemaRef::clone(schema))
-        .with_fingerprint_policy(policy)
+    exclude.iter().fold(
+        ChunkedTextSource::new(format)
+            .with_chunk_size(chunk_size)
+            .with_schema(SchemaRef::clone(schema))
+            .with_fingerprint_policy(policy),
+        |s, d| s.with_excluded(d.clone()),
+    )
 }
 
 /// The schema of the files under `root` as the source infers it: the first
@@ -217,11 +226,15 @@ pub(crate) fn infer_schema(
     root: &str,
     policy: FingerprintPolicy,
     partitioning: &Partitioning,
+    exclude: &[String],
 ) -> Result<SchemaRef> {
     match kind.text_format() {
         None => parquet_source(None, policy, root, partitioning).schema(root),
         Some(format) => Partitioned::new(
-            ChunkedTextSource::new(format).with_fingerprint_policy(policy),
+            exclude.iter().fold(
+                ChunkedTextSource::new(format).with_fingerprint_policy(policy),
+                |s, d| s.with_excluded(d.clone()),
+            ),
             root,
             partitioning.clone(),
             None,

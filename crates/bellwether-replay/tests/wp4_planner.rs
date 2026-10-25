@@ -22,9 +22,10 @@ mod common;
 
 use std::sync::Arc;
 
-use bellwether_build::{BuildOptions, Builder, Planner};
+use bellwether_build::{BuildOptions, Builder, Lookup as BuildLookup, Planner};
 use bellwether_replay::{
-    Catalog, PlanSource, Replayer, SegmentPlanner, TransientIndex, TransientLimits,
+    Catalog, KeyInput, MemoryKeySets, PlanSource, Replayer, RunQuery, SegmentPlanner,
+    TransientIndex, TransientLimits, WorkloadRecorder,
 };
 use bellwether_store::{ObjectStoreBackend, Snapshot};
 use bellwether_types::{KeySpec, Source};
@@ -106,9 +107,9 @@ fn committed_and_transient_segments_plan_identically_through_wp4_and_this_crate(
         let ours_transient = segment_planner.with_transient(&transients).unwrap();
         for run in workload.runs() {
             let rk = workload.run_keys(&keys, run).unwrap();
-            let committed = PlanSource::plan(&planner, config, &rk, None).unwrap();
-            let via_wp4 = wp4_transient.plan(config, &rk, None).unwrap();
-            let via_ours = ours_transient.plan(config, &rk, None).unwrap();
+            let committed = PlanSource::plan(&planner, config, &rk).unwrap();
+            let via_wp4 = wp4_transient.plan(config, &rk).unwrap();
+            let via_ours = ours_transient.plan(config, &rk).unwrap();
             let what = format!(
                 "{:?} {}",
                 config.iter().map(KeySpec::name).collect::<Vec<_>>(),
@@ -153,4 +154,155 @@ fn committed_and_transient_segments_plan_identically_through_wp4_and_this_crate(
             .unwrap(),
         ours.replay_specs(&hypothetical, &workload, &keys).unwrap()
     );
+
+    // Temporal replay (`latest` and `asof`) of a temporal candidate equals
+    // the build crate's `Planner` Latest/AsOf plan after indexing the same
+    // spec: row-group set, bytes, and residual, both unindexed (transient
+    // segments via `SegmentPlanner`) and over the snapshot (`Planner`).
+    let temporal_spec = specs[1].clone();
+    let temporal_configs = [
+        vec![temporal_spec.clone()],
+        vec![temporal_spec.clone(), specs[3].clone()],
+    ];
+    // File 1 starts at 1_767_225_600_000_000 + 3_600_000_000; an instant at
+    // the end of file 1 excludes later files' versions.
+    let asof_ts = 1_767_225_600_000_000_i64 + 2 * 3_600_000_000;
+    // A lookback of one hour, ending at each key's newest version (per key,
+    // through the version chains) or at the asof instant (the plain window
+    // on the temporal spec's timestamp), plans through the same code in
+    // both planners.
+    let hour: i64 = 3_600_000_000;
+    let KeySpec::Temporal {
+        ts_column: temporal_ts,
+        ..
+    } = &temporal_spec
+    else {
+        unreachable!("specs[1] is temporal")
+    };
+    for query in [
+        RunQuery::Latest,
+        RunQuery::Asof { ts: asof_ts },
+        RunQuery::Lookback {
+            asof: None,
+            lookback: hour,
+        },
+        RunQuery::Lookback {
+            asof: Some(asof_ts),
+            lookback: hour,
+        },
+    ] {
+        let t_keys = MemoryKeySets::new();
+        let mut rec = WorkloadRecorder::new(&t_keys, Arc::clone(&corpus.schema));
+        for (id, tuples) in &runs {
+            rec.record_query(
+                id,
+                KeyInput::Batch(&common::key_batch(&["entity_id"], tuples)),
+                query.clone(),
+                None,
+            )
+            .unwrap();
+        }
+        let t_workload = rec.finish().unwrap();
+        let mut narrower_than_locate = 0usize;
+        for config in &temporal_configs {
+            let transients: Vec<Arc<TransientIndex>> = config
+                .iter()
+                .map(|s| Arc::new(TransientIndex::build(&source, &catalog, s, &limits).unwrap()))
+                .collect();
+            let wp4_transient = PlanSource::with_transient(&planner, &transients).unwrap();
+            let ours_transient = segment_planner.with_transient(&transients).unwrap();
+            for run in t_workload.runs() {
+                let rk = t_workload.run_keys(&t_keys, run).unwrap();
+                let lookup = match &query {
+                    RunQuery::Latest => BuildLookup::Latest {
+                        columns: rk.columns().to_vec(),
+                        keys: rk.tuples().map(<[u8]>::to_vec).collect(),
+                    },
+                    RunQuery::Asof { ts } => BuildLookup::AsOf {
+                        columns: rk.columns().to_vec(),
+                        keys: rk.tuples().map(<[u8]>::to_vec).collect(),
+                        ts: *ts,
+                    },
+                    RunQuery::Lookback {
+                        asof: None,
+                        lookback,
+                    } => BuildLookup::Lookback {
+                        columns: rk.columns().to_vec(),
+                        keys: rk.tuples().map(<[u8]>::to_vec).collect(),
+                        lookback: *lookback,
+                    },
+                    RunQuery::Lookback {
+                        asof: Some(at),
+                        lookback,
+                    } => BuildLookup::Window {
+                        columns: rk.columns().to_vec(),
+                        keys: rk.tuples().map(<[u8]>::to_vec).collect(),
+                        ts_column: temporal_ts.clone(),
+                        lo: at - lookback,
+                        hi: *at,
+                    },
+                    RunQuery::Locate | RunQuery::Window(_) => unreachable!(),
+                };
+                let build_plan = planner.plan(config, &lookup).unwrap();
+                let committed = PlanSource::plan_query(&planner, config, &rk, &query).unwrap();
+                let via_wp4 = wp4_transient.plan_query(config, &rk, &query).unwrap();
+                let via_ours = ours_transient.plan_query(config, &rk, &query).unwrap();
+                assert_eq!(build_plan, committed);
+                assert_eq!(build_plan, via_wp4);
+                assert_eq!(build_plan, via_ours);
+                catalog.verify_plan(&via_ours).unwrap();
+                let locate_plan = PlanSource::plan(&planner, config, &rk).unwrap();
+                if build_plan.bytes < locate_plan.bytes {
+                    narrower_than_locate += 1;
+                }
+            }
+            assert_eq!(
+                via_wp4.replay_specs(config, &t_workload, &t_keys).unwrap(),
+                ours.replay_specs(config, &t_workload, &t_keys).unwrap()
+            );
+        }
+        assert!(
+            narrower_than_locate > 0,
+            "{query:?} must prune beyond locate on repeated keys"
+        );
+    }
+
+    // Unindexed folder (`Catalog::discover`, manifest version "0"): the
+    // transient temporal replay's row-group cells and bytes equal the
+    // committed `Planner`'s Latest/AsOf plan after indexing the same spec.
+    let unindexed = Replayer::unindexed(
+        &source,
+        &snapshot.manifest().source.root,
+        &bellwether_source::Partitioning::None,
+    )
+    .unwrap();
+    for query in [
+        RunQuery::Latest,
+        RunQuery::Asof { ts: asof_ts },
+        RunQuery::Lookback {
+            asof: None,
+            lookback: hour,
+        },
+        RunQuery::Lookback {
+            asof: Some(asof_ts),
+            lookback: hour,
+        },
+    ] {
+        for run in workload.runs() {
+            let rk = workload.run_keys(&keys, run).unwrap();
+            let unindexed_plan = unindexed
+                .plan_of_query(std::slice::from_ref(&temporal_spec), &rk, &query)
+                .unwrap();
+            let indexed_plan = via_wp4
+                .plan_of_query(std::slice::from_ref(&temporal_spec), &rk, &query)
+                .unwrap();
+            assert_eq!(common::cells(&unindexed_plan), common::cells(&indexed_plan));
+            assert_eq!(unindexed_plan.bytes, indexed_plan.bytes);
+            assert_eq!(
+                unindexed_plan.row_groups_selected,
+                indexed_plan.row_groups_selected
+            );
+            assert_eq!(unindexed_plan.residual, indexed_plan.residual);
+        }
+    }
 }

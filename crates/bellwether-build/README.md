@@ -129,6 +129,8 @@ Either probe silently misses. **Callers must encode probes with the typed encode
 | `Keys` | `In` over the lookup columns |
 | `Latest` | `And[In, NotOlderThan, LatestPerKey]` |
 | `AsOf` | `And[In, Between(ts ≤ asof), NotOlderThan, LatestPerKey]` |
+| `Window` with `asof` | `And[In, Between(asof − lookback ≤ ts ≤ asof)]` |
+| `Window` without | `And[In, NotOlderThan(newest − lookback per key)]` |
 | `Between` | `Between` |
 | `Window` | `And[In, Between(ts in window)]` |
 | `Bitemporal` | `And[In, Between(valid), Between(known), NotOlderThan(valid), NotOlderThan(known), LatestPerKey(valid)]` |
@@ -140,6 +142,7 @@ Details:
   - a `Between` bound of +0.0 below or -0.0 above is widened (`docs/format.md`, statistics semantics).
 - `NotOlderThan` carries each key's index-wide winning timestamp from every segment of the temporal spec. A stale row in a planned row group is dropped even when the newest version lives in a row group another spec pruned (invariant 5).
 - `In` for `Latest` and `AsOf` lists only keys that have a version. A key whose versions all have null timestamps has no latest (ADR 014).
+- `Lookback` returns every version of each key in its own window `[newest − lookback, newest]`, `newest` being the key's newest live version, so it has no `LatestPerKey`; its residual is `In` (keys with a version) then `NotOlderThan` with each key's window start. The versions come from the one temporal spec on the key columns, through every segment's version chains over live row groups (core `temporal::chains` and `temporal::lookback`); with none, from the one complete `bounds` sidecar on them, whose per-row-group maxima over live row groups give each key's newest time and whose ranges keep the row groups reaching into its window (`Planner::lookback_column` names the column either way). The lower bound is clamped to the smallest value the timestamp column holds. The plan is intersected per key with any other serving spec. A window ending at a fixed instant (`asof --lookback`) is a `Lookup::Window`. `tests/invariants.rs` checks lookbacks against decoded rows over random layouts, and `tests/windows.rs` both sources against decoded files.
 
 **Time series (WP21).**
 

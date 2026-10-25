@@ -48,7 +48,9 @@ pub use bellwether_ledger::RecordKind;
 pub use bellwether_profile::ProfileReport;
 pub use bellwether_source::{FingerprintPolicy, Partitioning, PathTemplate};
 pub use bellwether_types as types;
-pub use bellwether_verify::Reconciliation;
+pub use bellwether_verify::{
+    ExactTotal, GroupTotal, KeyRepr, Mismatch, Reconciliation, TotalColumn,
+};
 pub use engine::{
     schema_from_json, Engine, EngineOptions, FolderStatus, SourceFormat, DEFAULT_INDEX_DIR,
     ISSUE_TRACKER,
@@ -59,13 +61,13 @@ pub use ledger_views::{
     Finding, FindingsResult, ReceiptEntry, ReceiptsResult, RuleScore, ScorecardResult, UNATTRIBUTED,
 };
 pub use lookback::{split_window, window_reversed, Lookback};
-pub use reconcile::{ReconcileRequest, ReconcileResult};
+pub use reconcile::{ReconcileProblem, ReconcileRequest, ReconcileResult};
 pub use results::{
-    ChainLink, Cost, IndexResult, LinkStatus, LookupKind, PlanResult, ProposeRefusal,
-    ProposeResult, ReceiptResult, ReportResult, SidecarState, SpecState, Written,
+    ChainLink, Cost, IndexResult, LinkStatus, LookbackWindow, LookupKind, PlanResult,
+    ProposeRefusal, ProposeResult, ReceiptResult, ReportResult, SidecarState, SpecState, Written,
 };
 pub use why::{
-    Candidate, CandidateOrigin, Culprit, CulpritReason, Dataset, ProfileEvidence, Recommendation,
-    TimeWindow, WhyReport, WhyRequest, WorkloadInfo, DEFAULT_MAX_CANDIDATES, ENGINE_PROPOSER,
-    RESERVED_PROPOSERS,
+    Candidate, CandidateOrigin, Culprit, CulpritReason, Dataset, LookupMode, ProfileEvidence,
+    Recommendation, TimeWindow, WhyReport, WhyRequest, WorkloadInfo, DEFAULT_MAX_CANDIDATES,
+    ENGINE_PROPOSER, LAYOUT_BOUND_FRACTION, RESERVED_PROPOSERS,
 };

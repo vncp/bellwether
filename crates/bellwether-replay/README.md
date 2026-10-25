@@ -44,7 +44,7 @@ Replay reads very little. The current index costs no data reads at all. A hypoth
 
 **Templates.** A run's `template` groups it in reports. Without one it is the run's key-column set, `columns(<key columns>)`. That is a grouping by columns, not by query; a recorder that knows the query or pipeline step a run came from passes it as the template.
 
-**Query kind.** Every run records a `query_kind`. Only `locate` exists today; a workload naming any other kind is refused with `Error::UnknownKind`. `latest` and `asof` are reserved for when their runs can be priced (contract v3 backlog #14).
+**Query kind.** Every run records a `query_kind` (`locate`, `latest`, `asof`, or `window`; `asof` runs also carry `asof`, the instant in the timestamp column's dataset unit, omitted for the other kinds so existing hashes stay stable). A `latest` or `asof` run may also carry `lookback`, a window length in the same unit (`RunQuery::Lookback`, contract v3 backlog #38). A `latest` lookback asks for every version of each key in its own window `[newest − lookback, newest]`, `newest` being the key's newest live version, planned through `Lookup::Lookback`; an `asof` lookback asks for the rows of the keys in `[asof − lookback, asof]` on the timestamp column of the temporal spec serving the run (`asof_lookback_window`), planned as a window run is. A `window` run (`RunQuery::Window`, recorded by `why --window`) carries `window`, a time column and inclusive bounds, and is planned through `Lookup::Window`: the key specs, the specs bounding the time column, a temporal spec's version chains on it, and path values all prune it. The build planner and `SegmentPlanner` plan every kind alike (`tests/wp4_planner.rs` checks both against each other). `lookback` and `window` are omitted when absent, so existing hashes stay stable; a `locate` run with a lookback, a negative one, or a window beside any other kind is refused. A workload naming any other kind is refused with `Error::UnknownKind` (contract v3 backlog #14).
 
 **Cache entries.** Each run's payload goes to `cache/<blake3>.bin`. The payload is `BWKEYSET`, a version, a JSON header with columns, key types and encoding version, then length-prefixed elements per tuple. A reader refuses all of these:
 
@@ -60,7 +60,7 @@ Every read checks the BLAKE3 of the bytes it got against the hash it asked for, 
 
 - id
 - template
-- query kind
+- query kind (and `asof` instant when `query_kind == "asof"`, `lookback` for a lookback run, and `window` for a window run)
 - columns
 - key types
 - key count
@@ -94,7 +94,10 @@ The bench hashes are `u64`-specific. The replay hashes cover canonical encodings
 pub trait PlanSource: Send + Sync {
     fn manifest_version(&self) -> String;  // sequence string (ADR 020)
     fn specs(&self) -> Vec<KeySpec>;
-    fn plan(&self, specs: &[KeySpec], keys: &RunKeys) -> Result<ScanPlan>;
+    fn plan(&self, specs: &[KeySpec], keys: &RunKeys) -> Result<ScanPlan> {
+        self.plan_query(specs, keys, &RunQuery::Locate)
+    }
+    fn plan_query(&self, specs: &[KeySpec], keys: &RunKeys, query: &RunQuery) -> Result<ScanPlan>;
     fn with_transient(&self, t: &[Arc<TransientIndex>]) -> Result<Box<dyn PlanSource + '_>>;
 }
 ```

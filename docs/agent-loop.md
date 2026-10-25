@@ -8,9 +8,9 @@ are the types in
 the boundary they enforce is in [`architecture.md`](architecture.md) and
 [`threat-model.md`](threat-model.md).
 
-Status: pre-alpha. The types exist; the engine that writes them does not
-yet. The example is illustrative and every value in angle brackets is a
-placeholder.
+Status: pre-alpha. The engine writes every record this page shows, through
+the CLI (`bellwether why`, `propose`, `fix`, `receipt show`). The example is
+illustrative and every value in angle brackets is a placeholder.
 
 ## The four stages
 
@@ -24,10 +24,11 @@ placeholder.
 | 3 Score and verify | engine only | `Replay`, then `Certificate` | be skipped |
 | 4 Apply and attest | engine only | `Receipt` | happen without a passing `Certificate` |
 
-An agent reaches stages 1 and 2 through the `observe.*` and `propose.*` MCP
-tools; a human reaches the same code through the CLI (ADR 010). Stages 3 and
-4 run inside the engine. The agent can ask for them, but it cannot supply
-their results.
+A human reaches stages 1 and 2 through the CLI. An agent reaches the same
+code through the CLI with `--json` today, and through the `observe.*` and
+`propose.*` MCP tools when WP12 lands (ADR 010). Stages 3 and 4 run inside
+the engine. The agent can ask for them, but it cannot supply their
+results.
 
 ## How records are stored
 
@@ -44,6 +45,9 @@ Details that matter when reading or producing these records:
 - Tagged enums use a `"kind"` field (`EvidenceBody`, `ProposalBody`,
   `KeySpec`, `Coverage`) or an `"op"` field (`Predicate`).
 - `oldest_input_age` is a whole number of nanoseconds (contract v2).
+- `created_at` is RFC 3339 UTC with millisecond precision
+  (`2026-10-24T21:03:02.069Z`), written by the facade's one clock for every
+  record kind.
 - `record_version` is `2`, from `bellwether_types::format::RECORD_VERSION` (contract v2.1; version-1 records remain readable).
 
 The blocks below are shapes, not parseable JSON: angle-bracket placeholders

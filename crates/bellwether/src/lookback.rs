@@ -11,12 +11,11 @@
 //! number, say), and only there.
 //!
 //! A lookback of `N` ending at `end` is the window `[end - N, end]`, both
-//! ends inclusive, in the time column's dataset unit. For a column coarser
-//! than a second the start is exact: a `Date32` row on day `d` is in the
-//! window when its midnight is, so `N` converts to whole days rounding down
-//! (a 36-hour lookback ending on day `d` starts on day `d - 1`). A start
-//! below the column's range is clamped to its smallest value, which keeps
-//! every row a longer window would.
+//! ends inclusive, in the time column's dataset unit. `N` must be a whole
+//! number of that unit: a 36-hour lookback on a `Date32` column (whose unit
+//! is a day) is refused, never rounded; `1d` or `2d` is what it can
+//! measure. A start below the column's range is clamped to its smallest
+//! value, which keeps every row a longer window would.
 
 use arrow::datatypes::{DataType, TimeUnit};
 use bellwether_types::{Error, Result};
@@ -63,8 +62,9 @@ impl Lookback {
         let (digits, unit) = t.split_at(split);
         if digits.is_empty() {
             return Err(Error::Other(format!(
-                "--lookback {text:?} does not start with a whole number; write a number and a \
-                 unit, for example 252d, with the unit one of {UNITS}"
+                "--lookback {text:?} does not start with a whole number; write a whole number and \
+                 a unit, for example --lookback 252d, the unit one of {UNITS}; or a bare whole \
+                 number for an integer time column"
             )));
         }
         let amount: i64 = digits.parse().map_err(|_| {
@@ -79,7 +79,8 @@ impl Lookback {
             "w" => Some(Unit::Week),
             other => {
                 return Err(Error::Other(format!(
-                    "--lookback {text:?} has the unit {other:?}; the unit is one of {UNITS}"
+                    "--lookback {text:?} has the unit {other:?}; write a whole number and a unit, \
+                     for example --lookback 252d, the unit one of {UNITS}"
                 )))
             }
         };
@@ -107,9 +108,12 @@ impl Lookback {
         self.unit.map(|u| self.amount * u.seconds())
     }
 
-    /// The lookback in `ty`'s unit, rounded down for a unit coarser than
-    /// the lookback's (module docs), for the time column `column`.
+    /// The lookback in `ty`'s unit, for the time column `column` (module
+    /// docs): exact, or an error when it is not a whole number of the unit.
     pub(crate) fn in_unit(&self, column: &str, ty: &DataType) -> Result<i64> {
+        if let DataType::Dictionary(_, v) = ty {
+            return self.in_unit(column, v);
+        }
         let nanos_per_unit: Option<i128> = match ty {
             DataType::Timestamp(u, _) | DataType::Time32(u) | DataType::Time64(u) => {
                 Some(match u {
@@ -126,8 +130,20 @@ impl Lookback {
         let integer = ty.is_integer();
         match (self.seconds(), nanos_per_unit) {
             (Some(secs), Some(per)) => {
-                let n = i128::from(secs) * 1_000_000_000 / per;
-                Ok(i64::try_from(n).unwrap_or(i64::MAX))
+                let nanos = i128::from(secs) * 1_000_000_000;
+                if nanos % per != 0 {
+                    return Err(Error::KeySpec(format!(
+                        "--lookback {:?} is not a whole number of {column}'s unit ({ty}); give \
+                         a length that is, for example in days for a date column",
+                        self.text
+                    )));
+                }
+                i64::try_from(nanos / per).map_err(|_| {
+                    Error::KeySpec(format!(
+                        "--lookback {:?} is out of range for {column} ({ty})",
+                        self.text
+                    ))
+                })
             }
             (None, None) if integer => Ok(self.amount),
             (Some(_), None) if integer => Err(Error::KeySpec(format!(
@@ -145,19 +161,6 @@ impl Lookback {
             ))),
         }
     }
-}
-
-/// The start of a window of `n` (in `ty`'s unit) ending at `end`: `end - n`,
-/// clamped to the smallest value `ty` holds (module docs).
-pub(crate) fn window_start(end: i64, n: i64, ty: &DataType) -> i64 {
-    let min: i64 = match ty {
-        DataType::Int8 => i64::from(i8::MIN),
-        DataType::Int16 => i64::from(i16::MIN),
-        DataType::Int32 | DataType::Date32 | DataType::Time32(_) => i64::from(i32::MIN),
-        DataType::UInt8 | DataType::UInt16 | DataType::UInt32 | DataType::UInt64 => 0,
-        _ => i64::MIN,
-    };
-    end.saturating_sub(n).max(min)
 }
 
 /// Whether a window's start lies after its end, judged where both ends are
@@ -232,26 +235,23 @@ mod tests {
     }
 
     #[test]
-    fn a_lookback_converts_to_the_column_unit_rounding_down() {
+    fn a_lookback_converts_to_the_column_unit_exactly() {
         let us = DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()));
         let d = Lookback::parse("1d").unwrap();
         assert_eq!(d.in_unit("ts", &us).unwrap(), 86_400_000_000);
         assert_eq!(d.in_unit("day", &DataType::Date32).unwrap(), 1);
-        assert_eq!(
-            Lookback::parse("36h")
+        // Not a whole number of days: refused, never rounded.
+        for partial in ["36h", "23h", "1s"] {
+            let e = Lookback::parse(partial)
                 .unwrap()
                 .in_unit("day", &DataType::Date32)
-                .unwrap(),
-            1
-        );
-        assert_eq!(
-            Lookback::parse("23h")
-                .unwrap()
-                .in_unit("day", &DataType::Date32)
-                .unwrap(),
-            0
-        );
+                .unwrap_err()
+                .to_string();
+            assert!(e.contains("not a whole number of day's unit"), "{e}");
+        }
         assert_eq!(d.in_unit("d64", &DataType::Date64).unwrap(), 86_400_000);
+        let dict = DataType::Dictionary(Box::new(DataType::Int32), Box::new(us.clone()));
+        assert_eq!(d.in_unit("ts", &dict).unwrap(), 86_400_000_000);
         assert_eq!(
             Lookback::parse("5")
                 .unwrap()
@@ -262,17 +262,33 @@ mod tests {
         assert!(d.in_unit("v", &DataType::Int64).is_err());
         assert!(Lookback::parse("5").unwrap().in_unit("ts", &us).is_err());
         assert!(d.in_unit("s", &DataType::Utf8).is_err());
+        let ns = DataType::Timestamp(TimeUnit::Nanosecond, None);
+        assert!(Lookback::parse("9999999w")
+            .unwrap()
+            .in_unit("ts", &ns)
+            .is_err());
     }
 
     #[test]
-    fn a_window_start_is_clamped_to_the_column_range() {
-        assert_eq!(window_start(10, 3, &DataType::Int64), 7);
-        assert_eq!(window_start(2, 5, &DataType::UInt32), 0);
-        assert_eq!(
-            window_start(0, i64::MAX, &DataType::Date32),
-            i64::from(i32::MIN)
-        );
-        assert_eq!(window_start(i64::MIN + 1, 5, &DataType::Int64), i64::MIN);
+    fn lookbacks_convert_exactly_or_are_refused() {
+        let conv =
+            |given: &str, column: &str, ty: &DataType| Lookback::parse(given)?.in_unit(column, ty);
+        let us = DataType::Timestamp(TimeUnit::Microsecond, None);
+        let ms = DataType::Timestamp(TimeUnit::Millisecond, None);
+        assert_eq!(conv("252d", "ts", &us).unwrap(), 252 * 86_400_000_000);
+        assert_eq!(conv("2w", "d", &DataType::Date32).unwrap(), 14);
+        assert_eq!(conv("48h", "d", &DataType::Date32).unwrap(), 2);
+        assert_eq!(conv("90m", "ts", &ms).unwrap(), 5_400_000);
+        assert_eq!(conv("0s", "ts", &ms).unwrap(), 0);
+        assert_eq!(conv("7", "v", &DataType::Int32).unwrap(), 7);
+        // not a whole number of days, no unit, a unit on an integer column,
+        // an unknown unit, a sign, and an overflow are refused
+        assert!(conv("1h", "d", &DataType::Date32).is_err());
+        assert!(conv("30", "ts", &us).is_err());
+        assert!(conv("7d", "v", &DataType::Int64).is_err());
+        assert!(conv("3y", "ts", &us).is_err());
+        assert!(conv("-1d", "ts", &us).is_err());
+        assert!(conv("99999999999999999999w", "ts", &us).is_err());
     }
 
     #[test]

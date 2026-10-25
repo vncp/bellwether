@@ -83,13 +83,149 @@ impl TextFormat {
         }
     }
 
-    /// File extensions [`ChunkedTextSource::discover`] lists for this format.
+    /// File extensions [`ChunkedTextSource::discover`] lists for this format
+    /// by name alone. JSON lines also takes `.json` files by content
+    /// ([`Self::sniffed_extension`]).
     #[must_use]
     pub fn extensions(&self) -> &'static [&'static str] {
         match self {
             Self::Csv { .. } => &["csv"],
             Self::JsonLines => &["jsonl", "ndjson"],
         }
+    }
+
+    /// The extension of files this format reads only after checking their
+    /// content ([`sniff_json_lines`]): `.json` for JSON lines, the name GH
+    /// Archive and most exporters use for it.
+    #[must_use]
+    pub fn sniffed_extension(&self) -> Option<&'static str> {
+        match self {
+            Self::Csv { .. } => None,
+            Self::JsonLines => Some("json"),
+        }
+    }
+
+    /// The files this format reads, as a phrase for messages.
+    #[must_use]
+    pub fn accepted(&self) -> &'static str {
+        match self {
+            Self::Csv { .. } => "CSV files (.csv)",
+            Self::JsonLines => {
+                "JSON lines files (.jsonl, .ndjson, and .json files whose first byte is `{` \
+                 and whose every line is one JSON object)"
+            }
+        }
+    }
+
+    /// Whether `path` is a file of this format: by its extension, or, for a
+    /// `.json` file under JSON lines, by its content ([`sniff_json_lines`]).
+    ///
+    /// # Errors
+    /// A `.json` file whose first line is one JSON object but a later line
+    /// is not (damaged JSON lines, refused rather than left out), or a read
+    /// failure.
+    pub fn accepts<S: Storage>(&self, storage: &S, path: &str) -> Result<bool> {
+        if self.extensions().iter().any(|e| has_extension(path, e)) {
+            return Ok(true);
+        }
+        match self.sniffed_extension() {
+            Some(e) if has_extension(path, e) => sniff_json_lines(storage, path),
+            _ => Ok(false),
+        }
+    }
+
+    /// Whether `path` has an extension this format lists or sniffs: the
+    /// files [`Self::accepts`] looks at.
+    #[must_use]
+    pub fn candidate(&self, path: &str) -> bool {
+        self.extensions()
+            .iter()
+            .chain(self.sniffed_extension().as_slice())
+            .any(|e| has_extension(path, e))
+    }
+}
+
+/// A sniffed file's identity: path, size, and version token.
+type SniffKey = (String, u64, Option<String>);
+
+/// The longest line [`sniff_json_lines`] reads, in bytes.
+const MAX_SNIFF_LINE: usize = 256 * 1024 * 1024;
+
+/// Whether `path` holds JSON lines: its first byte is `{` and every line
+/// (blank lines aside) is exactly one JSON object. Reads the whole file in
+/// 1 MiB windows, holding at most one line. A file whose first line is not
+/// one object (a pretty-printed JSON document, such as an index's own
+/// `manifest.json`) is not JSON lines: `Ok(false)`.
+///
+/// # Errors
+/// The first line is one JSON object but a later line is not: the file is
+/// JSON lines with a damaged line, so it is refused by name and line rather
+/// than silently left out of the dataset. Also a read failure.
+pub fn sniff_json_lines<S: Storage>(storage: &S, path: &str) -> Result<bool> {
+    const WINDOW: u64 = 1024 * 1024;
+    let size = storage.head(path)?.size;
+    if size == 0 || storage.read_range(path, 0..1)?.first() != Some(&b'{') {
+        return Ok(false);
+    }
+    // `Err(reason)` when a non-blank line is not exactly one JSON object.
+    let check = |line: &[u8]| -> std::result::Result<(), String> {
+        let t = line.trim_ascii();
+        if t.is_empty() {
+            return Ok(());
+        }
+        if t[0] != b'{' {
+            return Err("it does not start with `{`".into());
+        }
+        serde_json::from_slice::<serde::de::IgnoredAny>(t)
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    };
+    // Line 1 decides whether this is JSON lines at all; a later bad line is
+    // damage, and refused.
+    let verdict = |line_no: u64, why: String| -> Result<bool> {
+        if line_no == 1 {
+            return Ok(false);
+        }
+        Err(Error::Source(format!(
+            "{path}: this .json file holds JSON lines (its first line is one JSON object), but \
+             line {line_no} is not one ({why}); a .json file is read as JSON lines only when \
+             every line is one JSON object, so repair that line, or move the file out of the \
+             folder"
+        )))
+    };
+    let mut pending: Vec<u8> = Vec::new();
+    let mut line_no = 1u64;
+    let mut pos = 0u64;
+    while pos < size {
+        let window = storage.read_range(path, pos..size.min(pos + WINDOW))?;
+        if window.is_empty() {
+            break;
+        }
+        pos += window.len() as u64;
+        let mut rest = &window[..];
+        while let Some(i) = rest.iter().position(|&b| b == b'\n') {
+            let checked = if pending.is_empty() {
+                check(&rest[..i])
+            } else {
+                pending.extend_from_slice(&rest[..i]);
+                let c = check(&pending);
+                pending.clear();
+                c
+            };
+            if let Err(why) = checked {
+                return verdict(line_no, why);
+            }
+            line_no += 1;
+            rest = &rest[i + 1..];
+        }
+        pending.extend_from_slice(rest);
+        if pending.len() > MAX_SNIFF_LINE {
+            return verdict(line_no, format!("it is longer than {MAX_SNIFF_LINE} bytes"));
+        }
+    }
+    match check(&pending) {
+        Ok(()) => Ok(true),
+        Err(why) => verdict(line_no, why),
     }
 }
 
@@ -146,6 +282,11 @@ pub struct ChunkedTextSource<S: Storage = LocalFs> {
     canonical: Arc<dyn Canonical>,
     layouts: Mutex<BoundedCache<FileFingerprint, Arc<Layout>>>,
     scans: Mutex<BoundedCache<FileFingerprint, Vec<RowGroupMeta>>>,
+    /// Content checks of sniffed files ([`sniff_json_lines`]) by path, size,
+    /// and version token, so a folder listed twice is read once.
+    sniffed: Mutex<std::collections::HashMap<SniffKey, bool>>,
+    /// Directories whose files are never data ([`Self::with_excluded`]).
+    excluded: Vec<String>,
 }
 
 impl ChunkedTextSource<LocalFs> {
@@ -185,7 +326,51 @@ impl<S: Storage> ChunkedTextSource<S> {
             canonical: Arc::new(DefaultCanonical),
             layouts: Mutex::new(BoundedCache::new(TEXT_CACHE_BYTES)),
             scans: Mutex::new(BoundedCache::new(TEXT_CACHE_BYTES)),
+            sniffed: Mutex::new(std::collections::HashMap::new()),
+            excluded: Vec::new(),
         }
+    }
+
+    /// Never lists a file under `dir`: discovery and schema inference skip
+    /// it. For an index location inside the data root, whose own `.json`
+    /// files (a single-line JSON object is valid JSON lines) would otherwise
+    /// be read as data. `dir` is compared as listed paths are spelled.
+    #[must_use]
+    pub fn with_excluded(mut self, dir: impl Into<String>) -> Self {
+        let dir = dir.into();
+        self.excluded.push(dir.trim_end_matches('/').to_string());
+        self
+    }
+
+    fn is_excluded(&self, path: &str) -> bool {
+        self.excluded.iter().any(|d| {
+            path.strip_prefix(d.as_str())
+                .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
+        })
+    }
+
+    /// [`TextFormat::accepts`], remembering each sniffed file's verdict for
+    /// its size and version token.
+    fn accepts(&self, path: &str) -> Result<bool> {
+        if !self.format.candidate(path) || self.is_excluded(path) {
+            return Ok(false);
+        }
+        if self
+            .format
+            .extensions()
+            .iter()
+            .any(|e| has_extension(path, e))
+        {
+            return Ok(true);
+        }
+        let meta = self.storage.head(path)?;
+        let key = (path.to_string(), meta.size, meta.etag);
+        if let Some(v) = lock(&self.sniffed).get(&key) {
+            return Ok(*v);
+        }
+        let v = self.format.accepts(&self.storage, path)?;
+        lock(&self.sniffed).insert(key, v);
+        Ok(v)
     }
 
     /// Sets the chunk size in bytes. Values below 1 are raised to 1. Row
@@ -561,13 +746,31 @@ pub fn csv_ends_in_quotes(bytes: &[u8], delimiter: u8) -> bool {
 
 impl<S: Storage> Source for ChunkedTextSource<S> {
     fn discover(&self, root: &str) -> Result<Vec<FileFingerprint>> {
-        let exts = self.format.extensions();
-        self.storage
-            .list(root)?
-            .into_iter()
-            .filter(|p| exts.iter().any(|e| has_extension(p, e)))
-            .map(|p| fingerprint_with_policy(&self.storage, &p, self.policy))
-            .collect()
+        let mut out = Vec::new();
+        // A sniffed `.json` file that is not JSON lines is refused by name,
+        // never silently left out of the dataset beside the files read.
+        let mut not_lines = Vec::new();
+        for p in self.storage.list(root)? {
+            if self.accepts(&p)? {
+                out.push(fingerprint_with_policy(&self.storage, &p, self.policy)?);
+            } else if self.format.candidate(&p) && !self.is_excluded(&p) {
+                not_lines.push(p);
+            }
+        }
+        if let Some(first) = not_lines.first() {
+            return Err(Error::Source(format!(
+                "{first}{}: a .json file here is not JSON lines (its first line is not one JSON \
+                 object), so it cannot be read with the other files; this format reads {}. Move \
+                 it out of the folder, or convert it to one JSON object per line",
+                if not_lines.len() > 1 {
+                    format!(" and {} more", not_lines.len() - 1)
+                } else {
+                    String::new()
+                },
+                self.format.accepted()
+            )));
+        }
+        Ok(out)
     }
 
     fn row_groups(&self, file: &FileFingerprint) -> Result<Vec<RowGroupMeta>> {
@@ -653,13 +856,19 @@ impl<S: Storage> Source for ChunkedTextSource<S> {
         if let Some(s) = &self.dataset {
             return Ok(Arc::clone(s));
         }
-        let exts = self.format.extensions();
-        let first = self
-            .storage
-            .list(root)?
-            .into_iter()
-            .find(|p| exts.iter().any(|e| has_extension(p, e)))
-            .ok_or_else(|| Error::Source(format!("{root}: no {:?} files", self.format)))?;
+        let mut first = None;
+        for p in self.storage.list(root)? {
+            if self.accepts(&p)? {
+                first = Some(p);
+                break;
+            }
+        }
+        let first = first.ok_or_else(|| {
+            Error::Source(format!(
+                "{root}: no files of this format; it reads {}",
+                self.format.accepted()
+            ))
+        })?;
         let fp = fingerprint_with_policy(&self.storage, &first, self.policy)?;
         let reader = open_verified(&self.storage, &fp, self.policy)?;
         Ok(Arc::clone(&self.layout_from(&fp, &reader)?.schema))

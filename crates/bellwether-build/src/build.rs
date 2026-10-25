@@ -256,6 +256,7 @@ impl<S: StoreExt + ?Sized> Builder<S> {
             cfg.kind,
             &cfg.schema,
             cfg.policy,
+            &opts.exclude,
             chunk_sizes,
             root,
             &cfg.partitioning,
@@ -429,7 +430,9 @@ impl Config {
         let schema = match (&opts.schema, &base_schema) {
             (Some(s), _) => persistable(s)?,
             (None, Some(b)) => SchemaRef::clone(b),
-            (None, None) => persistable(infer_schema(kind, root, policy, &partitioning)?.as_ref())?,
+            (None, None) => persistable(
+                infer_schema(kind, root, policy, &partitioning, &opts.exclude)?.as_ref(),
+            )?,
         };
         let columns = schema_to_columns(&schema, base.map_or(&[][..], |m| &m.schema.columns));
         let mut source_info = base.map(|m| m.source.clone()).unwrap_or_default();
@@ -615,11 +618,7 @@ fn plan_specs(
         schema
             .field_with_name(c)
             .map(|f| f.data_type().clone())
-            .map_err(|_| {
-                Error::KeySpec(format!(
-                    "key spec column {c:?} is not in the dataset schema"
-                ))
-            })
+            .map_err(|_| Error::KeySpec(format!("key spec {}", encoding::not_in_schema(schema, c))))
     };
     let mut names = BTreeSet::new();
     let mut out: Vec<SpecPlan> = specs

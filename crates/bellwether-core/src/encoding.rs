@@ -479,9 +479,7 @@ fn normalize<'a>(v: &Value<'a>, declared: &DataType) -> Result<Normalized<'a>> {
                 value: convert_time_unit(value, unit, *u)?,
             })
         }
-        other => Err(Error::Other(format!(
-            "type {other} has no canonical encoding in encoding version 1"
-        ))),
+        other => Err(Error::Other(no_encoding(other))),
     }
 }
 
@@ -596,6 +594,65 @@ pub fn encode_tuple(values: &[Value<'_>]) -> Result<Vec<u8>> {
     Ok(out)
 }
 
+/// The kind of nested type `dt` is (`"struct"`, `"list"`, `"map"`,
+/// `"union"`, `"run-end encoded"`), looking through dictionaries; `None` for
+/// a flat type. A nested column can sit in a dataset, but only a flat column
+/// can be a key: canonical encoding version 1 has no nested types.
+#[must_use]
+pub fn nested_kind(dt: &DataType) -> Option<&'static str> {
+    match dt {
+        DataType::Struct(_) => Some("struct"),
+        DataType::List(_)
+        | DataType::LargeList(_)
+        | DataType::FixedSizeList(_, _)
+        | DataType::ListView(_)
+        | DataType::LargeListView(_) => Some("list"),
+        DataType::Map(_, _) => Some("map"),
+        DataType::Union(_, _) => Some("union"),
+        DataType::RunEndEncoded(_, _) => Some("run-end encoded"),
+        DataType::Dictionary(_, v) => nested_kind(v),
+        _ => None,
+    }
+}
+
+/// Why a value of type `dt` cannot be canonically encoded, as a sentence.
+/// A nested type gets a sentence saying to flatten it (its Arrow spelling
+/// lists every child field, so it is not repeated); any other type is
+/// named.
+#[must_use]
+pub fn no_encoding(dt: &DataType) -> String {
+    match nested_kind(dt) {
+        Some(kind) => format!(
+            "a nested {kind} column cannot be a key, and a nested field cannot be addressed \
+             (canonical encoding version 1 has flat types only); flatten the field you look \
+             up into its own column first (in SQL, `SELECT s.f AS s_f` for field `f` of column \
+             `s`) and key on that column"
+        ),
+        None => format!("type {dt} has no canonical encoding in encoding version 1"),
+    }
+}
+
+/// Why `name` is not a column of `schema`, as a sentence. A dotted name
+/// whose head is a nested column (`repo.id` with `repo` a struct) gets the
+/// reason and what to do: a nested field cannot be addressed, so flatten
+/// it into its own column first (contract v3 backlog #36).
+#[must_use]
+pub fn not_in_schema(schema: &arrow::datatypes::Schema, name: &str) -> String {
+    let nested = name.split_once('.').and_then(|(head, _)| {
+        let f = schema.field_with_name(head).ok()?;
+        Some((head, nested_kind(f.data_type())?))
+    });
+    match nested {
+        Some((head, kind)) => format!(
+            "column {name:?} is not in the dataset schema: {head:?} is a nested {kind} column, \
+             and a nested field cannot be addressed; flatten it into its own column first \
+             (for example `SELECT {name} AS {}`) and name that column",
+            name.replace('.', "_")
+        ),
+        None => format!("column {name:?} is not in the dataset schema"),
+    }
+}
+
 /// Returns `Ok(())` if `dt` has a canonical encoding in version 1.
 pub fn check_supported(dt: &DataType) -> Result<()> {
     match dt {
@@ -626,9 +683,7 @@ pub fn check_supported(dt: &DataType) -> Result<()> {
         | DataType::Time64(TimeUnit::Microsecond | TimeUnit::Nanosecond)
         | DataType::Timestamp(_, _) => Ok(()),
         DataType::Dictionary(_, v) => check_supported(v),
-        other => Err(Error::Other(format!(
-            "type {other} has no canonical encoding in encoding version 1"
-        ))),
+        other => Err(Error::Other(no_encoding(other))),
     }
 }
 
@@ -752,11 +807,7 @@ pub fn value_at(array: &dyn Array, row: usize) -> Result<Option<Value<'_>>> {
                 t => Err(Error::Other(format!("unsupported dictionary type {t}")))
             )
         }
-        other => {
-            return Err(Error::Other(format!(
-                "type {other} has no canonical encoding in encoding version 1"
-            )))
-        }
+        other => return Err(Error::Other(no_encoding(other))),
     };
     Ok(Some(v))
 }
@@ -812,6 +863,26 @@ pub fn check_ts_type(dt: &DataType) -> Result<()> {
             "ts_column of type {dt} cannot order versions"
         ))),
     }
+}
+
+/// The smallest ordering value (in the unit [`ts_value_as`] returns) a
+/// `ts_column` of dataset type `dt` can hold: the lower clamp of a lookback
+/// window, so the window's bound always encodes at the column's type.
+pub fn ts_min(dt: &DataType) -> Result<i64> {
+    check_ts_type(dt)?;
+    Ok(match dt {
+        DataType::Dictionary(_, v) => return ts_min(v),
+        DataType::Int8 => i8::MIN.into(),
+        DataType::Int16 => i16::MIN.into(),
+        DataType::Int32 | DataType::Date32 => i32::MIN.into(),
+        DataType::UInt8
+        | DataType::UInt16
+        | DataType::UInt32
+        | DataType::UInt64
+        | DataType::Time32(_)
+        | DataType::Time64(_) => 0,
+        _ => i64::MIN,
+    })
 }
 
 /// Reads the ordering value of a temporal `ts_column` at `row`, converted to

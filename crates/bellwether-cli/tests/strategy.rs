@@ -158,6 +158,21 @@ fn truth(
         .collect()
 }
 
+/// Row groups holding a row of each of `syms` in that symbol's own window
+/// `[newest − n, newest]` (µs), `newest` its newest row.
+fn per_key_lookback(
+    rows: &[(String, u64, String, i64)],
+    syms: &[&str],
+    n: i64,
+) -> BTreeSet<(String, u64)> {
+    syms.iter()
+        .flat_map(|s| {
+            let newest = rows.iter().filter(|r| r.2 == *s).map(|r| r.3).max();
+            newest.map_or_else(BTreeSet::new, |hi| truth(rows, &[s], hi - n, hi))
+        })
+        .collect()
+}
+
 #[test]
 fn lookback_windows_on_a_path_template_lake() {
     let dir = tempfile::tempdir().unwrap();
@@ -277,26 +292,16 @@ fn lookback_windows_on_a_path_template_lake() {
     assert_eq!(planned(&v, &root), want);
     assert!(!want.is_empty());
 
-    // latest --lookback: one window ending at the keys' newest version.
+    // latest --lookback: each key's own window, ending at its own newest
+    // version.
     let v = json(&run(
         &["latest", r, "--keys", k, "--lookback", "36h", "--json"],
         0,
     ));
-    let newest = rows
-        .iter()
-        .filter(|x| ["NVDA", "AAPL"].contains(&x.2.as_str()))
-        .map(|x| x.3)
-        .max()
-        .unwrap();
-    assert_eq!(v["lookup"]["end"], newest);
+    assert!(v["lookup"]["end"].is_null(), "no one end: {v}");
     assert_eq!(
         planned(&v, &root),
-        truth(
-            &rows,
-            &["NVDA", "AAPL"],
-            newest - 36 * 3_600_000_000,
-            newest
-        )
+        per_key_lookback(&rows, &["NVDA", "AAPL"], 36 * 3_600_000_000)
     );
 
     // Calendar units only: months and trading days are usage errors.
@@ -469,9 +474,9 @@ fn a_csv_lake_takes_its_day_from_the_file_name() {
     assert!(String::from_utf8_lossy(&out.stderr).contains("daily/notes.csv"));
 }
 
-/// `latest --lookback` without a temporal key ends at each key's newest
-/// time from the per-key bounds sidecar (never a row group's or the
-/// dataset's maximum).
+/// `latest --lookback` without a temporal key gives each key its own window
+/// ending at its own newest time, from the per-key bounds sidecar (never a
+/// row group's or the dataset's maximum).
 #[test]
 fn latest_lookback_through_per_key_bounds() {
     let dir = tempfile::tempdir().unwrap();
@@ -479,8 +484,9 @@ fn latest_lookback_through_per_key_bounds() {
     let rows = lake(&root);
     let r = path(&root);
     let keys = dir.path().join("keys.parquet");
-    // NVDA's history ends on the second session; MSFT's runs to the fifth.
-    symbols(&keys, &["NVDA"]);
+    // NVDA's history ends on the second session; MSFT's runs to the fifth,
+    // so one window for both would leave NVDA without a row.
+    symbols(&keys, &["NVDA", "MSFT"]);
     let k = path(&keys);
     run(
         &[
@@ -497,18 +503,14 @@ fn latest_lookback_through_per_key_bounds() {
         &["latest", r, "--keys", k, "--lookback", "1d", "--json"],
         0,
     ));
-    let newest = rows
-        .iter()
-        .filter(|x| x.2 == "NVDA")
-        .map(|x| x.3)
-        .max()
-        .unwrap();
-    assert_eq!(v["lookup"]["end"], newest);
-    assert_eq!(
-        planned(&v, &root),
-        truth(&rows, &["NVDA"], newest - US_PER_DAY, newest)
+    assert!(v["lookup"]["end"].is_null(), "no one end: {v}");
+    let want = per_key_lookback(&rows, &["NVDA", "MSFT"], US_PER_DAY);
+    assert_eq!(planned(&v, &root), want);
+    let nvda = per_key_lookback(&rows, &["NVDA"], US_PER_DAY);
+    assert!(
+        !nvda.is_empty() && nvda.is_subset(&want),
+        "NVDA keeps its own window"
     );
-    assert!(!planned(&v, &root).is_empty());
     // Reversed windows and uncommitted sequences are usage errors.
     let out = bw()
         .args([

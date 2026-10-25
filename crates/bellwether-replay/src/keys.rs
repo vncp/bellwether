@@ -318,12 +318,13 @@ impl RunKeysBuilder {
         for c in columns {
             let dt = schema
                 .field_with_name(c)
-                .map_err(|_| {
-                    Error::KeySpec(format!("key column {c:?} is not in the dataset schema"))
-                })?
+                .map_err(|_| Error::KeySpec(format!("key {}", encoding::not_in_schema(schema, c))))?
                 .data_type()
                 .clone();
-            key_types.push(ColumnType::of(&dt)?);
+            key_types.push(
+                ColumnType::of(&dt)
+                    .map_err(|e| Error::KeySpec(format!("key column {c:?}: {e}")))?,
+            );
             declared.push(dt);
         }
         Ok(Self {

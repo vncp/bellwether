@@ -310,33 +310,106 @@ fn every_source_that_bounds_a_time_window_keeps_every_matching_row_group() {
     assert!(chains_pruned > 0, "the chains pruned nothing the key kept");
 }
 
+/// `latest --lookback`: each key's own window `[newest_k − n, newest_k]`,
+/// `newest_k` its newest non-null time anywhere, read through a temporal
+/// spec's version chains or, with none, through per-key bounds. Both plans
+/// keep every row group holding a row of a window, keep exactly those with
+/// the chains, and their residuals return exactly the windows' rows.
 #[test]
-fn the_newest_version_is_index_wide_and_ignores_null_times() {
+fn a_lookback_is_per_key_through_chains_or_bounds() {
     let s = Scratch::new();
     let days = corpus(&s);
     let all = rows(&days);
     let store = memory_store();
-    let specs = [temporal(&["symbol"], "ts")];
+    let bounds = bellwether_core::sidecar::SidecarDef {
+        kind: bellwether_core::sidecar::SidecarKind::Bounds,
+        columns: cols(&["symbol"]),
+        time_columns: cols(&["ts"]),
+    };
+    let specs = [temporal(&["symbol"], "ts"), exact(&["symbol"])];
     builder(&store)
-        .build(&s.root_str(), &specs, &opts(TEMPLATE))
+        .build(
+            &s.root_str(),
+            &specs,
+            &BuildOptions {
+                sidecars: vec![bounds],
+                ..opts(TEMPLATE)
+            },
+        )
         .unwrap();
     let p = planner(&store);
-    for keys in KEY_SETS {
-        let want = truth(&all, &days, "ts", keys, i64::MIN, i64::MAX)
-            .iter()
-            .filter_map(ts_us)
-            .max();
-        let encoded: Vec<Vec<u8>> = keys.iter().map(|k| enc_str(k)).collect();
-        assert_eq!(
-            p.newest_version(&specs, &cols(&["symbol"]), &encoded)
-                .unwrap(),
-            want,
-            "{keys:?}"
-        );
+    let symbol = cols(&["symbol"]);
+    assert_eq!(
+        p.lookback_column(&specs, &symbol).unwrap(),
+        Some("ts".into())
+    );
+    assert_eq!(
+        p.lookback_column(&specs[1..], &symbol).unwrap(),
+        Some("ts".into()),
+        "per-key bounds"
+    );
+    let mut newest: BTreeMap<Vec<u8>, i64> = BTreeMap::new();
+    for r in &all {
+        if let (Some(k), Some(t)) = (r.get("symbol"), ts_us(r)) {
+            let e = newest.entry(k.clone()).or_insert(t);
+            *e = (*e).max(t);
+        }
     }
-    // Without a temporal spec there is no index-wide newest version.
+    let live = rgs(&all);
+    let mut bounds_pruned = 0;
+    for n in [0, 1, 4, US_PER_DAY, 2 * US_PER_DAY + 3, i64::MAX] {
+        for keys in KEY_SETS {
+            let encoded: Vec<Vec<u8>> = keys.iter().map(|k| enc_str(k)).collect();
+            let want: Vec<Row> = all
+                .iter()
+                .filter(|r| {
+                    let (Some(k), Some(t)) = (r.get("symbol"), ts_us(r)) else {
+                        return false;
+                    };
+                    encoded.iter().any(|e| e.as_slice() == k) && newest[k].saturating_sub(n) <= t
+                })
+                .cloned()
+                .collect();
+            let l = Lookup::Lookback {
+                columns: symbol.clone(),
+                keys: encoded.clone(),
+                lookback: n,
+            };
+            let chains = p.plan(&specs, &l).unwrap();
+            assert_eq!(plan_rgs(&chains), rgs(&want), "chains {keys:?} {n}");
+            let by_bounds = p.plan(&specs[1..], &l).unwrap();
+            assert!(
+                rgs(&want).is_subset(&plan_rgs(&by_bounds)),
+                "bounds {keys:?} {n}"
+            );
+            for plan in [&chains, &by_bounds] {
+                let got = apply_residual(plan.residual.as_ref().unwrap(), planned_rows(plan, &all));
+                assert_eq!(sorted(got), sorted(want.clone()), "{keys:?} {n}");
+            }
+            bounds_pruned += live.len() - plan_rgs(&by_bounds).len();
+        }
+    }
+    assert!(bounds_pruned > 0, "per-key bounds pruned nothing");
+    // With neither a temporal spec nor bounds there is no newest time.
     assert!(p
-        .newest_version(&[], &cols(&["symbol"]), &[enc_str("AAPL")])
+        .plan(
+            &[exact(&["symbol"])],
+            &Lookup::Lookback {
+                columns: cols(&["close"]),
+                keys: vec![],
+                lookback: 1,
+            }
+        )
+        .is_err());
+    assert!(p
+        .plan(
+            &specs,
+            &Lookup::Lookback {
+                columns: symbol,
+                keys: vec![enc_str("AAPL")],
+                lookback: -1,
+            }
+        )
         .is_err());
 }
 

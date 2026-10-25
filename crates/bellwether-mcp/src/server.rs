@@ -346,6 +346,10 @@ impl Server {
                     keys: a.keys.map(|k| key_file(k, a.key_columns)),
                     bench_workload: None,
                     workload: a.workload,
+                    mode: None,
+                    latest_by: None,
+                    at: None,
+                    lookback: None,
                     window: None,
                     ts_column: None,
                     columns: a.columns,
@@ -374,6 +378,7 @@ impl Server {
                         group_by: r.group_by,
                     }),
                     verify_only: true,
+                    allow_no_gain: false,
                 };
                 fix_done(e.fix(&request))
             }

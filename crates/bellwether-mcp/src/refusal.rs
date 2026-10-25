@@ -32,6 +32,8 @@ pub enum RefusalCode {
     ConcurrentCommit,
     /// The key is already complete.
     NothingToApply,
+    /// The proposal's replay predicts no saving on the workload.
+    NothingToGain,
     /// Layout proposals cannot be applied in this release.
     LayoutNotApplicable,
     /// A rewrite cannot be attested yet.
@@ -84,12 +86,13 @@ pub enum RefusalCode {
 
 impl RefusalCode {
     /// Every code, in `AGENTS.md` order.
-    pub const ALL: [Self; 29] = [
+    pub const ALL: [Self; 30] = [
         Self::CertificateFailed,
         Self::StaleManifest,
         Self::DataChanged,
         Self::ConcurrentCommit,
         Self::NothingToApply,
+        Self::NothingToGain,
         Self::LayoutNotApplicable,
         Self::NoReplay,
         Self::ReservedProposer,
@@ -125,6 +128,7 @@ impl RefusalCode {
             Self::DataChanged => "data_changed",
             Self::ConcurrentCommit => "concurrent_commit",
             Self::NothingToApply => "nothing_to_apply",
+            Self::NothingToGain => "nothing_to_gain",
             Self::LayoutNotApplicable => "layout_not_applicable",
             Self::NoReplay => "no_replay",
             Self::ReservedProposer => "reserved_proposer",
@@ -168,6 +172,10 @@ impl RefusalCode {
                  retry"
             }
             Self::NothingToApply => "the key is already complete; there is nothing to attest",
+            Self::NothingToGain => {
+                "the replay predicts no saving on this workload; propose another key, or pass \
+                 allow_no_gain only if the human asks for it anyway"
+            }
             Self::LayoutNotApplicable => {
                 "layout proposals cannot be applied in this release; propose a key or a rewrite"
             }
@@ -508,6 +516,22 @@ pub fn from_fix(r: &FixRefusal, verification: Option<&Reconciliation>) -> Refusa
             ),
             json!({ "sequence": sequence }),
         ),
+        FixRefusal::NothingToGain {
+            replay,
+            current_bytes,
+            proposed_bytes,
+        } => Refusal::new(
+            RefusalCode::NothingToGain,
+            format!(
+                "replay {replay} predicts {proposed_bytes} bytes with the proposal against \
+                 {current_bytes} now: applying it saves nothing"
+            ),
+            json!({
+                "replay": replay,
+                "current_bytes": current_bytes,
+                "proposed_bytes": proposed_bytes,
+            }),
+        ),
         FixRefusal::LayoutNotApplicable => Refusal::new(
             RefusalCode::LayoutNotApplicable,
             "layout proposals cannot be applied in this release",
@@ -749,6 +773,14 @@ mod tests {
                     sequence: "3".into(),
                 },
                 RefusalCode::NothingToApply,
+            ),
+            (
+                FixRefusal::NothingToGain {
+                    replay: h,
+                    current_bytes: 10,
+                    proposed_bytes: 10,
+                },
+                RefusalCode::NothingToGain,
             ),
             (
                 FixRefusal::LayoutNotApplicable,

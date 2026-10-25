@@ -46,6 +46,12 @@
 //!   timestamp, then `LatestPerKey`, in that order. The bound comes from
 //!   every segment of the temporal spec, so a row superseded by a version in
 //!   a row group another spec pruned is still dropped (invariant 5);
+//! - lookbacks: `In` over `C` restricted to keys with a live version, then
+//!   `NotOlderThan` with each key's `newest − lookback` (`newest` is the
+//!   key's newest live version, so nothing newer is live). No
+//!   `LatestPerKey`: every version in the key's window is returned. The
+//!   plan holds every live row group with a version of a key in its window;
+//! - windows: `In` over `C`, then `Between` on the time column;
 //! - range lookups: `Between`, widened for signed zero.
 //!
 //! # Order
@@ -73,9 +79,9 @@ use arrow::datatypes::{DataType, SchemaRef};
 use bellwether_core::encoding::{self, tag, KeyColumns, Value};
 use bellwether_core::segment::ReadAt;
 use bellwether_core::sidecar::{
-    bitemporal_winner, BitemporalHit, SidecarDef, SidecarKind, SidecarReader, Triple,
+    bitemporal_winner, BitemporalHit, RgBounds, SidecarDef, SidecarKind, SidecarReader, Triple,
 };
-use bellwether_core::temporal::{self, VersionChain, VersionHit};
+use bellwether_core::temporal::{self, LookbackHit, VersionChain, VersionHit};
 use bellwether_core::SegmentReader;
 use bellwether_source::{
     fingerprint_with_policy, FingerprintPolicy, LocalFs, ParquetSource, Partitioning,
@@ -124,6 +130,24 @@ pub enum Lookup {
         /// The instant, in the timestamp column's dataset unit (days for
         /// `Date32`, the integer itself for an integer column).
         ts: i64,
+    },
+    /// Every version of each key in its own lookback window `[newest −
+    /// lookback, newest]`, `newest` being the key's newest live version
+    /// (index-wide, live row groups only). The versions come from the one
+    /// temporal spec whose columns are all in `columns` (its version
+    /// chains), or, with none, from the one complete `bounds` sidecar on
+    /// columns of `columns` (each key's own time range per row group; see
+    /// [`Planner::lookback_column`]). Bounds inclusive, in the timestamp
+    /// column's dataset unit; the lower bound is clamped to the smallest
+    /// value the column holds. A window ending at a fixed instant is a
+    /// [`Lookup::Window`].
+    Lookback {
+        /// Lookup columns.
+        columns: Vec<String>,
+        /// Canonical key tuples.
+        keys: Vec<Vec<u8>>,
+        /// The window's length, `>= 0`, in the timestamp column's unit.
+        lookback: i64,
     },
     /// Rows whose `column` lies in `[lo, hi]`, both canonical encodings of
     /// one value of the column's dataset type.
@@ -371,9 +395,10 @@ impl<S: StoreExt + ?Sized> Planner<S> {
                 if !seen.insert(c) {
                     return Err(Error::KeySpec(format!("lookup lists column {c:?} twice")));
                 }
-                let f = self.schema.field_with_name(c).map_err(|_| {
-                    Error::KeySpec(format!("column {c:?} is not in the dataset schema"))
-                })?;
+                let f = self
+                    .schema
+                    .field_with_name(c)
+                    .map_err(|_| Error::KeySpec(encoding::not_in_schema(&self.schema, c)))?;
                 Ok((c.clone(), f.data_type().clone()))
             })
             .collect()
@@ -471,27 +496,30 @@ impl<S: StoreExt + ?Sized> Planner<S> {
             ),
             [one] => Ok(one),
             many => {
-                let bitemporal = self.sidecars_for(lookup);
-                let own = match lookup {
-                    Lookup::Between { column, .. } => Some(column.as_str()),
-                    Lookup::Window { ts_column, .. } => Some(ts_column.as_str()),
-                    Lookup::Bitemporal { .. } => bitemporal
+                let own: Option<String> = match lookup {
+                    Lookup::Between { column, .. } => Some(column.clone()),
+                    Lookup::Window { ts_column, .. } => Some(ts_column.clone()),
+                    Lookup::Bitemporal { .. } => self
+                        .sidecars_for(lookup)
                         .first()
                         .and_then(|d| d.time_columns.first())
-                        .map(String::as_str),
+                        .cloned(),
                     Lookup::Latest { columns, .. } | Lookup::AsOf { columns, .. } => {
                         specs.iter().find_map(|s| match s {
                             KeySpec::Temporal {
                                 columns: c,
                                 ts_column,
-                            } if c.iter().all(|x| columns.contains(x)) => Some(ts_column.as_str()),
+                            } if c.iter().all(|x| columns.contains(x)) => Some(ts_column.clone()),
                             _ => None,
                         })
+                    }
+                    Lookup::Lookback { columns, .. } => {
+                        self.lookback_column(specs, columns).ok().flatten()
                     }
                     Lookup::Keys { .. } => None,
                 };
                 many.iter()
-                    .find(|s| Some(s.columns()[0].as_str()) == own)
+                    .find(|s| Some(&s.columns()[0]) == own.as_ref())
                     .copied()
                     .ok_or_else(|| {
                         format!(
@@ -613,10 +641,17 @@ impl<S: StoreExt + ?Sized> Planner<S> {
         let segs = self.resolve(specs, extra)?;
         match lookup {
             Lookup::Keys { columns, keys } => self.plan_keys(&segs, columns, keys),
-            Lookup::Latest { columns, keys } => self.plan_temporal(&segs, columns, keys, None),
-            Lookup::AsOf { columns, keys, ts } => {
-                self.plan_temporal(&segs, columns, keys, Some(*ts))
+            Lookup::Latest { columns, keys } => {
+                self.plan_temporal(&segs, columns, keys, Versions::Latest)
             }
+            Lookup::AsOf { columns, keys, ts } => {
+                self.plan_temporal(&segs, columns, keys, Versions::Asof(*ts))
+            }
+            Lookup::Lookback {
+                columns,
+                keys,
+                lookback,
+            } => self.plan_lookback(specs, &segs, columns, keys, *lookback),
             Lookup::Between { column, lo, hi } => self.plan_between(&segs, column, lo, hi),
             Lookup::Window {
                 columns,
@@ -867,7 +902,7 @@ impl<S: StoreExt + ?Sized> Planner<S> {
         segs: &[SpecSegments],
         columns: &[String],
         keys: &[Vec<u8>],
-        asof: Option<i64>,
+        versions: Versions,
     ) -> Result<ScanPlan> {
         let types = self.column_types(columns)?;
         let (keys, spans) = non_null_probes(keys, &types)?;
@@ -906,17 +941,74 @@ impl<S: StoreExt + ?Sized> Planner<S> {
             .zip(&spans)
             .map(|(k, sp)| zero_variants(&project(k, sp, positions)))
             .collect();
-        let mut probes: Vec<Vec<u8>> = variants.iter().flatten().cloned().collect();
-        probes.sort_unstable();
-        probes.dedup();
         let readers = t
             .sources
             .iter()
             .map(|src| self.open_segment(&t.spec, src, false))
             .collect::<Result<Vec<_>>>()?;
-        let hits = self.temporal_hits(&readers, &probes, asof)?;
-        // Variants are one key under SQL equality: fold their hits.
-        let winners: Vec<Option<VersionHit>> = variants
+        let (selection, mut acc) = match versions {
+            Versions::Latest | Versions::Asof(_) => {
+                let winners = self.winners(&readers, &variants, versions.asof())?;
+                let acc: Vec<Option<RoaringBitmap>> = winners
+                    .iter()
+                    .map(|w| Some(w.as_ref().map(|h| h.row_groups.clone()).unwrap_or_default()))
+                    .collect();
+                (Selection::Winners(winners), acc)
+            }
+            Versions::Lookback(lookback) => {
+                let hits = self.chain_lookbacks(&readers, &variants, &ts_type, lookback)?;
+                let acc = lookback_rows(&hits);
+                (Selection::Lookbacks(hits), acc)
+            }
+        };
+        let others: Vec<(&SpecSegments, Serve)> = serving
+            .iter()
+            .filter(|(s, _)| !std::ptr::eq(*s, t))
+            .map(|(s, h)| (*s, h.clone()))
+            .collect();
+        self.intersect(&mut acc, &others, keys, &spans)?;
+        let selected = acc
+            .into_iter()
+            .flatten()
+            .fold(RoaringBitmap::new(), |u, b| u | b);
+        let residual = match &selection {
+            Selection::Winners(winners) => temporal_residual(
+                &t.spec,
+                ts_column,
+                &ts_type,
+                columns,
+                keys,
+                &variants,
+                winners,
+                versions.asof(),
+            )?,
+            Selection::Lookbacks(hits) => lookback_residual(
+                t.spec.columns(),
+                ts_column,
+                &ts_type,
+                columns,
+                keys,
+                &variants,
+                hits,
+            )?,
+        };
+        self.finish(&selected, residual)
+    }
+
+    /// Each key's index-wide winning version (latest, or at `asof`): every
+    /// zero variant of the key's projection is probed, and the variants'
+    /// hits fold into one, since they are one key under SQL equality.
+    fn winners<R: ReadAt>(
+        &self,
+        readers: &[SegmentReader<R>],
+        variants: &[Vec<Vec<u8>>],
+        asof: Option<i64>,
+    ) -> Result<Vec<Option<VersionHit>>> {
+        let mut probes: Vec<Vec<u8>> = variants.iter().flatten().cloned().collect();
+        probes.sort_unstable();
+        probes.dedup();
+        let hits = self.temporal_hits(readers, &probes, asof)?;
+        Ok(variants
             .iter()
             .map(|vs| {
                 vs.iter()
@@ -931,25 +1023,38 @@ impl<S: StoreExt + ?Sized> Planner<S> {
                         })
                     })
             })
-            .collect();
-        let mut acc: Vec<Option<RoaringBitmap>> = winners
+            .collect())
+    }
+
+    /// Each key's lookback window (module docs) from the version chains of
+    /// every segment of the spec, counting only live row groups; a chain
+    /// naming a row group the manifest never assigned is an error.
+    fn chain_lookbacks<R: ReadAt>(
+        &self,
+        readers: &[SegmentReader<R>],
+        variants: &[Vec<Vec<u8>>],
+        ts_type: &DataType,
+        lookback: i64,
+    ) -> Result<Vec<Option<LookbackHit>>> {
+        let probes = sorted_probes(variants);
+        let chains = temporal::chains(readers, &probes)?;
+        for chain in chains.values() {
+            let ids: RoaringBitmap = chain.versions().iter().map(|(_, rg)| rg.0).collect();
+            self.locator.check_known(&ids)?;
+        }
+        let floor = encoding::ts_min(ts_type)?;
+        let live = self.locator.live();
+        Ok(variants
             .iter()
-            .map(|w| Some(w.as_ref().map(|h| h.row_groups.clone()).unwrap_or_default()))
-            .collect();
-        let others: Vec<(&SpecSegments, Serve)> = serving
-            .iter()
-            .filter(|(s, _)| !std::ptr::eq(*s, t))
-            .map(|(s, h)| (*s, h.clone()))
-            .collect();
-        self.intersect(&mut acc, &others, keys, &spans)?;
-        let selected = acc
-            .into_iter()
-            .flatten()
-            .fold(RoaringBitmap::new(), |u, b| u | b);
-        let residual = temporal_residual(
-            &t.spec, ts_column, &ts_type, columns, keys, &variants, &winners, asof,
-        )?;
-        self.finish(&selected, residual)
+            .map(|vs| {
+                temporal::lookback(
+                    vs.iter().filter_map(|v| chains.get(v)),
+                    live,
+                    lookback,
+                    floor,
+                )
+            })
+            .collect())
     }
 
     /// Index-wide newest version per probe, from core's cross-segment
@@ -1327,109 +1432,169 @@ impl<S: StoreExt + ?Sized> Planner<S> {
             .map(|_| ts_column.clone()))
     }
 
-    /// The newest non-null `ts_column` time among `keys` (over `columns`)
-    /// in live row groups, from the complete per-key bounds sidecar on
-    /// `columns@ts_column` (each key's own maximum per row group, never a
-    /// row group's or the dataset's): the end of a `latest --lookback`
-    /// window without a temporal key. `None` when no key has a non-null
-    /// time. Ported from the Argon WP21 implementation's idea; its
-    /// dataset-wide footer maximum is not used.
-    pub fn newest_by_bounds(
+    /// How a lookback on `columns` reads each key's versions (see
+    /// [`Lookup::Lookback`]): the one temporal spec of `specs` whose columns
+    /// are all in `columns`, else the one complete `bounds` sidecar whose
+    /// key columns are. `None` when neither exists; several of the kind
+    /// chosen is an error, since each defines its own key and so its own
+    /// windows.
+    fn lookback_source(&self, specs: &[KeySpec], columns: &[String]) -> Result<Option<Versioned>> {
+        let mut temporal = specs.iter().filter_map(|s| match s {
+            KeySpec::Temporal {
+                columns: c,
+                ts_column,
+            } if c.iter().all(|x| columns.contains(x)) => Some(ts_column),
+            _ => None,
+        });
+        match (temporal.next(), temporal.next()) {
+            (Some(ts), None) => return Ok(Some(Versioned::Temporal(ts.clone()))),
+            (Some(_), Some(_)) => {
+                return Err(Error::KeySpec(
+                    "more than one temporal key spec serves this lookup; name one".into(),
+                ))
+            }
+            (None, _) => {}
+        }
+        let bounds: Vec<SidecarDef> = self
+            .declared_sidecars()
+            .into_iter()
+            .filter(|d| {
+                d.kind == SidecarKind::Bounds
+                    && d.columns.iter().all(|c| columns.contains(c))
+                    && self.sidecar_completeness(d).is_some()
+            })
+            .collect();
+        match <[SidecarDef; 1]>::try_from(bounds) {
+            Ok([one]) => Ok(Some(Versioned::Bounds(one))),
+            Err(none) if none.is_empty() => Ok(None),
+            Err(many) => {
+                Err(Error::KeySpec(format!(
+                "several per-key bounds ({}) serve a lookback on {columns:?}, each with its own \
+                 key and so its own windows; declare a temporal key on the key columns",
+                many.iter().map(SidecarDef::name).collect::<Vec<_>>().join(", ")
+            )))
+            }
+        }
+    }
+
+    /// The timestamp column a lookback on `columns` is measured on (see
+    /// [`Lookup::Lookback`]): the temporal spec's, else the bounds
+    /// sidecar's. `None` when no temporal spec or complete bounds sidecar
+    /// serves `columns`.
+    pub fn lookback_column(&self, specs: &[KeySpec], columns: &[String]) -> Result<Option<String>> {
+        Ok(self.lookback_source(specs, columns)?.map(|v| match v {
+            Versioned::Temporal(ts) => ts,
+            Versioned::Bounds(def) => def.time_columns[0].clone(),
+        }))
+    }
+
+    /// Each key's lookback window (see [`Lookup::Lookback`]).
+    fn plan_lookback(
         &self,
+        specs: &[KeySpec],
+        segs: &[SpecSegments],
         columns: &[String],
         keys: &[Vec<u8>],
-        ts_column: &str,
-    ) -> Result<Option<i64>> {
-        let probe = Lookup::Window {
-            columns: columns.to_vec(),
-            keys: Vec::new(),
-            ts_column: ts_column.to_string(),
-            lo: 0,
-            hi: 0,
-        };
-        let Some(def) = self.sidecars_for(&probe).into_iter().next() else {
+        lookback: i64,
+    ) -> Result<ScanPlan> {
+        if lookback < 0 {
             return Err(Error::KeySpec(format!(
-                "latest --lookback needs each key's newest time: declare a temporal key \
-                 `temporal:{c}@{ts_column}` or per-key bounds `exact:{c}@{ts_column}`",
-                c = columns.join(",")
+                "a lookback window cannot be negative ({lookback})"
             )));
-        };
+        }
+        match self.lookback_source(specs, columns)? {
+            Some(Versioned::Temporal(_)) => {
+                self.plan_temporal(segs, columns, keys, Versions::Lookback(lookback))
+            }
+            Some(Versioned::Bounds(def)) => {
+                self.plan_bounds_lookback(segs, &def, columns, keys, lookback)
+            }
+            None => Err(Error::KeySpec(format!(
+                "a lookback needs each key's newest time: declare a temporal key \
+                 `temporal:{c}@<ts>` or per-key bounds `exact:{c}@<ts>`",
+                c = columns.join(",")
+            ))),
+        }
+    }
+
+    /// Each key's lookback window from the bounds sidecar `def`: the key's
+    /// newest time is the greatest of its own per-row-group maxima over live
+    /// row groups, and its window keeps the live row groups where its own
+    /// time range reaches into `[newest − lookback, newest]`. Every serving
+    /// key spec narrows each key's row groups, as for any lookup.
+    fn plan_bounds_lookback(
+        &self,
+        segs: &[SpecSegments],
+        def: &SidecarDef,
+        columns: &[String],
+        keys: &[Vec<u8>],
+        lookback: i64,
+    ) -> Result<ScanPlan> {
         let types = self.column_types(columns)?;
         let (keys, spans) = non_null_probes(keys, &types)?;
+        let ts_column = &def.time_columns[0];
+        let ts_type = self
+            .column_types(std::slice::from_ref(ts_column))?
+            .remove(0)
+            .1;
+        let floor = encoding::ts_min(&ts_type)?;
         let positions: Vec<usize> = def
             .columns
             .iter()
             .map(|c| columns.iter().position(|x| x == c))
             .collect::<Option<_>>()
             .ok_or_else(|| Error::Other(format!("{} does not serve {columns:?}", def.name())))?;
-        let probes = sorted_probes(&key_variants(&keys, &spans, &positions));
+        let variants = key_variants(&keys, &spans, &positions);
+        let probes = sorted_probes(&variants);
         let live = self.locator.live();
-        let mut newest: Option<i64> = None;
-        for seg in self.sidecar_segments(&def) {
-            let r = self.open_sidecar(&def, seg)?;
-            for bounds in r.bounds(&probes)?.values() {
-                for b in bounds.iter().filter(|b| live.contains(b.rg.0)) {
-                    newest = Some(newest.map_or(b.max, |n| n.max(b.max)));
-                }
+        let mut ranges: BTreeMap<Vec<u8>, Vec<RgBounds>> = BTreeMap::new();
+        for seg in self.sidecar_segments(def) {
+            let r = self.open_sidecar(def, seg)?;
+            for (key, bounds) in r.bounds(&probes)? {
+                ranges
+                    .entry(key)
+                    .or_default()
+                    .extend(bounds.into_iter().filter(|b| live.contains(b.rg.0)));
             }
         }
-        Ok(newest)
-    }
-
-    /// The newest timestamp among the versions of `keys` (over `columns`),
-    /// index-wide over live row groups (invariant 5), through the one
-    /// complete temporal spec of `specs` serving `columns`: the end of a
-    /// `latest --lookback` window. `None` when no key has a non-null
-    /// timestamp (ADR 014).
-    pub fn newest_version(
-        &self,
-        specs: &[KeySpec],
-        columns: &[String],
-        keys: &[Vec<u8>],
-    ) -> Result<Option<i64>> {
-        let segs = self.resolve(specs, &[])?;
-        let types = self.column_types(columns)?;
-        let (keys, spans) = non_null_probes(keys, &types)?;
-        let serving = Self::serving(&segs, columns)?;
-        let mut temporal = serving
+        let hits: Vec<Option<LookbackHit>> = variants
             .iter()
-            .filter(|(s, _)| matches!(s.spec, KeySpec::Temporal { .. }));
-        let (t, positions) = match (temporal.next(), temporal.next()) {
-            (Some((t, Serve::Project(p))), None) => (*t, p),
-            (Some((t, Serve::Prefix)), None) => {
-                return Err(Error::KeySpec(format!(
-                    "latest needs every column of {} in the lookup",
-                    t.spec.name()
-                )))
-            }
-            (None, _) => {
-                return Err(Error::KeySpec(format!(
-                    "latest needs a temporal key spec serving {columns:?}"
-                )))
-            }
-            (Some(_), Some(_)) => {
-                return Err(Error::KeySpec(
-                    "more than one temporal key spec serves this lookup; name one".into(),
-                ))
-            }
-        };
-        let mut probes: Vec<Vec<u8>> = keys
-            .iter()
-            .zip(&spans)
-            .flat_map(|(k, sp)| zero_variants(&project(k, sp, positions)))
+            .map(|vs| {
+                let mine = || vs.iter().filter_map(|v| ranges.get(v)).flatten();
+                let hi = mine().map(|b| b.max).max()?;
+                let lo = hi.saturating_sub(lookback).max(floor);
+                Some(LookbackHit {
+                    lo,
+                    hi,
+                    row_groups: mine()
+                        .filter(|b| b.overlaps(lo, hi))
+                        .map(|b| b.rg.0)
+                        .collect(),
+                })
+            })
             .collect();
-        probes.sort_unstable();
-        probes.dedup();
-        let readers = t
-            .sources
+        // The sidecar bounds every key, so key specs that serve none of the
+        // lookup's columns only take no part.
+        let serving: Vec<(&SpecSegments, Serve)> = segs
             .iter()
-            .map(|src| self.open_segment(&t.spec, src, false))
-            .collect::<Result<Vec<_>>>()?;
-        Ok(self
-            .temporal_hits(&readers, &probes, None)?
-            .values()
-            .map(|h| h.ts)
-            .max())
+            .filter_map(|s| serve(&s.spec, columns).map(|v| (s, v)))
+            .collect();
+        let mut acc = lookback_rows(&hits);
+        self.intersect(&mut acc, &serving, &keys, &spans)?;
+        let selected = acc
+            .into_iter()
+            .flatten()
+            .fold(RoaringBitmap::new(), |u, b| u | b);
+        let residual = lookback_residual(
+            &def.columns,
+            ts_column,
+            &ts_type,
+            columns,
+            &keys,
+            &variants,
+            &hits,
+        )?;
+        self.finish(&selected, residual)
     }
 
     /// The bitemporal as-of (see [`Lookup::Bitemporal`]).
@@ -1810,6 +1975,87 @@ fn live_winner(
         }
     }
     best
+}
+
+/// Which versions of each key a temporal lookup asks for.
+#[derive(Clone, Copy)]
+enum Versions {
+    Latest,
+    Asof(i64),
+    /// Every version in the key's own lookback window of this length.
+    Lookback(i64),
+}
+
+impl Versions {
+    fn asof(self) -> Option<i64> {
+        match self {
+            Self::Asof(ts) => Some(ts),
+            Self::Latest | Self::Lookback(_) => None,
+        }
+    }
+}
+
+/// Where a lookback reads each key's versions (see [`Lookup::Lookback`]).
+enum Versioned {
+    /// The temporal spec on this timestamp column: its version chains.
+    Temporal(String),
+    /// This `bounds` sidecar: each key's own time range per row group.
+    Bounds(SidecarDef),
+}
+
+/// Per key, what a temporal lookup selected: its winning version, or its
+/// lookback window.
+enum Selection {
+    Winners(Vec<Option<VersionHit>>),
+    Lookbacks(Vec<Option<LookbackHit>>),
+}
+
+/// Each key's row groups in its lookback window (none without a window).
+fn lookback_rows(hits: &[Option<LookbackHit>]) -> Vec<Option<RoaringBitmap>> {
+    hits.iter()
+        .map(|w| Some(w.as_ref().map(|h| h.row_groups.clone()).unwrap_or_default()))
+        .collect()
+}
+
+/// The residual of a lookback (see the module docs): `In` over the keys
+/// with a window, then `NotOlderThan` with each key's window start over
+/// `key_columns`, the columns the windows are keyed on. Each window ends at
+/// the key's newest live version, so only the lower bound needs stating.
+fn lookback_residual(
+    key_columns: &[String],
+    ts_column: &str,
+    ts_type: &DataType,
+    columns: &[String],
+    keys: &[Vec<u8>],
+    variants: &[Vec<Vec<u8>>],
+    hits: &[Option<LookbackHit>],
+) -> Result<Predicate> {
+    let with_window = keys
+        .iter()
+        .zip(hits)
+        .filter(|(_, w)| w.is_some())
+        .map(|(k, _)| k);
+    let mut bounds: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
+    for (vs, w) in variants.iter().zip(hits) {
+        let Some(w) = w else { continue };
+        let lo = encode_ts(w.lo, ts_type)?;
+        for v in vs {
+            bounds.insert(v.clone(), lo.clone());
+        }
+    }
+    Ok(Predicate::And {
+        all: vec![
+            Predicate::In {
+                columns: columns.to_vec(),
+                values: expanded(with_window),
+            },
+            Predicate::NotOlderThan {
+                columns: key_columns.to_vec(),
+                ts_column: ts_column.to_string(),
+                bounds: bounds.into_iter().collect(),
+            },
+        ],
+    })
 }
 
 /// The residual of a latest or asof lookup (see the module docs).

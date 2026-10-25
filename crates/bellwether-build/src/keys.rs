@@ -56,11 +56,7 @@ fn element_shape(dt: &DataType) -> Result<(Vec<u8>, Option<usize>)> {
             Some(11),
         ),
         DataType::Dictionary(_, v) => return element_shape(v),
-        other => {
-            return Err(Error::KeySpec(format!(
-                "type {other} has no canonical encoding in encoding version 1"
-            )))
-        }
+        other => return Err(Error::KeySpec(encoding::no_encoding(other))),
     })
 }
 

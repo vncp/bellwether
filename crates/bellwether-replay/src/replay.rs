@@ -59,10 +59,11 @@
 //! lookup touches, and the cached transient indexes (bounded by
 //! [`TransientCache`]'s byte cap).
 
+use std::borrow::Cow;
 use std::ops::Deref;
 use std::sync::Arc;
 
-use arrow::datatypes::{DataType, Schema, SchemaRef};
+use arrow::datatypes::{Schema, SchemaRef};
 use bellwether_build::Planner;
 use bellwether_core::segment::validate_spec;
 use bellwether_ledger::{rfc3339::is_rfc3339, Ledger};
@@ -78,9 +79,9 @@ use crate::catalog::Catalog;
 use crate::error::{ReplayError, ReplayResult};
 use crate::keys::RunKeys;
 use crate::layout::{replay_layout, LayoutModel, LayoutReplay};
-use crate::plan::{run_cost, servable, serving_run, PlanSource, SegmentPlanner};
+use crate::plan::{asof_lookback_window, run_cost, serves_query, PlanSource, SegmentPlanner};
 use crate::transient::{CacheStats, TransientCache, TransientIndex, TransientLimits};
-use crate::workload::{KeySetSource, RunWindow, Workload};
+use crate::workload::{KeySetSource, RunQuery, Workload};
 
 /// Default byte cap of a replayer's transient cache: 2 GiB.
 pub const DEFAULT_CACHE_BYTES: u64 = 2 << 30;
@@ -282,37 +283,88 @@ impl<'a> Replayer<'a> {
         self.planner.with_transient(&extra)
     }
 
-    /// The specs of `specs` that serve `keys` (in `window`, if any), and the
-    /// verified plan over them (every row group when none serves).
+    /// The specs of `specs` that serve `keys` under `query`, and the verified
+    /// plan over them (every row group when none serves, or when a temporal
+    /// run has no serving temporal spec). An `asof` lookback run is planned
+    /// as its window on the serving temporal spec's timestamp column
+    /// ([`asof_lookback_window`]).
     fn verified_plan(
         &self,
         planner: &dyn PlanSource,
         specs: &[KeySpec],
         keys: &RunKeys,
-        window: Option<&RunWindow>,
+        query: &RunQuery,
     ) -> Result<ScanPlan> {
         check_types(&self.catalog, keys)?;
-        let serving = serving_run(specs, keys.columns(), window);
-        let plan = planner.plan(&serving, keys, window)?;
+        let query = match query {
+            RunQuery::Lookback {
+                asof: Some(at),
+                lookback,
+            } => {
+                asof_lookback_window(self.catalog.schema(), specs, keys.columns(), *at, *lookback)?
+                    .map(|w| Cow::Owned(RunQuery::Window(w)))
+            }
+            q => Some(Cow::Borrowed(q)),
+        };
+        let serving: Vec<KeySpec> = query.as_ref().map_or_else(Vec::new, |q| {
+            specs
+                .iter()
+                .filter(|s| serves_query(s, keys.columns(), q))
+                .cloned()
+                .collect()
+        });
+        let plan = match query {
+            Some(q)
+                if !q.is_temporal()
+                    || serving
+                        .iter()
+                        .any(|s| matches!(s, KeySpec::Temporal { .. })) =>
+            {
+                planner.plan_query(&serving, keys, &q)?
+            }
+            _ => planner.plan_query(&[], keys, &RunQuery::Locate)?,
+        };
         self.catalog.verify_plan(&plan)?;
         Ok(plan)
     }
 
-    /// The exact cost of one ad hoc key set under `specs`.
+    /// The exact cost of one ad hoc `locate` key set under `specs`.
     pub fn cost_of_keys(&self, specs: &[KeySpec], run_id: &str, keys: &RunKeys) -> Result<RunCost> {
+        self.cost_of_query(specs, run_id, keys, &RunQuery::Locate)
+    }
+
+    /// The exact cost of one ad hoc key set under `specs` and `query`.
+    pub fn cost_of_query(
+        &self,
+        specs: &[KeySpec],
+        run_id: &str,
+        keys: &RunKeys,
+        query: &RunQuery,
+    ) -> Result<RunCost> {
         let planner = self.planner_for(specs)?;
-        let plan = self.verified_plan(planner.as_ref(), specs, keys, None)?;
+        let plan = self.verified_plan(planner.as_ref(), specs, keys, query)?;
         Ok(run_cost(run_id, keys.len() as u64, &plan, true))
     }
 
-    /// The plan for one ad hoc key set under `specs`, as costed.
+    /// The plan for one ad hoc `locate` key set under `specs`, as costed.
     pub fn plan_of_keys(&self, specs: &[KeySpec], keys: &RunKeys) -> Result<ScanPlan> {
-        let planner = self.planner_for(specs)?;
-        self.verified_plan(planner.as_ref(), specs, keys, None)
+        self.plan_of_query(specs, keys, &RunQuery::Locate)
     }
 
-    /// Every run's exact cost under `specs`, in workload order; a window
-    /// run is planned in its window.
+    /// The plan for one ad hoc key set under `specs` and `query`, as costed.
+    pub fn plan_of_query(
+        &self,
+        specs: &[KeySpec],
+        keys: &RunKeys,
+        query: &RunQuery,
+    ) -> Result<ScanPlan> {
+        let planner = self.planner_for(specs)?;
+        self.verified_plan(planner.as_ref(), specs, keys, query)
+    }
+
+    /// Every run's exact cost under `specs`, in workload order, each run
+    /// planned under its recorded query kind (`locate`, `latest`, `asof`, a
+    /// lookback, or `window`).
     pub fn replay_specs(
         &self,
         specs: &[KeySpec],
@@ -325,7 +377,30 @@ impl<'a> Replayer<'a> {
             .iter()
             .map(|run| {
                 let rk = workload.run_keys(keys, run)?;
-                let plan = self.verified_plan(planner.as_ref(), specs, &rk, run.window.as_ref())?;
+                let query = run.query()?;
+                let plan = self.verified_plan(planner.as_ref(), specs, &rk, &query)?;
+                Ok(run_cost(&run.run_id, rk.len() as u64, &plan, true))
+            })
+            .collect()
+    }
+
+    /// Every run's exact cost under `specs` when every run is planned with
+    /// `query` (for example `RunQuery::Locate` to price point lookups on a
+    /// temporal workload), in workload order.
+    pub fn replay_specs_as(
+        &self,
+        specs: &[KeySpec],
+        workload: &Workload,
+        keys: &dyn KeySetSource,
+        query: &RunQuery,
+    ) -> Result<Vec<RunCost>> {
+        let planner = self.planner_for(specs)?;
+        workload
+            .runs()
+            .iter()
+            .map(|run| {
+                let rk = workload.run_keys(keys, run)?;
+                let plan = self.verified_plan(planner.as_ref(), specs, &rk, query)?;
                 Ok(run_cost(&run.run_id, rk.len() as u64, &plan, true))
             })
             .collect()
@@ -397,7 +472,7 @@ impl<'a> Replayer<'a> {
                 if !workload
                     .runs()
                     .iter()
-                    .any(|r| servable(spec, &r.columns).is_some())
+                    .any(|r| r.query().is_ok_and(|q| serves_query(spec, &r.columns, &q)))
                 {
                     return Err(ReplayError::SpecServesNoRun {
                         spec: spec.name(),
@@ -591,19 +666,40 @@ fn check_configuration(specs: &[KeySpec]) -> Result<()> {
 /// nullability): keys and transient segments must encode at the index's
 /// types.
 fn check_same_columns(source: &Schema, index: &Schema) -> Result<()> {
-    let columns = |s: &Schema| -> Vec<(String, DataType, bool)> {
-        s.fields()
-            .iter()
-            .map(|f| (f.name().clone(), f.data_type().clone(), f.is_nullable()))
-            .collect()
+    let describe = |f: Option<&std::sync::Arc<arrow::datatypes::Field>>| match f {
+        None => "no column".to_string(),
+        Some(f) => format!(
+            "{:?}, {} `{}`",
+            f.name(),
+            if f.is_nullable() {
+                "nullable"
+            } else {
+                "non-null"
+            },
+            f.data_type()
+        ),
     };
-    if columns(source) != columns(index) {
-        return Err(Error::Source(format!(
-            "the source reports the dataset schema {:?}, but the index was built under {:?}; \
-             replay encodes keys at the index's types",
-            columns(source),
-            columns(index)
-        )));
+    let n = source.fields().len().max(index.fields().len());
+    for i in 0..n {
+        let (s, x) = (source.fields().get(i), index.fields().get(i));
+        let same = match (s, x) {
+            (Some(s), Some(x)) => {
+                s.name() == x.name()
+                    && s.data_type() == x.data_type()
+                    && s.is_nullable() == x.is_nullable()
+            }
+            _ => false,
+        };
+        if !same {
+            return Err(Error::Source(format!(
+                "the dataset schema changed since the index was built: column {} is {} in \
+                 the files and {} in the index; replay encodes keys at the index's types, so \
+                 re-index the folder",
+                i + 1,
+                describe(s),
+                describe(x),
+            )));
+        }
     }
     Ok(())
 }
@@ -618,7 +714,7 @@ fn check_types(catalog: &Catalog, keys: &RunKeys) -> Result<()> {
             .data_type();
         if &bellwether_core::segment::ColumnType::of(declared)? != recorded {
             return Err(Error::KeySpec(format!(
-                "keys on {c:?} were recorded as {recorded:?}, but the dataset declares \
+                "keys on {c:?} were recorded as {recorded}, but the dataset declares \
                  {declared}; re-record the workload"
             )));
         }

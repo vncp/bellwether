@@ -137,6 +137,27 @@ struct WhyArgs {
     /// A workload recorded earlier, by its hash.
     #[arg(long, value_name = "HASH", conflicts_with = "from")]
     workload: Option<String>,
+    /// The lookup the keys are priced under: `locate` (rows holding a key),
+    /// `latest` (each key's newest version), or `asof` (the version current
+    /// at --at) [default: asof with --at, latest with --latest-by, else
+    /// locate].
+    #[arg(long, value_enum, value_name = "MODE")]
+    mode: Option<ModeArg>,
+    /// Timestamp (or date, time, or integer version) column that orders
+    /// versions, for `latest` and `asof` pricing.
+    #[arg(long, value_name = "COL", conflicts_with = "bench_workload")]
+    latest_by: Option<String>,
+    /// The instant for `asof` pricing (with `--latest-by`): RFC 3339, a date
+    /// (YYYY-MM-DD), or an integer in the timestamp column's unit.
+    #[arg(long, value_name = "INSTANT", requires = "latest_by")]
+    at: Option<String>,
+    /// Price every version in a window instead of one per key: the
+    /// versions in [at − N, at] (asof) or [newest − N, newest] (latest). A
+    /// whole number with a calendar unit: s, m, h, d, or w (252d, 36h;
+    /// trading-day calendars are out of scope); a bare integer for an
+    /// integer timestamp column.
+    #[arg(long, value_name = "N", requires = "latest_by")]
+    lookback: Option<String>,
     /// Candidate key columns for the profile, comma-separated [default:
     /// every id-like column].
     #[arg(long, value_name = "COLS", value_delimiter = ',')]
@@ -149,26 +170,37 @@ struct WhyArgs {
     /// of the current one (the files it recorded, its key specs).
     #[arg(long, value_name = "SEQUENCE")]
     at_manifest: Option<u64>,
-    /// Price the runs as lookups in this time window, START..END, both
-    /// inclusive (as `locate --window`).
-    #[arg(long, value_name = "START..END", conflicts_with_all = ["at", "workload"])]
-    window: Option<String>,
-    /// With --lookback: the end of the window the runs are priced in.
+    /// Price the runs as point lookups in this time window, START..END,
+    /// both inclusive (as `locate --window`). A latest or asof lookup takes
+    /// --lookback instead.
     #[arg(
         long,
-        value_name = "INSTANT",
-        requires = "lookback",
-        conflicts_with = "workload"
+        value_name = "START..END",
+        conflicts_with_all = ["latest_by", "workload"]
     )]
-    at: Option<String>,
-    /// With --at: price the runs as lookups from --at minus N to --at (as
-    /// `asof --at --lookback`): s, m, h, d (24 hours of UTC), or w (7 days).
-    #[arg(long, value_name = "N", requires = "at")]
-    lookback: Option<String>,
+    window: Option<String>,
     /// The window's time column [default: the one a window lookup would
     /// take].
     #[arg(long = "ts", value_name = "COLUMN")]
     ts: Option<String>,
+}
+
+/// `why --mode`.
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum ModeArg {
+    Locate,
+    Latest,
+    Asof,
+}
+
+impl From<ModeArg> for bellwether::LookupMode {
+    fn from(m: ModeArg) -> Self {
+        match m {
+            ModeArg::Locate => Self::Locate,
+            ModeArg::Latest => Self::Latest,
+            ModeArg::Asof => Self::Asof,
+        }
+    }
 }
 
 #[derive(Args)]
@@ -738,26 +770,26 @@ fn check_lookback(lookback: Option<&str>) -> Result<(), Failure> {
 
 fn why(g: &Global, out: &Out, a: &WhyArgs) -> Result<Outcome, Failure> {
     check_lookback(a.lookback.as_deref())?;
-    let window = match (&a.window, &a.at, &a.lookback) {
-        (Some(w), _, _) => {
+    let window = a
+        .window
+        .as_deref()
+        .map(|w| {
             let (from, to) =
                 bellwether::split_window(w).map_err(|e| Failure::Usage(e.to_string()))?;
-            Some(bellwether::TimeWindow::Range {
+            if bellwether::window_reversed(from, to) {
+                return Err(Failure::Usage(format!(
+                    "--window {w} starts after it ends; give the start first, START..END"
+                )));
+            }
+            Ok(bellwether::TimeWindow {
                 from: from.to_string(),
                 to: to.to_string(),
             })
-        }
-        (None, Some(at), Some(lookback)) => Some(bellwether::TimeWindow::Lookback {
-            at: at.clone(),
-            lookback: lookback.clone(),
-        }),
-        _ => None,
-    };
+        })
+        .transpose()?;
     if window.is_none() && a.ts.is_some() {
         return Err(Failure::Usage(
-            "--ts names a window's time column; give the window with --window START..END (or \
-             --at and --lookback)"
-                .into(),
+            "--ts names a window's time column; give the window with --window START..END".into(),
         ));
     }
     let request = bellwether::WhyRequest {
@@ -768,11 +800,30 @@ fn why(g: &Global, out: &Out, a: &WhyArgs) -> Result<Outcome, Failure> {
             .as_deref()
             .map(|w| hash(w, "workload"))
             .transpose()?,
+        mode: a.mode.map(Into::into),
+        latest_by: a.latest_by.clone(),
+        at: a.at.clone(),
+        lookback: a.lookback.clone(),
         window,
         ts_column: a.ts.clone(),
         columns: a.columns.clone(),
         max_candidates: a.max_candidates,
     };
+    let mode = request.lookup_mode().map_err(Failure::Usage)?;
+    if mode != bellwether::LookupMode::Locate && a.from.is_none() && a.workload.is_none() {
+        return Err(Failure::Usage(format!(
+            "--mode {} prices a workload's keys; pass --from <keys.parquet> (or --workload <hash>)",
+            mode.as_str()
+        )));
+    }
+    if request.window.is_some() && mode != bellwether::LookupMode::Locate {
+        return Err(Failure::Usage(
+            "--window prices point lookups in a time window; a latest or asof lookup takes \
+             --lookback instead (--latest-by <column> --lookback <length>, and --at <instant> \
+             for asof)"
+                .into(),
+        ));
+    }
     let r = engine_at(g, &a.root.root, a.at_manifest)?.why(&request)?;
     done(&r, human::why(&r, out), EXIT_OK)
 }

@@ -129,10 +129,11 @@ pub enum LookupKind {
         /// The time column.
         ts_column: String,
     },
-    /// Rows of the keys whose time column lies in the lookback window
-    /// `[end - lookback, end]`: `asof --at T --lookback N` ends at `T`;
-    /// `latest --lookback N` ends at the newest timestamp among the
-    /// requested keys' versions (index-wide, live row groups only).
+    /// The rows of the keys in a lookback window: `asof --at T --lookback
+    /// N` reads the window `[T - N, T]` on the time column; `latest
+    /// --lookback N` reads each key's own window `[newest - N, newest]`,
+    /// `newest` being that key's newest time (index-wide, live row groups
+    /// only).
     Lookback {
         /// The instant as given (`asof`), or `None` (`latest`).
         at: Option<String>,
@@ -141,12 +142,12 @@ pub enum LookupKind {
         /// The lookback in calendar seconds (`d` is 86,400 s, `w` 7 days),
         /// or `None` for a bare integer in an integer column's unit.
         lookback_seconds: Option<i64>,
-        /// The window's end in the time column's dataset unit; `None` when
-        /// `latest` found no requested key with a non-null timestamp (the
-        /// plan is then empty).
+        /// `asof`: the window's end in the time column's dataset unit.
+        /// `None` for `latest`, where each key's window ends at its own
+        /// newest time.
         end: Option<i64>,
-        /// The window's start in that unit (`end` minus the lookback,
-        /// clamped to the column's range); `None` with `end`.
+        /// `asof`: the window's start in that unit (`end` minus the
+        /// lookback, clamped to the column's range). `None` for `latest`.
         lo: Option<i64>,
         /// The time column.
         ts_column: String,
@@ -167,6 +168,18 @@ pub enum LookupKind {
         /// The known-time column.
         known_column: String,
     },
+}
+
+/// A lookback window on a `latest` or `asof` lookup: every version of each
+/// key in `[end − length, end]`, `end` being the asof instant or, for
+/// `latest`, the key's newest version.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LookbackWindow {
+    /// The window as given (`252d`, `36h`; an integer for an integer
+    /// timestamp column or a recorded workload).
+    pub given: String,
+    /// The window's length in the timestamp column's dataset unit.
+    pub length: i64,
 }
 
 /// What [`crate::Engine::locate`], [`crate::Engine::latest`], and

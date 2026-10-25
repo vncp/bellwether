@@ -151,7 +151,7 @@ fn key_types_are_part_of_the_cache_key_and_the_seam_refuses_a_mismatch() {
     let honest = planner
         .with_transient(&[at_scale_4])
         .unwrap()
-        .plan(std::slice::from_ref(&spec), &rk4, None)
+        .plan(std::slice::from_ref(&spec), &rk4)
         .unwrap();
     assert!(honest.row_groups_selected > 0);
     // Keys encoded at scale 4 are refused by a scale-3 planner.
@@ -160,7 +160,7 @@ fn key_types_are_part_of_the_cache_key_and_the_seam_refuses_a_mismatch() {
     let err = p3
         .with_transient(&[at_scale_3])
         .unwrap()
-        .plan(std::slice::from_ref(&spec), &rk4, None)
+        .plan(std::slice::from_ref(&spec), &rk4)
         .unwrap_err();
     assert!(
         matches!(&err, Error::KeySpec(m) if m.contains("dataset declares")),

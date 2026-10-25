@@ -157,15 +157,15 @@ fn an_incomplete_spec_or_a_coverage_gap_refuses_only_the_plans_that_list_it() {
         let rk = workload.run_keys(&keys, &workload.runs()[0]).unwrap();
         let listing = vec![all[0].clone(), bad.clone()];
         for (planner, name) in [(&wp4 as &dyn PlanSource, "build"), (&ours, "replay")] {
-            let err = planner.plan(&listing, &rk, None).unwrap_err();
+            let err = planner.plan(&listing, &rk).unwrap_err();
             assert!(
                 matches!(&err, Error::KeySpec(m) if m.contains(why)),
                 "{name}: {err}"
             );
         }
         assert_eq!(
-            PlanSource::plan(&wp4, &all[..1], &rk, None).unwrap(),
-            ours.plan(&all[..1], &rk, None).unwrap()
+            PlanSource::plan(&wp4, &all[..1], &rk).unwrap(),
+            ours.plan(&all[..1], &rk).unwrap()
         );
         // Named in a configuration, the incomplete spec is built
         // transiently and costed like any hypothetical spec.

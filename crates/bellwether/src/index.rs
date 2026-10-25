@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use arrow::datatypes::{DataType, TimeUnit};
 use bellwether_build::{BuildOptions, Builder, Lookup, PlanOrder};
+use bellwether_core::encoding;
 use bellwether_core::sidecar::{SidecarDef, SidecarKind};
 use bellwether_source::Partitioning;
 use bellwether_store::parse_rfc3339;
@@ -15,7 +16,7 @@ use bytes::Bytes;
 
 use crate::engine::{folder_changes, guard, schema_hint, Engine, FolderChanges, Pinned};
 use crate::keys::KeyFile;
-use crate::lookback::{window_start, Lookback};
+use crate::lookback::Lookback;
 use crate::results::{Cost, IndexResult, LookupKind, PlanResult, SidecarState, SpecState};
 use crate::spec::Declaration;
 
@@ -64,6 +65,7 @@ impl Engine {
             .partitioning
             .clone_from(&self.options().partitioning);
         options.sidecars = declared.iter().filter_map(|d| d.sidecar.clone()).collect();
+        options.exclude = self.excluded();
         let report =
             Builder::new(Arc::clone(self.store()?), "").build(self.root(), &specs, &options)?;
         let pinned = self.pin_required("index")?;
@@ -205,12 +207,16 @@ impl Engine {
         .map_err(schema_hint)
     }
 
-    /// [`Engine::asof_lookback`] ending at the newest timestamp among the
-    /// versions of the keys in `keys`, index-wide over live row groups
-    /// (invariant 5), through the one temporal spec serving the key columns
-    /// (whose timestamp is the window's column). One window serves every
-    /// key, so a key whose history ended earlier has fewer rows in it. When
-    /// no key has a non-null timestamp the plan is empty (ADR 014).
+    /// Plans every version of each key in `keys` in its own lookback window
+    /// `[newest − lookback, newest]`, `newest` being the key's newest
+    /// non-null time over live row groups (invariant 5): so a key whose
+    /// history ended earlier still has its last `lookback` of versions. The
+    /// versions come from the one temporal spec serving the key columns,
+    /// else from the one complete per-key bounds sidecar on them
+    /// (`exact:<cols>@<ts>`, each key's own time range per row group); with
+    /// neither the lookup is [`Error::NotIndexed`]. `lookback` is read as
+    /// [`Engine::asof_lookback`] reads it. A key with no non-null time has
+    /// no window (ADR 014). The residual is `In` and `NotOlderThan`.
     pub fn latest_lookback(&self, keys: &KeyFile, lookback: &str) -> Result<PlanResult> {
         guard(|| {
             self.plan_lookup(
@@ -232,7 +238,7 @@ impl Engine {
     /// files that arrived since are out of scope by design; a recorded file
     /// that changed or vanished is still refused.
     fn refuse_stale(&self, pinned: &Pinned, verb: &str) -> Result<()> {
-        let mut changes = folder_changes(self.root(), pinned, self.format())?;
+        let mut changes = folder_changes(self.root(), pinned, self.format(), &self.excluded())?;
         if self.options().at_manifest.is_some() {
             changes.untracked.clear();
         }
@@ -674,9 +680,9 @@ pub(crate) fn default_window_column(
 }
 
 /// The lookback lookup on `columns` (see [`Engine::asof_lookback`] and
-/// [`Engine::latest_lookback`]): the window `[end - lookback, end]` on the
-/// time column, `end` the instant `at` or, without one, the newest version
-/// of the keys.
+/// [`Engine::latest_lookback`]): with `at`, the window `[at - lookback, at]`
+/// on the time column; without, each key's own window
+/// ([`Lookup::Lookback`]).
 #[allow(clippy::too_many_arguments)]
 fn lookback_lookup(
     root: &str,
@@ -690,66 +696,78 @@ fn lookback_lookup(
     ts_column: Option<&str>,
 ) -> Result<(Lookup, LookupKind)> {
     let lb = Lookback::parse(lookback)?;
-    let ts_column = match (at, ts_column) {
-        (_, Some(c)) => c.to_string(),
-        // `latest`: the temporal key's timestamp, else the one time column
-        // of the complete per-key bounds sidecars on the keys.
-        (None, None) => match serving_temporal(root, verb, specs, columns) {
-            Ok(ts) => ts,
-            Err(e) => match bounds_time_columns(pinned, columns).as_slice() {
-                [one] => one.clone(),
-                _ => return Err(e),
-            },
-        },
-        (Some(_), None) => {
-            let temporal: Vec<&String> = specs
-                .iter()
-                .filter_map(|s| match s {
-                    KeySpec::Temporal {
-                        columns: c,
-                        ts_column,
-                    } if c.iter().all(|x| columns.contains(x)) => Some(ts_column),
-                    _ => None,
-                })
-                .collect();
-            match temporal.as_slice() {
-                [one] => (*one).clone(),
-                [] => window_column(pinned, specs, columns)?,
-                _ => serving_temporal(root, verb, specs, columns)?,
-            }
-        }
-    };
-    let ts_type = pinned
-        .planner
-        .column_types(std::slice::from_ref(&ts_column))?
-        .remove(0)
-        .1;
-    let n = lb.in_unit(&ts_column, &ts_type)?;
-    let end = match at {
-        Some(a) => Some(instant_in_unit("at", a, &ts_column, &ts_type)?),
-        None if is_temporal_ts(specs, columns, &ts_column) => {
-            pinned.planner.newest_version(specs, columns, &tuples)?
-        }
-        None => pinned
+    let column_type = |c: &String| -> Result<DataType> {
+        Ok(pinned
             .planner
-            .newest_by_bounds(columns, &tuples, &ts_column)?,
+            .column_types(std::slice::from_ref(c))?
+            .remove(0)
+            .1)
     };
-    // No key has a version: an empty window (no row), never a full scan.
-    let (lo, hi) = end.map_or((1, 0), |e| (window_start(e, n, &ts_type), e));
+    let Some(at) = at else {
+        // `latest`: the temporal key's timestamp, else the per-key bounds'
+        // (the planner reads each key's versions from the same one).
+        let ts_column = pinned
+            .planner
+            .lookback_column(specs, columns)?
+            .ok_or_else(|| Error::NotIndexed {
+                root: root.to_string(),
+                operation: verb,
+                needs: Some(format!("temporal:{}@<timestamp column>", columns.join(","))),
+            })?;
+        let n = lb.in_unit(&ts_column, &column_type(&ts_column)?)?;
+        return Ok((
+            Lookup::Lookback {
+                columns: columns.to_vec(),
+                keys: tuples,
+                lookback: n,
+            },
+            LookupKind::Lookback {
+                at: None,
+                lookback: lb.as_given().to_string(),
+                lookback_seconds: lb.seconds(),
+                end: None,
+                lo: None,
+                ts_column,
+            },
+        ));
+    };
+    let ts_column = if let Some(c) = ts_column {
+        c.to_string()
+    } else {
+        let temporal: Vec<&String> = specs
+            .iter()
+            .filter_map(|s| match s {
+                KeySpec::Temporal {
+                    columns: c,
+                    ts_column,
+                } if c.iter().all(|x| columns.contains(x)) => Some(ts_column),
+                _ => None,
+            })
+            .collect();
+        match temporal.as_slice() {
+            [one] => (*one).clone(),
+            [] => window_column(pinned, specs, columns)?,
+            _ => serving_temporal(root, verb, specs, columns)?,
+        }
+    };
+    let ts_type = column_type(&ts_column)?;
+    let n = lb.in_unit(&ts_column, &ts_type)?;
+    let end = instant_in_unit("at", at, &ts_column, &ts_type)?;
+    let lo = end.saturating_sub(n).max(encoding::ts_min(&ts_type)?);
     Ok((
         Lookup::Window {
             columns: columns.to_vec(),
             keys: tuples,
             ts_column: ts_column.clone(),
             lo,
-            hi,
+            hi: end,
         },
         LookupKind::Lookback {
-            at: at.map(str::to_string),
+            at: Some(at.to_string()),
             lookback: lb.as_given().to_string(),
             lookback_seconds: lb.seconds(),
-            end,
-            lo: end.map(|_| lo),
+            end: Some(end),
+            lo: Some(lo),
             ts_column,
         },
     ))
@@ -843,13 +861,6 @@ fn not_complete_yet(root: &str, operation: &'static str, excluded: &[KeySpec]) -
                 .join(", "),
         ),
     }
-}
-
-/// Whether `ts_column` is the timestamp of the one temporal spec serving
-/// `columns`.
-fn is_temporal_ts(specs: &[KeySpec], columns: &[String], ts_column: &str) -> bool {
-    // Only whether one serves matters; the refusal's root and verb are unused.
-    serving_temporal("", "latest", specs, columns).is_ok_and(|t| t == ts_column)
 }
 
 /// The timestamp column of the one complete temporal spec whose columns are

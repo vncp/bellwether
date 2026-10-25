@@ -8,8 +8,10 @@
 //!   sequence (`Planner::completeness`, which recomputes coverage from the
 //!   live segments, ADR 012). An incomplete declared spec is not one the
 //!   index can plan with.
-//! - [`PlanSource::plan`] is `Planner::plan` over a `Lookup::Keys` of the
-//!   run's canonical tuples, or a `Lookup::Window` for a window run. The
+//! - [`PlanSource::plan_query`] is `Planner::plan` over the run's lookup:
+//!   `Lookup::Keys`, `Latest`, `AsOf`, or `Lookback` of the run's canonical
+//!   tuples, or a `Lookup::Window` for a window run and an `asof` lookback
+//!   run ([`crate::asof_lookback_window`]). The
 //!   planner refuses a listed spec that is not declared exactly or not
 //!   complete, and nothing else: an incomplete spec the plan does not use
 //!   is no error.
@@ -28,20 +30,39 @@ use bellwether_types::{Error, KeySpec, Result, ScanPlan};
 use roaring::RoaringBitmap;
 
 use crate::keys::RunKeys;
-use crate::plan::{check_key_types, PlanSource};
+use crate::plan::{check_key_types, planned_query, PlanSource};
 use crate::transient::TransientIndex;
-use crate::workload::RunWindow;
+use crate::workload::RunQuery;
 
-/// The run's keys as the build planner's lookup: canonical tuples over the
-/// run's columns, at the dataset types, in the run's window if it has one.
-fn lookup(keys: &RunKeys, window: Option<&RunWindow>) -> Lookup {
+/// The run's keys and query kind as the build planner's lookup: canonical
+/// tuples over the run's columns, at the dataset types. `query` is as
+/// planned ([`planned_query`]): an `asof` lookback run is already its
+/// window.
+fn lookup(keys: &RunKeys, query: &RunQuery) -> Lookup {
     let columns = keys.columns().to_vec();
-    let keys = keys.tuples().map(<[u8]>::to_vec).collect();
-    match window {
-        None => Lookup::Keys { columns, keys },
-        Some(w) => Lookup::Window {
+    let tuples: Vec<Vec<u8>> = keys.tuples().map(<[u8]>::to_vec).collect();
+    match query {
+        RunQuery::Locate => Lookup::Keys {
             columns,
-            keys,
+            keys: tuples,
+        },
+        RunQuery::Latest => Lookup::Latest {
+            columns,
+            keys: tuples,
+        },
+        RunQuery::Asof { ts } => Lookup::AsOf {
+            columns,
+            keys: tuples,
+            ts: *ts,
+        },
+        RunQuery::Lookback { lookback, .. } => Lookup::Lookback {
+            columns,
+            keys: tuples,
+            lookback: *lookback,
+        },
+        RunQuery::Window(w) => Lookup::Window {
+            columns,
+            keys: tuples,
             ts_column: w.ts_column.clone(),
             lo: w.lo,
             hi: w.hi,
@@ -111,14 +132,10 @@ where
             .collect()
     }
 
-    fn plan(
-        &self,
-        specs: &[KeySpec],
-        keys: &RunKeys,
-        window: Option<&RunWindow>,
-    ) -> Result<ScanPlan> {
+    fn plan_query(&self, specs: &[KeySpec], keys: &RunKeys, query: &RunQuery) -> Result<ScanPlan> {
         check_key_types(self.schema(), keys)?;
-        Planner::plan(self, specs, &lookup(keys, window))
+        let query = planned_query(self.schema(), specs, keys.columns(), query)?;
+        Planner::plan(self, specs, &lookup(keys, &query))
     }
 
     fn with_transient(
@@ -157,15 +174,11 @@ where
         out
     }
 
-    fn plan(
-        &self,
-        specs: &[KeySpec],
-        keys: &RunKeys,
-        window: Option<&RunWindow>,
-    ) -> Result<ScanPlan> {
+    fn plan_query(&self, specs: &[KeySpec], keys: &RunKeys, query: &RunQuery) -> Result<ScanPlan> {
         check_key_types(self.planner.schema(), keys)?;
+        let query = planned_query(self.planner.schema(), specs, keys.columns(), query)?;
         self.planner
-            .plan_with_transient(specs, &lookup(keys, window), &self.extra)
+            .plan_with_transient(specs, &lookup(keys, &query), &self.extra)
     }
 
     fn with_transient(
