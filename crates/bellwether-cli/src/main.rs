@@ -16,9 +16,10 @@ use std::io::{IsTerminal, Write};
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use bellwether::types::{Error, Hash, ProposalBody, RewriteShape};
-use bellwether::{Engine, EngineOptions, KeyFile, SourceFormat};
-use clap::{Args, Parser, Subcommand, ValueEnum};
+use bellwether::types::{Error, Hash, HashKind, ProposalBody, RewriteShape};
+use bellwether::{Engine, EngineOptions, KeyFile};
+use bellwether_mcp::args::OptionsError;
+use clap::{Args, Parser, Subcommand};
 use serde::Serialize;
 
 /// Exit code for success.
@@ -55,49 +56,10 @@ pub(crate) struct Global {
     /// Print nothing on success; errors still go to stderr.
     #[arg(long, short, global = true, conflicts_with = "json")]
     quiet: bool,
-    /// Index location: a path or a store URL [default: <ROOT>/.bellwether].
-    #[arg(long, global = true, value_name = "PATH|URL")]
-    index: Option<String>,
-    /// Kind of files under the root.
-    #[arg(long, global = true, value_enum, default_value_t = FormatArg::Parquet)]
-    format: FormatArg,
-    /// Chunk size in bytes for CSV and JSON lines files seen for the first
-    /// time.
-    #[arg(long, global = true, value_name = "BYTES")]
-    chunk_size: Option<u64>,
-    /// The dataset schema as a JSON file (a list of {"name", "type",
-    /// "nullable"} with Arrow type spellings), instead of inferring it from
-    /// the first file; needed when files differ in decimal scale or time
-    /// unit.
-    #[arg(long, global = true, value_name = "FILE")]
-    schema: Option<PathBuf>,
-    /// Which bytes a file fingerprint hashes when a new index is built:
-    /// the last 64 KiB (default) or the whole file, which also catches an
-    /// in-place patch that keeps size and mtime.
-    #[arg(long, global = true, value_enum)]
-    fingerprint_policy: Option<PolicyArg>,
-    /// A fixed RFC 3339 time for every record's `created_at` and for ages, so
-    /// runs are byte-reproducible (testing and audits).
-    #[arg(long, global = true, value_name = "RFC3339", hide = true)]
-    clock: Option<String>,
-}
-
-#[derive(Clone, Copy, ValueEnum)]
-enum PolicyArg {
-    /// BLAKE3 of the last 64 KiB.
-    Tail64k,
-    /// BLAKE3 of the whole file.
-    Full,
-}
-
-#[derive(Clone, Copy, ValueEnum)]
-enum FormatArg {
-    /// Parquet files.
-    Parquet,
-    /// Comma-separated files with a header row.
-    Csv,
-    /// JSON lines.
-    Jsonl,
+    /// How the engine opens the data folder: the same flags as
+    /// `bellwether-mcp`, from one definition.
+    #[command(flatten)]
+    engine: bellwether_mcp::EngineArgs,
 }
 
 #[derive(Subcommand)]
@@ -122,6 +84,12 @@ enum Command {
     },
     /// Render every receipt and profile from the ledger as one HTML file.
     Report(ReportArgs),
+    /// Read the ledger: the newest findings per root, every receipt with its
+    /// chain status, or the scorecard per rule id (the MCP resources).
+    Ledger {
+        #[command(subcommand)]
+        command: LedgerCommand,
+    },
     #[command(flatten)]
     Verify(verify_cmds::VerifyCommand),
     /// The benchmark (WP10): generate corpora and workloads, run the
@@ -130,14 +98,23 @@ enum Command {
         #[command(subcommand)]
         command: bench::BenchCommand,
     },
-    /// Serve the engine over MCP (arrives with WP12).
-    Mcp,
+    /// Serve the engine over MCP on stdin and stdout, bound to one data
+    /// folder (the same server as `bellwether-mcp`).
+    Mcp(McpArgs),
 }
 
 #[derive(Args)]
 pub(crate) struct RootArg {
     /// The folder of data files.
     pub(crate) root: String,
+}
+
+#[derive(Args)]
+struct McpArgs {
+    #[command(flatten)]
+    root: RootArg,
+    #[command(flatten)]
+    budget: bellwether_mcp::BudgetArgs,
 }
 
 #[derive(Args)]
@@ -266,6 +243,17 @@ struct ProposeArgs {
 }
 
 #[derive(Subcommand)]
+enum LedgerCommand {
+    /// The newest profile Evidence per data root, with its lints and the
+    /// receipts citing it.
+    Findings(RootArg),
+    /// Every receipt, newest first, with its chain status.
+    Receipts(RootArg),
+    /// Per rule id: proposals, certificates passed and failed, receipts.
+    Scorecard(RootArg),
+}
+
+#[derive(Subcommand)]
 enum ReceiptCommand {
     /// Walk a receipt back through its certificate, replay, proposal, and
     /// evidence.
@@ -339,7 +327,14 @@ fn main() -> ExitCode {
             ExitCode::from(EXIT_USAGE)
         }
         Err(Failure::Engine(e)) => {
-            eprintln!("bellwether: {e}");
+            match hint(&e) {
+                Some(h) => eprintln!("bellwether: {e}; {h}"),
+                None => eprintln!("bellwether: {e}"),
+            }
+            ExitCode::from(EXIT_ENGINE)
+        }
+        Err(Failure::Server(msg)) => {
+            eprintln!("bellwether: {msg}");
             ExitCode::from(EXIT_ENGINE)
         }
     }
@@ -348,11 +343,68 @@ fn main() -> ExitCode {
 pub(crate) enum Failure {
     Usage(String),
     Engine(Error),
+    /// The MCP server's transport failed after the engine opened.
+    Server(String),
 }
 
 impl From<Error> for Failure {
     fn from(e: Error) -> Self {
         Self::Engine(e)
+    }
+}
+
+/// The next step for a typed engine error, in this CLI's flags and
+/// commands. The facade's message says what happened in words that name no
+/// surface; the MCP server adds its own next step in its field names.
+fn hint(e: &Error) -> Option<String> {
+    let hash_arg = |k: &HashKind| match k {
+        HashKind::Evidence => {
+            "cite an evidence hash `bellwether why` printed for this index \
+                               (--evidence)"
+        }
+        HashKind::Proposal => {
+            "pass a proposal hash `bellwether propose` or `bellwether why` printed (--proposal)"
+        }
+        HashKind::Certificate => {
+            "pass the certificate hash `bellwether fix --verify-only` printed (--certificate)"
+        }
+        HashKind::Receipt => "pass a receipt hash `bellwether fix` printed",
+        HashKind::Workload => {
+            "pass the workload hash `bellwether why --from <keys.parquet>` printed (--workload)"
+        }
+    };
+    match e {
+        Error::RecordNotFound { kind, .. } | Error::WrongKind { expected: kind, .. } => {
+            Some(hash_arg(kind).to_string())
+        }
+        Error::NoWorkload { field, .. } => Some(
+            if *field == "rewrite" {
+                "pass --before-output <dir> --after-output <dir> --key <cols>"
+            } else {
+                "pass --workload <hash> (bellwether why prints it)"
+            }
+            .to_string(),
+        ),
+        Error::NotIndexed { root, needs, .. } => Some(format!(
+            "run `bellwether index {root} --key {}` first",
+            needs.as_deref().unwrap_or("<spec>")
+        )),
+        Error::InvalidArgument { field, .. } => {
+            let flag = match *field {
+                "by" => "--by",
+                "evidence" => "--evidence",
+                "at" => "--at",
+                "keys" => "--from or --keys",
+                "key_columns" => "--key",
+                "cluster_by" => "--layout",
+                "shape" => "--before, --after, and --invariant",
+                "workload" => "--from, --bench-workload, or --workload",
+                "rewrite" => "--before-output and --after-output",
+                _ => return None,
+            };
+            Some(format!("check {flag}"))
+        }
+        _ => None,
     }
 }
 
@@ -369,37 +421,15 @@ pub(crate) fn done<T: Serialize>(result: &T, human: String, code: u8) -> Result<
 }
 
 pub(crate) fn engine(global: &Global, root: &str) -> Result<Engine, Failure> {
-    let format = match global.format {
-        FormatArg::Parquet => SourceFormat::Parquet,
-        FormatArg::Csv => SourceFormat::Csv {
-            delimiter: b',',
-            has_header: true,
-        },
-        FormatArg::Jsonl => SourceFormat::JsonLines,
-    };
-    let schema = match &global.schema {
-        None => None,
-        Some(p) => {
-            let text = std::fs::read_to_string(p).map_err(|e| {
-                Failure::Usage(format!("cannot read the schema file {} ({e})", p.display()))
-            })?;
-            Some(bellwether::schema_from_json(&text)?)
-        }
-    };
-    Ok(Engine::open(
-        root,
-        EngineOptions {
-            index: global.index.clone(),
-            format,
-            chunk_size: global.chunk_size,
-            schema,
-            fingerprint_policy: global.fingerprint_policy.map(|p| match p {
-                PolicyArg::Tail64k => bellwether::FingerprintPolicy::Tail64K,
-                PolicyArg::Full => bellwether::FingerprintPolicy::Full,
-            }),
-            clock: global.clock.clone(),
-        },
-    )?)
+    Ok(Engine::open(root, engine_options(global)?)?)
+}
+
+/// The engine options the global flags name.
+fn engine_options(global: &Global) -> Result<EngineOptions, Failure> {
+    global.engine.options().map_err(|e| match e {
+        OptionsError::SchemaFile(m) => Failure::Usage(m),
+        OptionsError::Engine(e) => Failure::Engine(e),
+    })
 }
 
 pub(crate) fn hash(s: &str, what: &str) -> Result<Hash, Failure> {
@@ -453,6 +483,20 @@ fn run(cli: &Cli, out: &Out) -> Result<Outcome, Failure> {
             let r = engine(g, &root.root)?.receipt(&h)?;
             done(&r, human::receipt(&r, out), EXIT_OK)
         }
+        Command::Ledger { command } => match command {
+            LedgerCommand::Findings(root) => {
+                let r = engine(g, &root.root)?.findings()?;
+                done(&r, human::findings(&r, out), EXIT_OK)
+            }
+            LedgerCommand::Receipts(root) => {
+                let r = engine(g, &root.root)?.receipts()?;
+                done(&r, human::receipts(&r, out), EXIT_OK)
+            }
+            LedgerCommand::Scorecard(root) => {
+                let r = engine(g, &root.root)?.scorecard()?;
+                done(&r, human::scorecard(&r, out), EXIT_OK)
+            }
+        },
         Command::Report(a) => {
             let r = engine(g, &a.root.root)?.report(&a.html)?;
             done(&r, human::report(&r, out), EXIT_OK)
@@ -485,9 +529,19 @@ fn run(cli: &Cli, out: &Out) -> Result<Outcome, Failure> {
             };
             done(&w, human, code)
         }
-        Command::Mcp => Err(Failure::Usage(
-            "the MCP server arrives with WP12 (bellwether-mcp); until then use the CLI".into(),
-        )),
+        Command::Mcp(a) => {
+            let config = bellwether_mcp::Config {
+                root: a.root.root.clone(),
+                engine: engine_options(g)?,
+                budget: a.budget.into(),
+            };
+            // stdout is the protocol channel: nothing else is printed there.
+            match bellwether_mcp::serve_stdio(&config) {
+                Ok(()) => Ok(Outcome::Done(String::new(), String::new(), EXIT_OK)),
+                Err(bellwether_mcp::ServeError::Open(e)) => Err(Failure::Engine(e)),
+                Err(bellwether_mcp::ServeError::Transport(m)) => Err(Failure::Server(m)),
+            }
+        }
     }
 }
 
@@ -522,7 +576,8 @@ fn propose(g: &Global, out: &Out, a: &ProposeArgs) -> Result<Outcome, Failure> {
         .collect::<Result<Vec<_>, _>>()?;
     let r = engine(g, &a.root.root)?.propose(body, &evidence, &a.by)?;
     let code = match r {
-        bellwether::ProposeResult::Written { .. } => EXIT_OK,
+        bellwether::ProposeResult::Written { .. }
+        | bellwether::ProposeResult::WouldWrite { .. } => EXIT_OK,
         bellwether::ProposeResult::Refused { .. } => EXIT_REFUSED,
     };
     done(&r, human::propose(&r, out), code)

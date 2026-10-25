@@ -1666,7 +1666,6 @@ fn defect_4_fix_certificate_refuses_a_proposal_that_saves_nothing() {
             "--workload",
             &workload,
             "--verify-only",
-            "--allow-no-gain",
         ],
         0,
     ));

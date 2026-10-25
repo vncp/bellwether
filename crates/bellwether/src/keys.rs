@@ -50,12 +50,13 @@ impl KeyFile {
             return Ok(c.clone());
         }
         let path = &self.path;
-        let fail = |e: &dyn std::fmt::Display| {
-            Error::Source(format!(
+        let fail = |e: &dyn std::fmt::Display| Error::InvalidArgument {
+            field: "keys",
+            reason: format!(
                 "cannot read the key file {} ({e}); pass a Parquet file whose columns are the \
                  key columns",
                 path.display()
-            ))
+            ),
         };
         let file = File::open(path).map_err(|e| fail(&e))?;
         let meta = bellwether_source::load_reader_metadata(&file).map_err(|e| fail(&e))?;
@@ -72,12 +73,13 @@ impl KeyFile {
     /// Memory: the key set, which a run holds anyway (ADR 018).
     pub(crate) fn read(&self) -> Result<RecordBatch> {
         let path = &self.path;
-        let fail = |e: &dyn std::fmt::Display| {
-            Error::Source(format!(
+        let fail = |e: &dyn std::fmt::Display| Error::InvalidArgument {
+            field: "keys",
+            reason: format!(
                 "cannot read the key file {} ({e}); pass a Parquet file whose columns are the \
                  key columns",
                 path.display()
-            ))
+            ),
         };
         let file = File::open(path).map_err(|e| fail(&e))?;
         let meta = bellwether_source::load_reader_metadata(&file).map_err(|e| fail(&e))?;
@@ -92,25 +94,31 @@ impl KeyFile {
                 .collect(),
         };
         if names.is_empty() {
-            return Err(Error::KeySpec(format!(
-                "the key file {} has no columns; it needs one column per key column",
-                path.display()
-            )));
+            return Err(Error::InvalidArgument {
+                field: "keys",
+                reason: format!(
+                    "the key file {} has no columns; it needs one column per key column",
+                    path.display()
+                ),
+            });
         }
         let mut leaves = Vec::with_capacity(names.len());
         for n in &names {
-            let i = file_schema.index_of(n).map_err(|_| {
-                Error::KeySpec(format!(
-                    "the key file {} has no column {n:?} (it has {:?}); name its key columns \
-                     with --key",
-                    path.display(),
-                    file_schema
-                        .fields()
-                        .iter()
-                        .map(|f| f.name().as_str())
-                        .collect::<Vec<_>>()
-                ))
-            })?;
+            let i = file_schema
+                .index_of(n)
+                .map_err(|_| Error::InvalidArgument {
+                    field: "key_columns",
+                    reason: format!(
+                        "the key file {} has no column {n:?} (it has {:?}); name key columns the \
+                         file has",
+                        path.display(),
+                        file_schema
+                            .fields()
+                            .iter()
+                            .map(|f| f.name().as_str())
+                            .collect::<Vec<_>>()
+                    ),
+                })?;
             leaves.push(i);
         }
         let mask = ProjectionMask::roots(builder.parquet_schema(), leaves);

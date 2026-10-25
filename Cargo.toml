@@ -7,6 +7,7 @@ members = [
     "crates/bellwether-cli",
     "crates/bellwether-core",
     "crates/bellwether-ledger",
+    "crates/bellwether-mcp",
     "crates/bellwether-profile",
     "crates/bellwether-replay",
     "crates/bellwether-source",
@@ -14,8 +15,6 @@ members = [
     "crates/bellwether-types",
     "crates/bellwether-verify",
 ]
-# Crates are added to `members` as their work package lands:
-#   crates/bellwether-mcp
 
 [workspace.package]
 version = "0.1.0"
@@ -49,6 +48,10 @@ url = "2"
 tempfile = "3"
 proptest = "1"
 criterion = "0.5"
+# JSON Schema derives for the contract (the `schema` feature of
+# bellwether-types, off by default) and the MCP server's tool schemas; the
+# same major as rmcp's.
+schemars = { version = "1.2", default-features = false, features = ["derive", "std"] }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

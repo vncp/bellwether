@@ -8,7 +8,7 @@ mod common;
 use std::collections::BTreeSet;
 
 use bellwether::types::{
-    EvidenceBody, Hash, KeySpec, Predicate, ProposalBody, Record, RewriteShape,
+    Error, EvidenceBody, Hash, KeySpec, Predicate, ProposalBody, Record, RewriteShape,
 };
 use bellwether::{spec, Engine, EngineOptions, KeyFile, LookupKind, Written};
 use common::{ledger_bytes, ledger_corpus, oracle, write_keys};
@@ -82,7 +82,18 @@ fn locate_plans_every_row_group_holding_a_key_and_records_the_plan() {
     let err = e
         .locate(&KeyFile::new(dir.path().join("k.parquet")))
         .unwrap_err();
-    assert!(err.to_string().contains("bellwether index"), "{err}");
+    assert!(
+        matches!(
+            &err,
+            Error::NotIndexed {
+                operation: "locate",
+                needs: None,
+                ..
+            }
+        ),
+        "{err}"
+    );
+    assert!(err.to_string().contains("is not indexed"), "{err}");
 
     let idx = e.index(&[spec::parse("exact:id").unwrap()]).unwrap();
     assert_eq!(idx.committed, Some(1));

@@ -111,6 +111,10 @@ fn exit_codes_follow_the_contract() {
     run(&["receipt", "show", path(&data), "not-a-hash"], 2);
     run(&["mcp"], 2);
     // 4: engine errors.
+    // The MCP server opens the engine before the handshake: a missing root
+    // fails with nothing on stdout.
+    let out = run(&["mcp", path(&dir.path().join("missing"))], 4);
+    assert!(out.is_empty(), "{out}");
     run(
         &[
             "index",

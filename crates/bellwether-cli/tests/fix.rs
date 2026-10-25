@@ -47,6 +47,23 @@ fn sequence(index: &Path) -> u64 {
     m["sequence"].as_u64().unwrap()
 }
 
+/// Every file under `dir` with its bytes, sorted by path.
+fn objects(dir: &Path) -> std::collections::BTreeMap<std::path::PathBuf, Vec<u8>> {
+    let mut out = std::collections::BTreeMap::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        for e in std::fs::read_dir(&d).unwrap() {
+            let p = e.unwrap().path();
+            if p.is_dir() {
+                stack.push(p);
+            } else {
+                out.insert(p.clone(), std::fs::read(&p).unwrap());
+            }
+        }
+    }
+    out
+}
+
 #[test]
 fn fix_on_a_planted_batch_stamp_corpus_writes_an_intact_receipt() {
     let dir = tempfile::tempdir().unwrap();
@@ -379,32 +396,9 @@ fn a_key_that_is_already_complete_is_refused_never_attested() {
     );
     let proposal = p.trim().trim_start_matches("proposal ").to_string();
     let before = sequence(&index);
-    // The key is current, so its replay predicts no saving: the gain gate
-    // refuses first, citing that replay ...
-    let out = run(
-        &[
-            "--json",
-            "fix",
-            path(&data),
-            "--proposal",
-            &proposal,
-            "--workload",
-            &workload.to_hex(),
-        ],
-        3,
-    );
-    let r: FixResult = typed(&out);
-    assert!(
-        matches!(
-            r.outcome,
-            FixOutcome::Refused {
-                refusal: Refusal::NothingToGain { .. }
-            }
-        ),
-        "{:?}",
-        r.outcome
-    );
-    // ... and past the gate the apply finds nothing to do.
+    let stored = objects(&index);
+    // The key is complete, which is checked before scoring: nothing to do,
+    // even with the gain gate off.
     let out = run(
         &[
             "--json",
@@ -427,6 +421,9 @@ fn a_key_that_is_already_complete_is_refused_never_attested() {
     ));
     assert_eq!(sequence(&index), before);
     assert_eq!(receipts(&index), 0);
+    // Refused before it is scored: no Replay, plan, or Certificate either
+    // (no fixed clock, so a rewritten record would differ).
+    assert!(objects(&index) == stored, "the refused fix wrote");
 }
 
 #[test]

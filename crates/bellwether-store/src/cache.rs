@@ -79,6 +79,17 @@ impl<S: StoreExt + ?Sized> Cache<S> {
     /// The cached payload for `input_hash` and its age, or `None` on a miss.
     /// Store I/O errors other than absence are returned as errors.
     pub fn get_cached(&self, input_hash: &Hash) -> Result<Option<(Bytes, Duration)>> {
+        self.get_cached_at(input_hash, chrono::Utc::now())
+    }
+
+    /// [`Self::get_cached`] with the age measured to `now` instead of the
+    /// system clock (a caller's fixed clock); zero when the entry is stamped
+    /// after `now`.
+    pub fn get_cached_at(
+        &self,
+        input_hash: &Hash,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Option<(Bytes, Duration)>> {
         let Some((meta_bytes, _)) = self.store.get_opt(&self.meta_path(input_hash))? else {
             return Ok(None);
         };
@@ -94,7 +105,7 @@ impl<S: StoreExt + ?Sized> Cache<S> {
         let Ok(created) = parse_rfc3339(&meta.created_at) else {
             return Ok(None);
         };
-        let age = (chrono::Utc::now() - created).to_std().unwrap_or_default();
+        let age = (now - created).to_std().unwrap_or_default();
         Ok(Some((payload, age)))
     }
 }

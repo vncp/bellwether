@@ -77,6 +77,11 @@ jobs:
         run: |
           BELLWETHER_OBSERVE_LATENCY_CORPUS="$GITHUB_WORKSPACE/benches/out/replay-small" \
             cargo test --release -p bellwether --test latency -- --nocapture --test-threads=1
+      - name: the MCP observe tier (observe.why, in process and over stdio) meets 100 ms on replay-small
+        if: steps.bench.outputs.present == 'true'
+        run: |
+          BELLWETHER_OBSERVE_LATENCY_CORPUS="$GITHUB_WORKSPACE/benches/out/replay-small" \
+            cargo test --release -p bellwether-mcp --test latency -- --nocapture --test-threads=1
       - name: skipped
         if: steps.bench.outputs.present != 'true'
         run: echo "bench crate not present yet; nothing to assert"

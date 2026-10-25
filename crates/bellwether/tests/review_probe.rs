@@ -579,9 +579,12 @@ fn probe_duplicate_key_columns_and_odd_inputs_do_not_panic() {
         0,
         "the floor exact:id is already current"
     );
-    // asof without a temporal spec says what to do.
-    let err = e.asof(&KeyFile::new(&kf), "5").unwrap_err().to_string();
-    assert!(err.contains("bellwether index"), "{err}");
+    // asof without a temporal spec says which spec it needs.
+    let err = e.asof(&KeyFile::new(&kf), "5").unwrap_err();
+    assert!(
+        matches!(&err, bellwether::types::Error::NotIndexed { needs: Some(s), .. } if s.starts_with("temporal:id@")),
+        "{err}"
+    );
     // index location as a file:// URL and a relative path
     let idx = dir.path().join("elsewhere");
     let e2 = Engine::open(

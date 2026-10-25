@@ -473,11 +473,15 @@ impl Engine {
             req.workload.is_some(),
         ];
         if given.iter().filter(|g| **g).count() > 1 {
-            return Err(Error::Other(
-                "give one workload: a key file (--from), a bench workload directory \
-                 (--bench-workload), or a recorded workload hash (--workload)"
+            return Err(Error::InvalidArgument {
+                field: "workload",
+                reason: "give one workload: a key file, a bench workload directory, or a \
+                         recorded workload hash, not several"
                     .into(),
-            ));
+            });
+        }
+        if let Some(cols) = &req.columns {
+            self.check_columns(&cols.iter().collect::<Vec<_>>())?;
         }
         let mode = req.lookup_mode().map_err(Error::KeySpec)?;
         if mode != LookupMode::Locate && req.keys.is_none() && req.workload.is_none() {
@@ -652,13 +656,7 @@ impl Engine {
         resolved: Option<ResolvedTemporal>,
     ) -> Result<(Workload, Option<ResolvedTemporal>)> {
         if let Some(h) = &req.workload {
-            let w = Workload::load(cache, h).map_err(|e| {
-                Error::Other(format!(
-                    "workload {h} is not in the cache at {} ({e}); record it again with \
-                     `bellwether why --from <keys.parquet>`",
-                    self.index_location()
-                ))
-            })?;
+            let w = crate::fix::load_workload(self, cache, h)?;
             let temporal = match resolved {
                 Some(t) => {
                     // The runs are priced as recorded: a `--latest-by` that
