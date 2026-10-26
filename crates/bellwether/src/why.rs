@@ -167,6 +167,11 @@ pub struct WhyRequest {
     /// The keys one run looked up, as a key file. Recorded as a one-run
     /// workload (run id `keys`).
     pub keys: Option<KeyFile>,
+    /// With `keys`: further key files, each recorded as one more run of the
+    /// same lookup (run ids `keys-2`, `keys-3`, ...): several runs of one
+    /// query, so a detector that reads repetition (`R-join-1`) sees it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub more_keys: Vec<KeyFile>,
     /// A recorded workload in the benchmark's format (a directory holding
     /// `workload.json`, or the file itself).
     pub bench_workload: Option<PathBuf>,
@@ -258,6 +263,7 @@ impl Default for WhyRequest {
     fn default() -> Self {
         Self {
             keys: None,
+            more_keys: Vec::new(),
             bench_workload: None,
             workload: None,
             mode: None,
@@ -935,10 +941,25 @@ impl Engine {
         // The list-membership detector (B4) likewise, citing the key set or
         // workload it read.
         let membership = self.membership_lints(req, &replayer, &current_specs)?;
+        // The repeated semi-join detector (B3) likewise, citing the
+        // workload it read.
+        let join_lints = match &recorded {
+            Some((w, _)) => bellwether_profile::lints::repeated_semijoins(
+                &semijoin_uses(w, &self.cache()?)?,
+                &crate::join::folder_name(self.root()),
+                &current_specs,
+            ),
+            None => Vec::new(),
+        };
+        let join_input = match &recorded {
+            Some((w, _)) if !join_lints.is_empty() && text_input.is_none() => Some(w.hash()),
+            _ => None,
+        };
         let mut extra_lints = sketch_lints;
         extra_lints.extend(text_lints);
         extra_lints.extend(membership.lints);
-        let mut cites: Vec<Hash> = text_input.into_iter().collect();
+        extra_lints.extend(join_lints);
+        let mut cites: Vec<Hash> = text_input.into_iter().chain(join_input).collect();
         cites.extend(membership.inputs);
         let (profile, evidence) = self.profile(
             req,
@@ -1448,6 +1469,14 @@ impl Engine {
             req.workload.is_some(),
             !req.text.is_empty(),
         ];
+        if !req.more_keys.is_empty() && req.keys.is_none() {
+            return Err(Error::InvalidArgument {
+                field: "more_keys",
+                reason: "further key files are more runs of the first; give the first as the key \
+                         file (--from) too"
+                    .into(),
+            });
+        }
         if given.iter().filter(|g| **g).count() > 1 {
             return Err(Error::InvalidArgument {
                 field: "workload",
@@ -1767,20 +1796,23 @@ impl Engine {
             return Ok((w, temporal));
         }
         let recorder = WorkloadRecorder::new(cache, std::sync::Arc::clone(replayer.schema()));
-        if let Some(keys) = &req.keys {
-            let batch = keys.read()?;
+        if let Some(first) = &req.keys {
+            let files: Vec<&KeyFile> = std::iter::once(first).chain(&req.more_keys).collect();
+            let batches = files.iter().map(|k| k.read()).collect::<Result<Vec<_>>>()?;
             if let Some(t) = &resolved {
-                for f in batch.schema().fields() {
-                    if f.name() == &t.ts_column {
-                        return Err(Error::KeySpec(format!(
-                            "--latest-by column {:?} is also a key column of the lookup; give a \
-                             separate timestamp column or select key columns with --key",
-                            t.ts_column
-                        )));
+                for batch in &batches {
+                    for f in batch.schema().fields() {
+                        if f.name() == &t.ts_column {
+                            return Err(Error::KeySpec(format!(
+                                "--latest-by column {:?} is also a key column of the lookup; \
+                                 give a separate timestamp column or select key columns with --key",
+                                t.ts_column
+                            )));
+                        }
                     }
                 }
             }
-            let columns: Vec<String> = batch
+            let columns: Vec<String> = batches[0]
                 .schema()
                 .fields()
                 .iter()
@@ -1796,7 +1828,14 @@ impl Engine {
                     .as_ref()
                     .map_or(RunQuery::Locate, |t| t.query.clone()),
             };
-            recorder.record_query("keys", KeyInput::Batch(&batch), query, None)?;
+            for (i, batch) in batches.iter().enumerate() {
+                let id = if i == 0 {
+                    "keys".to_string()
+                } else {
+                    format!("keys-{}", i + 1)
+                };
+                recorder.record_query(&id, KeyInput::Batch(batch), query.clone(), None)?;
+            }
             return Ok((recorder.finish()?, resolved));
         }
         if !req.text.is_empty() {
@@ -2410,6 +2449,10 @@ impl Engine {
             .filter(|r| {
                 let query = match (temporal, r.query()) {
                     (Some(t), Ok(RunQuery::Locate)) => t.query.clone(),
+                    // A semi-join (B3) is priced only with an exact key on
+                    // each side (the pair index needs both), so each step
+                    // is served without a join key too.
+                    (_, Ok(RunQuery::SemiJoin(_))) => return false,
                     (_, Ok(q)) => q,
                     (_, Err(_)) => return true,
                 };
@@ -2573,6 +2616,34 @@ fn queried_spread(
         sample_size: None,
         quantile_error: None,
     }))
+}
+
+/// The semi-join runs of `w` per column pair (B3), for `R-join-1`.
+fn semijoin_uses(
+    w: &Workload,
+    cache: &Cache<ObjectStoreBackend>,
+) -> Result<Vec<bellwether_profile::lints::SemiJoinUse>> {
+    let mut by: BTreeMap<(Vec<String>, RunJoin), (u64, u64)> = BTreeMap::new();
+    for r in w.runs() {
+        if let Ok(RunQuery::SemiJoin(j)) = r.query() {
+            let keys = w.run_keys(cache, r)?.len() as u64;
+            let e = by.entry((r.columns.clone(), j)).or_default();
+            e.0 += 1;
+            e.1 = e.1.max(keys);
+        }
+    }
+    Ok(by
+        .into_iter()
+        .map(
+            |((columns, j), (runs, keys_max))| bellwether_profile::lints::SemiJoinUse {
+                columns,
+                right: j.right,
+                right_columns: j.right_columns,
+                runs,
+                keys_max,
+            },
+        )
+        .collect())
 }
 
 /// The semi-join run a `semijoin` request records (B3): its right side

@@ -467,6 +467,11 @@ impl Server {
                     ));
                 }
                 let request = WhyRequest {
+                    more_keys: a
+                        .more_keys
+                        .into_iter()
+                        .map(|k| key_file(k, a.key_columns.clone()))
+                        .collect(),
                     keys: a.keys.map(|k| key_file(k, a.key_columns)),
                     bench_workload: None,
                     workload: a.workload,

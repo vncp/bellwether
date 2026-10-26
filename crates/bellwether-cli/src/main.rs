@@ -186,9 +186,11 @@ struct McpArgs {
 struct WhyArgs {
     #[command(flatten)]
     root: RootArg,
-    /// A Parquet file of keys one run looked up.
+    /// A Parquet file of keys one run looked up; repeat for several runs
+    /// (recorded as runs keys, keys-2, keys-3, ...), each priced under the
+    /// same lookup.
     #[arg(long, value_name = "FILE")]
-    from: Option<PathBuf>,
+    from: Vec<PathBuf>,
     /// Key columns to take from --from, comma-separated [default: all].
     #[arg(long, value_name = "COLS", requires = "from", value_delimiter = ',')]
     key: Option<Vec<String>>,
@@ -1237,7 +1239,7 @@ fn why(g: &Global, out: &Out, a: &WhyArgs) -> Result<Outcome, Failure> {
                  --lookback <length>"
             )));
         }
-        if a.from.is_none() {
+        if a.from.is_empty() {
             return Err(Failure::Usage(
                 "--ts with --at and --lookback records the key file's run as that window; pass \
                  --from <keys.parquet>"
@@ -1246,7 +1248,13 @@ fn why(g: &Global, out: &Out, a: &WhyArgs) -> Result<Outcome, Failure> {
         }
     }
     let request = bellwether::WhyRequest {
-        keys: a.from.as_ref().map(|p| key_file(p, a.key.as_ref())),
+        keys: a.from.first().map(|p| key_file(p, a.key.as_ref())),
+        more_keys: a
+            .from
+            .iter()
+            .skip(1)
+            .map(|p| key_file(p, a.key.as_ref()))
+            .collect(),
         bench_workload: a.bench_workload.clone(),
         workload: a
             .workload
@@ -1273,7 +1281,7 @@ fn why(g: &Global, out: &Out, a: &WhyArgs) -> Result<Outcome, Failure> {
     } else {
         bellwether::LookupMode::Locate
     };
-    if mode != bellwether::LookupMode::Locate && a.from.is_none() && a.workload.is_none() {
+    if mode != bellwether::LookupMode::Locate && a.from.is_empty() && a.workload.is_none() {
         return Err(Failure::Usage(if mode.text_op().is_some() {
             format!(
                 "--mode {} prices a key file of one string column's values as a text lookup; \

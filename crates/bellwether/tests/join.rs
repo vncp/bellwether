@@ -584,3 +584,70 @@ fn why_semijoin_refuses_what_it_cannot_price() {
         "{err:?}"
     );
 }
+
+#[test]
+fn repeated_semijoins_without_a_join_key_raise_r_join_1() {
+    let dir = tempfile::tempdir().unwrap();
+    let (l, r) = corpus(dir.path());
+    engine(&r).index(&[exact("paid_order")]).unwrap();
+    let left = engine(&l);
+    left.index(&[exact("order_id")]).unwrap();
+    let (a, b) = (dir.path().join("a.parquet"), dir.path().join("b.parquet"));
+    write_keys(&a, &[Some(5), Some(160)]);
+    write_keys(&b, &[Some(200), Some(400), Some(410)]);
+    let req = |more: bool| WhyRequest {
+        keys: Some(KeyFile::new(&a)),
+        more_keys: if more {
+            vec![KeyFile::new(&b)]
+        } else {
+            Vec::new()
+        },
+        mode: Some(LookupMode::SemiJoin),
+        join: Some("payables.paid_order".into()),
+        ..WhyRequest::default()
+    };
+    let rules = |w: &bellwether::WhyReport| {
+        w.profile
+            .lints
+            .iter()
+            .filter(|l| l.rule == "R-join-1")
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    // Two runs on the pair, no join key: fires, naming the key and the
+    // command, and the Evidence cites the workload it read.
+    let w = left.why(&req(true)).unwrap();
+    assert_eq!(w.workload.as_ref().unwrap().runs, 2);
+    let lints = rules(&w);
+    assert_eq!(lints.len(), 1, "{:?}", w.profile.lints);
+    assert!(
+        lints[0].message.contains(&join().name()),
+        "{}",
+        lints[0].message
+    );
+    assert!(
+        lints[0].message.starts_with("2 recorded runs"),
+        "{}",
+        lints[0].message
+    );
+    assert!(w
+        .evidence
+        .evidence
+        .provenance
+        .inputs
+        .contains(&w.workload.as_ref().unwrap().hash));
+    // One run: not repeated.
+    assert!(rules(&left.why(&req(false)).unwrap()).is_empty());
+    // With the join key: silent.
+    left.index(&[join()]).unwrap();
+    assert!(rules(&left.why(&req(true)).unwrap()).is_empty());
+    // A locate workload on the same column: silent.
+    let plain = left
+        .why(&WhyRequest {
+            keys: Some(KeyFile::new(&a)),
+            more_keys: vec![KeyFile::new(&b)],
+            ..WhyRequest::default()
+        })
+        .unwrap();
+    assert!(rules(&plain).is_empty());
+}

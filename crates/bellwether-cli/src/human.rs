@@ -788,9 +788,11 @@ pub(crate) fn why(r: &bellwether::WhyReport, out: &Out, fix_command: &str) -> St
         let kind = match &w.lookup {
             Some(LookupKind::Latest) => "latest".to_string(),
             Some(LookupKind::Asof { at, .. }) => format!("asof {at}"),
-            Some(k @ LookupKind::TextRuns { .. }) => lookup_label(k),
-            // `why` prices locate (in a window or not), latest, asof, or
-            // text lookups.
+            Some(k @ (LookupKind::TextRuns { .. } | LookupKind::SemiJoin { .. })) => {
+                lookup_label(k)
+            }
+            // `why` prices locate (in a window or not), latest, asof, text
+            // lookups, or semi-joins.
             _ => return None,
         };
         Some(match &w.lookback {
@@ -839,6 +841,13 @@ pub(crate) fn why(r: &bellwether::WhyReport, out: &Out, fix_command: &str) -> St
                 "  window: rows with {} in {}..={} (the column's unit); every cost below plans \
                  that window",
                 win.ts_column, win.lo, win.hi
+            );
+        }
+        if let Some(LookupKind::SemiJoin { right, .. }) = &w.lookup {
+            let _ = writeln!(
+                s,
+                "  each cost below sums both steps of the semi-join: this folder (the dataset \
+                 row), then {right} beside it; without a join key each step locates every key"
             );
         }
         let labels: Vec<String> = r.candidates.iter().map(|c| label(&c.spec)).collect();
@@ -960,6 +969,12 @@ pub(crate) fn why(r: &bellwether::WhyReport, out: &Out, fix_command: &str) -> St
                         _ => "floor: only row groups holding a value".to_string(),
                     });
                 }
+                (CandidateOrigin::Workload, KeySpec::Join { .. }, _) => {
+                    notes.push(
+                        "floor (semijoin): only row groups holding a key both datasets hold"
+                            .to_string(),
+                    );
+                }
                 (CandidateOrigin::Workload, _, Some(_)) => {
                     notes.push("floor (locate): only row groups holding a key".to_string());
                 }
@@ -1045,6 +1060,15 @@ pub(crate) fn why(r: &bellwether::WhyReport, out: &Out, fix_command: &str) -> St
             CulpritReason::Lint {
                 rule, confidence, ..
             } => format!("lint {rule} (confidence {confidence:.2})"),
+            CulpritReason::NoIndexServes
+                if r.workload
+                    .as_ref()
+                    .is_some_and(|w| matches!(w.lookup, Some(LookupKind::SemiJoin { .. }))) =>
+            {
+                "no join key serves this semi-join, so each step locates every asked key in its \
+                 own dataset, whether the other dataset holds it or not"
+                    .to_string()
+            }
             CulpritReason::NoIndexServes => {
                 let span = r.dataset.row_groups * r.workload.as_ref().map_or(1, |w| w.runs);
                 let has_window = r.workload.as_ref().is_some_and(|w| !w.windows.is_empty());
@@ -1920,11 +1944,17 @@ pub(crate) fn semijoin(r: &bellwether::SemiJoinResult, out: &Out) -> String {
         let _ = writeln!(s, "    plan evidence {}", step.evidence.hash);
     }
     if r.matched < r.keys {
+        let other = r.keys - r.matched;
+        let (is, them) = if other == 1 {
+            ("is", "it")
+        } else {
+            ("are", "them")
+        };
         let _ = writeln!(
             s,
-            "  the other {} are missing from one dataset or both, so a semi-join keeps no row of \
-             them and neither step reads them",
-            count(r.keys - r.matched, "key", "keys")
+            "  the other {} {is} missing from one dataset or both, so a semi-join keeps no row of \
+             {them} and neither step reads {them}",
+            count(other, "key", "keys")
         );
     }
     s

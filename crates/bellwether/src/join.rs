@@ -653,7 +653,7 @@ impl Engine {
     }
 }
 
-fn folder_name(root: &str) -> String {
+pub(crate) fn folder_name(root: &str) -> String {
     Path::new(root)
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())

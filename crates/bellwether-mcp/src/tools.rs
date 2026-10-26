@@ -273,6 +273,11 @@ pub struct ScoreWhy {
     /// Key columns to take from `keys`, in tuple order; default: all.
     #[serde(default)]
     pub key_columns: Option<Vec<String>>,
+    /// Further key files (read, never written), each recorded as one more
+    /// run of the same lookup as `keys` (`why --from` repeated); default:
+    /// none.
+    #[serde(default)]
+    pub more_keys: Vec<String>,
     /// A workload recorded earlier, by its hash.
     #[serde(default)]
     pub workload: Option<Hash>,

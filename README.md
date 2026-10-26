@@ -287,7 +287,7 @@ The trust boundary at the wire: a proposal has no score field, so the input sche
 
 | Surface | What it can do | Worst case |
 |---|---|---|
-| `observe.*` (`observe.why` with no keys, `observe.profile`, `observe.locate`, `observe.asof`, `observe.text`) | read footers and the index; write the profile Evidence and cache entries | the agent reads evidence |
+| `observe.*` (`observe.why` with no keys, `observe.profile`, `observe.locate`, `observe.asof`, `observe.text`, `observe.semijoin`, `observe.join_overlap`, `observe.join_verify`) | read footers and the index; write the profile Evidence and cache entries | the agent reads evidence |
 | `score.*` (`score.why` with keys, a workload, or text lookups, `score.verify`, `score.record` with a query engine) | ask the engine to replay and verify; the engine writes its own Proposals, Replays, plan Evidence, and Certificates; charged to the session budget; with `--twin-of`, the engine submits a keys query or a rewrite's queries read-only to the one engine the human named | the agent spends its budget and is refused with `budget_exceeded`; a cost or verdict field in the arguments is refused with `caller_supplied_cost` |
 | `propose.*` | write a `Proposal` with no score, or nothing with `dry_run` | the ledger holds a bad proposal that scores poorly and never gets a Certificate |
 | `apply.receipt` | take a Certificate hash only; the engine applies and then writes the Receipt | the agent asks to apply something unverified and is told no, with a typed code |
