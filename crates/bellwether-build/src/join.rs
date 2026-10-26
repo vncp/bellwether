@@ -6,30 +6,34 @@
 //! A join key is declared on the left dataset like any key spec, but it is
 //! not built row group by row group: [`Builder::refresh_join`] builds it
 //! whole from both datasets' complete exact keys on the join columns (core's
-//! `join::build_pair`), in one commit to the left index that pins the right
-//! manifest's sequence (ADR 020) in the segment's header and its manifest
-//! entry, and records the key complete. A later left commit keeps it
-//! complete while its pair still covers every live left row group; once the
-//! left's row groups change it is incomplete (stale on the left), and once
-//! the right commits again it is stale on the right ([`JoinState`]). A stale
-//! key is never planned with: a semi-join planned from it could miss rows
-//! on the side that moved (invariant 1 per side).
+//! `join::build_pair`), split by key range into segments capped like any
+//! other (ADR 018), in one commit to the left index that pins what it was
+//! built from in every segment's header and manifest entry (ADR 020): the
+//! right manifest by sequence and content hash, and the left's live
+//! row-group set. It is recorded complete. A later left commit keeps it
+//! complete only while the left's live row groups are exactly that set;
+//! once a left file is added, changed, or removed it is incomplete (stale
+//! on the left), and once the right dataset's current manifest is another
+//! (a later commit, or the same sequence of an index deleted and rebuilt)
+//! it is stale on the right ([`JoinState`]). A stale key is never planned
+//! with: a semi-join planned from it could miss rows on the side that
+//! moved (invariant 1 per side).
 
 use std::cell::Cell;
 use std::sync::Arc;
 
-use bellwether_core::join::{self as cj, OverlapStats, Pins, Side};
-use bellwether_core::segment::{ColumnType, SegmentReader, WriterOptions};
+use bellwether_core::join::{self as cj, OverlapStats, PairCaps, Pins, Side};
+use bellwether_core::segment::{ColumnType, EncodedSegment, SegmentReader, WriterOptions};
 use bellwether_store::{
-    commit_with, CommitOptions, Extra, Manifest, RowGroupRange, SegmentRef, Snapshot,
-    StagedSegments, StoreExt,
+    commit_with, segment_path, CommitOptions, Extra, JoinPin, Manifest, RowGroupRange, SegmentRef,
+    Snapshot, StagedSegments, StoreExt,
 };
-use bellwether_types::{Error, KeySpec, Predicate, Quantity, Result, ScanPlan};
+use bellwether_types::{Error, Hash, KeySpec, Predicate, Quantity, Result, ScanPlan};
 use bytes::Bytes;
 use roaring::RoaringBitmap;
 
 use crate::build::Builder;
-use crate::config::columns_to_schema;
+use crate::config::{columns_to_schema, DEFAULT_MAX_SEGMENT_BYTES, DEFAULT_MAX_SEGMENT_KEYS};
 use crate::coverage::{completeness, live_ids, segment_of};
 use crate::plan::Planner;
 use crate::seg_io::SegmentBytes;
@@ -38,11 +42,40 @@ use crate::seg_io::SegmentBytes;
 /// commit changed the left's row groups or schema under it.
 const MAX_JOIN_RESTARTS: u32 = 8;
 
+/// The pair segment caps a build uses by default: the build's own segment
+/// caps ([`DEFAULT_MAX_SEGMENT_KEYS`] shared keys, [`DEFAULT_MAX_SEGMENT_BYTES`]
+/// bytes).
+pub const DEFAULT_PAIR_CAPS: PairCaps = PairCaps {
+    max_keys: DEFAULT_MAX_SEGMENT_KEYS,
+    max_bytes: DEFAULT_MAX_SEGMENT_BYTES,
+};
+
+/// A dataset's current manifest as a join key pins its right side: by
+/// sequence and by content hash ([`Snapshot::content_hash`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RightManifest {
+    /// The manifest sequence.
+    pub sequence: u64,
+    /// BLAKE3 of the manifest bytes as stored.
+    pub hash: Hash,
+}
+
+impl RightManifest {
+    /// The manifest `snapshot` pins.
+    #[must_use]
+    pub fn of<S: StoreExt + ?Sized>(snapshot: &Snapshot<S>) -> Self {
+        Self {
+            sequence: snapshot.sequence(),
+            hash: snapshot.content_hash(),
+        }
+    }
+}
+
 /// Whether a declared join key can be planned with.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum JoinState {
-    /// Built over every live left row group, and pinned to the right
-    /// manifest's current sequence.
+    /// Built over the left's live row groups as they are, and pinned to the
+    /// right dataset's current manifest.
     Fresh {
         /// The left sequence at which the key became complete.
         complete_at: u64,
@@ -51,8 +84,8 @@ pub enum JoinState {
     },
     /// Declared, and no pair index built yet.
     NotBuilt,
-    /// The left's row groups changed since the pair index was built: it no
-    /// longer covers every live left row group.
+    /// The left's live row groups changed since the pair index was built
+    /// (a file added, changed, or removed).
     LeftChanged {
         /// The left sequence whose exact keys the pair was built from.
         built_from: u64,
@@ -64,6 +97,16 @@ pub enum JoinState {
         /// The right sequence the pair is pinned to.
         pinned: u64,
         /// The right's current sequence.
+        current: u64,
+    },
+    /// The right dataset's current manifest is not the one the pair was
+    /// built at, though its sequence is not later: the right index was
+    /// deleted and rebuilt (or its manifest replaced), so its row-group ids
+    /// may name other rows.
+    RightRebuilt {
+        /// The right sequence the pair is pinned to.
+        pinned: u64,
+        /// The right's current sequence (another manifest).
         current: u64,
     },
 }
@@ -82,11 +125,17 @@ impl JoinState {
                 current,
             } => format!(
                 "stale on the left: built from the left's sequence {built_from}, and the left's \
-                 row groups changed by sequence {current}"
+                 row groups changed by sequence {current} (a file added, changed, or removed)"
             ),
             Self::RightAdvanced { pinned, current } => format!(
                 "stale on the right: pinned to the right dataset's sequence {pinned}, which is \
                  now at {current}"
+            ),
+            Self::RightRebuilt { pinned, current } => format!(
+                "stale on the right: pinned to the right dataset's manifest at sequence {pinned}, \
+                 and the right index now holds another manifest at sequence {current}: it was \
+                 deleted and rebuilt (or its manifest replaced), so its row-group ids may name \
+                 other rows"
             ),
         }
     }
@@ -111,8 +160,17 @@ pub enum JoinRefresh {
         left_exact: KeySpec,
         /// The exact key the right side was read from.
         right_exact: KeySpec,
-        /// The pair segment's manifest entry.
-        segment: SegmentRef,
+        /// The pair segments' manifest entries, in key order.
+        segments: Vec<SegmentRef>,
+    },
+    /// The right dataset's current manifest is not the one the caller
+    /// expected (it committed, or was rebuilt, since the caller read it);
+    /// nothing was built or committed.
+    RightChanged {
+        /// The right manifest's content hash the caller expected.
+        expected: Hash,
+        /// The right manifest found.
+        found: RightManifest,
     },
 }
 
@@ -176,10 +234,19 @@ fn column_types(m: &Manifest, columns: &[String]) -> Result<Vec<ColumnType>> {
         .map(|c| {
             let f = schema
                 .field_with_name(c)
-                .map_err(|_| Error::KeySpec(format!("join column {c:?} is not in the dataset")))?;
+                .map_err(|_| Error::KeySpec(format!("join column {c} is not in the dataset")))?;
             ColumnType::of(f.data_type())
         })
         .collect()
+}
+
+/// Column types in words: `Int64, Utf8`.
+fn types_in_words(types: &[ColumnType]) -> String {
+    types
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// Opens every segment of the complete `spec` in `snapshot`, by range (one
@@ -237,39 +304,51 @@ fn missing_side(
 }
 
 /// A join key's pair index built from both datasets' complete exact keys,
-/// not committed anywhere: what [`Builder::refresh_join`] commits, and the
-/// transient pair index `why` prices a join key with before it exists
-/// ([`transient_pair`]).
+/// not committed anywhere: the transient pair index `why` prices a join key
+/// with before it exists ([`transient_pair`]), the same bytes
+/// [`Builder::refresh_join`] commits.
 #[derive(Clone, Debug)]
 pub struct PairBuild {
-    /// The pair segment's bytes (`keyed_join` layout).
-    pub bytes: Vec<u8>,
+    /// The pair segments' bytes (`keyed_join` layout), in key order.
+    pub segments: Vec<Vec<u8>>,
     /// The exact key the left side was read from.
     pub left_exact: KeySpec,
     /// The exact key the right side was read from.
     pub right_exact: KeySpec,
     /// The left manifest sequence it was built from.
     pub left_sequence: u64,
-    /// The right manifest sequence it is pinned to.
-    pub right_sequence: u64,
-    /// The left row groups it covers, as its manifest entry records them.
+    /// What it pins (every segment's manifest entry records it).
+    pub pin: JoinPin,
+    /// The left row groups each segment covers, as its manifest entry
+    /// records them.
     pub rowgroup_range: RowGroupRange,
 }
 
-/// Builds the pair index of the join key `spec` from `left` (the left
+/// What [`build_segments`] built, besides the segments it emitted.
+struct PairMeta {
+    left_exact: KeySpec,
+    right_exact: KeySpec,
+    left_sequence: u64,
+    pin: JoinPin,
+    rowgroup_range: RowGroupRange,
+}
+
+/// Builds the pair segments of the join key `spec` from `left` (the left
 /// dataset's index, where `spec` is declared or about to be) and `right`
-/// (the right dataset's): from the complete exact keys on the join columns
-/// on each side, with counts when `spec` counts. A side with no such key
-/// is refused with [`Error::NotIndexed`] naming the spec to declare there:
-/// a missing exact key is an error, never a guess. Reads the two exact
-/// keys one block per segment at a time and holds the pair segment being
-/// written (ADR 018). The same bytes the index build commits, so a price
-/// computed from them is the plan.
-pub fn transient_pair<S: StoreExt + ?Sized, R: StoreExt + ?Sized>(
+/// (the right dataset's), handing each to `emit` as it is finished: from
+/// the complete exact keys on the join columns on each side, with counts
+/// when `spec` counts. A side with no such key is refused with
+/// [`Error::NotIndexed`] naming the spec to declare there: a missing exact
+/// key is an error, never a guess. Reads the two exact keys one block per
+/// segment at a time and holds one pair segment being written, capped by
+/// `caps` (ADR 018).
+fn build_segments<S: StoreExt + ?Sized, R: StoreExt + ?Sized>(
     left: &Snapshot<S>,
     right: &Snapshot<R>,
     spec: &KeySpec,
-) -> Result<PairBuild> {
+    caps: PairCaps,
+    emit: impl FnMut(EncodedSegment) -> Result<()>,
+) -> Result<PairMeta> {
     let KeySpec::Join {
         dataset,
         columns,
@@ -294,7 +373,8 @@ pub fn transient_pair<S: StoreExt + ?Sized, R: StoreExt + ?Sized>(
     let llive = live_ids(&m.rowgroup_space)?;
     let rlive = live_ids(&r.rowgroup_space)?;
     let range = llive.min().zip(llive.max());
-    let seg = cj::build_pair(
+    let now = RightManifest::of(right);
+    cj::build_pair(
         spec,
         &Side {
             segments: &lreaders,
@@ -309,19 +389,67 @@ pub fn transient_pair<S: StoreExt + ?Sized, R: StoreExt + ?Sized>(
         range,
         Pins {
             left: m.sequence,
-            right: r.sequence,
+            right: now.sequence,
+            right_manifest: now.hash,
         },
         &WriterOptions::default(),
+        caps,
+        emit,
     )?;
-    Ok(PairBuild {
-        bytes: seg.bytes,
+    Ok(PairMeta {
         left_exact,
         right_exact,
         left_sequence: m.sequence,
-        right_sequence: r.sequence,
+        pin: JoinPin {
+            right_sequence: now.sequence,
+            right_manifest: now.hash,
+            left_live: cj::live_identity(&llive),
+            extra: Extra::new(),
+        },
         rowgroup_range: range.map_or(RowGroupRange::new(0, 0), |(a, b)| {
             RowGroupRange::new(a, b.saturating_add(1))
         }),
+    })
+}
+
+/// Builds the pair index of the join key `spec` from `left` (the left
+/// dataset's index) and `right` (the right dataset's) without committing
+/// it: what `why` prices a join key with, the same segments
+/// [`Builder::refresh_join`] commits, so a price computed from them is the
+/// plan. The segments are split at `caps` and held in memory, all of them
+/// at most `max_bytes` (a transient index's cap, ADR 018); a pair past it
+/// is refused, never truncated.
+pub fn transient_pair<S: StoreExt + ?Sized, R: StoreExt + ?Sized>(
+    left: &Snapshot<S>,
+    right: &Snapshot<R>,
+    spec: &KeySpec,
+    caps: PairCaps,
+    max_bytes: u64,
+) -> Result<PairBuild> {
+    let mut segments: Vec<Vec<u8>> = Vec::new();
+    let mut held = 0u64;
+    let meta = build_segments(left, right, spec, caps, |seg| {
+        held = held.saturating_add(seg.bytes.len() as u64);
+        if held > max_bytes {
+            return Err(Error::Other(format!(
+                "the transient pair index of {} would hold more than {max_bytes} bytes, past \
+                 its cap on a transient index (TransientLimits::max_index_bytes), so it is not \
+                 priced in memory; declare it with `bellwether index <left folder> --key {}` to \
+                 build it into the index, segment by segment, and measure it there",
+                spec.name(),
+                spec.identity()
+            )));
+        }
+        segments.push(seg.bytes);
+        Ok(())
+    })?;
+    Ok(PairBuild {
+        segments,
+        left_exact: meta.left_exact,
+        right_exact: meta.right_exact,
+        left_sequence: meta.left_sequence,
+        pin: meta.pin,
+        rowgroup_range: meta.rowgroup_range,
     })
 }
 
@@ -359,20 +487,26 @@ impl<S: StoreExt + ?Sized> Builder<S> {
     /// Builds the join key `spec` (B3) into this (the left) index, if it is
     /// not fresh, declaring it in the same commit when the index does not
     /// declare it yet: from the complete exact keys on its columns in this
-    /// index and in the right dataset's index (`right_store`, `right_root`)
-    /// ([`transient_pair`]), in one commit that replaces its pair segment,
-    /// pins the right manifest's sequence, and records it complete. Starts
-    /// over if a concurrent commit changes the left's row groups or schema
-    /// before it lands.
+    /// index and in the right dataset's index (`right_store`, `right_root`),
+    /// split into segments at `caps`, each uploaded as it is finished, then
+    /// one commit that replaces its pair segments, pins the right manifest
+    /// and the left's live row groups, and records it complete. With
+    /// `expect`, the right manifest's content hash the caller verified
+    /// against: a right dataset whose current manifest is another is
+    /// [`JoinRefresh::RightChanged`], before anything is built or
+    /// committed. Starts over if a concurrent commit changes the left's row
+    /// groups or schema before it lands.
     pub fn refresh_join<R: StoreExt + ?Sized>(
         &self,
         spec: &KeySpec,
         right_store: &Arc<R>,
         right_root: &str,
+        expect: Option<Hash>,
+        caps: PairCaps,
     ) -> Result<JoinRefresh> {
         let mut restarts = 0u32;
         loop {
-            if let Some(done) = self.try_refresh_join(spec, right_store, right_root)? {
+            if let Some(done) = self.try_refresh_join(spec, right_store, right_root, expect, caps)? {
                 return Ok(done);
             }
             restarts += 1;
@@ -390,6 +524,8 @@ impl<S: StoreExt + ?Sized> Builder<S> {
         spec: &KeySpec,
         right_store: &Arc<R>,
         right_root: &str,
+        expect: Option<Hash>,
+        caps: PairCaps,
     ) -> Result<Option<JoinRefresh>> {
         if !matches!(spec, KeySpec::Join { .. }) {
             return Err(Error::KeySpec(format!("{} is not a join key", spec.name())));
@@ -397,36 +533,49 @@ impl<S: StoreExt + ?Sized> Builder<S> {
         let left = Snapshot::open(Arc::clone(self.store()), self.index_root())?;
         let m = left.manifest();
         let rsnap = Snapshot::open(Arc::clone(right_store), right_root)?;
-        let r = rsnap.manifest();
+        let now = RightManifest::of(&rsnap);
+        if let Some(expected) = expect.filter(|e| *e != now.hash) {
+            return Ok(Some(JoinRefresh::RightChanged {
+                expected,
+                found: now,
+            }));
+        }
         if m.schema.key_specs.contains(spec) {
-            let state = state_of(m, spec, r.sequence, || {
-                Ok(Some(pair_built_from(&left, spec)?))
-            })?;
+            let state = state_of(m, spec, now, || Ok(Some(pair_built_from(&left, spec)?)))?;
             if let JoinState::Fresh { right_sequence, .. } = state {
                 return Ok(Some(JoinRefresh::Fresh { right_sequence }));
             }
         }
         let (declared, replaced) = declare_join(m, spec)?;
-        let pair = transient_pair(&left, &rsnap, spec)?;
-        let bytes = pair.bytes.len() as u64;
-        let mut staged = StagedSegments::new();
-        let id = staged.stage(Bytes::from(pair.bytes));
+        let mut written: Vec<(Hash, u64)> = Vec::new();
+        let meta = build_segments(&left, &rsnap, spec, caps, |seg| {
+            let bytes = seg.bytes.len() as u64;
+            self.store().put_content_addressed(
+                &segment_path(self.index_root(), &seg.id),
+                Bytes::from(seg.bytes),
+            )?;
+            written.push((seg.id, bytes));
+            Ok(())
+        })?;
         let identity = spec.identity();
-        let segment = SegmentRef {
-            id,
-            kind: None,
-            key_spec: identity.clone(),
-            rowgroup_range: pair.rowgroup_range,
-            bytes,
-            right_sequence: Some(pair.right_sequence),
-            extra: Extra::new(),
-        };
+        let segments: Vec<SegmentRef> = written
+            .into_iter()
+            .map(|(id, bytes)| SegmentRef {
+                id,
+                kind: None,
+                key_spec: identity.clone(),
+                rowgroup_range: meta.rowgroup_range,
+                bytes,
+                join: Some(meta.pin.clone()),
+                extra: Extra::new(),
+            })
+            .collect();
         let (space, schema) = (m.rowgroup_space.clone(), m.schema.clone());
         let restart = Cell::new(false);
         let committed = commit_with(
             &**self.store(),
             self.index_root(),
-            &staged,
+            &StagedSegments::new(),
             CommitOptions::default(),
             |cur| {
                 // The pair's left bitmaps hold the ids of the row groups it
@@ -448,7 +597,9 @@ impl<S: StoreExt + ?Sized> Builder<S> {
                 if let Some(old) = &replaced {
                     next.key_spec_completeness.remove(old);
                 }
-                next.add_segment(segment.clone());
+                for s in &segments {
+                    next.add_segment(s.clone());
+                }
                 next.key_spec_completeness
                     .insert(identity.clone(), cur.sequence + 1);
                 Ok(next)
@@ -457,10 +608,10 @@ impl<S: StoreExt + ?Sized> Builder<S> {
         match committed {
             Ok(c) => Ok(Some(JoinRefresh::Built {
                 sequence: c.sequence,
-                right_sequence: pair.right_sequence,
-                left_exact: pair.left_exact,
-                right_exact: pair.right_exact,
-                segment,
+                right_sequence: meta.pin.right_sequence,
+                left_exact: meta.left_exact,
+                right_exact: meta.right_exact,
+                segments,
             })),
             Err(_) if restart.get() => Ok(None),
             Err(e) => Err(e),
@@ -480,32 +631,38 @@ fn pair_built_from<S: StoreExt + ?Sized>(snapshot: &Snapshot<S>, spec: &KeySpec)
         id: s.id,
         size: s.bytes,
     })?;
-    r.header()
-        .left_sequence
-        .ok_or_else(|| Error::Other("corrupt segment: a join segment without left_sequence".into()))
+    Ok(cj::header_pins(&r)?.left_sequence)
 }
 
-/// The state of `spec` in `m` against a right dataset at `right_now`.
-/// `built_from` reads the pair's left sequence, only when it is needed.
+/// The state of `spec` in `m` against a right dataset whose current
+/// manifest is `right_now`. `built_from` reads the pair's left sequence,
+/// only when it is needed.
 fn state_of(
     m: &Manifest,
     spec: &KeySpec,
-    right_now: u64,
+    right_now: RightManifest,
     built_from: impl FnOnce() -> Result<Option<u64>>,
 ) -> Result<JoinState> {
     let segs = pair_segments(m, spec);
     let Some(first) = segs.first() else {
         return Ok(JoinState::NotBuilt);
     };
-    let pinned = first.right_sequence.ok_or_else(|| {
+    let pin = first.join.as_ref().ok_or_else(|| {
         Error::Other(format!(
-            "corrupt index: the segment of {} pins no right manifest sequence",
+            "corrupt index: the segment of {} pins no right manifest; rebuild it with \
+             `bellwether index` on the left dataset",
             spec.identity()
         ))
     })?;
-    if segs.iter().any(|s| s.right_sequence != Some(pinned)) {
+    let same = |p: &JoinPin| {
+        p.right_sequence == pin.right_sequence
+            && p.right_manifest == pin.right_manifest
+            && p.left_live == pin.left_live
+    };
+    if segs.iter().any(|s| !s.join.as_ref().is_some_and(same)) {
         return Err(Error::Other(format!(
-            "corrupt index: the segments of {} are pinned to different right manifest sequences",
+            "corrupt index: the segments of {} are pinned to different manifests; rebuild it \
+             with `bellwether index` on the left dataset",
             spec.identity()
         )));
     }
@@ -515,11 +672,21 @@ fn state_of(
             current: m.sequence,
         });
     };
-    if pinned != right_now {
-        return Ok(JoinState::RightAdvanced {
-            pinned,
-            current: right_now,
+    let (pinned, current) = (pin.right_sequence, right_now.sequence);
+    if pin.right_manifest != right_now.hash {
+        return Ok(if current > pinned {
+            JoinState::RightAdvanced { pinned, current }
+        } else {
+            JoinState::RightRebuilt { pinned, current }
         });
+    }
+    if pinned != current {
+        return Err(Error::Other(format!(
+            "corrupt index: the segments of {} pin the right manifest at sequence {pinned}, and \
+             the manifest with that content is at sequence {current}; rebuild it with \
+             `bellwether index` on the left dataset",
+            spec.identity()
+        )));
     }
     Ok(JoinState::Fresh {
         complete_at,
@@ -529,17 +696,25 @@ fn state_of(
 
 impl<S: StoreExt + ?Sized> Planner<S> {
     /// The state of the declared join key `spec` in this (the left)
-    /// manifest, against a right dataset whose current manifest sequence is
-    /// `right_sequence`.
-    pub fn join_state(&self, spec: &KeySpec, right_sequence: u64) -> Result<JoinState> {
-        state_of(self.manifest(), spec, right_sequence, || {
-            Ok(Some(pair_built_from(&self.snapshot, spec)?))
-        })
+    /// manifest, against the right dataset's current manifest, which
+    /// `right` pins.
+    pub fn join_state<R: StoreExt + ?Sized>(
+        &self,
+        spec: &KeySpec,
+        right: &Planner<R>,
+    ) -> Result<JoinState> {
+        state_of(
+            self.manifest(),
+            spec,
+            RightManifest::of(&right.snapshot),
+            || Ok(Some(pair_built_from(&self.snapshot, spec)?)),
+        )
     }
 
     /// Opens the fresh join key `spec`'s pair segments against both
-    /// datasets' schemas, refusing a stale key and one whose recorded types
-    /// differ from either dataset's.
+    /// datasets' schemas, refusing a stale key, a segment whose header
+    /// pins other manifests than its manifest entry, and one whose recorded
+    /// types differ from either dataset's.
     fn pair_readers<R: StoreExt + ?Sized>(
         &self,
         spec: &KeySpec,
@@ -548,7 +723,7 @@ impl<S: StoreExt + ?Sized> Planner<S> {
         let KeySpec::Join { right_columns, .. } = spec else {
             return Err(Error::KeySpec(format!("{} is not a join key", spec.name())));
         };
-        match self.join_state(spec, right.sequence())? {
+        match self.join_state(spec, right)? {
             JoinState::Fresh { .. } => {}
             other => {
                 return Err(Error::KeySpec(format!(
@@ -578,23 +753,29 @@ impl<S: StoreExt + ?Sized> Planner<S> {
                         r.key_spec().identity()
                     )));
                 }
-                if r.header().right_sequence != s.right_sequence {
+                let h = cj::header_pins(&r)?;
+                let agrees = s.join.as_ref().is_some_and(|p| {
+                    p.right_sequence == h.right_sequence
+                        && p.right_manifest == h.right_manifest
+                        && p.left_live == h.left_live
+                });
+                if !agrees {
                     return Err(Error::Other(format!(
-                        "corrupt index: segment {} of {} pins right sequence {:?} in its header \
-                         and {:?} in the manifest",
+                        "corrupt index: segment {} of {} pins other manifests in its header \
+                         than in the manifest; rebuild it with `bellwether index` on the left \
+                         dataset",
                         s.id,
-                        spec.identity(),
-                        r.header().right_sequence,
-                        s.right_sequence
+                        spec.identity()
                     )));
                 }
-                if r.header().right_key_types.as_ref() != Some(&want_right) {
+                let recorded = r.header().right_key_types.as_deref().unwrap_or_default();
+                if recorded != want_right.as_slice() {
                     return Err(Error::KeySpec(format!(
-                        "{} was built with right key types {:?}, but the right dataset now \
-                         declares {:?}; re-index the left dataset to rebuild it",
+                        "{} was built with right key types ({}), but the right dataset now \
+                         declares ({}); re-index the left dataset to rebuild it",
                         spec.name(),
-                        r.header().right_key_types,
-                        want_right
+                        types_in_words(recorded),
+                        types_in_words(&want_right)
                     )));
                 }
                 Ok(r)

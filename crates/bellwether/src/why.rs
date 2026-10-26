@@ -816,7 +816,8 @@ impl Engine {
     /// [`LAYOUT_BOUND_FRACTION`] of the row groups the runs span (it names
     /// the lowest-fanout measured column); else the highest-confidence
     /// `batch_stamp_key` or `low_selectivity_single_column` lint on a column
-    /// the workload or a current spec uses; else, with a workload, its key
+    /// the workload or a current spec uses (never for a semi-join workload,
+    /// which a join key serves or none does); else, with a workload, its key
     /// columns when no current spec serves them, or the serving current
     /// spec's columns; each with its measured fanout.
     ///
@@ -838,6 +839,7 @@ impl Engine {
     #[allow(clippy::too_many_lines)]
     fn why_inner(&self, req: &WhyRequest) -> Result<WhyReport> {
         let has_workload = self.check_why_request(req)?;
+        self.check_why_scope(req)?;
         let pinned = self.pin()?;
         if req.sketches_only {
             return self.why_from_sketches(req, pinned.as_ref());
@@ -1460,6 +1462,28 @@ impl Engine {
         })
     }
 
+    /// Refuses a semi-join `why` (B3) that names, or whose recorded
+    /// workload's runs name, a right dataset this engine does not serve
+    /// ([`crate::EngineOptions::join_scope`]), before anything else is read.
+    fn check_why_scope(&self, req: &WhyRequest) -> Result<()> {
+        if self.options().join_scope == crate::JoinScope::Any {
+            return Ok(());
+        }
+        if let Some(side) = &req.join {
+            let (right, columns) = crate::spec::parse_join_side(side)?;
+            self.check_right_side(&right, &columns)?;
+        }
+        if let Some(h) = &req.workload {
+            let w = crate::fix::load_workload(self, &self.cache()?, h)?;
+            for run in w.runs() {
+                if let Some(j) = run.query()?.join() {
+                    self.check_right_side(&j.right, &j.right_columns)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Refuses a `why` request whose flags contradict each other, before any
     /// work. Returns whether it carries a workload.
     #[allow(clippy::too_many_lines)]
@@ -1507,10 +1531,21 @@ impl Engine {
             });
         }
         self.check_text_request(req)?;
-        let mode = req.lookup_mode().map_err(Error::KeySpec)?;
+        // A semi-join's flags given wrong are the caller's to fix.
+        let join_flags = |reason: String| Error::InvalidArgument {
+            field: "join",
+            reason,
+        };
+        let mode = req.lookup_mode().map_err(|reason| {
+            if req.join.is_some() || req.mode == Some(LookupMode::SemiJoin) {
+                join_flags(reason)
+            } else {
+                Error::KeySpec(reason)
+            }
+        })?;
         check_values_given(req, mode)?;
         if mode == LookupMode::SemiJoin && !(given[0] || given[2]) {
-            return Err(Error::KeySpec(
+            return Err(join_flags(
                 "--mode semijoin prices a key file on the left dataset's join columns, recorded \
                  as one semi-join run; pass --from <keys.parquet> (or --workload <hash> of \
                  semi-join runs)"
@@ -1754,16 +1789,20 @@ impl Engine {
                 None if req.mode == Some(LookupMode::SemiJoin) => {
                     let want = semijoin_query(req)?;
                     if let Some(r) = w.runs().iter().find(|r| r.query().ok() != want) {
-                        return Err(Error::KeySpec(format!(
-                            "workload {h} records run {:?} as a {} lookup, and --mode semijoin \
-                             --join {} asks for semi-joins with that right side; drop --mode and \
-                             --join to price it as recorded, or record the keys again with \
-                             `bellwether why --from <keys.parquet> --mode semijoin --join {}`",
-                            r.run_id,
-                            describe(&r.query()?),
-                            req.join.as_deref().unwrap_or_default(),
-                            req.join.as_deref().unwrap_or_default()
-                        )));
+                        return Err(Error::InvalidArgument {
+                            field: "join",
+                            reason: format!(
+                                "workload {h} records run {:?} as a {} lookup, and --mode \
+                                 semijoin --join {} asks for semi-joins with that right side; \
+                                 drop --mode and --join to price it as recorded, or record the \
+                                 keys again with `bellwether why --from <keys.parquet> --mode \
+                                 semijoin --join {}`",
+                                r.run_id,
+                                describe(&r.query()?),
+                                req.join.as_deref().unwrap_or_default(),
+                                req.join.as_deref().unwrap_or_default()
+                            ),
+                        });
                     }
                     None
                 }
@@ -1772,11 +1811,14 @@ impl Engine {
                     .iter()
                     .any(|r| r.query().is_ok_and(|q| q.join().is_some())) =>
                 {
-                    return Err(Error::KeySpec(format!(
-                        "workload {h} records semi-join runs, which are priced on both datasets; \
-                         pass --mode semijoin --join <right>.<columns> with the right side they \
-                         record"
-                    )));
+                    return Err(Error::InvalidArgument {
+                        field: "join",
+                        reason: format!(
+                            "workload {h} records semi-join runs, which are priced on both \
+                             datasets; pass --mode semijoin --join <right>.<columns> with the \
+                             right side they record"
+                        ),
+                    });
                 }
                 None if req.mode == Some(LookupMode::Locate) => {
                     if let Some(r) = w
@@ -2910,9 +2952,17 @@ fn culprit(
     if let Some(w) = workload {
         used.extend(w.runs().iter().flat_map(|r| r.columns.iter()));
     }
+    // A semi-join workload (B3) is served by a join key or by none: a key
+    // lint on one of its columns (a single column that prunes little) is
+    // not why its two steps read what they read.
+    let semijoin = workload
+        .and_then(|w| w.runs().first())
+        .and_then(|r| r.query().ok())
+        .is_some_and(|q| q.join().is_some());
     let lint = profile
         .lints
         .iter()
+        .filter(|_| !semijoin)
         .filter_map(|l| {
             let rank = CULPRIT_RULES.iter().position(|r| *r == l.rule)?;
             l.columns

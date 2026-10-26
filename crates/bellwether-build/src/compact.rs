@@ -158,7 +158,7 @@ impl<S: StoreExt + ?Sized> Builder<S> {
                     rowgroup_range: RowGroupRange::new(start, end),
                     bytes,
                     kind: None,
-                    right_sequence: None,
+                    join: None,
                     extra: Extra::new(),
                 },
             });
@@ -250,7 +250,7 @@ mod tests {
             rowgroup_range: RowGroupRange::new(start, end),
             bytes,
             kind: None,
-            right_sequence: None,
+            join: None,
             extra: Extra::new(),
         }
     }

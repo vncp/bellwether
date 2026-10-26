@@ -83,7 +83,10 @@ impl Engine {
         let builder = Builder::new(Arc::clone(self.store()?), "");
         let sketches_rebuilt = self.reset_unreadable_sketches(&builder, &options.sketches)?;
         let report = builder.build(self.root(), &specs, &options)?;
-        let joins = self.refresh_joins(&joins)?;
+        // A join key that cannot be rebuilt once the build committed is
+        // reported beside that commit (`JoinFreshness::NotRebuilt`), never
+        // in place of it.
+        let joins = self.refresh_joins(&joins, report.sequence.is_some())?;
         let pinned = self.pin_required("index")?;
         let m = pinned.manifest();
         Ok(IndexResult {

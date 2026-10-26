@@ -40,8 +40,8 @@ pub struct PairInput<'a> {
     /// The right dataset's replayer.
     pub replayer: Replayer<'a>,
     /// Per join key priced (by [`KeySpec::identity`]), the bytes of its
-    /// transient pair index.
-    pub pairs: BTreeMap<String, Bytes>,
+    /// transient pair index's segments.
+    pub pairs: BTreeMap<String, Vec<Bytes>>,
 }
 
 /// One run's cost over its two steps: files, row groups, and bytes summed;
@@ -77,10 +77,15 @@ impl<'a> Replayer<'a> {
         self
     }
 
-    /// The transient pair index attached for the join key `spec`, if any.
+    /// The segments of the transient pair index attached for the join key
+    /// `spec`, if any.
     #[must_use]
-    pub fn pair_index(&self, spec: &KeySpec) -> Option<&Bytes> {
-        self.pair.as_deref()?.pairs.get(&spec.identity())
+    pub fn pair_index(&self, spec: &KeySpec) -> Option<&[Bytes]> {
+        self.pair
+            .as_deref()?
+            .pairs
+            .get(&spec.identity())
+            .map(Vec::as_slice)
     }
 
     /// The right dataset attached, or the refusal naming what is missing.
@@ -170,17 +175,23 @@ impl<'a> Replayer<'a> {
                 spec.name()
             ))
         })?;
-        let reader = SegmentReader::open(bytes.clone())?;
-        if reader.key_spec() != spec {
-            return Err(Error::Other(format!(
-                "the pair index given for {} indexes {}",
-                spec.identity(),
-                reader.key_spec().identity()
-            )));
-        }
+        let readers = bytes
+            .iter()
+            .map(|b| {
+                let reader = SegmentReader::open(b.clone())?;
+                if reader.key_spec() != spec {
+                    return Err(Error::Other(format!(
+                        "the pair index given for {} indexes {}",
+                        spec.identity(),
+                        reader.key_spec().identity()
+                    )));
+                }
+                Ok(reader)
+            })
+            .collect::<Result<Vec<_>>>()?;
         let all: Vec<usize> = (0..keys.columns().len()).collect();
         let probes = keys.all_probes(&all);
-        let hits = bellwether_core::join::semijoin(std::slice::from_ref(&reader), &probes)?;
+        let hits = bellwether_core::join::semijoin(&readers, &probes)?;
         let (mut lsel, mut rsel) = (RoaringBitmap::new(), RoaringBitmap::new());
         let (mut lrows, mut rrows) = (Some(0u64), Some(0u64));
         let mut matched = Vec::with_capacity(hits.len());

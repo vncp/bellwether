@@ -308,6 +308,20 @@ pub enum Error {
         /// The whole message, naming the command to run.
         message: String,
     },
+    /// A join key (B3) names a right dataset this engine was not opened to
+    /// read: an MCP server reads only the right side its operator gave with
+    /// `--join` (none without it), never one a tool argument names. Refused
+    /// before any folder is read, so the refusal is the same whether a
+    /// folder of the name asked exists, is indexed, or not. `served` is the
+    /// right side served (`<right>.<columns>`), if any; `message` says what
+    /// to do.
+    #[error("{message}")]
+    JoinNotServed {
+        /// The right side the engine serves, if any.
+        served: Option<String>,
+        /// The whole message, naming what to do.
+        message: String,
+    },
     /// Serialization failure.
     #[error("serde error: {0}")]
     Serde(#[from] serde_json::Error),

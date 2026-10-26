@@ -530,7 +530,7 @@ pub fn build_index(
                 rowgroup_range: RowGroupRange::new(lo, hi),
                 bytes,
                 kind: None,
-                right_sequence: None,
+                join: None,
                 extra: Extra::new(),
             });
         }

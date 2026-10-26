@@ -1,20 +1,23 @@
 //! Join keys (B3): the keys two datasets share on one column pair.
 //!
 //! A join key `join:<left>.<cols>=<right>.<cols>` is declared on the left
-//! dataset and stored in its index as one segment in the `keyed_join`
-//! layout (`docs/format.md`, "Join keys"): per key value present on both
-//! sides, the left value record (`bitmap_len u32 | bitmap | [counts]`, row
-//! groups in the left dataset's id space) and then the right one (the right
+//! dataset and stored in its index as segments in the `keyed_join` layout
+//! (`docs/format.md`, "Join keys"): per key value present on both sides,
+//! the left value record (`bitmap_len u32 | bitmap | [counts]`, row groups
+//! in the left dataset's id space) and then the right one (the right
 //! dataset's id space). A key present on one side only is not stored; the
-//! index ends with the number of such keys per side. The header pins the
-//! right dataset's manifest sequence the pair was built at (ADR 020).
+//! index ends with the number of such keys per side. The header pins what
+//! the pair was built from (ADR 020): the right dataset's manifest by
+//! sequence and content hash, and the left's manifest sequence and live
+//! row-group set.
 //!
 //! [`build_pair`] builds it from both sides' exact segments on the join
 //! columns by a merge join over their sorted key streams, each side a k-way
-//! merge of its segments holding one block per segment at a time (ADR
-//! 018); only the live row groups of each side count. The same function
-//! builds the transient pair index `why` prices with, so predicted equals
-//! planned by construction.
+//! merge of its segments holding one block per segment at a time, and
+//! splits the shared keys by key range into segments capped by
+//! [`PairCaps`] (ADR 018); only the live row groups of each side count.
+//! The same function builds the transient pair index `why` prices with, so
+//! predicted equals planned by construction.
 //!
 //! SQL semantics, ADR 014: a tuple with a null element equals nothing, so
 //! a stored exact tuple with a trailing null marker is never paired and is
@@ -27,7 +30,7 @@
 
 use std::collections::BTreeMap;
 
-use bellwether_types::{Error, KeySpec, Result};
+use bellwether_types::{Error, Hash, KeySpec, Result};
 use roaring::RoaringBitmap;
 
 use crate::encoding::tuple_has_null;
@@ -314,21 +317,73 @@ fn check_side<R: ReadAt>(
     Ok(())
 }
 
-/// The manifest sequences a pair index is built at (ADR 020).
+/// The manifests a pair index is built from (ADR 020).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Pins {
-    /// The left manifest whose exact segments it reads.
+    /// The left manifest sequence whose exact segments it reads.
     pub left: u64,
-    /// The right manifest it is pinned to.
+    /// The right manifest sequence it is pinned to.
     pub right: u64,
+    /// The right manifest's content hash (BLAKE3 of its bytes as stored):
+    /// what tells the manifest it was built at from another at the same
+    /// sequence (an index deleted and rebuilt).
+    pub right_manifest: Hash,
 }
 
-/// Builds a join key's pair segment from both sides' exact segments (the
-/// module docs). `left_range` is the left row groups the pair covers,
+/// Caps on one pair segment (ADR 018): a segment is finished, and handed
+/// to the caller, before the shared key that would take it past
+/// `max_keys` keys or `max_bytes` bytes held, so a pair holds one open
+/// segment at a time whatever `|L ∩ R|` is. A key's own record larger than
+/// a cap gets a segment of its own.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PairCaps {
+    /// Shared keys one segment holds at most.
+    pub max_keys: u64,
+    /// Bytes one open segment holds (written blocks, index, open block)
+    /// before it is finished.
+    pub max_bytes: u64,
+}
+
+/// The identity of a live row-group set, as a join segment pins the
+/// left's (`left_live`, `docs/format.md`, "Join keys"): BLAKE3 over each
+/// id as 4 little-endian bytes, ascending. Two sets have one identity only
+/// when they are equal, so a left file removed (its ids retired, none
+/// added) changes it as surely as a file added.
+#[must_use]
+pub fn live_identity(live: &RoaringBitmap) -> Hash {
+    let mut h = blake3::Hasher::new();
+    for id in live {
+        h.update(&id.to_le_bytes());
+    }
+    Hash(*h.finalize().as_bytes())
+}
+
+/// Finishes one pair segment: its one-sided key counts and the left row
+/// groups it covers.
+fn close(
+    mut out: KeyedEmitter,
+    (left_only, right_only): (u64, u64),
+    left_range: Option<(u32, u32)>,
+) -> Result<EncodedSegment> {
+    out.set_join_totals(left_only, right_only)?;
+    if let Some((lo, hi)) = left_range {
+        out.processed(lo, hi)?;
+    }
+    out.finish()
+}
+
+/// Builds a join key's pair segments from both sides' exact segments (the
+/// module docs), handing each to `emit` as soon as it is finished, in key
+/// order: the segments split the shared keys by key range at `caps`, each
+/// covering every left row group (`left_range`) and counting the
+/// one-sided keys that fell in its stretch of the merge, so the segments
+/// together hold each shared key once and their one-sided counts sum to
+/// the pair's. `left_range` is the left row groups the pair covers,
 /// inclusive (every live left row group, so the spec is complete at the
 /// left's sequence), `None` for a left side with no row group; `pins` the
-/// left manifest sequence the left segments are of and the right
-/// manifest's sequence the pair is pinned to.
+/// left manifest sequence the left segments are of and the right manifest
+/// the pair is pinned to. Returns the number of segments (at least one).
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 pub fn build_pair<RL: ReadAt, RR: ReadAt>(
     spec: &KeySpec,
     left: &Side<'_, RL>,
@@ -336,7 +391,9 @@ pub fn build_pair<RL: ReadAt, RR: ReadAt>(
     left_range: Option<(u32, u32)>,
     pins: Pins,
     opts: &WriterOptions,
-) -> Result<EncodedSegment> {
+    caps: PairCaps,
+    mut emit: impl FnMut(EncodedSegment) -> Result<()>,
+) -> Result<u64> {
     check_spec(spec)?;
     let KeySpec::Join {
         columns,
@@ -365,8 +422,11 @@ pub fn build_pair<RL: ReadAt, RR: ReadAt>(
         }
     }
     header.left_sequence = Some(pins.left);
+    header.left_live = Some(live_identity(left.live));
     header.right_sequence = Some(pins.right);
+    header.right_manifest = Some(pins.right_manifest);
     let mut out = KeyedEmitter::new(&header, opts)?;
+    let mut segments = 0u64;
     let mut ls = LiveKeys {
         keys: MergedKeys::new(left.segments)?,
         live: left.live,
@@ -403,17 +463,31 @@ pub fn build_pair<RL: ReadAt, RR: ReadAt>(
                     if null(lk) {
                         left_only += 1;
                         right_only += 1;
-                    } else if *counts {
-                        out.push_join(lk, lv, rv)?;
                     } else {
-                        // Counted exact keys serve an uncounted join key
-                        // too; their counts are not stored.
-                        let bare = |v: &KeyValue| KeyValue {
-                            bitmap: v.bitmap.clone(),
-                            chain: v.chain.clone(),
-                            counts: None,
-                        };
-                        out.push_join(lk, &bare(lv), &bare(rv))?;
+                        // Full: finish this segment before the next key, so
+                        // the next one starts with it.
+                        if out.entries() > 0
+                            && (out.entries() >= caps.max_keys.max(1)
+                                || out.held_bytes() >= caps.max_bytes)
+                        {
+                            let full =
+                                std::mem::replace(&mut out, KeyedEmitter::new(&header, opts)?);
+                            emit(close(full, (left_only, right_only), left_range)?)?;
+                            segments += 1;
+                            (left_only, right_only) = (0, 0);
+                        }
+                        if *counts {
+                            out.push_join(lk, lv, rv)?;
+                        } else {
+                            // Counted exact keys serve an uncounted join key
+                            // too; their counts are not stored.
+                            let bare = |v: &KeyValue| KeyValue {
+                                bitmap: v.bitmap.clone(),
+                                chain: v.chain.clone(),
+                                counts: None,
+                            };
+                            out.push_join(lk, &bare(lv), &bare(rv))?;
+                        }
                     }
                     l = ls.next()?;
                     r = rs.next()?;
@@ -421,11 +495,8 @@ pub fn build_pair<RL: ReadAt, RR: ReadAt>(
             },
         }
     }
-    out.set_join_totals(left_only, right_only)?;
-    if let Some((lo, hi)) = left_range {
-        out.processed(lo, hi)?;
-    }
-    out.finish()
+    emit(close(out, (left_only, right_only), left_range)?)?;
+    Ok(segments + 1)
 }
 
 /// Reads one side's value record (`bitmap_len u32 | bitmap | [counts]`)
@@ -489,23 +560,60 @@ fn check_join<R: ReadAt>(r: &SegmentReader<R>) -> Result<()> {
     }
 }
 
-/// The right manifest sequence every segment of a join key is pinned to;
-/// segments pinned to different sequences are refused as one index.
-pub fn pinned_sequence<R: ReadAt>(readers: &[SegmentReader<R>]) -> Result<Option<u64>> {
-    let mut seq = None;
+/// What one join segment's header pins: the manifests its pair was built
+/// from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HeaderPins {
+    /// The left manifest sequence whose exact segments it read.
+    pub left_sequence: u64,
+    /// The left's live row-group set it covers ([`live_identity`]).
+    pub left_live: Hash,
+    /// The right manifest sequence it read.
+    pub right_sequence: u64,
+    /// The right manifest's content hash.
+    pub right_manifest: Hash,
+}
+
+/// The pins of one join segment's header (a validated join header holds
+/// all four).
+pub fn header_pins<R: ReadAt>(r: &SegmentReader<R>) -> Result<HeaderPins> {
+    check_join(r)?;
+    let h = r.header();
+    match (
+        h.left_sequence,
+        h.left_live,
+        h.right_sequence,
+        h.right_manifest,
+    ) {
+        (Some(left_sequence), Some(left_live), Some(right_sequence), Some(right_manifest)) => {
+            Ok(HeaderPins {
+                left_sequence,
+                left_live,
+                right_sequence,
+                right_manifest,
+            })
+        }
+        _ => Err(Error::Other(
+            "corrupt segment: a join segment without its left and right pins".into(),
+        )),
+    }
+}
+
+/// The pins every segment of one join key shares; segments pinned to
+/// different manifests are refused as one index. `None` for no segment.
+pub fn pinned<R: ReadAt>(readers: &[SegmentReader<R>]) -> Result<Option<HeaderPins>> {
+    let mut out: Option<HeaderPins> = None;
     for r in readers {
-        check_join(r)?;
-        let s = r.header().right_sequence;
-        if seq.is_some() && seq != s {
+        let p = header_pins(r)?;
+        if out.is_some_and(|o| o != p) {
             return Err(Error::Other(
-                "corrupt index: the segments of one join key are pinned to different right \
-                 manifest sequences"
+                "corrupt index: the segments of one join key are pinned to different manifests"
                     .into(),
             ));
         }
-        seq = s;
+        out = Some(p);
     }
-    Ok(seq)
+    Ok(out)
 }
 
 /// `semijoin(keys)`: for each probe key both sides hold, its row groups on

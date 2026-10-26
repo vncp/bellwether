@@ -16,7 +16,7 @@ use bellwether_types::{Error, Hash, Result, StoreVersion};
 use bytes::Bytes;
 
 use crate::backend::{StoreExt, DEFAULT_PAGE_SIZE};
-use crate::commit::read_manifest;
+use crate::commit::{read_manifest, read_manifest_raw};
 use crate::manifest::{
     join, manifest_history_path, segment_path, Manifest, SegmentRef, MANIFESTS_DIR,
 };
@@ -62,6 +62,7 @@ pub struct Snapshot<S: StoreExt + ?Sized> {
     manifest: Arc<Manifest>,
     version: StoreVersion,
     pinned_sequence: Option<u64>,
+    content_hash: Hash,
 }
 
 impl<S: StoreExt + ?Sized> std::fmt::Debug for Snapshot<S> {
@@ -79,7 +80,7 @@ impl<S: StoreExt + ?Sized> Snapshot<S> {
     /// is no manifest yet, or with [`Error::UnsupportedVersion`] if it is
     /// newer than this build.
     pub fn open(store: Arc<S>, root: &str) -> Result<Self> {
-        let (manifest, version) = read_manifest(&*store, root)?
+        let (manifest, version, bytes) = read_manifest_raw(&*store, root)?
             .ok_or_else(|| Error::Store(format!("no manifest under {root:?}")))?;
         Ok(Self {
             store,
@@ -87,6 +88,7 @@ impl<S: StoreExt + ?Sized> Snapshot<S> {
             manifest: Arc::new(manifest),
             version,
             pinned_sequence: None,
+            content_hash: Hash::of(&bytes),
         })
     }
 
@@ -117,9 +119,10 @@ impl<S: StoreExt + ?Sized> Snapshot<S> {
                 manifest: Arc::new(manifest),
                 version,
                 pinned_sequence: Some(sequence),
+                content_hash: Hash::of(&bytes),
             }));
         }
-        if let Some((current, version)) = read_manifest(&*store, root)? {
+        if let Some((current, version, bytes)) = read_manifest_raw(&*store, root)? {
             if current.sequence == sequence {
                 return Ok(Some(Self {
                     store,
@@ -127,6 +130,7 @@ impl<S: StoreExt + ?Sized> Snapshot<S> {
                     manifest: Arc::new(current),
                     version,
                     pinned_sequence: Some(sequence),
+                    content_hash: Hash::of(&bytes),
                 }));
             }
         }
@@ -166,6 +170,18 @@ impl<S: StoreExt + ?Sized> Snapshot<S> {
     #[must_use]
     pub fn sequence(&self) -> u64 {
         self.manifest.sequence
+    }
+
+    /// BLAKE3 of the pinned manifest's bytes as stored: its content
+    /// identity. Two manifests at one sequence (an index deleted and
+    /// rebuilt, or rewritten outside the commit protocol) have different
+    /// content hashes, so a reader that pinned another index's manifest
+    /// tells them apart where the sequence alone cannot (a join key's
+    /// right dataset, B3). The history copy of a commit holds the bytes
+    /// `manifest.json` held, so both give one hash.
+    #[must_use]
+    pub fn content_hash(&self) -> Hash {
+        self.content_hash
     }
 
     /// The index root this snapshot reads.

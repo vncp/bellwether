@@ -725,6 +725,44 @@ fn quantiles(v: &[f64; 3]) -> String {
     format!("{} / {} / {}", v[0], v[1], v[2])
 }
 
+/// Why no index serving a (non-join) lookup is the culprit, by what the
+/// files' statistics and the time window already narrow.
+fn no_index_serves(r: &bellwether::WhyReport) -> String {
+    let span = r.dataset.row_groups * r.workload.as_ref().map_or(1, |w| w.runs);
+    let has_window = r.workload.as_ref().is_some_and(|w| !w.windows.is_empty());
+    match (r.unserved.is_some(), r.current) {
+        (true, Some(m)) if m.row_groups < span => format!(
+            "no key index serves this lookup; the files' own min/max statistics{} already narrow \
+             it to {} of the {} the runs span{}",
+            if has_window {
+                " and the time window"
+            } else {
+                ""
+            },
+            num(m.row_groups),
+            count(span, "row group", "row groups"),
+            if r.recommended.is_none() {
+                ", and no candidate key reads fewer bytes, so the files' layout already does \
+                 what an index would"
+            } else {
+                ""
+            }
+        ),
+        (true, _) => "no index serves this lookup, and the files' min/max statistics skip \
+                      nothing, so it reads every row group"
+            .to_string(),
+        (false, Some(cur)) if has_window && cur.row_groups < span => format!(
+            "no key index serves this lookup; only the time window narrows it, to {} of {}",
+            num(cur.row_groups),
+            count(span, "row group", "row groups")
+        ),
+        _ if r.no_statistics => "no index serves this lookup, and the files carry no min/max \
+                                 statistics on its columns, so it reads every row group"
+            .to_string(),
+        _ => "no index serves this lookup, so it reads every row group".to_string(),
+    }
+}
+
 // One linear screen: state, funnel, culprit, recommendation, fanout, lints,
 // records.
 #[allow(clippy::too_many_lines)]
@@ -878,7 +916,13 @@ pub(crate) fn why(r: &bellwether::WhyReport, out: &Out, fix_command: &str) -> St
         funnel_header_kind(&mut s, w_col, kind_width.zip(kind_head.as_deref()));
         let blank = kind_cell("");
         let blank = blank.as_ref().map(|(w, v)| (*w, v.as_str()));
-        funnel_row_kind(&mut s, w_col, "dataset", &dataset, blank, &rows);
+        // With a kind column the dataset row's cell is blank (the column
+        // describes candidates); its note says what the row counts.
+        let dataset_note = match &kind_head {
+            Some(k) => format!("{rows} (no {k} value: the dataset, not a candidate)"),
+            None => rows.clone(),
+        };
+        funnel_row_kind(&mut s, w_col, "dataset", &dataset, blank, &dataset_note);
         // Over Parquet files with statistics, a run no current key serves is
         // priced as the files' own min/max statistics read it (the Replays'
         // `unserved`); without an index the full scan is context above it.
@@ -1005,18 +1049,6 @@ pub(crate) fn why(r: &bellwether::WhyReport, out: &Out, fix_command: &str) -> St
                 notes.push("recommended".to_string());
             }
             let cell = kind_cell(c.kind_column.as_ref().map_or("", |k| k.value.as_str()));
-            if let Some(k) = &c.kind_column {
-                notes.push(format!(
-                    "{}: {}{}",
-                    k.kind,
-                    k.label,
-                    if k.exactness.is_exact() {
-                        ""
-                    } else {
-                        " (not exact)"
-                    }
-                ));
-            }
             funnel_row_kind(
                 &mut s,
                 w_col,
@@ -1025,6 +1057,27 @@ pub(crate) fn why(r: &bellwether::WhyReport, out: &Out, fix_command: &str) -> St
                 cell.as_ref().map(|(w, v)| (*w, v.as_str())),
                 &notes.join(", "),
             );
+        }
+        // What the kind column holds, once per distinct label, under the
+        // table rather than among a row's notes.
+        let mut legends: Vec<String> = Vec::new();
+        for k in r.candidates.iter().filter_map(|c| c.kind_column.as_ref()) {
+            let line = format!(
+                "  {}: {}{}",
+                k.kind,
+                k.label,
+                if k.exactness.is_exact() {
+                    ""
+                } else {
+                    " (not exact)"
+                }
+            );
+            if !legends.contains(&line) {
+                legends.push(line);
+            }
+        }
+        for line in legends {
+            let _ = writeln!(s, "{line}");
         }
     } else {
         let _ = writeln!(
@@ -1060,52 +1113,26 @@ pub(crate) fn why(r: &bellwether::WhyReport, out: &Out, fix_command: &str) -> St
             CulpritReason::Lint {
                 rule, confidence, ..
             } => format!("lint {rule} (confidence {confidence:.2})"),
-            CulpritReason::NoIndexServes
-                if r.workload
-                    .as_ref()
-                    .is_some_and(|w| matches!(w.lookup, Some(LookupKind::SemiJoin { .. }))) =>
-            {
-                "no join key serves this semi-join, so each step locates every asked key in its \
-                 own dataset, whether the other dataset holds it or not"
-                    .to_string()
-            }
-            CulpritReason::NoIndexServes => {
-                let span = r.dataset.row_groups * r.workload.as_ref().map_or(1, |w| w.runs);
-                let has_window = r.workload.as_ref().is_some_and(|w| !w.windows.is_empty());
-                match (r.unserved.is_some(), r.current) {
-                    (true, Some(m)) if m.row_groups < span => format!(
-                        "no key index serves this lookup; the files' own min/max statistics{} \
-                         already narrow it to {} of the {} the runs span{}",
-                        if has_window {
-                            " and the time window"
-                        } else {
-                            ""
-                        },
-                        num(m.row_groups),
-                        count(span, "row group", "row groups"),
-                        if r.recommended.is_none() {
-                            ", and no candidate key reads fewer bytes, so the files' layout \
-                             already does what an index would"
-                        } else {
-                            ""
-                        }
-                    ),
-                    (true, _) => "no index serves this lookup, and the files' min/max \
-                                  statistics skip nothing, so it reads every row group"
-                        .to_string(),
-                    (false, Some(cur)) if has_window && cur.row_groups < span => format!(
-                        "no key index serves this lookup; only the time window narrows it, to {} \
-                         of {}",
-                        num(cur.row_groups),
-                        count(span, "row group", "row groups")
-                    ),
-                    _ if r.no_statistics => "no index serves this lookup, and the files carry \
-                                             no min/max statistics on its columns, so it reads \
-                                             every row group"
-                        .to_string(),
-                    _ => "no index serves this lookup, so it reads every row group".to_string(),
-                }
-            }
+            CulpritReason::NoIndexServes => match r.workload.as_ref().and_then(|w| match &w.lookup {
+                Some(LookupKind::SemiJoin {
+                    right,
+                    right_columns,
+                }) => Some((right, right_columns)),
+                _ => None,
+            }) {
+                Some((right, right_columns)) => format!(
+                    "no join key serves this semi-join (join:{}.{}={right}.{} is not declared), \
+                     so each step locates every asked key in its own dataset, whether the other \
+                     dataset holds it or not",
+                    std::path::Path::new(&r.root)
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_default(),
+                    c.columns.join(","),
+                    right_columns.join(",")
+                ),
+                None => no_index_serves(r),
+            },
             CulpritReason::Layout {
                 least_row_groups,
                 row_groups,
@@ -1980,20 +2007,25 @@ pub(crate) fn join_overlap(r: &bellwether::JoinOverlapResult, out: &Out) -> Stri
     let _ = writeln!(s, "  both sides   {:>14}  keys", num(r.both));
     let _ = writeln!(s, "  left only    {:>14}  keys", num(r.left_only));
     let _ = writeln!(s, "  right only   {:>14}  keys", num(r.right_only));
-    let mean = |sum: u64| {
-        if r.both == 0 {
+    let mean = |sum: u64, keys: u64| {
+        if keys == 0 {
             0.0
         } else {
-            sum as f64 / r.both as f64
+            sum as f64 / keys as f64
         }
     };
     let _ = writeln!(
         s,
         "  row groups per shared key: right max {}, mean {:.2}; left max {}, mean {:.2}",
         num(r.max_right_row_groups),
-        mean(r.sum_right_row_groups),
+        mean(r.sum_right_row_groups, r.both),
         num(r.max_left_row_groups),
-        mean(r.sum_left_row_groups)
+        mean(r.sum_left_row_groups, r.both)
+    );
+    let _ = writeln!(
+        s,
+        "  right row groups per left key: mean {:.2} (a key on the left only counts 0)",
+        mean(r.sum_right_row_groups, r.both + r.left_only)
     );
     if let Some(rows) = r.rows {
         let _ = writeln!(

@@ -523,6 +523,12 @@ impl Engine {
         let w = self.read(hash, HashKind::Proposal, existing_only)?;
         match &w.record {
             Record::Proposal(p) => {
+                // A join key naming a right dataset this engine does not
+                // serve is refused before anything else is read (B3,
+                // `EngineOptions::join_scope`).
+                if let ProposalBody::Key { spec, .. } = &p.body {
+                    self.check_join_scope(spec)?;
+                }
                 let p = p.clone();
                 Ok((w, p))
             }
@@ -1190,7 +1196,9 @@ impl Engine {
         if !p.planner.declared_specs().contains(spec) {
             return Ok(());
         }
-        let state = self.join_key_state(p, spec, &self.right_engine(right)?)?;
+        let right = self.right_engine(right)?;
+        let rpin = right.pin_required("a join key")?;
+        let state = self.join_key_state(p, spec, &right, &rpin)?;
         match state.state {
             JoinFreshness::Fresh { .. } => Ok(()),
             _ => Err(self.stale_join(&state)),
@@ -1209,7 +1217,9 @@ impl Engine {
 
     /// The right certificate a join key's (left) certificate cites (B3):
     /// it must be in the ledger, pass, and be of the right dataset's
-    /// current manifest; or the refusal.
+    /// current manifest, by sequence and by content (a right index deleted
+    /// and rebuilt to the same sequence is another manifest); or the
+    /// refusal.
     #[allow(clippy::result_large_err)]
     fn right_certificate(
         &self,
@@ -1230,13 +1240,17 @@ impl Engine {
                 .manifest_version
                 .clone()
                 .unwrap_or_default();
-            let current = pair.rpin().sequence().to_string();
-            if certified != current {
-                return Ok(Err(Refusal::StaleManifest {
-                    certificate: *input,
-                    certified,
-                    current,
-                }));
+            let rpin = pair.rpin();
+            // The certificate cites the manifest it verified by content.
+            if certified != rpin.sequence().to_string()
+                || !right.provenance.inputs.contains(&rpin.hash)
+            {
+                return Ok(Err(stale_right(
+                    *input,
+                    pair.right().root(),
+                    &certified,
+                    rpin.sequence(),
+                )));
             }
             return Ok(Ok(*input));
         }
@@ -1604,38 +1618,28 @@ impl Engine {
         test_seam::before_apply(self);
         // A join key (B3) is declared and built whole in one commit from
         // both datasets' exact keys, pinned to the right manifest the right
-        // certificate verified; a right commit since then is refused before
-        // anything is written.
+        // certificate verified: `refresh_join` is given its content hash and
+        // refuses, before building or committing anything, a right dataset
+        // whose current manifest is another (a commit, or an index deleted
+        // and rebuilt, since the certificate).
         let committed = if let Some((pair, right_cert)) = join {
-            let certified = pair.rpin().sequence();
-            let current = pair.right().manifest()?.map_or(0, |m| m.sequence);
-            if current != certified {
-                return Ok((
-                    refused(Refusal::StaleManifest {
-                        certificate: right_cert,
-                        certified: certified.to_string(),
-                        current: current.to_string(),
-                    }),
-                    Vec::new(),
-                ));
-            }
+            let rpin = pair.rpin();
             match Builder::new(Arc::clone(self.store()?), "").refresh_join(
                 spec,
                 pair.right().store()?,
                 "",
+                Some(rpin.hash),
+                self.build_options(Vec::new()).pair_caps(),
             )? {
-                bellwether_build::JoinRefresh::Built {
-                    sequence,
-                    right_sequence,
-                    ..
-                } if right_sequence == certified => Some(sequence),
-                bellwether_build::JoinRefresh::Built { right_sequence, .. } => {
+                bellwether_build::JoinRefresh::Built { sequence, .. } => Some(sequence),
+                bellwether_build::JoinRefresh::RightChanged { found, .. } => {
                     return Ok((
-                        refused(Refusal::StaleManifest {
-                            certificate: right_cert,
-                            certified: certified.to_string(),
-                            current: right_sequence.to_string(),
-                        }),
+                        refused(stale_right(
+                            right_cert,
+                            pair.right().root(),
+                            &rpin.sequence().to_string(),
+                            found.sequence,
+                        )),
                         Vec::new(),
                     ));
                 }
@@ -1906,6 +1910,27 @@ fn refused(refusal: Refusal) -> FixOutcome {
 /// commit nothing.
 fn complete(pinned: Option<&Pinned>, spec: &KeySpec) -> bool {
     pinned.is_some_and(|p| p.planner.completeness(spec).is_some())
+}
+
+/// The refusal for a join key's right certificate (B3) whose right
+/// manifest is no longer the right dataset's (at `root`) current one:
+/// `certified` is the sequence it verified, `current` the current one; at
+/// one sequence, the current manifest is another (the index was deleted
+/// and rebuilt), and the refusal says so.
+fn stale_right(certificate: Hash, root: &str, certified: &str, current: u64) -> Refusal {
+    let current = if certified == current.to_string() {
+        format!(
+            "{current} of {root}, another manifest at that sequence (its index was deleted and \
+             rebuilt since)"
+        )
+    } else {
+        format!("{current} of {root}")
+    };
+    Refusal::StaleManifest {
+        certificate,
+        certified: format!("{certified} of {root}"),
+        current,
+    }
 }
 
 fn not_workload_covered(cert_hash: &Hash) -> Error {
@@ -3116,7 +3141,7 @@ mod tests {
                     extra: Default::default(),
                 },
                 bytes: seg.bytes.len() as u64,
-                right_sequence: None,
+                join: None,
                 extra: Default::default(),
             });
             Ok(next)

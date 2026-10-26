@@ -42,8 +42,8 @@ use crate::why::{LookupMode, WhyRequest};
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum JoinFreshness {
-    /// Built over every live left row group and pinned to the right
-    /// dataset's current manifest sequence.
+    /// Built over the left's live row groups as they are and pinned to the
+    /// right dataset's current manifest.
     Fresh {
         /// The left sequence at which it became complete.
         complete_at: u64,
@@ -52,7 +52,8 @@ pub enum JoinFreshness {
     },
     /// Declared, with no pair index built yet.
     NotBuilt,
-    /// The left's row groups changed since it was built.
+    /// The left's row groups changed since it was built (a file added,
+    /// changed, or removed).
     StaleLeft {
         /// The left sequence its exact keys were read at.
         built_from: u64,
@@ -66,6 +67,31 @@ pub enum JoinFreshness {
         /// The right's current sequence.
         current: u64,
     },
+    /// The right dataset's index was deleted and rebuilt (or its manifest
+    /// replaced) since it was built: its current manifest is another one,
+    /// at a sequence no later than the pinned one.
+    StaleRightRebuilt {
+        /// The right sequence it is pinned to.
+        pinned: u64,
+        /// The right's current sequence (another manifest).
+        current: u64,
+    },
+    /// The right dataset's files changed since its index was built (files
+    /// its index does not cover), so its index, and then the join key, must
+    /// be rebuilt before a semi-join can use it.
+    StaleRightFiles {
+        /// The right manifest sequence that no longer describes its files.
+        right_sequence: u64,
+        /// Files its index does not track.
+        new: u64,
+        /// Tracked files whose fingerprint changed.
+        changed: u64,
+        /// Tracked files no longer found.
+        removed: u64,
+    },
+    /// `index` committed the left dataset's build, and could not rebuild
+    /// this join key; `message` says why and what to run.
+    NotRebuilt,
 }
 
 impl From<JoinState> for JoinFreshness {
@@ -87,8 +113,26 @@ impl From<JoinState> for JoinFreshness {
                 current,
             },
             JoinState::RightAdvanced { pinned, current } => Self::StaleRight { pinned, current },
+            JoinState::RightRebuilt { pinned, current } => {
+                Self::StaleRightRebuilt { pinned, current }
+            }
         }
     }
+}
+
+/// Which right datasets a join key (B3) may name
+/// ([`EngineOptions::join_scope`]).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum JoinScope {
+    /// Any folder beside the data root: the command line, where the human
+    /// names it.
+    #[default]
+    Any,
+    /// Only this right side, `<right>.<columns>` (the MCP server's
+    /// operator-given `--join`).
+    Only(String),
+    /// None: an MCP server started without `--join`.
+    Unserved,
 }
 
 /// One declared join key and its freshness.
@@ -227,19 +271,86 @@ pub(crate) fn right_root_of(root: &str, right: &str) -> Result<String> {
 }
 
 impl Engine {
+    /// Refuses the join key `spec` (B3) when this engine may not read its
+    /// right dataset ([`EngineOptions::join_scope`]): before anything is
+    /// read, with a refusal that names only the right side served, so it
+    /// is the same whether a folder of the name asked exists, is indexed,
+    /// or not. Any other key passes.
+    pub(crate) fn check_join_scope(&self, spec: &KeySpec) -> Result<()> {
+        match spec {
+            KeySpec::Join {
+                right,
+                right_columns,
+                ..
+            } => self.check_right_side(right, right_columns),
+            _ => Ok(()),
+        }
+    }
+
+    /// [`Engine::check_join_scope`] for a right side, `right.right_columns`.
+    pub(crate) fn check_right_side(&self, right: &str, right_columns: &[String]) -> Result<()> {
+        let served = match &self.options().join_scope {
+            JoinScope::Any => return Ok(()),
+            JoinScope::Only(side) => {
+                if crate::spec::parse_join_side(side)
+                    .is_ok_and(|(r, c)| r == right && c.as_slice() == right_columns)
+                {
+                    return Ok(());
+                }
+                Some(side.clone())
+            }
+            JoinScope::Unserved => None,
+        };
+        let message = match &served {
+            Some(side) => format!(
+                "this server semi-joins only with the right side it was started with (--join \
+                 {side}); a join key naming another right dataset or other columns is refused \
+                 before any folder is read. Use the join key on {side}, or ask the human to \
+                 restart the server with --join <right>.<columns> naming the dataset to join \
+                 with"
+            ),
+            None => "this server was started without --join, so it reads no right dataset and \
+                     plans no semi-join; a join key is refused before any folder is read. Ask \
+                     the human to restart the server with --join <right>.<columns> naming the \
+                     dataset to join with"
+                .to_string(),
+        };
+        Err(Error::JoinNotServed { served, message })
+    }
+
     /// The right dataset `right` of a join key on this (the left) dataset:
-    /// the folder of that name beside the data root, opened through its own
+    /// the folder of that name beside the data root (a symbolic link there
+    /// must resolve to a folder beside it too), opened through its own
     /// index at its default location, in this engine's file format and
     /// clock. Its index must exist.
     pub(crate) fn right_engine(&self, right: &str) -> Result<Engine> {
         self.require_folder("a join key")?;
         let path = right_root_of(self.root(), right)?;
         if !Path::new(&path).is_dir() {
-            return Err(Error::Source(format!(
-                "the right dataset {right} is the folder {path} beside the data root, and there \
-                 is no such folder; a join key names its right dataset by a folder beside the \
-                 left one"
-            )));
+            return Err(Error::InvalidArgument {
+                field: "join",
+                reason: format!(
+                    "the right dataset {right} is the folder {path} beside the data root, and \
+                     there is no such folder; a join key names its right dataset by a folder \
+                     beside the left one"
+                ),
+            });
+        }
+        let parent = Path::new(&path).parent().map(std::fs::canonicalize);
+        let resolved = std::fs::canonicalize(&path);
+        if let (Some(Ok(parent)), Ok(resolved)) = (parent, resolved) {
+            if resolved.parent() != Some(parent.as_path()) {
+                return Err(Error::InvalidArgument {
+                    field: "join",
+                    reason: format!(
+                        "the right dataset {right} is {path}, a link to {}, which is not beside \
+                         the data root (in {}); a join key reads only a dataset in the folder \
+                         that holds the left one: move or copy {right} there",
+                        resolved.display(),
+                        parent.display()
+                    ),
+                });
+            }
         }
         let options = EngineOptions {
             format: self.options().format,
@@ -273,16 +384,16 @@ impl Engine {
     }
 
     /// The state of the declared join key `spec` against its right dataset
-    /// `right`.
+    /// `right`, whose current manifest `rpin` pins.
     pub(crate) fn join_key_state(
         &self,
         pinned: &Pinned,
         spec: &KeySpec,
         right: &Engine,
+        rpin: &Pinned,
     ) -> Result<JoinKeyState> {
-        let rpin = right.pin_required("a join key")?;
-        let state = pinned.planner.join_state(spec, rpin.sequence())?;
-        let message = format!("{}: {}", spec.name(), state.describe());
+        let state = pinned.planner.join_state(spec, &rpin.planner)?;
+        let message = format!("{}: {}", spec.identity(), state.describe());
         let next = (!matches!(state, JoinState::Fresh { .. })).then(|| self.refresh_command());
         Ok(JoinKeyState {
             spec: spec.clone(),
@@ -297,15 +408,25 @@ impl Engine {
     /// The typed refusal for a join key that is not fresh.
     pub(crate) fn stale_join(&self, s: &JoinKeyState) -> Error {
         let (side, pinned, current) = match &s.state {
-            // Never called on a fresh key; a key never built is behind on
-            // the left.
-            JoinFreshness::Fresh { .. } | JoinFreshness::NotBuilt => ("left", 0, 0),
+            // Never called on a fresh key; a key never built (or not
+            // rebuilt) is behind on the left.
+            JoinFreshness::Fresh { .. } | JoinFreshness::NotBuilt | JoinFreshness::NotRebuilt => {
+                ("left", 0, 0)
+            }
             JoinFreshness::StaleLeft {
                 built_from,
                 current,
             } => ("left", *built_from, *current),
-            JoinFreshness::StaleRight { pinned, current } => ("right", *pinned, *current),
+            JoinFreshness::StaleRight { pinned, current }
+            | JoinFreshness::StaleRightRebuilt { pinned, current } => ("right", *pinned, *current),
+            JoinFreshness::StaleRightFiles { right_sequence, .. } => {
+                ("right", *right_sequence, *right_sequence)
+            }
         };
+        let rebuild = s
+            .next
+            .clone()
+            .unwrap_or_else(|| self.refresh_command());
         Error::StaleJoin {
             spec: s.spec.name(),
             side,
@@ -313,9 +434,8 @@ impl Engine {
             current,
             message: format!(
                 "{}, so it cannot be planned with: a semi-join planned from it could miss rows on \
-                 the side that moved; rebuild it with `{}`",
-                s.message,
-                self.refresh_command()
+                 the side that moved; rebuild it with `{rebuild}`",
+                s.message
             ),
         }
     }
@@ -324,8 +444,16 @@ impl Engine {
     /// (B3) that is not fresh, each from both datasets' complete exact keys
     /// (a missing one is refused naming the `bellwether index` command that
     /// declares it), and reports each key's state. Called by `index` after
-    /// the build.
-    pub(crate) fn refresh_joins(&self, given: &[KeySpec]) -> Result<Vec<JoinKeyState>> {
+    /// the build, whose commit `left_committed` says: once anything was
+    /// committed, a key that cannot be rebuilt is reported
+    /// ([`JoinFreshness::NotRebuilt`], with why and what to run) beside the
+    /// commit rather than refused, so the commit is never hidden; before,
+    /// the first refusal is returned.
+    pub(crate) fn refresh_joins(
+        &self,
+        given: &[KeySpec],
+        left_committed: bool,
+    ) -> Result<Vec<JoinKeyState>> {
         let mut joins: Vec<KeySpec> = self
             .pin()?
             .map(|p| {
@@ -342,21 +470,54 @@ impl Engine {
             joins.push(g.clone());
         }
         let builder = Builder::new(Arc::clone(self.store()?), "");
+        let caps = self.build_options(Vec::new()).pair_caps();
+        let mut committed = left_committed;
         let mut out = Vec::with_capacity(joins.len());
         for spec in joins {
             let KeySpec::Join { right, .. } = &spec else {
                 continue;
             };
-            let right = self.right_engine(right)?;
-            let rpin = right.pin_required("a join key")?;
-            right.refuse_stale(&rpin, "a join key")?;
-            let done = builder
-                .refresh_join(&spec, right.store()?, "")
-                .map_err(|e| self.side_hint(&right, e))?;
-            let pinned = self.pin_required("index")?;
-            let mut state = self.join_key_state(&pinned, &spec, &right)?;
-            state.refreshed = matches!(done, JoinRefresh::Built { .. });
-            out.push(state);
+            let refreshed = (|| {
+                let right = self.right_engine(right)?;
+                let rpin = right.pin_required("a join key")?;
+                right.refuse_stale(&rpin, "a join key")?;
+                let done = builder
+                    .refresh_join(&spec, right.store()?, "", Some(rpin.hash), caps)
+                    .map_err(|e| self.side_hint(&right, e))?;
+                if let JoinRefresh::RightChanged { found, .. } = done {
+                    return Err(Error::VersionConflict {
+                        expected: format!(
+                            "the manifest of {} read at sequence {}",
+                            right.root(),
+                            rpin.sequence()
+                        ),
+                        found: format!(
+                            "another manifest at sequence {} committed meanwhile; run the index \
+                             again",
+                            found.sequence
+                        ),
+                    });
+                }
+                let pinned = self.pin_required("index")?;
+                let mut state = self.join_key_state(&pinned, &spec, &right, &rpin)?;
+                state.refreshed = matches!(done, JoinRefresh::Built { .. });
+                Ok(state)
+            })();
+            match refreshed {
+                Ok(state) => {
+                    committed |= state.refreshed;
+                    out.push(state);
+                }
+                Err(e) if committed => out.push(JoinKeyState {
+                    right_root: right_root_of(self.root(), right)?,
+                    message: format!("{}: not rebuilt: {e}", spec.identity()),
+                    spec,
+                    state: JoinFreshness::NotRebuilt,
+                    next: Some(self.refresh_command()),
+                    refreshed: false,
+                }),
+                Err(e) => return Err(e),
+            }
         }
         Ok(out)
     }
@@ -486,7 +647,7 @@ impl Engine {
         let right = self.right_engine(right)?;
         let rpin = right.pin_required(verb)?;
         right.refuse_stale(&rpin, verb)?;
-        let state = self.join_key_state(&pinned, &spec, &right)?;
+        let state = self.join_key_state(&pinned, &spec, &right, &rpin)?;
         if !matches!(state.state, JoinFreshness::Fresh { .. }) {
             return Err(self.stale_join(&state));
         }
@@ -640,7 +801,38 @@ impl Engine {
                     continue;
                 };
                 let right = self.right_engine(right)?;
-                joins.push(self.join_key_state(&pinned, spec, &right)?);
+                let rpin = right.pin_required("join verify")?;
+                let mut state = self.join_key_state(&pinned, spec, &right, &rpin)?;
+                // Fresh against the right manifest, and the right's files
+                // moved on since its index was built: the next semi-join
+                // would be refused, so the key is not fresh.
+                if matches!(state.state, JoinFreshness::Fresh { .. }) {
+                    if let Err(Error::StaleIndex {
+                        untracked,
+                        changed,
+                        missing,
+                        message,
+                    }) = right.refuse_stale(&rpin, "a semi-join with it")
+                    {
+                        state.state = JoinFreshness::StaleRightFiles {
+                            right_sequence: rpin.sequence(),
+                            new: untracked.len() as u64,
+                            changed: changed.len() as u64,
+                            removed: missing.len() as u64,
+                        };
+                        state.message = format!(
+                            "{}: stale on the right: {message}; then `{}` rebuilds the join key",
+                            spec.identity(),
+                            self.refresh_command()
+                        );
+                        state.next = Some(format!(
+                            "{} && {}",
+                            right.refresh_command(),
+                            self.refresh_command()
+                        ));
+                    }
+                }
+                joins.push(state);
             }
             Ok(JoinVerifyResult {
                 root: self.root().to_string(),
@@ -674,12 +866,13 @@ pub(crate) fn join_key(root: &str, columns: &[String], j: &RunJoin) -> KeySpec {
 }
 
 /// What `why` prices a semi-join with (B3): the right dataset, pinned, its
-/// source, and the transient pair index of each join key it prices.
+/// source, and the transient pair index (its segments) of each join key it
+/// prices.
 pub(crate) struct WhyPair {
     right: Engine,
     rpin: Pinned,
     source: Box<dyn Source>,
-    pairs: BTreeMap<String, Bytes>,
+    pairs: BTreeMap<String, Vec<Bytes>>,
 }
 
 impl WhyPair {
@@ -750,7 +943,17 @@ impl Engine {
             right_columns: right_columns.clone(),
         };
         let spec = join_key(self.root(), &columns, &run);
-        crate::spec::check(&spec)?;
+        crate::spec::check(&spec).map_err(|e| Error::InvalidArgument {
+            field: "join",
+            reason: format!(
+                "{}; the right side names one column per key column, in the key columns' order \
+                 ({right}.<column>,<column>...)",
+                match &e {
+                    Error::KeySpec(m) => m.clone(),
+                    other => other.to_string(),
+                }
+            ),
+        })?;
         self.pair_for(pinned, &spec).map(Some)
     }
 
@@ -778,6 +981,7 @@ impl Engine {
                 needs: Some(bellwether_core::join::side_spec(columns, false).identity()),
             });
         };
+        self.check_join_scope(spec)?;
         let r = self.right_engine(right)?;
         let rpin = r.pin_required("a join key's price")?;
         r.refuse_stale(&rpin, "a join key's price")?;
@@ -791,7 +995,7 @@ impl Engine {
             } = d
             {
                 if c == columns && rr == right && rc == right_columns {
-                    let state = self.join_key_state(pinned, d, &r)?;
+                    let state = self.join_key_state(pinned, d, &r, &rpin)?;
                     if !matches!(state.state, JoinFreshness::Fresh { .. }) {
                         return Err(self.stale_join(&state));
                     }
@@ -801,11 +1005,18 @@ impl Engine {
                 }
             }
         }
+        // Split as the index build splits it, and held within a transient
+        // index's cap (ADR 018).
+        let caps = self.build_options(Vec::new()).pair_caps();
+        let max_bytes = bellwether_replay::TransientLimits::default().max_index_bytes;
         let mut pairs = BTreeMap::new();
         for s in priced {
-            let built = transient_pair(&pinned.snapshot, &rpin.snapshot, &s)
+            let built = transient_pair(&pinned.snapshot, &rpin.snapshot, &s, caps, max_bytes)
                 .map_err(|e| self.side_hint(&r, e))?;
-            pairs.insert(s.identity(), Bytes::from(built.bytes));
+            pairs.insert(
+                s.identity(),
+                built.segments.into_iter().map(Bytes::from).collect(),
+            );
         }
         let source = r.source(Some(&rpin))?;
         Ok(WhyPair {
@@ -819,8 +1030,9 @@ impl Engine {
 
 /// A join key's `why` column (B3): of the keys the workload asks (over
 /// every run, distinct), how many both datasets hold, and the right row
-/// groups per shared key of the whole pair (max and mean), exact, from the
-/// transient pair index the candidate was priced with; with gates, the
+/// groups per key of the whole pair (the most per shared key; the mean per
+/// shared key and per left key, a left-only key counting 0), exact, from
+/// the transient pair index the candidate was priced with; with gates, the
 /// shared keyset against each.
 pub(crate) fn join_column(
     replayer: &Replayer<'_>,
@@ -830,12 +1042,14 @@ pub(crate) fn join_column(
     gates: &[Gate],
 ) -> Result<KindColumn> {
     use bellwether_profile::render::thousands;
-    let bytes = replayer
+    let segments = replayer
         .pair_index(spec)
         .ok_or_else(|| Error::Other(format!("no pair index was built for {}", spec.name())))?;
-    let reader = SegmentReader::open(bytes.clone())?;
-    let readers = std::slice::from_ref(&reader);
-    let stats = bellwether_core::join::overlap_stats(readers)?;
+    let readers = segments
+        .iter()
+        .map(|b| SegmentReader::open(b.clone()))
+        .collect::<Result<Vec<_>>>()?;
+    let stats = bellwether_core::join::overlap_stats(&readers)?;
     let mut asked: BTreeSet<Vec<u8>> = BTreeSet::new();
     for run in workload.runs() {
         let rk = workload.run_keys(cache, run)?;
@@ -843,23 +1057,31 @@ pub(crate) fn join_column(
         asked.extend(rk.all_probes(&all));
     }
     let probes: Vec<Vec<u8>> = asked.into_iter().collect();
-    let matched = bellwether_core::join::semijoin(readers, &probes)?.len() as u64;
+    let matched = bellwether_core::join::semijoin(&readers, &probes)?.len() as u64;
     #[allow(clippy::cast_precision_loss)]
-    let mean = if stats.both == 0 {
-        0.0
-    } else {
-        stats.sum_right_row_groups as f64 / stats.both as f64
+    let mean = |keys: u64| {
+        if keys == 0 {
+            0.0
+        } else {
+            stats.sum_right_row_groups as f64 / keys as f64
+        }
     };
-    let mut value = format!(
-        "{} of {} keys on both; right row groups per shared key max {}, mean {mean:.2}",
-        thousands(matched),
-        thousands(probes.len() as u64),
-        thousands(stats.max_right_row_groups)
+    // The cell is short (the asked keys both hold); what it means and the
+    // pair's shape are the label, which a report prints once, under the
+    // table.
+    let mut label = format!(
+        "asked keys both datasets hold, of those asked; over the pair {} keys are shared, each \
+         in at most {} right row groups (mean {:.2} per shared key, {:.2} per left key, a \
+         left-only key counting 0)",
+        thousands(stats.both),
+        thousands(stats.max_right_row_groups),
+        mean(stats.both),
+        mean(stats.both + stats.left_only)
     );
     for g in gates {
         let fits = if matched <= g.limit { "within" } else { "over" };
         let _ = write!(
-            value,
+            label,
             "; {} shared keys {fits} {} ({})",
             thousands(matched),
             g.name,
@@ -868,11 +1090,12 @@ pub(crate) fn join_column(
     }
     Ok(KindColumn {
         kind: "join".into(),
-        label: format!(
-            "asked keys both datasets hold, of {} shared over the pair",
-            thousands(stats.both)
+        label,
+        value: format!(
+            "{} of {}",
+            thousands(matched),
+            thousands(probes.len() as u64)
         ),
-        value,
         exactness: Exactness::Exact,
     })
 }

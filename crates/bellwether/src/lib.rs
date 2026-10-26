@@ -74,8 +74,8 @@ pub use fix::{
     DataState, FixOutcome, FixRequest, FixResult, Refusal, RewriteOutputs, Score, SignatureWritten,
 };
 pub use join::{
-    JoinFreshness, JoinKeyState, JoinOverlapResult, JoinRows, JoinVerifyResult, SemiJoinResult,
-    SemiJoinStep,
+    JoinFreshness, JoinKeyState, JoinOverlapResult, JoinRows, JoinScope, JoinVerifyResult,
+    SemiJoinResult, SemiJoinStep,
 };
 pub use keys::KeyFile;
 pub use ledger_views::{

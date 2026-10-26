@@ -87,6 +87,11 @@ impl Engine {
         proposed_by: &str,
         write: bool,
     ) -> Result<ProposeResult> {
+        // A join key naming a right dataset this engine does not serve is
+        // refused before anything is read (B3, `EngineOptions::join_scope`).
+        if let Some(spec) = &declared.key {
+            self.check_join_scope(spec)?;
+        }
         if let Some(sketch) = &declared.sketch {
             // A sketch is approximate and never planned with: no replay can
             // price it, so it has no path to a receipt.

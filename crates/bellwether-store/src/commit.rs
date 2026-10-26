@@ -514,7 +514,7 @@ mod tests {
             key_spec: "exact:id".into(),
             rowgroup_range: RowGroupRange::new(n, n + 1),
             bytes: 1,
-            right_sequence: None,
+            join: None,
             extra: Extra::new(),
         }
     }

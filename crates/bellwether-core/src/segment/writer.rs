@@ -454,6 +454,19 @@ impl KeyedEmitter {
         Ok(())
     }
 
+    /// Keys pushed so far.
+    pub(crate) fn entries(&self) -> u64 {
+        self.f.entries
+    }
+
+    /// Bytes the emitter holds now: the segment written so far, its index,
+    /// and the open block's keys and values. The finished segment is at
+    /// most this plus the footer.
+    pub(crate) fn held_bytes(&self) -> u64 {
+        (self.f.out.len() + self.f.index.len() + self.f.suffix.len() + self.key_bytes)
+            .saturating_add(self.values.len()) as u64
+    }
+
     fn push_record(
         &mut self,
         key: &[u8],

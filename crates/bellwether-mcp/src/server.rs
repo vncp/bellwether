@@ -119,15 +119,45 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
+/// The right side of an operator's join key (`--join`), `<right>.<cols>`:
+/// the key's right side when it is a whole key, `join:...`, else the value.
+fn join_side_of(j: &str) -> bellwether::types::Result<String> {
+    if !j.trim_start().starts_with("join:") {
+        bellwether::spec::parse_join_side(j)?;
+        return Ok(j.trim().to_string());
+    }
+    match bellwether::spec::parse(j)? {
+        bellwether::types::KeySpec::Join {
+            right,
+            right_columns,
+            ..
+        } => Ok(format!("{right}.{}", right_columns.join(","))),
+        other => Err(bellwether::types::Error::KeySpec(format!(
+            "{} is not a join key",
+            other.name()
+        ))),
+    }
+}
+
 impl Server {
-    /// Opens the engine over `config.root`. Opening writes nothing.
+    /// Opens the engine over `config.root`. Opening writes nothing. The
+    /// engine reads no right dataset but the one `config.join` names (B3,
+    /// `EngineOptions::join_scope`): a join key a tool argument names with
+    /// another right side is refused before any folder is read.
     pub fn new(config: &Config) -> bellwether::types::Result<Self> {
-        let engine = Engine::open(&config.root, config.engine.clone())?;
+        let options = EngineOptions {
+            join_scope: match &config.join {
+                Some(j) => bellwether::JoinScope::Only(join_side_of(j)?),
+                None => bellwether::JoinScope::Unserved,
+            },
+            ..config.engine.clone()
+        };
+        let engine = Engine::open(&config.root, options.clone())?;
         Ok(Self {
             inner: Arc::new(Inner {
                 engine,
                 root: config.root.clone(),
-                options: config.engine.clone(),
+                options,
                 join: config.join.clone(),
                 budget: Meter::new(config.budget),
                 jobs: Mutex::new(Jobs::new()),
@@ -176,22 +206,7 @@ impl Server {
     /// The right side of the operator's join key, as `why` takes it:
     /// `<right>.<cols>`.
     fn join_side(&self) -> bellwether::types::Result<String> {
-        let j = self.join()?;
-        if j.trim_start().starts_with("join:") {
-            match bellwether::spec::parse(j)? {
-                bellwether::types::KeySpec::Join {
-                    right,
-                    right_columns,
-                    ..
-                } => Ok(format!("{right}.{}", right_columns.join(","))),
-                other => Err(bellwether::types::Error::KeySpec(format!(
-                    "{} is not a join key",
-                    other.name()
-                ))),
-            }
-        } else {
-            Ok(j.to_string())
-        }
+        join_side_of(self.join()?)
     }
 
     /// The session budget now.

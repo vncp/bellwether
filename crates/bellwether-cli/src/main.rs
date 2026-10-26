@@ -660,7 +660,7 @@ impl From<Error> for Failure {
                 field:
                     "lookback" | "latest_by" | "signing_key" | "trusted_keys" | "public_key" | "out"
                     | "name" | "valid_from" | "revoked_at" | "index" | "root" | "scratch" | "items"
-                    | "columns" | "text",
+                    | "columns" | "text" | "join",
                 ..
             } => Self::Usage(match hint(&e) {
                 Some(h) => format!("{e}; {h}"),
@@ -743,6 +743,11 @@ fn hint(e: &Error) -> Option<String> {
                 "items" => "--column",
                 "columns" => "--columns",
                 "text" => "--contains, --has, or --prefix",
+                "join" => {
+                    "the right side the join key names (--join <right>.<column>[,<column>...], or \
+                     the right side of a join: key spec): a folder beside the data root, one \
+                     column per key column; why takes --join with --mode semijoin"
+                }
                 _ => return None,
             };
             Some(format!("check {flag}"))
@@ -845,6 +850,8 @@ pub(crate) fn key_file(path: &std::path::Path, key: Option<&Vec<String>>) -> Key
 }
 
 /// `index`: the declared specs, built with `--threads` workers when given.
+/// The build committed and a join key could not be rebuilt (B3): the
+/// commit is reported, and the run exits 1 (a check failed).
 fn index(g: &Global, out: &Out, a: &IndexArgs) -> Result<Outcome, Failure> {
     let declared = a
         .keys
@@ -857,7 +864,16 @@ fn index(g: &Global, out: &Out, a: &IndexArgs) -> Result<Outcome, Failure> {
         ..engine_options(g)?
     };
     let r = Engine::open(&a.root.root, options)?.index_declared(&declared)?;
-    done(&r, human::index(&r, out), EXIT_OK)
+    let code = if r
+        .joins
+        .iter()
+        .any(|j| j.state == bellwether::JoinFreshness::NotRebuilt)
+    {
+        EXIT_FAILED
+    } else {
+        EXIT_OK
+    };
+    done(&r, human::index(&r, out), code)
 }
 
 #[allow(clippy::too_many_lines)]

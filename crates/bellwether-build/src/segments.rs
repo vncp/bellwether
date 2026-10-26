@@ -458,7 +458,7 @@ impl<'a> SpecWriter<'a> {
             rowgroup_range: RowGroupRange::new(self.start, self.end),
             bytes,
             kind: self.plan.target.kind().map(str::to_string),
-            right_sequence: None,
+            join: None,
             extra: Extra::new(),
         });
         Ok(())
