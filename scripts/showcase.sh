@@ -11,7 +11,8 @@
 #   scripts/showcase.sh --only gh-repos10,rec-gh-planted # re-measure some ids
 #   scripts/showcase.sh --market-hive                    # market with hive partitioning
 #   scripts/showcase.sh --accept-new-inputs              # after a DuckDB upgrade or a
-#                                                        # republished download
+#                                                        # republished download (measures
+#                                                        # everything; refused with --only)
 #
 # --market-hive needs an engine whose `fix` records --partitioning in the
 # index it builds. Without it the market folder is read as plain files (the

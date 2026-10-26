@@ -152,16 +152,21 @@ class Results:
         builds = sorted({r["build"] for r in rows if r["build"] != "footer statistics (no engine)"})
         dates = sorted({r["date"] for r in rows})
         line = f"{'; '.join(machines)}. {'; '.join(builds)}. Measured {', '.join(dates)}."
-        if load:
-            loads = []
-            for r in rows:
-                m = re.match(r"1-minute load average ([0-9.]+) on (\d+) cores", r.get("notes") or "")
-                if m:
-                    loads.append((float(m.group(1)), m.group(2)))
-            if loads:
-                lo, hi = min(x for x, _ in loads), max(x for x, _ in loads)
-                line += f" 1-minute load average while timing: {lo:.1f} to {hi:.1f} on {loads[0][1]} cores."
+        if load and self.load_range(qids):
+            lo, hi, cores = self.load_range(qids)
+            line += f" 1-minute load average while timing: {lo:.1f} to {hi:.1f} on {cores} cores."
         return line
+
+    def load_range(self, qids=None):
+        """(lowest, highest, cores) of the load averages recorded in `notes`."""
+        loads = []
+        for r in self.rows:
+            m = re.match(r"1-minute load average ([0-9.]+) on (\d+) cores", r.get("notes") or "")
+            if m and (qids is None or r["query"] in qids):
+                loads.append((float(m.group(1)), m.group(2)))
+        if not loads:
+            return None
+        return min(x for x, _ in loads), max(x for x, _ in loads), loads[0][1]
 
     def dataset(self, ds):
         meta = self.doc.get("datasets", {}).get(ds)
@@ -528,10 +533,12 @@ def reconcile_takeaway(res):
         cmp = f"it was {1 / max(times):.1f}× to {1 / min(times):.1f}× faster than DuckDB's EXCEPT ALL on the same files"
     else:
         cmp = f"DuckDB's EXCEPT ALL took {min(times):.2f}× to {max(times):.2f}× its time on the same files"
+    load = res.load_range(qids)
+    under = f" (timed at a 1-minute load average of {load[0]:.1f} to {load[1]:.1f} on {load[2]} cores)" if load else ""
     return (
         f"Bellwether compared up to {commas(res.v(big, 'bellwether', 'rows_compared'))} rows (both sides) at "
         f"{human_rate(res.v(big, 'bellwether', 'rows_per_s'))} and reported exactly the planted key in {len(found)} of "
-        f"{len(planted)} planted runs; {cmp}."
+        f"{len(planted)} planted runs; {cmp}{under}."
     )
 
 
@@ -809,7 +816,7 @@ def readme_block(res):
         "",
         headline(res, top, "How"),
         "",
-        f"<sub>{res.provenance_line(qids)} Full scan: exact footer sums. Both DuckDB columns, the plan column included, are "
+        f"<sub>{res.provenance_line(qids, load=True)} Full scan: exact footer sums. Both DuckDB columns, the plan column included, are "
         "DuckDB's profiler (`total_bytes_read`), which counts the footers it reads too, so DuckDB alone can exceed the "
         f"full scan. The plan's exact footer sums are on [the measured page]({MEASURED_PAGE}). Every number is a row of "
         "[`docs/measured/results/showcase.json`](docs/measured/results/showcase.json).</sub>",
@@ -820,7 +827,11 @@ def readme_block(res):
         "",
     ]
     if res.ids({"reconcile"}):
-        parts += [f"**Reconcile.** {reconcile_takeaway(res)}", "", reconcile_table(res), ""]
+        recs = res.ids({"reconcile"})
+        parts += [
+            f"**Reconcile.** {reconcile_takeaway(res)}", "", reconcile_table(res), "",
+            f"<sub>{res.provenance_line(recs, load=True)}</sub>", "",
+        ]
     parts += [
         f"**Time.** {latency_takeaway(res)} Per-question times, the throughput chart, receipts, and the SQL: "
         f"[the measured page]({MEASURED_PAGE}).",

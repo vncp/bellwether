@@ -53,7 +53,7 @@ Keys are distinct values chosen by a seeded hash (`ORDER BY hash(col, 42)`), so 
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="../assets/results-reconcile-dark.svg">
-    <img alt="Bellwether compared up to 40,664,186 rows (both sides) at 233 k rows/s and reported exactly the planted key in 2 of 2 planted runs; DuckDB's EXCEPT ALL was 4.2× to 25.0× faster on the same files, and writes no certificate." src="../assets/results-reconcile-light.svg" width="1000">
+    <img alt="Bellwether compared up to 40,664,186 rows (both sides) at 233 k rows/s and reported exactly the planted key in 2 of 2 planted runs; DuckDB's EXCEPT ALL was 4.2× to 25.0× faster on the same files, and writes no certificate (timed at a 1-minute load average of 4.8 to 12.1 on 12 cores)." src="../assets/results-reconcile-light.svg" width="1000">
   </picture>
 </p>
 <!-- results:showcase-charts:end -->

@@ -630,6 +630,11 @@ class Showcase:
         if planted:
             # The key the --json output names (the certificate holds counts
             # only); it must be the one the script planted.
+            if rid not in self.planted:
+                sys.exit(
+                    f"{rid}: {os.path.join(self.work, 'planted.json')} does not name the planted key; "
+                    "run scripts/showcase.sh, which plants the change and writes that file"
+                )
             want = self.planted[rid]
             got = [m["key"]["values"] for m in o["mismatches"]]
             if got != [want]:
@@ -755,7 +760,14 @@ def pin(a):
     """Refuse to mix inputs: the DuckDB version decides the GH Parquet layout,
     the sampled keys, and the taxi rewrite, and the downloads are the data.
     Both must match what the results file already records."""
-    if a.accept_new_inputs or not os.path.exists(a.out):
+    if a.accept_new_inputs:
+        if a.only:
+            sys.exit(
+                "--accept-new-inputs re-measures on new inputs, so it measures everything: drop --only "
+                "(rows measured on the old inputs would otherwise stay in the results file)"
+            )
+        return
+    if not os.path.exists(a.out):
         return
     old = json.load(open(a.out, encoding="utf-8"))
     builds = {r["build"] for r in old["rows"] if r["side"].startswith("duckdb")}

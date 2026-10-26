@@ -2,7 +2,7 @@
 <rect width="1157" height="402" fill="#ffffff" rx="12"/>
 <text x="24.0" y="34.0" fill="#1f2328" font-size="18" font-weight="600">Reconcile: rows checked per second</text>
 <text x="24.0" y="58.0" fill="#1f2328" font-size="15">Bellwether compared up to 40,664,186 rows (both sides) at 233 k rows/s and reported exactly the planted key in 2 of 2 planted runs; DuckDB's</text>
-<text x="24.0" y="80.0" fill="#1f2328" font-size="15">EXCEPT ALL was 4.2× to 25.0× faster on the same files, and writes no certificate.</text>
+<text x="24.0" y="80.0" fill="#1f2328" font-size="15">EXCEPT ALL was 4.2× to 25.0× faster on the same files, and writes no certificate (timed at a 1-minute load average of 4.8 to 12.1 on 12 cores).</text>
 <text x="24.0" y="98.0" fill="#656d76" font-size="12">Rows of both copies compared per second, one warm run each; Bellwether at its default 256 MiB memory budget, including writing its certificate. Apple M3 Pro, 12 cores, 36 GB, macOS</text>
 <text x="24.0" y="114.0" fill="#656d76" font-size="12">26.4.1, local SSD. DuckDB v2.0.0 (d54cbbe3df); bellwether release build of eca48d1 (rustc 1.99.1). Measured 2026-10-26. 1-minute load average while timing: 4.8 to 12.1 on 12 cores.</text>
 <rect x="24.0" y="132.0" width="12.0" height="12.0" rx="2" fill="#1a7f37"/>
