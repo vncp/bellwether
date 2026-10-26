@@ -59,7 +59,7 @@ use arrow::record_batch::RecordBatchReader;
 use bellwether_core::segment::ColumnType;
 use bellwether_store::{Cache, StoreExt};
 use bellwether_types::format::ENCODING_VERSION;
-use bellwether_types::{Error, Hash, Result};
+use bellwether_types::{Error, Hash, Result, TextOp};
 use bytes::Bytes;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use serde::{Deserialize, Serialize};
@@ -89,6 +89,16 @@ pub const QUERY_KIND_WINDOW: &str = "window";
 /// The query kind of a recorded run that counts the rows holding its keys
 /// (`count(*) where key in ...`, `bellwether count`).
 pub const QUERY_KIND_COUNT: &str = "count";
+/// The query kind of a recorded run that looks up the rows of a string
+/// column holding one of its words (`has_token`; B5, `has`).
+pub const QUERY_KIND_HAS_TOKEN: &str = "has_token";
+/// The query kind of a recorded run that looks up the rows of a string
+/// column containing one of its substrings (`contains`, `like '%x%'`; B5).
+pub const QUERY_KIND_CONTAINS: &str = "contains";
+/// The query kind of a recorded run that looks up the rows of a string
+/// column holding a word that starts with one of its prefixes (`has_prefix`;
+/// B5).
+pub const QUERY_KIND_HAS_PREFIX: &str = "has_prefix";
 
 /// The time window of a `window` run: the rows of its keys whose
 /// `ts_column` lies in `[lo, hi]`, both inclusive and in the column's
@@ -139,6 +149,12 @@ pub enum RunQuery {
     /// as a `locate`, and read from the index at no file cost when a
     /// serving spec stores counts on exactly the run's key columns.
     Count,
+    /// The rows whose string column (the run's one key column) matches one
+    /// of the run's values under the text match ([`QUERY_KIND_HAS_TOKEN`],
+    /// [`QUERY_KIND_CONTAINS`], [`QUERY_KIND_HAS_PREFIX`]; B5): the values
+    /// are the words, substrings, or prefixes, both sides case-folded. Only
+    /// a text key can plan it.
+    Text(TextOp),
 }
 
 impl RunQuery {
@@ -151,6 +167,9 @@ impl RunQuery {
             Self::Asof { .. } | Self::Lookback { asof: Some(_), .. } => QUERY_KIND_ASOF,
             Self::Window(_) => QUERY_KIND_WINDOW,
             Self::Count => QUERY_KIND_COUNT,
+            Self::Text(TextOp::HasToken) => QUERY_KIND_HAS_TOKEN,
+            Self::Text(TextOp::Contains) => QUERY_KIND_CONTAINS,
+            Self::Text(TextOp::HasPrefix) => QUERY_KIND_HAS_PREFIX,
         }
     }
 
@@ -161,7 +180,7 @@ impl RunQuery {
         match self {
             Self::Asof { ts } => Some(*ts),
             Self::Lookback { asof, .. } => *asof,
-            Self::Locate | Self::Latest | Self::Window(_) | Self::Count => None,
+            Self::Locate | Self::Latest | Self::Window(_) | Self::Count | Self::Text(_) => None,
         }
     }
 
@@ -170,7 +189,12 @@ impl RunQuery {
     pub fn lookback(&self) -> Option<i64> {
         match self {
             Self::Lookback { lookback, .. } => Some(*lookback),
-            Self::Locate | Self::Latest | Self::Asof { .. } | Self::Window(_) | Self::Count => None,
+            Self::Locate
+            | Self::Latest
+            | Self::Asof { .. }
+            | Self::Window(_)
+            | Self::Count
+            | Self::Text(_) => None,
         }
     }
 
@@ -179,6 +203,15 @@ impl RunQuery {
     pub fn window(&self) -> Option<&RunWindow> {
         match self {
             Self::Window(w) => Some(w),
+            _ => None,
+        }
+    }
+
+    /// The text match of a [`RunQuery::Text`] run.
+    #[must_use]
+    pub fn text_op(&self) -> Option<TextOp> {
+        match self {
+            Self::Text(op) => Some(*op),
             _ => None,
         }
     }
@@ -261,6 +294,22 @@ impl RecordedRun {
                  one",
                 self.run_id, self.query_kind
             )));
+        }
+        let text = match self.query_kind.as_str() {
+            QUERY_KIND_HAS_TOKEN => Some(TextOp::HasToken),
+            QUERY_KIND_CONTAINS => Some(TextOp::Contains),
+            QUERY_KIND_HAS_PREFIX => Some(TextOp::HasPrefix),
+            _ => None,
+        };
+        if let Some(op) = text {
+            if self.asof.is_some() || self.lookback.is_some() || self.columns.len() != 1 {
+                return Err(Error::Other(format!(
+                    "run {:?} is a {} run; it looks up one string column and records no asof, \
+                     lookback, or window",
+                    self.run_id, self.query_kind
+                )));
+            }
+            return Ok(RunQuery::Text(op));
         }
         let point = match (self.query_kind.as_str(), self.asof) {
             (QUERY_KIND_LOCATE, None) => RunQuery::Locate,
@@ -755,6 +804,7 @@ impl<'a> WorkloadRecorder<'a> {
                 )))
             }
         };
+        check_text(run_id, &built, &query, &self.schema)?;
         let payload = built.to_payload()?;
         let key_set = Hash::of(&payload);
         let columns = built.columns().to_vec();
@@ -807,6 +857,41 @@ impl<'a> WorkloadRecorder<'a> {
 
 fn field_names(schema: &Schema) -> Vec<String> {
     schema.fields().iter().map(|f| f.name().clone()).collect()
+}
+
+/// A text run (`has_token`, `contains`, `has_prefix`) looks up exactly one
+/// string column, and each of its values is an argument its match takes
+/// (core's `text::check_arg`: `has_token` one word, `has_prefix` a
+/// non-empty prefix). Refused with what to record instead.
+fn check_text(run_id: &str, keys: &RunKeys, query: &RunQuery, schema: &Schema) -> Result<()> {
+    let Some(op) = query.text_op() else {
+        return Ok(());
+    };
+    let [column] = keys.columns() else {
+        return Err(Error::KeySpec(format!(
+            "run {run_id:?} is a {} run on {} columns ({}); a text run looks up one string \
+             column, so give a key file with that one column",
+            query.kind_str(),
+            keys.columns().len(),
+            keys.columns().join(", ")
+        )));
+    };
+    let dt = schema
+        .field_with_name(column)
+        .map_err(|_| Error::KeySpec(format!("column {column:?} is not in the dataset schema")))?
+        .data_type();
+    bellwether_core::text::check_column_type(column, dt)?;
+    for key in keys.tuples() {
+        let value = bellwether_core::text::arg_of_key(key)?;
+        bellwether_core::text::check_arg(op, &value).map_err(|e| match e {
+            Error::InvalidArgument { field, reason } => Error::InvalidArgument {
+                field,
+                reason: format!("run {run_id:?}: {reason}"),
+            },
+            other => other,
+        })?;
+    }
+    Ok(())
 }
 
 fn read_parquet_keys(path: &Path, schema: &Schema) -> Result<(RunKeys, u64)> {

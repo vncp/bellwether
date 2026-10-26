@@ -73,7 +73,7 @@ use crate::catalog::Catalog;
 use crate::error::{ReplayError, ReplayResult};
 use crate::keys::RunKeys;
 use crate::plan::{with_residual, EncodedWindow};
-use crate::workload::RunWindow;
+use crate::workload::{RunQuery, RunWindow};
 
 /// A configuration without a Bellwether index.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -718,6 +718,25 @@ impl<'a> BaselinePlanner<'a> {
                 self.stats_selection(keys, &all, window)
             }
         }
+    }
+
+    /// The plan for one text run (B5, `query` a `RunQuery::Text`) on its
+    /// one string column, with the text residual. Both baselines read every
+    /// live row group: a string's minimum and maximum say nothing about
+    /// which substrings, case-folded words, or word prefixes it holds, and
+    /// a Parquet bloom filter holds whole values. No value reads nothing.
+    pub fn plan_text(&self, keys: &RunKeys, query: &RunQuery) -> ReplayResult<ScanPlan> {
+        let residual = crate::plan::text_residual(keys, query)?.ok_or_else(|| {
+            Error::Other(format!("a {} run is not a text lookup", query.kind_str()))
+        })?;
+        let selected = if keys.is_empty() {
+            RoaringBitmap::new()
+        } else {
+            self.catalog.all_ids()
+        };
+        let mut plan = self.catalog.plan_for(&selected)?;
+        plan.residual = Some(residual);
+        Ok(plan)
     }
 
     fn stats_selection(

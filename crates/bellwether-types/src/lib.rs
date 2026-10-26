@@ -195,7 +195,7 @@ pub enum Error {
     InvalidArgument {
         /// The request field: `by`, `evidence`, `at`, `window`, `valid`,
         /// `known`, `keys`, `key_columns`, `cluster_by`, `shape`, `workload`,
-        /// `rewrite`, `lookback`, `latest_by`, `columns`.
+        /// `rewrite`, `lookback`, `latest_by`, `columns`, `text`.
         field: &'static str,
         /// What is wrong with it, and what a usable value looks like.
         reason: String,
@@ -738,6 +738,73 @@ pub enum KeySpec {
         /// disagrees.
         conformance: Vec<ExprVector>,
     },
+    /// A token or trigram index over one string column (B5): per token, the
+    /// row groups holding a row whose case-folded value has it. Serves
+    /// [`Predicate::Text`] lookups (`has_token`, `contains`, `has_prefix`),
+    /// never key lookups. Spelled `text:<column>,tokenizer=words|trigram`.
+    Text {
+        /// The string column.
+        column: String,
+        /// How a value is split into tokens.
+        tokenizer: Tokenizer,
+        /// With `Some(fpr)`, one split-block bloom filter per row group over
+        /// the row group's tokens at that false-positive rate (ADR 008)
+        /// instead of a token dictionary; strictly between 0 and 1.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        bloom: Option<f64>,
+    },
+}
+
+/// How a [`KeySpec::Text`] splits a value into tokens. Both work on the
+/// value case-folded: each code point replaced by its Unicode full case
+/// folding (`CaseFolding.txt`, C and F), with no context; never
+/// normalized (`docs/format.md`, "Text keys").
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum Tokenizer {
+    /// The words of the folded value at Unicode word boundaries (UAX #29).
+    Words,
+    /// Every 3-byte window of the folded value's UTF-8 bytes.
+    Trigram,
+}
+
+impl Tokenizer {
+    /// The spelling in a spec: `words` or `trigram`.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Words => "words",
+            Self::Trigram => "trigram",
+        }
+    }
+}
+
+/// A text match ([`Predicate::Text`]). Each compares the row's case-folded
+/// value with the case-folded argument.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum TextOp {
+    /// One of the value's words equals the argument, which is one word.
+    HasToken,
+    /// The value contains the argument as a substring.
+    Contains,
+    /// One of the value's words starts with the argument.
+    HasPrefix,
+}
+
+impl TextOp {
+    /// The spelling in results and plans: `has_token`, `contains`, or
+    /// `has_prefix`.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::HasToken => "has_token",
+            Self::Contains => "contains",
+            Self::HasPrefix => "has_prefix",
+        }
+    }
 }
 
 #[allow(clippy::trivially_copy_pass_by_ref)] // serde's skip_serializing_if signature
@@ -767,7 +834,7 @@ impl KeySpec {
             | Self::Bloom { columns, .. }
             | Self::Temporal { columns, .. }
             | Self::Bitemporal { columns, .. } => columns,
-            Self::Range { column } => std::slice::from_ref(column),
+            Self::Range { column } | Self::Text { column, .. } => std::slice::from_ref(column),
             Self::Expr { over, .. } => over.columns(),
         }
     }
@@ -798,8 +865,11 @@ impl KeySpec {
     /// (`exact:symbol`, `bloom:symbol`, `temporal:id`, `temporal2:id`). An
     /// index holds at most one spec per name, so declaring another spec of
     /// the same name (another false-positive rate, counts on or off) is a
-    /// redefinition that rebuilds it. The manifest keys segments and
-    /// completeness by [`KeySpec::identity`], which carries every field.
+    /// redefinition that rebuilds it. A text key's name also carries its
+    /// tokenizer (`text:body,tokenizer=words`), so a words and a trigram key
+    /// coexist on one column; its bloom rate is not part of the name. The
+    /// manifest keys segments and completeness by [`KeySpec::identity`],
+    /// which carries every field.
     #[must_use]
     pub fn name(&self) -> String {
         let kind = match self {
@@ -808,6 +878,9 @@ impl KeySpec {
             Self::Range { .. } => "range",
             Self::Temporal { .. } => "temporal",
             Self::Bitemporal { .. } => "temporal2",
+            Self::Text {
+                column, tokenizer, ..
+            } => return format!("text:{column},tokenizer={}", tokenizer.as_str()),
             Self::Expr {
                 name, expr, over, ..
             } => {
@@ -870,6 +943,14 @@ impl KeySpec {
                 "temporal2:{}@{valid_column},{known_column}",
                 columns.join(",")
             ),
+            Self::Text {
+                column,
+                tokenizer,
+                bloom,
+            } => match bloom {
+                Some(fpr) => format!("text:{column},tokenizer={},bloom={fpr}", tokenizer.as_str()),
+                None => format!("text:{column},tokenizer={}", tokenizer.as_str()),
+            },
             // The name is an identifier and the expression is normalized
             // (a `:` only inside quotes), so the inner kind after the last
             // unquoted `:` is unambiguous.
@@ -904,7 +985,7 @@ impl KeySpec {
             } => vec![valid_column, known_column],
             // An expr key's name is an identifier and its expression is
             // checked by `bellwether_core::expr::check_spec`.
-            Self::Range { .. } | Self::Expr { .. } => Vec::new(),
+            Self::Range { .. } | Self::Expr { .. } | Self::Text { .. } => Vec::new(),
         };
         if let Some(c) = self
             .columns()
@@ -997,6 +1078,18 @@ pub enum Predicate {
     And {
         /// Conjuncts.
         all: Vec<Predicate>,
+    },
+    /// Keep the rows whose `column` matches at least one of `values` under
+    /// `operator`, both sides case-folded (see [`TextOp`]); a null never
+    /// matches (ADR 014). The residual of a text lookup
+    /// ([`KeySpec::Text`]).
+    Text {
+        /// The string column.
+        column: String,
+        /// The match.
+        operator: TextOp,
+        /// The arguments as given (the consumer folds them as the column).
+        values: Vec<String>,
     },
     /// Keep rows whose column tuple is among the keys `keys_from` names
     /// (contract v3; priced by relational replay, WP15).

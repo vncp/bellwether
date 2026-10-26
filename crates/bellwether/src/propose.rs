@@ -351,6 +351,9 @@ impl Engine {
                             bellwether_core::encoding::no_encoding(dt)
                         )));
                     }
+                    if matches!(spec, KeySpec::Text { .. }) {
+                        bellwether_core::text::check_column_type(c, dt)?;
+                    }
                 }
                 Ok(())
             }

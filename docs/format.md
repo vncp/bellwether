@@ -67,6 +67,8 @@ Versioned from the first commit. `bellwether-types::format::STORAGE_VERSION` (2)
                                            "Sidecar kinds"
                                  sketch:   sidecar segment, its own layout (magic "BWSKETCH"); approximate, never
                                            read by a planner; see "Sketch segments"
+                                 text:     the exact layout keyed by tokens, or with bloom=<fpr> the bloom layout
+                                           over tokens; header also records text_unicode; see "Text keys"
   ledger/<blake3>.rec            Record (Evidence | Proposal | Replay | Certificate | Receipt), canonical JSON
                                  Receipt.certificate must resolve and have pass == true
   ledger/<blake3>.sig.<key id>.json
@@ -92,7 +94,7 @@ rowgroup id      = dense u32 assigned at first sighting of (fingerprint, index_i
 
 ## Key specs
 
-`Exact{columns, counts?}`, `Bloom{columns, fpr}`, `Range{column}`, `Temporal{columns, ts_column, counts?}`, and (phase 5) `Expr{name, expr, over, conformance}` ([Expression keys](#expression-keys-expr-phase-5)). Composite is not a kind; every kind takes a column list and encodes it memcomparably (ADR 002). CSV and JSON lines sources define row groups as fixed byte-range chunks recorded in the manifest, so the rest of the system never knows the difference. `counts` (storage version 2) is serialized only when true, so a spec without it has the same JSON as in version 1; a version 1 manifest that carries it is refused.
+`Exact{columns, counts?}`, `Bloom{columns, fpr}`, `Range{column}`, `Temporal{columns, ts_column, counts?}`, and (phase 5) `Expr{name, expr, over, conformance}` ([Expression keys](#expression-keys-expr-phase-5)), and (phase 5) `Text{column, tokenizer, bloom?}` (see "Text keys"). Composite is not a kind; every kind takes a column list and encodes it memcomparably (ADR 002). CSV and JSON lines sources define row groups as fixed byte-range chunks recorded in the manifest, so the rest of the system never knows the difference. `counts` (storage version 2) is serialized only when true, so a spec without it has the same JSON as in version 1; a version 1 manifest that carries it is refused.
 
 **Key-spec identity (storage version 2).** `KeySpec::identity()` is the canonical string of every field of a spec, and the key under which the manifest lists its segments (`segments[].key_spec`) and its completeness (`key_spec_completeness`):
 
@@ -105,6 +107,8 @@ rowgroup id      = dense u32 assigned at first sighting of (fingerprint, index_i
 | `Temporal{columns: [id], ts_column: ts}` | `temporal:id@ts` |
 | `Temporal{columns: [id], ts_column: ts, counts: true}` | `temporal:id@ts,counts` |
 | `Expr{name: sym, expr: json_get(payload,'$.symbol'), over: Exact{counts: true}}` | `expr:sym=json_get(payload,'$.symbol'):exact,counts` (bloom: `...:bloom@0.01`) |
+| `Text{column: body, tokenizer: words}` | `text:body,tokenizer=words` |
+| `Text{column: body, tokenizer: trigram, bloom: 0.01}` | `text:body,tokenizer=trigram,bloom=0.01` |
 
 So `bloom:a@0.01` and `bloom:a@0.05` never share a segment list or a completeness entry. Two specs declared by a version 2 binary never share an identity: `,` and `@` separate its parts, so a new declaration (a key spec given to `index` that the index does not already declare, or a proposal's) naming a key or time column that contains either is refused (`exact:a,counts` could otherwise be `Exact{[a], counts}` or `Exact{["a,counts"]}`). For the same reason, because `,counts` ends a counted spec's identity, a new composite exact spec whose last key column is named `counts` is refused (list that column first). A spec an index already declares is read and indexed as it is, whatever its column names: a storage version 1 index on a column named `a,b` reads, plans, and upgrades like any other. Only two declared specs that actually share an identity are refused, which version 1 allowed only for two temporal specs whose time column holds an `@` (`temporal:id` on `ts@x` and `temporal:id@ts` on `x`, both `temporal:id@ts@x`): see "Reading storage version 1". Errors name a spec by its identity. `KeySpec::name()` is the display name and the spec's slot (`exact:a`, `bloom:a`, `temporal:id`): an index holds one spec per name, and declaring another spec under a declared name (another rate, counts on or off, another time column) rebuilds it and drops the old segments in the same commit. A storage version 1 manifest keyed both maps by name (one spec per name, so the rewrite is one-to-one); a version 2 reader rewrites those keys to identities when it reads one, and a version 1 manifest that no commit could upgrade yet (see "Manifest, storage version 2") is written back in names.
 
@@ -708,3 +712,41 @@ named `expr:<name>=<expr>:exact` or `expr:<name>=<expr>:bloom`, and identified (
 | `hash` | `hash('SYM1')` | `03 29185bcc 2d6b9e2a` |
 | `hash` | `hash('SYM1','X1')` | `03 2be2127e 8956e278` |
 | `hash` | `hash(1,'a')` | `03 e51a8fcd c38e4db3` |
+## Text keys (storage version 2, B5)
+
+A text key indexes the tokens of one string column (`Utf8`, `LargeUtf8`, `Utf8View`, or a dictionary of one) and serves the text operators `contains` (`like '%x%'`), `has` (`has_token`), and prefix match (`has_prefix`), never a key lookup. It is a key spec of its own, `{"kind": "text", "column": c, "tokenizer": "words" | "trigram", "bloom"?: fpr}` in `schema.key_specs`, named `text:<column>,tokenizer=<tokenizer>` (`KeySpec::name()`, its slot: a words and a trigram key coexist on one column), with identity `KeySpec::identity()` = the name, plus `,bloom=<fpr>` for a bloom layout; its segments are ordinary key-spec segments (`segments[].kind` absent, `key_spec` = the identity) and complete under the identity. A reader that does not know the kind refuses the manifest with `Error::UnsupportedVersion` (ADR 017), so text keys ride on storage version 2; a tokenizer this build does not know is refused the same way.
+
+**Tokens.** A value is case-folded first: each code point is replaced by its Unicode full case folding (`CaseFolding.txt`, statuses C and F), one code point at a time, with no context, so folding a concatenation folds each part and a substring of a value folds to a substring of the folded value. `ß` folds to `ss`, `ς` and `Σ` to `σ`, the Kelvin sign to `k`, `İ` to `i` + U+0307. The residual folds the same way, so plan and residual always agree.
+
+Text is **not Unicode-normalized**: folding maps case, never composition, so a precomposed `é` (U+00E9, NFC) and `e` followed by a combining acute (U+0065 U+0301, NFD) are different text. `contains("école")` in NFC does not match the NFD spelling, and `has_prefix("e")` matches the NFD word `école` (it starts with `e`) but not the NFC one. Normalize the column and the arguments to one form before indexing if both forms occur.
+
+- `words`: the words of the folded value at Unicode word boundaries (UAX #29, `unicode_words`), each stored as the canonical `Utf8` encoding of the word (ADR 016).
+- `trigram`: every 3-byte window of the folded value's UTF-8 bytes, each stored as the canonical `Binary` encoding of the 3 bytes (a window may cut a multi-byte character). A folded value shorter than 3 bytes has no trigram.
+
+A null value has no token and matches nothing (ADR 014); the empty string is a value with no token.
+
+**Segment.** Without `bloom`, the exact layout with tokens as keys: per distinct token, the roaring bitmap of the row groups holding a row with that token. With `bloom`, the bloom layout: one split-block bloom filter per row group over that row group's tokens, at the given false-positive rate (ADR 008). The header carries one more field, `text_unicode: {case, words}`, naming the tables tokens were folded and split with: the pinned crate and version that carries each (`"unicase 2.10.0"`, `"unicode-segmentation 1.13.3"`), never the toolchain's tables. A text segment without it, or a non-text segment with it, is corrupt; a reader whose tables differ refuses the segment with a typed error whose next step is `bellwether index <root>`, and `index` rebuilds exactly the text keys whose segments record other tables (only their segments are dropped; the ledger and every other key are kept), so one key never holds tokens from two table versions. `index` reads one segment header per text key to tell (a key's segments always share one table version), and its result lists each key it rebuilt this way with the old and new tables (`text_rebuilt`). This happens only after a deliberate upgrade of either crate, which the workspace pins to one exact version.
+
+**Lookups.** For an argument `a`, folded to `f`:
+
+| Spec | `has_token(a)` (`f` one word) | `contains(a)` | `has_prefix(a)` (`f` non-empty) |
+|---|---|---|---|
+| words | row groups of word `f`: exact | not served | row groups of any word with prefix `f`: exact |
+| words, bloom | candidates: row groups whose filter may hold `f` | not served | not served |
+| trigram (bloom or not) | candidates: row groups holding every trigram of `f` | the same | the same |
+
+An argument shorter than 3 bytes once folded has no trigram, so a trigram key plans every row group for it, and says so. Several serving specs are intersected; a run's several values are united. Exact means every planned row group holds a matching row; candidates mean a planned row group may hold none, so the residual is mandatory. The residual is `Text{column, operator, values}`: keep a row whose folded value matches one of the folded values.
+
+## Text key conformance vectors (storage version 2)
+
+`crates/bellwether-core/tests/text_keys.rs` checks these byte for byte.
+
+| Vector | Bytes |
+|---|---|
+| `fold("ẞİΣ\u{212A}ς")` | `ssi` U+0307 `σkσ` |
+| words key `grösse` | `06 67 72 c3 b6 73 73 65 00 00` |
+| trigram key `61 c3 b6` (`aö`) | `07 61 c3 b6 00 00` |
+| word prefix probe `st` | `06 73 74` |
+| words of `hello, wörld! can't 3.5 日本` | `hello`, `wörld`, `can't`, `3.5`, `日`, `本` |
+| `text:body,tokenizer=words` over row groups `["Hello, World"]`, `[null, "Straße"]` (one segment, block of 3 keys), blake3 | `9ec49da81fbc14f0851824f2cf1c9e0d5b4073518f07e8e7fe7506bb7c73e7e1` |
+| `text:body,tokenizer=trigram`, the same rows, blake3 | `61059108b1be52592ddf632085b14b055dc4640b736ff3a2c3e5896d82872e57` |

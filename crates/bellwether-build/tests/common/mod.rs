@@ -466,6 +466,20 @@ pub fn apply_residual(pred: &Predicate, rows: Vec<Row>) -> Vec<Row> {
                 .collect()
         }
         Predicate::And { all } => all.iter().fold(rows, |rows, p| apply_residual(p, rows)),
+        Predicate::Text {
+            column,
+            operator,
+            values,
+        } => rows
+            .into_iter()
+            .filter(|r| {
+                r.get(column).map(|v| decode_utf8(v)).is_some_and(|v| {
+                    values
+                        .iter()
+                        .any(|a| bellwether_core::text::matches(*operator, a, &v))
+                })
+            })
+            .collect(),
         Predicate::SemiJoin { .. } | Predicate::Join { .. } | Predicate::WindowPartition { .. } => {
             panic!("a lookup's residual is never relational: {pred:?}")
         }
@@ -473,6 +487,28 @@ pub fn apply_residual(pred: &Predicate, rows: Vec<Row>) -> Vec<Row> {
         // against decoded files in `tests/expr.rs`.
         Predicate::ExprIn { .. } => panic!("apply_residual does not evaluate expressions"),
     }
+}
+
+/// The string a canonical `Utf8` encoding holds (`0x06`, the bytes with
+/// `0x00` escaped as `0x00 0xFF`, then `0x00 0x00`).
+pub fn decode_utf8(enc: &[u8]) -> String {
+    assert_eq!(enc.first(), Some(&0x06), "not a canonical Utf8 encoding");
+    let mut out = Vec::new();
+    let mut i = 1;
+    while i < enc.len() {
+        match (enc[i], enc.get(i + 1)) {
+            (0x00, Some(0xFF)) => {
+                out.push(0);
+                i += 2;
+            }
+            (0x00, Some(0x00)) => break,
+            (b, _) => {
+                out.push(b);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8(out).expect("canonical Utf8 holds UTF-8")
 }
 
 /// The rows a lookup must return, by definition: rows whose `columns` tuple

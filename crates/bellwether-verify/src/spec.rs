@@ -44,6 +44,19 @@ pub enum CoverageRequest {
         /// Identifier of the identity in the rule catalog.
         identity: String,
     },
+    /// The rows a recorded workload asks for, chosen by the row filter
+    /// ([`ReconcileSpec::rows_where`], required) rather than by key tuples:
+    /// a workload of list-membership lookups (B4), whose runs name element
+    /// values, not reconcile keys. Every key with a kept row on either side
+    /// is compared; the certificate's coverage is the workload with the
+    /// number of keys compared.
+    WorkloadRows {
+        /// Hash of the recorded workload; it names the coverage and is one
+        /// of the certificate's provenance inputs.
+        workload: Hash,
+        /// Age of the recorded workload when the reconcile starts.
+        age: Duration,
+    },
 }
 
 /// The key tuples of a recorded workload, as the replay crate records them.
@@ -343,6 +356,15 @@ impl ReconcileSpec {
                 if w.keys.is_empty() {
                     return Err(VerifyError::InvalidSpec(
                         "workload coverage with no keys would compare nothing".into(),
+                    ));
+                }
+            }
+            CoverageRequest::WorkloadRows { .. } => {
+                if self.row_filter.is_none() {
+                    return Err(VerifyError::InvalidSpec(
+                        "workload-rows coverage chooses rows by the row filter; give one \
+                         (rows_where) or the whole data would be compared under a workload's name"
+                            .into(),
                     ));
                 }
             }

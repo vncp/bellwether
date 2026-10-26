@@ -17,6 +17,8 @@
 //! after the columns (exact) or the timestamp column (temporal). A spec of
 //! one column named `counts` is `exact:counts`; with counts,
 //! `exact:counts,counts`.
+//! | `Text { column: body, tokenizer: words, bloom: None }` | `text:body,tokenizer=words` |
+//! | `Text { column: body, tokenizer: trigram, bloom: Some(0.01) }` | `text:body,tokenizer=trigram,bloom=0.01` |
 //!
 //! An `expr` key's expression is in the closed language of
 //! `bellwether_core::expr`; it is stored normalized, so `label` gives the
@@ -41,7 +43,7 @@
 
 use bellwether_core::segment::validate_spec;
 use bellwether_core::sidecar::{SidecarDef, SidecarKind};
-use bellwether_types::{Error, KeySpec, Result, SketchSpec, SKETCH_DEFAULT_PRECISION};
+use bellwether_types::{Error, KeySpec, Result, SketchSpec, Tokenizer, SKETCH_DEFAULT_PRECISION};
 
 /// Parses the short form or the JSON form.
 pub fn parse(s: &str) -> Result<KeySpec> {
@@ -50,7 +52,8 @@ pub fn parse(s: &str) -> Result<KeySpec> {
         serde_json::from_str::<KeySpec>(s).map_err(|e| {
             Error::KeySpec(format!(
                 "{s:?} is not a key spec ({e}); write it as exact:col, temporal:col@ts, \
-                 bloom:col@0.01, range:col, expr:name=<expression>:exact, or its JSON form"
+                 bloom:col@0.01, range:col, text:col,tokenizer=words, expr:name=<expression>:exact, or
+                 its JSON form"
             ))
         })?
     } else if let Some(rest) = s.strip_prefix("expr:") {
@@ -81,7 +84,7 @@ pub fn check(spec: &KeySpec) -> Result<()> {
 fn bad(s: &str, why: &str) -> Error {
     Error::KeySpec(format!(
         "{s:?} is not a key spec ({why}); write it as exact:a,b, temporal:a@ts, bloom:a@0.01, \
-         range:ts, or expr:name=<expression>:exact"
+         range:ts, text:body,tokenizer=words (or tokenizer=trigram), or expr:name=<expression>:exact"
     ))
 }
 
@@ -222,8 +225,69 @@ fn parse_short(s: &str) -> Result<KeySpec> {
             "a sketch is an approximate distinct-count sidecar, not a key spec; declare it with \
              `index --key`",
         )),
+        ("text", None) => parse_text(s, cols),
+        ("text", Some(_)) => Err(bad(s, "a text key takes no '@'")),
         (other, _) => Err(bad(s, &format!("unknown kind {other:?}"))),
     }
+}
+
+/// `text:<column>,tokenizer=words|trigram[,bloom=<fpr>]`: the column, then
+/// each parameter once, in any order.
+fn parse_text(s: &str, rest: &str) -> Result<KeySpec> {
+    let mut parts = rest.split(',').map(str::trim);
+    let column = parts.next().unwrap_or_default();
+    if column.is_empty() || column.contains('=') {
+        return Err(bad(
+            s,
+            "a text key names its column first, text:body,tokenizer=words",
+        ));
+    }
+    let (mut tokenizer, mut bloom) = (None, None);
+    for p in parts {
+        match p.split_once('=') {
+            Some(("tokenizer", t)) if tokenizer.is_none() => {
+                tokenizer = Some(match t.trim() {
+                    "words" => Tokenizer::Words,
+                    "trigram" => Tokenizer::Trigram,
+                    other => {
+                        let why = format!("unknown tokenizer {other:?}; use words or trigram");
+                        return Err(bad(s, &why));
+                    }
+                });
+            }
+            Some(("bloom", f)) if bloom.is_none() => {
+                bloom = Some(f.trim().parse::<f64>().map_err(|_| {
+                    bad(
+                        s,
+                        "the bloom false-positive rate is not a number, bloom=0.01",
+                    )
+                })?);
+            }
+            Some(("tokenizer" | "bloom", _)) => {
+                return Err(bad(s, &format!("{p:?} is given twice")));
+            }
+            _ => {
+                return Err(bad(
+                    s,
+                    &format!(
+                        "{p:?} is not a text key parameter; a text key takes tokenizer= and bloom="
+                    ),
+                ))
+            }
+        }
+    }
+    let tokenizer = tokenizer.ok_or_else(|| {
+        bad(
+            s,
+            "a text key names its tokenizer, text:body,tokenizer=words (word tokens: has_token, \
+             has_prefix) or text:body,tokenizer=trigram (substrings: contains)",
+        )
+    })?;
+    Ok(KeySpec::Text {
+        column: column.to_string(),
+        tokenizer,
+        bloom,
+    })
 }
 
 /// The short form of `spec`: its identity ([`KeySpec::identity`],
@@ -456,6 +520,9 @@ mod tests {
             "exact:counts,counts",
             "temporal:id@ts,counts",
             "temporal:id@counts",
+            "text:body,tokenizer=words",
+            "text:body,tokenizer=trigram",
+            "text:body,tokenizer=trigram,bloom=0.01",
         ] {
             let spec = parse(s).unwrap();
             assert_eq!(label(&spec), s);
@@ -503,6 +570,14 @@ mod tests {
             "hash:a",
             "exact:a,a",
             "{\"kind\":\"zorder\"}",
+            "text:body",
+            "text:body,tokenizer=ngram",
+            "text:body,tokenizer=words,tokenizer=trigram",
+            "text:,tokenizer=words",
+            "text:a,b,tokenizer=words",
+            "text:body,tokenizer=words,bloom=2",
+            "text:body,tokenizer=words,bloom=x",
+            "text:body@ts,tokenizer=words",
         ] {
             assert!(parse(s).is_err(), "{s}");
         }

@@ -478,6 +478,8 @@ impl<'a> SpecWriter<'a> {
 /// - bloom: its distinct key tuples, and 8 bytes per tuple (the writer
 ///   holds one hash per key);
 /// - range: one entry if any key is present, and twice the longest key;
+/// - text: the batch's distinct tokens and their canonical bytes (8 per
+///   token with a bloom filter; core's `text::measure`);
 /// - a sidecar: core's `sidecar::measure` (distinct keys, and key bytes
 ///   plus 20 per stored record).
 pub(crate) fn measure(plan: &SpecPlan, batch: &RecordBatch) -> Result<(u64, u64)> {
@@ -488,6 +490,17 @@ pub(crate) fn measure(plan: &SpecPlan, batch: &RecordBatch) -> Result<(u64, u64)
         }
         Target::Sketch(spec) => return Ok((1, sketch_seg::max_entry_bytes(spec))),
     };
+    if let KeySpec::Text {
+        column,
+        tokenizer,
+        bloom,
+    } = spec
+    {
+        let arr = batch
+            .column_by_name(column)
+            .ok_or_else(|| Error::KeySpec(format!("column {column} not in batch")))?;
+        return bellwether_core::text::measure(*tokenizer, bloom.is_some(), arr.as_ref());
+    }
     let column = |name: &str| -> Result<ArrayRef> {
         batch
             .column_by_name(name)

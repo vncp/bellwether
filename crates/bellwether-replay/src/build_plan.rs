@@ -15,6 +15,7 @@
 //!   planner refuses a listed spec that is not declared exactly or not
 //!   complete, and nothing else: an incomplete spec the plan does not use
 //!   is no error.
+//! - [`PlanSource::plan_text`] is `Planner::plan` over a `Lookup::Text`.
 //! - [`PlanSource::with_transient`] passes each transient index's segment
 //!   bytes as a `TransientSpec`, after checking that the index was built at
 //!   the pinned sequence, that every segment records the dataset's key
@@ -26,11 +27,11 @@ use std::sync::Arc;
 
 use bellwether_build::{Lookup, Planner, TransientSpec};
 use bellwether_store::StoreExt;
-use bellwether_types::{Error, KeySpec, Result, ScanPlan};
+use bellwether_types::{Error, KeySpec, Result, ScanPlan, TextOp};
 use roaring::RoaringBitmap;
 
 use crate::keys::RunKeys;
-use crate::plan::{check_key_types, planned_query, PlanSource};
+use crate::plan::{check_key_types, planned_query, text_run, PlanSource};
 use crate::transient::TransientIndex;
 use crate::workload::RunQuery;
 
@@ -38,10 +39,10 @@ use crate::workload::RunQuery;
 /// tuples over the run's columns, at the dataset types. `query` is as
 /// planned ([`planned_query`]): an `asof` lookback run is already its
 /// window.
-fn lookup(keys: &RunKeys, query: &RunQuery) -> Lookup {
+fn lookup(keys: &RunKeys, query: &RunQuery) -> Result<Lookup> {
     let columns = keys.columns().to_vec();
     let tuples: Vec<Vec<u8>> = keys.tuples().map(<[u8]>::to_vec).collect();
-    match query {
+    Ok(match query {
         RunQuery::Locate | RunQuery::Count => Lookup::Keys {
             columns,
             keys: tuples,
@@ -67,6 +68,20 @@ fn lookup(keys: &RunKeys, query: &RunQuery) -> Lookup {
             lo: w.lo,
             hi: w.hi,
         },
+        RunQuery::Text(_) => {
+            let (column, op, values) = text_run(keys, query)?
+                .ok_or_else(|| Error::Other("a text run without a text match".into()))?;
+            text_lookup(column, op, &values)
+        }
+    })
+}
+
+/// A text lookup as the build planner's lookup.
+fn text_lookup(column: &str, op: TextOp, values: &[String]) -> Lookup {
+    Lookup::Text {
+        column: column.to_string(),
+        op,
+        values: values.to_vec(),
     }
 }
 
@@ -135,7 +150,17 @@ where
     fn plan_query(&self, specs: &[KeySpec], keys: &RunKeys, query: &RunQuery) -> Result<ScanPlan> {
         check_key_types(self.schema(), keys)?;
         let query = planned_query(self.schema(), specs, keys.columns(), query)?;
-        Planner::plan(self, specs, &lookup(keys, &query))
+        Planner::plan(self, specs, &lookup(keys, &query)?)
+    }
+
+    fn plan_text(
+        &self,
+        specs: &[KeySpec],
+        column: &str,
+        op: TextOp,
+        values: &[String],
+    ) -> Result<ScanPlan> {
+        Planner::plan(self, specs, &text_lookup(column, op, values))
     }
 
     fn lookback_column(&self, specs: &[KeySpec], run_columns: &[String]) -> Result<Option<String>> {
@@ -186,7 +211,18 @@ where
         check_key_types(self.planner.schema(), keys)?;
         let query = planned_query(self.planner.schema(), specs, keys.columns(), query)?;
         self.planner
-            .plan_with_transient(specs, &lookup(keys, &query), &self.extra)
+            .plan_with_transient(specs, &lookup(keys, &query)?, &self.extra)
+    }
+
+    fn plan_text(
+        &self,
+        specs: &[KeySpec],
+        column: &str,
+        op: TextOp,
+        values: &[String],
+    ) -> Result<ScanPlan> {
+        self.planner
+            .plan_with_transient(specs, &text_lookup(column, op, values), &self.extra)
     }
 
     fn lookback_column(&self, specs: &[KeySpec], run_columns: &[String]) -> Result<Option<String>> {

@@ -11,7 +11,8 @@
 //! paths name files the engine reads (key files, rewrite outputs), and a
 //! rewrite is `RewriteShape` data.
 
-use bellwether::types::{Gate, Hash, KeySpec, RewriteShape};
+use bellwether::types::{Gate, Hash, KeySpec, RewriteShape, TextOp};
+use bellwether::TextQuery;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -177,6 +178,50 @@ pub struct ObserveAsof {
     pub at_manifest: Option<u64>,
 }
 
+/// One text lookup (B5): rows whose string `column` matches `value` under
+/// `op` (`has_token`, `contains`, or `has_prefix`), both case-folded.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct TextLookup {
+    /// The string column.
+    pub column: String,
+    /// `has_token` (one word), `contains` (a substring), or `has_prefix`
+    /// (a word starting with `value`).
+    pub op: TextOp,
+    /// The word, substring, or prefix.
+    pub value: String,
+}
+
+impl From<TextLookup> for TextQuery {
+    fn from(t: TextLookup) -> Self {
+        Self {
+            column: t.column,
+            op: t.op,
+            value: t.value,
+        }
+    }
+}
+
+/// `observe.text`: which files and row groups hold rows matching a text
+/// lookup, through the folder's text keys.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ObserveText {
+    /// The string column.
+    pub column: String,
+    /// `has_token` (one word), `contains` (a substring), or `has_prefix`
+    /// (a word starting with `value`).
+    pub op: TextOp,
+    /// The word, substring, or prefix.
+    pub value: String,
+    /// Plan against the committed manifest at this sequence (a plan's
+    /// `sequence`) instead of the current one. Default: the current
+    /// manifest. A sequence the index no longer retains is refused with
+    /// `not_retained`.
+    #[serde(default)]
+    pub at_manifest: Option<u64>,
+}
+
 /// `score.why`: replay a workload under every candidate key. Writes engine
 /// Proposals and Replays.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -206,6 +251,13 @@ pub struct ScoreWhy {
     /// Run in this call instead of returning a job id.
     #[serde(default)]
     pub wait: bool,
+    /// Text lookups (B5), recorded as the workload instead of `keys` or
+    /// `workload`: one run each, priced under the current configuration and
+    /// each candidate text key (`text:<column>,tokenizer=words` for words
+    /// and word prefixes, `tokenizer=trigram` for substrings); default:
+    /// none.
+    #[serde(default)]
+    pub text: Vec<TextLookup>,
 }
 
 /// The outputs a rewrite proposal is verified on (folders the engine reads).
@@ -428,6 +480,15 @@ pub fn catalog() -> Vec<ToolDef> {
             "Plan the version of each key current at an instant, against the current manifest \
              or a committed one (at_manifest). Writes the plan Evidence and the key set to the \
              cache only.",
+        ),
+        def::<ObserveText>(
+            "observe.text",
+            Tier::Observe,
+            true,
+            "Plan which files and row groups hold rows whose string column matches a text \
+             lookup (has_token, contains, has_prefix; case-folded), through the folder's text \
+             keys. The result says when the plan is a candidate set and the residual is \
+             mandatory. Writes the plan Evidence and the lookup to the cache only.",
         ),
         def::<ScoreWhy>(
             "score.why",

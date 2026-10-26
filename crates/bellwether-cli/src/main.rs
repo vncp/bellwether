@@ -18,7 +18,7 @@ use std::io::{IsTerminal, Write};
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use bellwether::types::{Error, Hash, HashKind, ProposalBody, RewriteShape};
+use bellwether::types::{Error, Hash, HashKind, ProposalBody, RewriteShape, TextOp};
 use bellwether::{Engine, EngineOptions, KeyFile};
 use bellwether_mcp::args::OptionsError;
 use clap::{Args, Parser, Subcommand};
@@ -190,9 +190,11 @@ struct WhyArgs {
     #[arg(long, value_name = "HASH", conflicts_with = "from")]
     workload: Option<String>,
     /// The lookup the keys are priced under: `locate` (rows holding a key),
-    /// `latest` (each key's newest version), or `asof` (the version current
-    /// at --at) [default: asof with --at, latest with --latest-by, else
-    /// locate].
+    /// `latest` (each key's newest version), `asof` (the version current
+    /// at --at), or a text lookup over a key file of one string column's
+    /// values: `contains` (substrings), `has-token` (words), `has-prefix`
+    /// (word prefixes), case-folded [default: asof with --at, latest with
+    /// --latest-by, else locate].
     #[arg(long, value_enum, value_name = "MODE")]
     mode: Option<ModeArg>,
     /// Timestamp (or date, time, or integer version) column that orders
@@ -237,6 +239,19 @@ struct WhyArgs {
     /// window (pass the same column to --latest-by).
     #[arg(long = "ts", value_name = "COLUMN")]
     ts: Option<String>,
+    /// Record a text lookup as a run: rows whose string column contains
+    /// TEXT, case-folded, for example body=quarterly (repeat for several
+    /// runs; instead of --from, --bench-workload, or --workload).
+    #[arg(long, value_name = "COL=TEXT", conflicts_with_all = ["from", "bench_workload", "workload", "mode"])]
+    contains: Vec<String>,
+    /// Record a text lookup as a run: rows whose string column has the
+    /// word WORD, case-folded (repeat for several runs).
+    #[arg(long, value_name = "COL=WORD", conflicts_with_all = ["from", "bench_workload", "workload", "mode"])]
+    has: Vec<String>,
+    /// Record a text lookup as a run: rows whose string column has a word
+    /// starting with PREFIX, case-folded (repeat for several runs).
+    #[arg(long, value_name = "COL=PREFIX", conflicts_with_all = ["from", "bench_workload", "workload", "mode"])]
+    prefix: Vec<String>,
     /// With --twin-of: a limit to compare each candidate's keyset with,
     /// NAME:N (repeat for several), for example in:1000000 (a membership
     /// list the engine accepts) or join:200000 (a join's broadcast size).
@@ -280,6 +295,9 @@ enum ModeArg {
     Locate,
     Latest,
     Asof,
+    Contains,
+    HasToken,
+    HasPrefix,
 }
 
 impl From<ModeArg> for bellwether::LookupMode {
@@ -288,6 +306,9 @@ impl From<ModeArg> for bellwether::LookupMode {
             ModeArg::Locate => Self::Locate,
             ModeArg::Latest => Self::Latest,
             ModeArg::Asof => Self::Asof,
+            ModeArg::Contains => Self::Contains,
+            ModeArg::HasToken => Self::HasToken,
+            ModeArg::HasPrefix => Self::HasPrefix,
         }
     }
 }
@@ -328,9 +349,35 @@ struct LookupArgs {
 
 #[derive(Args)]
 #[command(group(clap::ArgGroup::new("range").multiple(false).args(["from", "window"])))]
+#[command(group(clap::ArgGroup::new("text").multiple(false).args(["contains", "has", "prefix"])))]
+#[command(group(clap::ArgGroup::new("what").required(true).multiple(false).args(["keys", "contains", "has", "prefix"])))]
 struct LocateArgs {
     #[command(flatten)]
-    lookup: LookupArgs,
+    root: RootArg,
+    /// A Parquet file of keys.
+    #[arg(long, value_name = "FILE")]
+    keys: Option<PathBuf>,
+    /// Key columns to take from the file, comma-separated [default: all].
+    #[arg(long, value_name = "COLS", value_delimiter = ',', requires = "keys")]
+    key: Option<Vec<String>>,
+    /// Plan against the committed manifest at this sequence instead of the
+    /// current one, so a lookup run later over a grown folder reads exactly
+    /// what it read then. Files added since are ignored; the retained
+    /// sequences are listed when one is not.
+    #[arg(long, value_name = "SEQUENCE")]
+    at_manifest: Option<u64>,
+    /// Rows whose string column contains TEXT, case-folded (a text key,
+    /// text:COL,tokenizer=trigram), for example body=quarterly.
+    #[arg(long, value_name = "COL=TEXT", conflicts_with_all = ["range", "to", "ts", "columns"])]
+    contains: Option<String>,
+    /// Rows whose string column has the word WORD, case-folded (a text key,
+    /// text:COL,tokenizer=words or trigram), for example body=guidance.
+    #[arg(long, value_name = "COL=WORD", conflicts_with_all = ["range", "to", "ts", "columns"])]
+    has: Option<String>,
+    /// Rows whose string column has a word starting with PREFIX,
+    /// case-folded (a text key), for example body=restat.
+    #[arg(long, value_name = "COL=PREFIX", conflicts_with_all = ["range", "to", "ts", "columns"])]
+    prefix: Option<String>,
     /// Window start (inclusive): RFC 3339, a date (YYYY-MM-DD), or an
     /// integer in the time column's unit.
     #[arg(long, value_name = "INSTANT", requires = "to")]
@@ -574,7 +621,7 @@ impl From<Error> for Failure {
                 field:
                     "lookback" | "latest_by" | "signing_key" | "trusted_keys" | "public_key" | "out"
                     | "name" | "valid_from" | "revoked_at" | "index" | "root" | "scratch" | "items"
-                    | "columns",
+                    | "columns" | "text",
                 ..
             } => Self::Usage(match hint(&e) {
                 Some(h) => format!("{e}; {h}"),
@@ -656,6 +703,7 @@ fn hint(e: &Error) -> Option<String> {
                 "index" => "--index <dir>",
                 "items" => "--column",
                 "columns" => "--columns",
+                "text" => "--contains, --has, or --prefix",
                 _ => return None,
             };
             Some(format!("check {flag}"))
@@ -1043,13 +1091,72 @@ fn locate(g: &Global, out: &Out, a: &LocateArgs) -> Result<Outcome, Failure> {
                 .into(),
         ));
     }
-    lookup(g, out, &a.lookup, |e, keys| match (window, &a.columns) {
+    let engine = engine_at(g, &a.root.root, a.at_manifest)?;
+    if let Some(query) = text_query(a.contains.as_deref(), a.has.as_deref(), a.prefix.as_deref())? {
+        let result = engine.locate_text(&query)?;
+        return done(&result, human::plan(&result, out), EXIT_OK);
+    }
+    let Some(keys) = &a.keys else {
+        return Err(Failure::Usage(
+            "say what to locate: --keys <file> or --contains, --has, or --prefix COL=TEXT".into(),
+        ));
+    };
+    let keys = key_file(keys, a.key.as_ref());
+    let result = match (window, &a.columns) {
         (w, Some(columns)) => {
-            e.locate_columns(keys, w.map(|(f, t)| (f, t, a.ts.as_deref())), columns)
+            engine.locate_columns(&keys, w.map(|(f, t)| (f, t, a.ts.as_deref())), columns)?
         }
-        (Some((from, to)), None) => e.locate_window(keys, from, to, a.ts.as_deref()),
-        (None, None) => e.locate(keys),
-    })
+        (Some((from, to)), None) => engine.locate_window(&keys, from, to, a.ts.as_deref())?,
+        (None, None) => engine.locate(&keys)?,
+    };
+    done(&result, human::plan(&result, out), EXIT_OK)
+}
+
+/// The text lookup `--contains`, `--has`, or `--prefix` gives (at most one;
+/// clap refuses several), each `COL=TEXT`, split at the first `=`.
+fn text_query(
+    contains: Option<&str>,
+    has: Option<&str>,
+    prefix: Option<&str>,
+) -> Result<Option<bellwether::TextQuery>, Failure> {
+    let (flag, op, given) = match (contains, has, prefix) {
+        (Some(c), _, _) => ("--contains", TextOp::Contains, c),
+        (None, Some(h), _) => ("--has", TextOp::HasToken, h),
+        (None, None, Some(p)) => ("--prefix", TextOp::HasPrefix, p),
+        (None, None, None) => return Ok(None),
+    };
+    text_arg(flag, op, given).map(Some)
+}
+
+/// One `COL=TEXT` argument of `flag` as a text lookup.
+fn text_arg(flag: &str, op: TextOp, given: &str) -> Result<bellwether::TextQuery, Failure> {
+    match given.split_once('=') {
+        Some((column, value)) if !column.trim().is_empty() => Ok(bellwether::TextQuery {
+            column: column.trim().to_string(),
+            op,
+            value: value.to_string(),
+        }),
+        _ => Err(Failure::Usage(format!(
+            "{flag} takes COL=TEXT, the string column and the text, for example {flag} \
+             body=quarterly; {given:?} names no column"
+        ))),
+    }
+}
+
+/// `why`'s text lookups, in flag order: every --contains, then --has,
+/// then --prefix.
+fn why_text(a: &WhyArgs) -> Result<Vec<bellwether::TextQuery>, Failure> {
+    let mut out = Vec::new();
+    for (flag, op, given) in [
+        ("--contains", TextOp::Contains, &a.contains),
+        ("--has", TextOp::HasToken, &a.has),
+        ("--prefix", TextOp::HasPrefix, &a.prefix),
+    ] {
+        for g in given {
+            out.push(text_arg(flag, op, g)?);
+        }
+    }
+    Ok(out)
 }
 
 /// A malformed `--lookback` is a usage error (exit 2), refused before any
@@ -1116,13 +1223,30 @@ fn why(g: &Global, out: &Out, a: &WhyArgs) -> Result<Outcome, Failure> {
         max_candidates: a.max_candidates,
         gates: a.gates.clone(),
         sketches_only: a.sketches_only,
+        text: why_text(a)?,
     };
-    let mode = request.lookup_mode().map_err(Failure::Usage)?;
+    // Text lookups take none of the lookup-mode flags; the facade refuses
+    // them first, with that cause.
+    let mode = if request.text.is_empty() {
+        request.lookup_mode().map_err(Failure::Usage)?
+    } else {
+        bellwether::LookupMode::Locate
+    };
     if mode != bellwether::LookupMode::Locate && a.from.is_none() && a.workload.is_none() {
-        return Err(Failure::Usage(format!(
-            "--mode {} prices a workload's keys; pass --from <keys.parquet> (or --workload <hash>)",
-            mode.as_str()
-        )));
+        return Err(Failure::Usage(if mode.text_op().is_some() {
+            format!(
+                "--mode {} prices a key file of one string column's values as a text lookup; \
+                 pass --from <values.parquet> (or --workload <hash>), or give the lookups with \
+                 --contains, --has, or --prefix COL=TEXT",
+                mode.as_str()
+            )
+        } else {
+            format!(
+                "--mode {} prices a workload's keys; pass --from <keys.parquet> (or --workload \
+                 <hash>)",
+                mode.as_str()
+            )
+        }));
     }
     if request.window.is_some() && mode != bellwether::LookupMode::Locate {
         return Err(Failure::Usage(

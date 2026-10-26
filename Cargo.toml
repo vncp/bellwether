@@ -54,6 +54,15 @@ criterion = "0.5"
 # bellwether-types, off by default) and the MCP server's tool schemas; the
 # same major as rmcp's.
 schemars = { version = "1.2", default-features = false, features = ["derive", "std"] }
+# Text keys (B5): the Unicode tables tokens are folded and split under.
+# Each is pinned to one exact version, because a text segment records the
+# version it was built under and a reader on another refuses it
+# (bellwether-core's `text` module); bump them only on purpose, and the
+# release notes then say to rebuild text keys.
+# Word boundaries (UAX #29); already in the graph through comfy-table.
+unicode-segmentation = "=1.13.3"
+# Full case folding (CaseFolding.txt), with its own tables.
+unicase = "=2.10.0"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

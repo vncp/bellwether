@@ -10,8 +10,8 @@ use std::time::Instant;
 
 use bellwether::types::{Error, ProposalBody};
 use bellwether::{
-    Engine, EngineOptions, FixOutcome, FixRequest, FixResult, KeyFile, ProposeResult, WhyRequest,
-    DEFAULT_MAX_CANDIDATES,
+    Engine, EngineOptions, FixOutcome, FixRequest, FixResult, KeyFile, ProposeResult, TextQuery,
+    WhyRequest, DEFAULT_MAX_CANDIDATES,
 };
 use serde::Serialize;
 use serde_json::{json, Value};
@@ -22,8 +22,8 @@ use crate::jobs::{job_id, Job, JobInfo, JobState, Jobs};
 use crate::refusal::{self, Refusal, RefusalCode};
 use crate::tools::{
     self, ApplyReceipt, JobRef, JobsStart, KeyArg, ObserveAsof, ObserveCardinality, ObserveCount,
-    ObserveLocate, ObserveOverlap, ObserveWhy, ProposeKey, ProposeLayout, ProposeRewrite,
-    ScoreRecord, ScoreVerify, ScoreWhy, Tier,
+    ObserveLocate, ObserveOverlap, ObserveText, ObserveWhy, ProposeKey, ProposeLayout,
+    ProposeRewrite, ScoreRecord, ScoreVerify, ScoreWhy, Tier,
 };
 
 /// How the server is configured at startup. Nothing is read from the
@@ -365,12 +365,29 @@ impl Server {
                     Err(err) => failed(&err),
                 }
             }
+            "observe.text" => {
+                let a = parse!(ObserveText);
+                let pinned = match self.lookup_engine(a.at_manifest) {
+                    Ok(p) => p,
+                    Err(err) => return failed(&err),
+                };
+                let query = TextQuery {
+                    column: a.column,
+                    op: a.op,
+                    value: a.value,
+                };
+                match pinned.as_ref().unwrap_or(e).locate_text(&query) {
+                    Ok(r) => done(&r, None),
+                    Err(err) => failed(&err),
+                }
+            }
             "score.why" => {
                 let a = parse!(ScoreWhy);
-                if a.keys.is_none() && a.workload.is_none() {
+                if a.keys.is_none() && a.workload.is_none() && a.text.is_empty() {
                     return Done::Failed(Refusal::new(
                         RefusalCode::NoWorkload,
-                        "score.why replays a workload; without one, call observe.why",
+                        "score.why replays a workload (keys, workload, or text lookups); without \
+                         one, call observe.why",
                         json!({}),
                     ));
                 }
@@ -390,6 +407,7 @@ impl Server {
                         .map_or(DEFAULT_MAX_CANDIDATES, |n| n as usize),
                     gates: a.gates,
                     sketches_only: false,
+                    text: a.text.into_iter().map(Into::into).collect(),
                 };
                 match e.why(&request) {
                     Ok(r) => done(&r, None),

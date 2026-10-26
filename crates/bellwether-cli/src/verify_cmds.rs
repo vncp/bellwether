@@ -317,6 +317,18 @@ fn rows_asked(filter: &[Predicate]) -> String {
             Predicate::WindowPartition { columns } => {
                 format!("whole partitions of {}", columns.join(", "))
             }
+            Predicate::Text {
+                column,
+                operator,
+                values,
+            } => match values.as_slice() {
+                [one] => format!("{}({column}, {one:?}), case-folded", operator.as_str()),
+                many => format!(
+                    "{}({column}, any of {} values), case-folded",
+                    operator.as_str(),
+                    many.len()
+                ),
+            },
             Predicate::ExprIn { expr, .. } => format!("the workload's keys of {expr}"),
             Predicate::And { all } => {
                 for q in all {

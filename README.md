@@ -203,6 +203,7 @@ Reproduce everything above, downloads included, with [`scripts/showcase.sh`](scr
 | `counts` (on `exact` and `temporal`) | `count(*) where key in (...)`: the count that precedes a gated query | `index --key exact:col,counts` or `temporal:col@ts,counts` | `count --keys`: exact rows and row groups from the index, no data file read; plans through the spec carry exact row counts |
 | `sketch` | `count(distinct col)`; "is this column a key" | `index --key sketch:col[,col][,a+b][,p=14][,minhash=K]` | never (approximate; read by `why`, `sketch cardinality`, `sketch overlap`) |
 | `expr` | a filter or join key that is a function of a column: a member of a JSON column, `lower`, `substr`, `cast`, `date_trunc`, `hash` | `index --key "expr:<name>=<expression>:exact"` (or `:exact,counts`, `:bloom@<fpr>`) | point lookups (`locate`) and, with counts, `count` by the same expression after normalization; any other expression is refused, never guessed |
+| `text` | `contains`, `like '%x%'`, `has`, prefix match on a string column, case-insensitive | `index --key text:col,tokenizer=words` (whole words, prefixes; exact row groups) or `text:col,tokenizer=trigram` (substrings; candidates, residual mandatory) | `locate --contains/--has/--prefix COL=TEXT`; priced by `why --contains/--has/--prefix`, proposed and receipted by `fix` ([funnels](docs/measured/2026-10-26-text.md)) |
 
 ## How `fix` proves a change
 
@@ -285,8 +286,8 @@ The trust boundary at the wire: a proposal has no score field, so the input sche
 
 | Surface | What it can do | Worst case |
 |---|---|---|
-| `observe.*` (`observe.why` with no keys, `observe.profile`, `observe.locate`, `observe.asof`) | read footers and the index; write the profile Evidence and cache entries | the agent reads evidence |
-| `score.*` (`score.why` with keys or a workload, `score.verify`, `score.record` with a query engine) | ask the engine to replay and verify; the engine writes its own Proposals, Replays, plan Evidence, and Certificates; charged to the session budget; with `--twin-of`, the engine submits a keys query or a rewrite's queries read-only to the one engine the human named | the agent spends its budget and is refused with `budget_exceeded`; a cost or verdict field in the arguments is refused with `caller_supplied_cost` |
+| `observe.*` (`observe.why` with no keys, `observe.profile`, `observe.locate`, `observe.asof`, `observe.text`) | read footers and the index; write the profile Evidence and cache entries | the agent reads evidence |
+| `score.*` (`score.why` with keys, a workload, or text lookups, `score.verify`, `score.record` with a query engine) | ask the engine to replay and verify; the engine writes its own Proposals, Replays, plan Evidence, and Certificates; charged to the session budget; with `--twin-of`, the engine submits a keys query or a rewrite's queries read-only to the one engine the human named | the agent spends its budget and is refused with `budget_exceeded`; a cost or verdict field in the arguments is refused with `caller_supplied_cost` |
 | `propose.*` | write a `Proposal` with no score, or nothing with `dry_run` | the ledger holds a bad proposal that scores poorly and never gets a Certificate |
 | `apply.receipt` | take a Certificate hash only; the engine applies and then writes the Receipt | the agent asks to apply something unverified and is told no, with a typed code |
 | `jobs.*` | start a score or apply call as a job, poll it, read its result | whatever the started tool may do |
@@ -298,7 +299,7 @@ The trust boundary at the wire: a proposal has no score field, so the input sche
 |---|---|---|---|---|---|
 | Runs | one process | inside the query engine | inside the Hudi writer and engine | inside ClickHouse | inside the database |
 | Granularity | row group | file (min/max) | file group or record | granule | row |
-| Key kinds | exact, bloom, range, temporal, sketch (approximate, never plans), expr | min/max statistics | bloom, record-level, column stats | minmax, set, bloom variants | B-tree |
+| Key kinds | exact, bloom, range, temporal, sketch (approximate, never plans), expr, text | min/max statistics | bloom, record-level, column stats | minmax, set, bloom variants | B-tree |
 | Composite keys | native, prefix seek | Z-order or clustering columns | record key | multi-column expressions | yes |
 | Latest / as-of | native over plain files | table time travel | incremental and point-in-time queries | no | via `ROW_NUMBER` scan |
 | Tells you which key to index | measured fanout + exact replay | no | no | no | estimated (what-if API) |

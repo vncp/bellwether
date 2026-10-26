@@ -15,6 +15,8 @@
 //!   share.
 //! - [`sketch`]: `sketch` sidecar segments (per item, per file HyperLogLog
 //!   registers and MinHash signatures). Approximate; no planner reads them.
+//! - [`text`]: text keys (B5): case folding, the words and trigram
+//!   tokenizers, the residual's row test, and the planning rule.
 //!
 //! Invariants owned here: 1 (no false negatives in pruning,
 //! `tests/no_false_negatives.rs`) and 5 (stale-version rejection,
@@ -36,6 +38,7 @@ pub mod segment;
 pub mod sidecar;
 pub mod sketch;
 pub mod temporal;
+pub mod text;
 
 pub use merge::{count_live_keys, merge};
 pub use segment::{EncodedSegment, SegmentReader, SegmentWriter, WriterOptions};

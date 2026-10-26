@@ -14,7 +14,7 @@ Dependencies, as `dev/check-layering.py` permits: `bellwether-types` (the contra
 | `record(&ledger, &certified) -> Hash` | Checks that the certificate's proposal resolves, then writes the plan Evidence and the certificate, each through `Ledger::put`; a refusal writes nothing. Never a Receipt: applying and attesting is the facade's. |
 | `Side::new(&source, root)`, `.indexed(&planner)` | One side: any `bellwether_types::Source` over a root, optionally with its index. |
 | `ReconcileSpec` | `key_columns`, `latest_by`, `ignored_columns`, `total_columns`, `group_by`, `coverage`, `row_filter`. Builder methods of the same names (`rows_where` for the row filter). |
-| `CoverageRequest` | `Full`, `Workload(WorkloadKeys { workload, age, keys })`, `Sampled { fraction, seed }`, and `StaticProof`, which is always refused with `VerifyError::StaticProofUnsupported` (the rewrite verifier's, WP13). |
+| `CoverageRequest` | `Full`, `Workload(WorkloadKeys { workload, age, keys })`, `WorkloadRows { workload, age }` (rows chosen by the row filter, for workloads whose runs name values that are not reconcile keys: list membership, text lookups), `Sampled { fraction, seed }`, and `StaticProof`, which is always refused with `VerifyError::StaticProofUnsupported` (the rewrite verifier's, WP13). |
 | `Options` | `memory_budget` (default `DEFAULT_MEMORY_BUDGET`, 256 MiB) and `max_examples` (default 100). |
 | `SidePlanner`, `ManifestIdentity` | The seam for an indexed side. |
 | `IndexPlanner::open(&store, index_root)` | `SidePlanner` over `bellwether_build::Planner`, pinned to the current manifest. |

@@ -1382,6 +1382,25 @@ pub(crate) fn schema_hint(e: Error) -> Error {
     }
 }
 
+/// `e`, with a text key's rebuild step (core's `text::REBUILD_STEP`)
+/// naming the data root instead of "the data folder".
+pub(crate) fn root_hint(root: &str, e: Error) -> Error {
+    let step = bellwether_core::text::REBUILD_STEP;
+    let named = |m: String| {
+        m.replace(
+            step,
+            &step.replace(
+                "`bellwether index` on the data folder",
+                &format!("`bellwether index {}`", crate::spec::shell_quote(root)),
+            ),
+        )
+    };
+    match e {
+        Error::KeySpec(m) if m.contains(step) => Error::KeySpec(named(m)),
+        other => other,
+    }
+}
+
 /// Runs `f`, turning a panic into an error that names the issue tracker, so
 /// no panic reaches a caller of the facade.
 pub(crate) fn guard<T>(f: impl FnOnce() -> Result<T>) -> Result<T> {

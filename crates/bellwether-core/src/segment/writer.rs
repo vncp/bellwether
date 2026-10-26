@@ -710,11 +710,20 @@ pub fn validate_spec(spec: &KeySpec) -> Result<()> {
     if spec.columns().is_empty() {
         return Err(Error::KeySpec("key spec needs at least one column".into()));
     }
-    if let KeySpec::Bloom { fpr, .. } = spec.physical() {
+    if let KeySpec::Bloom { fpr, .. }
+    | KeySpec::Text {
+        bloom: Some(fpr), ..
+    } = spec.physical()
+    {
         if !(*fpr > 0.0 && *fpr < 1.0) {
             return Err(Error::KeySpec(format!(
                 "bloom fpr must be strictly between 0 and 1, got {fpr}"
             )));
+        }
+    }
+    if let KeySpec::Text { column, .. } = spec {
+        if column.is_empty() {
+            return Err(Error::KeySpec("a text key needs a column name".into()));
         }
     }
     crate::expr::check_spec(spec)
@@ -994,6 +1003,27 @@ impl SegmentWriter {
                 .cloned()
                 .ok_or_else(|| Error::KeySpec(format!("column {name} not in batch")))
         };
+        if let KeySpec::Text {
+            column: c,
+            tokenizer,
+            ..
+        } = &self.spec
+        {
+            // Every distinct token of the row group, staged before any is
+            // recorded; a null holds no token (ADR 014).
+            let arr = column(c)?;
+            let mut keys = std::collections::BTreeSet::new();
+            for row in 0..arr.len() {
+                if let Some(v) = crate::text::value_at(arr.as_ref(), row)? {
+                    crate::text::keys_of(*tokenizer, v, &mut keys);
+                }
+            }
+            self.check_insertable(rg)?;
+            for k in &keys {
+                self.insert(k, rg)?;
+            }
+            return Ok(());
+        }
         let cols = match (&dataset.expr, self.spec.columns()) {
             (Some(typed), [name]) if batch.column_by_name(name).is_none() => {
                 vec![typed.eval(batch)?]
@@ -1066,7 +1096,11 @@ impl SegmentWriter {
                 e.finish()
             }
             Acc::Bloom(m) => {
-                let KeySpec::Bloom { fpr, .. } = self.spec.physical() else {
+                let (KeySpec::Bloom { fpr, .. }
+                | KeySpec::Text {
+                    bloom: Some(fpr), ..
+                }) = self.spec.physical()
+                else {
                     return Err(Error::KeySpec(
                         "bloom accumulator without bloom spec".into(),
                     ));

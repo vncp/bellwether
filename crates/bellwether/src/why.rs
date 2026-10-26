@@ -13,24 +13,25 @@ use bellwether_core::encoding::check_ts_type;
 use bellwether_profile::{ProfileOptions, ProfileReport};
 use bellwether_replay::{
     proposed_specs, record_bench_workload, servable, serves_query, Baseline, KeyInput, Lookup,
-    Replayer, RunQuery, RunWindow, Workload, WorkloadRecorder, QUERY_KIND_LOCATE,
+    RecordedRun, Replayer, RunQuery, RunWindow, Workload, WorkloadRecorder, QUERY_KIND_LOCATE,
 };
 use bellwether_store::{Cache, ObjectStoreBackend, StoreExt};
 use bellwether_types::{
     format, Error, Evidence, EvidenceBody, Fanout, Gate, Hash, KeySpec, Lint, Proposal,
-    ProposalBody, Record, Result, Store, TwinOf,
+    ProposalBody, Record, Result, Store, TextOp, TwinOf,
 };
 use serde::{Deserialize, Serialize};
 
 use bellwether_source_sql::{TableRun, MEASURED_AGGREGATES};
 
-use crate::engine::{folder_changes, guard, schema_hint, Engine, Pinned, SnapshotFiles};
+use crate::engine::{folder_changes, guard, root_hint, schema_hint, Engine, Pinned, SnapshotFiles};
 use crate::index::{instant_in_unit, no_time_column};
 use crate::keys::KeyFile;
 use crate::lookback::Lookback;
 use crate::results::{total, Cost, LookbackWindow, LookupKind, Written};
 use crate::sketch::{CountingSource, ItemCardinality};
 use crate::spec::label;
+use crate::text::TextQuery;
 use crate::twin::{self, TwinCandidate, TwinReport};
 
 /// Who the engine's own candidate proposals are by.
@@ -72,16 +73,41 @@ pub enum LookupMode {
     Latest,
     /// The version of each key current at an instant (`bellwether asof`).
     Asof,
+    /// The rows whose string column contains one of the values, case-folded
+    /// (B5: `contains`, `like '%x%'`; `bellwether locate --contains`).
+    Contains,
+    /// The rows whose string column holds one of the values as a word,
+    /// case-folded (B5: `has`; `bellwether locate --has`).
+    HasToken,
+    /// The rows whose string column holds a word starting with one of the
+    /// values, case-folded (B5: prefix match; `bellwether locate --prefix`).
+    HasPrefix,
 }
 
 impl LookupMode {
-    /// The CLI spelling: `locate`, `latest`, or `asof`.
+    /// The CLI spelling: `locate`, `latest`, `asof`, `contains`,
+    /// `has-token`, or `has-prefix`.
     #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Locate => "locate",
             Self::Latest => "latest",
             Self::Asof => "asof",
+            Self::Contains => "contains",
+            Self::HasToken => "has-token",
+            Self::HasPrefix => "has-prefix",
+        }
+    }
+
+    /// The text match a text mode (`contains`, `has-token`, `has-prefix`)
+    /// prices, `None` for the others.
+    #[must_use]
+    pub fn text_op(self) -> Option<TextOp> {
+        match self {
+            Self::Contains => Some(TextOp::Contains),
+            Self::HasToken => Some(TextOp::HasToken),
+            Self::HasPrefix => Some(TextOp::HasPrefix),
+            Self::Locate | Self::Latest | Self::Asof => None,
         }
     }
 }
@@ -100,8 +126,13 @@ pub struct WhyRequest {
     pub workload: Option<Hash>,
     /// The lookup the workload's keys are priced under. `None` infers it:
     /// `asof` when `at` is given, else `latest` when `latest_by` is given,
-    /// else `locate`. `latest` needs `latest_by`; `asof` needs `latest_by`
-    /// and `at`; `locate` takes neither, nor `lookback`.
+    /// else `locate` (a recorded workload of text runs is priced as
+    /// recorded). `latest` needs `latest_by`; `asof` needs `latest_by` and
+    /// `at`; `locate` takes neither, nor `lookback`; `contains`,
+    /// `has_token`, and `has_prefix` (B5) price a key file of one string
+    /// column's words, substrings, or prefixes as one text run, with the
+    /// text keys on the column as the floor candidates, and take none of
+    /// them.
     #[serde(default)]
     pub mode: Option<LookupMode>,
     /// Timestamp (or date, time, or integer version) column for temporal
@@ -156,6 +187,12 @@ pub struct WhyRequest {
     /// priced by reading key columns) and `columns`.
     #[serde(default)]
     pub sketches_only: bool,
+    /// Text lookups (B5), recorded as the workload: one text run each
+    /// (`text-1`, `text-2`, ...), priced like any workload under the
+    /// current configuration and each candidate text key. Instead of a key
+    /// file or a workload, and with no `mode`.
+    #[serde(default)]
+    pub text: Vec<TextQuery>,
 }
 
 impl Default for WhyRequest {
@@ -174,6 +211,7 @@ impl Default for WhyRequest {
             max_candidates: DEFAULT_MAX_CANDIDATES,
             gates: Vec::new(),
             sketches_only: false,
+            text: Vec::new(),
         }
     }
 }
@@ -224,6 +262,18 @@ impl WhyRequest {
             };
         };
         match mode {
+            LookupMode::Contains | LookupMode::HasToken | LookupMode::HasPrefix
+                if self.latest_by.is_some()
+                    || self.at.is_some()
+                    || self.lookback.is_some()
+                    || self.window.is_some() =>
+            {
+                Err(format!(
+                    "--mode {} prices text lookups and takes no --latest-by, --at, --lookback, or \
+                     --window; drop them, or pass --mode latest or --mode asof to price versions",
+                    mode.as_str()
+                ))
+            }
             LookupMode::Locate
                 if self.latest_by.is_some() || self.at.is_some() || self.lookback.is_some() =>
             {
@@ -424,6 +474,28 @@ pub enum CulpritReason {
         /// The serving spec.
         spec: KeySpec,
     },
+    /// The workload's text runs (B5), per match they ask for on the
+    /// culprit's column: the complete text keys that serve it, or none (its
+    /// runs then read every row group). A text lookup has no value fanout:
+    /// what it reads depends on the words or substrings, not on one value.
+    Text {
+        /// One entry per match the runs ask for, in `contains`,
+        /// `has_token`, `has_prefix` order.
+        matches: Vec<TextMatch>,
+    },
+}
+
+/// One text match of a workload's runs on one column, and what serves it
+/// ([`CulpritReason::Text`]).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TextMatch {
+    /// The match.
+    pub operator: TextOp,
+    /// Runs asking for it.
+    pub runs: u64,
+    /// The complete text keys on the column that serve it; empty when none
+    /// does.
+    pub served_by: Vec<KeySpec>,
 }
 
 /// The columns behind the read, with their measured fanout.
@@ -653,7 +725,7 @@ impl Engine {
     /// spec serves read as the files' min/max statistics read it), so the
     /// number is the one `fix` gates on and a receipt cites.
     pub fn why(&self, request: &WhyRequest) -> Result<WhyReport> {
-        guard(|| self.why_inner(request)).map_err(schema_hint)
+        guard(|| self.why_inner(request)).map_err(|e| root_hint(self.root(), schema_hint(e)))
     }
 
     #[allow(clippy::too_many_lines)]
@@ -714,7 +786,10 @@ impl Engine {
         let mut twin_pass = None;
         let mut twin_lints = Vec::new();
         let mut resolved_temporal = resolved_temporal;
-        if let (Some(of), true) = (&mut twin_of, has_workload) {
+        // The workload is recorded before the profile, so the detectors
+        // that read its runs (the twin pass, `R-text-1`) land in the profile
+        // Evidence.
+        if has_workload {
             let cache = self.cache()?;
             let (w, temporal) = self.record_workload(
                 req,
@@ -723,17 +798,34 @@ impl Engine {
                 &cache,
                 resolved_temporal.take(),
             )?;
-            let p = twin::pass(source, replayer.catalog(), &w, &cache, &req.gates)?;
-            twin::predict(of, &p, w.hash());
-            twin_lints = twin::lints(
-                &p,
-                &req.gates,
-                temporal.is_some(),
-                of.engine_rows == of.lake_rows,
-            );
-            twin_pass = Some(p);
+            if let Some(of) = &mut twin_of {
+                let p = twin::pass(source, replayer.catalog(), &w, &cache, &req.gates)?;
+                twin::predict(of, &p, w.hash());
+                twin_lints = twin::lints(
+                    &p,
+                    &req.gates,
+                    temporal.is_some(),
+                    of.engine_rows == of.lake_rows,
+                );
+                twin_pass = Some(p);
+            }
             recorded = Some((w, temporal));
         }
+        // The text detector (B5) reads the workload's runs, which the
+        // profile does not; its lints ride in the same Evidence, which then
+        // cites the workload they were read from.
+        let text_lints = match &recorded {
+            Some((w, _)) => {
+                bellwether_profile::lints::text_lookups(&crate::text::text_uses(w)?, &current_specs)
+            }
+            None => Vec::new(),
+        };
+        let text_input = match &recorded {
+            Some((w, _)) if !text_lints.is_empty() => Some(w.hash()),
+            _ => None,
+        };
+        let mut extra_lints = sketch_lints;
+        extra_lints.extend(text_lints);
         let (profile, evidence) = self.profile(
             req,
             Measure::Source(source),
@@ -741,12 +833,13 @@ impl Engine {
             has_workload,
             twin_of.clone(),
             &twin_lints,
-            sketch_lints,
+            extra_lints,
+            text_input,
         )?;
         let mut report = WhyReport {
             root: self.root().to_string(),
             sequence,
-            current_specs,
+            current_specs: current_specs.clone(),
             workload: None,
             evidence,
             profile,
@@ -794,10 +887,17 @@ impl Engine {
         } else {
             None
         };
-        report.culprit = workload
-            .as_ref()
-            .and_then(|w| layout_culprit(&report, w, indexed_row_groups))
-            .or_else(|| culprit(&report.current_specs, &report.profile, workload.as_ref()));
+        let text_runs = match &workload {
+            Some(w) => is_text_workload(w)?,
+            None => false,
+        };
+        report.culprit = match workload.as_ref() {
+            Some(w) if text_runs => text_culprit(&report.current_specs, w)?,
+            _ => workload
+                .as_ref()
+                .and_then(|w| layout_culprit(&report, w, indexed_row_groups))
+                .or_else(|| culprit(&report.current_specs, &report.profile, workload.as_ref())),
+        };
         if self.is_table() {
             report.exact = false;
             report.model = Some(MEASURED_AGGREGATES.to_string());
@@ -916,6 +1016,7 @@ impl Engine {
             None,
             &[],
             lints,
+            None,
         )?;
         let current_specs = p.specs().0;
         let culprit = culprit(&current_specs, &profile, None);
@@ -1109,6 +1210,33 @@ fn sketch_view(pinned: &Pinned, folded: &[crate::sketch::Folded]) -> Result<Sket
 }
 
 impl Engine {
+    /// Refuses text lookups (`req.text`) given with a lookup mode, a
+    /// timestamp column, an instant, a lookback, or a window, on a column the
+    /// dataset lacks, or with an argument their match refuses; before any
+    /// other check, so the refusal states this cause.
+    fn check_text_request(&self, req: &WhyRequest) -> Result<()> {
+        if !req.text.is_empty() {
+            if req.mode.is_some()
+                || req.latest_by.is_some()
+                || req.at.is_some()
+                || req.lookback.is_some()
+                || req.window.is_some()
+            {
+                return Err(Error::InvalidArgument {
+                    field: "text",
+                    reason: "text lookups say their own match and take no lookup mode, \
+                         timestamp column, instant, lookback, or window; drop those"
+                        .into(),
+                });
+            }
+            self.check_columns(&req.text.iter().map(|q| &q.column).collect::<Vec<_>>())?;
+            for q in &req.text {
+                bellwether_core::text::check_arg(q.op, &q.value)?;
+            }
+        }
+        Ok(())
+    }
+
     /// Refuses a `why` request whose flags contradict each other, before any
     /// work. Returns whether it carries a workload.
     fn check_why_request(&self, req: &WhyRequest) -> Result<bool> {
@@ -1116,12 +1244,13 @@ impl Engine {
             req.keys.is_some(),
             req.bench_workload.is_some(),
             req.workload.is_some(),
+            !req.text.is_empty(),
         ];
         if given.iter().filter(|g| **g).count() > 1 {
             return Err(Error::InvalidArgument {
                 field: "workload",
-                reason: "give one workload: a key file, a bench workload directory, or a \
-                         recorded workload hash, not several"
+                reason: "give one workload: a key file, a bench workload directory, a recorded \
+                         workload hash, or text lookups, not several"
                     .into(),
             });
         }
@@ -1145,7 +1274,16 @@ impl Engine {
                     .into(),
             });
         }
+        self.check_text_request(req)?;
         let mode = req.lookup_mode().map_err(Error::KeySpec)?;
+        if mode.text_op().is_some() && req.keys.is_none() && req.workload.is_none() {
+            return Err(Error::KeySpec(format!(
+                "--mode {} prices a key file of one string column's values (named after the \
+                 column) as a text lookup; pass --from <values.parquet> (or --workload <hash>), \
+                 or give the lookups themselves with --contains, --has, or --prefix COL=TEXT",
+                mode.as_str()
+            )));
+        }
         if req.window.is_some() && !(given[0] || given[1]) {
             return Err(Error::Other(
                 "a window (--window) applies to the runs why records: give a key file (--from) or \
@@ -1188,7 +1326,10 @@ impl Engine {
                  --lookback <length>"
             )));
         }
-        if mode != LookupMode::Locate && req.keys.is_none() && req.workload.is_none() {
+        if matches!(mode, LookupMode::Latest | LookupMode::Asof)
+            && req.keys.is_none()
+            && req.workload.is_none()
+        {
             return Err(Error::KeySpec(
                 "--latest-by prices a workload's keys under latest or asof lookups; pass --from \
                  <keys.parquet> (or --workload <hash>)"
@@ -1201,7 +1342,10 @@ impl Engine {
     /// Profiles the data root and builds its Evidence, recording it when the
     /// index location is writable. With a workload, an unwritable location
     /// is refused (the store's one-line error naming `--index`), since the
-    /// Proposals must cite a recorded Evidence. [`Measure::Manifest`]
+    /// Proposals must cite a recorded Evidence. Lints the profile does not
+    /// compute (`extra_lints`: the sketch detector's, and `R-text-1`, which
+    /// reads the workload's runs) join the same Evidence, which then also
+    /// cites `cites` (the workload `R-text-1` read). [`Measure::Manifest`]
     /// profiles from totals the caller already holds and reads no file.
     #[allow(clippy::too_many_arguments)]
     fn profile(
@@ -1212,7 +1356,8 @@ impl Engine {
         has_workload: bool,
         twin: Option<TwinOf>,
         twin_lints: &[Lint],
-        sketch_lints: Vec<bellwether_types::Lint>,
+        extra_lints: Vec<bellwether_types::Lint>,
+        cites: Option<Hash>,
     ) -> Result<(ProfileReport, ProfileEvidence)> {
         let writable = if has_workload {
             Some(Arc::clone(self.store()?))
@@ -1261,14 +1406,20 @@ impl Engine {
         });
         // A key file or a recorded workload says which columns lookups
         // supply, as a bench workload does (contract v3 backlog #35): the
-        // lints then read them instead of assuming an order.
-        if let Some(keys) = &req.keys {
+        // lints then read them instead of assuming an order. A text run's
+        // column is searched by its words, never looked up by value, so it
+        // supplies no key column.
+        let text_mode = req.mode.and_then(LookupMode::text_op).is_some();
+        if let (Some(keys), false) = (&req.keys, text_mode) {
             options.supplied_columns = keys.column_names()?;
         } else if let Some(h) = &req.workload {
             // An unreadable workload is refused by `record_workload`, with
             // its own message; here it only informs no column.
             if let Some(w) = self.cache().ok().and_then(|c| Workload::load(&c, h).ok()) {
                 for r in w.runs() {
+                    if r.query().is_ok_and(|q| q.text_op().is_some()) {
+                        continue;
+                    }
                     for c in &r.columns {
                         if !options.supplied_columns.contains(c) {
                             options.supplied_columns.push(c.clone());
@@ -1285,11 +1436,17 @@ impl Engine {
                 bellwether_profile::manifest_profile(self.root(), &store, &options, totals)?
             }
         };
-        // The sketch detector's lints join the profile's before the
-        // Evidence is built, so the Evidence records them; its provenance
-        // cites the manifest, which names the sketch segments by content.
-        profile.lints.extend(sketch_lints);
+        // The sketch detector's lints and `R-text-1` join the profile's
+        // before the Evidence is built, so the Evidence records them; the
+        // sketches are cited through the manifest, which names their
+        // segments by content, and the text lints through the workload.
+        profile.lints.extend(extra_lints);
         let mut evidence = bellwether_profile::evidence(&profile)?;
+        if let Some(h) = cites {
+            if !evidence.provenance.inputs.contains(&h) {
+                evidence.provenance.inputs.push(h);
+            }
+        }
         if let EvidenceBody::Profile {
             twin: slot, lints, ..
         } = &mut evidence.body
@@ -1355,6 +1512,20 @@ impl Engine {
                     }
                     Some(t)
                 }
+                None if req.mode.is_some_and(|m| m.text_op().is_some()) => {
+                    let want = req.mode.and_then(LookupMode::text_op).map(RunQuery::Text);
+                    if let Some(r) = w.runs().iter().find(|r| r.query().ok() != want) {
+                        let mode = req.mode.map_or("", LookupMode::as_str);
+                        return Err(Error::KeySpec(format!(
+                            "workload {h} records its runs as {} lookups, and --mode {mode} asks \
+                             for text lookups; drop --mode to price them as recorded, or record \
+                             the values again with `bellwether why --from <values.parquet> \
+                             --mode {mode}`",
+                            describe(&r.query()?),
+                        )));
+                    }
+                    None
+                }
                 None if req.mode == Some(LookupMode::Locate) => {
                     if let Some(r) = w
                         .runs()
@@ -1395,10 +1566,18 @@ impl Engine {
                 .map(|f| f.name().clone())
                 .collect();
             let mut recorder = self.windowed(recorder, req, pinned, replayer, &columns)?;
-            let query = resolved
-                .as_ref()
-                .map_or(RunQuery::Locate, |t| t.query.clone());
+            let query = match req.mode.and_then(LookupMode::text_op) {
+                Some(op) => RunQuery::Text(op),
+                None => resolved
+                    .as_ref()
+                    .map_or(RunQuery::Locate, |t| t.query.clone()),
+            };
             recorder.record_query("keys", KeyInput::Batch(&batch), query, None)?;
+            return Ok((recorder.finish()?, resolved));
+        }
+        if !req.text.is_empty() {
+            let mut recorder = recorder;
+            crate::text::record(&mut recorder, replayer.schema(), &req.text)?;
             return Ok((recorder.finish()?, resolved));
         }
         let mut recorder = self.windowed(recorder, req, pinned, replayer, &[])?;
@@ -1512,6 +1691,26 @@ impl Engine {
                 workload.runs().iter().map(|r| r.columns.clone()).collect();
             set.into_iter().collect()
         };
+        // A workload of text runs (B5) is priced on text keys alone; one
+        // mixing them with key lookups would price each candidate on runs
+        // it cannot serve.
+        let queries: Vec<RunQuery> = workload
+            .runs()
+            .iter()
+            .map(RecordedRun::query)
+            .collect::<Result<_>>()?;
+        let text_runs = queries.iter().filter(|q| q.text_op().is_some()).count();
+        if text_runs > 0 && text_runs < queries.len() {
+            return Err(Error::KeySpec(format!(
+                "workload {} mixes {text_runs} text runs (contains, has_token, has_prefix) with {} \
+                 key lookups; a text key serves only the former, so price them as two \
+                 workloads (record the text lookups with `bellwether why --contains, --has, or \
+                 --prefix COL=TEXT`, the keys with `bellwether why --from <keys.parquet>`)",
+                workload.hash(),
+                queries.len() - text_runs
+            )));
+        }
+        let text = text_runs > 0;
         let mut windows: Vec<RunWindow> = Vec::new();
         for w in workload.runs().iter().filter_map(|r| r.window.as_ref()) {
             if !windows.contains(w) {
@@ -1530,19 +1729,36 @@ impl Engine {
                 check_planned_column(replayer, cols, t)?;
             }
         }
-        let query_kind = temporal
-            .as_ref()
-            .map_or(QUERY_KIND_LOCATE, |t| t.query.kind_str())
-            .to_string();
-        let lookup_kind = temporal
-            .as_ref()
-            .map_or(LookupKind::Locate, |t| t.lookup.clone());
+        let text_kind = text.then(|| {
+            let columns: BTreeSet<String> = run_columns.iter().flatten().cloned().collect();
+            let operators: BTreeSet<TextOp> =
+                queries.iter().filter_map(RunQuery::text_op).collect();
+            LookupKind::TextRuns {
+                columns: columns.into_iter().collect(),
+                operators: operators.into_iter().collect(),
+            }
+        });
+        let query_kind = if text {
+            let kinds: BTreeSet<&str> = queries.iter().map(RunQuery::kind_str).collect();
+            kinds.into_iter().collect::<Vec<_>>().join(",")
+        } else {
+            temporal
+                .as_ref()
+                .map_or(QUERY_KIND_LOCATE, |t| t.query.kind_str())
+                .to_string()
+        };
+        let lookup_kind = match &text_kind {
+            Some(k) => k.clone(),
+            None => temporal
+                .as_ref()
+                .map_or(LookupKind::Locate, |t| t.lookup.clone()),
+        };
         let lookback = temporal.as_ref().and_then(|t| t.lookback.clone());
         report.workload = Some(WorkloadInfo {
             hash: workload.hash(),
             runs: workload.runs().len() as u64,
             query_kind,
-            lookup: temporal.as_ref().map(|t| t.lookup.clone()),
+            lookup: text_kind.or_else(|| temporal.as_ref().map(|t| t.lookup.clone())),
             lookback: lookback.clone(),
             columns: run_columns.clone(),
             keys_p50_p95_max: workload.keys_p50_p95_max(),
@@ -1579,22 +1795,39 @@ impl Engine {
                 }
             }
         }
-        for c in &run_columns {
-            // A run keyed on an expression gets an `expr` key over it (an
-            // exact segment on a virtual column the engine names); a run on
-            // dataset columns gets the exact key on them.
-            let spec = match c.as_slice() {
-                [e] if bellwether_core::expr::is_expression(e, replayer.schema()) => {
-                    let parsed = bellwether_core::expr::Expr::parse(e)?;
-                    let name = bellwether_core::expr::suggested_name(&parsed, replayer.schema());
-                    bellwether_core::expr::spec(&name, e, bellwether_core::expr::Over::Exact)?
-                }
-                _ => KeySpec::Exact {
-                    columns: c.clone(),
-                    counts: false,
-                    bounds: None,
-                },
-            };
+        // A text workload's floor is the text keys on its columns (a words
+        // dictionary for whole words and prefixes, a trigram key for every
+        // match); an exact key looks whole values up and serves none of it.
+        // A run keyed on an expression gets an `expr` key over it (an exact
+        // segment on a virtual column the engine names); a run on dataset
+        // columns gets the exact key on them.
+        let floor: Vec<KeySpec> = if text {
+            crate::text::floor_keys(workload)?
+        } else {
+            run_columns
+                .iter()
+                .map(|c| -> Result<KeySpec> {
+                    Ok(match c.as_slice() {
+                        [e] if bellwether_core::expr::is_expression(e, replayer.schema()) => {
+                            let parsed = bellwether_core::expr::Expr::parse(e)?;
+                            let name =
+                                bellwether_core::expr::suggested_name(&parsed, replayer.schema());
+                            bellwether_core::expr::spec(
+                                &name,
+                                e,
+                                bellwether_core::expr::Over::Exact,
+                            )?
+                        }
+                        _ => KeySpec::Exact {
+                            columns: c.clone(),
+                            counts: false,
+                            bounds: None,
+                        },
+                    })
+                })
+                .collect::<Result<_>>()?
+        };
+        for spec in floor {
             // An exact `expr` key the index already declares over the same
             // (normalized) expression is the same key under another name.
             let declared = matches!(&spec, KeySpec::Expr { expr, .. } if report
@@ -1670,7 +1903,7 @@ impl Engine {
                 counts: false,
                 bounds: None,
             };
-            if !serves(&exact_spec) {
+            if text || !serves(&exact_spec) {
                 if !current_names.contains(&label(&exact_spec))
                     && !names.contains(&label(&exact_spec))
                 {
@@ -1771,44 +2004,57 @@ impl Engine {
             } else {
                 None
             };
-            // The kind column: an `expr` candidate's (null-expression rows and
-            // distinct derived values); else, as below.
-            let kind_column = match expr_column(replayer, &spec)? {
-                Some(c) => Some(c),
-                None => match sketch_column(&report.sketch, spec.columns()) {
+            // The kind column: a text key's (distinct tokens); an `expr`
+            // candidate's (null-expression rows and distinct derived values);
+            // else the sketch's rows per value where a sketch holds the
+            // candidate's columns; otherwise the `counts` column: for an exact
+            // candidate on exactly the workload's key columns, the rows its
+            // keys hold, from a replay with that key storing counts (the
+            // counts replay computes for `exact:<cols>,counts`; exact).
+            let kind_column = match &spec {
+                KeySpec::Text { .. } => Some(crate::text::kind_column(
+                    replayer,
+                    &spec,
+                    total(&scored.replay.proposed).bytes < total(&scored.replay.current).bytes,
+                )?),
+                _ => match expr_column(replayer, &spec)? {
                     Some(c) => Some(c),
-                    None => match &spec {
-                        KeySpec::Exact {
-                            columns,
-                            bounds: None,
-                            ..
-                        } if temporal.is_none()
-                            && workload.runs().iter().all(|r| {
-                                &r.columns == columns && matches!(r.query(), Ok(RunQuery::Locate))
-                            }) =>
-                        {
-                            let counted = KeySpec::Exact {
-                                columns: columns.clone(),
-                                counts: true,
+                    None => match sketch_column(&report.sketch, spec.columns()) {
+                        Some(c) => Some(c),
+                        None => match &spec {
+                            KeySpec::Exact {
+                                columns,
                                 bounds: None,
-                            };
-                            let specs = proposed_specs(replayer.current_specs(), &counted);
-                            let costs = replayer.replay_specs(&specs, workload, cache)?;
-                            costs
-                                .iter()
-                                .map(|c| c.rows.as_ref().map(|q| q.value))
-                                .sum::<Option<u64>>()
-                                .map(|rows| bellwether_types::KindColumn {
-                                    kind: "counts".into(),
-                                    label: format!(
+                                ..
+                            } if temporal.is_none()
+                                && workload.runs().iter().all(|r| {
+                                    &r.columns == columns
+                                        && matches!(r.query(), Ok(RunQuery::Locate))
+                                }) =>
+                            {
+                                let counted = KeySpec::Exact {
+                                    columns: columns.clone(),
+                                    counts: true,
+                                    bounds: None,
+                                };
+                                let specs = proposed_specs(replayer.current_specs(), &counted);
+                                let costs = replayer.replay_specs(&specs, workload, cache)?;
+                                costs
+                                    .iter()
+                                    .map(|c| c.rows.as_ref().map(|q| q.value))
+                                    .sum::<Option<u64>>()
+                                    .map(|rows| bellwether_types::KindColumn {
+                                        kind: "counts".into(),
+                                        label: format!(
                                         "rows holding the keys over every run, as {} counts them",
                                         counted.identity()
                                     ),
-                                    value: rows.to_string(),
-                                    exactness: bellwether_types::Exactness::Exact,
-                                })
-                        }
-                        _ => None,
+                                        value: rows.to_string(),
+                                        exactness: bellwether_types::Exactness::Exact,
+                                    })
+                            }
+                            _ => None,
+                        },
                     },
                 },
             };
@@ -2002,12 +2248,60 @@ fn fanout_of(profile: &ProfileReport, columns: &[String]) -> Option<Fanout> {
     })
 }
 
-/// The layout culprit documented on [`Engine::why`]: `None` unless the
+/// Whether every run of `w` is a text run (a mixed workload is refused
+/// before any culprit is named).
+fn is_text_workload(w: &Workload) -> Result<bool> {
+    for r in w.runs() {
+        if r.query()?.text_op().is_none() {
+            return Ok(false);
+        }
+    }
+    Ok(!w.runs().is_empty())
+}
+
+/// The culprit of a text workload: per column its runs search (the first
+/// one; the report names one culprit), each match they ask for and the
+/// complete text keys that serve it ([`CulpritReason::Text`]).
+fn text_culprit(current: &[KeySpec], w: &Workload) -> Result<Option<Culprit>> {
+    let Some(u) = crate::text::text_uses(w)?.into_iter().next() else {
+        return Ok(None);
+    };
+    let matches = [TextOp::Contains, TextOp::HasToken, TextOp::HasPrefix]
+        .into_iter()
+        .filter(|op| u.runs(*op) > 0)
+        .map(|op| TextMatch {
+            operator: op,
+            runs: u.runs(op),
+            served_by: current
+                .iter()
+                .filter(|s| bellwether_core::text::serves(s, &u.column, op))
+                .cloned()
+                .collect(),
+        })
+        .collect();
+    Ok(Some(Culprit {
+        columns: vec![u.column],
+        fanout: None,
+        reason: CulpritReason::Text { matches },
+    }))
+}
+
+/// The layout culprit documented on [`Engine::why`]: `None` for text
+/// lookups, and unless the
 /// floor was priced (a candidate exact key on a run's own columns, or a
 /// current spec serving the first run) and every priced configuration reads
 /// at least [`LAYOUT_BOUND_FRACTION`] of the `runs × indexed_row_groups` row
 /// groups the runs span. A dataset of one row group never names the layout.
 fn layout_culprit(r: &WhyReport, w: &Workload, indexed_row_groups: u64) -> Option<Culprit> {
+    // A text lookup (B5) that reads nearly every row group under every
+    // text key is a term in nearly every row group, which the text key's
+    // `why` column says; no clustering of the files changes that.
+    if matches!(
+        r.workload.as_ref().and_then(|i| i.lookup.as_ref()),
+        Some(LookupKind::TextRuns { .. })
+    ) {
+        return None;
+    }
     let current = r.current?;
     let columns = w.runs().first()?.columns.clone();
     let floor_priced = r
@@ -2174,7 +2468,10 @@ fn check_planned_column(
 /// timestamp, date, time, or integer), and `at` and `lookback` must convert
 /// exactly to that column's unit. `None` for a `locate` request.
 fn resolve_temporal(req: &WhyRequest, schema: &Schema) -> Result<Option<ResolvedTemporal>> {
-    if req.lookup_mode().map_err(Error::KeySpec)? == LookupMode::Locate {
+    if !matches!(
+        req.lookup_mode().map_err(Error::KeySpec)?,
+        LookupMode::Latest | LookupMode::Asof
+    ) {
         return Ok(None);
     }
     let Some(ts_column) = &req.latest_by else {
@@ -2258,10 +2555,11 @@ fn infer_workload_temporal(
     let query = first.query()?;
     // A window run reads every row of its keys in a fixed window, and a
     // count run counts every row of its keys: no version is chosen, so
-    // there is no temporal lookup to infer.
+    // there is no temporal lookup to infer. A text run (B5) chooses no
+    // version either.
     if matches!(
         query,
-        RunQuery::Locate | RunQuery::Window(_) | RunQuery::Count
+        RunQuery::Locate | RunQuery::Window(_) | RunQuery::Count | RunQuery::Text(_)
     ) {
         return Ok(None);
     }

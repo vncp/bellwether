@@ -14,6 +14,7 @@ use bellwether_bench::perf::{all_cells, plan_cells, read_row_groups, ReadReport}
 use bellwether_bench::report::write_report;
 use bellwether_bench::results::Results;
 use bellwether_bench::slo::{assert_slo, Mode};
+use bellwether_bench::text::{generate_text, TextParams, TextShape, TextSummary};
 use bellwether_bench::truth::write_ground_truth;
 use bellwether_bench::workload::{generate_workload, WorkloadParams};
 use clap::{Args, Subcommand, ValueEnum};
@@ -51,6 +52,10 @@ pub(crate) enum BenchCommand {
     },
     /// Write the synthetic bitemporal market trade corpus, workload, and ground truth.
     Market(MarketArgs),
+    /// Write a text corpus (1–4 KB documents with planted terms at 1% and
+    /// 0.01% of rows) in the ledger or market shape, with ground truth, for
+    /// text keys (`text:body,tokenizer=words|trigram`).
+    Text(TextArgs),
     /// Read row groups through the benchmark's byte-counting reader and
     /// report the time and bytes: the planned row groups of a lookup's
     /// --json output (--plan), or every row group under a folder (--all).
@@ -105,6 +110,39 @@ pub(crate) struct ReadArgs {
     /// full scan; directories starting with `.` are skipped).
     #[arg(long, value_name = "DIR")]
     all: Option<PathBuf>,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+pub(crate) enum TextShapeArg {
+    /// `entity_id`, `version_ts`, `body`: attribute blobs on a ledger.
+    Ledger,
+    /// `symbol`, `ts`, `body`: documents keyed by symbol and date.
+    Market,
+}
+
+#[derive(Args)]
+pub(crate) struct TextArgs {
+    /// Output directory (`data/` and `workload/text-truth.json`).
+    #[arg(long)]
+    out: PathBuf,
+    /// The shape the documents ride on.
+    #[arg(long, value_enum)]
+    shape: TextShapeArg,
+    /// RNG seed [default: 5].
+    #[arg(long)]
+    seed: Option<u64>,
+    /// Day partitions [default: 3].
+    #[arg(long)]
+    days: Option<u32>,
+    /// Files per day [default: 2].
+    #[arg(long)]
+    files_per_day: Option<u32>,
+    /// Row groups per file [default: 4].
+    #[arg(long)]
+    row_groups_per_file: Option<u32>,
+    /// Rows per row group [default: 500].
+    #[arg(long)]
+    rows_per_row_group: Option<u32>,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -261,6 +299,9 @@ pub(crate) struct Wrote {
     /// What the read cost (`read` only).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub read: Option<ReadReport>,
+    /// Text corpus summary and ground truth (`text` only).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub text: Option<TextSummary>,
     /// Expr corpus summary (`expr` only).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub expr: Option<ExprSummary>,
@@ -357,6 +398,7 @@ pub(crate) fn run(cmd: &BenchCommand) -> Result<Wrote, Error> {
             ("slo", results.clone(), failed, None)
         }
         BenchCommand::Market(a) => return market(a),
+        BenchCommand::Text(a) => return text(a),
         BenchCommand::Read(a) => return read(a),
         BenchCommand::Expr(a) => return expr(a),
     };
@@ -367,11 +409,53 @@ pub(crate) fn run(cmd: &BenchCommand) -> Result<Wrote, Error> {
         failed,
         market,
         read: None,
+        text: None,
         expr: None,
     })
 }
 
 /// `bench market`: the rung's parameters, each flag given overriding one.
+fn text(a: &TextArgs) -> Result<Wrote, Error> {
+    let mut params = TextParams::small(match a.shape {
+        TextShapeArg::Ledger => TextShape::Ledger,
+        TextShapeArg::Market => TextShape::Market,
+    });
+    if let Some(v) = a.seed {
+        params.seed = v;
+    }
+    if let Some(v) = a.days {
+        params.days = v;
+    }
+    if let Some(v) = a.files_per_day {
+        params.files_per_day = v;
+    }
+    if let Some(v) = a.row_groups_per_file {
+        params.row_groups_per_file = v;
+    }
+    if let Some(v) = a.rows_per_row_group {
+        params.rows_per_row_group = v;
+    }
+    let summary = generate_text(&a.out, &params).map_err(|e| bench_err(&e))?;
+    let truth = a.out.join("workload").join("text-truth.json");
+    Ok(Wrote {
+        what: "text corpus",
+        path: format!(
+            "{} ({} files, {} row groups, {} rows, {} bytes of text)",
+            a.out.display(),
+            summary.files,
+            summary.row_groups,
+            summary.rows,
+            summary.body_bytes
+        ),
+        blake3: file_hash(&truth)?,
+        failed: Vec::new(),
+        market: None,
+        read: None,
+        expr: None,
+        text: Some(summary),
+    })
+}
+
 fn market(a: &MarketArgs) -> Result<Wrote, Error> {
     let mut params = match a.rung.unwrap_or(MarketRungArg::Small) {
         MarketRungArg::Small => MarketParams::rung(MarketRung::Small),
@@ -425,6 +509,7 @@ fn market(a: &MarketArgs) -> Result<Wrote, Error> {
         market: Some(summary),
         read: None,
         expr: None,
+        text: None,
     })
 }
 
@@ -471,6 +556,7 @@ fn expr(a: &ExprArgs) -> Result<Wrote, Error> {
         market: None,
         read: None,
         expr: Some(summary),
+        text: None,
     })
 }
 
@@ -512,6 +598,7 @@ fn read(a: &ReadArgs) -> Result<Wrote, Error> {
         failed: Vec::new(),
         market: None,
         read: Some(report),
+        text: None,
         expr: None,
     })
 }

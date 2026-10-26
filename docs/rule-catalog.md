@@ -260,6 +260,40 @@ of 22 row groups, and no rule said so (defect 8 of
 - **Confidence rubric**: high when every fanout it rests on is exact; low
   when any is sampled.
 
+### R-text-1
+
+- **id**: `R-text-1` (B5)
+- **Detector**: the workload `why` replays records text runs (`contains`,
+  `like '%x%'`, `has`, prefix match: query kinds `contains`, `has_token`,
+  `has_prefix`) on a string column, and for at least one of the matches the
+  runs ask, no text key complete at the current manifest serves it on that
+  column (`bellwether_profile::lints::text_lookups`). An exact key on the
+  column does not count: it looks whole values up. A words key serves
+  `has_token` and `has_prefix`; a trigram key serves all three. Fires once
+  per column; silent without text runs or when every match has a serving
+  text key. The message names only the keys for the unserved matches: a
+  trigram key for `contains`, a words key for `has_token` and `has_prefix`.
+- **Estimator**: `why` replays the same runs under each candidate text key
+  (`text:<column>,tokenizer=words` when some run asks for words or
+  prefixes, `text:<column>,tokenizer=trigram` always) from transient
+  segments, exact sums of row-group statistics like every replay, and shows
+  each key's distinct tokens in its `text` column: for a trigram key, how
+  many row groups the median trigram is in (a substring prunes only by its
+  rarer trigrams); "high entropy" when the key holds at least one distinct
+  token per two rows (its dictionary is about as large as the column); and
+  when the replay shows it reads no fewer bytes on the runs.
+- **Guidance template**: file `<consumer>`, step `<filter on the string
+  column>`. Before: `scan every row group, then filter contains(<column>,
+  <text>)`. After: `plan through text:<column>,tokenizer=trigram, then
+  apply the residual`. Invariant: `the rows the filter keeps are unchanged`
+  (a trigram plan is a candidate set; the residual is mandatory).
+- **Verification method**: reconcile over the rows the recorded text runs
+  ask for (the workload's text residual chooses the rows on both sides).
+- **Confidence rubric**: high (0.9): the runs are recorded and the specs are
+  the manifest's; nothing is sampled.
+- **Lives in**: the `profile` Evidence `why` writes, which then cites the
+  workload.
+
 ### unprefiltered_window
 
 - **id**: `unprefiltered_window`

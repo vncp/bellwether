@@ -761,6 +761,7 @@ fn key_spec_fields(kind: &str, storage_version: u64) -> Option<&'static [&'stati
         // --- phase 5 kinds ---
         // Storage version 2 on: a reader of version 1 refuses the kind.
         "expr" if v2 => Some(&["kind", "name", "expr", "over", "conformance"]),
+        "text" if v2 => Some(&["kind", "column", "tokenizer", "bloom"]),
         _ => None,
     }
 }
@@ -802,6 +803,16 @@ fn types_owned_fields_known(manifest: &Value, storage_version: u64) -> bool {
         .and_then(Value::as_array);
     for spec in key_specs.into_iter().flatten() {
         if !key_spec_known(spec, storage_version) {
+            return false;
+        }
+        // A text key's tokenizer is a closed set too: a later one is a
+        // shape this build does not know, never a serde error.
+        if spec.get("kind").and_then(Value::as_str) == Some("text")
+            && !matches!(
+                spec.get("tokenizer").and_then(Value::as_str),
+                Some("words" | "trigram")
+            )
+        {
             return false;
         }
     }
@@ -1006,6 +1017,11 @@ mod tests {
                 }),
                 conformance: Vec::new(),
             },
+            KeySpec::Text {
+                column: "a".into(),
+                tokenizer: bellwether_types::Tokenizer::Trigram,
+                bloom: Some(0.01),
+            },
         ];
         let mut kinds_seen = BTreeSet::new();
         for spec in &specs {
@@ -1017,7 +1033,8 @@ mod tests {
                 | KeySpec::Range { .. }
                 | KeySpec::Temporal { .. }
                 | KeySpec::Bitemporal { .. }
-                | KeySpec::Expr { .. } => {}
+                | KeySpec::Expr { .. }
+                | KeySpec::Text { .. } => {}
             }
             let v = serde_json::to_value(spec).unwrap();
             let kind = v["kind"].as_str().unwrap().to_string();
@@ -1074,6 +1091,54 @@ mod tests {
                 "rowgroup_space": {"files": [{"rowgroup_ids": [], "fingerprint": {
                   "path": "a", "size": 1, "etag": null, "mtime_ns": 5,
                   "tail_blake3": "0000000000000000000000000000000000000000000000000000000000000000"}}]}}"#,
+        );
+    }
+
+    /// A text key (B5) lives in `schema.key_specs` of a storage version 2
+    /// manifest as an ordinary key spec, and this build reads it. Storage
+    /// version 1 has no text kind: a version 1 manifest that names one is
+    /// refused with the typed unknown-kind error, exactly as a version 1
+    /// reader refuses a version 2 manifest's text key (never a serde error,
+    /// never by dropping the spec; ADR 017). A field or a tokenizer this
+    /// build does not know is refused the same way.
+    #[test]
+    fn text_key_specs_are_read_at_version_2_and_refused_typed_otherwise() {
+        let m = Manifest::from_slice(
+            br#"{"storage_version": 2, "created_at": "x",
+                "schema": {"key_specs": [{"kind": "text", "column": "body", "tokenizer": "words"},
+                  {"kind": "text", "column": "body", "tokenizer": "trigram", "bloom": 0.01}]}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            m.schema.key_specs[0],
+            KeySpec::Text {
+                column: "body".into(),
+                tokenizer: bellwether_types::Tokenizer::Words,
+                bloom: None,
+            }
+        );
+        assert_eq!(m.schema.key_specs[1].name(), "text:body,tokenizer=trigram");
+        assert_eq!(
+            m.schema.key_specs[1].identity(),
+            "text:body,tokenizer=trigram,bloom=0.01"
+        );
+        let again = Manifest::from_slice(&m.to_vec().unwrap()).unwrap();
+        assert_eq!(again.schema.key_specs, m.schema.key_specs);
+        // Version 1 has no text kind.
+        expect_unsupported_shape(
+            r#"{"storage_version": 1, "created_at": "x",
+                "schema": {"key_specs": [{"kind": "text", "column": "body", "tokenizer": "words"}]}}"#,
+        );
+        // A field a text key does not have.
+        expect_unsupported_shape(
+            r#"{"storage_version": 2, "created_at": "x",
+                "schema": {"key_specs": [{"kind": "text", "column": "b", "tokenizer": "words",
+                  "stemmer": "en"}]}}"#,
+        );
+        // A tokenizer this build does not know.
+        expect_unsupported_shape(
+            r#"{"storage_version": 2, "created_at": "x",
+                "schema": {"key_specs": [{"kind": "text", "column": "b", "tokenizer": "ngram4"}]}}"#,
         );
     }
 

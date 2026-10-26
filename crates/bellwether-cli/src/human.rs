@@ -5,7 +5,7 @@
 use std::fmt::Write as _;
 
 use bellwether::spec::label;
-use bellwether::types::{EvidenceBody, Hash, Record};
+use bellwether::types::{EvidenceBody, Hash, Record, TextOp, Tokenizer};
 use bellwether::{
     Cost, CountResult, IndexResult, LinkStatus, LookupKind, PlanResult, ProposeResult,
     ReceiptResult, ReportResult,
@@ -120,6 +120,26 @@ pub(crate) fn funnel_header_kind(s: &mut String, w: usize, kind: Option<(usize, 
     let _ = writeln!(s, "{}", line.trim_end());
 }
 
+/// One line per text key `index` rebuilt because its segments recorded
+/// other Unicode tables (B5).
+fn text_rebuilt(s: &mut String, rebuilt: &[bellwether::TextRebuilt]) {
+    for t in rebuilt {
+        let mut was = Vec::new();
+        if t.case[0] != t.case[1] {
+            was.push(format!("{}, this binary uses {}", t.case[0], t.case[1]));
+        }
+        if t.words[0] != t.words[1] {
+            was.push(format!("{}, this binary uses {}", t.words[0], t.words[1]));
+        }
+        let _ = writeln!(
+            s,
+            "\n  rebuilt {}: its segments were built with {}",
+            t.spec,
+            was.join("; and with ")
+        );
+    }
+}
+
 pub(crate) fn index(r: &IndexResult, out: &Out) -> String {
     let mut s = String::new();
     let what = match r.committed {
@@ -201,6 +221,7 @@ pub(crate) fn index(r: &IndexResult, out: &Out) -> String {
             r.sketches_rebuilt.join(", ")
         );
     }
+    text_rebuilt(&mut s, &r.text_rebuilt);
     if !r.unknown_segment_kinds.is_empty() {
         let _ = writeln!(
             s,
@@ -269,6 +290,58 @@ fn lookup_label(lookup: &LookupKind) -> String {
                 bound(known, known_ts, known_column)
             )
         }
+        LookupKind::Text {
+            operator,
+            value,
+            column,
+            ..
+        } => format!("locate {}({column}, {value:?})", operator.as_str()),
+        LookupKind::TextRuns { columns, operators } => format!(
+            "text lookups ({}) on {}, case-folded",
+            operators
+                .iter()
+                .map(|o| o.as_str())
+                .collect::<Vec<_>>()
+                .join(", "),
+            columns.join(", ")
+        ),
+    }
+}
+
+/// A text lookup's plan lines (B5): the keys it went through, the
+/// folded argument, and whether the residual is mandatory.
+fn text_plan(s: &mut String, lookup: &LookupKind) {
+    if let LookupKind::Text {
+        operator,
+        value,
+        folded,
+        column,
+        serving,
+        exact_row_groups,
+        unpruned,
+    } = lookup
+    {
+        let keys: Vec<String> = serving.iter().map(label).collect();
+        let _ = writeln!(s, "  text keys: {}", keys.join(", "));
+        if folded != value {
+            let _ = writeln!(s, "  argument case-folded: {folded:?}");
+        }
+        if let Some(why) = unpruned {
+            let _ = writeln!(s, "  not pruned: {why}");
+        }
+        let residual = format!("{}({column}, {value:?})", operator.as_str());
+        if *exact_row_groups {
+            let _ = writeln!(
+                s,
+                "  residual: {residual} on every row read; every planned row group holds a match"
+            );
+        } else {
+            let _ = writeln!(
+                s,
+                "  residual MANDATORY: {residual} on every row read; the plan is a candidate set, \
+                 and a planned row group may hold no match"
+            );
+        }
     }
 }
 
@@ -319,19 +392,17 @@ pub(crate) fn count_result(r: &CountResult, out: &Out) -> String {
 pub(crate) fn plan(r: &PlanResult, out: &Out) -> String {
     let mut s = String::new();
     let what = lookup_label(&r.lookup);
-    let _ = writeln!(
-        s,
-        "{}",
-        heading(
-            out,
-            &format!(
-                "{what}: {} on ({}) at manifest sequence {}",
-                count(r.keys, "key", "keys"),
-                r.columns.join(", "),
-                r.sequence
-            )
+    let title = if matches!(r.lookup, LookupKind::Text { .. }) {
+        format!("{what}, case-folded, at manifest sequence {}", r.sequence)
+    } else {
+        format!(
+            "{what}: {} on ({}) at manifest sequence {}",
+            count(r.keys, "key", "keys"),
+            r.columns.join(", "),
+            r.sequence
         )
-    );
+    };
+    let _ = writeln!(s, "{}", heading(out, &title));
     let _ = writeln!(
         s,
         "  {:<34} {:>9} {:>12} {:>18}",
@@ -398,6 +469,7 @@ pub(crate) fn plan(r: &PlanResult, out: &Out) -> String {
     if !specs.is_empty() && !r.sidecars.is_empty() {
         let _ = writeln!(s, "  sidecars: {}", r.sidecars.join(", "));
     }
+    text_plan(&mut s, &r.lookup);
     if let Some(c) = &r.path_values {
         let _ = writeln!(
             s,
@@ -634,7 +706,9 @@ pub(crate) fn why(r: &bellwether::WhyReport, out: &Out, fix_command: &str) -> St
         let kind = match &w.lookup {
             Some(LookupKind::Latest) => "latest".to_string(),
             Some(LookupKind::Asof { at, .. }) => format!("asof {at}"),
-            // `why` prices locate (in a window or not), latest, or asof.
+            Some(k @ LookupKind::TextRuns { .. }) => lookup_label(k),
+            // `why` prices locate (in a window or not), latest, asof, or
+            // text lookups.
             _ => return None,
         };
         Some(match &w.lookback {
@@ -643,13 +717,19 @@ pub(crate) fn why(r: &bellwether::WhyReport, out: &Out, fix_command: &str) -> St
         })
     });
     if let (Some(w), Some(current)) = (&r.workload, r.current) {
+        let text = matches!(w.lookup, Some(LookupKind::TextRuns { .. }));
+        let contains_runs = matches!(
+            &w.lookup,
+            Some(LookupKind::TextRuns { operators, .. }) if operators.contains(&TextOp::Contains)
+        );
         let kind = kind_label
             .as_ref()
             .map_or_else(String::new, |k| format!(" ({k})"));
         let _ = writeln!(
             s,
-            "funnel: {}{kind}, keys p50/p95/max {}/{}/{}; {basis}, summed over runs",
+            "funnel: {}{kind}, {} p50/p95/max {}/{}/{}; {basis}, summed over runs",
             count(w.runs, "run", "runs"),
+            if text { "values per run" } else { "keys" },
             num(w.keys_p50_p95_max[0]),
             num(w.keys_p50_p95_max[1]),
             num(w.keys_p50_p95_max[2])
@@ -739,6 +819,30 @@ pub(crate) fn why(r: &bellwether::WhyReport, out: &Out, fix_command: &str) -> St
                 // read: not the floor the plain exact key is.
                 (CandidateOrigin::Workload, KeySpec::Exact { counts: true, .. }, _) => {
                     notes.push("count runs answered from per-key counts, no data read".to_string());
+                }
+                (
+                    CandidateOrigin::Workload,
+                    KeySpec::Text {
+                        tokenizer: Tokenizer::Words,
+                        ..
+                    },
+                    _,
+                ) => {
+                    notes.push(if contains_runs {
+                        "floor (has_token, has_prefix): only row groups holding a matching word; \
+                         it does not serve contains, whose runs read what the current \
+                         configuration reads"
+                            .to_string()
+                    } else {
+                        "floor: only row groups holding a matching word".to_string()
+                    });
+                }
+                (CandidateOrigin::Workload, KeySpec::Text { .. }, _) => {
+                    notes.push(
+                        "trigrams: row groups holding every trigram of a value, a candidate set \
+                         (the residual is mandatory)"
+                            .to_string(),
+                    );
                 }
                 (CandidateOrigin::Workload, KeySpec::Temporal { .. }, Some(k)) => {
                     notes.push(if w.lookback.is_some() {
@@ -915,6 +1019,21 @@ pub(crate) fn why(r: &bellwether::WhyReport, out: &Out, fix_command: &str) -> St
                 )
             }
             CulpritReason::ServingSpec { spec } => format!("the serving key {}", label(spec)),
+            CulpritReason::Text { matches } => {
+                let parts: Vec<String> = matches
+                    .iter()
+                    .map(|m| {
+                        let runs = format!("{} ({} run(s))", m.operator.as_str(), num(m.runs));
+                        if m.served_by.is_empty() {
+                            format!("{runs} unserved: no text key serves it, so each reads every row group")
+                        } else {
+                            let keys: Vec<String> = m.served_by.iter().map(label).collect();
+                            format!("{runs} served by {}", keys.join(", "))
+                        }
+                    })
+                    .collect();
+                format!("text lookups: {}", parts.join("; "))
+            }
         };
         // A table read as one unit: every lookup reads all of it whatever
         // the index, which is the cause to state.
