@@ -386,7 +386,7 @@ CI also asserts the latency budgets in release builds (the bench SLOs, replay's 
 
 ## Tables as sources
 
-A SQL table reads like a folder (ADR 027, `bellwether-source-sql`): SQLite in process, DuckDB, Postgres, and Flight SQL through ADBC, SQL Server through ODBC. Reconcile a table against the files it came from, ask `why` a lookup over it is slow (every cost measured, and labeled so), and `fix` verifies a key and names the `CREATE INDEX` a human runs: the engine changes nothing in a database and writes no receipt for it.
+A SQL table reads like a folder (ADR 027, `bellwether-source-sql`): SQLite in process, DuckDB, Postgres, and Flight SQL through ADBC, SQL Server through ODBC. A run without a snapshot re-reads each unit's identity at the end, and that identity is a checksum of the unit's statistics unless the root names a version column (`version=<column>`): an in-place update that keeps every column's bounds, null count, and bytes is not seen without one. Reconcile a table against the files it came from, ask `why` a lookup over it is slow (every cost measured, and labeled so), and `fix` verifies a key and names the `CREATE INDEX` a human runs: the engine changes nothing in a database and writes no receipt for it.
 
 ```bash
 # the table against the Parquet files it was loaded from: a certificate naming both

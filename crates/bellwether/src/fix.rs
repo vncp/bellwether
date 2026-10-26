@@ -669,8 +669,11 @@ impl Engine {
                 if let ProposalBody::Rewrite { shape } = body {
                     result.invariant = Some(shape.invariant.clone());
                 }
-                if let (ProposalBody::Key { .. }, false) = (body, dry_run) {
-                    // Re-scored now, and gated like `fix --proposal`.
+                if let ProposalBody::Key { .. } = body {
+                    // Re-scored now, and gated like `fix --proposal`. The
+                    // dry run scores too (a measured score is never
+                    // recorded, so it writes nothing) and so agrees with
+                    // the real apply.
                     let Coverage::Workload { workload, .. } = &certificate.coverage else {
                         return Err(not_workload_covered(cert_hash));
                     };

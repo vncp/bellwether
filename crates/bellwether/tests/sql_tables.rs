@@ -677,6 +677,31 @@ fn attest_only_keeps_the_gain_gate() {
         "{:?}",
         r.outcome
     );
+    // The apply tier and its dry run gate the same way, and the dry run
+    // writes nothing.
+    let cert = r.certificate.as_ref().unwrap().hash;
+    let ledger = d.path().join("g").join("ledger");
+    let before = std::fs::read_dir(&ledger).unwrap().count();
+    for out in [
+        e.apply_dry_run(&cert).unwrap().outcome,
+        e.fix(&FixRequest {
+            certificate: Some(cert),
+            ..FixRequest::default()
+        })
+        .unwrap()
+        .outcome,
+    ] {
+        assert!(
+            matches!(
+                out,
+                FixOutcome::Refused {
+                    refusal: Refusal::NothingToGain { .. }
+                }
+            ),
+            "{out:?}"
+        );
+    }
+    assert_eq!(std::fs::read_dir(&ledger).unwrap().count(), before);
 }
 
 /// Item 4: no facade error over a table names its connection.

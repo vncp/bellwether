@@ -31,6 +31,8 @@ use crate::url::{EngineKind, SqlUrl, TableName};
 /// One database instance, shared by every source over the same target.
 struct Shared {
     database: ManagedDatabase,
+    /// The canonical database path (DuckDB), which a driver may print.
+    path: String,
     // Keeps the library loaded as long as the database lives.
     _driver: ManagedDriver,
 }
@@ -43,20 +45,39 @@ static INSTANCES: LazyLock<Instances> = LazyLock::new(|| Mutex::new(HashMap::new
 pub(crate) struct AdbcDriver {
     engine: EngineKind,
     /// The connection, scrubbed from every error message.
-    secret: String,
+    secrets: Vec<String>,
     conn: ManagedConnection,
     _shared: Arc<Shared>,
 }
 
-/// An ADBC error as a source error, with every occurrence of the
-/// connection (`secret`) replaced: a driver may echo it.
-fn adbc_err(engine: EngineKind, secret: &str) -> impl Fn(adbc_core::error::Error) -> Error + '_ {
+/// An ADBC error as a source error, with every spelling of the connection
+/// (`secrets`: as given, and the canonical path a driver prints) replaced:
+/// a driver may echo it. A file another process holds read-write gets the
+/// next step.
+fn adbc_err(
+    engine: EngineKind,
+    secrets: &[String],
+) -> impl Fn(adbc_core::error::Error) -> Error + '_ {
     move |e| {
-        Error::Source(format!(
-            "{engine} (ADBC): {}",
-            super::scrub(e.message.trim(), secret)
-        ))
+        let mut m = scrub_all(e.message.trim(), secrets);
+        if m.contains("Could not set lock") || m.contains("Conflicting lock") {
+            m.push_str(
+                "; another process holds the database file read-write: stop it, or read a \
+                 copy of the file",
+            );
+        }
+        Error::Source(format!("{engine} (ADBC): {m}"))
     }
+}
+
+/// `message` with every secret replaced, longest first, so a path that
+/// contains another (`/private/var/x` and `/var/x`) is replaced whole.
+fn scrub_all(message: &str, secrets: &[String]) -> String {
+    let mut sorted: Vec<&String> = secrets.iter().filter(|s| !s.is_empty()).collect();
+    sorted.sort_by_key(|s| std::cmp::Reverse(s.len()));
+    sorted
+        .iter()
+        .fold(message.to_string(), |m, s| super::scrub(&m, s))
 }
 
 /// The driver library's environment variable, default name, and init
@@ -198,9 +219,10 @@ fn shared(url: &SqlUrl, create: bool) -> Result<Arc<Shared>> {
     }
     let database = driver
         .new_database_with_opts(opts)
-        .map_err(adbc_err(engine, &url.db))?;
+        .map_err(adbc_err(engine, &[url.db.clone(), key.clone()]))?;
     let s = Arc::new(Shared {
         database,
+        path: key.clone(),
         _driver: driver,
     });
     if !key.is_empty() {
@@ -218,10 +240,10 @@ impl AdbcDriver {
         let conn = shared
             .database
             .new_connection()
-            .map_err(adbc_err(url.engine, &url.db))?;
+            .map_err(adbc_err(url.engine, &[url.db.clone(), shared.path.clone()]))?;
         Ok(Self {
             engine: url.engine,
-            secret: url.db.clone(),
+            secrets: vec![url.db.clone(), shared.path.clone()],
             conn,
             _shared: shared,
         })
@@ -235,7 +257,7 @@ impl Driver for AdbcDriver {
         _native: &SchemaRef,
         each: &mut dyn FnMut(RecordBatch) -> Result<()>,
     ) -> Result<()> {
-        let e = adbc_err(self.engine, &self.secret);
+        let e = adbc_err(self.engine, &self.secrets);
         let mut st = self.conn.new_statement().map_err(&e)?;
         st.set_sql_query(sql).map_err(&e)?;
         let reader = st.execute().map_err(&e)?;
@@ -244,7 +266,7 @@ impl Driver for AdbcDriver {
                 Error::Source(format!(
                     "{} (ADBC): reading a result: {}",
                     self.engine,
-                    super::scrub(&err.to_string(), &self.secret)
+                    scrub_all(&err.to_string(), &self.secrets)
                 ))
             })?;
             each(batch)?;
@@ -253,7 +275,7 @@ impl Driver for AdbcDriver {
     }
 
     fn execute(&mut self, sql: &str) -> Result<()> {
-        let e = adbc_err(self.engine, &self.secret);
+        let e = adbc_err(self.engine, &self.secrets);
         let mut st = self.conn.new_statement().map_err(&e)?;
         st.set_sql_query(sql).map_err(&e)?;
         st.execute_update().map_err(&e)?;
@@ -263,6 +285,6 @@ impl Driver for AdbcDriver {
     fn table_schema(&mut self, table: &TableName) -> Result<Schema> {
         self.conn
             .get_table_schema(None, Some(&table.schema), &table.table)
-            .map_err(adbc_err(self.engine, &self.secret))
+            .map_err(adbc_err(self.engine, &self.secrets))
     }
 }

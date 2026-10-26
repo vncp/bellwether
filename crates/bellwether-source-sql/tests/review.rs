@@ -272,3 +272,27 @@ fn duckdb_sources_open_read_only() {
     let src = SqlSource::connect(&duck_root(&db, "t", ""), SqlOptions::default()).unwrap();
     assert_eq!(src.discover(src.root()).unwrap()[0].size, 1);
 }
+
+/// Round 2: a relative DuckDB path with `..` is scrubbed in its canonical
+/// spelling too, and a file another instance holds read-write names the
+/// next step.
+#[test]
+fn duckdb_errors_scrub_the_canonical_path() {
+    if duckdb_driver().is_none() {
+        return;
+    }
+    let (_d, dir) = tmp();
+    let sub = dir.join("TOKEN-9e2b");
+    std::fs::create_dir_all(sub.join("x")).unwrap();
+    let db = sub.join("t.duckdb");
+    duck_exec(&db, &["CREATE TABLE t (a BIGINT)"]);
+    let rel = format!("{}/x/../t.duckdb", sub.display());
+    let e = SqlSource::connect(
+        &format!("sql://duckdb/main.nope?db={}", q(&rel)),
+        SqlOptions::default(),
+    )
+    .and_then(|s| s.discover(s.root()).map(|_| ()))
+    .unwrap_err()
+    .to_string();
+    assert!(!e.contains("TOKEN-9e2b"), "{e}");
+}
