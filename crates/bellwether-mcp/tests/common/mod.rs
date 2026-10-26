@@ -188,6 +188,7 @@ pub fn server_at(
             ..bellwether::EngineOptions::default()
         },
         budget,
+        join: None,
     })
     .unwrap()
 }

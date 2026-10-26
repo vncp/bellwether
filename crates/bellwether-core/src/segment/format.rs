@@ -7,7 +7,7 @@ use std::sync::Mutex;
 
 use arrow::datatypes::{DataType, Schema, TimeUnit};
 use bellwether_types::format::{ENCODING_VERSION, STORAGE_VERSION};
-use bellwether_types::{Error, KeySpec, Result};
+use bellwether_types::{Error, Hash, KeySpec, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::bloom::BloomHash;
@@ -78,6 +78,10 @@ pub enum Layout {
     BloomPerRowGroup,
     /// Per-row-group `(min, max)`, sorted by `min`, in blocks. Range.
     MinMax,
+    /// As `Keyed`, with a value record per side: each key's left and right
+    /// row-group bitmaps (each in its own dataset's id space), and an index
+    /// that ends with the one-sided key counts. Join (B3).
+    KeyedJoin,
     /// As `Keyed`, and each key's value also carries one aggregate cell per
     /// row group holding it (`crate::agg`). Agg (B7).
     KeyedAgg,
@@ -99,6 +103,7 @@ impl Layout {
                 Some(Self::BloomPerRowGroup)
             }
             KeySpec::Range { .. } => Some(Self::MinMax),
+            KeySpec::Join { .. } => Some(Self::KeyedJoin),
             KeySpec::Agg { .. } => Some(Self::KeyedAgg),
             KeySpec::Exact { .. } | KeySpec::Bloom { .. } | KeySpec::Bitemporal { .. } => None,
             KeySpec::Expr { over, .. } => Self::for_spec(over),
@@ -412,6 +417,32 @@ pub struct SegmentHeader {
     /// reader built on other tables refuses the segment.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub text_unicode: Option<crate::text::UnicodeTables>,
+    /// For a join key (B3) only: the left dataset's manifest sequence whose
+    /// exact segments the pair index was built from (provenance).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub left_sequence: Option<u64>,
+    /// For a join key (B3) only: the identity of the left's live row-group
+    /// set the pair index was built over ([`crate::join::live_identity`]).
+    /// The pair stays valid while the left's live set is that set: a left
+    /// commit that adds, changes, or removes a file makes it stale.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub left_live: Option<Hash>,
+    /// For a join key (B3) only: the right dataset's manifest sequence the
+    /// pair index was built at (ADR 020).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub right_sequence: Option<u64>,
+    /// For a join key (B3) only: BLAKE3 of the right dataset's manifest
+    /// bytes the pair index was built at, its content identity. The pair
+    /// index describes the right dataset only at that manifest; a reader
+    /// whose right dataset's manifest is another (a later sequence, or the
+    /// same sequence of an index deleted and rebuilt) refuses to plan with
+    /// it (`Error::StaleJoin`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub right_manifest: Option<Hash>,
+    /// For a join key (B3) only: each right key column's dataset type, as
+    /// `key_types` records the left's; present together with `key_types`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub right_key_types: Option<Vec<ColumnType>>,
     /// For an agg key (and only an agg key) written from a dataset schema:
     /// the value column's dataset type, which its cells were encoded and
     /// summed at (a decimal's scale is not visible in the bytes). Recorded
@@ -443,6 +474,11 @@ impl SegmentHeader {
             ts_type: None,
             text_unicode: spec_is_text.then(crate::text::UnicodeTables::current),
             value_type: None,
+            left_sequence: None,
+            left_live: None,
+            right_sequence: None,
+            right_manifest: None,
+            right_key_types: None,
             extra: serde_json::Map::new(),
         }
     }
@@ -558,8 +594,51 @@ impl SegmentHeader {
             }
             (_, None) => {}
         }
+        // A join key's header pins what its pair was built from: the left
+        // manifest sequence and live set, the right manifest by sequence and
+        // content; it records the right key types exactly when it records
+        // the left's. No other segment carries any of them.
+        let pins = [
+            self.left_sequence.is_some(),
+            self.left_live.is_some(),
+            self.right_sequence.is_some(),
+            self.right_manifest.is_some(),
+        ];
+        if let KeySpec::Join { right_columns, .. } = &self.key_spec {
+            if self.storage_version < 2 {
+                return Err(corrupt(
+                    "a join segment is a storage version 2 kind; version 1 has none",
+                ));
+            }
+            if pins.contains(&false) {
+                return Err(corrupt(
+                    "a join segment records the left manifest sequence and live row groups and \
+                     the right manifest sequence and content hash it was built from",
+                ));
+            }
+            if self.right_key_types.is_some() != self.key_types.is_some() {
+                return Err(corrupt(
+                    "right_key_types is recorded exactly when key_types is",
+                ));
+            }
+            if self
+                .right_key_types
+                .as_ref()
+                .is_some_and(|t| t.len() != right_columns.len())
+            {
+                return Err(corrupt(
+                    "right_key_types does not match the join key's right columns",
+                ));
+            }
+        } else if pins.contains(&true) || self.right_key_types.is_some() {
+            return Err(corrupt(
+                "left_sequence, left_live, right_sequence, right_manifest or right_key_types on a \
+                 segment that is not a join key",
+            ));
+        }
         // An expr key's header carries its expression and conformance
         // vectors; a reader recomputes them before trusting the keys.
+        crate::join::check_spec(&self.key_spec)?;
         crate::expr::check_spec(&self.key_spec)
     }
 }

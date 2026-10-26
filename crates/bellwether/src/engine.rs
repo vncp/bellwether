@@ -186,6 +186,14 @@ pub struct EngineOptions {
     /// `twin_of`: a one-file adapter for another engine
     /// (`bellwether_source_engine` README), or a test double.
     pub engine_adapter: Option<EngineConnector>,
+    /// Which right datasets a join key (B3) may name: any folder beside
+    /// the data root ([`crate::JoinScope::Any`], the command line, where the
+    /// human names it), only the right side the MCP server's operator gave
+    /// with `--join` ([`crate::JoinScope::Only`]), or none
+    /// ([`crate::JoinScope::Unserved`]). A join key naming another is
+    /// refused with [`Error::JoinNotServed`] before any folder is read, so
+    /// the refusal says nothing about what exists beside the root.
+    pub join_scope: crate::JoinScope,
 }
 
 /// Opens an engine adapter for a `twin_of` root and an optional scratch

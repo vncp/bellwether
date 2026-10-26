@@ -22,8 +22,9 @@ use crate::jobs::{job_id, Job, JobInfo, JobState, Jobs};
 use crate::refusal::{self, Refusal, RefusalCode};
 use crate::tools::{
     self, ApplyReceipt, JobRef, JobsStart, KeyArg, Membership, ObserveAggregate, ObserveAsof,
-    ObserveCardinality, ObserveCount, ObserveLocate, ObserveOverlap, ObserveText, ObserveWhy,
-    ProposeKey, ProposeLayout, ProposeRewrite, ScoreRecord, ScoreVerify, ScoreWhy, Tier,
+    ObserveCardinality, ObserveCount, ObserveJoinOverlap, ObserveJoinVerify, ObserveLocate,
+    ObserveOverlap, ObserveSemijoin, ObserveText, ObserveWhy, ProposeKey, ProposeLayout,
+    ProposeRewrite, ScoreRecord, ScoreVerify, ScoreWhy, Tier,
 };
 
 /// How the server is configured at startup. Nothing is read from the
@@ -36,6 +37,10 @@ pub struct Config {
     pub engine: EngineOptions,
     /// The per-session budget.
     pub budget: Budget,
+    /// The join key the semi-join tools plan with (B3; the operator's
+    /// `--join`): `<right>.<cols>` or `join:<left>.<cols>=<right>.<cols>`.
+    /// `None`: those tools are refused.
+    pub join: Option<String>,
 }
 
 /// One tool call's reply.
@@ -91,6 +96,7 @@ struct Inner {
     /// a committed manifest (`at_manifest`).
     root: String,
     options: EngineOptions,
+    join: Option<String>,
     budget: Meter,
     jobs: Mutex<Jobs>,
 }
@@ -113,15 +119,46 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
+/// The right side of an operator's join key (`--join`), `<right>.<cols>`:
+/// the key's right side when it is a whole key, `join:...`, else the value.
+fn join_side_of(j: &str) -> bellwether::types::Result<String> {
+    if !j.trim_start().starts_with("join:") {
+        bellwether::spec::parse_join_side(j)?;
+        return Ok(j.trim().to_string());
+    }
+    match bellwether::spec::parse(j)? {
+        bellwether::types::KeySpec::Join {
+            right,
+            right_columns,
+            ..
+        } => Ok(format!("{right}.{}", right_columns.join(","))),
+        other => Err(bellwether::types::Error::KeySpec(format!(
+            "{} is not a join key",
+            other.name()
+        ))),
+    }
+}
+
 impl Server {
-    /// Opens the engine over `config.root`. Opening writes nothing.
+    /// Opens the engine over `config.root`. Opening writes nothing. The
+    /// engine reads no right dataset but the one `config.join` names (B3,
+    /// `EngineOptions::join_scope`): a join key a tool argument names with
+    /// another right side is refused before any folder is read.
     pub fn new(config: &Config) -> bellwether::types::Result<Self> {
-        let engine = Engine::open(&config.root, config.engine.clone())?;
+        let options = EngineOptions {
+            join_scope: match &config.join {
+                Some(j) => bellwether::JoinScope::Only(join_side_of(j)?),
+                None => bellwether::JoinScope::Unserved,
+            },
+            ..config.engine.clone()
+        };
+        let engine = Engine::open(&config.root, options.clone())?;
         Ok(Self {
             inner: Arc::new(Inner {
                 engine,
                 root: config.root.clone(),
-                options: config.engine.clone(),
+                options,
+                join: config.join.clone(),
                 budget: Meter::new(config.budget),
                 jobs: Mutex::new(Jobs::new()),
             }),
@@ -149,6 +186,27 @@ impl Server {
                 )
             })
             .transpose()
+    }
+
+    /// The join key the operator started the server with (`--join`), or
+    /// the refusal saying a semi-join tool needs one.
+    fn join(&self) -> bellwether::types::Result<&str> {
+        self.inner
+            .join
+            .as_deref()
+            .ok_or_else(|| bellwether::types::Error::InvalidArgument {
+                field: "join",
+                reason: "the server was started without a join key, so it plans no semi-join; \
+                         ask the human to start it with --join <right>.<columns> (the right \
+                         dataset is a folder beside the data root)"
+                    .into(),
+            })
+    }
+
+    /// The right side of the operator's join key, as `why` takes it:
+    /// `<right>.<cols>`.
+    fn join_side(&self) -> bellwether::types::Result<String> {
+        join_side_of(self.join()?)
     }
 
     /// The session budget now.
@@ -389,6 +447,30 @@ impl Server {
                     Err(err) => failed(&err),
                 }
             }
+            "observe.semijoin" => {
+                let a = parse!(ObserveSemijoin);
+                match self
+                    .join()
+                    .and_then(|j| e.semijoin(j, &key_file(a.keys, a.key_columns)))
+                {
+                    Ok(r) => done(&r, None),
+                    Err(err) => failed(&err),
+                }
+            }
+            "observe.join_overlap" => {
+                let _ = parse!(ObserveJoinOverlap);
+                match self.join().and_then(|j| e.join_overlap(j)) {
+                    Ok(r) => done(&r, None),
+                    Err(err) => failed(&err),
+                }
+            }
+            "observe.join_verify" => {
+                let _ = parse!(ObserveJoinVerify);
+                match e.join_verify(self.inner.join.as_deref()) {
+                    Ok(r) => done(&r, None),
+                    Err(err) => failed(&err),
+                }
+            }
             "observe.text" => {
                 let a = parse!(ObserveText);
                 let pinned = match self.lookup_engine(a.at_manifest) {
@@ -416,13 +498,28 @@ impl Server {
                     ));
                 }
                 let request = WhyRequest {
+                    more_keys: a
+                        .more_keys
+                        .into_iter()
+                        .map(|k| key_file(k, a.key_columns.clone()))
+                        .collect(),
                     keys: a.keys.map(|k| key_file(k, a.key_columns)),
                     bench_workload: None,
                     workload: a.workload,
-                    mode: a.contains.map(|m| match m {
-                        Membership::Any => bellwether::LookupMode::ContainsAny,
-                        Membership::All => bellwether::LookupMode::ContainsAll,
-                    }),
+                    mode: match (a.contains, a.join) {
+                        (Some(_), true) => {
+                            return failed(&bellwether::types::Error::InvalidArgument {
+                                field: "join",
+                                reason: "a run is a list membership (contains) or a semi-join \
+                                         (join), not both; drop one"
+                                    .into(),
+                            })
+                        }
+                        (Some(Membership::Any), false) => Some(bellwether::LookupMode::ContainsAny),
+                        (Some(Membership::All), false) => Some(bellwether::LookupMode::ContainsAll),
+                        (None, true) => Some(bellwether::LookupMode::SemiJoin),
+                        (None, false) => None,
+                    },
                     latest_by: None,
                     at: None,
                     lookback: None,
@@ -435,6 +532,14 @@ impl Server {
                     gates: a.gates,
                     sketches_only: false,
                     text: a.text.into_iter().map(Into::into).collect(),
+                    join: if a.join {
+                        match self.join_side() {
+                            Ok(j) => Some(j),
+                            Err(err) => return failed(&err),
+                        }
+                    } else {
+                        None
+                    },
                     aggregate: a.aggregate.map(|g| bellwether::AggregateQuery {
                         value: g.value,
                         functions: g.functions.unwrap_or_else(tools::default_functions),

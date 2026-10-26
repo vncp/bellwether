@@ -244,3 +244,5 @@ The same file also covers:
 ## Memory (ADR 018)
 
 `StoreExt::list_pages(prefix, page_size, f)` polls the `object_store` list stream and holds at most one page. GC uses it and caps the orphans it holds per run. `Store::list` returns a `Vec` because the contract requires it, so it materializes the whole listing; callers that need bounded memory use `list_pages`. Apart from the capped orphan set, GC holds only sets bounded by the manifest's own lists, which are already in memory.
+
+**Join keys (B3).** `SegmentRef.join` (a `JoinPin`: `right_sequence`, `right_manifest`, `left_live`, unknown fields kept) is present only on a join key's segment: what its pair was built from, which the segment header repeats; the allow-list admits the `join` kind at storage version 2 only. `Snapshot::content_hash()` is the BLAKE3 of the pinned manifest's bytes as stored (the history copy holds the same bytes), the identity a join key pins its right dataset by, since a manifest at one sequence of an index deleted and rebuilt is another manifest.

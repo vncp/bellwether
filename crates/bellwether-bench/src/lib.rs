@@ -30,6 +30,10 @@
 //!   shapes (ledger attributes, market holdings), `contains_any` runs of 10,
 //!   10^3, and 10^5 terms and a `contains_all` run, and exact ground truth,
 //!   for list keys (B4).
+//! - [`joins`] writes two datasets beside each other in both shapes (ledger
+//!   orders and payables on `order_id`, market trades and quotes on
+//!   `(symbol, minute)`) with 1:N skew, semi-join key sets of 10, 10^3, and
+//!   10^5 keys, and exact ground truth per side, for join keys (B3).
 //! - [`agg`] writes the ledger corpus for agg keys (B7): decimal amounts at
 //!   scale 6 over skewed accounts with null amounts, per-key sum runs of 10,
 //!   10^3, and 10^5 accounts, and exact per-run sums (`scripts/agg-funnels.py`).
@@ -60,6 +64,7 @@ pub mod env;
 pub mod expr;
 pub mod generate;
 pub mod harness;
+pub mod joins;
 pub mod lists;
 pub mod market;
 pub mod mem;

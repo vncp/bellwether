@@ -103,6 +103,10 @@ impl<S: StoreExt + ?Sized> Builder<S> {
         let schema = columns_to_schema(&m.schema.columns)?;
         let mut groups = Vec::new();
         for spec in &m.schema.key_specs {
+            // A join key (B3) is one segment, rebuilt whole; never merged.
+            if matches!(spec, KeySpec::Join { .. }) {
+                continue;
+            }
             let name = spec.identity();
             let mut segs: Vec<&SegmentRef> =
                 m.segments.iter().filter(|s| segment_of(s, &name)).collect();
@@ -154,6 +158,7 @@ impl<S: StoreExt + ?Sized> Builder<S> {
                     rowgroup_range: RowGroupRange::new(start, end),
                     bytes,
                     kind: None,
+                    join: None,
                     extra: Extra::new(),
                 },
             });
@@ -245,6 +250,7 @@ mod tests {
             rowgroup_range: RowGroupRange::new(start, end),
             bytes,
             kind: None,
+            join: None,
             extra: Extra::new(),
         }
     }

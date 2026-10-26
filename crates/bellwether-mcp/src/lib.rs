@@ -36,7 +36,7 @@ pub mod refusal;
 pub mod server;
 pub mod tools;
 
-pub use args::{BudgetArgs, EngineArgs, KeyArgs};
+pub use args::{BudgetArgs, EngineArgs, JoinArgs, KeyArgs};
 pub use budget::{Budget, BudgetState};
 pub use envelope::{Envelope, Status};
 pub use handler::Handler;

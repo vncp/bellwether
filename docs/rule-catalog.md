@@ -28,6 +28,8 @@ plan.
 membership runs rather than footer statistics; `why` raises it into the
 same `profile` Evidence.
 
+`R-join-1` (2026-10-26, join keys) likewise reads the recorded workload's
+semi-join runs.
 `R-agg-1` (2026-10-26, agg keys) reads the recorded workload's aggregate
 runs, or a reconcile that just ran, rather than footer statistics; `why`
 raises the first into the same `profile` Evidence and `reconcile` returns
@@ -571,6 +573,40 @@ kind (`docs/adding-an-index-kind.md`: no kind without its detector).
 - **Confidence rubric**: high: the runs are recorded and the specs are the
   manifest's; nothing is sampled. Advice only: it changes no plan.
 
+### R-join-1
+
+Added 2026-10-26 with join keys (B3), the detector that recommends the
+kind.
+
+- **id**: `R-join-1`
+- **Detector**: from the recorded workload. At least two runs
+  (`JOIN_REPEAT_MIN_RUNS`) semi-join the data root with one right dataset
+  on one column pair (`semijoin` runs: `in (subquery)`, `exists`, a
+  semi-join; recorded by `why --from <keys.parquet> [--from ...] --mode
+  semijoin --join <right>.<columns>` or found in a recorded workload), and no
+  key spec complete at the current manifest is a join key on that pair
+  (counted or not). One lint per pair
+  (`bellwether_profile::lints::repeated_semijoins`, raised by `why` into the
+  same `profile` Evidence, which then cites the workload it was read from).
+  A single run is a lookup, not a pattern: it does not fire.
+- **Estimator**: without a join key each run's two steps locate every asked
+  key by the exact key on each side, whether the other side holds it or
+  not. Bytes: `why --mode semijoin` replays the runs under the transient
+  join key, built from both datasets' exact keys, and reports each step's
+  exact row groups and bytes and, in the `join` column, how many asked keys
+  both datasets hold and the right row groups per shared key.
+- **Guidance template**: file `bellwether.toml` (or `bellwether index`),
+  step `key_specs` of the left dataset. Before: no join key on the pair.
+  After: `join:<left>.<columns>=<right>.<columns>` (both datasets keep
+  `exact:<columns>`). Invariant: `every row group of either dataset holding
+  a row whose key both datasets hold is still selected` (invariant 1 per
+  side).
+- **Verification method**: reconcile over touched keys, once per dataset:
+  for the asked keys both datasets' files hold, every row against the rows
+  in that side's planned row groups (`fix`; the left certificate, which the
+  receipt cites, cites the right one).
+- **Confidence rubric**: high: the runs are recorded and the specs are the
+  manifest's; nothing is sampled. Advice only: it changes no plan.
 ### R-agg-1
 
 Added 2026-10-26 with agg keys (B7), the detector that recommends the

@@ -98,12 +98,16 @@ pub enum Lookup {
 pub fn servable(spec: &KeySpec, run_columns: &[String]) -> Option<Lookup> {
     // A text key serves text lookups only (`PlanSource::plan_text`), never
     // a key: its dictionary holds tokens, not values. A list key serves
-    // membership runs only (`serves_query`). An agg key serves aggregate
+    // membership runs only (`serves_query`). A join key (B3) serves
+    // semi-join runs only (`serves_query`). An agg key serves aggregate
     // runs only (`PlanSource::aggregate`).
     if run_columns.is_empty()
         || matches!(
             spec,
-            KeySpec::Text { .. } | KeySpec::List { .. } | KeySpec::Agg { .. }
+            KeySpec::Text { .. }
+                | KeySpec::List { .. }
+                | KeySpec::Join { .. }
+                | KeySpec::Agg { .. }
         )
     {
         return None;
@@ -140,6 +144,7 @@ pub fn serves_window(spec: &KeySpec, ts_column: &str) -> bool {
         | KeySpec::Expr { .. }
         | KeySpec::Text { .. }
         | KeySpec::List { .. }
+        | KeySpec::Join { .. }
         | KeySpec::Agg { .. } => false,
     }
 }
@@ -175,6 +180,15 @@ pub fn serves_query(spec: &KeySpec, run_columns: &[String], query: &RunQuery) ->
         RunQuery::ContainsAny | RunQuery::ContainsAll => {
             matches!(spec, KeySpec::List { column } if run_columns == std::slice::from_ref(column))
         }
+        // A semi-join run (B3) is served by the join key on its pair, and
+        // each side, without one, by the keys serving a locate there.
+        RunQuery::SemiJoin(j) => matches!(
+            spec,
+            KeySpec::Join { columns, right, right_columns, .. }
+                if columns.as_slice() == run_columns
+                    && *right == j.right
+                    && *right_columns == j.right_columns
+        ),
         RunQuery::Aggregate(a) => {
             servable(spec, run_columns).is_some()
                 || bellwether_build::serving_agg(
@@ -261,6 +275,7 @@ pub fn planned_time_column(
         | RunQuery::Text(_)
         | RunQuery::ContainsAny
         | RunQuery::ContainsAll
+        | RunQuery::SemiJoin(_)
         | RunQuery::Aggregate(_) => Ok(None),
         RunQuery::Latest | RunQuery::Asof { .. } => serving_temporal_column(specs, run_columns),
         RunQuery::Lookback { asof: None, .. } => planner.lookback_column(specs, run_columns),
@@ -1121,6 +1136,7 @@ impl SegmentPlanner {
             | RunQuery::Lookback { asof: Some(_), .. }
             | RunQuery::ContainsAny
             | RunQuery::ContainsAll
+            | RunQuery::SemiJoin(_)
             | RunQuery::Aggregate(_) => {
                 return Err(Error::Other(format!(
                     "a {} run is not planned through version chains alone",

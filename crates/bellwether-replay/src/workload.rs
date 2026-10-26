@@ -106,6 +106,24 @@ pub const QUERY_KIND_CONTAINS_ANY: &str = "contains_any";
 /// The query kind of a recorded run that looks up the rows whose list
 /// column holds every one of its values (`contains_all`; B4).
 pub const QUERY_KIND_CONTAINS_ALL: &str = "contains_all";
+/// The query kind of a recorded run that semi-joins its keys with a right
+/// dataset (`semijoin`: `in (subquery)`, `exists`, a semi-join; B3): its
+/// keys are values of the run's columns in the left dataset (the data
+/// root), and the run asks for the rows of both datasets holding a key the
+/// other also holds. The right side is [`RecordedRun::join`].
+pub const QUERY_KIND_SEMIJOIN: &str = "semijoin";
+
+/// The right side of a semi-join run (B3): the right dataset (the folder of
+/// that name beside the data root) and its join columns, pairwise with the
+/// run's columns.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct RunJoin {
+    /// The right dataset's name.
+    pub right: String,
+    /// Its join columns, pairwise with the run's key columns.
+    pub right_columns: Vec<String>,
+}
+
 /// The query kind of a recorded run that aggregates one value column per
 /// key over its keys (`sum/count/min/max(value) ... where key in (...)
 /// group by key`; B7), with the value and functions in
@@ -196,6 +214,11 @@ pub enum RunQuery {
     /// The rows whose list column holds every one of the run's values
     /// ([`QUERY_KIND_CONTAINS_ALL`]).
     ContainsAll,
+    /// The rows of both datasets whose key the other holds, for the run's
+    /// keys ([`QUERY_KIND_SEMIJOIN`]; B3): a two-step plan, the left
+    /// dataset then the right. Only a join key on the pair answers it
+    /// alone; otherwise each side is planned by its own keys.
+    SemiJoin(RunJoin),
     /// Per key, `functions` of one value column over the key's rows
     /// ([`QUERY_KIND_AGGREGATE`]; B7): answered from an agg key on the value
     /// beside the key counting rows on exactly the run's columns, reading
@@ -220,6 +243,7 @@ impl RunQuery {
             Self::Text(TextOp::HasPrefix) => QUERY_KIND_HAS_PREFIX,
             Self::ContainsAny => QUERY_KIND_CONTAINS_ANY,
             Self::ContainsAll => QUERY_KIND_CONTAINS_ALL,
+            Self::SemiJoin(_) => QUERY_KIND_SEMIJOIN,
             Self::Aggregate(_) => QUERY_KIND_AGGREGATE,
         }
     }
@@ -238,6 +262,7 @@ impl RunQuery {
             | Self::Text(_)
             | Self::ContainsAny
             | Self::ContainsAll
+            | Self::SemiJoin(_)
             | Self::Aggregate(_) => None,
         }
     }
@@ -255,6 +280,7 @@ impl RunQuery {
             | Self::Text(_)
             | Self::ContainsAny
             | Self::ContainsAll
+            | Self::SemiJoin(_)
             | Self::Aggregate(_) => None,
         }
     }
@@ -302,6 +328,15 @@ impl RunQuery {
     pub fn is_membership(&self) -> bool {
         matches!(self, Self::ContainsAny | Self::ContainsAll)
     }
+
+    /// The right side of a semi-join run (B3).
+    #[must_use]
+    pub fn join(&self) -> Option<&RunJoin> {
+        match self {
+            Self::SemiJoin(j) => Some(j),
+            _ => None,
+        }
+    }
 }
 
 /// One recorded run.
@@ -343,6 +378,11 @@ pub struct RecordedRun {
     /// `locate` run hashes as before) otherwise.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub window: Option<RunWindow>,
+    /// The right side of a semi-join run ([`QUERY_KIND_SEMIJOIN`]; B3);
+    /// absent (and not serialized, so every other run hashes as before)
+    /// otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub join: Option<RunJoin>,
     /// The value and functions of an `aggregate` run; absent (and not
     /// serialized, so other runs hash as before) otherwise.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -378,6 +418,22 @@ impl RecordedRun {
                 self.run_id, self.query_kind
             )));
         }
+        if self.query_kind == QUERY_KIND_SEMIJOIN {
+            return match &self.join {
+                Some(j)
+                    if self.asof.is_none()
+                        && self.lookback.is_none()
+                        && j.right_columns.len() == self.columns.len() =>
+                {
+                    Ok(RunQuery::SemiJoin(j.clone()))
+                }
+                _ => Err(Error::Other(format!(
+                    "run {:?} is a semijoin run; it records its right dataset and one right \
+                     column per key column, and no asof, lookback, or window",
+                    self.run_id
+                ))),
+            };
+        }
         if self.query_kind == QUERY_KIND_AGGREGATE {
             return match (&self.aggregate, self.asof, self.lookback) {
                 (Some(a), None, None)
@@ -399,6 +455,13 @@ impl RecordedRun {
                     self.run_id
                 ))),
             };
+        }
+        if self.join.is_some() {
+            return Err(Error::Other(format!(
+                "run {:?} has query_kind {:?} but records a right dataset; only a semijoin run \
+                 records one",
+                self.run_id, self.query_kind
+            )));
         }
         if self.aggregate.is_some() {
             return Err(Error::Other(format!(
@@ -935,6 +998,19 @@ impl<'a> WorkloadRecorder<'a> {
         };
         check_text(run_id, &built, &query, &self.schema)?;
         check_membership(run_id, &built, &query, &self.schema)?;
+        if let RunQuery::SemiJoin(j) = &query {
+            if j.right_columns.len() != built.columns().len() {
+                return Err(Error::KeySpec(format!(
+                    "run {run_id:?} semi-joins {} key column(s) ({}) with {} column(s) of {} \
+                     ({}); pair one right column with each key column",
+                    built.columns().len(),
+                    built.columns().join(", "),
+                    j.right_columns.len(),
+                    j.right,
+                    j.right_columns.join(", ")
+                )));
+            }
+        }
         check_aggregate(run_id, &built, &query, &self.schema)?;
         if matches!(query, RunQuery::ContainsAll) && null_tuples > 0 {
             // A null value is in no list (ADR 014), so no row holds every
@@ -965,6 +1041,7 @@ impl<'a> WorkloadRecorder<'a> {
                 null_tuples,
                 key_set,
                 window: query.window().cloned(),
+                join: query.join().cloned(),
                 aggregate: query.aggregate().cloned(),
             },
             payload,

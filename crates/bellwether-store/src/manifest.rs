@@ -367,6 +367,32 @@ pub struct SegmentRef {
     pub rowgroup_range: RowGroupRange,
     /// Size of the segment in bytes.
     pub bytes: u64,
+    /// For a join key's segment (B3): what the pair index was built from,
+    /// as its header records it (ADR 020). Absent for every other segment.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub join: Option<JoinPin>,
+    /// Unknown fields (ADR 017).
+    #[serde(flatten)]
+    pub extra: Extra,
+}
+
+/// What a join key's pair segment (B3) was built from, in its manifest
+/// entry (`segments[].join`) and its header alike: the right dataset's
+/// manifest, by sequence and by content, and the left's live row groups.
+/// The key is stale on the right once the right dataset's current
+/// manifest is another (a later sequence, or the same sequence of an
+/// index deleted and rebuilt), and stale on the left once the left's live
+/// row groups are another set (a file added, changed, or removed).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JoinPin {
+    /// The right dataset's manifest sequence.
+    pub right_sequence: u64,
+    /// BLAKE3 of the right dataset's manifest bytes as stored
+    /// ([`crate::Snapshot::content_hash`]).
+    pub right_manifest: Hash,
+    /// The identity of the left's live row-group set the pair was built
+    /// over (core's `join::live_identity`).
+    pub left_live: Hash,
     /// Unknown fields (ADR 017).
     #[serde(flatten)]
     pub extra: Extra,
@@ -759,6 +785,15 @@ fn key_spec_fields(kind: &str, storage_version: u64) -> Option<&'static [&'stati
         // a list key (B4) is a storage version 2 kind: a version 1 build
         // refuses a manifest declaring one
         "list" if v2 => Some(&["kind", "column"]),
+        // a join key (B3) likewise
+        "join" if v2 => Some(&[
+            "kind",
+            "dataset",
+            "columns",
+            "right",
+            "right_columns",
+            "counts",
+        ]),
         "temporal" if v2 => Some(&["kind", "columns", "ts_column", "counts"]),
         "temporal" => Some(&["kind", "columns", "ts_column"]),
         // --- phase 5 kinds ---
@@ -1027,6 +1062,13 @@ mod tests {
                 bloom: Some(0.01),
             },
             KeySpec::List { column: "a".into() },
+            KeySpec::Join {
+                dataset: "l".into(),
+                columns: vec!["a".into()],
+                right: "r".into(),
+                right_columns: vec!["b".into()],
+                counts: true,
+            },
             KeySpec::Agg {
                 columns: vec!["a".into()],
                 value: "v".into(),
@@ -1046,6 +1088,7 @@ mod tests {
                 | KeySpec::Expr { .. }
                 | KeySpec::Text { .. }
                 | KeySpec::List { .. }
+                | KeySpec::Join { .. }
                 | KeySpec::Agg { .. } => {}
             }
             let v = serde_json::to_value(spec).unwrap();
@@ -1231,6 +1274,56 @@ mod tests {
         expect_unsupported_shape(
             r#"{"storage_version": 2, "created_at": "x",
                 "schema": {"key_specs": [{"kind": "list", "column": "t", "keys_only": true}]}}"#,
+        );
+    }
+
+    /// A join key (B3) is a storage version 2 kind, like a list key: a
+    /// version 2 manifest declaring it reads back as written, with its
+    /// segment's pins (the right manifest by sequence and content, the
+    /// left's live set) and an unknown pin field kept (ADR 017); a version
+    /// 1 manifest declaring it, or a join key with a field this build does
+    /// not know, is refused with the typed shape error.
+    #[test]
+    fn a_join_key_is_a_storage_version_2_kind_and_its_segment_pins_the_right() {
+        let json = |version: u32| {
+            format!(
+                r#"{{"storage_version": {version}, "created_at": "x",
+                "schema": {{"key_specs": [{{"kind": "join", "dataset": "orders",
+                    "columns": ["id"], "right": "payables", "right_columns": ["order_id"]}}]}},
+                "segments": [{{"id": "{}", "key_spec": "join:orders.id=payables.order_id",
+                    "rowgroup_range": {{"start": 0, "end": 4}}, "bytes": 10,
+                    "join": {{"right_sequence": 7, "right_manifest": "{}",
+                        "left_live": "{}", "later": 1}}}}]}}"#,
+                "11".repeat(32),
+                "22".repeat(32),
+                "33".repeat(32)
+            )
+        };
+        let m = Manifest::from_slice(json(2).as_bytes()).unwrap();
+        assert_eq!(
+            m.schema.key_specs[0].name(),
+            "join:orders.id=payables.order_id"
+        );
+        let pin = m.segments[0].join.as_ref().unwrap();
+        assert_eq!(pin.right_sequence, 7);
+        assert_eq!(pin.right_manifest, Hash([0x22; 32]));
+        assert_eq!(pin.left_live, Hash([0x33; 32]));
+        let back: Value = serde_json::from_slice(&m.to_vec().unwrap()).unwrap();
+        assert_eq!(back["schema"]["key_specs"][0]["kind"], "join");
+        assert_eq!(back["segments"][0]["join"]["right_sequence"], 7);
+        assert_eq!(back["segments"][0]["join"]["later"], 1);
+        assert!(key_spec_fields("join", 1).is_none());
+        match Manifest::from_slice(json(1).as_bytes()) {
+            Err(Error::UnknownKind {
+                what: UNSUPPORTED_SHAPE,
+                ..
+            }) => {}
+            other => panic!("expected UnknownKind (shape), got {other:?}"),
+        }
+        expect_unsupported_shape(
+            r#"{"storage_version": 2, "created_at": "x",
+                "schema": {"key_specs": [{"kind": "join", "dataset": "a", "columns": ["x"],
+                "right": "b", "right_columns": ["y"], "outer": true}]}}"#,
         );
     }
 

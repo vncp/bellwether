@@ -79,6 +79,13 @@ fn lookup(keys: &RunKeys, query: &RunQuery) -> Result<Lookup> {
             column: columns.join(","),
             values: tuples,
         },
+        RunQuery::SemiJoin(_) => {
+            return Err(Error::Other(
+                "a semijoin run spans two datasets and is planned per side by the replayer, \
+                 never as one dataset's lookup"
+                    .into(),
+            ))
+        }
         RunQuery::Text(_) => {
             let (column, op, values) = text_run(keys, query)?
                 .ok_or_else(|| Error::Other("a text run without a text match".into()))?;

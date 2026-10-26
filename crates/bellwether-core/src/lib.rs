@@ -19,6 +19,9 @@
 //!   tokenizers, the residual's row test, and the planning rule.
 //! - [`list`]: list keys (B4), an inverted index over a list column's
 //!   elements, and the `contains_any` / `contains_all` lookups.
+//! - [`join`]: join keys (B3), the keys two datasets share on one column
+//!   pair: the pair build from both sides' exact segments, `semijoin`, and
+//!   `overlap_stats`.
 //! - [`agg`]: agg keys (B7), per-key, per-row-group aggregates of one value
 //!   column, and the rule that decides which row groups they answer.
 //!
@@ -38,6 +41,7 @@ pub mod bloom;
 pub mod encoding;
 pub mod expr;
 pub mod hll;
+pub mod join;
 pub mod list;
 pub mod merge;
 pub mod render;

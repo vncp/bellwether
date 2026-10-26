@@ -797,6 +797,30 @@ fn verify_and_outcome_human(s: &mut String, r: &FixResult) {
             );
         }
     }
+    // A join key (B3): the right dataset's certificate, which the left one
+    // cites, and the keys both compared rows of.
+    if let Some(j) = &r.join {
+        if let Record::Certificate(cert) = &j.certificate.record {
+            let _ = writeln!(
+                s,
+                "            right dataset {}: {}, {} mismatched, {} missing left, {} missing \
+                 right, certificate {} (cited by the one above)",
+                j.right_root,
+                if cert.pass { "pass" } else { "FAIL" },
+                num(cert.body.mismatched),
+                num(cert.body.missing_left),
+                num(cert.body.missing_right),
+                short(&j.certificate.hash)
+            );
+        }
+        let _ = writeln!(
+            s,
+            "            rows compared on both datasets: those of the {} of {} asked keys both \
+             datasets' files hold",
+            num(j.matched),
+            num(j.keys)
+        );
+    }
     if let Some(filter) = r.verification.as_ref().and_then(|v| v.row_filter.as_ref()) {
         let _ = writeln!(
             s,

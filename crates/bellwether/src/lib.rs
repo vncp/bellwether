@@ -35,6 +35,7 @@ mod engine;
 mod engine_fix;
 mod fix;
 mod index;
+mod join;
 mod keys;
 mod ledger_views;
 mod lookback;
@@ -73,6 +74,10 @@ pub use engine::{
 pub use engine_fix::{EngineCompare, EngineRun, PairRun};
 pub use fix::{
     DataState, FixOutcome, FixRequest, FixResult, Refusal, RewriteOutputs, Score, SignatureWritten,
+};
+pub use join::{
+    JoinFreshness, JoinKeyState, JoinOverlapResult, JoinRows, JoinScope, JoinVerifyResult,
+    SemiJoinResult, SemiJoinStep,
 };
 pub use keys::KeyFile;
 pub use ledger_views::{

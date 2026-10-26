@@ -251,3 +251,7 @@ The shared measures have their own unit tests in `bellwether-source` (`stats`), 
 
 - **Files on disk.** The workload reader is bench-format only and reads local files. The time measures cover dates and timestamps, not integers that encode times. `Lint` has no typed field for the recommended composite; it is named in the message and listed, in the same order, in the fanout.
 - **Fields `Fanout` and `EvidenceBody::Profile` lack.** They have no field for sample size or error, skipped candidates, range statistics, or time measures. These live in `ProfileReport` and the cache, and the Evidence carries only what the contract types allow.
+
+### `R-join-1` (join keys, B3)
+
+`lints::repeated_semijoins(uses, left, complete)` fires once per column pair that at least `JOIN_REPEAT_MIN_RUNS` (2) recorded semi-join runs use between the data root and one right dataset when no complete join key holds the pair, high confidence, naming the key and the `why --mode semijoin --join` command that prices it. `why` calls it with the workload's runs and adds its lints to the same `profile` Evidence, citing the workload. It is not part of `lints::run`.

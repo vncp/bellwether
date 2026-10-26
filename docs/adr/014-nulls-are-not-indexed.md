@@ -24,6 +24,11 @@ A list key (`list:<column>`) indexes a list's elements, so "not indexed" is stat
 
 Rejected alternative: indexing the empty list as a sentinel element, so `cardinality(x) = 0` could be planned. No membership operator needs it, and it would be the null-group counting this ADR avoids.
 
+## Amendment 2026-10-26: join keys (B3)
+
+A join key pairs the tuples two datasets' exact keys hold. A tuple holding a null (in any column; a trailing null is the null marker of the 2026-10-24 amendment) equals nothing in SQL, so it is never paired: it counts as a key of its side alone (`|L \ R|` or `|R \ L|`), and a probe holding a null matches nothing. Float columns are refused as join columns: `-0.0` and `0.0` are equal in SQL and encode differently, and engines disagree on whether `NaN` equals itself, so a pairing would be a guess.
+
+A pair split into segments by key range (ADR 018) counts a null-holding tuple, like any one-sided key, in the one segment whose stretch of the merge it fell in, so the one-sided counts summed over a key's segments are the pair's and a null tuple is never counted twice or paired across segments.
 ## Amendment 2026-10-26: null values in agg keys are counted, not indexed (agg keys, B7)
 
 An agg key (`agg:<key>@<value>{...}`) stores aggregates of a value column per key per row group, so a null can now sit in two places. A null in the key follows this ADR unchanged: a row whose leading key column is null is in no cell, and a lookup tuple holding a null matches nothing. A null in the value column is not indexed either, but it is counted: every cell stores `rows` (the key's rows in the row group) and `nulls` (those whose value is null), and the value is never summed or compared. That is SQL's aggregate semantics: `count(*)` is `rows`, `count(value)` is `rows - nulls`, `sum`, `min`, and `max` skip nulls, and `sum` of a key whose values are all null is null, which the lookup reports as null rather than zero (the cell stores an integer zero only so its bytes have one shape). Counting nulls separately is what lets the counted exact key prove coverage: a cell answers a row group only when its `rows`, nulls included, equal the lookup key's count there.
