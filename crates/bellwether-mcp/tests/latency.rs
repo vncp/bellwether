@@ -53,6 +53,7 @@ fn observe_why_meets_the_budget_in_process_and_over_stdio() {
             ..bellwether::EngineOptions::default()
         },
         budget: bellwether_mcp::Budget::default(),
+        join: None,
     })
     .unwrap();
     assert!(!srv.call("observe.why", json!({})).is_error());

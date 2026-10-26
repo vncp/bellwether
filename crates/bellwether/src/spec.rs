@@ -15,6 +15,8 @@
 //! | `Exact { columns: [symbol], bounds: Some(ts) }` | `exact:symbol@ts` (with counts `exact:symbol@ts,counts`) |
 //! | `Bloom { columns: [symbol], fpr: 0.01, bounds: Some(ts) }` | `bloom:symbol@0.01@ts` |
 //! | `Bitemporal { columns: [id], valid_column: valid, known_column: known }` | `temporal2:id@valid,known` |
+//! | `Join { dataset: orders, columns: [order_id], right: payables, right_columns: [order_id] }` | `join:orders.order_id=payables.order_id` |
+//! | `Join { .., counts: true }` | `join:orders.order_id=payables.order_id,counts` |
 //!
 //! A trailing `,counts` asks the spec to store, per key and per row group,
 //! the number of rows (storage version 2, ADR 028); it is the last element
@@ -268,6 +270,11 @@ fn parse_short(s: &str) -> Result<KeySpec> {
         )),
         ("text", None) => parse_text(s, cols),
         ("text", Some(_)) => Err(bad(s, "a text key takes no '@'")),
+        ("join", None) => parse_join(s, cols),
+        ("join", Some(_)) => Err(bad(
+            s,
+            "a join key takes no '@'; write join:<left>.<columns>=<right>.<columns>",
+        )),
         (other, _) => Err(bad(s, &format!("unknown kind {other:?}"))),
     }
 }
@@ -278,6 +285,59 @@ fn one_column(s: &str, list: &str, what: &str) -> Result<String> {
         [one] => Ok(one.clone()),
         _ => Err(bad(s, &format!("the {what} time column is one column"))),
     }
+}
+
+/// `join:<left>.<cols>=<right>.<cols>[,counts]`: each side a dataset (a
+/// folder name, which holds no `.`) then its columns after the first `.`.
+fn parse_join(s: &str, rest: &str) -> Result<KeySpec> {
+    let (left, right) = rest.split_once('=').ok_or_else(|| {
+        bad(
+            s,
+            "a join key pairs two sides with '=', join:orders.order_id=payables.order_id",
+        )
+    })?;
+    let (right_list, counts) = strip_counts(right);
+    let (dataset, columns) = join_side(s, left)?;
+    let (right, right_columns) = join_side(s, right_list)?;
+    Ok(KeySpec::Join {
+        dataset,
+        columns,
+        right,
+        right_columns,
+        counts,
+    })
+}
+
+/// One side of a join key: `<dataset>.<col>[,<col>...]`.
+fn join_side(s: &str, side: &str) -> Result<(String, Vec<String>)> {
+    let (dataset, cols) = side.trim().split_once('.').ok_or_else(|| {
+        bad(
+            s,
+            "each side of a join key is <dataset>.<columns>, join:orders.order_id=payables.order_id",
+        )
+    })?;
+    Ok((dataset.trim().to_string(), columns(s, cols)?))
+}
+
+/// The right side a join lookup names (`--join`): `<right dataset>.<col>[,<col>...]`,
+/// the folder beside the data root and its join columns, pairwise with the
+/// key file's (or the left side's) columns.
+pub fn parse_join_side(s: &str) -> Result<(String, Vec<String>)> {
+    let s = s.trim();
+    let bad_side = |why: &str| Error::InvalidArgument {
+        field: "join",
+        reason: format!(
+            "{s:?} does not name a right dataset and its columns ({why}); write \
+             <right dataset>.<column>[,<column>...], for example payables.order_id, or the \
+             whole key, join:orders.order_id=payables.order_id"
+        ),
+    };
+    let (dataset, cols) = s.split_once('.').ok_or_else(|| bad_side("no '.'"))?;
+    let columns: Vec<String> = cols.split(',').map(|c| c.trim().to_string()).collect();
+    if dataset.trim().is_empty() || columns.iter().any(String::is_empty) {
+        return Err(bad_side("a name is empty"));
+    }
+    Ok((dataset.trim().to_string(), columns))
 }
 
 /// `text:<column>,tokenizer=words|trigram[,bloom=<fpr>]`: the column, then
@@ -483,6 +543,9 @@ mod tests {
             "exact:a,b@ts,counts",
             "bloom:a,b@0.01@ts",
             "temporal2:id@valid,known",
+            "join:orders.order_id=payables.order_id",
+            "join:trades.symbol,minute=quotes.sym,minute,counts",
+            "join:orders.counts=payables.order_id",
         ] {
             let spec = parse(s).unwrap();
             assert_eq!(label(&spec), s);
@@ -652,5 +715,44 @@ mod tests {
         assert_eq!(shell_quote("{day:date}.parquet"), "'{day:date}.parquet'");
         assert_eq!(shell_quote("it's"), r"'it'\''s'");
         assert_eq!(shell_quote(""), "''");
+    }
+
+    #[test]
+    fn join_keys_parse_both_sides_and_refuse_what_cannot_be_one() {
+        assert_eq!(
+            parse("join:trades.symbol,minute=quotes.sym,minute,counts").unwrap(),
+            KeySpec::Join {
+                dataset: "trades".into(),
+                columns: vec!["symbol".into(), "minute".into()],
+                right: "quotes".into(),
+                right_columns: vec!["sym".into(), "minute".into()],
+                counts: true,
+            }
+        );
+        for (bad, why) in [
+            ("join:orders.id", "pairs two sides"),
+            ("join:orders=payables.id", "<dataset>.<columns>"),
+            (
+                "join:orders.id=payables.a,b",
+                "1 left column(s) with 2 right",
+            ),
+            ("join:or ders.id=payables.id", "not a folder name"),
+            ("join:orders.id,id=payables.a,b", "twice"),
+            ("join:orders.id=payables.id@ts", "takes no '@'"),
+        ] {
+            let e = parse(bad).map(|s| label(&s)).unwrap_err().to_string();
+            assert!(e.contains(why), "{bad}: {e}");
+        }
+        assert_eq!(
+            parse_join_side("payables.order_id").unwrap(),
+            ("payables".into(), vec!["order_id".into()])
+        );
+        assert_eq!(
+            parse_join_side(" quotes.sym,minute ").unwrap(),
+            ("quotes".into(), vec!["sym".into(), "minute".into()])
+        );
+        for bad in ["payables", ".id", "payables.", "payables.a,"] {
+            assert!(parse_join_side(bad).is_err(), "{bad}");
+        }
     }
 }

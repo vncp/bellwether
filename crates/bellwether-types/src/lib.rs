@@ -269,6 +269,40 @@ pub enum Error {
         /// The whole message, naming what to do.
         message: String,
     },
+    /// A join key (B3) whose pair index no longer describes both datasets:
+    /// the left dataset (the data root) or the right one (named in the
+    /// spec) committed a manifest after the pair index was built over it
+    /// (ADR 020), so a semi-join planned from it could miss rows on that
+    /// side (invariant 1 per side). Refused, never answered from the old
+    /// pair index; re-index the left dataset to rebuild it. `message` names
+    /// the command.
+    #[error("{message}")]
+    StaleJoin {
+        /// The join key's name (`join:orders.order_id=payables.order_id`).
+        spec: String,
+        /// The side that advanced: `left` or `right`.
+        side: &'static str,
+        /// The manifest sequence of that side the pair index was built at.
+        pinned: u64,
+        /// That side's current manifest sequence.
+        current: u64,
+        /// The whole message, naming the command to run.
+        message: String,
+    },
+    /// A join key (B3) names a right dataset this engine was not opened to
+    /// read: an MCP server reads only the right side its operator gave with
+    /// `--join` (none without it), never one a tool argument names. Refused
+    /// before any folder is read, so the refusal is the same whether a
+    /// folder of the name asked exists, is indexed, or not. `served` is the
+    /// right side served (`<right>.<columns>`), if any; `message` says what
+    /// to do.
+    #[error("{message}")]
+    JoinNotServed {
+        /// The right side the engine serves, if any.
+        served: Option<String>,
+        /// The whole message, naming what to do.
+        message: String,
+    },
     /// Serialization failure.
     #[error("serde error: {0}")]
     Serde(#[from] serde_json::Error),
@@ -745,6 +779,35 @@ pub enum KeySpec {
         /// The list or map column.
         column: String,
     },
+    /// Dataset-pair key overlap (B3): the keys two datasets share on one
+    /// column pair, for semi-joins, anti-joins, and `in (subquery)` between
+    /// them. Declared on the left dataset (the data root, named by its
+    /// folder) and stored in its manifest; the right dataset is the folder
+    /// named `right` beside the root, read through its own index. Per key
+    /// value on both sides, a row-group bitmap per side (each in its own
+    /// dataset's row-group id space); keys on one side only are counted per
+    /// side. Built from both sides' complete exact keys on the columns and
+    /// pinned to the right manifest's sequence (ADR 020): stale when either
+    /// side commits again. Spelled `join:<dataset>.<cols>=<right>.<cols>`
+    /// (`join:orders.order_id=payables.order_id`), with `,counts` for
+    /// per-side row counts. Serves only semi-join lookups and overlap
+    /// statistics, never a lookup on one dataset alone.
+    Join {
+        /// The left dataset's name: the data root's folder name.
+        dataset: String,
+        /// The left key columns, in prefix order.
+        columns: Vec<String>,
+        /// The right dataset's name: a folder beside the data root.
+        right: String,
+        /// The right key columns, pairwise with `columns`.
+        right_columns: Vec<String>,
+        /// Store, per shared key and per row group of each side holding
+        /// it, its rows there (storage version 2), so the rows a semi-join
+        /// keeps and the size of the join are exact from the index. Needs
+        /// counted exact keys on both sides.
+        #[serde(default, skip_serializing_if = "is_false")]
+        counts: bool,
+    },
 }
 
 /// How a [`KeySpec::Text`] splits a value into tokens. Both work on the
@@ -825,7 +888,8 @@ impl KeySpec {
             Self::Exact { columns, .. }
             | Self::Bloom { columns, .. }
             | Self::Temporal { columns, .. }
-            | Self::Bitemporal { columns, .. } => columns,
+            | Self::Bitemporal { columns, .. }
+            | Self::Join { columns, .. } => columns,
             Self::Range { column } | Self::Text { column, .. } | Self::List { column } => {
                 std::slice::from_ref(column)
             }
@@ -850,7 +914,9 @@ impl KeySpec {
             Self::Expr { over, .. } => over.counts(),
             other => matches!(
                 other,
-                Self::Exact { counts: true, .. } | Self::Temporal { counts: true, .. }
+                Self::Exact { counts: true, .. }
+                    | Self::Temporal { counts: true, .. }
+                    | Self::Join { counts: true, .. }
             ),
         }
     }
@@ -883,6 +949,19 @@ impl KeySpec {
                 return format!("expr:{name}={expr}:{inner}");
             }
             Self::List { .. } => "list",
+            Self::Join {
+                dataset,
+                columns,
+                right,
+                right_columns,
+                ..
+            } => {
+                return format!(
+                    "join:{dataset}.{}={right}.{}",
+                    columns.join(","),
+                    right_columns.join(",")
+                )
+            }
         };
         format!("{kind}:{}", self.columns().join(","))
     }
@@ -903,6 +982,7 @@ impl KeySpec {
     /// | bitemporal | `temporal2:id@valid,known` |
     /// | expr | `expr:sym=json_get(payload,'$.symbol'):exact` (with counts `...:exact,counts`; bloom `...:bloom@0.01`) |
     /// | list (B4) | `list:tags` |
+    /// | join (B3) | `join:orders.order_id=payables.order_id` (with counts `...,counts`) |
     ///
     /// The false-positive rate is Rust's shortest round-trip spelling of the
     /// `f64`. The identity is one-to-one: no key or time column a spec names
@@ -929,6 +1009,7 @@ impl KeySpec {
             },
             Self::Range { column } => format!("range:{column}"),
             Self::List { column } => format!("list:{column}"),
+            Self::Join { .. } => format!("{}{counts}", self.name()),
             Self::Temporal {
                 columns, ts_column, ..
             } => format!("temporal:{}@{ts_column}{counts}", columns.join(",")),
@@ -982,13 +1063,20 @@ impl KeySpec {
             } => vec![valid_column, known_column],
             // An expr key's name is an identifier and its expression is
             // checked by `bellwether_core::expr::check_spec`.
-            Self::Range { .. } | Self::Expr { .. } | Self::Text { .. } | Self::List { .. } => {
-                Vec::new()
-            }
+            Self::Range { .. }
+            | Self::Expr { .. }
+            | Self::Text { .. }
+            | Self::List { .. }
+            | Self::Join { .. } => Vec::new(),
+        };
+        let right: &[String] = match self {
+            Self::Join { right_columns, .. } => right_columns,
+            _ => &[],
         };
         if let Some(c) = self
             .columns()
             .iter()
+            .chain(right)
             .chain(times)
             .find(|c| c.contains([',', '@']))
         {
@@ -1011,6 +1099,31 @@ impl KeySpec {
                      because exact:{rest},counts already means the spec on {rest} that stores \
                      counts; list it first instead, as exact:counts,{rest}"
                 )));
+            }
+        }
+        if let Self::Join {
+            columns,
+            right_columns,
+            ..
+        } = self
+        {
+            if let Some(c) = columns
+                .iter()
+                .chain(right_columns)
+                .find(|c| c.contains('='))
+            {
+                return Err(Error::KeySpec(format!(
+                    "the join column \"{c}\" contains '=', which separates the two sides of a \
+                     join key's identity, so a new join key cannot name it; rename the column"
+                )));
+            }
+            if right_columns.last().is_some_and(|c| c == "counts") {
+                return Err(Error::KeySpec(
+                    "a right join column named \"counts\" cannot come last, because a trailing \
+                     \",counts\" already means a join key that stores counts; list the columns \
+                     in another order on both sides"
+                        .into(),
+                ));
             }
         }
         Ok(())

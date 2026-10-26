@@ -205,6 +205,7 @@ Reproduce everything above, downloads included, with [`scripts/showcase.sh`](scr
 | `expr` | a filter or join key that is a function of a column: a member of a JSON column, `lower`, `substr`, `cast`, `date_trunc`, `hash` | `index --key "expr:<name>=<expression>:exact"` (or `:exact,counts`, `:bloom@<fpr>`) | point lookups (`locate`) and, with counts, `count` by the same expression after normalization; any other expression is refused, never guessed |
 | `text` | `contains`, `like '%x%'`, `has`, prefix match on a string column, case-insensitive | `index --key text:col,tokenizer=words` (whole words, prefixes; exact row groups) or `text:col,tokenizer=trigram` (substrings; candidates, residual mandatory) | `locate --contains/--has/--prefix COL=TEXT`; priced by `why --contains/--has/--prefix`, proposed and receipted by `fix` ([funnels](docs/measured/2026-10-26-text.md)) |
 | `list` | array membership: `array_contains`, `has_any`, `has_all`, `exists(unnest)` over a `List`, `LargeList`, or a map's keys | `index --key list:col` | `locate --keys values.parquet --any\|--all`; priced by `why --mode contains-any\|contains-all` |
+| `join` | semi-join, anti-join, `in (subquery)`, `exists` between two datasets on one column pair; drive side and whether the keyset fits a membership list | `index <left> --key join:left.col=right.col` (both datasets need `exact:<col>`; the right is the folder beside the left) | `join semijoin --join right.col --keys keys.parquet` (two steps, each the row groups of keys both hold), `join overlap` (exact \|L∩R\|, \|L∖R\|, \|R∖L\|), `join verify`; priced by `why --mode semijoin --join right.col`, proposed and receipted by `fix` |
 
 ## How `fix` proves a change
 
@@ -287,7 +288,7 @@ The trust boundary at the wire: a proposal has no score field, so the input sche
 
 | Surface | What it can do | Worst case |
 |---|---|---|
-| `observe.*` (`observe.why` with no keys, `observe.profile`, `observe.locate`, `observe.asof`, `observe.text`) | read footers and the index; write the profile Evidence and cache entries | the agent reads evidence |
+| `observe.*` (`observe.why` with no keys, `observe.profile`, `observe.locate`, `observe.asof`, `observe.text`, `observe.semijoin`, `observe.join_overlap`, `observe.join_verify`) | read footers and the index; write the profile Evidence and cache entries | the agent reads evidence |
 | `score.*` (`score.why` with keys, a workload, or text lookups, `score.verify`, `score.record` with a query engine) | ask the engine to replay and verify; the engine writes its own Proposals, Replays, plan Evidence, and Certificates; charged to the session budget; with `--twin-of`, the engine submits a keys query or a rewrite's queries read-only to the one engine the human named | the agent spends its budget and is refused with `budget_exceeded`; a cost or verdict field in the arguments is refused with `caller_supplied_cost` |
 | `propose.*` | write a `Proposal` with no score, or nothing with `dry_run` | the ledger holds a bad proposal that scores poorly and never gets a Certificate |
 | `apply.receipt` | take a Certificate hash only; the engine applies and then writes the Receipt | the agent asks to apply something unverified and is told no, with a typed code |
@@ -300,7 +301,7 @@ The trust boundary at the wire: a proposal has no score field, so the input sche
 |---|---|---|---|---|---|
 | Runs | one process | inside the query engine | inside the Hudi writer and engine | inside ClickHouse | inside the database |
 | Granularity | row group | file (min/max) | file group or record | granule | row |
-| Key kinds | exact, bloom, range, temporal, sketch (approximate, never plans), expr, text, list | min/max statistics | bloom, record-level, column stats | minmax, set, bloom variants | B-tree |
+| Key kinds | exact, bloom, range, temporal, sketch (approximate, never plans), expr, text, list, join (dataset pairs) | min/max statistics | bloom, record-level, column stats | minmax, set, bloom variants | B-tree |
 | Composite keys | native, prefix seek | Z-order or clustering columns | record key | multi-column expressions | yes |
 | Latest / as-of | native over plain files | table time travel | incremental and point-in-time queries | no | via `ROW_NUMBER` scan |
 | Tells you which key to index | measured fanout + exact replay | no | no | no | estimated (what-if API) |

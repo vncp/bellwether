@@ -10,6 +10,7 @@
 
 mod bench;
 mod human;
+mod join_cmds;
 mod keys_cmds;
 mod sketch_cmds;
 mod verify_cmds;
@@ -64,6 +65,8 @@ pub(crate) struct Global {
     engine: bellwether_mcp::EngineArgs,
 }
 
+// Parsed once per process: the size of `why`'s arguments costs nothing.
+#[allow(clippy::large_enum_variant)]
 #[derive(Subcommand)]
 enum Command {
     /// Profile the folder and, with keys, replay them under every candidate
@@ -106,6 +109,13 @@ enum Command {
     Bench {
         #[command(subcommand)]
         command: bench::BenchCommand,
+    },
+    /// Join keys (B3) between this folder and a dataset beside it: plan a
+    /// semi-join, read the key overlap, or check that each join key is
+    /// fresh.
+    Join {
+        #[command(subcommand)]
+        command: join_cmds::JoinCommand,
     },
     /// Approximate distinct counts and overlaps from `sketch` sidecars
     /// (never used to plan): cardinality per column, overlap of two.
@@ -170,15 +180,19 @@ struct McpArgs {
     budget: bellwether_mcp::BudgetArgs,
     #[command(flatten)]
     keys: bellwether_mcp::KeyArgs,
+    #[command(flatten)]
+    join: bellwether_mcp::JoinArgs,
 }
 
 #[derive(Args)]
 struct WhyArgs {
     #[command(flatten)]
     root: RootArg,
-    /// A Parquet file of keys one run looked up.
+    /// A Parquet file of keys one run looked up; repeat for several runs
+    /// (recorded as runs keys, keys-2, keys-3, ...), each priced under the
+    /// same lookup.
     #[arg(long, value_name = "FILE")]
-    from: Option<PathBuf>,
+    from: Vec<PathBuf>,
     /// Key columns to take from --from, comma-separated [default: all].
     #[arg(long, value_name = "COLS", requires = "from", value_delimiter = ',')]
     key: Option<Vec<String>>,
@@ -196,11 +210,19 @@ struct WhyArgs {
     /// (word prefixes), case-folded, a list-membership lookup over a key
     /// file of one list column's values (named after the column):
     /// `contains-any` (rows whose list holds any of them) or `contains-all`
-    /// (every one), priced against list:<column>, or `bitemporal` (with
-    /// --valid-by and --known-by) [default: asof with --at, latest with
+    /// (every one), priced against list:<column>, `bitemporal` (with
+    /// --valid-by and --known-by), or `semijoin` (the rows of this folder
+    /// and of the --join dataset whose key the other holds), priced against
+    /// the join key on the pair [default: asof with --at, latest with
     /// --latest-by, bitemporal with --valid-by, else locate].
     #[arg(long, value_enum, value_name = "MODE")]
     mode: Option<ModeArg>,
+    /// With --mode semijoin: the right dataset and its join columns,
+    /// RIGHT.COL[,COL...], pairwise with the key file's columns; RIGHT is
+    /// the folder of that name beside the data root, read through its own
+    /// index.
+    #[arg(long, value_name = "RIGHT.COLS")]
+    join: Option<String>,
     /// Timestamp (or date, time, or integer version) column that orders
     /// versions, for `latest` and `asof` pricing.
     #[arg(long, value_name = "COL", conflicts_with = "bench_workload")]
@@ -326,6 +348,7 @@ enum ModeArg {
     ContainsAny,
     ContainsAll,
     Bitemporal,
+    Semijoin,
 }
 
 impl From<ModeArg> for bellwether::LookupMode {
@@ -340,6 +363,7 @@ impl From<ModeArg> for bellwether::LookupMode {
             ModeArg::ContainsAny => Self::ContainsAny,
             ModeArg::ContainsAll => Self::ContainsAll,
             ModeArg::Bitemporal => Self::Bitemporal,
+            ModeArg::Semijoin => Self::SemiJoin,
         }
     }
 }
@@ -678,7 +702,7 @@ impl From<Error> for Failure {
                 field:
                     "lookback" | "latest_by" | "signing_key" | "trusted_keys" | "public_key" | "out"
                     | "name" | "valid_from" | "revoked_at" | "index" | "root" | "scratch" | "items"
-                    | "columns" | "text",
+                    | "columns" | "text" | "join",
                 ..
             } => Self::Usage(match hint(&e) {
                 Some(h) => format!("{e}; {h}"),
@@ -761,6 +785,11 @@ fn hint(e: &Error) -> Option<String> {
                 "items" => "--column",
                 "columns" => "--columns",
                 "text" => "--contains, --has, or --prefix",
+                "join" => {
+                    "the right side the join key names (--join <right>.<column>[,<column>...], or \
+                     the right side of a join: key spec): a folder beside the data root, one \
+                     column per key column; why takes --join with --mode semijoin"
+                }
                 _ => return None,
             };
             Some(format!("check {flag}"))
@@ -854,7 +883,7 @@ pub(crate) fn hash(s: &str, what: &str) -> Result<Hash, Failure> {
     })
 }
 
-fn key_file(path: &std::path::Path, key: Option<&Vec<String>>) -> KeyFile {
+pub(crate) fn key_file(path: &std::path::Path, key: Option<&Vec<String>>) -> KeyFile {
     let f = KeyFile::new(path);
     match key {
         Some(c) => f.with_columns(c.clone()),
@@ -863,6 +892,8 @@ fn key_file(path: &std::path::Path, key: Option<&Vec<String>>) -> KeyFile {
 }
 
 /// `index`: the declared specs, built with `--threads` workers when given.
+/// The build committed and a join key could not be rebuilt (B3): the
+/// commit is reported, and the run exits 1 (a check failed).
 fn index(g: &Global, out: &Out, a: &IndexArgs) -> Result<Outcome, Failure> {
     let declared = a
         .keys
@@ -875,7 +906,16 @@ fn index(g: &Global, out: &Out, a: &IndexArgs) -> Result<Outcome, Failure> {
         ..engine_options(g)?
     };
     let r = Engine::open(&a.root.root, options)?.index_declared(&declared)?;
-    done(&r, human::index(&r, out), EXIT_OK)
+    let code = if r
+        .joins
+        .iter()
+        .any(|j| j.state == bellwether::JoinFreshness::NotRebuilt)
+    {
+        EXIT_FAILED
+    } else {
+        EXIT_OK
+    };
+    done(&r, human::index(&r, out), code)
 }
 
 #[allow(clippy::too_many_lines)]
@@ -980,6 +1020,7 @@ fn run(cli: &Cli, out: &Out) -> Result<Outcome, Failure> {
             };
             done(&w, human, code)
         }
+        Command::Join { command } => join_cmds::run(g, out, command),
         Command::Sketch { command } => sketch_cmds::run(g, out, command),
         Command::Keys { command } => keys_cmds::run(g, command),
         Command::Mcp(a) => mcp(g, a),
@@ -1017,6 +1058,7 @@ fn mcp(g: &Global, a: &McpArgs) -> Result<Outcome, Failure> {
         root: a.root.root.clone(),
         engine,
         budget: a.budget.into(),
+        join: a.join.join.clone(),
     };
     // stdout is the protocol channel: nothing else is printed there.
     match bellwether_mcp::serve_stdio(&config) {
@@ -1241,6 +1283,7 @@ fn check_lookback(lookback: Option<&str>) -> Result<(), Failure> {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn why(g: &Global, out: &Out, a: &WhyArgs) -> Result<Outcome, Failure> {
     check_lookback(a.lookback.as_deref())?;
     let window = a
@@ -1268,7 +1311,7 @@ fn why(g: &Global, out: &Out, a: &WhyArgs) -> Result<Outcome, Failure> {
                  --lookback <length>"
             )));
         }
-        if a.from.is_none() {
+        if a.from.is_empty() {
             return Err(Failure::Usage(
                 "--ts with --at and --lookback records the key file's run as that window; pass \
                  --from <keys.parquet>"
@@ -1277,7 +1320,13 @@ fn why(g: &Global, out: &Out, a: &WhyArgs) -> Result<Outcome, Failure> {
         }
     }
     let request = bellwether::WhyRequest {
-        keys: a.from.as_ref().map(|p| key_file(p, a.key.as_ref())),
+        keys: a.from.first().map(|p| key_file(p, a.key.as_ref())),
+        more_keys: a
+            .from
+            .iter()
+            .skip(1)
+            .map(|p| key_file(p, a.key.as_ref()))
+            .collect(),
         bench_workload: a.bench_workload.clone(),
         workload: a
             .workload
@@ -1299,6 +1348,7 @@ fn why(g: &Global, out: &Out, a: &WhyArgs) -> Result<Outcome, Failure> {
         gates: a.gates.clone(),
         sketches_only: a.sketches_only,
         text: why_text(a)?,
+        join: a.join.clone(),
     };
     // Text lookups take none of the lookup-mode flags; the facade refuses
     // them first, with that cause.
@@ -1307,7 +1357,7 @@ fn why(g: &Global, out: &Out, a: &WhyArgs) -> Result<Outcome, Failure> {
     } else {
         bellwether::LookupMode::Locate
     };
-    if mode != bellwether::LookupMode::Locate && a.from.is_none() && a.workload.is_none() {
+    if mode != bellwether::LookupMode::Locate && a.from.is_empty() && a.workload.is_none() {
         return Err(Failure::Usage(if mode.text_op().is_some() {
             format!(
                 "--mode {} prices a key file of one string column's values as a text lookup; \

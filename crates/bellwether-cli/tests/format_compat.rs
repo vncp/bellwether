@@ -726,6 +726,7 @@ fn index_says_what_the_fold_does_and_two_bitemporal_sources_are_picked_by_their_
             ..bellwether::EngineOptions::default()
         },
         budget: bellwether_mcp::Budget::default(),
+        join: None,
     })
     .unwrap();
     let at = |flag: &str| {

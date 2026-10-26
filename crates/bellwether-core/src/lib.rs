@@ -19,6 +19,9 @@
 //!   tokenizers, the residual's row test, and the planning rule.
 //! - [`list`]: list keys (B4), an inverted index over a list column's
 //!   elements, and the `contains_any` / `contains_all` lookups.
+//! - [`join`]: join keys (B3), the keys two datasets share on one column
+//!   pair: the pair build from both sides' exact segments, `semijoin`, and
+//!   `overlap_stats`.
 //!
 //! Invariants owned here: 1 (no false negatives in pruning,
 //! `tests/no_false_negatives.rs`) and 5 (stale-version rejection,
@@ -35,6 +38,7 @@ pub mod bloom;
 pub mod encoding;
 pub mod expr;
 pub mod hll;
+pub mod join;
 pub mod list;
 pub mod merge;
 pub mod segment;

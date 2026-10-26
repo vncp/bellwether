@@ -348,13 +348,15 @@ fn serve(spec: &KeySpec, columns: &[String]) -> Option<Serve> {
     // value as a whole.
     // A bitemporal key's bitmaps hold only the row groups of rows whose
     // valid and known times are both set, so it serves bitemporal lookups
-    // only (`plan_bitemporal`).
+    // only (`plan_bitemporal`). A join key (B3) answers semi-joins between
+    // two datasets only (`Planner::plan_semijoin`), never a lookup on one.
     if matches!(
         spec,
         KeySpec::Text { .. }
             | KeySpec::Expr { .. }
             | KeySpec::List { .. }
             | KeySpec::Bitemporal { .. }
+            | KeySpec::Join { .. }
     ) {
         return None;
     }
@@ -372,12 +374,12 @@ fn serve(spec: &KeySpec, columns: &[String]) -> Option<Serve> {
 
 /// Plans lookups against one pinned manifest version (invariant 4).
 pub struct Planner<S: StoreExt + ?Sized> {
-    snapshot: Snapshot<S>,
-    schema: SchemaRef,
+    pub(crate) snapshot: Snapshot<S>,
+    pub(crate) schema: SchemaRef,
     kind: SourceKind,
     policy: FingerprintPolicy,
     parquet: Option<ParquetSource<LocalFs>>,
-    locator: Locator,
+    pub(crate) locator: Locator,
     verified: Mutex<BTreeSet<usize>>,
     footers: AtomicU64,
 }
@@ -2685,7 +2687,7 @@ impl<S: StoreExt + ?Sized> Planner<S> {
 
     // -- the plan --------------------------------------------------------------
 
-    fn finish(&self, selected: &RoaringBitmap, residual: Predicate) -> Result<ScanPlan> {
+    pub(crate) fn finish(&self, selected: &RoaringBitmap, residual: Predicate) -> Result<ScanPlan> {
         self.locator.check_known(selected)?;
         let live = selected & self.locator.live();
         let mut per_file: BTreeMap<usize, RoaringBitmap> = BTreeMap::new();

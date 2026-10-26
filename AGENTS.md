@@ -78,7 +78,7 @@ already holds.
 
 | Tier | Tool | Writes |
 |---|---|---|
-| observe | `observe.why` (no keys), `observe.cardinality`, `observe.overlap`, `observe.profile`, `observe.locate`, `observe.asof`, `observe.text` | Evidence and cache entries only |
+| observe | `observe.why` (no keys), `observe.cardinality`, `observe.overlap`, `observe.profile`, `observe.locate`, `observe.asof`, `observe.text`, `observe.semijoin`, `observe.join_overlap`, `observe.join_verify` | Evidence and cache entries only |
 | score (engine-scored) | `score.why` (with keys, a workload, or `text` lookups), `score.verify`, `score.record` (keys from the query engine, with `--twin-of`) | engine Proposals, Replays, plan Evidence, Certificates; `score.record` a workload in the cache |
 | propose | `propose.key`, `propose.layout`, `propose.rewrite` | one Proposal, or nothing with `dry_run` |
 | apply | `apply.receipt` | Replay, the index commit, Receipt; nothing with `dry_run` or on a refusal, unless another commit lands during the apply (`concurrent_commit`: the key is built, the receipt withheld) |
@@ -153,6 +153,8 @@ line. No refusal is prose only.
 | `caller_supplied_cost` | The arguments carried a score, cost, measurement, replay, prediction, verdict, or certificate field (`fields.field`). The engine measures, verifies, and attests on its own; remove the field and call again. |
 | `measurement_refused` | A query engine's log entry for one run cannot stand as its measurement; `fields.reason` says why: `cache_served` (the query text turned a cache on), `statistics_missing`, `not_the_query_submitted` or `ambiguous_log_entry` (another client ran under the run's tag), `tag_mismatch`, or `result_rows_differ` (the rows the run returned are not the rows it exported). Nothing was recorded. For `cache_served`, propose the rewrite again without those settings. |
 | `measurement_changed` | `apply.receipt` measured a rewrite of engine queries again, in the state certified, and a query's rows read, bytes read, or result rows disagree with the certified replay's (`fields.pair`, `fields.side`, `fields.certified`, `fields.measured`). Nothing was written. Do not apply; verify the proposal again. |
+| `stale_join` | A join key's pair index (B3) is stale: the data folder's row groups changed (`fields.side` is `left`) or the right dataset committed again (`right`) since it was built; `fields.spec`, `fields.pinned`, `fields.current`. Nothing was planned. Ask the human to run `bellwether index` on the data folder, which rebuilds it, then call the tool again. |
+| `join_not_served` | A join key (B3) names a right dataset this server does not serve: the server reads only the right side the human gave with `--join` (`fields.served`, `<right>.<columns>`; null when it was started without `--join`). Refused by `propose.key`, `score.verify`, `apply.receipt`, and `score.why` before any folder is read, so the refusal is the same whether a folder of the name asked exists, is indexed, or not. Use the join key on `fields.served`, or ask the human to restart the server with `--join <right>.<columns>`. |
 
 ## What you may never do
 

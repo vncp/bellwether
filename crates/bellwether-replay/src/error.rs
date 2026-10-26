@@ -25,9 +25,9 @@ pub enum ReplayError {
     /// A proposed key spec serves none of the workload's runs, so scoring it
     /// would report "no change" for a spec that was never applicable.
     #[error(
-        "proposed spec {spec} serves none of the workload's runs (their key columns: {}); \
-         propose a key on the columns the runs look up",
-        .run_columns.iter().map(|c| c.join(",")).collect::<Vec<_>>().join("; ")
+        "proposed spec {spec} serves none of the workload's runs, which look up {}; propose a \
+         key on the columns a run looks up",
+        column_sets(run_columns)
     )]
     SpecServesNoRun {
         /// The proposed spec's name.
@@ -92,6 +92,17 @@ pub enum ReplayError {
 /// Result alias for operations that return [`ReplayError`].
 pub type ReplayResult<T> = std::result::Result<T, ReplayError>;
 
+/// Key-column sets in words: `(order_id)` or `(a, b) and (c)`.
+fn column_sets(sets: &[Vec<String>]) -> String {
+    if sets.is_empty() {
+        return "no key columns".into();
+    }
+    sets.iter()
+        .map(|s| format!("({})", s.join(", ")))
+        .collect::<Vec<_>>()
+        .join(" and ")
+}
+
 impl From<ReplayError> for Error {
     fn from(e: ReplayError) -> Self {
         let msg = e.to_string();
@@ -126,14 +137,6 @@ mod tests {
             }),
             Error::KeySpec(_)
         ));
-        // Plain text, never Debug: each run's columns comma-joined.
-        let m = ReplayError::SpecServesNoRun {
-            spec: "exact:x".into(),
-            run_columns: vec![vec!["a".into(), "b".into()], vec!["c".into()]],
-        }
-        .to_string();
-        assert!(m.contains("(their key columns: a,b; c)"), "{m}");
-        assert!(!m.contains('"') && !m.contains('['), "{m}");
         assert!(matches!(
             Error::from(ReplayError::BenchMismatch {
                 run_id: Some("r".into()),
@@ -145,5 +148,15 @@ mod tests {
             Error::from(ReplayError::Engine(Error::NotFound(Hash::of(b"x")))),
             Error::NotFound(_)
         ));
+        // Review of PR #32, item 7h: the run columns in words, never Debug.
+        let e = ReplayError::SpecServesNoRun {
+            spec: "exact:x".into(),
+            run_columns: vec![vec!["order_id".into()], vec!["a".into(), "b".into()]],
+        };
+        assert_eq!(
+            e.to_string(),
+            "proposed spec exact:x serves none of the workload's runs, which look up (order_id) \
+             and (a, b); propose a key on the columns a run looks up"
+        );
     }
 }

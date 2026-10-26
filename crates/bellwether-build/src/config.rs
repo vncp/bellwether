@@ -310,6 +310,18 @@ impl Default for BuildOptions {
     }
 }
 
+impl BuildOptions {
+    /// The caps a join key's pair segments (B3) are split at: this build's
+    /// `max_segment_keys` shared keys and `max_segment_bytes` bytes.
+    #[must_use]
+    pub fn pair_caps(&self) -> bellwether_core::join::PairCaps {
+        bellwether_core::join::PairCaps {
+            max_keys: self.max_segment_keys,
+            max_bytes: self.max_segment_bytes,
+        }
+    }
+}
+
 impl fmt::Debug for BuildOptions {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("BuildOptions")

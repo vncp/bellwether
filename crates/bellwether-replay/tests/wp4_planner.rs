@@ -254,7 +254,8 @@ fn committed_and_transient_segments_plan_identically_through_wp4_and_this_crate(
                     | RunQuery::Text(_)
                     | RunQuery::ContainsAny
                     | RunQuery::ContainsAll
-                    | RunQuery::Bitemporal(_) => unreachable!(),
+                    | RunQuery::Bitemporal(_)
+                    | RunQuery::SemiJoin(_) => unreachable!(),
                 };
                 let build_plan = planner.plan(config, &lookup).unwrap();
                 let committed = PlanSource::plan_query(&planner, config, &rk, &query).unwrap();

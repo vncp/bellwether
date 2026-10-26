@@ -97,12 +97,17 @@ impl<S: StoreExt + ?Sized> Builder<S> {
     /// different key types are refused rather than merged. A merge whose
     /// inputs a concurrent commit already dropped is skipped. Coverage is
     /// unchanged, so completeness is kept.
+    #[allow(clippy::too_many_lines)]
     pub fn compact(&self, options: &CompactOptions) -> Result<CompactReport> {
         let snapshot = Snapshot::open(Arc::clone(self.store()), self.index_root())?;
         let m = snapshot.manifest();
         let schema = columns_to_schema(&m.schema.columns)?;
         let mut groups = Vec::new();
         for spec in &m.schema.key_specs {
+            // A join key (B3) is one segment, rebuilt whole; never merged.
+            if matches!(spec, KeySpec::Join { .. }) {
+                continue;
+            }
             let name = spec.identity();
             let mut segs: Vec<&SegmentRef> = m
                 .segments
@@ -157,6 +162,7 @@ impl<S: StoreExt + ?Sized> Builder<S> {
                     rowgroup_range: RowGroupRange::new(start, end),
                     bytes,
                     kind: None,
+                    join: None,
                     extra: Extra::new(),
                 },
             });
@@ -248,6 +254,7 @@ mod tests {
             rowgroup_range: RowGroupRange::new(start, end),
             bytes,
             kind: None,
+            join: None,
             extra: Extra::new(),
         }
     }

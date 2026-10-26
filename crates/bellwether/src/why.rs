@@ -14,7 +14,7 @@ use bellwether_profile::lints::MembershipUse;
 use bellwether_profile::{ProfileOptions, ProfileReport};
 use bellwether_replay::{
     proposed_specs, record_bench_workload, servable, serves_query, Baseline, KeyInput, Lookup,
-    RecordedRun, Replayer, RunBitemporal, RunQuery, RunWindow, Workload, WorkloadRecorder,
+    RecordedRun, Replayer, RunBitemporal, RunJoin, RunQuery, RunWindow, Workload, WorkloadRecorder,
     QUERY_KIND_LOCATE,
 };
 use bellwether_store::{Cache, ObjectStoreBackend, StoreExt};
@@ -94,12 +94,18 @@ pub enum LookupMode {
     /// (`bellwether asof --valid --known`), priced against
     /// `temporal2:<key>@<valid_by>,<known_by>`.
     Bitemporal,
+    /// The rows of the data root (the left dataset) and of the right
+    /// dataset named by [`WhyRequest::join`] whose key the other also holds
+    /// (B3: a semi-join, `in (subquery)`, `exists`; `bellwether join
+    /// semijoin`), priced as two steps.
+    #[serde(rename = "semijoin")]
+    SemiJoin,
 }
 
 impl LookupMode {
     /// The CLI spelling: `locate`, `latest`, `asof`, `contains`,
-    /// `has-token`, `has-prefix`, `contains-any`, `contains-all`, or
-    /// `bitemporal`.
+    /// `has-token`, `has-prefix`, `contains-any`, `contains-all`,
+    /// `bitemporal`, or `semijoin`.
     #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
@@ -112,6 +118,7 @@ impl LookupMode {
             Self::ContainsAny => "contains-any",
             Self::ContainsAll => "contains-all",
             Self::Bitemporal => "bitemporal",
+            Self::SemiJoin => "semijoin",
         }
     }
 
@@ -128,7 +135,8 @@ impl LookupMode {
             | Self::Asof
             | Self::ContainsAny
             | Self::ContainsAll
-            | Self::Bitemporal => None,
+            | Self::Bitemporal
+            | Self::SemiJoin => None,
         }
     }
 
@@ -165,6 +173,11 @@ pub struct WhyRequest {
     /// The keys one run looked up, as a key file. Recorded as a one-run
     /// workload (run id `keys`).
     pub keys: Option<KeyFile>,
+    /// With `keys`: further key files, each recorded as one more run of the
+    /// same lookup (run ids `keys-2`, `keys-3`, ...): several runs of one
+    /// query, so a detector that reads repetition (`R-join-1`) sees it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub more_keys: Vec<KeyFile>,
     /// A recorded workload in the benchmark's format (a directory holding
     /// `workload.json`, or the file itself).
     pub bench_workload: Option<PathBuf>,
@@ -261,12 +274,21 @@ pub struct WhyRequest {
     /// file or a workload, and with no `mode`.
     #[serde(default)]
     pub text: Vec<TextQuery>,
+    /// With `mode` `semijoin` (B3): the right dataset and its join columns,
+    /// `<right>.<column>[,<column>...]` (`payables.order_id`), pairwise with
+    /// the key file's columns. The right dataset is the folder of that name
+    /// beside the data root, read through its own index; the candidate is
+    /// the join key on the pair, priced from both datasets' complete exact
+    /// keys (a missing one is refused, never guessed).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub join: Option<String>,
 }
 
 impl Default for WhyRequest {
     fn default() -> Self {
         Self {
             keys: None,
+            more_keys: Vec::new(),
             bench_workload: None,
             workload: None,
             mode: None,
@@ -284,6 +306,7 @@ impl Default for WhyRequest {
             gates: Vec::new(),
             sketches_only: false,
             text: Vec::new(),
+            join: None,
         }
     }
 }
@@ -327,6 +350,12 @@ impl WhyRequest {
         } else {
             LookupMode::Locate
         };
+        if self.join.is_some() && self.mode != Some(LookupMode::SemiJoin) {
+            return Err(
+                "--join names the right dataset of a semi-join; pass --mode semijoin with it"
+                    .into(),
+            );
+        }
         let Some(mode) = self.mode else {
             return match inferred {
                 LookupMode::Asof if self.latest_by.is_none() => Err(
@@ -343,6 +372,24 @@ impl WhyRequest {
             };
         };
         match mode {
+            LookupMode::SemiJoin if self.join.is_none() => Err(
+                "--mode semijoin prices the keys on both datasets of a semi-join; name the right \
+                 dataset and its columns with --join <right>.<column> (a folder beside the data \
+                 root)"
+                    .into(),
+            ),
+            LookupMode::SemiJoin
+                if self.latest_by.is_some()
+                    || self.at.is_some()
+                    || self.lookback.is_some()
+                    || self.window.is_some() =>
+            {
+                Err(
+                    "--mode semijoin prices the rows each dataset keeps for the keys and takes no \
+                     --latest-by, --at, --lookback, or --window; drop them"
+                        .into(),
+                )
+            }
             LookupMode::Contains | LookupMode::HasToken | LookupMode::HasPrefix
             | LookupMode::ContainsAny
             | LookupMode::ContainsAll
@@ -839,7 +886,8 @@ impl Engine {
     /// [`LAYOUT_BOUND_FRACTION`] of the row groups the runs span (it names
     /// the lowest-fanout measured column); else the highest-confidence
     /// `batch_stamp_key` or `low_selectivity_single_column` lint on a column
-    /// the workload or a current spec uses; else, with a workload, its key
+    /// the workload or a current spec uses (never for a semi-join workload,
+    /// which a join key serves or none does); else, with a workload, its key
     /// columns when no current spec serves them, or the serving current
     /// spec's columns; each with its measured fanout.
     ///
@@ -861,6 +909,7 @@ impl Engine {
     #[allow(clippy::too_many_lines)]
     fn why_inner(&self, req: &WhyRequest) -> Result<WhyReport> {
         let has_workload = self.check_why_request(req)?;
+        self.check_why_scope(req)?;
         let pinned = self.pin()?;
         if req.sketches_only {
             return self.why_from_sketches(req, pinned.as_ref());
@@ -883,7 +932,14 @@ impl Engine {
         let source: &dyn bellwether_types::Source = &counting;
         let sequence = pinned.as_ref().map_or(0, Pinned::sequence);
         let current_specs = pinned.as_ref().map(|p| p.specs().0).unwrap_or_default();
+        // A semi-join (B3) is priced on both datasets: the right one's
+        // replayer and the candidate join key's transient pair index.
+        let why_pair = self.why_pair(req, pinned.as_ref())?;
         let replayer = crate::fix::replayer(self, source, pinned.as_ref())?;
+        let replayer = match &why_pair {
+            Some(p) => replayer.with_pair(p.input()?),
+            None => replayer,
+        };
         let resolved_temporal = resolve_temporal(req, replayer.schema())?;
         let catalog = replayer.catalog();
         let indexed_row_groups = catalog.len() as u64;
@@ -957,10 +1013,25 @@ impl Engine {
         // The list-membership detector (B4) likewise, citing the key set or
         // workload it read.
         let membership = self.membership_lints(req, &replayer, &current_specs)?;
+        // The repeated semi-join detector (B3) likewise, citing the
+        // workload it read.
+        let join_lints = match &recorded {
+            Some((w, _)) => bellwether_profile::lints::repeated_semijoins(
+                &semijoin_uses(w, &self.cache()?)?,
+                &crate::join::folder_name(self.root()),
+                &current_specs,
+            ),
+            None => Vec::new(),
+        };
+        let join_input = match &recorded {
+            Some((w, _)) if !join_lints.is_empty() && text_input.is_none() => Some(w.hash()),
+            _ => None,
+        };
         let mut extra_lints = sketch_lints;
         extra_lints.extend(text_lints);
         extra_lints.extend(membership.lints);
-        let mut cites: Vec<Hash> = text_input.into_iter().collect();
+        extra_lints.extend(join_lints);
+        let mut cites: Vec<Hash> = text_input.into_iter().chain(join_input).collect();
         cites.extend(membership.inputs);
         let (profile, evidence) = self.profile(
             req,
@@ -1461,8 +1532,31 @@ impl Engine {
         })
     }
 
+    /// Refuses a semi-join `why` (B3) that names, or whose recorded
+    /// workload's runs name, a right dataset this engine does not serve
+    /// ([`crate::EngineOptions::join_scope`]), before anything else is read.
+    fn check_why_scope(&self, req: &WhyRequest) -> Result<()> {
+        if self.options().join_scope == crate::JoinScope::Any {
+            return Ok(());
+        }
+        if let Some(side) = &req.join {
+            let (right, columns) = crate::spec::parse_join_side(side)?;
+            self.check_right_side(&right, &columns)?;
+        }
+        if let Some(h) = &req.workload {
+            let w = crate::fix::load_workload(self, &self.cache()?, h)?;
+            for run in w.runs() {
+                if let Some(j) = run.query()?.join() {
+                    self.check_right_side(&j.right, &j.right_columns)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Refuses a `why` request whose flags contradict each other, before any
     /// work. Returns whether it carries a workload.
+    #[allow(clippy::too_many_lines)]
     fn check_why_request(&self, req: &WhyRequest) -> Result<bool> {
         let given = [
             req.keys.is_some(),
@@ -1470,6 +1564,14 @@ impl Engine {
             req.workload.is_some(),
             !req.text.is_empty(),
         ];
+        if !req.more_keys.is_empty() && req.keys.is_none() {
+            return Err(Error::InvalidArgument {
+                field: "more_keys",
+                reason: "further key files are more runs of the first; give the first as the key \
+                         file (--from) too"
+                    .into(),
+            });
+        }
         if given.iter().filter(|g| **g).count() > 1 {
             return Err(Error::InvalidArgument {
                 field: "workload",
@@ -1499,8 +1601,27 @@ impl Engine {
             });
         }
         self.check_text_request(req)?;
-        let mode = req.lookup_mode().map_err(Error::KeySpec)?;
+        // A semi-join's flags given wrong are the caller's to fix.
+        let join_flags = |reason: String| Error::InvalidArgument {
+            field: "join",
+            reason,
+        };
+        let mode = req.lookup_mode().map_err(|reason| {
+            if req.join.is_some() || req.mode == Some(LookupMode::SemiJoin) {
+                join_flags(reason)
+            } else {
+                Error::KeySpec(reason)
+            }
+        })?;
         check_values_given(req, mode)?;
+        if mode == LookupMode::SemiJoin && !(given[0] || given[2]) {
+            return Err(join_flags(
+                "--mode semijoin prices a key file on the left dataset's join columns, recorded \
+                 as one semi-join run; pass --from <keys.parquet> (or --workload <hash> of \
+                 semi-join runs)"
+                    .into(),
+            ));
+        }
         if req.window.is_some() && !(given[0] || given[1]) {
             return Err(Error::Other(
                 "a window (--window) applies to the runs why records: give a key file (--from) or \
@@ -1706,6 +1827,7 @@ impl Engine {
         Ok((profile, out))
     }
 
+    #[allow(clippy::too_many_lines)]
     fn record_workload(
         &self,
         req: &WhyRequest,
@@ -1742,6 +1864,40 @@ impl Engine {
                     check_value_runs(h, &w, req.mode)?;
                     None
                 }
+                None if req.mode == Some(LookupMode::SemiJoin) => {
+                    let want = semijoin_query(req)?;
+                    if let Some(r) = w.runs().iter().find(|r| r.query().ok() != want) {
+                        return Err(Error::InvalidArgument {
+                            field: "join",
+                            reason: format!(
+                                "workload {h} records run {:?} as a {} lookup, and --mode \
+                                 semijoin --join {} asks for semi-joins with that right side; \
+                                 drop --mode and --join to price it as recorded, or record the \
+                                 keys again with `bellwether why --from <keys.parquet> --mode \
+                                 semijoin --join {}`",
+                                r.run_id,
+                                describe(&r.query()?),
+                                req.join.as_deref().unwrap_or_default(),
+                                req.join.as_deref().unwrap_or_default()
+                            ),
+                        });
+                    }
+                    None
+                }
+                None if w
+                    .runs()
+                    .iter()
+                    .any(|r| r.query().is_ok_and(|q| q.join().is_some())) =>
+                {
+                    return Err(Error::InvalidArgument {
+                        field: "join",
+                        reason: format!(
+                            "workload {h} records semi-join runs, which are priced on both \
+                             datasets; pass --mode semijoin --join <right>.<columns> with the \
+                             right side they record"
+                        ),
+                    });
+                }
                 None if req.mode == Some(LookupMode::Locate) => {
                     if let Some(r) = w
                         .runs()
@@ -1762,34 +1918,47 @@ impl Engine {
             return Ok((w, temporal));
         }
         let recorder = WorkloadRecorder::new(cache, std::sync::Arc::clone(replayer.schema()));
-        if let Some(keys) = &req.keys {
-            let batch = keys.read()?;
+        if let Some(first) = &req.keys {
+            let files: Vec<&KeyFile> = std::iter::once(first).chain(&req.more_keys).collect();
+            let batches = files.iter().map(|k| k.read()).collect::<Result<Vec<_>>>()?;
             if let Some(t) = &resolved {
-                for f in batch.schema().fields() {
-                    if let Some((flag, c)) =
-                        t.time_columns().into_iter().find(|(_, c)| f.name() == c)
-                    {
-                        return Err(Error::KeySpec(format!(
-                            "{flag} column {c:?} is also a key column of the lookup; give a \
-                             separate time column or select key columns with --key"
-                        )));
+                for batch in &batches {
+                    for f in batch.schema().fields() {
+                        if let Some((flag, c)) =
+                            t.time_columns().into_iter().find(|(_, c)| f.name() == c)
+                        {
+                            return Err(Error::KeySpec(format!(
+                                "{flag} column {c:?} is also a key column of the lookup; give a \
+                                 separate time column or select key columns with --key"
+                            )));
+                        }
                     }
                 }
             }
-            let columns: Vec<String> = batch
+            let columns: Vec<String> = batches[0]
                 .schema()
                 .fields()
                 .iter()
                 .map(|f| f.name().clone())
                 .collect();
             let mut recorder = self.windowed(recorder, req, pinned, replayer, &columns)?;
-            let query = match req.mode.and_then(LookupMode::value_query) {
-                Some(q) => q,
-                None => resolved
+            let query = match (
+                req.mode.and_then(LookupMode::value_query),
+                semijoin_query(req)?,
+            ) {
+                (Some(q), _) | (None, Some(q)) => q,
+                (None, None) => resolved
                     .as_ref()
                     .map_or(RunQuery::Locate, |t| t.query.clone()),
             };
-            recorder.record_query("keys", KeyInput::Batch(&batch), query, None)?;
+            for (i, batch) in batches.iter().enumerate() {
+                let id = if i == 0 {
+                    "keys".to_string()
+                } else {
+                    format!("keys-{}", i + 1)
+                };
+                recorder.record_query(&id, KeyInput::Batch(batch), query.clone(), None)?;
+            }
             return Ok((recorder.finish()?, resolved));
         }
         if !req.text.is_empty() {
@@ -1940,6 +2109,20 @@ impl Engine {
             )));
         }
         let membership = membership > 0;
+        // A semi-join workload (B3) is priced on the join key of its pair
+        // alone: the right side its runs record (one right side, since the
+        // pair attached is one right dataset).
+        let joined: BTreeSet<&RunJoin> = queries.iter().filter_map(RunQuery::join).collect();
+        if !joined.is_empty() && (joined.len() > 1 || queries.iter().any(|q| q.join().is_none())) {
+            return Err(Error::KeySpec(format!(
+                "workload {} mixes semi-join runs of {} right side(s) with {} other lookups; a \
+                 join key serves the semi-joins of one pair, so record each as its own workload",
+                workload.hash(),
+                joined.len(),
+                queries.iter().filter(|q| q.join().is_none()).count()
+            )));
+        }
+        let semijoin = joined.into_iter().next().cloned();
         let mut windows: Vec<RunWindow> = Vec::new();
         for w in workload.runs().iter().filter_map(|r| r.window.as_ref()) {
             if !windows.contains(w) {
@@ -1984,7 +2167,11 @@ impl Engine {
             }),
             _ => None,
         };
-        let run_kind = text_kind.or(membership_kind);
+        let semijoin_kind = semijoin.as_ref().map(|j| LookupKind::SemiJoin {
+            right: j.right.clone(),
+            right_columns: j.right_columns.clone(),
+        });
+        let run_kind = text_kind.or(membership_kind).or(semijoin_kind);
         let query_kind = if text {
             let kinds: BTreeSet<&str> = queries.iter().map(RunQuery::kind_str).collect();
             kinds.into_iter().collect::<Vec<_>>().join(",")
@@ -2053,6 +2240,14 @@ impl Engine {
             Vec::new()
         } else if text {
             crate::text::floor_keys(workload)?
+        } else if let Some(j) = &semijoin {
+            // A semi-join run's floor is the join key on its pair (B3): an
+            // exact key on either side locates every asked key, held by the
+            // other side or not.
+            run_columns
+                .iter()
+                .map(|c| crate::join::join_key(self.root(), c, j))
+                .collect()
         } else if membership {
             // A membership run's floor is the list key on its one column
             // (B4); an exact key cannot look a list's elements up.
@@ -2165,7 +2360,7 @@ impl Engine {
                 counts: false,
                 bounds: None,
             };
-            if text || membership || bitemporal || !serves(&exact_spec) {
+            if text || membership || bitemporal || semijoin.is_some() || !serves(&exact_spec) {
                 if !current_names.contains(&label(&exact_spec))
                     && !names.contains(&label(&exact_spec))
                 {
@@ -2284,6 +2479,11 @@ impl Engine {
                 )?),
                 // a list key's column: its distinct elements (B4)
                 KeySpec::List { .. } => Some(list_column(replayer, &spec)?),
+                // a join key's column: the asked keys both datasets hold and
+                // the right row groups per shared key (B3)
+                KeySpec::Join { .. } => Some(crate::join::join_column(
+                    replayer, &spec, workload, cache, &req.gates,
+                )?),
                 _ => match expr_column(replayer, &spec)? {
                     Some(c) => Some(c),
                     None => match sketch_column(&report.sketch, spec.columns()) {
@@ -2378,6 +2578,10 @@ impl Engine {
             .filter(|r| {
                 let query = match (temporal, r.query()) {
                     (Some(t), Ok(RunQuery::Locate)) => t.query.clone(),
+                    // A semi-join (B3) is priced only with an exact key on
+                    // each side (the pair index needs both), so each step
+                    // is served without a join key too.
+                    (_, Ok(RunQuery::SemiJoin(_))) => return false,
                     (_, Ok(q)) => q,
                     (_, Err(_)) => return true,
                 };
@@ -2541,6 +2745,49 @@ fn queried_spread(
         sample_size: None,
         quantile_error: None,
     }))
+}
+
+/// The semi-join runs of `w` per column pair (B3), for `R-join-1`.
+fn semijoin_uses(
+    w: &Workload,
+    cache: &Cache<ObjectStoreBackend>,
+) -> Result<Vec<bellwether_profile::lints::SemiJoinUse>> {
+    let mut by: BTreeMap<(Vec<String>, RunJoin), (u64, u64)> = BTreeMap::new();
+    for r in w.runs() {
+        if let Ok(RunQuery::SemiJoin(j)) = r.query() {
+            let keys = w.run_keys(cache, r)?.len() as u64;
+            let e = by.entry((r.columns.clone(), j)).or_default();
+            e.0 += 1;
+            e.1 = e.1.max(keys);
+        }
+    }
+    Ok(by
+        .into_iter()
+        .map(
+            |((columns, j), (runs, keys_max))| bellwether_profile::lints::SemiJoinUse {
+                columns,
+                right: j.right,
+                right_columns: j.right_columns,
+                runs,
+                keys_max,
+            },
+        )
+        .collect())
+}
+
+/// The semi-join run a `semijoin` request records (B3): its right side
+/// from [`WhyRequest::join`]. `None` for another mode.
+fn semijoin_query(req: &WhyRequest) -> Result<Option<RunQuery>> {
+    match (req.mode, &req.join) {
+        (Some(LookupMode::SemiJoin), Some(j)) => {
+            let (right, right_columns) = crate::spec::parse_join_side(j)?;
+            Ok(Some(RunQuery::SemiJoin(RunJoin {
+                right,
+                right_columns,
+            })))
+        }
+        _ => Ok(None),
+    }
 }
 
 /// Refuses a text (B5) or membership (B4) `mode` without the values it
@@ -2801,9 +3048,17 @@ fn culprit(
     if let Some(w) = workload {
         used.extend(w.runs().iter().flat_map(|r| r.columns.iter()));
     }
+    // A semi-join workload (B3) is served by a join key or by none: a key
+    // lint on one of its columns (a single column that prunes little) is
+    // not why its two steps read what they read.
+    let semijoin = workload
+        .and_then(|w| w.runs().first())
+        .and_then(|r| r.query().ok())
+        .is_some_and(|q| q.join().is_some());
     let lint = profile
         .lints
         .iter()
+        .filter(|_| !semijoin)
         .filter_map(|l| {
             let rank = CULPRIT_RULES.iter().position(|r| *r == l.rule)?;
             l.columns

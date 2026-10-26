@@ -233,6 +233,9 @@ pub struct SegmentReader<R> {
     entries: u64,
     rg: Option<(RowGroupId, RowGroupId)>,
     pub(crate) index: Index,
+    /// A join segment's one-sided key counts (`left_only`, `right_only`),
+    /// from the end of its index; `None` for every other layout.
+    pub(crate) join_totals: Option<(u64, u64)>,
 }
 
 impl<R: ReadAt> SegmentReader<R> {
@@ -292,7 +295,7 @@ impl<R: ReadAt> SegmentReader<R> {
         let blocks = claimed as usize;
         let reserve = |min_entry| reserve_hint(u64::from(claimed), index_len as u64, min_entry);
         let index = match header.layout {
-            Layout::Keyed | Layout::KeyedTemporal | Layout::Bitemporal => {
+            Layout::Keyed | Layout::KeyedTemporal | Layout::KeyedJoin | Layout::Bitemporal => {
                 let mut v = Vec::with_capacity(reserve(MIN_KEYED_ENTRY));
                 for _ in 0..blocks {
                     v.push(KeyedBlock {
@@ -337,6 +340,11 @@ impl<R: ReadAt> SegmentReader<R> {
                 Index::Range(v)
             }
         };
+        let join_totals = if header.layout == Layout::KeyedJoin {
+            Some((c.u64()?, c.u64()?))
+        } else {
+            None
+        };
         if !c.is_done() {
             return Err(corrupt("index trailing bytes"));
         }
@@ -346,6 +354,7 @@ impl<R: ReadAt> SegmentReader<R> {
             entries,
             rg: has_rg.then_some((RowGroupId(lo), RowGroupId(hi))),
             index,
+            join_totals,
         })
     }
 
@@ -491,13 +500,24 @@ impl<R: ReadAt> SegmentReader<R> {
     }
 
     pub(crate) fn value_at(&self, view: &BlockView<'_>, i: usize) -> Result<KeyValue> {
-        let (off, len, sum) = view.value_ref(i);
-        let bytes = verified(self.src.read_at(off, len)?, sum, "value record")?;
+        if self.header.layout == Layout::KeyedJoin {
+            return Err(Error::KeySpec(format!(
+                "{} holds a pair of values per key; read it through bellwether_core::join",
+                self.header.key_spec.name()
+            )));
+        }
+        let bytes = self.value_bytes(view, i)?;
         KeyValue::decode(
             &bytes,
             ValueShape::of(&self.header.key_spec, self.header.layout),
             self.header.storage_version,
         )
+    }
+
+    /// The checked bytes of value record `i` of a block.
+    pub(crate) fn value_bytes(&self, view: &BlockView<'_>, i: usize) -> Result<Cow<'_, [u8]>> {
+        let (off, len, sum) = view.value_ref(i);
+        verified(self.src.read_at(off, len)?, sum, "value record")
     }
 
     pub(crate) fn bloom_bitset(&self, e: &BloomEntry) -> Result<Cow<'_, [u8]>> {
@@ -646,6 +666,22 @@ impl<R: ReadAt> SegmentReader<R> {
         keys: &[K],
         mut f: impl FnMut(&[u8], KeyValue),
     ) -> Result<()> {
+        self.visit_found(keys, |key, view, idx| {
+            f(key, self.value_at(view, idx)?);
+            Ok(())
+        })
+    }
+
+    /// Visits each distinct key of `keys` present in a keyed segment (any
+    /// keyed layout, the join layout included), in ascending order, with
+    /// its block's directory and its position there. Per key: block-index
+    /// binary search, bloom check, key binary search. A probe tuple that
+    /// contains a null matches nothing (ADR 014).
+    pub(crate) fn visit_found<K: AsRef<[u8]>>(
+        &self,
+        keys: &[K],
+        mut f: impl FnMut(&[u8], &BlockView<'_>, usize) -> Result<()>,
+    ) -> Result<()> {
         let Index::Keyed(blocks) = &self.index else {
             return Err(Error::KeySpec(format!(
                 "{} segments have no per-key values",
@@ -683,7 +719,7 @@ impl<R: ReadAt> SegmentReader<R> {
             };
             let view = BlockView::parse(body, b.n, self.checked())?;
             if let Some(idx) = view.find(key)? {
-                f(key, self.value_at(&view, idx)?);
+                f(key, &view, idx)?;
             }
         }
         Ok(())

@@ -372,3 +372,7 @@ The contract v3 backlog in `docs/contract-v3.md` tracks this:
 - **Rewrite proposals.** This crate defines no replay for them (backlog #2).
 
 Contract v2.1 closed two gaps: the layout model, through `Replay.model`, and unindexed data identity, through `Replay.inputs`.
+
+## Semi-join runs (B3)
+
+A run recorded with `RunQuery::SemiJoin(RunJoin { right, right_columns })` (`query_kind` `semijoin`, `RecordedRun.join`) semi-joins its keys, values of the run's columns in the data root (the left dataset), with the right dataset, the folder `right` beside the root. A replayer prices it only with the right side attached (`Replayer::with_pair(PairInput)`: the right dataset's own replayer and, per join key priced, its transient pair index from `bellwether_build::transient_pair`). Under a configuration holding the join key on the run's pair, each step reads the row groups holding a key both datasets hold, as `Planner::plan_semijoin` plans (`semijoin_plans`; `tests/join.rs` checks predicted equals planned side by side, with and without counts); under any other, each step is a locate of the keys by that side's own keys, and a side no key serves is priced by its files' statistics. A run's cost is the sum of its steps (`pair_cost`), and a Replay of a semi-join workload cites both catalogs. A missing right side, another right dataset, or a join key with no pair index is refused.

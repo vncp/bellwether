@@ -128,6 +128,9 @@ pub struct Replayer<'a> {
     /// Embedded bloom filters read pricing unserved runs, for
     /// [`Replayer::bloom_filters_read`].
     filters_read: AtomicU64,
+    /// The right dataset semi-join runs are priced with (B3), when given
+    /// ([`Replayer::with_pair`]).
+    pub(crate) pair: Option<Box<crate::join::PairInput<'a>>>,
 }
 
 impl std::fmt::Debug for Replayer<'_> {
@@ -177,6 +180,7 @@ impl<'a> Replayer<'a> {
             cache: TransientCache::new(DEFAULT_CACHE_BYTES),
             unserved: Baseline::RawScan,
             filters_read: AtomicU64::new(0),
+            pair: None,
         })
     }
 
@@ -265,6 +269,12 @@ impl<'a> Replayer<'a> {
         self
     }
 
+    /// The fingerprint policy embedded filters are verified under.
+    #[must_use]
+    pub(crate) fn fingerprint_policy(&self) -> FingerprintPolicy {
+        self.policy
+    }
+
     /// The baseline unserved runs are priced under.
     #[must_use]
     pub fn unserved(&self) -> Baseline {
@@ -318,11 +328,16 @@ impl<'a> Replayer<'a> {
 
     /// The planner for `specs`: the base planner plus transient segments for
     /// every spec it does not have.
-    fn planner_for(&self, specs: &[KeySpec]) -> Result<Box<dyn PlanSource + '_>> {
+    pub(crate) fn planner_for(&self, specs: &[KeySpec]) -> Result<Box<dyn PlanSource + '_>> {
         check_configuration(specs)?;
         let have = self.planner.specs();
         let mut extra: Vec<Arc<TransientIndex>> = Vec::new();
         for spec in specs {
+            // A join key (B3) is priced from its pair index, never built
+            // as a one-dataset transient (`crate::join`).
+            if matches!(spec, KeySpec::Join { .. }) {
+                continue;
+            }
             if !have.contains(spec) && !extra.iter().any(|t| t.spec() == spec) {
                 extra.push(self.transient(spec)?);
             }
@@ -346,7 +361,7 @@ impl<'a> Replayer<'a> {
     /// configuration that plans it on another column gets the window
     /// converted to that column's unit ([`converted_lookback_window`]), or,
     /// when the units do not convert, no window.
-    fn verified_plan(
+    pub(crate) fn verified_plan(
         &self,
         planner: &dyn PlanSource,
         specs: &[KeySpec],
@@ -354,6 +369,13 @@ impl<'a> Replayer<'a> {
         query: &RunQuery,
     ) -> Result<(ScanPlan, bool)> {
         check_types(&self.catalog, keys)?;
+        if query.join().is_some() {
+            return Err(Error::Other(
+                "a semijoin run spans two datasets and has two plans, one per side; price it \
+                 with Replayer::semijoin_plans"
+                    .into(),
+            ));
+        }
         // A text run's values are words, substrings, or prefixes, never
         // whole values: no file statistic or Parquet bloom filter can
         // exclude a row group for them, so an unserved text run reads what
@@ -575,9 +597,18 @@ impl<'a> Replayer<'a> {
                     recorded = run.query()?;
                     &recorded
                 };
-                let (plan, unserved) = self.verified_plan(planner.as_ref(), specs, &rk, query)?;
+                let (cost, unserved) = if let Some(j) = query.join() {
+                    self.semijoin_cost(planner.as_ref(), specs, &run.run_id, &rk, j)?
+                } else {
+                    let (plan, unserved) =
+                        self.verified_plan(planner.as_ref(), specs, &rk, query)?;
+                    (
+                        cost_of(query, &run.run_id, rk.len() as u64, &plan),
+                        unserved,
+                    )
+                };
                 stats |= unserved;
-                Ok(cost_of(query, &run.run_id, rk.len() as u64, &plan))
+                Ok(cost)
             })
             .collect::<Result<Vec<_>>>()?;
         Ok((costs, stats))
@@ -619,6 +650,10 @@ impl<'a> Replayer<'a> {
                 let rk = workload.run_keys(keys, run)?;
                 check_types(&self.catalog, &rk)?;
                 let query = run.query()?;
+                if let Some(j) = query.join() {
+                    let (l, r) = self.semijoin_baseline(&planner, baseline, &rk, j)?;
+                    return Ok(crate::join::pair_cost(&run.run_id, rk.len() as u64, &l, &r));
+                }
                 let plan = if query.is_membership() {
                     planner.plan_membership(&rk, matches!(query, RunQuery::ContainsAll))?
                 } else if query.text_op().is_some() {
@@ -725,7 +760,7 @@ impl<'a> Replayer<'a> {
                 current,
                 proposed,
                 created_at: created_at.to_string(),
-                inputs: vec![self.catalog.digest()],
+                inputs: self.inputs(workload),
                 model,
                 configuration: self.current.iter().map(KeySpec::identity).collect(),
                 operators: Vec::new(),

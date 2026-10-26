@@ -107,6 +107,9 @@ pub(crate) struct Framing {
     rg: Option<(u32, u32)>,
     blocks: u32,
     index: Vec<u8>,
+    /// Bytes the layout appends to the index after its entries (the join
+    /// layout's one-sided key counts); empty for every other layout.
+    suffix: Vec<u8>,
 }
 
 impl Framing {
@@ -136,6 +139,7 @@ impl Framing {
             rg: None,
             blocks: 0,
             index: Vec::new(),
+            suffix: Vec::new(),
         })
     }
 
@@ -181,6 +185,7 @@ impl Framing {
         prelude.put_u32(self.blocks);
         self.out.extend_from_slice(&prelude);
         self.out.extend_from_slice(&self.index);
+        self.out.extend_from_slice(&self.suffix);
         let index_len = self.pos() - index_offset;
         let start = usize::try_from(index_offset).unwrap_or(usize::MAX);
         let sum = checksum(&[&self.out[..self.header_end], &self.out[start..]]);
@@ -446,8 +451,11 @@ impl KeyValue {
 
 pub(crate) struct KeyedEmitter {
     f: Framing,
-    /// What every value record holds after its bitmap.
+    /// What every value record holds after its bitmap (each side's, for
+    /// the join layout).
     shape: ValueShape,
+    /// The join layout (B3): every value is a pair ([`KeyedEmitter::push_join`]).
+    join: bool,
     opts: WriterOptions,
     keys: Vec<Vec<u8>>,
     key_bytes: usize,
@@ -460,6 +468,7 @@ impl KeyedEmitter {
         Ok(Self {
             f: Framing::start(header)?,
             shape: ValueShape::of(&header.key_spec, header.layout),
+            join: header.layout == Layout::KeyedJoin,
             opts: opts.clone(),
             keys: Vec::new(),
             key_bytes: 0,
@@ -479,15 +488,107 @@ impl KeyedEmitter {
         self.f.set_processed(lo, hi)
     }
 
+    /// Checks that a value carries counts exactly when the spec stores them.
+    fn check_counts(&self, value: &KeyValue) -> Result<()> {
+        if value.counts.is_some() != self.shape.counts {
+            return Err(Error::Other(format!(
+                "keyed emitter: the spec {} counts, but a value {} counts",
+                if self.shape.counts {
+                    "stores"
+                } else {
+                    "stores no"
+                },
+                if value.counts.is_some() {
+                    "carries"
+                } else {
+                    "carries no"
+                },
+            )));
+        }
+        Ok(())
+    }
+
     /// Keys must arrive strictly ascending, each held by at least one row
     /// group.
     pub(crate) fn push(&mut self, key: &[u8], value: &KeyValue) -> Result<()> {
+        if self.join {
+            return Err(Error::Other(
+                "keyed emitter: a join segment's values are pairs".into(),
+            ));
+        }
+        self.check_counts(value)?;
+        let shape = self.shape;
+        self.push_record(key, &value.bitmap, |out| value.encode(shape, out))
+    }
+
+    /// A join segment's value (B3): the key's left value record, then its
+    /// right one, each `bitmap_len u32 | bitmap | [counts]`. Both bitmaps
+    /// must be non-empty: a key held on one side only is counted, never
+    /// stored. Only the left bitmap is in this segment's row-group space,
+    /// so only it widens the recorded range.
+    pub(crate) fn push_join(
+        &mut self,
+        key: &[u8],
+        left: &KeyValue,
+        right: &KeyValue,
+    ) -> Result<()> {
+        if !self.join {
+            return Err(Error::Other(
+                "keyed emitter: only a join segment's values are pairs".into(),
+            ));
+        }
+        self.check_counts(left)?;
+        self.check_counts(right)?;
+        if right.bitmap.is_empty() {
+            return Err(Error::Other(
+                "keyed emitter: a join key must be held on both sides".into(),
+            ));
+        }
+        let shape = self.shape;
+        self.push_record(key, &left.bitmap, |out| {
+            left.encode(shape, out)?;
+            right.encode(shape, out)
+        })
+    }
+
+    /// The one-sided key counts the join layout ends its index with.
+    pub(crate) fn set_join_totals(&mut self, left_only: u64, right_only: u64) -> Result<()> {
+        if !self.join {
+            return Err(Error::Other(
+                "keyed emitter: only a join segment records one-sided keys".into(),
+            ));
+        }
+        self.f.suffix.clear();
+        self.f.suffix.put_u64(left_only);
+        self.f.suffix.put_u64(right_only);
+        Ok(())
+    }
+
+    /// Keys pushed so far.
+    pub(crate) fn entries(&self) -> u64 {
+        self.f.entries
+    }
+
+    /// Bytes the emitter holds now: the segment written so far, its index,
+    /// and the open block's keys and values. The finished segment is at
+    /// most this plus the footer.
+    pub(crate) fn held_bytes(&self) -> u64 {
+        (self.f.out.len() + self.f.index.len() + self.f.suffix.len() + self.key_bytes)
+            .saturating_add(self.values.len()) as u64
+    }
+
+    fn push_record(
+        &mut self,
+        key: &[u8],
+        bitmap: &RoaringBitmap,
+        encode: impl FnOnce(&mut Vec<u8>) -> Result<()>,
+    ) -> Result<()> {
         if let Some(last) = self.keys.last() {
             if key <= last.as_slice() {
                 return Err(Error::Other("keyed emitter: keys out of order".into()));
             }
         }
-        let (Some(lo), Some(hi)) = (value.bitmap.min(), value.bitmap.max()) else {
+        let (Some(lo), Some(hi)) = (bitmap.min(), bitmap.max()) else {
             return Err(Error::Other(
                 "keyed emitter: a key must be held by at least one row group".into(),
             ));
@@ -496,7 +597,7 @@ impl KeyedEmitter {
         let before = self.values.len();
         // Refuses a value whose counts, bounds or versions do not match the
         // spec's shape.
-        value.encode(self.shape, &mut self.values)?;
+        encode(&mut self.values)?;
         self.value_lens.push(len_u32(self.values.len() - before)?);
         self.key_bytes += key.len();
         self.keys.push(key.to_vec());
@@ -573,6 +674,11 @@ impl KeyedEmitter {
     }
 
     pub(crate) fn finish(mut self) -> Result<EncodedSegment> {
+        if self.join && self.f.suffix.is_empty() {
+            return Err(Error::Other(
+                "keyed emitter: a join segment records its one-sided key counts".into(),
+            ));
+        }
         self.flush()?;
         Ok(self.f.finish())
     }
@@ -876,6 +982,7 @@ pub fn validate_spec(spec: &KeySpec) -> Result<()> {
             )));
         }
     }
+    crate::join::check_spec(spec)?;
     crate::expr::check_spec(spec)
 }
 
@@ -908,6 +1015,13 @@ impl SegmentWriter {
         let acc = match layout {
             Layout::Keyed | Layout::KeyedTemporal | Layout::Bitemporal => {
                 Acc::Keyed(BTreeMap::new())
+            }
+            Layout::KeyedJoin => {
+                return Err(Error::KeySpec(format!(
+                    "{} is built from both datasets' exact keys by \
+                     bellwether_core::join::build_pair, never row by row",
+                    spec.name()
+                )))
             }
             Layout::BloomPerRowGroup => Acc::Bloom(BTreeMap::new()),
             Layout::MinMax => Acc::Range(BTreeMap::new()),

@@ -99,7 +99,13 @@ pub fn servable(spec: &KeySpec, run_columns: &[String]) -> Option<Lookup> {
     // A text key serves text lookups only (`PlanSource::plan_text`), never
     // a key: its dictionary holds tokens, not values. A list key serves
     // membership runs only (`serves_query`).
-    if run_columns.is_empty() || matches!(spec, KeySpec::Text { .. } | KeySpec::List { .. }) {
+    // A join key (B3) serves semi-join runs only (`serves_query`).
+    if run_columns.is_empty()
+        || matches!(
+            spec,
+            KeySpec::Text { .. } | KeySpec::List { .. } | KeySpec::Join { .. }
+        )
+    {
         return None;
     }
     if let KeySpec::Expr { expr, .. } = spec {
@@ -133,7 +139,8 @@ pub fn serves_window(spec: &KeySpec, ts_column: &str) -> bool {
         | KeySpec::Bitemporal { .. }
         | KeySpec::Expr { .. }
         | KeySpec::Text { .. }
-        | KeySpec::List { .. } => false,
+        | KeySpec::List { .. }
+        | KeySpec::Join { .. } => false,
     }
 }
 
@@ -168,6 +175,15 @@ pub fn serves_query(spec: &KeySpec, run_columns: &[String], query: &RunQuery) ->
             matches!(spec, KeySpec::List { column } if run_columns == std::slice::from_ref(column))
         }
         RunQuery::Bitemporal(b) => serves_bitemporal(spec, run_columns, b),
+        // A semi-join run (B3) is served by the join key on its pair, and
+        // each side, without one, by the keys serving a locate there.
+        RunQuery::SemiJoin(j) => matches!(
+            spec,
+            KeySpec::Join { columns, right, right_columns, .. }
+                if columns.as_slice() == run_columns
+                    && *right == j.right
+                    && *right_columns == j.right_columns
+        ),
     }
 }
 
@@ -228,7 +244,8 @@ pub fn planned_time_column(
         | RunQuery::Count
         | RunQuery::Text(_)
         | RunQuery::ContainsAny
-        | RunQuery::ContainsAll => Ok(None),
+        | RunQuery::ContainsAll
+        | RunQuery::SemiJoin(_) => Ok(None),
         RunQuery::Latest | RunQuery::Asof { .. } => serving_temporal_column(specs, run_columns),
         // Planned on its valid clock when a bitemporal key on its clocks
         // serves it; unplannable (every row group) otherwise.
@@ -1125,7 +1142,8 @@ impl SegmentPlanner {
             | RunQuery::Lookback { asof: Some(_), .. }
             | RunQuery::ContainsAny
             | RunQuery::ContainsAll
-            | RunQuery::Bitemporal(_) => {
+            | RunQuery::Bitemporal(_)
+            | RunQuery::SemiJoin(_) => {
                 return Err(Error::Other(format!(
                     "a {} run is not planned through version chains alone",
                     query.kind_str()

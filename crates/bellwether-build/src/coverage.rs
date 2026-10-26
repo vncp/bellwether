@@ -99,15 +99,39 @@ fn all_complete(manifest: &Manifest, targets: &[Target], name: &str, live: &Roar
 /// spec, it records a completeness sequence under the spec's
 /// [`KeySpec::identity`] (storage version 2; every field of the spec, so
 /// `bloom:id@0.01` and `bloom:id@0.05` never share an entry), and its live
-/// segments cover every live row group. Coverage is recomputed here rather
-/// than trusted, so a manifest edited by another writer cannot make a
-/// partial spec look complete.
+/// segments cover every live row group; for a join key (B3), also every
+/// one of its segments pins the manifest's live row-group set
+/// (`segments[].join.left_live`), so a left file removed (row groups retired, none
+/// added, coverage intact) leaves it incomplete. Coverage is recomputed
+/// here rather than trusted, so a manifest edited by another writer cannot
+/// make a partial spec look complete.
 #[must_use]
 pub fn completeness(manifest: &Manifest, spec: &KeySpec) -> Option<u64> {
     if !manifest.schema.key_specs.contains(spec) {
         return None;
     }
-    recorded_and_covered(manifest, &targets_of(spec))
+    let seq = recorded_and_covered(manifest, &targets_of(spec))?;
+    if matches!(spec, KeySpec::Join { .. }) {
+        let live = live_ids(&manifest.rowgroup_space).ok()?;
+        if !join_pins_live(manifest, &spec.identity(), &live) {
+            return None;
+        }
+    }
+    Some(seq)
+}
+
+/// Whether the join key named `name` has segments in `manifest` and every
+/// one pins `live` as the left's live row-group set it was built over
+/// (`segments[].join.left_live`): a pair index describes the left only at
+/// the live set it read.
+pub(crate) fn join_pins_live(manifest: &Manifest, name: &str, live: &RoaringBitmap) -> bool {
+    let id = bellwether_core::join::live_identity(live);
+    let mut segs = manifest
+        .segments
+        .iter()
+        .filter(|s| segment_of(s, name, None))
+        .peekable();
+    segs.peek().is_some() && segs.all(|s| s.join.as_ref().is_some_and(|p| p.left_live == id))
 }
 
 /// The sequence at which the per-key bounds or bitemporal versions `def`
@@ -182,6 +206,25 @@ pub(crate) fn completeness_map(
         };
         out.insert(name, seq);
     }
+    // A join key (B3) becomes complete only by its own commit
+    // (`Builder::refresh_join`); a later commit keeps its entry only while
+    // the left's live row groups are exactly the set its pair was built
+    // over (a commit that adds a key or compacts changes none), and drops
+    // it (the key is then stale on the left) once a file is added,
+    // changed, or removed.
+    for spec in crate::target::declared_joins(&next.schema.key_specs) {
+        let name = spec.identity();
+        if let Some(&recorded) = base.key_spec_completeness.get(&name) {
+            let target = Target::Key(spec.clone());
+            if base.schema.key_specs.contains(&spec)
+                && is_complete(base, &target, &live_base)
+                && is_complete(next, &target, &live_next)
+                && join_pins_live(next, &name, &live_next)
+            {
+                out.insert(name, recorded);
+            }
+        }
+    }
     Ok(out)
 }
 
@@ -242,14 +285,19 @@ impl Locator {
     }
 
     /// Fails unless every id in `ids` is live or retired: a segment that
-    /// references an id the manifest never assigned is corrupt.
+    /// references an id the manifest never assigned was built against
+    /// another manifest than this one.
     pub(crate) fn check_known(&self, ids: &RoaringBitmap) -> Result<()> {
         let mut unknown = ids - &self.live;
         unknown -= &self.retired;
         match unknown.min() {
             None => Ok(()),
             Some(id) => Err(Error::Other(format!(
-                "a segment references row-group id {id}, which the manifest neither tracks nor retired"
+                "a segment references row-group id {id}, which this manifest neither tracks nor \
+                 retired: the segment was built against another manifest than this one (an \
+                 index deleted and rebuilt, or a manifest restored or edited by hand), so its row \
+                 groups may name other rows; restore the manifest from manifests/, or delete the \
+                 index folder and run `bellwether index` on the data folder with its key specs"
             ))),
         }
     }
@@ -299,6 +347,7 @@ mod tests {
             rowgroup_range: RowGroupRange::new(start, end),
             bytes: 1,
             kind: None,
+            join: None,
             extra: Extra::new(),
         }
     }
@@ -465,7 +514,18 @@ mod tests {
         ids.insert(3);
         assert!(loc.check_known(&ids).is_ok());
         ids.insert(10);
-        assert!(loc.check_known(&ids).is_err());
+        // Review of PR #32, item 7c: the true cause and the next step.
+        let msg = loc.check_known(&ids).unwrap_err().to_string();
+        assert!(msg.contains("row-group id 10"), "{msg}");
+        assert!(msg.contains("built against another manifest"), "{msg}");
+        assert!(
+            msg.contains("restore the manifest from manifests/"),
+            "{msg}"
+        );
+        assert!(
+            msg.contains("`bellwether index` on the data folder"),
+            "{msg}"
+        );
 
         let mut dup = m.clone();
         dup.rowgroup_space.files[1].rowgroup_ids[0] = RowGroupId(0);

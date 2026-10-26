@@ -516,6 +516,7 @@ fn dry_runs_never_create_an_absent_index_location() {
                 ..bellwether::EngineOptions::default()
             },
             budget: Budget::default(),
+            join: None,
         })
         .unwrap();
         let before = objects(g.dir.path());

@@ -86,6 +86,11 @@ impl Engine {
         proposed_by: &str,
         write: bool,
     ) -> Result<ProposeResult> {
+        // A join key naming a right dataset this engine does not serve is
+        // refused before anything is read (B3, `EngineOptions::join_scope`).
+        for spec in declared.iter().filter_map(|d| d.key.as_ref()) {
+            self.check_join_scope(spec)?;
+        }
         if let Some((d, sketch)) = declared
             .iter()
             .find_map(|d| d.sketch.as_ref().map(|s| (d, s)))
@@ -281,10 +286,26 @@ impl Engine {
 
     fn check_body(&self, body: &ProposalBody) -> Result<()> {
         match body {
-            // The spec and every spec applied beside it get the same checks.
-            ProposalBody::Key { spec, sidecars } => std::iter::once(spec)
-                .chain(sidecars)
-                .try_for_each(|s| self.check_key(s)),
+            ProposalBody::Key { spec, sidecars } => {
+                // A join key (B3) is built whole from both datasets in a
+                // commit of its own, so it is proposed alone.
+                if !sidecars.is_empty()
+                    && std::iter::once(spec)
+                        .chain(sidecars)
+                        .any(|s| matches!(s, KeySpec::Join { .. }))
+                {
+                    return Err(Error::KeySpec(
+                        "a join key is applied alone, built whole from both datasets; propose \
+                         the specs beside it in a proposal of their own"
+                            .into(),
+                    ));
+                }
+                // The spec and every spec applied beside it get the same
+                // checks.
+                std::iter::once(spec)
+                    .chain(sidecars)
+                    .try_for_each(|s| self.check_key(s))
+            }
             ProposalBody::Layout { cluster_by } => {
                 if cluster_by.is_empty() {
                     return Err(Error::InvalidArgument {
