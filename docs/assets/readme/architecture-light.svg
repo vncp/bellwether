@@ -1,0 +1,76 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1100 600" width="1100" height="600" role="img" aria-labelledby="title desc">
+<title id="title">Bellwether architecture</title>
+<desc id="desc">Who drives it: you in a terminal, a coding agent over MCP, CI or a script, and the benchmark, all through one binary. Inside the Rust engine, five layers with dependencies pointing one way: bellwether-cli and bellwether-mcp (arguments and envelopes only), the bellwether facade (fix runs score, verify, apply, attest), profile, replay, verify and build, then core, source, store and ledger, then bellwether-types, the contract. The engine reads statistics from your files and writes segments, a manifest, a ledger and a cache beside them, on local disk or object storage.</desc>
+<defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#656d76"/></marker></defs>
+<g font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif">
+<rect x="0.5" y="0.5" width="1099" height="599" rx="16" fill="#f6f8fa" stroke="#d0d7de" stroke-width="1"/>
+<rect x="30" y="56" width="270" height="480" rx="12" fill="#ffffff" stroke="#d0d7de" stroke-width="1"/>
+<text x="52" y="92" font-size="12" fill="#656d76" font-weight="600" letter-spacing="0.12em">WHO DRIVES IT</text>
+<text x="52" y="115" font-size="13" fill="#8c959f">one binary, every surface</text>
+<line x1="52" y1="134" x2="278" y2="134" stroke="#d0d7de" stroke-width="1"/>
+<text x="52" y="168" font-size="16" fill="#1f2328" font-weight="600">You, in a terminal</text>
+<text x="52" y="189" font-size="13" fill="#656d76">bellwether &lt;verb&gt; · --json</text>
+<line x1="52" y1="208" x2="278" y2="208" stroke="#d0d7de" stroke-width="1"/>
+<text x="52" y="240" font-size="16" fill="#1f2328" font-weight="600">A coding agent</text>
+<text x="52" y="261" font-size="13" fill="#656d76">bellwether mcp · tiered tools</text>
+<line x1="52" y1="280" x2="278" y2="280" stroke="#d0d7de" stroke-width="1"/>
+<text x="52" y="312" font-size="16" fill="#1f2328" font-weight="600">CI or a script</text>
+<text x="52" y="333" font-size="13" fill="#656d76">exit codes 0–4 · one JSON line</text>
+<line x1="52" y1="352" x2="278" y2="352" stroke="#d0d7de" stroke-width="1"/>
+<text x="52" y="384" font-size="16" fill="#1f2328" font-weight="600">The benchmark</text>
+<text x="52" y="405" font-size="13" fill="#656d76">bellwether bench · corpora, SLOs</text>
+<line x1="52" y1="424" x2="278" y2="424" stroke="#d0d7de" stroke-width="1"/>
+<text x="52" y="456" font-size="16" fill="#1f2328" font-weight="600">Both agree</text>
+<text x="52" y="477" font-size="13" fill="#656d76">--json is the MCP result (ADR 010)</text>
+<text x="165.0" y="566" font-size="13" fill="#8c959f" text-anchor="middle">no surface holds engine logic</text>
+<rect x="800" y="56" width="270" height="480" rx="12" fill="#ffffff" stroke="#d0d7de" stroke-width="1"/>
+<text x="822" y="92" font-size="12" fill="#656d76" font-weight="600" letter-spacing="0.12em">YOUR STORAGE</text>
+<text x="822" y="115" font-size="13" fill="#8c959f">local disk · S3 · Azure · GCS</text>
+<line x1="822" y1="134" x2="1048" y2="134" stroke="#d0d7de" stroke-width="1"/>
+<text x="822" y="168" font-size="14" fill="#1f2328" font-weight="700" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace">your files</text>
+<text x="822" y="189" font-size="13" fill="#656d76">Parquet · CSV · JSON lines, as-is</text>
+<line x1="822" y1="208" x2="1048" y2="208" stroke="#d0d7de" stroke-width="1"/>
+<text x="822" y="240" font-size="14" fill="#1f2328" font-weight="700" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace">segments/</text>
+<text x="822" y="261" font-size="13" fill="#656d76">immutable, named by content hash</text>
+<line x1="822" y1="280" x2="1048" y2="280" stroke="#d0d7de" stroke-width="1"/>
+<text x="822" y="312" font-size="14" fill="#1f2328" font-weight="700" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace">manifest.json</text>
+<text x="822" y="333" font-size="13" fill="#656d76">advanced by conditional PUT</text>
+<line x1="822" y1="352" x2="1048" y2="352" stroke="#d0d7de" stroke-width="1"/>
+<text x="822" y="384" font-size="14" fill="#1f2328" font-weight="700" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace">ledger/</text>
+<text x="822" y="405" font-size="13" fill="#656d76">append-only, hash-named records</text>
+<line x1="822" y1="424" x2="1048" y2="424" stroke="#d0d7de" stroke-width="1"/>
+<text x="822" y="456" font-size="14" fill="#1f2328" font-weight="700" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace">cache/</text>
+<text x="822" y="477" font-size="13" fill="#656d76">rebuildable</text>
+<text x="935.0" y="566" font-size="13" fill="#8c959f" text-anchor="middle">the data is never converted</text>
+<rect x="340" y="56" width="420" height="480" rx="12" fill="#ffffff" stroke="#d0d7de" stroke-width="1"/>
+<text x="364" y="92" font-size="12" fill="#656d76" font-weight="600" letter-spacing="0.12em">RUST ENGINE</text>
+<text x="364" y="115" font-size="13" fill="#8c959f">thirteen crates; imports point down</text>
+<line x1="364" y1="134" x2="736" y2="134" stroke="#d0d7de" stroke-width="1"/>
+<rect x="364" y="150" width="372" height="58" rx="8" fill="#f6f8fa" stroke="#d0d7de" stroke-width="1"/>
+<text x="382" y="175" font-size="14" fill="#1f2328" font-weight="700" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace">bellwether-cli · bellwether-mcp</text>
+<text x="382" y="195" font-size="13" fill="#656d76">arguments and envelopes; no engine logic</text>
+<line x1="550.0" y1="209" x2="550.0" y2="222" stroke="#656d76" stroke-width="1.5" marker-end="url(#arrow)"/>
+<rect x="364" y="224" width="372" height="58" rx="8" fill="#f6f8fa" stroke="#d0d7de" stroke-width="1"/>
+<text x="382" y="249" font-size="14" fill="#1f2328" font-weight="700" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace">bellwether</text>
+<text x="382" y="269" font-size="13" fill="#656d76">the facade: score → verify → apply → attest</text>
+<line x1="550.0" y1="283" x2="550.0" y2="296" stroke="#656d76" stroke-width="1.5" marker-end="url(#arrow)"/>
+<rect x="364" y="298" width="372" height="58" rx="8" fill="#f6f8fa" stroke="#d0d7de" stroke-width="1"/>
+<text x="382" y="323" font-size="14" fill="#1f2328" font-weight="700" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace">profile · replay · verify · build</text>
+<text x="382" y="343" font-size="13" fill="#656d76">fanout · exact cost · certificates · segments</text>
+<line x1="550.0" y1="357" x2="550.0" y2="370" stroke="#656d76" stroke-width="1.5" marker-end="url(#arrow)"/>
+<rect x="364" y="372" width="372" height="58" rx="8" fill="#f6f8fa" stroke="#d0d7de" stroke-width="1"/>
+<text x="382" y="397" font-size="14" fill="#1f2328" font-weight="700" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace">core · source · store · ledger</text>
+<text x="382" y="417" font-size="13" fill="#656d76">keys · footers · commits · records</text>
+<line x1="550.0" y1="431" x2="550.0" y2="444" stroke="#656d76" stroke-width="1.5" marker-end="url(#arrow)"/>
+<rect x="364" y="446" width="372" height="58" rx="8" fill="#f6f8fa" stroke="#d0d7de" stroke-width="1"/>
+<text x="382" y="471" font-size="14" fill="#1f2328" font-weight="700" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace">bellwether-types</text>
+<text x="382" y="491" font-size="13" fill="#656d76">the contract: records, traits, format</text>
+<text x="550.0" y="566" font-size="13" fill="#8c959f" text-anchor="middle">dependencies point one way: dev/check-layering.py</text>
+<line x1="304" y1="300" x2="336" y2="300" stroke="#0969da" stroke-width="2" marker-end="url(#arrow)"/>
+<text x="320.0" y="288" font-size="12" fill="#0969da" text-anchor="middle">calls</text>
+<line x1="764" y1="280" x2="796" y2="280" stroke="#656d76" stroke-width="1.5" marker-end="url(#arrow)"/>
+<text x="780.0" y="268" font-size="12" fill="#656d76" text-anchor="middle">writes</text>
+<line x1="796" y1="330" x2="764" y2="330" stroke="#656d76" stroke-width="1.5" marker-end="url(#arrow)"/>
+<text x="780.0" y="350" font-size="12" fill="#656d76" text-anchor="middle">reads</text>
+</g>
+</svg>

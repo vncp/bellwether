@@ -4,7 +4,7 @@
 use std::sync::Arc;
 
 use arrow::datatypes::{DataType, TimeUnit};
-use bellwether_build::{BuildOptions, Builder, Lookup, PlanOrder};
+use bellwether_build::{Builder, Lookup, PlanOrder};
 use bellwether_core::encoding;
 use bellwether_core::sidecar::SidecarDef;
 use bellwether_store::parse_rfc3339;
@@ -57,15 +57,8 @@ impl Engine {
         for s in &specs {
             crate::spec::check(s)?;
         }
-        let mut options = BuildOptions::new(self.format().kind());
-        options.chunk_size = self.options().chunk_size;
-        options.schema.clone_from(&self.options().schema);
-        options.fingerprint_policy = self.options().fingerprint_policy;
-        options
-            .partitioning
-            .clone_from(&self.options().partitioning);
-        options.sidecars = declared.iter().filter_map(|d| d.sidecar.clone()).collect();
-        options.exclude = self.excluded();
+        let options =
+            self.build_options(declared.iter().filter_map(|d| d.sidecar.clone()).collect());
         let report =
             Builder::new(Arc::clone(self.store()?), "").build(self.root(), &specs, &options)?;
         let pinned = self.pin_required("index")?;

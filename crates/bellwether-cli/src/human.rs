@@ -331,6 +331,36 @@ pub(crate) fn propose(r: &ProposeResult, _out: &Out) -> String {
             "refused: the proposer name {name:?} is reserved for the engine's own candidates; pass \
              your agent or user name with --by\n"
         ),
+        ProposeResult::Refused {
+            refusal:
+                bellwether::ProposeRefusal::SidecarNotProposable {
+                    declaration,
+                    sidecar,
+                    key,
+                    command,
+                    ..
+                },
+        } => {
+            let alone = key.as_deref().map_or_else(String::new, |k| {
+                format!(
+                    "; to reach a receipt, propose the key alone with --key {}",
+                    bellwether::spec::shell_quote(k)
+                )
+            });
+            let build = command.as_deref().map_or_else(
+                || {
+                    "build it with `bellwether index` and the source options this engine was \
+                     opened with (no command line spells them)"
+                        .to_string()
+                },
+                |c| format!("build it with `{c}`"),
+            );
+            format!(
+                "refused: {declaration} declares the sidecar {sidecar}, and a proposal can carry \
+                 only a key spec, so it has no replay, certificate, or receipt yet; {build} (no \
+                 receipt){alone}\n"
+            )
+        }
     }
 }
 

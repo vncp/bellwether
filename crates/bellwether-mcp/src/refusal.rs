@@ -43,6 +43,8 @@ pub enum RefusalCode {
     AttestOnly,
     /// The proposer name is reserved for the engine.
     ReservedProposer,
+    /// The key declares a sidecar, which no proposal can carry yet.
+    SidecarNotProposable,
     /// Scoring needs keys, a workload, or rewrite outputs.
     NoWorkload,
     /// The folder changed since the index was built.
@@ -93,7 +95,7 @@ pub enum RefusalCode {
 
 impl RefusalCode {
     /// Every code, in `AGENTS.md` order.
-    pub const ALL: [Self; 33] = [
+    pub const ALL: [Self; 34] = [
         Self::CertificateFailed,
         Self::StaleManifest,
         Self::DataChanged,
@@ -104,6 +106,7 @@ impl RefusalCode {
         Self::NoReplay,
         Self::AttestOnly,
         Self::ReservedProposer,
+        Self::SidecarNotProposable,
         Self::NoWorkload,
         Self::StaleIndex,
         Self::NotIndexed,
@@ -143,6 +146,7 @@ impl RefusalCode {
             Self::NoReplay => "no_replay",
             Self::AttestOnly => "attest_only",
             Self::ReservedProposer => "reserved_proposer",
+            Self::SidecarNotProposable => "sidecar_not_proposable",
             Self::NoWorkload => "no_workload",
             Self::StaleIndex => "stale_index",
             Self::NotIndexed => "not_indexed",
@@ -201,6 +205,10 @@ impl RefusalCode {
                  the engine applies nothing to a table"
             }
             Self::ReservedProposer => "pass your own agent name in `by`",
+            Self::SidecarNotProposable => {
+                "propose a key spec (exact, bloom, range, or temporal) for a receipt, or ask the \
+                 human to run the index command in `fields.command` (no receipt)"
+            }
             Self::NoWorkload => {
                 "pass `keys` (a Parquet key file) or a recorded `workload` hash for a key, or the \
                  rewrite outputs for a rewrite"
@@ -474,6 +482,46 @@ pub fn from_propose(r: &ProposeRefusal) -> Refusal {
             format!("the proposer name {name:?} is reserved for the engine's own candidates"),
             json!({ "name": name }),
         ),
+        ProposeRefusal::SidecarNotProposable {
+            declaration,
+            sidecar,
+            key,
+            root,
+            command,
+        } => {
+            let mut r = Refusal::new(
+                RefusalCode::SidecarNotProposable,
+                format!(
+                    "{declaration} declares the sidecar {sidecar}, and a proposal can carry only \
+                     a key spec, so it has no replay, certificate, or receipt yet"
+                ),
+                json!({
+                    "declaration": declaration,
+                    "sidecar": sidecar,
+                    "key": key,
+                    "root": root,
+                    "command": command,
+                }),
+            );
+            let how = if command.is_some() {
+                "the command in `fields.command`"
+            } else {
+                "`bellwether index` and this server's source options, which no command line \
+                 spells (`fields.command` is null)"
+            };
+            let build = format!(
+                "ask the human to index {root} with the declaration {declaration} ({how}; no \
+                 receipt)"
+            );
+            r.next = match key {
+                Some(k) => format!(
+                    "call propose.key with `spec` \"{k}\" (`fields.key`, the key alone) to reach \
+                     a receipt, or {build}"
+                ),
+                None => build,
+            };
+            r
+        }
     }
 }
 

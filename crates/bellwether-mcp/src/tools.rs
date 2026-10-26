@@ -162,7 +162,7 @@ pub struct ScoreVerify {
 #[serde(deny_unknown_fields)]
 pub struct ProposeKey {
     /// The key.
-    pub spec: KeySpec,
+    pub spec: KeyArg,
     /// Evidence hashes the proposal cites; at least one.
     pub evidence: Vec<Hash>,
     /// Who proposes: your agent name. `engine` is reserved.
@@ -170,6 +170,20 @@ pub struct ProposeKey {
     /// Return what would be written, and write nothing.
     #[serde(default)]
     pub dry_run: bool,
+}
+
+/// The key `propose.key` proposes: the contract's `KeySpec` as JSON, or the
+/// short form `bellwether index --key` and `bellwether propose --key` read.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(untagged)]
+pub enum KeyArg {
+    /// The short form: exact:a,b, bloom:a@0.01, range:ts, or temporal:id@ts.
+    /// A sidecar declaration (temporal2:id@valid,known, or exact:a@ts with
+    /// its per-key time bounds) is refused with `sidecar_not_proposable`:
+    /// a proposal carries a key spec only.
+    Short(String),
+    /// The key spec's JSON form.
+    Spec(KeySpec),
 }
 
 /// `propose.layout`: propose clustering files by columns.
@@ -308,8 +322,8 @@ pub fn catalog() -> Vec<ToolDef> {
             "propose.key",
             Tier::Propose,
             false,
-            "Propose an index key citing Evidence. Writes one Proposal (no score field exists), \
-             or nothing with dry_run.",
+            "Propose an index key (JSON, or the short form such as exact:id) citing Evidence. \
+             Writes one Proposal (no score field exists), or nothing with dry_run.",
         ),
         def::<ProposeLayout>(
             "propose.layout",

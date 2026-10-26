@@ -7,7 +7,8 @@ use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use arrow::datatypes::SchemaRef;
-use bellwether_build::{Planner, SourceKind};
+use bellwether_build::{BuildOptions, Planner, SourceKind};
+use bellwether_core::sidecar::SidecarDef;
 use bellwether_ledger::Ledger;
 use bellwether_source::{
     fingerprint_with_policy, ChunkedTextSource, FingerprintPolicy, LocalFs, ParquetSource,
@@ -142,6 +143,16 @@ pub struct EngineOptions {
     /// "now" when ages are computed, so two runs over the same inputs write
     /// byte-identical records. `None` uses the system clock.
     pub clock: Option<String>,
+    /// The command-line flags that shaped how this engine reads the folder
+    /// and where its index is (`--index`, `--format`, `--chunk-size`,
+    /// `--schema`, `--fingerprint-policy`, `--partitioning` or
+    /// `--path-template`), one argument per element, unquoted, paths made
+    /// absolute, as the shared flag definition (`bellwether_mcp::EngineArgs`)
+    /// renders them. The facade only assembles them into the `bellwether
+    /// index` command a refusal names (`ProposeRefusal::SidecarNotProposable`).
+    /// `None` for an engine a library caller opened: that command is then
+    /// given only when every source option above is the default.
+    pub source_flags: Option<Vec<String>>,
     /// The key `fix` signs with (ADR 029): right after it writes a Receipt
     /// it signs that Receipt and, when the same call wrote it, the
     /// Certificate; a verify-only run signs its passing Certificate. Only
@@ -1098,6 +1109,23 @@ pub(crate) fn commit_age(m: &Manifest, now_nanos: i64) -> Result<Duration> {
 }
 
 impl Engine {
+    /// The build options every index commit uses (`index` and the apply
+    /// stage of `fix` alike), from this engine's options: the source format
+    /// (a CSV dialect included), chunk size, dataset schema, fingerprint
+    /// policy, and partitioning (hive or a path template), so whichever verb
+    /// builds an index first records the same `manifest.source`; plus
+    /// `sidecars` to declare and the index directory to exclude.
+    pub(crate) fn build_options(&self, sidecars: Vec<SidecarDef>) -> BuildOptions {
+        let mut options = BuildOptions::new(self.format().kind());
+        options.chunk_size = self.options.chunk_size;
+        options.schema.clone_from(&self.options.schema);
+        options.fingerprint_policy = self.options.fingerprint_policy;
+        options.partitioning.clone_from(&self.options.partitioning);
+        options.sidecars = sidecars;
+        options.exclude = self.excluded();
+        options
+    }
+
     /// Directories under the data root whose files are never data: the
     /// index location, when it is local and lies inside the root (its own
     /// `.json` files would otherwise pass for JSON lines). Spelled as the

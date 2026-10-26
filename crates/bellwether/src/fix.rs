@@ -28,7 +28,7 @@ use std::time::Duration;
 use arrow::array::RecordBatch;
 use arrow::datatypes::SchemaRef;
 use bellwether_build::encode_ts;
-use bellwether_build::{BuildOptions, Builder};
+use bellwether_build::Builder;
 use bellwether_ledger::RecordKind;
 use bellwether_replay::{proposed_specs, Catalog, Replayer, RunKeys, RunQuery, Workload};
 use bellwether_source_sql::{is_sql_root, SqlUrl, MEASURED_AGGREGATES};
@@ -1078,11 +1078,7 @@ impl Engine {
     ) -> Result<(FixOutcome, Vec<SignatureWritten>)> {
         #[cfg(test)]
         test_seam::before_apply(self);
-        let mut options = BuildOptions::new(self.format().kind());
-        options.chunk_size = self.options().chunk_size;
-        options.schema.clone_from(&self.options().schema);
-        options.fingerprint_policy = self.options().fingerprint_policy;
-        options.exclude = self.excluded();
+        let options = self.build_options(Vec::new());
         let report = Builder::new(Arc::clone(self.store()?), "").build(
             self.root(),
             std::slice::from_ref(spec),
