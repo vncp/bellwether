@@ -9,6 +9,7 @@ use bellwether_bench::harness::{run_all, DuckDbMode, RunOptions, ScanFault};
 use bellwether_bench::market::{
     generate_market, parse_ymd, MarketParams, MarketRung, MarketSummary,
 };
+use bellwether_bench::perf::{all_cells, plan_cells, read_row_groups, ReadReport};
 use bellwether_bench::report::write_report;
 use bellwether_bench::results::Results;
 use bellwether_bench::slo::{assert_slo, Mode};
@@ -49,6 +50,23 @@ pub(crate) enum BenchCommand {
     },
     /// Write the synthetic bitemporal market trade corpus, workload, and ground truth.
     Market(MarketArgs),
+    /// Read row groups through the benchmark's byte-counting reader and
+    /// report the time and bytes: the planned row groups of a lookup's
+    /// --json output (--plan), or every row group under a folder (--all).
+    Read(ReadArgs),
+}
+
+#[derive(Args)]
+#[command(group(clap::ArgGroup::new("what").required(true).args(["plan", "all"])))]
+pub(crate) struct ReadArgs {
+    /// The --json output of `locate`, `latest`, or `asof`, saved to a file;
+    /// its plan's row groups are read.
+    #[arg(long, value_name = "FILE")]
+    plan: Option<PathBuf>,
+    /// A data folder: every row group of every .parquet file under it (a
+    /// full scan; directories starting with `.` are skipped).
+    #[arg(long, value_name = "DIR")]
+    all: Option<PathBuf>,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -202,6 +220,9 @@ pub(crate) struct Wrote {
     /// Market corpus summary (`market` only).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub market: Option<MarketSummary>,
+    /// What the read cost (`read` only).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub read: Option<ReadReport>,
 }
 
 fn bench_err(e: &bellwether_bench::BenchError) -> Error {
@@ -295,6 +316,7 @@ pub(crate) fn run(cmd: &BenchCommand) -> Result<Wrote, Error> {
             ("slo", results.clone(), failed, None)
         }
         BenchCommand::Market(a) => return market(a),
+        BenchCommand::Read(a) => return read(a),
     };
     Ok(Wrote {
         what,
@@ -302,6 +324,7 @@ pub(crate) fn run(cmd: &BenchCommand) -> Result<Wrote, Error> {
         blake3: file_hash(&path)?,
         failed,
         market,
+        read: None,
     })
 }
 
@@ -357,5 +380,47 @@ fn market(a: &MarketArgs) -> Result<Wrote, Error> {
         blake3: file_hash(&truth_path)?,
         failed: Vec::new(),
         market: Some(summary),
+        read: None,
+    })
+}
+
+/// `bench read`: the row groups of a plan, or of a whole folder, through the
+/// byte-counting reader.
+fn read(a: &ReadArgs) -> Result<Wrote, Error> {
+    let (source, cells) = match (&a.plan, &a.all) {
+        (Some(plan), _) => {
+            let bytes = std::fs::read(plan)
+                .map_err(|e| Error::Other(format!("cannot read {} ({e})", plan.display())))?;
+            let value: serde_json::Value = serde_json::from_slice(&bytes).map_err(|e| {
+                Error::Other(format!(
+                    "{} is not JSON ({e}); save the --json output of locate, latest, or asof",
+                    plan.display()
+                ))
+            })?;
+            (plan, plan_cells(&value).map_err(|e| bench_err(&e))?)
+        }
+        (None, Some(dir)) => (dir, all_cells(dir).map_err(|e| bench_err(&e))?),
+        (None, None) => {
+            return Err(Error::Other(
+                "bench read needs --plan FILE or --all DIR".into(),
+            ))
+        }
+    };
+    let report = read_row_groups(&cells).map_err(|e| bench_err(&e))?;
+    Ok(Wrote {
+        what: "read",
+        path: format!(
+            "{} ({} files, {} row groups, {} rows, {} bytes fetched, {:.1} ms)",
+            source.display(),
+            report.files,
+            report.row_groups,
+            report.rows,
+            report.bytes_fetched,
+            report.total_ms
+        ),
+        blake3: None,
+        failed: Vec::new(),
+        market: None,
+        read: Some(report),
     })
 }

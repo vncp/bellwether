@@ -295,15 +295,20 @@ The build planner reads footers through its own source, which the test's countin
 
 ### Memory caps
 
-`max_segment_key_bytes` and `max_index_bytes` cap **accounted** key bytes (the measures above), not resident memory. Measured in debug builds:
+`max_segment_key_bytes` and `max_index_bytes` cap **accounted** key bytes (the measures above), not resident memory.
 
-- **Open writer.** An open transient segment writer costs about 290 bytes of resident memory per key.
+The per-key resident overhead (contract v3, entry 32) was measured in a release build by `tests/resident.rs` (`cargo test --release -p bellwether-replay --test resident -- --ignored`), over 1,048,576 keys, on 2026-10-26 ([the measured document](../../docs/measured/2026-10-26-performance.md)). These are the documented constants:
+
+- **Open writer: 320 bytes resident per key.** An open transient segment writer over `UInt64` keys accounts 9 bytes per key and holds 320, which is 35.5 times the accounted bytes. A key cap therefore bounds resident memory at about 36 times itself for narrow keys.
+- **Layout map: 84 bytes resident per key.** The cluster-key map over 9-byte keys accounts 73 bytes per key (`CLUSTER_KEY_OVERHEAD` included) and holds 84, which is 1.15 times the accounted bytes.
+
+Earlier debug-build figures, for scale:
+
 - **Index cap, u64 keys.** An 8 MiB `max_index_bytes` cap admitted about 900,000 keys, and resident memory peaked near 284 MB, 33 times the cap.
 - **Default caps, u64 keys.** 2 million unique keys peaked near 397 MB for a 90 MB index.
 - **Rows cap.** For narrow keys, `max_segment_rows` (2^20 rows, roughly 300 MB resident) is the bound that takes effect.
-- **Layout map.** `CLUSTER_KEY_OVERHEAD` undercounts the measured resident cost of the cluster-key map by about 15 to 25% for 9-byte keys: resident is about 1.2 times accounted.
 
-A calibrated per-key overhead, shared with the build crate, is a joint follow-up (`docs/contract-v3.md`, entry 32).
+Charging the writer's measured overhead to the caps, shared with the build crate, is a WP22b candidate.
 
 ## Tests
 

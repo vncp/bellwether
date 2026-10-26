@@ -1,0 +1,47 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1100 408" width="1100" height="408" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif">
+<rect width="1100" height="408" fill="#0d1117" rx="12"/>
+<text x="24.0" y="34.0" fill="#e6edf3" font-size="18" font-weight="600">Reconcile throughput by memory budget, rows per second per side</text>
+<text x="24.0" y="58.0" fill="#e6edf3" font-size="15">ledger-small compared 648,758 rows per second per side at 8 GiB and 330,455 at 64 MiB (10 passes); taxi compared 372,364 rows per second</text>
+<text x="24.0" y="80.0" fill="#e6edf3" font-size="15">per side at 8 GiB and 22,737 at 64 MiB (224 passes).</text>
+<text x="24.0" y="98.0" fill="#8b949e" font-size="12">reconcile_rows_per_s_per_side (rows/s). Apple M3 Pro, 12 cores, 36 GiB, macOS 26.4.1, local SSD. bellwether release build of sources at f809e5403d08 (rustc 1.99.1; sha256</text>
+<text x="24.0" y="114.0" fill="#8b949e" font-size="12">3f05ece30dc0). Measured 2026-10-26.</text>
+<rect x="24.0" y="132.0" width="12.0" height="12.0" rx="2" fill="#3fb950"/>
+<text x="42.0" y="142.0" fill="#e6edf3" font-size="13">bellwether-budget-64M</text>
+<rect x="221.2" y="132.0" width="12.0" height="12.0" rx="2" fill="#a371f7"/>
+<text x="239.2" y="142.0" fill="#e6edf3" font-size="13">bellwether-budget-256M</text>
+<rect x="425.6" y="132.0" width="12.0" height="12.0" rx="2" fill="#f0883e"/>
+<text x="443.6" y="142.0" fill="#e6edf3" font-size="13">bellwether-budget-1G</text>
+<rect x="615.6" y="132.0" width="12.0" height="12.0" rx="2" fill="#58a6ff"/>
+<text x="633.6" y="142.0" fill="#e6edf3" font-size="13">bellwether-budget-8G</text>
+<text x="24.0" y="186.0" fill="#e6edf3" font-size="14" font-weight="600">NYC taxi</text>
+<text x="224.0" y="206.0" fill="#e6edf3" font-size="13" text-anchor="end">reconcile</text>
+<rect x="236.0" y="194.0" width="18.0" height="11.0" rx="2" fill="#3fb950"/>
+<text x="260.0" y="204.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">23 k rows/s</tspan><tspan fill="#8b949e" font-size="10"></tspan></text>
+<rect x="236.0" y="208.0" width="62.7" height="11.0" rx="2" fill="#a371f7"/>
+<text x="304.7" y="218.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">79 k rows/s</tspan><tspan fill="#8b949e" font-size="10"></tspan></text>
+<rect x="236.0" y="222.0" width="169.7" height="11.0" rx="2" fill="#f0883e"/>
+<text x="411.7" y="232.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">214 k rows/s</tspan><tspan fill="#8b949e" font-size="10"></tspan></text>
+<rect x="236.0" y="236.0" width="295.1" height="11.0" rx="2" fill="#58a6ff"/>
+<text x="537.1" y="246.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">372 k rows/s</tspan><tspan fill="#8b949e" font-size="10"></tspan></text>
+<text x="24.0" y="281.0" fill="#e6edf3" font-size="14" font-weight="600">ledger-small</text>
+<text x="224.0" y="301.0" fill="#e6edf3" font-size="13" text-anchor="end">reconcile</text>
+<rect x="236.0" y="289.0" width="261.9" height="11.0" rx="2" fill="#3fb950"/>
+<text x="503.9" y="299.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">330 k rows/s</tspan><tspan fill="#8b949e" font-size="10"></tspan></text>
+<rect x="236.0" y="303.0" width="453.0" height="11.0" rx="2" fill="#a371f7"/>
+<text x="695.0" y="313.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">572 k rows/s</tspan><tspan fill="#8b949e" font-size="10"></tspan></text>
+<rect x="236.0" y="317.0" width="544.4" height="11.0" rx="2" fill="#f0883e"/>
+<text x="786.4" y="327.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">687 k rows/s</tspan><tspan fill="#8b949e" font-size="10"></tspan></text>
+<rect x="236.0" y="331.0" width="514.1" height="11.0" rx="2" fill="#58a6ff"/>
+<text x="756.1" y="341.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">649 k rows/s</tspan><tspan fill="#8b949e" font-size="10"></tspan></text>
+<line x1="236.0" y1="162.0" x2="236.0" y2="358.0" stroke="#8b949e" stroke-opacity="0.25" stroke-dasharray="3 4"/>
+<text x="236.0" y="376.0" fill="#8b949e" font-size="11" text-anchor="middle">0</text>
+<line x1="394.5" y1="162.0" x2="394.5" y2="358.0" stroke="#8b949e" stroke-opacity="0.25" stroke-dasharray="3 4"/>
+<text x="394.5" y="376.0" fill="#8b949e" font-size="11" text-anchor="middle">200 k rows/s</text>
+<line x1="553.0" y1="162.0" x2="553.0" y2="358.0" stroke="#8b949e" stroke-opacity="0.25" stroke-dasharray="3 4"/>
+<text x="553.0" y="376.0" fill="#8b949e" font-size="11" text-anchor="middle">400 k rows/s</text>
+<line x1="711.5" y1="162.0" x2="711.5" y2="358.0" stroke="#8b949e" stroke-opacity="0.25" stroke-dasharray="3 4"/>
+<text x="711.5" y="376.0" fill="#8b949e" font-size="11" text-anchor="middle">600 k rows/s</text>
+<line x1="870.0" y1="162.0" x2="870.0" y2="358.0" stroke="#8b949e" stroke-opacity="0.25" stroke-dasharray="3 4"/>
+<text x="870.0" y="376.0" fill="#8b949e" font-size="11" text-anchor="middle">800 k rows/s</text>
+<text x="236.0" y="394.0" fill="#8b949e" font-size="11">linear scale</text>
+</svg>

@@ -1,0 +1,408 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1255 3194" width="1255" height="3194" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif">
+<rect width="1255" height="3194" fill="#0d1117" rx="12"/>
+<text x="24.0" y="34.0" fill="#e6edf3" font-size="18" font-weight="600">Lookup wall time, warm, p50 of 20 (plan, plan + read, full scan, DuckDB)</text>
+<text x="24.0" y="58.0" fill="#e6edf3" font-size="15">Planning with the index and reading only the planned row groups beat a full scan in 0 of 42 lookups and DuckDB in 0 of 42; the plan alone (one bellwether</text>
+<text x="24.0" y="80.0" fill="#e6edf3" font-size="15">process) took 83 ms at the median, of which 4 ms is starting any bellwether process.</text>
+<text x="24.0" y="98.0" fill="#8b949e" font-size="12">lookup_p50_ms_warm (ms). Apple M3 Pro, 12 cores, 36 GiB, macOS 26.4.1, local SSD. DuckDB v2.0.0 (Cyanoptera) d54cbbe3df; bellwether release build of sources at f809e5403d08 (rustc 1.99.1; sha256</text>
+<text x="24.0" y="114.0" fill="#8b949e" font-size="12">3f05ece30dc0); bellwether-bench byte-counting reader in the same binary, sources at f809e5403d08. Measured 2026-10-26.</text>
+<rect x="24.0" y="132.0" width="12.0" height="12.0" rx="2" fill="#a371f7"/>
+<text x="42.0" y="142.0" fill="#e6edf3" font-size="13">bellwether-plan</text>
+<rect x="178.0" y="132.0" width="12.0" height="12.0" rx="2" fill="#3fb950"/>
+<text x="196.0" y="142.0" fill="#e6edf3" font-size="13">bellwether-end-to-end</text>
+<rect x="375.2" y="132.0" width="12.0" height="12.0" rx="2" fill="#6e7681"/>
+<text x="393.2" y="142.0" fill="#e6edf3" font-size="13">full-scan</text>
+<rect x="486.0" y="132.0" width="12.0" height="12.0" rx="2" fill="#58a6ff"/>
+<text x="504.0" y="142.0" fill="#e6edf3" font-size="13">duckdb</text>
+<text x="24.0" y="186.0" fill="#e6edf3" font-size="14" font-weight="600">market-default</text>
+<text x="493.0" y="206.0" fill="#e6edf3" font-size="13" text-anchor="end">locate --window: 10 keys, the day before the midpoint instant</text>
+<rect x="505.0" y="194.0" width="193.6" height="11.0" rx="2" fill="#a371f7"/>
+<text x="704.6" y="204.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">31 ms</tspan><tspan fill="#8b949e" font-size="10"></tspan></text>
+<rect x="505.0" y="208.0" width="195.7" height="11.0" rx="2" fill="#3fb950"/>
+<text x="706.7" y="218.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">32 ms</tspan><tspan fill="#8b949e" font-size="10"></tspan></text>
+<rect x="505.0" y="222.0" width="76.7" height="11.0" rx="2" fill="#6e7681"/>
+<text x="587.7" y="232.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">3.9 ms</tspan><tspan fill="#8b949e" font-size="10"></tspan></text>
+<rect x="505.0" y="236.0" width="62.0" height="11.0" rx="2" fill="#58a6ff"/>
+<text x="573.0" y="246.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">3.0 ms</tspan><tspan fill="#8b949e" font-size="10"></tspan></text>
+<text x="493.0" y="275.0" fill="#e6edf3" font-size="13" text-anchor="end">locate --window: 10 keys, the 30 days before the midpoint instant</text>
+<rect x="505.0" y="263.0" width="192.7" height="11.0" rx="2" fill="#a371f7"/>
+<text x="703.7" y="273.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">30 ms</tspan><tspan fill="#8b949e" font-size="10"></tspan></text>
+<rect x="505.0" y="277.0" width="196.0" height="11.0" rx="2" fill="#3fb950"/>
+<text x="707.0" y="287.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">32 ms</tspan><tspan fill="#8b949e" font-size="10"></tspan></text>
+<rect x="505.0" y="291.0" width="76.7" height="11.0" rx="2" fill="#6e7681"/>
+<text x="587.7" y="301.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">3.9 ms</tspan><tspan fill="#8b949e" font-size="10"></tspan></text>
+<rect x="505.0" y="305.0" width="78.3" height="11.0" rx="2" fill="#58a6ff"/>
+<text x="589.3" y="315.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">4.0 ms</tspan><tspan fill="#8b949e" font-size="10"></tspan></text>
+<text x="493.0" y="344.0" fill="#e6edf3" font-size="13" text-anchor="end">latest: the newest version of 10 keys</text>
+<rect x="505.0" y="332.0" width="188.7" height="11.0" rx="2" fill="#a371f7"/>
+<text x="699.7" y="342.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">28 ms</tspan><tspan fill="#8b949e" font-size="10"></tspan></text>
+<rect x="505.0" y="346.0" width="189.7" height="11.0" rx="2" fill="#3fb950"/>
+<text x="700.7" y="356.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">29 ms</tspan><tspan fill="#8b949e" font-size="10"></tspan></text>
+<rect x="505.0" y="360.0" width="76.7" height="11.0" rx="2" fill="#6e7681"/>
+<text x="587.7" y="370.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">3.9 ms</tspan><tspan fill="#8b949e" font-size="10"></tspan></text>
+<rect x="505.0" y="374.0" width="78.3" height="11.0" rx="2" fill="#58a6ff"/>
+<text x="589.3" y="384.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">4.0 ms</tspan><tspan fill="#8b949e" font-size="10"></tspan></text>
+<text x="493.0" y="413.0" fill="#e6edf3" font-size="13" text-anchor="end">asof --at the midpoint instant: 10 keys</text>
+<rect x="505.0" y="401.0" width="195.7" height="11.0" rx="2" fill="#a371f7"/>
+<text x="706.7" y="411.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">32 ms</tspan><tspan fill="#8b949e" font-size="10"></tspan></text>
+<rect x="505.0" y="415.0" width="196.7" height="11.0" rx="2" fill="#3fb950"/>
+<text x="707.7" y="425.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">33 ms</tspan><tspan fill="#8b949e" font-size="10"></tspan></text>
+<rect x="505.0" y="429.0" width="76.7" height="11.0" rx="2" fill="#6e7681"/>
+<text x="587.7" y="439.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">3.9 ms</tspan><tspan fill="#8b949e" font-size="10"></tspan></text>
+<rect x="505.0" y="443.0" width="78.3" height="11.0" rx="2" fill="#58a6ff"/>
+<text x="589.3" y="453.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">4.0 ms</tspan><tspan fill="#8b949e" font-size="10"></tspan></text>
+<text x="493.0" y="482.0" fill="#e6edf3" font-size="13" text-anchor="end">asof --at the midpoint --lookback 1d: 10 keys</text>
+<rect x="505.0" y="470.0" width="193.6" height="11.0" rx="2" fill="#a371f7"/>
+<text x="704.6" y="480.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">31 ms</tspan><tspan fill="#8b949e" font-size="10"></tspan></text>
+<rect x="505.0" y="484.0" width="195.6" height="11.0" rx="2" fill="#3fb950"/>
+<text x="706.6" y="494.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">32 ms</tspan><tspan fill="#8b949e" font-size="10"></tspan></text>
+<rect x="505.0" y="498.0" width="76.7" height="11.0" rx="2" fill="#6e7681"/>
+<text x="587.7" y="508.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">3.9 ms</tspan><tspan fill="#8b949e" font-size="10"></tspan></text>
+<rect x="505.0" y="512.0" width="62.0" height="11.0" rx="2" fill="#58a6ff"/>
+<text x="573.0" y="522.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">3.0 ms</tspan><tspan fill="#8b949e" font-size="10"></tspan></text>
+<text x="493.0" y="551.0" fill="#e6edf3" font-size="13" text-anchor="end">asof --at the midpoint --lookback 30d: 10 keys</text>
+<rect x="505.0" y="539.0" width="194.1" height="11.0" rx="2" fill="#a371f7"/>
+<text x="705.1" y="549.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">31 ms</tspan><tspan fill="#8b949e" font-size="10"></tspan></text>
+<rect x="505.0" y="553.0" width="197.2" height="11.0" rx="2" fill="#3fb950"/>
+<text x="708.2" y="563.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">33 ms</tspan><tspan fill="#8b949e" font-size="10"></tspan></text>
+<rect x="505.0" y="567.0" width="76.7" height="11.0" rx="2" fill="#6e7681"/>
+<text x="587.7" y="577.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">3.9 ms</tspan><tspan fill="#8b949e" font-size="10"></tspan></text>
+<rect x="505.0" y="581.0" width="78.3" height="11.0" rx="2" fill="#58a6ff"/>
+<text x="589.3" y="591.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">4.0 ms</tspan><tspan fill="#8b949e" font-size="10"></tspan></text>
+<text x="24.0" y="626.0" fill="#e6edf3" font-size="14" font-weight="600">market-10x</text>
+<text x="493.0" y="646.0" fill="#e6edf3" font-size="13" text-anchor="end">locate --window: 10 keys, the day before the midpoint instant</text>
+<rect x="505.0" y="634.0" width="246.2" height="11.0" rx="2" fill="#a371f7"/>
+<text x="757.2" y="644.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">78 ms</tspan><tspan fill="#8b949e" font-size="10"></tspan></text>
+<rect x="505.0" y="648.0" width="246.7" height="11.0" rx="2" fill="#3fb950"/>
+<text x="757.7" y="658.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">79 ms</tspan><tspan fill="#8b949e" font-size="10"></tspan></text>
+<rect x="505.0" y="662.0" width="205.3" height="11.0" rx="2" fill="#6e7681"/>
+<text x="716.3" y="672.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">38 ms</tspan><tspan fill="#8b949e" font-size="10"></tspan></text>
+<rect x="505.0" y="676.0" width="152.9" height="11.0" rx="2" fill="#58a6ff"/>
+<text x="663.9" y="686.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">15 ms</tspan><tspan fill="#8b949e" font-size="10"></tspan></text>
+<text x="493.0" y="715.0" fill="#e6edf3" font-size="13" text-anchor="end">locate --window: 10 keys, the 30 days before the midpoint instant</text>
+<rect x="505.0" y="703.0" width="249.1" height="11.0" rx="2" fill="#a371f7"/>
+<text x="760.1" y="713.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">82 ms</tspan><tspan fill="#8b949e" font-size="10"></tspan></text>
+<rect x="505.0" y="717.0" width="251.2" height="11.0" rx="2" fill="#3fb950"/>
+<text x="762.2" y="727.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">86 ms</tspan><tspan fill="#8b949e" font-size="10"></tspan></text>
+<rect x="505.0" y="731.0" width="205.3" height="11.0" rx="2" fill="#6e7681"/>
+<text x="716.3" y="741.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">38 ms</tspan><tspan fill="#8b949e" font-size="10"></tspan></text>
+<rect x="505.0" y="745.0" width="156.5" height="11.0" rx="2" fill="#58a6ff"/>
+<text x="667.5" y="755.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">16 ms</tspan><tspan fill="#8b949e" font-size="10"></tspan></text>
+<text x="493.0" y="784.0" fill="#e6edf3" font-size="13" text-anchor="end">latest: the newest version of 10 keys</text>
+<rect x="505.0" y="772.0" width="225.3" height="11.0" rx="2" fill="#a371f7"/>
+<text x="736.3" y="782.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">54 ms</tspan><tspan fill="#8b949e" font-size="10"></tspan></text>
+<rect x="505.0" y="786.0" width="225.9" height="11.0" rx="2" fill="#3fb950"/>
+<text x="736.9" y="796.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">55 ms</tspan><tspan fill="#8b949e" font-size="10"></tspan></text>
+<rect x="505.0" y="800.0" width="205.3" height="11.0" rx="2" fill="#6e7681"/>
+<text x="716.3" y="810.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">38 ms</tspan><tspan fill="#8b949e" font-size="10"></tspan></text>
+<rect x="505.0" y="814.0" width="152.9" height="11.0" rx="2" fill="#58a6ff"/>
+<text x="663.9" y="824.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">15 ms</tspan><tspan fill="#8b949e" font-size="10"></tspan></text>
+<text x="493.0" y="853.0" fill="#e6edf3" font-size="13" text-anchor="end">asof --at the midpoint instant: 10 keys</text>
+<rect x="505.0" y="841.0" width="227.7" height="11.0" rx="2" fill="#a371f7"/>
+<text x="738.7" y="851.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">56 ms</tspan><tspan fill="#8b949e" font-size="10"></tspan></text>
+<rect x="505.0" y="855.0" width="228.2" height="11.0" rx="2" fill="#3fb950"/>
+<text x="739.2" y="865.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">57 ms</tspan><tspan fill="#8b949e" font-size="10"></tspan></text>
+<rect x="505.0" y="869.0" width="205.3" height="11.0" rx="2" fill="#6e7681"/>
+<text x="716.3" y="879.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">38 ms</tspan><tspan fill="#8b949e" font-size="10"></tspan></text>
+<rect x="505.0" y="883.0" width="152.9" height="11.0" rx="2" fill="#58a6ff"/>
+<text x="663.9" y="893.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">15 ms</tspan><tspan fill="#8b949e" font-size="10"></tspan></text>
+<text x="493.0" y="922.0" fill="#e6edf3" font-size="13" text-anchor="end">asof --at the midpoint --lookback 1d: 10 keys</text>
+<rect x="505.0" y="910.0" width="247.1" height="11.0" rx="2" fill="#a371f7"/>
+<text x="758.1" y="920.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">80 ms</tspan><tspan fill="#8b949e" font-size="10"></tspan></text>
+<rect x="505.0" y="924.0" width="247.6" height="11.0" rx="2" fill="#3fb950"/>
+<text x="758.6" y="934.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">80 ms</tspan><tspan fill="#8b949e" font-size="10"></tspan></text>
+<rect x="505.0" y="938.0" width="205.3" height="11.0" rx="2" fill="#6e7681"/>
+<text x="716.3" y="948.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">38 ms</tspan><tspan fill="#8b949e" font-size="10"></tspan></text>
+<rect x="505.0" y="952.0" width="152.9" height="11.0" rx="2" fill="#58a6ff"/>
+<text x="663.9" y="962.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">15 ms</tspan><tspan fill="#8b949e" font-size="10"></tspan></text>
+<text x="493.0" y="991.0" fill="#e6edf3" font-size="13" text-anchor="end">asof --at the midpoint --lookback 30d: 10 keys</text>
+<rect x="505.0" y="979.0" width="249.6" height="11.0" rx="2" fill="#a371f7"/>
+<text x="760.6" y="989.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">83 ms</tspan><tspan fill="#8b949e" font-size="10"></tspan></text>
+<rect x="505.0" y="993.0" width="251.5" height="11.0" rx="2" fill="#3fb950"/>
+<text x="762.5" y="1003.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">86 ms</tspan><tspan fill="#8b949e" font-size="10"></tspan></text>
+<rect x="505.0" y="1007.0" width="205.3" height="11.0" rx="2" fill="#6e7681"/>
+<text x="716.3" y="1017.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">38 ms</tspan><tspan fill="#8b949e" font-size="10"></tspan></text>
+<rect x="505.0" y="1021.0" width="156.5" height="11.0" rx="2" fill="#58a6ff"/>
+<text x="667.5" y="1031.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">16 ms</tspan><tspan fill="#8b949e" font-size="10"></tspan></text>
+<text x="493.0" y="1060.0" fill="#e6edf3" font-size="13" text-anchor="end">locate --window: 300 keys, the day before the midpoint instant</text>
+<rect x="505.0" y="1048.0" width="363.2" height="11.0" rx="2" fill="#a371f7"/>
+<text x="874.2" y="1058.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">622 ms</tspan><tspan fill="#8b949e" font-size="10"></tspan></text>
+<rect x="505.0" y="1062.0" width="363.5" height="11.0" rx="2" fill="#3fb950"/>
+<text x="874.5" y="1072.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">626 ms</tspan><tspan fill="#8b949e" font-size="10"></tspan></text>
+<rect x="505.0" y="1076.0" width="205.3" height="11.0" rx="2" fill="#6e7681"/>
+<text x="716.3" y="1086.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">38 ms</tspan><tspan fill="#8b949e" font-size="10"></tspan></text>
+<rect x="505.0" y="1090.0" width="156.5" height="11.0" rx="2" fill="#58a6ff"/>
+<text x="667.5" y="1100.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">16 ms</tspan><tspan fill="#8b949e" font-size="10"></tspan></text>
+<text x="493.0" y="1129.0" fill="#e6edf3" font-size="13" text-anchor="end">locate --window: 300 keys, the 30 days before the midpoint instant</text>
+<rect x="505.0" y="1117.0" width="364.0" height="11.0" rx="2" fill="#a371f7"/>
+<text x="875.0" y="1127.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">631 ms</tspan><tspan fill="#8b949e" font-size="10"></tspan></text>
+<rect x="505.0" y="1131.0" width="366.0" height="11.0" rx="2" fill="#3fb950"/>
+<text x="877.0" y="1141.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">654 ms</tspan><tspan fill="#8b949e" font-size="10"></tspan></text>
+<rect x="505.0" y="1145.0" width="205.3" height="11.0" rx="2" fill="#6e7681"/>
+<text x="716.3" y="1155.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">38 ms</tspan><tspan fill="#8b949e" font-size="10"></tspan></text>
+<rect x="505.0" y="1159.0" width="188.1" height="11.0" rx="2" fill="#58a6ff"/>
+<text x="699.1" y="1169.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">28 ms</tspan><tspan fill="#8b949e" font-size="10"></tspan></text>
+<text x="493.0" y="1198.0" fill="#e6edf3" font-size="13" text-anchor="end">latest: the newest version of 300 keys</text>
+<rect x="505.0" y="1186.0" width="340.0" height="11.0" rx="2" fill="#a371f7"/>
+<text x="851.0" y="1196.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">413 ms</tspan><tspan fill="#8b949e" font-size="10"></tspan></text>
+<rect x="505.0" y="1200.0" width="340.2" height="11.0" rx="2" fill="#3fb950"/>
+<text x="851.2" y="1210.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">414 ms</tspan><tspan fill="#8b949e" font-size="10"></tspan></text>
+<rect x="505.0" y="1214.0" width="205.3" height="11.0" rx="2" fill="#6e7681"/>
+<text x="716.3" y="1224.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">38 ms</tspan><tspan fill="#8b949e" font-size="10"></tspan></text>
+<rect x="505.0" y="1228.0" width="199.1" height="11.0" rx="2" fill="#58a6ff"/>
+<text x="710.1" y="1238.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">34 ms</tspan><tspan fill="#8b949e" font-size="10"></tspan></text>
+<text x="493.0" y="1267.0" fill="#e6edf3" font-size="13" text-anchor="end">asof --at the midpoint instant: 300 keys</text>
+<rect x="505.0" y="1255.0" width="339.5" height="11.0" rx="2" fill="#a371f7"/>
+<text x="850.5" y="1265.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">409 ms</tspan><tspan fill="#8b949e" font-size="10"></tspan></text>
+<rect x="505.0" y="1269.0" width="339.8" height="11.0" rx="2" fill="#3fb950"/>
+<text x="850.8" y="1279.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">411 ms</tspan><tspan fill="#8b949e" font-size="10"></tspan></text>
+<rect x="505.0" y="1283.0" width="205.3" height="11.0" rx="2" fill="#6e7681"/>
+<text x="716.3" y="1293.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">38 ms</tspan><tspan fill="#8b949e" font-size="10"></tspan></text>
+<rect x="505.0" y="1297.0" width="183.9" height="11.0" rx="2" fill="#58a6ff"/>
+<text x="694.9" y="1307.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">26 ms</tspan><tspan fill="#8b949e" font-size="10"></tspan></text>
+<text x="493.0" y="1336.0" fill="#e6edf3" font-size="13" text-anchor="end">asof --at the midpoint --lookback 1d: 300 keys</text>
+<rect x="505.0" y="1324.0" width="363.1" height="11.0" rx="2" fill="#a371f7"/>
+<text x="874.1" y="1334.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">621 ms</tspan><tspan fill="#8b949e" font-size="10"></tspan></text>
+<rect x="505.0" y="1338.0" width="363.5" height="11.0" rx="2" fill="#3fb950"/>
+<text x="874.5" y="1348.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">625 ms</tspan><tspan fill="#8b949e" font-size="10"></tspan></text>
+<rect x="505.0" y="1352.0" width="205.3" height="11.0" rx="2" fill="#6e7681"/>
+<text x="716.3" y="1362.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">38 ms</tspan><tspan fill="#8b949e" font-size="10"></tspan></text>
+<rect x="505.0" y="1366.0" width="156.5" height="11.0" rx="2" fill="#58a6ff"/>
+<text x="667.5" y="1376.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">16 ms</tspan><tspan fill="#8b949e" font-size="10"></tspan></text>
+<text x="493.0" y="1405.0" fill="#e6edf3" font-size="13" text-anchor="end">asof --at the midpoint --lookback 30d: 300 keys</text>
+<rect x="505.0" y="1393.0" width="363.9" height="11.0" rx="2" fill="#a371f7"/>
+<text x="874.9" y="1403.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">630 ms</tspan><tspan fill="#8b949e" font-size="10"></tspan></text>
+<rect x="505.0" y="1407.0" width="365.8" height="11.0" rx="2" fill="#3fb950"/>
+<text x="876.8" y="1417.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">651 ms</tspan><tspan fill="#8b949e" font-size="10"></tspan></text>
+<rect x="505.0" y="1421.0" width="205.3" height="11.0" rx="2" fill="#6e7681"/>
+<text x="716.3" y="1431.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">38 ms</tspan><tspan fill="#8b949e" font-size="10"></tspan></text>
+<rect x="505.0" y="1435.0" width="183.9" height="11.0" rx="2" fill="#58a6ff"/>
+<text x="694.9" y="1445.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">26 ms</tspan><tspan fill="#8b949e" font-size="10"></tspan></text>
+<text x="493.0" y="1474.0" fill="#e6edf3" font-size="13" text-anchor="end">locate --window: 3000 keys, the day before the midpoint instant</text>
+<rect x="505.0" y="1462.0" width="487.0" height="11.0" rx="2" fill="#a371f7"/>
+<text x="998.0" y="1472.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">5.57 s</tspan><tspan fill="#8b949e" font-size="10"></tspan></text>
+<rect x="505.0" y="1476.0" width="487.0" height="11.0" rx="2" fill="#3fb950"/>
+<text x="998.0" y="1486.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">5.58 s</tspan><tspan fill="#8b949e" font-size="10"></tspan></text>
+<rect x="505.0" y="1490.0" width="205.3" height="11.0" rx="2" fill="#6e7681"/>
+<text x="716.3" y="1500.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">38 ms</tspan><tspan fill="#8b949e" font-size="10"></tspan></text>
+<rect x="505.0" y="1504.0" width="160.0" height="11.0" rx="2" fill="#58a6ff"/>
+<text x="671.0" y="1514.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">17 ms</tspan><tspan fill="#8b949e" font-size="10"></tspan></text>
+<text x="493.0" y="1543.0" fill="#e6edf3" font-size="13" text-anchor="end">locate --window: 3000 keys, the 30 days before the midpoint instant</text>
+<rect x="505.0" y="1531.0" width="486.6" height="11.0" rx="2" fill="#a371f7"/>
+<text x="997.6" y="1541.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">5.53 s</tspan><tspan fill="#8b949e" font-size="10"></tspan></text>
+<rect x="505.0" y="1545.0" width="486.8" height="11.0" rx="2" fill="#3fb950"/>
+<text x="997.8" y="1555.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">5.55 s</tspan><tspan fill="#8b949e" font-size="10"></tspan></text>
+<rect x="505.0" y="1559.0" width="205.3" height="11.0" rx="2" fill="#6e7681"/>
+<text x="716.3" y="1569.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">38 ms</tspan><tspan fill="#8b949e" font-size="10"></tspan></text>
+<rect x="505.0" y="1573.0" width="188.1" height="11.0" rx="2" fill="#58a6ff"/>
+<text x="699.1" y="1583.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">28 ms</tspan><tspan fill="#8b949e" font-size="10"></tspan></text>
+<text x="493.0" y="1612.0" fill="#e6edf3" font-size="13" text-anchor="end">latest: the newest version of 3000 keys</text>
+<rect x="505.0" y="1600.0" width="462.6" height="11.0" rx="2" fill="#a371f7"/>
+<text x="973.6" y="1610.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">3.62 s</tspan><tspan fill="#8b949e" font-size="10"></tspan></text>
+<rect x="505.0" y="1614.0" width="462.6" height="11.0" rx="2" fill="#3fb950"/>
+<text x="973.6" y="1624.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">3.62 s</tspan><tspan fill="#8b949e" font-size="10"></tspan></text>
+<rect x="505.0" y="1628.0" width="205.3" height="11.0" rx="2" fill="#6e7681"/>
+<text x="716.3" y="1638.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">38 ms</tspan><tspan fill="#8b949e" font-size="10"></tspan></text>
+<rect x="505.0" y="1642.0" width="223.1" height="11.0" rx="2" fill="#58a6ff"/>
+<text x="734.1" y="1652.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">52 ms</tspan><tspan fill="#8b949e" font-size="10"></tspan></text>
+<text x="493.0" y="1681.0" fill="#e6edf3" font-size="13" text-anchor="end">asof --at the midpoint instant: 3000 keys</text>
+<rect x="505.0" y="1669.0" width="461.2" height="11.0" rx="2" fill="#a371f7"/>
+<text x="972.2" y="1679.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">3.53 s</tspan><tspan fill="#8b949e" font-size="10"></tspan></text>
+<rect x="505.0" y="1683.0" width="461.3" height="11.0" rx="2" fill="#3fb950"/>
+<text x="972.3" y="1693.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">3.53 s</tspan><tspan fill="#8b949e" font-size="10"></tspan></text>
+<rect x="505.0" y="1697.0" width="205.3" height="11.0" rx="2" fill="#6e7681"/>
+<text x="716.3" y="1707.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">38 ms</tspan><tspan fill="#8b949e" font-size="10"></tspan></text>
+<rect x="505.0" y="1711.0" width="206.8" height="11.0" rx="2" fill="#58a6ff"/>
+<text x="717.8" y="1721.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">39 ms</tspan><tspan fill="#8b949e" font-size="10"></tspan></text>
+<text x="493.0" y="1750.0" fill="#e6edf3" font-size="13" text-anchor="end">asof --at the midpoint --lookback 1d: 3000 keys</text>
+<rect x="505.0" y="1738.0" width="484.4" height="11.0" rx="2" fill="#a371f7"/>
+<text x="995.4" y="1748.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">5.32 s</tspan><tspan fill="#8b949e" font-size="10"></tspan></text>
+<rect x="505.0" y="1752.0" width="484.4" height="11.0" rx="2" fill="#3fb950"/>
+<text x="995.4" y="1762.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">5.33 s</tspan><tspan fill="#8b949e" font-size="10"></tspan></text>
+<rect x="505.0" y="1766.0" width="205.3" height="11.0" rx="2" fill="#6e7681"/>
+<text x="716.3" y="1776.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">38 ms</tspan><tspan fill="#8b949e" font-size="10"></tspan></text>
+<rect x="505.0" y="1780.0" width="160.0" height="11.0" rx="2" fill="#58a6ff"/>
+<text x="671.0" y="1790.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">17 ms</tspan><tspan fill="#8b949e" font-size="10"></tspan></text>
+<text x="493.0" y="1819.0" fill="#e6edf3" font-size="13" text-anchor="end">asof --at the midpoint --lookback 30d: 3000 keys</text>
+<rect x="505.0" y="1807.0" width="483.5" height="11.0" rx="2" fill="#a371f7"/>
+<text x="994.5" y="1817.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">5.24 s</tspan><tspan fill="#8b949e" font-size="10"></tspan></text>
+<rect x="505.0" y="1821.0" width="483.8" height="11.0" rx="2" fill="#3fb950"/>
+<text x="994.8" y="1831.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">5.26 s</tspan><tspan fill="#8b949e" font-size="10"></tspan></text>
+<rect x="505.0" y="1835.0" width="205.3" height="11.0" rx="2" fill="#6e7681"/>
+<text x="716.3" y="1845.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">38 ms</tspan><tspan fill="#8b949e" font-size="10"></tspan></text>
+<rect x="505.0" y="1849.0" width="188.1" height="11.0" rx="2" fill="#58a6ff"/>
+<text x="699.1" y="1859.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">28 ms</tspan><tspan fill="#8b949e" font-size="10"></tspan></text>
+<text x="24.0" y="1894.0" fill="#e6edf3" font-size="14" font-weight="600">gh-events</text>
+<text x="493.0" y="1914.0" fill="#e6edf3" font-size="13" text-anchor="end">locate --window: 10 keys, the day before the midpoint instant</text>
+<rect x="505.0" y="1902.0" width="195.8" height="11.0" rx="2" fill="#a371f7"/>
+<text x="706.8" y="1912.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">32 ms</tspan><tspan fill="#8b949e" font-size="10"></tspan></text>
+<rect x="505.0" y="1916.0" width="200.0" height="11.0" rx="2" fill="#3fb950"/>
+<text x="711.0" y="1926.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">35 ms</tspan><tspan fill="#8b949e" font-size="10"></tspan></text>
+<rect x="505.0" y="1930.0" width="98.2" height="11.0" rx="2" fill="#6e7681"/>
+<text x="609.2" y="1940.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">5.7 ms</tspan><tspan fill="#8b949e" font-size="10"></tspan></text>
+<rect x="505.0" y="1944.0" width="62.0" height="11.0" rx="2" fill="#58a6ff"/>
+<text x="573.0" y="1954.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">3.0 ms</tspan><tspan fill="#8b949e" font-size="10"></tspan></text>
+<text x="493.0" y="1983.0" fill="#e6edf3" font-size="13" text-anchor="end">locate --window: 10 keys, the 30 days before the midpoint instant</text>
+<rect x="505.0" y="1971.0" width="188.9" height="11.0" rx="2" fill="#a371f7"/>
+<text x="699.9" y="1981.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">28 ms</tspan><tspan fill="#8b949e" font-size="10"></tspan></text>
+<rect x="505.0" y="1985.0" width="193.5" height="11.0" rx="2" fill="#3fb950"/>
+<text x="704.5" y="1995.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">31 ms</tspan><tspan fill="#8b949e" font-size="10"></tspan></text>
+<rect x="505.0" y="1999.0" width="98.2" height="11.0" rx="2" fill="#6e7681"/>
+<text x="609.2" y="2009.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">5.7 ms</tspan><tspan fill="#8b949e" font-size="10"></tspan></text>
+<rect x="505.0" y="2013.0" width="62.0" height="11.0" rx="2" fill="#58a6ff"/>
+<text x="573.0" y="2023.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">3.0 ms</tspan><tspan fill="#8b949e" font-size="10"></tspan></text>
+<text x="493.0" y="2052.0" fill="#e6edf3" font-size="13" text-anchor="end">latest: the newest version of 10 keys</text>
+<rect x="505.0" y="2040.0" width="188.7" height="11.0" rx="2" fill="#a371f7"/>
+<text x="699.7" y="2050.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">28 ms</tspan><tspan fill="#8b949e" font-size="10"></tspan></text>
+<rect x="505.0" y="2054.0" width="195.1" height="11.0" rx="2" fill="#3fb950"/>
+<text x="706.1" y="2064.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">32 ms</tspan><tspan fill="#8b949e" font-size="10"></tspan></text>
+<rect x="505.0" y="2068.0" width="98.2" height="11.0" rx="2" fill="#6e7681"/>
+<text x="609.2" y="2078.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">5.7 ms</tspan><tspan fill="#8b949e" font-size="10"></tspan></text>
+<rect x="505.0" y="2082.0" width="90.9" height="11.0" rx="2" fill="#58a6ff"/>
+<text x="601.9" y="2092.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">5.0 ms</tspan><tspan fill="#8b949e" font-size="10"></tspan></text>
+<text x="493.0" y="2121.0" fill="#e6edf3" font-size="13" text-anchor="end">asof --at the midpoint instant: 10 keys</text>
+<rect x="505.0" y="2109.0" width="190.5" height="11.0" rx="2" fill="#a371f7"/>
+<text x="701.5" y="2119.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">29 ms</tspan><tspan fill="#8b949e" font-size="10"></tspan></text>
+<rect x="505.0" y="2123.0" width="195.1" height="11.0" rx="2" fill="#3fb950"/>
+<text x="706.1" y="2133.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">32 ms</tspan><tspan fill="#8b949e" font-size="10"></tspan></text>
+<rect x="505.0" y="2137.0" width="98.2" height="11.0" rx="2" fill="#6e7681"/>
+<text x="609.2" y="2147.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">5.7 ms</tspan><tspan fill="#8b949e" font-size="10"></tspan></text>
+<rect x="505.0" y="2151.0" width="62.0" height="11.0" rx="2" fill="#58a6ff"/>
+<text x="573.0" y="2161.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">3.0 ms</tspan><tspan fill="#8b949e" font-size="10"></tspan></text>
+<text x="493.0" y="2190.0" fill="#e6edf3" font-size="13" text-anchor="end">asof --at the midpoint --lookback 1d: 10 keys</text>
+<rect x="505.0" y="2178.0" width="186.2" height="11.0" rx="2" fill="#a371f7"/>
+<text x="697.2" y="2188.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">27 ms</tspan><tspan fill="#8b949e" font-size="10"></tspan></text>
+<rect x="505.0" y="2192.0" width="191.4" height="11.0" rx="2" fill="#3fb950"/>
+<text x="702.4" y="2202.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">30 ms</tspan><tspan fill="#8b949e" font-size="10"></tspan></text>
+<rect x="505.0" y="2206.0" width="98.2" height="11.0" rx="2" fill="#6e7681"/>
+<text x="609.2" y="2216.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">5.7 ms</tspan><tspan fill="#8b949e" font-size="10"></tspan></text>
+<rect x="505.0" y="2220.0" width="62.0" height="11.0" rx="2" fill="#58a6ff"/>
+<text x="573.0" y="2230.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">3.0 ms</tspan><tspan fill="#8b949e" font-size="10"></tspan></text>
+<text x="493.0" y="2259.0" fill="#e6edf3" font-size="13" text-anchor="end">asof --at the midpoint --lookback 30d: 10 keys</text>
+<rect x="505.0" y="2247.0" width="188.0" height="11.0" rx="2" fill="#a371f7"/>
+<text x="699.0" y="2257.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">28 ms</tspan><tspan fill="#8b949e" font-size="10"></tspan></text>
+<rect x="505.0" y="2261.0" width="192.6" height="11.0" rx="2" fill="#3fb950"/>
+<text x="703.6" y="2271.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">30 ms</tspan><tspan fill="#8b949e" font-size="10"></tspan></text>
+<rect x="505.0" y="2275.0" width="98.2" height="11.0" rx="2" fill="#6e7681"/>
+<text x="609.2" y="2285.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">5.7 ms</tspan><tspan fill="#8b949e" font-size="10"></tspan></text>
+<rect x="505.0" y="2289.0" width="62.0" height="11.0" rx="2" fill="#58a6ff"/>
+<text x="573.0" y="2299.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">3.0 ms</tspan><tspan fill="#8b949e" font-size="10"></tspan></text>
+<text x="493.0" y="2328.0" fill="#e6edf3" font-size="13" text-anchor="end">locate --window: 300 keys, the day before the midpoint instant</text>
+<rect x="505.0" y="2316.0" width="249.7" height="11.0" rx="2" fill="#a371f7"/>
+<text x="760.7" y="2326.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">83 ms</tspan><tspan fill="#8b949e" font-size="10"></tspan></text>
+<rect x="505.0" y="2330.0" width="251.8" height="11.0" rx="2" fill="#3fb950"/>
+<text x="762.8" y="2340.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">87 ms</tspan><tspan fill="#8b949e" font-size="10"></tspan></text>
+<rect x="505.0" y="2344.0" width="98.2" height="11.0" rx="2" fill="#6e7681"/>
+<text x="609.2" y="2354.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">5.7 ms</tspan><tspan fill="#8b949e" font-size="10"></tspan></text>
+<rect x="505.0" y="2358.0" width="78.3" height="11.0" rx="2" fill="#58a6ff"/>
+<text x="589.3" y="2368.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">4.0 ms</tspan><tspan fill="#8b949e" font-size="10"></tspan></text>
+<text x="493.0" y="2397.0" fill="#e6edf3" font-size="13" text-anchor="end">locate --window: 300 keys, the 30 days before the midpoint instant</text>
+<rect x="505.0" y="2385.0" width="249.5" height="11.0" rx="2" fill="#a371f7"/>
+<text x="760.5" y="2395.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">83 ms</tspan><tspan fill="#8b949e" font-size="10"></tspan></text>
+<rect x="505.0" y="2399.0" width="251.5" height="11.0" rx="2" fill="#3fb950"/>
+<text x="762.5" y="2409.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">86 ms</tspan><tspan fill="#8b949e" font-size="10"></tspan></text>
+<rect x="505.0" y="2413.0" width="98.2" height="11.0" rx="2" fill="#6e7681"/>
+<text x="609.2" y="2423.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">5.7 ms</tspan><tspan fill="#8b949e" font-size="10"></tspan></text>
+<rect x="505.0" y="2427.0" width="62.0" height="11.0" rx="2" fill="#58a6ff"/>
+<text x="573.0" y="2437.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">3.0 ms</tspan><tspan fill="#8b949e" font-size="10"></tspan></text>
+<text x="493.0" y="2466.0" fill="#e6edf3" font-size="13" text-anchor="end">latest: the newest version of 300 keys</text>
+<rect x="505.0" y="2454.0" width="226.5" height="11.0" rx="2" fill="#a371f7"/>
+<text x="737.5" y="2464.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">55 ms</tspan><tspan fill="#8b949e" font-size="10"></tspan></text>
+<rect x="505.0" y="2468.0" width="231.9" height="11.0" rx="2" fill="#3fb950"/>
+<text x="742.9" y="2478.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">61 ms</tspan><tspan fill="#8b949e" font-size="10"></tspan></text>
+<rect x="505.0" y="2482.0" width="98.2" height="11.0" rx="2" fill="#6e7681"/>
+<text x="609.2" y="2492.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">5.7 ms</tspan><tspan fill="#8b949e" font-size="10"></tspan></text>
+<rect x="505.0" y="2496.0" width="101.2" height="11.0" rx="2" fill="#58a6ff"/>
+<text x="612.2" y="2506.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">6.0 ms</tspan><tspan fill="#8b949e" font-size="10"></tspan></text>
+<text x="493.0" y="2535.0" fill="#e6edf3" font-size="13" text-anchor="end">asof --at the midpoint instant: 300 keys</text>
+<rect x="505.0" y="2523.0" width="225.9" height="11.0" rx="2" fill="#a371f7"/>
+<text x="736.9" y="2533.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">55 ms</tspan><tspan fill="#8b949e" font-size="10"></tspan></text>
+<rect x="505.0" y="2537.0" width="228.9" height="11.0" rx="2" fill="#3fb950"/>
+<text x="739.9" y="2547.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">58 ms</tspan><tspan fill="#8b949e" font-size="10"></tspan></text>
+<rect x="505.0" y="2551.0" width="98.2" height="11.0" rx="2" fill="#6e7681"/>
+<text x="609.2" y="2561.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">5.7 ms</tspan><tspan fill="#8b949e" font-size="10"></tspan></text>
+<rect x="505.0" y="2565.0" width="78.3" height="11.0" rx="2" fill="#58a6ff"/>
+<text x="589.3" y="2575.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">4.0 ms</tspan><tspan fill="#8b949e" font-size="10"></tspan></text>
+<text x="493.0" y="2604.0" fill="#e6edf3" font-size="13" text-anchor="end">asof --at the midpoint --lookback 1d: 300 keys</text>
+<rect x="505.0" y="2592.0" width="249.1" height="11.0" rx="2" fill="#a371f7"/>
+<text x="760.1" y="2602.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">82 ms</tspan><tspan fill="#8b949e" font-size="10"></tspan></text>
+<rect x="505.0" y="2606.0" width="251.1" height="11.0" rx="2" fill="#3fb950"/>
+<text x="762.1" y="2616.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">85 ms</tspan><tspan fill="#8b949e" font-size="10"></tspan></text>
+<rect x="505.0" y="2620.0" width="98.2" height="11.0" rx="2" fill="#6e7681"/>
+<text x="609.2" y="2630.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">5.7 ms</tspan><tspan fill="#8b949e" font-size="10"></tspan></text>
+<rect x="505.0" y="2634.0" width="62.0" height="11.0" rx="2" fill="#58a6ff"/>
+<text x="573.0" y="2644.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">3.0 ms</tspan><tspan fill="#8b949e" font-size="10"></tspan></text>
+<text x="493.0" y="2673.0" fill="#e6edf3" font-size="13" text-anchor="end">asof --at the midpoint --lookback 30d: 300 keys</text>
+<rect x="505.0" y="2661.0" width="251.0" height="11.0" rx="2" fill="#a371f7"/>
+<text x="762.0" y="2671.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">85 ms</tspan><tspan fill="#8b949e" font-size="10"></tspan></text>
+<rect x="505.0" y="2675.0" width="253.1" height="11.0" rx="2" fill="#3fb950"/>
+<text x="764.1" y="2685.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">88 ms</tspan><tspan fill="#8b949e" font-size="10"></tspan></text>
+<rect x="505.0" y="2689.0" width="98.2" height="11.0" rx="2" fill="#6e7681"/>
+<text x="609.2" y="2699.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">5.7 ms</tspan><tspan fill="#8b949e" font-size="10"></tspan></text>
+<rect x="505.0" y="2703.0" width="90.9" height="11.0" rx="2" fill="#58a6ff"/>
+<text x="601.9" y="2713.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">5.0 ms</tspan><tspan fill="#8b949e" font-size="10"></tspan></text>
+<text x="493.0" y="2742.0" fill="#e6edf3" font-size="13" text-anchor="end">locate --window: 3000 keys, the day before the midpoint instant</text>
+<rect x="505.0" y="2730.0" width="319.3" height="11.0" rx="2" fill="#a371f7"/>
+<text x="830.3" y="2740.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">286 ms</tspan><tspan fill="#8b949e" font-size="10"></tspan></text>
+<rect x="505.0" y="2744.0" width="319.9" height="11.0" rx="2" fill="#3fb950"/>
+<text x="830.9" y="2754.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">289 ms</tspan><tspan fill="#8b949e" font-size="10"></tspan></text>
+<rect x="505.0" y="2758.0" width="98.2" height="11.0" rx="2" fill="#6e7681"/>
+<text x="609.2" y="2768.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">5.7 ms</tspan><tspan fill="#8b949e" font-size="10"></tspan></text>
+<rect x="505.0" y="2772.0" width="78.3" height="11.0" rx="2" fill="#58a6ff"/>
+<text x="589.3" y="2782.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">4.0 ms</tspan><tspan fill="#8b949e" font-size="10"></tspan></text>
+<text x="493.0" y="2811.0" fill="#e6edf3" font-size="13" text-anchor="end">locate --window: 3000 keys, the 30 days before the midpoint instant</text>
+<rect x="505.0" y="2799.0" width="317.4" height="11.0" rx="2" fill="#a371f7"/>
+<text x="828.4" y="2809.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">276 ms</tspan><tspan fill="#8b949e" font-size="10"></tspan></text>
+<rect x="505.0" y="2813.0" width="318.0" height="11.0" rx="2" fill="#3fb950"/>
+<text x="829.0" y="2823.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">279 ms</tspan><tspan fill="#8b949e" font-size="10"></tspan></text>
+<rect x="505.0" y="2827.0" width="98.2" height="11.0" rx="2" fill="#6e7681"/>
+<text x="609.2" y="2837.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">5.7 ms</tspan><tspan fill="#8b949e" font-size="10"></tspan></text>
+<rect x="505.0" y="2841.0" width="78.3" height="11.0" rx="2" fill="#58a6ff"/>
+<text x="589.3" y="2851.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">4.0 ms</tspan><tspan fill="#8b949e" font-size="10"></tspan></text>
+<text x="493.0" y="2880.0" fill="#e6edf3" font-size="13" text-anchor="end">latest: the newest version of 3000 keys</text>
+<rect x="505.0" y="2868.0" width="294.2" height="11.0" rx="2" fill="#a371f7"/>
+<text x="805.2" y="2878.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">183 ms</tspan><tspan fill="#8b949e" font-size="10"></tspan></text>
+<rect x="505.0" y="2882.0" width="295.9" height="11.0" rx="2" fill="#3fb950"/>
+<text x="806.9" y="2892.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">189 ms</tspan><tspan fill="#8b949e" font-size="10"></tspan></text>
+<rect x="505.0" y="2896.0" width="98.2" height="11.0" rx="2" fill="#6e7681"/>
+<text x="609.2" y="2906.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">5.7 ms</tspan><tspan fill="#8b949e" font-size="10"></tspan></text>
+<rect x="505.0" y="2910.0" width="109.9" height="11.0" rx="2" fill="#58a6ff"/>
+<text x="620.9" y="2920.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">7.0 ms</tspan><tspan fill="#8b949e" font-size="10"></tspan></text>
+<text x="493.0" y="2949.0" fill="#e6edf3" font-size="13" text-anchor="end">asof --at the midpoint instant: 3000 keys</text>
+<rect x="505.0" y="2937.0" width="292.7" height="11.0" rx="2" fill="#a371f7"/>
+<text x="803.7" y="2947.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">178 ms</tspan><tspan fill="#8b949e" font-size="10"></tspan></text>
+<rect x="505.0" y="2951.0" width="293.8" height="11.0" rx="2" fill="#3fb950"/>
+<text x="804.8" y="2961.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">182 ms</tspan><tspan fill="#8b949e" font-size="10"></tspan></text>
+<rect x="505.0" y="2965.0" width="98.2" height="11.0" rx="2" fill="#6e7681"/>
+<text x="609.2" y="2975.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">5.7 ms</tspan><tspan fill="#8b949e" font-size="10"></tspan></text>
+<rect x="505.0" y="2979.0" width="90.9" height="11.0" rx="2" fill="#58a6ff"/>
+<text x="601.9" y="2989.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">5.0 ms</tspan><tspan fill="#8b949e" font-size="10"></tspan></text>
+<text x="493.0" y="3018.0" fill="#e6edf3" font-size="13" text-anchor="end">asof --at the midpoint --lookback 1d: 3000 keys</text>
+<rect x="505.0" y="3006.0" width="319.2" height="11.0" rx="2" fill="#a371f7"/>
+<text x="830.2" y="3016.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">285 ms</tspan><tspan fill="#8b949e" font-size="10"></tspan></text>
+<rect x="505.0" y="3020.0" width="319.8" height="11.0" rx="2" fill="#3fb950"/>
+<text x="830.8" y="3030.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">288 ms</tspan><tspan fill="#8b949e" font-size="10"></tspan></text>
+<rect x="505.0" y="3034.0" width="98.2" height="11.0" rx="2" fill="#6e7681"/>
+<text x="609.2" y="3044.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">5.7 ms</tspan><tspan fill="#8b949e" font-size="10"></tspan></text>
+<rect x="505.0" y="3048.0" width="78.3" height="11.0" rx="2" fill="#58a6ff"/>
+<text x="589.3" y="3058.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">4.0 ms</tspan><tspan fill="#8b949e" font-size="10"></tspan></text>
+<text x="493.0" y="3087.0" fill="#e6edf3" font-size="13" text-anchor="end">asof --at the midpoint --lookback 30d: 3000 keys</text>
+<rect x="505.0" y="3075.0" width="317.7" height="11.0" rx="2" fill="#a371f7"/>
+<text x="828.7" y="3085.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">278 ms</tspan><tspan fill="#8b949e" font-size="10"></tspan></text>
+<rect x="505.0" y="3089.0" width="318.3" height="11.0" rx="2" fill="#3fb950"/>
+<text x="829.3" y="3099.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">281 ms</tspan><tspan fill="#8b949e" font-size="10"></tspan></text>
+<rect x="505.0" y="3103.0" width="98.2" height="11.0" rx="2" fill="#6e7681"/>
+<text x="609.2" y="3113.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">5.7 ms</tspan><tspan fill="#8b949e" font-size="10"></tspan></text>
+<rect x="505.0" y="3117.0" width="78.3" height="11.0" rx="2" fill="#58a6ff"/>
+<text x="589.3" y="3127.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">4.0 ms</tspan><tspan fill="#8b949e" font-size="10"></tspan></text>
+<line x1="505.0" y1="162.0" x2="505.0" y2="3144.0" stroke="#8b949e" stroke-opacity="0.25" stroke-dasharray="3 4"/>
+<text x="505.0" y="3162.0" fill="#8b949e" font-size="11" text-anchor="middle">1.0 ms</text>
+<line x1="635.0" y1="162.0" x2="635.0" y2="3144.0" stroke="#8b949e" stroke-opacity="0.25" stroke-dasharray="3 4"/>
+<text x="635.0" y="3162.0" fill="#8b949e" font-size="11" text-anchor="middle">10 ms</text>
+<line x1="765.0" y1="162.0" x2="765.0" y2="3144.0" stroke="#8b949e" stroke-opacity="0.25" stroke-dasharray="3 4"/>
+<text x="765.0" y="3162.0" fill="#8b949e" font-size="11" text-anchor="middle">100 ms</text>
+<line x1="895.0" y1="162.0" x2="895.0" y2="3144.0" stroke="#8b949e" stroke-opacity="0.25" stroke-dasharray="3 4"/>
+<text x="895.0" y="3162.0" fill="#8b949e" font-size="11" text-anchor="middle">1.00 s</text>
+<line x1="1025.0" y1="162.0" x2="1025.0" y2="3144.0" stroke="#8b949e" stroke-opacity="0.25" stroke-dasharray="3 4"/>
+<text x="1025.0" y="3162.0" fill="#8b949e" font-size="11" text-anchor="middle">10.00 s</text>
+<text x="505.0" y="3180.0" fill="#8b949e" font-size="11">log scale</text>
+</svg>
