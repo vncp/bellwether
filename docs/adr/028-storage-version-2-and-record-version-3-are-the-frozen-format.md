@@ -1,6 +1,6 @@
 # ADR 028: Storage version 2 and record version 3 are the frozen format
 
-**Status:** accepted · **Date:** 2026-10-26
+**Status:** accepted; **M5 declared** (the second pull request landed: storage version 2 and record version 3 are frozen) · **Date:** 2026-10-26
 
 ## Decision
 
@@ -29,25 +29,28 @@ Each pull request fills a named subset, and neither is a placeholder for the oth
   - the `SemiJoin`, `Join` and `WindowPartition` predicates.
   
   Ledger rule 7b reads `exactness`, and rule 9 passes a certificate only when `uncomparable == 0`.
-- **Fixtures.** `fixtures/format-v1/` was built by the last version 1 binary. `fixtures/format-v0.1/` was built by this one, with counts; its status is pre-M5: shapes final, bytes frozen at the second pull request, which must still read it. CI replays every plan, count and record hash both of them pin (`crates/bellwether-cli/tests/format_compat.rs`).
+- **Fixtures.** `fixtures/format-v1/` was built by the last version 1 binary. The fixture this pull request built (pre-M5: shapes final, bytes frozen at the second pull request) is `fixtures/format-v0.1-pre/` since the second pull request moved it there byte for byte. CI replays every plan, count and record hash it pins (`crates/bellwether-cli/tests/format_compat.rs`).
 - **The typed refusal of later shapes** (`Error::UnsupportedShape`), above, with a test per shape in the store (manifest), core (segment header) and CLI (exit 4, the message, no serde text).
 
-**Filled by the second:**
+**Landed by the second (WP14/B1 PR 2), which declares M5:**
 
-- **Verify** fills `examples`, `uncomparable`, `totals` and `row_filter`.
-- **Replay** fills `configuration`. It already sets `exactness`: `Exact` everywhere, and `Measured { model }` for a layout replay; the facade sets `Measured { model }` on every cost of a replay over a SQL table (ADR 027), whose runs no spec serves stay priced as a raw scan (`unserved` absent).
+- **Verify** fills `examples`, `uncomparable`, `totals` and `row_filter`; an uncomparable key no longer counts in `mismatched`.
+- **Replay** fills `configuration`. It already sets `exactness`: `Exact` everywhere, and `Measured { model }` for a layout replay; the facade sets `Measured { model }` on every cost of a replay over a SQL table (ADR 027), whose runs no spec serves stay priced as a raw scan (`unserved` absent). It prices a proposal's `sidecars` with its spec, and a bitemporal run (`why --valid-by/--known-by`, MCP `score.why` `valid_by`/`known_by`) against a `temporal2` candidate.
 - **Profile** fills `sample_size`, `quantile_error` and `Lint.fix`, and the facade fills a key proposal's `sidecars`.
-- **Plans:** `plan_ordered` fills `ScanPlan.order`, so two files can interleave.
+- **Plans:** `plan_ordered` fills `ScanPlan.order` when no order of whole files is a time order, so two files can interleave; when one is, `order` stays absent and the pinned plans of the earlier fixtures replay unchanged.
 - **Folded sidecars:**
-  - per-key time bounds move into the exact value record (`[counts] | [bounds]`, with the all-null sentinel);
-  - bitemporal versions get a `bitemporal` layout;
-  - `KeySpec::Exact.bounds` and `KeySpec::Bitemporal` become declarable as key specs;
-  - a bloom with bounds keeps its `bounds` sidecar.
+  - per-key time bounds move into the exact value record (`[counts] | [bounds]`, with the all-null sentinel `(i64::MAX, i64::MIN)`, which overlaps no window);
+  - bitemporal versions get a `bitemporal` layout (`bitmap | count | (valid, known, rg)` triples);
+  - `KeySpec::Exact.bounds` and `KeySpec::Bitemporal` are declarable as key specs, and `propose`/`fix` build, verify and receipt them (with any `sidecars`) end to end on CLI and MCP;
+  - a bloom with bounds keeps them in its `bounds` segment, a storage version 2 segment in the `keyed` layout under the bloom spec whose records are `bitmap | bounds`, each checksummed, listed with `kind: "bounds"` under the bloom's identity (round 1 of the review moved it out of the unchecksummed version 1 sidecar layout before the freeze, since every region a read touches has a checksum);
+  - an index written before M5 reads and plans as written; its first build with work folds its `bounds` and `temporal2` sidecars into key specs, rebuilds them, drops `schema.sidecars` entries of those kinds, and reports each fold (`sidecars_folded`). A sidecar no key spec can take (its spec's slot is held by one on another time column) is never discarded: it stays a declared sidecar, is built and still plans, and is reported (`kept_legacy`). Folding on read was rejected: a read never writes, and every pinned output of the earlier fixtures stays byte-identical.
 - **Manifest:**
-  - `schema.columns[].data_type` in core's `ColumnType` spelling;
+  - `schema.columns[].data_type` in core's `ColumnType` spelling (`{"arrow": …}` for a nested or dictionary type);
   - `source.dialect` in place of the `csv;delimiter=…` encoding;
   - the widest decimal across files when a new index infers its schema.
-- **A fixture** for the bytes it adds. It must still read `fixtures/format-v0.1/` unchanged.
+- **`Error::UnsupportedShape` is removed**: no shape of storage version 2 is unsupported by this binary.
+- **Deferred to WP15: the relational predicates** (contract v3 entry 23). `Predicate::{SemiJoin, Join, WindowPartition}` are frozen in their record version 3 shapes, and the verifier refuses them. WP15 may only **add behaviour** to them (pricing and planning by relational replay); it adds no field, variant or serialized form to a record. A WP15 need that a pinned shape cannot carry is a new record version with a fixture, not an edit.
+- **Fixture.** `fixtures/format-v0.1/` is rebuilt at M5 with every byte the second adds: `exact:id@ts,counts`, a bitemporal key, `bloom:id@0.01@ts`, a fixed proposal with bounds, `ColumnType` spellings and a CSV index with `source.dialect`. `format_compat.rs` replays all three fixtures (`format-v1`, `format-v0.1-pre`, `format-v0.1`) byte for byte, and `crates/bellwether-core/tests/folded_conformance.rs` pins the folded layouts' bytes against `docs/format.md` ("Folded layout conformance vectors").
 
 ## Rejected alternatives
 
@@ -69,5 +72,6 @@ ADR 026 prices the relational subset exactly from statistics and counted indexes
 - A version 2 binary reads version 1 manifests (keys rewritten from names to identities) and version 1 segments (no checksums, no counts). It writes only version 2 segments. A commit stamps a version 1 manifest `storage_version: 2` only when every file carries the row-group statistics (a build with work fills them); a commit that fills nothing (compaction, garbage collection, removing a spec) writes it back at version 1, in names.
 - A version 1 binary refuses a version 2 index with `Error::UnsupportedVersion`. The upgrade is one-way, and `bellwether index` names it.
 - A first-release version 2 binary refuses a second-release version 2 shape with `Error::UnsupportedShape`, naming the shape and saying to upgrade.
-- `docs/format.md` documents the version 2 bytes: the full segment layout with a worked segment, conformance vectors, the minimal manifest, the sidecar proposal vectors, and "Reading storage version 1".
+- `docs/format.md` documents the frozen version 2 bytes: the full segment layout with a worked segment, the folded layouts, conformance vectors, the minimal manifest, the sidecar proposal vectors, and "Reading storage version 1".
 - `docs/contract-v3.md` marks each entry this ADR closes.
+- From M5 a change to the bytes of a segment, a manifest or a record is a new version with a new fixture directory.

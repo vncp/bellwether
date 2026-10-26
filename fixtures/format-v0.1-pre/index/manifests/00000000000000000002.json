@@ -1,0 +1,460 @@
+{
+  "commit_nonce": 791056585919096402,
+  "committed_at": "2026-10-26T07:33:42.103Z",
+  "created_at": "2026-10-26T07:33:42.031Z",
+  "deleting": [],
+  "key_spec_completeness": {
+    "bloom:id@0.01": 1,
+    "bounds:id@ts": 1,
+    "exact:id": 1,
+    "range:ts": 1,
+    "temporal2:id@valid,known": 1,
+    "temporal:id@ts,counts": 1
+  },
+  "rowgroup_space": {
+    "files": [
+      {
+        "column_bytes": [
+          115,
+          67,
+          121,
+          106,
+          115,
+          95,
+          0,
+          112,
+          67,
+          115,
+          106,
+          122,
+          99,
+          0,
+          106,
+          67,
+          106,
+          106,
+          106,
+          88,
+          0
+        ],
+        "fingerprint": {
+          "etag": "2026-10-25T00:00:00.000000000Z",
+          "path": "/private/tmp/bellwether-format-v0.1/data/day=2026-01-01/part-0.parquet",
+          "size": 4430,
+          "tail_blake3": "f2d8e294c1c58fb467b692a61e0a583667018a175ac61408e1da5cd76c046e89"
+        },
+        "rowgroup_bytes": [
+          619,
+          621,
+          579
+        ],
+        "rowgroup_ids": [
+          0,
+          1,
+          2
+        ],
+        "rowgroup_rows": [
+          4,
+          4,
+          2
+        ]
+      },
+      {
+        "column_bytes": [
+          117,
+          67,
+          121,
+          106,
+          115,
+          99,
+          0,
+          112,
+          45,
+          121,
+          106,
+          122,
+          99,
+          0,
+          106,
+          67,
+          106,
+          106,
+          106,
+          88,
+          0
+        ],
+        "fingerprint": {
+          "etag": "2026-10-25T00:00:00.000000000Z",
+          "path": "/private/tmp/bellwether-format-v0.1/data/day=2026-01-01/part-1.parquet",
+          "size": 4407,
+          "tail_blake3": "317cb5ec1a8c4f7b02f44a778542979afc48aa56fae83b015d3f0c9d397e1ef6"
+        },
+        "rowgroup_bytes": [
+          625,
+          605,
+          579
+        ],
+        "rowgroup_ids": [
+          3,
+          4,
+          5
+        ],
+        "rowgroup_rows": [
+          4,
+          4,
+          2
+        ]
+      },
+      {
+        "column_bytes": [
+          117,
+          67,
+          121,
+          106,
+          122,
+          99,
+          0,
+          112,
+          67,
+          121,
+          106,
+          115,
+          99,
+          0,
+          106,
+          45,
+          106,
+          106,
+          106,
+          88,
+          0
+        ],
+        "fingerprint": {
+          "etag": "2026-10-25T00:00:00.000000000Z",
+          "path": "/private/tmp/bellwether-format-v0.1/data/day=2026-01-02/part-0.parquet",
+          "size": 4407,
+          "tail_blake3": "2852f467a5f695ec8467b0893fefac04941b9d38922d0709149a56446aa1eb9e"
+        },
+        "rowgroup_bytes": [
+          632,
+          620,
+          557
+        ],
+        "rowgroup_ids": [
+          6,
+          7,
+          8
+        ],
+        "rowgroup_rows": [
+          4,
+          4,
+          2
+        ]
+      },
+      {
+        "column_bytes": [
+          117,
+          45,
+          115,
+          106,
+          115,
+          99,
+          0,
+          112,
+          67,
+          121,
+          106,
+          122,
+          99,
+          0,
+          106,
+          67,
+          106,
+          106,
+          106,
+          88,
+          0
+        ],
+        "fingerprint": {
+          "etag": "2026-10-25T00:00:00.000000000Z",
+          "path": "/private/tmp/bellwether-format-v0.1/data/day=2026-01-02/part-1.parquet",
+          "size": 4401,
+          "tail_blake3": "6dad5ee3f2d6b43772ec472955e1a5f9e0ecf565106b4a6014bc43478e528fc4"
+        },
+        "rowgroup_bytes": [
+          597,
+          627,
+          579
+        ],
+        "rowgroup_ids": [
+          9,
+          10,
+          11
+        ],
+        "rowgroup_rows": [
+          4,
+          4,
+          2
+        ]
+      },
+      {
+        "column_bytes": [
+          112,
+          67,
+          115,
+          106,
+          122,
+          99,
+          0,
+          117,
+          45,
+          121,
+          106,
+          115,
+          99,
+          0,
+          106,
+          67,
+          106,
+          106,
+          106,
+          88,
+          0
+        ],
+        "fingerprint": {
+          "etag": "2026-10-25T00:00:00.000000000Z",
+          "path": "/private/tmp/bellwether-format-v0.1/data/day=2026-01-03/part-0.parquet",
+          "size": 4401,
+          "tail_blake3": "06f69397fbc534c0c7703caf15b4cc774d0ad32ad9801ed9676e63cb4b01bd05"
+        },
+        "rowgroup_bytes": [
+          621,
+          603,
+          579
+        ],
+        "rowgroup_ids": [
+          12,
+          13,
+          14
+        ],
+        "rowgroup_rows": [
+          4,
+          4,
+          2
+        ]
+      }
+    ],
+    "next_id": 15,
+    "tombstones": []
+  },
+  "schema": {
+    "columns": [
+      {
+        "data_type": "Int64",
+        "name": "id",
+        "nullable": true
+      },
+      {
+        "data_type": "Utf8",
+        "name": "symbol",
+        "nullable": true
+      },
+      {
+        "data_type": "Timestamp(µs, \"UTC\")",
+        "name": "ts",
+        "nullable": true
+      },
+      {
+        "data_type": "Timestamp(µs, \"UTC\")",
+        "name": "valid",
+        "nullable": true
+      },
+      {
+        "data_type": "Timestamp(µs, \"UTC\")",
+        "name": "known",
+        "nullable": true
+      },
+      {
+        "data_type": "Decimal128(10, 2)",
+        "name": "amount",
+        "nullable": true
+      },
+      {
+        "data_type": "Date32",
+        "name": "day",
+        "nullable": true
+      }
+    ],
+    "key_specs": [
+      {
+        "columns": [
+          "id"
+        ],
+        "kind": "exact"
+      },
+      {
+        "columns": [
+          "id"
+        ],
+        "fpr": 0.01,
+        "kind": "bloom"
+      },
+      {
+        "column": "ts",
+        "kind": "range"
+      },
+      {
+        "columns": [
+          "id"
+        ],
+        "counts": true,
+        "kind": "temporal",
+        "ts_column": "ts"
+      }
+    ],
+    "sidecars": [
+      {
+        "columns": [
+          "id"
+        ],
+        "kind": "bounds",
+        "time_columns": [
+          "ts"
+        ]
+      },
+      {
+        "columns": [
+          "id"
+        ],
+        "kind": "temporal2",
+        "time_columns": [
+          "valid",
+          "known"
+        ]
+      }
+    ]
+  },
+  "segment_tombstones": [],
+  "segments": [
+    {
+      "bytes": 1041,
+      "id": "410a20765810bc37220b24171fca6d7e617908921add2788f706cc5c4f90895c",
+      "key_spec": "bloom:id@0.01",
+      "rowgroup_range": {
+        "end": 12,
+        "start": 0
+      }
+    },
+    {
+      "bytes": 1155,
+      "id": "f9ede723d3351bdd1b1213e2675be3ffbcbdc966b22497e75124fbabf051aadf",
+      "key_spec": "bounds:id@ts",
+      "kind": "bounds",
+      "rowgroup_range": {
+        "end": 12,
+        "start": 0
+      }
+    },
+    {
+      "bytes": 907,
+      "id": "b0b918ca6a9c1d0a98b2aa6f7431531388f62bddbcd8e6d2de056412206926fd",
+      "key_spec": "exact:id",
+      "rowgroup_range": {
+        "end": 12,
+        "start": 0
+      }
+    },
+    {
+      "bytes": 749,
+      "id": "4c26d4a4ef11241ddb68249be9a39df750820b100652437800608db6c901ebb1",
+      "key_spec": "range:ts",
+      "rowgroup_range": {
+        "end": 12,
+        "start": 0
+      }
+    },
+    {
+      "bytes": 1182,
+      "id": "6bb311f722a0e8ce2c6b51e0d7eab9e136fdcd9588c8cbc4644508b6c3987d01",
+      "key_spec": "temporal2:id@valid,known",
+      "kind": "temporal2",
+      "rowgroup_range": {
+        "end": 12,
+        "start": 0
+      }
+    },
+    {
+      "bytes": 1574,
+      "id": "00a6d38da47ae9b66e03d12ca6008be18a86d0dbf13cc150ee502dba2885b23b",
+      "key_spec": "temporal:id@ts,counts",
+      "rowgroup_range": {
+        "end": 12,
+        "start": 0
+      }
+    },
+    {
+      "bytes": 465,
+      "id": "fd060af06354c5960d84b475aee504908b6bc3f6f404a936fc5d0ca2c733beeb",
+      "key_spec": "bloom:id@0.01",
+      "rowgroup_range": {
+        "end": 15,
+        "start": 12
+      }
+    },
+    {
+      "bytes": 601,
+      "id": "19a350ccd783b0c2af0008a8bbcc362e78498d849e267734b2c48b746c044c3c",
+      "key_spec": "bounds:id@ts",
+      "kind": "bounds",
+      "rowgroup_range": {
+        "end": 15,
+        "start": 12
+      }
+    },
+    {
+      "bytes": 800,
+      "id": "647b439cc906851b473e2618085d524881dc02bb4e27d351d7a819a1d330b439",
+      "key_spec": "exact:id",
+      "rowgroup_range": {
+        "end": 15,
+        "start": 12
+      }
+    },
+    {
+      "bytes": 443,
+      "id": "415baf0fec2c2adcfb7e0411a4574f9bd75d6cc6759dca4893793bea40f26399",
+      "key_spec": "range:ts",
+      "rowgroup_range": {
+        "end": 15,
+        "start": 12
+      }
+    },
+    {
+      "bytes": 668,
+      "id": "81c548d92281eb5b366a075c2d4b398b4bb4cd5b88f970c1db379152c07a64ac",
+      "key_spec": "temporal2:id@valid,known",
+      "kind": "temporal2",
+      "rowgroup_range": {
+        "end": 15,
+        "start": 12
+      }
+    },
+    {
+      "bytes": 1115,
+      "id": "6dd6134dd8835a4306290829ac7d37d1e343b96c8787310c731f4ff57e6b5cfa",
+      "key_spec": "temporal:id@ts,counts",
+      "rowgroup_range": {
+        "end": 15,
+        "start": 12
+      }
+    }
+  ],
+  "sequence": 2,
+  "source": {
+    "fingerprint_policy": "tail64k",
+    "kind": "parquet",
+    "partitioning": "hive",
+    "root": "/private/tmp/bellwether-format-v0.1/data"
+  },
+  "storage_version": 2
+}

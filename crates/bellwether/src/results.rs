@@ -61,6 +61,17 @@ pub struct SidecarState {
     pub complete_at: Option<u64>,
 }
 
+/// A sidecar of an index written before M5 that a build folded into a key
+/// spec ([`IndexResult::sidecars_folded`]).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SidecarFolded {
+    /// The sidecar's name (`bounds:symbol@ts`, `temporal2:id@valid,known`).
+    pub sidecar: String,
+    /// The identity of the key spec it now is (`exact:symbol@ts`,
+    /// `temporal2:id@valid,known`).
+    pub into: String,
+}
+
 /// What [`crate::Engine::index`] did.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct IndexResult {
@@ -121,6 +132,23 @@ pub struct IndexResult {
     /// committed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub upgraded_from: Option<u32>,
+    /// The sidecars of an index written before M5 (per-key time bounds,
+    /// bitemporal versions) this build folded into key specs, each rebuilt
+    /// under its new identity. Only what folded; absent (omitted in JSON)
+    /// when none did.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sidecars_folded: Vec<SidecarFolded>,
+    /// The sidecars of an index written before M5 that no key spec can
+    /// take (a spec on their key columns keeps another time column): kept
+    /// as sidecars, which still plan, are still built, and are listed in
+    /// `sidecars`. Absent (omitted in JSON) when none is.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub kept_legacy: Vec<String>,
+    /// On an `index` with nothing to do over an index written before M5:
+    /// the folds its next build with work makes. Absent (omitted in JSON)
+    /// otherwise.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fold_pending: Vec<SidecarFolded>,
     /// Text keys this build rebuilt whole because their segments were built
     /// under other Unicode tables (B5; after a deliberate upgrade of a
     /// table crate). Absent (omitted in JSON) when none was.
@@ -325,10 +353,12 @@ pub struct PlanResult {
     /// What the plan reads.
     pub planned: Cost,
     /// The timestamp or date column whose row-group minimum orders the
-    /// plan's entries (read in order, each entry's row groups ascending),
-    /// when that order holds; `None` when the order is unspecified.
+    /// planned row groups: read the entries in order, each entry's row
+    /// groups ascending, or, when files overlap in time, the plan's
+    /// `order` (`(entry, row group)` pairs interleaving files). Set exactly
+    /// when such an order exists (a complete range key on the column).
     pub ordered_by: Option<String>,
-    /// Why the order is unspecified, when it is.
+    /// Why there is no order, when there is none.
     pub unordered_reason: Option<String>,
     /// The rows holding the keys in the planned row groups, exact from the
     /// per-key counts of a spec on exactly the lookup's columns that stores
@@ -425,20 +455,16 @@ pub enum ProposeRefusal {
         /// The name given.
         name: String,
     },
-    /// The declaration builds a sidecar (`temporal2:id@valid,known`
-    /// bitemporal versions, or the per-key time bounds of
-    /// `exact:symbol@ts`), which a Proposal cannot carry: `ProposalBody::Key`
-    /// holds a key spec, and replay prices key specs only. It is built with
-    /// `bellwether index --key`, which gives it no receipt
-    /// (`docs/contract-v3.md`, entry 42).
-    SidecarNotProposable {
+    /// The declaration is a sketch (`sketch:...`): approximate and never
+    /// planned with, so no replay can price it and it has no certificate or
+    /// receipt. It is built with `bellwether index --key`. (Per-key time
+    /// bounds and bitemporal versions are key specs, proposed like any
+    /// other; M5.)
+    SketchNotProposable {
         /// The declaration, as `index --key` reads it.
         declaration: String,
-        /// The sidecar it declares, by its manifest name.
-        sidecar: String,
-        /// The key spec the sidecar rides beside, which can be proposed
-        /// alone; `None` for a sidecar declared alone (`temporal2`).
-        key: Option<String>,
+        /// The sketch, by its manifest name (`sketch:batch,id`).
+        sketch: String,
         /// The data root.
         root: String,
         /// The `bellwether index` command that builds it, every argument

@@ -1,12 +1,11 @@
 {
-  "commit_nonce": 791056585919096402,
-  "committed_at": "2026-10-26T07:33:42.103Z",
-  "created_at": "2026-10-26T07:33:42.031Z",
+  "commit_nonce": 7018779233804060008,
+  "committed_at": "2026-10-26T21:34:46.733Z",
+  "created_at": "2026-10-26T21:34:46.660Z",
   "deleting": [],
   "key_spec_completeness": {
-    "bloom:id@0.01": 1,
-    "bounds:id@ts": 1,
-    "exact:id": 1,
+    "bloom:id@0.01@ts": 1,
+    "exact:id@ts,counts": 1,
     "range:ts": 1,
     "temporal2:id@valid,known": 1,
     "temporal:id@ts,counts": 1
@@ -250,49 +249,74 @@
   "schema": {
     "columns": [
       {
-        "data_type": "Int64",
+        "data_type": {
+          "type": "int64"
+        },
         "name": "id",
         "nullable": true
       },
       {
-        "data_type": "Utf8",
+        "data_type": {
+          "type": "utf8"
+        },
         "name": "symbol",
         "nullable": true
       },
       {
-        "data_type": "Timestamp(µs, \"UTC\")",
+        "data_type": {
+          "type": "timestamp",
+          "tz": "UTC",
+          "unit": "microsecond"
+        },
         "name": "ts",
         "nullable": true
       },
       {
-        "data_type": "Timestamp(µs, \"UTC\")",
+        "data_type": {
+          "type": "timestamp",
+          "tz": "UTC",
+          "unit": "microsecond"
+        },
         "name": "valid",
         "nullable": true
       },
       {
-        "data_type": "Timestamp(µs, \"UTC\")",
+        "data_type": {
+          "type": "timestamp",
+          "tz": "UTC",
+          "unit": "microsecond"
+        },
         "name": "known",
         "nullable": true
       },
       {
-        "data_type": "Decimal128(10, 2)",
+        "data_type": {
+          "precision": 10,
+          "scale": 2,
+          "type": "decimal128"
+        },
         "name": "amount",
         "nullable": true
       },
       {
-        "data_type": "Date32",
+        "data_type": {
+          "type": "date32"
+        },
         "name": "day",
         "nullable": true
       }
     ],
     "key_specs": [
       {
+        "bounds": "ts",
         "columns": [
           "id"
         ],
+        "counts": true,
         "kind": "exact"
       },
       {
+        "bounds": "ts",
         "columns": [
           "id"
         ],
@@ -310,45 +334,32 @@
         "counts": true,
         "kind": "temporal",
         "ts_column": "ts"
-      }
-    ],
-    "sidecars": [
-      {
-        "columns": [
-          "id"
-        ],
-        "kind": "bounds",
-        "time_columns": [
-          "ts"
-        ]
       },
       {
         "columns": [
           "id"
         ],
-        "kind": "temporal2",
-        "time_columns": [
-          "valid",
-          "known"
-        ]
+        "kind": "bitemporal",
+        "known_column": "known",
+        "valid_column": "valid"
       }
     ]
   },
   "segment_tombstones": [],
   "segments": [
     {
-      "bytes": 1041,
-      "id": "410a20765810bc37220b24171fca6d7e617908921add2788f706cc5c4f90895c",
-      "key_spec": "bloom:id@0.01",
+      "bytes": 1055,
+      "id": "5c8a8e37a9d2d1750bd6da64b997fdc84dfa8166fe8b08f6956a342f8659ad08",
+      "key_spec": "bloom:id@0.01@ts",
       "rowgroup_range": {
         "end": 12,
         "start": 0
       }
     },
     {
-      "bytes": 1155,
-      "id": "f9ede723d3351bdd1b1213e2675be3ffbcbdc966b22497e75124fbabf051aadf",
-      "key_spec": "bounds:id@ts",
+      "bytes": 1576,
+      "id": "642f0bff7aad26879c2c74c7516da406462fb09ebf9025b440dac2aca1b1fe6a",
+      "key_spec": "bloom:id@0.01@ts",
       "kind": "bounds",
       "rowgroup_range": {
         "end": 12,
@@ -356,9 +367,9 @@
       }
     },
     {
-      "bytes": 907,
-      "id": "b0b918ca6a9c1d0a98b2aa6f7431531388f62bddbcd8e6d2de056412206926fd",
-      "key_spec": "exact:id",
+      "bytes": 1615,
+      "id": "fb8fb55f50903c8371b7e703349ba3a08f90ab2d619491c4aea27a2e5afcc462",
+      "key_spec": "exact:id@ts,counts",
       "rowgroup_range": {
         "end": 12,
         "start": 0
@@ -374,10 +385,9 @@
       }
     },
     {
-      "bytes": 1182,
-      "id": "6bb311f722a0e8ce2c6b51e0d7eab9e136fdcd9588c8cbc4644508b6c3987d01",
+      "bytes": 1752,
+      "id": "c1e8d697c07d25c2c5dba4f3792b1209cf0562d400912a11d718c93321d39aaa",
       "key_spec": "temporal2:id@valid,known",
-      "kind": "temporal2",
       "rowgroup_range": {
         "end": 12,
         "start": 0
@@ -393,18 +403,18 @@
       }
     },
     {
-      "bytes": 465,
-      "id": "fd060af06354c5960d84b475aee504908b6bc3f6f404a936fc5d0ca2c733beeb",
-      "key_spec": "bloom:id@0.01",
+      "bytes": 479,
+      "id": "10d6622d19febfaf1535369b12cb4bd557fe7cf2557018ac8aa224db1354c04b",
+      "key_spec": "bloom:id@0.01@ts",
       "rowgroup_range": {
         "end": 15,
         "start": 12
       }
     },
     {
-      "bytes": 601,
-      "id": "19a350ccd783b0c2af0008a8bbcc362e78498d849e267734b2c48b746c044c3c",
-      "key_spec": "bounds:id@ts",
+      "bytes": 1037,
+      "id": "e6b1da020f89c5ca2a9f8d1292582716f633c3fa7fdc8976bfcc38cb67b13ac2",
+      "key_spec": "bloom:id@0.01@ts",
       "kind": "bounds",
       "rowgroup_range": {
         "end": 15,
@@ -412,9 +422,9 @@
       }
     },
     {
-      "bytes": 800,
-      "id": "647b439cc906851b473e2618085d524881dc02bb4e27d351d7a819a1d330b439",
-      "key_spec": "exact:id",
+      "bytes": 1049,
+      "id": "b3047971515a3486eb5031f3c093f18a7681d7329f7c74aa135ffbdbabb5ae65",
+      "key_spec": "exact:id@ts,counts",
       "rowgroup_range": {
         "end": 15,
         "start": 12
@@ -430,10 +440,9 @@
       }
     },
     {
-      "bytes": 668,
-      "id": "81c548d92281eb5b366a075c2d4b398b4bb4cd5b88f970c1db379152c07a64ac",
+      "bytes": 1110,
+      "id": "889f037b30cfa4c192394f1718c9769737d91de8666385c2a2eaa0329feaab65",
       "key_spec": "temporal2:id@valid,known",
-      "kind": "temporal2",
       "rowgroup_range": {
         "end": 15,
         "start": 12

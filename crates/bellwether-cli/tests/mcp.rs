@@ -164,19 +164,17 @@ fn every_tool_with_a_cli_counterpart_returns_the_cli_json_line() {
     assert_eq!(refused["outcome"], "refused");
     let canon = std::fs::canonicalize(&data).unwrap();
     let canon = path(&canon);
-    // A sidecar declaration, in the short form `index --key` reads: the
-    // same typed refusal from both sides (exit 3), with its code, facts, and
-    // a next line naming the index command and, beside a key, the key to
-    // propose alone. The short form of a key spec proposes it.
-    for (declaration, key) in [
-        ("temporal2:id@ts,batch", None),
-        ("exact:id@ts", Some("exact:id")),
+    // Per-key time bounds and bitemporal versions are key specs (M5): the
+    // short form proposes them, the same record from both sides, and a
+    // repeated `--key` is the MCP `sidecars` argument.
+    for (declaration, kind) in [
+        ("temporal2:id@ts,batch", "bitemporal"),
+        ("exact:id@ts", "exact"),
     ] {
-        let args = json!({"spec": declaration, "evidence": [ev], "by": "agent"});
-        let refused = both(
+        let written = both(
             &srv,
             "propose.key",
-            args.clone(),
+            json!({"spec": declaration, "evidence": [ev], "by": "agent"}),
             &[
                 "propose",
                 d,
@@ -187,50 +185,61 @@ fn every_tool_with_a_cli_counterpart_returns_the_cli_json_line() {
                 "--key",
                 declaration,
             ],
-            3,
+            0,
         );
-        assert_eq!(refused["outcome"], "refused");
-        assert_eq!(refused["refusal"]["kind"], "sidecar_not_proposable");
-        assert_eq!(refused["refusal"]["declaration"], declaration);
-        let r = srv.call("propose.key", args);
-        let refusal = r.envelope.refusal.unwrap();
-        assert_eq!(refusal.code.as_str(), "sidecar_not_proposable");
-        assert_eq!(refusal.fields["key"], json!(key));
-        assert_eq!(
-            refusal.fields["command"],
-            json!(format!("bellwether index {canon} --key {declaration}"))
-        );
-        // The next line names MCP fields and tools, never a CLI flag.
-        assert!(
-            refusal
-                .next
-                .contains(&format!("index {canon} with the declaration {declaration}")),
-            "{}",
-            refusal.next
-        );
-        assert!(!refusal.next.contains("--"), "{}", refusal.next);
-        if let Some(k) = key {
-            assert!(
-                refusal
-                    .next
-                    .contains(&format!("propose.key with `spec` \"{k}\"")),
-                "{}",
-                refusal.next
-            );
-        }
-        // The human line says the same and what to do.
-        let human = run(&["propose", d, "--evidence", &ev, "--key", declaration], 3);
-        assert!(
-            human.contains(&format!("bellwether index {canon} --key {declaration}")),
-            "{human}"
-        );
-        if let Some(k) = key {
-            assert!(
-                human.contains(&format!("alone with --key {k}\n")),
-                "{human}"
-            );
-        }
+        assert_eq!(written["outcome"], "written");
+        assert_eq!(written["proposal"]["record"]["body"]["spec"]["kind"], kind);
     }
+    let with_sidecar = both(
+        &srv,
+        "propose.key",
+        json!({"spec": "exact:id", "sidecars": ["temporal2:id@ts,batch"],
+            "evidence": [ev], "by": "agent"}),
+        &[
+            "propose",
+            d,
+            "--evidence",
+            &ev,
+            "--by",
+            "agent",
+            "--key",
+            "exact:id",
+            "--key",
+            "temporal2:id@ts,batch",
+        ],
+        0,
+    );
+    let body = &with_sidecar["proposal"]["record"]["body"];
+    assert_eq!(body["spec"]["kind"], "exact", "{body}");
+    assert_eq!(body["sidecars"][0]["kind"], "bitemporal", "{body}");
+    // A sketch is approximate and never planned with: the same typed
+    // refusal from both sides (exit 3), naming the index command.
+    let args = json!({"spec": "sketch:id", "evidence": [ev], "by": "agent"});
+    let refused = both(
+        &srv,
+        "propose.key",
+        args.clone(),
+        &[
+            "propose",
+            d,
+            "--evidence",
+            &ev,
+            "--by",
+            "agent",
+            "--key",
+            "sketch:id",
+        ],
+        3,
+    );
+    assert_eq!(refused["outcome"], "refused");
+    assert_eq!(refused["refusal"]["kind"], "sketch_not_proposable");
+    let refusal = srv.call("propose.key", args).envelope.refusal.unwrap();
+    assert_eq!(refusal.code.as_str(), "sketch_not_proposable");
+    assert_eq!(
+        refusal.fields["command"],
+        json!(format!("bellwether index {canon} --key sketch:id"))
+    );
+    assert!(!refusal.next.contains("--"), "{}", refusal.next);
     let short = both(
         &srv,
         "propose.key",
@@ -403,6 +412,334 @@ fn every_tool_with_a_cli_counterpart_returns_the_cli_json_line() {
             uri,
         );
     }
+}
+
+/// One row of the bitemporal lake: (file, row group, id, valid s, known s).
+type BitemporalRow = (String, u64, i64, i64, i64);
+
+/// Three files of four row groups of 30 rows: row `k` has id `(k * 7) %
+/// 20` (every row group holds every id), was true from `k / 9` seconds and
+/// became known `k % 4` seconds later (`valid`, `known`: UTC µs).
+fn bitemporal_lake(dir: &Path) -> Vec<BitemporalRow> {
+    use std::sync::Arc;
+
+    use arrow::array::{ArrayRef, Int64Array, RecordBatch, TimestampMicrosecondArray};
+    use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
+    use parquet::arrow::ArrowWriter;
+    use parquet::file::properties::WriterProperties;
+
+    std::fs::create_dir_all(dir).unwrap();
+    let ts = || DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()));
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("valid", ts(), true),
+        Field::new("known", ts(), true),
+    ]));
+    let mut rows = Vec::new();
+    let mut k = 0i64;
+    for f in 0..3 {
+        let name = format!("part-{f}.parquet");
+        let props = WriterProperties::builder()
+            .set_max_row_group_row_count(Some(usize::MAX))
+            .build();
+        let file = std::fs::File::create(dir.join(&name)).unwrap();
+        let mut w = ArrowWriter::try_new(file, Arc::clone(&schema), Some(props)).unwrap();
+        for rg in 0..4u64 {
+            let ks: Vec<i64> = (k..k + 30).collect();
+            k += 30;
+            let id: Vec<i64> = ks.iter().map(|k| (k * 7) % 20).collect();
+            let valid: Vec<i64> = ks.iter().map(|k| k / 9).collect();
+            let known: Vec<i64> = ks.iter().zip(&valid).map(|(k, v)| v + k % 4).collect();
+            let us = |s: &[i64]| -> ArrayRef {
+                Arc::new(
+                    TimestampMicrosecondArray::from_iter_values(s.iter().map(|s| s * 1_000_000))
+                        .with_timezone("UTC"),
+                )
+            };
+            let batch = RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(Int64Array::from(id.clone())) as ArrayRef,
+                    us(&valid),
+                    us(&known),
+                ],
+            )
+            .unwrap();
+            w.write(&batch).unwrap();
+            w.flush().unwrap();
+            for i in 0..ks.len() {
+                rows.push((name.clone(), rg, id[i], valid[i], known[i]));
+            }
+        }
+        w.close().unwrap();
+    }
+    rows
+}
+
+/// The (file, row group) pairs of a plan line's Evidence, relative to `root`.
+fn plan_row_groups(v: &Value, root: &Path) -> std::collections::BTreeSet<(String, u64)> {
+    let base = format!("{}/", path(&std::fs::canonicalize(root).unwrap()));
+    v["evidence"]["record"]["body"]["plan"]["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|e| {
+            let rel = e["file"]["path"]
+                .as_str()
+                .unwrap()
+                .strip_prefix(&base)
+                .unwrap()
+                .to_string();
+            e["row_groups"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(move |r| (rel.clone(), r.as_u64().unwrap()))
+        })
+        .collect()
+}
+
+/// A bitemporal key end to end, from both sides, byte for byte (M5, ADR
+/// 028): `why --valid-by --known-by` (`score.why`) prices the current
+/// configuration and recommends `temporal2:id@valid,known`; it is proposed
+/// (`propose.key`), scored and verified (`score.verify`), applied with a
+/// receipt (`apply.receipt`), the receipt is in the ledger (the receipts
+/// resource), and `asof --valid --known` (`observe.asof`) then plans exactly
+/// the row groups holding each key's winning version, which is what the
+/// receipt's replay predicted.
+#[test]
+fn a_bitemporal_key_goes_from_why_to_receipt_to_asof_on_both_sides() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    let rows = bitemporal_lake(&data);
+    let kf = dir.path().join("k.parquet");
+    // Key 1 has a late print: its version valid at 29 s became known at
+    // 32 s, after the known bound, so its winner is the one valid at 27 s.
+    keys(&kf, "id", &[1, 3, 11]);
+    let (d, k) = (path(&data), path(&kf));
+    // A bitemporal run is priced over an index.
+    cli(&["index", d, "--key", "exact:id"], 0);
+    let srv = server(&data);
+    let (valid, known) = ("1970-01-01T00:00:30Z", "1970-01-01T00:00:31Z");
+
+    let why = both(
+        &srv,
+        "score.why",
+        json!({"keys": k, "valid_by": "valid", "known_by": "known", "valid": valid,
+               "known": known, "wait": true}),
+        &[
+            "why",
+            d,
+            "--from",
+            k,
+            "--valid-by",
+            "valid",
+            "--known-by",
+            "known",
+            "--valid",
+            valid,
+            "--known",
+            known,
+        ],
+        0,
+    );
+    // The current configuration is priced (no bitemporal key serves the
+    // runs, so they read every row group holding a key: all of them), and
+    // the bitemporal key is the recommendation.
+    assert_eq!(why["current"]["row_groups"], 12, "{why}");
+    assert_eq!(
+        why["recommended"]["spec"],
+        json!({"kind": "bitemporal", "columns": ["id"], "valid_column": "valid",
+               "known_column": "known"}),
+        "{why}"
+    );
+    let ev = h(&why, "/evidence/hash");
+    let workload = h(&why, "/workload/hash");
+    // The human output words the bitemporal candidate as the bitemporal
+    // as-of floor, not a locate's (fix's verify wording is checked below).
+    let human = |args: &[&str]| run(&[&["--clock", CLOCK][..], args].concat(), 0);
+    let why = human(&[
+        "why",
+        d,
+        "--from",
+        k,
+        "--valid-by",
+        "valid",
+        "--known-by",
+        "known",
+        "--valid",
+        valid,
+        "--known",
+        known,
+    ]);
+    assert!(
+        why.contains("floor (bitemporal as-of)") && !why.contains("floor (locate)"),
+        "{why}"
+    );
+
+    let proposed = both(
+        &srv,
+        "propose.key",
+        json!({"spec": "temporal2:id@valid,known", "evidence": [ev], "by": "agent"}),
+        &[
+            "propose",
+            d,
+            "--evidence",
+            &ev,
+            "--by",
+            "agent",
+            "--key",
+            "temporal2:id@valid,known",
+        ],
+        0,
+    );
+    let proposal = h(&proposed, "/proposal/hash");
+    let verified = both(
+        &srv,
+        "score.verify",
+        json!({"proposal": proposal, "workload": workload, "wait": true}),
+        &[
+            "fix",
+            d,
+            "--proposal",
+            &proposal,
+            "--workload",
+            &workload,
+            "--verify-only",
+        ],
+        0,
+    );
+    assert_eq!(verified["outcome"]["kind"], "verified", "{verified}");
+    // Verify compared each key's winning row, the late print's included:
+    // per key, the greatest valid time at or before the bound among rows
+    // known at or before it (never a version known later).
+    let winners = [1, 3, 11]
+        .iter()
+        .filter_map(|id| {
+            rows.iter()
+                .filter(|r| r.2 == *id && r.3 <= 30 && r.4 <= 31)
+                .map(|r| (r.3, r.4))
+                .max()
+        })
+        .count();
+    assert_eq!(winners, 3);
+    assert_eq!(
+        verified["verification"]["counts"]["matched"],
+        json!(winners),
+        "{verified}"
+    );
+    let cert = h(&verified, "/certificate/hash");
+
+    // The apply, once from each side over the same saved index.
+    let index = index_dir(&data);
+    let saved = dir.path().join("saved-index");
+    copy_tree(&index, &saved);
+    let c = cli(&["fix", d, "--certificate", &cert], 0);
+    std::fs::remove_dir_all(&index).unwrap();
+    copy_tree(&saved, &index);
+    let srv = server(&data);
+    let (m, applied) = mcp(
+        &srv,
+        "apply.receipt",
+        json!({"certificate": cert, "wait": true}),
+    );
+    same(&c, &m, "apply.receipt");
+    assert_eq!(applied["outcome"]["kind"], "applied", "{applied}");
+    let receipt = h(&applied, "/outcome/receipt/hash");
+    let receipts = srv.resource(bellwether_mcp::RECEIPTS).unwrap();
+    same(
+        &cli(&["ledger", "receipts", d], 0),
+        &(receipts.clone() + "\n"),
+        "receipts",
+    );
+    assert!(receipts.contains(&receipt), "{receipts}");
+
+    // asof --valid --known plans exactly the winners' row groups: per key,
+    // the greatest valid time at or before 30 s among rows known at or
+    // before 31 s, then the greatest known time at it.
+    let asof = both(
+        &srv,
+        "observe.asof",
+        json!({"keys": k, "valid": valid, "known": known}),
+        &["asof", d, "--keys", k, "--valid", valid, "--known", known],
+        0,
+    );
+    let mut want = std::collections::BTreeSet::new();
+    for id in [1, 3, 11] {
+        let best = rows
+            .iter()
+            .filter(|r| r.2 == id && r.3 <= 30 && r.4 <= 31)
+            .map(|r| (r.3, r.4))
+            .max()
+            .unwrap();
+        want.extend(
+            rows.iter()
+                .filter(|r| r.2 == id && (r.3, r.4) == best)
+                .map(|r| (r.0.clone(), r.1)),
+        );
+    }
+    assert_eq!(plan_row_groups(&asof, &data), want, "{asof}");
+    assert!(want.len() < 12, "the bitemporal key prunes: {want:?}");
+    assert!(
+        asof["specs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|s| s["kind"] == "bitemporal"),
+        "{asof}"
+    );
+    // The replay the receipt cites predicted what asof reads.
+    assert_eq!(
+        verified["score"]["proposed"]["bytes"], asof["planned"]["bytes"],
+        "{verified}"
+    );
+    // fix's verify compares each key's as-of version, not a lookback.
+    let human = |args: &[&str]| run(&[&["--clock", CLOCK][..], args].concat(), 0);
+    let fix = human(&[
+        "fix",
+        d,
+        "--proposal",
+        &proposal,
+        "--workload",
+        &workload,
+        "--verify-only",
+    ]);
+    assert!(
+        fix.contains("each key's as-of version") && !fix.contains("lookback"),
+        "{fix}"
+    );
+}
+
+/// A bitemporal run on a folder with no index is priced over an index of
+/// its bitemporal key: `why` refuses naming the command and the exact key
+/// to declare, with no placeholder left unfilled.
+#[test]
+fn a_bitemporal_why_without_an_index_names_the_key_to_declare() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    bitemporal_lake(&data);
+    let kf = dir.path().join("k.parquet");
+    keys(&kf, "id", &[3]);
+    let out = common::bw()
+        .args([
+            "why",
+            path(&data),
+            "--from",
+            path(&kf),
+            "--valid-by",
+            "valid",
+            "--known-by",
+            "known",
+        ])
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_ne!(out.status.code(), Some(0), "{err}");
+    assert!(
+        err.contains("bellwether index") && err.contains("--key temporal2:id@valid,known"),
+        "{err}"
+    );
+    assert!(!err.contains('<') && !err.contains('>'), "{err}");
 }
 
 /// `cols` Int64 columns `c0..` over `rows` rows in two row groups (value
@@ -680,4 +1017,129 @@ fn count_and_a_projected_locate_return_the_cli_json_line() {
     );
     assert!(plain.get("projected_bytes").is_none(), "{plain}");
     assert_eq!(plain["planned"], located["planned"]);
+}
+
+/// One file of four row groups: key 1's rows all have a null `ts` (row
+/// groups 0 and 1), key 2 has a time in every row group, key 3 in the last
+/// two.
+fn null_version_lake(dir: &Path) {
+    use std::sync::Arc;
+
+    use arrow::array::{ArrayRef, Int64Array, RecordBatch, TimestampMicrosecondArray};
+    use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
+    use parquet::arrow::ArrowWriter;
+    use parquet::file::properties::WriterProperties;
+
+    std::fs::create_dir_all(dir).unwrap();
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new(
+            "ts",
+            DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+            true,
+        ),
+    ]));
+    let props = WriterProperties::builder()
+        .set_max_row_group_row_count(Some(usize::MAX))
+        .build();
+    let file = std::fs::File::create(dir.join("part-0.parquet")).unwrap();
+    let mut w = ArrowWriter::try_new(file, Arc::clone(&schema), Some(props)).unwrap();
+    let rgs: [&[(i64, Option<i64>)]; 4] = [
+        &[(1, None), (2, Some(1))],
+        &[(1, None), (2, Some(2))],
+        &[(2, Some(3)), (3, Some(3))],
+        &[(2, Some(4)), (3, Some(4))],
+    ];
+    for rows in rgs {
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from_iter_values(rows.iter().map(|r| r.0))) as ArrayRef,
+                Arc::new(
+                    TimestampMicrosecondArray::from(
+                        rows.iter()
+                            .map(|r| r.1.map(|s| s * 1_000_000))
+                            .collect::<Vec<_>>(),
+                    )
+                    .with_timezone("UTC"),
+                ),
+            ],
+        )
+        .unwrap();
+        w.write(&batch).unwrap();
+        w.flush().unwrap();
+    }
+    w.close().unwrap();
+}
+
+/// PR #30 review, item 5: a workload key whose every row has a null
+/// version time cannot be compared (ADR 014), so the certificate fails
+/// with it `uncomparable`, not `mismatched`. The fix refusal carries the
+/// count apart and says why and what to do, in the CLI's human output and
+/// in the MCP refusal, which is the CLI's `--json` line.
+#[test]
+fn a_key_with_no_version_is_refused_as_uncomparable_with_its_cause_on_both_sides() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    null_version_lake(&data);
+    let k = dir.path().join("k.parquet");
+    keys(&k, "id", &[1, 2]);
+    let (d, k) = (path(&data), path(&k));
+    cli(&["index", d, "--key", "exact:id"], 0);
+    let why = cli(&["why", d, "--from", k, "--latest-by", "ts"], 0);
+    let why: Value = serde_json::from_str(why.lines().last().unwrap()).unwrap();
+    let (workload, ev) = (h(&why, "/workload/hash"), h(&why, "/evidence/hash"));
+    let proposed = cli(
+        &[
+            "propose",
+            d,
+            "--evidence",
+            &ev,
+            "--by",
+            "agent",
+            "--key",
+            "temporal:id@ts",
+        ],
+        0,
+    );
+    let proposal = h(
+        &serde_json::from_str(proposed.lines().last().unwrap()).unwrap(),
+        "/proposal/hash",
+    );
+    let srv = server(&data);
+    let args = [
+        "fix",
+        d,
+        "--proposal",
+        &proposal,
+        "--workload",
+        &workload,
+        "--verify-only",
+    ];
+    let reply = srv.call(
+        "score.verify",
+        json!({"proposal": proposal, "workload": workload, "wait": true}),
+    );
+    same(&cli(&args, 1), &(reply.text.clone() + "\n"), "score.verify");
+    let refused: Value = serde_json::from_str(&reply.text).unwrap();
+    assert_eq!(refused["outcome"]["refusal"]["kind"], "certificate_failed");
+    assert_eq!(
+        refused["outcome"]["refusal"]["uncomparable"], 1,
+        "{refused}"
+    );
+    assert_eq!(refused["outcome"]["refusal"]["mismatched"], 0, "{refused}");
+    let cause = "1 key could not be compared (uncomparable): every row of such a key on one side \
+                 has a null version time";
+    let r = reply.envelope.refusal.as_ref().unwrap();
+    assert!(
+        r.message.contains("0 mismatched, 1 uncomparable"),
+        "{}",
+        r.message
+    );
+    assert!(r.message.contains(cause), "{}", r.message);
+    assert_eq!(r.fields["uncomparable"], 1);
+    // The human output names the count and the cause.
+    let human = run(&[&["--clock", CLOCK][..], &args].concat(), 1);
+    assert!(human.contains("0 mismatched, 1 uncomparable"), "{human}");
+    assert!(human.contains(cause), "{human}");
 }

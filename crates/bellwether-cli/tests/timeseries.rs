@@ -93,11 +93,12 @@ fn the_market_workload_plans_match_the_ground_truth() {
         0,
     ));
     // The partition column is in the dataset schema, typed by inference.
-    assert!(indexed["sidecars"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .all(|s| s["complete_at"] == 1));
+    // Per-key bounds and bitemporal versions are key specs (M5), all
+    // complete; no sidecar is declared.
+    let specs = indexed["specs"].as_array().unwrap();
+    assert_eq!(specs.len(), 4, "{indexed}");
+    assert!(specs.iter().all(|s| s["complete_at"] == 1), "{indexed}");
+    assert_eq!(indexed["sidecars"], serde_json::json!([]), "{indexed}");
     let workload: Value =
         serde_json::from_slice(&std::fs::read(out.join("workload/market.json")).unwrap()).unwrap();
     let truth: Value =
@@ -128,7 +129,14 @@ fn the_market_workload_plans_match_the_ground_truth() {
                     0,
                 ));
                 assert_eq!(v["lookup"]["ts_column"], "ts");
-                assert_eq!(v["sidecars"][0], "bounds:symbol@ts");
+                // The per-key bounds folded into the exact key plan it.
+                assert_eq!(v["sidecars"], serde_json::json!([]));
+                assert!(
+                    v["specs"].as_array().unwrap().contains(
+                        &serde_json::json!({"kind": "exact", "columns": ["symbol"], "bounds": "ts"})
+                    ),
+                    "{v}"
+                );
                 let got = planned(&v, &out);
                 let w = &t["window"];
                 // Never misses a matching row group (invariant 1), never
@@ -287,4 +295,70 @@ fn malformed_time_series_arguments_are_refused_with_what_to_do() {
         err.contains("--at-manifest") && err.contains("1..=1"),
         "{err}"
     );
+}
+
+/// A time column the dataset lacks, or one that cannot order versions, is
+/// refused by `index` and by `propose` alike, naming the spec's identity
+/// once and the dataset's columns; `propose` writes no proposal for a
+/// spec `index` would refuse, whether it is the spec or one beside it.
+#[test]
+fn a_bad_time_column_is_refused_by_index_and_propose() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("d");
+    common::corpus(&data, 2, 2, 10, 5);
+    let keys = dir.path().join("k.parquet");
+    common::keys(&keys, "id", &[1]);
+    let fails = |args: &[&str]| -> String {
+        let out = common::bw().args(args).output().unwrap();
+        assert_eq!(out.status.code(), Some(4), "{args:?}");
+        String::from_utf8(out.stderr).unwrap()
+    };
+    let err = fails(&["index", path(&data), "--key", "exact:id@nosuch"]);
+    assert_eq!(
+        err.matches("key spec error").count(),
+        1,
+        "one prefix: {err}"
+    );
+    assert!(
+        err.contains("exact:id@nosuch: the time column \"nosuch\" is not in the dataset")
+            && err.contains("id, batch, ts, payload"),
+        "{err}"
+    );
+
+    run(&["index", path(&data), "--key", "exact:id"], 0);
+    let why: Value = serde_json::from_str(&run(
+        &["why", path(&data), "--from", path(&keys), "--json"],
+        0,
+    ))
+    .unwrap();
+    let ev = why["evidence"]["hash"].as_str().unwrap();
+    let ledger = data.join(".bellwether").join("ledger");
+    let records = || std::fs::read_dir(&ledger).unwrap().count();
+    let before = records();
+    for (declared, needle) in [
+        (
+            vec!["exact:id@nosuch"],
+            "column \"nosuch\" is not in the dataset",
+        ),
+        (
+            vec!["exact:id", "temporal2:batch@ts,nosuch"],
+            "column \"nosuch\" is not in the dataset",
+        ),
+        (
+            vec!["bloom:id@0.01@payload"],
+            "bloom:id@0.01@payload: the time column \"payload\" is of type Utf8, which cannot \
+             order versions",
+        ),
+    ] {
+        let mut args = vec!["propose", path(&data), "--evidence", ev];
+        for d in &declared {
+            args.extend(["--key", d]);
+        }
+        let err = fails(&args);
+        assert!(
+            err.contains(needle) && !err.contains("{\"") && !err.contains("[\""),
+            "{declared:?}: {err}"
+        );
+    }
+    assert_eq!(records(), before, "no proposal was written");
 }

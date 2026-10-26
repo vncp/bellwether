@@ -1,0 +1,1 @@
+{"record":"proposal","record_version":3,"evidence":["185b448300f299e5369581c10fca4e9bf11aa14cb724ba0bd35c77c6e7fa86f2"],"proposed_by":"engine","created_at":"2026-10-25T00:00:00.000Z","body":{"kind":"key","spec":{"kind":"exact","columns":["symbol"]}}}

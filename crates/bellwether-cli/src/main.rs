@@ -65,6 +65,8 @@ pub(crate) struct Global {
     engine: bellwether_mcp::EngineArgs,
 }
 
+// Parsed once per process: the size of `why`'s arguments costs nothing.
+#[allow(clippy::large_enum_variant)]
 #[derive(Subcommand)]
 enum Command {
     /// Profile the folder and, with keys, replay them under every candidate
@@ -205,13 +207,14 @@ struct WhyArgs {
     /// `latest` (each key's newest version), `asof` (the version current
     /// at --at), a text lookup over a key file of one string column's
     /// values: `contains` (substrings), `has-token` (words), `has-prefix`
-    /// (word prefixes), case-folded, or a list-membership lookup over a key
+    /// (word prefixes), case-folded, a list-membership lookup over a key
     /// file of one list column's values (named after the column):
     /// `contains-any` (rows whose list holds any of them) or `contains-all`
-    /// (every one), priced against list:<column>, or `semijoin` (the rows of
-    /// this folder and of the --join dataset whose key the other holds),
-    /// priced against the join key on the pair [default: asof with --at,
-    /// latest with --latest-by, else locate].
+    /// (every one), priced against list:<column>, `bitemporal` (with
+    /// --valid-by and --known-by), or `semijoin` (the rows of this folder
+    /// and of the --join dataset whose key the other holds), priced against
+    /// the join key on the pair [default: asof with --at, latest with
+    /// --latest-by, bitemporal with --valid-by, else locate].
     #[arg(long, value_enum, value_name = "MODE")]
     mode: Option<ModeArg>,
     /// With --mode semijoin: the right dataset and its join columns,
@@ -235,6 +238,27 @@ struct WhyArgs {
     /// integer timestamp column.
     #[arg(long, value_name = "N", requires = "latest_by")]
     lookback: Option<String>,
+    /// Price a bitemporal lookup (`asof --valid --known`): the column a
+    /// version is true from. With --known-by; the candidate is
+    /// temporal2:<key>@<valid-by>,<known-by>, priced over an index.
+    #[arg(
+        long,
+        value_name = "COL",
+        requires = "known_by",
+        conflicts_with_all = ["latest_by", "window", "bench_workload"]
+    )]
+    valid_by: Option<String>,
+    /// The column a version became known at (with --valid-by).
+    #[arg(long, value_name = "COL", requires = "valid_by")]
+    known_by: Option<String>,
+    /// The valid-time bound of the bitemporal lookup (with --valid-by): RFC
+    /// 3339, a date, or an integer in the column's unit [default: none].
+    #[arg(long, value_name = "INSTANT", requires = "valid_by")]
+    valid: Option<String>,
+    /// The known-time bound of the bitemporal lookup (with --known-by);
+    /// rows learned later are ignored [default: none].
+    #[arg(long, value_name = "INSTANT", requires = "known_by")]
+    known: Option<String>,
     /// Candidate key columns for the profile, comma-separated [default:
     /// every id-like column].
     #[arg(long, value_name = "COLS", value_delimiter = ',')]
@@ -323,6 +347,7 @@ enum ModeArg {
     HasPrefix,
     ContainsAny,
     ContainsAll,
+    Bitemporal,
     Semijoin,
 }
 
@@ -337,6 +362,7 @@ impl From<ModeArg> for bellwether::LookupMode {
             ModeArg::HasPrefix => Self::HasPrefix,
             ModeArg::ContainsAny => Self::ContainsAny,
             ModeArg::ContainsAll => Self::ContainsAll,
+            ModeArg::Bitemporal => Self::Bitemporal,
             ModeArg::Semijoin => Self::SemiJoin,
         }
     }
@@ -455,6 +481,13 @@ struct LatestArgs {
     /// this instant (needs a temporal2 key).
     #[arg(long, value_name = "INSTANT", conflicts_with = "lookback")]
     known: Option<String>,
+    /// Bitemporal: the valid-time column of the temporal2 key to plan
+    /// through, when several serve the key columns (with --known-by).
+    #[arg(long, value_name = "COL", requires_all = ["known_by", "known"])]
+    valid_by: Option<String>,
+    /// Bitemporal: the known-time column of that key (with --valid-by).
+    #[arg(long, value_name = "COL", requires = "valid_by")]
+    known_by: Option<String>,
     /// Every row of the keys in the N before their newest version (one
     /// window ending at the newest timestamp among the keys, through their
     /// temporal key): a whole number and a calendar unit, s, m, h, d (24
@@ -488,6 +521,13 @@ struct AsofArgs {
     /// Bitemporal: the known-time instant; rows learned later are ignored.
     #[arg(long, value_name = "INSTANT")]
     known: Option<String>,
+    /// Bitemporal: the valid-time column of the temporal2 key to plan
+    /// through, when several serve the key columns (with --known-by).
+    #[arg(long, value_name = "COL", requires = "known_by", conflicts_with = "at")]
+    valid_by: Option<String>,
+    /// Bitemporal: the known-time column of that key (with --valid-by).
+    #[arg(long, value_name = "COL", requires = "valid_by")]
+    known_by: Option<String>,
 }
 
 #[derive(Args)]
@@ -500,11 +540,13 @@ struct ProposeArgs {
     /// Who proposes: an agent name or a user.
     #[arg(long, value_name = "NAME", default_value = "cli")]
     by: String,
-    /// Propose an index key (a key spec, as for `index`). A sidecar
-    /// declaration (temporal2:id@valid,known, or exact:a@ts) is refused: it
-    /// is built with `index --key` and has no receipt yet.
+    /// Propose an index key (a key spec, as for `index`): exact:a@ts (per-key
+    /// time bounds), temporal2:id@valid,known (bitemporal versions) and
+    /// every other spec. Repeat to apply more specs in the same commit: the
+    /// first is the proposal's spec, the rest its sidecars. A sketch is
+    /// refused: it is approximate and never planned with.
     #[arg(long, value_name = "SPEC", group = "body")]
-    key: Option<String>,
+    key: Vec<String>,
     /// Propose clustering files by these columns, comma-separated.
     #[arg(long, value_name = "COLS", value_delimiter = ',', group = "body")]
     layout: Option<Vec<String>>,
@@ -891,7 +933,12 @@ fn run(cli: &Cli, out: &Out) -> Result<Outcome, Failure> {
         Command::Latest(a) => {
             check_lookback(a.lookback.as_deref())?;
             lookup(g, out, &a.lookup, |e, keys| match (&a.known, &a.lookback) {
-                (Some(known), _) => e.asof_bitemporal(keys, None, Some(known)),
+                (Some(known), _) => e.asof_bitemporal(
+                    keys,
+                    None,
+                    Some(known),
+                    a.valid_by.as_deref().zip(a.known_by.as_deref()),
+                ),
                 (None, Some(n)) => e.latest_lookback(keys, n),
                 (None, None) => e.latest(keys),
             })
@@ -901,7 +948,12 @@ fn run(cli: &Cli, out: &Out) -> Result<Outcome, Failure> {
             lookup(g, out, &a.lookup, |e, keys| match (&a.at, &a.lookback) {
                 (Some(at), Some(n)) => e.asof_lookback(keys, at, n, a.ts.as_deref()),
                 (Some(at), None) => e.asof(keys, at),
-                (None, _) => e.asof_bitemporal(keys, a.valid.as_deref(), a.known.as_deref()),
+                (None, _) => e.asof_bitemporal(
+                    keys,
+                    a.valid.as_deref(),
+                    a.known.as_deref(),
+                    a.valid_by.as_deref().zip(a.known_by.as_deref()),
+                ),
             })
         }
         Command::Propose(a) => propose(g, out, a),
@@ -1031,15 +1083,18 @@ fn lookup(
 
 fn propose(g: &Global, out: &Out, a: &ProposeArgs) -> Result<Outcome, Failure> {
     enum What {
-        Key(bellwether::spec::Declaration),
+        Key(Vec<bellwether::spec::Declaration>),
         Body(ProposalBody),
     }
-    // A key is read as `index --key` reads it, so a sidecar declaration
-    // reaches the facade's typed refusal rather than an unknown-kind usage
-    // error.
-    let what = if let Some(k) = &a.key {
+    // A key is read as `index --key` reads it, so a sketch reaches the
+    // facade's typed refusal rather than an unknown-kind usage error.
+    let what = if !a.key.is_empty() {
         What::Key(
-            bellwether::spec::parse_declaration(k).map_err(|e| Failure::Usage(e.to_string()))?,
+            a.key
+                .iter()
+                .map(|k| bellwether::spec::parse_declaration(k))
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| Failure::Usage(e.to_string()))?,
         )
     } else if let Some(cols) = &a.layout {
         What::Body(ProposalBody::Layout {
@@ -1282,6 +1337,10 @@ fn why(g: &Global, out: &Out, a: &WhyArgs) -> Result<Outcome, Failure> {
         latest_by: a.latest_by.clone(),
         at: a.at.clone(),
         lookback: a.lookback.clone(),
+        valid_by: a.valid_by.clone(),
+        known_by: a.known_by.clone(),
+        valid: a.valid.clone(),
+        known: a.known.clone(),
         window,
         ts_column: a.ts.clone(),
         columns: a.columns.clone(),

@@ -463,7 +463,13 @@ fn run(
     spec: &ReconcileSpec,
     budget: u64,
 ) -> Result<Reconciliation, VerifyError> {
-    let (ls, rs) = (ParquetSource::new(), ParquetSource::new());
+    // The dataset scale is 2 (a.parquet's), declared: inferred, a side
+    // whose b.parquet is at scale 3 would take scale 3 (the widest, M5), and
+    // two sides at different scales are refused as a schema error.
+    let (ls, rs) = (
+        ParquetSource::new().with_schema(schema(2)),
+        ParquetSource::new().with_schema(schema(2)),
+    );
     let (lr, rr) = (
         l.to_str().unwrap().to_string(),
         r.to_str().unwrap().to_string(),

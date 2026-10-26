@@ -403,6 +403,13 @@ impl<'a> SpecWriter<'a> {
                     Target::Sidecar(def) => {
                         AnyWriter::Sidecar(SidecarWriter::for_dataset(def.clone(), ctx.schema)?)
                     }
+                    Target::BloomBounds(spec) => {
+                        AnyWriter::Key(SegmentWriter::bloom_bounds_for_dataset(
+                            spec.clone(),
+                            ctx.schema,
+                            WriterOptions::default(),
+                        )?)
+                    }
                     Target::Sketch(spec) => {
                         AnyWriter::Sketch(SketchWriter::for_dataset(spec, ctx.schema)?)
                     }
@@ -481,16 +488,42 @@ impl<'a> SpecWriter<'a> {
 /// - range: one entry if any key is present, and twice the longest key;
 /// - text: the batch's distinct tokens and their canonical bytes (8 per
 ///   token with a bloom filter; core's `text::measure`);
-/// - a sidecar: core's `sidecar::measure` (distinct keys, and key bytes
-///   plus 20 per stored record).
+/// - a sidecar of an index written before M5: core's `sidecar::measure`
+///   (distinct keys, and key bytes plus 20 per stored record);
+/// - a bloom's `bounds` segment: as an exact spec with bounds on its
+///   columns (its records are that spec's, without counts).
+#[allow(clippy::too_many_lines)]
 pub(crate) fn measure(plan: &SpecPlan, batch: &RecordBatch) -> Result<(u64, u64)> {
+    let bounds_records;
     let spec = match &plan.target {
         Target::Key(spec) => spec,
         Target::Sidecar(def) => {
             return sidecar::measure(def, &plan.key_types, &plan.time_types, batch)
         }
+        Target::BloomBounds(spec) => {
+            bounds_records = KeySpec::Exact {
+                columns: spec.columns().to_vec(),
+                counts: false,
+                bounds: bellwether_core::segment::bloom_bounds_column(spec).map(str::to_string),
+            };
+            &bounds_records
+        }
         Target::Sketch(spec) => return Ok((1, sketch_seg::max_entry_bytes(spec))),
     };
+    if let KeySpec::Bitemporal {
+        columns,
+        valid_column,
+        known_column,
+    } = spec
+    {
+        // The bitemporal layout's records are the temporal2 sidecar's.
+        let def = sidecar::SidecarDef {
+            kind: sidecar::SidecarKind::Bitemporal,
+            columns: columns.clone(),
+            time_columns: vec![valid_column.clone(), known_column.clone()],
+        };
+        return sidecar::measure(&def, &plan.key_types, &plan.time_types, batch);
+    }
     if let KeySpec::Text {
         column,
         tokenizer,
@@ -562,6 +595,10 @@ pub(crate) fn measure(plan: &SpecPlan, batch: &RecordBatch) -> Result<(u64, u64)
             bytes += match spec.physical() {
                 KeySpec::Bloom { .. } => 8,
                 KeySpec::Temporal { .. } => key_len + 8,
+                // a `[min, max]` per row group holding the key
+                KeySpec::Exact {
+                    bounds: Some(_), ..
+                } => key_len + 16,
                 _ => key_len,
             };
         }

@@ -78,6 +78,13 @@ fn lookup(keys: &RunKeys, query: &RunQuery) -> Result<Lookup> {
             column: columns.join(","),
             values: tuples,
         },
+        RunQuery::Bitemporal(b) => Lookup::Bitemporal {
+            columns,
+            clocks: Some((b.valid_column.clone(), b.known_column.clone())),
+            keys: tuples,
+            valid: b.valid,
+            known: b.known,
+        },
         RunQuery::SemiJoin(_) => {
             return Err(Error::Other(
                 "a semijoin run spans two datasets and is planned per side by the replayer, \
@@ -143,6 +150,7 @@ where
         out.push(TransientSpec {
             spec: t.spec().clone(),
             segments: t.segment_bytes(),
+            bounds: t.bounds_bytes().to_vec(),
         });
     }
     Ok(out)

@@ -400,12 +400,15 @@ fn builds_over_a_bench_shaped_ledger() {
         .schema
         .columns
         .iter()
-        .map(|c| c.data_type.clone())
+        .map(|c| c.data_type.to_string())
         .collect();
     let expected: Vec<String> = ledger_schema()
         .fields()
         .iter()
-        .map(|f| f.data_type().to_string())
+        .map(|f| {
+            let t = bellwether_core::segment::ColumnType::of(f.data_type()).unwrap();
+            serde_json::to_value(t).unwrap().to_string()
+        })
         .collect();
     assert_eq!(recorded, expected);
     for spec in specs() {

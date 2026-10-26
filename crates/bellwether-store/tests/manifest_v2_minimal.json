@@ -41,12 +41,16 @@
   "schema": {
     "columns": [
       {
-        "data_type": "Utf8",
+        "data_type": {
+          "type": "utf8"
+        },
         "name": "symbol",
         "nullable": true
       },
       {
-        "data_type": "Date32",
+        "data_type": {
+          "type": "date32"
+        },
         "name": "day",
         "nullable": true
       }

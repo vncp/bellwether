@@ -422,11 +422,49 @@ impl Server {
                     Ok(p) => p,
                     Err(err) => return failed(&err),
                 };
-                match pinned
-                    .as_ref()
-                    .unwrap_or(e)
-                    .asof(&key_file(a.keys, a.key_columns), &a.at)
-                {
+                let engine = pinned.as_ref().unwrap_or(e);
+                let keys = key_file(a.keys, a.key_columns);
+                let clocks = match (&a.valid_by, &a.known_by) {
+                    (Some(v), Some(k)) => Ok(Some((v.as_str(), k.as_str()))),
+                    (None, None) => Ok(None),
+                    (v, _) => Err(Error::InvalidArgument {
+                        field: if v.is_some() { "known_by" } else { "valid_by" },
+                        reason: "a bitemporal key is picked by both of its clock columns: give \
+                                 `valid_by` and `known_by` together"
+                            .into(),
+                    }),
+                };
+                let bitemporal = a.valid.is_some() || a.known.is_some();
+                let r = match (&a.at, bitemporal, clocks) {
+                    (_, _, Err(err)) => Err(err),
+                    (Some(at), false, Ok(None)) => engine.asof(&keys, at),
+                    (Some(_), false, Ok(Some(_))) => Err(Error::InvalidArgument {
+                        field: "valid_by",
+                        reason: "`valid_by` and `known_by` pick the bitemporal key of a \
+                                 bitemporal as-of: give `valid` and/or `known` with them, not \
+                                 `at`"
+                            .into(),
+                    }),
+                    (None, true, Ok(clocks)) => engine.asof_bitemporal(
+                        &keys,
+                        a.valid.as_deref(),
+                        a.known.as_deref(),
+                        clocks,
+                    ),
+                    (Some(_), true, _) => Err(Error::InvalidArgument {
+                        field: "at",
+                        reason: "`at` is a temporal as-of; `valid` and `known` a bitemporal one: \
+                                 give `at`, or `valid` and/or `known`, not both"
+                            .into(),
+                    }),
+                    (None, false, _) => Err(Error::InvalidArgument {
+                        field: "at",
+                        reason: "an as-of needs an instant: give `at` (a temporal key), or \
+                                 `valid` and/or `known` (a temporal2 key)"
+                            .into(),
+                    }),
+                };
+                match r {
                     Ok(r) => done(&r, None),
                     Err(err) => failed(&err),
                 }
@@ -507,6 +545,10 @@ impl Server {
                     latest_by: None,
                     at: None,
                     lookback: None,
+                    valid_by: a.valid_by,
+                    known_by: a.known_by,
+                    valid: a.valid,
+                    known: a.known,
                     window: None,
                     ts_column: None,
                     columns: a.columns,
@@ -582,19 +624,21 @@ impl Server {
             }
             "propose.key" => {
                 let a = parse!(ProposeKey);
-                // The short form is read as `index --key` reads it, so a
-                // sidecar declaration reaches the facade's typed refusal.
-                let declared = match a.spec {
-                    KeyArg::Short(s) => match bellwether::spec::parse_declaration(&s) {
-                        Ok(d) => d,
-                        Err(err) => return failed(&err),
-                    },
-                    KeyArg::Spec(spec) => bellwether::spec::Declaration {
-                        key: Some(spec),
-                        sidecar: None,
-                        sketch: None,
-                    },
-                };
+                // Each key is read as `index --key` reads it, so a sketch
+                // reaches the facade's typed refusal.
+                let mut declared = Vec::with_capacity(1 + a.sidecars.len());
+                for arg in std::iter::once(a.spec).chain(a.sidecars) {
+                    declared.push(match arg {
+                        KeyArg::Short(s) => match bellwether::spec::parse_declaration(&s) {
+                            Ok(d) => d,
+                            Err(err) => return failed(&err),
+                        },
+                        KeyArg::Spec(spec) => bellwether::spec::Declaration {
+                            key: Some(spec),
+                            sketch: None,
+                        },
+                    });
+                }
                 propose_done(if a.dry_run {
                     e.propose_key_dry_run(&declared, &a.evidence, &a.by)
                 } else {

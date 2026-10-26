@@ -379,18 +379,18 @@ fn a_sketch_is_refused_as_a_proposal() {
         .hash
         .unwrap();
     let d = bellwether::spec::parse_declaration("sketch:batch,id").unwrap();
-    match e.propose_key(&d, &[ev], "agent").unwrap() {
+    match e.propose_key(&[d], &[ev], "agent").unwrap() {
         ProposeResult::Refused {
             refusal:
-                ProposeRefusal::SidecarNotProposable {
-                    sidecar,
-                    key,
+                ProposeRefusal::SketchNotProposable {
+                    sketch,
+                    declaration,
                     command,
                     ..
                 },
         } => {
-            assert_eq!(sidecar, "sketch:batch,id");
-            assert_eq!(key, None);
+            assert_eq!(sketch, "sketch:batch,id");
+            assert_eq!(declaration, "sketch:batch,id");
             assert!(command.unwrap().ends_with("--key sketch:batch,id"));
         }
         other => panic!("{other:?}"),

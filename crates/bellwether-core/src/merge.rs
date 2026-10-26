@@ -82,12 +82,18 @@ fn merged_header<R: ReadAt>(inputs: &[SegmentReader<R>]) -> Result<SegmentHeader
                 h.key_spec.identity()
             )));
         }
+        if h.layout != h0.layout {
+            return Err(Error::KeySpec(format!(
+                "cannot merge a segment of {}'s filters with one of its per-key bounds",
+                h0.key_spec.identity()
+            )));
+        }
         if h.bloom_hash != h0.bloom_hash {
             return Err(Error::KeySpec(
                 "cannot merge segments whose filters hash different inputs".into(),
             ));
         }
-        if h.key_types != h0.key_types || h.ts_type != h0.ts_type {
+        if h.key_types != h0.key_types || h.ts_type != h0.ts_type || h.time_types != h0.time_types {
             return Err(Error::KeySpec(format!(
                 "cannot merge segments whose recorded types differ: {} and {}",
                 crate::segment::types(
@@ -107,9 +113,11 @@ fn merged_header<R: ReadAt>(inputs: &[SegmentReader<R>]) -> Result<SegmentHeader
         }
     }
     let mut header = SegmentHeader::new(h0.key_spec.clone());
+    header.layout = h0.layout;
     header.bloom_hash = h0.bloom_hash;
     header.key_types.clone_from(&h0.key_types);
     header.ts_type.clone_from(&h0.ts_type);
+    header.time_types.clone_from(&h0.time_types);
     header.extra.clone_from(&h0.extra);
     Ok(header)
 }
@@ -249,11 +257,39 @@ pub fn count_live_keys<R: ReadAt>(
 }
 
 /// Folds `other`'s value of `key` into `value`: bitmaps OR-ed, chains
-/// merged, and counts combined. Counts of one (key, row group) are never
-/// summed across inputs: segments of one spec are built over disjoint row
-/// groups, so two inputs that both count a key in one row group are a
-/// double count, and the merge is refused rather than storing it.
+/// merged, bitemporal versions united, per-key bounds of one row group
+/// widened (the all-null sentinel, `[i64::MAX, i64::MIN]`, absorbs into any
+/// real range), and counts combined. Counts of one (key, row group) are
+/// never summed across inputs: segments of one spec are built over
+/// disjoint row groups, so two inputs that both count a key in one row
+/// group are a double count, and the merge is refused rather than storing
+/// it.
 fn fold(value: &mut KeyValue, other: KeyValue, key: &[u8]) -> Result<()> {
+    let bounds = match (value.bounds.take(), &other.bounds) {
+        (None, None) => None,
+        (Some(a), Some(b)) => {
+            let mut per_rg: std::collections::BTreeMap<u32, (i64, i64)> =
+                value.bitmap.iter().zip(a).collect();
+            for (rg, (lo, hi)) in other.bitmap.iter().zip(b.iter().copied()) {
+                per_rg
+                    .entry(rg)
+                    .and_modify(|w| *w = (w.0.min(lo), w.1.max(hi)))
+                    .or_insert((lo, hi));
+            }
+            Some(per_rg.into_values().collect())
+        }
+        _ => {
+            return Err(Error::Other(
+                "cannot merge a value with per-key bounds with one without".into(),
+            ))
+        }
+    };
+    value.bounds = bounds;
+    if !other.triples.is_empty() {
+        value.triples.extend(other.triples.iter().copied());
+        value.triples.sort_unstable();
+        value.triples.dedup();
+    }
     let counts = match (value.counts.take(), other.counts) {
         (None, None) => None,
         (Some(a), Some(b)) => {

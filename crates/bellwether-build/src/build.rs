@@ -29,8 +29,8 @@ use crate::coverage::{completeness, completeness_map, covered, live_ids, segment
 use crate::segments::{self, Ctx, FileRow, SpecPlan};
 use crate::sources::{infer_schema, DataSource};
 use crate::target::{
-    decl_of, declared_sidecars, declared_sketches, declared_targets, known_decl, sketch_columns,
-    sketch_decl, unknown_kind, Target, SKETCH_KIND,
+    bloom_bounds_def, decl_of, declared_sidecars, declared_sketches, declared_targets, fold_legacy,
+    known_decl, sketch_columns, sketch_decl, unknown_kind, Target, SKETCH_KIND,
 };
 
 /// Most key specs one index may declare.
@@ -106,6 +106,20 @@ pub struct BuildReport {
     /// older than this binary's: the commit upgraded the index to
     /// [`bellwether_types::format::STORAGE_VERSION`] (ADR 028).
     pub upgraded_from: Option<u32>,
+    /// The sidecars of an index written before M5 (per-key time bounds,
+    /// bitemporal versions) this build folded into key specs, each with the
+    /// identity of the spec it folded into (`("bounds:id@ts",
+    /// "exact:id@ts")`); those specs were rebuilt (`specs_rebuilt`). Only
+    /// what folded: a sidecar no key spec could take is in
+    /// [`BuildReport::sidecars_kept`].
+    pub sidecars_folded: Vec<(String, String)>,
+    /// The sidecars of an index written before M5 no key spec can take
+    /// (another spec on their key columns holds its slot with another time
+    /// column): kept as sidecars, built like any target, still planned.
+    pub sidecars_kept: Vec<String>,
+    /// On a build with nothing to do over an index written before M5: the
+    /// folds its next build with work will make (as `sidecars_folded`).
+    pub sidecars_fold_pending: Vec<(String, String)>,
     /// Restarts after a conflicting concurrent commit.
     pub restarts: u32,
     /// Most row groups held by workers at once (at most the thread count).
@@ -323,21 +337,23 @@ impl<S: StoreExt + ?Sized> Builder<S> {
             Locator::new(&m.rowgroup_space)?;
         }
         let cfg = Config::resolve(base.as_ref(), root, opts)?;
-        let declared = declared_specs(base.as_ref(), key_specs, opts.remove_unlisted)?;
+        let mut declared = declared_specs(base.as_ref(), key_specs, opts.remove_unlisted)?;
         if let Some((a, b)) = KeySpec::shared_identity(&declared) {
             return Err(shared_identity(root, base.as_ref(), a, b));
         }
-        let sidecars = declared_sidecar_defs(base.as_ref(), &opts.sidecars, opts.remove_unlisted)?;
+        let mut sidecars = declared_sidecar_defs(base.as_ref(), opts.remove_unlisted);
         let sketches = declared_sketch_specs(base.as_ref(), &opts.sketches, opts.remove_unlisted)?;
         // A join key (B3) is not built row group by row group: it is
         // checked here and built whole by `Builder::refresh_join`.
         check_joins(root, &declared, &cfg.schema)?;
-        let row_specs: Vec<KeySpec> = declared
-            .iter()
-            .filter(|s| !matches!(s, KeySpec::Join { .. }))
-            .cloned()
-            .collect();
-        let specs = plan_specs(&row_specs, &sidecars, &sketches, &cfg.schema)?;
+        let row_specs = |declared: &[KeySpec]| -> Vec<KeySpec> {
+            declared
+                .iter()
+                .filter(|s| !matches!(s, KeySpec::Join { .. }))
+                .cloned()
+                .collect()
+        };
+        let mut specs = plan_specs(&row_specs(&declared), &sidecars, &sketches, &cfg.schema)?;
         let chunk_sizes = base_chunk_sizes(base.as_ref())
             .into_iter()
             .chain(cfg.new_chunk_size.size());
@@ -363,8 +379,7 @@ impl<S: StoreExt + ?Sized> Builder<S> {
         )?;
         let live = live_ids(&files.space)?;
         let stale = stale_text_specs(&*self.store, &self.index_root, base.as_ref())?;
-        let work = plan_work(base.as_ref(), &specs, &cfg, &live, &stale);
-        let mut report = files.report(&work);
+        let mut work = plan_work(base.as_ref(), &specs, &cfg, &live, &stale);
         // A join key declared, redefined, or removed changes the schema
         // even when no row group needs indexing.
         let joins_unchanged = base.as_ref().is_some_and(|m| {
@@ -374,9 +389,37 @@ impl<S: StoreExt + ?Sized> Builder<S> {
         if joins_unchanged && is_noop(base.as_ref(), &files, &work, &cfg, &specs)? {
             // Nothing committed: a version 1 index stays at version 1 and
             // keeps planning as before (ADR 028); no statistics were recorded.
+            // The fold of a pre-M5 index's sidecars waits for a build with
+            // work, and the report says what it will do.
+            let mut report = files.report(&work);
             report.files_filled = 0;
+            if !sidecars.is_empty() {
+                let fold = fold_legacy(&declared, &sidecars);
+                report.sidecars_fold_pending = fold.folded;
+                report.sidecars_kept = fold.kept.iter().map(SidecarDef::name).collect();
+            }
             return Ok(Attempt::Done(Box::new(report)));
         }
+        // A build with work folds the sidecars of an index written before
+        // M5 into key specs, which it rebuilds (they are new identities);
+        // a sidecar no key spec can take stays a sidecar.
+        let mut sidecars_folded = Vec::new();
+        let mut sidecars_kept = Vec::new();
+        if !sidecars.is_empty() {
+            let fold = fold_legacy(&declared, &sidecars);
+            if let Some((a, b)) = KeySpec::shared_identity(&fold.specs) {
+                return Err(shared_identity(root, base.as_ref(), a, b));
+            }
+            declared = fold.specs;
+            sidecars_kept = fold.kept.iter().map(SidecarDef::name).collect();
+            sidecars = fold.kept;
+            sidecars_folded = fold.folded;
+            specs = plan_specs(&row_specs(&declared), &sidecars, &sketches, &cfg.schema)?;
+            work = plan_work(base.as_ref(), &specs, &cfg, &live, &stale);
+        }
+        let mut report = files.report(&work);
+        report.sidecars_folded = sidecars_folded;
+        report.sidecars_kept = sidecars_kept;
         let items = segments::items(&files.rows, &work.needed, opts.max_segment_row_groups)?;
         let ctx = Ctx {
             store: &*self.store,
@@ -469,12 +512,12 @@ impl Config {
         let kind = opts.source;
         let recorded = base.filter(|m| !m.source.kind.is_empty());
         if let Some(m) = recorded {
-            let was = SourceKind::parse(&m.source.kind)?;
+            let was = SourceKind::of(&m.source)?;
             if was != kind {
                 return Err(Error::Other(format!(
                     "the index was built from {} files and this build reads {}; build a new index",
-                    m.source.kind,
-                    kind.manifest_kind()
+                    was.label(),
+                    kind.label()
                 )));
             }
             if !m.source.root.is_empty() && m.source.root != root {
@@ -539,7 +582,7 @@ impl Config {
         };
         let columns = schema_to_columns(&schema, base.map_or(&[][..], |m| &m.schema.columns));
         let mut source_info = base.map(|m| m.source.clone()).unwrap_or_default();
-        source_info.kind = kind.manifest_kind();
+        kind.record(&mut source_info);
         source_info.root = root.to_string();
         source_info.fingerprint_policy = Some(policy_name(policy).to_string());
         source_info.partitioning = partitioning.manifest_name();
@@ -759,33 +802,14 @@ fn schema_info(
     }
 }
 
-/// The sidecars a build declares, by the rules of [`declared_specs`]:
-/// `given`, plus, unless `remove_unlisted`, every sidecar the base declares
-/// under another name (a given one under an existing name replaces it).
-fn declared_sidecar_defs(
-    base: Option<&Manifest>,
-    given: &[SidecarDef],
-    remove_unlisted: bool,
-) -> Result<Vec<SidecarDef>> {
-    let mut names = BTreeSet::new();
-    for d in given {
-        if !names.insert(d.name()) {
-            return Err(Error::KeySpec(format!(
-                "the sidecar {} is given twice",
-                d.name()
-            )));
-        }
-    }
+/// The sidecars of an index written before M5 a build keeps declaring
+/// until it folds them into key specs: the base's, unless
+/// `remove_unlisted` (which no longer lists them).
+fn declared_sidecar_defs(base: Option<&Manifest>, remove_unlisted: bool) -> Vec<SidecarDef> {
     if remove_unlisted {
-        return Ok(given.to_vec());
+        return Vec::new();
     }
-    let mut out: Vec<SidecarDef> = base.map(declared_sidecars).unwrap_or_default();
-    for d in given {
-        if !out.iter().any(|o| o.name() == d.name()) {
-            out.push(d.clone());
-        }
-    }
-    Ok(out)
+    base.map(declared_sidecars).unwrap_or_default()
 }
 
 /// The sketches a build declares, by the rules of [`declared_specs`]:
@@ -871,14 +895,14 @@ fn plan_specs(
                 let typed = bellwether_core::expr::typed_spec(spec, schema)?;
                 ColumnType::of(typed.data_type())
                     .map_err(|e| Error::KeySpec(format!("{name}: {e}")))?;
-                return Ok(SpecPlan {
+                return Ok(vec![SpecPlan {
                     target: Target::Key(spec.clone()),
                     name: spec.identity(),
                     key_types: vec![typed.data_type().clone()],
                     ts_type: None,
                     time_types: Vec::new(),
                     columns: typed.input_columns(),
-                });
+                }]);
             }
             let mut seen = BTreeSet::new();
             let mut key_types = Vec::new();
@@ -912,16 +936,73 @@ fn plan_specs(
                 }
                 _ => None,
             };
-            Ok(SpecPlan {
+            // Per-key bounds (exact) and bitemporal versions: their time
+            // columns, each a column a version or window orders by. A
+            // refusal names the spec's identity once, and a column the
+            // dataset lacks with the dataset's columns.
+            let identity = spec.identity();
+            let within = |e: Error| match e {
+                Error::KeySpec(m) => Error::KeySpec(format!("{identity}: {m}")),
+                other => other,
+            };
+            for c in bellwether_core::segment::record_time_columns(
+                spec,
+                bellwether_core::segment::Layout::Keyed,
+            ) {
+                if schema.field_with_name(&c).is_err() {
+                    return Err(Error::KeySpec(format!(
+                        "{identity}: the time column {c:?} is not in the dataset; its columns are \
+                         {}",
+                        schema
+                            .fields()
+                            .iter()
+                            .map(|f| f.name().as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )));
+                }
+            }
+            let time_types = bellwether_core::segment::time_types(spec, schema).map_err(within)?;
+            for (c, t) in bellwether_core::segment::time_columns(spec)
+                .into_iter()
+                .zip(&time_types)
+            {
+                ColumnType::of(t).map_err(within)?;
+                if !columns.contains(&c) {
+                    columns.push(c);
+                }
+            }
+            let mut plans = vec![SpecPlan {
                 target: Target::Key(spec.clone()),
                 name: spec.identity(),
-                key_types,
+                key_types: key_types.clone(),
                 ts_type,
-                time_types: Vec::new(),
+                time_types,
                 columns,
-            })
+            }];
+            // A bloom with bounds keeps them in `bounds` segments under its
+            // identity: a bloom has no per-key record to carry them.
+            if let Some(def) = bloom_bounds_def(spec) {
+                def.validate().map_err(within)?;
+                let time_types = def.time_types(schema).map_err(within)?;
+                for t in &time_types {
+                    ColumnType::of(t).map_err(|e| Error::KeySpec(format!("{identity}: {e}")))?;
+                }
+                plans.push(SpecPlan {
+                    target: Target::BloomBounds(spec.clone()),
+                    name: spec.identity(),
+                    key_types,
+                    ts_type: None,
+                    time_types,
+                    columns: def.columns.iter().chain(&def.time_columns).cloned().collect(),
+                });
+            }
+            Ok(plans)
         })
-        .collect::<Result<_>>()?;
+        .collect::<Result<Vec<Vec<SpecPlan>>>>()?
+        .into_iter()
+        .flatten()
+        .collect();
     for def in sidecars {
         def.validate()?;
         let name = def.name();
@@ -1229,7 +1310,7 @@ struct WorkPlan {
 /// ([`crate::overlapping_counts`]); the build rebuilds the spec instead.
 fn double_covered(m: &Manifest, name: &str, live: &RoaringBitmap) -> bool {
     let mut seen = RoaringBitmap::new();
-    for s in m.segments.iter().filter(|s| segment_of(s, name)) {
+    for s in m.segments.iter().filter(|s| segment_of(s, name, None)) {
         let (start, end) = (s.rowgroup_range.start.0, s.rowgroup_range.end.0);
         let mut covers = RoaringBitmap::new();
         if start < end {
@@ -1389,7 +1470,7 @@ fn plan_work(
             });
         }
         let needed = match base {
-            Some(m) if !replaced => live - &covered(m, &p.name),
+            Some(m) if !replaced => live - &covered(m, &p.name, p.target.kind()),
             _ => live.clone(),
         };
         work.needed.push(needed);
@@ -1430,8 +1511,8 @@ fn is_noop(
         && work.needed.iter().all(RoaringBitmap::is_empty)
         && work.replaced.is_empty()
         && work.removed.is_empty()
-        && m.source == cfg.source_info
-        && m.schema.columns == cfg.columns
+        && same_source(&m.source, &cfg.source_info)?
+        && same_columns(&m.schema.columns, &cfg.columns)?
         && declared_targets(m) == declared
         && m.segments.iter().all(|s| {
             unknown_kind(s)
@@ -1442,6 +1523,28 @@ fn is_noop(
         unchanged
             && completeness_map(m, m, &declared, &BTreeSet::new())? == m.key_spec_completeness,
     )
+}
+
+/// Whether a manifest's `source` describes the same source as `now`, the
+/// one this build would record: equal once both are spelled as storage
+/// version 2 spells them (a version 1 manifest carries a CSV dialect in
+/// `kind`; a build with nothing else to do does not respell it).
+fn same_source(recorded: &SourceInfo, now: &SourceInfo) -> Result<bool> {
+    let mut respelled = recorded.clone();
+    if !recorded.kind.is_empty() {
+        SourceKind::of(recorded)?.record(&mut respelled);
+    }
+    Ok(respelled == *now)
+}
+
+/// Whether a manifest's columns are `now`'s, the ones this build would
+/// record, once both are spelled as storage version 2 spells them (a
+/// version 1 manifest spells types as Arrow displays them).
+fn same_columns(recorded: &[ColumnDef], now: &[ColumnDef]) -> Result<bool> {
+    if recorded.is_empty() {
+        return Ok(now.is_empty());
+    }
+    Ok(schema_to_columns(columns_to_schema(recorded)?.as_ref(), recorded) == now)
 }
 
 // ---------------------------------------------------------------------------
@@ -1504,6 +1607,7 @@ impl Delta<'_> {
         if let Some(missing) = targets.iter().find(|t| !map.contains_key(&t.name())) {
             let what = match missing {
                 Target::Key(_) => "key spec",
+                Target::BloomBounds(_) => "the per-key bounds of key spec",
                 Target::Sidecar(_) => "sidecar",
                 Target::Sketch(_) => "sketch",
             };

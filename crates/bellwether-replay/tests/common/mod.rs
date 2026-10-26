@@ -541,7 +541,7 @@ pub fn build_index(
         .iter()
         .map(|f| ColumnDef {
             name: f.name().clone(),
-            data_type: f.data_type().to_string(),
+            data_type: f.data_type().to_string().into(),
             nullable: f.is_nullable(),
             extra: Extra::new(),
         })
@@ -553,6 +553,7 @@ pub fn build_index(
             root: corpus.data.clone(),
             fingerprint_policy: None,
             partitioning: None,
+            dialect: None,
             extra: Extra::new(),
         };
         m.schema = SchemaInfo {

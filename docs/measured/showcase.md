@@ -23,7 +23,7 @@ Keys are distinct values chosen by a seeded hash (`ORDER BY hash(col, 42)`), so 
 
 ### What is not run through `fix`, and why
 
-Bitemporal keys (`temporal2:symbol@ts,known_at`) cannot be proposed or receipted until storage version 2, so the no-lookahead question's key was built with `index` and has no receipt; its row has a plan but no prediction. `why` prices the question's valid-time as-of, which is what its "unindexed" row shows.
+These results were measured before storage version 2 was frozen (M5), when bitemporal keys (`temporal2:symbol@ts,known_at`) could not be proposed or receipted, so the no-lookahead question's key was built with `index` and has no receipt; its row has a plan but no prediction. `why` prices the question's valid-time as-of, which is what its "unindexed" row shows. Since M5, `why --valid-by --known-by` prices a bitemporal key and `fix` receipts it; the measured run has not been repeated.
 
 ## Charts
 

@@ -26,11 +26,9 @@ use arrow::datatypes::{Schema, SchemaRef};
 use bellwether_core::segment::ColumnType;
 use bellwether_store::Manifest;
 use bellwether_types::{
-    ColumnStats, Error, FileFingerprint, Hash, Result, RowGroupId, RowGroupMeta, ScanEntry,
-    ScanPlan, Source,
+    Error, FileFingerprint, Hash, Result, RowGroupId, RowGroupMeta, ScanEntry, ScanPlan, Source,
 };
 use roaring::RoaringBitmap;
-use serde::Serialize;
 
 /// One live row group.
 #[derive(Clone, Debug, PartialEq)]
@@ -61,40 +59,14 @@ pub struct Catalog {
     cell_bytes: HashMap<(usize, u32), u64>,
 }
 
-/// A row group's footer report, as the digest covers it.
-#[derive(Serialize)]
-struct DigestRowGroup<'a> {
-    id: u32,
-    index_in_file: u32,
-    rows: u64,
-    bytes: u64,
-    byte_range: Option<(u64, u64)>,
-    stats: &'a [ColumnStats],
-}
-
-#[derive(Serialize)]
-struct DigestInput<'a> {
-    manifest_version: &'a str,
-    /// `(name, type, nullable)` per column; the type in core's recorded
-    /// spelling where it has one, else Arrow's display form.
-    schema: Vec<(String, String, bool)>,
-    files: Vec<(&'a FileFingerprint, Vec<DigestRowGroup<'a>>)>,
-    tombstoned: Vec<u32>,
-}
-
-/// The schema as the digest covers it.
-fn schema_identity(schema: &Schema) -> Result<Vec<(String, String, bool)>> {
-    schema
-        .fields()
-        .iter()
-        .map(|f| {
-            let ty = match ColumnType::of(f.data_type()) {
-                Ok(t) => serde_json::to_string(&t)?,
-                Err(_) => format!("arrow:{}", f.data_type()),
-            };
-            Ok((f.name().clone(), ty, f.is_nullable()))
-        })
-        .collect()
+/// The schema as the digest covers it: core's recorded spelling where it
+/// has one (`bellwether_source::catalog::schema_identity`).
+fn schema_identity(schema: &Schema) -> Vec<bellwether_source::catalog::SchemaColumn> {
+    bellwether_source::catalog::schema_identity(schema, |t| {
+        ColumnType::of(t)
+            .ok()
+            .and_then(|c| serde_json::to_string(&c).ok())
+    })
 }
 
 impl Catalog {
@@ -237,28 +209,26 @@ impl Catalog {
                 )));
             }
         }
-        let mut per_file: BTreeMap<usize, Vec<DigestRowGroup<'_>>> = BTreeMap::new();
+        let mut per_file: BTreeMap<usize, Vec<(u32, &RowGroupMeta)>> = BTreeMap::new();
         for rg in &row_groups {
-            per_file.entry(rg.file).or_default().push(DigestRowGroup {
-                id: rg.id.0,
-                index_in_file: rg.meta.index_in_file,
-                rows: rg.meta.rows,
-                bytes: rg.meta.bytes,
-                byte_range: rg.meta.byte_range,
-                stats: &rg.meta.stats,
-            });
+            per_file
+                .entry(rg.file)
+                .or_default()
+                .push((rg.id.0, &rg.meta));
         }
-        let digest = Hash::of_record(&DigestInput {
-            manifest_version: &manifest_version,
-            schema: schema_identity(&schema)?,
-            files: files
-                .iter()
-                .enumerate()
-                .map(|(i, f)| (f, per_file.remove(&i).unwrap_or_default()))
-                .collect(),
-            tombstoned: tombstoned.iter().collect(),
-        })?;
-        drop(per_file);
+        let digest_files: Vec<(&FileFingerprint, Vec<(u32, &RowGroupMeta)>)> = files
+            .iter()
+            .enumerate()
+            .map(|(i, f)| (f, per_file.remove(&i).unwrap_or_default()))
+            .collect();
+        let retired: Vec<u32> = tombstoned.iter().collect();
+        let digest = bellwether_source::catalog::digest(
+            &manifest_version,
+            &schema_identity(&schema),
+            &digest_files,
+            &retired,
+        )?;
+        drop(digest_files);
         let file_index = files
             .iter()
             .enumerate()

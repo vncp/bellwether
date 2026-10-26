@@ -1,9 +1,10 @@
 //! Manifests written before the 2026-10-24 dependency upgrade spell column
 //! types the way Arrow 53 printed them (`Timestamp(Microsecond,
-//! Some("UTC"))`); Arrow 59 prints `Timestamp(µs, "UTC")`. An index built
-//! by the old release must still open, plan, and take incremental builds,
-//! and its first new commit rewrites the spelling to the current form
-//! without changing any type (contract v3, entry 9).
+//! Some("UTC"))`); Arrow 59 prints `Timestamp(µs, "UTC")`, and storage
+//! version 2 (M5) writes core's `ColumnType` JSON. An index built by the
+//! old release must still open, plan, and take incremental builds, and its
+//! first new commit rewrites the spelling to the current form without
+//! changing any type (contract v3, entry 9).
 
 #![allow(clippy::unwrap_used, missing_docs)]
 
@@ -84,12 +85,29 @@ fn manifest_json(store: &bellwether_store::ObjectStoreBackend) -> serde_json::Va
     serde_json::from_slice(&manifest_bytes(store)).unwrap()
 }
 
+/// Each column's `data_type` as written: a string as itself, an object as
+/// its compact JSON.
 fn spellings(m: &serde_json::Value) -> Vec<String> {
     m["schema"]["columns"]
         .as_array()
         .unwrap()
         .iter()
-        .map(|c| c["data_type"].as_str().unwrap().to_string())
+        .map(|c| match &c["data_type"] {
+            serde_json::Value::String(s) => s.clone(),
+            other => other.to_string(),
+        })
+        .collect()
+}
+
+/// The storage version 2 spelling of every column: core's `ColumnType`
+/// JSON.
+fn typed() -> Vec<String> {
+    columns()
+        .iter()
+        .map(|(f, _)| {
+            let t = bellwether_core::segment::ColumnType::of(f.data_type()).unwrap();
+            serde_json::to_value(t).unwrap().to_string()
+        })
         .collect()
 }
 
@@ -121,17 +139,8 @@ fn an_index_with_arrow_53_type_spellings_opens_plans_and_rebuilds() {
     let path = "idx/manifest.json";
     let (_, version) = store.get(path).unwrap();
     let mut m = manifest_json(&store);
-    assert_eq!(
-        spellings(&m),
-        [
-            "Int64",
-            "Utf8",
-            r#"Timestamp(µs, "UTC")"#,
-            "Time64(ns)",
-            "Time32(ms)"
-        ],
-        "this build writes Arrow 59's spelling"
-    );
+    assert_eq!(spellings(&m), typed(), "this build writes ColumnType JSON");
+    assert_eq!(typed()[0], r#"{"type":"int64"}"#);
     for (col, (_, old)) in m["schema"]["columns"]
         .as_array_mut()
         .unwrap()
@@ -167,16 +176,7 @@ fn an_index_with_arrow_53_type_spellings_opens_plans_and_rebuilds() {
         &BuildOptions::new(SourceKind::Parquet),
     );
     assert_eq!((r.files_new, r.files_unchanged), (1, 2));
-    assert_eq!(
-        spellings(&manifest_json(&store)),
-        [
-            "Int64",
-            "Utf8",
-            r#"Timestamp(µs, "UTC")"#,
-            "Time64(ns)",
-            "Time32(ms)"
-        ]
-    );
+    assert_eq!(spellings(&manifest_json(&store)), typed());
     let plan = planner(&store).plan(&specs, &lookup(&[203])).unwrap();
     assert_eq!(plan_rgs(&plan).len(), 1, "the new file's key is served");
 }

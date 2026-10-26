@@ -14,7 +14,7 @@ use bellwether_profile::lints::MembershipUse;
 use bellwether_profile::{ProfileOptions, ProfileReport};
 use bellwether_replay::{
     proposed_specs, record_bench_workload, servable, serves_query, Baseline, KeyInput, Lookup,
-    RecordedRun, Replayer, RunJoin, RunQuery, RunWindow, Workload, WorkloadRecorder,
+    RecordedRun, Replayer, RunBitemporal, RunJoin, RunQuery, RunWindow, Workload, WorkloadRecorder,
     QUERY_KIND_LOCATE,
 };
 use bellwether_store::{Cache, ObjectStoreBackend, StoreExt};
@@ -90,6 +90,10 @@ pub enum LookupMode {
     /// The rows whose list column holds every one of the values
     /// (`bellwether locate --all`).
     ContainsAll,
+    /// Each key's version true at a valid time as known at a known time
+    /// (`bellwether asof --valid --known`), priced against
+    /// `temporal2:<key>@<valid_by>,<known_by>`.
+    Bitemporal,
     /// The rows of the data root (the left dataset) and of the right
     /// dataset named by [`WhyRequest::join`] whose key the other also holds
     /// (B3: a semi-join, `in (subquery)`, `exists`; `bellwether join
@@ -100,8 +104,8 @@ pub enum LookupMode {
 
 impl LookupMode {
     /// The CLI spelling: `locate`, `latest`, `asof`, `contains`,
-    /// `has-token`, `has-prefix`, `contains-any`, `contains-all`, or
-    /// `semijoin`.
+    /// `has-token`, `has-prefix`, `contains-any`, `contains-all`,
+    /// `bitemporal`, or `semijoin`.
     #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
@@ -113,6 +117,7 @@ impl LookupMode {
             Self::HasPrefix => "has-prefix",
             Self::ContainsAny => "contains-any",
             Self::ContainsAll => "contains-all",
+            Self::Bitemporal => "bitemporal",
             Self::SemiJoin => "semijoin",
         }
     }
@@ -130,6 +135,7 @@ impl LookupMode {
             | Self::Asof
             | Self::ContainsAny
             | Self::ContainsAll
+            | Self::Bitemporal
             | Self::SemiJoin => None,
         }
     }
@@ -212,6 +218,25 @@ pub struct WhyRequest {
     /// column.
     #[serde(default)]
     pub lookback: Option<String>,
+    /// The valid-time column of a bitemporal lookup (`asof --valid
+    /// --known`): the run is recorded as a bitemporal run on it and
+    /// `known_by`, and `temporal2:<run columns>@<valid_by>,<known_by>` is
+    /// the floor candidate. Needs `known_by`; takes no `latest_by`, `at`,
+    /// `lookback`, or `window`. A bitemporal run is priced over an index.
+    #[serde(default)]
+    pub valid_by: Option<String>,
+    /// The known-time column of a bitemporal lookup (with `valid_by`).
+    #[serde(default)]
+    pub known_by: Option<String>,
+    /// The valid-time bound of a bitemporal lookup (with `valid_by`):
+    /// RFC 3339, a date, or an integer in `valid_by`'s unit; absent:
+    /// unbounded.
+    #[serde(default)]
+    pub valid: Option<String>,
+    /// The known-time bound of a bitemporal lookup, in `known_by`'s unit
+    /// likewise; absent: unbounded.
+    #[serde(default)]
+    pub known: Option<String>,
     /// Record the runs of `keys` or `bench_workload` as window runs: each
     /// looks its keys up in this window, and every cost is the window's
     /// plan (pruned by the time column as `locate --window` is). Prices
@@ -270,6 +295,10 @@ impl Default for WhyRequest {
             latest_by: None,
             at: None,
             lookback: None,
+            valid_by: None,
+            known_by: None,
+            valid: None,
+            known: None,
             window: None,
             ts_column: None,
             columns: None,
@@ -295,15 +324,24 @@ impl WhyRequest {
     }
 
     /// The lookup this request prices: `mode`, or the one `at` and
-    /// `latest_by` imply. An inconsistent combination (`latest` or `asof`
-    /// without `latest_by`, `asof` without `at`, `latest` with `at`,
-    /// `locate` with `latest_by`, `at`, or `lookback`, or a `lookback` that
-    /// is not a whole number with an optional unit) is refused with one
-    /// sentence saying what to pass instead. Needs no schema, so a caller
-    /// can tell a usage error from an engine failure before any work.
+    /// `latest_by` (or `valid_by` and `known_by`) imply. An inconsistent
+    /// combination (`latest` or `asof` without `latest_by`, `asof` without
+    /// `at`, `latest` with `at`, `locate` with `latest_by`, `at`, or
+    /// `lookback`, a `lookback` that is not a whole number with an optional
+    /// unit, or a bitemporal lookup without both clocks or with a flag of
+    /// another lookup) is refused with one sentence saying what to pass
+    /// instead. Needs no schema, so a caller can tell a usage error from an
+    /// engine failure before any work.
     pub fn lookup_mode(&self) -> std::result::Result<LookupMode, String> {
         if let Some(l) = &self.lookback {
             Lookback::parse(l).map_err(|e| e.to_string())?;
+        }
+        let bitemporal = self.valid_by.is_some()
+            || self.known_by.is_some()
+            || self.valid.is_some()
+            || self.known.is_some();
+        if bitemporal || self.mode == Some(LookupMode::Bitemporal) {
+            return self.bitemporal_mode();
         }
         let inferred = if self.at.is_some() {
             LookupMode::Asof
@@ -390,6 +428,38 @@ impl WhyRequest {
             ),
             m => Ok(m),
         }
+    }
+
+    /// [`WhyRequest::lookup_mode`] of a bitemporal request: both clocks,
+    /// no flag of another lookup, and no other `mode`.
+    fn bitemporal_mode(&self) -> std::result::Result<LookupMode, String> {
+        if let Some(m) = self.mode.filter(|m| *m != LookupMode::Bitemporal) {
+            return Err(format!(
+                "--valid-by, --known-by, --valid and --known price a bitemporal lookup, not --mode \
+                 {}; drop --mode (or pass --mode bitemporal)",
+                m.as_str()
+            ));
+        }
+        if self.valid_by.is_none() || self.known_by.is_none() {
+            return Err(
+                "a bitemporal lookup names both of its clocks; pass --valid-by <valid-time column> \
+                 --known-by <known-time column> (and --valid/--known <instant> to bound them)"
+                    .into(),
+            );
+        }
+        if self.latest_by.is_some()
+            || self.at.is_some()
+            || self.lookback.is_some()
+            || self.window.is_some()
+        {
+            return Err(
+                "a bitemporal lookup (--valid-by, --known-by) takes no --latest-by, --at, \
+                 --lookback or --window; drop them, or drop --valid-by and --known-by to price a \
+                 latest, asof or window lookup"
+                    .into(),
+            );
+        }
+        Ok(LookupMode::Bitemporal)
     }
 }
 
@@ -1604,6 +1674,13 @@ impl Engine {
                     .into(),
             ));
         }
+        if mode == LookupMode::Bitemporal && req.keys.is_none() && req.workload.is_none() {
+            return Err(Error::KeySpec(
+                "--valid-by and --known-by price a workload's keys under a bitemporal lookup; \
+                 pass --from <keys.parquet> (or --workload <hash>)"
+                    .into(),
+            ));
+        }
         Ok(given.iter().any(|g| *g))
     }
 
@@ -1763,17 +1840,18 @@ impl Engine {
             let w = crate::fix::load_workload(self, cache, h)?;
             let temporal = match resolved {
                 Some(t) => {
-                    // The runs are priced as recorded: a `--latest-by` that
-                    // asks for another lookup would label their costs as
-                    // the requested lookup's.
+                    // The runs are priced as recorded: a `--latest-by` (or
+                    // `--valid-by`) that asks for another lookup would label
+                    // their costs as the requested lookup's.
                     for r in w.runs() {
                         let q = r.query()?;
                         if q != t.query {
+                            let flag = t.time_columns()[0].0;
                             return Err(Error::KeySpec(format!(
-                                "workload {h} records its runs as {} lookups, and --mode, \
-                                 --latest-by, --at, and --lookback ask for {} lookups; record \
-                                 the keys again with `bellwether why --from <keys.parquet> \
-                                 --latest-by {}` and the same options",
+                                "workload {h} records its runs as {} lookups, and the lookup \
+                                 options given ask for {} lookups; drop them to price the runs \
+                                 as recorded, or record the keys again with `bellwether why \
+                                 --from <keys.parquet> {flag} {}` and the same options",
                                 describe(&q),
                                 describe(&t.query),
                                 t.ts_column
@@ -1846,11 +1924,12 @@ impl Engine {
             if let Some(t) = &resolved {
                 for batch in &batches {
                     for f in batch.schema().fields() {
-                        if f.name() == &t.ts_column {
+                        if let Some((flag, c)) =
+                            t.time_columns().into_iter().find(|(_, c)| f.name() == c)
+                        {
                             return Err(Error::KeySpec(format!(
-                                "--latest-by column {:?} is also a key column of the lookup; \
-                                 give a separate timestamp column or select key columns with --key",
-                                t.ts_column
+                                "{flag} column {c:?} is also a key column of the lookup; give a \
+                                 separate time column or select key columns with --key"
                             )));
                         }
                     }
@@ -2052,16 +2131,22 @@ impl Engine {
         }
         if let Some(t) = &temporal {
             for cols in &run_columns {
-                if cols.contains(&t.ts_column) {
+                if let Some((flag, c)) = t
+                    .time_columns()
+                    .into_iter()
+                    .find(|(_, c)| cols.iter().any(|k| k == c))
+                {
                     return Err(Error::KeySpec(format!(
-                        "--latest-by column {:?} is also a key column of the workload; give a \
-                         separate timestamp column",
-                        t.ts_column
+                        "{flag} column {c:?} is also a key column of the workload; give a \
+                         separate time column"
                     )));
                 }
                 check_planned_column(replayer, cols, t)?;
             }
         }
+        // A bitemporal workload is served by a bitemporal key alone: no
+        // exact, count, window or profile candidate plans its runs.
+        let bitemporal = temporal.is_some_and(|t| t.query.bitemporal().is_some());
         let text_kind = text.then(|| {
             let columns: BTreeSet<String> = run_columns.iter().flatten().cloned().collect();
             let operators: BTreeSet<TextOp> =
@@ -2139,11 +2224,7 @@ impl Engine {
         let mut names = BTreeSet::new();
         if let Some(t) = &temporal {
             for c in &run_columns {
-                let spec = KeySpec::Temporal {
-                    columns: c.clone(),
-                    ts_column: t.ts_column.clone(),
-                    counts: false,
-                };
+                let spec = t.floor(c);
                 if !current_names.contains(&label(&spec)) && names.insert(label(&spec)) {
                     chosen.push((spec, CandidateOrigin::Workload));
                 }
@@ -2155,7 +2236,9 @@ impl Engine {
         // A run keyed on an expression gets an `expr` key over it (an exact
         // segment on a virtual column the engine names); a run on dataset
         // columns gets the exact key on them.
-        let floor: Vec<KeySpec> = if text {
+        let floor: Vec<KeySpec> = if bitemporal {
+            Vec::new()
+        } else if text {
             crate::text::floor_keys(workload)?
         } else if let Some(j) = &semijoin {
             // A semi-join run's floor is the join key on its pair (B3): an
@@ -2277,7 +2360,7 @@ impl Engine {
                 counts: false,
                 bounds: None,
             };
-            if text || membership || semijoin.is_some() || !serves(&exact_spec) {
+            if text || membership || bitemporal || semijoin.is_some() || !serves(&exact_spec) {
                 if !current_names.contains(&label(&exact_spec))
                     && !names.contains(&label(&exact_spec))
                 {
@@ -2367,7 +2450,9 @@ impl Engine {
                     .record(&ledger, &proposal.hash, workload, cache, &self.now())
                     .map_err(Error::from)?
             };
-            let locate = if temporal.is_some() {
+            // A bitemporal key answers no point lookup: its runs have no
+            // locate price beside theirs.
+            let locate = if temporal.is_some() && !bitemporal {
                 let specs = proposed_specs(replayer.current_specs(), &spec);
                 Some(total(&replayer.replay_specs_as(
                     &specs,
@@ -2473,7 +2558,7 @@ impl Engine {
             },
         };
         report.current = Some(current);
-        if temporal.is_some() {
+        if temporal.is_some() && !bitemporal {
             report.current_locate = Some(total(&replayer.replay_specs_as(
                 replayer.current_specs(),
                 workload,
@@ -2769,9 +2854,20 @@ fn list_column(replayer: &Replayer<'_>, spec: &KeySpec) -> Result<bellwether_typ
 }
 
 /// A run's lookup in words, for refusals: `locate`, `latest`, `asof at 30`,
-/// either with `, lookback 3600` (in the timestamp column's unit), or
-/// `window 10..=20 of ts`.
+/// either with `, lookback 3600` (in the timestamp column's unit),
+/// `window 10..=20 of ts`, or `bitemporal valid <= 5 on valid, known <= 9
+/// on known` (a missing bound: `any`).
 fn describe(q: &RunQuery) -> String {
+    if let Some(b) = q.bitemporal() {
+        let bound = |v: Option<i64>| v.map_or_else(|| "any".to_string(), |v| format!("<= {v}"));
+        return format!(
+            "bitemporal valid {} on {}, known {} on {}",
+            bound(b.valid),
+            b.valid_column,
+            bound(b.known),
+            b.known_column
+        );
+    }
     let base = match (q.asof_ts(), q.window()) {
         (Some(ts), _) => format!("asof at {ts}"),
         (None, Some(w)) => format!("window {}..={} of {}", w.lo, w.hi, w.ts_column),
@@ -3006,10 +3102,44 @@ fn culprit(
 
 #[derive(Clone, Debug)]
 struct ResolvedTemporal {
+    /// The column that orders versions: `--latest-by`'s, or a bitemporal
+    /// lookup's valid-time column.
     ts_column: String,
     query: RunQuery,
     lookup: LookupKind,
     lookback: Option<LookbackWindow>,
+}
+
+impl ResolvedTemporal {
+    /// The time columns the lookup reads, each with the flag that named
+    /// it: `--latest-by`'s, or a bitemporal lookup's two clocks.
+    fn time_columns(&self) -> Vec<(&'static str, &str)> {
+        match self.query.bitemporal() {
+            Some(b) => vec![
+                ("--valid-by", b.valid_column.as_str()),
+                ("--known-by", b.known_column.as_str()),
+            ],
+            None => vec![("--latest-by", self.ts_column.as_str())],
+        }
+    }
+
+    /// The candidate key a run on `columns` is priced with first: the
+    /// temporal key on its columns and `ts_column`, or the bitemporal key
+    /// on them and the lookup's two clocks.
+    fn floor(&self, columns: &[String]) -> KeySpec {
+        match self.query.bitemporal() {
+            Some(b) => KeySpec::Bitemporal {
+                columns: columns.to_vec(),
+                valid_column: b.valid_column.clone(),
+                known_column: b.known_column.clone(),
+            },
+            None => KeySpec::Temporal {
+                columns: columns.to_vec(),
+                ts_column: self.ts_column.clone(),
+                counts: false,
+            },
+        }
+    }
 }
 
 /// Refuses `--latest-by` when the current configuration plans `t`'s lookups
@@ -3057,13 +3187,13 @@ fn check_planned_column(
 /// dataset schema before profiling or recording: the column must exist in
 /// the dataset and have a type that can order versions (`check_ts_type`:
 /// timestamp, date, time, or integer), and `at` and `lookback` must convert
-/// exactly to that column's unit. `None` for a `locate` request.
+/// exactly to that column's unit; a bitemporal request's two clocks and
+/// bounds likewise ([`resolve_bitemporal`]). `None` for a `locate` request.
 fn resolve_temporal(req: &WhyRequest, schema: &Schema) -> Result<Option<ResolvedTemporal>> {
-    if !matches!(
-        req.lookup_mode().map_err(Error::KeySpec)?,
-        LookupMode::Latest | LookupMode::Asof
-    ) {
-        return Ok(None);
+    match req.lookup_mode().map_err(Error::KeySpec)? {
+        LookupMode::Latest | LookupMode::Asof => {}
+        LookupMode::Bitemporal => return resolve_bitemporal(req, schema).map(Some),
+        _ => return Ok(None),
     }
     let Some(ts_column) = &req.latest_by else {
         return Ok(None);
@@ -3133,9 +3263,85 @@ fn resolve_temporal(req: &WhyRequest, schema: &Schema) -> Result<Option<Resolved
     }))
 }
 
+/// The dataset type of the time column `column` that `flag` named, refused
+/// with what to pass when the column is missing or cannot order versions.
+fn time_column_type(
+    flag: &str,
+    column: &str,
+    schema: &Schema,
+) -> Result<arrow::datatypes::DataType> {
+    if column.is_empty() {
+        return Err(Error::KeySpec(format!(
+            "{flag} needs a time column name; pass {flag} <column>"
+        )));
+    }
+    let field = schema.field_with_name(column).map_err(|_| {
+        let names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
+        Error::KeySpec(format!(
+            "{flag} column {column:?} is not in the dataset schema (columns: {}); pass an \
+             existing timestamp, date, time, or integer column with {flag}",
+            names.join(", ")
+        ))
+    })?;
+    let ty = field.data_type();
+    check_ts_type(ty).map_err(|_| {
+        Error::KeySpec(format!(
+            "{flag} column {column:?} has type {ty}, which cannot order versions; pass a \
+             timestamp, date, time, or integer column with {flag}"
+        ))
+    })?;
+    Ok(ty.clone())
+}
+
+/// A bitemporal request (`valid_by`, `known_by`, and the optional `valid`
+/// and `known` bounds) against the dataset schema: two distinct clocks
+/// that order versions, and each bound converted exactly to its clock's
+/// unit, as `asof --valid --known` converts them.
+fn resolve_bitemporal(req: &WhyRequest, schema: &Schema) -> Result<ResolvedTemporal> {
+    let valid_column = req.valid_by.as_deref().unwrap_or_default().trim();
+    let known_column = req.known_by.as_deref().unwrap_or_default().trim();
+    let valid_type = time_column_type("--valid-by", valid_column, schema)?;
+    let known_type = time_column_type("--known-by", known_column, schema)?;
+    if valid_column == known_column {
+        return Err(Error::KeySpec(format!(
+            "--valid-by and --known-by both name {valid_column:?}; a bitemporal lookup has two \
+             clocks, the time a version is true from and the time it became known"
+        )));
+    }
+    let valid_ts = req
+        .valid
+        .as_deref()
+        .map(|v| instant_in_unit("valid", v, valid_column, &valid_type))
+        .transpose()?;
+    let known_ts = req
+        .known
+        .as_deref()
+        .map(|k| instant_in_unit("known", k, known_column, &known_type))
+        .transpose()?;
+    Ok(ResolvedTemporal {
+        ts_column: valid_column.to_string(),
+        query: RunQuery::Bitemporal(RunBitemporal {
+            valid_column: valid_column.to_string(),
+            known_column: known_column.to_string(),
+            valid: valid_ts,
+            known: known_ts,
+        }),
+        lookup: LookupKind::Bitemporal {
+            valid: req.valid.clone(),
+            known: req.known.clone(),
+            valid_ts,
+            known_ts,
+            valid_column: valid_column.to_string(),
+            known_column: known_column.to_string(),
+        },
+        lookback: None,
+    })
+}
+
 /// When `--workload <hash>` loads a workload whose runs already record
-/// `latest` or `asof`, derive the temporal lookup metadata from the workload
-/// and any current temporal spec.
+/// `latest`, `asof`, or a bitemporal lookup, derive the temporal lookup
+/// metadata from the workload (and, for `latest` and `asof`, any current
+/// temporal spec).
 fn infer_workload_temporal(
     workload: &Workload,
     current_specs: &[KeySpec],
@@ -3158,6 +3364,23 @@ fn infer_workload_temporal(
             | RunQuery::ContainsAll
     ) {
         return Ok(None);
+    }
+    // A bitemporal run records both of its clocks and its bounds, in their
+    // columns' units.
+    if let RunQuery::Bitemporal(b) = &query {
+        return Ok(Some(ResolvedTemporal {
+            ts_column: b.valid_column.clone(),
+            lookup: LookupKind::Bitemporal {
+                valid: b.valid.map(|v| v.to_string()),
+                known: b.known.map(|k| k.to_string()),
+                valid_ts: b.valid,
+                known_ts: b.known,
+                valid_column: b.valid_column.clone(),
+                known_column: b.known_column.clone(),
+            },
+            query,
+            lookback: None,
+        }));
     }
     let ts_column = current_specs
         .iter()
@@ -3199,6 +3422,7 @@ fn with_query(workload: &Workload, query: &RunQuery) -> Result<Workload> {
         r.query_kind = query.kind_str().to_string();
         r.asof = query.asof_ts();
         r.lookback = query.lookback();
+        r.bitemporal = query.bitemporal().cloned();
     }
     Workload::new(m)
 }

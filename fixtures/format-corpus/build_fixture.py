@@ -8,8 +8,15 @@ Run from the repository root:
         --out fixtures/format-v1 --root /tmp/bellwether-format-v1
 
 `--counts` declares the counted forms of the exact and temporal specs (a
-storage version 2 binary only). The steps, every one under the fixed clock
-2026-10-25T00:00:00Z:
+storage version 2 binary only). `--m5` (storage version 2 at M5, implies
+`--counts`) declares the folded forms instead: `exact:id@ts,counts` (per-key
+counts and time bounds in one value record), `bloom:id@0.01@ts` (a bloom
+with its bounds segment), `temporal2:id@valid,known` as a bitemporal key
+spec; proposes `exact:symbol@ts,counts`; indexes `text/` (a CSV file,
+so the manifest holds a `source.dialect`) beside the Parquet folder; and
+indexes `nested/` (list, struct, map and dictionary columns, written by
+`nested.py`, so the manifest holds the `{"arrow": "<display>"}` spelling). The
+steps, every one under the fixed clock 2026-10-25T00:00:00Z:
 
 1. copy `data/` to `<root>/data` and set every file's mtime to the fixed
    clock, so a fingerprint's etag is the same wherever the fixture is
@@ -23,12 +30,16 @@ storage version 2 binary only). The steps, every one under the fixed clock
    Evidence, Certificate, Receipt; sequence 3);
 5. `reconcile` against `right/` (one amount differs): a failing Certificate;
 6. every pinned lookup with `--json`, and `receipt` (the explain chain text);
-   with `--counts`, also `count` and `locate --columns`.
+   with `--counts`, also `count` and `locate --columns`; with `--m5`, also
+   `locate` and `count` over `<root>/text`, whose index is copied to
+   `index-text/`, and `locate` over `<root>/nested` (indexed with
+   `exact:id`), whose index is copied to `index-nested/`.
 
 `expected.json` holds the root the fixture was built at, the clock, every
 lookup's argument list and its output lines, the receipt text, and the hash
 of every ledger record. A test restores the fixture under another root by
 replacing the recorded root in the manifests and in the pinned outputs.
+`text/trades.csv` is written by hand, not by `generate.py`.
 """
 
 import argparse
@@ -64,6 +75,7 @@ def main():
     ap.add_argument("--out", required=True)
     ap.add_argument("--root", required=True)
     ap.add_argument("--counts", action="store_true")
+    ap.add_argument("--m5", action="store_true")
     a = ap.parse_args()
 
     root = os.path.realpath(a.root) if os.path.exists(a.root) else a.root
@@ -74,6 +86,12 @@ def main():
     right = os.path.join(root, "right")
     copy_tree(os.path.join(HERE, "data"), data)
     copy_tree(os.path.join(HERE, "right"), right)
+    text = os.path.join(root, "text")
+    nested = os.path.join(root, "nested")
+    if a.m5:
+        a.counts = True
+        copy_tree(os.path.join(HERE, "text"), text)
+        copy_tree(os.path.join(HERE, "nested"), nested)
     steps = []
 
     def run(*args, ok=(0,)):
@@ -85,26 +103,38 @@ def main():
         return p
 
     suffix = ",counts" if a.counts else ""
-    keys = [
-        "exact:id@ts",
-        "bloom:id@0.01",
-        "range:ts",
-        f"temporal:id@ts{suffix}",
-        "temporal2:id@valid,known",
-    ]
+    if a.m5:
+        keys = [
+            "exact:id@ts,counts",
+            "bloom:id@0.01@ts",
+            "range:ts",
+            "temporal:id@ts,counts",
+            "temporal2:id@valid,known",
+        ]
+    else:
+        keys = [
+            "exact:id@ts",
+            "bloom:id@0.01",
+            "range:ts",
+            f"temporal:id@ts{suffix}",
+            "temporal2:id@valid,known",
+        ]
     args = ["index", data, "--partitioning", "hive"]
     for k in keys:
         args += ["--key", k]
     run(*args)
     copy_tree(os.path.join(HERE, "extra"), data)
     run("index", data)
+    if a.m5:
+        run("--format", "csv", "index", text, "--key", "exact:id,counts")
+        run("index", nested, "--key", "exact:id")
 
     why = json.loads(
         run("--json", "why", data, "--from", os.path.join(HERE, "keys-symbol.parquet")).stdout.splitlines()[-1]
     )
     workload = why["workload"]["hash"]
     evidence = why["evidence"]["hash"]
-    proposal_key = "exact:symbol,counts" if a.counts else "exact:symbol"
+    proposal_key = "exact:symbol@ts,counts" if a.m5 else "exact:symbol,counts" if a.counts else "exact:symbol"
     prop = json.loads(
         run(
             "--json", "propose", data, "--key", proposal_key, "--by", "fixture",
@@ -144,6 +174,14 @@ def main():
             ["count", data, "--keys", symbols],
             ["locate", data, "--keys", ids, "--columns", "id,amount"],
         ]
+    if a.m5:
+        # M5: a CSV source's index (`source.dialect`).
+        lookups += [
+            ["--format", "csv", "locate", text, "--keys", ids],
+            ["--format", "csv", "count", text, "--keys", ids],
+            # M5: nested and dictionary columns (`{"arrow": …}`).
+            ["locate", nested, "--keys", ids],
+        ]
     pinned = []
     for args in lookups:
         out = run("--json", *args).stdout.splitlines()
@@ -156,6 +194,21 @@ def main():
         os.path.join(data, ".bellwether"), os.path.join(out, "index"), ignore=shutil.ignore_patterns("*.lock#*")
     )
     shutil.rmtree(os.path.join(out, "index", "cache"), ignore_errors=True)
+    if a.m5:
+        shutil.rmtree(os.path.join(out, "index-text"), ignore_errors=True)
+        shutil.copytree(
+            os.path.join(text, ".bellwether"),
+            os.path.join(out, "index-text"),
+            ignore=shutil.ignore_patterns("*.lock#*"),
+        )
+        shutil.rmtree(os.path.join(out, "index-text", "cache"), ignore_errors=True)
+        shutil.rmtree(os.path.join(out, "index-nested"), ignore_errors=True)
+        shutil.copytree(
+            os.path.join(nested, ".bellwether"),
+            os.path.join(out, "index-nested"),
+            ignore=shutil.ignore_patterns("*.lock#*"),
+        )
+        shutil.rmtree(os.path.join(out, "index-nested", "cache"), ignore_errors=True)
     ledger = sorted(
         f[: -len(".rec")] for f in os.listdir(os.path.join(out, "index", "ledger")) if f.endswith(".rec")
     )

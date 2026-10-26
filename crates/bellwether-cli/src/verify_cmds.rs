@@ -287,6 +287,12 @@ fn key(k: &KeyRepr) -> String {
     format!("({})", v.join(", "))
 }
 
+/// Why `n` keys could not be compared, and what to do (the facade's
+/// wording, shared with MCP).
+fn uncomparable_cause(n: u64) -> String {
+    bellwether::uncomparable_cause(n)
+}
+
 fn coverage(c: &Coverage) -> String {
     match c {
         Coverage::Full => "full".into(),
@@ -337,6 +343,32 @@ fn rows_asked(filter: &[Predicate]) -> String {
                 format!("{column} holding every one of the workload's values")
             }
             Predicate::And { all } => {
+                // A bitemporal run's winners: a per-key bound on each of
+                // its two clocks, read from the data, not a lookback.
+                let clocks: Vec<&str> = all
+                    .iter()
+                    .filter_map(|q| match q {
+                        Predicate::NotOlderThan { ts_column, .. } => Some(ts_column.as_str()),
+                        _ => None,
+                    })
+                    .collect();
+                if let [valid, known] = clocks.as_slice() {
+                    for q in all
+                        .iter()
+                        .filter(|q| !matches!(q, Predicate::NotOlderThan { .. }))
+                    {
+                        walk(q, out);
+                    }
+                    let phrase = format!(
+                        "each key's as-of version: the rows at its greatest {valid} within the \
+                         bounds among those known by then, at the greatest {known}, found in the \
+                         data"
+                    );
+                    if !out.contains(&phrase) {
+                        out.push(phrase);
+                    }
+                    return;
+                }
                 for q in all {
                     walk(q, out);
                 }
@@ -425,16 +457,24 @@ fn reconcile_human(r: &ReconcileResult, out: &Out) -> String {
         )
     );
     let c = &o.counts;
+    // The typed result counts a key that failed to compare in `mismatched`
+    // and again in `no_comparable_version`; shown apart, as the certificate
+    // counts them (`mismatched`, `uncomparable`).
+    let uncomparable = c.no_comparable_version;
     let _ = writeln!(
         s,
-        "  {:<22} {:>14}\n  {:<22} {:>14}\n  {:<22} {:>14}\n  {:<22} {:>14}\n  {:<22} {:>14}\n  {:<22} {:>14}",
+        "  {:<22} {:>14}\n  {:<22} {:>14}\n  {:<22} {:>14}\n  {:<22} {:>14}\n  {:<22} {:>14}\n  {:<22} {:>14}\n  {:<22} {:>14}",
         "keys compared", num(c.keys_compared),
         "matched", num(c.matched),
-        "mismatched", num(c.mismatched),
+        "mismatched", num(c.mismatched.saturating_sub(uncomparable)),
+        "uncomparable", num(uncomparable),
         "missing on the left", num(c.missing_left),
         "missing on the right", num(c.missing_right),
         "totals that differ", num(c.totals_differ)
     );
+    if uncomparable > 0 {
+        let _ = writeln!(s, "  {}", uncomparable_cause(uncomparable));
+    }
     if !o.ignored_columns.is_empty() {
         let _ = writeln!(s, "  not compared: {}", o.ignored_columns.join(", "));
     }
@@ -540,7 +580,18 @@ fn fix_human(r: &FixResult, out: &Out, table: bool) -> String {
     let mut s = String::new();
     let what = match &r.proposal.record {
         Record::Proposal(p) => match &p.body {
-            ProposalBody::Key { spec, .. } => format!("key {}", label(spec)),
+            ProposalBody::Key { spec, sidecars } if sidecars.is_empty() => {
+                format!("key {}", label(spec))
+            }
+            // Every spec the proposal applies, in its one commit.
+            ProposalBody::Key { spec, sidecars } => format!(
+                "keys {}, applied in one commit",
+                std::iter::once(spec)
+                    .chain(sidecars)
+                    .map(label)
+                    .collect::<Vec<_>>()
+                    .join(" and ")
+            ),
             ProposalBody::Layout { cluster_by } => format!("layout by {}", cluster_by.join(", ")),
             ProposalBody::Rewrite { shape } if !shape.pairs.is_empty() => format!(
                 "rewrite of {} engine quer{}, compared by ({})",
@@ -744,14 +795,22 @@ fn verify_and_outcome_human(s: &mut String, r: &FixResult) {
         if let Record::Certificate(cert) = &c.record {
             let _ = writeln!(
                 s,
-                "  2 verify  {}, coverage {}, {} mismatched, {} missing left, {} missing right, certificate {}",
+                "  2 verify  {}, coverage {}, {} mismatched, {} uncomparable, {} missing left, {} missing right, certificate {}",
                 if cert.pass { "pass" } else { "FAIL" },
                 coverage(&cert.coverage),
                 num(cert.body.mismatched),
+                num(cert.body.uncomparable),
                 num(cert.body.missing_left),
                 num(cert.body.missing_right),
                 short(&c.hash)
             );
+            if cert.body.uncomparable > 0 {
+                let _ = writeln!(
+                    s,
+                    "            {}",
+                    uncomparable_cause(cert.body.uncomparable)
+                );
+            }
         }
     }
     // A join key (B3): the right dataset's certificate, which the left one
@@ -862,12 +921,13 @@ fn verify_and_outcome_human(s: &mut String, r: &FixResult) {
             let why = match refusal {
                 Refusal::CertificateFailed {
                     mismatched,
+                    uncomparable,
                     missing_left,
                     missing_right,
                     totals_differ,
                     ..
                 } => format!(
-                    "the certificate failed ({mismatched} mismatched, {missing_left} missing left, {missing_right} missing right, {totals_differ} totals differ); no receipt"
+                    "the certificate failed ({mismatched} mismatched, {uncomparable} uncomparable, {missing_left} missing left, {missing_right} missing right, {totals_differ} totals differ); no receipt"
                 ),
                 Refusal::StaleManifest {
                     certified, current, ..

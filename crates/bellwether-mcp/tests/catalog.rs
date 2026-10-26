@@ -127,9 +127,8 @@ fn schemas_are_closed_and_carry_no_dangerous_field() {
         }
     }
     // The key spec in propose.key is the contract's KeySpec (its tagged
-    // variants, each closed) or the short form `index --key` reads, so a
-    // sidecar declaration such as temporal2 passes the schema and reaches
-    // the facade's typed refusal (`sidecar_not_proposable`).
+    // variants, each closed) or the short form `index --key` reads, so
+    // per-key bounds and bitemporal keys pass the schema as short forms.
     let key = catalog()
         .into_iter()
         .find(|t| t.name == "propose.key")

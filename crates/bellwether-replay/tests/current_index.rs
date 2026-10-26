@@ -829,3 +829,75 @@ fn attribution_hooks_return_exact_counterfactual_deltas() {
     let ids: BTreeSet<&str> = d.iter().map(|x| x.run_id.as_str()).collect();
     assert_eq!(ids.len(), workload.runs().len());
 }
+
+/// A key proposal's `sidecars` are applied with its spec in one commit, so
+/// the replay prices the configuration holding all of them: each sidecar
+/// must serve a run like the spec, and the proposed costs are those of the
+/// spec and its sidecars together.
+#[test]
+fn a_proposals_sidecars_are_priced_and_checked_with_its_spec() {
+    let corpus = common::write_corpus(&CorpusSpec::default());
+    let source = corpus.source();
+    let replayer = Replayer::unindexed(
+        &source,
+        &corpus.data,
+        &bellwether_source::Partitioning::None,
+    )
+    .unwrap();
+    let runs = common::entity_runs(&corpus, 10, 8);
+    let (keys, workload) = common::record(&["entity_id"], &runs);
+    let loose = KeySpec::Bloom {
+        columns: cols(&["entity_id"]),
+        fpr: 0.5,
+        bounds: None,
+    };
+    let exact = specs()[0].clone();
+    let p = Hash::of(b"p");
+    let alone = replayer
+        .replay_specs(std::slice::from_ref(&loose), &workload, &keys)
+        .unwrap();
+    let both = replayer
+        .replay_specs(&[loose.clone(), exact.clone()], &workload, &keys)
+        .unwrap();
+    let rgs = |c: &[RunCost]| c.iter().map(|c| c.row_groups).sum::<u64>();
+    assert!(
+        rgs(&both) < rgs(&alone),
+        "the exact sidecar narrows the loose bloom: {} vs {}",
+        rgs(&both),
+        rgs(&alone)
+    );
+    let scored = replayer
+        .score(
+            &p,
+            &ProposalBody::Key {
+                spec: loose.clone(),
+                sidecars: vec![exact],
+            },
+            &workload,
+            &keys,
+            AT,
+        )
+        .unwrap();
+    assert_eq!(scored.replay.proposed, both);
+    // A sidecar no run looks up is refused by name, as the spec would be.
+    let err = replayer
+        .score(
+            &p,
+            &ProposalBody::Key {
+                spec: loose,
+                sidecars: vec![KeySpec::Exact {
+                    columns: cols(&["payload"]),
+                    counts: false,
+                    bounds: None,
+                }],
+            },
+            &workload,
+            &keys,
+            AT,
+        )
+        .unwrap_err();
+    assert!(
+        matches!(&err, ReplayError::SpecServesNoRun { spec, .. } if spec == "exact:payload"),
+        "{err}"
+    );
+}

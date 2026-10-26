@@ -478,7 +478,7 @@ impl Engine {
             joins.push(g.clone());
         }
         let builder = Builder::new(Arc::clone(self.store()?), "");
-        let caps = self.build_options(Vec::new()).pair_caps();
+        let caps = self.build_options().pair_caps();
         let mut committed = left_committed;
         let mut out = Vec::with_capacity(joins.len());
         for spec in joins {
@@ -1048,7 +1048,7 @@ impl Engine {
         }
         // Split as the index build splits it, and held within a transient
         // index's cap (ADR 018).
-        let caps = self.build_options(Vec::new()).pair_caps();
+        let caps = self.build_options().pair_caps();
         let max_bytes = bellwether_replay::TransientLimits::default().max_index_bytes;
         let mut pairs = BTreeMap::new();
         for s in priced {

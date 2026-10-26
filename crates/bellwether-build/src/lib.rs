@@ -54,8 +54,8 @@ pub use join::{
 };
 pub use keys::encode_ts;
 pub use plan::{
-    default_window_column, overlapping_counts, partition_columns, KeyCount, Lookup, PlanOrder,
-    Planner, TransientSpec,
+    default_window_column, overlapping_counts, partition_columns, several_bitemporal_keys,
+    KeyCount, Lookup, PlanOrder, Planner, TransientSpec,
 };
-pub use target::declared_sketches;
+pub use target::{declared_sketches, TimedSource};
 pub use verify::Drift;
