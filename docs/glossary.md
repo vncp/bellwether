@@ -26,7 +26,7 @@ Every term the README and docs use, in one place, in plain language. If a term i
 | **Receipt** | The record that an apply happened, linking the evidence, proposal, replay, and passing certificate. The only record a reviewer or a gate needs to read. |
 | **Ledger** | The append-only, content-addressed store of all the records above. |
 | **Trust boundary** | The line between what an agent may do (observe, propose) and what only the engine may do (score, verify, apply). |
-| **Evolve** | The optimizer: a population search over plans, keys, layouts, and pipelines, scored by replay, gated by reconcile, selected by Pareto over runs. |
+| **Evolve** | The optimizer, shipped in stages: `advise` (deterministic proposers, no language model) first; `evolve --llm` (scoped structural proposers) only if `advise` leaves structural anti-patterns; rulebook promotion last. Every candidate is scored by replay, gated by reconcile, admitted by preserve-and-extend against held-out anchors, and selected by Pareto over runs. |
 | **Counterfactual attribution** | For each operator in a plan, the exact cost difference from replacing it with its best alternative. The optimizer's backward pass. |
 | **Pareto frontier** | The set of candidates none of which is beaten on every run and objective at once. Keeps the candidate that protects the worst run. |
 | **Rulebook** | Rules distilled from winning mutations, each promoted only when held-out replay reproduces its gain. The learned, transferable artifact. |

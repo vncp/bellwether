@@ -319,7 +319,7 @@ What Bellwether deliberately is not:
 
 ## Planned: evolve
 
-Most LLM query optimizers score their own suggestions with an estimate and verify them by hope. Bellwether has the two things text-space optimizers like [GEPA](https://arxiv.org/abs/2507.19457) and [SkillOpt](https://github.com/microsoft/SkillOpt) need and most data systems lack: a loss you cannot game (exact replay) and a gate you cannot skip (reconciliation). `evolve` (M6) is to be that loop applied to data pipelines: a reflective, population-based search over query plans, physical designs, and whole pipelines, with counterfactual attribution as the backward pass, finite-difference descent for numeric knobs, Pareto selection across your recorded runs, and a rulebook promoted only by held-out replay. It is a design, not yet code: [`docs/evolve.md`](docs/evolve.md), ADRs [021](docs/adr/021-reflective-workload-optimization.md) through [025](docs/adr/025-rulebook-validation.md).
+Most LLM query optimizers score their own suggestions with an estimate and verify them by hope. Bellwether has the two things text-space optimizers like [GEPA](https://arxiv.org/abs/2507.19457) and [SkillOpt](https://github.com/microsoft/SkillOpt) need and most data systems lack: a loss you cannot game (exact replay) and a gate you cannot skip (reconciliation). `advise` and `evolve` (M6) are to be that loop applied to data pipelines: a search over query plans, physical designs, and whole pipelines, each candidate scored by exact replay, gated by reconciliation, and selected by Pareto across your recorded runs with held-out anchors. It ships in three stages, each useful alone and each opened by a measured trigger: `advise` first (deterministic, no language model: rule-driven enumeration, exact finite-difference descent on knobs, layout and materialization search, receipts for every admitted change); `evolve --llm` only if `advise` leaves anti-patterns that need a structural rewrite, with scoped proposers fed by counterfactual attribution, within a stated cost per accepted mutation; rulebook promotion last, each rule promoted only by temporally held-out replay. If `advise` already captures the frontier, stages two and three do not ship. It is a design, not yet code: [`docs/evolve.md`](docs/evolve.md), ADRs [021](docs/adr/021-reflective-workload-optimization.md) through [025](docs/adr/025-rulebook-validation.md), [031](docs/adr/031-scoped-proposers-and-a-frozen-outer-loop.md), and [032](docs/adr/032-staged-delivery-with-a-measured-trigger.md).
 
 ## Architecture
 
@@ -391,8 +391,9 @@ bellwether why ./orders/ --workload <workload hash> --twin-of "$ENGINE" --gate i
 bellwether propose ./orders/ --rewrite before.sql=after.sql --evidence <twin evidence> --by me
 bellwether fix ./orders/ --twin-of "$ENGINE" --proposal <proposal hash> --scratch ./orders/_scratch
 
-# Arriving later: evolve (M6)
-bellwether evolve ./pipeline/ --workload runs/ --budget 50g
+# Arriving later (M6, staged): advise first, with no language model; evolve only if advise leaves rewrites it cannot reach
+bellwether advise ./pipeline/ --workload runs/
+bellwether evolve ./pipeline/ --workload runs/ --llm --budget 50g
 ```
 
 Every command takes `--json` and then prints its typed result as one JSON line, with each ledger record it wrote embedded with its hash: the same value the MCP server returns (ADR 010). Exit codes: 0 success, 1 a certificate failed or mismatches were found, 2 usage, 3 refused at the trust boundary, 4 engine error.
@@ -448,14 +449,14 @@ bellwether fix ./orders/ --twin-of "$ENGINE" --proposal <proposal> --scratch ./o
 
 Pre-alpha. The architecture and on-disk format are fixed and documented; the crates are being built against them, each landing by reviewed pull request. Milestones as [`docs/work-packages.md`](docs/work-packages.md) defines them:
 
-- [x] Contract crate, architecture, invariants, threat model, format, 28 decision records
+- [x] Contract crate, architecture, invariants, threat model, format, 32 decision records
 - [x] Engine foundations: canonical encoding, segments and blooms, Parquet and text sources, object-store manifest commits, the ledger; each crate reviewed against its invariants, with the reviewer's probes kept as regression tests
 - [x] **M1** `why` works with no index built: footers, the profile's fanout and lints as a recorded Evidence, and replay
 - [x] **M2** the index: `index`, `locate`, `latest`, `asof`
 - [x] **M3** receipts: `fix` writes one
 - [x] **M4** agent-first: the loop runs end to end from an MCP client
 - [ ] **M5** the format frozen after storage version 2 (per-key counts and per-column bytes), with a compatibility fixture
-- [ ] **M6** `evolve`: reflective workload optimization over the synthetic ledger, with a rulebook as output and a replayable run in the ledger; the loss covers the relational operators (projection, joins, windows, aggregation input) exactly
+- [ ] **M6** staged optimization against your recorded workload: `advise` first (no language model; enumeration, knob descent, layout and materialization search, with receipts), then `evolve --llm` only if `advise` leaves structural anti-patterns, then rulebook promotion; each stage a replayable run in the ledger; the loss covers the relational operators (projection, joins, windows, aggregation input) exactly
 - [ ] **M7** a SQL table reconciles against a folder of files with a certificate; plans execute inside DataFusion and DuckDB without a sidecar step; receipts gate pull requests
 - [ ] **M8** rules transfer across datasets and the exact-versus-estimated ablation is measured; receipts are signed (signing landed with [#10](https://github.com/vncp/bellwether/pull/10))
 
@@ -465,7 +466,7 @@ Not built, or not yet measured:
 
 - **SQL tables as a source.** In review ([#11](https://github.com/vncp/bellwether/pull/11)).
 - **Receipts for bitemporal keys.** A `temporal2` key is built with `index` and serves `asof --valid --known`; proposing and receipting one needs storage version 2.
-- **`evolve`.** Designed ([`docs/evolve.md`](docs/evolve.md), ADRs 021 to 025); no code yet.
+- **`advise` and `evolve`.** Designed in stages ([`docs/evolve.md`](docs/evolve.md), ADRs 021 to 025, 031, 032); no code yet.
 - **Engine adapters, CI receipts, a multi-machine build.** Planned (WP16, WP17, WP22). Today a plan is a list of files and row groups your engine reads, on one machine.
 - **Performance.** Latency is measured only where the Results say so; planning beat DuckDB alone on 2 of 14 questions. WP22 measures the rest in release builds.
 

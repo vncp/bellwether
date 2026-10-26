@@ -55,6 +55,7 @@ All notable changes are documented here. The format follows Keep a Changelog; ve
   024 (counterfactual attribution), 025 (rulebook validation); amendments to
   ADR 008 (bloom hash input) and ADR 017 (scope of unknown-field
   preservation).
+- Evolve is planned in three stages (WP13 split into 13a `advise`, 13b `evolve`, 13c rulebook v2), each opened by a measured trigger with a kill criterion in `docs/evolve.md` §3: ADR 031 (scoped proposers and a frozen outer loop) and ADR 032 (staged delivery with a measured trigger); amendments to ADR 021 (stages, a deterministic composer, preserve-and-extend admission, an anchor set), ADR 022 (generalization lint), ADR 023 (layout and cadence as artifacts), ADR 024 (attribution over lineage edges, bisect on a failed output certificate), and ADR 025 (parameterized templates, temporal holdout, `helpful`/`harmful` counters, bucket caps); `docs/evolve.md` gains what transfers from harness optimization (§2.1), seven evaluation additions (§11), and generic use through `Scorer` and `Verifier` (§15). Docs only; no evolve code yet.
 - `docs/format.md`: dataset-schema scale and unit for decimals and
   timestamps, statistics semantics, per-kind segment layouts, `bloom_hash`
   header field, pinned encoding test vectors.
