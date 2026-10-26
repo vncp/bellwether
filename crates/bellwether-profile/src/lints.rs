@@ -1028,8 +1028,12 @@ pub struct ReconcileRescan {
     pub key: Vec<String>,
     /// The totalled decimal column.
     pub value: String,
+    /// Its type on the side.
+    pub value_type: arrow::datatypes::DataType,
     /// Rows read on the side.
     pub rows: u64,
+    /// Rows read whose leading key column is null.
+    pub null_key_rows: u64,
     /// The specs complete in the side's index (empty when unindexed).
     pub complete: Vec<KeySpec>,
 }
@@ -1039,21 +1043,29 @@ pub struct ReconcileRescan {
 /// column), and the side's index has no complete agg key on exactly the
 /// key columns storing the total's sum, so the next reconcile reads them
 /// all again. Fires once per such side, high confidence (the reconcile ran;
-/// the specs are the side's manifest's). Does not fire when the side was
-/// answered by an agg key, or when its index declares one complete (then
-/// it was not used for another reason the reconcile states: a changed
-/// file, or a row whose leading key is null).
+/// the specs are the side's manifest's). Never names a key that could not
+/// answer the side: it does not fire when the total cannot be summed into
+/// an agg key (a Decimal256, which `index` refuses), when a row's leading
+/// key column is null (no agg key holds that row, ADR 014, so the side is
+/// read whatever the index), when the side was answered by an agg key, or
+/// when its index declares one complete (then the reconcile's
+/// `agg_not_used` states why it did not answer: a changed file, a null
+/// leading key, a compared non-key column, ...).
 #[must_use]
 pub fn reconcile_rescans(rescans: &[ReconcileRescan]) -> Vec<Lint> {
     rescans
         .iter()
         .filter(|r| {
-            !r.complete.iter().any(|s| {
-                matches!(s, KeySpec::Agg { columns, value, functions }
-                    if *columns == r.key
-                        && *value == r.value
-                        && functions.contains(&AggregateFn::Sum))
-            })
+            matches!(
+                bellwether_core::agg::sum_kind(&r.value, &r.value_type),
+                Ok(bellwether_core::agg::SumKind::Int)
+            ) && r.null_key_rows == 0
+                && !r.complete.iter().any(|s| {
+                    matches!(s, KeySpec::Agg { columns, value, functions }
+                        if *columns == r.key
+                            && *value == r.value
+                            && functions.contains(&AggregateFn::Sum))
+                })
         })
         .map(|r| {
             let functions = [AggregateFn::Sum, AggregateFn::Count];
@@ -1430,9 +1442,28 @@ mod tests {
             root: "/data/copy".into(),
             key: cols(&["account"]),
             value: "amount".into(),
+            value_type: arrow::datatypes::DataType::Decimal128(18, 6),
             rows: 5000,
+            null_key_rows: 0,
             complete,
         }
+    }
+
+    /// `R-agg-1` never names a key that could not answer the side: a
+    /// Decimal256 total, which `index` refuses to sum, and a side with a
+    /// null leading key, whose rows no agg key holds, stay quiet.
+    #[test]
+    fn reconcile_rescans_do_not_fire_where_no_agg_key_could_answer() {
+        let wide = ReconcileRescan {
+            value_type: arrow::datatypes::DataType::Decimal256(40, 6),
+            ..rescan(Vec::new())
+        };
+        assert!(reconcile_rescans(&[wide]).is_empty());
+        let nulls = ReconcileRescan {
+            null_key_rows: 1,
+            ..rescan(Vec::new())
+        };
+        assert!(reconcile_rescans(&[nulls]).is_empty());
     }
 
     /// `R-agg-1` fires on a reconcile side read to total per key when its

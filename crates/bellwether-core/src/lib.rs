@@ -40,6 +40,7 @@ pub mod expr;
 pub mod hll;
 pub mod list;
 pub mod merge;
+pub mod render;
 pub mod segment;
 pub mod sidecar;
 pub mod sketch;

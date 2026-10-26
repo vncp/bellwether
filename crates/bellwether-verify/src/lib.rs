@@ -44,7 +44,6 @@ mod index;
 mod outcome;
 mod planner;
 mod reconcile;
-mod render;
 mod rowhash;
 mod schema;
 mod spec;
@@ -56,12 +55,11 @@ pub use certificate::{record, AgedInput, CertificateContext, Certified, Manifest
 pub use error::{Result, VerifyError};
 pub use index::IndexPlanner;
 pub use outcome::{
-    Counts, GroupRepr, GroupTotal, KeyRepr, MemoryReport, Mismatch, Reconciliation, SidePath,
-    SideReport, Sides, VersionDigest,
+    AggNotUsed, Counts, GroupRepr, GroupTotal, KeyRepr, MemoryReport, Mismatch, Reconciliation,
+    SidePath, SideReport, Sides, VersionDigest,
 };
 pub use planner::{AggTotals, ManifestIdentity, SidePlanner};
 pub use reconcile::{Reconciler, Side, PARTITION_SEED};
-pub use render::render_tuple;
 pub use rowhash::{push_hashed_column, row_hash};
 pub use spec::{
     CoverageRequest, Options, ReconcileSpec, TotalColumn, WorkloadKeys, DEFAULT_MAX_EXAMPLES,

@@ -911,8 +911,9 @@ impl SegmentWriter {
     /// `key` in row group `rg`, `value` the canonical encoding of its value
     /// at the dataset type, or `None` for a null value. All or nothing: the
     /// touched cells are updated on copies, so on error (a value that
-    /// cannot be summed, a sum past 128 bits) nothing is recorded. Rows
-    /// are added in the order given, which a float sum depends on.
+    /// cannot be summed, a sum past 128 bits, refused naming the spec, the
+    /// key and the row group) nothing is recorded. Rows are added in the
+    /// order given, which a float sum depends on.
     pub fn insert_values(
         &mut self,
         rg: RowGroupId,
@@ -937,7 +938,18 @@ impl SegmentWriter {
                 staged.insert(key.as_slice(), current);
             }
             if let Some(cell) = staged.get_mut(key.as_slice()) {
-                cell.add_row(value.as_deref(), functions)?;
+                cell.add_row(value.as_deref(), functions).map_err(|e| {
+                    if crate::agg::is_sum_overflow(&e) {
+                        let types = self.dataset.as_ref().map_or(&[][..], |d| &d.keys);
+                        crate::agg::sum_overflow(
+                            &self.spec,
+                            &crate::render::key_label(key, types),
+                            crate::agg::OverflowAt::RowGroup(rg.0),
+                        )
+                    } else {
+                        e
+                    }
+                })?;
             }
         }
         for (key, cell) in staged {

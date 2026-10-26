@@ -16,6 +16,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use arrow::array::{Array, RecordBatch};
 use arrow::datatypes::{i256, DataType};
 use bellwether_core::encoding;
+use bellwether_core::render::render_tuple;
 use bellwether_types::{
     format, AggServed, Coverage, Evidence, EvidenceBody, FileFingerprint, Hash, Provenance, Record,
     RowGroupMeta, ScanPlan, Source,
@@ -24,11 +25,10 @@ use xxhash_rust::xxh3::{xxh3_128, xxh3_64_with_seed};
 
 use crate::error::{Result, VerifyError};
 use crate::outcome::{
-    Counts, GroupRepr, GroupTotal, KeyRepr, MemoryReport, Mismatch, Reconciliation, SidePath,
-    SideReport, Sides, VersionDigest,
+    AggNotUsed, Counts, GroupRepr, GroupTotal, KeyRepr, MemoryReport, Mismatch, Reconciliation,
+    SidePath, SideReport, Sides, VersionDigest,
 };
 use crate::planner::{AggTotals, ManifestIdentity, SidePlanner};
-use crate::render::render_tuple;
 use crate::rowhash::{check_probe, hex, push_hashed_column};
 use crate::schema::{class, Plan, TotalCol};
 use crate::spec::{CoverageRequest, Options, ReconcileSpec, MAX_PASSES};
@@ -220,6 +220,8 @@ struct Prepared<'s> {
     /// Per side, the `agg` key whose per-key rows and totals stand in for
     /// its rows (B7), when one does.
     agg: [Option<AggSide<'s>>; 2],
+    /// The sides holding an agg key that could not stand in, and why.
+    agg_not_used: Vec<AggNotUsed>,
 }
 
 /// A side whose per-key rows and totals an index's `agg` key answers (B7).
@@ -229,6 +231,16 @@ struct AggSide<'s> {
     spec: String,
     /// The rows it aggregates: every row of the side.
     rows: u64,
+}
+
+/// What a side's index offers a reconcile (B7, [`agg_side`]).
+enum AggUse<'s> {
+    /// No complete agg key on the key columns storing a total's sum.
+    Absent,
+    /// One that stands in for the side's rows.
+    Served(AggSide<'s>),
+    /// One that cannot, and why.
+    NotUsed(AggNotUsed),
 }
 
 /// A provenance input: its hash, its age when taken, and when it was taken.
@@ -321,6 +333,9 @@ struct Attempt {
     seen: u64,
     unsampled: u64,
     rows_read: [u64; 2],
+    /// Rows read per side whose leading key column is null, counted in
+    /// the first pass.
+    null_keys: [u64; 2],
     peak_batch: u64,
 }
 
@@ -405,6 +420,7 @@ impl Reconciler {
                 seen: 0,
                 unsampled: 0,
                 rows_read: [0, 0],
+                null_keys: [0, 0],
                 peak_batch: 0,
             };
             let result = attempt(&prep, passes, &mut a);
@@ -450,6 +466,7 @@ impl Reconciler {
         let mut reports: Vec<SideReport> = Vec::with_capacity(2);
         let mut ranges: Vec<Option<(i128, i128)>> = Vec::with_capacity(2);
         let mut agg: Vec<Option<AggSide<'s>>> = Vec::with_capacity(2);
+        let mut agg_not_used = Vec::new();
         for s in 0..2 {
             let (set, path) = read_set(
                 &sides[s],
@@ -472,14 +489,23 @@ impl Reconciler {
                     &counted.per_file,
                 )?,
             };
-            let served = agg_side(
+            let used = agg_side(
                 &self.spec,
                 &plan,
                 &scope,
                 &sides[s],
+                s,
                 indexed[s].as_ref(),
                 &fps[s],
             )?;
+            let served = match used {
+                AggUse::Served(a) => Some(a),
+                AggUse::NotUsed(n) => {
+                    agg_not_used.push(n);
+                    None
+                }
+                AggUse::Absent => None,
+            };
             let path = match &served {
                 Some(a) => {
                     // Nothing is read: the plan a workload scope made is
@@ -505,6 +531,7 @@ impl Reconciler {
                 path,
                 row_groups,
                 rows,
+                null_key_rows: 0,
             });
             read.push(set);
         }
@@ -530,6 +557,7 @@ impl Reconciler {
                 .unwrap_or_else(|_| unreachable!("two sides")),
             indexed,
             agg: agg.try_into().unwrap_or_else(|_| unreachable!("two sides")),
+            agg_not_used,
         })
     }
 
@@ -657,6 +685,10 @@ impl Reconciler {
                 })
             })
             .collect();
+        let mut sides = prep.reports;
+        for (report, n) in sides.iter_mut().zip(a.null_keys) {
+            report.null_key_rows = n;
+        }
         Ok(Execution {
             outcome: Reconciliation {
                 pass,
@@ -669,9 +701,10 @@ impl Reconciler {
                 row_filter: self.spec.row_filter.clone(),
                 hashed_columns: prep.plan.hashed_names.clone(),
                 ignored_columns: prep.plan.ignored.clone(),
-                sides: prep.reports,
+                sides,
                 memory,
                 agg,
+                agg_not_used: prep.agg_not_used,
             },
             inputs,
             manifests,
@@ -1180,76 +1213,184 @@ fn agg_row_hash(plan: &Plan, key: &[u8], row: &mut Vec<u8>) -> Option<u128> {
     Some(xxh3_128(row))
 }
 
-/// The `agg` key that can stand in for a side's rows (B7), when one can:
-/// the side is indexed; no version rule, row filter, or expression scope
-/// selects among a key's rows; every hashed column is a key column; the one
-/// total is a Decimal128 column summed as stored, grouped by nothing or by
-/// exactly the key; a complete agg key on exactly the key columns stores
-/// that column's sum at the side's dataset type; and its rows are every
-/// row of the side (a row whose leading key column is null is in no agg
-/// key, ADR 014, so such a side is read instead).
+/// What a side's index offers a reconcile (B7): [`AggUse::Absent`] unless
+/// the side is indexed and its index holds a complete agg key on exactly
+/// the key columns storing the sum of one of the totals. That key stands in
+/// for the side's rows ([`AggUse::Served`]) when no version rule, row
+/// filter, or expression scope selects among a key's rows; every hashed
+/// column is a key column; the one total is a Decimal128 column summed as
+/// stored, grouped by nothing or by exactly the key; the side's types are
+/// the index's; and its rows are every row of the side (a row whose
+/// leading key column is null is in no agg key, ADR 014). Otherwise the
+/// side is read and [`AggUse::NotUsed`] says why, and what to change when
+/// a change of the request would let it answer.
+#[allow(clippy::too_many_lines)] // one cause per condition
 fn agg_side<'s>(
     spec: &ReconcileSpec,
     plan: &Plan,
     scope: &Scope,
     side: &Side<'s>,
+    s: usize,
     ix: Option<&Indexed>,
     files: &[FileFingerprint],
-) -> Result<Option<AggSide<'s>>> {
+) -> Result<AggUse<'s>> {
     let (Some(planner), Some(ix)) = (side.planner(), ix) else {
-        return Ok(None);
+        return Ok(AggUse::Absent);
     };
-    let scoped = matches!(
-        scope,
-        Scope::Full | Scope::Sampled { .. } | Scope::Workload { expr: None, .. }
-    );
-    if !scoped
-        || plan.latest_by.is_some()
-        || plan.filter.is_some()
-        || spec.keys_of.is_some()
-        || !plan
-            .hashed_names
+    let mut found = None;
+    for t in &plan.totals {
+        let column = &plan.projection[t.proj];
+        if let Some(totals) = planner.agg_totals(&spec.key_columns, column)? {
+            found = Some((t, column, totals));
+            break;
+        }
+    }
+    let Some((t, column, totals)) = found else {
+        return Ok(AggUse::Absent);
+    };
+    let mut causes = Vec::new();
+    let mut next = None;
+    match scope {
+        Scope::Full | Scope::Sampled { .. } | Scope::Workload { expr: None, .. } => {}
+        Scope::Workload { expr: Some(_), .. } => causes.push(format!(
+            "the keys are values of the expression {}, not of the key columns",
+            spec.keys_of.as_deref().unwrap_or_default()
+        )),
+        Scope::WorkloadRows { .. } => causes.push(
+            "only the rows a workload's runs read are compared, and the agg key totals every row"
+                .to_string(),
+        ),
+    }
+    if let Some(c) = &spec.latest_by {
+        causes.push(format!(
+            "the newest row per key by {c} is compared, and the agg key totals every row"
+        ));
+    }
+    if plan.filter.is_some() && !matches!(scope, Scope::WorkloadRows { .. }) {
+        causes.push(
+            "a row filter keeps only some of each key's rows, and the agg key totals every row"
+                .to_string(),
+        );
+    }
+    if !(spec.group_by.is_empty() || spec.group_by == spec.key_columns) {
+        causes.push(format!(
+            "totals are grouped by {}, and the agg key totals per key",
+            spec.group_by.join(", ")
+        ));
+    }
+    if plan.totals.len() > 1 {
+        let names: Vec<&str> = plan
+            .totals
             .iter()
-            .all(|c| spec.key_columns.contains(c))
-        || !(spec.group_by.is_empty() || spec.group_by == spec.key_columns)
-    {
-        return Ok(None);
+            .map(|t| plan.projection[t.proj].as_str())
+            .collect();
+        causes.push(format!(
+            "{} are totalled, and an agg key stands in for one total",
+            names.join(", ")
+        ));
     }
-    let [t] = plan.totals.as_slice() else {
-        return Ok(None);
-    };
-    if t.wide || t.quantize {
-        return Ok(None);
+    if t.quantize {
+        causes.push(format!(
+            "{column} is totalled quantized, and an agg key's sum of floats is never exact"
+        ));
+    } else if t.wide {
+        causes.push(format!(
+            "{column} is a Decimal256, whose totals an agg key cannot hold"
+        ));
     }
-    let column = &plan.projection[t.proj];
-    let same_type = |name: &str, dt: &DataType| {
+    let compared: Vec<&String> = plan
+        .hashed_names
+        .iter()
+        .filter(|c| !spec.key_columns.contains(c))
+        .collect();
+    if !compared.is_empty() {
+        let list = compared
+            .iter()
+            .map(|c| c.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        causes.push(format!(
+            "{list} {} compared row by row, and the agg key holds only each key's rows and the \
+             total of {column}",
+            if compared.len() == 1 { "is" } else { "are" }
+        ));
+        let mut ignore: Vec<&str> = plan.ignored.iter().map(String::as_str).collect();
+        ignore.extend(compared.iter().map(|c| c.as_str()));
+        ignore.sort_unstable();
+        ignore.dedup();
+        let what = if compared.as_slice() == [column] {
+            format!("compares {column} only through its exact total")
+        } else {
+            format!("compares each key's rows and only the exact total of {column}")
+        };
+        next = Some(format!(
+            "ignore {list} too (--ignore {} on the CLI, `ignore` here): the reconcile then \
+             {what}, which the agg key answers",
+            ignore.join(",")
+        ));
+    }
+    let in_index = |name: &str| {
         ix.manifest
             .dataset_schema
             .field_with_name(name)
-            .is_ok_and(|f| f.data_type() == dt)
+            .ok()
+            .map(|f| f.data_type().clone())
     };
     let side_schema = side.source.schema(side.root)?;
-    let typed = std::iter::once(column).chain(&spec.key_columns).all(|c| {
-        side_schema
-            .field_with_name(c)
-            .is_ok_and(|f| same_type(c, f.data_type()))
-    });
-    if !typed {
-        return Ok(None);
+    for c in std::iter::once(column).chain(&spec.key_columns) {
+        let mine = side_schema.field_with_name(c).ok().map(|f| f.data_type());
+        let theirs = in_index(c);
+        if mine != theirs.as_ref() {
+            causes.push(format!(
+                "{c} is {} on this side and {} in its index",
+                mine.map_or_else(|| "absent".to_string(), ToString::to_string),
+                theirs.map_or_else(|| "absent".to_string(), |t| t.to_string()),
+            ));
+        }
     }
-    let Some(totals) = planner.agg_totals(&spec.key_columns, column)? else {
-        return Ok(None);
+    let not_used = |causes: Vec<String>, next: Option<String>| {
+        AggUse::NotUsed(AggNotUsed {
+            side: SIDE_NAMES[s].to_string(),
+            spec: totals.spec(),
+            causes,
+            next,
+        })
     };
+    if !causes.is_empty() {
+        return Ok(not_used(causes, next));
+    }
     let all = count_rows(side.source, &ReadSet::Scan(files.to_vec()), None)?.rows;
     let mut rows = 0u64;
-    totals.visit(&mut |_, n, _| {
+    let visited = totals.visit(&mut |_, n, _| {
         rows += n;
         Ok(())
-    })?;
-    if rows != all {
-        return Ok(None);
+    });
+    match visited {
+        Ok(()) => {}
+        Err(e) if bellwether_core::agg::is_sum_overflow(&e) => {
+            return Ok(not_used(
+                vec![format!(
+                    "a key's total of {column} overflows the agg key's 128-bit sum, so the rows \
+                     are read to total it exactly"
+                )],
+                None,
+            ));
+        }
+        Err(e) => return Err(e.into()),
     }
-    Ok(Some(AggSide {
+    if rows != all {
+        return Ok(not_used(
+            vec![format!(
+                "{} of its {} rows have a null {} and are in no agg key (ADR 014), so the rows \
+                 are read to compare them",
+                all.saturating_sub(rows),
+                all,
+                spec.key_columns[0]
+            )],
+            None,
+        ));
+    }
+    Ok(AggUse::Served(AggSide {
         spec: totals.spec(),
         totals,
         rows,
@@ -1341,6 +1482,11 @@ fn read_row_group(
                     column: plan.projection[i].clone(),
                 }));
             }
+        }
+        // A null leading key column is the lone marker first (ADR 014):
+        // counted once, in the first pass.
+        if p == 0 && key.first() == Some(&encoding::tag::NULL) {
+            a.null_keys[s] += 1;
         }
         if passes > 1 && xxh3_64_with_seed(key, PARTITION_SEED) % u64::from(passes) != u64::from(p)
         {

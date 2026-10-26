@@ -5,8 +5,8 @@
 use arrow::datatypes::DataType;
 use bellwether_build::{AggLookup, Aggregated};
 use bellwether_core::agg::{AggCell, AggSum};
+use bellwether_core::render::render_tuple;
 use bellwether_types::{AggregateFn, Error, Exactness, Hash, KeySpec, Result, AGG_FLOAT_SUM_MODEL};
-use bellwether_verify::render_tuple;
 use serde::{Deserialize, Serialize};
 
 use crate::engine::{guard, schema_hint, Engine};
@@ -132,6 +132,7 @@ impl Engine {
             // No index: name the keys that answer this aggregate.
             let schema = self.source(None)?.schema(self.root())?;
             let (run_keys, _) = keys.run_keys(&schema)?;
+            summable(&schema, run_keys.columns(), value, &functions)?;
             return Err(Error::NotIndexed {
                 root: self.root().to_string(),
                 operation: "aggregate",
@@ -150,6 +151,7 @@ impl Engine {
         }
         let (run_keys, null_tuples) = keys.run_keys(schema)?;
         let columns = run_keys.columns().to_vec();
+        summable(schema, &columns, value, &functions)?;
         if let Some(needs) = missing_spec(&specs, &columns, value, &functions) {
             return Err(Error::NotIndexed {
                 root: self.root().to_string(),
@@ -185,6 +187,51 @@ impl Engine {
             pinned.sequence(),
         ))
     }
+}
+
+/// Refuses a sum of a column that has none (a string, a Decimal256, ...):
+/// no agg key can store it, so naming one to declare would be refused in
+/// turn. Names the functions the column has and the agg key that answers
+/// them.
+fn summable(
+    schema: &arrow::datatypes::Schema,
+    columns: &[String],
+    value: &str,
+    functions: &[AggregateFn],
+) -> Result<()> {
+    let Ok(field) = schema.field_with_name(value) else {
+        return Ok(());
+    };
+    if !functions.contains(&AggregateFn::Sum)
+        || bellwether_core::agg::sum_kind(value, field.data_type()).is_ok()
+    {
+        return Ok(());
+    }
+    let rest: Vec<AggregateFn> = AggregateFn::canonical(
+        &functions
+            .iter()
+            .copied()
+            .filter(|f| *f != AggregateFn::Sum)
+            .chain([AggregateFn::Min, AggregateFn::Max])
+            .collect::<Vec<_>>(),
+    );
+    let names: Vec<&str> = rest.iter().map(|f| f.as_str()).collect();
+    Err(Error::InvalidArgument {
+        field: "functions",
+        reason: format!(
+            "{value} is {}, which has no sum (an agg key sums integer, Decimal128 and float \
+             columns); ask for {} instead, which {} answers beside exact:{},counts",
+            field.data_type(),
+            names.join(", "),
+            KeySpec::Agg {
+                columns: columns.to_vec(),
+                value: value.to_string(),
+                functions: rest.clone(),
+            }
+            .identity(),
+            columns.join(",")
+        ),
+    })
 }
 
 /// The declaration an aggregate lacks, as the spec `index --key` takes:

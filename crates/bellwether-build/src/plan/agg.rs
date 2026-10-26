@@ -282,10 +282,16 @@ pub fn answer<R: ReadAt>(
     }
     let mut cells: BTreeMap<Vec<u8>, BTreeMap<u32, AggCell>> = BTreeMap::new();
     let agg_probes = sorted(&agg_variants);
+    // A lookup that asks for no sum adds none: a total past 128 bits then
+    // fails only the lookups that ask for it.
+    let wants_sum = lookup.functions.contains(&AggregateFn::Sum);
     for r in agg_readers {
         for (k, per_rg) in r.agg_cells(&agg_probes)? {
             let m = cells.entry(k).or_default();
-            for (rg, cell) in per_rg {
+            for (rg, mut cell) in per_rg {
+                if !wants_sum {
+                    cell.sum = None;
+                }
                 if live.contains(rg.0) && m.insert(rg.0, cell).is_some() {
                     return Err(Error::Other(format!(
                         "corrupt index: two segments listed under {} aggregate the same key in \
@@ -299,11 +305,24 @@ pub fn answer<R: ReadAt>(
             }
         }
     }
+    // A sum past 128 bits names the agg key and the lookup key.
+    let key_types: Vec<DataType> = types.iter().map(|(_, t)| t.clone()).collect();
+    let overflow = |key: &[u8], e: Error| {
+        if core_agg::is_sum_overflow(&e) {
+            core_agg::sum_overflow(
+                agg,
+                &bellwether_core::render::key_label(key, &key_types),
+                core_agg::OverflowAt::Lookup,
+            )
+        } else {
+            e
+        }
+    };
     // Every variant of a key is the same key under SQL equality: their
     // counts add and their cells combine, per row group.
     let mut per_key: Vec<(BTreeMap<u32, u64>, BTreeMap<u32, AggCell>)> =
         Vec::with_capacity(keys.len());
-    for (cv, av) in count_variants.iter().zip(&agg_variants) {
+    for ((cv, av), key) in count_variants.iter().zip(&agg_variants).zip(&keys) {
         let mut c: BTreeMap<u32, u64> = BTreeMap::new();
         for v in cv {
             for (rg, n) in counts.get(v).into_iter().flatten() {
@@ -314,7 +333,7 @@ pub fn answer<R: ReadAt>(
         for v in av {
             for (rg, cell) in cells.get(v).into_iter().flatten() {
                 match a.get_mut(rg) {
-                    Some(x) => x.combine(cell)?,
+                    Some(x) => x.combine(cell).map_err(|e| overflow(key, e))?,
                     None => {
                         a.insert(*rg, cell.clone());
                     }
@@ -332,7 +351,7 @@ pub fn answer<R: ReadAt>(
     let mut read_keys: Vec<&Vec<u8>> = Vec::new();
     let mut rows = 0u64;
     for (key, (c, a)) in keys.iter().zip(&per_key) {
-        let cover = core_agg::cover(c, a, &residual)?;
+        let cover = core_agg::cover(c, a, &residual).map_err(|e| overflow(key, e))?;
         rows = rows
             .checked_add(cover.rows)
             .ok_or_else(|| Error::Other("row count overflows u64".into()))?;

@@ -67,9 +67,9 @@ const AGGREGATE_ROWS_SHOWN: usize = 20;
 /// `aggregate`: per key its rows, count, nulls and the asked aggregates,
 /// then where they came from, whether any float sum is measured rather
 /// than exact, and the row groups still to read when the index answered
-/// only part.
+/// only part, with the `index` command (on `root`) that answers it all.
 #[allow(clippy::too_many_lines)] // header, one row per key, then the residual
-pub(crate) fn aggregate_result(r: &AggregateResult, out: &Out) -> String {
+pub(crate) fn aggregate_result(r: &AggregateResult, root: &str, out: &Out) -> String {
     let mut s = String::new();
     let _ = writeln!(
         s,
@@ -86,10 +86,16 @@ pub(crate) fn aggregate_result(r: &AggregateResult, out: &Out) -> String {
             )
         )
     );
-    let shown = |v: &Option<AggValue>| -> Option<String> {
-        v.as_ref()
-            .map(|v| v.value.clone().unwrap_or_else(|| "null".into()))
+    // An empty string reads `""`, never a blank cell; a null reads `null`.
+    let cell = |v: Option<&str>| -> String {
+        match v {
+            None => "null".into(),
+            Some("") => "\"\"".into(),
+            Some(t) => t.to_string(),
+        }
     };
+    let shown =
+        |v: &Option<AggValue>| -> Option<String> { v.as_ref().map(|v| cell(v.value.as_deref())) };
     let mut header = format!(
         "  {:<24} {:>12} {:>12} {:>8}",
         "key", "rows", "count", "nulls"
@@ -102,11 +108,7 @@ pub(crate) fn aggregate_result(r: &AggregateResult, out: &Out) -> String {
     }
     let _ = writeln!(s, "{}", header.trim_end());
     for g in r.groups.iter().take(AGGREGATE_ROWS_SHOWN) {
-        let key: Vec<String> = g
-            .key
-            .iter()
-            .map(|v| v.clone().unwrap_or_else(|| "null".into()))
-            .collect();
+        let key: Vec<String> = g.key.iter().map(|v| cell(v.as_deref())).collect();
         let mut line = format!(
             "  {:<24} {:>12} {:>12} {:>8}",
             key.join(", "),
@@ -188,9 +190,12 @@ pub(crate) fn aggregate_result(r: &AggregateResult, out: &Out) -> String {
         let _ = writeln!(
             s,
             "  the values above are exact over the other rows; read those row groups, keep the \
-             rows of these keys, and add them, or declare agg:{}@{} to answer from the index alone",
+             rows of these keys, and add them, or declare the agg key on ({}) to answer from the \
+             index alone: bellwether index {root} --key 'agg:{}@{}{{{}}}'",
+            r.columns.join(", "),
             r.columns.join(","),
-            r.value
+            r.value,
+            r.functions.join(",")
         );
     }
     s
@@ -1281,6 +1286,11 @@ pub(crate) fn why(r: &bellwether::WhyReport, out: &Out, fix_command: &str) -> St
                 values,
             } => list_layout(*least_row_groups, *row_groups, values),
             CulpritReason::ServingSpec { spec } => format!("the serving key {}", label(spec)),
+            CulpritReason::AggAnswered { spec } => format!(
+                "none: the index answers the aggregates from {} beside its counted key; nothing \
+                 is read",
+                label(spec)
+            ),
             CulpritReason::Text { matches } => {
                 let parts: Vec<String> = matches
                     .iter()
@@ -1369,6 +1379,31 @@ pub(crate) fn why(r: &bellwether::WhyReport, out: &Out, fix_command: &str) -> St
                     "recommended{for_kind}: none; no candidate reads fewer bytes than the current configuration"
                 );
             }
+        }
+        // Aggregate runs (B7) on a folder without the counted key an agg
+        // key needs: that key comes first, and saves no bytes on its own.
+        let counted = r.candidates.iter().find(|c| {
+            c.origin == CandidateOrigin::Workload
+                && matches!(c.spec, KeySpec::Exact { counts: true, .. })
+        });
+        if let (Some(LookupKind::Aggregate { .. }), Some(c), true) = (
+            &w.lookup,
+            counted,
+            r.tables.is_empty()
+                && !r
+                    .candidates
+                    .iter()
+                    .any(|c| matches!(c.spec, KeySpec::Agg { .. })),
+        ) {
+            let _ = writeln!(
+                s,
+                "  first apply the counted key the agg key needs ({}); it saves no bytes on its \
+                 own, so allow that: {fix_command} --proposal {} --workload {} --allow-no-gain\n  \
+                 then run why again: it proposes the agg key",
+                label(&c.spec),
+                c.proposal.hash,
+                w.hash
+            );
         }
     }
     if let Some(t) = &r.twin {

@@ -24,6 +24,13 @@ pub(crate) enum VerifyCommand {
     /// key, latest version, and exact decimal totals; writes a Certificate. The summary names the first 10
     /// mismatching keys (every one is in --json), prints the exact totals,
     /// and says how many passes the comparison made over each side.
+    ///
+    /// A side whose index holds agg:<key>@<total>{sum,count} (B7) is
+    /// answered from it, reading no row, when only per-key rows and that
+    /// one total are compared: every other column ignored, the total too
+    /// (--key account --totals amount --ignore amount,memo,...; an ignored
+    /// total is still compared, through its exact sum). Otherwise the
+    /// summary says why the side was read and what to pass.
     Reconcile(ReconcileArgs),
     /// Score, verify, apply, and attest a proposal (or apply a certificate);
     /// ends with a receipt hash, or a refusal.
@@ -488,6 +495,20 @@ fn reconcile_human(r: &ReconcileResult, out: &Out) -> String {
             a.specs.join(", "),
             count(a.rows, "row", "rows")
         );
+    }
+    // A side whose agg key could have answered and did not: why, and what
+    // makes it answer.
+    for n in &o.agg_not_used {
+        let _ = writeln!(
+            s,
+            "  the {} side was read, not answered from its index's {}: {}",
+            n.side,
+            n.spec,
+            n.causes.join("; ")
+        );
+        if let Some(next) = &n.next {
+            let _ = writeln!(s, "    next: {next}");
+        }
     }
     tables_human(&mut s, &r.tables);
     if !r.lints.is_empty() {

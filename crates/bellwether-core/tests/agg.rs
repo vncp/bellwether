@@ -371,7 +371,7 @@ fn float_sums_are_compensated_and_both_zeros_order() {
     assert_eq!((all.rows, all.nulls), (4, 2));
     // Neumaier keeps the 1.0 that a naive sum loses.
     let k = &cells[&key("k")][0].1;
-    assert_eq!(k.sum.unwrap().render(None), "1");
+    assert_eq!(k.sum.unwrap().render(None), "1.0");
     assert_eq!(
         sum_kind("amount", &DataType::Float32).unwrap(),
         SumKind::Float
@@ -402,6 +402,106 @@ fn integer_sums_are_exact_i128_and_overflow_is_an_error() {
         max: None,
     };
     assert!(big.combine(&big.clone()).is_err());
+}
+
+/// A float sum touching an infinity or a NaN is what IEEE 754 makes it, in
+/// a row group and across row groups: `[inf, 1]` sums to inf, `[-inf, inf]`
+/// and `[NaN]` to NaN, two finite values past `f64::MAX` to inf. Equal
+/// cells compare equal bit for bit (a NaN sum equals the same NaN sum), so
+/// a check of the cells a build stores against the rows can pass; `-0.0`
+/// and `+0.0` sums differ, as their bytes do, and print as min and max do.
+#[test]
+fn non_finite_float_sums_follow_ieee_754_and_compare_by_bits() {
+    let mut w = SegmentWriter::for_dataset(
+        spec(&ALL),
+        &schema(DataType::Float64),
+        WriterOptions::default(),
+    )
+    .unwrap();
+    let inf = f64::INFINITY;
+    w.add_batch(
+        RowGroupId(0),
+        &float_batch(&[
+            (Some("i"), Some(inf)),
+            (Some("i"), Some(1.0)),
+            (Some("j"), Some(1.0)),
+            (Some("j"), Some(inf)),
+            (Some("m"), Some(-inf)),
+            (Some("m"), Some(inf)),
+            (Some("n"), Some(f64::NAN)),
+            (Some("o"), Some(f64::MAX)),
+            (Some("o"), Some(f64::MAX)),
+            (Some("x"), Some(inf)),
+        ]),
+    )
+    .unwrap();
+    w.add_batch(
+        RowGroupId(1),
+        &float_batch(&[(Some("x"), Some(1.0)), (Some("x"), Some(0.5))]),
+    )
+    .unwrap();
+    let r = open(&w.finish().unwrap().bytes);
+    let keys: Vec<Vec<u8>> = ["i", "j", "m", "n", "o", "x"]
+        .iter()
+        .map(|k| key(k))
+        .collect();
+    let cells = r.agg_cells(&keys).unwrap();
+    let sum = |k: &str| cells[&key(k)][0].1.sum.unwrap();
+    assert_eq!(sum("i").render(None), "inf");
+    assert_eq!(sum("i").value(), inf);
+    assert_eq!(sum("j").render(None), "inf");
+    assert_eq!(sum("m").render(None), "NaN");
+    assert_eq!(sum("n").render(None), "NaN");
+    assert_eq!(sum("o").render(None), "inf");
+    // Across row groups: inf, then 1.5.
+    let x = &cells[&key("x")];
+    let mut all = x[0].1.clone();
+    all.combine(&x[1].1).unwrap();
+    assert_eq!(all.sum.unwrap().render(None), "inf");
+    // A NaN cell equals itself, bit for bit, and a decoded copy of it.
+    let n = &cells[&key("n")][0].1;
+    assert_eq!(n, &n.clone());
+    let mut again = AggCell::empty();
+    again
+        .add_row(
+            Some(&encode_tuple_as(&[Value::Float(f64::NAN)], &[DataType::Float64]).unwrap()),
+            &ALL,
+        )
+        .unwrap();
+    assert_eq!(&again, n);
+    // Signed zeros: different bytes, different sums.
+    let zero = |z: f64| AggSum::Float { sum: z, comp: 0.0 };
+    assert_ne!(zero(0.0), zero(-0.0));
+    assert_eq!(zero(-0.0).render(None), "-0.0");
+    assert_eq!(zero(0.0).render(None), "0.0");
+}
+
+/// A sum past 128 bits within a row group fails the build naming the spec,
+/// the key, the row group, and the spec to declare instead.
+#[test]
+fn a_build_time_sum_overflow_names_the_spec_key_and_row_group() {
+    let dt = DataType::Decimal128(38, 0);
+    let mut w =
+        SegmentWriter::for_dataset(spec(&ALL), &schema(dt.clone()), WriterOptions::default())
+            .unwrap();
+    let big = 10i128.pow(38) - 1;
+    let err = w
+        .add_batch(
+            RowGroupId(3),
+            &dec_batch(
+                &[(Some("acct-7"), Some(big)), (Some("acct-7"), Some(big))],
+                &dt,
+            ),
+        )
+        .unwrap_err()
+        .to_string();
+    for part in [
+        "agg:account@amount{sum,count,min,max}",
+        "the sum of amount for key (acct-7) in row group 3",
+        "agg:account@amount{count,min,max}",
+    ] {
+        assert!(err.contains(part), "{part}: {err}");
+    }
 }
 
 #[test]

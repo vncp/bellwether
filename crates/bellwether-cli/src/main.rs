@@ -678,7 +678,7 @@ impl From<Error> for Failure {
                 field:
                     "lookback" | "latest_by" | "signing_key" | "trusted_keys" | "public_key" | "out"
                     | "name" | "valid_from" | "revoked_at" | "index" | "root" | "scratch" | "items"
-                    | "columns" | "text",
+                    | "columns" | "text" | "functions",
                 ..
             } => Self::Usage(match hint(&e) {
                 Some(h) => format!("{e}; {h}"),
@@ -773,6 +773,7 @@ fn hint(e: &Error) -> Option<String> {
                 "items" => "--column",
                 "columns" => "--columns",
                 "text" => "--contains, --has, or --prefix",
+                "functions" => "--fn",
                 _ => return None,
             };
             Some(format!("check {flag}"))
@@ -910,7 +911,7 @@ fn run(cli: &Cli, out: &Out) -> Result<Outcome, Failure> {
                 &a.value,
                 &functions,
             )?;
-            done(&r, human::aggregate_result(&r, out), EXIT_OK)
+            done(&r, human::aggregate_result(&r, engine.root(), out), EXIT_OK)
         }
         Command::Latest(a) => {
             check_lookback(a.lookback.as_deref())?;

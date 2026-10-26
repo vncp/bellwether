@@ -8,7 +8,8 @@
 //! as a wrong sum. A row's key is its canonical tuple over the agg key's
 //! columns at the dataset types (ADR 016), skipped when its leading column
 //! is null (ADR 014), exactly as an index key; its value is folded in row
-//! order by [`AggCell::add_row`], so a float sum compares bit for bit. That
+//! order by [`AggCell::add_row`], so a float sum compares bit for bit (a
+//! NaN sum equals the same NaN, `AggSum`'s equality). That
 //! fold is the one piece shared with the writer, and the core crate's
 //! property test checks it against a brute-force oracle; everything else
 //! here (which rows belong to which key and row group, the decoding, the
@@ -20,13 +21,13 @@ use std::fmt::Write as _;
 use arrow::datatypes::{DataType, Schema};
 use bellwether_core::agg::{functions, value_at, AggCell, AggSum};
 use bellwether_core::encoding;
+use bellwether_core::render::render_tuple;
 use bellwether_types::{
     AggCellCheck, AggCellDiff, Error, KeySpec, RowGroupId, RowGroupMeta, Source,
-    MAX_MISMATCH_EXAMPLES,
+    AGG_FLOAT_SUM_MODEL, MAX_MISMATCH_EXAMPLES,
 };
 
 use crate::error::Result;
-use crate::render::render_tuple;
 use crate::rowhash::hex;
 
 /// Checks `stored`, the cells of the agg key `spec` per key and row group,
@@ -125,7 +126,7 @@ pub fn check_agg_cells<'a>(
         if let Some(sum) = &c.sum {
             let _ = write!(s, ", sum {}", sum.render(scale));
             if let AggSum::Float { .. } = sum {
-                s.push_str(" (inexact)");
+                let _ = write!(s, " (measured by {AGG_FLOAT_SUM_MODEL})");
             }
         }
         for (name, v) in [("min", &c.min), ("max", &c.max)] {

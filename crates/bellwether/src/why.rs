@@ -608,6 +608,13 @@ pub enum CulpritReason {
         /// `has_token`, `has_prefix` order.
         matches: Vec<TextMatch>,
     },
+    /// The workload's aggregate runs (B7) read nothing: a complete agg key
+    /// beside its counted key answers every aggregate from the index, so no
+    /// column's layout or lint is the cause of any read.
+    AggAnswered {
+        /// The agg key that answers.
+        spec: KeySpec,
+    },
 }
 
 /// One text match of a workload's runs on one column, and what serves it
@@ -1029,10 +1036,10 @@ impl Engine {
         };
         report.culprit = match workload.as_ref() {
             Some(w) if text_runs => text_culprit(&report.current_specs, w)?,
-            _ => workload
-                .as_ref()
-                .and_then(|w| layout_culprit(&report, w, indexed_row_groups, spread))
-                .or_else(|| culprit(&report.current_specs, &report.profile, workload.as_ref())),
+            Some(w) => answered_aggregates(&report, w)
+                .or_else(|| layout_culprit(&report, w, indexed_row_groups, spread))
+                .or_else(|| culprit(&report.current_specs, &report.profile, Some(w))),
+            None => culprit(&report.current_specs, &report.profile, None),
         };
         if self.is_table() {
             report.exact = false;
@@ -2868,6 +2875,31 @@ fn text_culprit(current: &[KeySpec], w: &Workload) -> Result<Option<Culprit>> {
         fanout: None,
         reason: CulpritReason::Text { matches },
     }))
+}
+
+/// The culprit of aggregate runs (B7) the current index answers without
+/// reading a row group ([`CulpritReason::AggAnswered`]): the agg key that
+/// serves them. `None` for other runs, or when the current configuration
+/// reads anything (then a layout, a lint, or a missing key is the cause).
+fn answered_aggregates(r: &WhyReport, w: &Workload) -> Option<Culprit> {
+    if !matches!(
+        r.workload.as_ref().and_then(|i| i.lookup.as_ref()),
+        Some(LookupKind::Aggregate { .. })
+    ) || r.current?.row_groups != 0
+    {
+        return None;
+    }
+    let first = w.runs().first()?;
+    let query = first.query().ok()?;
+    let spec = r
+        .current_specs
+        .iter()
+        .find(|s| matches!(s, KeySpec::Agg { .. }) && serves_query(s, &first.columns, &query))?;
+    Some(Culprit {
+        columns: first.columns.clone(),
+        fanout: None,
+        reason: CulpritReason::AggAnswered { spec: spec.clone() },
+    })
 }
 
 /// The layout culprit documented on [`Engine::why`]: `None` for text

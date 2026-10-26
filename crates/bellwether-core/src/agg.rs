@@ -147,17 +147,93 @@ pub fn value_type(spec: &KeySpec, schema: &Schema) -> Result<Option<DataType>> {
 }
 
 /// A sum stored in a cell.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug)]
 pub enum AggSum {
     /// An exact sum: integers, or a decimal at its dataset scale.
     Int(i128),
     /// A compensated float sum; the value is `sum + comp`. Never exact.
+    /// Once the running sum is infinite or NaN it stays as IEEE 754 makes
+    /// it (`inf + 1 = inf`, `inf + -inf = NaN`) and the compensation stops.
     Float {
         /// The running sum.
         sum: f64,
         /// The running compensation.
         comp: f64,
     },
+}
+
+/// Two sums are equal when their stored bytes are: integers by value,
+/// floats bit for bit, so a NaN sum equals the same NaN and `-0.0` differs
+/// from `+0.0`, as the cells a build writes do.
+impl PartialEq for AggSum {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Int(a), Self::Int(b)) => a == b,
+            (Self::Float { sum: a, comp: c }, Self::Float { sum: b, comp: d }) => {
+                a.to_bits() == b.to_bits() && c.to_bits() == d.to_bits()
+            }
+            _ => false,
+        }
+    }
+}
+
+/// The text of the error an integer sum past 128 bits raises in
+/// [`AggCell::add_row`] and [`AggCell::combine`], which know no spec or
+/// key; callers that do replace it with [`sum_overflow`].
+const SUM_OVERFLOW: &str = "an agg sum overflows a 128-bit integer";
+
+/// Whether `e` is the bare overflow of an integer sum ([`SUM_OVERFLOW`]).
+#[must_use]
+pub fn is_sum_overflow(e: &Error) -> bool {
+    matches!(e, Error::Other(m) if m == SUM_OVERFLOW)
+}
+
+/// The functions of `spec` without `sum`, as a spec lists them:
+/// `{count,min,max}`.
+fn without_sum(spec: &KeySpec) -> String {
+    let rest: Vec<&str> = functions(spec)
+        .iter()
+        .filter(|f| **f != AggregateFn::Sum)
+        .map(|f| f.as_str())
+        .collect();
+    format!("{{{}}}", rest.join(","))
+}
+
+/// Where a sum overflowed: within one row group as the build writes its
+/// cell, or across the row groups a lookup adds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OverflowAt {
+    /// The build, in this row group.
+    RowGroup(u32),
+    /// A lookup, adding the key's cells.
+    Lookup,
+}
+
+/// The refusal for a sum of `spec`'s value column for the key `key` (as
+/// displayed) past 128 bits: what overflowed, where, and what to do.
+#[must_use]
+pub fn sum_overflow(spec: &KeySpec, key: &str, at: OverflowAt) -> Error {
+    let value = match spec {
+        KeySpec::Agg { value, .. } => value.as_str(),
+        _ => "the value",
+    };
+    let rest = without_sum(spec);
+    match at {
+        OverflowAt::RowGroup(rg) => Error::KeySpec(format!(
+            "{}: the sum of {value} for key ({key}) in row group {rg} overflows a 128-bit \
+             integer, so no exact sum can be stored; declare the agg key without sum \
+             (agg:{}@{value}{rest})",
+            spec.identity(),
+            spec.columns().join(","),
+        )),
+        OverflowAt::Lookup => Error::KeySpec(format!(
+            "{}: the sum of {value} for key ({key}) over its row groups overflows a 128-bit \
+             integer, so it has no exact total; ask without sum (--fn {}), which this key \
+             answers",
+            spec.identity(),
+            rest.trim_start_matches('{').trim_end_matches('}'),
+        )),
+    }
 }
 
 impl AggSum {
@@ -172,22 +248,22 @@ impl AggSum {
     }
 
     /// Adds `other`, as the next term: an integer sum exactly (an overflow
-    /// is an error), a float sum by Neumaier's rule on its running sum, its
-    /// compensation added to ours.
+    /// is an error, [`is_sum_overflow`]), a float sum by Neumaier's rule on
+    /// its running sum, its compensation added to ours while both are
+    /// finite.
     fn add(&mut self, other: &Self) -> Result<()> {
         match (self, other) {
             (Self::Int(a), Self::Int(b)) => {
-                *a = a.checked_add(*b).ok_or_else(|| {
-                    Error::Other(
-                        "an agg sum overflows a 128-bit integer; declare the agg key without sum"
-                            .into(),
-                    )
-                })?;
+                *a = a
+                    .checked_add(*b)
+                    .ok_or_else(|| Error::Other(SUM_OVERFLOW.into()))?;
                 Ok(())
             }
             (Self::Float { sum, comp }, Self::Float { sum: s, comp: c }) => {
                 neumaier(sum, comp, *s);
-                *comp += c;
+                if sum.is_finite() {
+                    *comp += c;
+                }
                 Ok(())
             }
             _ => Err(corrupt("an agg key mixes integer and float sums")),
@@ -195,12 +271,26 @@ impl AggSum {
     }
 
     /// The sum as a decimal string: an integer, or a decimal at `scale`
-    /// (`Decimal128`), or a float in Rust's shortest round-trip form.
+    /// (`Decimal128`), or a float as Arrow displays a `Float64` (`0.0`,
+    /// `-0.0`, `6.5`, `inf`, `NaN`), as a float minimum and maximum print.
     #[must_use]
     pub fn render(&self, scale: Option<i8>) -> String {
         match self {
             Self::Int(v) => render_scaled(*v, scale.unwrap_or(0)),
-            Self::Float { sum, comp } => format!("{}", sum + comp),
+            Self::Float { .. } => crate::render::render_f64(self.value()),
+        }
+    }
+
+    /// The sum's value as an `f64`: `sum + comp` for a float sum, or the
+    /// sum alone when there is no compensation (so a `-0.0` sum keeps its
+    /// sign) or it is not finite.
+    #[must_use]
+    #[allow(clippy::cast_precision_loss)]
+    pub fn value(&self) -> f64 {
+        match self {
+            Self::Int(v) => *v as f64,
+            Self::Float { sum, comp } if sum.is_finite() && *comp != 0.0 => sum + comp,
+            Self::Float { sum, .. } => *sum,
         }
     }
 
@@ -211,13 +301,18 @@ impl AggSum {
     }
 }
 
-/// Neumaier's compensated addition of `x` to `(sum, comp)`.
+/// Neumaier's compensated addition of `x` to `(sum, comp)`. Once the sum is
+/// not finite (an infinite or NaN term, or a finite overflow) it is kept
+/// as IEEE 754 makes it and the compensation stops: `(sum - t) + x` of an
+/// infinite `t` is NaN, which would turn `inf + 1` into NaN.
 fn neumaier(sum: &mut f64, comp: &mut f64, x: f64) {
     let t = *sum + x;
-    if sum.abs() >= x.abs() {
-        *comp += (*sum - t) + x;
-    } else {
-        *comp += (x - t) + *sum;
+    if t.is_finite() {
+        if sum.abs() >= x.abs() {
+            *comp += (*sum - t) + x;
+        } else {
+            *comp += (x - t) + *sum;
+        }
     }
     *sum = t;
 }

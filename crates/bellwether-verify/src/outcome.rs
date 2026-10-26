@@ -213,6 +213,32 @@ pub struct SideReport {
     pub row_groups: u64,
     /// Rows in the read set, from the sources' statistics.
     pub rows: u64,
+    /// Rows read whose leading key column is null (counted once, whatever
+    /// the pass count; 0 on a side answered from an agg key, which holds
+    /// none). No agg key (B7) holds such a row (ADR 014), so a side with
+    /// one is always read. Omitted when 0.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub null_key_rows: u64,
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)] // serde's skip_serializing_if signature
+fn is_zero(n: &u64) -> bool {
+    *n == 0
+}
+
+/// A side's `agg` key (B7) that did not stand in for its rows, and why:
+/// the side was read instead.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AggNotUsed {
+    /// `left` or `right`.
+    pub side: String,
+    /// The agg key's identity.
+    pub spec: String,
+    /// Each reason the agg key could not answer this reconcile.
+    pub causes: Vec<String>,
+    /// What makes it answer the next one, when anything does.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next: Option<String>,
 }
 
 /// How the memory bound was kept (ADR 018). Depends on the budget.
@@ -270,4 +296,9 @@ pub struct Reconciliation {
     /// answered instead of a scan (B7); empty when every side was read.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub agg: Vec<AggServed>,
+    /// The sides that hold a complete agg key on the key and a total but
+    /// were read anyway, with the reasons and the next step (B7); empty
+    /// when no such side exists.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub agg_not_used: Vec<AggNotUsed>,
 }

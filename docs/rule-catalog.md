@@ -592,9 +592,16 @@ kind (`docs/adding-an-index-kind.md`: no kind without its detector).
     side's index has no complete agg key on exactly the key columns storing
     the total's sum. One lint per such side
     (`bellwether_profile::lints::reconcile_rescans`, in the reconcile
-    result's `lints`); it does not fire when an agg key answered the side,
-    or when one is declared complete and was not used for a reason the
-    reconcile states (a changed file, a row whose leading key is null).
+    result's `lints`). It never names a key that could not answer: it does
+    not fire when the total is a Decimal256 (no agg key sums one, so
+    `index` would refuse it), when a row of the side has a null leading key
+    column (no agg key holds that row, ADR 014, so the side is read
+    whatever the index), when an agg key answered the side, or when one is
+    declared complete and was not used, for a reason the reconcile states
+    in `agg_not_used` with the next step (a compared non-key column, the
+    total included, with the `--ignore` that drops it; a changed file, with
+    the `index` run; a row whose leading key is null; a version rule, row
+    filter, or grouping the agg key cannot answer).
 - **Estimator**: without an agg key every aggregate run reads every row
   group holding its keys (the locate plan through the counted key, or every
   live row group without one), and every reconcile reads every row of the
