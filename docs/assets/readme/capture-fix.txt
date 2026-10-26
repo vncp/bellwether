@@ -1,14 +1,14 @@
 #! title: bellwether fix, then reconcile
-#! caption: bellwether fix with the proposal and workload the why capture printed, then reconcile against a copy with one entity's amount raised by 0.01 (planted with DuckDB); the bench ledger corpus (bench generate --seed 42: 16 files, 64 row groups, 128,000 rows; bench workload: 12 recorded runs); debug build of 7f2e4ac, 2026-10-26.
-$ bellwether fix ledger/data --proposal b89662e18be6488d2456da0adf8397ebeaa0876d8decd4dacd6f12bff0b1934f --workload 3a1921721b730b1ea76a1933a0cb7cccae1f2d7f1cd90a2ebfd34228807cb842
-[1mfix b89662e18be6: key exact:entity_id, against manifest sequence 0[0m
-  1 score     134.0 MB ->   130.3 MB over the workload (444 -> 432 row groups), replay 754f495c9f6e
+#! caption: bellwether fix with the proposal and workload the why capture printed, then reconcile against a copy with one entity's amount raised by 0.01 (planted with DuckDB); the bench ledger corpus (bench generate --seed 42: 16 files, 64 row groups, 128,000 rows; bench workload: 12 recorded runs); debug build of d39d283, 2026-10-26.
+$ bellwether fix ledger/data --proposal 954c3319b8274ffa02a12fe7e12668d46e73a52b89a7500d4cb7217550bc68a4 --workload 3a1921721b730b1ea76a1933a0cb7cccae1f2d7f1cd90a2ebfd34228807cb842
+[1mfix 954c3319b827: key exact:entity_id, against manifest sequence 0[0m
+  1 score     134.0 MB ->   130.3 MB over the workload (444 -> 432 row groups), replay 3c4757f2ab39
             a lookup no key serves is priced as the files' own min/max statistics read it, as a reader without an index does
-  2 verify  pass, coverage workload, 935 keys, 0 mismatched, 0 missing left, 0 missing right, certificate 686fbf7e752d
+  2 verify  pass, coverage workload, 935 keys, 0 mismatched, 0 missing left, 0 missing right, certificate 09a5ba602b03
   3 apply   manifest 0 -> 1
-  4 attest  receipt 4d00a5c1c31fe54098953692245673b815bec4e02fbef4ad564c401bd6305f1b
+  4 attest  receipt b4bac210d313a2322b6721ba4b282a75ea1a0a7a1dda8a6b36b4d23a0db3333e
             receipt unsigned (no --signing-key; `bellwether keys generate --out <path>` makes a key)
-  realized 130,336,047 bytes at manifest 1, replay e6f35b4e5e7f
+  realized 130,336,047 bytes at manifest 1, replay 1372a9292bdc
 
 $ bellwether reconcile ledger/data changed/data --key entity_id --latest-by version_ts --totals amount
 [1mreconcile: FAIL, coverage full[0m
@@ -27,5 +27,5 @@ $ bellwether reconcile ledger/data changed/data --key entity_id --latest-by vers
 
   read 1 pass over each side under a 268,435,456-byte state budget (0 restarts): 128,000 rows read on the left, 128,000 on the right
 
-certificate 08c6cf3566df58cc1724dbee760868db66d1acf031a91eb5e5885895c054153a
+certificate f18dd25b2d3c6f8f74880e6be6beaa0174ce6b8056655b9ddc73fa5d5e0dc18d
 #! exit 1

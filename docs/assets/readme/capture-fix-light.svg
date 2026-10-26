@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 737" width="1000" height="737" role="img" aria-labelledby="title desc">
 <title id="title">bellwether fix, then reconcile</title>
-<desc id="desc">bellwether fix with the proposal and workload the why capture printed, then reconcile against a copy with one entity's amount raised by 0.01 (planted with DuckDB); the bench ledger corpus (bench generate --seed 42: 16 files, 64 row groups, 128,000 rows; bench workload: 12 recorded runs); debug build of 7f2e4ac, 2026-10-26.</desc>
+<desc id="desc">bellwether fix with the proposal and workload the why capture printed, then reconcile against a copy with one entity's amount raised by 0.01 (planted with DuckDB); the bench ledger corpus (bench generate --seed 42: 16 files, 64 row groups, 128,000 rows; bench workload: 12 recorded runs); debug build of d39d283, 2026-10-26.</desc>
 <rect x="0.5" y="0.5" width="999" height="736" rx="10" fill="#f6f8fa" stroke="#d0d7de"/>
 <path d="M0.5 40V10.5a10 10 0 0 1 10-10H989.5a10 10 0 0 1 10 10V40Z" fill="#eaeef2"/>
 <line x1="0.5" y1="40" x2="999.5" y2="40" stroke="#d0d7de"/>
@@ -9,17 +9,17 @@
 <circle cx="58" cy="20.0" r="5.5" fill="#d0d7de"/>
 <text x="500.0" y="24.5" text-anchor="middle" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" fill="#656d76">bellwether fix, then reconcile</text>
 <g font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="13" fill="#1f2328">
-<text x="24.0" y="77" textLength="897.0" lengthAdjust="spacing" xml:space="preserve" style="white-space:pre"><tspan fill="#1a7f37">$ </tspan><tspan fill="#0969da">bellwether fix ledger/data --proposal b89662e18be6488d2456da0adf8397ebeaa0876d8decd4dacd6f12bff0b1934f --workload</tspan></text>
+<text x="24.0" y="77" textLength="897.0" lengthAdjust="spacing" xml:space="preserve" style="white-space:pre"><tspan fill="#1a7f37">$ </tspan><tspan fill="#0969da">bellwether fix ledger/data --proposal 954c3319b8274ffa02a12fe7e12668d46e73a52b89a7500d4cb7217550bc68a4 --workload</tspan></text>
 <text x="70.8" y="95" textLength="499.2" lengthAdjust="spacing" xml:space="preserve" style="white-space:pre"><tspan fill="#0969da">3a1921721b730b1ea76a1933a0cb7cccae1f2d7f1cd90a2ebfd34228807cb842</tspan></text>
-<text x="24.0" y="113" textLength="514.8" lengthAdjust="spacing" xml:space="preserve" style="white-space:pre"><tspan font-weight="700">fix b89662e18be6: key exact:entity_id, against manifest sequence 0</tspan></text>
-<text x="39.6" y="131" textLength="756.6" lengthAdjust="spacing" xml:space="preserve" style="white-space:pre">1 score     134.0 MB -&gt;   130.3 MB over the workload (444 -&gt; 432 row groups), replay 754f495c9f6e</text>
+<text x="24.0" y="113" textLength="514.8" lengthAdjust="spacing" xml:space="preserve" style="white-space:pre"><tspan font-weight="700">fix 954c3319b827: key exact:entity_id, against manifest sequence 0</tspan></text>
+<text x="39.6" y="131" textLength="756.6" lengthAdjust="spacing" xml:space="preserve" style="white-space:pre">1 score     134.0 MB -&gt;   130.3 MB over the workload (444 -&gt; 432 row groups), replay 3c4757f2ab39</text>
 <text x="117.6" y="149" textLength="834.6" lengthAdjust="spacing" xml:space="preserve" style="white-space:pre">a lookup no key serves is priced as the files' own min/max statistics read it, as a reader without an index</text>
 <text x="148.8" y="167" textLength="31.2" lengthAdjust="spacing" xml:space="preserve" style="white-space:pre">does</text>
-<text x="39.6" y="185" textLength="904.8" lengthAdjust="spacing" xml:space="preserve" style="white-space:pre">2 verify  pass, coverage workload, 935 keys, 0 mismatched, 0 missing left, 0 missing right, certificate 686fbf7e752d</text>
+<text x="39.6" y="185" textLength="904.8" lengthAdjust="spacing" xml:space="preserve" style="white-space:pre">2 verify  pass, coverage workload, 935 keys, 0 mismatched, 0 missing left, 0 missing right, certificate 09a5ba602b03</text>
 <text x="39.6" y="203" textLength="195.0" lengthAdjust="spacing" xml:space="preserve" style="white-space:pre">3 apply   manifest 0 -&gt; 1</text>
-<text x="39.6" y="221" textLength="639.6" lengthAdjust="spacing" xml:space="preserve" style="white-space:pre">4 attest  receipt 4d00a5c1c31fe54098953692245673b815bec4e02fbef4ad564c401bd6305f1b</text>
+<text x="39.6" y="221" textLength="639.6" lengthAdjust="spacing" xml:space="preserve" style="white-space:pre">4 attest  receipt b4bac210d313a2322b6721ba4b282a75ea1a0a7a1dda8a6b36b4d23a0db3333e</text>
 <text x="117.6" y="239" textLength="686.4" lengthAdjust="spacing" xml:space="preserve" style="white-space:pre">receipt unsigned (no --signing-key; `bellwether keys generate --out &lt;path&gt;` makes a key)</text>
-<text x="39.6" y="257" textLength="475.8" lengthAdjust="spacing" xml:space="preserve" style="white-space:pre">realized 130,336,047 bytes at manifest 1, replay e6f35b4e5e7f</text>
+<text x="39.6" y="257" textLength="475.8" lengthAdjust="spacing" xml:space="preserve" style="white-space:pre">realized 130,336,047 bytes at manifest 1, replay 1372a9292bdc</text>
 <text x="24.0" y="293" textLength="795.6" lengthAdjust="spacing" xml:space="preserve" style="white-space:pre"><tspan fill="#1a7f37">$ </tspan><tspan fill="#0969da">bellwether reconcile ledger/data changed/data --key entity_id --latest-by version_ts --totals amount</tspan></text>
 <text x="24.0" y="311" textLength="234.0" lengthAdjust="spacing" xml:space="preserve" style="white-space:pre"><tspan font-weight="700">reconcile: FAIL, coverage full</tspan></text>
 <text x="39.6" y="329" textLength="288.6" lengthAdjust="spacing" xml:space="preserve" style="white-space:pre">keys compared                   6,855</text>
@@ -34,11 +34,11 @@
 <text x="55.2" y="527" textLength="803.4" lengthAdjust="spacing" xml:space="preserve" style="white-space:pre">amount           all rows                                1546909874.77            1546909874.78  DIFFER</text>
 <text x="39.6" y="563" textLength="936.0" lengthAdjust="spacing" xml:space="preserve" style="white-space:pre">read 1 pass over each side under a 268,435,456-byte state budget (0 restarts): 128,000 rows read on the left, 128,000 on</text>
 <text x="70.8" y="581" textLength="70.2" lengthAdjust="spacing" xml:space="preserve" style="white-space:pre">the right</text>
-<text x="24.0" y="617" textLength="592.8" lengthAdjust="spacing" xml:space="preserve" style="white-space:pre">certificate 08c6cf3566df58cc1724dbee760868db66d1acf031a91eb5e5885895c054153a</text>
+<text x="24.0" y="617" textLength="592.8" lengthAdjust="spacing" xml:space="preserve" style="white-space:pre">certificate f18dd25b2d3c6f8f74880e6be6beaa0174ce6b8056655b9ddc73fa5d5e0dc18d</text>
 <text x="24.0" y="635" textLength="46.8" lengthAdjust="spacing" xml:space="preserve" style="white-space:pre"><tspan fill="#656d76">exit 1</tspan></text>
 </g>
 <line x1="24" y1="660" x2="976" y2="660" stroke="#d0d7de"/>
 <text x="24" y="682" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" font-style="italic" fill="#656d76">bellwether fix with the proposal and workload the why capture printed, then reconcile against a copy with one entity's amount raised by 0.01 (planted</text>
 <text x="24" y="699" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" font-style="italic" fill="#656d76">with DuckDB); the bench ledger corpus (bench generate --seed 42: 16 files, 64 row groups, 128,000 rows; bench workload: 12 recorded runs); debug build</text>
-<text x="24" y="716" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" font-style="italic" fill="#656d76">of 7f2e4ac, 2026-10-26.</text>
+<text x="24" y="716" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" font-style="italic" fill="#656d76">of d39d283, 2026-10-26.</text>
 </svg>
