@@ -343,6 +343,8 @@ fn a_candidate_on_a_sketched_item_carries_the_sketch_column() {
     assert_eq!(k.kind, "sketch");
     assert!(k.value.starts_with('≈'), "{}", k.value);
     assert!(k.label.contains("approximate"), "{}", k.label);
+    // The error bound rides in the label: three standard errors at p = 14.
+    assert!(k.label.contains("(±2.4% distinct)"), "{}", k.label);
     assert!(!k.exactness.is_exact());
     // The JSON omits the column for candidates without one.
     assert!(w.reads.files > 0);

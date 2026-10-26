@@ -214,10 +214,10 @@ proptest! {
 }
 
 /// The HyperLogLog error bound against a brute-force distinct count: over
-/// 330 deterministic trials from 1 to 300,000 distinct values (with
-/// duplicates, across files), the reported 99.7 % interval holds the exact
-/// count in at least 99 % of trials, and every estimate is within four
-/// relative standard errors.
+/// 312 deterministic trials at precisions 10, 12, and 14, from 1 to 300,000
+/// distinct values (with duplicates, across files), the reported 99.7 %
+/// interval holds the exact count in at least 99 % of trials, and every
+/// estimate is within four relative standard errors.
 #[test]
 fn hll_error_bound_holds_against_a_brute_force_oracle() {
     let mut rng = Rng(7);

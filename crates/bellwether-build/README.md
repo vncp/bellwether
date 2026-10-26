@@ -150,6 +150,12 @@ Details:
 - **`Lookup::Bitemporal`.** Through the one complete `temporal2` sidecar serving the key columns: per key, the greatest valid time at or before `valid` among versions known at or before `known` (either unbounded), then the greatest known time; the plan holds exactly the live row groups of each winner, ties kept (`tests/bitemporal.rs`). Retired row groups never win.
 - **Order.** `Planner::plan_ordered` plans the same row groups and orders entries by a timestamp range key's row-group minimum, returning `PlanOrder::Ordered` only when that order holds for every planned row group (`tests/ordered.rs`).
 
+**Sketches (B2): built here, never planned with.**
+
+- `BuildOptions::sketches` declares `bellwether_types::SketchSpec`s (`sketch:a,b,a+b[,p=14][,minhash=K]` on the command line): per item, per file, the HyperLogLog registers and optional MinHash signature of `bellwether_core::sketch`. Each is recorded in `schema.sidecars[]` with kind `sketch` (items in `columns`, no time column, `p` and `minhash` in `params`), its segments carry `segments[].kind = "sketch"`, and it is built, covered, and recorded complete by the sidecar rules (`sketch_completeness`; `declared_sketches` lists them). A malformed sketch declaration is kept unchanged like an unknown kind and never used.
+- **No planner path reads a sketch.** `declared_sidecars`, the only sidecars the planner sees, never yields one, and the planner modules never name the kind. `tests/sketch.rs` proves it: every lookup plans byte-identically with and without a sketch, and still does after every sketch segment is deleted from the store; a source tripwire fails if a planner file ever mentions the sketch kind.
+- Memory: a sketch writer grows by one entry per file stretch, each at most `sketch::max_entry_bytes` (`2^p` registers and `k` slots per item); that bound is charged against `max_segment_bytes` when an entry starts, so a segment closes before the cap is crossed.
+
 ## Memory (ADR 018)
 
 - **Build.**
@@ -192,6 +198,7 @@ Ground truth never goes through the code under test:
 | `tests/invariant1_by_value.rs` | Invariant 1 against an oracle comparing decoded values (SQL equality) over two decimal scales, two time units, nulls, signed zero, NaN, and CSV/JSONL chunks |
 | `tests/invariant5_retired.rs` | Latest and asof give the live answer when an old segment still holds a retired newest version, including ties, signed-zero variants, and asof with a pruned winner |
 | `tests/ledger.rs` | A ledger shaped like `bellwether-bench`'s; `real_bench_corpus` (ignored) runs the same checks over a corpus the bench crate wrote: `BELLWETHER_BENCH_CORPUS=<dir> cargo test -p bellwether-build --test ledger -- --ignored` |
+| `tests/sketch.rs` | Stored sketches equal sketches of the decoded files (the `parquet` crate's reader fed to core's sketcher), complete like a sidecar; new and changed files re-sketched, retired entries unused; a sketch on a missing column refused with nothing committed; no planner path reads a sketch (plans equal with, without, and after deleting every sketch segment; the planner sources never name the kind) |
 
 ## Benchmark
 

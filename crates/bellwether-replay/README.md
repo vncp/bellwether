@@ -26,6 +26,7 @@ Replay reads very little. The current index costs no data reads at all. A hypoth
 | `transient` | `TransientIndex`, `TransientCache`, `TransientLimits` | A hypothetical spec's segments, built over key reads, and their cache. |
 | `baseline` | `Baseline::{RawScan, ParquetStats}` | Costs without a Bellwether index. |
 | `layout` | `LayoutModel`, `replay_layout` | Layout proposals under a stated model, `exact: false`. |
+| `sketch` | `TransientSketch` | What a `sketch` sidecar would hold, computed now: reads only the sketch's item columns, one row group at a time in catalog order, through core's `FileSketcher` (the code a build writes segments with), so its registers equal a committed sketch's over the same files (the facade's `tests/sketch.rs` checks predicted equals built). It reports the files, row groups, and rows it read. **Approximate**, like every sketch, and never handed to a planner. Memory: one row group's item columns, one file's open sketch, and the running totals (`2^p` registers and `k` slots per item). |
 | `replay` | `Replayer`, `Scored`, `write_replay` | Pins one manifest, scores proposals, and writes `Replay` records through the ledger. |
 | `report` | `report`, `TemplateSummary` | Per-run rows. Per-template p50/p95/max of keys, files, row groups and bytes. |
 | `attribution` | `Replayer::replace_node`, `Replayer::interaction` | Counterfactual hooks for WP13 (ADR 024). |

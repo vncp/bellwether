@@ -100,6 +100,24 @@ fn quiet_below_each_threshold() {
     assert!(low_cardinality_key(&empty).is_empty());
 }
 
+/// Each threshold is inclusive: a column exactly at it fires, one step past
+/// it does not.
+#[test]
+fn each_threshold_is_inclusive() {
+    // 10,000,000 rows over 100 values: exactly 100,000 rows per value.
+    let mut at = stamp_and_id();
+    at[0].distinct = 100;
+    assert_eq!(low_cardinality_key(&at).len(), 1);
+    // Exactly ten times the values beside it (720 = 10 x 72).
+    let mut ratio = stamp_and_id();
+    ratio[1].distinct = 720;
+    assert_eq!(low_cardinality_key(&ratio).len(), 1);
+    // Exactly 90 % of the column's files hold both.
+    let mut share = stamp_and_id();
+    share[0].copresent = vec![("id".into(), 9_000)];
+    assert_eq!(low_cardinality_key(&share).len(), 1);
+}
+
 #[test]
 fn names_the_partner_with_the_most_values() {
     let mut cols = stamp_and_id();
