@@ -168,7 +168,50 @@ pub struct EngineOptions {
     /// `None` uses the available parallelism. The segments a build writes
     /// do not depend on it.
     pub threads: Option<usize>,
+    /// The query engine whose tables the data root copies (ADR 033): a
+    /// `clickhouse://` or `kusto://` root, connection parameters included
+    /// (records name it without them). With it, `why` reports the twin's
+    /// diagnosis beside the engine's table identity, and `fix` scores and
+    /// verifies a rewrite of engine queries in that engine.
+    pub twin_of: Option<String>,
+    /// The scratch folder a query engine's exports are written under (ADR
+    /// 033): a folder of the lake, under the same account and permissions,
+    /// named by whoever runs the engine (never by a tool argument). Each run
+    /// writes a fresh `bellwether-<run>` folder in it.
+    pub scratch: Option<String>,
+    /// Keep the exports after the certificate is written; by default they
+    /// are deleted.
+    pub keep_exports: bool,
+    /// An engine adapter to use instead of the built-in ones for
+    /// `twin_of`: a one-file adapter for another engine
+    /// (`bellwether_source_engine` README), or a test double.
+    pub engine_adapter: Option<EngineConnector>,
 }
+
+/// Opens an engine adapter for a `twin_of` root and an optional scratch
+/// folder ([`EngineOptions::engine_adapter`]).
+pub type ConnectFn = dyn Fn(&str, Option<&Path>) -> Result<Box<dyn bellwether_source_engine::EngineAdapter>>
+    + Send
+    + Sync;
+
+/// A custom engine adapter's constructor. Two connectors are equal when
+/// they are the same function object.
+#[derive(Clone)]
+pub struct EngineConnector(pub Arc<ConnectFn>);
+
+impl std::fmt::Debug for EngineConnector {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("EngineConnector(..)")
+    }
+}
+
+impl PartialEq for EngineConnector {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for EngineConnector {}
 
 /// The pinned current manifest: its planner, its snapshot, and its content
 /// hash and age, read together so they describe one commit.
@@ -261,7 +304,31 @@ impl Engine {
         guard(|| Self::open_inner(root, options))
     }
 
+    #[allow(clippy::too_many_lines)]
     fn open_inner(root: &str, options: EngineOptions) -> Result<Self> {
+        if bellwether_source_engine::is_engine_uri(root) {
+            let r = bellwether_source_engine::redact(root);
+            return Err(Error::InvalidArgument {
+                field: "root",
+                reason: format!(
+                    "{r} is a query engine, which bellwether reads through its lake twin: give the \
+                     folder that copies its tables as the root and name the engine with --twin-of \
+                     {r} (why, propose, fix), or record keys from it with `bellwether workload \
+                     record <folder> --from-engine {r}`"
+                ),
+            });
+        }
+        if let Some(t) = &options.twin_of {
+            bellwether_source_engine::EngineUri::parse(t)?;
+            if is_sql_root(root) {
+                return Err(Error::InvalidArgument {
+                    field: "twin_of",
+                    reason: "a twin is a folder of files copying an engine's tables; a table root \
+                             takes no --twin-of"
+                        .into(),
+                });
+            }
+        }
         if is_sql_root(root) {
             return Self::open_table(root, options);
         }

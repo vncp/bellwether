@@ -70,7 +70,11 @@ fn a_stdio_session_matches_the_in_process_server() {
                "score": 0.99}),
     );
     assert_eq!(r["isError"], true);
-    assert_eq!(r["structuredContent"]["refusal"]["code"], "invalid_input");
+    // A score is a caller-supplied cost, refused by name (ADR 033).
+    assert_eq!(
+        r["structuredContent"]["refusal"]["code"],
+        "caller_supplied_cost"
+    );
     assert_ne!(
         r["structuredContent"]["refusal"]["next"].as_str().unwrap(),
         ""
@@ -192,9 +196,9 @@ fn the_binary_takes_the_shared_engine_and_budget_flags() {
         flags += 1;
     }
     assert_eq!(
-        flags, 10,
-        "index, format, chunk-size, schema, fingerprint-policy, partitioning, path-template, 3 \
-         budgets"
+        flags, 13,
+        "index, format, chunk-size, schema, fingerprint-policy, partitioning, path-template, \
+         twin-of, scratch, keep, 3 budgets"
     );
 
     let dir = tempfile::tempdir().unwrap();

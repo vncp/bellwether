@@ -28,3 +28,4 @@ Short, dated, and final until superseded by a later ADR. Each states what was ch
 - [ADR 024](024-counterfactual-attribution.md) — Attribution by counterfactual replay is the backward pass
 - [ADR 025](025-rulebook-validation.md) — A rule is promoted only by held-out replay
 - [ADR 029](029-signatures-are-detached-objects-beside-the-record.md) — Signatures are detached objects beside the record
+- [ADR 033](033-query-engines-are-measured-sources.md) — Query engines are measured sources

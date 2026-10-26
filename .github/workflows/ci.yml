@@ -13,6 +13,25 @@ jobs:
   check:
     name: fmt · clippy · test
     runs-on: ubuntu-latest
+    services:
+      # The reference query-engine adapter (ADR 033) is tested end to end
+      # against this server (bellwether-source-engine/tests/clickhouse.rs;
+      # in CI those tests fail rather than skip without it). Pinned by
+      # digest: clickhouse/clickhouse-server:26.9.25.15. The user `default`
+      # gets network access with no password and access management (the
+      # export-denial test creates a user without the export grant).
+      clickhouse:
+        image: clickhouse/clickhouse-server:26.9.25.15@sha256:19bfacb135479a892551a8155cfbbc8211aedf2aa888cd91950b9ee7e76cc7e3
+        env:
+          CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: "1"
+        ports:
+          - 8123:8123
+        options: >-
+          --ulimit nofile=262144:262144
+          --health-cmd "clickhouse-client --query 'SELECT 1'"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -35,7 +54,15 @@ jobs:
       - name: clippy
         run: cargo clippy --workspace --all-targets --all-features
       - name: test
+        env:
+          BELLWETHER_CLICKHOUSE_URL: clickhouse://127.0.0.1:8123/default
         run: cargo test --workspace --all-features
+      - name: the ClickHouse adapter ran against the service container (not skipped)
+        env:
+          BELLWETHER_CLICKHOUSE_URL: clickhouse://127.0.0.1:8123/default
+        run: |
+          cargo test -p bellwether-source-engine --all-features --test clickhouse -- --nocapture 2>&1 | tee clickhouse.log
+          ! grep -q 'SKIPPED:' clickhouse.log
 
   format-compat:
     name: persisted format v0.1 fixture

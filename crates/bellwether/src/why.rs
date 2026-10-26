@@ -17,7 +17,8 @@ use bellwether_replay::{
 };
 use bellwether_store::{Cache, ObjectStoreBackend, StoreExt};
 use bellwether_types::{
-    format, Error, Evidence, Fanout, Hash, KeySpec, Proposal, ProposalBody, Record, Result, Store,
+    format, Error, Evidence, EvidenceBody, Fanout, Gate, Hash, KeySpec, Lint, Proposal,
+    ProposalBody, Record, Result, Store, TwinOf,
 };
 use serde::{Deserialize, Serialize};
 
@@ -30,6 +31,7 @@ use crate::lookback::Lookback;
 use crate::results::{total, Cost, LookbackWindow, LookupKind, Written};
 use crate::sketch::{CountingSource, ItemCardinality};
 use crate::spec::label;
+use crate::twin::{self, TwinCandidate, TwinReport};
 
 /// Who the engine's own candidate proposals are by.
 pub const ENGINE_PROPOSER: &str = "engine";
@@ -142,6 +144,10 @@ pub struct WhyRequest {
     /// Most profile candidates replayed beyond the workload's own key
     /// columns.
     pub max_candidates: usize,
+    /// With a twin (`twin_of`): the gates each candidate's keyset is
+    /// compared against (`--gate <name>:<n>`, ADR 033).
+    #[serde(default)]
+    pub gates: Vec<Gate>,
     /// Diagnose from the index's manifest and its complete `sketch`
     /// sidecars alone: no data file is opened, footers included, and the
     /// report's `sketch` column and the `R-sketch-1` lint carry the
@@ -166,6 +172,7 @@ impl Default for WhyRequest {
             ts_column: None,
             columns: None,
             max_candidates: DEFAULT_MAX_CANDIDATES,
+            gates: Vec::new(),
             sketches_only: false,
         }
     }
@@ -511,6 +518,12 @@ pub struct WhyReport {
     /// the identity re-read that stood in for one. Omitted for a folder.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tables: Vec<TableRun>,
+    /// With `twin_of` (ADR 033): the diagnosis is on the lake twin of a
+    /// query engine; its header line, the engine's identity beside the
+    /// lake's, and per candidate the fanout, files per key, and keyset
+    /// against each gate. Omitted otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub twin: Option<TwinReport>,
     /// The `sketch` column: for each item of the index's complete `sketch`
     /// sidecars, its approximate distinct count with its bound, fanout
     /// (`rows_per_value`), and files per value, read from the sketch's
@@ -640,6 +653,7 @@ impl Engine {
         guard(|| self.why_inner(request)).map_err(schema_hint)
     }
 
+    #[allow(clippy::too_many_lines)]
     fn why_inner(&self, req: &WhyRequest) -> Result<WhyReport> {
         let has_workload = self.check_why_request(req)?;
         let pinned = self.pin()?;
@@ -669,11 +683,61 @@ impl Engine {
         let catalog = replayer.catalog();
         let indexed_row_groups = catalog.len() as u64;
         let (dataset, untracked) = self.dataset(catalog, pinned.as_ref(), source)?;
+        // The lake twin of a query engine (ADR 033): the engine's identity
+        // now, and, with a key sample, the twin pass, before the profile
+        // Evidence is written so the Evidence records both.
+        let mut twin_of: Option<TwinOf> = if self.options().twin_of.is_some() {
+            let engine = self.twin_adapter(None)?;
+            let identity = Engine::twin_identity(&*engine)?;
+            Some(twin::twin_of(
+                &*engine,
+                &identity,
+                sequence,
+                dataset.rows,
+                &req.gates,
+            ))
+        } else {
+            None
+        };
+        if twin_of.is_none() && !req.gates.is_empty() {
+            return Err(Error::InvalidArgument {
+                field: "gates",
+                reason: "a gate compares the key sample with a query engine's limit; name the \
+                         engine the folder copies with --twin-of"
+                    .into(),
+            });
+        }
+        let mut recorded = None;
+        let mut twin_pass = None;
+        let mut twin_lints = Vec::new();
+        let mut resolved_temporal = resolved_temporal;
+        if let (Some(of), true) = (&mut twin_of, has_workload) {
+            let cache = self.cache()?;
+            let (w, temporal) = self.record_workload(
+                req,
+                pinned.as_ref(),
+                &replayer,
+                &cache,
+                resolved_temporal.take(),
+            )?;
+            let p = twin::pass(source, replayer.catalog(), &w, &cache, &req.gates)?;
+            twin::predict(of, &p, w.hash());
+            twin_lints = twin::lints(
+                &p,
+                &req.gates,
+                temporal.is_some(),
+                of.engine_rows == of.lake_rows,
+            );
+            twin_pass = Some(p);
+            recorded = Some((w, temporal));
+        }
         let (profile, evidence) = self.profile(
             req,
             Measure::Source(source),
             pinned.as_ref(),
             has_workload,
+            twin_of.clone(),
+            &twin_lints,
             sketch_lints,
         )?;
         let mut report = WhyReport {
@@ -697,6 +761,7 @@ impl Engine {
             exact: true,
             model: None,
             tables: Vec::new(),
+            twin: None,
             sketch,
             reads: DiagnosisReads::default(),
             from_sketches: false,
@@ -704,8 +769,16 @@ impl Engine {
         };
         let workload = if has_workload {
             let cache = self.cache()?;
-            let (workload, temporal) =
-                self.record_workload(req, pinned.as_ref(), &replayer, &cache, resolved_temporal)?;
+            let (workload, temporal) = match recorded {
+                Some(r) => r,
+                None => self.record_workload(
+                    req,
+                    pinned.as_ref(),
+                    &replayer,
+                    &cache,
+                    resolved_temporal,
+                )?,
+            };
             self.replay_candidates(
                 &mut report,
                 &replayer,
@@ -726,6 +799,27 @@ impl Engine {
             report.exact = false;
             report.model = Some(MEASURED_AGGREGATES.to_string());
             report.tables = self.finish_tables()?;
+        }
+        if let Some(of) = twin_of {
+            report.twin = Some(TwinReport {
+                note: twin::note(&of),
+                key: twin_pass.as_ref().and_then(|p| p.sets.get(&p.key).cloned()),
+                candidates: report
+                    .candidates
+                    .iter()
+                    .map(|c| TwinCandidate {
+                        spec: c.spec.clone(),
+                        twin: twin_pass
+                            .as_ref()
+                            .and_then(|p| twin::measured(p, c.spec.columns())),
+                        kind_column: c.kind_column.clone(),
+                    })
+                    .collect(),
+                lints: twin_lints,
+                row_groups_read: twin_pass.as_ref().map_or(0, |p| p.row_groups_read),
+                rows_read: twin_pass.as_ref().map_or(0, |p| p.rows_read),
+                of,
+            });
         }
         let read = counting.reads();
         report.reads = DiagnosisReads {
@@ -811,8 +905,15 @@ impl Engine {
             rows: totals.rows,
             bytes: files.iter().map(|f| f.fingerprint.size).sum(),
         };
-        let (profile, evidence) =
-            self.profile(req, Measure::Manifest(totals), Some(p), false, lints)?;
+        let (profile, evidence) = self.profile(
+            req,
+            Measure::Manifest(totals),
+            Some(p),
+            false,
+            None,
+            &[],
+            lints,
+        )?;
         let current_specs = p.specs().0;
         let culprit = culprit(&current_specs, &profile, None);
         Ok(WhyReport {
@@ -836,6 +937,7 @@ impl Engine {
             exact: true,
             model: None,
             tables: Vec::new(),
+            twin: None,
             sketch: column,
             reads: DiagnosisReads {
                 exact_index_segments,
@@ -1098,12 +1200,15 @@ impl Engine {
     /// is refused (the store's one-line error naming `--index`), since the
     /// Proposals must cite a recorded Evidence. [`Measure::Manifest`]
     /// profiles from totals the caller already holds and reads no file.
+    #[allow(clippy::too_many_arguments)]
     fn profile(
         &self,
         req: &WhyRequest,
         measure: Measure<'_>,
         pinned: Option<&Pinned>,
         has_workload: bool,
+        twin: Option<TwinOf>,
+        twin_lints: &[Lint],
         sketch_lints: Vec<bellwether_types::Lint>,
     ) -> Result<(ProfileReport, ProfileEvidence)> {
         let writable = if has_workload {
@@ -1182,6 +1287,13 @@ impl Engine {
         // cites the manifest, which names the sketch segments by content.
         profile.lints.extend(sketch_lints);
         let mut evidence = bellwether_profile::evidence(&profile)?;
+        if let EvidenceBody::Profile {
+            twin: slot, lints, ..
+        } = &mut evidence.body
+        {
+            *slot = twin;
+            lints.extend_from_slice(twin_lints);
+        }
         // Every record this engine writes carries the engine's clock.
         evidence.provenance.created_at = self.now();
         let out = if writable.is_some() {

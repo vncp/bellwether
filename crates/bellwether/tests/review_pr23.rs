@@ -165,6 +165,9 @@ fn probe_reconcile_anchor_and_rewrite_layout() {
         .propose(
             ProposalBody::Rewrite {
                 shape: RewriteShape {
+                    pairs: Vec::new(),
+                    key: Vec::new(),
+                    keys: None,
                     before: "a".into(),
                     after: "b".into(),
                     invariant: "same rows by id".into(),

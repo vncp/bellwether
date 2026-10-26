@@ -90,6 +90,7 @@ fn every_profile_evidence_carries_resolvable_provenance() {
         fanout,
         lints,
         workload_keys,
+        ..
     } = &e.body
     else {
         panic!("expected a profile body");

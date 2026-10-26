@@ -502,6 +502,9 @@ pub(crate) fn why(r: &bellwether::WhyReport, out: &Out, fix_command: &str) -> St
         )
     };
     let _ = writeln!(s, "{}", heading(out, &format!("why {}: {state}", r.root)));
+    if let Some(t) = &r.twin {
+        twin_header(&mut s, t);
+    }
     crate::verify_cmds::tables_human(&mut s, &r.tables);
     let basis = match (&r.model, r.exact) {
         (Some(model), false) => format!(
@@ -881,6 +884,9 @@ pub(crate) fn why(r: &bellwether::WhyReport, out: &Out, fix_command: &str) -> St
             }
         }
     }
+    if let Some(t) = &r.twin {
+        twin_table(&mut s, t);
+    }
     let _ = writeln!(
         s,
         "\nfanout: files and row groups one value touches, p50 / p95 / max"
@@ -1174,6 +1180,174 @@ pub(crate) fn scorecard(r: &bellwether::ScorecardResult, out: &Out) -> String {
     }
     unreadable_line(&mut s, &r.unreadable);
     s
+}
+
+pub(crate) fn engine_workload(r: &bellwether::EngineWorkload, _out: &Out) -> String {
+    format!(
+        "recorded workload {}: {} keys over ({}) from {} rows of {} (query {}){}\n  diagnose it: \
+         bellwether why <folder> --workload {} --twin-of {}\n",
+        r.workload,
+        num(r.keys),
+        r.columns.join(", "),
+        num(r.rows),
+        r.engine,
+        r.tag,
+        if r.null_tuples > 0 {
+            format!(
+                "; {} rows held a null and were dropped (ADR 014)",
+                num(r.null_tuples)
+            )
+        } else {
+            String::new()
+        },
+        r.workload,
+        r.engine
+    )
+}
+
+/// The twin's header (ADR 033): the diagnosis is on a copy, and how fresh
+/// the copy is against the engine's table identity.
+fn twin_header(s: &mut String, t: &bellwether::TwinReport) {
+    let of = &t.of;
+    let _ = writeln!(s, "  {}", t.note);
+    let behind = i128::from(of.engine_rows) - i128::from(of.lake_rows);
+    let fresh = match behind {
+        0 => "the same row count".to_string(),
+        d if d > 0 => format!(
+            "{} rows behind the engine",
+            num(u64::try_from(d).unwrap_or(0))
+        ),
+        d => format!(
+            "{} rows ahead of the engine",
+            num(u64::try_from(-d).unwrap_or(0))
+        ),
+    };
+    let _ = writeln!(
+        s,
+        "  freshness: the engine holds {} rows in {} units (identity {}); the lake at sequence \
+         {} holds {} rows: {fresh}",
+        num(of.engine_rows),
+        num(of.units),
+        short(&of.identity),
+        of.sequence,
+        num(of.lake_rows)
+    );
+}
+
+/// The twin's columns per candidate: fanout, files per key, and the keyset
+/// against each gate, then the twin lints.
+#[allow(
+    clippy::too_many_lines,
+    clippy::type_complexity,
+    clippy::single_match_else
+)]
+fn twin_table(s: &mut String, t: &bellwether::TwinReport) {
+    let Some(key) = &t.key else {
+        let _ = writeln!(
+            s,
+            "\ntwin: no key sample; pass --from <keys.parquet> or --workload <hash> for fanout, \
+             files per key, and gates"
+        );
+        return;
+    };
+    let _ = writeln!(
+        s,
+        "\ntwin: {} sampled keys hold {} rows in {} row groups and {} files of the lake (the \
+         prediction fix compares the engine with); the pass read {} rows of the key columns in \
+         {} row groups",
+        num(key.keyset),
+        num(key.rows),
+        num(key.row_groups),
+        num(key.files),
+        num(t.rows_read),
+        num(t.row_groups_read)
+    );
+    let gates: Vec<String> = key
+        .gates
+        .iter()
+        .map(|g| format!("{}<={}", g.name, num(g.limit)))
+        .collect();
+    let kind = t
+        .candidates
+        .iter()
+        .find_map(|c| c.kind_column.as_ref().map(|k| k.kind.clone()));
+    let _ = writeln!(
+        s,
+        "  {:<34} {:>10}  {:<24} {:<18} {:<}{}",
+        "candidate",
+        "keyset",
+        "rows/key p50/p95/max",
+        "files/key",
+        if gates.is_empty() {
+            String::new()
+        } else {
+            format!("gates ({})", gates.join(", "))
+        },
+        kind.as_ref().map_or_else(String::new, |k| format!("  {k}"))
+    );
+    let mut rows: Vec<(
+        String,
+        Option<&bellwether::TwinColumns>,
+        Option<&str>,
+        Vec<String>,
+    )> = vec![("the sample's key".to_string(), Some(key), None, Vec::new())];
+    for c in &t.candidates {
+        rows.push((
+            label(&c.spec),
+            c.twin.as_ref(),
+            c.kind_column.as_ref().map(|k| k.value.as_str()),
+            c.spec.columns().to_vec(),
+        ));
+    }
+    for (name, cols, kind_value, spec_columns) in rows {
+        match cols {
+            Some(c) => {
+                let fit: Vec<String> = c
+                    .gates
+                    .iter()
+                    .map(|g| format!("{} {}", g.name, if g.fits { "fits" } else { "OVER" }))
+                    .collect();
+                let q = |v: &[u64; 3]| format!("{} / {} / {}", num(v[0]), num(v[1]), num(v[2]));
+                let _ = writeln!(
+                    s,
+                    "  {:<34} {:>10}  {:<24} {:<18} {}{}",
+                    tail(&name, 34),
+                    num(c.keyset),
+                    q(&c.rows_per_key),
+                    q(&c.files_per_key),
+                    fit.join(", "),
+                    kind_value.map_or_else(String::new, |k| format!("  {k}"))
+                );
+            }
+            None => {
+                let lacks: Vec<&str> = spec_columns
+                    .iter()
+                    .filter(|c| !key.columns.contains(c))
+                    .map(String::as_str)
+                    .collect();
+                let why = if lacks.is_empty() {
+                    "not measured: of a sample over more than four columns, the twin measures \
+                     the prefixes and the single columns"
+                        .to_string()
+                } else {
+                    format!("the key sample has no {}", lacks.join(", "))
+                };
+                let _ = writeln!(s, "  {:<34} {:>10}  {why}", tail(&name, 34), "-");
+            }
+        }
+    }
+    if !t.lints.is_empty() {
+        let _ = writeln!(s, "  twin lints (advice; they change no plan)");
+        for l in &t.lints {
+            let _ = writeln!(
+                s,
+                "    {} [{}]\n      {}",
+                l.rule,
+                l.columns.join(", "),
+                l.message
+            );
+        }
+    }
 }
 
 /// One sketched item's `why` cell: `≈138,889 rows/value of ≈72 (±2.4%),

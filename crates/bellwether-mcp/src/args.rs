@@ -91,6 +91,23 @@ pub struct EngineArgs {
         conflicts_with = "partitioning"
     )]
     pub path_template: Option<String>,
+    /// The query engine whose tables the data folder copies (ADR 033):
+    /// `clickhouse://[user@]host[:port]/<db>[/<table>]` or
+    /// `kusto://<cluster>/<db>[/<table>]`; a secret only as
+    /// `password=env:NAME`.
+    /// `why` then diagnoses the folder as its twin, and `fix` scores and
+    /// verifies a rewrite of engine queries in that engine.
+    #[arg(long, global = true, value_name = "URI")]
+    pub twin_of: Option<String>,
+    /// The folder a query engine's exports are written under for `fix` and
+    /// `workload record` (a folder of the lake, same account and
+    /// permissions); each run writes a fresh folder in it.
+    #[arg(long, global = true, value_name = "DIR")]
+    pub scratch: Option<String>,
+    /// Keep the engine's exports after the certificate is written (by
+    /// default they are deleted).
+    #[arg(long, global = true)]
+    pub keep: bool,
     /// A fixed RFC 3339 time for every record's `created_at` and for ages, so
     /// runs are byte-reproducible (testing and audits).
     #[arg(long, global = true, value_name = "RFC3339", hide = true)]
@@ -181,6 +198,10 @@ impl EngineArgs {
             // Builds use the available parallelism; the CLI's `index
             // --threads` sets it per call.
             threads: None,
+            twin_of: self.twin_of.clone(),
+            scratch: self.scratch.clone(),
+            keep_exports: self.keep,
+            engine_adapter: None,
         })
     }
 

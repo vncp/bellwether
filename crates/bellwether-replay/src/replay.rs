@@ -610,6 +610,7 @@ impl<'a> Replayer<'a> {
             .map(|l| l.description.clone());
         Ok(Scored {
             replay: Replay {
+                prediction: None,
                 record_version: RECORD_VERSION,
                 proposal: *proposal,
                 manifest_version: self.manifest_version(),

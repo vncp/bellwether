@@ -564,6 +564,9 @@ fn batch_stamp(
         row_groups_histogram: main.batch.rgs.log2_buckets(),
         fanout: Some(fanout),
         fix: Some(RewriteShape {
+            pairs: Vec::new(),
+            key: Vec::new(),
+            keys: None,
             before: "join on batch_id".into(),
             after: "join on (entity_id, batch_id)".into(),
             invariant: "the set of output rows per entity_id is unchanged".into(),
@@ -658,6 +661,9 @@ fn low_selectivity(
         row_groups_histogram: status.rgs.log2_buckets(),
         fanout: Some(fanout),
         fix: Some(RewriteShape {
+            pairs: Vec::new(),
+            key: Vec::new(),
+            keys: None,
             before: "key = [status]".into(),
             after: "key = [status, entity_id]".into(),
             invariant: "every row group holding a queried key is still selected (invariant 1)"
@@ -724,6 +730,9 @@ fn scattered_time(overlap: &OverlapDepth, late_rows: u64, rows_total: u64) -> Re
         fanout: None,
         row_groups_histogram: Vec::new(),
         fix: Some(RewriteShape {
+            pairs: Vec::new(),
+            key: Vec::new(),
+            keys: None,
             before: "written in arrival order".into(),
             after: "sorted or clustered by version_ts within each partition".into(),
             invariant: "the multiset of rows is unchanged".into(),
@@ -780,6 +789,9 @@ fn lookback(
         row_groups_histogram: entity.rgs.log2_buckets(),
         fanout: Some(fanout),
         fix: Some(RewriteShape {
+            pairs: Vec::new(),
+            key: Vec::new(),
+            keys: None,
             before: "scan all history, rank by version_ts per entity_id, keep first".into(),
             after: "latest(keys) via temporal index on entity_id by version_ts, then apply \
                     LatestPerKey residual"
@@ -817,6 +829,9 @@ fn declared_unused() -> AntiPattern {
         fanout: None,
         row_groups_histogram: Vec::new(),
         fix: Some(RewriteShape {
+            pairs: Vec::new(),
+            key: Vec::new(),
+            keys: None,
             before: "<spec name> declared in key_specs".into(),
             after: "removed".into(),
             invariant: "no recorded run's ScanPlan changes".into(),

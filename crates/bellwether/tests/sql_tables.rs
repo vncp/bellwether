@@ -578,6 +578,9 @@ fn a_rewrite_over_a_table_is_attest_only_and_names_the_agent_s_text() {
         .propose(
             ProposalBody::Rewrite {
                 shape: RewriteShape {
+                    pairs: Vec::new(),
+                    key: Vec::new(),
+                    keys: None,
                     before: "SELECT * FROM trips".into(),
                     after: "DROP TABLE trips".into(),
                     invariant: "same rows".into(),

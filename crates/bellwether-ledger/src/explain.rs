@@ -275,13 +275,23 @@ fn evidence_link(hash: Hash, e: &Evidence) -> Link {
             root,
             fanout,
             lints,
+            twin,
             ..
-        } => vec![
-            ("body", "profile".to_owned()),
-            ("root", root.clone()),
-            ("fanout", fanout.len().to_string()),
-            ("lints", lints.len().to_string()),
-        ],
+        } => {
+            let mut f = vec![
+                ("body", "profile".to_owned()),
+                ("root", root.clone()),
+                ("fanout", fanout.len().to_string()),
+                ("lints", lints.len().to_string()),
+            ];
+            if let Some(t) = twin {
+                f.push(("twin_of", t.engine.clone()));
+                f.push(("engine_rows", t.engine_rows.to_string()));
+                f.push(("lake_rows", t.lake_rows.to_string()));
+                f.push(("predicted_rows", t.predicted_rows.to_string()));
+            }
+            f
+        }
         EvidenceBody::Plan { plan } => vec![
             ("body", "plan".to_owned()),
             ("bytes", plan.bytes.to_string()),
@@ -304,6 +314,14 @@ fn proposal_link(hash: Hash, p: &Proposal) -> Link {
     let body = match &p.body {
         ProposalBody::Key { spec } => ("key", spec.name()),
         ProposalBody::Layout { cluster_by } => ("layout", cluster_by.join(",")),
+        ProposalBody::Rewrite { shape } if !shape.pairs.is_empty() => (
+            "rewrite",
+            format!(
+                "{} engine query pair(s), compared by {}",
+                shape.pairs.len(),
+                shape.key.join(",")
+            ),
+        ),
         ProposalBody::Rewrite { shape } => ("rewrite", format!("{:?}", shape.after)),
     };
     Link::new(
@@ -328,6 +346,16 @@ fn replay_link(hash: Hash, r: &Replay) -> Link {
     if let Some(m) = &r.model {
         // A modelled number must never read like a measured one.
         facts.push(("model", m.clone()));
+        if r.current
+            .iter()
+            .chain(&r.proposed)
+            .any(|c| c.measured.is_some())
+        {
+            facts.push(("costs", "measured, not exact".to_owned()));
+        }
+    }
+    if let Some(p) = &r.prediction {
+        prediction_facts(&mut facts, p);
     }
     if let Some(u) = &r.unserved {
         // Lookups no key serves were priced by the files' own statistics,
@@ -335,6 +363,28 @@ fn replay_link(hash: Hash, r: &Replay) -> Link {
         facts.push(("unserved", u.clone()));
     }
     Link::new(hash, RecordKind::Replay, &r.created_at, facts)
+}
+
+/// The prediction error, as facts: the twin's rows beside the engine's,
+/// each pair's value in the proposal's order.
+fn prediction_facts(facts: &mut Vec<(&'static str, String)>, p: &bellwether_types::Prediction) {
+    let each = |f: &dyn Fn(&bellwether_types::PairPrediction) -> String| {
+        p.pairs.iter().map(f).collect::<Vec<_>>().join(", ")
+    };
+    facts.push(("predicted_rows", p.predicted_rows.to_string()));
+    facts.push((
+        "read_rows_before",
+        each(&|q| q.before_read_rows.to_string()),
+    ));
+    facts.push(("read_rows_after", each(&|q| q.after_read_rows.to_string())));
+    facts.push((
+        "ratio_after",
+        each(&|q| {
+            q.after_ratio
+                .clone()
+                .unwrap_or_else(|| "undefined".to_owned())
+        }),
+    ));
 }
 
 fn certificate_link(hash: Hash, c: &Certificate) -> Link {
@@ -357,13 +407,15 @@ fn certificate_link(hash: Hash, c: &Certificate) -> Link {
 }
 
 fn receipt_link(hash: Hash, r: &Receipt) -> Link {
-    Link::new(
-        hash,
-        RecordKind::Receipt,
-        &r.created_at,
-        vec![(
-            "manifest",
-            format!("{}->{}", r.manifest_before, r.manifest_after),
-        )],
-    )
+    let mut facts = vec![(
+        "manifest",
+        format!("{}->{}", r.manifest_before, r.manifest_after),
+    )];
+    if r.attest_only {
+        facts.push(("apply", "attest-only".to_owned()));
+    }
+    if let Some(p) = &r.prediction {
+        prediction_facts(&mut facts, p);
+    }
+    Link::new(hash, RecordKind::Receipt, &r.created_at, facts)
 }

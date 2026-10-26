@@ -627,6 +627,9 @@ fn a_verify_only_rewrite_signs_its_certificate() {
         .propose(
             bellwether::types::ProposalBody::Rewrite {
                 shape: bellwether::types::RewriteShape {
+                    pairs: Vec::new(),
+                    key: Vec::new(),
+                    keys: None,
                     before: "a".into(),
                     after: "b".into(),
                     invariant: "same rows by id".into(),

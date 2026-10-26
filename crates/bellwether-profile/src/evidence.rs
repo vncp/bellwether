@@ -75,6 +75,7 @@ pub fn evidence(report: &ProfileReport) -> Result<Evidence> {
             created_at: now_rfc3339(),
         },
         body: EvidenceBody::Profile {
+            twin: None,
             root: report.root.clone(),
             fanout: report.fanout.iter().map(|e| e.fanout.clone()).collect(),
             lints: report.lints.clone(),

@@ -6,7 +6,8 @@ use std::fmt::Write as _;
 use bellwether_ledger::RecordKind;
 use bellwether_source::Partitioning;
 use bellwether_types::{
-    format, Error, Hash, HashKind, KeySpec, Proposal, ProposalBody, Record, Result, RewriteShape,
+    format, Error, Evidence, EvidenceBody, Hash, HashKind, KeySpec, Proposal, ProposalBody,
+    QueryPair, Record, Result, RewriteShape,
 };
 
 use crate::engine::{guard, Engine, SourceFormat};
@@ -265,6 +266,22 @@ impl Engine {
         if let Some(refused) = self.check_proposer_and_evidence(evidence, proposed_by, write)? {
             return Ok(refused);
         }
+        let mut body = body;
+        if let ProposalBody::Rewrite { shape } = &mut body {
+            if !shape.pairs.is_empty() {
+                // The evidence resolved above, so the ledger is there; a dry
+                // run reads it without creating anything.
+                let store = self
+                    .existing_store()?
+                    .ok_or_else(|| Error::RecordNotFound {
+                        kind: HashKind::Evidence,
+                        hash: evidence[0],
+                        place: format!("the ledger at {}", self.index_location()),
+                    })?;
+                let ledger = bellwether_ledger::Ledger::new(std::sync::Arc::clone(store));
+                self.complete_engine_rewrite(&ledger, evidence, shape)?;
+            }
+        }
         self.check_body(&body)?;
         let proposal = Proposal {
             record_version: format::RECORD_VERSION,
@@ -329,6 +346,53 @@ impl Engine {
         }
     }
 
+    /// A rewrite of engine queries (ADR 033) cites the twin diagnosis it
+    /// rests on, and that diagnosis must have run on a key sample; its key
+    /// columns default to the sample's, and its key sample to the twin's
+    /// recorded workload. A key sample given must be the twin's.
+    fn complete_engine_rewrite<S>(
+        &self,
+        ledger: &bellwether_ledger::Ledger<S>,
+        evidence: &[Hash],
+        shape: &mut RewriteShape,
+    ) -> Result<()>
+    where
+        S: std::ops::Deref,
+        S::Target: bellwether_types::Store,
+    {
+        let twin = evidence.iter().find_map(|h| match ledger.get(h) {
+            Ok(Record::Evidence(Evidence {
+                body: EvidenceBody::Profile { twin: Some(t), .. },
+                ..
+            })) => Some(t),
+            _ => None,
+        });
+        let Some(twin) = twin else {
+            return Err(Error::InvalidArgument {
+                field: "evidence",
+                reason: "a rewrite of engine queries cites the twin diagnosis it rests on: run \
+                         `why` with the engine named (--twin-of) and cite the evidence it prints"
+                    .into(),
+            });
+        };
+        if shape.keys.is_none() {
+            shape.keys = twin.workload;
+        }
+        crate::engine_fix::key_sample(shape, &twin)?;
+        if shape.key.is_empty() {
+            // Read from an existing index only: a dry run creates nothing.
+            if let (Some(w), Some(store)) = (twin.workload, self.existing_store()?) {
+                let cache = bellwether_store::Cache::new(std::sync::Arc::clone(store), "");
+                if let Ok(wl) = bellwether_replay::Workload::load(&cache, &w) {
+                    if let Some(r) = wl.runs().first() {
+                        shape.key.clone_from(&r.columns);
+                    }
+                }
+            }
+        }
+        crate::engine_fix::check_pairs(shape)
+    }
+
     /// Every column in `cols` is in the dataset, or [`Error::UnknownColumn`]
     /// naming the first that is not and the columns there are. Returns the
     /// dataset schema.
@@ -372,4 +436,31 @@ fn check_shape(shape: &RewriteShape) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// A rewrite of engine queries as the CLI writes it (ADR 033): the pairs
+/// as given, the key columns (empty: the key sample's), and the invariant
+/// (default: each pair returns the same rows by its key columns). The
+/// descriptions say what the pairs are; the pairs are the proposal.
+#[must_use]
+pub fn engine_rewrite(
+    pairs: Vec<QueryPair>,
+    key: Vec<String>,
+    invariant: Option<String>,
+) -> RewriteShape {
+    let n = pairs.len();
+    RewriteShape {
+        before: format!(
+            "{n} quer{} as {} run in the engine today",
+            if n == 1 { "y" } else { "ies" },
+            if n == 1 { "it" } else { "they" }
+        ),
+        after: format!("the rewritten quer{}", if n == 1 { "y" } else { "ies" }),
+        invariant: invariant.unwrap_or_else(|| {
+            "each pair returns the same rows, compared by the proposal's key columns".to_string()
+        }),
+        pairs,
+        key,
+        keys: None,
+    }
 }

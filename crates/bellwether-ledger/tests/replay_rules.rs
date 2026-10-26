@@ -117,6 +117,8 @@ fn a_receipt_rechecks_its_replay() {
         .put(&Record::Certificate(certificate(Some(p), true)))
         .unwrap();
     let receipt = bellwether_types::Receipt {
+        attest_only: false,
+        prediction: None,
         record_version: bellwether_types::format::RECORD_VERSION,
         evidence: vec![e],
         proposal: p,
@@ -200,6 +202,9 @@ fn a_rewrite_proposal_replay_follows_the_same_exactness_rule() {
         &ledger,
         ProposalBody::Rewrite {
             shape: RewriteShape {
+                pairs: Vec::new(),
+                key: Vec::new(),
+                keys: None,
                 before: "join on batch_id".into(),
                 after: "join on (entity_id, batch_id)".into(),
                 invariant: "same rows for every trigger key".into(),
@@ -294,6 +299,8 @@ fn explain_shows_the_model_only_when_a_replay_has_one() {
         )))
         .unwrap();
     let receipt = bellwether_types::Receipt {
+        attest_only: false,
+        prediction: None,
         record_version: bellwether_types::format::RECORD_VERSION,
         evidence: vec![evidence_hash],
         proposal: layout_proposal,

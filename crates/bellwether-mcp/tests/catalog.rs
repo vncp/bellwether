@@ -65,6 +65,7 @@ fn the_tools_are_the_tiers_and_nothing_else() {
             ("observe.asof", Tier::Observe),
             ("score.why", Tier::Score),
             ("score.verify", Tier::Score),
+            ("score.record", Tier::Score),
             ("propose.key", Tier::Propose),
             ("propose.layout", Tier::Propose),
             ("propose.rewrite", Tier::Propose),
@@ -78,8 +79,11 @@ fn the_tools_are_the_tiers_and_nothing_else() {
 }
 
 /// Schemas come from the contract's derives, closed; no tool takes a path
-/// to write, a command, a query, or a score; apply takes a certificate hash
-/// only (and its delivery flags); observe.why takes no keys.
+/// to write, a command, a free-form query, or a score; apply takes a
+/// certificate hash only (and its delivery flags); observe.why takes no
+/// keys. The one query text a tool takes is `score.record`'s
+/// `keys_query` (and a rewrite's `shape.pairs`), submitted read-only to the
+/// engine the operator started the server with.
 #[test]
 fn schemas_are_closed_and_carry_no_dangerous_field() {
     for t in catalog() {
