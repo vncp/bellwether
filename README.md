@@ -70,7 +70,7 @@ A coding agent can drive it, but only the engine is allowed to measure, verify, 
     <img alt="The Bellwether loop. On the agent's side, which an MCP client or a person on the CLI drives: observe (why, profile, locate, asof; read-only, from cache, producing Evidence) and propose (a key, a layout, or a rewrite; no score field exists, producing a Proposal). On the engine's side, which never calls a model: score (exact replay of recorded keys, a Replay), verify (reconcile: same rows?, a Certificate), apply (only with a passing certificate), attest (hash-links the chain, a Receipt). A dashed trust boundary, enforced by record types rather than prompts, separates them. Evidence and proposal hashes cross to the engine; replays, certificates, receipts, and refusals with a next step come back. The engine reads your folder's footers and statistics and writes only its index beside the files." src="docs/assets/readme/loop-light.svg" width="100%">
   </picture>
 </p>
-<p align="center"><em>The loop and the trust boundary. Drawn by <code>scripts/render_figures.py</code>; this image follows your GitHub theme.</em></p>
+<p align="center"><em>The loop and the trust boundary · drawn by <code>scripts/render_figures.py</code></em></p>
 
 ## Results
 
@@ -168,7 +168,7 @@ Jobs over a data lake routinely read a thousand times more than they return, bec
     <img alt="Three steps. 1 Ask: bellwether why ./data/ tells you which column is a real key and exactly how many bytes each index would save on your recorded queries. 2 Fix: bellwether fix ./data/ --proposal … scores, verifies the same rows come back, builds the index, and only then applies. 3 Proof: a receipt and an index; a hash-linked receipt a reviewer or CI can check, and lookups in milliseconds over plain files." src="docs/assets/readme/three-steps-light.svg" width="100%">
   </picture>
 </p>
-<p align="center"><em>Ask, fix, proof. Drawn by <code>scripts/render_figures.py</code>; the captures further down show each step on generated data.</em></p>
+<p align="center"><em>Ask, fix, proof · drawn by <code>scripts/render_figures.py</code></em></p>
 
 ## Highlights
 
@@ -191,7 +191,7 @@ In order, every time: **score** the proposal by exact replay, **verify** that th
     <img alt="Terminal output of bellwether fix with the proposal and workload hashes why printed: 1 score, 231.7 MB to 130.3 MB over the workload (768 to 432 row groups); 2 verify, pass, coverage workload, 935 keys, 0 mismatched, 0 missing; 3 apply, manifest 0 to 1; 4 attest, the receipt hash; realized 130,336,047 bytes at manifest 1. Then bellwether reconcile ledger/data changed/data --key entity_id --latest-by version_ts --totals amount: FAIL, coverage full, 6,855 keys compared, 6,854 matched, 1 mismatched; the mismatching key named is entity_id 3, rows differ; the exact amount totals differ, 1546909874.77 against 1546909874.78; one pass over each side under a 268,435,456-byte state budget, 128,000 rows read on each side; the certificate hash; exit 1." src="docs/assets/readme/capture-fix-light.svg" width="100%">
   </picture>
 </p>
-<p align="center"><em><code>bellwether fix</code> with the hashes the <code>why</code> capture below printed, then <code>reconcile</code> against a copy with one entity's amount raised by 0.01; bench ledger corpus (seed 42, 128,000 rows), debug build of eca48d1, run by <code>scripts/readme-captures.sh</code>.</em></p>
+<p align="center"><em><code>bellwether fix</code>, then <code>reconcile</code> against one planted change · bench ledger corpus · debug build of eca48d1</em></p>
 
 `reconcile` is the same verifier pointed at two folders. It exits 1 when they differ, names the first ten differing keys (`--json` carries every one it kept), prints the exact totals, and says how many passes it made over each side to stay inside `--memory-budget`. Afterwards, `bellwether report` renders every receipt in the ledger as one self-contained HTML file: the funnel behind it, the certificate, and realized against predicted bytes.
 
@@ -201,7 +201,7 @@ In order, every time: **score** the proposal by exact replay, **verify** that th
     <img alt="Terminal output of bellwether report ledger/data --html report.html: wrote report.html (6,318 bytes), 1 receipt with realized bytes, 1 profile evidence record. Below it, that report's receipt section: key exact:entity_id, manifest 0 to 1 by engine; certificate pass, coverage workload, 935 keys, 0 mismatched, 0 missing; the replay over the 12-run workload; funnel bars for files, row groups, and bytes, each after-fix bar at 56.25% of its before bar; and a table, before 192 files, 768 row groups, 231,706,344 bytes, after (predicted) 108 files, 432 row groups, 130,336,047 bytes." src="docs/assets/readme/capture-report-light.svg" width="100%">
   </picture>
 </p>
-<p align="center"><em><code>bellwether report</code> right after that fix, with the receipt's section of the <code>report.html</code> it wrote drawn below it; same corpus and build.</em></p>
+<p align="center"><em><code>bellwether report</code> after that fix, its receipt section drawn below · same corpus and build</em></p>
 
 ## From files to a plan
 
@@ -213,7 +213,7 @@ Footers and statistics in, scan plan out: profile the columns, replay your recor
     <img alt="Terminal output of bellwether why ledger/data --bench-workload ledger on a folder with nothing indexed. The funnel over 12 recorded runs: the dataset is 16 files, 64 row groups, 19.3 MB, 128,000 rows; with no index the runs read 192 files, 768 row groups, 231.7 MB; exact:entity_id, the floor, would read 108 files, 432 row groups, 130.3 MB, and is recommended. The culprit line says no index serves this lookup, so it reads every row group, and that one entity_id value touches 4 / 8 / 16 row groups (p50 / p95 / max). Then the fix line with its proposal and workload hashes, the fanout per candidate column (entity_id 6,855 distinct values; status 5 values, each in all 64 row groups), three lints (batch_stamp_key on batch_id, low_selectivity_single_column on status, scattered_time_column on version_ts), and the evidence, workload, and proposal hashes." src="docs/assets/readme/capture-why-light.svg" width="100%">
   </picture>
 </p>
-<p align="center"><em><code>bellwether why</code> on an unindexed folder: the bench ledger corpus (seed 42: 16 files, 64 row groups, 128,000 rows) and its 12 recorded runs; debug build of eca48d1, run by <code>scripts/readme-captures.sh</code>.</em></p>
+<p align="center"><em><code>bellwether why</code> on an unindexed folder · bench ledger corpus, 12 recorded runs · debug build of eca48d1</em></p>
 
 Read the funnel top down: the dataset, what the recorded runs read now, then each candidate key with what it would read on the same runs. The floor is the key on the workload's own columns, which reads only the row groups that hold a key; `recommended` names the cheapest candidate and the `fix` line to apply it. When every candidate reads about as much as the floor and the floor reads nearly everything, the culprit line says the layout is the cause, not a missing index.
 
@@ -238,7 +238,7 @@ bellwether locate ./data --keys universe.parquet --at-manifest 3
     <img alt="Terminal output of bellwether index on the market corpus with exact:symbol@ts, range:ts, and temporal2:symbol@ts,known_at: manifest sequence 1, 20 files and 216 row groups read, 16 segments, every key spec and sidecar complete at 1. Then bellwether asof for 10 symbols with --valid 2026-01-01T14:33:36.594660Z and --known 2026-01-02T15:29:06.427726Z: of 20 files and 216 live row groups it plans 3 files, 8 row groups, 97,851 bytes, through exact:symbol, range:ts, and the temporal2 sidecar; the order line says why the plan has no time order; the three planned files follow with their row groups and bytes, and the plan's evidence hash." src="docs/assets/readme/capture-asof-light.svg" width="100%">
   </picture>
 </p>
-<p align="center"><em><code>bellwether index</code> and <code>asof --valid --known</code> on the bench market corpus (small rung), one 10-symbol query of its own workload; debug build of eca48d1, run by <code>scripts/readme-captures.sh</code>.</em></p>
+<p align="center"><em><code>bellwether index</code>, then <code>asof --valid --known</code> · bench market corpus, one 10-symbol query · debug build of eca48d1</em></p>
 
 Measured on the synthetic `market` corpus (`bellwether bench market --rung small`: 50 symbols, 10 days, 216 row groups, 102,739 prints with 3,786 restatements and 3,929 late prints; debug build, [`scripts/market-funnels.py`](scripts/market-funnels.py)), six one-hour windows over 1, 10, and 50 symbols together planned:
 
@@ -270,7 +270,7 @@ Then ask it to run the prompt `diagnose_slow_query`, which is [`AGENTS.md`](AGEN
     <img alt="A JSON-RPC exchange with bellwether mcp over stdio. After initialize and observe.why, the client sends tools/call propose.key with spec exact on entity_id, the evidence hash, by coding-agent, and score 0.99. The server replies with isError true and an envelope whose status is refused, tier propose, tool propose.key, and whose refusal has code invalid_input, the message 'the arguments do not match propose.key's input schema', the field error 'Additional properties are not allowed (score was unexpected)', and next: 'fix the arguments to match the tool's input schema; send no extra fields'. The session budget shows 0 replays and 0 rows spent, and nothing is cited." src="docs/assets/readme/capture-mcp-light.svg" width="100%">
   </picture>
 </p>
-<p align="center"><em>A stdio session with <code>bellwether mcp</code> on the bench ledger corpus: a proposal with a smuggled <code>score</code>, refused before anything is written; debug build of eca48d1, run by <code>scripts/readme-captures.sh</code>.</em></p>
+<p align="center"><em><code>bellwether mcp</code> over stdio, a smuggled <code>score</code> refused · bench ledger corpus · debug build of eca48d1</em></p>
 
 A proposal has no score field, so the input schema itself rejects one: the call is refused with a stable code and nothing reaches the ledger. The `next` line is the one thing the agent should do about it, in MCP terms, never a CLI flag.
 
@@ -319,7 +319,7 @@ Most LLM query optimizers score their own suggestions with an estimate and verif
     <img alt="Architecture. Who drives it: you in a terminal (bellwether with any verb, --json), a coding agent (bellwether mcp, tiered tools), CI or a script (exit codes 0 to 4, one JSON line), and the benchmark (bellwether bench); --json is the MCP result (ADR 010). They call the Rust engine, whose crates stack with imports pointing down: bellwether-cli and bellwether-mcp (arguments and envelopes, no engine logic), then the bellwether facade (score, verify, apply, attest), then profile, replay, verify and build, then core, source, store and ledger, then bellwether-types, the contract. The engine reads your storage (local disk, S3, Azure, GCS) and writes beside your files: segments/ (immutable, named by content hash), manifest.json (advanced by conditional PUT), ledger/ (append-only, hash-named records), and cache/ (rebuildable). The data is never converted." src="docs/assets/readme/architecture-light.svg" width="100%">
   </picture>
 </p>
-<p align="center"><em>Surfaces, crates, and storage. Drawn by <code>scripts/render_figures.py</code>; the layering it shows is the one <code>dev/check-layering.py</code> enforces.</em></p>
+<p align="center"><em>Surfaces, crates, and storage · drawn by <code>scripts/render_figures.py</code></em></p>
 
 Thirteen crates, dependencies pointing one way, enforced by a script in CI. The CLI and the MCP server hold no engine logic: both call the `bellwether` facade, so what the CLI prints as `--json` is byte for byte what an agent receives.
 
