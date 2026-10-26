@@ -153,15 +153,18 @@ It keys the transient cache together with the full spec and its key and timestam
 
 Configurations:
 
-- **Current.** The manifest's declared specs that are complete at the pinned sequence. With none, every run reads every row group. A declared spec that is not complete is not current: the index cannot plan with it yet.
+- **Current.** The manifest's declared specs that are complete at the pinned sequence. With none, every run is unserved (below). A declared spec that is not complete is not current: the index cannot plan with it yet.
 - **Hypothetical** (`replay_specs`). Any specs. Those the index cannot plan with, including a declared spec that is not complete, are built as transient segments and planned through `PlanSource::with_transient`. A configuration holds every hypothetical index it needs at once, because one plan intersects them.
-- **Unserved runs.** A run that no spec of a configuration serves reads every live row group. The index cannot narrow it.
+- **Unserved runs.** A run that no spec of a configuration serves is priced under the replayer's unserved baseline (`Replayer::with_unserved`):
+  - `RawScan`, the default: every live row group the planner cannot exclude (a window run's partitions). The index cannot narrow it.
+  - `ParquetStats`: of those, the row groups the `ParquetStats` baseline (below) keeps for the run's keys and window: what any Parquet reader skips to without an index. Both keep every row group holding a key, so their intersection does (invariant 1). An `asof` or `latest` run that no temporal spec serves is planned on its keys alone: a recorded run names no time column, so two callers could not agree on an instant bound. The facade sets it on every Parquet replayer, indexed or not, so a predicted cost equals the realized one.
 - **Key proposal.** The current specs, plus the proposed spec, which replaces a current spec of the same `KeySpec::name`. A proposed spec that serves none of the workload's runs is refused, never reported as "no change".
 - **Layout proposal.** Costs come from the layout model: `exact: false`. The `Replay` names the model in `model`, the statement `LayoutModel::describe` gives (below).
 - **Rewrite proposal.** Refused. Its cost depends on the rewritten plan, and a `RewriteShape` states that plan in prose (contract v3 backlog #2).
 - **Baselines.**
   - `RawScan` reads every row group.
   - `ParquetStats` keeps a row group when some key tuple passes, for every key column, two tests: the footer min/max, and the row group's embedded split-block bloom filter (below). A NaN probe is never pruned by range or by a filter.
+  - A window run: `ParquetStats` also skips a row group whose footer range for the window's time column lies wholly outside the window; `RawScan` still reads every row group.
 
 **`ParquetStats` filter probing.** The filter is probed with the PLAIN value of the key converted to the file column's physical type (ADR 008 amendment):
 
@@ -179,7 +182,7 @@ Configurations:
 
 A value the file column cannot hold fails the probe. A run column whose filter has none of these shapes is refused with `ReplayError::UnprobeableFilter`: `BOOLEAN`, `INT96`, a decimal stored as `BYTE_ARRAY`, or a `Decimal256` dataset column. The baseline is never silently weaker than `docs/benchmark.md` defines it.
 
-The baseline reads its filters once, after verifying each file's fingerprint on the opened handle, and **holds every embedded filter of every run column of every file** for its lifetime.
+The baseline reads its filters once, after verifying each file's fingerprint on the opened handle, and **holds every embedded filter of every run column of every file** for its lifetime. A replayer pricing unserved runs under `ParquetStats` reads each column's filters the first time it needs them and holds them for its own lifetime.
 
 ## The Replay record
 
@@ -194,6 +197,8 @@ The baseline reads its filters once, after verifying each file's fingerprint on 
 - **`model`** is present exactly when a proposed cost is inexact. That is a layout replay over a workload with runs, and the model is the layout model's statement. A key proposal's replay is exact throughout and names no model. Current costs are always exact.
 
 The ledger enforces these rules on `put`. `write_replay` checks them first, against the proposal it resolves itself.
+
+**`unserved`** is `"parquet_stats"` when some run, under the current configuration or the proposal, was unserved and priced under `ParquetStats` (above); absent otherwise, so a record that prices nothing that way keeps the bytes it had before the field existed. The replayer sets it; the ledger stores it as given.
 
 ## Errors
 

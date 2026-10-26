@@ -1,9 +1,9 @@
 #! title: bellwether mcp (stdio)
-#! caption: A JSON-RPC session with bellwether mcp over stdio on the bench ledger corpus (bench generate --seed 42: 16 files, 64 row groups, 128,000 rows; bench workload: 12 recorded runs): observe.why, then propose.key with a score smuggled in; the request as sent, the reply pretty-printed with its session budget block elided, nothing else edited; debug build of eca48d1, 2026-10-26.
+#! caption: A JSON-RPC session with bellwether mcp over stdio on the bench ledger corpus (bench generate --seed 42: 16 files, 64 row groups, 128,000 rows; bench workload: 12 recorded runs): observe.why, then propose.key with a score smuggled in; the request as sent, the reply pretty-printed with its session budget block elided, nothing else edited; debug build of 79ab8ec, 2026-10-26.
 $ bellwether mcp ledger/data
-#! (initialize, then observe.why, which returned evidence 50954ea477b5...)
+#! (initialize, then observe.why, which returned evidence a47e696c25a1...)
 #! client -> server, the line as sent
-{"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "propose.key", "arguments": {"spec": {"kind": "exact", "columns": ["entity_id"]}, "evidence": ["50954ea477b5ed80e64031c357e0e7a04916d99c78efa07ae2b7f446952246ea"], "by": "coding-agent", "score": 0.99}}}
+{"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "propose.key", "arguments": {"spec": {"kind": "exact", "columns": ["entity_id"]}, "evidence": ["a47e696c25a1150467aa6e00cb09f30e9a3fad9b0b5267f92102d4e53e61c1b1"], "by": "coding-agent", "score": 0.99}}}
 #! server -> client, pretty-printed; the session budget block elided
 {
   "jsonrpc": "2.0",

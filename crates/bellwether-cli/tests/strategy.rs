@@ -821,9 +821,18 @@ fn fix_on_an_unindexed_partitioned_folder_records_its_partitioning() {
             ],
             0,
         ));
-        let rec = &why["recommended"];
-        assert!(rec.is_object(), "{flags:?}: {why}");
-        let proposal = rec["proposal"].as_str().unwrap();
+        // No row group without NVDA has a symbol range that spans it, so
+        // the files' own min/max statistics already skip to its row groups
+        // in the window and nothing is recommended; the cheapest candidate
+        // is applied anyway, with --allow-no-gain.
+        assert!(why["recommended"].is_null(), "{flags:?}: {why}");
+        let rec = why["candidates"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .min_by_key(|c| c["proposed"]["bytes"].as_u64().unwrap())
+            .unwrap();
+        let proposal = rec["proposal"]["hash"].as_str().unwrap();
         let workload = why["workload"]["hash"].as_str().unwrap();
         // Proposing a sidecar on the folder not yet indexed is refused, and
         // the index command it names carries the same source flag, so
@@ -855,6 +864,7 @@ fn fix_on_an_unindexed_partitioned_folder_records_its_partitioning() {
                 "--workload",
                 workload,
                 "--json",
+                "--allow-no-gain",
             ],
             0,
         ));

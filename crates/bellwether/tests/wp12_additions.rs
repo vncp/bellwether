@@ -20,7 +20,7 @@ use bellwether::{
     spec, Engine, EngineOptions, FixOutcome, FixRequest, KeyFile, ProposeRefusal, ProposeResult,
     Refusal, WhyRequest, UNATTRIBUTED,
 };
-use common::{ledger_corpus, write_file, write_keys};
+use common::{ledger_corpus, scattered_corpus, write_file, write_keys};
 
 fn open(root: &Path) -> Engine {
     Engine::open(root.to_str().unwrap(), EngineOptions::default()).unwrap()
@@ -61,7 +61,7 @@ struct Fixture {
 fn fixture(indexed: bool) -> Fixture {
     let dir = tempfile::tempdir().unwrap();
     let data = dir.path().join("data");
-    ledger_corpus(&data, 3, 4, 25, 400);
+    scattered_corpus(&data, 3, 4, 25, 400);
     let kf = dir.path().join("k.parquet");
     write_keys(&kf, "id", &[5, 77, 123]);
     if indexed {

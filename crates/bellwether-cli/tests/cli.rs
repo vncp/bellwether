@@ -86,7 +86,7 @@ fn human_output_leads_with_the_funnel_and_quiet_prints_nothing() {
     run(&["index", path(&data), "--key", "exact:id"], 0);
     let out = run(&["locate", path(&data), "--keys", path(&kf)], 0);
     let lines: Vec<&str> = out.lines().collect();
-    assert!(lines[0].starts_with("locate: 1 keys on (id)"), "{out}");
+    assert!(lines[0].starts_with("locate: 1 key on (id)"), "{out}");
     assert!(lines[1].contains("files") && lines[1].contains("row groups"));
     assert!(lines[2].trim_start().starts_with("live"));
     assert!(lines[3].trim_start().starts_with("planned"));

@@ -26,6 +26,12 @@ pub(crate) fn num(n: u64) -> String {
     out
 }
 
+/// `n` with its noun, singular for exactly one: `1 receipt`, `2 receipts`,
+/// `1,000 row groups`. Every count a sentence prints goes through it.
+pub(crate) fn count(n: u64, one: &str, many: &str) -> String {
+    format!("{} {}", num(n), if n == 1 { one } else { many })
+}
+
 /// A byte count rounded for reading: `1.5 GB`. Decimal units.
 #[allow(clippy::cast_precision_loss)]
 pub(crate) fn size(bytes: u64) -> String {
@@ -100,13 +106,13 @@ pub(crate) fn index(r: &IndexResult, out: &Out) -> String {
     let _ = writeln!(s, "{}", heading(out, &format!("index {}: {what}", r.root)));
     let _ = writeln!(
         s,
-        "  files: {} new, {} changed, {} removed, {} unchanged; {} row groups read; {} segments written, {} live",
+        "  files: {} new, {} changed, {} removed, {} unchanged; {} read; {} written, {} live",
         num(r.files_new),
         num(r.files_changed),
         num(r.files_removed),
         num(r.files_unchanged),
-        num(r.row_groups_read),
-        num(r.segments_written),
+        count(r.row_groups_read, "row group", "row groups"),
+        count(r.segments_written, "segment", "segments"),
         num(r.segments)
     );
     let labels: Vec<String> = r.specs.iter().map(|x| label(&x.spec)).collect();
@@ -215,8 +221,8 @@ pub(crate) fn plan(r: &PlanResult, out: &Out) -> String {
         heading(
             out,
             &format!(
-                "{what}: {} keys on ({}) at manifest sequence {}",
-                num(r.keys),
+                "{what}: {} on ({}) at manifest sequence {}",
+                count(r.keys, "key", "keys"),
                 r.columns.join(", "),
                 r.sequence
             )
@@ -247,21 +253,13 @@ pub(crate) fn plan(r: &PlanResult, out: &Out) -> String {
     if r.null_tuples > 0 {
         let _ = writeln!(
             s,
-            "  {} key rows held a null and match nothing (ADR 014)",
-            num(r.null_tuples)
+            "  {} held a null and match nothing (ADR 014)",
+            count(r.null_tuples, "key row", "key rows")
         );
     }
     let specs: Vec<String> = r.specs.iter().map(label).collect();
-    let _ = writeln!(
-        s,
-        "  specs: {}",
-        if specs.is_empty() {
-            "none (raw scan)".to_string()
-        } else {
-            specs.join(", ")
-        }
-    );
-    if !r.sidecars.is_empty() {
+    let _ = writeln!(s, "  specs: {}", specs_line(&specs, &r.sidecars));
+    if !specs.is_empty() && !r.sidecars.is_empty() {
         let _ = writeln!(s, "  sidecars: {}", r.sidecars.join(", "));
     }
     if let Some(c) = &r.path_values {
@@ -300,12 +298,35 @@ pub(crate) fn plan(r: &PlanResult, out: &Out) -> String {
                 );
             }
             if plan.entries.len() > 20 {
-                let _ = writeln!(s, "  ... {} more files", plan.entries.len() - 20);
+                let _ = writeln!(
+                    s,
+                    "  ... {} more",
+                    count((plan.entries.len() - 20) as u64, "file", "files")
+                );
             }
         }
     }
     let _ = writeln!(s, "\nevidence {}", r.evidence.hash);
     s
+}
+
+/// The plan's specs line: the specs it used, or, with none, the sidecar
+/// that alone planned it (the bitemporal sidecar for a bitemporal lookup),
+/// never "raw scan" then.
+fn specs_line(specs: &[String], sidecars: &[String]) -> String {
+    match (specs.is_empty(), sidecars.is_empty()) {
+        (false, _) => specs.join(", "),
+        (true, true) => "none (raw scan)".to_string(),
+        (true, false) => format!(
+            "none; planned by the {} {}",
+            if sidecars.len() == 1 {
+                "sidecar"
+            } else {
+                "sidecars"
+            },
+            sidecars.join(", ")
+        ),
+    }
 }
 
 fn tail(p: &str, w: usize) -> String {
@@ -450,9 +471,10 @@ pub(crate) fn why(r: &bellwether::WhyReport, out: &Out, fix_command: &str) -> St
     if !r.untracked.is_empty() {
         let _ = writeln!(
             s,
-            "  {} file(s) landed after the last index build and are counted in the dataset but not \
-             in the costs; run `bellwether index {}` first",
-            r.untracked.len(),
+            "  {} landed after the last index build and {} counted in the dataset but not in \
+             the costs; run `bellwether index {}` first",
+            count(r.untracked.len() as u64, "file", "files"),
+            if r.untracked.len() == 1 { "is" } else { "are" },
             r.root
         );
     }
@@ -475,28 +497,17 @@ pub(crate) fn why(r: &bellwether::WhyReport, out: &Out, fix_command: &str) -> St
         })
     });
     if let (Some(w), Some(current)) = (&r.workload, r.current) {
-        match &kind_label {
-            None => {
-                let _ = writeln!(
-                    s,
-                    "funnel: {} run(s), keys p50/p95/max {}/{}/{}; {basis}, summed over runs",
-                    num(w.runs),
-                    num(w.keys_p50_p95_max[0]),
-                    num(w.keys_p50_p95_max[1]),
-                    num(w.keys_p50_p95_max[2])
-                );
-            }
-            Some(k) => {
-                let _ = writeln!(
-                    s,
-                    "funnel: {} run(s) ({k}), keys p50/p95/max {}/{}/{}; {basis}, summed over runs",
-                    num(w.runs),
-                    num(w.keys_p50_p95_max[0]),
-                    num(w.keys_p50_p95_max[1]),
-                    num(w.keys_p50_p95_max[2])
-                );
-            }
-        }
+        let kind = kind_label
+            .as_ref()
+            .map_or_else(String::new, |k| format!(" ({k})"));
+        let _ = writeln!(
+            s,
+            "funnel: {}{kind}, keys p50/p95/max {}/{}/{}; {basis}, summed over runs",
+            count(w.runs, "run", "runs"),
+            num(w.keys_p50_p95_max[0]),
+            num(w.keys_p50_p95_max[1]),
+            num(w.keys_p50_p95_max[2])
+        );
         for win in &w.windows {
             let _ = writeln!(
                 s,
@@ -509,18 +520,35 @@ pub(crate) fn why(r: &bellwether::WhyReport, out: &Out, fix_command: &str) -> St
         let w_col = label_width(labels.iter().map(String::as_str), MIN_FUNNEL_LABEL);
         funnel_header(&mut s, w_col);
         funnel_row(&mut s, w_col, "dataset", &dataset, &rows);
-        let current_name = if r.current_specs.is_empty() {
-            "current (no index)"
-        } else {
-            "current"
+        // Without an index, over Parquet files, the current cost is what the
+        // files' own statistics leave (the Replays' `unserved`); the full
+        // scan is context above it.
+        let current_name = match (r.current_specs.is_empty(), r.full_scan) {
+            (true, Some(_)) => "unindexed (min/max pruning)",
+            (true, None) => "current (no index)",
+            (false, _) => "current",
         };
+        if let Some(f) = &r.full_scan {
+            funnel_row(
+                &mut s,
+                w_col,
+                "unindexed (full scan)",
+                f,
+                "context: what a reader that skips nothing reads",
+            );
+        }
         let current_note = match (&kind_label, r.current_locate) {
             (Some(_), Some(loc)) => format!(
-                "a point lookup (locate) would read {} row groups, {} bytes ({})",
-                num(loc.row_groups),
+                "a point lookup (locate) would read {}, {} bytes ({})",
+                count(loc.row_groups, "row group", "row groups"),
                 num(loc.bytes),
                 size(loc.bytes)
             ),
+            (_, None) if r.full_scan.is_some() => {
+                "what the files' own footer statistics skip to without an index; a key must \
+                 read less"
+                    .to_string()
+            }
             _ => String::new(),
         };
         funnel_row(&mut s, w_col, current_name, &current, &current_note);
@@ -556,8 +584,8 @@ pub(crate) fn why(r: &bellwether::WhyReport, out: &Out, fix_command: &str) -> St
             }
             if let (Some(_), Some(loc)) = (&kind_label, c.locate) {
                 notes.push(format!(
-                    "locate would read {} row groups, {} bytes ({})",
-                    num(loc.row_groups),
+                    "locate would read {}, {} bytes ({})",
+                    count(loc.row_groups, "row group", "row groups"),
                     num(loc.bytes),
                     size(loc.bytes)
                 ));
@@ -594,15 +622,33 @@ pub(crate) fn why(r: &bellwether::WhyReport, out: &Out, fix_command: &str) -> St
             CulpritReason::Lint {
                 rule, confidence, ..
             } => format!("lint {rule} (confidence {confidence:.2})"),
-            CulpritReason::NoIndexServes => match r.current {
-                Some(cur) if cur.row_groups < r.dataset.row_groups => format!(
-                    "no key index serves this lookup; only the time window narrows it, to {} of \
-                     {} row groups",
-                    num(cur.row_groups),
-                    num(r.dataset.row_groups)
-                ),
-                _ => "no index serves this lookup, so it reads every row group".to_string(),
-            },
+            CulpritReason::NoIndexServes => {
+                let span = r.dataset.row_groups * r.workload.as_ref().map_or(1, |w| w.runs);
+                match (r.full_scan, r.current) {
+                    (Some(_), Some(m)) if m.row_groups < span => format!(
+                        "no key index serves this lookup; the files' own min/max statistics \
+                         already narrow it to {} of the {} the runs span{}",
+                        num(m.row_groups),
+                        count(span, "row group", "row groups"),
+                        if r.recommended.is_none() {
+                            ", and no candidate key reads fewer bytes, so the files' layout \
+                             already does what an index would"
+                        } else {
+                            ""
+                        }
+                    ),
+                    (Some(_), _) => "no index serves this lookup, and the files' min/max \
+                                     statistics skip nothing, so it reads every row group"
+                        .to_string(),
+                    (None, Some(cur)) if cur.row_groups < r.dataset.row_groups => format!(
+                        "no key index serves this lookup; only the time window narrows it, to {} \
+                         of {}",
+                        num(cur.row_groups),
+                        count(r.dataset.row_groups, "row group", "row groups")
+                    ),
+                    _ => "no index serves this lookup, so it reads every row group".to_string(),
+                }
+            }
             CulpritReason::Layout {
                 least_row_groups,
                 row_groups,
@@ -634,9 +680,9 @@ pub(crate) fn why(r: &bellwether::WhyReport, out: &Out, fix_command: &str) -> St
                     )
                 };
                 format!(
-                    "the layout, not a missing index: every candidate, the floor included, reads at least {} of the {} row groups the runs span, {because}, so no index helps, and only files rewritten clustered by the lookup columns would prune{lowest}",
+                    "the layout, not a missing index: every candidate, the floor included, reads at least {} of the {} the runs span, {because}, so no index helps, and only files rewritten clustered by the lookup columns would prune{lowest}",
                     num(*least_row_groups),
-                    num(*row_groups)
+                    count(*row_groups, "row group", "row groups")
                 )
             }
             CulpritReason::ServingSpec { spec } => format!("the serving key {}", label(spec)),
@@ -660,11 +706,16 @@ pub(crate) fn why(r: &bellwether::WhyReport, out: &Out, fix_command: &str) -> St
         let for_kind = kind_label
             .as_ref()
             .map_or_else(String::new, |k| format!(" (for {k})"));
+        let baseline = if r.full_scan.is_some() {
+            " with min/max pruning"
+        } else {
+            ""
+        };
         match &r.recommended {
             Some(rec) => {
                 let _ = writeln!(
                     s,
-                    "recommended{for_kind}: {} reads {} bytes ({}) instead of {} ({})",
+                    "recommended{for_kind}: {} reads {} bytes ({}) instead of {} ({}){baseline}",
                     label(&rec.spec),
                     num(rec.proposed.bytes),
                     size(rec.proposed.bytes),
@@ -686,6 +737,13 @@ pub(crate) fn why(r: &bellwether::WhyReport, out: &Out, fix_command: &str) -> St
                         rec.proposal, w.hash
                     );
                 }
+            }
+            None if r.full_scan.is_some() => {
+                let _ = writeln!(
+                    s,
+                    "recommended{for_kind}: none; no candidate reads fewer bytes than the files' \
+                     own min/max statistics already read without an index"
+                );
             }
             None => {
                 let _ = writeln!(
@@ -770,20 +828,24 @@ pub(crate) fn why(r: &bellwether::WhyReport, out: &Out, fix_command: &str) -> St
 }
 
 pub(crate) fn report(r: &ReportResult, _out: &Out) -> String {
+    let receipts = r.receipts.len() as u64;
     let signed = r.signed.map_or_else(String::new, |n| {
         format!(
-            "; {n} of {} receipts signed (receipt and certificate) by a trusted key",
-            r.receipts.len()
+            "; {n} of {} signed (receipt and certificate) by a trusted key",
+            count(receipts, "receipt", "receipts")
         )
     });
     format!(
-        "wrote {} ({} bytes): {} receipts ({} with realized bytes), {} profile evidence \
-         records{signed}\n",
+        "wrote {} ({}): {} ({} with realized bytes), {}{signed}\n",
         r.path,
-        num(r.bytes),
-        r.receipts.len(),
-        r.realized,
-        r.evidence.len()
+        count(r.bytes, "byte", "bytes"),
+        count(receipts, "receipt", "receipts"),
+        num(r.realized),
+        count(
+            r.evidence.len() as u64,
+            "profile evidence record",
+            "profile evidence records"
+        )
     )
 }
 
@@ -792,8 +854,8 @@ fn unreadable_line(s: &mut String, unreadable: &[Hash]) {
         let shown: Vec<String> = unreadable.iter().map(short).collect();
         let _ = writeln!(
             s,
-            "  {} record(s) this build cannot read, skipped: {}",
-            unreadable.len(),
+            "  {} this build cannot read, skipped: {}",
+            count(unreadable.len() as u64, "record", "records"),
             shown.join(" ")
         );
     }
@@ -804,7 +866,13 @@ pub(crate) fn findings(r: &bellwether::FindingsResult, out: &Out) -> String {
     let _ = writeln!(
         s,
         "{}",
-        heading(out, &format!("findings: {} root(s)", r.findings.len()))
+        heading(
+            out,
+            &format!(
+                "findings: {}",
+                count(r.findings.len() as u64, "root", "roots")
+            )
+        )
     );
     for f in &r.findings {
         let Record::Evidence(e) = &f.evidence.record else {

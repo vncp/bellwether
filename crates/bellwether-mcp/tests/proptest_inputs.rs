@@ -30,7 +30,9 @@ use std::path::PathBuf;
 use std::sync::LazyLock;
 
 use bellwether_mcp::{Server, Status};
-use common::{delta, finish, json, ledger_corpus, objects, ok, server, write_keys};
+use common::{
+    delta, finish, json, ledger_corpus, objects, ok, scattered_corpus, server, write_keys,
+};
 use proptest::prelude::*;
 use serde_json::{json, Map, Value};
 
@@ -362,7 +364,7 @@ fn the_loop_signs_exactly_what_the_engine_stages_wrote() {
     for signing in [true, false] {
         let dir = tempfile::tempdir().unwrap();
         let data = dir.path().join("data");
-        ledger_corpus(&data, 2, 2, 20, 100);
+        scattered_corpus(&data, 2, 2, 20, 100);
         let keys = dir.path().join("k.parquet");
         write_keys(&keys, "id", &[3, 41]);
         let index = data.join(".bellwether");

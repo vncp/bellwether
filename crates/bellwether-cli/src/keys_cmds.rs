@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use bellwether::{ChainLink, ReceiptResult, RecordKind, SignatureStatus, TrustedKeys};
 use clap::{Args, Subcommand};
 
-use crate::human::short;
+use crate::human::{count, short};
 use crate::{done, engine_keyed, hash, human, Failure, Global, Out, Outcome, EXIT_FAILED, EXIT_OK};
 
 /// `--trusted-keys`: the reader's trust file.
@@ -113,11 +113,11 @@ pub(crate) fn run(g: &Global, cmd: &KeysCommand) -> Result<Outcome, Failure> {
                 (Some(f), Some(t)) => format!("for signatures made from {f} until before {t}"),
             };
             let s = format!(
-                "{} now trusts {} (key {}) {window}; it lists {} key(s)\n",
+                "{} now trusts {} (key {}) {window}; it lists {}\n",
                 r.file,
                 r.key.name,
                 short(&r.key.key_id),
-                r.keys
+                count(r.keys, "key", "keys")
             );
             done(&r, s, EXIT_OK)
         }
@@ -219,7 +219,7 @@ pub(crate) fn signature_lines(s: &mut String, r: &ReceiptResult) {
             .filter(|x| matches!(x, SignatureStatus::Valid { .. }))
             .count();
         let invalid = sigs.len() - valid;
-        let mut line = format!("{valid} valid signature(s)");
+        let mut line = count(valid as u64, "valid signature", "valid signatures");
         if invalid > 0 {
             let _ = write!(line, ", {invalid} INVALID");
         }

@@ -30,7 +30,7 @@ use arrow::datatypes::SchemaRef;
 use bellwether_build::encode_ts;
 use bellwether_build::Builder;
 use bellwether_ledger::RecordKind;
-use bellwether_replay::{proposed_specs, Catalog, Replayer, RunKeys, RunQuery, Workload};
+use bellwether_replay::{proposed_specs, Baseline, Catalog, Replayer, RunKeys, RunQuery, Workload};
 use bellwether_source_sql::{is_sql_root, SqlUrl, MEASURED_AGGREGATES};
 use bellwether_store::{parse_rfc3339, Cache, ObjectStoreBackend};
 use bellwether_types::{
@@ -101,7 +101,9 @@ pub enum Score {
     Replayed {
         /// The Replay.
         replay: Box<Written>,
-        /// Summed over runs, under the current configuration.
+        /// Summed over runs, under the current configuration. A run no
+        /// current spec serves is priced, over Parquet files, as their
+        /// min/max statistics read it (the Replay's `unserved` says so).
         current: Cost,
         /// Summed over runs, under the proposal.
         proposed: Cost,
@@ -1378,15 +1380,30 @@ fn anchor(p: &Pinned) -> ManifestAnchor {
     }
 }
 
-fn replayer<'a>(
+/// The replayer every `why` and `fix` replay is computed by, pinned to
+/// `pinned` or over the unindexed folder: over Parquet files, a run no spec
+/// of a configuration serves is priced as the files' own min/max statistics
+/// read it (`Baseline::ParquetStats`), so `why`'s numbers, the score `fix`
+/// gates on, and the realized replay after the apply are one measure, the
+/// Replay a receipt cites. CSV and JSON lines have no footer statistics,
+/// and a table's costs are measured (ADR 027): such a run reads every row
+/// group.
+pub(crate) fn replayer<'a>(
     engine: &Engine,
     source: &'a dyn Source,
     pinned: Option<&Pinned>,
 ) -> Result<Replayer<'a>> {
-    match pinned {
-        Some(p) => Replayer::for_snapshot(source, &p.snapshot),
-        None => Replayer::unindexed(source, engine.root(), &engine.partitioning(None)?),
-    }
+    let replayer = match pinned {
+        Some(p) => Replayer::for_snapshot(source, &p.snapshot)?,
+        None => Replayer::unindexed(source, engine.root(), &engine.partitioning(None)?)?
+            .with_fingerprint_policy(engine.options().fingerprint_policy.unwrap_or_default()),
+    };
+    Ok(match engine.format() {
+        crate::SourceFormat::Parquet if !engine.is_table() => {
+            replayer.with_unserved(Baseline::ParquetStats)
+        }
+        _ => replayer,
+    })
 }
 
 /// The recorded workload `hash`: absent is [`Error::RecordNotFound`];
@@ -1840,8 +1857,9 @@ mod tests {
     fn an_incomplete_plan_fails_verify_and_writes_no_receipt() {
         let dir = tempfile::tempdir().unwrap();
         let data = dir.path().join("data");
-        // ids 0..299 once each: 5 and 77 in part-000, 123 in part-001.
-        common::ledger_corpus(&data, 3, 4, 25, 400);
+        // id 37k mod 400 for row k in 0..299: 5 (k 65) and 123 (k 79) in
+        // part-000, 77 (k 121) in part-001; min/max prunes nothing.
+        common::scattered_corpus(&data, 3, 4, 25, 400);
         let kf = dir.path().join("k.parquet");
         common::write_keys(&kf, "id", &[5, 77, 123]);
         let (e, wl, p) = setup(&data, &kf);
@@ -1915,7 +1933,9 @@ mod tests {
     fn a_commit_between_the_gate_and_the_apply_withholds_the_receipt() {
         let dir = tempfile::tempdir().unwrap();
         let data = dir.path().join("data");
-        common::ledger_corpus(&data, 3, 4, 25, 400);
+        // Ids scattered over row groups (37k mod 400): the files' min/max
+        // statistics skip nothing, so the key has a gain to apply.
+        common::scattered_corpus(&data, 3, 4, 25, 400);
         let kf = dir.path().join("k.parquet");
         common::write_keys(&kf, "id", &[5, 77, 123]);
         Engine::open(data.to_str().unwrap(), EngineOptions::default())
@@ -2107,10 +2127,13 @@ mod tests {
             let mut w = ArrowWriter::try_new(file, Arc::clone(&schema), Some(props)).unwrap();
             for r in 0..3 {
                 let d = FIRST + f * 3 + r;
+                // A day without A still spans it in its footer min/max
+                // ("0" to "B"), so a reader's own statistics read it and a
+                // key on symbol is worth building.
                 let syms = if (d - FIRST) % 2 == 0 {
                     ["A", "B", "A", "B"]
                 } else {
-                    ["B", "B", "B", "B"]
+                    ["0", "B", "B", "B"]
                 };
                 let ts: Vec<i64> = (0..4)
                     .map(|i| i64::from(d) * 86_400_000_000 + i * 1_000_000 + 1)
@@ -2558,7 +2581,10 @@ mod tests {
                 ..WhyRequest::default()
             })
             .unwrap();
+        // An unserved asof run is bounded by its keys only, never by an
+        // instant (A is in every file), so the temporal floor is recommended.
         let rec = why.recommended.as_ref().expect("a recommendation");
+        let floor = rec.proposal;
         let wl = why.workload.as_ref().unwrap().hash;
         test_seam::set(|sel| {
             assert!(
@@ -2567,7 +2593,7 @@ mod tests {
             );
             sel.retain(|p, _| !p.ends_with("a-start.parquet"));
         });
-        let bad = fix_key(&e, rec.proposal, wl, true);
+        let bad = fix_key(&e, floor, wl, true);
         test_seam::clear();
         assert!(
             matches!(
@@ -2580,7 +2606,7 @@ mod tests {
             bad.outcome,
             bad.verification
         );
-        let ok = fix_key(&e, rec.proposal, wl, true);
+        let ok = fix_key(&e, floor, wl, true);
         assert!(
             matches!(ok.outcome, FixOutcome::Verified),
             "{:?}",

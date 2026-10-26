@@ -1,5 +1,5 @@
 #! title: bellwether asof --valid --known
-#! caption: bellwether index and asof on the bench market corpus (bench market --rung small: 50 symbols, 10 days, prints with restatements and late arrivals), one as-of query of the corpus's own workload (10 symbols); debug build of eca48d1, 2026-10-26.
+#! caption: bellwether index and asof on the bench market corpus (bench market --rung small: 50 symbols, 10 days, prints with restatements and late arrivals), one as-of query of the corpus's own workload (10 symbols); debug build of 79ab8ec, 2026-10-26.
 $ bellwether index market/data --partitioning hive --key exact:symbol@ts --key range:ts --key temporal2:symbol@ts,known_at
 [1mindex /private/tmp/bellwether-readme/market/data: committed manifest sequence 1[0m
   files: 20 new, 0 changed, 0 removed, 0 unchanged; 216 row groups read; 16 segments written, 16 live
@@ -10,7 +10,7 @@ $ bellwether index market/data --partitioning hive --key exact:symbol@ts --key r
   bounds:symbol@ts                                      1
   temporal2:symbol@ts,known_at                          1
 
-manifest 82462e6e5dc455ca7beba88f0ce8078a8db4c7b7f8ecc42abeef4220f421bb2d
+manifest 5a025f8bf5a28ef2653c28fa24fe88052e44866aa70e0e368c69dfdb9d832c72
 
 $ bellwether asof market/data --keys market/workload/keys/q0019.parquet --valid 2026-01-01T14:33:36.594660Z --known 2026-01-02T15:29:06.427726Z
 [1mbitemporal ts <= 2026-01-01T14:33:36.594660Z (1767278016594660), known_at <= 2026-01-02T15:29:06.427726Z (1767367746427726): 10 keys on (symbol) at manifest sequence 1[0m
@@ -26,4 +26,4 @@ $ bellwether asof market/data --keys market/workload/keys/q0019.parquet --valid 
   ...ether-readme/market/data/day=2026-01-01/part-0000.parquet           3             34,995
   ...ether-readme/market/data/day=2026-01-02/part-0000.parquet           1             13,910
 
-evidence 79eba8b00a82ca6ca7c477fd3a7d43dece6ec4ca970e3b2c7b4e24c3f9613691
+evidence 9518e1627beed07d03d01f7ff055855180b8f94dff537fd304296d22d7dce43e

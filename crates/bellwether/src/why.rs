@@ -12,8 +12,8 @@ use arrow::datatypes::Schema;
 use bellwether_core::encoding::check_ts_type;
 use bellwether_profile::{ProfileOptions, ProfileReport};
 use bellwether_replay::{
-    proposed_specs, record_bench_workload, servable, serves_query, KeyInput, Lookup, Replayer,
-    RunQuery, RunWindow, Workload, WorkloadRecorder, QUERY_KIND_LOCATE,
+    proposed_specs, record_bench_workload, servable, serves_query, Baseline, KeyInput, Lookup,
+    Replayer, RunQuery, RunWindow, Workload, WorkloadRecorder, QUERY_KIND_LOCATE,
 };
 use bellwether_store::{Cache, ObjectStoreBackend, StoreExt};
 use bellwether_types::{
@@ -435,13 +435,23 @@ pub struct WhyReport {
     /// cover the files the index tracks, so run `bellwether index` first.
     pub untracked: Vec<String>,
     /// Summed over runs under the workload's query kind, under the current
-    /// configuration (exact). Present with a workload.
+    /// configuration (exact). Present with a workload. Over Parquet files,
+    /// a run no current spec serves is priced as the files' own min/max
+    /// statistics (and embedded bloom filters) read it, as the Replays say
+    /// in `unserved`: what a reader without an index skips to.
     pub current: Option<Cost>,
     /// When the workload is temporal (`latest` or `asof`): summed over runs
     /// for point (`locate`) lookups under the current configuration. Absent
     /// (`None`, omitted in JSON) when `current` is already `locate`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub current_locate: Option<Cost>,
+    /// With a workload, when `current` prices the runs by the files'
+    /// min/max statistics (no key spec is current, over Parquet files):
+    /// summed over runs, what a reader that skips nothing reads, every live
+    /// row group (replay's `Baseline::RawScan`). Context only; nothing is
+    /// measured against it. Absent (`None`, omitted in JSON) otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub full_scan: Option<Cost>,
     /// Candidates replayed: the floor key(s) on each run's key columns, then
     /// the profile's measured candidates that serve a run in the profile's
     /// rank order, minus specs already current.
@@ -524,7 +534,10 @@ impl Engine {
     /// Among all candidates it selects the one reading the fewest bytes over
     /// all runs under that lookup kind (ties broken by fewer key columns,
     /// then candidate order), and recommends it only if it reads strictly
-    /// fewer bytes than the current configuration under that lookup kind.
+    /// fewer bytes than the current configuration under that lookup kind,
+    /// as priced by the candidate's own Replay (over Parquet files, a run no
+    /// spec serves read as the files' min/max statistics read it), so the
+    /// number is the one `fix` gates on and a receipt cites.
     pub fn why(&self, request: &WhyRequest) -> Result<WhyReport> {
         guard(|| self.why_inner(request)).map_err(schema_hint)
     }
@@ -542,10 +555,7 @@ impl Engine {
         };
         let sequence = pinned.as_ref().map_or(0, Pinned::sequence);
         let current_specs = pinned.as_ref().map(|p| p.specs().0).unwrap_or_default();
-        let replayer = match &pinned {
-            Some(p) => Replayer::for_snapshot(&*source, &p.snapshot)?,
-            None => Replayer::unindexed(&*source, self.root(), &self.partitioning(None)?)?,
-        };
+        let replayer = crate::fix::replayer(self, &*source, pinned.as_ref())?;
         let resolved_temporal = resolve_temporal(req, replayer.schema())?;
         let catalog = replayer.catalog();
         let indexed_row_groups = catalog.len() as u64;
@@ -582,6 +592,7 @@ impl Engine {
             untracked,
             current: None,
             current_locate: None,
+            full_scan: None,
             candidates: Vec::new(),
             not_serving: Vec::new(),
             recommended: None,
@@ -1216,6 +1227,15 @@ impl Engine {
                 cache,
                 &RunQuery::Locate,
             )?));
+        }
+        // Without an index, over Parquet files, `current` is what the files'
+        // own statistics leave; the full scan is context beside it.
+        if replayer.current_specs().is_empty() && replayer.unserved() == Baseline::ParquetStats {
+            report.full_scan = Some(total(
+                &replayer
+                    .replay_baseline(Baseline::RawScan, workload, cache)
+                    .map_err(Error::from)?,
+            ));
         }
         report.recommended = report
             .candidates

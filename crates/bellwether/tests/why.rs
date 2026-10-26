@@ -10,7 +10,7 @@ use bellwether::{
     spec, CandidateOrigin, CulpritReason, Engine, EngineOptions, FixOutcome, FixRequest, KeyFile,
     LookupKind, WhyRequest, Written, ENGINE_PROPOSER,
 };
-use common::{ledger_bytes, ledger_corpus, oracle, write_keys};
+use common::{ledger_bytes, ledger_corpus, oracle, scattered_corpus, write_keys};
 
 fn open(root: &std::path::Path) -> Engine {
     Engine::open(root.to_str().unwrap(), EngineOptions::default()).unwrap()
@@ -88,7 +88,7 @@ fn why_reports_an_unindexed_folder_from_its_footers_with_no_workload() {
 fn why_with_keys_replays_each_candidate_and_the_floor_is_the_oracle() {
     let dir = tempfile::tempdir().unwrap();
     let data = dir.path().join("data");
-    ledger_corpus(&data, 3, 4, 25, 400);
+    scattered_corpus(&data, 3, 4, 25, 400);
     let keys = [5i64, 77, 123];
     write_keys(&dir.path().join("k.parquet"), "id", &keys);
     let request = WhyRequest {
@@ -171,16 +171,17 @@ fn why_over_an_index_that_does_not_serve_the_workload() {
         .unwrap();
     assert_eq!(r.sequence, 1);
     assert_eq!(r.current_specs.len(), 1);
-    assert_eq!(
-        r.current.unwrap().row_groups,
-        8,
-        "exact:batch cannot narrow id lookups"
-    );
+    // exact:batch cannot narrow id lookups; the files' own min/max
+    // statistics can (ids are sorted: 1 and 2 sit in the first row group),
+    // and an indexed folder's replay prices the unserved run with them too.
+    assert_eq!(r.current.unwrap().row_groups, 1);
+    assert!(r.full_scan.is_none(), "a key spec is current");
     for c in &r.candidates {
         let Record::Replay(rp) = &c.replay.record else {
             panic!()
         };
         assert_eq!(rp.manifest_version, "1");
+        assert_eq!(rp.unserved.as_deref(), Some("parquet_stats"));
     }
     assert_eq!(r.culprit.unwrap().reason, CulpritReason::NoIndexServes);
 
@@ -244,12 +245,16 @@ fn record_workload(data: &std::path::Path, runs: &[(&str, &str, Vec<i64>)]) -> H
 fn the_recommendation_is_the_strictly_cheapest_candidate() {
     let dir = tempfile::tempdir().unwrap();
     let data = dir.path().join("data");
-    // id is unique per row; a batch spans two row groups of 25 rows.
-    ledger_corpus(&data, 3, 4, 25, 1_000);
+    // Row k has id 37k mod 1000 (unique, scattered: every row group's id
+    // range spans nearly all ids, so min/max pruning skips nothing for an
+    // id lookup) and batch k / 50 (sorted: a batch spans two of the 12 row
+    // groups of 25 rows, which min/max pruning finds by itself).
+    scattered_corpus(&data, 3, 4, 25, 1_000);
     let e = open(&data);
+    // ids of rows 10 and 200, in row groups 0 and 8.
     let hash = record_workload(
         &data,
-        &[("a", "id", vec![5, 6]), ("b", "batch", vec![0, 1, 2])],
+        &[("a", "id", vec![370, 400]), ("b", "batch", vec![0, 1, 2])],
     );
     let r = e
         .why(&WhyRequest {
@@ -259,6 +264,12 @@ fn the_recommendation_is_the_strictly_cheapest_candidate() {
         })
         .unwrap();
     assert_eq!(r.candidates.len(), 2, "exact:batch and exact:id");
+    let current = r.current.unwrap();
+    assert_eq!(
+        current.row_groups,
+        12 + 6,
+        "a skips nothing, b 6 by min/max"
+    );
     let cheapest = r
         .candidates
         .iter()
@@ -270,10 +281,82 @@ fn the_recommendation_is_the_strictly_cheapest_candidate() {
         .max_by_key(|c| c.proposed.bytes)
         .unwrap();
     assert!(cheapest.proposed.bytes < dearest.proposed.bytes);
+    assert_eq!(cheapest.spec.name(), "exact:id");
+    assert_eq!(
+        cheapest.proposed.row_groups,
+        2 + 6,
+        "b still min/max-pruned"
+    );
+    assert_eq!(
+        dearest.proposed, current,
+        "exact:batch adds nothing to min/max"
+    );
     let rec = r.recommended.as_ref().unwrap();
     assert_eq!(rec.spec, cheapest.spec);
     assert_eq!(rec.proposed, cheapest.proposed);
-    assert_eq!(rec.current, r.current.unwrap());
+    assert_eq!(rec.current, current);
+}
+
+/// A workload mixing lookup columns, on an unindexed folder: `exact:id`
+/// serves the id runs, and the batch runs it does not serve are priced as
+/// the files' min/max statistics read them, in `why`'s numbers and in the
+/// Replay the recommendation cites, which `fix` recomputes and a receipt
+/// cites (the receipt half is `where_min_max_keeps_extra_row_groups_...`
+/// in the CLI's `output_defects.rs`: `fix` verifies one key-column set at
+/// a time, so it refuses this workload). Charging the batch runs a full
+/// scan instead (as a raw-scan replay does) would make `exact:id` dearer
+/// than reading with min/max pruning, and nothing would be recommended.
+#[test]
+fn a_key_serving_some_runs_is_recommended_on_the_replay_it_cites() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    scattered_corpus(&data, 3, 4, 25, 1_000);
+    let e = open(&data);
+    // id run: rows 10, 110, 210 (row groups 0, 4, 8), so the key saves 9
+    // of 12 row groups; batch run: batch 0, rows 0..50, row groups 0 and 1.
+    let ids: Vec<i64> = [10, 110, 210].iter().map(|k| (k * 37) % 1_000).collect();
+    let hash = record_workload(&data, &[("a", "id", ids), ("b", "batch", vec![0])]);
+    let r = e
+        .why(&WhyRequest {
+            workload: Some(hash),
+            max_candidates: 0,
+            ..WhyRequest::default()
+        })
+        .unwrap();
+    let current = r.current.unwrap();
+    let full = r
+        .full_scan
+        .expect("no index, Parquet: the full scan is context");
+    assert_eq!(full.row_groups, 24, "every row group, both runs");
+    assert_eq!(
+        current.row_groups,
+        12 + 2,
+        "min/max narrows only the batch run"
+    );
+    let floor = r
+        .candidates
+        .iter()
+        .find(|c| c.spec.name() == "exact:id")
+        .unwrap();
+    assert_eq!(floor.proposed.row_groups, 3 + 2);
+    // Under a full scan for the batch run, the key would read 3 + 12 row
+    // groups, more than min/max pruning's 12 + 2.
+    let rec = r.recommended.as_ref().expect("exact:id is recommended");
+    assert_eq!(rec.spec, floor.spec);
+    assert_eq!((rec.current, rec.proposed), (current, floor.proposed));
+    // The recommendation's number is its Replay's, run by run.
+    assert_eq!(rec.replay, floor.replay.hash);
+    let Record::Replay(replay) = &floor.replay.record else {
+        panic!()
+    };
+    assert_eq!(replay.unserved.as_deref(), Some("parquet_stats"));
+    let sum = |c: &[bellwether::types::RunCost]| c.iter().map(|c| c.bytes).sum::<u64>();
+    assert_eq!(sum(&replay.current), rec.current.bytes);
+    assert_eq!(sum(&replay.proposed), rec.proposed.bytes);
+    assert_eq!(
+        replay.proposed[1], replay.current[1],
+        "batch run: min/max both"
+    );
 }
 
 #[test]

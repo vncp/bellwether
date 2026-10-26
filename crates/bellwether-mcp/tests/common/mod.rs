@@ -74,6 +74,22 @@ pub fn write_file(path: &Path, row_groups: &[Vec<Row>]) {
 /// several versions spread over row groups), batch `k / 50` (a write
 /// stamp), ts `k` seconds, and a payload.
 pub fn ledger_corpus(dir: &Path, files: usize, rgs: usize, rows: usize, entities: i64) {
+    ledger_corpus_with(dir, files, rgs, rows, |k| k % entities);
+}
+
+/// [`ledger_corpus`] with row `k`'s id `(k * 37) % entities`: consecutive
+/// rows get ids far apart, so every row group's id range spans nearly the
+/// whole key space and the files' own min/max statistics skip nothing for
+/// a point lookup. The loop tests use it: on ids sorted into row groups,
+/// min/max pruning already reads what `exact:id` would, so `why`
+/// recommends nothing and `fix` refuses `nothing_to_gain`. `entities` must
+/// not be a multiple of 37.
+pub fn scattered_corpus(dir: &Path, files: usize, rgs: usize, rows: usize, entities: i64) {
+    assert_ne!(entities % 37, 0, "37 must not divide entities");
+    ledger_corpus_with(dir, files, rgs, rows, |k| (k * 37) % entities);
+}
+
+fn ledger_corpus_with(dir: &Path, files: usize, rgs: usize, rows: usize, id: impl Fn(i64) -> i64) {
     std::fs::create_dir_all(dir).unwrap();
     let mut k: i64 = 0;
     for f in 0..files {
@@ -81,12 +97,7 @@ pub fn ledger_corpus(dir: &Path, files: usize, rgs: usize, rows: usize, entities
         for _ in 0..rgs {
             let mut g = Vec::new();
             for _ in 0..rows {
-                g.push((
-                    k % entities,
-                    k / 50,
-                    Some(k * 1_000_000),
-                    format!("p{k:06}"),
-                ));
+                g.push((id(k), k / 50, Some(k * 1_000_000), format!("p{k:06}")));
                 k += 1;
             }
             groups.push(g);

@@ -399,6 +399,26 @@ impl Catalog {
         })
     }
 
+    /// The ids of the live row groups `plan` reads; a file or row group
+    /// outside the catalog contributes none ([`Catalog::verify_plan`]
+    /// refuses such a plan).
+    #[must_use]
+    pub fn ids_of(&self, plan: &ScanPlan) -> RoaringBitmap {
+        let read: HashMap<usize, &RoaringBitmap> = plan
+            .entries
+            .iter()
+            .filter_map(|e| self.file_index.get(&e.file).map(|fi| (*fi, &e.row_groups)))
+            .collect();
+        self.row_groups
+            .iter()
+            .filter(|rg| {
+                read.get(&rg.file)
+                    .is_some_and(|b| b.contains(rg.meta.index_in_file))
+            })
+            .map(|rg| rg.id.0)
+            .collect()
+    }
+
     /// Checks that `plan` is internally consistent and that every entry's
     /// bytes are the exact sum of its row groups' compressed sizes in this
     /// catalog, so a plan from any [`crate::PlanSource`] is costed exactly

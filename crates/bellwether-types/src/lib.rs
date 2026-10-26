@@ -949,6 +949,12 @@ pub struct Replay {
     /// in version-1 records.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// How the replay priced runs that no spec of the configuration serves:
+    /// absent means every live row group (a raw scan); `"parquet_stats"`
+    /// means the row groups the files' min/max statistics keep. Absent in
+    /// records written before it existed, which keep their bytes and hashes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unserved: Option<String>,
     /// RFC 3339.
     pub created_at: String,
 }
@@ -1391,6 +1397,7 @@ mod schema_feature {
                 }],
                 proposed: vec![],
                 model: None,
+                unserved: None,
                 created_at: "2026-10-24T00:00:00.000Z".into(),
             }),
             Record::Certificate(Certificate {

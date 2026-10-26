@@ -10,7 +10,7 @@ use bellwether::{
 };
 use clap::{Args, Subcommand};
 
-use crate::human::{heading, num, short, size};
+use crate::human::{count, heading, num, short, size};
 use crate::{
     done, engine, engine_keyed, hash, Failure, Global, Out, Outcome, RootArg, EXIT_FAILED, EXIT_OK,
     EXIT_REFUSED,
@@ -277,9 +277,9 @@ fn key(k: &KeyRepr) -> String {
 fn coverage(c: &Coverage) -> String {
     match c {
         Coverage::Full => "full".into(),
-        Coverage::Workload { keys, .. } => format!("workload, {} keys", num(*keys)),
+        Coverage::Workload { keys, .. } => format!("workload, {}", count(*keys, "key", "keys")),
         Coverage::Sampled { keys, fraction } => {
-            format!("sampled, {} keys ({fraction})", num(*keys))
+            format!("sampled, {} ({fraction})", count(*keys, "key", "keys"))
         }
         Coverage::StaticProof { identity } => format!("static proof {identity}"),
     }
@@ -366,8 +366,8 @@ fn totals_human(s: &mut String, o: &bellwether::Reconciliation) {
     if o.totals.len() > HUMAN_TOTALS {
         let _ = writeln!(
             s,
-            "    ... {} more groups in --json",
-            o.totals.len() - HUMAN_TOTALS
+            "    ... {} more in --json",
+            count((o.totals.len() - HUMAN_TOTALS) as u64, "group", "groups")
         );
     }
 }
@@ -415,8 +415,8 @@ fn reconcile_human(r: &ReconcileResult, out: &Out) -> String {
         let shown = per_key.len().min(HUMAN_MISMATCHES);
         let _ = writeln!(
             s,
-            "\n  first {shown} of {} mismatching keys ({}): every kept example is in --json",
-            num(per_key_total),
+            "\n  first {shown} of {} ({}): every kept example is in --json",
+            count(per_key_total, "mismatching key", "mismatching keys"),
             o.key_columns.join(", ")
         );
         for (what, k) in per_key.iter().take(HUMAN_MISMATCHES) {
@@ -427,11 +427,11 @@ fn reconcile_human(r: &ReconcileResult, out: &Out) -> String {
     let m = &o.memory;
     let _ = writeln!(
         s,
-        "\n  read {} pass(es) over each side under a {}-byte state budget ({} restarts): {} rows read on the left, {} on the right",
-        m.passes,
+        "\n  read {} over each side under a {}-byte state budget ({}): {} read on the left, {} on the right",
+        count(u64::from(m.passes), "pass", "passes"),
         num(m.budget_bytes),
-        m.restarts,
-        num(m.rows_read[0]),
+        count(u64::from(m.restarts), "restart", "restarts"),
+        count(m.rows_read[0], "row", "rows"),
         num(m.rows_read[1])
     );
     if m.passes > 1 {
@@ -532,15 +532,23 @@ fn fix_human(r: &FixResult, out: &Out, table: bool) -> String {
             current,
             proposed,
         }) => {
+            // Sizes carry their unit: no "bytes" after them.
             let _ = writeln!(
                 s,
-                "  1 score   {:>10} -> {:>10} bytes over the workload ({} -> {} row groups), replay {}",
+                "  1 score   {:>10} -> {:>10} over the workload ({} -> {}), replay {}",
                 size(current.bytes),
                 size(proposed.bytes),
                 num(current.row_groups),
-                num(proposed.row_groups),
+                count(proposed.row_groups, "row group", "row groups"),
                 short(&replay.hash)
             );
+            if matches!(&replay.record, Record::Replay(rp) if rp.unserved.is_some()) {
+                let _ = writeln!(
+                    s,
+                    "            a lookup no key serves is priced as the files' own min/max \
+                     statistics read it, as a reader without an index does"
+                );
+            }
         }
         Some(Score::Measured {
             replay,
@@ -609,8 +617,8 @@ fn fix_human(r: &FixResult, out: &Out, table: bool) -> String {
                     let bytes: u64 = rp.current.iter().map(|c| c.bytes).sum();
                     let _ = writeln!(
                         s,
-                        "  realized {} bytes at manifest {}, replay {}",
-                        num(bytes),
+                        "  realized {} at manifest {}, replay {}",
+                        count(bytes, "byte", "bytes"),
                         rp.manifest_version,
                         short(&r.hash)
                     );

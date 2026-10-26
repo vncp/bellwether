@@ -1226,7 +1226,10 @@ fn nullable_default() -> bool {
 /// of `{"name": ..., "type": ..., "nullable": ...}` objects in column order,
 /// each `type` spelled as Arrow prints it and as the manifest records it
 /// (`"Int64"`, `"Decimal128(12, 4)"`, `"Timestamp(Microsecond, Some(\"UTC\"))"`).
-/// `nullable` defaults to true.
+/// `nullable` defaults to true. A timestamp in the named zone `"UTC"` is
+/// loaded as the offset `"+00:00"`, the same instants: the CSV and JSON
+/// lines decoders take only offset zones. Another named zone is refused by
+/// those sources when they open the folder (`why` and `index` alike).
 pub fn schema_from_json(json: &str) -> Result<SchemaRef> {
     use std::str::FromStr;
     let cols: Vec<SchemaColumn> = serde_json::from_str(json).map_err(|e| {
@@ -1251,6 +1254,12 @@ pub fn schema_from_json(json: &str) -> Result<SchemaRef> {
                     c.name, c.data_type
                 ))
             })?;
+            let dt = match dt {
+                arrow::datatypes::DataType::Timestamp(unit, Some(tz)) if &*tz == "UTC" => {
+                    arrow::datatypes::DataType::Timestamp(unit, Some("+00:00".into()))
+                }
+                other => other,
+            };
             Ok(arrow::datatypes::Field::new(c.name, dt, c.nullable))
         })
         .collect::<Result<Vec<_>>>()?;

@@ -46,11 +46,14 @@
 //! Filters are read when the baseline is built, from local files whose
 //! fingerprint is verified on the opened handle first, and are held for the
 //! baseline's lifetime: every embedded filter of every run column of every
-//! file. Nothing else of a file is read. On `bellwether-bench` corpora this
-//! is the bench's `parquet_stats` strategy, and the bench tests check
+//! file. A [`crate::Replayer`] pricing unserved runs under `ParquetStats`
+//! reads each column's filters once and keeps them for its own lifetime.
+//! Nothing else of a file is read. On `bellwether-bench` corpora this is
+//! the bench's `parquet_stats` strategy, and the bench tests check
 //! equality run by run.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use arrow::datatypes::{i256, ArrowPrimitiveType, DataType, Float16Type, Schema};
 use bellwether_core::encoding::NAN_KEY;
@@ -78,6 +81,18 @@ pub enum Baseline {
     RawScan,
     /// Footer min/max, then embedded bloom filters (module docs).
     ParquetStats,
+}
+
+impl Baseline {
+    /// The name a [`bellwether_types::Replay`] records in `unserved`:
+    /// `raw_scan` or `parquet_stats`.
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::RawScan => "raw_scan",
+            Self::ParquetStats => "parquet_stats",
+        }
+    }
 }
 
 /// Time units by their number of steps per second.
@@ -599,25 +614,31 @@ fn probe(elem: &[u8], dataset: &DataType, conv: Conversion) -> Option<Probe> {
 }
 
 #[derive(Clone)]
-struct Embedded {
+pub(crate) struct Embedded {
     filter: Sbbf,
     conversion: Conversion,
     dataset: DataType,
 }
 
+/// One column's embedded filters, by catalog row-group position.
+pub(crate) type ColumnFilters = BTreeMap<usize, Embedded>;
+
 /// Plans a run under a [`Baseline`].
 pub struct BaselinePlanner<'a> {
     catalog: &'a Catalog,
     kind: Baseline,
-    /// Embedded filters by (catalog row-group position, column name).
-    filters: BTreeMap<(usize, String), Embedded>,
+    /// Embedded filters by column name.
+    filters: BTreeMap<String, Arc<ColumnFilters>>,
 }
 
 impl std::fmt::Debug for BaselinePlanner<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("BaselinePlanner")
             .field("kind", &self.kind)
-            .field("filters", &self.filters.len())
+            .field(
+                "filters",
+                &self.filters.values().map(|m| m.len()).sum::<usize>(),
+            )
             .finish_non_exhaustive()
     }
 }
@@ -644,69 +665,27 @@ impl<'a> BaselinePlanner<'a> {
         columns: &[String],
         policy: FingerprintPolicy,
     ) -> ReplayResult<Self> {
-        let schema = catalog.schema();
         let mut filters = BTreeMap::new();
-        for (fi, fp) in catalog.files().iter().enumerate() {
-            let wanted: Vec<(usize, &String)> = catalog
-                .row_groups()
-                .iter()
-                .enumerate()
-                .filter(|(_, rg)| rg.file == fi)
-                .flat_map(|(pos, rg)| {
-                    columns.iter().filter_map(move |c| {
-                        stats_of(&rg.meta.stats, c)
-                            .is_some_and(|s| s.has_bloom)
-                            .then_some((pos, c))
-                    })
-                })
-                .collect();
-            if wanted.is_empty() {
-                continue;
-            }
-            let reader = open_verified(fp, policy)?;
-            let options = ReadOptionsBuilder::new()
-                .with_reader_properties(
-                    ReaderProperties::builder()
-                        .set_read_bloom_filter(true)
-                        .build(),
-                )
-                .build();
-            let file = SerializedFileReader::new_with_options(reader, options)
-                .map_err(|e| Error::Source(format!("{}: {e}", fp.path)))?;
-            let descr = file.metadata().file_metadata().schema_descr_ptr();
-            for (pos, column) in wanted {
-                let refuse = |why: String| ReplayError::UnprobeableFilter {
-                    file: fp.path.clone(),
-                    column: column.clone(),
-                    why,
-                };
-                let ci = (0..descr.num_columns())
-                    .find(|&i| descr.column(i).path().parts() == [column.as_str()])
-                    .ok_or_else(|| refuse("the filter is not on a top-level column".into()))?;
-                let dataset = dataset_type(schema, column)?;
-                let conv = conversion(&dataset, &descr.column(ci)).map_err(refuse)?;
-                let index = catalog.row_groups()[pos].meta.index_in_file as usize;
-                let rg = file
-                    .get_row_group(index)
-                    .map_err(|e| Error::Source(format!("{}: {e}", fp.path)))?;
-                let filter = rg.get_column_bloom_filter(ci).ok_or_else(|| {
-                    refuse("the footer declares a filter that could not be read".into())
-                })?;
-                filters.insert(
-                    (pos, column.clone()),
-                    Embedded {
-                        filter: filter.clone(),
-                        conversion: conv,
-                        dataset,
-                    },
-                );
+        for column in columns {
+            if !filters.contains_key(column) {
+                let loaded = column_filters(catalog, column, policy)?;
+                filters.insert(column.clone(), Arc::new(loaded));
             }
         }
-        Ok(Self {
+        Ok(Self::parquet_stats_with(catalog, filters))
+    }
+
+    /// The Parquet-statistics baseline over filters already read by
+    /// [`column_filters`], one entry per key column a run may name.
+    pub(crate) fn parquet_stats_with(
+        catalog: &'a Catalog,
+        filters: BTreeMap<String, Arc<ColumnFilters>>,
+    ) -> Self {
+        Self {
             catalog,
             kind: Baseline::ParquetStats,
             filters,
-        })
+        }
     }
 
     /// The baseline.
@@ -722,19 +701,39 @@ impl<'a> BaselinePlanner<'a> {
         let window = window
             .map(|w| EncodedWindow::new(self.catalog.schema(), w))
             .transpose()?;
-        let all: Vec<usize> = (0..keys.columns().len()).collect();
-        let selected = if keys.is_empty() {
-            RoaringBitmap::new()
-        } else {
-            match self.kind {
-                Baseline::RawScan => self.catalog.all_ids(),
-                Baseline::ParquetStats => self.stats_selection(keys, &all, window.as_ref())?,
-            }
-        };
+        let selected = self.selection(keys, window.as_ref())?;
         let plan = self.catalog.plan_for(&selected)?;
         Ok(with_residual(plan, keys, window.as_ref()))
     }
 
+    /// The ids of the row groups [`BaselinePlanner::plan`] reads.
+    pub(crate) fn select(
+        &self,
+        keys: &RunKeys,
+        window: Option<&RunWindow>,
+    ) -> ReplayResult<RoaringBitmap> {
+        let window = window
+            .map(|w| EncodedWindow::new(self.catalog.schema(), w))
+            .transpose()?;
+        self.selection(keys, window.as_ref())
+    }
+
+    fn selection(
+        &self,
+        keys: &RunKeys,
+        window: Option<&EncodedWindow>,
+    ) -> ReplayResult<RoaringBitmap> {
+        if keys.is_empty() {
+            return Ok(RoaringBitmap::new());
+        }
+        match self.kind {
+            Baseline::RawScan => Ok(self.catalog.all_ids()),
+            Baseline::ParquetStats => {
+                let all: Vec<usize> = (0..keys.columns().len()).collect();
+                self.stats_selection(keys, &all, window)
+            }
+        }
+    }
     fn stats_selection(
         &self,
         keys: &RunKeys,
@@ -760,7 +759,7 @@ impl<'a> BaselinePlanner<'a> {
             let filters: Vec<Option<&Embedded>> = keys
                 .columns()
                 .iter()
-                .map(|c| self.filters.get(&(pos, c.clone())))
+                .map(|c| self.filters.get(c).and_then(|m| m.get(&pos)))
                 .collect();
             'tuples: for i in 0..keys.len() {
                 for probe_bytes in keys.probes(i, all) {
@@ -796,6 +795,73 @@ impl<'a> BaselinePlanner<'a> {
             .into()),
         }
     }
+}
+
+/// Every embedded bloom filter of `column` in the catalog, by row-group
+/// position: each file that declares one (`ColumnStats::has_bloom`) is
+/// opened once, its fingerprint verified under `policy` on the opened
+/// handle first. A declared filter that cannot be probed exactly, or
+/// cannot be read, is a [`ReplayError::UnprobeableFilter`].
+pub(crate) fn column_filters(
+    catalog: &Catalog,
+    column: &str,
+    policy: FingerprintPolicy,
+) -> ReplayResult<ColumnFilters> {
+    let schema = catalog.schema();
+    let mut filters = ColumnFilters::new();
+    for (fi, fp) in catalog.files().iter().enumerate() {
+        let wanted: Vec<usize> = catalog
+            .row_groups()
+            .iter()
+            .enumerate()
+            .filter(|(_, rg)| {
+                rg.file == fi && stats_of(&rg.meta.stats, column).is_some_and(|s| s.has_bloom)
+            })
+            .map(|(pos, _)| pos)
+            .collect();
+        if wanted.is_empty() {
+            continue;
+        }
+        let refuse = |why: String| ReplayError::UnprobeableFilter {
+            file: fp.path.clone(),
+            column: column.to_string(),
+            why,
+        };
+        let reader = open_verified(fp, policy)?;
+        let options = ReadOptionsBuilder::new()
+            .with_reader_properties(
+                ReaderProperties::builder()
+                    .set_read_bloom_filter(true)
+                    .build(),
+            )
+            .build();
+        let file = SerializedFileReader::new_with_options(reader, options)
+            .map_err(|e| Error::Source(format!("{}: {e}", fp.path)))?;
+        let descr = file.metadata().file_metadata().schema_descr_ptr();
+        let ci = (0..descr.num_columns())
+            .find(|&i| descr.column(i).path().parts() == [column])
+            .ok_or_else(|| refuse("the filter is not on a top-level column".into()))?;
+        let dataset = dataset_type(schema, column)?;
+        let conv = conversion(&dataset, &descr.column(ci)).map_err(refuse)?;
+        for pos in wanted {
+            let index = catalog.row_groups()[pos].meta.index_in_file as usize;
+            let rg = file
+                .get_row_group(index)
+                .map_err(|e| Error::Source(format!("{}: {e}", fp.path)))?;
+            let filter = rg.get_column_bloom_filter(ci).ok_or_else(|| {
+                refuse("the footer declares a filter that could not be read".into())
+            })?;
+            filters.insert(
+                pos,
+                Embedded {
+                    filter: filter.clone(),
+                    conversion: conv,
+                    dataset: dataset.clone(),
+                },
+            );
+        }
+    }
+    Ok(filters)
 }
 
 fn dataset_type(schema: &Schema, column: &str) -> ReplayResult<DataType> {

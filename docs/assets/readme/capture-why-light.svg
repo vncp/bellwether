@@ -1,7 +1,7 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 1026" width="1000" height="1026" role="img" aria-labelledby="title desc">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 1080" width="1000" height="1080" role="img" aria-labelledby="title desc">
 <title id="title">bellwether why</title>
-<desc id="desc">bellwether why on the bench ledger corpus (bench generate --seed 42: 16 files, 64 row groups, 128,000 rows; bench workload: 12 recorded runs), nothing indexed; debug build of eca48d1, 2026-10-26.</desc>
-<rect x="0.5" y="0.5" width="999" height="1025" rx="10" fill="#f6f8fa" stroke="#d0d7de"/>
+<desc id="desc">bellwether why on the bench ledger corpus (bench generate --seed 42: 16 files, 64 row groups, 128,000 rows; bench workload: 12 recorded runs), nothing indexed; debug build of 79ab8ec, 2026-10-26.</desc>
+<rect x="0.5" y="0.5" width="999" height="1079" rx="10" fill="#f6f8fa" stroke="#d0d7de"/>
 <path d="M0.5 40V10.5a10 10 0 0 1 10-10H989.5a10 10 0 0 1 10 10V40Z" fill="#eaeef2"/>
 <line x1="0.5" y1="40" x2="999.5" y2="40" stroke="#d0d7de"/>
 <circle cx="22" cy="20.0" r="5.5" fill="#d0d7de"/>
@@ -11,51 +11,54 @@
 <g font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="13" fill="#1f2328">
 <text x="24.0" y="77" textLength="405.6" lengthAdjust="spacing" xml:space="preserve" style="white-space:pre"><tspan fill="#1a7f37">$ </tspan><tspan fill="#0969da">bellwether why ledger/data --bench-workload ledger</tspan></text>
 <text x="24.0" y="95" textLength="460.2" lengthAdjust="spacing" xml:space="preserve" style="white-space:pre"><tspan font-weight="700">why /private/tmp/bellwether-readme/ledger/data: not indexed</tspan></text>
-<text x="24.0" y="113" textLength="780.0" lengthAdjust="spacing" xml:space="preserve" style="white-space:pre">funnel: 12 run(s), keys p50/p95/max 20/400/400; exact sums of row-group statistics, summed over runs</text>
+<text x="24.0" y="113" textLength="764.4" lengthAdjust="spacing" xml:space="preserve" style="white-space:pre">funnel: 12 runs, keys p50/p95/max 20/400/400; exact sums of row-group statistics, summed over runs</text>
 <text x="343.8" y="131" textLength="288.6" lengthAdjust="spacing" xml:space="preserve" style="white-space:pre">files   row groups              bytes</text>
 <text x="39.6" y="149" textLength="787.8" lengthAdjust="spacing" xml:space="preserve" style="white-space:pre">dataset                                   16           64         19,308,862    19.3 MB  128,000 rows</text>
-<text x="39.6" y="167" textLength="678.6" lengthAdjust="spacing" xml:space="preserve" style="white-space:pre">current (no index)                       192          768        231,706,344   231.7 MB</text>
-<text x="39.6" y="185" textLength="928.2" lengthAdjust="spacing" xml:space="preserve" style="white-space:pre">exact:entity_id                          108          432        130,336,047   130.3 MB  floor: only row groups holding</text>
-<text x="70.8" y="203" textLength="140.4" lengthAdjust="spacing" xml:space="preserve" style="white-space:pre">a key, recommended</text>
-<text x="24.0" y="239" textLength="951.6" lengthAdjust="spacing" xml:space="preserve" style="white-space:pre">culprit (entity_id): no index serves this lookup, so it reads every row group; one value touches 1 / 2 / 4 files and 4 / 8</text>
-<text x="55.2" y="257" textLength="257.4" lengthAdjust="spacing" xml:space="preserve" style="white-space:pre">/ 16 row groups (p50 / p95 / max)</text>
-<text x="24.0" y="275" textLength="756.6" lengthAdjust="spacing" xml:space="preserve" style="white-space:pre">recommended: exact:entity_id reads 130,336,047 bytes (130.3 MB) instead of 231,706,344 (231.7 MB)</text>
-<text x="39.6" y="293" textLength="608.4" lengthAdjust="spacing" xml:space="preserve" style="white-space:pre">apply it: bellwether fix /private/tmp/bellwether-readme/ledger/data --proposal</text>
-<text x="70.8" y="311" textLength="585.0" lengthAdjust="spacing" xml:space="preserve" style="white-space:pre">f52bf7e5852394996831f0cdb90ead9ce6af7c36c8dd141d714e312272779e29 --workload</text>
-<text x="70.8" y="329" textLength="499.2" lengthAdjust="spacing" xml:space="preserve" style="white-space:pre">3a1921721b730b1ea76a1933a0cb7cccae1f2d7f1cd90a2ebfd34228807cb842</text>
-<text x="24.0" y="365" textLength="491.4" lengthAdjust="spacing" xml:space="preserve" style="white-space:pre">fanout: files and row groups one value touches, p50 / p95 / max</text>
-<text x="39.6" y="383" textLength="803.4" lengthAdjust="spacing" xml:space="preserve" style="white-space:pre">key                                      distinct  files/value            row groups/value       sample</text>
-<text x="39.6" y="401" textLength="795.6" lengthAdjust="spacing" xml:space="preserve" style="white-space:pre">entity_id                                   6,855  1 / 2 / 4              4 / 8 / 16             exact</text>
-<text x="39.6" y="419" textLength="795.6" lengthAdjust="spacing" xml:space="preserve" style="white-space:pre">batch_id                                      288  4 / 4 / 4              4 / 4 / 4              exact</text>
-<text x="39.6" y="437" textLength="795.6" lengthAdjust="spacing" xml:space="preserve" style="white-space:pre">status                                          5  16 / 16 / 16           64 / 64 / 64           exact</text>
-<text x="39.6" y="455" textLength="795.6" lengthAdjust="spacing" xml:space="preserve" style="white-space:pre">payload                                   128,000  1 / 1 / 1              1 / 1 / 1              exact</text>
-<text x="39.6" y="473" textLength="795.6" lengthAdjust="spacing" xml:space="preserve" style="white-space:pre">entity_id, batch_id                       128,000  1 / 1 / 1              1 / 1 / 1              exact</text>
-<text x="39.6" y="491" textLength="795.6" lengthAdjust="spacing" xml:space="preserve" style="white-space:pre">entity_id, payload                        128,000  1 / 1 / 1              1 / 1 / 1              exact</text>
-<text x="39.6" y="509" textLength="795.6" lengthAdjust="spacing" xml:space="preserve" style="white-space:pre">batch_id, payload                         128,000  1 / 1 / 1              1 / 1 / 1              exact</text>
-<text x="39.6" y="527" textLength="795.6" lengthAdjust="spacing" xml:space="preserve" style="white-space:pre">status, payload                           128,000  1 / 1 / 1              1 / 1 / 1              exact</text>
-<text x="39.6" y="545" textLength="795.6" lengthAdjust="spacing" xml:space="preserve" style="white-space:pre">entity_id, status                          24,057  1 / 2 / 4              3 / 7 / 16             exact</text>
-<text x="39.6" y="563" textLength="795.6" lengthAdjust="spacing" xml:space="preserve" style="white-space:pre">batch_id, status                            1,438  4 / 4 / 4              4 / 4 / 4              exact</text>
-<text x="39.6" y="581" textLength="117.0" lengthAdjust="spacing" xml:space="preserve" style="white-space:pre">not candidates:</text>
-<text x="55.2" y="599" textLength="585.0" lengthAdjust="spacing" xml:space="preserve" style="white-space:pre">version_ts: Timestamp(µs, &quot;UTC&quot;): a time column, analyzed for range overlap</text>
-<text x="55.2" y="617" textLength="382.2" lengthAdjust="spacing" xml:space="preserve" style="white-space:pre">amount: Decimal128(18, 2): not an identifier type</text>
-<text x="24.0" y="653" textLength="39.0" lengthAdjust="spacing" xml:space="preserve" style="white-space:pre">lints</text>
-<text x="39.6" y="671" textLength="241.8" lengthAdjust="spacing" xml:space="preserve" style="white-space:pre">batch_stamp_key [batch_id] 0.90</text>
-<text x="55.2" y="689" textLength="897.0" lengthAdjust="spacing" xml:space="preserve" style="white-space:pre">batch_id looks like an id but behaves like a write-batch stamp: it rises with version_ts across days, and one value</text>
-<text x="86.4" y="707" textLength="873.6" lengthAdjust="spacing" xml:space="preserve" style="white-space:pre">touches 4 of 16 files and 4 row groups at the median, against 1 for (entity_id, batch_id), so look up or join on</text>
-<text x="86.4" y="725" textLength="405.6" lengthAdjust="spacing" xml:space="preserve" style="white-space:pre">(entity_id, batch_id) or on entity_id alone instead.</text>
-<text x="39.6" y="743" textLength="335.4" lengthAdjust="spacing" xml:space="preserve" style="white-space:pre">low_selectivity_single_column [status] 0.60</text>
-<text x="55.2" y="761" textLength="865.8" lengthAdjust="spacing" xml:space="preserve" style="white-space:pre">As a single-column key status prunes almost nothing: its median value touches 64 of 64 row groups (100%), while</text>
-<text x="86.4" y="779" textLength="647.4" lengthAdjust="spacing" xml:space="preserve" style="white-space:pre">(entity_id, status) touches at most 7 at p95, so index (entity_id, status) instead.</text>
-<text x="39.6" y="797" textLength="304.2" lengthAdjust="spacing" xml:space="preserve" style="white-space:pre">scattered_time_column [version_ts] 0.60</text>
-<text x="55.2" y="815" textLength="920.4" lengthAdjust="spacing" xml:space="preserve" style="white-space:pre">version_ts is out of order: a point in time falls inside 27.8 row-group ranges on average, and only 25% of consecutive</text>
-<text x="86.4" y="833" textLength="889.2" lengthAdjust="spacing" xml:space="preserve" style="white-space:pre">row groups in a file ascend without overlapping, so range pruning on version_ts reads far more than it needs; sort</text>
-<text x="86.4" y="851" textLength="413.4" lengthAdjust="spacing" xml:space="preserve" style="white-space:pre">or cluster each partition by version_ts when writing.</text>
-<text x="24.0" y="887" textLength="54.6" lengthAdjust="spacing" xml:space="preserve" style="white-space:pre">records</text>
-<text x="39.6" y="905" textLength="577.2" lengthAdjust="spacing" xml:space="preserve" style="white-space:pre">evidence  93f6ac80e866f90e8dbaffba3c9cc18936358012dae901b4662d9b1836d399da</text>
-<text x="39.6" y="923" textLength="577.2" lengthAdjust="spacing" xml:space="preserve" style="white-space:pre">workload  3a1921721b730b1ea76a1933a0cb7cccae1f2d7f1cd90a2ebfd34228807cb842</text>
-<text x="39.6" y="941" textLength="873.6" lengthAdjust="spacing" xml:space="preserve" style="white-space:pre">proposal  f52bf7e5852394996831f0cdb90ead9ce6af7c36c8dd141d714e312272779e29  replay 00904c20dd44  exact:entity_id</text>
+<text x="39.6" y="167" textLength="904.8" lengthAdjust="spacing" xml:space="preserve" style="white-space:pre">unindexed (full scan)                    192          768        231,706,344   231.7 MB  context: what a reader that</text>
+<text x="70.8" y="185" textLength="148.2" lengthAdjust="spacing" xml:space="preserve" style="white-space:pre">skips nothing reads</text>
+<text x="39.6" y="203" textLength="897.0" lengthAdjust="spacing" xml:space="preserve" style="white-space:pre">unindexed (min/max pruning)              111          444        133,956,413   134.0 MB  what the files' own footer</text>
+<text x="70.8" y="221" textLength="444.6" lengthAdjust="spacing" xml:space="preserve" style="white-space:pre">statistics skip to without an index; a key must read less</text>
+<text x="39.6" y="239" textLength="928.2" lengthAdjust="spacing" xml:space="preserve" style="white-space:pre">exact:entity_id                          108          432        130,336,047   130.3 MB  floor: only row groups holding</text>
+<text x="70.8" y="257" textLength="140.4" lengthAdjust="spacing" xml:space="preserve" style="white-space:pre">a key, recommended</text>
+<text x="24.0" y="293" textLength="928.2" lengthAdjust="spacing" xml:space="preserve" style="white-space:pre">culprit (entity_id): no key index serves this lookup; the files' own min/max statistics already narrow it to 444 of the</text>
+<text x="55.2" y="311" textLength="834.6" lengthAdjust="spacing" xml:space="preserve" style="white-space:pre">768 row groups the runs span; one value touches 1 / 2 / 4 files and 4 / 8 / 16 row groups (p50 / p95 / max)</text>
+<text x="24.0" y="329" textLength="920.4" lengthAdjust="spacing" xml:space="preserve" style="white-space:pre">recommended: exact:entity_id reads 130,336,047 bytes (130.3 MB) instead of 133,956,413 (134.0 MB) with min/max pruning</text>
+<text x="39.6" y="347" textLength="608.4" lengthAdjust="spacing" xml:space="preserve" style="white-space:pre">apply it: bellwether fix /private/tmp/bellwether-readme/ledger/data --proposal</text>
+<text x="70.8" y="365" textLength="585.0" lengthAdjust="spacing" xml:space="preserve" style="white-space:pre">9f3f305b4851845769dbe8b83403906582854c39e76089dc70d20294c5249c18 --workload</text>
+<text x="70.8" y="383" textLength="499.2" lengthAdjust="spacing" xml:space="preserve" style="white-space:pre">3a1921721b730b1ea76a1933a0cb7cccae1f2d7f1cd90a2ebfd34228807cb842</text>
+<text x="24.0" y="419" textLength="491.4" lengthAdjust="spacing" xml:space="preserve" style="white-space:pre">fanout: files and row groups one value touches, p50 / p95 / max</text>
+<text x="39.6" y="437" textLength="803.4" lengthAdjust="spacing" xml:space="preserve" style="white-space:pre">key                                      distinct  files/value            row groups/value       sample</text>
+<text x="39.6" y="455" textLength="795.6" lengthAdjust="spacing" xml:space="preserve" style="white-space:pre">entity_id                                   6,855  1 / 2 / 4              4 / 8 / 16             exact</text>
+<text x="39.6" y="473" textLength="795.6" lengthAdjust="spacing" xml:space="preserve" style="white-space:pre">batch_id                                      288  4 / 4 / 4              4 / 4 / 4              exact</text>
+<text x="39.6" y="491" textLength="795.6" lengthAdjust="spacing" xml:space="preserve" style="white-space:pre">status                                          5  16 / 16 / 16           64 / 64 / 64           exact</text>
+<text x="39.6" y="509" textLength="795.6" lengthAdjust="spacing" xml:space="preserve" style="white-space:pre">payload                                   128,000  1 / 1 / 1              1 / 1 / 1              exact</text>
+<text x="39.6" y="527" textLength="795.6" lengthAdjust="spacing" xml:space="preserve" style="white-space:pre">entity_id, batch_id                       128,000  1 / 1 / 1              1 / 1 / 1              exact</text>
+<text x="39.6" y="545" textLength="795.6" lengthAdjust="spacing" xml:space="preserve" style="white-space:pre">entity_id, payload                        128,000  1 / 1 / 1              1 / 1 / 1              exact</text>
+<text x="39.6" y="563" textLength="795.6" lengthAdjust="spacing" xml:space="preserve" style="white-space:pre">batch_id, payload                         128,000  1 / 1 / 1              1 / 1 / 1              exact</text>
+<text x="39.6" y="581" textLength="795.6" lengthAdjust="spacing" xml:space="preserve" style="white-space:pre">status, payload                           128,000  1 / 1 / 1              1 / 1 / 1              exact</text>
+<text x="39.6" y="599" textLength="795.6" lengthAdjust="spacing" xml:space="preserve" style="white-space:pre">entity_id, status                          24,057  1 / 2 / 4              3 / 7 / 16             exact</text>
+<text x="39.6" y="617" textLength="795.6" lengthAdjust="spacing" xml:space="preserve" style="white-space:pre">batch_id, status                            1,438  4 / 4 / 4              4 / 4 / 4              exact</text>
+<text x="39.6" y="635" textLength="117.0" lengthAdjust="spacing" xml:space="preserve" style="white-space:pre">not candidates:</text>
+<text x="55.2" y="653" textLength="585.0" lengthAdjust="spacing" xml:space="preserve" style="white-space:pre">version_ts: Timestamp(µs, &quot;UTC&quot;): a time column, analyzed for range overlap</text>
+<text x="55.2" y="671" textLength="382.2" lengthAdjust="spacing" xml:space="preserve" style="white-space:pre">amount: Decimal128(18, 2): not an identifier type</text>
+<text x="24.0" y="707" textLength="39.0" lengthAdjust="spacing" xml:space="preserve" style="white-space:pre">lints</text>
+<text x="39.6" y="725" textLength="241.8" lengthAdjust="spacing" xml:space="preserve" style="white-space:pre">batch_stamp_key [batch_id] 0.90</text>
+<text x="55.2" y="743" textLength="897.0" lengthAdjust="spacing" xml:space="preserve" style="white-space:pre">batch_id looks like an id but behaves like a write-batch stamp: it rises with version_ts across days, and one value</text>
+<text x="86.4" y="761" textLength="873.6" lengthAdjust="spacing" xml:space="preserve" style="white-space:pre">touches 4 of 16 files and 4 row groups at the median, against 1 for (entity_id, batch_id), so look up or join on</text>
+<text x="86.4" y="779" textLength="405.6" lengthAdjust="spacing" xml:space="preserve" style="white-space:pre">(entity_id, batch_id) or on entity_id alone instead.</text>
+<text x="39.6" y="797" textLength="335.4" lengthAdjust="spacing" xml:space="preserve" style="white-space:pre">low_selectivity_single_column [status] 0.60</text>
+<text x="55.2" y="815" textLength="865.8" lengthAdjust="spacing" xml:space="preserve" style="white-space:pre">As a single-column key status prunes almost nothing: its median value touches 64 of 64 row groups (100%), while</text>
+<text x="86.4" y="833" textLength="647.4" lengthAdjust="spacing" xml:space="preserve" style="white-space:pre">(entity_id, status) touches at most 7 at p95, so index (entity_id, status) instead.</text>
+<text x="39.6" y="851" textLength="304.2" lengthAdjust="spacing" xml:space="preserve" style="white-space:pre">scattered_time_column [version_ts] 0.60</text>
+<text x="55.2" y="869" textLength="920.4" lengthAdjust="spacing" xml:space="preserve" style="white-space:pre">version_ts is out of order: a point in time falls inside 27.8 row-group ranges on average, and only 25% of consecutive</text>
+<text x="86.4" y="887" textLength="889.2" lengthAdjust="spacing" xml:space="preserve" style="white-space:pre">row groups in a file ascend without overlapping, so range pruning on version_ts reads far more than it needs; sort</text>
+<text x="86.4" y="905" textLength="413.4" lengthAdjust="spacing" xml:space="preserve" style="white-space:pre">or cluster each partition by version_ts when writing.</text>
+<text x="24.0" y="941" textLength="54.6" lengthAdjust="spacing" xml:space="preserve" style="white-space:pre">records</text>
+<text x="39.6" y="959" textLength="577.2" lengthAdjust="spacing" xml:space="preserve" style="white-space:pre">evidence  fe47da9f877b6bc9433ccb569b18074f0b17fa4a86f60007981c35e8075d1e04</text>
+<text x="39.6" y="977" textLength="577.2" lengthAdjust="spacing" xml:space="preserve" style="white-space:pre">workload  3a1921721b730b1ea76a1933a0cb7cccae1f2d7f1cd90a2ebfd34228807cb842</text>
+<text x="39.6" y="995" textLength="873.6" lengthAdjust="spacing" xml:space="preserve" style="white-space:pre">proposal  9f3f305b4851845769dbe8b83403906582854c39e76089dc70d20294c5249c18  replay 3caf79c959ac  exact:entity_id</text>
 </g>
-<line x1="24" y1="966" x2="976" y2="966" stroke="#d0d7de"/>
-<text x="24" y="988" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" font-style="italic" fill="#656d76">bellwether why on the bench ledger corpus (bench generate --seed 42: 16 files, 64 row groups, 128,000 rows; bench workload: 12 recorded runs), nothing</text>
-<text x="24" y="1005" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" font-style="italic" fill="#656d76">indexed; debug build of eca48d1, 2026-10-26.</text>
+<line x1="24" y1="1020" x2="976" y2="1020" stroke="#d0d7de"/>
+<text x="24" y="1042" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" font-style="italic" fill="#656d76">bellwether why on the bench ledger corpus (bench generate --seed 42: 16 files, 64 row groups, 128,000 rows; bench workload: 12 recorded runs), nothing</text>
+<text x="24" y="1059" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" font-style="italic" fill="#656d76">indexed; debug build of 79ab8ec, 2026-10-26.</text>
 </svg>

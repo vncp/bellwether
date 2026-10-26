@@ -23,7 +23,7 @@ use bellwether::{
     Engine, EngineOptions, FixOutcome, FixRequest, FixResult, KeyFile, RecordKind, SigningKey,
     TrustedKey, TrustedKeys, Verdict, WhyRequest,
 };
-use common::{ledger_corpus, write_keys};
+use common::{scattered_corpus, write_keys};
 
 const CLOCK: &str = "2026-10-25T12:00:00.000Z";
 const SEED: [u8; 32] = [42; 32];
@@ -61,7 +61,7 @@ fn open(data: &Path, signing_key: Option<SigningKey>, trusted: Option<TrustedKey
 /// workload from `why`.
 fn corpus(dir: &Path) -> (PathBuf, Hash, Hash) {
     let data = dir.join("data");
-    ledger_corpus(&data, 3, 4, 25, 400);
+    scattered_corpus(&data, 3, 4, 25, 400);
     let kf = dir.join("k.parquet");
     write_keys(&kf, "id", &[5, 77, 123]);
     let (p, wl) = why_of(&data, &kf);

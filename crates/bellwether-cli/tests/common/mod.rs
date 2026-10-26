@@ -24,6 +24,22 @@ pub fn bw() -> Command {
 /// `files` files × `rgs` row groups × `rows` rows; row `k` has id
 /// `k % entities`, batch `k / 50`, ts `k` seconds, payload `p<k>`.
 pub fn corpus(dir: &Path, files: usize, rgs: usize, rows: usize, entities: i64) {
+    corpus_with(dir, files, rgs, rows, |k| k % entities);
+}
+
+/// [`corpus`] with row `k`'s id `(k * 37) % entities`: consecutive rows get
+/// ids far apart, so every row group's id range spans nearly the whole key
+/// space and the files' own min/max statistics skip nothing for a point
+/// lookup. The loop tests use it: on ids sorted into row groups, min/max
+/// pruning already reads what `exact:id` would, so `why` recommends nothing
+/// and `fix` refuses `nothing_to_gain`. `entities` must not be a multiple
+/// of 37.
+pub fn scattered(dir: &Path, files: usize, rgs: usize, rows: usize, entities: i64) {
+    assert_ne!(entities % 37, 0, "37 must not divide entities");
+    corpus_with(dir, files, rgs, rows, |k| (k * 37) % entities);
+}
+
+fn corpus_with(dir: &Path, files: usize, rgs: usize, rows: usize, id: impl Fn(i64) -> i64) {
     std::fs::create_dir_all(dir).unwrap();
     let schema = Arc::new(Schema::new(vec![
         Field::new("id", DataType::Int64, false),
@@ -49,9 +65,7 @@ pub fn corpus(dir: &Path, files: usize, rgs: usize, rows: usize, entities: i64) 
             let batch = RecordBatch::try_new(
                 Arc::clone(&schema),
                 vec![
-                    Arc::new(Int64Array::from_iter_values(
-                        ks.iter().map(|k| k % entities),
-                    )) as ArrayRef,
+                    Arc::new(Int64Array::from_iter_values(ks.iter().map(|k| id(*k)))) as ArrayRef,
                     Arc::new(Int64Array::from_iter_values(ks.iter().map(|k| k / 50))),
                     Arc::new(
                         TimestampMicrosecondArray::from_iter_values(

@@ -22,8 +22,8 @@ use std::path::{Path, PathBuf};
 
 use bellwether_mcp::{Budget, Status};
 use common::{
-    code, delta, finish, json, ledger_corpus, objects, ok, server, server_at, write_file,
-    write_keys, CLOCKS,
+    code, delta, finish, json, ledger_corpus, objects, ok, scattered_corpus, server, server_at,
+    write_file, write_keys, CLOCKS,
 };
 use serde_json::{json, Value};
 
@@ -37,7 +37,7 @@ struct Loop {
 fn folder() -> Loop {
     let dir = tempfile::tempdir().unwrap();
     let data = dir.path().join("data");
-    ledger_corpus(&data, 3, 4, 25, 400);
+    scattered_corpus(&data, 3, 4, 25, 400);
     let keys = dir.path().join("k.parquet");
     write_keys(&keys, "id", &[5, 77, 123]);
     Loop {
