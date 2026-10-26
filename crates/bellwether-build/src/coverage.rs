@@ -91,7 +91,7 @@ pub(crate) fn is_complete(manifest: &Manifest, name: &str, live: &RoaringBitmap)
 /// `bloom:id@0.01` and `bloom:id@0.05` never share an entry), and its live
 /// segments cover every live row group; for a join key (B3), also every
 /// one of its segments pins the manifest's live row-group set
-/// ([`join_pins_live`]), so a left file removed (row groups retired, none
+/// (`segments[].join.left_live`), so a left file removed (row groups retired, none
 /// added, coverage intact) leaves it incomplete. Coverage is recomputed
 /// here rather than trusted, so a manifest edited by another writer cannot
 /// make a partial spec look complete.
