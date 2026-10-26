@@ -343,6 +343,12 @@ impl RunKeysBuilder {
                     )))
                 }
             };
+            // A list (or map) column's run values are its elements (B4):
+            // they encode at the element type.
+            let dt = match bellwether_core::list::element_type(&dt) {
+                Some(_) => bellwether_core::list::check_list_column(c, &dt)?,
+                None => dt,
+            };
             key_types.push(
                 ColumnType::of(&dt)
                     .map_err(|e| Error::KeySpec(format!("key column {c:?}: {e}")))?,

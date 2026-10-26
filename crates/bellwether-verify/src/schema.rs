@@ -159,6 +159,16 @@ pub(crate) enum RowTest {
         cols: Vec<(String, usize)>,
         values: HashSet<Vec<u8>>,
     },
+    /// The list in `col` holds an element in `values` (B4).
+    ContainsAny {
+        col: usize,
+        values: HashSet<Vec<u8>>,
+    },
+    /// The list in `col` holds, for every group, an element in it (B4).
+    ContainsAll {
+        col: usize,
+        groups: Vec<HashSet<Vec<u8>>>,
+    },
 }
 
 impl RowTest {
@@ -221,7 +231,7 @@ impl RowTest {
             | Predicate::WindowPartition { .. } => {
                 return Err(VerifyError::InvalidSpec(
                     "a row filter holds only the residual of a lookup (in, between, \
-                     not-older-than, latest-per-key); a semi-join, join, or window partition \
+                     not-older-than, latest-per-key, contains-any, contains-all); a semi-join, join, or window partition \
                      is priced by replay and cannot filter the rows a reconciliation compares"
                         .into(),
                 ))
@@ -237,6 +247,14 @@ impl RowTest {
                     .iter()
                     .map(|v| bellwether_core::text::fold(v))
                     .collect(),
+            },
+            Predicate::ContainsAny { column, values } => Self::ContainsAny {
+                col: index(column),
+                values: values.iter().cloned().collect(),
+            },
+            Predicate::ContainsAll { column, values } => Self::ContainsAll {
+                col: index(column),
+                groups: values.iter().map(|g| g.iter().cloned().collect()).collect(),
             },
         })
     }
@@ -302,15 +320,43 @@ impl RowTest {
                     .encode_row(&named, row)?
                     .is_some_and(|v| values.contains(&v))
             }
+            Self::ContainsAny { col, values } => {
+                let elements = list_elements(cols[*col], &types[*col], row)?;
+                elements.iter().any(|e| values.contains(e))
+            }
+            Self::ContainsAll { col, groups } => {
+                let elements = list_elements(cols[*col], &types[*col], row)?;
+                groups
+                    .iter()
+                    .all(|g| elements.iter().any(|e| g.contains(e)))
+            }
         })
     }
+}
+
+/// The canonical element keys of row `row` of list column `array`, whose
+/// dataset type is `dt` (ADR 014: none for a null or empty list).
+fn list_elements(
+    array: &dyn Array,
+    dt: &DataType,
+    row: usize,
+) -> bellwether_types::Result<Vec<Vec<u8>>> {
+    let element = bellwether_core::list::element_type(dt).ok_or_else(|| {
+        bellwether_types::Error::KeySpec(format!(
+            "a membership test reads a list column; this column has type {dt}"
+        ))
+    })?;
+    bellwether_core::list::row_element_keys(array, row, element)
 }
 
 /// The columns `p` reads.
 fn predicate_columns(p: &Predicate, out: &mut Vec<String>) {
     match p {
         Predicate::In { columns, .. } => out.extend(columns.iter().cloned()),
-        Predicate::Between { column, .. } | Predicate::Text { column, .. } => {
+        Predicate::Between { column, .. }
+        | Predicate::Text { column, .. }
+        | Predicate::ContainsAny { column, .. }
+        | Predicate::ContainsAll { column, .. } => {
             out.push(column.clone());
         }
         Predicate::NotOlderThan {
@@ -350,7 +396,8 @@ impl Plan {
         let ignored: BTreeSet<&String> = spec.ignored_columns.iter().collect();
         let hashed_names = compared_columns(left, right, &ignored)?;
         let projection = projection(spec, left, right, &hashed_names)?;
-        let types = side_types(&projection, left, right)?;
+        let list_only = filter_only_columns(spec, &hashed_names);
+        let types = side_types(&projection, left, right, &list_only)?;
         let index = |c: &str| -> usize {
             projection
                 .iter()
@@ -542,8 +589,36 @@ fn projection(
         .collect())
 }
 
+/// The columns only the row filter reads: never hashed, keyed, versioned,
+/// totalled, or grouped by. A list column may be read this way, to test
+/// membership (a list key's residual, B4); its two sides must then share an
+/// element class.
+fn filter_only_columns(spec: &ReconcileSpec, hashed: &[String]) -> BTreeSet<String> {
+    let mut filtered: Vec<String> = Vec::new();
+    for p in spec.row_filter.iter().flatten() {
+        predicate_columns(p, &mut filtered);
+    }
+    filtered
+        .into_iter()
+        .filter(|c| {
+            !hashed.contains(c)
+                && !spec.key_columns.contains(c)
+                && spec.latest_by.as_ref() != Some(c)
+                && !spec.total_columns.iter().any(|t| &t.column == c)
+                && !spec.group_by.contains(c)
+        })
+        .collect()
+}
+
 /// Each side's dataset type per projected column, which must share a class.
-fn side_types(projection: &[String], left: &Schema, right: &Schema) -> Result<[Vec<DataType>; 2]> {
+/// A column in `list_only` (read only by a membership test) may instead be
+/// a list whose element types share a class on both sides.
+fn side_types(
+    projection: &[String],
+    left: &Schema,
+    right: &Schema,
+    list_only: &BTreeSet<String>,
+) -> Result<[Vec<DataType>; 2]> {
     let mut types: [Vec<DataType>; 2] = [Vec::new(), Vec::new()];
     for name in projection {
         let lt = left
@@ -554,8 +629,14 @@ fn side_types(projection: &[String], left: &Schema, right: &Schema) -> Result<[V
             .field_with_name(name)
             .map_err(|e| VerifyError::Schema(e.to_string()))?
             .data_type();
-        let lc = class(lt).map_err(|e| unsupported(name, lt, &e))?;
-        let rc = class(rt).map_err(|e| unsupported(name, rt, &e))?;
+        let of = |dt: &DataType| -> Result<Class> {
+            match bellwether_core::list::element_type(dt) {
+                Some(e) if list_only.contains(name) => class(e),
+                _ => class(dt),
+            }
+        };
+        let lc = of(lt).map_err(|e| unsupported(name, lt, &e))?;
+        let rc = of(rt).map_err(|e| unsupported(name, rt, &e))?;
         if lc != rc {
             return Err(VerifyError::Schema(format!(
                 "column {name:?} is {lt} on the left and {rt} on the right, which do not share a \

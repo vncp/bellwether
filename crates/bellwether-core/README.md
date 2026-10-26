@@ -145,6 +145,17 @@ footer     index_offset u64 | index_len u64 | checksum u64 | "BWSEGMNT"
   - `lookup_prefix_range(lo, hi)` selects keys whose leading columns lie between two prefixes, inclusive. This is `Between` on the leading column of a composite key.
 - **Temporal results are index-wide.** `temporal::latest` and `temporal::asof` fold every segment of the key spec with `VersionHit::combine`. `SegmentReader::latest` and `SegmentReader::asof` answer for one segment only. Ties are kept: a `VersionHit { ts, row_groups }` holds every row group with a version at the winning timestamp. A key whose versions all have null timestamps has no `latest`. `ts` and `asof`'s argument are in the dataset column's unit.
 
+## List keys (B4, `list:<column>`; `docs/format.md`, "List keys")
+
+`list` holds the inverted index over a list column: per distinct element (its canonical encoding at the dataset's element type), the row groups holding a row whose list contains it, in the exact layout unchanged. A column qualifies when it is a `List<T>` or `LargeList<T>` of a type with a canonical encoding, or a `Map<K, V>` by its keys (`list::check_list_column` says why anything else does not). `SegmentWriter` adds a row group's distinct elements; a null list, an empty list, and a null element add nothing (ADR 014); a duplicate element is one key.
+
+- `list::contains_any(readers, values)`: the union of each value's row groups over every segment of the key.
+- `list::contains_all(readers, groups)`: the intersection, one group per queried value (both encodings of a float zero in one group); no group at all is refused.
+- `list::distinct_elements(readers)`: the exact distinct elements over every segment, merged in key order so an element in several segments counts once; holds one block per segment. `why` reports it as the `list` column.
+- `list::row_element_keys(array, row, element)`: one row's element encodings, for the residual (`Predicate::ContainsAny` / `ContainsAll`).
+
+Tests (`tests/list.rs`): round trip, the pinned conformance vectors, nulls and empty lists, float zero and NaN, type conversion and refusals, an every-byte corruption sweep, and a property test of both lookups and `distinct_elements` against a brute-force oracle over random multi-segment layouts with duplicates.
+
 ## Lookup cost and memory bound (ADR 018)
 
 `SegmentReader::open` holds the header and the block index, which is two keys and five integers per block of up to 1024 keys. A keyed lookup of `k` keys:

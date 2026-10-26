@@ -204,6 +204,7 @@ Reproduce everything above, downloads included, with [`scripts/showcase.sh`](scr
 | `sketch` | `count(distinct col)`; "is this column a key" | `index --key sketch:col[,col][,a+b][,p=14][,minhash=K]` | never (approximate; read by `why`, `sketch cardinality`, `sketch overlap`) |
 | `expr` | a filter or join key that is a function of a column: a member of a JSON column, `lower`, `substr`, `cast`, `date_trunc`, `hash` | `index --key "expr:<name>=<expression>:exact"` (or `:exact,counts`, `:bloom@<fpr>`) | point lookups (`locate`) and, with counts, `count` by the same expression after normalization; any other expression is refused, never guessed |
 | `text` | `contains`, `like '%x%'`, `has`, prefix match on a string column, case-insensitive | `index --key text:col,tokenizer=words` (whole words, prefixes; exact row groups) or `text:col,tokenizer=trigram` (substrings; candidates, residual mandatory) | `locate --contains/--has/--prefix COL=TEXT`; priced by `why --contains/--has/--prefix`, proposed and receipted by `fix` ([funnels](docs/measured/2026-10-26-text.md)) |
+| `list` | array membership: `array_contains`, `has_any`, `has_all`, `exists(unnest)` over a `List`, `LargeList`, or a map's keys | `index --key list:col` | `locate --keys values.parquet --any\|--all`; priced by `why --mode contains-any\|contains-all` |
 
 ## How `fix` proves a change
 
@@ -299,7 +300,7 @@ The trust boundary at the wire: a proposal has no score field, so the input sche
 |---|---|---|---|---|---|
 | Runs | one process | inside the query engine | inside the Hudi writer and engine | inside ClickHouse | inside the database |
 | Granularity | row group | file (min/max) | file group or record | granule | row |
-| Key kinds | exact, bloom, range, temporal, sketch (approximate, never plans), expr, text | min/max statistics | bloom, record-level, column stats | minmax, set, bloom variants | B-tree |
+| Key kinds | exact, bloom, range, temporal, sketch (approximate, never plans), expr, text, list | min/max statistics | bloom, record-level, column stats | minmax, set, bloom variants | B-tree |
 | Composite keys | native, prefix seek | Z-order or clustering columns | record key | multi-column expressions | yes |
 | Latest / as-of | native over plain files | table time travel | incremental and point-in-time queries | no | via `ROW_NUMBER` scan |
 | Tells you which key to index | measured fanout + exact replay | no | no | no | estimated (what-if API) |

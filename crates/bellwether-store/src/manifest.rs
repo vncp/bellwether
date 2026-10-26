@@ -756,6 +756,9 @@ fn key_spec_fields(kind: &str, storage_version: u64) -> Option<&'static [&'stati
         "exact" => Some(&["kind", "columns"]),
         "bloom" => Some(&["kind", "columns", "fpr"]),
         "range" => Some(&["kind", "column"]),
+        // a list key (B4) is a storage version 2 kind: a version 1 build
+        // refuses a manifest declaring one
+        "list" if v2 => Some(&["kind", "column"]),
         "temporal" if v2 => Some(&["kind", "columns", "ts_column", "counts"]),
         "temporal" => Some(&["kind", "columns", "ts_column"]),
         // --- phase 5 kinds ---
@@ -1022,6 +1025,7 @@ mod tests {
                 tokenizer: bellwether_types::Tokenizer::Trigram,
                 bloom: Some(0.01),
             },
+            KeySpec::List { column: "a".into() },
         ];
         let mut kinds_seen = BTreeSet::new();
         for spec in &specs {
@@ -1034,7 +1038,8 @@ mod tests {
                 | KeySpec::Temporal { .. }
                 | KeySpec::Bitemporal { .. }
                 | KeySpec::Expr { .. }
-                | KeySpec::Text { .. } => {}
+                | KeySpec::Text { .. }
+                | KeySpec::List { .. } => {}
             }
             let v = serde_json::to_value(spec).unwrap();
             let kind = v["kind"].as_str().unwrap().to_string();
@@ -1181,6 +1186,45 @@ mod tests {
         expect_unsupported_shape(&with(
             &expr.replace("\"kind\": \"exact\"", "\"kind\": \"zorder\""),
         ));
+    }
+
+    /// A list key (B4) is a storage version 2 kind: a version 2 manifest
+    /// declaring it reads back as written, and a version 1 manifest
+    /// declaring it (what a version 1 build would be handed) is refused with
+    /// the typed unknown-kind error, never a serde error and never by
+    /// dropping the declaration on a rewrite; so is a list key with a field
+    /// this build does not know. The version 1 binary's own allow-list is
+    /// `key_spec_fields(_, 1)`, the one the M5 fixture was written under.
+    #[test]
+    fn a_list_key_is_a_storage_version_2_kind() {
+        let json = |version: u32| {
+            format!(
+                r#"{{"storage_version": {version}, "created_at": "x",
+                "schema": {{"key_specs": [{{"kind": "list", "column": "tags"}}]}}}}"#
+            )
+        };
+        let m = Manifest::from_slice(json(2).as_bytes()).unwrap();
+        assert_eq!(
+            m.schema.key_specs[0],
+            KeySpec::List {
+                column: "tags".into()
+            }
+        );
+        assert_eq!(m.schema.key_specs[0].name(), "list:tags");
+        let back: Value = serde_json::from_slice(&m.to_vec().unwrap()).unwrap();
+        assert_eq!(back["schema"]["key_specs"][0]["kind"], "list");
+        assert!(key_spec_fields("list", 1).is_none());
+        match Manifest::from_slice(json(1).as_bytes()) {
+            Err(Error::UnknownKind {
+                what: UNSUPPORTED_SHAPE,
+                ..
+            }) => {}
+            other => panic!("expected UnknownKind (shape), got {other:?}"),
+        }
+        expect_unsupported_shape(
+            r#"{"storage_version": 2, "created_at": "x",
+                "schema": {"key_specs": [{"kind": "list", "column": "t", "keys_only": true}]}}"#,
+        );
     }
 
     #[test]

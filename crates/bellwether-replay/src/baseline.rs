@@ -739,6 +739,30 @@ impl<'a> BaselinePlanner<'a> {
         Ok(plan)
     }
 
+    /// The plan for one membership run (`contains_any`, or `contains_all`
+    /// when `all`) on its one list column, with the membership residual.
+    /// Both baselines read every live row group: Parquet records a list
+    /// column's statistics on its nested leaf, which the catalog reports as
+    /// unknown, and a reader does not prune row groups by array membership
+    /// from them. No value reads nothing.
+    pub fn plan_membership(&self, keys: &RunKeys, all: bool) -> ReplayResult<ScanPlan> {
+        let [column] = keys.columns() else {
+            return Err(Error::KeySpec(format!(
+                "a membership run looks up one list column, not {:?}",
+                keys.columns()
+            ))
+            .into());
+        };
+        let selected = if keys.is_empty() {
+            RoaringBitmap::new()
+        } else {
+            self.catalog.all_ids()
+        };
+        let mut plan = self.catalog.plan_for(&selected)?;
+        plan.residual = Some(crate::plan::membership_residual(column, keys, all));
+        Ok(plan)
+    }
+
     fn stats_selection(
         &self,
         keys: &RunKeys,

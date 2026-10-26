@@ -17,6 +17,8 @@
 //!   registers and MinHash signatures). Approximate; no planner reads them.
 //! - [`text`]: text keys (B5): case folding, the words and trigram
 //!   tokenizers, the residual's row test, and the planning rule.
+//! - [`list`]: list keys (B4), an inverted index over a list column's
+//!   elements, and the `contains_any` / `contains_all` lookups.
 //!
 //! Invariants owned here: 1 (no false negatives in pruning,
 //! `tests/no_false_negatives.rs`) and 5 (stale-version rejection,
@@ -33,6 +35,7 @@ pub mod bloom;
 pub mod encoding;
 pub mod expr;
 pub mod hll;
+pub mod list;
 pub mod merge;
 pub mod segment;
 pub mod sidecar;

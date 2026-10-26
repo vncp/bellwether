@@ -11,6 +11,7 @@
 //! | `Expr { name: sym, expr: json_get(payload,'$.symbol'), over: Exact }` | `expr:sym=json_get(payload,'$.symbol'):exact` |
 //! | `Expr { .., over: Exact { counts: true } }` | `expr:sym=json_get(payload,'$.symbol'):exact,counts` |
 //! | `Expr { .., over: Bloom { fpr: 0.01 } }` | `expr:sym=json_get(payload,'$.symbol'):bloom@0.01` |
+//! | `List { column: tags }` | `list:tags` |
 //!
 //! A trailing `,counts` asks the spec to store, per key and per row group,
 //! the number of rows (storage version 2, ADR 028); it is the last element
@@ -84,7 +85,7 @@ pub fn check(spec: &KeySpec) -> Result<()> {
 fn bad(s: &str, why: &str) -> Error {
     Error::KeySpec(format!(
         "{s:?} is not a key spec ({why}); write it as exact:a,b, temporal:a@ts, bloom:a@0.01, \
-         range:ts, text:body,tokenizer=words (or tokenizer=trigram), or expr:name=<expression>:exact"
+         range:ts, text:body,tokenizer=words (or tokenizer=trigram), expr:name=<expression>:exact, or list:tags"
     ))
 }
 
@@ -220,6 +221,16 @@ fn parse_short(s: &str) -> Result<KeySpec> {
              accepts; a key spec itself has no '@'",
         )),
         ("range", Some(_)) => Err(bad(s, "a range spec takes no '@'")),
+        ("list", None) => match columns(s, cols)?.as_slice() {
+            [one] => Ok(KeySpec::List {
+                column: one.clone(),
+            }),
+            _ => Err(bad(
+                s,
+                "a list key indexes the elements of exactly one list column, list:tags",
+            )),
+        },
+        ("list", Some(_)) => Err(bad(s, "a list key takes no '@'; write list:<column>")),
         ("sketch", _) => Err(bad(
             s,
             "a sketch is an approximate distinct-count sidecar, not a key spec; declare it with \

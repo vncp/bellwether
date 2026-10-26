@@ -354,6 +354,7 @@ impl<'a> Replayer<'a> {
         // exclude a row group for them, so an unserved text run reads what
         // the planner plans (every row group), under either baseline.
         let text = query.text_op().is_some();
+        let query_is_membership = query.is_membership();
         // A count is planned as the locate of its keys; [`cost_of`] prices it.
         let query = match query {
             RunQuery::Count => &RunQuery::Locate,
@@ -399,6 +400,13 @@ impl<'a> Replayer<'a> {
         let (Some(window), Baseline::ParquetStats) = (unserved, self.unserved) else {
             return Ok((plan, false));
         };
+        // A membership run (B4) no list key serves: a list's footer
+        // statistics are on its nested leaf, which the catalog reports as
+        // unknown, so min/max keeps every row group the plan holds; its
+        // values are elements, never compared with a column's bounds.
+        if query_is_membership {
+            return Ok((plan, true));
+        }
         let (kept, filters) =
             unserved_selection(&self.catalog, keys, window.as_ref(), self.policy)?;
         self.filters_read.fetch_add(filters, Ordering::Relaxed);
@@ -562,7 +570,9 @@ impl<'a> Replayer<'a> {
                 let rk = workload.run_keys(keys, run)?;
                 check_types(&self.catalog, &rk)?;
                 let query = run.query()?;
-                let plan = if query.text_op().is_some() {
+                let plan = if query.is_membership() {
+                    planner.plan_membership(&rk, matches!(query, RunQuery::ContainsAll))?
+                } else if query.text_op().is_some() {
                     planner.plan_text(&rk, &query)?
                 } else {
                     planner.plan(&rk, run.window.as_ref())?
@@ -852,7 +862,9 @@ fn check_same_columns(source: &Schema, index: &Schema) -> Result<()> {
 fn check_types(catalog: &Catalog, keys: &RunKeys) -> Result<()> {
     for (c, recorded) in keys.columns().iter().zip(keys.key_types()) {
         let declared = crate::keys::declared_type(catalog.schema(), c)?;
-        if bellwether_core::segment::ColumnType::of(&declared)? != *recorded {
+        if bellwether_core::segment::ColumnType::of(bellwether_core::list::value_type(&declared))?
+            != *recorded
+        {
             return Err(Error::KeySpec(format!(
                 "keys on {c:?} were recorded as {recorded}, but the dataset declares \
                  {declared}; re-record the workload"

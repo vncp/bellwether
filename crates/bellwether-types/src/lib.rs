@@ -753,6 +753,17 @@ pub enum KeySpec {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         bloom: Option<f64>,
     },
+    /// Inverted index over a list column (B4): per element value, the row
+    /// groups holding a row whose list contains it. `column` is an Arrow
+    /// `List<T>` or `LargeList<T>` of a type with a canonical encoding
+    /// (ADR 016), or a `Map<K, V>` indexed by its keys. A null list, an
+    /// empty list, and a null element are not indexed (ADR 014). It serves
+    /// only membership lookups (`contains_any`, `contains_all`), never a
+    /// lookup by the column's value as a whole.
+    List {
+        /// The list or map column.
+        column: String,
+    },
 }
 
 /// How a [`KeySpec::Text`] splits a value into tokens. Both work on the
@@ -834,7 +845,9 @@ impl KeySpec {
             | Self::Bloom { columns, .. }
             | Self::Temporal { columns, .. }
             | Self::Bitemporal { columns, .. } => columns,
-            Self::Range { column } | Self::Text { column, .. } => std::slice::from_ref(column),
+            Self::Range { column } | Self::Text { column, .. } | Self::List { column } => {
+                std::slice::from_ref(column)
+            }
             Self::Expr { over, .. } => over.columns(),
         }
     }
@@ -888,6 +901,7 @@ impl KeySpec {
                 let inner = inner.split(':').next().unwrap_or_default();
                 return format!("expr:{name}={expr}:{inner}");
             }
+            Self::List { .. } => "list",
         };
         format!("{kind}:{}", self.columns().join(","))
     }
@@ -907,6 +921,7 @@ impl KeySpec {
     /// | temporal | `temporal:id@ts` (with counts `temporal:id@ts,counts`) |
     /// | bitemporal | `temporal2:id@valid,known` |
     /// | expr | `expr:sym=json_get(payload,'$.symbol'):exact` (with counts `...:exact,counts`; bloom `...:bloom@0.01`) |
+    /// | list (B4) | `list:tags` |
     ///
     /// The false-positive rate is Rust's shortest round-trip spelling of the
     /// `f64`. The identity is one-to-one: no key or time column a spec names
@@ -932,6 +947,7 @@ impl KeySpec {
                 None => format!("bloom:{}@{fpr}", columns.join(",")),
             },
             Self::Range { column } => format!("range:{column}"),
+            Self::List { column } => format!("list:{column}"),
             Self::Temporal {
                 columns, ts_column, ..
             } => format!("temporal:{}@{ts_column}{counts}", columns.join(",")),
@@ -985,7 +1001,9 @@ impl KeySpec {
             } => vec![valid_column, known_column],
             // An expr key's name is an identifier and its expression is
             // checked by `bellwether_core::expr::check_spec`.
-            Self::Range { .. } | Self::Expr { .. } | Self::Text { .. } => Vec::new(),
+            Self::Range { .. } | Self::Expr { .. } | Self::Text { .. } | Self::List { .. } => {
+                Vec::new()
+            }
         };
         if let Some(c) = self
             .columns()
@@ -1124,6 +1142,27 @@ pub enum Predicate {
         expr: String,
         /// Canonical-encoded values of the expression's type.
         values: Vec<Vec<u8>>,
+    },
+    /// The list (or map, by its keys) in `column` holds an element equal to
+    /// at least one of `values`, each the canonical encoding (ADR 016) of
+    /// one value at the element's dataset type; a float zero is listed in
+    /// both encodings. A null or empty list, and a null element, match
+    /// nothing (ADR 014).
+    ContainsAny {
+        /// The list or map column.
+        column: String,
+        /// Canonical element encodings.
+        values: Vec<Vec<u8>>,
+    },
+    /// The list (or map, by its keys) in `column` holds, for every group in
+    /// `values`, an element equal to one of the group's encodings. A group
+    /// is one queried value: one canonical encoding, or both encodings of a
+    /// float zero. A null or empty list matches nothing (ADR 014).
+    ContainsAll {
+        /// The list or map column.
+        column: String,
+        /// One group of canonical element encodings per queried value.
+        values: Vec<Vec<Vec<u8>>>,
     },
 }
 

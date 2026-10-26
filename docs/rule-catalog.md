@@ -24,6 +24,10 @@ may judge against another partner. The three plan
 rules describe intended behavior until an `EvidenceBody` carries a consumer
 plan.
 
+`R-list-1` (2026-10-26, list keys) reads the recorded workload's
+membership runs rather than footer statistics; `why` raises it into the
+same `profile` Evidence.
+
 ## How to read an entry
 
 Every entry uses the same fields.
@@ -528,3 +532,36 @@ case where the agent found the rewrite anyway, the lints are wrong-shaped:
 fix or remove them before adding more. The receipts' twin Evidence records
 which lints fired (`bellwether ledger scorecard` counts them per rule id), so
 the count is read from the ledger, not remembered.
+
+### R-list-1
+
+Added 2026-10-26 with list keys (B4), the detector that recommends the
+kind (`docs/adding-an-index-kind.md`: no kind without its detector).
+
+- **id**: `R-list-1`
+- **Detector**: from the recorded workload. Some run asks for list
+  membership on a column (`contains_any`: `array_contains`, `has_any`,
+  `exists(unnest)`; `contains_all`: `has_all`), recorded by `why --from
+  <values.parquet> --mode contains-any|contains-all` or found in a recorded
+  workload, and no key spec complete at the current manifest is
+  `list:<column>`. One lint per such column
+  (`bellwether_profile::lints::list_membership`, raised by `why` into the
+  same `profile` Evidence, which then cites the key set or workload it was
+  read from).
+- **Estimator**: every such run reads every live row group today: Parquet
+  keeps a list's statistics on its nested elements, which the catalog
+  reports as unknown and readers do not prune by membership, so both
+  baselines read everything (`bellwether_replay::BaselinePlanner::plan_membership`).
+  Bytes: `why --mode contains-any|contains-all` replays the runs under the
+  transient `list:<column>` and reports the exact row groups and bytes, and
+  the column's distinct elements in the `list` column.
+- **Guidance template**: file `bellwether.toml` (or `bellwether index`),
+  step `key_specs`. Before: no list key on `<column>`. After:
+  `list:<column>`. Invariant: `every row group holding a row whose list
+  holds a queried value is still selected` (invariant 1).
+- **Verification method**: reconcile of the rows the runs ask for (the
+  membership residual over the workload's own values), keyed by every
+  hashable column, with the plan's row groups on one side and every live
+  row group on the other (`fix`, workload-rows coverage).
+- **Confidence rubric**: high: the runs are recorded and the specs are the
+  manifest's; nothing is sampled. Advice only: it changes no plan.

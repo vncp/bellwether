@@ -30,7 +30,9 @@ use arrow::datatypes::SchemaRef;
 use bellwether_build::encode_ts;
 use bellwether_build::Builder;
 use bellwether_ledger::RecordKind;
-use bellwether_replay::{proposed_specs, Baseline, Catalog, Replayer, RunKeys, RunQuery, Workload};
+use bellwether_replay::{
+    proposed_specs, Baseline, Catalog, RecordedRun, Replayer, RunKeys, RunQuery, Workload,
+};
 use bellwether_source_sql::{is_sql_root, SqlUrl, MEASURED_AGGREGATES};
 use bellwether_store::{parse_rfc3339, Cache, ObjectStoreBackend};
 use bellwether_types::{
@@ -951,6 +953,7 @@ impl Engine {
             });
         }
         let text = text.first().copied().unwrap_or(false);
+        let membership = membership_runs(runs)?;
         if runs.iter().any(|r| r.columns != columns) {
             return Err(Error::InvalidArgument {
                 field: "workload",
@@ -977,10 +980,10 @@ impl Engine {
             }
             // Both encodings of a float zero, as the planner probes them:
             // SQL equality matches a row stored under either zero. A text
-            // run's values are words, substrings, or prefixes, not
-            // reconcile keys: its rows are chosen by the row filter
-            // (`rows_asked`).
-            if !text {
+            // run's values are words, substrings, or prefixes, and a
+            // membership run's (B4) list elements, not reconcile keys: their
+            // rows are chosen by the row filter (`rows_asked`).
+            if !text && !membership {
                 let all: Vec<usize> = (0..rk.columns().len()).collect();
                 keys.extend(rk.all_probes(&all));
             }
@@ -1010,12 +1013,13 @@ impl Engine {
             None => cache.get_cached(&workload.hash())?,
         };
         let workload_age = cached.map_or(Duration::ZERO, |(_, age)| age);
-        // A text workload (B5) names words and substrings, not keys: rows
-        // are compared keyed by every hashable column, and chosen by the
-        // runs' text matches. A workload keyed on an expression (an expr
+        // A text workload (B5) names words and substrings, and a membership
+        // workload (B4) list elements, not keys: rows are compared keyed by
+        // every hashable column, and chosen by the runs' text matches or
+        // membership tests. A workload keyed on an expression (an expr
         // key's runs) compares the rows whose expression value is one of its
         // keys, each row identified by the expression's input columns.
-        let (key_columns, coverage, keys_of) = if text {
+        let (key_columns, coverage, keys_of) = if text || membership {
             let hashable: Vec<String> = replayer
                 .schema()
                 .fields()
@@ -1023,6 +1027,17 @@ impl Engine {
                 .filter(|f| bellwether_core::encoding::check_supported(f.data_type()).is_ok())
                 .map(|f| f.name().clone())
                 .collect();
+            if hashable.is_empty() {
+                return Err(Error::Other(format!(
+                    "every column of {} is nested (a list, map, or struct), so verify has no \
+                     column to compare rows by and cannot certify {}; build it without a \
+                     receipt with `bellwether index {} --key {}`",
+                    self.root(),
+                    crate::spec::label(spec),
+                    self.root(),
+                    crate::spec::label(spec)
+                )));
+            }
             (
                 hashable,
                 CoverageRequest::WorkloadRows {
@@ -1589,6 +1604,25 @@ fn unhashable(schema: &arrow::datatypes::Schema, keys: &[String]) -> Vec<String>
         .collect()
 }
 
+/// Whether a workload's runs are list-membership runs (B4); a workload
+/// mixing them with key lookups is refused, since verify compares one kind
+/// at a time.
+fn membership_runs(runs: &[RecordedRun]) -> Result<bool> {
+    let membership = runs
+        .iter()
+        .map(|r| r.query().map(|q| q.is_membership()))
+        .collect::<Result<Vec<bool>>>()?;
+    if membership.iter().any(|m| *m) && !membership.iter().all(|m| *m) {
+        return Err(Error::InvalidArgument {
+            field: "workload",
+            reason: "the workload mixes list-membership runs with key lookups; verify compares \
+                     one kind at a time, so record each as its own workload"
+                .into(),
+        });
+    }
+    Ok(membership.first().copied().unwrap_or(false))
+}
+
 /// One run as verify compares it: its keys, its lookup, the time column the
 /// lookup is planned on (`Replayer::planned_time_column`; `None` when no
 /// index can plan it, so the run reads every row group), and its plan's
@@ -1607,9 +1641,10 @@ struct AskedRun {
 /// built from each key's newest time in `source` (the left side, every
 /// live row group of `catalog`). A row is compared, on both sides, when
 /// some run keeps it: one of the run's keys, within its window, or for a
-/// text run (B5) a row whose string matches one of the run's values.
-/// Locate and plain `latest` runs keep every row of their keys, and
-/// `latest` and
+/// text run (B5) a row whose string matches one of the run's values, and for
+/// a membership run (B4) a row whose list holds any (or every one) of the
+/// run's values. Locate and
+/// plain `latest` runs keep every row of their keys, and `latest` and
 /// `asof` compare the newest kept version per key (`latest_by`). An index
 /// whose bounds disagree with the data plans other row groups than these
 /// windows need, so its certificate fails.
@@ -1630,6 +1665,23 @@ fn rows_asked(
     let mut narrowed = false;
     let mut filter = Vec::with_capacity(runs.len());
     for run in runs {
+        if run.query.is_membership() {
+            // The rows whose list holds the run's values, from the
+            // workload alone.
+            let [column] = run.keys.columns() else {
+                return Err(Error::KeySpec(format!(
+                    "a membership run looks up one list column, not {:?}",
+                    run.keys.columns()
+                )));
+            };
+            filter.push(bellwether_replay::membership_residual(
+                column,
+                &run.keys,
+                matches!(run.query, RunQuery::ContainsAll),
+            ));
+            narrowed = true;
+            continue;
+        }
         if let Some(text) = bellwether_replay::text_residual(&run.keys, &run.query)? {
             // The rows whose string matches the run's values, from the
             // workload alone.

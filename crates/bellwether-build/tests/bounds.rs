@@ -157,6 +157,7 @@ fn ts_decoding_in_this_test_matches_the_encoder() {
         rg: 0,
         row: 0,
         cols: [("ts".to_string(), Some(enc))].into(),
+        lists: BTreeMap::new(),
     };
     assert_eq!(ts_us(&r), Some(-5));
 }

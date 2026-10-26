@@ -26,6 +26,10 @@
 //! - [`text`] writes a text corpus (1–4 KB documents with planted terms at
 //!   1% and 0.01% of rows) in the ledger or market shape, with exact ground
 //!   truth, for text keys (B5; `scripts/text-funnels.py`).
+//! - [`lists`] writes a list column with skewed element cardinality in both
+//!   shapes (ledger attributes, market holdings), `contains_any` runs of 10,
+//!   10^3, and 10^5 terms and a `contains_all` run, and exact ground truth,
+//!   for list keys (B4).
 
 #![forbid(unsafe_code)]
 // Benchmark arithmetic converts freely between counts, sizes, and floating
@@ -52,6 +56,7 @@ pub mod env;
 pub mod expr;
 pub mod generate;
 pub mod harness;
+pub mod lists;
 pub mod market;
 pub mod mem;
 pub mod perf;

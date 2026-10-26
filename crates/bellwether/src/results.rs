@@ -249,6 +249,19 @@ pub enum LookupKind {
         /// `has_prefix`), sorted.
         operators: Vec<TextOp>,
     },
+    // --- phase 5 kinds ---
+    /// Rows whose list column holds at least one of the values
+    /// (`contains_any`: `array_contains`, `has_any`, `exists(unnest)`).
+    ContainsAny {
+        /// The list column.
+        column: String,
+    },
+    /// Rows whose list column holds every one of the values
+    /// (`contains_all`).
+    ContainsAll {
+        /// The list column.
+        column: String,
+    },
 }
 
 /// A lookback window on a `latest` or `asof` lookup: every version of each

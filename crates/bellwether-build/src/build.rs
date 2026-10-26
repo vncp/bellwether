@@ -690,7 +690,10 @@ fn shared_identity(root: &str, base: Option<&Manifest>, a: &KeySpec, b: &KeySpec
                 }
                 // An expr key's column is an identifier; it names no time
                 // column.
-                KeySpec::Range { .. } | KeySpec::Expr { .. } | KeySpec::Text { .. } => {}
+                KeySpec::Range { .. }
+                | KeySpec::Expr { .. }
+                | KeySpec::Text { .. }
+                | KeySpec::List { .. } => {}
             }
             format!(
                 "re-declare {} under its name with a time column whose name has no ',' or '@', \
@@ -868,6 +871,12 @@ fn plan_specs(
                     return Err(Error::KeySpec(format!("{name} lists column {c:?} twice")));
                 }
                 let t = column_type(c)?;
+                // A list key's elements are its keys: the element type is
+                // the one its segments encode at and record.
+                let t = match spec {
+                    KeySpec::List { .. } => bellwether_core::list::check_list_column(c, &t)?,
+                    _ => t,
+                };
                 ColumnType::of(&t).map_err(|e| Error::KeySpec(format!("{name}: key column {c:?}: {e}")))?;
                 if matches!(spec, KeySpec::Text { .. }) {
                     bellwether_core::text::check_column_type(c, &t)?;
@@ -1220,14 +1229,20 @@ fn double_covered(m: &Manifest, name: &str, live: &RoaringBitmap) -> bool {
 }
 
 /// Whether any column of `target` whose type its segments record (key
-/// columns, a temporal timestamp, a sidecar's time columns) has a different
-/// recorded type under `new` than under `old`.
+/// columns, a temporal timestamp, a sidecar's time columns; a list key's
+/// element type) has a different recorded type under `new` than under
+/// `old`.
 fn types_differ(old: &Schema, new: &Schema, target: &Target) -> bool {
+    let list = matches!(target, Target::Key(KeySpec::List { .. }));
     target.typed_columns().iter().any(|c| {
         let recorded = |s: &Schema| {
-            s.field_with_name(c)
-                .ok()
-                .and_then(|f| ColumnType::of(f.data_type()).ok())
+            let dt = s.field_with_name(c).ok()?.data_type();
+            let dt = if list {
+                bellwether_core::list::element_type(dt)?
+            } else {
+                dt
+            };
+            ColumnType::of(dt).ok()
         };
         match (recorded(old), recorded(new)) {
             (Some(a), Some(b)) => a != b,

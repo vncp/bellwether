@@ -330,6 +330,12 @@ fn rows_asked(filter: &[Predicate]) -> String {
                 ),
             },
             Predicate::ExprIn { expr, .. } => format!("the workload's keys of {expr}"),
+            Predicate::ContainsAny { column, .. } => {
+                format!("{column} holding any of the workload's values")
+            }
+            Predicate::ContainsAll { column, .. } => {
+                format!("{column} holding every one of the workload's values")
+            }
             Predicate::And { all } => {
                 for q in all {
                     walk(q, out);

@@ -434,6 +434,20 @@ impl Engine {
         })
     }
 
+    /// Plans the rows whose list column holds at least one (`all` false:
+    /// `array_contains`, `has_any`) or every one (`all` true) of the values
+    /// in `keys`, a key file of one column named after a list (or map)
+    /// column of the dataset, its values of the list's element type. The
+    /// plan goes through the one complete list key on that column
+    /// (`list:<column>`); without one the lookup is refused with the
+    /// `bellwether index` command that declares it. A null value matches
+    /// nothing (ADR 014): `any` drops and counts it; `all` is refused, since
+    /// no row could hold every value. The residual is
+    /// `ContainsAny` or `ContainsAll`, which the reader applies per row.
+    pub fn locate_contains(&self, keys: &KeyFile, all: bool) -> Result<PlanResult> {
+        guard(|| self.plan_lookup(keys, Mode::Contains { all }, None)).map_err(schema_hint)
+    }
+
     /// Invariant 1 over the folder, not only the index: a file that landed
     /// or changed after the last build would be silently left out of the
     /// plan, so it is refused. A plan pinned to an earlier manifest
@@ -452,6 +466,35 @@ impl Engine {
         }
     }
 
+    /// The pinned manifest for a lookup; on a folder never indexed, a
+    /// membership lookup names the key to declare, the list key on the key
+    /// file's one column.
+    fn pin_for_lookup(
+        &self,
+        verb: &'static str,
+        keys: &KeyFile,
+        mode: &Mode<'_>,
+    ) -> Result<Pinned> {
+        match self.pin_required(verb) {
+            Err(Error::NotIndexed {
+                root,
+                operation,
+                needs: None,
+            }) if matches!(mode, Mode::Contains { .. }) => {
+                let needs = match keys.column_names()?.as_slice() {
+                    [c] => Some(format!("list:{c}")),
+                    _ => None,
+                };
+                Err(Error::NotIndexed {
+                    root,
+                    operation,
+                    needs,
+                })
+            }
+            other => other,
+        }
+    }
+
     fn plan_lookup(
         &self,
         keys: &KeyFile,
@@ -459,20 +502,21 @@ impl Engine {
         projection: Option<&[String]>,
     ) -> Result<PlanResult> {
         let verb = match mode {
-            Mode::Locate | Mode::Window { .. } => "locate",
+            Mode::Locate | Mode::Window { .. } | Mode::Contains { .. } => "locate",
             Mode::Latest
             | Mode::Bitemporal { valid: None, .. }
             | Mode::Lookback { at: None, .. } => "latest",
             Mode::Asof(_) | Mode::Bitemporal { .. } | Mode::Lookback { .. } => "asof",
         };
         self.require_folder(verb)?;
-        let pinned = self.pin_required(verb)?;
+        let pinned = self.pin_for_lookup(verb, keys, &mode)?;
         self.refuse_stale(&pinned, verb)?;
         let (specs, excluded) = pinned.specs();
         if let Some(columns) = projection {
             check_projection(pinned.planner.schema(), columns)?;
         }
         let (run_keys, null_tuples) = keys.run_keys(pinned.planner.schema())?;
+        refuse_null_in_all(&mode, null_tuples)?;
         let columns = run_keys.columns().to_vec();
         refuse_expression_lookup(&columns, &mode, verb, self.root(), pinned.planner.schema())?;
         let tuples: Vec<Vec<u8>> = run_keys.tuples().map(<[u8]>::to_vec).collect();
@@ -480,6 +524,14 @@ impl Engine {
         let key_set = bellwether_types::Hash::of(&payload);
         self.cache()?.put_cached(&key_set, Bytes::from(payload))?;
         let (lookup, kind) = self.lookup_of(&pinned, &specs, &columns, tuples, mode, verb)?;
+        // A membership lookup plans with the list key on its column alone:
+        // no other kind answers it.
+        let specs = match &kind {
+            LookupKind::ContainsAny { column } | LookupKind::ContainsAll { column } => {
+                list_key(self.root(), &specs, &excluded, column)?
+            }
+            _ => specs,
+        };
         let (mut plan, order) = pinned.planner.plan_ordered(&specs, &lookup).map_err(|e| {
             if specs.is_empty() && !excluded.is_empty() {
                 not_complete_yet(self.root(), verb, &excluded)
@@ -557,7 +609,28 @@ impl Engine {
         mode: Mode<'_>,
         verb: &'static str,
     ) -> Result<(Lookup, LookupKind)> {
+        let schema = pinned.planner.schema();
+        let list_column = columns.iter().find(|c| {
+            schema
+                .field_with_name(c)
+                .is_ok_and(|f| bellwether_core::list::element_type(f.data_type()).is_some())
+        });
+        if let (Some(c), false) = (list_column, matches!(mode, Mode::Contains { .. })) {
+            return Err(Error::InvalidArgument {
+                field: "keys",
+                reason: format!(
+                    "{c:?} is a list column, whose rows hold many values, so a {verb} by its \
+                     value is not a lookup the index answers; look its elements up with \
+                     `bellwether locate {} --keys <file> --any` (rows holding any of the \
+                     values) or `--all` (rows holding every one)",
+                    self.root()
+                ),
+            });
+        }
         Ok(match mode {
+            Mode::Contains { all } => {
+                membership_lookup(self.root(), columns, tuples, list_column.is_some(), all)?
+            }
             Mode::Locate => (
                 Lookup::Keys {
                     columns: columns.to_vec(),
@@ -696,6 +769,107 @@ enum Mode<'a> {
         valid: Option<&'a str>,
         known: Option<&'a str>,
     },
+    /// A membership lookup on a list column (B4): any of the values, or
+    /// every one (`all`).
+    Contains {
+        all: bool,
+    },
+}
+
+/// The one complete list key on `column` among `specs`, as the spec list a
+/// membership lookup plans with; none is [`Error::NotIndexed`] naming the
+/// key it needs (or the incomplete one in `excluded`).
+fn list_key(
+    root: &str,
+    specs: &[KeySpec],
+    excluded: &[KeySpec],
+    column: &str,
+) -> Result<Vec<KeySpec>> {
+    let want = KeySpec::List {
+        column: column.to_string(),
+    };
+    if specs.contains(&want) {
+        return Ok(vec![want]);
+    }
+    if excluded.contains(&want) {
+        return Err(not_complete_yet(
+            root,
+            "locate",
+            std::slice::from_ref(&want),
+        ));
+    }
+    Err(Error::NotIndexed {
+        root: root.to_string(),
+        operation: "locate",
+        needs: Some(want.name()),
+    })
+}
+
+/// `locate --all` with a null value: no list holds a null (ADR 014), so no
+/// row holds every value; refused rather than dropping the null, which would
+/// widen the lookup to the remaining values.
+fn refuse_null_in_all(mode: &Mode<'_>, null_tuples: u64) -> Result<()> {
+    if matches!(mode, Mode::Contains { all: true }) && null_tuples > 0 {
+        return Err(Error::InvalidArgument {
+            field: "keys",
+            reason: format!(
+                "the key file holds {null_tuples} null value(s), and no list holds a null (ADR \
+                 014), so no row holds every value; remove the null values for --all, or use \
+                 --any, which skips them"
+            ),
+        });
+    }
+    Ok(())
+}
+
+/// The membership lookup (`locate --any`, or `--all` when `all`) over the
+/// key file's one column, which must be a list column (`is_list`).
+fn membership_lookup(
+    root: &str,
+    columns: &[String],
+    tuples: Vec<Vec<u8>>,
+    is_list: bool,
+    all: bool,
+) -> Result<(Lookup, LookupKind)> {
+    let [column] = columns else {
+        return Err(Error::InvalidArgument {
+            field: "keys",
+            reason: format!(
+                "a membership lookup reads one list column, and the key file has \
+                 {} ({}); select it with --key <column>",
+                columns.len(),
+                columns.join(", ")
+            ),
+        });
+    };
+    if !is_list {
+        return Err(Error::InvalidArgument {
+            field: "keys",
+            reason: format!(
+                "{column:?} is not a list column (List, LargeList, or Map), so \
+                 --any and --all do not apply; look its values up with `bellwether \
+                 locate {root} --keys <file>`"
+            ),
+        });
+    }
+    let column = column.clone();
+    Ok(if all {
+        (
+            Lookup::ContainsAll {
+                column: column.clone(),
+                values: tuples,
+            },
+            LookupKind::ContainsAll { column },
+        )
+    } else {
+        (
+            Lookup::ContainsAny {
+                column: column.clone(),
+                values: tuples,
+            },
+            LookupKind::ContainsAny { column },
+        )
+    })
 }
 
 /// The as-of lookup through the one temporal spec serving `columns`, its

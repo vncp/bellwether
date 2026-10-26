@@ -147,6 +147,10 @@ A run's cost has these parts:
 
 It keys the transient cache together with the full spec and its key and timestamp types. An unindexed folder has manifest version `"0"`, so its digest, not the version, names its data.
 
+### Membership runs (B4)
+
+A run recorded with `RunQuery::ContainsAny` or `ContainsAll` (`query_kind` `contains_any` / `contains_all`) looks up one list column; its values are encoded at the column's element type. Recording refuses a membership run on a flat column or on several columns, a list column in any other kind of run, and a `contains_all` run with a null value (no list holds a null, ADR 014). Both planners plan it by the build planner's `Lookup::ContainsAny` / `ContainsAll` rules through `list:<column>` alone (`serves_query`), with the same residual (`membership_residual`), so predicted equals planned (`tests/list.rs`: the build lookup, committed segments, transient segments through WP4, and `SegmentPlanner` agree run by run; the unindexed replayer prices every run the same). A transient list key measures each row group's distinct elements. Both baselines read every live row group for a membership run (`BaselinePlanner::plan_membership`), and so does an unserved membership run under `Replayer::with_unserved(Baseline::ParquetStats)` (its Replay is labelled as priced by min/max): Parquet keeps a list's statistics on its nested leaf, which the catalog reports as unknown, and a run's values are elements, never compared with a column's bounds.
+
 ## Configurations
 
 `Replayer` pins one manifest version. It is built three ways:

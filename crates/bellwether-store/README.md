@@ -102,6 +102,10 @@ These `object_store` errors map to `Error::VersionConflict`:
 
 `Manifest::from_slice` also refuses a newer `storage_version` with `Error::UnsupportedVersion { what: "storage" }` (`UNSUPPORTED_STORAGE`) before typed deserialization.
 
+### List keys (B4)
+
+`list` is a key-spec kind (`key_spec_fields`: `kind`, `column`): declared in `schema.key_specs`, its segments ordinary key-spec segments named `list:<column>`. A build that predates the kind refuses such a manifest with the typed unknown-kind error, never a serde error and never by dropping the declaration on a rewrite (tested with storage version 1's allow-list). The kind is admitted by storage version 2 (WP14); this branch merges after it.
+
 ## Commit protocol
 
 ```rust

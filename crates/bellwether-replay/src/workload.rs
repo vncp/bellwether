@@ -99,6 +99,13 @@ pub const QUERY_KIND_CONTAINS: &str = "contains";
 /// column holding a word that starts with one of its prefixes (`has_prefix`;
 /// B5).
 pub const QUERY_KIND_HAS_PREFIX: &str = "has_prefix";
+/// The query kind of a recorded run that looks up the rows whose list
+/// column holds any of its values (`contains_any`: `array_contains`,
+/// `has_any`, `exists(unnest)`; B4).
+pub const QUERY_KIND_CONTAINS_ANY: &str = "contains_any";
+/// The query kind of a recorded run that looks up the rows whose list
+/// column holds every one of its values (`contains_all`; B4).
+pub const QUERY_KIND_CONTAINS_ALL: &str = "contains_all";
 
 /// The time window of a `window` run: the rows of its keys whose
 /// `ts_column` lies in `[lo, hi]`, both inclusive and in the column's
@@ -155,10 +162,18 @@ pub enum RunQuery {
     /// are the words, substrings, or prefixes, both sides case-folded. Only
     /// a text key can plan it.
     Text(TextOp),
+    /// The rows whose list column (the run's one key column, a list or map
+    /// in the dataset) holds at least one of the run's values
+    /// ([`QUERY_KIND_CONTAINS_ANY`]).
+    ContainsAny,
+    /// The rows whose list column holds every one of the run's values
+    /// ([`QUERY_KIND_CONTAINS_ALL`]).
+    ContainsAll,
 }
 
 impl RunQuery {
-    /// The `query_kind` tag (`locate`, `latest`, `asof`, or `window`).
+    /// The `query_kind` tag (`locate`, `latest`, `asof`, `window`,
+    /// `contains_any`, or `contains_all`).
     #[must_use]
     pub fn kind_str(&self) -> &'static str {
         match self {
@@ -170,6 +185,8 @@ impl RunQuery {
             Self::Text(TextOp::HasToken) => QUERY_KIND_HAS_TOKEN,
             Self::Text(TextOp::Contains) => QUERY_KIND_CONTAINS,
             Self::Text(TextOp::HasPrefix) => QUERY_KIND_HAS_PREFIX,
+            Self::ContainsAny => QUERY_KIND_CONTAINS_ANY,
+            Self::ContainsAll => QUERY_KIND_CONTAINS_ALL,
         }
     }
 
@@ -180,7 +197,13 @@ impl RunQuery {
         match self {
             Self::Asof { ts } => Some(*ts),
             Self::Lookback { asof, .. } => *asof,
-            Self::Locate | Self::Latest | Self::Window(_) | Self::Count | Self::Text(_) => None,
+            Self::Locate
+            | Self::Latest
+            | Self::Window(_)
+            | Self::Count
+            | Self::Text(_)
+            | Self::ContainsAny
+            | Self::ContainsAll => None,
         }
     }
 
@@ -194,7 +217,9 @@ impl RunQuery {
             | Self::Asof { .. }
             | Self::Window(_)
             | Self::Count
-            | Self::Text(_) => None,
+            | Self::Text(_)
+            | Self::ContainsAny
+            | Self::ContainsAll => None,
         }
     }
 
@@ -224,6 +249,13 @@ impl RunQuery {
             self,
             Self::Latest | Self::Asof { .. } | Self::Lookback { .. }
         )
+    }
+
+    /// Whether this asks which rows' list column holds the run's values
+    /// (`contains_any` or `contains_all`), so only a list key can plan it.
+    #[must_use]
+    pub fn is_membership(&self) -> bool {
+        matches!(self, Self::ContainsAny | Self::ContainsAll)
     }
 }
 
@@ -294,6 +326,23 @@ impl RecordedRun {
                  one",
                 self.run_id, self.query_kind
             )));
+        }
+        if matches!(
+            self.query_kind.as_str(),
+            QUERY_KIND_CONTAINS_ANY | QUERY_KIND_CONTAINS_ALL
+        ) {
+            if self.asof.is_some() || self.lookback.is_some() || self.columns.len() != 1 {
+                return Err(Error::Other(format!(
+                    "run {:?} is a {} run; it looks up one list column and records no asof, \
+                     lookback, or window",
+                    self.run_id, self.query_kind
+                )));
+            }
+            return Ok(if self.query_kind == QUERY_KIND_CONTAINS_ANY {
+                RunQuery::ContainsAny
+            } else {
+                RunQuery::ContainsAll
+            });
         }
         let text = match self.query_kind.as_str() {
             QUERY_KIND_HAS_TOKEN => Some(TextOp::HasToken),
@@ -805,6 +854,17 @@ impl<'a> WorkloadRecorder<'a> {
             }
         };
         check_text(run_id, &built, &query, &self.schema)?;
+        check_membership(run_id, &built, &query, &self.schema)?;
+        if matches!(query, RunQuery::ContainsAll) && null_tuples > 0 {
+            // A null value is in no list (ADR 014), so no row holds every
+            // value; dropping it, as a key lookup drops a null key, would
+            // widen the run to the remaining values.
+            return Err(Error::KeySpec(format!(
+                "run {run_id:?} is a contains_all run with {null_tuples} null value(s); no list \
+                 holds a null (ADR 014), so no row would match: remove the null values from the \
+                 key file, or record a contains_any run"
+            )));
+        }
         let payload = built.to_payload()?;
         let key_set = Hash::of(&payload);
         let columns = built.columns().to_vec();
@@ -890,6 +950,46 @@ fn check_text(run_id: &str, keys: &RunKeys, query: &RunQuery, schema: &Schema) -
             },
             other => other,
         })?;
+    }
+    Ok(())
+}
+
+/// A membership run (`contains_any`, `contains_all`) looks up exactly one
+/// column, a list (or map) in the dataset; any other run never looks up a
+/// list column, whose rows have no single value to equal a key. Refused
+/// with what to record instead.
+fn check_membership(run_id: &str, keys: &RunKeys, query: &RunQuery, schema: &Schema) -> Result<()> {
+    let is_list = |c: &String| {
+        schema
+            .field_with_name(c)
+            .is_ok_and(|f| bellwether_core::list::element_type(f.data_type()).is_some())
+    };
+    let columns = keys.columns();
+    if query.is_membership() {
+        return match columns {
+            [c] if is_list(c) => Ok(()),
+            [c] => Err(Error::KeySpec(format!(
+                "run {run_id:?} is a {} run on {c:?}, which is not a list column; a membership \
+                 run looks up the elements of one List, LargeList, or Map column (record a \
+                 locate run for a flat column)",
+                query.kind_str()
+            ))),
+            _ => Err(Error::KeySpec(format!(
+                "run {run_id:?} is a {} run on {} columns ({}); a membership run looks up the \
+                 elements of exactly one list column, so give a key file with that one column",
+                query.kind_str(),
+                columns.len(),
+                columns.join(", ")
+            ))),
+        };
+    }
+    if let Some(c) = columns.iter().find(|c| is_list(c)) {
+        return Err(Error::KeySpec(format!(
+            "run {run_id:?} looks up {c:?}, a list column, as a {} run; a list column's rows hold \
+             many values, so record its values as a membership run: contains_any (rows holding \
+             any of them; `--any` on the command line) or contains_all (`--all`)",
+            query.kind_str()
+        )));
     }
     Ok(())
 }
