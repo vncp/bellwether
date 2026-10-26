@@ -376,6 +376,9 @@ fn lookup_label(lookup: &LookupKind) -> String {
         LookupKind::ContainsAll { column } => {
             format!("locate rows whose {column} holds every value")
         }
+        LookupKind::Aggregate { value, functions } => {
+            format!("aggregate {}({value}) per key", functions.join(", "))
+        }
         LookupKind::Latest => "latest".to_string(),
         LookupKind::Asof { at, ts, ts_column } => format!("asof {at} ({ts_column} = {ts})"),
         LookupKind::Window {

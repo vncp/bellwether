@@ -10,16 +10,17 @@ use std::sync::Arc;
 
 use arrow::datatypes::Schema;
 use bellwether_core::encoding::check_ts_type;
-use bellwether_profile::lints::MembershipUse;
+use bellwether_profile::lints::{AggregateUse, MembershipUse};
 use bellwether_profile::{ProfileOptions, ProfileReport};
 use bellwether_replay::{
     proposed_specs, record_bench_workload, servable, serves_query, Baseline, KeyInput, Lookup,
-    RecordedRun, Replayer, RunQuery, RunWindow, Workload, WorkloadRecorder, QUERY_KIND_LOCATE,
+    RecordedRun, Replayer, RunAggregate, RunQuery, RunWindow, Workload, WorkloadRecorder,
+    QUERY_KIND_LOCATE,
 };
 use bellwether_store::{Cache, ObjectStoreBackend, StoreExt};
 use bellwether_types::{
-    format, Error, Evidence, EvidenceBody, Fanout, Gate, Hash, KeySpec, Lint, Proposal,
-    ProposalBody, Record, Result, Store, TextOp, TwinOf,
+    format, AggregateFn, Error, Evidence, EvidenceBody, Fanout, Gate, Hash, KeySpec, Lint,
+    Proposal, ProposalBody, Record, Result, Store, TextOp, TwinOf,
 };
 use serde::{Deserialize, Serialize};
 
@@ -89,11 +90,16 @@ pub enum LookupMode {
     /// The rows whose list column holds every one of the values
     /// (`bellwether locate --all`).
     ContainsAll,
+    /// Per key, aggregates of one value column (B7; `bellwether
+    /// aggregate`): `sum/count/min/max(value) ... where key in (...) group
+    /// by key`, with the value and functions in [`WhyRequest::aggregate`].
+    Aggregate,
 }
 
 impl LookupMode {
     /// The CLI spelling: `locate`, `latest`, `asof`, `contains`,
-    /// `has-token`, `has-prefix`, `contains-any`, or `contains-all`.
+    /// `has-token`, `has-prefix`, `contains-any`, `contains-all`, or
+    /// `aggregate`.
     #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
@@ -105,6 +111,7 @@ impl LookupMode {
             Self::HasPrefix => "has-prefix",
             Self::ContainsAny => "contains-any",
             Self::ContainsAll => "contains-all",
+            Self::Aggregate => "aggregate",
         }
     }
 
@@ -116,9 +123,12 @@ impl LookupMode {
             Self::Contains => Some(TextOp::Contains),
             Self::HasToken => Some(TextOp::HasToken),
             Self::HasPrefix => Some(TextOp::HasPrefix),
-            Self::Locate | Self::Latest | Self::Asof | Self::ContainsAny | Self::ContainsAll => {
-                None
-            }
+            Self::Locate
+            | Self::Latest
+            | Self::Asof
+            | Self::ContainsAny
+            | Self::ContainsAll
+            | Self::Aggregate => None,
         }
     }
 
@@ -171,7 +181,10 @@ pub struct WhyRequest {
     /// them;
     /// `contains_any` and `contains_all` (B4) price a key file of one list
     /// column's element values as membership lookups, with `list:<column>`
-    /// as the floor candidate, and take none of them.
+    /// as the floor candidate, and take none of them; `aggregate` (B7)
+    /// prices a key file as one aggregate run of [`WhyRequest::aggregate`],
+    /// with the agg key on its columns as the candidate (beside the counted
+    /// key it needs), and takes none of them either.
     #[serde(default)]
     pub mode: Option<LookupMode>,
     /// Timestamp (or date, time, or integer version) column for temporal
@@ -232,6 +245,29 @@ pub struct WhyRequest {
     /// file or a workload, and with no `mode`.
     #[serde(default)]
     pub text: Vec<TextQuery>,
+    /// What an `aggregate` lookup computes per key (B7, `--mode aggregate
+    /// --value V --fn F`): given with `mode` `aggregate`, or alone (the
+    /// mode is then `aggregate`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub aggregate: Option<AggregateQuery>,
+}
+
+/// What an aggregate lookup computes per key (B7): `functions` of `value`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AggregateQuery {
+    /// The aggregated column.
+    pub value: String,
+    /// The functions; `count` is always computed, and the order is sum,
+    /// count, min, max whatever order they are given in.
+    pub functions: Vec<bellwether_types::AggregateFn>,
+}
+
+impl AggregateQuery {
+    /// The run query an aggregate lookup records.
+    #[must_use]
+    pub fn run_query(&self) -> RunQuery {
+        RunQuery::Aggregate(RunAggregate::new(&self.value, &self.functions))
+    }
 }
 
 impl Default for WhyRequest {
@@ -251,6 +287,7 @@ impl Default for WhyRequest {
             gates: Vec::new(),
             sketches_only: false,
             text: Vec::new(),
+            aggregate: None,
         }
     }
 }
@@ -285,7 +322,10 @@ impl WhyRequest {
         } else {
             LookupMode::Locate
         };
-        let Some(mode) = self.mode else {
+        let Some(mode) = self
+            .mode
+            .or(self.aggregate.as_ref().map(|_| LookupMode::Aggregate))
+        else {
             return match inferred {
                 LookupMode::Asof if self.latest_by.is_none() => Err(
                     "--at requires --latest-by <timestamp column>; pass --latest-by <column> --at \
@@ -300,6 +340,35 @@ impl WhyRequest {
                 m => Ok(m),
             };
         };
+        match (mode, &self.aggregate) {
+            (LookupMode::Aggregate, None) => {
+                return Err(
+                    "--mode aggregate needs the column to aggregate; pass --value <column> (and \
+                     --fn sum,count,min,max)"
+                        .into(),
+                )
+            }
+            (LookupMode::Aggregate, Some(_))
+                if self.latest_by.is_some()
+                    || self.at.is_some()
+                    || self.lookback.is_some()
+                    || self.window.is_some() =>
+            {
+                return Err(
+                    "--mode aggregate prices per-key aggregates over every row of the keys and \
+                     takes no --latest-by, --at, --lookback, or --window; drop them"
+                        .into(),
+                )
+            }
+            (m, Some(_)) if m != LookupMode::Aggregate => {
+                return Err(format!(
+                    "--value and --fn price an aggregate lookup, and --mode {} asks for another; \
+                     pass --mode aggregate (or drop --mode)",
+                    m.as_str()
+                ))
+            }
+            _ => {}
+        }
         match mode {
             LookupMode::Contains | LookupMode::HasToken | LookupMode::HasPrefix
             | LookupMode::ContainsAny
@@ -883,11 +952,14 @@ impl Engine {
         // The list-membership detector (B4) likewise, citing the key set or
         // workload it read.
         let membership = self.membership_lints(req, &replayer, &current_specs)?;
+        let aggregates = self.aggregate_lints(req, &replayer, &current_specs)?;
         let mut extra_lints = sketch_lints;
         extra_lints.extend(text_lints);
         extra_lints.extend(membership.lints);
+        extra_lints.extend(aggregates.lints);
         let mut cites: Vec<Hash> = text_input.into_iter().collect();
         cites.extend(membership.inputs);
+        cites.extend(aggregates.inputs);
         let (profile, evidence) = self.profile(
             req,
             Measure::Source(source),
@@ -1387,6 +1459,72 @@ impl Engine {
         })
     }
 
+    /// The `R-agg-1` lints (B7) for the request's aggregate runs: a key
+    /// file priced with `--mode aggregate --value V --fn F`, or a recorded
+    /// workload's aggregate runs, that no complete agg key beside a counted
+    /// key in `current` answers. The key set (stored in the cache) or the
+    /// workload is the lints' input.
+    fn aggregate_lints(
+        &self,
+        req: &WhyRequest,
+        replayer: &Replayer<'_>,
+        current: &[KeySpec],
+    ) -> Result<MembershipLints> {
+        let mut uses: BTreeMap<(Vec<String>, String), AggregateUse> = BTreeMap::new();
+        let mut inputs = Vec::new();
+        let mut add = |columns: &[String], a: &RunAggregate, keys: u64| {
+            let u = uses
+                .entry((columns.to_vec(), a.value.clone()))
+                .or_insert_with(|| AggregateUse {
+                    columns: columns.to_vec(),
+                    value: a.value.clone(),
+                    functions: Vec::new(),
+                    runs: 0,
+                    keys_max: 0,
+                });
+            let mut all = u.functions.clone();
+            all.extend(a.functions.iter().copied());
+            u.functions = AggregateFn::canonical(&all);
+            u.runs += 1;
+            u.keys_max = u.keys_max.max(keys);
+        };
+        match (&req.aggregate, &req.keys, &req.workload) {
+            (Some(asked), Some(keys), _) => {
+                let (run_keys, _) = keys.run_keys(replayer.schema())?;
+                let payload = run_keys.to_payload()?;
+                let hash = Hash::of(&payload);
+                if let Some(cache) = self.writable_store().and_then(|_| self.cache().ok()) {
+                    cache.put_cached(&hash, bytes::Bytes::from(payload))?;
+                }
+                inputs.push(hash);
+                let RunQuery::Aggregate(a) = asked.run_query() else {
+                    return Err(Error::Other(
+                        "an aggregate request records an aggregate".into(),
+                    ));
+                };
+                add(run_keys.columns(), &a, run_keys.len() as u64);
+            }
+            (_, None, Some(h)) => {
+                if let Some(w) = self.cache().ok().and_then(|c| Workload::load(&c, h).ok()) {
+                    for r in w.runs() {
+                        if let Ok(RunQuery::Aggregate(a)) = r.query() {
+                            add(&r.columns, &a, r.keys);
+                        }
+                    }
+                    if !uses.is_empty() {
+                        inputs.push(*h);
+                    }
+                }
+            }
+            _ => {}
+        }
+        let uses: Vec<AggregateUse> = uses.into_values().collect();
+        Ok(MembershipLints {
+            lints: bellwether_profile::lints::grouped_aggregates(&uses, current),
+            inputs,
+        })
+    }
+
     /// Refuses a `why` request whose flags contradict each other, before any
     /// work. Returns whether it carries a workload.
     fn check_why_request(&self, req: &WhyRequest) -> Result<bool> {
@@ -1656,6 +1794,10 @@ impl Engine {
                     }
                     Some(t)
                 }
+                None if req.aggregate.is_some() => {
+                    check_aggregate_runs(h, &w, req.aggregate.as_ref())?;
+                    None
+                }
                 None if req.mode.and_then(LookupMode::value_query).is_some() => {
                     check_value_runs(h, &w, req.mode)?;
                     None
@@ -1702,6 +1844,10 @@ impl Engine {
             let mut recorder = self.windowed(recorder, req, pinned, replayer, &columns)?;
             let query = match req.mode.and_then(LookupMode::value_query) {
                 Some(q) => q,
+                None if req.aggregate.is_some() => req
+                    .aggregate
+                    .as_ref()
+                    .map_or(RunQuery::Locate, AggregateQuery::run_query),
                 None => resolved
                     .as_ref()
                     .map_or(RunQuery::Locate, |t| t.query.clone()),
@@ -1895,7 +2041,18 @@ impl Engine {
             }),
             _ => None,
         };
-        let run_kind = text_kind.or(membership_kind);
+        // A workload of aggregate runs of one value and set of functions
+        // (B7) is reported as that aggregate.
+        let aggregate_kind = match queries.first().and_then(RunQuery::aggregate) {
+            Some(a) if queries.iter().all(|q| q.aggregate() == Some(a)) => {
+                Some(LookupKind::Aggregate {
+                    value: a.value.clone(),
+                    functions: a.functions.iter().map(|f| f.as_str().to_string()).collect(),
+                })
+            }
+            _ => None,
+        };
+        let run_kind = text_kind.or(membership_kind).or(aggregate_kind);
         let query_kind = if text {
             let kinds: BTreeSet<&str> = queries.iter().map(RunQuery::kind_str).collect();
             kinds.into_iter().collect::<Vec<_>>().join(",")
@@ -2017,12 +2174,14 @@ impl Engine {
         // A count run: the exact key on its columns storing counts answers
         // the count from the index with no data file read, so it is priced
         // whenever no current spec counts those columns already (one that
-        // stores counts on exactly the run's columns, in any order).
+        // stores counts on exactly the run's columns, in any order). An
+        // aggregate run (B7) needs that counted key beside its agg key, so
+        // it is priced first when missing.
         if temporal.is_none() {
             let counted: BTreeSet<Vec<String>> = workload
                 .runs()
                 .iter()
-                .filter(|r| matches!(r.query(), Ok(RunQuery::Count)))
+                .filter(|r| matches!(r.query(), Ok(RunQuery::Count | RunQuery::Aggregate(_))))
                 .map(|r| r.columns.clone())
                 .collect();
             for c in counted {
@@ -2036,6 +2195,41 @@ impl Engine {
                     counts: true,
                     bounds: None,
                 };
+                if !answered && !current_names.contains(&label(&spec)) && names.insert(label(&spec))
+                {
+                    chosen.push((spec, CandidateOrigin::Workload));
+                }
+            }
+            // An aggregate run beside a complete counted key on its columns:
+            // the agg key on those columns and its value, storing every
+            // function the workload's runs ask of that value, answers it from
+            // the index. Without the counted key it answers nothing, and is
+            // proposed once the counted key is in place.
+            let mut aggregated: BTreeMap<(Vec<String>, String), Vec<AggregateFn>> = BTreeMap::new();
+            for r in workload.runs() {
+                if let Ok(RunQuery::Aggregate(a)) = r.query() {
+                    aggregated
+                        .entry((r.columns.clone(), a.value.clone()))
+                        .or_default()
+                        .extend(a.functions.iter().copied());
+                }
+            }
+            for ((columns, value), functions) in aggregated {
+                if bellwether_build::counting_spec(replayer.current_specs(), &columns).is_none() {
+                    continue;
+                }
+                let spec = KeySpec::Agg {
+                    columns,
+                    value,
+                    functions: AggregateFn::canonical(&functions),
+                };
+                let answered = workload.runs().iter().all(|r| match r.query() {
+                    Ok(RunQuery::Aggregate(a)) => {
+                        bellwether_replay::aggregate_specs(replayer.current_specs(), &r.columns, &a)
+                            .is_some()
+                    }
+                    _ => true,
+                });
                 if !answered && !current_names.contains(&label(&spec)) && names.insert(label(&spec))
                 {
                     chosen.push((spec, CandidateOrigin::Workload));
@@ -2195,6 +2389,9 @@ impl Engine {
                 )?),
                 // a list key's column: its distinct elements (B4)
                 KeySpec::List { .. } => Some(list_column(replayer, &spec)?),
+                // an agg key's column: the row groups its aggregate runs
+                // still read, against those holding their keys (B7)
+                KeySpec::Agg { .. } => Some(agg_column(replayer, workload, cache, &spec)?),
                 _ => match expr_column(replayer, &spec)? {
                     Some(c) => Some(c),
                     None => match sketch_column(&report.sketch, spec.columns()) {
@@ -2454,10 +2651,50 @@ fn queried_spread(
     }))
 }
 
-/// Refuses a text (B5) or membership (B4) `mode` without the values it
-/// prices: a key file of one string or list column's values, or a recorded
-/// workload.
+/// Refuses a recorded workload `w` priced as aggregate lookups (`--mode
+/// aggregate --value V --fn F`) when a run records another lookup or
+/// another aggregate: its costs would be labelled as the asked ones.
+fn check_aggregate_runs(h: &Hash, w: &Workload, asked: Option<&AggregateQuery>) -> Result<()> {
+    let want = asked.map(AggregateQuery::run_query);
+    let Some(r) = w.runs().iter().find(|r| r.query().ok() != want) else {
+        return Ok(());
+    };
+    let q = r.query()?;
+    let recorded = match q.aggregate() {
+        Some(a) => format!(
+            "aggregate lookups of {}{{{}}}",
+            a.value,
+            fn_list(&a.functions)
+        ),
+        None => format!("{} lookups", describe(&q)),
+    };
+    Err(Error::KeySpec(format!(
+        "workload {h} records its runs as {recorded}, and --value and --fn ask for another \
+         aggregate; drop them to price the runs as recorded, or record the keys again with \
+         `bellwether why --from <keys.parquet> --mode aggregate --value <column> --fn <list>`"
+    )))
+}
+
+/// Aggregate functions as a spec lists them: `sum,count`.
+fn fn_list(functions: &[bellwether_types::AggregateFn]) -> String {
+    functions
+        .iter()
+        .map(|f| f.as_str())
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// Refuses a text (B5), membership (B4), or aggregate (B7) `mode` without
+/// the values or keys it prices: a key file of one string or list column's
+/// values, or of keys, or a recorded workload.
 fn check_values_given(req: &WhyRequest, mode: LookupMode) -> Result<()> {
+    if mode == LookupMode::Aggregate && req.keys.is_none() && req.workload.is_none() {
+        return Err(Error::KeySpec(
+            "--mode aggregate prices a key file's keys as one aggregate lookup; pass --from \
+             <keys.parquet> (or --workload <hash>)"
+                .into(),
+        ));
+    }
     if mode.value_query().is_none() || req.keys.is_some() || req.workload.is_some() {
         return Ok(());
     }
@@ -2501,6 +2738,48 @@ fn check_value_runs(h: &Hash, w: &Workload, mode: Option<LookupMode>) -> Result<
 struct MembershipLints {
     lints: Vec<bellwether_types::Lint>,
     inputs: Vec<Hash>,
+}
+
+/// An agg key's `why` column (B7): over the workload's aggregate runs it
+/// answers, the row groups still read to finish the aggregates under it
+/// (those its counted key does not prove answered) against the row groups
+/// holding the runs' keys, both exact, from replays of the runs with it
+/// and as `locate` lookups under the current configuration.
+fn agg_column(
+    replayer: &Replayer<'_>,
+    workload: &Workload,
+    cache: &Cache<ObjectStoreBackend>,
+    spec: &KeySpec,
+) -> Result<bellwether_types::KindColumn> {
+    let served: Vec<bool> = workload
+        .runs()
+        .iter()
+        .map(|r| {
+            r.query()
+                .is_ok_and(|q| q.aggregate().is_some() && serves_query(spec, &r.columns, &q))
+        })
+        .collect();
+    let with = replayer.replay_specs(
+        &proposed_specs(replayer.current_specs(), spec),
+        workload,
+        cache,
+    )?;
+    let holding =
+        replayer.replay_specs_as(replayer.current_specs(), workload, cache, &RunQuery::Locate)?;
+    let sum = |costs: &[bellwether_types::RunCost]| -> u64 {
+        costs
+            .iter()
+            .zip(&served)
+            .filter(|(_, s)| **s)
+            .map(|(c, _)| c.row_groups)
+            .sum()
+    };
+    Ok(bellwether_types::KindColumn {
+        kind: "agg".into(),
+        label: "row groups read to finish the aggregates / row groups holding the keys".into(),
+        value: format!("{} / {}", sum(&with), sum(&holding)),
+        exactness: bellwether_types::Exactness::Exact,
+    })
 }
 
 /// A list key's `why` column (B4): the distinct element values of its
@@ -2897,6 +3176,7 @@ fn infer_workload_temporal(
             | RunQuery::Text(_)
             | RunQuery::ContainsAny
             | RunQuery::ContainsAll
+            | RunQuery::Aggregate(_)
     ) {
         return Ok(None);
     }

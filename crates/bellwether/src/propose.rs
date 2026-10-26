@@ -324,6 +324,29 @@ impl Engine {
                     bellwether_core::expr::typed_spec(spec, &schema)?;
                     return Ok(());
                 }
+                if let KeySpec::Agg { value, .. } = spec {
+                    // The value column exists and can be aggregated as
+                    // declared, and the key counting rows on exactly the
+                    // agg key's columns is declared: without it the agg key
+                    // is never built (refused by name, not at `fix`).
+                    let schema = self.check_columns(&[value])?;
+                    bellwether_core::agg::value_type(spec, &schema)?;
+                    let declared = self
+                        .manifest()?
+                        .map(|m| m.schema.key_specs.clone())
+                        .unwrap_or_default();
+                    if bellwether_build::counting_spec(&declared, spec.columns()).is_none() {
+                        let cols = spec.columns().join(",");
+                        return Err(Error::KeySpec(format!(
+                            "{} needs a key counting rows on exactly ({cols}) beside it, whose \
+                             counts prove which aggregates answer a lookup, and the index \
+                             declares none; declare it first with `bellwether index {} --key \
+                             'exact:{cols},counts'`, then propose the agg key",
+                            spec.identity(),
+                            self.root()
+                        )));
+                    }
+                }
                 // A spec the index does not declare yet is a new
                 // declaration: it must name its columns uniquely.
                 if !self

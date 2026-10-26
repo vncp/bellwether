@@ -57,7 +57,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use arrow::datatypes::{DataType, Schema};
-use bellwether_build::encode_ts;
+use bellwether_build::{encode_ts, AggLookup};
 use bellwether_core::encoding;
 use bellwether_core::segment::{ColumnType, ReadAt, SegmentReader};
 use bellwether_core::temporal::{self, LookbackHit, VersionChain, VersionHit};
@@ -73,7 +73,7 @@ use roaring::RoaringBitmap;
 use crate::catalog::Catalog;
 use crate::keys::RunKeys;
 use crate::transient::TransientIndex;
-use crate::workload::{RunQuery, RunWindow};
+use crate::workload::{RunAggregate, RunQuery, RunWindow};
 
 /// How a key spec serves a run's keys ([`servable`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -153,7 +153,8 @@ pub fn serves_window(spec: &KeySpec, ts_column: &str) -> bool {
 /// specs that serve `run_columns` also participate by per-key intersection
 /// when paired with one temporal spec. A membership run (`contains_any`,
 /// `contains_all`) is served by a list key on its one column, and by
-/// nothing else.
+/// nothing else. An aggregate run is served by an agg key that answers it
+/// ([`aggregate_specs`]) and, read as a `locate`, by what serves its keys.
 #[must_use]
 pub fn serves_query(spec: &KeySpec, run_columns: &[String], query: &RunQuery) -> bool {
     match query {
@@ -174,7 +175,42 @@ pub fn serves_query(spec: &KeySpec, run_columns: &[String], query: &RunQuery) ->
         RunQuery::ContainsAny | RunQuery::ContainsAll => {
             matches!(spec, KeySpec::List { column } if run_columns == std::slice::from_ref(column))
         }
+        RunQuery::Aggregate(a) => {
+            servable(spec, run_columns).is_some()
+                || bellwether_build::serving_agg(
+                    std::slice::from_ref(spec),
+                    &agg_lookup_of(run_columns, Vec::new(), a),
+                )
+                .is_some()
+        }
     }
+}
+
+/// The build planner's aggregate lookup of an aggregate run's keys.
+fn agg_lookup_of(columns: &[String], keys: Vec<Vec<u8>>, a: &RunAggregate) -> AggLookup {
+    AggLookup {
+        columns: columns.to_vec(),
+        keys,
+        value: a.value.clone(),
+        functions: a.functions.clone(),
+    }
+}
+
+/// The agg key and the counted key among `specs` that answer an aggregate
+/// run on `run_columns` from the index, by the build planner's rules
+/// (`bellwether_build::serving_agg`, `counting_spec`): an agg key on the
+/// run's value storing every function asked, its key columns among the
+/// run's, beside a spec counting rows on exactly the run's columns. `None`
+/// when either is missing: the run is then read as a `locate`.
+#[must_use]
+pub fn aggregate_specs(
+    specs: &[KeySpec],
+    run_columns: &[String],
+    a: &RunAggregate,
+) -> Option<(KeySpec, KeySpec)> {
+    let agg = bellwether_build::serving_agg(specs, &agg_lookup_of(run_columns, Vec::new(), a))?;
+    let counting = bellwether_build::counting_spec(specs, run_columns)?;
+    Some((agg.clone(), counting.clone()))
 }
 
 /// The timestamp column of the one temporal spec of `specs` whose columns
@@ -224,7 +260,8 @@ pub fn planned_time_column(
         | RunQuery::Count
         | RunQuery::Text(_)
         | RunQuery::ContainsAny
-        | RunQuery::ContainsAll => Ok(None),
+        | RunQuery::ContainsAll
+        | RunQuery::Aggregate(_) => Ok(None),
         RunQuery::Latest | RunQuery::Asof { .. } => serving_temporal_column(specs, run_columns),
         RunQuery::Lookback { asof: None, .. } => planner.lookback_column(specs, run_columns),
         RunQuery::Lookback { asof: Some(_), .. } => {
@@ -373,12 +410,54 @@ pub trait PlanSource: Send + Sync {
         values: &[String],
     ) -> Result<ScanPlan>;
 
+    /// The plan of an aggregate run answered from the index: the row groups
+    /// the agg key and the counted key among `specs` ([`aggregate_specs`])
+    /// do not answer, with the `In` residual over the keys holding rows
+    /// there, and `rows` the keys' exact rows from the counts. Both
+    /// planners compute it with `bellwether_build::aggregate_answer`, so a
+    /// priced agg key plans what the built one does. An error when no agg
+    /// key and counted key among `specs` answer the run.
+    fn plan_aggregate(
+        &self,
+        specs: &[KeySpec],
+        keys: &RunKeys,
+        aggregate: &RunAggregate,
+    ) -> Result<ScanPlan>;
+
     /// This source with hypothetical specs' transient segments added, so
     /// each plans exactly as committed segments of that spec would. A
     /// transient index covers every live row group of the pinned catalog,
     /// so it is complete by construction.
     fn with_transient(&self, transient: &[Arc<TransientIndex>])
         -> Result<Box<dyn PlanSource + '_>>;
+}
+
+/// The build planner's lookup of an aggregate run.
+pub(crate) fn agg_lookup(keys: &RunKeys, aggregate: &RunAggregate) -> AggLookup {
+    agg_lookup_of(
+        keys.columns(),
+        keys.tuples().map(<[u8]>::to_vec).collect(),
+        aggregate,
+    )
+}
+
+/// The refusal when no agg key and counted key among `specs` answer an
+/// aggregate run: the two declarations it needs.
+pub(crate) fn no_aggregate(specs: &[KeySpec], run_columns: &[String], a: &RunAggregate) -> Error {
+    let cols = run_columns.join(",");
+    Error::KeySpec(format!(
+        "none of {:?} answers an aggregate of {} by ({cols}) from the index: it needs an agg key \
+         (agg:{cols}@{}{{{}}}) beside a key counting rows on exactly those columns \
+         (exact:{cols},counts)",
+        specs.iter().map(KeySpec::name).collect::<Vec<_>>(),
+        a.value,
+        a.value,
+        a.functions
+            .iter()
+            .map(|f| f.as_str())
+            .collect::<Vec<_>>()
+            .join(",")
+    ))
 }
 
 /// A [`RunQuery::Text`] run as its text lookup: its one column, its match,
@@ -1041,7 +1120,8 @@ impl SegmentPlanner {
             | RunQuery::Text(_)
             | RunQuery::Lookback { asof: Some(_), .. }
             | RunQuery::ContainsAny
-            | RunQuery::ContainsAll => {
+            | RunQuery::ContainsAll
+            | RunQuery::Aggregate(_) => {
                 return Err(Error::Other(format!(
                     "a {} run is not planned through version chains alone",
                     query.kind_str()
@@ -1427,6 +1507,36 @@ impl PlanSource for SegmentPlanner {
             operator: op,
             values: values.to_vec(),
         });
+        Ok(plan)
+    }
+
+    fn plan_aggregate(
+        &self,
+        specs: &[KeySpec],
+        keys: &RunKeys,
+        aggregate: &RunAggregate,
+    ) -> Result<ScanPlan> {
+        let schema = self.catalog.schema();
+        check_key_types(schema, keys)?;
+        let (agg, counting) = aggregate_specs(specs, keys.columns(), aggregate)
+            .ok_or_else(|| no_aggregate(specs, keys.columns(), aggregate))?;
+        let (a, c) = (self.listed(&agg)?, self.listed(&counting)?);
+        let types = keys
+            .columns()
+            .iter()
+            .map(|col| Ok((col.clone(), crate::keys::declared_type(schema, col)?)))
+            .collect::<Result<Vec<_>>>()?;
+        let lookup = agg_lookup(keys, aggregate);
+        let answer = bellwether_build::aggregate_answer(
+            (&agg, a.readers()),
+            (&counting, c.readers()),
+            &self.catalog.all_ids(),
+            &types,
+            &lookup,
+        )?;
+        let mut plan = self.catalog.plan_for(&answer.residual)?;
+        plan.residual = Some(answer.residual_predicate(&lookup));
+        plan.rows = Some(Quantity::exact(answer.rows));
         Ok(plan)
     }
 

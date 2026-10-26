@@ -65,9 +65,9 @@ pub use error::{ReplayError, ReplayResult};
 pub use keys::{RunKeys, RunKeysBuilder};
 pub use layout::{replay_layout, LayoutModel, LayoutReplay, LAYOUT_MODEL_VERSION};
 pub use plan::{
-    asof_lookback_window, count_cost, membership_residual, planned_time_column, run_cost, servable,
-    serves_query, serves_window, serving_temporal_column, text_residual, Lookup, PlanSource,
-    RangeRead, SegmentBytes, SegmentPlanner, SpecSegments,
+    aggregate_specs, asof_lookback_window, count_cost, membership_residual, planned_time_column,
+    run_cost, servable, serves_query, serves_window, serving_temporal_column, text_residual,
+    Lookup, PlanSource, RangeRead, SegmentBytes, SegmentPlanner, SpecSegments,
 };
 pub use replay::{proposed_specs, write_replay, Replayer, Scored, DEFAULT_CACHE_BYTES};
 pub use report::{
@@ -80,7 +80,7 @@ pub use transient::{
 };
 pub use workload::{
     record_bench_workload, BenchWorkloadSummary, KeyInput, KeySetSink, KeySetSource, MemoryKeySets,
-    RecordedRun, RunQuery, RunWindow, Workload, WorkloadFile, WorkloadManifest, WorkloadRecorder,
-    BENCH_WORKLOAD_FORMAT, QUERY_KIND_ASOF, QUERY_KIND_COUNT, QUERY_KIND_LATEST, QUERY_KIND_LOCATE,
-    QUERY_KIND_WINDOW, WORKLOAD_FORMAT,
+    RecordedRun, RunAggregate, RunQuery, RunWindow, Workload, WorkloadFile, WorkloadManifest,
+    WorkloadRecorder, BENCH_WORKLOAD_FORMAT, QUERY_KIND_AGGREGATE, QUERY_KIND_ASOF,
+    QUERY_KIND_COUNT, QUERY_KIND_LATEST, QUERY_KIND_LOCATE, QUERY_KIND_WINDOW, WORKLOAD_FORMAT,
 };

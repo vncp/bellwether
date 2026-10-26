@@ -190,6 +190,29 @@ pub(crate) fn measure(
         }
         return Ok(longest.map_or((0, 0), |l| (1, 2 * l)));
     }
+    // An agg key adds one cell per key and row group, sized as the build
+    // sizes it: two LEB128 counts (at most 20 bytes), a 17-byte sum, and a
+    // minimum and maximum each at most the longest value encoding of the
+    // batch plus its 4-byte length.
+    let cell = match spec {
+        KeySpec::Agg { value, .. } => {
+            let arr = column(value)?;
+            let declared = batch
+                .schema()
+                .field_with_name(value)
+                .map(|f| f.data_type().clone())
+                .map_err(|_| Error::KeySpec(format!("column {value} not in batch")))?;
+            let mut longest = 0u64;
+            for row in 0..batch.num_rows() {
+                buf.clear();
+                if encoding::encode_array_value_as(arr.as_ref(), row, &declared, &mut buf)? {
+                    longest = longest.max(buf.len() as u64);
+                }
+            }
+            20 + 17 + 2 * (4 + longest)
+        }
+        _ => 0,
+    };
     let mut seen: HashSet<Vec<u8>> = HashSet::new();
     let mut bytes = 0u64;
     for row in 0..batch.num_rows() {
@@ -210,7 +233,7 @@ pub(crate) fn measure(
             bytes += match spec.physical() {
                 KeySpec::Bloom { .. } => 8,
                 KeySpec::Temporal { .. } => key_len + 8,
-                _ => key_len,
+                _ => key_len + cell,
             };
         }
     }

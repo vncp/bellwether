@@ -262,6 +262,14 @@ pub enum LookupKind {
         /// The list column.
         column: String,
     },
+    /// Per key, aggregates of one value column over the keys' rows (B7:
+    /// `sum/count/min/max(value) ... group by key`).
+    Aggregate {
+        /// The aggregated column.
+        value: String,
+        /// The functions, in the order sum, count, min, max.
+        functions: Vec<String>,
+    },
 }
 
 /// A lookback window on a `latest` or `asof` lookup: every version of each

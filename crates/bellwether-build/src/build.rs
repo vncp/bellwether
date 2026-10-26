@@ -914,9 +914,9 @@ fn plan_specs(
                 if !beside {
                     let cols = spec.columns().join(",");
                     return Err(Error::KeySpec(format!(
-                        "{} is declared beside a key that counts rows on exactly {cols}, whose \
-                         counts prove which aggregates answer a lookup; declare both, for \
-                         example `--key 'exact:{cols},counts' --key '{}'`",
+                        "{} needs a key counting rows on exactly ({cols}) beside it, whose \
+                         counts prove which aggregates answer a lookup, and none is declared; \
+                         declare both, for example `--key 'exact:{cols},counts' --key '{}'`",
                         spec.identity(),
                         spec.identity()
                     )));

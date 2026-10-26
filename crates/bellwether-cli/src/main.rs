@@ -202,8 +202,9 @@ struct WhyArgs {
     /// (word prefixes), case-folded, or a list-membership lookup over a key
     /// file of one list column's values (named after the column):
     /// `contains-any` (rows whose list holds any of them) or `contains-all`
-    /// (every one), priced against list:<column> [default: asof with --at,
-    /// latest with --latest-by, else locate].
+    /// (every one), priced against list:<column>, or `aggregate` (per-key
+    /// aggregates of --value) [default: aggregate with --value, asof with
+    /// --at, latest with --latest-by, else locate].
     #[arg(long, value_enum, value_name = "MODE")]
     mode: Option<ModeArg>,
     /// Timestamp (or date, time, or integer version) column that orders
@@ -272,6 +273,20 @@ struct WhyArgs {
     /// the diagnosis, approximate.
     #[arg(long, conflicts_with_all = ["from", "bench_workload", "workload", "columns"])]
     sketches_only: bool,
+    /// Price the keys as one aggregate lookup of this column per key (B7,
+    /// `--mode aggregate`, as `bellwether aggregate`): the candidate is the
+    /// agg key on the key columns beside exact:<cols>,counts.
+    #[arg(long, value_name = "COLUMN", conflicts_with_all = ["bench_workload", "latest_by", "window"])]
+    value: Option<String>,
+    /// With --value: the functions, comma-separated: sum, count, min, max
+    /// [default: sum,count].
+    #[arg(
+        long = "fn",
+        value_name = "FNS",
+        value_delimiter = ',',
+        requires = "value"
+    )]
+    functions: Vec<String>,
 }
 
 /// `--gate NAME:N`.
@@ -309,6 +324,7 @@ enum ModeArg {
     HasPrefix,
     ContainsAny,
     ContainsAll,
+    Aggregate,
 }
 
 impl From<ModeArg> for bellwether::LookupMode {
@@ -322,6 +338,7 @@ impl From<ModeArg> for bellwether::LookupMode {
             ModeArg::HasPrefix => Self::HasPrefix,
             ModeArg::ContainsAny => Self::ContainsAny,
             ModeArg::ContainsAll => Self::ContainsAll,
+            ModeArg::Aggregate => Self::Aggregate,
         }
     }
 }
@@ -886,18 +903,7 @@ fn run(cli: &Cli, out: &Out) -> Result<Outcome, Failure> {
             done(&r, human::count_result(&r, out), EXIT_OK)
         }
         Command::Aggregate(a) => {
-            let functions = a
-                .functions
-                .iter()
-                .map(|f| {
-                    bellwether::types::AggregateFn::parse(f.trim()).ok_or_else(|| {
-                        Failure::Usage(format!(
-                            "--fn {f:?} is not an aggregate function; pass a comma-separated \
-                             list of sum, count, min, max, for example --fn sum,count"
-                        ))
-                    })
-                })
-                .collect::<Result<Vec<_>, _>>()?;
+            let functions = aggregate_functions(&a.functions)?;
             let engine = engine_at(g, &a.lookup.root.root, a.lookup.at_manifest)?;
             let r = engine.aggregate(
                 &key_file(&a.lookup.keys, a.lookup.key.as_ref()),
@@ -1233,6 +1239,22 @@ fn why_text(a: &WhyArgs) -> Result<Vec<bellwether::TextQuery>, Failure> {
     Ok(out)
 }
 
+/// `--fn sum,count,min,max` as aggregate functions; an unknown name is a
+/// usage error (exit 2).
+fn aggregate_functions(given: &[String]) -> Result<Vec<bellwether::types::AggregateFn>, Failure> {
+    given
+        .iter()
+        .map(|f| {
+            bellwether::types::AggregateFn::parse(f.trim()).ok_or_else(|| {
+                Failure::Usage(format!(
+                    "--fn {f:?} is not an aggregate function; pass a comma-separated list of \
+                     sum, count, min, max, for example --fn sum,count"
+                ))
+            })
+        })
+        .collect()
+}
+
 /// A malformed `--lookback` is a usage error (exit 2), refused before any
 /// engine work.
 fn check_lookback(lookback: Option<&str>) -> Result<(), Failure> {
@@ -1298,6 +1320,23 @@ fn why(g: &Global, out: &Out, a: &WhyArgs) -> Result<Outcome, Failure> {
         gates: a.gates.clone(),
         sketches_only: a.sketches_only,
         text: why_text(a)?,
+        aggregate: a
+            .value
+            .as_ref()
+            .map(|value| -> Result<_, Failure> {
+                Ok(bellwether::AggregateQuery {
+                    value: value.clone(),
+                    functions: if a.functions.is_empty() {
+                        vec![
+                            bellwether::types::AggregateFn::Sum,
+                            bellwether::types::AggregateFn::Count,
+                        ]
+                    } else {
+                        aggregate_functions(&a.functions)?
+                    },
+                })
+            })
+            .transpose()?,
     };
     // Text lookups take none of the lookup-mode flags; the facade refuses
     // them first, with that cause.

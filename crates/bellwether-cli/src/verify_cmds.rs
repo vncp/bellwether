@@ -479,7 +479,29 @@ fn reconcile_human(r: &ReconcileResult, out: &Out) -> String {
             "  each pass reads both sides again; a larger --memory-budget makes fewer passes"
         );
     }
+    for a in &o.agg {
+        let _ = writeln!(
+            s,
+            "  the {} side's per-key rows and totals came from its index's {}: {} aggregated, \
+             none read",
+            a.side,
+            a.specs.join(", "),
+            count(a.rows, "row", "rows")
+        );
+    }
     tables_human(&mut s, &r.tables);
+    if !r.lints.is_empty() {
+        let _ = writeln!(s, "\n  lints:");
+        for l in &r.lints {
+            let _ = writeln!(
+                s,
+                "    {} [{}]\n      {}",
+                l.rule,
+                l.columns.join(", "),
+                l.message
+            );
+        }
+    }
     let _ = writeln!(s, "\ncertificate {}", r.certificate.hash);
     s
 }

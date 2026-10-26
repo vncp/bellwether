@@ -971,7 +971,14 @@ impl Engine {
         for run in runs {
             let rk = workload.run_keys(cache, run)?;
             let query = run.query()?;
-            let plan = replayer.plan_of_query(&specs, &rk, &query)?;
+            // An aggregate run (B7) is verified on the rows it aggregates:
+            // every row of its keys, as the locate of its keys plans them
+            // (its counted key serves that); the plan it is priced with
+            // reads only the row groups the counts do not prove answered.
+            let plan = match &query {
+                RunQuery::Aggregate(_) => replayer.plan_of_query(&specs, &rk, &RunQuery::Locate)?,
+                q => replayer.plan_of_query(&specs, &rk, q)?,
+            };
             for e in &plan.entries {
                 selected
                     .entry(e.file.path.clone())
