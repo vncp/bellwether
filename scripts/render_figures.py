@@ -5,7 +5,6 @@ Writes, deterministically, from the definitions below:
 
   docs/assets/readme/wordmark-{light,dark}.svg       the name and its mark
   docs/assets/readme/loop-{light,dark}.svg           the loop and the trust boundary
-  docs/assets/readme/three-steps-{light,dark}.svg    ask, fix, proof
   docs/assets/readme/architecture-{light,dark}.svg   surfaces, crates, storage
 
   scripts/render_figures.py           write every figure
@@ -17,27 +16,28 @@ overflow fails here instead of on GitHub. Standard library only.
 """
 
 import argparse
+import glob
 import os
 import sys
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 ASSETS = os.path.join(REPO, "docs", "assets", "readme")
 
-SANS = "-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif"
-MONO = "ui-monospace,SFMono-Regular,'SF Mono',Menlo,Consolas,'DejaVu Sans Mono',monospace"
+# The results charts' stack (scripts/render_charts.py), and one monospace
+# stack shared with scripts/render_terminal.py.
+SANS = "-apple-system,Segoe UI,Helvetica,Arial,sans-serif"
+MONO = "ui-monospace,SFMono-Regular,Menlo,Consolas,monospace"
 
 THEMES = {
     "light": {
         "panel": "#f6f8fa", "panel_line": "#d0d7de", "box": "#ffffff", "box_line": "#d0d7de",
         "inner": "#f6f8fa", "fg": "#1f2328", "muted": "#656d76", "faint": "#8c959f",
-        "agent": "#0969da", "engine": "#1a7f37", "boundary": "#cf222e", "proof": "#9a6700",
-        "on_accent": "#ffffff",
+        "agent": "#0969da", "boundary": "#cf222e",
     },
     "dark": {
         "panel": "#0d1117", "panel_line": "#30363d", "box": "#161b22", "box_line": "#30363d",
         "inner": "#0d1117", "fg": "#e6edf3", "muted": "#8b949e", "faint": "#6e7681",
-        "agent": "#58a6ff", "engine": "#3fb950", "boundary": "#ff7b72", "proof": "#d29922",
-        "on_accent": "#0d1117",
+        "agent": "#58a6ff", "boundary": "#ff7b72",
     },
 }
 
@@ -178,7 +178,7 @@ def loop(theme):
     card_rows(
         s, 30, 56, 420, "THE AGENT, OR YOU", "any MCP client · the bellwether CLI",
         [
-            ("observe", "why · profile · locate · asof", "read-only, from cache → Evidence"),
+            ("observe", "why · profile · locate · asof", "never changes your data → Evidence"),
             ("propose", "a key, a layout, a rewrite", "no score field exists → Proposal"),
         ],
         top=200, step=120, verb_w=118,
@@ -217,43 +217,6 @@ def loop(theme):
     s.path("M1010 402C1010 470 990 503 726 503", "muted", arrow=True)
     s.text(744, 530, "reads footers and statistics;", 13, "muted", room=240)
     s.text(744, 547, "writes only its index, beside them", 13, "muted", room=240)
-    s.add("</g>")
-    return s.done()
-
-
-# ---- three steps ----------------------------------------------------------------
-def three_steps(theme):
-    s = Svg(
-        1100, 260, "Bellwether in three steps",
-        "Three steps. 1 Ask: bellwether why ./data/ says which column is a real key and exactly how many bytes "
-        "each index would save on your recorded queries. 2 Fix: bellwether fix ./data/ --proposal … scores, "
-        "verifies the same rows come back, builds the index, and only then applies. 3 Proof: a receipt and an "
-        "index; a hash-linked receipt a reviewer or CI can check, and lookups in milliseconds over plain files.",
-        theme,
-    )
-    s.arrow_marker("muted")
-    s.add(f'<g font-family="{SANS}">')
-    s.rect(0.5, 0.5, 1099, 259, "panel", "panel_line", rx=16)
-    steps = [
-        ("Ask", "bellwether why ./data/", "agent",
-         ["Which column is a real key, and", "exactly how many bytes each index", "would save on your recorded queries."]),
-        ("Fix", "bellwether fix ./data/ --proposal …", "proof",
-         ["Scores, verifies the same rows come", "back, builds the index, and only", "then applies."]),
-        ("Proof", "receipt + index", "engine",
-         ["A hash-linked receipt a reviewer or", "CI can check, and lookups in", "milliseconds over plain files."]),
-    ]
-    w, gap, x0 = 316, 46, 30
-    for i, (name, cmd, accent, lines) in enumerate(steps):
-        x = x0 + i * (w + gap)
-        s.rect(x, 30, w, 200, "box", accent, sw=2)
-        s.add(f'<circle cx="{x + 32}" cy="66" r="15" fill="{s.c(accent)}"/>')
-        s.text(x + 32, 71, str(i + 1), 15, "on_accent", 700, anchor="middle")
-        s.text(x + 58, 73, name, 20, "fg", 600, room=w - 80)
-        s.text(x + 24, 110, cmd, 12.5, accent, mono=True, room=w - 40)
-        for j, ln in enumerate(lines):
-            s.text(x + 24, 142 + j * 20, ln, 14, "muted", room=w - 40)
-        if i < len(steps) - 1:
-            s.line(x + w + 6, 130, x + w + gap - 6, 130, "muted", 2, arrow=True)
     s.add("</g>")
     return s.done()
 
@@ -347,7 +310,7 @@ def architecture(theme):
     return s.done()
 
 
-FIGURES = {"wordmark": wordmark, "loop": loop, "three-steps": three_steps, "architecture": architecture}
+FIGURES = {"wordmark": wordmark, "loop": loop, "architecture": architecture}
 
 
 def outputs():
@@ -364,10 +327,15 @@ def main():
     a = ap.parse_args()
     files = outputs()
     stale = [p for p, c in files.items() if not os.path.exists(p) or open(p, encoding="utf-8").read() != c]
+    # Every SVG here that is not a capture is a figure this script draws.
+    orphans = [p for p in glob.glob(os.path.join(ASSETS, "*.svg"))
+               if not os.path.basename(p).startswith("capture-") and p not in files]
     if a.check:
         for p in stale:
             print(f"stale: {os.path.relpath(p, REPO)} (run scripts/render_figures.py)")
-        if stale:
+        for p in orphans:
+            print(f"orphan: {os.path.relpath(p, REPO)} (no figure draws it; delete it)")
+        if stale or orphans:
             sys.exit(1)
         print(f"{len(files)} figures match their definitions")
         return
@@ -376,6 +344,9 @@ def main():
         with open(p, "w", encoding="utf-8") as f:
             f.write(files[p])
         print(f"wrote {os.path.relpath(p, REPO)}")
+    for p in orphans:
+        os.remove(p)
+        print(f"removed {os.path.relpath(p, REPO)}")
 
 
 if __name__ == "__main__":

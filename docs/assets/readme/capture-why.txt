@@ -10,7 +10,7 @@ funnel: 12 run(s), keys p50/p95/max 20/400/400; exact sums of row-group statisti
 
 culprit (entity_id): no index serves this lookup, so it reads every row group; one value touches 1 / 2 / 4 files and 4 / 8 / 16 row groups (p50 / p95 / max)
 recommended: exact:entity_id reads 130,336,047 bytes (130.3 MB) instead of 231,706,344 (231.7 MB)
-  apply it: bellwether fix /private/tmp/bellwether-readme/ledger/data --proposal 1fbca7a5433d0d524e7b16378ef7dd9e7b4cb8733848397446981f003474c6f0 --workload 3a1921721b730b1ea76a1933a0cb7cccae1f2d7f1cd90a2ebfd34228807cb842
+  apply it: bellwether fix /private/tmp/bellwether-readme/ledger/data --proposal f52bf7e5852394996831f0cdb90ead9ce6af7c36c8dd141d714e312272779e29 --workload 3a1921721b730b1ea76a1933a0cb7cccae1f2d7f1cd90a2ebfd34228807cb842
 
 fanout: files and row groups one value touches, p50 / p95 / max
   key                                      distinct  files/value            row groups/value       sample
@@ -37,6 +37,6 @@ lints
     version_ts is out of order: a point in time falls inside 27.8 row-group ranges on average, and only 25% of consecutive row groups in a file ascend without overlapping, so range pruning on version_ts reads far more than it needs; sort or cluster each partition by version_ts when writing.
 
 records
-  evidence  8d750deb2ceca98bdd0e4d488620a982075166e1685d2bb42bdcaeafdc29cad8
+  evidence  93f6ac80e866f90e8dbaffba3c9cc18936358012dae901b4662d9b1836d399da
   workload  3a1921721b730b1ea76a1933a0cb7cccae1f2d7f1cd90a2ebfd34228807cb842
-  proposal  1fbca7a5433d0d524e7b16378ef7dd9e7b4cb8733848397446981f003474c6f0  replay dcccf81f71b0  exact:entity_id
+  proposal  f52bf7e5852394996831f0cdb90ead9ce6af7c36c8dd141d714e312272779e29  replay 00904c20dd44  exact:entity_id

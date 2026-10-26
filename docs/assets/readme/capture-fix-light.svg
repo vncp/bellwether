@@ -7,16 +7,16 @@
 <circle cx="22" cy="20.0" r="5.5" fill="#d0d7de"/>
 <circle cx="40" cy="20.0" r="5.5" fill="#d0d7de"/>
 <circle cx="58" cy="20.0" r="5.5" fill="#d0d7de"/>
-<text x="500.0" y="24.5" text-anchor="middle" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif" font-size="13" fill="#656d76">bellwether fix, then reconcile</text>
-<g font-family="ui-monospace,SFMono-Regular,'SF Mono',Menlo,Consolas,'DejaVu Sans Mono','Liberation Mono',monospace" font-size="13" fill="#1f2328">
-<text x="24.0" y="77" textLength="897.0" lengthAdjust="spacing" xml:space="preserve" style="white-space:pre"><tspan fill="#1a7f37">$ </tspan><tspan fill="#0969da">bellwether fix ledger/data --proposal 1fbca7a5433d0d524e7b16378ef7dd9e7b4cb8733848397446981f003474c6f0 --workload</tspan></text>
+<text x="500.0" y="24.5" text-anchor="middle" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" fill="#656d76">bellwether fix, then reconcile</text>
+<g font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="13" fill="#1f2328">
+<text x="24.0" y="77" textLength="897.0" lengthAdjust="spacing" xml:space="preserve" style="white-space:pre"><tspan fill="#1a7f37">$ </tspan><tspan fill="#0969da">bellwether fix ledger/data --proposal f52bf7e5852394996831f0cdb90ead9ce6af7c36c8dd141d714e312272779e29 --workload</tspan></text>
 <text x="70.8" y="95" textLength="499.2" lengthAdjust="spacing" xml:space="preserve" style="white-space:pre"><tspan fill="#0969da">3a1921721b730b1ea76a1933a0cb7cccae1f2d7f1cd90a2ebfd34228807cb842</tspan></text>
-<text x="24.0" y="113" textLength="514.8" lengthAdjust="spacing" xml:space="preserve" style="white-space:pre"><tspan font-weight="700">fix 1fbca7a5433d: key exact:entity_id, against manifest sequence 0</tspan></text>
-<text x="39.6" y="131" textLength="803.4" lengthAdjust="spacing" xml:space="preserve" style="white-space:pre">1 score     231.7 MB -&gt;   130.3 MB bytes over the workload (768 -&gt; 432 row groups), replay 52da3b0de2d5</text>
-<text x="39.6" y="149" textLength="904.8" lengthAdjust="spacing" xml:space="preserve" style="white-space:pre">2 verify  pass, coverage workload, 935 keys, 0 mismatched, 0 missing left, 0 missing right, certificate 71f9d02657df</text>
+<text x="24.0" y="113" textLength="514.8" lengthAdjust="spacing" xml:space="preserve" style="white-space:pre"><tspan font-weight="700">fix f52bf7e58523: key exact:entity_id, against manifest sequence 0</tspan></text>
+<text x="39.6" y="131" textLength="803.4" lengthAdjust="spacing" xml:space="preserve" style="white-space:pre">1 score     231.7 MB -&gt;   130.3 MB bytes over the workload (768 -&gt; 432 row groups), replay edbecaa1943e</text>
+<text x="39.6" y="149" textLength="904.8" lengthAdjust="spacing" xml:space="preserve" style="white-space:pre">2 verify  pass, coverage workload, 935 keys, 0 mismatched, 0 missing left, 0 missing right, certificate 9ac9b41875c8</text>
 <text x="39.6" y="167" textLength="195.0" lengthAdjust="spacing" xml:space="preserve" style="white-space:pre">3 apply   manifest 0 -&gt; 1</text>
-<text x="39.6" y="185" textLength="639.6" lengthAdjust="spacing" xml:space="preserve" style="white-space:pre">4 attest  receipt f264c16ec8566dcc2de1781dd9efee0c5e56057a7bd38f06bb966d0791a0f568</text>
-<text x="39.6" y="203" textLength="475.8" lengthAdjust="spacing" xml:space="preserve" style="white-space:pre">realized 130,336,047 bytes at manifest 1, replay 17fc8287a36f</text>
+<text x="39.6" y="185" textLength="639.6" lengthAdjust="spacing" xml:space="preserve" style="white-space:pre">4 attest  receipt 3184c88430d9751dff8f8c7f5c1ec149c025fbb47b50fd94a65652b081878b96</text>
+<text x="39.6" y="203" textLength="475.8" lengthAdjust="spacing" xml:space="preserve" style="white-space:pre">realized 130,336,047 bytes at manifest 1, replay 570856bb5487</text>
 <text x="24.0" y="239" textLength="795.6" lengthAdjust="spacing" xml:space="preserve" style="white-space:pre"><tspan fill="#1a7f37">$ </tspan><tspan fill="#0969da">bellwether reconcile ledger/data changed/data --key entity_id --latest-by version_ts --totals amount</tspan></text>
 <text x="24.0" y="257" textLength="234.0" lengthAdjust="spacing" xml:space="preserve" style="white-space:pre"><tspan font-weight="700">reconcile: FAIL, coverage full</tspan></text>
 <text x="39.6" y="275" textLength="288.6" lengthAdjust="spacing" xml:space="preserve" style="white-space:pre">keys compared                   6,855</text>
@@ -31,11 +31,11 @@
 <text x="55.2" y="473" textLength="803.4" lengthAdjust="spacing" xml:space="preserve" style="white-space:pre">amount           all rows                                1546909874.77            1546909874.78  DIFFER</text>
 <text x="39.6" y="509" textLength="881.4" lengthAdjust="spacing" xml:space="preserve" style="white-space:pre">read 1 pass(es) over each side under a 268,435,456-byte state budget (0 restarts): 128,000 rows read on the left,</text>
 <text x="70.8" y="527" textLength="156.0" lengthAdjust="spacing" xml:space="preserve" style="white-space:pre">128,000 on the right</text>
-<text x="24.0" y="563" textLength="592.8" lengthAdjust="spacing" xml:space="preserve" style="white-space:pre">certificate 8755117d5a73945b18abe6c4ed4350a161782dfb29c36142a41a3328d825aba0</text>
+<text x="24.0" y="563" textLength="592.8" lengthAdjust="spacing" xml:space="preserve" style="white-space:pre">certificate 99f7f426eca2eea1f35aa37147a856c2c9e13b4ef5aeb5864a81df3aa7dfd685</text>
 <text x="24.0" y="581" textLength="46.8" lengthAdjust="spacing" xml:space="preserve" style="white-space:pre"><tspan fill="#656d76">exit 1</tspan></text>
 </g>
 <line x1="24" y1="606" x2="976" y2="606" stroke="#d0d7de"/>
-<text x="24" y="628" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif" font-size="12" font-style="italic" fill="#656d76">bellwether fix with the proposal and workload the why capture printed, then reconcile against a copy with one entity's amount raised by 0.01 (planted</text>
-<text x="24" y="645" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif" font-size="12" font-style="italic" fill="#656d76">with DuckDB); the bench ledger corpus (bench generate --seed 42: 16 files, 64 row groups, 128,000 rows; bench workload: 12 recorded runs); debug build</text>
-<text x="24" y="662" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif" font-size="12" font-style="italic" fill="#656d76">of eca48d1, 2026-10-26.</text>
+<text x="24" y="628" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" font-style="italic" fill="#656d76">bellwether fix with the proposal and workload the why capture printed, then reconcile against a copy with one entity's amount raised by 0.01 (planted</text>
+<text x="24" y="645" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" font-style="italic" fill="#656d76">with DuckDB); the bench ledger corpus (bench generate --seed 42: 16 files, 64 row groups, 128,000 rows; bench workload: 12 recorded runs); debug build</text>
+<text x="24" y="662" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" font-style="italic" fill="#656d76">of eca48d1, 2026-10-26.</text>
 </svg>

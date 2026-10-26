@@ -10,7 +10,7 @@ $ bellwether index market/data --partitioning hive --key exact:symbol@ts --key r
   bounds:symbol@ts                                      1
   temporal2:symbol@ts,known_at                          1
 
-manifest 0ba37c56a9a2643bd2a586d2af8c51964783ae70ad54308ca014268a92b2d150
+manifest 82462e6e5dc455ca7beba88f0ce8078a8db4c7b7f8ecc42abeef4220f421bb2d
 
 $ bellwether asof market/data --keys market/workload/keys/q0019.parquet --valid 2026-01-01T14:33:36.594660Z --known 2026-01-02T15:29:06.427726Z
 [1mbitemporal ts <= 2026-01-01T14:33:36.594660Z (1767278016594660), known_at <= 2026-01-02T15:29:06.427726Z (1767367746427726): 10 keys on (symbol) at manifest sequence 1[0m
@@ -26,4 +26,4 @@ $ bellwether asof market/data --keys market/workload/keys/q0019.parquet --valid 
   ...ether-readme/market/data/day=2026-01-01/part-0000.parquet           3             34,995
   ...ether-readme/market/data/day=2026-01-02/part-0000.parquet           1             13,910
 
-evidence 302db23d62c53e92f29939baaddf9159305af3714e11abc5829d9c5c9baaab58
+evidence 79eba8b00a82ca6ca7c477fd3a7d43dece6ec4ca970e3b2c7b4e24c3f9613691

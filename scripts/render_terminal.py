@@ -47,8 +47,9 @@ CHAR_W = FONT_SIZE * 0.6  # every monospace face the README can meet is close to
 LINE_H = 18
 COLS = int((WIDTH - 2 * PAD) / CHAR_W)  # 123
 CONT_INDENT = 4
-MONO = "ui-monospace,SFMono-Regular,'SF Mono',Menlo,Consolas,'DejaVu Sans Mono','Liberation Mono',monospace"
-SANS = "-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif"
+# The same stacks as scripts/render_figures.py (sans: the results charts').
+MONO = "ui-monospace,SFMono-Regular,Menlo,Consolas,monospace"
+SANS = "-apple-system,Segoe UI,Helvetica,Arial,sans-serif"
 
 THEMES = {
     "light": {
@@ -394,6 +395,14 @@ def report_page(html, theme, x, y, w):
             body = body.replace("<text ", f'<text fill="{rp["fg"]}" font-family="{SANS}" font-size="12" ')
             o.append(f'<svg x="{cx}" y="{cy + 4}" width="{sw:g}" height="{sh:g}" viewBox="0 0 {sw:g} {sh:g}">'
                      f"{body}</svg>")
+            # A legend beside the bars, in the words of the report's own table
+            # rows; the report itself shows the colors' meaning on hover only.
+            lx = cx + sw + 30
+            for i, (var, name) in enumerate((("now", "before"), ("fix", "after (predicted)"))):
+                ly = cy + 18 + i * 22
+                o.append(f'<rect x="{lx}" y="{ly}" width="14" height="10" fill="{rp[var]}"/>')
+                o.append(f'<text x="{lx + 22}" y="{ly + 10}" font-family="{SANS}" font-size="12" '
+                         f'fill="{rp["fg"]}">{name}</text>')
             cy += sh + 8
         else:
             rows = re.findall(r"<tr>(.*?)</tr>", part, re.S)

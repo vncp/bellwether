@@ -2,7 +2,7 @@
 <title id="title">Bellwether architecture</title>
 <desc id="desc">Who drives it: you in a terminal, a coding agent over MCP, CI or a script, and the benchmark, all through one binary. Inside the Rust engine, five layers with dependencies pointing one way: bellwether-cli and bellwether-mcp (arguments and envelopes only), the bellwether facade (fix runs score, verify, apply, attest), profile, replay, verify and build, then core, source, store and ledger, then bellwether-types, the contract. The engine reads statistics from your files and writes segments, a manifest, a ledger and a cache beside them, on local disk or object storage.</desc>
 <defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#8b949e"/></marker></defs>
-<g font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif">
+<g font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif">
 <rect x="0.5" y="0.5" width="1099" height="599" rx="16" fill="#0d1117" stroke="#30363d" stroke-width="1"/>
 <rect x="30" y="56" width="270" height="480" rx="12" fill="#161b22" stroke="#30363d" stroke-width="1"/>
 <text x="52" y="92" font-size="12" fill="#8b949e" font-weight="600" letter-spacing="0.12em">WHO DRIVES IT</text>
@@ -27,19 +27,19 @@
 <text x="822" y="92" font-size="12" fill="#8b949e" font-weight="600" letter-spacing="0.12em">YOUR STORAGE</text>
 <text x="822" y="115" font-size="13" fill="#6e7681">local disk · S3 · Azure · GCS</text>
 <line x1="822" y1="134" x2="1048" y2="134" stroke="#30363d" stroke-width="1"/>
-<text x="822" y="168" font-size="14" fill="#e6edf3" font-weight="700" font-family="ui-monospace,SFMono-Regular,'SF Mono',Menlo,Consolas,'DejaVu Sans Mono',monospace">your files</text>
+<text x="822" y="168" font-size="14" fill="#e6edf3" font-weight="700" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace">your files</text>
 <text x="822" y="189" font-size="13" fill="#8b949e">Parquet · CSV · JSON lines, as-is</text>
 <line x1="822" y1="208" x2="1048" y2="208" stroke="#30363d" stroke-width="1"/>
-<text x="822" y="240" font-size="14" fill="#e6edf3" font-weight="700" font-family="ui-monospace,SFMono-Regular,'SF Mono',Menlo,Consolas,'DejaVu Sans Mono',monospace">segments/</text>
+<text x="822" y="240" font-size="14" fill="#e6edf3" font-weight="700" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace">segments/</text>
 <text x="822" y="261" font-size="13" fill="#8b949e">immutable, named by content hash</text>
 <line x1="822" y1="280" x2="1048" y2="280" stroke="#30363d" stroke-width="1"/>
-<text x="822" y="312" font-size="14" fill="#e6edf3" font-weight="700" font-family="ui-monospace,SFMono-Regular,'SF Mono',Menlo,Consolas,'DejaVu Sans Mono',monospace">manifest.json</text>
+<text x="822" y="312" font-size="14" fill="#e6edf3" font-weight="700" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace">manifest.json</text>
 <text x="822" y="333" font-size="13" fill="#8b949e">advanced by conditional PUT</text>
 <line x1="822" y1="352" x2="1048" y2="352" stroke="#30363d" stroke-width="1"/>
-<text x="822" y="384" font-size="14" fill="#e6edf3" font-weight="700" font-family="ui-monospace,SFMono-Regular,'SF Mono',Menlo,Consolas,'DejaVu Sans Mono',monospace">ledger/</text>
+<text x="822" y="384" font-size="14" fill="#e6edf3" font-weight="700" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace">ledger/</text>
 <text x="822" y="405" font-size="13" fill="#8b949e">append-only, hash-named records</text>
 <line x1="822" y1="424" x2="1048" y2="424" stroke="#30363d" stroke-width="1"/>
-<text x="822" y="456" font-size="14" fill="#e6edf3" font-weight="700" font-family="ui-monospace,SFMono-Regular,'SF Mono',Menlo,Consolas,'DejaVu Sans Mono',monospace">cache/</text>
+<text x="822" y="456" font-size="14" fill="#e6edf3" font-weight="700" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace">cache/</text>
 <text x="822" y="477" font-size="13" fill="#8b949e">rebuildable</text>
 <text x="935.0" y="566" font-size="13" fill="#6e7681" text-anchor="middle">the data is never converted</text>
 <rect x="340" y="56" width="420" height="480" rx="12" fill="#161b22" stroke="#30363d" stroke-width="1"/>
@@ -47,23 +47,23 @@
 <text x="364" y="115" font-size="13" fill="#6e7681">thirteen crates; imports point down</text>
 <line x1="364" y1="134" x2="736" y2="134" stroke="#30363d" stroke-width="1"/>
 <rect x="364" y="150" width="372" height="58" rx="8" fill="#0d1117" stroke="#30363d" stroke-width="1"/>
-<text x="382" y="175" font-size="14" fill="#e6edf3" font-weight="700" font-family="ui-monospace,SFMono-Regular,'SF Mono',Menlo,Consolas,'DejaVu Sans Mono',monospace">bellwether-cli · bellwether-mcp</text>
+<text x="382" y="175" font-size="14" fill="#e6edf3" font-weight="700" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace">bellwether-cli · bellwether-mcp</text>
 <text x="382" y="195" font-size="13" fill="#8b949e">arguments and envelopes; no engine logic</text>
 <line x1="550.0" y1="209" x2="550.0" y2="222" stroke="#8b949e" stroke-width="1.5" marker-end="url(#arrow)"/>
 <rect x="364" y="224" width="372" height="58" rx="8" fill="#0d1117" stroke="#30363d" stroke-width="1"/>
-<text x="382" y="249" font-size="14" fill="#e6edf3" font-weight="700" font-family="ui-monospace,SFMono-Regular,'SF Mono',Menlo,Consolas,'DejaVu Sans Mono',monospace">bellwether</text>
+<text x="382" y="249" font-size="14" fill="#e6edf3" font-weight="700" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace">bellwether</text>
 <text x="382" y="269" font-size="13" fill="#8b949e">the facade: score → verify → apply → attest</text>
 <line x1="550.0" y1="283" x2="550.0" y2="296" stroke="#8b949e" stroke-width="1.5" marker-end="url(#arrow)"/>
 <rect x="364" y="298" width="372" height="58" rx="8" fill="#0d1117" stroke="#30363d" stroke-width="1"/>
-<text x="382" y="323" font-size="14" fill="#e6edf3" font-weight="700" font-family="ui-monospace,SFMono-Regular,'SF Mono',Menlo,Consolas,'DejaVu Sans Mono',monospace">profile · replay · verify · build</text>
+<text x="382" y="323" font-size="14" fill="#e6edf3" font-weight="700" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace">profile · replay · verify · build</text>
 <text x="382" y="343" font-size="13" fill="#8b949e">fanout · exact cost · certificates · segments</text>
 <line x1="550.0" y1="357" x2="550.0" y2="370" stroke="#8b949e" stroke-width="1.5" marker-end="url(#arrow)"/>
 <rect x="364" y="372" width="372" height="58" rx="8" fill="#0d1117" stroke="#30363d" stroke-width="1"/>
-<text x="382" y="397" font-size="14" fill="#e6edf3" font-weight="700" font-family="ui-monospace,SFMono-Regular,'SF Mono',Menlo,Consolas,'DejaVu Sans Mono',monospace">core · source · store · ledger</text>
+<text x="382" y="397" font-size="14" fill="#e6edf3" font-weight="700" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace">core · source · store · ledger</text>
 <text x="382" y="417" font-size="13" fill="#8b949e">keys · footers · commits · records</text>
 <line x1="550.0" y1="431" x2="550.0" y2="444" stroke="#8b949e" stroke-width="1.5" marker-end="url(#arrow)"/>
 <rect x="364" y="446" width="372" height="58" rx="8" fill="#0d1117" stroke="#30363d" stroke-width="1"/>
-<text x="382" y="471" font-size="14" fill="#e6edf3" font-weight="700" font-family="ui-monospace,SFMono-Regular,'SF Mono',Menlo,Consolas,'DejaVu Sans Mono',monospace">bellwether-types</text>
+<text x="382" y="471" font-size="14" fill="#e6edf3" font-weight="700" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace">bellwether-types</text>
 <text x="382" y="491" font-size="13" fill="#8b949e">the contract: records, traits, format</text>
 <text x="550.0" y="566" font-size="13" fill="#6e7681" text-anchor="middle">dependencies point one way: dev/check-layering.py</text>
 <line x1="304" y1="300" x2="336" y2="300" stroke="#58a6ff" stroke-width="2" marker-end="url(#arrow)"/>

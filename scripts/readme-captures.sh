@@ -112,7 +112,7 @@ show reconcile ledger/data changed/data --key entity_id --latest-by version_ts -
 
 # ---- report: the funnel behind the receipt, from the ledger -----------------
 start report "bellwether report" \
-  "bellwether report over the ledger after the fix capture; below it, the receipt's section of the report.html it wrote, drawn from that HTML (funnel bars and table as the report renders them); $BUILD."
+  "bellwether report over the ledger after the fix capture; below it, the receipt's section of the report.html it wrote, drawn from that HTML (funnel bars and table as the report renders them, plus a before/after legend in the table's words); $BUILD."
 show report ledger/data --html report.html
 python3 - "$W/report.html" "$OUT/capture-report.html" <<'PY'
 import re, sys
@@ -141,7 +141,7 @@ show asof market/data --keys "$KEYS" --valid "$VALID" --known "$KNOWN"
 
 # ---- MCP: a refusal over stdio ----------------------------------------------
 start mcp "bellwether mcp (stdio)" \
-  "A JSON-RPC session with bellwether mcp over stdio on $LEDGER_DESC: observe.why, then propose.key with a score smuggled in; the request as sent, the reply pretty-printed, nothing else edited; $BUILD."
+  "A JSON-RPC session with bellwether mcp over stdio on $LEDGER_DESC: observe.why, then propose.key with a score smuggled in; the request as sent, the reply pretty-printed with its session budget block elided, nothing else edited; $BUILD."
 python3 - "$BW" ledger/data >>"$OUT/capture-mcp.txt" <<'PY'
 import json, subprocess, sys
 bw, root = sys.argv[1], sys.argv[2]
@@ -170,8 +170,10 @@ print("#! (initialize, then observe.why, which returned evidence " + evidence[:1
 print("#! client -> server, the line as sent")
 print(json.dumps({"jsonrpc": "2.0", "id": n + 1, "method": "tools/call", "params": call}))
 r = request("tools/call", call)
-print("#! server -> client, pretty-printed")
-print(json.dumps(r, indent=2))
+print("#! server -> client, pretty-printed; the session budget block elided")
+shown = json.loads(json.dumps(r))
+shown["result"]["structuredContent"]["budget"] = "\0elided"
+print(json.dumps(shown, indent=2).replace('"\\u0000elided"', "{ … }"))
 p.stdin.close()
 p.wait()
 PY

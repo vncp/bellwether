@@ -7,8 +7,11 @@
 
 <p align="center"><b>Find out why your lake queries read a thousand times more than they return, build the index that fixes it, and prove the fix returned the same rows. One binary. No cluster.</b></p>
 
+<p align="center">NYC taxi, trips from 10 pickup zones in one week: <b>342.3 MB → 25.5 MB</b> read for the same 1,090 rows, verified. <a href="#results">Results</a></p>
+
 <p align="center">
   <a href="#what-you-can-do-with-it">What you can do with it</a> ·
+  <a href="#in-one-minute">In one minute</a> ·
   <a href="#thirty-second-start">Start</a> ·
   <a href="#how-it-works">How it works</a> ·
   <a href="#results">Results</a> ·
@@ -31,15 +34,31 @@
 - **Build the index, with a receipt.** `bellwether fix` scores the change by exact replay, verifies the same rows come back, builds the index in one manifest commit, and ends with a receipt hash a reviewer or a CI gate can check. Or it refuses, and says why.
 - **Prove two datasets agree.** `bellwether reconcile` compares two folders by key, latest version, and exact decimal totals, names the keys that differ, and writes a certificate either way, inside a memory budget you set.
 - **Ask time-series questions of plain files.** The current state of a set of keys, their state on March 3rd, and what was known at a given moment about the state at another (`asof --valid --known`, no lookahead), located to the row group.
-- **Let a coding agent drive it, safely.** `bellwether mcp` serves the same engine over MCP. The agent may observe and propose; only the engine scores, verifies, and applies. Every refusal carries a stable code and one next step.
+- **Let a coding agent drive it, safely.** `bellwether mcp` serves the same engine over MCP, in tiers of tools; every refusal carries a stable code and one next step.
 - **Reconcile a SQL table against files** *(landing with [#11](https://github.com/vncp/bellwether/pull/11))*. A table becomes one side of a reconcile, with costs labeled measured rather than exact.
+
+## In one minute
+
+1. **Ask.** `bellwether why ./data/ --from keys.parquet` profiles the columns (files and row groups each value touches), replays the recorded keys under every candidate key, and prints the funnel, the culprit, and the recommended key, with the `fix` line to run.
+2. **Fix.** `bellwether fix ./data/ --proposal … --workload …` scores, verifies, applies, and attests, in that order. If the replay predicts no saving it refuses (`nothing_to_gain`) and applies nothing.
+3. **Proof.** The receipt hash. `bellwether receipt show` walks it back through the certificate, the replay, the proposal, and the evidence; `bellwether report` draws every receipt's funnel; `locate`, `latest`, and `asof` now plan only the row groups that hold the keys.
+
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/assets/readme/capture-why-dark.svg">
+    <img alt="Terminal output of bellwether why ledger/data --bench-workload ledger on a folder with nothing indexed. The funnel over 12 recorded runs: the dataset is 16 files, 64 row groups, 19.3 MB, 128,000 rows; with no index the runs read 192 files, 768 row groups, 231.7 MB; exact:entity_id, the floor, would read 108 files, 432 row groups, 130.3 MB, and is recommended. The culprit line says no index serves this lookup, so it reads every row group, and that one entity_id value touches 4 / 8 / 16 row groups (p50 / p95 / max). Then the fix line with its proposal and workload hashes, the fanout per candidate column (entity_id 6,855 distinct values; status 5 values, each in all 64 row groups), three lints (batch_stamp_key on batch_id, low_selectivity_single_column on status, scattered_time_column on version_ts), and the evidence, workload, and proposal hashes." src="docs/assets/readme/capture-why-light.svg" width="100%">
+  </picture>
+</p>
+<p align="center"><em><code>bellwether why</code> on an unindexed folder · bench ledger corpus, 12 recorded runs · debug build of eca48d1</em></p>
+
+Read the funnel top down: the dataset, what the recorded runs read now, then each candidate key with what it would read on the same runs. The floor is the key on the workload's own columns, which reads only the row groups that hold a key; `recommended` names the cheapest candidate and the `fix` line to apply it. When every candidate reads about as much as the floor and the floor reads nearly everything, the culprit line says the layout is the cause, not a missing index.
 
 ## Thirty-second start
 
 From source (Rust 1.89 or newer):
 
 ```sh
-cargo install --git https://github.com/vncp/bellwether bellwether-cli     # → bellwether
+cargo install --locked --git https://github.com/vncp/bellwether bellwether-cli     # → bellwether
 ```
 
 Your first `why`, on the keys one run of your job looked up (a Parquet file of them):
@@ -54,23 +73,43 @@ It ends with the `fix` line to run, hashes filled in. Your first `fix` scores, v
 bellwether fix ./orders/ --proposal <proposal hash> --workload <workload hash>
 ```
 
-No data at hand? `bellwether bench generate --out demo` writes a synthetic versioned ledger, `bellwether bench workload --corpus demo` records runs of lookups against it, and `bellwether why demo/data --bench-workload demo` starts from there. The captures below start the same way, on a smaller corpus; [`scripts/readme-captures.sh`](scripts/readme-captures.sh) has the exact commands.
+No data at hand? `bellwether bench generate --out demo` writes a synthetic versioned ledger, `bellwether bench workload --corpus demo` records runs of lookups against it, and `bellwether why demo/data --bench-workload demo` starts from there. The `why`, `fix`, `report`, and MCP captures in this README start that way, on a smaller corpus; the time-series capture uses `bellwether bench market`. [`scripts/readme-captures.sh`](scripts/readme-captures.sh) has the exact commands.
 
 ## How it works
 
 Bellwether is a standalone index and query advisor for Parquet lakes, written in Rust. Point it at a folder of files. It measures which columns actually discriminate rows, replays your real query keys against hypothetical indexes to compute exact savings, builds a row-group-precision index with composite and point-in-time keys, and attests every change with a reconciliation receipt.
 
-Costs come from the files' own statistics. `why` records the keys a job looked up as a workload and replays it against the current configuration and every candidate key; each cost is a sum of row-group statistics from the files that exist, never an estimate. A lookup (`locate`, `latest`, `asof`) hands your engine a list of files and row groups with a residual predicate, and DuckDB, DataFusion, Polars, Spark, or your own code reads the rows.
+Costs come from the files' own statistics. `why` records the keys a job looked up as a workload and replays it against the current configuration and every candidate key; each cost is a sum of row-group statistics from the files that exist, never an estimate, and a number that cannot be computed exactly is labeled, never guessed. A lookup (`locate`, `latest`, `asof`) hands your engine a list of files and row groups with a residual predicate. Nothing above the file layer is format-specific: a text file's fixed byte-range chunks play the role of Parquet row groups.
 
-A coding agent can drive it, but only the engine is allowed to measure, verify, or apply. An agent (or a person) may **observe** and **propose**. Only the engine may **score**, **verify**, and **apply**. The boundary is enforced by the record types, not by a prompt: a proposal has no score field, and a receipt cannot be written without a certificate that passed.
+An agent (or a person) may **observe** and **propose**. Only the engine may **score**, **verify**, and **apply**. The boundary is enforced by the record types, not by a prompt: a proposal has no score field, and a receipt cannot be written without a certificate that passed. A confused or compromised agent can waste your time and nothing else.
 
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="docs/assets/readme/loop-dark.svg">
-    <img alt="The Bellwether loop. On the agent's side, which an MCP client or a person on the CLI drives: observe (why, profile, locate, asof; read-only, from cache, producing Evidence) and propose (a key, a layout, or a rewrite; no score field exists, producing a Proposal). On the engine's side, which never calls a model: score (exact replay of recorded keys, a Replay), verify (reconcile: same rows?, a Certificate), apply (only with a passing certificate), attest (hash-links the chain, a Receipt). A dashed trust boundary, enforced by record types rather than prompts, separates them. Evidence and proposal hashes cross to the engine; replays, certificates, receipts, and refusals with a next step come back. The engine reads your folder's footers and statistics and writes only its index beside the files." src="docs/assets/readme/loop-light.svg" width="100%">
+    <img alt="The Bellwether loop. On the agent's side, which an MCP client or a person on the CLI drives: observe (why, profile, locate, asof; never changes your data, producing Evidence) and propose (a key, a layout, or a rewrite; no score field exists, producing a Proposal). On the engine's side, which never calls a model: score (exact replay of recorded keys, a Replay), verify (reconcile: same rows?, a Certificate), apply (only with a passing certificate), attest (hash-links the chain, a Receipt). A dashed trust boundary, enforced by record types rather than prompts, separates them. Evidence and proposal hashes cross to the engine; replays, certificates, receipts, and refusals with a next step come back. The engine reads your folder's footers and statistics and writes only its index beside the files." src="docs/assets/readme/loop-light.svg" width="100%">
   </picture>
 </p>
 <p align="center"><em>The loop and the trust boundary · drawn by <code>scripts/render_figures.py</code></em></p>
+
+## Contents
+
+- [What you can do with it](#what-you-can-do-with-it)
+- [In one minute](#in-one-minute)
+- [Thirty-second start](#thirty-second-start)
+- [How it works](#how-it-works)
+- [Results](#results)
+- [Highlights](#highlights)
+- [How `fix` proves a change](#how-fix-proves-a-change)
+- [Questions over time](#questions-over-time)
+- [For a coding agent](#for-a-coding-agent)
+- [How it compares](#how-it-compares)
+- [Planned: evolve](#planned-evolve)
+- [Architecture](#architecture)
+- [Run it](#run-it)
+- [Status](#status)
+- [Docs](#docs)
+- [Where it came from](#where-it-came-from)
+- [Contributing and license](#contributing-and-license)
 
 ## Results
 
@@ -135,51 +174,15 @@ Bellwether measures this before anything is built: `why` prices every candidate 
 
 Reproduce everything above, downloads included, with [`scripts/showcase.sh`](scripts/showcase.sh); it rewrites the results file, and [`scripts/render_charts.py`](scripts/render_charts.py) redraws every chart and table from it (CI fails if a committed chart no longer matches the committed numbers). Earlier runs, with their transcripts: [every CLI verb on taxi and GH Archive data](docs/measured/2026-10-24-realdata.md) and [a ClickBench slice before any index existed](docs/measured/2026-10-24-clickbench.md).
 
-## Contents
-
-- [What you can do with it](#what-you-can-do-with-it)
-- [Thirty-second start](#thirty-second-start)
-- [How it works](#how-it-works)
-- [Results](#results)
-- [In one minute](#in-one-minute)
-- [Highlights](#highlights)
-- [How `fix` proves a change](#how-fix-proves-a-change)
-- [From files to a plan](#from-files-to-a-plan)
-- [Time series](#time-series)
-- [For a coding agent](#for-a-coding-agent)
-- [How it compares](#how-it-compares)
-- [Architecture](#architecture)
-- [Run it](#run-it)
-- [Status](#status)
-- [Docs](#docs)
-- [Contributing and license](#contributing-and-license)
-
-## In one minute
-
-Jobs over a data lake routinely read a thousand times more than they return, because nobody knows which column a real index should be on, and nobody can prove a faster version of the job returns the same rows. Bellwether answers both questions from the files' own statistics: the cost of any candidate index is computed exactly, never estimated, and every applied change ends in a receipt a reviewer or a CI gate can check.
-
-1. **Ask.** `bellwether why ./data/ --from keys.parquet` profiles the columns (files and row groups each value touches), replays the recorded keys under every candidate key, and prints the funnel, the culprit, and the recommended key, with the `fix` line to run.
-2. **Fix.** `bellwether fix ./data/ --proposal … --workload …` scores, verifies, applies, and attests, in that order. If the replay predicts no saving it refuses (`nothing_to_gain`) and applies nothing.
-3. **Proof.** The receipt hash. `bellwether receipt show` walks it back through the certificate, the replay, the proposal, and the evidence; `bellwether report` draws every receipt's funnel; `locate`, `latest`, and `asof` now plan only the row groups that hold the keys.
-
-<p align="center">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="docs/assets/readme/three-steps-dark.svg">
-    <img alt="Three steps. 1 Ask: bellwether why ./data/ tells you which column is a real key and exactly how many bytes each index would save on your recorded queries. 2 Fix: bellwether fix ./data/ --proposal … scores, verifies the same rows come back, builds the index, and only then applies. 3 Proof: a receipt and an index; a hash-linked receipt a reviewer or CI can check, and lookups in milliseconds over plain files." src="docs/assets/readme/three-steps-light.svg" width="100%">
-  </picture>
-</p>
-<p align="center"><em>Ask, fix, proof · drawn by <code>scripts/render_figures.py</code></em></p>
-
 ## Highlights
 
-- **Tells you which column to index, with evidence.** Fanout per column (files and row groups touched per value), then an exact replay of your recorded query keys against each candidate key. The cost is a sum of row-group statistics, never an estimate.
-- **Prunes to the row group, not the file.** Composite keys with prefix lookup, latest-version and as-of lookups over plain append-only files. Single-key seek in the core index: ~0.2 µs at 10k keys, ~0.5 µs at 1M keys.
+- **Tells you which column to index, with evidence.** Fanout per column (files and row groups touched per value), then an exact replay of your recorded query keys against each candidate key.
+- **Prunes to the row group, not the file.** Composite keys with prefix lookup, latest-version and as-of lookups over plain append-only files.
 - **Shows its receipts.** Every applied change hash-links the evidence it was based on, the proposal, the exact before-and-after replay, and a reconciliation certificate proving the same rows came back. If it cannot prove something, it says so.
-- **Agent-first, with a trust boundary.** MCP tools in tiers: `observe.*` and `propose.*` for the agent; `score.*` and `apply.receipt` ask the engine, which alone scores, verifies, and applies. A confused or compromised agent can waste your time and nothing else.
+- **Agent-first.** MCP tools in tiers (`observe.*`, `propose.*`, `score.*`, `apply.receipt`, `jobs.*`), typed refusals, dry runs, and per-session budgets.
 - **Parquet stays Parquet.** Immutable sidecar segments and a manifest committed by conditional PUT. No table format conversion, no locks, no new file format. Local disk, S3, Azure, GCS.
-- **Time travel without a table format.** `latest` and `asof` answer "the current state of these keys" and "their state on March 3rd" across a folder of history files, located to the row group.
+- **Time travel without a table format.** `latest` and `asof` work across a folder of history files, no snapshots or table metadata needed.
 - **Runs on a laptop.** Memory is bounded per operation and stated in the docs. The "which files do I need" question no longer needs a cluster or a JVM.
-- **Learns your workload's rulebook** *(planned, M6)*. `evolve` will search query plans, physical designs, and whole pipelines with an exact loss (replay) and a hard constraint (reconciliation); see [Evolve](#evolve-planned).
 
 ## How `fix` proves a change
 
@@ -203,21 +206,7 @@ In order, every time: **score** the proposal by exact replay, **verify** that th
 </p>
 <p align="center"><em><code>bellwether report</code> after that fix, its receipt section drawn below · same corpus and build</em></p>
 
-## From files to a plan
-
-Footers and statistics in, scan plan out: profile the columns, replay your recorded keys against each candidate index for an exact cost, build immutable index segments plus one small manifest, and hand your engine a list of files and row groups with a residual predicate. Nothing above the file layer is format-specific: a text file's fixed byte-range chunks play the role of Parquet row groups, and a SQL table is a planned source.
-
-<p align="center">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="docs/assets/readme/capture-why-dark.svg">
-    <img alt="Terminal output of bellwether why ledger/data --bench-workload ledger on a folder with nothing indexed. The funnel over 12 recorded runs: the dataset is 16 files, 64 row groups, 19.3 MB, 128,000 rows; with no index the runs read 192 files, 768 row groups, 231.7 MB; exact:entity_id, the floor, would read 108 files, 432 row groups, 130.3 MB, and is recommended. The culprit line says no index serves this lookup, so it reads every row group, and that one entity_id value touches 4 / 8 / 16 row groups (p50 / p95 / max). Then the fix line with its proposal and workload hashes, the fanout per candidate column (entity_id 6,855 distinct values; status 5 values, each in all 64 row groups), three lints (batch_stamp_key on batch_id, low_selectivity_single_column on status, scattered_time_column on version_ts), and the evidence, workload, and proposal hashes." src="docs/assets/readme/capture-why-light.svg" width="100%">
-  </picture>
-</p>
-<p align="center"><em><code>bellwether why</code> on an unindexed folder · bench ledger corpus, 12 recorded runs · debug build of eca48d1</em></p>
-
-Read the funnel top down: the dataset, what the recorded runs read now, then each candidate key with what it would read on the same runs. The floor is the key on the workload's own columns, which reads only the row groups that hold a key; `recommended` names the cheapest candidate and the `fix` line to apply it. When every candidate reads about as much as the floor and the floor reads nearly everything, the culprit line says the layout is the cause, not a missing index.
-
-## Time series
+## Questions over time
 
 For folders of market data (partitioned by date, many symbols per file), five additions, all additive to storage version 1 ([format](docs/format.md), [capabilities and status](docs/time-series-capabilities.md)):
 
@@ -267,12 +256,12 @@ Then ask it to run the prompt `diagnose_slow_query`, which is [`AGENTS.md`](AGEN
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="docs/assets/readme/capture-mcp-dark.svg">
-    <img alt="A JSON-RPC exchange with bellwether mcp over stdio. After initialize and observe.why, the client sends tools/call propose.key with spec exact on entity_id, the evidence hash, by coding-agent, and score 0.99. The server replies with isError true and an envelope whose status is refused, tier propose, tool propose.key, and whose refusal has code invalid_input, the message 'the arguments do not match propose.key's input schema', the field error 'Additional properties are not allowed (score was unexpected)', and next: 'fix the arguments to match the tool's input schema; send no extra fields'. The session budget shows 0 replays and 0 rows spent, and nothing is cited." src="docs/assets/readme/capture-mcp-light.svg" width="100%">
+    <img alt="A JSON-RPC exchange with bellwether mcp over stdio. After initialize and observe.why, the client sends tools/call propose.key with spec exact on entity_id, the evidence hash, by coding-agent, and score 0.99. The server replies with isError true and an envelope whose status is refused, tier propose, tool propose.key, and whose refusal has code invalid_input, the message 'the arguments do not match propose.key's input schema', the field error 'Additional properties are not allowed (score was unexpected)', and next: 'fix the arguments to match the tool's input schema; send no extra fields'. The session budget block is elided as { … }; chains and cites are empty." src="docs/assets/readme/capture-mcp-light.svg" width="100%">
   </picture>
 </p>
 <p align="center"><em><code>bellwether mcp</code> over stdio, a smuggled <code>score</code> refused · bench ledger corpus · debug build of eca48d1</em></p>
 
-A proposal has no score field, so the input schema itself rejects one: the call is refused with a stable code and nothing reaches the ledger. The `next` line is the one thing the agent should do about it, in MCP terms, never a CLI flag.
+The trust boundary at the wire: a proposal has no score field, so the input schema rejects one before anything is written, and `next` says what to do in MCP terms, never a CLI flag.
 
 | Surface | What it can do | Worst case |
 |---|---|---|
@@ -297,19 +286,17 @@ A proposal has no score field, so the input schema itself rejects one: the call 
 | Agent interface | MCP, with trust boundary | no | no | no | no |
 | Data must be converted or loaded | no | yes (table format) | yes (Hudi table) | yes | yes |
 
-The honest summary: the index kinds are not new. What is new is the diagnosis, the receipt, and the boundary between an agent that proposes and an engine that proves.
+The honest summary: the index kinds are not new. What is new is the diagnosis, the receipt, and the agent boundary.
 
 What Bellwether deliberately is not:
 
 - **Not a query engine.** It produces a scan plan (files, row groups, residual predicate). DuckDB, DataFusion, Polars, Spark, or your own code reads the rows.
 - **Not a table format.** It never rewrites your data or asks you to convert it.
-- **Not a database.** If your data fits in Postgres or SQL Server, use their indexes. Bellwether is for data that lives as files because it is too big, too shared, or owned by a pipeline. A SQL table can be one side of a reconcile, with costs labeled measured rather than exact.
-- **Not an estimator.** Every cost it reports is a sum of statistics from the files that exist. A number that cannot be computed exactly is labeled, never guessed.
-- **Not an autonomous agent.** The model proposes. The engine scores, verifies, applies, and signs. That direction never reverses.
+- **Not a database.** If your data fits in Postgres or SQL Server, use their indexes. Bellwether is for data that lives as files because it is too big, too shared, or owned by a pipeline.
 
-### Evolve (planned)
+## Planned: evolve
 
-Most LLM query optimizers score their own suggestions with an estimate and verify them by hope. Bellwether has the two things text-space optimizers like [GEPA](https://arxiv.org/abs/2507.19457) and [SkillOpt](https://github.com/microsoft/SkillOpt) need and most data systems lack: a loss you cannot game (exact replay) and a gate you cannot skip (reconciliation). `evolve` (M6) is that loop applied to data pipelines: a reflective, population-based search over query plans, physical designs, and whole pipelines, with counterfactual attribution as the backward pass, finite-difference descent for numeric knobs, Pareto selection across your recorded runs, and a rulebook promoted only by held-out replay. It is a design, not yet code: [`docs/evolve.md`](docs/evolve.md), ADRs [021](docs/adr/021-reflective-workload-optimization.md) through [025](docs/adr/025-rulebook-validation.md).
+Most LLM query optimizers score their own suggestions with an estimate and verify them by hope. Bellwether has the two things text-space optimizers like [GEPA](https://arxiv.org/abs/2507.19457) and [SkillOpt](https://github.com/microsoft/SkillOpt) need and most data systems lack: a loss you cannot game (exact replay) and a gate you cannot skip (reconciliation). `evolve` (M6) is to be that loop applied to data pipelines: a reflective, population-based search over query plans, physical designs, and whole pipelines, with counterfactual attribution as the backward pass, finite-difference descent for numeric knobs, Pareto selection across your recorded runs, and a rulebook promoted only by held-out replay. It is a design, not yet code: [`docs/evolve.md`](docs/evolve.md), ADRs [021](docs/adr/021-reflective-workload-optimization.md) through [025](docs/adr/025-rulebook-validation.md).
 
 ## Architecture
 
@@ -346,7 +333,7 @@ On disk: immutable `segments/` named by content hash, one `manifest.json` advanc
 What you will run, end to end:
 
 ```bash
-# Why did this job read 54 GB to return 3 rows, and what would have fixed it?
+# Why does a job read far more than it returns? (Results: 342.3 MB read for 1,090 taxi trips; 25.5 MB on the planned row groups)
 bellwether why ./orders/ --from last_week_keys.parquet --key order_id
 
 # Build an index, in one manifest commit
@@ -368,7 +355,7 @@ bellwether receipt show ./orders/ <receipt hash>
 bellwether reconcile ./orders/ ./orders-rewritten/ --key order_id --latest-by updated_at
 
 # Render every receipt and profile from the ledger: funnel, fanout, realized-vs-predicted
-bellwether report ./orders/ --html out/
+bellwether report ./orders/ --html report.html
 
 # Serve the same engine to a coding agent over MCP (stdio), bound to one folder
 bellwether mcp ./orders/
@@ -397,7 +384,7 @@ CI also asserts the latency budgets in release builds (the bench SLOs, replay's 
 
 ## Status
 
-Pre-alpha. The architecture and on-disk format are fixed and documented; the crates are being built against them, each landing by reviewed pull request.
+Pre-alpha. The architecture and on-disk format are fixed and documented; the crates are being built against them, each landing by reviewed pull request. Milestones as [`docs/work-packages.md`](docs/work-packages.md) defines them:
 
 - [x] Contract crate, architecture, invariants, threat model, format, 27 decision records
 - [x] Engine foundations: canonical encoding, segments and blooms, Parquet and text sources, object-store manifest commits, the ledger; each crate reviewed against its invariants, with the reviewer's probes kept as regression tests
@@ -405,10 +392,10 @@ Pre-alpha. The architecture and on-disk format are fixed and documented; the cra
 - [x] **M2** the index: `index`, `locate`, `latest`, `asof`
 - [x] **M3** receipts: `fix` writes one
 - [x] **M4** agent-first: the loop runs end to end from an MCP client
-- [ ] **M5** format v0.1 frozen with a compatibility fixture
-- [ ] **M6** `evolve` and `report`: reflective optimization of plans, keys, layouts, and whole pipelines against your recorded workload, with charts rendered from the ledger
+- [ ] **M5** the format frozen after storage version 2 (per-key counts and per-column bytes), with a compatibility fixture
+- [ ] **M6** `evolve`: reflective workload optimization over the synthetic ledger, with a rulebook as output and a replayable run in the ledger; the loss covers the relational operators (projection, joins, windows, aggregation input) exactly
 - [ ] **M7** a SQL table reconciles against a folder of files with a certificate; plans execute inside DataFusion and DuckDB without a sidecar step; receipts gate pull requests
-- [ ] **M8** the loss covers joins, windows, projections, and layouts exactly; rules transfer across datasets; receipts are signed
+- [ ] **M8** rules transfer across datasets and the exact-versus-estimated ablation is measured; receipts are signed
 
 Built beyond the milestones: the time-series keys (partition values from paths, ordered plans, `--at-manifest` pinned lookups, per-key time bounds, bitemporal as-of, the `market` corpus), `report` as one HTML file from the ledger, and the ledger views (`bellwether ledger findings|receipts|scorecard`).
 
@@ -420,8 +407,6 @@ Not built, or not yet measured:
 - **`evolve`.** Designed ([`docs/evolve.md`](docs/evolve.md), ADRs 021 to 025); no code yet.
 - **Engine adapters, CI receipts, a multi-machine build.** Planned (WP16, WP17, WP22). Today a plan is a list of files and row groups your engine reads, on one machine.
 - **Performance.** Latency is measured only where the Results say so; planning beat DuckDB alone on 2 of 14 questions. WP22 measures the rest in release builds.
-
-Everything planned, with its decision records: [work packages](docs/work-packages.md).
 
 ## Docs
 
