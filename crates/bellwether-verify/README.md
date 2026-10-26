@@ -112,6 +112,22 @@ The comparison runs in `P` passes over hash-partitioned key space. Pass `p` read
 
 `tests/memory_bound.rs` holds the bound at `P > 1` with the meter's peak and checks the results equal the `P = 1` results across five specs (plain, totals by group, `latest_by` with totals, sampled, workload), forces an underestimate that restarts, and checks the integer key range lowers `P`. `tests/real_memory.rs` measures the real heap with a counting allocator: on 600,000 keys under a 64 MiB budget, the heap grew 59.4 MB while the meter peaked at 58.9 MB, over five passes.
 
+### Measured budgets
+
+A release build was measured on 2026-10-26 with `scripts/perf.sh`: full coverage, with `latest_by` and totals by group. The full tables are in [the measured document](../../docs/measured/2026-10-26-performance.md#reconcile).
+
+- **The ledger small rung**, 8,000,000 rows and 401,325 keys a side, reconciles in one pass from a 592 MiB budget. **Recommend 640 MiB.** The meter's peak there is 164 MiB: the `P` choice counts rows, not keys (see Known limits).
+- **The six taxi months**, 20,332,093 rows and 20,314,139 keys, reconcile in one pass from 16 GiB (meter peak 9.9 GiB). **Recommend 16 GiB.**
+- **Below one pass, the cost is the extra passes.** On taxi:
+
+  | Budget | Passes | Rows per second per side |
+  |---|---:|---:|
+  | 8 GiB | 2 | 406,715 |
+  | 1 GiB | 14 | 207,977 |
+  | 64 MiB | 224 | 22,737 |
+
+- **Measured peak RSS on the ledger rung exceeds the bound stated above at small budgets.** At 64 MiB it was 1.63 GB, against a meter peak of 18 MiB. At 256 MiB it was 1.13 GB. At 1 GiB it was 469 MB. The taxi pair stays at 460 MB even at 64 MiB. The cause is under investigation as a defect; until it is fixed, budget memory for this shape from the measured RSS, not from `--memory-budget`.
+
 ## Tests
 
 | File | Covers |
