@@ -131,7 +131,7 @@ An agent (or a person) may **observe** and **propose**. Only the engine may **sc
 | GH Archive | events for 10 repositories | 31 | 13.0 MB (24 rg) | **5.3 MB (8 rg)** | 2.5× | 12.8 MB (24 rg) | DuckDB's min/max statistics skip no row group for these keys; `exact:repo_id` plans 8 of 24 |
 | GH Archive | the latest event of 10 repositories | 11 | 13.0 MB (24 rg) | **5.3 MB (8 rg)** | 2.5× | 12.8 MB (24 rg) | DuckDB's min/max statistics skip no row group for these keys; `temporal:repo_id@created_at` plans 8 of 24 |
 
-<sub>Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1, local SSD. DuckDB v2.0.0 (d54cbbe3df); bellwether release build of eca48d1 (rustc 1.99.1). Measured 2026-10-26. 1-minute load average while timing: 3.7 to 8.8 on 12 cores. Full scan: exact footer sums. Both DuckDB columns, the plan column included, are DuckDB's profiler (`total_bytes_read`), which counts the footers it reads too, so DuckDB alone can exceed the full scan. The plan's exact footer sums are on [the measured page](docs/measured/showcase.md). Every number is a row of [`docs/measured/results/showcase.json`](docs/measured/results/showcase.json).</sub>
+<sub>Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1, local SSD. DuckDB v2.0.0 (d54cbbe3df); bellwether release build of 7f3318f (rustc 1.99.1) for Market (synthetic); bellwether release build of eca48d1 (rustc 1.99.1) for NYC taxi, GH Archive, ClickBench. Measured 2026-10-26. 1-minute load average while timing: 3.7 to 8.8 on 12 cores. Full scan: exact footer sums. Both DuckDB columns, the plan column included, are DuckDB's profiler (`total_bytes_read`), which counts the footers it reads too, so DuckDB alone can exceed the full scan. The plan's exact footer sums are on [the measured page](docs/measured/showcase.md). Every number is a row of [`docs/measured/results/showcase.json`](docs/measured/results/showcase.json).</sub>
 
 <p align="center">
   <picture>
@@ -174,7 +174,7 @@ On 2 of these 4 questions Bellwether said so before building anything: `why` pri
 | ClickBench | page views of 3 sites (CounterID) | 974,143 | 384.6 MB (5 rg) | 383.5 MB (5 rg) | same | 1.5 GB (28 rg) | DuckDB's min/max statistics skip to 5 row groups, as many as `exact:CounterID` plans; `why` compared the key against a full scan (28 row groups), not that min/max baseline, so it recommended the key and `fix` attested it |
 <!-- results:showcase-headline:end -->
 
-Reproduce everything above, downloads included, with [`scripts/showcase.sh`](scripts/showcase.sh); it rewrites the results file, and [`scripts/render_charts.py`](scripts/render_charts.py) redraws every chart and table from it (CI fails if a committed chart no longer matches the committed numbers). Earlier runs, with their transcripts: [every CLI verb on taxi and GH Archive data](docs/measured/2026-10-24-realdata.md) and [a ClickBench slice before any index existed](docs/measured/2026-10-24-clickbench.md).
+Reproduce everything above, downloads included, with [`scripts/showcase.sh`](scripts/showcase.sh); it rewrites the results file, and [`scripts/render_charts.py`](scripts/render_charts.py) redraws every chart and table from it (CI fails if a committed chart no longer matches the committed numbers). Earlier runs, with their transcripts: [every CLI verb on taxi and GH Archive data](docs/measured/2026-10-24-realdata.md) and [a ClickBench slice before any index existed](docs/measured/2026-10-24-clickbench.md). Performance of the engine itself (lookup latency, index build, reconcile memory budgets): [docs/measured/2026-10-26-performance.md](docs/measured/2026-10-26-performance.md).
 
 ## Highlights
 
@@ -184,7 +184,10 @@ Reproduce everything above, downloads included, with [`scripts/showcase.sh`](scr
 - **Agent-first.** MCP tools in tiers (`observe.*`, `propose.*`, `score.*`, `apply.receipt`, `jobs.*`), typed refusals, dry runs, and per-session budgets.
 - **Parquet stays Parquet.** Immutable sidecar segments and a manifest committed by conditional PUT. No table format conversion, no locks, no new file format. Local disk, S3, Azure, GCS.
 - **Time travel without a table format.** `latest` and `asof` work across a folder of history files, no snapshots or table metadata needed.
-- **Runs on a laptop.** Memory is bounded per operation and stated in the docs. The "which files do I need" question no longer needs a cluster or a JVM.
+- **Runs on a laptop.** Memory is bounded per operation and stated in the docs. The "which files do I need" question no longer needs a cluster or a JVM. [Measured on one](docs/measured/2026-10-26-performance.md), with three caveats from that page:
+  - `reconcile` exceeds its stated memory bound on wide row groups at small `--memory-budget` values: 1.6 GiB at 64 MiB on the ledger rung. This is [an open defect](docs/measured/2026-10-26-performance.md#findings).
+  - Plan plus read was slower than both a full scan and DuckDB in all 42 measured lookups. The plan makes one store round trip per indexed value ([the measured cause](docs/measured/2026-10-26-performance.md#hypotheses-for-wp22b-ranked-by-expected-gain)). The index saves bytes read, not yet wall time.
+  - The lookup timings overlapped another process's compile; [the load record](docs/measured/2026-10-26-performance.md#measured-under-load) shows by how much.
 
 ## How `fix` proves a change
 

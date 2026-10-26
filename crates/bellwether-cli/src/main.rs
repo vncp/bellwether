@@ -225,6 +225,10 @@ struct IndexArgs {
     /// key temporal2:id@valid,known. Repeat for several.
     #[arg(long = "key", value_name = "SPEC")]
     keys: Vec<String>,
+    /// Worker threads for the build [default: the available parallelism].
+    /// The segments written do not depend on it.
+    #[arg(long, value_name = "N", value_parser = clap::value_parser!(u32).range(1..))]
+    threads: Option<u32>,
 }
 
 #[derive(Args)]
@@ -634,20 +638,27 @@ fn key_file(path: &std::path::Path, key: Option<&Vec<String>>) -> KeyFile {
     }
 }
 
+/// `index`: the declared specs, built with `--threads` workers when given.
+fn index(g: &Global, out: &Out, a: &IndexArgs) -> Result<Outcome, Failure> {
+    let declared = a
+        .keys
+        .iter()
+        .map(|s| bellwether::spec::parse_declaration(s))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| Failure::Usage(e.to_string()))?;
+    let options = EngineOptions {
+        threads: a.threads.map(|n| n as usize),
+        ..engine_options(g)?
+    };
+    let r = Engine::open(&a.root.root, options)?.index_declared(&declared)?;
+    done(&r, human::index(&r, out), EXIT_OK)
+}
+
 fn run(cli: &Cli, out: &Out) -> Result<Outcome, Failure> {
     let g = &cli.global;
     match &cli.command {
         Command::Why(a) => why(g, out, a),
-        Command::Index(a) => {
-            let declared = a
-                .keys
-                .iter()
-                .map(|s| bellwether::spec::parse_declaration(s))
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|e| Failure::Usage(e.to_string()))?;
-            let r = engine(g, &a.root.root)?.index_declared(&declared)?;
-            done(&r, human::index(&r, out), EXIT_OK)
-        }
+        Command::Index(a) => index(g, out, a),
         Command::Locate(a) => locate(g, out, a),
         Command::Latest(a) => {
             check_lookback(a.lookback.as_deref())?;
@@ -703,7 +714,13 @@ fn run(cli: &Cli, out: &Out) -> Result<Outcome, Failure> {
             } else {
                 EXIT_FAILED
             };
-            let human = if w.failed.is_empty() {
+            let human = if w.read.is_some() {
+                format!(
+                    "read {}
+",
+                    w.path
+                )
+            } else if w.failed.is_empty() {
                 format!(
                     "wrote {} to {}
 ",

@@ -17,6 +17,9 @@
 //! - [`market`] writes a deterministic synthetic bitemporal market trade corpus
 //!   (`symbol`, `ts`, `known_at`, `price`, `size`), time-series workloads
 //!   (`window`, `asof`, `latest_known`), and exact ground truth (`truth.json`).
+//! - [`perf`] reads a lookup's planned row groups (or every row group under a
+//!   folder) through the byte-counting reader, for the release measurements
+//!   of `scripts/perf.sh`.
 
 #![forbid(unsafe_code)]
 // Benchmark arithmetic converts freely between counts, sizes, and floating
@@ -44,6 +47,7 @@ pub mod generate;
 pub mod harness;
 pub mod market;
 pub mod mem;
+pub mod perf;
 pub mod report;
 pub mod results;
 pub mod slo;

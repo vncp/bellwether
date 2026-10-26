@@ -164,6 +164,10 @@ pub struct EngineOptions {
     /// signatures into a verdict. Load them with
     /// [`crate::load_trusted_keys`].
     pub trusted_keys: Option<bellwether_ledger::TrustedKeys>,
+    /// Worker threads for builds (`index`, and the apply step of `fix`).
+    /// `None` uses the available parallelism. The segments a build writes
+    /// do not depend on it.
+    pub threads: Option<usize>,
 }
 
 /// The pinned current manifest: its planner, its snapshot, and its content
@@ -1123,6 +1127,7 @@ impl Engine {
         options.partitioning.clone_from(&self.options.partitioning);
         options.sidecars = sidecars;
         options.exclude = self.excluded();
+        options.threads = self.options.threads;
         options
     }
 

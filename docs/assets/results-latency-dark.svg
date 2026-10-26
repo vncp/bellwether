@@ -1,106 +1,107 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1171 884" width="1171" height="884" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif">
-<rect width="1171" height="884" fill="#0d1117" rx="12"/>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1171 900" width="1171" height="900" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif">
+<rect width="1171" height="900" fill="#0d1117" rx="12"/>
 <text x="24.0" y="34.0" fill="#e6edf3" font-size="18" font-weight="600">Time to answer each question</text>
 <text x="24.0" y="58.0" fill="#e6edf3" font-size="15">Bellwether's plan plus DuckDB on the plan was faster than DuckDB alone on 2 of the 12 questions with a plan (the latest trip from every pickup</text>
 <text x="24.0" y="80.0" fill="#e6edf3" font-size="15">zone: 544 ms against 1.09 s). On 10, DuckDB on the plan took no more than 5% longer than DuckDB alone, and often less, but the plan step (one</text>
 <text x="24.0" y="102.0" fill="#e6edf3" font-size="15">bellwether process, 24 ms to 183 ms) cost more than that saved.</text>
 <text x="24.0" y="120.0" fill="#8b949e" font-size="12">Median of 3 warm runs. DuckDB: the profiler's query time. Bellwether: the lookup verb's wall time (a whole process) plus DuckDB's query time on the plan. Apple M3 Pro, 12 cores, 36 GB,</text>
-<text x="24.0" y="136.0" fill="#8b949e" font-size="12">macOS 26.4.1, local SSD. DuckDB v2.0.0 (d54cbbe3df); bellwether release build of eca48d1 (rustc 1.99.1). Measured 2026-10-26. 1-minute load average while timing: 3.7 to 8.8 on 12 cores.</text>
-<rect x="24.0" y="154.0" width="12.0" height="12.0" rx="2" fill="#58a6ff"/>
-<text x="42.0" y="164.0" fill="#e6edf3" font-size="13">DuckDB alone</text>
-<rect x="156.4" y="154.0" width="12.0" height="12.0" rx="2" fill="#3fb950"/>
-<text x="174.4" y="164.0" fill="#e6edf3" font-size="13">Bellwether plan + DuckDB on the plan</text>
-<text x="409.0" y="202.0" fill="#e6edf3" font-size="13" text-anchor="end">the latest print of 6 symbols</text>
-<text x="409.0" y="217.0" fill="#8b949e" font-size="11" text-anchor="end">Market (synthetic)</text>
-<rect x="421.0" y="190.0" width="153.3" height="11.0" rx="2" fill="#58a6ff"/>
-<text x="580.3" y="200.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">15 ms</tspan><tspan fill="#8b949e" font-size="10"></tspan></text>
-<rect x="421.0" y="204.0" width="201.1" height="11.0" rx="2" fill="#3fb950"/>
-<text x="628.1" y="214.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">35 ms</tspan><tspan fill="#8b949e" font-size="10">  plan 31 ms + query 4.3 ms</tspan></text>
-<text x="409.0" y="248.0" fill="#e6edf3" font-size="13" text-anchor="end">6 symbols at 16:00 as known that evening (no lookahead)</text>
-<text x="409.0" y="263.0" fill="#8b949e" font-size="11" text-anchor="end">Market (synthetic)</text>
-<rect x="421.0" y="236.0" width="144.4" height="11.0" rx="2" fill="#58a6ff"/>
-<text x="571.4" y="246.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">13 ms</tspan><tspan fill="#8b949e" font-size="10"></tspan></text>
-<rect x="421.0" y="250.0" width="212.7" height="11.0" rx="2" fill="#3fb950"/>
-<text x="639.7" y="260.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">43 ms</tspan><tspan fill="#8b949e" font-size="10">  plan 39 ms + query 4.5 ms</tspan></text>
-<text x="409.0" y="294.0" fill="#e6edf3" font-size="13" text-anchor="end">trips from 10 pickup zones in one week</text>
-<text x="409.0" y="309.0" fill="#8b949e" font-size="11" text-anchor="end">NYC taxi</text>
-<rect x="421.0" y="282.0" width="247.8" height="11.0" rx="2" fill="#58a6ff"/>
-<text x="674.8" y="292.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">80 ms</tspan><tspan fill="#8b949e" font-size="10"></tspan></text>
-<rect x="421.0" y="296.0" width="262.5" height="11.0" rx="2" fill="#3fb950"/>
-<text x="689.5" y="306.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">105 ms</tspan><tspan fill="#8b949e" font-size="10">  plan 40 ms + query 64 ms</tspan></text>
-<text x="409.0" y="340.0" fill="#e6edf3" font-size="13" text-anchor="end">the latest trip from every pickup zone</text>
-<text x="409.0" y="355.0" fill="#8b949e" font-size="11" text-anchor="end">NYC taxi</text>
-<rect x="421.0" y="328.0" width="395.0" height="11.0" rx="2" fill="#58a6ff"/>
-<text x="822.0" y="338.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">1.09 s</tspan><tspan fill="#8b949e" font-size="10"></tspan></text>
-<rect x="421.0" y="342.0" width="355.6" height="11.0" rx="2" fill="#3fb950"/>
-<text x="782.6" y="352.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">544 ms</tspan><tspan fill="#8b949e" font-size="10">  plan 190 ms + query 354 ms</tspan></text>
-<text x="409.0" y="386.0" fill="#e6edf3" font-size="13" text-anchor="end">prints of 6 symbols in one hour</text>
-<text x="409.0" y="401.0" fill="#8b949e" font-size="11" text-anchor="end">Market (synthetic)</text>
-<rect x="421.0" y="374.0" width="137.9" height="11.0" rx="2" fill="#58a6ff"/>
-<text x="564.9" y="384.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">12 ms</tspan><tspan fill="#8b949e" font-size="10"></tspan></text>
-<rect x="421.0" y="388.0" width="210.1" height="11.0" rx="2" fill="#3fb950"/>
-<text x="637.1" y="398.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">41 ms</tspan><tspan fill="#8b949e" font-size="10">  plan 33 ms + query 8.3 ms</tspan></text>
-<text x="409.0" y="432.0" fill="#e6edf3" font-size="13" text-anchor="end">each pickup zone's last trip before 1 March</text>
-<text x="409.0" y="447.0" fill="#8b949e" font-size="11" text-anchor="end">NYC taxi</text>
-<rect x="421.0" y="420.0" width="330.1" height="11.0" rx="2" fill="#58a6ff"/>
-<text x="757.1" y="430.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">346 ms</tspan><tspan fill="#8b949e" font-size="10"></tspan></text>
-<rect x="421.0" y="434.0" width="352.7" height="11.0" rx="2" fill="#3fb950"/>
-<text x="779.7" y="444.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">517 ms</tspan><tspan fill="#8b949e" font-size="10">  plan 183 ms + query 334 ms</tspan></text>
-<text x="409.0" y="478.0" fill="#e6edf3" font-size="13" text-anchor="end">page views of 10 users</text>
-<text x="409.0" y="493.0" fill="#8b949e" font-size="11" text-anchor="end">ClickBench</text>
-<rect x="421.0" y="466.0" width="345.4" height="11.0" rx="2" fill="#58a6ff"/>
-<text x="772.4" y="476.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">454 ms</tspan><tspan fill="#8b949e" font-size="10"></tspan></text>
-<rect x="421.0" y="480.0" width="315.3" height="11.0" rx="2" fill="#3fb950"/>
-<text x="742.3" y="490.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">266 ms</tspan><tspan fill="#8b949e" font-size="10">  plan 30 ms + query 236 ms</tspan></text>
-<text x="409.0" y="524.0" fill="#e6edf3" font-size="13" text-anchor="end">events for 10 repositories, 06:00 to 08:00</text>
-<text x="409.0" y="539.0" fill="#8b949e" font-size="11" text-anchor="end">GH Archive</text>
-<rect x="421.0" y="512.0" width="98.3" height="11.0" rx="2" fill="#58a6ff"/>
-<text x="525.3" y="522.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">5.7 ms</tspan><tspan fill="#8b949e" font-size="10"></tspan></text>
-<rect x="421.0" y="526.0" width="195.1" height="11.0" rx="2" fill="#3fb950"/>
-<text x="622.1" y="536.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">32 ms</tspan><tspan fill="#8b949e" font-size="10">  plan 27 ms + query 4.8 ms</tspan></text>
-<text x="409.0" y="570.0" fill="#e6edf3" font-size="13" text-anchor="end">events for 10 repositories</text>
-<text x="409.0" y="585.0" fill="#8b949e" font-size="11" text-anchor="end">GH Archive</text>
-<rect x="421.0" y="558.0" width="110.7" height="11.0" rx="2" fill="#58a6ff"/>
-<text x="537.7" y="568.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">7.1 ms</tspan><tspan fill="#8b949e" font-size="10"></tspan></text>
-<rect x="421.0" y="572.0" width="196.4" height="11.0" rx="2" fill="#3fb950"/>
-<text x="623.4" y="582.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">32 ms</tspan><tspan fill="#8b949e" font-size="10">  plan 26 ms + query 6.5 ms</tspan></text>
-<text x="409.0" y="616.0" fill="#e6edf3" font-size="13" text-anchor="end">the latest event of 10 repositories</text>
-<text x="409.0" y="631.0" fill="#8b949e" font-size="11" text-anchor="end">GH Archive</text>
-<rect x="421.0" y="604.0" width="118.1" height="11.0" rx="2" fill="#58a6ff"/>
-<text x="545.1" y="614.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">8.1 ms</tspan><tspan fill="#8b949e" font-size="10"></tspan></text>
-<rect x="421.0" y="618.0" width="198.6" height="11.0" rx="2" fill="#3fb950"/>
-<text x="625.6" y="628.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">34 ms</tspan><tspan fill="#8b949e" font-size="10">  plan 26 ms + query 7.4 ms</tspan></text>
-<text x="409.0" y="662.0" fill="#e6edf3" font-size="13" text-anchor="end">trips from 10 pickup zones, all six months</text>
-<text x="409.0" y="677.0" fill="#8b949e" font-size="11" text-anchor="end">NYC taxi</text>
-<rect x="421.0" y="650.0" width="295.1" height="11.0" rx="2" fill="#58a6ff"/>
-<text x="722.1" y="660.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">186 ms</tspan><tspan fill="#8b949e" font-size="10"></tspan></text>
-<text x="427.0" y="674.0" fill="#8b949e" font-size="11">no plan: fix refused, so there is nothing to time</text>
-<text x="409.0" y="708.0" fill="#e6edf3" font-size="13" text-anchor="end">events for 1,000 repositories</text>
-<text x="409.0" y="723.0" fill="#8b949e" font-size="11" text-anchor="end">GH Archive</text>
-<rect x="421.0" y="696.0" width="156.2" height="11.0" rx="2" fill="#58a6ff"/>
-<text x="583.2" y="706.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">16 ms</tspan><tspan fill="#8b949e" font-size="10"></tspan></text>
-<text x="427.0" y="720.0" fill="#8b949e" font-size="11">no plan: fix refused, so there is nothing to time</text>
-<text x="409.0" y="754.0" fill="#e6edf3" font-size="13" text-anchor="end">page views of 1,000 users</text>
-<text x="409.0" y="769.0" fill="#8b949e" font-size="11" text-anchor="end">ClickBench</text>
-<rect x="421.0" y="742.0" width="346.8" height="11.0" rx="2" fill="#58a6ff"/>
-<text x="773.8" y="752.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">466 ms</tspan><tspan fill="#8b949e" font-size="10"></tspan></text>
-<rect x="421.0" y="756.0" width="358.9" height="11.0" rx="2" fill="#3fb950"/>
-<text x="785.9" y="766.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">576 ms</tspan><tspan fill="#8b949e" font-size="10">  plan 90 ms + query 486 ms</tspan></text>
-<text x="409.0" y="800.0" fill="#e6edf3" font-size="13" text-anchor="end">page views of 3 sites (CounterID)</text>
-<text x="409.0" y="815.0" fill="#8b949e" font-size="11" text-anchor="end">ClickBench</text>
-<rect x="421.0" y="788.0" width="292.4" height="11.0" rx="2" fill="#58a6ff"/>
-<text x="719.4" y="798.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">178 ms</tspan><tspan fill="#8b949e" font-size="10"></tspan></text>
-<rect x="421.0" y="802.0" width="300.7" height="11.0" rx="2" fill="#3fb950"/>
-<text x="727.7" y="812.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">206 ms</tspan><tspan fill="#8b949e" font-size="10">  plan 24 ms + query 182 ms</tspan></text>
-<line x1="421.0" y1="184.0" x2="421.0" y2="834.0" stroke="#8b949e" stroke-opacity="0.25" stroke-dasharray="3 4"/>
-<text x="421.0" y="852.0" fill="#8b949e" font-size="11" text-anchor="middle">1.0 ms</text>
-<line x1="551.0" y1="184.0" x2="551.0" y2="834.0" stroke="#8b949e" stroke-opacity="0.25" stroke-dasharray="3 4"/>
-<text x="551.0" y="852.0" fill="#8b949e" font-size="11" text-anchor="middle">10 ms</text>
-<line x1="681.0" y1="184.0" x2="681.0" y2="834.0" stroke="#8b949e" stroke-opacity="0.25" stroke-dasharray="3 4"/>
-<text x="681.0" y="852.0" fill="#8b949e" font-size="11" text-anchor="middle">100 ms</text>
-<line x1="811.0" y1="184.0" x2="811.0" y2="834.0" stroke="#8b949e" stroke-opacity="0.25" stroke-dasharray="3 4"/>
-<text x="811.0" y="852.0" fill="#8b949e" font-size="11" text-anchor="middle">1.00 s</text>
-<line x1="941.0" y1="184.0" x2="941.0" y2="834.0" stroke="#8b949e" stroke-opacity="0.25" stroke-dasharray="3 4"/>
-<text x="941.0" y="852.0" fill="#8b949e" font-size="11" text-anchor="middle">10.00 s</text>
-<text x="421.0" y="870.0" fill="#8b949e" font-size="11">log scale</text>
+<text x="24.0" y="136.0" fill="#8b949e" font-size="12">macOS 26.4.1, local SSD. DuckDB v2.0.0 (d54cbbe3df); bellwether release build of 7f3318f (rustc 1.99.1) for Market (synthetic); bellwether release build of eca48d1 (rustc 1.99.1) for NYC</text>
+<text x="24.0" y="152.0" fill="#8b949e" font-size="12">taxi, GH Archive, ClickBench. Measured 2026-10-26. 1-minute load average while timing: 3.7 to 8.8 on 12 cores.</text>
+<rect x="24.0" y="170.0" width="12.0" height="12.0" rx="2" fill="#58a6ff"/>
+<text x="42.0" y="180.0" fill="#e6edf3" font-size="13">DuckDB alone</text>
+<rect x="156.4" y="170.0" width="12.0" height="12.0" rx="2" fill="#3fb950"/>
+<text x="174.4" y="180.0" fill="#e6edf3" font-size="13">Bellwether plan + DuckDB on the plan</text>
+<text x="409.0" y="218.0" fill="#e6edf3" font-size="13" text-anchor="end">the latest print of 6 symbols</text>
+<text x="409.0" y="233.0" fill="#8b949e" font-size="11" text-anchor="end">Market (synthetic)</text>
+<rect x="421.0" y="206.0" width="159.6" height="11.0" rx="2" fill="#58a6ff"/>
+<text x="586.6" y="216.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">17 ms</tspan><tspan fill="#8b949e" font-size="10"></tspan></text>
+<rect x="421.0" y="220.0" width="200.2" height="11.0" rx="2" fill="#3fb950"/>
+<text x="627.2" y="230.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">35 ms</tspan><tspan fill="#8b949e" font-size="10">  plan 30 ms + query 4.5 ms</tspan></text>
+<text x="409.0" y="264.0" fill="#e6edf3" font-size="13" text-anchor="end">6 symbols at 16:00 as known that evening (no lookahead)</text>
+<text x="409.0" y="279.0" fill="#8b949e" font-size="11" text-anchor="end">Market (synthetic)</text>
+<rect x="421.0" y="252.0" width="152.5" height="11.0" rx="2" fill="#58a6ff"/>
+<text x="579.5" y="262.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">15 ms</tspan><tspan fill="#8b949e" font-size="10"></tspan></text>
+<rect x="421.0" y="266.0" width="214.4" height="11.0" rx="2" fill="#3fb950"/>
+<text x="641.4" y="276.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">45 ms</tspan><tspan fill="#8b949e" font-size="10">  plan 40 ms + query 4.8 ms</tspan></text>
+<text x="409.0" y="310.0" fill="#e6edf3" font-size="13" text-anchor="end">trips from 10 pickup zones in one week</text>
+<text x="409.0" y="325.0" fill="#8b949e" font-size="11" text-anchor="end">NYC taxi</text>
+<rect x="421.0" y="298.0" width="247.8" height="11.0" rx="2" fill="#58a6ff"/>
+<text x="674.8" y="308.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">80 ms</tspan><tspan fill="#8b949e" font-size="10"></tspan></text>
+<rect x="421.0" y="312.0" width="262.5" height="11.0" rx="2" fill="#3fb950"/>
+<text x="689.5" y="322.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">105 ms</tspan><tspan fill="#8b949e" font-size="10">  plan 40 ms + query 64 ms</tspan></text>
+<text x="409.0" y="356.0" fill="#e6edf3" font-size="13" text-anchor="end">the latest trip from every pickup zone</text>
+<text x="409.0" y="371.0" fill="#8b949e" font-size="11" text-anchor="end">NYC taxi</text>
+<rect x="421.0" y="344.0" width="395.0" height="11.0" rx="2" fill="#58a6ff"/>
+<text x="822.0" y="354.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">1.09 s</tspan><tspan fill="#8b949e" font-size="10"></tspan></text>
+<rect x="421.0" y="358.0" width="355.6" height="11.0" rx="2" fill="#3fb950"/>
+<text x="782.6" y="368.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">544 ms</tspan><tspan fill="#8b949e" font-size="10">  plan 190 ms + query 354 ms</tspan></text>
+<text x="409.0" y="402.0" fill="#e6edf3" font-size="13" text-anchor="end">prints of 6 symbols in one hour</text>
+<text x="409.0" y="417.0" fill="#8b949e" font-size="11" text-anchor="end">Market (synthetic)</text>
+<rect x="421.0" y="390.0" width="143.9" height="11.0" rx="2" fill="#58a6ff"/>
+<text x="570.9" y="400.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">13 ms</tspan><tspan fill="#8b949e" font-size="10"></tspan></text>
+<rect x="421.0" y="404.0" width="216.4" height="11.0" rx="2" fill="#3fb950"/>
+<text x="643.4" y="414.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">46 ms</tspan><tspan fill="#8b949e" font-size="10">  plan 37 ms + query 9.5 ms</tspan></text>
+<text x="409.0" y="448.0" fill="#e6edf3" font-size="13" text-anchor="end">each pickup zone's last trip before 1 March</text>
+<text x="409.0" y="463.0" fill="#8b949e" font-size="11" text-anchor="end">NYC taxi</text>
+<rect x="421.0" y="436.0" width="330.1" height="11.0" rx="2" fill="#58a6ff"/>
+<text x="757.1" y="446.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">346 ms</tspan><tspan fill="#8b949e" font-size="10"></tspan></text>
+<rect x="421.0" y="450.0" width="352.7" height="11.0" rx="2" fill="#3fb950"/>
+<text x="779.7" y="460.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">517 ms</tspan><tspan fill="#8b949e" font-size="10">  plan 183 ms + query 334 ms</tspan></text>
+<text x="409.0" y="494.0" fill="#e6edf3" font-size="13" text-anchor="end">page views of 10 users</text>
+<text x="409.0" y="509.0" fill="#8b949e" font-size="11" text-anchor="end">ClickBench</text>
+<rect x="421.0" y="482.0" width="345.4" height="11.0" rx="2" fill="#58a6ff"/>
+<text x="772.4" y="492.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">454 ms</tspan><tspan fill="#8b949e" font-size="10"></tspan></text>
+<rect x="421.0" y="496.0" width="315.3" height="11.0" rx="2" fill="#3fb950"/>
+<text x="742.3" y="506.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">266 ms</tspan><tspan fill="#8b949e" font-size="10">  plan 30 ms + query 236 ms</tspan></text>
+<text x="409.0" y="540.0" fill="#e6edf3" font-size="13" text-anchor="end">events for 10 repositories, 06:00 to 08:00</text>
+<text x="409.0" y="555.0" fill="#8b949e" font-size="11" text-anchor="end">GH Archive</text>
+<rect x="421.0" y="528.0" width="98.3" height="11.0" rx="2" fill="#58a6ff"/>
+<text x="525.3" y="538.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">5.7 ms</tspan><tspan fill="#8b949e" font-size="10"></tspan></text>
+<rect x="421.0" y="542.0" width="195.1" height="11.0" rx="2" fill="#3fb950"/>
+<text x="622.1" y="552.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">32 ms</tspan><tspan fill="#8b949e" font-size="10">  plan 27 ms + query 4.8 ms</tspan></text>
+<text x="409.0" y="586.0" fill="#e6edf3" font-size="13" text-anchor="end">events for 10 repositories</text>
+<text x="409.0" y="601.0" fill="#8b949e" font-size="11" text-anchor="end">GH Archive</text>
+<rect x="421.0" y="574.0" width="110.7" height="11.0" rx="2" fill="#58a6ff"/>
+<text x="537.7" y="584.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">7.1 ms</tspan><tspan fill="#8b949e" font-size="10"></tspan></text>
+<rect x="421.0" y="588.0" width="196.4" height="11.0" rx="2" fill="#3fb950"/>
+<text x="623.4" y="598.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">32 ms</tspan><tspan fill="#8b949e" font-size="10">  plan 26 ms + query 6.5 ms</tspan></text>
+<text x="409.0" y="632.0" fill="#e6edf3" font-size="13" text-anchor="end">the latest event of 10 repositories</text>
+<text x="409.0" y="647.0" fill="#8b949e" font-size="11" text-anchor="end">GH Archive</text>
+<rect x="421.0" y="620.0" width="118.1" height="11.0" rx="2" fill="#58a6ff"/>
+<text x="545.1" y="630.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">8.1 ms</tspan><tspan fill="#8b949e" font-size="10"></tspan></text>
+<rect x="421.0" y="634.0" width="198.6" height="11.0" rx="2" fill="#3fb950"/>
+<text x="625.6" y="644.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">34 ms</tspan><tspan fill="#8b949e" font-size="10">  plan 26 ms + query 7.4 ms</tspan></text>
+<text x="409.0" y="678.0" fill="#e6edf3" font-size="13" text-anchor="end">trips from 10 pickup zones, all six months</text>
+<text x="409.0" y="693.0" fill="#8b949e" font-size="11" text-anchor="end">NYC taxi</text>
+<rect x="421.0" y="666.0" width="295.1" height="11.0" rx="2" fill="#58a6ff"/>
+<text x="722.1" y="676.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">186 ms</tspan><tspan fill="#8b949e" font-size="10"></tspan></text>
+<text x="427.0" y="690.0" fill="#8b949e" font-size="11">no plan: fix refused, so there is nothing to time</text>
+<text x="409.0" y="724.0" fill="#e6edf3" font-size="13" text-anchor="end">events for 1,000 repositories</text>
+<text x="409.0" y="739.0" fill="#8b949e" font-size="11" text-anchor="end">GH Archive</text>
+<rect x="421.0" y="712.0" width="156.2" height="11.0" rx="2" fill="#58a6ff"/>
+<text x="583.2" y="722.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">16 ms</tspan><tspan fill="#8b949e" font-size="10"></tspan></text>
+<text x="427.0" y="736.0" fill="#8b949e" font-size="11">no plan: fix refused, so there is nothing to time</text>
+<text x="409.0" y="770.0" fill="#e6edf3" font-size="13" text-anchor="end">page views of 1,000 users</text>
+<text x="409.0" y="785.0" fill="#8b949e" font-size="11" text-anchor="end">ClickBench</text>
+<rect x="421.0" y="758.0" width="346.8" height="11.0" rx="2" fill="#58a6ff"/>
+<text x="773.8" y="768.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">466 ms</tspan><tspan fill="#8b949e" font-size="10"></tspan></text>
+<rect x="421.0" y="772.0" width="358.9" height="11.0" rx="2" fill="#3fb950"/>
+<text x="785.9" y="782.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">576 ms</tspan><tspan fill="#8b949e" font-size="10">  plan 90 ms + query 486 ms</tspan></text>
+<text x="409.0" y="816.0" fill="#e6edf3" font-size="13" text-anchor="end">page views of 3 sites (CounterID)</text>
+<text x="409.0" y="831.0" fill="#8b949e" font-size="11" text-anchor="end">ClickBench</text>
+<rect x="421.0" y="804.0" width="292.4" height="11.0" rx="2" fill="#58a6ff"/>
+<text x="719.4" y="814.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">178 ms</tspan><tspan fill="#8b949e" font-size="10"></tspan></text>
+<rect x="421.0" y="818.0" width="300.7" height="11.0" rx="2" fill="#3fb950"/>
+<text x="727.7" y="828.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">206 ms</tspan><tspan fill="#8b949e" font-size="10">  plan 24 ms + query 182 ms</tspan></text>
+<line x1="421.0" y1="200.0" x2="421.0" y2="850.0" stroke="#8b949e" stroke-opacity="0.25" stroke-dasharray="3 4"/>
+<text x="421.0" y="868.0" fill="#8b949e" font-size="11" text-anchor="middle">1.0 ms</text>
+<line x1="551.0" y1="200.0" x2="551.0" y2="850.0" stroke="#8b949e" stroke-opacity="0.25" stroke-dasharray="3 4"/>
+<text x="551.0" y="868.0" fill="#8b949e" font-size="11" text-anchor="middle">10 ms</text>
+<line x1="681.0" y1="200.0" x2="681.0" y2="850.0" stroke="#8b949e" stroke-opacity="0.25" stroke-dasharray="3 4"/>
+<text x="681.0" y="868.0" fill="#8b949e" font-size="11" text-anchor="middle">100 ms</text>
+<line x1="811.0" y1="200.0" x2="811.0" y2="850.0" stroke="#8b949e" stroke-opacity="0.25" stroke-dasharray="3 4"/>
+<text x="811.0" y="868.0" fill="#8b949e" font-size="11" text-anchor="middle">1.00 s</text>
+<line x1="941.0" y1="200.0" x2="941.0" y2="850.0" stroke="#8b949e" stroke-opacity="0.25" stroke-dasharray="3 4"/>
+<text x="941.0" y="868.0" fill="#8b949e" font-size="11" text-anchor="middle">10.00 s</text>
+<text x="421.0" y="886.0" fill="#8b949e" font-size="11">log scale</text>
 </svg>

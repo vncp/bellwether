@@ -163,6 +163,7 @@ Details:
   - one whole bloom or range segment at a time (they are scanned per probe);
   - the bitmaps and version hits for the keys asked.
 - **Compaction.** Holds a group's inputs and its output, so about twice `max_output_bytes`.
+- **Resident bytes per key (contract v3, entry 32).** The caps count accounted key bytes, not resident memory. A release build measured an open segment writer over `UInt64` keys at **320 resident bytes per key**, against 9 bytes accounted: 35.5 times. Over 9-byte keys, the layout map measured 84 resident bytes per key, against 73 accounted: 1.15 times. For narrow keys, then, the resident memory of `specs × cap` is about 36 times the cap. The figures come from `bellwether-replay`'s `tests/resident.rs` and are listed in [the measured document](../../docs/measured/2026-10-26-performance.md). Charging that overhead to the caps is a WP22b candidate.
 
 ## Tests
 
