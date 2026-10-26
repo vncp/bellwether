@@ -342,6 +342,7 @@ where
         .collect::<Result<Vec<_>>>()?;
     let rows_total = footers.value.rows_total();
     let lints = lints::run(&lints::LintInputs {
+        schema: &schema,
         plan: &plan,
         entries: &entries,
         ranges: &ranges,

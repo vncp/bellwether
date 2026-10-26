@@ -8,12 +8,20 @@
 //! | `Temporal { columns: [id], ts_column: ts }` | `temporal:id@ts` |
 //! | `Exact { columns: [a, b], counts: true }` | `exact:a,b,counts` |
 //! | `Temporal { columns: [id], ts_column: ts, counts: true }` | `temporal:id@ts,counts` |
+//! | `Expr { name: sym, expr: json_get(payload,'$.symbol'), over: Exact }` | `expr:sym=json_get(payload,'$.symbol'):exact` |
+//! | `Expr { .., over: Exact { counts: true } }` | `expr:sym=json_get(payload,'$.symbol'):exact,counts` |
+//! | `Expr { .., over: Bloom { fpr: 0.01 } }` | `expr:sym=json_get(payload,'$.symbol'):bloom@0.01` |
 //!
 //! A trailing `,counts` asks the spec to store, per key and per row group,
 //! the number of rows (storage version 2, ADR 028); it is the last element
 //! after the columns (exact) or the timestamp column (temporal). A spec of
 //! one column named `counts` is `exact:counts`; with counts,
 //! `exact:counts,counts`.
+//!
+//! An `expr` key's expression is in the closed language of
+//! `bellwether_core::expr`; it is stored normalized, so `label` gives the
+//! normalized spelling, and the kind after the last `:` outside quotes is
+//! `exact`, `exact,counts`, or `bloom@<fpr>`.
 //!
 //! A spec may also be given as its JSON form (`{"kind":"exact",...}`).
 //! [`label`] and [`parse`] are inverses. Specs are validated by core's
@@ -42,9 +50,11 @@ pub fn parse(s: &str) -> Result<KeySpec> {
         serde_json::from_str::<KeySpec>(s).map_err(|e| {
             Error::KeySpec(format!(
                 "{s:?} is not a key spec ({e}); write it as exact:col, temporal:col@ts, \
-                 bloom:col@0.01, range:col, or its JSON form"
+                 bloom:col@0.01, range:col, expr:name=<expression>:exact, or its JSON form"
             ))
         })?
+    } else if let Some(rest) = s.strip_prefix("expr:") {
+        parse_expr(s, rest)?
     } else {
         parse_short(s)?
     };
@@ -71,8 +81,57 @@ pub fn check(spec: &KeySpec) -> Result<()> {
 fn bad(s: &str, why: &str) -> Error {
     Error::KeySpec(format!(
         "{s:?} is not a key spec ({why}); write it as exact:a,b, temporal:a@ts, bloom:a@0.01, \
-         or range:ts"
+         range:ts, or expr:name=<expression>:exact"
     ))
+}
+
+/// `expr:<name>=<expression>:<kind>`, the kind after the last `:` that is
+/// outside quotes (an expression's strings and quoted columns may hold
+/// `:`), `exact` or `bloom@<fpr>`.
+fn parse_expr(s: &str, rest: &str) -> Result<KeySpec> {
+    let bad_expr = |why: &str| {
+        Error::KeySpec(format!(
+            "{s:?} is not an expr key ({why}); write it as \
+             expr:<name>=<expression>:exact or expr:<name>=<expression>:bloom@0.01, for \
+             example expr:sym=json_get(payload,'$.symbol'):exact"
+        ))
+    };
+    let (name, tail) = rest
+        .split_once('=')
+        .ok_or_else(|| bad_expr("no '=' after the name"))?;
+    let mut quote: Option<char> = None;
+    let mut split = None;
+    for (i, c) in tail.char_indices() {
+        match (quote, c) {
+            (None, '\'' | '"') => quote = Some(c),
+            (Some(q), c) if c == q => quote = None,
+            (None, ':') => split = Some(i),
+            _ => {}
+        }
+    }
+    let i = split.ok_or_else(|| bad_expr("no ':<kind>' after the expression"))?;
+    let (text, kind) = (tail[..i].trim(), tail[i + 1..].trim());
+    let over = match kind.split_once('@') {
+        None if kind == "exact" => bellwether_core::expr::Over::Exact,
+        None if kind.replace(' ', "") == "exact,counts" => bellwether_core::expr::Over::Counts,
+        Some(("bloom", fpr)) => bellwether_core::expr::Over::Bloom(
+            fpr.trim()
+                .parse()
+                .map_err(|_| bad_expr("the false-positive rate after '@' is not a number"))?,
+        ),
+        None if kind == "bloom" => {
+            return Err(bad_expr(
+                "a bloom expr key needs a false-positive rate, :bloom@0.01",
+            ))
+        }
+        _ => {
+            return Err(bad_expr(&format!(
+                "the kind after the expression is exact, exact,counts, or bloom@<fpr>, not \
+                 {kind:?}"
+            )))
+        }
+    };
+    bellwether_core::expr::spec(name.trim(), text, over)
 }
 
 fn columns(s: &str, list: &str) -> Result<Vec<String>> {
@@ -367,14 +426,7 @@ pub fn parse_sketch(s: &str) -> Result<SketchSpec> {
 /// quotes, each `'` written `'\''`.
 #[must_use]
 pub fn shell_quote(s: &str) -> String {
-    let plain = !s.is_empty()
-        && s.chars()
-            .all(|c| c.is_ascii_alphanumeric() || "_@%+=:,./-".contains(c));
-    if plain {
-        s.to_string()
-    } else {
-        format!("'{}'", s.replace('\'', r"'\''"))
-    }
+    bellwether_core::expr::shell_quote(s)
 }
 
 fn message(e: &Error) -> String {

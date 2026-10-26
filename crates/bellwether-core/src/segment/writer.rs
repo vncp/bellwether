@@ -674,6 +674,8 @@ struct DatasetTypes {
     ts: Option<DataType>,
     recorded_keys: Vec<ColumnType>,
     recorded_ts: Option<ColumnType>,
+    /// The checked expression of an `expr` key.
+    expr: Option<crate::expr::Typed>,
 }
 
 /// Builds one segment for one key spec.
@@ -708,14 +710,14 @@ pub fn validate_spec(spec: &KeySpec) -> Result<()> {
     if spec.columns().is_empty() {
         return Err(Error::KeySpec("key spec needs at least one column".into()));
     }
-    if let KeySpec::Bloom { fpr, .. } = spec {
+    if let KeySpec::Bloom { fpr, .. } = spec.physical() {
         if !(*fpr > 0.0 && *fpr < 1.0) {
             return Err(Error::KeySpec(format!(
                 "bloom fpr must be strictly between 0 and 1, got {fpr}"
             )));
         }
     }
-    Ok(())
+    crate::expr::check_spec(spec)
 }
 
 impl SegmentWriter {
@@ -755,11 +757,16 @@ impl SegmentWriter {
         let (keys, ts) = spec_types(&w.spec, schema)?;
         let recorded_keys = keys.iter().map(ColumnType::of).collect::<Result<_>>()?;
         let recorded_ts = ts.as_ref().map(ColumnType::of).transpose()?;
+        let expr = match &w.spec {
+            KeySpec::Expr { .. } => Some(crate::expr::typed_spec(&w.spec, schema)?),
+            _ => None,
+        };
         w.dataset = Some(DatasetTypes {
             keys,
             ts,
             recorded_keys,
             recorded_ts,
+            expr,
         });
         Ok(w)
     }
@@ -970,6 +977,10 @@ impl SegmentWriter {
     /// convert, a value not representable in the dataset type) nothing from
     /// the batch is recorded and the writer stays usable, so a caller that
     /// skips the row group never publishes a segment holding part of it.
+    ///
+    /// For an `expr` key the batch holds the expression's input columns; the
+    /// virtual column is derived from them here, for this batch only (or
+    /// taken from the batch when it already holds a column of that name).
     pub fn add_batch(&mut self, rg: RowGroupId, batch: &RecordBatch) -> Result<()> {
         let Some(dataset) = self.dataset.clone() else {
             return Err(Error::KeySpec(
@@ -983,12 +994,17 @@ impl SegmentWriter {
                 .cloned()
                 .ok_or_else(|| Error::KeySpec(format!("column {name} not in batch")))
         };
-        let cols = self
-            .spec
-            .columns()
-            .iter()
-            .map(|c| column(c))
-            .collect::<Result<Vec<_>>>()?;
+        let cols = match (&dataset.expr, self.spec.columns()) {
+            (Some(typed), [name]) if batch.column_by_name(name).is_none() => {
+                vec![typed.eval(batch)?]
+            }
+            _ => self
+                .spec
+                .columns()
+                .iter()
+                .map(|c| column(c))
+                .collect::<Result<Vec<_>>>()?,
+        };
         let keys = KeyColumns::new(&cols, &dataset.keys)?;
         let ts = match (&self.spec, &dataset.ts) {
             (KeySpec::Temporal { ts_column, .. }, Some(declared)) => {
@@ -1050,7 +1066,7 @@ impl SegmentWriter {
                 e.finish()
             }
             Acc::Bloom(m) => {
-                let KeySpec::Bloom { fpr, .. } = &self.spec else {
+                let KeySpec::Bloom { fpr, .. } = self.spec.physical() else {
                     return Err(Error::KeySpec(
                         "bloom accumulator without bloom spec".into(),
                     ));

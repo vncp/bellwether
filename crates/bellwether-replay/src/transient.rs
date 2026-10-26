@@ -108,6 +108,9 @@ pub struct BuildStats {
     pub largest_segment_key_bytes: u64,
     /// Total segment bytes.
     pub bytes: u64,
+    /// Rows whose key is not indexed because its leading column is null
+    /// (ADR 014); for an `expr` key, rows whose expression is null.
+    pub null_rows: u64,
 }
 
 /// A hypothetical spec's segments over every live row group of one catalog.
@@ -122,11 +125,15 @@ pub struct TransientIndex {
 }
 
 /// The dataset types of a spec's key columns and, for a temporal spec, its
-/// timestamp column.
+/// timestamp column; for an `expr` key, its expression's value type.
 pub(crate) fn spec_types(
     spec: &KeySpec,
     schema: &Schema,
 ) -> Result<(Vec<DataType>, Option<DataType>)> {
+    if let KeySpec::Expr { .. } = spec {
+        let t = bellwether_core::expr::typed_spec(spec, schema)?;
+        return Ok((vec![t.data_type().clone()], None));
+    }
     let lookup = |c: &str| -> Result<DataType> {
         let dt = schema
             .field_with_name(c)
@@ -202,7 +209,7 @@ pub(crate) fn measure(
             }
         }
         if seen.insert(buf.clone()) {
-            bytes += match spec {
+            bytes += match spec.physical() {
                 KeySpec::Bloom { .. } => 8,
                 KeySpec::Temporal { .. } => key_len + 8,
                 _ => key_len,
@@ -230,7 +237,9 @@ impl TransientIndex {
         }
         let schema = catalog.schema();
         let (key_types, ts_type) = spec_types(spec, schema)?;
-        let mut columns: Vec<String> = spec.columns().to_vec();
+        // An expr key reads its expression's input columns and derives the
+        // virtual column one row group at a time (ADR 018).
+        let mut columns: Vec<String> = bellwether_core::expr::input_columns(spec)?;
         if let KeySpec::Temporal { ts_column, .. } = spec {
             if !columns.contains(ts_column) {
                 columns.push(ts_column.clone());
@@ -254,6 +263,7 @@ impl TransientIndex {
         let mut open: Option<(RowGroupId, RowGroupId)> = None;
         for rg in catalog.row_groups() {
             let batch = source.read_columns(&rg.meta, &columns)?;
+            let batch = bellwether_core::expr::with_derived(spec, schema, &batch)?;
             let rows = batch.num_rows() as u64;
             if rows != rg.meta.rows {
                 return Err(Error::Source(format!(
@@ -294,6 +304,11 @@ impl TransientIndex {
             open_bytes += bytes;
             build.stats.row_groups_read += 1;
             build.stats.rows_read += rows;
+            if let Some(lead) = spec.columns().first() {
+                build.stats.null_rows += batch
+                    .column_by_name(lead)
+                    .map_or(0, |c| c.logical_null_count() as u64);
+            }
         }
         // The open writer is finished whenever it processed a row group,
         // even one that gave it no keys.
@@ -362,6 +377,29 @@ impl TransientIndex {
     #[must_use]
     pub fn stats(&self) -> &BuildStats {
         &self.stats
+    }
+
+    /// For an exact spec (or an `expr` key over exact), the distinct keys
+    /// the index holds, as `(low, high)`: exact (`low == high`) when one
+    /// segment holds them all; otherwise each segment's key count is exact
+    /// but a key may sit in several, so the distinct count lies between the
+    /// largest segment's and their sum. `None` for any other spec.
+    #[must_use]
+    pub fn distinct_keys(&self) -> Option<(u64, u64)> {
+        if !matches!(self.spec().physical(), KeySpec::Exact { .. }) {
+            return None;
+        }
+        let readers = self.segments.readers();
+        let high = readers.iter().map(SegmentReader::entries).sum();
+        let low = match readers {
+            [_] | [] => high,
+            _ => readers
+                .iter()
+                .map(SegmentReader::entries)
+                .max()
+                .unwrap_or(0),
+        };
+        Some((low, high))
     }
 
     /// The segments, for planners.

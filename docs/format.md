@@ -92,7 +92,7 @@ rowgroup id      = dense u32 assigned at first sighting of (fingerprint, index_i
 
 ## Key specs
 
-`Exact{columns, counts?}`, `Bloom{columns, fpr}`, `Range{column}`, `Temporal{columns, ts_column, counts?}`. Composite is not a kind; every kind takes a column list and encodes it memcomparably (ADR 002). CSV and JSON lines sources define row groups as fixed byte-range chunks recorded in the manifest, so the rest of the system never knows the difference. `counts` (storage version 2) is serialized only when true, so a spec without it has the same JSON as in version 1; a version 1 manifest that carries it is refused.
+`Exact{columns, counts?}`, `Bloom{columns, fpr}`, `Range{column}`, `Temporal{columns, ts_column, counts?}`, and (phase 5) `Expr{name, expr, over, conformance}` ([Expression keys](#expression-keys-expr-phase-5)). Composite is not a kind; every kind takes a column list and encodes it memcomparably (ADR 002). CSV and JSON lines sources define row groups as fixed byte-range chunks recorded in the manifest, so the rest of the system never knows the difference. `counts` (storage version 2) is serialized only when true, so a spec without it has the same JSON as in version 1; a version 1 manifest that carries it is refused.
 
 **Key-spec identity (storage version 2).** `KeySpec::identity()` is the canonical string of every field of a spec, and the key under which the manifest lists its segments (`segments[].key_spec`) and its completeness (`key_spec_completeness`):
 
@@ -104,6 +104,7 @@ rowgroup id      = dense u32 assigned at first sighting of (fingerprint, index_i
 | `Range{column: ts}` | `range:ts` |
 | `Temporal{columns: [id], ts_column: ts}` | `temporal:id@ts` |
 | `Temporal{columns: [id], ts_column: ts, counts: true}` | `temporal:id@ts,counts` |
+| `Expr{name: sym, expr: json_get(payload,'$.symbol'), over: Exact{counts: true}}` | `expr:sym=json_get(payload,'$.symbol'):exact,counts` (bloom: `...:bloom@0.01`) |
 
 So `bloom:a@0.01` and `bloom:a@0.05` never share a segment list or a completeness entry. Two specs declared by a version 2 binary never share an identity: `,` and `@` separate its parts, so a new declaration (a key spec given to `index` that the index does not already declare, or a proposal's) naming a key or time column that contains either is refused (`exact:a,counts` could otherwise be `Exact{[a], counts}` or `Exact{["a,counts"]}`). For the same reason, because `,counts` ends a counted spec's identity, a new composite exact spec whose last key column is named `counts` is refused (list that column first). A spec an index already declares is read and indexed as it is, whatever its column names: a storage version 1 index on a column named `a,b` reads, plans, and upgrades like any other. Only two declared specs that actually share an identity are refused, which version 1 allowed only for two temporal specs whose time column holds an `@` (`temporal:id` on `ts@x` and `temporal:id@ts` on `x`, both `temporal:id@ts@x`): see "Reading storage version 1". Errors name a spec by its identity. `KeySpec::name()` is the display name and the spec's slot (`exact:a`, `bloom:a`, `temporal:id`): an index holds one spec per name, and declaring another spec under a declared name (another rate, counts on or off, another time column) rebuilds it and drops the old segments in the same commit. A storage version 1 manifest keyed both maps by name (one spec per name, so the rewrite is one-to-one); a version 2 reader rewrites those keys to identities when it reads one, and a version 1 manifest that no commit could upgrade yet (see "Manifest, storage version 2") is written back in names.
 
@@ -656,3 +657,54 @@ Float items count canonical bytes, not SQL equality: `0.0` and `-0.0` are two va
 | `first entry, item id` | `00 00 00 00 01 00 00 00 02 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 02 00 00 00 00 00 00 00 02 0f 00 00 00 03 08 a9 ce 44 2c 92 04 07 de 13 b3 66 ea df fb b4` |
 | `footer` | `02 00 00 00 00 00 00 00 03 00 00 00 ab 25 6d ba de e3 11 dd b0 80 2d e7 f2 40 53 1b a6 12 d6 4b 1e 04 dc d8 62 76 30 ad a5 67 a7 d0 42 57 53 4b 45 54 43 48` |
 | `segment blake3` | `e84c9be5a3d4bdad2674f98364b2d2440e40795bf7f91c35a5c923429ddfd4f3` |
+
+## Expression keys (`expr`, phase 5)
+
+An `expr` key indexes a value derived from dataset columns by a closed, deterministic expression: the operator it serves is a filter or join key that is a function of a column (`json_get(payload,'$.symbol') = 'S-R0007-1'`, `date_trunc(ts,day) = ...`). It is a key-spec kind of its own (not a sidecar): `schema.key_specs[]` holds
+
+```
+{"kind":"expr", "name":<virtual column>, "expr":<normalized expression>,
+ "over":{"kind":"exact","columns":[<name>],"counts"?:true} | {"kind":"bloom","columns":[<name>],"fpr":<f64>},
+ "conformance":[{"expr":<closed expression>, "value":<lowercase hex> | null}, ...]}
+```
+
+named `expr:<name>=<expr>:exact` or `expr:<name>=<expr>:bloom`, and identified (storage version 2, the key of its segments and completeness) as `expr:<name>=<expr>:exact`, `expr:<name>=<expr>:exact,counts`, or `expr:<name>=<expr>:bloom@<fpr>`. `name` is an identifier that is not a dataset column. The store's key-spec allow-list holds `expr`, and the spec an `expr` key wraps is checked against the same list, so a reader without the kind refuses the manifest with the typed shape error (ADR 017), never a serde error or a silent drop on rewrite. A reader built before this kind refuses such a manifest, and so does this binary for a storage version 1 manifest that names it: the kind ships with storage version 2.
+
+**Segments.** An `expr` key's segments are ordinary segments in the layout of `over` (the exact or bloom bytes above, nothing added), listed in `segments[]` with the `expr` spec's identity as `key_spec` and no `kind`. With `:exact,counts` the exact segment stores, per derived value and row group, its rows (the storage version 2 counts layout), so `bellwether count --keys` with a key file named by the expression answers `count(*) where <expr> in (...)` from the index, and a `locate` plan states its rows. The key column is the virtual column, encoded at the expression's value type with the canonical encoding. The segment header's key spec is the whole `expr` spec, so a segment carries its expression and conformance vectors. The build reads the expression's input columns one row group at a time and derives the virtual column for that row group only (ADR 018); a row whose value is null is not indexed (ADR 014).
+
+**Expression language.** Six functions, string and integer literals, column references; no user code (`bellwether_core::expr` documents each function's types and value). `json_get(s, path)` gives a JSON value at a path as text (a string's text, a number's literal token as written, `true`/`false`; null for a JSON null, an object, an array, a missing path, or a document that is not valid JSON; a repeated member takes its first occurrence). `lower(s)` is the Unicode lowercase mapping as Rust's `str::to_lowercase` computes it (per-character default lowercase, the multi-character `İ` mapping, the final-sigma rule). `substr(s, start, len)` counts Unicode scalar values from a 1-based start. `cast(x, int64|utf8|timestamp_s|ms|us|ns)` converts strictly (a string that is not an integer is null). `date_trunc(t, second|minute|hour|day|month|year)` floors in UTC. `hash(x, ...)` is xxhash64 (seed 0) over the arguments' concatenated canonical encodings, as `UInt64`.
+
+**Normalized form.** Function names and keywords lowercase, no whitespace, columns bare when an identifier (`[A-Za-z_][A-Za-z0-9_]*`) else double-quoted, strings single-quoted with `'` doubled, integers in decimal, JSON paths `$` then `.key` (identifier), `["key"]` (other, `"` and `\` escaped by `\`), or `[n]`; `date_trunc('day', ts)` normalizes to `date_trunc(ts,day)`. A lookup matches an `expr` key only when its expression normalizes to the key's expression; a lookup on any other expression, on the virtual column's name, or on an expression beside another column is refused, naming the `expr` keys that exist. An `expr` key answers point lookups (`locate`) only; `latest`, `asof`, window, and lookback lookups on an expression are refused. The residual is `ExprIn {expr, values}`: the expression recomputed per row, kept when its canonical value is one of `values`; a null value matches nothing.
+
+**Conformance vectors.** An `expr` spec carries every vector below for each function its expression calls, and a spec that does not record every vector this binary pins for a function its expression calls (none at all, or only another function's) is refused at `index`, at segment open, and at plan, naming the missing vector. The consequence: adding a vector to a function later makes every existing `expr` key over that function refuse until it is declared again and rebuilt, so after the format freeze adding a vector is a format change. Every reader (segment open, spec check, build, plan, price, verify) recomputes them and refuses the key, naming both values, when this binary computes another: an evaluator whose behaviour moved (for example a changed Unicode table under `lower`) refuses rather than misses rows (invariant 1). A character whose mapping a later Unicode version adds is outside what the vectors see. `crates/bellwether-core/tests/expr_conformance.rs` checks every row of this table against the code's table, and every value against the evaluator. Values are canonical encodings (ADR 016) in lowercase hex; spaces are for reading only.
+
+| Function | Closed expression | Value |
+|---|---|---|
+| `json_get` | `json_get('{"symbol":"SYM1","px":1.50}','$.symbol')` | `0653594d 310000` |
+| `json_get` | `json_get('{"px":1.50}','$.px')` | `06312e35 300000` |
+| `json_get` | `json_get('{"a":{"b c":[10,"x\u00e9"]}}','$.a["b c"][1]')` | `0678c3a9 0000` |
+| `json_get` | `json_get('{"a":1,"a":2}','$.a')` | `06310000` |
+| `json_get` | `json_get('{"a":"\ud83d\ude00"}','$.a')` | `06f09f98 800000` |
+| `json_get` | `json_get('{"a":true}','$.a')` | `06747275 650000` |
+| `json_get` | `json_get('{"a":null}','$.a')` | `null` |
+| `json_get` | `json_get('{"a":[1]}','$.a')` | `null` |
+| `json_get` | `json_get('{"a":1','$.a')` | `null` |
+| `lower` | `lower('AbC-Z')` | `06616263 2d7a0000` |
+| `lower` | `lower('ÀB')` | `06c3a062 0000` |
+| `lower` | `lower('İ')` | `0669cc87 0000` |
+| `lower` | `lower('ΣΑΣ')` | `06cf83ce b1cf8200 00` |
+| `substr` | `substr('héllo',2,3)` | `06c3a96c 6c0000` |
+| `substr` | `substr('abc',5,2)` | `060000` |
+| `cast` | `cast('007',int64)` | `02800000 00000000 07` |
+| `cast` | `cast('-12',int64)` | `027fffff ffffffff f4` |
+| `cast` | `cast('1.5',int64)` | `null` |
+| `cast` | `cast(42,utf8)` | `06343200 00` |
+| `cast` | `cast(86400000000,timestamp_us)` | `080403 80000014 1dd76000` |
+| `date_trunc` | `date_trunc(cast(90061000001,timestamp_us),day)` | `080403 80000014 1dd76000` |
+| `date_trunc` | `date_trunc(cast(90061000001,timestamp_us),hour)` | `080403 80000014 f46b0400` |
+| `date_trunc` | `date_trunc(cast(-1,timestamp_us),day)` | `080403 7fffffeb e228a000` |
+| `date_trunc` | `date_trunc(cast(6307200000000,timestamp_us),month)` | `080403 800004a2 e0a32000` |
+| `date_trunc` | `date_trunc(cast(6307200000000,timestamp_us),year)` | `080403 80000000 00000000` |
+| `hash` | `hash('SYM1')` | `03 29185bcc 2d6b9e2a` |
+| `hash` | `hash('SYM1','X1')` | `03 2be2127e 8956e278` |
+| `hash` | `hash(1,'a')` | `03 e51a8fcd c38e4db3` |

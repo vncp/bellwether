@@ -670,7 +670,9 @@ fn shared_identity(root: &str, base: Option<&Manifest>, a: &KeySpec, b: &KeySpec
                     fix(valid_column);
                     fix(known_column);
                 }
-                KeySpec::Range { .. } => {}
+                // An expr key's column is an identifier; it names no time
+                // column.
+                KeySpec::Range { .. } | KeySpec::Expr { .. } => {}
             }
             format!(
                 "re-declare {} under its name with a time column whose name has no ',' or '@', \
@@ -790,6 +792,8 @@ fn declared_sketch_specs(
 /// Validates the declared key specs, sidecars, and sketches against the
 /// dataset schema: key specs first, in declaration order, then sidecars,
 /// then sketches.
+// One arm per kind of target (key spec, expr key, sidecar, sketch).
+#[allow(clippy::too_many_lines)]
 fn plan_specs(
     specs: &[KeySpec],
     sidecars: &[SidecarDef],
@@ -822,6 +826,22 @@ fn plan_specs(
                     "two declared key specs share the name {name}; KeySpec::name omits ts_column and fpr, \
                      so at most one of them can be declared"
                 )));
+            }
+            if let KeySpec::Expr { .. } = spec {
+                // The one key column is the virtual column, at the
+                // expression's type; the worker reads the expression's
+                // inputs and derives it per row group.
+                let typed = bellwether_core::expr::typed_spec(spec, schema)?;
+                ColumnType::of(typed.data_type())
+                    .map_err(|e| Error::KeySpec(format!("{name}: {e}")))?;
+                return Ok(SpecPlan {
+                    target: Target::Key(spec.clone()),
+                    name: spec.identity(),
+                    key_types: vec![typed.data_type().clone()],
+                    ts_type: None,
+                    time_types: Vec::new(),
+                    columns: typed.input_columns(),
+                });
             }
             let mut seen = BTreeSet::new();
             let mut key_types = Vec::new();

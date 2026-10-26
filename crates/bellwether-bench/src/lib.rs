@@ -17,6 +17,9 @@
 //! - [`market`] writes a deterministic synthetic bitemporal market trade corpus
 //!   (`symbol`, `ts`, `known_at`, `price`, `size`), time-series workloads
 //!   (`window`, `asof`, `latest_known`), and exact ground truth (`truth.json`).
+//! - [`expr`] writes a corpus with a JSON attribute column on each shape
+//!   (ledger, market), key files for equality on a JSON path at three
+//!   selectivities, and exact ground truth, for `expr` keys.
 //! - [`perf`] reads a lookup's planned row groups (or every row group under a
 //!   folder) through the byte-counting reader, for the release measurements
 //!   of `scripts/perf.sh`.
@@ -43,6 +46,7 @@
 
 pub mod corpus;
 pub mod env;
+pub mod expr;
 pub mod generate;
 pub mod harness;
 pub mod market;

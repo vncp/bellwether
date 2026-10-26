@@ -167,6 +167,13 @@ pub struct ReconcileSpec {
     /// predicate keeps are read and skipped on both sides. `None` compares
     /// every row.
     pub row_filter: Option<Vec<Predicate>>,
+    /// With workload coverage: the workload's keys are values of this
+    /// expression (normalized, `bellwether_core::expr`) over the dataset's
+    /// columns, not key tuples. A row is covered when its expression's
+    /// value is one of them; [`ReconcileSpec::key_columns`] (normally the
+    /// expression's input columns) still identify the rows compared. `None`
+    /// keys the workload by the key columns.
+    pub keys_of: Option<String>,
 }
 
 impl ReconcileSpec {
@@ -186,7 +193,16 @@ impl ReconcileSpec {
             group_by: Vec::new(),
             coverage: CoverageRequest::Full,
             row_filter: None,
+            keys_of: None,
         }
+    }
+
+    /// Reads the workload coverage's keys as values of `expr`
+    /// ([`ReconcileSpec::keys_of`]).
+    #[must_use]
+    pub fn keys_of(mut self, expr: impl Into<String>) -> Self {
+        self.keys_of = Some(expr.into());
+        self
     }
 
     /// Compares the newest version per key by `column`.
@@ -300,6 +316,13 @@ impl ReconcileSpec {
         if self.row_filter.as_ref().is_some_and(Vec::is_empty) {
             return Err(VerifyError::InvalidSpec(
                 "a row filter with no predicate would compare nothing".into(),
+            ));
+        }
+        if self.keys_of.is_some() && !matches!(self.coverage, CoverageRequest::Workload(_)) {
+            return Err(VerifyError::InvalidSpec(
+                "keys_of reads a workload's keys as an expression's values; it needs workload \
+                 coverage"
+                    .into(),
             ));
         }
         match &self.coverage {

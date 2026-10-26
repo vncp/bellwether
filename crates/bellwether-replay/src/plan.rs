@@ -87,11 +87,17 @@ pub enum Lookup {
 }
 
 /// How `spec` serves a run keyed on `run_columns`, or `None` if it cannot
-/// (module docs, rule (a) then rule (b)).
+/// (module docs, rule (a) then rule (b)). An `expr` key serves exactly the
+/// runs keyed on its (normalized) expression, never one naming its virtual
+/// column.
 #[must_use]
 pub fn servable(spec: &KeySpec, run_columns: &[String]) -> Option<Lookup> {
     if run_columns.is_empty() {
         return None;
+    }
+    if let KeySpec::Expr { expr, .. } = spec {
+        return (run_columns == std::slice::from_ref(expr))
+            .then(|| Lookup::Point { project: vec![0] });
     }
     let p = spec.columns();
     let project: Option<Vec<usize>> = p
@@ -116,7 +122,7 @@ pub fn serves_window(spec: &KeySpec, ts_column: &str) -> bool {
         KeySpec::Exact { columns, .. } | KeySpec::Temporal { columns, .. } => {
             columns.first().is_some_and(|c| c == ts_column)
         }
-        KeySpec::Bloom { .. } | KeySpec::Bitemporal { .. } => false,
+        KeySpec::Bloom { .. } | KeySpec::Bitemporal { .. } | KeySpec::Expr { .. } => false,
     }
 }
 
@@ -1138,6 +1144,13 @@ impl PlanSource for SegmentPlanner {
             listed.push(self.listed(spec)?);
         }
         let query = planned_query(self.catalog.schema(), specs, keys.columns(), query)?;
+        if *query != RunQuery::Locate && is_expression_run(self.catalog.schema(), keys.columns()) {
+            return Err(Error::KeySpec(format!(
+                "{} is an expression; an expression key answers point lookups (locate) only, \
+                 so a latest, asof, lookback, or window run needs dataset columns",
+                keys.columns().join(", ")
+            )));
+        }
         if query.is_temporal() && specs.is_empty() {
             return Err(Error::KeySpec(format!(
                 "latest and asof need a temporal key spec serving {:?}",
@@ -1152,6 +1165,7 @@ impl PlanSource for SegmentPlanner {
             if keys.is_empty() {
                 return Ok(with_residual(
                     self.catalog.plan_for(&RoaringBitmap::new())?,
+                    self.catalog.schema(),
                     keys,
                     window.as_ref(),
                 ));
@@ -1160,6 +1174,7 @@ impl PlanSource for SegmentPlanner {
                 let selected = self.select_window(specs, &listed, keys, w)?;
                 return Ok(with_residual(
                     self.catalog.plan_for(&selected)?,
+                    self.catalog.schema(),
                     keys,
                     Some(w),
                 ));
@@ -1167,6 +1182,7 @@ impl PlanSource for SegmentPlanner {
             if specs.is_empty() {
                 return Ok(with_residual(
                     self.catalog.plan_for(&self.catalog.all_ids())?,
+                    self.catalog.schema(),
                     keys,
                     None,
                 ));
@@ -1190,7 +1206,12 @@ impl PlanSource for SegmentPlanner {
         }
         let selected = Self::select(&serving, keys)?;
         let rows = Self::count_rows(&serving, keys, &self.catalog.all_ids())?;
-        let mut plan = with_residual(self.catalog.plan_for(&selected)?, keys, None);
+        let mut plan = with_residual(
+            self.catalog.plan_for(&selected)?,
+            self.catalog.schema(),
+            keys,
+            None,
+        );
         plan.rows = rows.map(Quantity::exact);
         Ok(plan)
     }
@@ -1229,17 +1250,20 @@ impl PlanSource for SegmentPlanner {
 /// would silently miss.
 pub(crate) fn check_key_types(schema: &Schema, keys: &RunKeys) -> Result<()> {
     for (c, recorded) in keys.columns().iter().zip(keys.key_types()) {
-        let declared = schema
-            .field_with_name(c)
-            .map_err(|_| Error::KeySpec(format!("key column {c:?} is not in the dataset")))?
-            .data_type();
-        if &ColumnType::of(declared)? != recorded {
+        let declared = crate::keys::declared_type(schema, c)?;
+        if ColumnType::of(&declared)? != *recorded {
             return Err(Error::KeySpec(format!(
                 "keys on {c:?} were encoded as {recorded}, but the dataset declares {declared}; re-read the keys"
             )));
         }
     }
     Ok(())
+}
+
+/// Whether a run's key columns are one expression (`bellwether_core::expr`)
+/// rather than dataset columns.
+pub(crate) fn is_expression_run(schema: &Schema, columns: &[String]) -> bool {
+    matches!(columns, [c] if bellwether_core::expr::is_expression(c, schema))
 }
 
 /// A run's window with both bounds encoded at the time column's dataset
@@ -1279,15 +1303,24 @@ impl EncodedWindow {
 /// `plan` with the residual that makes it row-exact (ADR 011): the run's key
 /// tuples, float zeros in both encodings, and for a window run `Between` on
 /// its time column. An empty key set gives an empty `In` and no row groups.
+/// A run keyed on an expression gets `ExprIn`, which recomputes it per row.
 pub(crate) fn with_residual(
     mut plan: ScanPlan,
+    schema: &Schema,
     keys: &RunKeys,
     window: Option<&EncodedWindow>,
 ) -> ScanPlan {
     let all: Vec<usize> = (0..keys.columns().len()).collect();
-    let keyed = Predicate::In {
-        columns: keys.columns().to_vec(),
-        values: keys.all_probes(&all),
+    let keyed = if is_expression_run(schema, keys.columns()) {
+        Predicate::ExprIn {
+            expr: keys.columns()[0].clone(),
+            values: keys.all_probes(&all),
+        }
+    } else {
+        Predicate::In {
+            columns: keys.columns().to_vec(),
+            values: keys.all_probes(&all),
+        }
     };
     plan.residual = Some(match window {
         None => keyed,

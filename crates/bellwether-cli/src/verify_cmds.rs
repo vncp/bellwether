@@ -317,6 +317,7 @@ fn rows_asked(filter: &[Predicate]) -> String {
             Predicate::WindowPartition { columns } => {
                 format!("whole partitions of {}", columns.join(", "))
             }
+            Predicate::ExprIn { expr, .. } => format!("the workload's keys of {expr}"),
             Predicate::And { all } => {
                 for q in all {
                     walk(q, out);
