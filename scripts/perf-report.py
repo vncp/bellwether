@@ -12,7 +12,8 @@ import json
 def fmt_ms(v):
     if v is None:
         return "-"
-    return f"{v:,.0f}" if v >= 100 else f"{v:,.1f}" if v >= 10 else f"{v:,.2f}"
+    return (f"{v:,.0f}" if v >= 100 else f"{v:,.1f}" if v >= 10 else f"{v:,.2f}" if v >= 0.1
+            else f"{v:,.3f}")
 
 
 def mib(v):
