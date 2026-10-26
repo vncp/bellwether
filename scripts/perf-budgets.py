@@ -6,7 +6,11 @@
 
 Every metric with a direction gets a budget: a latency (direction "lower")
 gets measured x 1.25, a throughput (direction "higher") measured / 1.25.
-Context metrics (direction "none": counts, passes, bytes planned) get none.
+Context metrics (direction "none": counts, passes, bytes planned), DuckDB's
+times (the baseline), and reconcile meter peaks (bounded by the budget by
+construction) get none. A reconcile peak-memory budget is never above the
+verify README's stated bound (ADR 018): where the measurement is past it, the
+budget is the bound, so WP22b's check fails until the defect is fixed.
 The file names the measurement it derives from (date, commit, machine,
 build) and keeps an empty [runner] section for the CI runner's own baseline,
 which the first perf.yml run measures (WP22b). Nothing reads this file to
@@ -46,6 +50,22 @@ def section_of(mid, sections):
     return sections.get(name)
 
 
+FOOTER_CACHE = 256 << 20
+
+
+def stated_bound(m, context):
+    """A reconcile peak's ADR 018 bound (the verify README): the budget, one
+    decoded batch, and the footer cache; from the metric or its context."""
+    if "bound_bytes" in m:
+        return m["bound_bytes"]
+    parts = m["id"].split("/")
+    if parts[0] == "reconcile" and len(parts) == 4 and parts[3] in ("peak-rss", "peak-footprint"):
+        mem = context.get(f"reconcile/{parts[1]}/{parts[2]}", {}).get("memory")
+        if mem:
+            return mem["budget_bytes"] + mem["peak_batch_bytes"] + FOOTER_CACHE
+    return None
+
+
 def q(s):
     return json.dumps(s, ensure_ascii=False)
 
@@ -81,7 +101,15 @@ def main():
         v = m["value"]
         if v is None:
             continue
+        if m.get("side") == "duckdb" or m.get("metric") == "meter peak state":
+            # The baseline and the meter (bounded by the budget by
+            # construction) are context, never budgets.
+            continue
         budget = v * FACTOR if m["direction"] == "lower" else v / FACTOR
+        bound = stated_bound(m, doc["context"])
+        capped = bound is not None and budget > bound
+        if capped:
+            budget = bound
         sec = section_of(m["id"], env.get("sections", {}))
         out += [
             "[[budget]]",
@@ -91,6 +119,12 @@ def main():
             f"measured = {round(v, 3)}",
             f"budget = {round(budget, 3)}",
         ]
+        if bound is not None:
+            out.append(f"stated_bound = {bound}")
+        if capped:
+            # Measured past the verify README's stated bound: the budget is
+            # the bound, so the check fails until the defect is fixed.
+            out.append("capped_at_stated_bound = true")
         if sec:
             out += [f"measured_at = {q(sec['started_at'])}", f"commit = {q(sec['commit'])}",
                     # Cores busy outside the run during its section: a loaded

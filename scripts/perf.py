@@ -18,7 +18,7 @@ Sections (--sections, comma-separated; default all):
   reconcile  rows per second per side at four memory budgets, passes, peaks
   latency    replay p50 run, why end to end, observe and MCP latency,
              resident bytes per key (contract v3 entry 32)
-  profiles   samply over the five hot paths, top ten self-time frames
+  profiles   samply over the five hot paths and the ledger build, top ten self-time frames
 
 Quantiles are nearest-rank (docs/benchmark.md): the value at zero-based
 index ceil(q * n) - 1 of the sorted samples.
@@ -28,6 +28,7 @@ import argparse
 import bisect
 import datetime as dt
 import gzip
+import hashlib
 import json
 import math
 import os
@@ -88,6 +89,13 @@ def time_cmd():
     return ["/usr/bin/time", "-v"], parse
 
 
+def peak_footprint(err):
+    """macOS `/usr/bin/time -l`'s peak memory footprint (dirty memory, not
+    mapped file pages), or None where it is not printed."""
+    m = re.search(r"(\d+)\s+peak memory footprint", err)
+    return int(m.group(1)) if m else None
+
+
 def parse_duration(s):
     """A Rust `Duration` Debug string (12.3ms, 850µs, 1.2s) in ms."""
     m = re.fullmatch(r"([\d.]+)(ns|µs|us|ms|s)", s.strip())
@@ -121,6 +129,15 @@ def environment(a):
     dirty = bool(subprocess.run(["git", "-C", REPO, "status", "--porcelain", "--untracked-files=no", "--",
                                  ".", ":(exclude)docs/measured/results/perf.json"],
                                 capture_output=True, text=True).stdout.strip())
+    # The binary's identity: cargo rebuilds whenever a Rust source or
+    # manifest changes, so the binary matches the newest commit touching
+    # them, provided none is modified in the tree.
+    src = ["--", "crates/**/*.rs", "crates/*/Cargo.toml", "crates/*/build.rs", "Cargo.toml", "Cargo.lock"]
+    sources = first(["git", "-C", REPO, "log", "-1", "--format=%h", "--abbrev=12", *src])
+    sources_dirty = bool(subprocess.run(["git", "-C", REPO, "status", "--porcelain", *src],
+                                        capture_output=True, text=True).stdout.strip())
+    with open(a.bin, "rb") as f:
+        sha = hashlib.sha256(f.read()).hexdigest()
     machine = f"{cpu}, {cores} cores, {mem // 2**30} GiB, {osv}, {'CI runner disk' if os.environ.get('GITHUB_ACTIONS') else 'local SSD'}"
     return {
         "date": dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%d"),
@@ -136,6 +153,9 @@ def environment(a):
         "rustc": first(["rustc", "-V"]),
         "build": a.build_label,
         "binary": a.bin,
+        "binary_sha256": sha,
+        "built_from": sources,
+        "built_from_dirty": sources_dirty,
         "duckdb_cli": first(["duckdb", "-no-agent", "--version"]),
         "storage": "local disk",
     }
@@ -192,9 +212,21 @@ def external_cpu():
         f = line.split(None, 1)
         if len(f) == 2:
             names[int(f[0])] = f[1].strip()
-    ext = [(cpu, names.get(pid, str(pid))) for pid, (_, cpu) in procs.items() if not mine(pid) and cpu > 0]
+    ext = [(cpu, public_name(names.get(pid, str(pid)))) for pid, (_, cpu) in procs.items()
+           if not mine(pid) and cpu > 0]
     ext.sort(reverse=True)
     return sum(c for c, _ in ext) / 100.0, [f"{n} {c:.0f}%" for c, n in ext[:5]]
+
+
+# Outside processes are named only when they are build or query tools; the
+# rest of the desktop is "other process".
+TOOLS = {"rustc", "cargo", "cargo-clippy", "clippy-driver", "rustdoc", "ld", "cc", "clang", "duckdb",
+         "bellwether", "bellwether-mcp", "python3", "git", "kernel_task", "WindowServer"}
+
+
+def public_name(comm):
+    base = comm.strip("()").rsplit("/", 1)[-1]
+    return base if base in TOOLS or base.startswith("bellwether") else "other process"
 
 
 def scrub(text, a):
@@ -274,7 +306,7 @@ class Perf:
         self.env["sections"] = self.sections
 
     def sample(self, mid, values, **extra):
-        self.samples.write(json.dumps({"id": mid, "values": values, **extra}) + "\n")
+        self.samples.write(scrub(json.dumps({"id": mid, "values": values, **extra}), self.a) + "\n")
         self.samples.flush()
 
     def metric(self, mid, value, unit, direction, exactness="measured", **fields):
@@ -283,13 +315,17 @@ class Perf:
         self.metrics.append({"id": mid, "value": value, "unit": unit, "direction": direction,
                              "exactness": exactness, **fields})
 
-    def quantiles(self, mid, values, unit="ms", **fields):
+    def quantiles(self, mid, values, unit="ms", direction="lower", **fields):
         self.sample(mid, values, **fields)
         for q, name in [(0.5, "p50"), (0.95, "p95")]:
-            self.metric(f"{mid}/{name}", round(nearest_rank(values, q), 3), unit, "lower",
+            self.metric(f"{mid}/{name}", round(nearest_rank(values, q), 3), unit, direction,
                         stat=name, n=len(values), **fields)
 
     def write(self):
+        for sec in self.sections.values():
+            sec["external_top_at_max"] = [
+                f"{public_name(e.rsplit(' ', 1)[0])} {e.rsplit(' ', 1)[1]}" if " " in e else e
+                for e in sec.get("external_top_at_max", [])]
         doc = {"format": FORMAT, "environment": self.env, "cache": {"warm": "warm: the same call ran "
                "just before, so bellwether's cache directory and the OS page cache hold its inputs",
                "cold": self.cache.label}, "context": self.context, "metrics": self.metrics}
@@ -310,13 +346,15 @@ class Perf:
                      if m["id"] == "process/bellwether--version/warm/p50"), None)
 
     def showcase_rows(self):
-        """The rows docs/measured/results/README.md defines, one unit per
-        metric, for the README charts."""
+        """Chart rows for the README's results renderer: one object per
+        value with dataset, query, side, metric, value, unit, exactness,
+        machine, build, and date, and one unit per metric."""
         env = self.env
         rustc = (env.get("rustc") or "").split(" (")[0]
+        built = f"sources at {env['built_from']}" + (" (modified)" if env["built_from_dirty"] else "")
         builds = {
-            "bellwether": f"bellwether release build of {env['commit']} ({rustc})",
-            "full-scan": f"bellwether-bench byte-counting reader, release build of {env['commit']} ({rustc})",
+            "bellwether": f"bellwether release build of {built} ({rustc}; sha256 {env['binary_sha256'][:12]})",
+            "full-scan": f"bellwether-bench byte-counting reader in the same binary, {built}",
             "duckdb": f"DuckDB {(env.get('duckdb_cli') or '').strip()}",
         }
         rows, queries = [], {}
@@ -383,7 +421,7 @@ class Perf:
 
 def charts(rows, start=None):
     """The charts the README draws from these rows, each with a takeaway
-    sentence computed from the numbers (docs/measured/results/README.md)."""
+    sentence computed from the numbers."""
     def by(metric):
         out = {}
         for r in rows:
@@ -463,7 +501,7 @@ RECONCILE_NAMES = {"ledger": "ledger-small", "replay": "replay-small", "taxi": "
 
 # What each section owns in perf.json (metric ids and context keys).
 SECTION_PREFIXES = {
-    "lookups": ("lookup/", "process/", "dataset/", "skipped"),
+    "lookups": ("lookup/", "process/", "dataset/", "keys/", "skipped"),
     "build": ("build/",),
     "reconcile": ("reconcile/",),
     "latency": ("replay/", "observe/", "mcp/", "why/", "resident/"),
@@ -616,10 +654,12 @@ def duck_sql(d, keys, where, qualify):
     return f"SELECT count(*), sum(h) FROM ({sel})"
 
 
-def duck_times(sql, reps):
-    """DuckDB's own .timer query times (ms) for reps runs in one process,
-    after one discarded run, and the result row."""
-    script = ".timer on\n" + (sql + ";\n") * (reps + 1)
+def duck_times(sql, reps, discard=1):
+    """DuckDB's own .timer query times (ms) for reps runs in one fresh
+    process, after `discard` runs whose times are dropped, and the result
+    row. Warm: discard=1. Cold: reps=1, discard=0, so the timed query is the
+    first one the process runs."""
+    script = ".timer on\n" + (sql + ";\n") * (reps + discard)
     env = {k: v for k, v in os.environ.items() if k != "AI_AGENT"}
     p = subprocess.run(["duckdb", "-no-agent", "-init", "/dev/null", "-csv", "-noheader"],
                        input=script, capture_output=True, text=True, env=env)
@@ -627,9 +667,9 @@ def duck_times(sql, reps):
         sys.exit(f"duckdb failed: {p.stderr.strip()}\n{sql}")
     times = [float(x) * 1000 for x in re.findall(r"Run Time \(s\): real ([\d.]+)", p.stdout)]
     rows = [l for l in p.stdout.splitlines() if not l.startswith("Run Time")]
-    if len(times) != reps + 1:
-        sys.exit(f"duckdb printed {len(times)} timings for {reps + 1} queries")
-    return times[1:], rows[0]
+    if len(times) != reps + discard:
+        sys.exit(f"duckdb printed {len(times)} timings for {reps + discard} queries")
+    return times[discard:], rows[0]
 
 
 def read_ms(p, args):
@@ -667,6 +707,10 @@ def section_lookups(p, datasets):
                     f"{d.name}: {k} keys asked, the corpus has {d.symbols} distinct keys")
                 continue
             keys = key_file(p, d, k)
+            # The key sets depend on DuckDB's hash(); record them so a run on
+            # another DuckDB can use the same keys.
+            p.context[f"keys/{d.name}/k{k}"] = duck(
+                f"SELECT string_agg(CAST({d.key} AS VARCHAR), ',' ORDER BY {d.key}) FROM read_parquet('{keys}')").strip('"').split(",")
             for name, args, where, qualify, what in lookups_for(d):
                 lookup_one(p, d, k, keys, name, args, where, qualify, what)
     return p
@@ -707,10 +751,12 @@ def lookup_one(p, d, k, keys, name, args, where, qualify, what):
     dc = []
     for _ in range(C):
         p.cache.drop()
-        dc.append(duck_times(sql, 0 + 1)[0][0])
+        dc.append(duck_times(sql, 1, discard=0)[0][0])
     for cache, xs in (("warm", dw), ("cold", dc)):
-        p.quantiles(f"{mid}/duckdb/{cache}", xs, side="duckdb", metric="end-to-end", cache=cache,
-                    command=f"duckdb .timer: {sql}", **common)
+        # DuckDB is the baseline, not code this repository can regress: its
+        # times are context (direction "none"), never budgeted.
+        p.quantiles(f"{mid}/duckdb/{cache}", xs, direction="none", side="duckdb", metric="end-to-end",
+                    cache=cache, command=f"duckdb .timer: {sql}", **common)
     p.context[mid] = {"what": what, "planned": v["planned"], "row_groups_total": v["row_groups_total"],
                       "files_total": v["files_total"], "read": r, "duckdb_rows": row.split(",")[0],
                       "command": printable}
@@ -807,7 +853,16 @@ def reconcile_once(p, name, left, right, args, budget):
         sys.exit(f"reconcile failed ({code}): {err.strip()}")
     v = json.loads(out)
     mem = v["outcome"]["memory"]
-    return ms, v, mem, rss(err), "bellwether " + " ".join(cmd[1:-3] + ["--json"])
+    return ms, v, mem, (rss(err), peak_footprint(err)), "bellwether " + " ".join(cmd[1:-3] + ["--json"])
+
+
+# The verify README's stated bound (ADR 018), less the fingerprint lists:
+# the budget, one decoded batch, and ParquetSource's footer cache.
+FOOTER_CACHE = 256 << 20
+
+
+def stated_bound(mem):
+    return mem["budget_bytes"] + mem["peak_batch_bytes"] + FOOTER_CACHE
 
 
 def section_reconcile(p, ledger):
@@ -834,7 +889,7 @@ def section_reconcile(p, ledger):
                     say(f"  {label:>5}: not run, about {predicted} passes, "
                         f"{predicted * one_pass_ms / 60000:,.0f} min")
                     continue
-            ms, v, mem, peak, cmd = reconcile_once(p, name, left, right, args, label)
+            ms, v, mem, (peak, foot), cmd = reconcile_once(p, name, left, right, args, label)
             rows = [s["rows"] for s in v["outcome"]["sides"]]
             results[label] = (mem["passes"], b)
             if mem["passes"] == 1 and one_pass_ms is None:
@@ -842,16 +897,25 @@ def section_reconcile(p, ledger):
                 # Budget the planner needs for one pass is at least the
                 # state it held; the bisection below measures the real need.
                 results["_need"] = {name: mem["peak_state_bytes"]}
-            common = dict(dataset=name, query="reconcile", budget=label, command=cmd)
+            common = dict(dataset=name, query="reconcile", budget=label, n=1, command=cmd)
             p.metric(f"reconcile/{name}/{label}/wall", round(ms, 1), "ms", "lower", metric="wall", **common)
             p.metric(f"reconcile/{name}/{label}/rows-per-s-per-side", round(rows[0] / (ms / 1000)),
                      "rows/s", "higher", metric="rows per second per side", **common)
             p.metric(f"reconcile/{name}/{label}/passes", mem["passes"], "passes", "none",
                      exactness="exact", metric="passes", **common)
-            p.metric(f"reconcile/{name}/{label}/meter-peak", mem["peak_state_bytes"], "bytes", "lower",
+            # The meter's peak is bounded by the budget by construction:
+            # context, not a budget of its own.
+            p.metric(f"reconcile/{name}/{label}/meter-peak", mem["peak_state_bytes"], "bytes", "none",
                      exactness="exact", metric="meter peak state", **common)
+            # Peak memory is budgeted, but never above the stated bound: a
+            # run past it is a defect, not a baseline (perf-budgets.py caps).
+            bound = stated_bound(mem)
             p.metric(f"reconcile/{name}/{label}/peak-rss", peak, "bytes", "lower", metric="peak RSS",
-                     **common)
+                     bound_bytes=bound, **common)
+            if foot is not None:
+                p.metric(f"reconcile/{name}/{label}/peak-footprint", foot, "bytes", "lower",
+                         metric="peak memory footprint (dirty memory, /usr/bin/time -l)", bound_bytes=bound,
+                         **common)
             p.context[f"reconcile/{name}/{label}"] = {"memory": mem, "rows": rows, "pass": v["outcome"]["pass"],
                                                        "counts": v["outcome"]["counts"], "what": what}
             say(f"  {label:>5}: {ms:9.0f} ms  passes {mem['passes']:4d}  meter peak "
@@ -869,9 +933,9 @@ def section_reconcile(p, ledger):
             b = max(b for _, b in results.values()) * 2
             limit = p.env["memory_bytes"] // 2
             while b <= limit:
-                ms, _, mem, peak, _ = reconcile_once(p, name, left, right, args, f"{b >> 20}M")
+                ms, _, mem, (peak, foot), _ = reconcile_once(p, name, left, right, args, f"{b >> 20}M")
                 above.append({"budget_mib": b >> 20, "passes": mem["passes"], "meter_peak": mem["peak_state_bytes"],
-                              "wall_ms": round(ms), "peak_rss": peak})
+                              "wall_ms": round(ms), "peak_rss": peak, "peak_footprint": foot})
                 say(f"  {b >> 20:>5}M: {ms:9.0f} ms  passes {mem['passes']:4d}  meter peak "
                     f"{mem['peak_state_bytes'] / 2**20:8.1f} MiB  RSS {peak / 2**20:7.0f} MiB")
                 results[f"{b >> 20}M"] = (mem["passes"], b)
@@ -1020,6 +1084,8 @@ def demangle(sym):
 
 # bellwether's own functions (any workspace crate), by demangled name.
 OWN = re.compile(r"(^|[<&\s])bellwether(_[a-z]+)?::")
+# A segment value read through the store (one round trip each, hypothesis 1).
+READS = re.compile(r"ReadAt>::read_at|StoreExt>::get_range")
 GENERIC = re.compile(r"^(bellwether::main|bellwether::run|bellwether::\w+_cmds::run|<?rayon|<?core::|<?std::"
                      r"|<?alloc::)")
 
@@ -1040,6 +1106,8 @@ def top_frames(profile, syms, n=10):
     agg, total, idle = {}, 0, 0
     inclusive, leaf_callers = {}, {}
     wall, wall_inclusive = 0, {}
+    cpu_total, inclusive_no_reads = 0, {}
+    waits, wait_callers = {}, {}
     for th in profile["threads"]:
         smp = th["samples"]
         weights = smp.get("threadCPUDelta") or [1] * len(smp["stack"])
@@ -1074,6 +1142,7 @@ def top_frames(profile, syms, n=10):
             return out
 
         main = th.get("isMainThread")
+        prev = None
         for s, w in zip(smp["stack"], weights):
             if s is None:
                 continue
@@ -1083,23 +1152,42 @@ def top_frames(profile, syms, n=10):
                 wall += 1
                 for nm in set(own_frames(s)):
                     wall_inclusive[nm] = wall_inclusive.get(nm, 0) + 1
+            # A sample's CPU delta is the CPU the thread used since the
+            # previous sample; a thread found waiting now was running then,
+            # so the delta is credited to the previous sample's stack.
+            at, prev = (prev if prev is not None else s), s
             if not w:
                 continue
-            name, libname = frame_name(stk["frame"][s])
-            if name.lstrip("_") in idle_names:
-                idle += w
-                continue
+            cpu_total += w
+            name, libname = frame_name(stk["frame"][at])
             key = f"{name} [{libname}]"
+            if name.lstrip("_") in idle_names:
+                # CPU charged to a wait primitive is kernel time sleeping and
+                # waking the thread; name the code that waited.
+                idle += w
+                waits[key] = waits.get(key, 0) + w
+                q = stk["prefix"][at]
+                while q is not None:
+                    nm, lib = frame_name(stk["frame"][q])
+                    if lib == "bellwether" and nm != "?" and not GENERIC.search(nm):
+                        wc = wait_callers.setdefault(key, {})
+                        wc[nm] = wc.get(nm, 0) + w
+                        break
+                    q = stk["prefix"][q]
+                continue
             agg[key] = agg.get(key, 0) + w
             total += w
-            mine = own_frames(s)
+            mine = own_frames(at)
+            reads = any(READS.search(nm) for nm in mine)
             for nm in set(mine):
                 inclusive[nm] = inclusive.get(nm, 0) + w
+                if not reads:
+                    inclusive_no_reads[nm] = inclusive_no_reads.get(nm, 0) + w
             if not OWN.search(name):
                 # The nearest bellwether function, or on a thread with none
                 # (a blocking-I/O pool), the nearest named library function.
                 caller = mine[0] if mine else None
-                q = stk["prefix"][s]
+                q = stk["prefix"][at]
                 while caller is None and q is not None:
                     nm, lib = frame_name(stk["frame"][q])
                     if lib == "bellwether" and nm != "?" and not GENERIC.search(nm) and not nm.startswith(("tokio::", "<tokio::")):
@@ -1116,12 +1204,21 @@ def top_frames(profile, syms, n=10):
         # them out so the table shows where the time goes.
         keep = [(k, v) for k, v in d.items() if not GENERIC.search(k)]
         return sorted(keep, key=lambda kv: -kv[1])[:15]
-    return {"on_cpu_weight": total, "idle_weight": idle,
+    unit = (profile.get("meta", {}).get("sampleUnits") or {}).get("threadCPUDelta", "µs")
+    per_s = {"ns": 1e9, "µs": 1e6, "us": 1e6, "ms": 1e3}.get(unit)
+    return {"cpu_weight": cpu_total, "on_cpu_weight": total, "idle_weight": idle,
+            "cpu_seconds": round(cpu_total / per_s, 2) if per_s else None,
             "top": [{"frame": k, "self_pct": pct(v)} for k, v in top],
-            "inclusive": [{"frame": k, "total_pct": pct(v)} for k, v in ranked(inclusive)],
+            "inclusive": [{"frame": k, "total_pct": pct(v),
+                           "without_store_reads_pct": pct(inclusive_no_reads.get(k, 0))}
+                          for k, v in ranked(inclusive)],
             "callers": {k: [{"frame": c, "pct": pct(v)} for c, v in
                             sorted(leaf_callers.get(k, {}).items(), key=lambda kv: -kv[1])[:3]]
                         for k, _ in top[:3]},
+            "waits": [{"frame": k, "cpu_pct": round(100 * v / max(1, cpu_total), 1),
+                       "callers": [{"frame": c, "cpu_pct": round(100 * x / max(1, cpu_total), 1)} for c, x in
+                                   sorted(wait_callers.get(k, {}).items(), key=lambda kv: -kv[1])[:2]]}
+                      for k, v in sorted(waits.items(), key=lambda kv: -kv[1])[:4]],
             "main_thread_wall_samples": wall,
             "main_thread_wall": [{"frame": k, "wall_pct": round(100 * v / max(1, wall), 1)}
                                  for k, v in ranked(wall_inclusive)]}
@@ -1161,6 +1258,8 @@ def section_profiles(p, mkt10, ledger):
                          "entity_id", "--latest-by", "version_ts", "--totals", "amount", "--group-by",
                          "status", "--memory-budget", four, "--index",
                          os.path.join(p.a.work, "profile-reconcile-idx"), "--quiet"], None))
+        lidx = os.path.join(p.a.work, "profile-build-ledger-idx")
+        jobs.append(("build-ledger-small-all-threads", 1, [bw, *ledger.index_args(idx=lidx), "--quiet"], lidx))
         widx = os.path.join(p.a.work, "why-idx")
         jobs.append(("why-200-runs", 1, [bw, "why", ledger.data, "--bench-workload", ledger.root,
                      "--index", widx, "--quiet"], None))
@@ -1182,6 +1281,17 @@ def section_profiles(p, mkt10, ledger):
         p.context[f"profile/{name}"] = top
         for i, t in enumerate(top["top"], 1):
             say(f"  {i:2d}. {t['self_pct']:5.1f}%  {t['frame']}")
+        # The same command once more without the profiler, under
+        # /usr/bin/time: how much CPU the process really used per second of
+        # wall time (the profile's CPU weights include the sampler's effect).
+        if fresh:
+            shutil.rmtree(fresh, ignore_errors=True)
+        _, _, err, _ = sh(["/usr/bin/time", "-p", *cmd])
+        t = {k: float(v) for k, v in re.findall(r"^(real|user|sys)\s+([\d.]+)", err, re.M)}
+        if t.get("real"):
+            p.context[f"profile/{name}"]["unprofiled"] = {
+                "wall_s": t["real"], "user_s": t.get("user"), "sys_s": t.get("sys"),
+                "cores_busy": round((t.get("user", 0) + t.get("sys", 0)) / t["real"], 2)}
         # Read whether the four-pass budget gave four passes.
         if name == "reconcile-four-pass":
             v = json.loads(sh([*cmd[:-1], "--json"])[1])
@@ -1199,7 +1309,7 @@ def reanalyze_profiles(out):
             profile = json.load(f)
         with open(prof.replace(".json.gz", ".json.syms.json")) as f:
             syms = json.load(f)
-        keep = {k: v for k, v in old.items() if k in ("command", "iterations", "rate_hz", "passes")}
+        keep = {k: v for k, v in old.items() if k in ("command", "iterations", "rate_hz", "passes", "unprofiled")}
         doc["context"][key] = {**top_frames(profile, syms), **keep}
         say(f"reanalyzed {key}")
     with open(path, "w") as f:
@@ -1291,6 +1401,14 @@ def main():
                 key = f"reconcile {','.join(a.reconcile_datasets)}"
                 if len(a.reconcile_budgets) < len(BUDGETS):
                     key += f" at {','.join(a.reconcile_budgets)}"
+            if name == "reconcile":
+                # A rerun supersedes older records of the same pairs and
+                # budgets.
+                for old in [k for k in p.sections if k.startswith("reconcile ") and k != key]:
+                    w = old.split(" ")
+                    budgets = w[3].split(",") if len(w) == 4 else [l for l, _ in BUDGETS]
+                    if set(w[1].split(",")) <= set(a.reconcile_datasets) and set(budgets) <= set(a.reconcile_budgets):
+                        del p.sections[old]
             p.section(key, start=True)
             run()
             p.section(key, start=False)
