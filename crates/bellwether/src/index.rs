@@ -63,17 +63,36 @@ impl Engine {
         for s in &specs {
             crate::spec::check(s)?;
         }
+        // A join key (B3) is built whole from both datasets' exact keys,
+        // after the build, in its own commit (`refresh_joins`).
+        let (joins, specs): (Vec<KeySpec>, Vec<KeySpec>) = specs
+            .into_iter()
+            .partition(|s| matches!(s, KeySpec::Join { .. }));
+        if !joins.is_empty() && specs.is_empty() && self.manifest()?.is_none() {
+            return Err(Error::KeySpec(format!(
+                "{} is built from the exact keys on its columns in both datasets, and {} is not \
+                 indexed yet; declare the exact key on its left columns too (--key exact:{})",
+                joins[0].name(),
+                self.root(),
+                joins[0].columns().join(",")
+            )));
+        }
         let mut options =
             self.build_options(declared.iter().filter_map(|d| d.sidecar.clone()).collect());
         options.sketches = declared.iter().filter_map(|d| d.sketch.clone()).collect();
         let builder = Builder::new(Arc::clone(self.store()?), "");
         let sketches_rebuilt = self.reset_unreadable_sketches(&builder, &options.sketches)?;
         let report = builder.build(self.root(), &specs, &options)?;
+        let joins = self.refresh_joins(&joins)?;
         let pinned = self.pin_required("index")?;
         let m = pinned.manifest();
         Ok(IndexResult {
             root: self.root().to_string(),
-            committed: report.sequence,
+            committed: joins
+                .iter()
+                .any(|j| j.refreshed)
+                .then(|| pinned.sequence())
+                .or(report.sequence),
             sequence: pinned.sequence(),
             manifest: pinned.hash,
             segments: m.segments.len() as u64,
@@ -125,6 +144,7 @@ impl Engine {
                     words: [t.recorded.words, t.current.words],
                 })
                 .collect(),
+            joins,
         })
     }
 

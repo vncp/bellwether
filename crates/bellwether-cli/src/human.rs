@@ -222,6 +222,7 @@ pub(crate) fn index(r: &IndexResult, out: &Out) -> String {
         );
     }
     text_rebuilt(&mut s, &r.text_rebuilt);
+    join_states(&mut s, &r.joins);
     if !r.unknown_segment_kinds.is_empty() {
         let _ = writeln!(
             s,
@@ -243,6 +244,10 @@ fn lookup_label(lookup: &LookupKind) -> String {
             format!("locate rows whose {column} holds every value")
         }
         LookupKind::Latest => "latest".to_string(),
+        LookupKind::SemiJoin {
+            right,
+            right_columns,
+        } => format!("semijoin with {right}.{}", right_columns.join(",")),
         LookupKind::Asof { at, ts, ts_column } => format!("asof {at} ({ts_column} = {ts})"),
         LookupKind::Window {
             from,
@@ -1840,5 +1845,165 @@ pub(crate) fn overlap(r: &bellwether::OverlapResult, out: &Out) -> String {
     );
     let _ = writeln!(s, "  left  {} in {}", r.left_sketch, r.left_root);
     let _ = writeln!(s, "  right {} in {}", r.right_sketch, r.right_root);
+    s
+}
+
+/// Each join key's state (B3), with the command that refreshes it.
+fn join_states(s: &mut String, joins: &[bellwether::JoinKeyState]) {
+    if joins.is_empty() {
+        return;
+    }
+    let _ = writeln!(
+        *s,
+        "\n  join keys (right dataset read through its own index):"
+    );
+    for j in joins {
+        let built = if j.refreshed { "rebuilt; " } else { "" };
+        let _ = writeln!(*s, "  {built}{}", j.message);
+        let _ = writeln!(*s, "    right dataset {}", j.right_root);
+        if let Some(next) = &j.next {
+            let _ = writeln!(*s, "    run `{next}` to rebuild it");
+        }
+    }
+}
+
+/// `join semijoin`: the two steps and what each reads.
+pub(crate) fn semijoin(r: &bellwether::SemiJoinResult, out: &Out) -> String {
+    let mut s = String::new();
+    let _ = writeln!(
+        s,
+        "{}",
+        heading(
+            out,
+            &format!(
+                "semijoin {}: {} of {} asked keys are on both datasets",
+                r.spec.name(),
+                num(r.matched),
+                num(r.keys)
+            )
+        )
+    );
+    if r.null_tuples > 0 {
+        let _ = writeln!(
+            s,
+            "  {} dropped: a key holding a null equals nothing",
+            count(r.null_tuples, "input row", "input rows")
+        );
+    }
+    for (n, step) in [(1, &r.left), (2, &r.right)] {
+        let _ = writeln!(
+            s,
+            "  step {n}  {} at manifest sequence {}",
+            step.root, step.sequence
+        );
+        let _ = writeln!(
+            s,
+            "    reads {} of {} in {}, {}",
+            num(step.planned.row_groups),
+            count(step.row_groups_total, "row group", "row groups"),
+            count(step.planned.files, "file", "files"),
+            size(step.planned.bytes)
+        );
+        if let Some(rows) = step.rows {
+            let _ = writeln!(
+                s,
+                "    {} hold the shared keys (exact)",
+                count(rows, "row", "rows")
+            );
+        }
+        let _ = writeln!(
+            s,
+            "    residual: keep the rows whose ({}) is one of the {} shared keys",
+            step.columns.join(", "),
+            num(r.matched)
+        );
+        let _ = writeln!(s, "    plan evidence {}", step.evidence.hash);
+    }
+    if r.matched < r.keys {
+        let _ = writeln!(
+            s,
+            "  the other {} are missing from one dataset or both, so a semi-join keeps no row of \
+             them and neither step reads them",
+            count(r.keys - r.matched, "key", "keys")
+        );
+    }
+    s
+}
+
+/// `join overlap`: the key sets' overlap, exact.
+#[allow(clippy::cast_precision_loss)]
+pub(crate) fn join_overlap(r: &bellwether::JoinOverlapResult, out: &Out) -> String {
+    let mut s = String::new();
+    let _ = writeln!(
+        s,
+        "{}",
+        heading(
+            out,
+            &format!(
+                "join overlap {}: exact, from the pair index (left sequence {}, right sequence {})",
+                r.spec.name(),
+                r.sequence,
+                r.right_sequence
+            )
+        )
+    );
+    let _ = writeln!(s, "  both sides   {:>14}  keys", num(r.both));
+    let _ = writeln!(s, "  left only    {:>14}  keys", num(r.left_only));
+    let _ = writeln!(s, "  right only   {:>14}  keys", num(r.right_only));
+    let mean = |sum: u64| {
+        if r.both == 0 {
+            0.0
+        } else {
+            sum as f64 / r.both as f64
+        }
+    };
+    let _ = writeln!(
+        s,
+        "  row groups per shared key: right max {}, mean {:.2}; left max {}, mean {:.2}",
+        num(r.max_right_row_groups),
+        mean(r.sum_right_row_groups),
+        num(r.max_left_row_groups),
+        mean(r.sum_left_row_groups)
+    );
+    if let Some(rows) = r.rows {
+        let _ = writeln!(
+            s,
+            "  rows: left ⋉ right keeps {}, right ⋉ left keeps {}, left ⋈ right is {}",
+            num(rows.left),
+            num(rows.right),
+            num(rows.join)
+        );
+    }
+    let _ = writeln!(s, "  right dataset {}", r.right_root);
+    s
+}
+
+/// `join verify`: each join key's state.
+pub(crate) fn join_verify(r: &bellwether::JoinVerifyResult, out: &Out) -> String {
+    let mut s = String::new();
+    let verdict = if r.pass {
+        "every join key is fresh".to_string()
+    } else {
+        let stale = r.joins.iter().filter(|j| j.next.is_some()).count() as u64;
+        format!("{} stale", count(stale, "join key is", "join keys are"))
+    };
+    let _ = writeln!(
+        s,
+        "{}",
+        heading(
+            out,
+            &format!(
+                "join verify {} at manifest sequence {}: {verdict}",
+                r.root, r.sequence
+            )
+        )
+    );
+    for j in &r.joins {
+        let _ = writeln!(s, "  {}", j.message);
+        let _ = writeln!(s, "    right dataset {}", j.right_root);
+        if let Some(next) = &j.next {
+            let _ = writeln!(s, "    run `{next}` to rebuild it");
+        }
+    }
     s
 }

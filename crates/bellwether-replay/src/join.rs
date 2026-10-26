@@ -77,6 +77,12 @@ impl<'a> Replayer<'a> {
         self
     }
 
+    /// The transient pair index attached for the join key `spec`, if any.
+    #[must_use]
+    pub fn pair_index(&self, spec: &KeySpec) -> Option<&Bytes> {
+        self.pair.as_deref()?.pairs.get(&spec.identity())
+    }
+
     /// The right dataset attached, or the refusal naming what is missing.
     fn pair_for(&self, j: &RunJoin) -> Result<&PairInput<'a>> {
         let pair = self.pair.as_deref().ok_or_else(|| Error::InvalidArgument {

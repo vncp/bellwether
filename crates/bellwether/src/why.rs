@@ -14,7 +14,8 @@ use bellwether_profile::lints::MembershipUse;
 use bellwether_profile::{ProfileOptions, ProfileReport};
 use bellwether_replay::{
     proposed_specs, record_bench_workload, servable, serves_query, Baseline, KeyInput, Lookup,
-    RecordedRun, Replayer, RunQuery, RunWindow, Workload, WorkloadRecorder, QUERY_KIND_LOCATE,
+    RecordedRun, Replayer, RunJoin, RunQuery, RunWindow, Workload, WorkloadRecorder,
+    QUERY_KIND_LOCATE,
 };
 use bellwether_store::{Cache, ObjectStoreBackend, StoreExt};
 use bellwether_types::{
@@ -89,11 +90,18 @@ pub enum LookupMode {
     /// The rows whose list column holds every one of the values
     /// (`bellwether locate --all`).
     ContainsAll,
+    /// The rows of the data root (the left dataset) and of the right
+    /// dataset named by [`WhyRequest::join`] whose key the other also holds
+    /// (B3: a semi-join, `in (subquery)`, `exists`; `bellwether join
+    /// semijoin`), priced as two steps.
+    #[serde(rename = "semijoin")]
+    SemiJoin,
 }
 
 impl LookupMode {
     /// The CLI spelling: `locate`, `latest`, `asof`, `contains`,
-    /// `has-token`, `has-prefix`, `contains-any`, or `contains-all`.
+    /// `has-token`, `has-prefix`, `contains-any`, `contains-all`, or
+    /// `semijoin`.
     #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
@@ -105,6 +113,7 @@ impl LookupMode {
             Self::HasPrefix => "has-prefix",
             Self::ContainsAny => "contains-any",
             Self::ContainsAll => "contains-all",
+            Self::SemiJoin => "semijoin",
         }
     }
 
@@ -116,9 +125,12 @@ impl LookupMode {
             Self::Contains => Some(TextOp::Contains),
             Self::HasToken => Some(TextOp::HasToken),
             Self::HasPrefix => Some(TextOp::HasPrefix),
-            Self::Locate | Self::Latest | Self::Asof | Self::ContainsAny | Self::ContainsAll => {
-                None
-            }
+            Self::Locate
+            | Self::Latest
+            | Self::Asof
+            | Self::ContainsAny
+            | Self::ContainsAll
+            | Self::SemiJoin => None,
         }
     }
 
@@ -232,6 +244,14 @@ pub struct WhyRequest {
     /// file or a workload, and with no `mode`.
     #[serde(default)]
     pub text: Vec<TextQuery>,
+    /// With `mode` `semijoin` (B3): the right dataset and its join columns,
+    /// `<right>.<column>[,<column>...]` (`payables.order_id`), pairwise with
+    /// the key file's columns. The right dataset is the folder of that name
+    /// beside the data root, read through its own index; the candidate is
+    /// the join key on the pair, priced from both datasets' complete exact
+    /// keys (a missing one is refused, never guessed).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub join: Option<String>,
 }
 
 impl Default for WhyRequest {
@@ -251,6 +271,7 @@ impl Default for WhyRequest {
             gates: Vec::new(),
             sketches_only: false,
             text: Vec::new(),
+            join: None,
         }
     }
 }
@@ -285,6 +306,12 @@ impl WhyRequest {
         } else {
             LookupMode::Locate
         };
+        if self.join.is_some() && self.mode != Some(LookupMode::SemiJoin) {
+            return Err(
+                "--join names the right dataset of a semi-join; pass --mode semijoin with it"
+                    .into(),
+            );
+        }
         let Some(mode) = self.mode else {
             return match inferred {
                 LookupMode::Asof if self.latest_by.is_none() => Err(
@@ -301,6 +328,24 @@ impl WhyRequest {
             };
         };
         match mode {
+            LookupMode::SemiJoin if self.join.is_none() => Err(
+                "--mode semijoin prices the keys on both datasets of a semi-join; name the right \
+                 dataset and its columns with --join <right>.<column> (a folder beside the data \
+                 root)"
+                    .into(),
+            ),
+            LookupMode::SemiJoin
+                if self.latest_by.is_some()
+                    || self.at.is_some()
+                    || self.lookback.is_some()
+                    || self.window.is_some() =>
+            {
+                Err(
+                    "--mode semijoin prices the rows each dataset keeps for the keys and takes no \
+                     --latest-by, --at, --lookback, or --window; drop them"
+                        .into(),
+                )
+            }
             LookupMode::Contains | LookupMode::HasToken | LookupMode::HasPrefix
             | LookupMode::ContainsAny
             | LookupMode::ContainsAll
@@ -809,7 +854,14 @@ impl Engine {
         let source: &dyn bellwether_types::Source = &counting;
         let sequence = pinned.as_ref().map_or(0, Pinned::sequence);
         let current_specs = pinned.as_ref().map(|p| p.specs().0).unwrap_or_default();
+        // A semi-join (B3) is priced on both datasets: the right one's
+        // replayer and the candidate join key's transient pair index.
+        let why_pair = self.why_pair(req, pinned.as_ref())?;
         let replayer = crate::fix::replayer(self, source, pinned.as_ref())?;
+        let replayer = match &why_pair {
+            Some(p) => replayer.with_pair(p.input()?),
+            None => replayer,
+        };
         let resolved_temporal = resolve_temporal(req, replayer.schema())?;
         let catalog = replayer.catalog();
         let indexed_row_groups = catalog.len() as u64;
@@ -1427,6 +1479,14 @@ impl Engine {
         self.check_text_request(req)?;
         let mode = req.lookup_mode().map_err(Error::KeySpec)?;
         check_values_given(req, mode)?;
+        if mode == LookupMode::SemiJoin && !(given[0] || given[2]) {
+            return Err(Error::KeySpec(
+                "--mode semijoin prices a key file on the left dataset's join columns, recorded \
+                 as one semi-join run; pass --from <keys.parquet> (or --workload <hash> of \
+                 semi-join runs)"
+                    .into(),
+            ));
+        }
         if req.window.is_some() && !(given[0] || given[1]) {
             return Err(Error::Other(
                 "a window (--window) applies to the runs why records: give a key file (--from) or \
@@ -1660,6 +1720,33 @@ impl Engine {
                     check_value_runs(h, &w, req.mode)?;
                     None
                 }
+                None if req.mode == Some(LookupMode::SemiJoin) => {
+                    let want = semijoin_query(req)?;
+                    if let Some(r) = w.runs().iter().find(|r| r.query().ok() != want) {
+                        return Err(Error::KeySpec(format!(
+                            "workload {h} records run {:?} as a {} lookup, and --mode semijoin \
+                             --join {} asks for semi-joins with that right side; drop --mode and \
+                             --join to price it as recorded, or record the keys again with \
+                             `bellwether why --from <keys.parquet> --mode semijoin --join {}`",
+                            r.run_id,
+                            describe(&r.query()?),
+                            req.join.as_deref().unwrap_or_default(),
+                            req.join.as_deref().unwrap_or_default()
+                        )));
+                    }
+                    None
+                }
+                None if w
+                    .runs()
+                    .iter()
+                    .any(|r| r.query().is_ok_and(|q| q.join().is_some())) =>
+                {
+                    return Err(Error::KeySpec(format!(
+                        "workload {h} records semi-join runs, which are priced on both datasets; \
+                         pass --mode semijoin --join <right>.<columns> with the right side they \
+                         record"
+                    )));
+                }
                 None if req.mode == Some(LookupMode::Locate) => {
                     if let Some(r) = w
                         .runs()
@@ -1700,9 +1787,12 @@ impl Engine {
                 .map(|f| f.name().clone())
                 .collect();
             let mut recorder = self.windowed(recorder, req, pinned, replayer, &columns)?;
-            let query = match req.mode.and_then(LookupMode::value_query) {
-                Some(q) => q,
-                None => resolved
+            let query = match (
+                req.mode.and_then(LookupMode::value_query),
+                semijoin_query(req)?,
+            ) {
+                (Some(q), _) | (None, Some(q)) => q,
+                (None, None) => resolved
                     .as_ref()
                     .map_or(RunQuery::Locate, |t| t.query.clone()),
             };
@@ -1857,6 +1947,20 @@ impl Engine {
             )));
         }
         let membership = membership > 0;
+        // A semi-join workload (B3) is priced on the join key of its pair
+        // alone: the right side its runs record (one right side, since the
+        // pair attached is one right dataset).
+        let joined: BTreeSet<&RunJoin> = queries.iter().filter_map(RunQuery::join).collect();
+        if !joined.is_empty() && (joined.len() > 1 || queries.iter().any(|q| q.join().is_none())) {
+            return Err(Error::KeySpec(format!(
+                "workload {} mixes semi-join runs of {} right side(s) with {} other lookups; a \
+                 join key serves the semi-joins of one pair, so record each as its own workload",
+                workload.hash(),
+                joined.len(),
+                queries.iter().filter(|q| q.join().is_none()).count()
+            )));
+        }
+        let semijoin = joined.into_iter().next().cloned();
         let mut windows: Vec<RunWindow> = Vec::new();
         for w in workload.runs().iter().filter_map(|r| r.window.as_ref()) {
             if !windows.contains(w) {
@@ -1895,7 +1999,11 @@ impl Engine {
             }),
             _ => None,
         };
-        let run_kind = text_kind.or(membership_kind);
+        let semijoin_kind = semijoin.as_ref().map(|j| LookupKind::SemiJoin {
+            right: j.right.clone(),
+            right_columns: j.right_columns.clone(),
+        });
+        let run_kind = text_kind.or(membership_kind).or(semijoin_kind);
         let query_kind = if text {
             let kinds: BTreeSet<&str> = queries.iter().map(RunQuery::kind_str).collect();
             kinds.into_iter().collect::<Vec<_>>().join(",")
@@ -1966,6 +2074,14 @@ impl Engine {
         // columns gets the exact key on them.
         let floor: Vec<KeySpec> = if text {
             crate::text::floor_keys(workload)?
+        } else if let Some(j) = &semijoin {
+            // A semi-join run's floor is the join key on its pair (B3): an
+            // exact key on either side locates every asked key, held by the
+            // other side or not.
+            run_columns
+                .iter()
+                .map(|c| crate::join::join_key(self.root(), c, j))
+                .collect()
         } else if membership {
             // A membership run's floor is the list key on its one column
             // (B4); an exact key cannot look a list's elements up.
@@ -2078,7 +2194,7 @@ impl Engine {
                 counts: false,
                 bounds: None,
             };
-            if text || membership || !serves(&exact_spec) {
+            if text || membership || semijoin.is_some() || !serves(&exact_spec) {
                 if !current_names.contains(&label(&exact_spec))
                     && !names.contains(&label(&exact_spec))
                 {
@@ -2195,6 +2311,11 @@ impl Engine {
                 )?),
                 // a list key's column: its distinct elements (B4)
                 KeySpec::List { .. } => Some(list_column(replayer, &spec)?),
+                // a join key's column: the asked keys both datasets hold and
+                // the right row groups per shared key (B3)
+                KeySpec::Join { .. } => Some(crate::join::join_column(
+                    replayer, &spec, workload, cache, &req.gates,
+                )?),
                 _ => match expr_column(replayer, &spec)? {
                     Some(c) => Some(c),
                     None => match sketch_column(&report.sketch, spec.columns()) {
@@ -2452,6 +2573,21 @@ fn queried_spread(
         sample_size: None,
         quantile_error: None,
     }))
+}
+
+/// The semi-join run a `semijoin` request records (B3): its right side
+/// from [`WhyRequest::join`]. `None` for another mode.
+fn semijoin_query(req: &WhyRequest) -> Result<Option<RunQuery>> {
+    match (req.mode, &req.join) {
+        (Some(LookupMode::SemiJoin), Some(j)) => {
+            let (right, right_columns) = crate::spec::parse_join_side(j)?;
+            Ok(Some(RunQuery::SemiJoin(RunJoin {
+                right,
+                right_columns,
+            })))
+        }
+        _ => Ok(None),
+    }
 }
 
 /// Refuses a text (B5) or membership (B4) `mode` without the values it

@@ -613,7 +613,7 @@ fn recorded_chunk_size(base: Option<&Manifest>) -> NewChunkSize {
 /// the base does not already declare is a new declaration and must meet
 /// [`KeySpec::check_names`]; one it declares (a storage version 1 spec on a
 /// column named `a,b`) is indexed as it is.
-fn declared_specs(
+pub(crate) fn declared_specs(
     base: Option<&Manifest>,
     key_specs: &[KeySpec],
     remove_unlisted: bool,
@@ -1529,7 +1529,7 @@ fn joins_of(specs: &[KeySpec]) -> BTreeSet<String> {
 /// root's folder name (the left dataset is the root), and its left columns
 /// in the schema with types a join pairs. The right side is checked when
 /// the pair is built (`Builder::refresh_join`), which reads its index.
-fn check_joins(root: &str, declared: &[KeySpec], schema: &Schema) -> Result<()> {
+pub(crate) fn check_joins(root: &str, declared: &[KeySpec], schema: &Schema) -> Result<()> {
     let folder = std::path::Path::new(root)
         .file_name()
         .and_then(|n| n.to_str())

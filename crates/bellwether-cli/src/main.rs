@@ -10,6 +10,7 @@
 
 mod bench;
 mod human;
+mod join_cmds;
 mod keys_cmds;
 mod sketch_cmds;
 mod verify_cmds;
@@ -107,6 +108,13 @@ enum Command {
         #[command(subcommand)]
         command: bench::BenchCommand,
     },
+    /// Join keys (B3) between this folder and a dataset beside it: plan a
+    /// semi-join, read the key overlap, or check that each join key is
+    /// fresh.
+    Join {
+        #[command(subcommand)]
+        command: join_cmds::JoinCommand,
+    },
     /// Approximate distinct counts and overlaps from `sketch` sidecars
     /// (never used to plan): cardinality per column, overlap of two.
     Sketch {
@@ -170,6 +178,8 @@ struct McpArgs {
     budget: bellwether_mcp::BudgetArgs,
     #[command(flatten)]
     keys: bellwether_mcp::KeyArgs,
+    #[command(flatten)]
+    join: bellwether_mcp::JoinArgs,
 }
 
 #[derive(Args)]
@@ -196,10 +206,18 @@ struct WhyArgs {
     /// (word prefixes), case-folded, or a list-membership lookup over a key
     /// file of one list column's values (named after the column):
     /// `contains-any` (rows whose list holds any of them) or `contains-all`
-    /// (every one), priced against list:<column> [default: asof with --at,
+    /// (every one), priced against list:<column>, or `semijoin` (the rows of
+    /// this folder and of the --join dataset whose key the other holds),
+    /// priced against the join key on the pair [default: asof with --at,
     /// latest with --latest-by, else locate].
     #[arg(long, value_enum, value_name = "MODE")]
     mode: Option<ModeArg>,
+    /// With --mode semijoin: the right dataset and its join columns,
+    /// RIGHT.COL[,COL...], pairwise with the key file's columns; RIGHT is
+    /// the folder of that name beside the data root, read through its own
+    /// index.
+    #[arg(long, value_name = "RIGHT.COLS")]
+    join: Option<String>,
     /// Timestamp (or date, time, or integer version) column that orders
     /// versions, for `latest` and `asof` pricing.
     #[arg(long, value_name = "COL", conflicts_with = "bench_workload")]
@@ -303,6 +321,7 @@ enum ModeArg {
     HasPrefix,
     ContainsAny,
     ContainsAll,
+    Semijoin,
 }
 
 impl From<ModeArg> for bellwether::LookupMode {
@@ -316,6 +335,7 @@ impl From<ModeArg> for bellwether::LookupMode {
             ModeArg::HasPrefix => Self::HasPrefix,
             ModeArg::ContainsAny => Self::ContainsAny,
             ModeArg::ContainsAll => Self::ContainsAll,
+            ModeArg::Semijoin => Self::SemiJoin,
         }
     }
 }
@@ -814,7 +834,7 @@ pub(crate) fn hash(s: &str, what: &str) -> Result<Hash, Failure> {
     })
 }
 
-fn key_file(path: &std::path::Path, key: Option<&Vec<String>>) -> KeyFile {
+pub(crate) fn key_file(path: &std::path::Path, key: Option<&Vec<String>>) -> KeyFile {
     let f = KeyFile::new(path);
     match key {
         Some(c) => f.with_columns(c.clone()),
@@ -930,6 +950,7 @@ fn run(cli: &Cli, out: &Out) -> Result<Outcome, Failure> {
             };
             done(&w, human, code)
         }
+        Command::Join { command } => join_cmds::run(g, out, command),
         Command::Sketch { command } => sketch_cmds::run(g, out, command),
         Command::Keys { command } => keys_cmds::run(g, command),
         Command::Mcp(a) => mcp(g, a),
@@ -967,6 +988,7 @@ fn mcp(g: &Global, a: &McpArgs) -> Result<Outcome, Failure> {
         root: a.root.root.clone(),
         engine,
         budget: a.budget.into(),
+        join: a.join.join.clone(),
     };
     // stdout is the protocol channel: nothing else is printed there.
     match bellwether_mcp::serve_stdio(&config) {
@@ -1242,6 +1264,7 @@ fn why(g: &Global, out: &Out, a: &WhyArgs) -> Result<Outcome, Failure> {
         gates: a.gates.clone(),
         sketches_only: a.sketches_only,
         text: why_text(a)?,
+        join: a.join.clone(),
     };
     // Text lookups take none of the lookup-mode flags; the facade refuses
     // them first, with that cause.

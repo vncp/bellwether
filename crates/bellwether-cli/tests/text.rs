@@ -118,6 +118,7 @@ fn server(data: &Path) -> bellwether_mcp::Server {
             ..bellwether::EngineOptions::default()
         },
         budget: bellwether_mcp::Budget::default(),
+        join: None,
     })
     .unwrap()
 }

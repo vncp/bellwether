@@ -50,6 +50,7 @@ use serde::{Deserialize, Serialize};
 use crate::engine::{folder_changes, guard, Engine, Pinned};
 use crate::engine_fix::{engine_shape, EngineCompare, EngineRun};
 use crate::index::stale_index;
+use crate::join::{JoinFreshness, WhyPair};
 use crate::results::{total, Cost, Written};
 
 /// The two outputs a Rewrite proposal is verified on, and how to compare
@@ -383,6 +384,31 @@ pub struct FixResult {
     /// after. Omitted otherwise.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub engine: Option<EngineRun>,
+    /// For a join key (B3): the right dataset's side of the verification,
+    /// whose certificate the left certificate (`certificate`, the one a
+    /// receipt cites) cites as an input. Omitted otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub join: Option<JoinCheck>,
+}
+
+/// The right dataset's side of a join key's verification (B3): the rows of
+/// the semi-join's keys there, all of them against those in the right
+/// step's planned row groups.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct JoinCheck {
+    /// The right dataset's canonical root.
+    pub right_root: String,
+    /// Distinct keys the workload asks.
+    pub keys: u64,
+    /// Those both datasets hold, read from their files: the keys both
+    /// certificates compare rows of.
+    pub matched: u64,
+    /// The right step's planned row groups (a `plan` Evidence).
+    pub plan: Written,
+    /// The right certificate (stored even when it fails).
+    pub certificate: Written,
+    /// Its typed outcome.
+    pub verification: Reconciliation,
 }
 
 /// One signature `fix` wrote.
@@ -532,6 +558,7 @@ impl Engine {
             verification: None,
             outcome: FixOutcome::Verified,
             signatures: Vec::new(),
+            join: None,
         };
         match &proposal.body {
             ProposalBody::Layout { .. } => {
@@ -539,6 +566,9 @@ impl Engine {
                 Ok(result)
             }
             ProposalBody::Key { spec, .. } => {
+                // A join key (B3) declared and stale is rebuilt by `index`,
+                // not proposed again: refused with that command.
+                self.refuse_stale_join(pinned.as_ref(), spec)?;
                 // A key already complete has nothing to apply: refused
                 // before anything is scored, so the refusal writes nothing.
                 if !req.verify_only && complete(pinned.as_ref(), spec) {
@@ -553,7 +583,10 @@ impl Engine {
                     needs: "a recorded workload (the keys a slow lookup ran)",
                 })?;
                 let source = self.source(pinned.as_ref())?;
-                let replayer = replayer(self, &*source, pinned.as_ref())?;
+                // A join key is priced and verified on both datasets.
+                let pair = self.pair_of(pinned.as_ref(), spec)?;
+                let replayer =
+                    with_pair(replayer(self, &*source, pinned.as_ref())?, pair.as_ref())?;
                 let cache = self.cache()?;
                 let workload = load_workload(self, &cache, &workload_hash)?;
                 // 1. Score.
@@ -602,15 +635,42 @@ impl Engine {
                     }
                 }
                 // 2. Verify.
-                let (plan, cert, verification) = self.verify_key(
-                    hash,
-                    spec,
-                    &replayer,
-                    &*source,
-                    &workload,
-                    &cache,
-                    pinned.as_ref(),
-                )?;
+                let (plan, cert, verification) = match &pair {
+                    Some(p) => {
+                        let (plan, cert, verification, join) = self.verify_join(
+                            hash,
+                            spec,
+                            &replayer,
+                            &*source,
+                            &workload,
+                            &cache,
+                            pinned.as_ref(),
+                            p,
+                        )?;
+                        // The right side first: a right certificate that
+                        // fails withholds the receipt.
+                        let right = cert_of(&join.certificate)?.clone();
+                        let right_hash = join.certificate.hash;
+                        result.join = Some(join);
+                        if let Some(r) = failed(&right_hash, &right) {
+                            result.plan = Some(plan);
+                            result.verification = Some(verification);
+                            result.certificate = Some(cert);
+                            result.outcome = refused(r);
+                            return Ok(result);
+                        }
+                        (plan, cert, verification)
+                    }
+                    None => self.verify_key(
+                        hash,
+                        spec,
+                        &replayer,
+                        &*source,
+                        &workload,
+                        &cache,
+                        pinned.as_ref(),
+                    )?,
+                };
                 result.plan = Some(plan);
                 result.verification = Some(verification);
                 let certificate = cert_of(&cert)?.clone();
@@ -644,6 +704,8 @@ impl Engine {
                             true,
                             before,
                             &workload,
+                            pair.as_ref()
+                                .zip(result.join.as_ref().map(|j| j.certificate.hash)),
                         )?;
                     }
                 }
@@ -737,6 +799,7 @@ impl Engine {
             verification: None,
             outcome: FixOutcome::Verified,
             signatures: Vec::new(),
+            join: None,
         };
         // The gate runs before anything is written; for a key proposal it
         // also checks that the data is still the data certified.
@@ -834,8 +897,21 @@ impl Engine {
                     return Err(not_workload_covered(cert_hash));
                 };
                 let pinned = self.pin()?;
+                self.refuse_stale_join(pinned.as_ref(), spec)?;
                 let source = self.source(pinned.as_ref())?;
-                let replayer = replayer(self, &*source, pinned.as_ref())?;
+                let pair = self.pair_of(pinned.as_ref(), spec)?;
+                let right_cert = match &pair {
+                    Some(p) => match self.right_certificate(cert_hash, &certificate, p)? {
+                        Ok(h) => Some(h),
+                        Err(r) => {
+                            result.outcome = refused(r);
+                            return Ok(result);
+                        }
+                    },
+                    None => None,
+                };
+                let replayer =
+                    with_pair(replayer(self, &*source, pinned.as_ref())?, pair.as_ref())?;
                 let cache = self.cache()?;
                 let workload = load_workload(self, &cache, workload)?;
                 let (replay, current_cost, proposed_cost) =
@@ -863,6 +939,7 @@ impl Engine {
                     false,
                     before,
                     &workload,
+                    pair.as_ref().zip(right_cert),
                 )?;
             }
         }
@@ -1094,6 +1171,258 @@ impl Engine {
         Ok((plan_evidence, cert, certified.outcome))
     }
 
+    /// Refuses a fix of the join key `spec` (B3) when the index declares
+    /// it and it is stale: `bellwether index` rebuilds it, with no
+    /// proposal; and the current configuration could not plan with it, so
+    /// no replay of it would be the plan.
+    fn refuse_stale_join(&self, pinned: Option<&Pinned>, spec: &KeySpec) -> Result<()> {
+        let (Some(p), KeySpec::Join { right, .. }) = (pinned, spec) else {
+            return Ok(());
+        };
+        if !p.planner.declared_specs().contains(spec) {
+            return Ok(());
+        }
+        let state = self.join_key_state(p, spec, &self.right_engine(right)?)?;
+        match state.state {
+            JoinFreshness::Fresh { .. } => Ok(()),
+            _ => Err(self.stale_join(&state)),
+        }
+    }
+
+    /// For a join key (B3), what it is priced and verified on: its right
+    /// dataset and transient pair index ([`Engine::pair_for`]). `None` for
+    /// another key.
+    fn pair_of(&self, pinned: Option<&Pinned>, spec: &KeySpec) -> Result<Option<WhyPair>> {
+        match spec {
+            KeySpec::Join { .. } => self.pair_for(pinned, spec).map(Some),
+            _ => Ok(None),
+        }
+    }
+
+    /// The right certificate a join key's (left) certificate cites (B3):
+    /// it must be in the ledger, pass, and be of the right dataset's
+    /// current manifest; or the refusal.
+    #[allow(clippy::result_large_err)]
+    fn right_certificate(
+        &self,
+        cert_hash: &Hash,
+        certificate: &Certificate,
+        pair: &WhyPair,
+    ) -> Result<std::result::Result<Hash, Refusal>> {
+        let ledger = self.ledger()?;
+        for input in &certificate.provenance.inputs {
+            let Ok(Record::Certificate(right)) = ledger.get(input) else {
+                continue;
+            };
+            if let Some(r) = failed(input, &right) {
+                return Ok(Err(r));
+            }
+            let certified = right
+                .provenance
+                .manifest_version
+                .clone()
+                .unwrap_or_default();
+            let current = pair.rpin().sequence().to_string();
+            if certified != current {
+                return Ok(Err(Refusal::StaleManifest {
+                    certificate: *input,
+                    certified,
+                    current,
+                }));
+            }
+            return Ok(Ok(*input));
+        }
+        Err(Error::LedgerRule(format!(
+            "certificate {cert_hash} verifies a join key but cites no certificate of its right \
+             dataset; verify the proposal again with `bellwether fix --verify-only`"
+        )))
+    }
+
+    /// Stage 2 for a join key (B3): one certificate per dataset. Each
+    /// compares, for the keys the workload asks that **both datasets
+    /// hold** (read from their files, never from an index), every row of
+    /// those keys in the dataset against the rows in its step's planned row
+    /// groups (the union over runs of the two-step plan under the current
+    /// keys plus the join key). The right certificate is written first;
+    /// the left one, which a receipt cites, cites it.
+    #[allow(clippy::too_many_arguments)]
+    fn verify_join(
+        &self,
+        proposal: &Hash,
+        spec: &KeySpec,
+        replayer: &Replayer<'_>,
+        source: &dyn Source,
+        workload: &Workload,
+        cache: &Cache<ObjectStoreBackend>,
+        pinned: Option<&Pinned>,
+        pair: &WhyPair,
+    ) -> Result<(Written, Written, Reconciliation, JoinCheck)> {
+        let KeySpec::Join {
+            columns,
+            right,
+            right_columns,
+            ..
+        } = spec
+        else {
+            return Err(Error::KeySpec(format!("{} is not a join key", spec.name())));
+        };
+        let specs = proposed_specs(replayer.current_specs(), spec);
+        let rreplayer = replayer_of(pair)?;
+        type Selected = BTreeMap<String, (FileFingerprint, RoaringBitmap)>;
+        let (mut lsel, mut rsel): (Selected, Selected) = (BTreeMap::new(), BTreeMap::new());
+        let mut asked: std::collections::BTreeSet<Vec<u8>> = std::collections::BTreeSet::new();
+        for run in workload.runs() {
+            let query = run.query()?;
+            let j = match query.join() {
+                Some(j)
+                    if run.columns == *columns
+                        && j.right == *right
+                        && j.right_columns == *right_columns =>
+                {
+                    j
+                }
+                _ => {
+                    return Err(Error::InvalidArgument {
+                        field: "workload",
+                        reason: format!(
+                            "run {:?} is not a semi-join of {} with {right}.{}, so {} cannot be \
+                             verified on it; record the keys with `bellwether why --from \
+                             <keys.parquet> --mode semijoin --join {right}.{}`",
+                            run.run_id,
+                            columns.join(","),
+                            right_columns.join(","),
+                            spec.name(),
+                            right_columns.join(",")
+                        ),
+                    })
+                }
+            };
+            let rk = workload.run_keys(cache, run)?;
+            let (l, r) = replayer.semijoin_plans(&specs, &rk, j)?;
+            for (sel, plan) in [(&mut lsel, &l), (&mut rsel, &r)] {
+                for e in &plan.entries {
+                    sel.entry(e.file.path.clone())
+                        .or_insert_with(|| (e.file.clone(), RoaringBitmap::new()))
+                        .1 |= &e.row_groups;
+                }
+            }
+            let all: Vec<usize> = (0..rk.columns().len()).collect();
+            asked.extend(rk.all_probes(&all));
+        }
+        #[cfg(test)]
+        test_seam::apply(&mut lsel);
+        // The ground truth both certificates compare by: the asked keys
+        // each dataset's files hold.
+        let lhas = present_keys(
+            source,
+            replayer.catalog(),
+            replayer.schema(),
+            columns,
+            &asked,
+        )?;
+        let rhas = present_keys(
+            pair.source(),
+            rreplayer.catalog(),
+            rreplayer.schema(),
+            right_columns,
+            &asked,
+        )?;
+        let matched: Vec<Vec<u8>> = asked
+            .iter()
+            .filter(|k| lhas.contains(*k) && rhas.contains(*k))
+            .cloned()
+            .collect();
+        let cached = match &self.options().clock {
+            Some(c) => cache.get_cached_at(&workload.hash(), parse_rfc3339(c)?)?,
+            None => cache.get_cached(&workload.hash())?,
+        };
+        let age = cached.map_or(Duration::ZERO, |(_, age)| age);
+        let right_plan =
+            self.plan_evidence(&rreplayer, workload, union_plan(&rreplayer, &rsel)?)?;
+        let (right_cert, right_outcome) = self.certify_side(
+            proposal,
+            right_columns,
+            &matched,
+            (&rreplayer, pair.source(), pair.right().root()),
+            rsel,
+            Some(anchor(pair.rpin())),
+            vec![right_plan.hash],
+            (workload.hash(), age),
+        )?;
+        let left_plan = self.plan_evidence(replayer, workload, union_plan(replayer, &lsel)?)?;
+        let (left_cert, left_outcome) = self.certify_side(
+            proposal,
+            columns,
+            &matched,
+            (replayer, source, self.root()),
+            lsel,
+            pinned.map(anchor),
+            vec![left_plan.hash, right_cert.hash],
+            (workload.hash(), age),
+        )?;
+        Ok((
+            left_plan,
+            left_cert,
+            left_outcome,
+            JoinCheck {
+                right_root: pair.right().root().to_string(),
+                keys: asked.len() as u64,
+                matched: matched.len() as u64,
+                plan: right_plan,
+                certificate: right_cert,
+                verification: right_outcome,
+            },
+        ))
+    }
+
+    /// One dataset's certificate of a join key: every row of `keys` in the
+    /// dataset against the rows in `selected` (its step's planned row
+    /// groups), keyed by `columns`.
+    #[allow(clippy::too_many_arguments)]
+    fn certify_side(
+        &self,
+        proposal: &Hash,
+        columns: &[String],
+        keys: &[Vec<u8>],
+        (replayer, source, root): (&Replayer<'_>, &dyn Source, &str),
+        selected: BTreeMap<String, (FileFingerprint, RoaringBitmap)>,
+        manifest: Option<ManifestAnchor>,
+        inputs: Vec<Hash>,
+        (workload, age): (Hash, Duration),
+    ) -> Result<(Written, Reconciliation)> {
+        let planned = PlannedSource {
+            inner: source,
+            selected,
+            schema: SchemaRef::clone(replayer.schema()),
+        };
+        let rec_spec = ReconcileSpec::new(columns.to_vec())
+            .ignore(unhashable(replayer.schema(), columns))
+            .coverage(CoverageRequest::Workload(WorkloadKeys {
+                workload,
+                age,
+                keys: keys.to_vec(),
+            }));
+        let ctx = CertificateContext {
+            proposal: Some(*proposal),
+            manifest,
+            inputs: inputs
+                .into_iter()
+                .map(|hash| AgedInput {
+                    hash,
+                    age: Duration::ZERO,
+                })
+                .collect(),
+            clock: self.options().clock.clone(),
+        };
+        let certified = self.reconciler(rec_spec, Options::default())?.certify(
+            &Side::new(source, root),
+            &Side::new(&planned, root),
+            &ctx,
+        )?;
+        let cert = self.record_certified(&certified)?;
+        Ok((cert, certified.outcome))
+    }
+
     /// Writes `plan` as the `plan` Evidence verify reads under: it cites the
     /// catalog digest and the workload.
     fn plan_evidence(
@@ -1228,10 +1557,16 @@ impl Engine {
     /// committed), computed and written now: the realized cost. The current
     /// configuration now includes the applied key, so its `current` costs
     /// are what the receipt's replay predicted as `proposed`.
-    fn realize(&self, proposal: &Hash, workload: &Workload) -> Result<Option<Box<Written>>> {
+    fn realize(
+        &self,
+        proposal: &Hash,
+        spec: &KeySpec,
+        workload: &Workload,
+    ) -> Result<Option<Box<Written>>> {
         let pinned = self.pin()?;
         let source = self.source(pinned.as_ref())?;
-        let replayer = replayer(self, &*source, pinned.as_ref())?;
+        let pair = self.pair_of(pinned.as_ref(), spec)?;
+        let replayer = with_pair(replayer(self, &*source, pinned.as_ref())?, pair.as_ref())?;
         let cache = self.cache()?;
         let (replay, _, _) = self.score(&replayer, proposal, workload, &cache)?;
         Ok(Some(Box::new(replay)))
@@ -1252,16 +1587,59 @@ impl Engine {
         certificate_written: bool,
         before: u64,
         workload: &Workload,
+        join: Option<(&WhyPair, Hash)>,
     ) -> Result<(FixOutcome, Vec<SignatureWritten>)> {
         #[cfg(test)]
         test_seam::before_apply(self);
-        let options = self.build_options(Vec::new());
-        let report = Builder::new(Arc::clone(self.store()?), "").build(
-            self.root(),
-            std::slice::from_ref(spec),
-            &options,
-        )?;
-        let after = match advance(before, report.sequence) {
+        let committed = match join {
+            // A join key (B3) is declared and built whole in one commit
+            // from both datasets' exact keys, pinned to the right manifest
+            // the right certificate verified; a right commit since then is
+            // refused before anything is written.
+            Some((pair, right_cert)) => {
+                let certified = pair.rpin().sequence();
+                let current = pair.right().manifest()?.map_or(0, |m| m.sequence);
+                if current != certified {
+                    return Ok((
+                        refused(Refusal::StaleManifest {
+                            certificate: right_cert,
+                            certified: certified.to_string(),
+                            current: current.to_string(),
+                        }),
+                        Vec::new(),
+                    ));
+                }
+                match Builder::new(Arc::clone(self.store()?), "").refresh_join(
+                    spec,
+                    Arc::clone(pair.right().store()?),
+                    "",
+                )? {
+                    bellwether_build::JoinRefresh::Built {
+                        sequence,
+                        right_sequence,
+                        ..
+                    } if right_sequence == certified => Some(sequence),
+                    bellwether_build::JoinRefresh::Built { right_sequence, .. } => {
+                        return Ok((
+                            refused(Refusal::StaleManifest {
+                                certificate: right_cert,
+                                certified: certified.to_string(),
+                                current: right_sequence.to_string(),
+                            }),
+                            Vec::new(),
+                        ));
+                    }
+                    bellwether_build::JoinRefresh::Fresh { .. } => None,
+                }
+            }
+            None => {
+                let options = self.build_options(Vec::new());
+                Builder::new(Arc::clone(self.store()?), "")
+                    .build(self.root(), std::slice::from_ref(spec), &options)?
+                    .sequence
+            }
+        };
+        let after = match advance(before, committed) {
             Ok(after) => after,
             Err(refusal) => return Ok((refused(refusal), Vec::new())),
         };
@@ -1289,7 +1667,7 @@ impl Engine {
         let signatures = self.sign_written(&signed, Some(&applied))?;
         // After the apply: the same proposal replayed at manifest_after, the
         // realized cost `report` sets beside the predicted one.
-        let (realized, warning) = match self.realize(proposal_hash, workload) {
+        let (realized, warning) = match self.realize(proposal_hash, spec, workload) {
             Ok(r) => (r, None),
             Err(e) => (
                 None,
@@ -1559,6 +1937,79 @@ fn anchor(p: &Pinned) -> ManifestAnchor {
         hash: p.hash,
         age: p.age,
     }
+}
+
+/// `replayer` with a join key's right dataset attached (B3), when there is
+/// one.
+pub(crate) fn with_pair<'a>(
+    replayer: Replayer<'a>,
+    pair: Option<&'a WhyPair>,
+) -> Result<Replayer<'a>> {
+    Ok(match pair {
+        Some(p) => replayer.with_pair(p.input()?),
+        None => replayer,
+    })
+}
+
+/// The right dataset's own replayer (B3).
+fn replayer_of(pair: &WhyPair) -> Result<Replayer<'_>> {
+    replayer(pair.right(), pair.source(), Some(pair.rpin()))
+}
+
+/// The tuples of `asked` some row of the dataset holds on `columns`, read
+/// from every live row group's key columns (one row group at a time; only
+/// asked tuples are kept, ADR 018). A tuple holding a null equals nothing
+/// (ADR 014).
+fn present_keys(
+    source: &dyn Source,
+    catalog: &Catalog,
+    schema: &SchemaRef,
+    columns: &[String],
+    asked: &std::collections::BTreeSet<Vec<u8>>,
+) -> Result<std::collections::BTreeSet<Vec<u8>>> {
+    let types = columns
+        .iter()
+        .map(|c| {
+            schema
+                .field_with_name(c)
+                .map(|f| f.data_type().clone())
+                .map_err(|_| Error::KeySpec(format!("join column {c:?} is not in the dataset")))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let mut found = std::collections::BTreeSet::new();
+    if asked.is_empty() {
+        return Ok(found);
+    }
+    for rg in catalog.row_groups() {
+        let batch = source.read_columns(&rg.meta, columns)?;
+        let arrays = columns
+            .iter()
+            .map(|c| {
+                batch
+                    .column_by_name(c)
+                    .cloned()
+                    .ok_or_else(|| Error::Source(format!("the source returned no column {c:?}")))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let mut tuple = Vec::new();
+        'rows: for row in 0..batch.num_rows() {
+            tuple.clear();
+            for (a, t) in arrays.iter().zip(&types) {
+                if !bellwether_core::encoding::encode_array_value_as(
+                    a.as_ref(),
+                    row,
+                    t,
+                    &mut tuple,
+                )? {
+                    continue 'rows;
+                }
+            }
+            if asked.contains(&tuple) {
+                found.insert(tuple.clone());
+            }
+        }
+    }
+    Ok(found)
 }
 
 /// The replayer every `why` and `fix` replay is computed by, pinned to

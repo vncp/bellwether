@@ -267,6 +267,7 @@ impl World {
             root: self.root.to_str().unwrap().to_string(),
             engine: self.options(),
             budget: bellwether_mcp::Budget::default(),
+            join: None,
         })
         .unwrap()
     }

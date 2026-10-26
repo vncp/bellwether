@@ -235,17 +235,134 @@ fn missing_side(
     }
 }
 
+/// A join key's pair index built from both datasets' complete exact keys,
+/// not committed anywhere: what [`Builder::refresh_join`] commits, and the
+/// transient pair index `why` prices a join key with before it exists
+/// ([`transient_pair`]).
+#[derive(Clone, Debug)]
+pub struct PairBuild {
+    /// The pair segment's bytes (`keyed_join` layout).
+    pub bytes: Vec<u8>,
+    /// The exact key the left side was read from.
+    pub left_exact: KeySpec,
+    /// The exact key the right side was read from.
+    pub right_exact: KeySpec,
+    /// The left manifest sequence it was built from.
+    pub left_sequence: u64,
+    /// The right manifest sequence it is pinned to.
+    pub right_sequence: u64,
+    /// The left row groups it covers, as its manifest entry records them.
+    pub rowgroup_range: RowGroupRange,
+}
+
+/// Builds the pair index of the join key `spec` from `left` (the left
+/// dataset's index, where `spec` is declared or about to be) and `right`
+/// (the right dataset's): from the complete exact keys on the join columns
+/// on each side, with counts when `spec` counts. A side with no such key
+/// is refused with [`Error::NotIndexed`] naming the spec to declare there:
+/// a missing exact key is an error, never a guess. Reads the two exact
+/// keys one block per segment at a time and holds the pair segment being
+/// written (ADR 018). The same bytes the index build commits, so a price
+/// computed from them is the plan.
+pub fn transient_pair<S: StoreExt + ?Sized, R: StoreExt + ?Sized>(
+    left: &Snapshot<S>,
+    right: &Snapshot<R>,
+    spec: &KeySpec,
+) -> Result<PairBuild> {
+    let KeySpec::Join {
+        dataset,
+        columns,
+        right: right_name,
+        right_columns,
+        counts,
+    } = spec
+    else {
+        return Err(Error::KeySpec(format!("{} is not a join key", spec.name())));
+    };
+    cj::check_spec(spec)?;
+    let (m, r) = (left.manifest(), right.manifest());
+    let left_exact = join_side_spec(m, columns, *counts)
+        .ok_or_else(|| missing_side(spec, "left", dataset, columns, *counts))?;
+    let right_exact = join_side_spec(r, right_columns, *counts)
+        .ok_or_else(|| missing_side(spec, "right", right_name, right_columns, *counts))?;
+    let left_types = column_types(m, columns)?;
+    let right_types = column_types(r, right_columns)?;
+    cj::check_comparable(spec, &left_types, &right_types)?;
+    let lreaders = open_side(left, &left_exact)?;
+    let rreaders = open_side(right, &right_exact)?;
+    let llive = live_ids(&m.rowgroup_space)?;
+    let rlive = live_ids(&r.rowgroup_space)?;
+    let range = llive.min().zip(llive.max());
+    let seg = cj::build_pair(
+        spec,
+        &Side {
+            segments: &lreaders,
+            live: &llive,
+            types: Some(left_types),
+        },
+        &Side {
+            segments: &rreaders,
+            live: &rlive,
+            types: Some(right_types),
+        },
+        range,
+        Pins {
+            left: m.sequence,
+            right: r.sequence,
+        },
+        &WriterOptions::default(),
+    )?;
+    Ok(PairBuild {
+        bytes: seg.bytes,
+        left_exact,
+        right_exact,
+        left_sequence: m.sequence,
+        right_sequence: r.sequence,
+        rowgroup_range: range.map_or(RowGroupRange::new(0, 0), |(a, b)| {
+            RowGroupRange::new(a, b.saturating_add(1))
+        }),
+    })
+}
+
+/// The declarations after declaring the join key `spec` in `m`: `spec`
+/// added, or replacing the spec of its name (another `counts`), checked
+/// against the left dataset as a build checks a declared join key; and
+/// the identity it replaces, if any.
+fn declare_join(m: &Manifest, spec: &KeySpec) -> Result<(Vec<KeySpec>, Option<String>)> {
+    if m.schema.key_specs.contains(spec) {
+        return Ok((m.schema.key_specs.clone(), None));
+    }
+    let replaced = m
+        .schema
+        .key_specs
+        .iter()
+        .find(|s| s.name() == spec.name())
+        .map(KeySpec::identity);
+    let declared = crate::build::declared_specs(Some(m), std::slice::from_ref(spec), false)?;
+    let schema = columns_to_schema(&m.schema.columns)?;
+    crate::build::check_joins(&m.source.root, &declared, &schema)?;
+    if declared.len() + m.schema.sidecars.len() > crate::MAX_KEY_SPECS {
+        return Err(Error::KeySpec(format!(
+            "declaring {} would make {} key specs and {} sidecars; at most {} are allowed per \
+             index",
+            spec.name(),
+            declared.len(),
+            m.schema.sidecars.len(),
+            crate::MAX_KEY_SPECS
+        )));
+    }
+    Ok((declared, replaced))
+}
+
 impl<S: StoreExt + ?Sized> Builder<S> {
-    /// Builds the declared join key `spec` (B3) into this (the left) index,
-    /// if it is not fresh: from the complete exact keys on its columns in
-    /// this index and in the right dataset's index (`right_store`,
-    /// `right_root`), each with counts when `spec` counts (a missing one is
-    /// refused with [`Error::NotIndexed`] naming it), in one commit that
-    /// replaces its pair segment, pins the right manifest's sequence, and
-    /// records it complete. Reads the two exact keys one block per segment
-    /// at a time and holds the pair segment being written (ADR 018).
-    /// Starts over if a concurrent commit changes the left's row groups or
-    /// schema before it lands.
+    /// Builds the join key `spec` (B3) into this (the left) index, if it is
+    /// not fresh, declaring it in the same commit when the index does not
+    /// declare it yet: from the complete exact keys on its columns in this
+    /// index and in the right dataset's index (`right_store`, `right_root`)
+    /// ([`transient_pair`]), in one commit that replaces its pair segment,
+    /// pins the right manifest's sequence, and records it complete. Starts
+    /// over if a concurrent commit changes the left's row groups or schema
+    /// before it lands.
     pub fn refresh_join<R: StoreExt + ?Sized>(
         &self,
         spec: &KeySpec,
@@ -267,83 +384,40 @@ impl<S: StoreExt + ?Sized> Builder<S> {
         }
     }
 
-    #[allow(clippy::too_many_lines)]
     fn try_refresh_join<R: StoreExt + ?Sized>(
         &self,
         spec: &KeySpec,
         right_store: &Arc<R>,
         right_root: &str,
     ) -> Result<Option<JoinRefresh>> {
-        let KeySpec::Join {
-            dataset,
-            columns,
-            right,
-            right_columns,
-            counts,
-        } = spec
-        else {
+        if !matches!(spec, KeySpec::Join { .. }) {
             return Err(Error::KeySpec(format!("{} is not a join key", spec.name())));
-        };
+        }
         let left = Snapshot::open(Arc::clone(self.store()), self.index_root())?;
         let m = left.manifest();
-        if !m.schema.key_specs.contains(spec) {
-            return Err(Error::KeySpec(format!(
-                "{} is not declared in this index",
-                spec.identity()
-            )));
-        }
         let rsnap = Snapshot::open(Arc::clone(right_store), right_root)?;
         let r = rsnap.manifest();
-        let planner_state = state_of(m, spec, r.sequence, || {
-            Ok(Some(pair_built_from(&left, spec)?))
-        })?;
-        if let JoinState::Fresh { right_sequence, .. } = planner_state {
-            return Ok(Some(JoinRefresh::Fresh { right_sequence }));
+        if m.schema.key_specs.contains(spec) {
+            let state = state_of(m, spec, r.sequence, || {
+                Ok(Some(pair_built_from(&left, spec)?))
+            })?;
+            if let JoinState::Fresh { right_sequence, .. } = state {
+                return Ok(Some(JoinRefresh::Fresh { right_sequence }));
+            }
         }
-        let left_exact = join_side_spec(m, columns, *counts)
-            .ok_or_else(|| missing_side(spec, "left", dataset, columns, *counts))?;
-        let right_exact = join_side_spec(r, right_columns, *counts)
-            .ok_or_else(|| missing_side(spec, "right", right, right_columns, *counts))?;
-        let left_types = column_types(m, columns)?;
-        let right_types = column_types(r, right_columns)?;
-        cj::check_comparable(spec, &left_types, &right_types)?;
-        let lreaders = open_side(&left, &left_exact)?;
-        let rreaders = open_side(&rsnap, &right_exact)?;
-        let llive = live_ids(&m.rowgroup_space)?;
-        let rlive = live_ids(&r.rowgroup_space)?;
-        let range = llive.min().zip(llive.max());
-        let seg = cj::build_pair(
-            spec,
-            &Side {
-                segments: &lreaders,
-                live: &llive,
-                types: Some(left_types),
-            },
-            &Side {
-                segments: &rreaders,
-                live: &rlive,
-                types: Some(right_types),
-            },
-            range,
-            Pins {
-                left: m.sequence,
-                right: r.sequence,
-            },
-            &WriterOptions::default(),
-        )?;
-        let bytes = seg.bytes.len() as u64;
+        let (declared, replaced) = declare_join(m, spec)?;
+        let pair = transient_pair(&left, &rsnap, spec)?;
+        let bytes = pair.bytes.len() as u64;
         let mut staged = StagedSegments::new();
-        let id = staged.stage(Bytes::from(seg.bytes));
+        let id = staged.stage(Bytes::from(pair.bytes));
         let identity = spec.identity();
         let segment = SegmentRef {
             id,
             kind: None,
             key_spec: identity.clone(),
-            rowgroup_range: range.map_or(RowGroupRange::new(0, 0), |(a, b)| {
-                RowGroupRange::new(a, b.saturating_add(1))
-            }),
+            rowgroup_range: pair.rowgroup_range,
             bytes,
-            right_sequence: Some(r.sequence),
+            right_sequence: Some(pair.right_sequence),
             extra: Extra::new(),
         };
         let (space, schema) = (m.rowgroup_space.clone(), m.schema.clone());
@@ -365,8 +439,14 @@ impl<S: StoreExt + ?Sized> Builder<S> {
                     });
                 }
                 let mut next = cur.clone();
-                next.segments
-                    .retain(|s| !(s.kind.is_none() && s.key_spec == identity));
+                next.schema.key_specs.clone_from(&declared);
+                next.segments.retain(|s| {
+                    !(s.kind.is_none()
+                        && (s.key_spec == identity || replaced.as_ref() == Some(&s.key_spec)))
+                });
+                if let Some(old) = &replaced {
+                    next.key_spec_completeness.remove(old);
+                }
                 next.add_segment(segment.clone());
                 next.key_spec_completeness
                     .insert(identity.clone(), cur.sequence + 1);
@@ -376,9 +456,9 @@ impl<S: StoreExt + ?Sized> Builder<S> {
         match committed {
             Ok(c) => Ok(Some(JoinRefresh::Built {
                 sequence: c.sequence,
-                right_sequence: r.sequence,
-                left_exact,
-                right_exact,
+                right_sequence: pair.right_sequence,
+                left_exact: pair.left_exact,
+                right_exact: pair.right_exact,
                 segment,
             })),
             Err(_) if restart.get() => Ok(None),

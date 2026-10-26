@@ -195,6 +195,29 @@ pub struct ObserveAsof {
     pub at_manifest: Option<u64>,
 }
 
+/// `observe.semijoin` (B3): `semijoin(keys)` through the join key the
+/// server was started with (`--join`).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ObserveSemijoin {
+    /// A Parquet file of keys on the join key's left columns (read, never
+    /// written); an absolute path.
+    pub keys: String,
+    /// Key columns to take from the file, in tuple order; default: all.
+    #[serde(default)]
+    pub key_columns: Option<Vec<String>>,
+}
+
+/// `observe.join_overlap` (B3): the key overlap of the server's join key.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ObserveJoinOverlap {}
+
+/// `observe.join_verify` (B3): whether the folder's join keys are fresh.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ObserveJoinVerify {}
+
 /// One text lookup (B5): rows whose string `column` matches `value` under
 /// `op` (`has_token`, `contains`, or `has_prefix`), both case-folded.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -272,6 +295,12 @@ pub struct ScoreWhy {
     /// membership runs of that kind.
     #[serde(default)]
     pub contains: Option<Membership>,
+    /// Price `keys` (or `workload`'s semi-join runs) as a semi-join (B3;
+    /// `why --mode semijoin`) with the right side of the join key the server
+    /// was started with (`--join`): the floor candidate is that join key,
+    /// priced from both datasets' complete exact keys.
+    #[serde(default)]
+    pub join: bool,
     /// Run in this call instead of returning a job id.
     #[serde(default)]
     pub wait: bool,
@@ -513,6 +542,31 @@ pub fn catalog() -> Vec<ToolDef> {
              lookup (has_token, contains, has_prefix; case-folded), through the folder's text \
              keys. The result says when the plan is a candidate set and the residual is \
              mandatory. Writes the plan Evidence and the lookup to the cache only.",
+        ),
+        def::<ObserveSemijoin>(
+            "observe.semijoin",
+            Tier::Observe,
+            true,
+            "Plan semijoin(keys) through the join key the server was started with (--join): step \
+             1, this folder's row groups holding a key the right dataset also holds; step 2, the \
+             right dataset's; each with its residual and, with counts, exact rows. Refused with \
+             stale_join when either dataset changed since the key was built. Writes one plan \
+             Evidence per step and the key set to the cache only.",
+        ),
+        def::<ObserveJoinOverlap>(
+            "observe.join_overlap",
+            Tier::Observe,
+            true,
+            "The key overlap of the server's join key, exact, from its pair index: keys on both \
+             datasets, on one only, and row groups (with counts, rows) per shared key. Refused \
+             with stale_join when either dataset changed since it was built. Writes nothing.",
+        ),
+        def::<ObserveJoinVerify>(
+            "observe.join_verify",
+            Tier::Observe,
+            true,
+            "Whether each join key of the folder (or the server's --join key) is fresh, or stale \
+             on the left or right, with the command that rebuilds it. Writes nothing.",
         ),
         def::<ScoreWhy>(
             "score.why",

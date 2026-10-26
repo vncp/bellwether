@@ -82,7 +82,7 @@ pub use transient::{
 };
 pub use workload::{
     record_bench_workload, BenchWorkloadSummary, KeyInput, KeySetSink, KeySetSource, MemoryKeySets,
-    RecordedRun, RunQuery, RunWindow, Workload, WorkloadFile, WorkloadManifest, WorkloadRecorder,
-    BENCH_WORKLOAD_FORMAT, QUERY_KIND_ASOF, QUERY_KIND_COUNT, QUERY_KIND_LATEST, QUERY_KIND_LOCATE,
-    QUERY_KIND_WINDOW, WORKLOAD_FORMAT,
+    RecordedRun, RunJoin, RunQuery, RunWindow, Workload, WorkloadFile, WorkloadManifest,
+    WorkloadRecorder, BENCH_WORKLOAD_FORMAT, QUERY_KIND_ASOF, QUERY_KIND_COUNT, QUERY_KIND_LATEST,
+    QUERY_KIND_LOCATE, QUERY_KIND_SEMIJOIN, QUERY_KIND_WINDOW, WORKLOAD_FORMAT,
 };

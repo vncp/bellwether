@@ -116,7 +116,7 @@ pub const QUERY_KIND_SEMIJOIN: &str = "semijoin";
 /// The right side of a semi-join run (B3): the right dataset (the folder of
 /// that name beside the data root) and its join columns, pairwise with the
 /// run's columns.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct RunJoin {
     /// The right dataset's name.
     pub right: String,

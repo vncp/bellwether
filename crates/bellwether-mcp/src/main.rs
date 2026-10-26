@@ -1,6 +1,6 @@
 //! `bellwether-mcp`: the MCP server over stdio, bound to one data folder.
 //! The same server is `bellwether mcp`, with the same flags
-//! ([`EngineArgs`], [`BudgetArgs`], [`KeyArgs`]). Exit codes: 0 when the
+//! ([`EngineArgs`], [`BudgetArgs`], [`KeyArgs`], [`JoinArgs`]). Exit codes: 0 when the
 //! client disconnects, 2 usage (a key or trust file that cannot be used
 //! included), 4 the server could not start.
 
@@ -9,7 +9,7 @@
 use std::process::ExitCode;
 
 use bellwether_mcp::args::OptionsError;
-use bellwether_mcp::{serve_stdio, BudgetArgs, Config, EngineArgs, KeyArgs};
+use bellwether_mcp::{serve_stdio, BudgetArgs, Config, EngineArgs, JoinArgs, KeyArgs};
 use clap::Parser;
 
 /// Serve Bellwether over MCP (stdio) for one data folder.
@@ -24,6 +24,8 @@ struct Args {
     budget: BudgetArgs,
     #[command(flatten)]
     keys: KeyArgs,
+    #[command(flatten)]
+    join: JoinArgs,
 }
 
 fn main() -> ExitCode {
@@ -46,6 +48,7 @@ fn main() -> ExitCode {
         root: args.root,
         engine,
         budget: args.budget.into(),
+        join: args.join.join,
     };
     match serve_stdio(&config) {
         Ok(()) => ExitCode::SUCCESS,

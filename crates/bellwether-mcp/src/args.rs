@@ -297,6 +297,20 @@ impl KeyArgs {
     }
 }
 
+/// The join key the server's semi-join tools plan with (B3): fixed by the
+/// operator at start, never by a tool argument, so an agent cannot point the
+/// server at another folder. The right dataset is the folder named beside
+/// the data root, read through its own index.
+#[derive(Clone, Debug, Default, clap::Args)]
+pub struct JoinArgs {
+    /// The join key `observe.semijoin`, `observe.join_overlap`, and
+    /// `score.why` with `join` use: RIGHT.COLS (the right dataset, a folder
+    /// beside the data root, and its join columns), or the whole key,
+    /// join:LEFT.COLS=RIGHT.COLS.
+    #[arg(long, value_name = "RIGHT.COLS")]
+    pub join: Option<String>,
+}
+
 /// The per-session budget flags.
 #[derive(Clone, Copy, Debug, clap::Args)]
 pub struct BudgetArgs {
