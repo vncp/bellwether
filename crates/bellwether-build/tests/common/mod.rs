@@ -483,6 +483,9 @@ pub fn apply_residual(pred: &Predicate, rows: Vec<Row>) -> Vec<Row> {
         Predicate::SemiJoin { .. } | Predicate::Join { .. } | Predicate::WindowPartition { .. } => {
             panic!("a lookup's residual is never relational: {pred:?}")
         }
+        // Rows here hold canonical bytes; an expression residual is checked
+        // against decoded files in `tests/expr.rs`.
+        Predicate::ExprIn { .. } => panic!("apply_residual does not evaluate expressions"),
     }
 }
 

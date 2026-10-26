@@ -329,6 +329,7 @@ fn rows_asked(filter: &[Predicate]) -> String {
                     many.len()
                 ),
             },
+            Predicate::ExprIn { expr, .. } => format!("the workload's keys of {expr}"),
             Predicate::And { all } => {
                 for q in all {
                     walk(q, out);

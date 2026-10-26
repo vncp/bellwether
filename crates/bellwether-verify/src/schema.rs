@@ -152,13 +152,20 @@ pub(crate) enum RowTest {
         op: bellwether_types::TextOp,
         args: Vec<String>,
     },
+    /// The value of an expression over `cols` (name, projection index), at
+    /// the left side's types, is one of `values` (`ExprIn`).
+    ExprIn {
+        typed: Box<bellwether_core::expr::Typed>,
+        cols: Vec<(String, usize)>,
+        values: HashSet<Vec<u8>>,
+    },
 }
 
 impl RowTest {
     /// The test a residual predicate makes of one row. A relational
     /// predicate (`SemiJoin`, `Join`, `WindowPartition`) is priced by replay
     /// and never a row filter; it is refused.
-    fn compile(p: &Predicate, index: &dyn Fn(&str) -> usize) -> Result<Self> {
+    fn compile(p: &Predicate, index: &dyn Fn(&str) -> usize, types: &[DataType]) -> Result<Self> {
         let cols = |c: &[String]| c.iter().map(|c| index(c)).collect();
         Ok(match p {
             Predicate::In { columns, values } => Self::In {
@@ -182,9 +189,33 @@ impl RowTest {
             Predicate::LatestPerKey { .. } => Self::All,
             Predicate::And { all } => Self::And(
                 all.iter()
-                    .map(|p| Self::compile(p, index))
+                    .map(|p| Self::compile(p, index, types))
                     .collect::<Result<_>>()?,
             ),
+            Predicate::ExprIn { expr, values } => {
+                let parsed = bellwether_core::expr::Expr::parse(expr)
+                    .map_err(|e| VerifyError::InvalidSpec(e.to_string()))?;
+                let cols: Vec<(String, usize)> = parsed
+                    .columns()
+                    .into_iter()
+                    .map(|c| {
+                        let i = index(&c);
+                        (c, i)
+                    })
+                    .collect();
+                let schema = Schema::new(
+                    cols.iter()
+                        .map(|(c, i)| arrow::datatypes::Field::new(c, types[*i].clone(), true))
+                        .collect::<Vec<_>>(),
+                );
+                let checked = bellwether_core::expr::Typed::new(parsed, &schema)
+                    .map_err(|e| VerifyError::InvalidSpec(e.to_string()))?;
+                Self::ExprIn {
+                    typed: Box::new(checked),
+                    cols,
+                    values: values.iter().cloned().collect(),
+                }
+            }
             Predicate::SemiJoin { .. }
             | Predicate::Join { .. }
             | Predicate::WindowPartition { .. } => {
@@ -260,25 +291,47 @@ impl RowTest {
             }
             Self::Text { col, op, args } => bellwether_core::text::value_at(cols[*col], row)?
                 .is_some_and(|v| bellwether_core::text::matches_any(*op, args, v)),
+            Self::ExprIn {
+                typed,
+                cols: inputs,
+                values,
+            } => {
+                let named: Vec<(&str, &dyn Array)> =
+                    inputs.iter().map(|(c, i)| (c.as_str(), cols[*i])).collect();
+                typed
+                    .encode_row(&named, row)?
+                    .is_some_and(|v| values.contains(&v))
+            }
         })
     }
 }
 
 /// The columns `p` reads.
-fn predicate_columns<'p>(p: &'p Predicate, out: &mut Vec<&'p String>) {
+fn predicate_columns(p: &Predicate, out: &mut Vec<String>) {
     match p {
-        Predicate::In { columns, .. } => out.extend(columns),
-        Predicate::Between { column, .. } | Predicate::Text { column, .. } => out.push(column),
+        Predicate::In { columns, .. } => out.extend(columns.iter().cloned()),
+        Predicate::Between { column, .. } | Predicate::Text { column, .. } => {
+            out.push(column.clone());
+        }
         Predicate::NotOlderThan {
             columns, ts_column, ..
         } => {
-            out.extend(columns);
-            out.push(ts_column);
+            out.extend(columns.iter().cloned());
+            out.push(ts_column.clone());
         }
         Predicate::And { all } => {
             for q in all {
                 predicate_columns(q, out);
             }
+        }
+        // An expression that does not parse reads nothing here; compiling
+        // the filter refuses it.
+        Predicate::ExprIn { expr, .. } => {
+            out.extend(
+                bellwether_core::expr::Expr::parse(expr)
+                    .map(|e| e.columns())
+                    .unwrap_or_default(),
+            );
         }
         // Join and window predicates are refused by `RowTest::compile`;
         // they name no column a row test reads.
@@ -368,7 +421,7 @@ impl Plan {
             .map(|residuals| {
                 residuals
                     .iter()
-                    .map(|p| RowTest::compile(p, &index))
+                    .map(|p| RowTest::compile(p, &index, &types[0]))
                     .collect::<Result<Vec<_>>>()
             })
             .transpose()?;
@@ -452,9 +505,17 @@ fn projection(
     hashed: &[String],
 ) -> Result<Vec<String>> {
     let mut needed: HashSet<&str> = hashed.iter().map(String::as_str).collect();
-    let mut filtered: Vec<&String> = Vec::new();
+    let mut filtered: Vec<String> = Vec::new();
     for p in spec.row_filter.iter().flatten() {
         predicate_columns(p, &mut filtered);
+    }
+    // The columns an expression-keyed workload's expression reads.
+    if let Some(e) = &spec.keys_of {
+        filtered.extend(
+            bellwether_core::expr::Expr::parse(e)
+                .map_err(|e| VerifyError::InvalidSpec(e.to_string()))?
+                .columns(),
+        );
     }
     for c in spec
         .key_columns
@@ -462,7 +523,7 @@ fn projection(
         .chain(spec.latest_by.iter())
         .chain(spec.total_columns.iter().map(|t| &t.column))
         .chain(&spec.group_by)
-        .chain(filtered)
+        .chain(filtered.iter())
     {
         for (side, schema) in [("left", left), ("right", right)] {
             if schema.field_with_name(c).is_err() {

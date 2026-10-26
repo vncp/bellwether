@@ -418,7 +418,7 @@ impl Engine {
         let counted = pinned
             .planner
             .count(&specs, &columns, &tuples)?
-            .ok_or_else(|| no_counts(self.root(), &columns))?;
+            .ok_or_else(|| no_counts(self.root(), &columns, pinned.planner.schema()))?;
         Ok(CountResult {
             columns,
             keys: counted.keys,
@@ -474,6 +474,7 @@ impl Engine {
         }
         let (run_keys, null_tuples) = keys.run_keys(pinned.planner.schema())?;
         let columns = run_keys.columns().to_vec();
+        refuse_expression_lookup(&columns, &mode, verb, self.root(), pinned.planner.schema())?;
         let tuples: Vec<Vec<u8>> = run_keys.tuples().map(<[u8]>::to_vec).collect();
         let payload = run_keys.to_payload()?;
         let key_set = bellwether_types::Hash::of(&payload);
@@ -788,11 +789,52 @@ fn window_column(pinned: &Pinned, specs: &[KeySpec], columns: &[String]) -> Resu
 /// The refusal of a count on `columns` with no complete spec that counts
 /// them: typed, naming the spec that would (each surface adds the command
 /// that declares it).
-fn no_counts(root: &str, columns: &[String]) -> Error {
+/// An expression key column is answered by an `expr` key, which serves
+/// point lookups only: refuse every other lookup before any temporal or
+/// window rule would name a key that cannot exist.
+fn refuse_expression_lookup(
+    columns: &[String],
+    mode: &Mode<'_>,
+    verb: &str,
+    root: &str,
+    schema: &arrow::datatypes::Schema,
+) -> Result<()> {
+    if let ([c], false) = (columns, matches!(mode, Mode::Locate)) {
+        if bellwether_core::expr::is_expression(c, schema) {
+            return Err(Error::KeySpec(format!(
+                "the key column {c} is an expression; an expr key answers point lookups \
+                     only, so {} on an expression is not supported; find the \
+                     rows holding these values with `bellwether locate {} --keys <key file>`, \
+                     or key the lookup on dataset columns",
+                if matches!(mode, Mode::Window { .. }) {
+                    "a window (--from/--to)".to_string()
+                } else {
+                    verb.to_string()
+                },
+                crate::spec::shell_quote(root)
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn no_counts(root: &str, columns: &[String], schema: &arrow::datatypes::Schema) -> Error {
+    let needs = match columns {
+        // A count on an expression is answered by an expr key over it that
+        // stores counts.
+        [c] if bellwether_core::expr::is_expression(c, schema) => {
+            let e = bellwether_core::expr::Expr::parse(c).map(|e| {
+                let name = bellwether_core::expr::suggested_name(&e, schema);
+                format!("expr:{name}={e}:exact,counts")
+            });
+            e.unwrap_or_else(|_| format!("expr:<name>={c}:exact,counts"))
+        }
+        _ => format!("exact:{},counts", columns.join(",")),
+    };
     Error::NotIndexed {
         root: root.to_string(),
         operation: "count",
-        needs: Some(format!("exact:{},counts", columns.join(","))),
+        needs: Some(needs),
     }
 }
 

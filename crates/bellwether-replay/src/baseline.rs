@@ -695,7 +695,12 @@ impl<'a> BaselinePlanner<'a> {
             .transpose()?;
         let selected = self.selection(keys, window.as_ref())?;
         let plan = self.catalog.plan_for(&selected)?;
-        Ok(with_residual(plan, keys, window.as_ref()))
+        Ok(with_residual(
+            plan,
+            self.catalog.schema(),
+            keys,
+            window.as_ref(),
+        ))
     }
 
     fn selection(

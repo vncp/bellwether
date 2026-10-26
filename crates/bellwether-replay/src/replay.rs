@@ -851,12 +851,8 @@ fn check_same_columns(source: &Schema, index: &Schema) -> Result<()> {
 /// Checks that a run's keys were encoded at the dataset's types.
 fn check_types(catalog: &Catalog, keys: &RunKeys) -> Result<()> {
     for (c, recorded) in keys.columns().iter().zip(keys.key_types()) {
-        let declared = catalog
-            .schema()
-            .field_with_name(c)
-            .map_err(|_| Error::KeySpec(format!("key column {c:?} is not in the dataset")))?
-            .data_type();
-        if &bellwether_core::segment::ColumnType::of(declared)? != recorded {
+        let declared = crate::keys::declared_type(catalog.schema(), c)?;
+        if bellwether_core::segment::ColumnType::of(&declared)? != *recorded {
             return Err(Error::KeySpec(format!(
                 "keys on {c:?} were recorded as {recorded}, but the dataset declares \
                  {declared}; re-record the workload"

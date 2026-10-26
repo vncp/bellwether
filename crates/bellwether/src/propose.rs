@@ -316,6 +316,14 @@ impl Engine {
         match body {
             ProposalBody::Key { spec, .. } => {
                 crate::spec::check(spec)?;
+                if let KeySpec::Expr { .. } = spec {
+                    // The expression's input columns exist, it type-checks,
+                    // and its virtual column is not a dataset column.
+                    let inputs = bellwether_core::expr::input_columns(spec)?;
+                    let schema = self.check_columns(&inputs.iter().collect::<Vec<_>>())?;
+                    bellwether_core::expr::typed_spec(spec, &schema)?;
+                    return Ok(());
+                }
                 // A spec the index does not declare yet is a new
                 // declaration: it must name its columns uniquely.
                 if !self

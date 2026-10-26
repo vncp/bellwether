@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 
 use bellwether::types::{Error, Hash};
 use bellwether_bench::corpus::{GenParams, Rung};
+use bellwether_bench::expr::{generate_expr, ExprParams, ExprShape, ExprSummary};
 use bellwether_bench::harness::{run_all, DuckDbMode, RunOptions, ScanFault};
 use bellwether_bench::market::{
     generate_market, parse_ymd, MarketParams, MarketRung, MarketSummary,
@@ -59,6 +60,43 @@ pub(crate) enum BenchCommand {
     /// report the time and bytes: the planned row groups of a lookup's
     /// --json output (--plan), or every row group under a folder (--all).
     Read(ReadArgs),
+    /// Write a corpus with a JSON attribute column (ledger or market shape),
+    /// key files for equality on a JSON path at three selectivities, and
+    /// exact ground truth: the `expr` key benchmark.
+    Expr(ExprArgs),
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+pub(crate) enum ExprShapeArg {
+    /// A versioned ledger whose `attrs` JSON holds an `account` join key.
+    Ledger,
+    /// Market prints whose vendor `payload` JSON holds the `symbol`.
+    Market,
+}
+
+#[derive(Args)]
+pub(crate) struct ExprArgs {
+    /// Output directory (`data/` and `workload/`).
+    #[arg(long)]
+    out: PathBuf,
+    /// The shape.
+    #[arg(long, value_enum)]
+    shape: ExprShapeArg,
+    /// RNG seed.
+    #[arg(long)]
+    seed: Option<u64>,
+    /// Files [default: 10].
+    #[arg(long)]
+    files: Option<u64>,
+    /// Row groups per file [default: 20].
+    #[arg(long)]
+    row_groups_per_file: Option<u64>,
+    /// Rows per row group, a multiple of 4 [default: 1000].
+    #[arg(long)]
+    rows_per_row_group: Option<u64>,
+    /// Keys per rare or medium query [default: 3].
+    #[arg(long)]
+    keys_per_query: Option<u64>,
 }
 
 #[derive(Args)]
@@ -264,6 +302,9 @@ pub(crate) struct Wrote {
     /// Text corpus summary and ground truth (`text` only).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub text: Option<TextSummary>,
+    /// Expr corpus summary (`expr` only).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expr: Option<ExprSummary>,
 }
 
 fn bench_err(e: &bellwether_bench::BenchError) -> Error {
@@ -359,6 +400,7 @@ pub(crate) fn run(cmd: &BenchCommand) -> Result<Wrote, Error> {
         BenchCommand::Market(a) => return market(a),
         BenchCommand::Text(a) => return text(a),
         BenchCommand::Read(a) => return read(a),
+        BenchCommand::Expr(a) => return expr(a),
     };
     Ok(Wrote {
         what,
@@ -368,6 +410,7 @@ pub(crate) fn run(cmd: &BenchCommand) -> Result<Wrote, Error> {
         market,
         read: None,
         text: None,
+        expr: None,
     })
 }
 
@@ -408,6 +451,7 @@ fn text(a: &TextArgs) -> Result<Wrote, Error> {
         failed: Vec::new(),
         market: None,
         read: None,
+        expr: None,
         text: Some(summary),
     })
 }
@@ -464,6 +508,54 @@ fn market(a: &MarketArgs) -> Result<Wrote, Error> {
         failed: Vec::new(),
         market: Some(summary),
         read: None,
+        expr: None,
+        text: None,
+    })
+}
+
+/// `bench expr`: the preset for the shape, each flag given overriding one.
+fn expr(a: &ExprArgs) -> Result<Wrote, Error> {
+    let shape = match a.shape {
+        ExprShapeArg::Ledger => ExprShape::Ledger,
+        ExprShapeArg::Market => ExprShape::Market,
+    };
+    let mut params = ExprParams::small(shape);
+    if let Some(v) = a.seed {
+        params.seed = v;
+    }
+    if let Some(v) = a.files {
+        params.files = v;
+    }
+    if let Some(v) = a.row_groups_per_file {
+        params.row_groups_per_file = v;
+    }
+    if let Some(v) = a.rows_per_row_group {
+        params.rows_per_row_group = v;
+    }
+    if let Some(v) = a.keys_per_query {
+        params.keys_per_query = v;
+    }
+    let summary = generate_expr(&a.out, &params).map_err(|e| bench_err(&e))?;
+    let truth_path = a.out.join("workload").join("truth.json");
+    Ok(Wrote {
+        what: "expr corpus",
+        path: format!(
+            "{} ({} shape, {} files, {} row groups, {} rows, {} rows without the keyed member, \
+             {} bytes, {} queries)",
+            a.out.display(),
+            shape.as_str(),
+            summary.files,
+            summary.row_groups,
+            summary.rows,
+            summary.null_rows,
+            summary.bytes,
+            summary.queries
+        ),
+        blake3: file_hash(&truth_path)?,
+        failed: Vec::new(),
+        market: None,
+        read: None,
+        expr: Some(summary),
         text: None,
     })
 }
@@ -507,5 +599,6 @@ fn read(a: &ReadArgs) -> Result<Wrote, Error> {
         market: None,
         read: Some(report),
         text: None,
+        expr: None,
     })
 }

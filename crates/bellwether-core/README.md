@@ -9,6 +9,7 @@ Work package WP1. This crate holds canonical key encoding, split-block bloom fil
 | `segment` | `SegmentWriter` (`for_dataset` for Arrow batches), `SegmentReader<R: ReadAt>`, `FileRange`, and `EncodedSegment::path()` = `segments/<blake3>.seg` |
 | `temporal` | `latest` and `asof` across every segment of a key spec, plus `VersionChain`, `VersionHit`, and `is_stale` |
 | `merge` | `merge(&[SegmentReader], &WriterOptions)` |
+| `expr` | The `expr` key language (`json_get`, `lower`, `substr`, `cast`, `date_trunc`, `hash`): `Expr::parse` and the normalized form (`normalize`), `Typed::eval` (one batch's derived column, row at a time, JSON scanned without a tree and capped at `MAX_JSON_DEPTH`), the pinned `VECTORS` and `verify_vectors`, and the `KeySpec::Expr` rules (`spec`, `check_spec`, `typed_spec`, `with_derived`, `suggested_name`). A segment of an `expr` key is the inner exact or bloom layout over the virtual column; its header carries the expression and vectors, which a reader recomputes before opening it. |
 | `sidecar` | `bounds` and `temporal2` sidecar segment writer (`SidecarWriter`), reader (`SidecarReader<R: ReadAt>`), `bitemporal_winner`, and `measure` |
 | `sketch` | `sketch` sidecar segments (approximate, never planned with): `FileSketcher` (one file's per-item HyperLogLog and optional MinHash), `SketchWriter`/`SketchReader` (one entry per file stretch, BLAKE3-sealed), `SketchTotals` (folds entries; `cardinality(i, exact)` with its interval, `copresent`), `overlap` (MinHash or HyperLogLog Jaccard with bounds), `value_hash`, `validate`, `item_types` |
 | `hll` | The one HyperLogLog (Ertl's improved raw estimator, `p` in 4..=18), shared by the profiler's fanout pass and the `sketch` sidecar; `merge` is the register-wise maximum (lossless union) |
@@ -25,6 +26,9 @@ Tests:
 | `tests/segment_format.rs` | Format rules |
 | `tests/corrupt_sweep.rs` | Every truncation and a byte-flip sweep never panic |
 | `tests/conformance.rs` | The pinned test vectors of `docs/format.md`, through both the scalar and the Arrow encoder paths; the test also requires the document's table to list exactly these vectors |
+| `tests/expr_conformance.rs` | Every `expr` conformance vector reproduces, each function has at least two, and `docs/format.md` lists exactly the code's table |
+| `tests/expr_language.rs` | Differently spelled equal expressions normalize equal and near misses do not; parse and type refusals; each function property-tested against an independent oracle (`serde_json` for `json_get`) |
+| `tests/expr_segments.rs` | `expr` segments: round trip, nulls (ADR 014), a brute-force oracle, truncation and byte-corruption sweeps, and a header whose vector or expression changed refused typed |
 | `tests/sidecar_conformance.rs` | Pinned byte and record conformance for `bounds` and `temporal2` sidecar segments, `measure`, `add_batch` atomicity, and corruption sweeps |
 | `tests/text_keys.rs` | Text keys: a property test of every lookup through every text spec against a brute-force oracle with its own case folding (multi-byte UTF-8, sharp s, the sigmas, dotted and dotless i, the Kelvin sign, decomposed accents, CJK, NUL, nulls), round trip and merge, nulls (ADR 014), the Unicode-tables refusal, and the conformance vectors of `docs/format.md` |
 | `tests/text_corrupt_sweep.rs` | Corrupt text segments never panic: every header byte and a sample of the rest in the gate, every truncation, position, and byte value under `--ignored` |

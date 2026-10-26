@@ -97,6 +97,7 @@ impl Layout {
             }
             KeySpec::Range { .. } => Some(Self::MinMax),
             KeySpec::Exact { .. } | KeySpec::Bloom { .. } | KeySpec::Bitemporal { .. } => None,
+            KeySpec::Expr { over, .. } => Self::for_spec(over),
         }
     }
 }
@@ -322,10 +323,16 @@ impl std::fmt::Display for ColumnType {
 
 /// The dataset types a key spec's columns take from a dataset schema: the
 /// key columns in prefix order, and the timestamp column for temporal specs.
+/// An `expr` key's one key column is its virtual column, at its
+/// expression's type.
 pub(crate) fn spec_types(
     spec: &KeySpec,
     schema: &Schema,
 ) -> Result<(Vec<DataType>, Option<DataType>)> {
+    if let KeySpec::Expr { .. } = spec {
+        let t = crate::expr::typed_spec(spec, schema)?;
+        return Ok((vec![t.data_type().clone()], None));
+    }
     let lookup = |column: &str| -> Result<DataType> {
         let dt = schema
             .field_with_name(column)
@@ -465,7 +472,7 @@ impl SegmentHeader {
             )));
         }
         if let (KeySpec::Bloom { columns, .. }, BloomHash::ParquetPlain) =
-            (&self.key_spec, self.bloom_hash)
+            (self.key_spec.physical(), self.bloom_hash)
         {
             if columns.len() != 1 {
                 return Err(corrupt("parquet_plain filters cover exactly one column"));
@@ -511,7 +518,9 @@ impl SegmentHeader {
             }
             (_, None) => {}
         }
-        Ok(())
+        // An expr key's header carries its expression and conformance
+        // vectors; a reader recomputes them before trusting the keys.
+        crate::expr::check_spec(&self.key_spec)
     }
 }
 

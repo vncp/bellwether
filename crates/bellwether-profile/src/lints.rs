@@ -5,11 +5,12 @@
 //! | `batch_stamp_key` | `bellwether_source::stats::batch_stamp` holds for column `B` against its composite with the chosen partner `K` (see below), under some time column: one value of `B` touches at least 2 files at the median, `B`'s median row groups per value is at least 2 times the composite's, and `B` concords with time across days at least 0.9 |
 //! | `low_selectivity_single_column` | the median value of `C` touches at least [`LOW_SELECTIVITY_MIN_FRACTION`] of all row groups, some id-like `O` that is not a batch stamp makes the composite's p95 at most half of that median, and `C` is not a batch stamp (a batch stamp is not a key at all) |
 //! | `scattered_time_column` | a date or timestamp column's overlap depth is at least `SCATTER_MIN_DEPTH` and its sortedness below `SCATTER_MAX_SORTEDNESS` (`bellwether_source::stats`) |
-//! | `declared_but_unused_key` | a manifest declares a key spec and a recorded workload exists whose runs never supply the spec's leading column |
+//! | `declared_but_unused_key` | a manifest declares a key spec and a recorded workload exists whose runs never supply the spec's leading column (for an `expr` key, its expression) |
 //! | `R-sketch-1` (low-cardinality key, [`low_cardinality_key`]) | from `sketch` sidecars, not the profile: a sketched column `B` whose values each cover at least [`LOW_CARDINALITY_MIN_ROWS_PER_VALUE`] rows, beside an id-like sketched column `K` with at least [`LOW_CARDINALITY_PARTNER_RATIO`] times `B`'s distinct values, present in at least [`LOW_CARDINALITY_COPRESENCE`] of the files `B` is present in |
 //! | `no_discriminating_column` | the dataset has at least 2 row groups and every measured single column (composites are not searched) has a median value touching at least [`NO_DISCRIMINATING_MIN_FRACTION`] of all row groups: the layout, not a missing index, sets the cost of a lookup |
 //! | `R-counts-1` (count before scan, [`COUNT_BEFORE_SCAN`]) | a recorded workload has a `count` run that a later run over the same keys follows ([`WorkloadSummary::counts_before_scan`]), and no declared `exact` spec on exactly the workload's key columns stores counts |
 //! | `R-text-1` | the workload records text runs (`contains`, `has_token`, `has_prefix`) on a string column, and for some of those matches no complete text key on the column serves it ([`text_lookups`]; the caller reads the workload's runs, so it is not part of [`run`]) |
+//! | `R-expr-1` | lookups supply a function of a dataset column (`bellwether_core::expr`, for example `json_get(payload,'$.symbol')`) that type-checks, and no declared `expr` key is over that expression, normalized |
 //!
 //! The two decisions the benchmark also makes are not reimplemented here:
 //! `batch_stamp_key` is `bellwether_source::stats::batch_stamp` and
@@ -48,6 +49,8 @@
 //! `wide_projection_before_filter`) are out of scope: no `EvidenceBody`
 //! carries a plan today. This module never emits them.
 
+use arrow::datatypes::Schema;
+use bellwether_core::expr::{suggested_name, Expr, Typed};
 use bellwether_source::stats::{
     batch_stamp as batch_stamp_decision, partner_order, BatchStamp, PartnerCandidate,
 };
@@ -86,6 +89,9 @@ pub const LOW_CARDINALITY_PARTNER_RATIO: f64 = 10.0;
 /// `R-sketch-1`: files holding both columns over files holding the column,
 /// at least.
 pub const LOW_CARDINALITY_COPRESENCE: f64 = 0.9;
+/// Rule id: lookups filter on a function of a column that no `expr` key
+/// indexes.
+pub const EXPR_RULE: &str = "R-expr-1";
 
 /// Rule id (B5): text lookups on a string column no text key serves.
 pub const TEXT_LOOKUP: &str = "R-text-1";
@@ -112,6 +118,8 @@ pub const NO_DISCRIMINATING_MIN_FRACTION: f64 = 0.75;
 /// Everything the detectors read.
 #[derive(Clone, Copy, Debug)]
 pub struct LintInputs<'a> {
+    /// The dataset schema.
+    pub schema: &'a Schema,
     /// Candidate columns, their types, and the time columns.
     pub plan: &'a KeyPlan,
     /// One entry per key of the plan.
@@ -143,6 +151,7 @@ pub fn run(inputs: &LintInputs<'_>) -> Result<Vec<Lint>> {
     lints.extend(declared_but_unused(inputs));
     lints.extend(count_before_scan(inputs));
     lints.extend(no_discriminating(inputs.entries));
+    lints.extend(expression_lookups(inputs));
     Ok(lints)
 }
 
@@ -163,6 +172,87 @@ fn pair<'a>(inputs: &LintInputs<'a>, a: &str, b: &str) -> Option<&'a FanoutEntry
 
 fn supplied(inputs: &LintInputs<'_>, column: &str) -> bool {
     inputs.supplied.iter().any(|c| c == column)
+}
+
+/// The normalized text of each supplied column that is an expression over
+/// dataset columns: a function call, not itself a dataset column, that
+/// reads at least one column and type-checks against the schema (so the
+/// `expr` key the lint recommends is one `index` accepts).
+fn supplied_expressions<'a>(inputs: &'a LintInputs<'_>) -> impl Iterator<Item = String> + 'a {
+    inputs.supplied.iter().filter_map(|c| {
+        if inputs.schema.field_with_name(c).is_ok() {
+            return None;
+        }
+        let e = Expr::parse(c).ok().filter(Expr::is_call)?;
+        if e.columns().is_empty() {
+            return None;
+        }
+        Typed::new(e.clone(), inputs.schema).ok()?;
+        Some(e.to_string())
+    })
+}
+
+/// `R-expr-1`: each expression the lookups supply (a run keyed on a
+/// function of a column) that no declared `expr` key is over, normalized.
+/// An index on the column the expression reads cannot prune such a lookup,
+/// since it holds the column's values and the lookup's are derived. High
+/// confidence: the recorded runs state the predicate, nothing is inferred.
+fn expression_lookups(inputs: &LintInputs<'_>) -> Vec<Lint> {
+    let declared: Vec<(&str, &str)> = inputs
+        .manifest
+        .map(|m| {
+            m.key_specs
+                .iter()
+                .filter_map(|s| match s {
+                    KeySpec::Expr { name, expr, .. } => Some((name.as_str(), expr.as_str())),
+                    _ => None,
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut seen: Vec<String> = Vec::new();
+    let mut out: Vec<Lint> = Vec::new();
+    for norm in supplied_expressions(inputs) {
+        if declared.iter().any(|(_, e)| *e == norm) || seen.contains(&norm) {
+            continue;
+        }
+        seen.push(norm.clone());
+        let Ok(parsed) = Expr::parse(&norm) else {
+            continue;
+        };
+        let columns = parsed.columns();
+        let name = suggested_name(&parsed, inputs.schema);
+        let near = if declared.is_empty() {
+            String::new()
+        } else {
+            format!(
+                " The declared expr keys ({}) are over other expressions; a lookup matches an \
+                 expr key only when its expression normalizes to the key's.",
+                declared
+                    .iter()
+                    .map(|(n, e)| format!("{n} = {e}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        };
+        out.push(Lint {
+            rule: EXPR_RULE.into(),
+            columns: columns.clone(),
+            message: format!(
+                "Lookups filter on {norm}, a function of {cols}, so no index on {cols} can \
+                 prune them: an index holds the column's values and these lookups ask for \
+                 derived ones, so every row group is read and the expression recomputed per \
+                 row.{near} An expr key indexes the derived value: price it with `bellwether \
+                 why --from <keys>` (its candidate is expr:{name}={norm}:exact), then build it \
+                 with `bellwether index --key \"expr:{name}={norm}:exact\"`.",
+                cols = columns.join(", "),
+            ),
+            confidence: HIGH,
+            site: None,
+            fix: None,
+        });
+    }
+    out
 }
 
 /// Whether anything says which columns lookups supply: a recorded workload,
@@ -416,9 +506,19 @@ fn declared_but_unused(inputs: &LintInputs<'_>) -> Vec<Lint> {
         let Some(lead) = spec.columns().first() else {
             continue;
         };
-        if supplied(inputs, lead) {
+        // An `expr` key is used by a run keyed on its expression, never by
+        // its virtual column's name.
+        let used = match spec {
+            KeySpec::Expr { expr, .. } => supplied_expressions(inputs).any(|e| e == *expr),
+            _ => supplied(inputs, lead),
+        };
+        if used {
             continue;
         }
+        let lead = match spec {
+            KeySpec::Expr { expr, .. } => expr,
+            _ => lead,
+        };
         let name = spec.name();
         let identity = spec.identity();
         let bytes: u64 = manifest

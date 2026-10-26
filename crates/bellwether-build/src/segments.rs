@@ -356,6 +356,16 @@ impl<'a> SpecWriter<'a> {
         id: u32,
         batch: &RecordBatch,
     ) -> Result<()> {
+        // An expr key's virtual column, derived for this row group only
+        // (ADR 018) and dropped with it.
+        let derived;
+        let batch = match &self.plan.target {
+            Target::Key(spec @ KeySpec::Expr { .. }) => {
+                derived = bellwether_core::expr::with_derived(spec, ctx.schema, batch)?;
+                &derived
+            }
+            _ => batch,
+        };
         let (keys, bytes) = match (&self.plan.target, &self.writer) {
             // A sketch grows by one entry per file stretch, at most
             // `max_entry_bytes` each: the bound is charged when one starts.
@@ -535,7 +545,7 @@ pub(crate) fn measure(plan: &SpecPlan, batch: &RecordBatch) -> Result<(u64, u64)
         }
         if !seen.contains(buf.as_slice()) {
             seen.insert(buf.clone());
-            bytes += match spec {
+            bytes += match spec.physical() {
                 KeySpec::Bloom { .. } => 8,
                 KeySpec::Temporal { .. } => key_len + 8,
                 _ => key_len,

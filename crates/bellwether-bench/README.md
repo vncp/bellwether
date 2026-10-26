@@ -19,6 +19,7 @@ cargo run -p bellwether-bench --release -- <subcommand>
 | `workload` | `<corpus>/workload/run-NNNN.parquet`, `<corpus>/workload.json` |
 | `ground-truth` | `<corpus>/expected.json` |
 | `text --shape ledger\|market` | `<out>/data/day=YYYY-MM-DD/part-NNNN.parquet` (1–4 KB `body` documents with terms planted at 1% and 0.01% of rows) and `<out>/workload/text-truth.json` (per query, the rows and row groups holding a match); `scripts/text-funnels.py` |
+| `bellwether bench expr --shape ledger\|market --out DIR` | `DIR/data/part-NNNN.parquet` with a JSON attribute column (`attrs` holding an `account` join key, or a vendor `payload` holding `symbol`), `DIR/workload/keys-{rare,medium,wide}.parquet` (and `keys-day.parquet` for `date_trunc(ts,day)` on market), each with one column named by the expression, and `DIR/workload/truth.json`: per query, the row groups and rows holding a key. Rare values live in one row group, medium values in one span of ten, wide values in every row group (the case no index improves). `scripts/expr-funnels.py` measures the `expr` key funnel on both shapes. |
 | `run` | `benches/out/results.json` (or `--out`) |
 | `report` | `benches/out/report.html` (or `--out`) |
 | `--assert-slo` | Exit status. With no subcommand (what CI runs), the tool generates a smoke corpus in `benches/out/slo/`, runs the harness, and asserts in **strict** mode: a skipped core check fails. With `--results PATH` it asserts on that file, leniently. `run --assert-slo` asserts on the results that run just wrote. On any other subcommand it is a usage error. |

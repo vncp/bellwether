@@ -758,6 +758,9 @@ fn key_spec_fields(kind: &str, storage_version: u64) -> Option<&'static [&'stati
         "range" => Some(&["kind", "column"]),
         "temporal" if v2 => Some(&["kind", "columns", "ts_column", "counts"]),
         "temporal" => Some(&["kind", "columns", "ts_column"]),
+        // --- phase 5 kinds ---
+        // Storage version 2 on: a reader of version 1 refuses the kind.
+        "expr" if v2 => Some(&["kind", "name", "expr", "over", "conformance"]),
         "text" if v2 => Some(&["kind", "column", "tokenizer", "bloom"]),
         _ => None,
     }
@@ -766,6 +769,26 @@ fn key_spec_fields(kind: &str, storage_version: u64) -> Option<&'static [&'stati
 /// Serialized field names of `FileFingerprint` this build understands.
 /// Kept in step with `bellwether-types` by a drift test.
 const FINGERPRINT_FIELDS: &[&str] = &["path", "size", "etag", "tail_blake3"];
+
+/// Whether a serialized `KeySpec` has a kind and fields this build
+/// understands, including the inner spec an `expr` key wraps.
+fn key_spec_known(spec: &Value, storage_version: u64) -> bool {
+    fn keys_within(v: &Value, allowed: &[&str]) -> bool {
+        v.as_object()
+            .is_some_and(|o| o.keys().all(|k| allowed.contains(&k.as_str())))
+    }
+    let Some(allowed) = spec
+        .get("kind")
+        .and_then(Value::as_str)
+        .and_then(|k| key_spec_fields(k, storage_version))
+    else {
+        return false;
+    };
+    keys_within(spec, allowed)
+        && spec
+            .get("over")
+            .is_none_or(|o| key_spec_known(o, storage_version))
+}
 
 /// Whether every types-owned struct in the manifest has only kinds and
 /// fields this build understands at the manifest's storage version (see the
@@ -779,14 +802,7 @@ fn types_owned_fields_known(manifest: &Value, storage_version: u64) -> bool {
         .pointer("/schema/key_specs")
         .and_then(Value::as_array);
     for spec in key_specs.into_iter().flatten() {
-        let Some(allowed) = spec
-            .get("kind")
-            .and_then(Value::as_str)
-            .and_then(|k| key_spec_fields(k, storage_version))
-        else {
-            return false;
-        };
-        if !keys_within(spec, allowed) {
+        if !key_spec_known(spec, storage_version) {
             return false;
         }
         // A text key's tokenizer is a closed set too: a later one is a
@@ -991,6 +1007,16 @@ mod tests {
                 ts_column: "t".into(),
                 counts: true,
             },
+            KeySpec::Expr {
+                name: "k".into(),
+                expr: "lower(a)".into(),
+                over: Box::new(KeySpec::Exact {
+                    columns: vec!["k".into()],
+                    counts: true,
+                    bounds: None,
+                }),
+                conformance: Vec::new(),
+            },
             KeySpec::Text {
                 column: "a".into(),
                 tokenizer: bellwether_types::Tokenizer::Trigram,
@@ -1007,6 +1033,7 @@ mod tests {
                 | KeySpec::Range { .. }
                 | KeySpec::Temporal { .. }
                 | KeySpec::Bitemporal { .. }
+                | KeySpec::Expr { .. }
                 | KeySpec::Text { .. } => {}
             }
             let v = serde_json::to_value(spec).unwrap();
@@ -1113,6 +1140,47 @@ mod tests {
             r#"{"storage_version": 2, "created_at": "x",
                 "schema": {"key_specs": [{"kind": "text", "column": "b", "tokenizer": "ngram4"}]}}"#,
         );
+    }
+
+    /// An `expr` key (phase 5) is a `KeySpec` kind. A reader whose
+    /// allow-list lacks a kind, as every reader built before the kind did,
+    /// refuses the manifest with the typed shape error, never a serde error
+    /// and never a silent drop on rewrite (ADR 017); this reader reads it,
+    /// and checks the spec an `expr` key wraps the same way.
+    #[test]
+    fn expr_keys_load_and_a_reader_without_the_kind_refuses_typed() {
+        let at = |version: u32, spec: &str| {
+            format!(
+                r#"{{"storage_version": {version}, "created_at": "x",
+                    "schema": {{"key_specs": [{spec}]}}}}"#
+            )
+        };
+        let with = |spec: &str| at(2, spec);
+        let expr = r#"{"kind": "expr", "name": "k", "expr": "lower(a)",
+                       "over": {"kind": "exact", "columns": ["k"], "counts": true},
+                       "conformance": []}"#;
+        let m = Manifest::from_slice(with(expr).as_bytes()).unwrap();
+        assert!(matches!(m.schema.key_specs[0], KeySpec::Expr { .. }));
+        // The kind ships with storage version 2: a version 1 manifest that
+        // names it is refused typed, as a version 1 reader refuses it.
+        expect_unsupported_shape(&at(1, expr));
+        // What a reader without the kind sees: the same manifest with a kind
+        // name its allow-list does not hold.
+        expect_unsupported_shape(&with(
+            &expr.replace("\"expr\", \"name\"", "\"expr9\", \"name\""),
+        ));
+        // A field this build does not know, on the expr key or on the spec it
+        // wraps.
+        expect_unsupported_shape(&with(
+            &expr.replace("\"name\"", "\"collation\": 1, \"name\""),
+        ));
+        expect_unsupported_shape(&with(&expr.replace(
+            "\"columns\": [\"k\"]",
+            "\"columns\": [\"k\"], \"collation\": 1",
+        )));
+        expect_unsupported_shape(&with(
+            &expr.replace("\"kind\": \"exact\"", "\"kind\": \"zorder\""),
+        ));
     }
 
     #[test]
