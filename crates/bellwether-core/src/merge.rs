@@ -52,7 +52,7 @@ impl<R: ReadAt> KeyedCursor<'_, R> {
             let Some(body) = self.body.as_deref() else {
                 return Ok(None);
             };
-            let view = BlockView::parse(body, b.n)?;
+            let view = BlockView::parse(body, b.n, self.seg.checked())?;
             if self.pos < view.len() {
                 let key = view.key(self.pos)?.to_vec();
                 let value = self.seg.value_at(&view, self.pos)?;
@@ -78,8 +78,8 @@ fn merged_header<R: ReadAt>(inputs: &[SegmentReader<R>]) -> Result<SegmentHeader
         if h.key_spec != h0.key_spec {
             return Err(Error::KeySpec(format!(
                 "cannot merge segments of different key specs: {} and {}",
-                h0.key_spec.name(),
-                h.key_spec.name()
+                h0.key_spec.identity(),
+                h.key_spec.identity()
             )));
         }
         if h.bloom_hash != h0.bloom_hash {
@@ -173,8 +173,7 @@ fn merge_keyed<R: ReadAt>(
                 break;
             };
             if let Some(v) = heads[j].take() {
-                value.bitmap |= v.bitmap;
-                value.chain.merge(&v.chain);
+                fold(&mut value, v, &key)?;
             }
             advance(&mut cursors, &mut heads, &mut heap, j)?;
         }
@@ -238,6 +237,60 @@ pub fn count_live_keys<R: ReadAt>(
         }
     }
     Ok(count)
+}
+
+/// Folds `other`'s value of `key` into `value`: bitmaps OR-ed, chains
+/// merged, and counts combined. Counts of one (key, row group) are never
+/// summed across inputs: segments of one spec are built over disjoint row
+/// groups, so two inputs that both count a key in one row group are a
+/// double count, and the merge is refused rather than storing it.
+fn fold(value: &mut KeyValue, other: KeyValue, key: &[u8]) -> Result<()> {
+    let counts = match (value.counts.take(), other.counts) {
+        (None, None) => None,
+        (Some(a), Some(b)) => {
+            if !(&value.bitmap & &other.bitmap).is_empty() {
+                return Err(Error::Other(format!(
+                    "cannot merge counted segments that both count key {} in row group {}: \
+                     segments of one spec cover disjoint row groups",
+                    hex(key),
+                    (&value.bitmap & &other.bitmap).min().unwrap_or_default()
+                )));
+            }
+            let mut left = value.bitmap.iter().zip(a).peekable();
+            let mut right = other.bitmap.iter().zip(b).peekable();
+            let mut merged = Vec::new();
+            loop {
+                let take_left = match (left.peek(), right.peek()) {
+                    (Some(l), Some(r)) => l.0 < r.0,
+                    (Some(_), None) => true,
+                    (None, Some(_)) => false,
+                    (None, None) => break,
+                };
+                let next = if take_left { left.next() } else { right.next() };
+                if let Some((_, n)) = next {
+                    merged.push(n);
+                }
+            }
+            Some(merged)
+        }
+        _ => {
+            return Err(Error::Other(
+                "cannot merge a counted value with an uncounted one".into(),
+            ))
+        }
+    };
+    value.bitmap |= other.bitmap;
+    value.chain.merge(&other.chain);
+    value.counts = counts;
+    Ok(())
+}
+
+fn hex(b: &[u8]) -> String {
+    use std::fmt::Write as _;
+    b.iter().fold(String::new(), |mut s, x| {
+        let _ = write!(s, "{x:02x}");
+        s
+    })
 }
 
 fn advance<R: ReadAt>(
@@ -350,6 +403,8 @@ mod tests {
     fn segment(extra: Option<(&str, i64)>, rg: u32) -> SegmentReader<Vec<u8>> {
         let mut header = SegmentHeader::new(KeySpec::Exact {
             columns: vec!["id".into()],
+            counts: false,
+            bounds: None,
         });
         if let Some((k, v)) = extra {
             header.extra.insert(k.into(), serde_json::json!(v));
@@ -409,10 +464,13 @@ mod tests {
         for spec in [
             KeySpec::Exact {
                 columns: vec!["k".into()],
+                counts: false,
+                bounds: None,
             },
             KeySpec::Bloom {
                 columns: vec!["k".into()],
                 fpr: 0.01,
+                bounds: None,
             },
             KeySpec::Range { column: "k".into() },
         ] {

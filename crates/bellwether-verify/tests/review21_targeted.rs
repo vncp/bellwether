@@ -635,6 +635,8 @@ fn finding_a_refused_certificate_leaves_no_orphan_plan_evidence() {
             &canonical,
             &[KeySpec::Exact {
                 columns: vec!["id".into()],
+                counts: false,
+                bounds: None,
             }],
             &BuildOptions::new(SourceKind::Parquet),
         )

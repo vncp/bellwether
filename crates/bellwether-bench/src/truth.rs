@@ -241,6 +241,8 @@ impl Dist {
             row_groups_per_value: self.rgs.p50_p95_max(),
             files_total,
             row_groups_total,
+            sample_size: None,
+            quantile_error: None,
         }
     }
 }
@@ -570,10 +572,14 @@ fn batch_stamp(
             before: "join on batch_id".into(),
             after: "join on (entity_id, batch_id)".into(),
             invariant: "the set of output rows per entity_id is unchanged".into(),
+            before_plan: None,
+            after_plan: None,
         }),
         fix_fanout: Some(fix_fanout),
         fix_key_spec: Some(KeySpec::Exact {
             columns: strings(&["entity_id", "batch_id"]),
+            counts: false,
+            bounds: None,
         }),
         fix_layout: None,
         versions: None,
@@ -668,10 +674,14 @@ fn low_selectivity(
             after: "key = [status, entity_id]".into(),
             invariant: "every row group holding a queried key is still selected (invariant 1)"
                 .into(),
+            before_plan: None,
+            after_plan: None,
         }),
         fix_fanout: Some(fix_fanout),
         fix_key_spec: Some(KeySpec::Exact {
             columns: strings(&["status", "entity_id"]),
+            counts: false,
+            bounds: None,
         }),
         fix_layout: None,
         versions: None,
@@ -736,6 +746,8 @@ fn scattered_time(overlap: &OverlapDepth, late_rows: u64, rows_total: u64) -> Re
             before: "written in arrival order".into(),
             after: "sorted or clustered by version_ts within each partition".into(),
             invariant: "the multiset of rows is unchanged".into(),
+            before_plan: None,
+            after_plan: None,
         }),
         fix_fanout: None,
         fix_key_spec: None,
@@ -797,11 +809,14 @@ fn lookback(
                     LatestPerKey residual"
                 .into(),
             invariant: "the newest version per key is unchanged (invariant 5)".into(),
+            before_plan: None,
+            after_plan: None,
         }),
         fix_fanout: None,
         fix_key_spec: Some(KeySpec::Temporal {
             columns: strings(&["entity_id"]),
             ts_column: "version_ts".into(),
+            counts: false,
         }),
         fix_layout: None,
         versions: Some(VersionDetail {
@@ -835,6 +850,8 @@ fn declared_unused() -> AntiPattern {
             before: "<spec name> declared in key_specs".into(),
             after: "removed".into(),
             invariant: "no recorded run's ScanPlan changes".into(),
+            before_plan: None,
+            after_plan: None,
         }),
         fix_fanout: None,
         fix_key_spec: None,

@@ -8,6 +8,7 @@
 //! | `declared_but_unused_key` | a manifest declares a key spec and a recorded workload exists whose runs never supply the spec's leading column |
 //! | `R-sketch-1` (low-cardinality key, [`low_cardinality_key`]) | from `sketch` sidecars, not the profile: a sketched column `B` whose values each cover at least [`LOW_CARDINALITY_MIN_ROWS_PER_VALUE`] rows, beside an id-like sketched column `K` with at least [`LOW_CARDINALITY_PARTNER_RATIO`] times `B`'s distinct values, present in at least [`LOW_CARDINALITY_COPRESENCE`] of the files `B` is present in |
 //! | `no_discriminating_column` | the dataset has at least 2 row groups and every measured single column (composites are not searched) has a median value touching at least [`NO_DISCRIMINATING_MIN_FRACTION`] of all row groups: the layout, not a missing index, sets the cost of a lookup |
+//! | `R-counts-1` (count before scan, [`COUNT_BEFORE_SCAN`]) | a recorded workload has a `count` run that a later run over the same keys follows ([`WorkloadSummary::counts_before_scan`]), and no declared `exact` spec on exactly the workload's key columns stores counts |
 //!
 //! The two decisions the benchmark also makes are not reimplemented here:
 //! `batch_stamp_key` is `bellwether_source::stats::batch_stamp` and
@@ -67,6 +68,10 @@ pub const DECLARED_BUT_UNUSED_KEY: &str = "declared_but_unused_key";
 /// Rule id: no measured key prunes, because every value is spread over
 /// nearly every row group.
 pub const NO_DISCRIMINATING_COLUMN: &str = "no_discriminating_column";
+/// Rule id of the `counts` detector (`docs/rule-catalog.md`): a count pass
+/// over keys that a later query looks up again, with no counting spec to
+/// answer it from the index.
+pub const COUNT_BEFORE_SCAN: &str = "R-counts-1";
 
 /// Rule id of the `sketch` detector (`docs/rule-catalog.md`): the
 /// low-cardinality key, read from sketches.
@@ -132,6 +137,7 @@ pub fn run(inputs: &LintInputs<'_>) -> Result<Vec<Lint>> {
     lints.extend(low_selectivity(inputs, &stamps));
     lints.extend(scattered_time(inputs));
     lints.extend(declared_but_unused(inputs));
+    lints.extend(count_before_scan(inputs));
     lints.extend(no_discriminating(inputs.entries));
     Ok(lints)
 }
@@ -292,6 +298,7 @@ fn batch_stamp(inputs: &LintInputs<'_>) -> Result<Vec<Lint>> {
             ),
             confidence,
             site: None,
+            fix: None,
         });
     }
     Ok(out)
@@ -364,6 +371,7 @@ fn low_selectivity(inputs: &LintInputs<'_>, stamps: &[String]) -> Vec<Lint> {
             ),
             confidence,
             site: None,
+            fix: None,
         });
     }
     out
@@ -389,6 +397,7 @@ fn scattered_time(inputs: &LintInputs<'_>) -> Vec<Lint> {
                 ),
                 confidence: MEDIUM,
                 site: None,
+                fix: None,
             }
         })
         .collect()
@@ -407,10 +416,11 @@ fn declared_but_unused(inputs: &LintInputs<'_>) -> Vec<Lint> {
             continue;
         }
         let name = spec.name();
+        let identity = spec.identity();
         let bytes: u64 = manifest
             .segment_bytes
             .iter()
-            .filter(|(n, _)| *n == name)
+            .filter(|(n, _)| *n == identity)
             .map(|(_, b)| *b)
             .sum();
         out.push(Lint {
@@ -422,9 +432,54 @@ fn declared_but_unused(inputs: &LintInputs<'_>) -> Vec<Lint> {
             ),
             confidence: MEDIUM,
             site: None,
+            fix: None,
         });
     }
     out
+}
+
+/// `R-counts-1`: the recorded workload counts a key set and then looks the
+/// same keys up again (a count pass gating the query), and no declared
+/// spec counts its key columns (one storing counts whose key is exactly
+/// those columns, in any order, exact or temporal, as the planner counts
+/// with), so every count costs what the query costs. Advice:
+/// `exact:<columns>,counts`, which answers the count from the index with
+/// no data file read, exactly. High confidence: both facts are exact (run
+/// hashes, declared specs).
+fn count_before_scan(inputs: &LintInputs<'_>) -> Vec<Lint> {
+    let Some(workload) = inputs.workload else {
+        return Vec::new();
+    };
+    if workload.counts_before_scan == 0 || workload.key_columns.is_empty() {
+        return Vec::new();
+    }
+    let columns = &workload.key_columns;
+    let counted = inputs.manifest.is_some_and(|m| {
+        m.key_specs.iter().any(|s| {
+            s.counts()
+                && s.columns().len() == columns.len()
+                && s.columns().iter().all(|c| columns.contains(c))
+        })
+    });
+    if counted {
+        return Vec::new();
+    }
+    let cols = columns.join(",");
+    let n = workload.counts_before_scan;
+    let runs = if n == 1 { "run" } else { "runs" };
+    vec![Lint {
+        rule: COUNT_BEFORE_SCAN.into(),
+        columns: columns.clone(),
+        message: format!(
+            "{n} recorded count {runs} each precede a later run over the same keys on ({cols}), \
+             and no key spec stores counts on ({cols}), so each count reads what the query \
+             reads; declaring exact:{cols},counts answers `bellwether count` from the index with \
+             no data file read and gives plans exact row counts."
+        ),
+        confidence: HIGH,
+        site: None,
+        fix: None,
+    }]
 }
 
 /// `no_discriminating_column`: the measured single column with the lowest
@@ -473,7 +528,7 @@ fn no_discriminating(entries: &[FanoutEntry]) -> Option<Lint> {
             fraction * 100.0,
         ),
         confidence: if sampled { LOW } else { HIGH },
-        site: None,
+        site: None, fix: None,
     })
 }
 
@@ -566,6 +621,7 @@ pub fn low_cardinality_key(columns: &[SketchedColumn]) -> Vec<Lint> {
             ),
             confidence: if exact { HIGH } else { MEDIUM },
             site: None,
+            fix: None,
         });
     }
     out
@@ -587,6 +643,8 @@ mod tests {
                 row_groups_per_value: [p50, p50, p50],
                 files_total: 1,
                 row_groups_total: 22,
+                sample_size: None,
+                quantile_error: None,
             },
             sample: SampleInfo {
                 retained: 100,

@@ -42,7 +42,7 @@ fn lookup(keys: &RunKeys, query: &RunQuery) -> Lookup {
     let columns = keys.columns().to_vec();
     let tuples: Vec<Vec<u8>> = keys.tuples().map(<[u8]>::to_vec).collect();
     match query {
-        RunQuery::Locate => Lookup::Keys {
+        RunQuery::Locate | RunQuery::Count => Lookup::Keys {
             columns,
             keys: tuples,
         },

@@ -39,13 +39,18 @@ fn specs() -> Vec<KeySpec> {
     vec![
         KeySpec::Exact {
             columns: cols(&["entity_id"]),
+            counts: false,
+            bounds: None,
         },
         KeySpec::Temporal {
             columns: cols(&["entity_id"]),
             ts_column: "version_ts".into(),
+            counts: false,
         },
         KeySpec::Exact {
             columns: cols(&["entity_id", "batch_id"]),
+            counts: false,
+            bounds: None,
         },
         KeySpec::Range {
             column: "entity_id".into(),
@@ -53,6 +58,7 @@ fn specs() -> Vec<KeySpec> {
         KeySpec::Bloom {
             columns: cols(&["entity_id"]),
             fpr: 0.01,
+            bounds: None,
         },
     ]
 }
@@ -146,6 +152,7 @@ fn committed_and_transient_segments_plan_identically_through_wp4_and_this_crate(
         KeySpec::Bloom {
             columns: cols(&["entity_id", "batch_id"]),
             fpr: 0.05,
+            bounds: None,
         },
     ];
     assert_eq!(
@@ -241,7 +248,7 @@ fn committed_and_transient_segments_plan_identically_through_wp4_and_this_crate(
                         lo: at - lookback,
                         hi: *at,
                     },
-                    RunQuery::Locate | RunQuery::Window(_) => unreachable!(),
+                    RunQuery::Locate | RunQuery::Count | RunQuery::Window(_) => unreachable!(),
                 };
                 let build_plan = planner.plan(config, &lookup).unwrap();
                 let committed = PlanSource::plan_query(&planner, config, &rk, &query).unwrap();

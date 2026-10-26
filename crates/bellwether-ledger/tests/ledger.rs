@@ -169,7 +169,9 @@ fn records_that_do_not_round_trip_are_rejected_at_write() {
         spec: KeySpec::Bloom {
             columns: vec!["id".into()],
             fpr: f64::NAN,
+            bounds: None,
         },
+        sidecars: Vec::new(),
     };
     assert_rule(ledger.put(&Record::Proposal(p)), "round-trip");
 
@@ -476,11 +478,15 @@ fn plan_evidence_round_trips_and_explains() {
                 },
                 row_groups: rgs,
                 bytes: 4096,
+                columns: None,
             }],
             residual: None,
             bytes: 4096,
             row_groups_total: 8,
             row_groups_selected: 2,
+            projected_bytes: None,
+            order: None,
+            rows: None,
         },
     };
     let rec = Record::Evidence(e);

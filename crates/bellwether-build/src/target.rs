@@ -41,8 +41,20 @@ pub(crate) enum Target {
 }
 
 impl Target {
-    /// The name its segments and completeness are recorded under.
+    /// The key its segments and completeness are recorded under: a key
+    /// spec's [`KeySpec::identity`] (storage version 2), a sidecar's name.
     pub(crate) fn name(&self) -> String {
+        match self {
+            Self::Key(k) => k.identity(),
+            Self::Sidecar(d) => d.name(),
+            Self::Sketch(s) => s.name(),
+        }
+    }
+
+    /// The slot it occupies in the declaration: a key spec's
+    /// [`KeySpec::name`] (one spec per name; another spec of the same name
+    /// is a redefinition), a sidecar's name.
+    pub(crate) fn slot(&self) -> String {
         match self {
             Self::Key(k) => k.name(),
             Self::Sidecar(d) => d.name(),
@@ -63,7 +75,9 @@ impl Target {
     /// temporal timestamp or the sidecar's time columns.
     pub(crate) fn typed_columns(&self) -> Vec<String> {
         match self {
-            Self::Key(KeySpec::Temporal { columns, ts_column }) => {
+            Self::Key(KeySpec::Temporal {
+                columns, ts_column, ..
+            }) => {
                 let mut c = columns.clone();
                 c.push(ts_column.clone());
                 c

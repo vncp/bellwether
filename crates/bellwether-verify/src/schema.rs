@@ -148,9 +148,12 @@ pub(crate) enum RowTest {
 }
 
 impl RowTest {
-    fn compile(p: &Predicate, index: &dyn Fn(&str) -> usize) -> Self {
+    /// The test a residual predicate makes of one row. A relational
+    /// predicate (`SemiJoin`, `Join`, `WindowPartition`) is priced by replay
+    /// and never a row filter; it is refused.
+    fn compile(p: &Predicate, index: &dyn Fn(&str) -> usize) -> Result<Self> {
         let cols = |c: &[String]| c.iter().map(|c| index(c)).collect();
-        match p {
+        Ok(match p {
             Predicate::In { columns, values } => Self::In {
                 cols: cols(columns),
                 values: values.iter().cloned().collect(),
@@ -170,10 +173,22 @@ impl RowTest {
                 bounds: bounds.iter().cloned().collect(),
             },
             Predicate::LatestPerKey { .. } => Self::All,
-            Predicate::And { all } => {
-                Self::And(all.iter().map(|p| Self::compile(p, index)).collect())
+            Predicate::And { all } => Self::And(
+                all.iter()
+                    .map(|p| Self::compile(p, index))
+                    .collect::<Result<_>>()?,
+            ),
+            Predicate::SemiJoin { .. }
+            | Predicate::Join { .. }
+            | Predicate::WindowPartition { .. } => {
+                return Err(VerifyError::InvalidSpec(
+                    "a row filter holds only the residual of a lookup (in, between, \
+                     not-older-than, latest-per-key); a semi-join, join, or window partition \
+                     is priced by replay and cannot filter the rows a reconciliation compares"
+                        .into(),
+                ))
             }
-        }
+        })
     }
 
     /// Whether this test keeps row `row` of `cols` (projected, at `types`);
@@ -239,12 +254,17 @@ fn predicate_columns<'p>(p: &'p Predicate, out: &mut Vec<&'p String>) {
             out.extend(columns);
             out.push(ts_column);
         }
-        Predicate::LatestPerKey { .. } => {}
         Predicate::And { all } => {
             for q in all {
                 predicate_columns(q, out);
             }
         }
+        // Join and window predicates are refused by `RowTest::compile`;
+        // they name no column a row test reads.
+        Predicate::LatestPerKey { .. }
+        | Predicate::SemiJoin { .. }
+        | Predicate::Join { .. }
+        | Predicate::WindowPartition { .. } => {}
     }
 }
 
@@ -321,12 +341,16 @@ impl Plan {
                 quantize: t.quantize.is_some(),
             });
         }
-        let filter = spec.row_filter.as_ref().map(|residuals| {
-            residuals
-                .iter()
-                .map(|p| RowTest::compile(p, &index))
-                .collect()
-        });
+        let filter = spec
+            .row_filter
+            .as_ref()
+            .map(|residuals| {
+                residuals
+                    .iter()
+                    .map(|p| RowTest::compile(p, &index))
+                    .collect::<Result<Vec<_>>>()
+            })
+            .transpose()?;
         Ok(Self {
             key: spec.key_columns.iter().map(|c| index(c)).collect(),
             latest_by,

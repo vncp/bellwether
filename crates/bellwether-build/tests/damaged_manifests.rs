@@ -47,6 +47,8 @@ mod lowered_next_id {
         let b = Builder::new(Arc::clone(&store), "idx");
         let spec = KeySpec::Exact {
             columns: vec!["id".into()],
+            counts: false,
+            bounds: None,
         };
         let o = BuildOptions {
             schema: Some(simple_schema()),
@@ -115,6 +117,8 @@ mod dropped_segment_after_rewrite {
         let b = Builder::new(Arc::clone(&store), "idx");
         let spec = KeySpec::Exact {
             columns: vec!["id".into()],
+            counts: false,
+            bounds: None,
         };
         let o = BuildOptions {
             schema: Some(simple_schema()),

@@ -21,9 +21,9 @@ use crate::envelope::{cites_of, Chain, Envelope, Status};
 use crate::jobs::{job_id, Job, JobInfo, JobState, Jobs};
 use crate::refusal::{self, Refusal, RefusalCode};
 use crate::tools::{
-    self, ApplyReceipt, JobRef, JobsStart, KeyArg, ObserveAsof, ObserveCardinality, ObserveLocate,
-    ObserveOverlap, ObserveWhy, ProposeKey, ProposeLayout, ProposeRewrite, ScoreRecord,
-    ScoreVerify, ScoreWhy, Tier,
+    self, ApplyReceipt, JobRef, JobsStart, KeyArg, ObserveAsof, ObserveCardinality, ObserveCount,
+    ObserveLocate, ObserveOverlap, ObserveWhy, ProposeKey, ProposeLayout, ProposeRewrite,
+    ScoreRecord, ScoreVerify, ScoreWhy, Tier,
 };
 
 /// How the server is configured at startup. Nothing is read from the
@@ -324,10 +324,27 @@ impl Server {
                     Ok(p) => p,
                     Err(err) => return failed(&err),
                 };
+                let engine = pinned.as_ref().unwrap_or(e);
+                let keys = key_file(a.keys, a.key_columns);
+                let result = match &a.columns {
+                    Some(columns) => engine.locate_columns(&keys, None, columns),
+                    None => engine.locate(&keys),
+                };
+                match result {
+                    Ok(r) => done(&r, None),
+                    Err(err) => failed(&err),
+                }
+            }
+            "observe.count" => {
+                let a = parse!(ObserveCount);
+                let pinned = match self.lookup_engine(a.at_manifest) {
+                    Ok(p) => p,
+                    Err(err) => return failed(&err),
+                };
                 match pinned
                     .as_ref()
                     .unwrap_or(e)
-                    .locate(&key_file(a.keys, a.key_columns))
+                    .count(&key_file(a.keys, a.key_columns))
                 {
                     Ok(r) => done(&r, None),
                     Err(err) => failed(&err),

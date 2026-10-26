@@ -8,7 +8,8 @@ request, and a new rule id is never reused for a different pattern.
 Status (2026-10-24): the five statistics rules (`batch_stamp_key`,
 `low_selectivity_single_column`, `declared_but_unused_key`,
 `scattered_time_column`, `no_discriminating_column`) are implemented in
-`bellwether-profile` (WP5), with
+`bellwether-profile` (WP5), and so is the workload rule `R-counts-1`
+(storage version 2), with
 the detectors and thresholds stated in their entries below. Two decisions
 are defined once in `bellwether_source::stats` and called by both the
 profiler and the benchmark's ground truth: `overlap_depth` decides
@@ -315,8 +316,41 @@ of 22 row groups, and no rule said so (defect 8 of
   plan. Low when the step is opaque code.
 
 Note: `RowGroupMeta.bytes` is a single total per row group. The estimator
-for this rule needs per-column chunk sizes, which `ColumnStats` does not
-carry today.
+for this rule needs per-column chunk sizes: storage version 2 records them
+in the manifest (`column_bytes`, `docs/format.md`), and `locate --columns`
+prices a projection from them; no detector reads them yet.
+
+### R-counts-1
+
+- **id**: `R-counts-1` (count before scan; `bellwether_profile::lints`,
+  `COUNT_BEFORE_SCAN`).
+- **Detector**: a recorded bench workload holds a run with `query: "count"`
+  that a later run over the same keys follows (the same run hash, so the
+  same key set on the same key column), and no declared spec counts the
+  workload's key columns. A spec counts them when it stores counts and its
+  key is exactly those columns in any order, exact or temporal
+  (`exact:a,b,counts`, `exact:b,a,counts`, `temporal:a@ts,counts` for a
+  workload on `a`): the specs the planner answers a count with. The pattern
+  is the count pass that gates a query: count the rows of a key set,
+  decide, then read them. Without a recorded workload it is not raised.
+- **Estimator**: exact, from the workload. Without a counting spec a count
+  run costs what the `locate` of the same keys costs (replay prices a
+  `count` run that way); with one it reads no data file
+  (`RunCost.bytes == 0`, rows exact). The lint reports the number of count
+  passes (`WorkloadSummary.counts_before_scan`); the bytes saved come from
+  replaying the workload under the counting spec: `why` adds
+  `exact:<cols>,counts` to its candidates for the columns of every count
+  run that no current spec counts, prices it, and recommends it when it
+  reads fewer bytes (`why --from`).
+- **Guidance template**: file `bellwether.toml`, step `key_specs`. Before:
+  `exact:<cols>` or nothing. After: `exact:<cols>,counts`. Invariant: `every
+  count equals the rows a locate of the same keys reads that hold the key`.
+- **Verification method**: static algebraic identity: a count from the
+  index is the sum of the per-row-group counts the build wrote from the
+  same rows (`docs/format.md`, the counts oracle test); no output of the
+  gated query changes.
+- **Confidence rubric**: high: both inputs are exact (verified run hashes,
+  declared specs).
 
 ### R-sketch-1
 

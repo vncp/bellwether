@@ -52,7 +52,10 @@ fn setup() -> (
             body: ProposalBody::Key {
                 spec: KeySpec::Exact {
                     columns: vec!["k_i64".into()],
+                    counts: false,
+                    bounds: None,
                 },
+                sidecars: Vec::new(),
             },
         }))
         .unwrap();

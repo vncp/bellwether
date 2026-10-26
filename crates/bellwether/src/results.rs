@@ -89,6 +89,12 @@ pub struct IndexResult {
     /// sketched again. Omitted in JSON when none.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub sketches_rebuilt: Vec<String>,
+    /// Counted key specs (by identity) this build rebuilt because two of
+    /// their segments counted one row group: a corrupt index, which every
+    /// count and plan through the spec refused until then. Omitted in JSON
+    /// when none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub specs_repaired: Vec<String>,
     /// Files seen for the first time.
     pub files_new: u64,
     /// Tracked files whose fingerprint changed (ADR 013).
@@ -103,6 +109,23 @@ pub struct IndexResult {
     pub row_groups_assigned: u64,
     /// Row-group ids retired (never reused).
     pub row_groups_retired: u64,
+    /// Unchanged files whose storage version 2 statistics (rows, bytes,
+    /// column bytes per row group) this build recorded from their footers:
+    /// every tracked file on the first commit over a version 1 manifest.
+    /// Zero (omitted in JSON) otherwise.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub files_filled: u64,
+    /// The storage version this build's commit upgraded the index from
+    /// (ADR 028): a binary of that version can no longer open it. Absent
+    /// (omitted in JSON) when the index was already current or nothing was
+    /// committed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upgraded_from: Option<u32>,
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)] // serde passes a reference
+fn is_zero(n: &u64) -> bool {
+    *n == 0
 }
 
 /// Which lookup a plan answers.
@@ -228,8 +251,52 @@ pub struct PlanResult {
     pub ordered_by: Option<String>,
     /// Why the order is unspecified, when it is.
     pub unordered_reason: Option<String>,
+    /// The rows holding the keys in the planned row groups, exact from the
+    /// per-key counts of a spec on exactly the lookup's columns that stores
+    /// them (`exact:…,counts`; storage version 2). Absent otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rows: Option<u64>,
+    /// With `--columns`: the compressed bytes of only those columns over the
+    /// planned row groups, from the manifest's per-column bytes (a text
+    /// source has none and counts its whole chunks). Absent otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub projected_bytes: Option<u64>,
+    /// With `--columns` on a storage version 1 manifest, which records no
+    /// per-column bytes: the Parquet footers they were read from instead,
+    /// one per planned file. Zero (omitted) otherwise.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub column_bytes_from_footers: u64,
     /// The `plan` Evidence.
     pub evidence: Written,
+}
+
+/// What [`crate::Engine::count`] answered: `count(*) where (columns) in
+/// keys`, exact, from the per-key counts of one spec. Writes nothing.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct CountResult {
+    /// Key columns, in tuple order.
+    pub columns: Vec<String>,
+    /// Distinct non-null key tuples counted.
+    pub keys: u64,
+    /// Input rows dropped because their tuple held a null (ADR 014).
+    pub null_tuples: u64,
+    /// BLAKE3 of the canonical key set (the one `locate` cites for the same
+    /// keys).
+    pub key_set: Hash,
+    /// The manifest sequence counted against.
+    pub sequence: u64,
+    /// The spec whose counts answered (its identity, `exact:…,counts`).
+    pub counted_by: String,
+    /// Rows whose key tuple is one of the keys.
+    pub rows: u64,
+    /// Live row groups holding at least one of the keys.
+    pub row_groups: u64,
+    /// Live row groups in the index.
+    pub row_groups_total: u64,
+    /// Files holding those row groups.
+    pub files: u64,
+    /// Live files in the index.
+    pub files_total: u64,
 }
 
 /// What [`crate::Engine::propose`] did: wrote the Proposal, or refused at

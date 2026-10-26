@@ -147,6 +147,8 @@ fn an_indexed_folder_cites_the_manifest_and_its_sequence() {
             m.source.root.clone_from(&root);
             m.schema.key_specs = vec![KeySpec::Exact {
                 columns: vec!["entity_id".into()],
+                counts: false,
+                bounds: None,
             }];
             Ok(m)
         })

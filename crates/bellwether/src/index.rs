@@ -16,7 +16,9 @@ use bytes::Bytes;
 use crate::engine::{folder_changes, guard, schema_hint, Engine, FolderChanges, Pinned};
 use crate::keys::KeyFile;
 use crate::lookback::Lookback;
-use crate::results::{Cost, IndexResult, LookupKind, PlanResult, SidecarState, SpecState};
+use crate::results::{
+    Cost, CountResult, IndexResult, LookupKind, PlanResult, SidecarState, SpecState,
+};
 use crate::spec::Declaration;
 
 impl Engine {
@@ -101,6 +103,7 @@ impl Engine {
                 .collect(),
             unknown_segment_kinds: m.unknown_segment_kinds(),
             sketches_rebuilt,
+            specs_repaired: report.specs_repaired,
             files_new: report.files_new,
             files_changed: report.files_changed,
             files_removed: report.files_removed,
@@ -108,6 +111,8 @@ impl Engine {
             row_groups_read: report.row_groups_read,
             row_groups_assigned: report.row_groups_assigned,
             row_groups_retired: report.row_groups_retired,
+            files_filled: report.files_filled,
+            upgraded_from: report.upgraded_from,
         })
     }
 
@@ -116,14 +121,14 @@ impl Engine {
     /// Evidence of kind `plan`. The plan includes every row group holding a
     /// queried key (invariant 1) and carries an `In` residual (ADR 011).
     pub fn locate(&self, keys: &KeyFile) -> Result<PlanResult> {
-        guard(|| self.plan_lookup(keys, Mode::Locate)).map_err(schema_hint)
+        guard(|| self.plan_lookup(keys, Mode::Locate, None)).map_err(schema_hint)
     }
 
     /// Plans the newest version of each key, through the one temporal spec
     /// that serves the key columns. The residual carries `NotOlderThan` and
     /// `LatestPerKey` (invariant 5).
     pub fn latest(&self, keys: &KeyFile) -> Result<PlanResult> {
-        guard(|| self.plan_lookup(keys, Mode::Latest)).map_err(schema_hint)
+        guard(|| self.plan_lookup(keys, Mode::Latest, None)).map_err(schema_hint)
     }
 
     /// Plans the version of each key current at `at`: an RFC 3339 instant
@@ -132,7 +137,7 @@ impl Engine {
     /// exact. The residual carries `NotOlderThan` and `LatestPerKey`
     /// (invariant 5).
     pub fn asof(&self, keys: &KeyFile, at: &str) -> Result<PlanResult> {
-        guard(|| self.plan_lookup(keys, Mode::Asof(at))).map_err(schema_hint)
+        guard(|| self.plan_lookup(keys, Mode::Asof(at), None)).map_err(schema_hint)
     }
 
     /// Plans the rows of the keys in `keys` whose time column lies in
@@ -158,6 +163,7 @@ impl Engine {
                     to,
                     ts_column,
                 },
+                None,
             )
         })
         .map_err(schema_hint)
@@ -176,7 +182,8 @@ impl Engine {
         valid: Option<&str>,
         known: Option<&str>,
     ) -> Result<PlanResult> {
-        guard(|| self.plan_lookup(keys, Mode::Bitemporal { valid, known })).map_err(schema_hint)
+        guard(|| self.plan_lookup(keys, Mode::Bitemporal { valid, known }, None))
+            .map_err(schema_hint)
     }
 
     /// Plans the rows of the keys in `keys` in the lookback window ending at
@@ -207,6 +214,7 @@ impl Engine {
                     lookback,
                     ts_column,
                 },
+                None,
             )
         })
         .map_err(schema_hint)
@@ -231,9 +239,77 @@ impl Engine {
                     lookback,
                     ts_column: None,
                 },
+                None,
             )
         })
         .map_err(schema_hint)
+    }
+
+    /// [`Engine::locate`], or [`Engine::locate_window`] when `window` is
+    /// `(from, to, ts_column)`, for a consumer that reads only `columns`:
+    /// each plan entry also carries the compressed bytes of each of those
+    /// columns over its row groups, and the result their sum
+    /// (`projected_bytes`), from the manifest's per-column bytes (storage
+    /// version 2; no footer is read). A storage version 1 manifest records
+    /// none, so they are read from the planned files' footers and the
+    /// result says how many (`column_bytes_from_footers`). A text source's
+    /// chunks have no per-column bytes, so its entries count their whole
+    /// chunks. `columns` must be distinct dataset columns (the invalid
+    /// argument `columns` otherwise).
+    pub fn locate_columns(
+        &self,
+        keys: &KeyFile,
+        window: Option<(&str, &str, Option<&str>)>,
+        columns: &[String],
+    ) -> Result<PlanResult> {
+        let mode = match window {
+            Some((from, to, ts_column)) => Mode::Window {
+                from,
+                to,
+                ts_column,
+            },
+            None => Mode::Locate,
+        };
+        guard(|| self.plan_lookup(keys, mode, Some(columns))).map_err(schema_hint)
+    }
+
+    /// `count(*) where (columns) in keys` over the keys in `keys`, exact,
+    /// from the per-key counts of the complete spec with counts on exactly
+    /// the key file's columns (`exact:<cols>,counts`, or a temporal spec
+    /// with counts): rows, row groups, and files holding the keys. Reads the
+    /// manifest and the index segments; no data file is opened, but the
+    /// folder is checked for files changed since the build, as for every
+    /// lookup. Writes nothing. Without such a spec the count is refused
+    /// with the `index --key` that adds one.
+    pub fn count(&self, keys: &KeyFile) -> Result<CountResult> {
+        guard(|| self.count_inner(keys)).map_err(schema_hint)
+    }
+
+    fn count_inner(&self, keys: &KeyFile) -> Result<CountResult> {
+        let pinned = self.pin_required("count")?;
+        self.refuse_stale(&pinned, "count")?;
+        let (specs, _) = pinned.specs();
+        let (run_keys, null_tuples) = keys.run_keys(pinned.planner.schema())?;
+        let columns = run_keys.columns().to_vec();
+        let tuples: Vec<Vec<u8>> = run_keys.tuples().map(<[u8]>::to_vec).collect();
+        let key_set = bellwether_types::Hash::of(&run_keys.to_payload()?);
+        let counted = pinned
+            .planner
+            .count(&specs, &columns, &tuples)?
+            .ok_or_else(|| no_counts(self.root(), &columns))?;
+        Ok(CountResult {
+            columns,
+            keys: counted.keys,
+            null_tuples,
+            key_set,
+            sequence: pinned.sequence(),
+            counted_by: counted.counted_by.identity(),
+            rows: counted.rows,
+            row_groups: counted.row_groups,
+            row_groups_total: counted.row_groups_total,
+            files: counted.files,
+            files_total: pinned.manifest().rowgroup_space.files.len() as u64,
+        })
     }
 
     /// Invariant 1 over the folder, not only the index: a file that landed
@@ -254,7 +330,12 @@ impl Engine {
         }
     }
 
-    fn plan_lookup(&self, keys: &KeyFile, mode: Mode<'_>) -> Result<PlanResult> {
+    fn plan_lookup(
+        &self,
+        keys: &KeyFile,
+        mode: Mode<'_>,
+        projection: Option<&[String]>,
+    ) -> Result<PlanResult> {
         let verb = match mode {
             Mode::Locate | Mode::Window { .. } => "locate",
             Mode::Latest
@@ -266,6 +347,9 @@ impl Engine {
         let pinned = self.pin_required(verb)?;
         self.refuse_stale(&pinned, verb)?;
         let (specs, excluded) = pinned.specs();
+        if let Some(columns) = projection {
+            check_projection(pinned.planner.schema(), columns)?;
+        }
         let (run_keys, null_tuples) = keys.run_keys(pinned.planner.schema())?;
         let columns = run_keys.columns().to_vec();
         let tuples: Vec<Vec<u8>> = run_keys.tuples().map(<[u8]>::to_vec).collect();
@@ -273,7 +357,7 @@ impl Engine {
         let key_set = bellwether_types::Hash::of(&payload);
         self.cache()?.put_cached(&key_set, Bytes::from(payload))?;
         let (lookup, kind) = self.lookup_of(&pinned, &specs, &columns, tuples, mode, verb)?;
-        let (plan, order) = pinned.planner.plan_ordered(&specs, &lookup).map_err(|e| {
+        let (mut plan, order) = pinned.planner.plan_ordered(&specs, &lookup).map_err(|e| {
             if specs.is_empty() && !excluded.is_empty() {
                 not_complete_yet(self.root(), verb, &excluded)
             } else {
@@ -286,6 +370,12 @@ impl Engine {
         ) {
             check_temporal_residual(&plan)?;
         }
+        let column_bytes_from_footers = match projection {
+            Some(columns) => pinned.planner.project(&mut plan, columns)?,
+            None => 0,
+        };
+        let rows = plan.rows.as_ref().map(|q| q.value);
+        let projected_bytes = plan.projected_bytes;
         let sidecars: Vec<String> = pinned
             .planner
             .sidecars_for(&lookup)
@@ -326,6 +416,9 @@ impl Engine {
             planned,
             ordered_by,
             unordered_reason,
+            rows,
+            projected_bytes,
+            column_bytes_from_footers,
             evidence,
         })
     }
@@ -570,6 +663,54 @@ fn window_column(pinned: &Pinned, specs: &[KeySpec], columns: &[String]) -> Resu
         .ok_or_else(|| no_time_column(columns))
 }
 
+/// The refusal of a count on `columns` with no complete spec that counts
+/// them: typed, naming the spec that would (each surface adds the command
+/// that declares it).
+fn no_counts(root: &str, columns: &[String]) -> Error {
+    Error::NotIndexed {
+        root: root.to_string(),
+        operation: "count",
+        needs: Some(format!("exact:{},counts", columns.join(","))),
+    }
+}
+
+/// Refuses a projection that is not a list of distinct dataset columns:
+/// the typed invalid argument `columns`, naming the dataset's columns, so
+/// each surface reports it as its own flag or field.
+fn check_projection(schema: &arrow::datatypes::Schema, columns: &[String]) -> Result<()> {
+    let names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
+    let invalid = |reason: String| Error::InvalidArgument {
+        field: "columns",
+        reason,
+    };
+    if columns.is_empty() {
+        return Err(invalid(format!(
+            "a projection names no column; name one or more of {}",
+            names.join(", ")
+        )));
+    }
+    for (i, c) in columns.iter().enumerate() {
+        if c.is_empty() {
+            return Err(invalid(format!(
+                "a projection column name is empty; name one or more of {}",
+                names.join(", ")
+            )));
+        }
+        if !names.contains(&c.as_str()) {
+            return Err(invalid(format!(
+                "the projection column \"{c}\" is not in the dataset; its columns are {}",
+                names.join(", ")
+            )));
+        }
+        if columns[..i].contains(c) {
+            return Err(invalid(format!(
+                "the projection lists the column \"{c}\" twice; list each column once"
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// The refusal of a window lookup on `columns` with no time column named
 /// and none to take: it lists what gives one.
 pub(crate) fn no_time_column(columns: &[String]) -> Error {
@@ -645,6 +786,7 @@ fn lookback_lookup(
                 KeySpec::Temporal {
                     columns: c,
                     ts_column,
+                    ..
                 } if c.iter().all(|x| columns.contains(x)) => Some(ts_column),
                 _ => None,
             })
@@ -785,6 +927,7 @@ fn serving_temporal(
         KeySpec::Temporal {
             columns: c,
             ts_column,
+            ..
         } if c.iter().all(|x| columns.contains(x)) => Some(ts_column.clone()),
         _ => None,
     });
@@ -932,6 +1075,9 @@ mod tests {
             bytes: 0,
             row_groups_total: 0,
             row_groups_selected: 0,
+            projected_bytes: None,
+            order: None,
+            rows: None,
         };
         let and = |all: Vec<Predicate>| Some(Predicate::And { all });
         assert!(

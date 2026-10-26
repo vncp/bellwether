@@ -83,14 +83,18 @@ fn bench_build(c: &mut Criterion) {
     let specs = [
         KeySpec::Exact {
             columns: vec!["id".into()],
+            counts: false,
+            bounds: None,
         },
         KeySpec::Temporal {
             columns: vec!["id".into()],
             ts_column: "ts".into(),
+            counts: false,
         },
         KeySpec::Bloom {
             columns: vec!["grp".into()],
             fpr: 0.01,
+            bounds: None,
         },
     ];
     let corpora: Vec<(u64, tempfile::TempDir)> = [4usize, 8, 16]

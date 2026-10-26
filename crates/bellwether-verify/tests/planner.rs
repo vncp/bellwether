@@ -73,6 +73,8 @@ fn a_planned_side_reads_only_planned_row_groups_and_cites_the_plan() {
             &canonical(data.path()),
             &[KeySpec::Exact {
                 columns: vec!["id".into()],
+                counts: false,
+                bounds: None,
             }],
             &BuildOptions::new(SourceKind::Parquet),
         )
@@ -166,6 +168,8 @@ fn an_indexed_side_under_full_coverage_scans_and_still_anchors() {
             &canonical(data.path()),
             &[KeySpec::Exact {
                 columns: vec!["id".into()],
+                counts: false,
+                bounds: None,
             }],
             &BuildOptions::new(SourceKind::Parquet),
         )
@@ -259,6 +263,7 @@ fn honest(dir: &std::path::Path) -> Fake {
                 file: f.clone(),
                 row_groups: (0..n).collect::<RoaringBitmap>(),
                 bytes: rgs.iter().map(|rg| rg.bytes).sum(),
+                columns: None,
             }
         })
         .collect();
@@ -280,6 +285,9 @@ fn honest(dir: &std::path::Path) -> Fake {
             bytes: 0,
             row_groups_total: 0,
             row_groups_selected: 0,
+            projected_bytes: None,
+            order: None,
+            rows: None,
         },
     }
 }

@@ -14,8 +14,8 @@ use arrow::array::RecordBatch;
 use arrow::datatypes::{Schema, SchemaRef};
 use bellwether_source_engine::{identity, ratio, MeasuredEngine, ResultHandle, Tag};
 use bellwether_types::{
-    FileFingerprint, Hash, PairPrediction, Prediction, QueryStats, Receipt, Record, Result,
-    RowGroupMeta, RunCost, Source,
+    Exactness, FileFingerprint, Hash, PairPrediction, Prediction, QueryStats, Receipt, Record,
+    Result, RowGroupMeta, RunCost, Source,
 };
 
 #[test]
@@ -152,7 +152,7 @@ fn prediction() -> Prediction {
 #[test]
 fn the_adr_033_fields_have_pinned_bytes_and_hashes() {
     let receipt = Record::Receipt(Receipt {
-        record_version: 2,
+        record_version: 3,
         evidence: vec![h('e')],
         proposal: h('f'),
         replay: h('a'),
@@ -168,7 +168,7 @@ fn the_adr_033_fields_have_pinned_bytes_and_hashes() {
     let a = "a".repeat(64);
     let c = "c".repeat(64);
     let want = format!(
-        r#"{{"record":"receipt","record_version":2,"evidence":["{e}"],"proposal":"{f}","replay":"{a}","certificate":"{c}","manifest_before":"0","manifest_after":"0","created_at":"2026-10-26T00:00:00.000Z","attest_only":true,"prediction":{{"evidence":"{e}","predicted_rows":2,"predicted_row_groups":1,"pairs":[{{"before_read_rows":1600,"after_read_rows":400,"before_read_bytes":64000,"after_read_bytes":16000,"before_ratio":"800.000","after_ratio":"200.000"}},{{"before_read_rows":5,"after_read_rows":3,"before_read_bytes":200,"after_read_bytes":100,"before_ratio":"2.500","after_ratio":"1.500"}}]}}}}"#
+        r#"{{"record":"receipt","record_version":3,"evidence":["{e}"],"proposal":"{f}","replay":"{a}","certificate":"{c}","manifest_before":"0","manifest_after":"0","created_at":"2026-10-26T00:00:00.000Z","attest_only":true,"prediction":{{"evidence":"{e}","predicted_rows":2,"predicted_row_groups":1,"pairs":[{{"before_read_rows":1600,"after_read_rows":400,"before_read_bytes":64000,"after_read_bytes":16000,"before_ratio":"800.000","after_ratio":"200.000"}},{{"before_read_rows":5,"after_read_rows":3,"before_read_bytes":200,"after_read_bytes":100,"before_ratio":"2.500","after_ratio":"1.500"}}]}}}}"#
     );
     assert_eq!(serde_json::to_string(&receipt).unwrap(), want);
     assert_eq!(receipt.hash().unwrap().to_hex(), RECEIPT);
@@ -180,6 +180,10 @@ fn the_adr_033_fields_have_pinned_bytes_and_hashes() {
         row_groups: 1,
         bytes: 16_000,
         exact: false,
+        exactness: Exactness::Measured {
+            model: "clickhouse.query_log".into(),
+        },
+        rows: None,
         measured: Some(QueryStats {
             tag: "bw-0123456789abcdef-p0-after".into(),
             read_rows: 400,
@@ -192,13 +196,13 @@ fn the_adr_033_fields_have_pinned_bytes_and_hashes() {
             units_total: Some(4),
         }),
     };
-    let want = r#"{"run_id":"bw-0123456789abcdef-p0-after","keys":2,"files":1,"row_groups":1,"bytes":16000,"exact":false,"measured":{"tag":"bw-0123456789abcdef-p0-after","read_rows":400,"read_bytes":16000,"peak_memory_bytes":1048576,"cpu_ns":1500000,"duration_ns":2000000,"result_rows":2,"units_read":1,"units_total":4}}"#;
+    let want = r#"{"run_id":"bw-0123456789abcdef-p0-after","keys":2,"files":1,"row_groups":1,"bytes":16000,"exact":false,"exactness":{"kind":"measured","model":"clickhouse.query_log"},"measured":{"tag":"bw-0123456789abcdef-p0-after","read_rows":400,"read_bytes":16000,"peak_memory_bytes":1048576,"cpu_ns":1500000,"duration_ns":2000000,"result_rows":2,"units_read":1,"units_total":4}}"#;
     assert_eq!(serde_json::to_string(&cost).unwrap(), want);
     assert_eq!(Hash::of_record(&cost).unwrap().to_hex(), RUN_COST);
 }
 
-const RECEIPT: &str = "a75c47726b81d82a0e968c4aba143fc7feed9b5a32bfbc690e2dcd3379d81ac1";
-const RUN_COST: &str = "39c0305370655bd56bc6602de676ecfb4bb4e9868858774e37a31944db9d0537";
+const RECEIPT: &str = "86c7ffc92a990bf9235e23ea6a8dc21b48a4357279d2d2e8214890e089c69c34";
+const RUN_COST: &str = "7487563e98460bee3490ac37be52a0849914e7503dc85e25372ad968f3688c01";
 
 /// Records of every kind whose type gained a field, as written before ADR
 /// 033 (`serde_json` of the types at `origin/main`), byte for byte.

@@ -61,7 +61,7 @@ fn adding_a_spec_builds_every_row_group_and_records_completeness_at_its_commit()
     };
     let r = build_ok(&b, &s.root_str(), &[exact(&["id"]), bloom(&["grp"])], &opts);
     assert_eq!(r.sequence, Some(2));
-    assert_eq!(r.specs_rebuilt, vec!["bloom:grp".to_string()]);
+    assert_eq!(r.specs_rebuilt, vec!["bloom:grp@0.01".to_string()]);
     assert_eq!(r.row_groups_read, 9, "every tracked row group, read once");
     // only the new spec's column is read: the exact spec is already complete
     let read_cols = probe.columns.lock().unwrap().clone();
@@ -217,25 +217,97 @@ fn a_definition_change_under_the_same_name_rebuilds_the_spec() {
     let by_grp = KeySpec::Temporal {
         columns: cols(&["id"]),
         ts_column: "id".into(),
+        counts: false,
     };
     assert_eq!(by_ts.name(), by_grp.name());
     build_ok(&b, &s.root_str(), std::slice::from_ref(&by_ts), &opts);
-    // declaring both is refused: the manifest keys segments by name
+    // declaring both is refused: an index holds one spec per name
     let err = b
         .build(&s.root_str(), &[by_ts.clone(), by_grp.clone()], &opts)
         .unwrap_err();
     assert!(matches!(err, Error::KeySpec(_)), "{err}");
     let r = build_ok(&b, &s.root_str(), std::slice::from_ref(&by_grp), &opts);
-    assert_eq!(r.specs_rebuilt, vec!["temporal:id".to_string()]);
+    assert_eq!(r.specs_rebuilt, vec!["temporal:id@id".to_string()]);
     let m = b.manifest().unwrap().unwrap();
     assert_eq!(completeness(&m, &by_grp), Some(2));
     assert_eq!(completeness(&m, &by_ts), None);
-    let specs = segment_specs(&store, "temporal:id");
+    let specs = segment_specs(&store, "temporal:id@id");
     assert!(!specs.is_empty());
     assert!(
         specs.iter().all(|k| k == &by_grp),
         "no segment of the old definition is live"
     );
+}
+
+/// Completeness and segments are keyed by [`KeySpec::identity`], which
+/// holds every field of the spec. `bloom:grp@0.01` and `bloom:grp@0.05`
+/// share the name `bloom:grp`; keyed by name, the old filter's segments
+/// and completeness entry would serve the new declaration.
+#[test]
+fn completeness_is_keyed_by_identity_not_name() {
+    let s = Scratch::new();
+    three_files(&s);
+    let store = memory_store();
+    let b = builder(&store);
+    let opts = parquet_opts(&simple_schema());
+    let tight = bloom(&["grp"]);
+    let loose = KeySpec::Bloom {
+        columns: cols(&["grp"]),
+        fpr: 0.05,
+        bounds: None,
+    };
+    assert_eq!(tight.name(), loose.name());
+    assert_ne!(tight.identity(), loose.identity());
+    build_ok(&b, &s.root_str(), std::slice::from_ref(&tight), &opts);
+    let m = b.manifest().unwrap().unwrap();
+    assert_eq!(
+        m.key_spec_completeness.keys().collect::<Vec<_>>(),
+        vec!["bloom:grp@0.01"]
+    );
+    assert_eq!(completeness(&m, &tight), Some(1));
+    assert_eq!(completeness(&m, &loose), None, "not declared");
+
+    let r = build_ok(&b, &s.root_str(), std::slice::from_ref(&loose), &opts);
+    assert_eq!(r.specs_rebuilt, vec!["bloom:grp@0.05".to_string()]);
+    let m = b.manifest().unwrap().unwrap();
+    assert_eq!(
+        m.key_spec_completeness.keys().collect::<Vec<_>>(),
+        vec!["bloom:grp@0.05"],
+        "recorded under the new identity only"
+    );
+    assert_eq!(completeness(&m, &loose), Some(2), "recorded at the rebuild");
+    assert_eq!(completeness(&m, &tight), None);
+    assert!(m.segments.iter().all(|x| x.key_spec == "bloom:grp@0.05"));
+    let specs = segment_specs(&store, "bloom:grp@0.05");
+    assert!(!specs.is_empty());
+    assert!(
+        specs.iter().all(|k| k == &loose),
+        "no segment of the 0.01 filter is live"
+    );
+
+    // A foreign writer re-declares the 0.01 filter but leaves the 0.05
+    // segments and entry: the 0.01 spec is not complete, and planning it
+    // is an error.
+    commit(&*store, "idx", &StagedSegments::new(), |cur| {
+        let mut next = cur.clone();
+        next.schema.key_specs = vec![tight.clone()];
+        Ok(next)
+    })
+    .unwrap();
+    let m = b.manifest().unwrap().unwrap();
+    assert_eq!(completeness(&m, &tight), None);
+    assert_eq!(completeness(&m, &loose), None);
+    let p = planner(&store);
+    let err = p
+        .plan(
+            std::slice::from_ref(&tight),
+            &Lookup::Keys {
+                columns: cols(&["grp"]),
+                keys: vec![b"g".to_vec()],
+            },
+        )
+        .unwrap_err();
+    assert!(matches!(err, Error::KeySpec(_)), "{err}");
 }
 
 #[test]
@@ -252,7 +324,7 @@ fn removing_a_spec_takes_remove_unlisted_and_drops_its_segments_and_completeness
         .unwrap()
         .segments
         .iter()
-        .filter(|x| x.key_spec == "bloom:grp")
+        .filter(|x| x.key_spec == "bloom:grp@0.01")
         .map(|x| x.id)
         .collect();
     // listing only exact:id keeps bloom:grp; nothing to do, nothing committed
@@ -265,11 +337,11 @@ fn removing_a_spec_takes_remove_unlisted_and_drops_its_segments_and_completeness
         ..opts.clone()
     };
     let r = build_ok(&b, &s.root_str(), &[exact(&["id"])], &removing);
-    assert_eq!(r.specs_removed, vec!["bloom:grp".to_string()]);
+    assert_eq!(r.specs_removed, vec!["bloom:grp@0.01".to_string()]);
     assert_eq!(r.row_groups_read, 0);
     let m = b.manifest().unwrap().unwrap();
     assert!(m.segments.iter().all(|x| x.key_spec == "exact:id"));
-    assert!(!m.key_spec_completeness.contains_key("bloom:grp"));
+    assert!(!m.key_spec_completeness.contains_key("bloom:grp@0.01"));
     assert_eq!(m.schema.key_specs, vec![exact(&["id"])]);
     for id in bloom_ids {
         assert!(m.is_tombstoned(&id), "dropped segments wait for GC");
@@ -290,6 +362,7 @@ fn remove_spec_removes_exactly_the_declared_spec() {
     let other = KeySpec::Temporal {
         columns: cols(&["id"]),
         ts_column: "grp".into(),
+        counts: false,
     };
     assert!(b.remove_spec(&other).is_err());
     assert_eq!(
@@ -307,7 +380,7 @@ fn remove_spec_removes_exactly_the_declared_spec() {
     let m = b.manifest().unwrap().unwrap();
     assert_eq!(m.schema.key_specs, vec![exact(&["id"])]);
     assert!(m.segments.iter().all(|x| x.key_spec == "exact:id"));
-    assert!(!m.key_spec_completeness.contains_key("temporal:id"));
+    assert!(!m.key_spec_completeness.contains_key("temporal:id@ts"));
     assert_eq!(completeness(&m, &exact(&["id"])), Some(1));
     // later builds no longer index it
     write_numbered(&s.path("d.parquet"), 300, 12, 4);

@@ -865,6 +865,8 @@ fn a_fabricated_replay_never_reaches_a_receipt() {
         inputs: vec![ev],
         current: vec![cost(&fake)],
         proposed: vec![cost(&fake)],
+        configuration: Vec::new(),
+        operators: Vec::new(),
         model: Some(MODEL.into()),
         unserved: None,
         prediction: None,
@@ -914,6 +916,10 @@ fn cost(s: &QueryStats) -> bellwether::types::RunCost {
         row_groups: 1,
         bytes: s.read_bytes,
         exact: false,
+        exactness: bellwether::types::Exactness::Measured {
+            model: MODEL.into(),
+        },
+        rows: None,
         measured: Some(s.clone()),
     }
 }

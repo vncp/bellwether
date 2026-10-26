@@ -36,7 +36,7 @@ use bellwether_core::bloom::{CanonicalHash, Sbbf};
 use bellwether_core::encoding::{
     encode_tuple, encode_tuple_as, encode_value_as, tuple_has_null, KeyColumns, Value,
 };
-use bellwether_core::segment::{ColumnType, SegmentHeader, PREAMBLE_LEN};
+use bellwether_core::segment::{checksum, ColumnType, SegmentHeader, FOOTER_LEN_V2, PREAMBLE_LEN};
 use bellwether_core::{merge, temporal, SegmentReader, SegmentWriter, WriterOptions};
 use bellwether_types::{KeySpec, RowGroupId};
 use common::*;
@@ -114,10 +114,13 @@ fn decimals_at_mixed_scales_and_widths_are_one_key_through_both_encoder_paths() 
         for spec in [
             KeySpec::Exact {
                 columns: vec!["amt".into()],
+                counts: false,
+                bounds: None,
             },
             KeySpec::Bloom {
                 columns: vec!["amt".into()],
                 fpr: 0.01,
+                bounds: None,
             },
             KeySpec::Range {
                 column: "amt".into(),
@@ -305,6 +308,7 @@ fn add_batch_into_a_row_group_with_a_ready_filter_records_nothing() {
     let spec = KeySpec::Bloom {
         columns: vec!["id".into()],
         fpr: 0.1,
+        bounds: None,
     };
     let mut w = SegmentWriter::for_dataset(spec, &schema, WriterOptions::default()).unwrap();
     let mut f = Sbbf::<CanonicalHash>::with_ndv_fpp(1, 0.1).unwrap();
@@ -413,9 +417,37 @@ fn header_validation_checks_key_types_arity_and_ts_type_presence() {
 // Signed zero
 // ---------------------------------------------------------------------------
 
+/// Recomputes the checksums of a storage version 2 range segment with one
+/// block after its bytes were patched: the block's (in its index entry) and
+/// the footer's (over the preamble, the header, and the index).
+fn reseal_one_block_range(bytes: &mut [u8]) {
+    let u64_at = |b: &[u8], at: usize| u64::from_le_bytes(b[at..at + 8].try_into().unwrap());
+    let u32_at = |b: &[u8], at: usize| u32::from_le_bytes(b[at..at + 4].try_into().unwrap());
+    let foot = bytes.len() - FOOTER_LEN_V2;
+    let index_offset = usize::try_from(u64_at(bytes, foot)).unwrap();
+    let index_len = usize::try_from(u64_at(bytes, foot + 8)).unwrap();
+    assert_eq!(u32_at(bytes, index_offset + 17), 1, "one block");
+    // entry: first_min | max_of_max | off u64 | len u32 | n u32 | sum u64
+    let mut at = index_offset + 21;
+    for _ in 0..2 {
+        at += 4 + usize::try_from(u32_at(bytes, at)).unwrap();
+    }
+    let off = usize::try_from(u64_at(bytes, at)).unwrap();
+    let len = usize::try_from(u32_at(bytes, at + 8)).unwrap();
+    let block_sum = checksum(&[&bytes[off..off + len]]);
+    bytes[at + 16..at + 24].copy_from_slice(&block_sum.to_le_bytes());
+    let header_end = PREAMBLE_LEN + usize::try_from(u32_at(bytes, 16)).unwrap();
+    let sum = checksum(&[
+        &bytes[..header_end],
+        &bytes[index_offset..index_offset + index_len],
+    ]);
+    bytes[foot + 16..foot + 24].copy_from_slice(&sum.to_le_bytes());
+}
+
 /// Merge applies the Parquet signed-zero rule to its inputs' stored bounds.
 /// The writer already widens every bound, so an unwidened segment, as an
-/// older writer would store it, is made by patching -0.0 back to +0.0.
+/// older writer would store it, is made by patching -0.0 back to +0.0 (and
+/// recomputing the checksums the patch invalidates).
 #[test]
 fn merge_widens_signed_zero_bounds_of_an_unwidened_segment() {
     let f = |x: f64| encode_tuple(&[Value::Float(x)]).unwrap();
@@ -442,6 +474,7 @@ fn merge_widens_signed_zero_bounds_of_an_unwidened_segment() {
         patched, 2,
         "the stored minimum and the index's first minimum"
     );
+    reseal_one_block_range(&mut bytes);
     let unwidened = SegmentReader::open(bytes).unwrap();
     assert!(unwidened.lookup(&[&neg]).unwrap().is_empty());
     let merged = SegmentReader::open(

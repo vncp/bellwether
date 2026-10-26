@@ -97,6 +97,9 @@ jobs:
         if: steps.fixture.outputs.present == 'true'
       - uses: Swatinem/rust-cache@v2
         if: steps.fixture.outputs.present == 'true'
+      - name: install the ODBC driver manager (`--all-features` links the `odbc` feature of bellwether-source-sql)
+        if: steps.fixture.outputs.present == 'true'
+        run: sudo apt-get update && sudo apt-get install -y unixodbc-dev
       - name: current binary must read the frozen v0.1 fixture
         if: steps.fixture.outputs.present == 'true'
         run: cargo test --workspace --test '*format_compat*' --all-features

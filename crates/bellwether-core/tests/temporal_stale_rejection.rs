@@ -102,6 +102,8 @@ fn newest_version_in_a_pruned_row_group_still_rejects_the_stale_row() {
     }
     let region = KeySpec::Exact {
         columns: vec!["region".into()],
+        counts: false,
+        bounds: None,
     };
     let mut w = SegmentWriter::for_dataset(region, &schema, WriterOptions::default()).unwrap();
     for (i, b) in rgs.iter().enumerate() {
@@ -168,6 +170,7 @@ fn the_fold_refuses_segments_of_other_specs_or_recorded_types() {
     let other = KeySpec::Temporal {
         columns: vec!["id".into(), "tag".into()],
         ts_column: "updated_at".into(),
+        counts: false,
     };
     let mixed = [one(common::temporal()), one(other)];
     assert!(temporal::latest(&mixed, &[&k]).is_err());

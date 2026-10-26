@@ -61,7 +61,7 @@ bw_fetch_gh "$DL" "$GH_HOURS"
 
 # ---- datasets ----------------------------------------------------------------
 cd "$W" || exit 1
-rm -rf taxi taxi_duck taxi_duck_mut taxi_dec taxi_dec_duck gh ghfix1000 ghfix10 ghjson ghnested keys
+rm -rf taxi taxi_duck taxi_duck_mut taxi_dec taxi_dec_duck gh ghfix1000 ghfix10 ghjson ghnested keys idx-counts
 mkdir -p taxi taxi_duck taxi_duck_mut taxi_dec taxi_dec_duck gh ghjson ghnested keys
 cp "$DL"/taxi/*.parquet taxi/
 
@@ -290,6 +290,37 @@ duckdb -no-agent -c "COPY (SELECT * REPLACE (fare_amount::DECIMAL(10,2) AS fare_
 say "WORKAROUND: decimal copies of January for --totals (fare_amount cast to DECIMAL(10,2) on both sides)"
 run 33-reconcile-dec-totals reconcile taxi_dec taxi_dec_duck --key $K --totals fare_amount --group-by VendorID
 say "DuckDB fare_amount total, January, by VendorID: $(duck "SELECT string_agg(VendorID || '=' || s, ' ' ORDER BY VendorID) FROM (SELECT VendorID, sum(fare_amount) s FROM 'taxi_dec/jan.parquet' GROUP BY 1)")"
+
+# ---- 3b. count ---------------------------------------------------------------
+# count(*) where key in (...) from per-key counts (exact:<key>,counts), one
+# index location per folder under idx-counts/, so the indexes above are
+# unchanged. Keys: an integer (PULocationID, repo_id), a timestamp
+# (created_at) and a decimal (fare_amount in the decimal January copy). The
+# oracle is DuckDB over the rows: count(*) of the rows whose key is in the
+# key file, and the row groups holding one (oracle_pairs).
+say ""
+say "## 3b. count from per-key counts, against DuckDB"
+sample 'gh/*.parquet' created_at 1000 keys/gh_created.parquet
+sample 'taxi_dec/*.parquet' fare_amount 1000 keys/taxi_fare.parquet
+count_check() { # count_check NAME DIR KEYCOL KEYS
+  check "$1: count rows = DuckDB count(*)" "$(j "$1" '.rows')" \
+    "$(duck "SELECT count(*) FROM read_parquet('$2/*.parquet') WHERE $3 IN (SELECT $3 FROM read_parquet('$4'))")"
+  check "$1: count row groups = DuckDB row groups holding a key" "$(j "$1" '.row_groups')" \
+    "$(oracle_pairs "$2" "$3" "$4" locate | wc -l | tr -d ' ')"
+}
+once 34-taxi-count-index index taxi --index idx-counts/taxi --key exact:PULocationID,counts
+run 35-taxi-count count taxi --index idx-counts/taxi --keys keys/taxi_pu.parquet
+count_check 35-taxi-count taxi PULocationID keys/taxi_pu.parquet
+once 36-gh-count-index index gh --index idx-counts/gh --key exact:repo_id,counts --key exact:created_at,counts
+run 37-gh-count count gh --index idx-counts/gh --keys keys/gh_repo.parquet
+count_check 37-gh-count gh repo_id keys/gh_repo.parquet
+run 38-gh-count10 count gh --index idx-counts/gh --keys keys/gh_repo10.parquet
+count_check 38-gh-count10 gh repo_id keys/gh_repo10.parquet
+run 39-gh-count-ts count gh --index idx-counts/gh --keys keys/gh_created.parquet
+count_check 39-gh-count-ts gh created_at keys/gh_created.parquet
+once 3a-dec-count-index index taxi_dec --index idx-counts/taxi_dec --key exact:fare_amount,counts
+run 3b-dec-count count taxi_dec --index idx-counts/taxi_dec --keys keys/taxi_fare.parquet
+count_check 3b-dec-count taxi_dec fare_amount keys/taxi_fare.parquet
 
 # ---- 4. fix ------------------------------------------------------------------
 say ""

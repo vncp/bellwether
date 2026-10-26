@@ -80,6 +80,8 @@ mod coverage_and_null_probes {
     fn exact(c: &[&str]) -> KeySpec {
         KeySpec::Exact {
             columns: c.iter().map(|s| (*s).to_string()).collect(),
+            counts: false,
+            bounds: None,
         }
     }
 
@@ -105,11 +107,13 @@ mod coverage_and_null_probes {
             KeySpec::Bloom {
                 columns: vec!["a".into()],
                 fpr: 0.01,
+                bounds: None,
             },
             KeySpec::Range { column: "a".into() },
             KeySpec::Temporal {
                 columns: vec!["a".into()],
                 ts_column: "c".into(),
+                counts: false,
             },
         ];
         let r = b.build(&s.root_str(), &specs, &opts()).unwrap();
@@ -358,15 +362,19 @@ mod keyless_segments {
         let kinds = [
             KeySpec::Exact {
                 columns: vec!["k".into()],
+                counts: false,
+                bounds: None,
             },
             KeySpec::Bloom {
                 columns: vec!["k".into()],
                 fpr: 0.01,
+                bounds: None,
             },
             KeySpec::Range { column: "k".into() },
             KeySpec::Temporal {
                 columns: vec!["k".into()],
                 ts_column: "t".into(),
+                counts: false,
             },
         ];
         let mut report = Vec::new();

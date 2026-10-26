@@ -80,10 +80,13 @@ fn bench(c: &mut Criterion) {
     for spec in [
         KeySpec::Exact {
             columns: vec!["entity_id".into()],
+            counts: false,
+            bounds: None,
         },
         KeySpec::Bloom {
             columns: vec!["entity_id".into()],
             fpr: 0.01,
+            bounds: None,
         },
     ] {
         replayer.transient(&spec).unwrap();

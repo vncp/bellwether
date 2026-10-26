@@ -7,8 +7,8 @@ use std::fmt::Write as _;
 use bellwether::spec::label;
 use bellwether::types::{EvidenceBody, Hash, Record};
 use bellwether::{
-    Cost, IndexResult, LinkStatus, LookupKind, PlanResult, ProposeResult, ReceiptResult,
-    ReportResult,
+    Cost, CountResult, IndexResult, LinkStatus, LookupKind, PlanResult, ProposeResult,
+    ReceiptResult, ReportResult,
 };
 
 use crate::Out;
@@ -138,6 +138,24 @@ pub(crate) fn index(r: &IndexResult, out: &Out) -> String {
         count(r.segments_written, "segment", "segments"),
         num(r.segments)
     );
+    if let Some(from) = r.upgraded_from {
+        let _ = writeln!(
+            s,
+            "  manifest upgraded to storage version {} (this index can no longer be opened by a \
+             version {from} binary); {} unchanged files' row-group statistics read from their \
+             footers, once",
+            bellwether::types::format::STORAGE_VERSION,
+            num(r.files_filled)
+        );
+    }
+    for spec in &r.specs_repaired {
+        let _ = writeln!(
+            s,
+            "  rebuilt {spec}: two of its segments counted the same row groups (a manifest no \
+             build writes), so counts through it were refused; its counts are now read from the \
+             data again"
+        );
+    }
     let labels: Vec<String> = r.specs.iter().map(|x| label(&x.spec)).collect();
     let w = label_width(
         labels
@@ -254,6 +272,50 @@ fn lookup_label(lookup: &LookupKind) -> String {
     }
 }
 
+pub(crate) fn count_result(r: &CountResult, out: &Out) -> String {
+    let mut s = String::new();
+    let _ = writeln!(
+        s,
+        "{}",
+        heading(
+            out,
+            &format!(
+                "count: {} keys on ({}) at manifest sequence {}",
+                num(r.keys),
+                r.columns.join(", "),
+                r.sequence
+            )
+        )
+    );
+    let _ = writeln!(s, "  rows        {:>14}  holding the keys", num(r.rows));
+    let _ = writeln!(
+        s,
+        "  row groups  {:>14} of {}",
+        num(r.row_groups),
+        num(r.row_groups_total)
+    );
+    let _ = writeln!(
+        s,
+        "  files       {:>14} of {}",
+        num(r.files),
+        num(r.files_total)
+    );
+    if r.null_tuples > 0 {
+        let _ = writeln!(
+            s,
+            "  {} key rows held a null and match nothing (ADR 014)",
+            num(r.null_tuples)
+        );
+    }
+    let _ = writeln!(
+        s,
+        "  exact, from the per-key counts of {}; no data file was read",
+        r.counted_by
+    );
+    s
+}
+
+#[allow(clippy::too_many_lines)]
 pub(crate) fn plan(r: &PlanResult, out: &Out) -> String {
     let mut s = String::new();
     let what = lookup_label(&r.lookup);
@@ -292,6 +354,38 @@ pub(crate) fn plan(r: &PlanResult, out: &Out) -> String {
         num(r.planned.bytes),
         size(r.planned.bytes)
     );
+    if let Some(p) = r.projected_bytes {
+        let _ = writeln!(
+            s,
+            "  {:<34} {:>9} {:>12} {:>18} {:>10}",
+            "planned, projected columns",
+            "",
+            "",
+            num(p),
+            size(p)
+        );
+    }
+    if r.column_bytes_from_footers > 0 {
+        let footers = if r.column_bytes_from_footers == 1 {
+            "footer"
+        } else {
+            "footers"
+        };
+        let _ = writeln!(
+            s,
+            "  manifest sequence {} is a storage version 1 manifest, which records no \
+             per-column bytes, so the projected bytes were read from {} Parquet {footers}",
+            r.sequence,
+            num(r.column_bytes_from_footers)
+        );
+    }
+    if let Some(rows) = r.rows {
+        let _ = writeln!(
+            s,
+            "  rows holding the keys: {} (exact, from the index's per-key counts)",
+            num(rows)
+        );
+    }
     if r.null_tuples > 0 {
         let _ = writeln!(
             s,
@@ -641,6 +735,11 @@ pub(crate) fn why(r: &bellwether::WhyReport, out: &Out, fix_command: &str) -> St
         for c in &r.candidates {
             let mut notes = Vec::new();
             match (&c.origin, &c.spec, &kind_label) {
+                // Priced for count runs, which it answers with no data file
+                // read: not the floor the plain exact key is.
+                (CandidateOrigin::Workload, KeySpec::Exact { counts: true, .. }, _) => {
+                    notes.push("count runs answered from per-key counts, no data read".to_string());
+                }
                 (CandidateOrigin::Workload, KeySpec::Temporal { .. }, Some(k)) => {
                     notes.push(if w.lookback.is_some() {
                         format!(

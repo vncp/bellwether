@@ -680,6 +680,8 @@ mod tests {
         let exact = plan_for(
             KeySpec::Exact {
                 columns: vec!["id".into()],
+                counts: false,
+                bounds: None,
             },
             &schema,
         );
@@ -688,6 +690,7 @@ mod tests {
             KeySpec::Temporal {
                 columns: vec!["id".into()],
                 ts_column: "ts".into(),
+                counts: false,
             },
             &schema,
         );
@@ -697,6 +700,7 @@ mod tests {
             KeySpec::Bloom {
                 columns: vec!["s".into()],
                 fpr: 0.01,
+                bounds: None,
             },
             &schema,
         );
@@ -707,6 +711,8 @@ mod tests {
         let composite = plan_for(
             KeySpec::Exact {
                 columns: vec!["id".into(), "s".into()],
+                counts: false,
+                bounds: None,
             },
             &schema,
         );

@@ -167,4 +167,4 @@ Deliberate breaks, each in a scratch copy built in its own target directory, eac
 
 - Without a value range (a string or composite key), `P` is chosen from row counts, which over-count keys with many versions; the run then makes more passes than it needs. A wrong guess the other way costs a restart, never the bound.
 - A planner's completeness is trusted (invariant 1 is the build crate's).
-- `CertBody` has no field for per-key examples (`docs/contract-v3.md` #25), and keys that failed to compare share the `mismatched` counter (#26); the typed result carries both.
+- Record version 3 gives `CertBody` the fields `examples`, `uncomparable`, `totals` and `row_filter` (`docs/contract-v3.md` #25, #26, #37, #44; ADR 028), but this crate still writes them empty: keys that failed to compare share the `mismatched` counter, and the typed result carries the examples and the filter. Filling them is the second pull request of the freeze. The ledger already refuses a passing certificate with `uncomparable > 0`.

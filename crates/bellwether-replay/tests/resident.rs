@@ -80,6 +80,8 @@ fn open_writer_resident_bytes_per_key() {
     let schema = Schema::new(vec![Field::new("id", DataType::UInt64, false)]);
     let spec = KeySpec::Exact {
         columns: vec!["id".into()],
+        counts: false,
+        bounds: None,
     };
     let schema_ref = Arc::new(schema.clone());
     let before = resident_bytes();

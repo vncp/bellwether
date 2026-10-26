@@ -786,6 +786,8 @@ impl CachedEntry {
                 row_groups_per_value: self.row_groups.map(f64::from),
                 files_total: self.files_total,
                 row_groups_total: self.row_groups_total,
+                sample_size: None,
+                quantile_error: None,
             },
             sample: SampleInfo {
                 retained: self.retained,

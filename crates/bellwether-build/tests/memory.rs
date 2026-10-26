@@ -134,7 +134,7 @@ fn segments_respect_the_key_cap() {
     // segment; temporal: 16 pairs per row group, one per segment
     let count = |name: &str| m.segments.iter().filter(|x| x.key_spec == name).count();
     assert_eq!(count("exact:id"), 4);
-    assert_eq!(count("temporal:id"), 8);
+    assert_eq!(count("temporal:id@ts"), 8);
     for seg in &m.segments {
         let bytes = store
             .get(&bellwether_store::segment_path("idx", &seg.id))

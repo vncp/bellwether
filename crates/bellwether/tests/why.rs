@@ -120,7 +120,9 @@ fn why_with_keys_replays_each_candidate_and_the_floor_is_the_oracle() {
     assert_eq!(
         floor.spec,
         KeySpec::Exact {
-            columns: vec!["id".into()]
+            columns: vec!["id".into()],
+            counts: false,
+            bounds: None,
         }
     );
     assert_eq!(floor.proposed.row_groups, oracle(&data, &keys).len() as u64);
@@ -136,7 +138,7 @@ fn why_with_keys_replays_each_candidate_and_the_floor_is_the_oracle() {
             vec![r.evidence.hash.unwrap()],
             "cites the profile"
         );
-        assert!(matches!(&p.body, ProposalBody::Key { spec } if *spec == c.spec));
+        assert!(matches!(&p.body, ProposalBody::Key { spec, .. } if *spec == c.spec));
         let Record::Replay(rp) = &c.replay.record else {
             panic!()
         };
@@ -207,8 +209,21 @@ fn why_over_an_index_that_does_not_serve_the_workload() {
 }
 
 /// Records `runs` (run id, key column, keys) into the engine's cache as one
-/// workload and returns its hash.
+/// workload of `locate` runs and returns its hash.
 fn record_workload(data: &std::path::Path, runs: &[(&str, &str, Vec<i64>)]) -> Hash {
+    let runs: Vec<_> = runs
+        .iter()
+        .map(|(id, c, k)| (*id, *c, k.clone(), bellwether_replay::RunQuery::Locate))
+        .collect();
+    record_queries(data, &runs)
+}
+
+/// Records `runs` (run id, key column, keys, query) into the engine's
+/// cache as one workload and returns its hash.
+fn record_queries(
+    data: &std::path::Path,
+    runs: &[(&str, &str, Vec<i64>, bellwether_replay::RunQuery)],
+) -> Hash {
     use std::sync::Arc;
 
     use arrow::array::{ArrayRef, Int64Array, RecordBatch};
@@ -225,7 +240,7 @@ fn record_workload(data: &std::path::Path, runs: &[(&str, &str, Vec<i64>)]) -> H
         .schema(root.to_str().unwrap())
         .unwrap();
     let mut rec = WorkloadRecorder::new(&cache, schema);
-    for (id, column, keys) in runs {
+    for (id, column, keys, query) in runs {
         let s = Arc::new(Schema::new(vec![Field::new(
             *column,
             DataType::Int64,
@@ -236,9 +251,80 @@ fn record_workload(data: &std::path::Path, runs: &[(&str, &str, Vec<i64>)]) -> H
             vec![Arc::new(Int64Array::from(keys.clone())) as ArrayRef],
         )
         .unwrap();
-        rec.record(id, KeyInput::Batch(&b)).unwrap();
+        rec.record_query(id, KeyInput::Batch(&b), query.clone(), None)
+            .unwrap();
     }
     rec.finish().unwrap().hash()
+}
+
+/// Count runs ahead of their locates, over an index that serves the key
+/// without counts: `why` prices `exact:<cols>,counts` (each count then
+/// reads nothing) and recommends it, since it reads strictly less than the
+/// current configuration; once it is current it is no longer a candidate.
+#[test]
+fn why_prices_and_recommends_counts_for_count_runs() {
+    use bellwether_replay::RunQuery::{Count, Locate};
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    ledger_corpus(&data, 3, 4, 25, 1_000);
+    let e = open(&data);
+    e.index(&[spec::parse("exact:id").unwrap()]).unwrap();
+    let runs = [
+        ("c1", "id", vec![5, 260, 700], Count),
+        ("l1", "id", vec![5, 260, 700], Locate),
+        ("c2", "id", vec![30, 999], Count),
+        ("l2", "id", vec![30, 999], Locate),
+    ];
+    let hash = record_queries(&data, &runs);
+    let r = e
+        .why(&WhyRequest {
+            workload: Some(hash),
+            max_candidates: 0,
+            ..WhyRequest::default()
+        })
+        .unwrap();
+    let counted = spec::parse("exact:id,counts").unwrap();
+    let c = r
+        .candidates
+        .iter()
+        .find(|c| c.spec == counted)
+        .unwrap_or_else(|| panic!("exact:id,counts is not priced: {:?}", r.candidates));
+    assert_eq!(c.origin, CandidateOrigin::Workload);
+    let Record::Replay(rp) = &c.replay.record else {
+        panic!()
+    };
+    // Each count reads nothing and carries its rows; each locate reads what
+    // the current configuration reads.
+    for (now, then) in rp.current.iter().zip(&rp.proposed) {
+        if now.run_id.starts_with('c') {
+            assert!(now.bytes > 0, "{now:?}");
+            assert_eq!((then.bytes, then.row_groups, then.files), (0, 0, 0));
+            assert!(then.rows.is_some(), "{then:?}");
+        } else {
+            assert_eq!(then.bytes, now.bytes, "{then:?}");
+        }
+    }
+    let current = r.current.unwrap();
+    assert!(c.proposed.bytes < current.bytes);
+    let rec = r.recommended.as_ref().expect("a recommendation");
+    assert_eq!(rec.spec, counted);
+    assert_eq!(rec.proposed, c.proposed);
+
+    // Declared, the counted spec is current: nothing is left to price.
+    e.index(std::slice::from_ref(&counted)).unwrap();
+    let r = e
+        .why(&WhyRequest {
+            workload: Some(hash),
+            max_candidates: 0,
+            ..WhyRequest::default()
+        })
+        .unwrap();
+    assert!(
+        r.candidates.iter().all(|c| !c.spec.counts()),
+        "{:?}",
+        r.candidates
+    );
+    assert!(r.recommended.is_none());
 }
 
 #[test]
@@ -609,6 +695,7 @@ fn why_with_latest_by_prices_temporal_and_locate_and_equals_latest_and_asof_plan
         KeySpec::Temporal {
             columns: vec!["pu".into()],
             ts_column: "pickup_ts".into(),
+            counts: false,
         }
     );
     assert_eq!(rec.lookup, LookupKind::Latest);

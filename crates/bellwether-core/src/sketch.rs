@@ -50,7 +50,7 @@ use std::collections::BTreeSet;
 
 use arrow::array::{ArrayRef, RecordBatch};
 use arrow::datatypes::{DataType, Schema};
-use bellwether_types::format::{ENCODING_VERSION, STORAGE_VERSION};
+use bellwether_types::format::ENCODING_VERSION;
 use bellwether_types::{
     ApproxCardinality, ApproxOverlap, Error, ExactDistinctSource, Hash, OverlapMethod, Result,
     RowGroupId, SketchSpec, SKETCH_CONFIDENCE,
@@ -61,6 +61,12 @@ use xxhash_rust::xxh3::xxh3_128_with_seed;
 use crate::encoding::{self, KeyColumns};
 use crate::hll::{Hll, MAX_PRECISION, MIN_PRECISION};
 use crate::segment::ColumnType;
+
+/// The storage version of the sketch layout this module reads and writes.
+/// A sketch is an additive sidecar kind of storage version 1; storage
+/// version 2 keeps its bytes unchanged (ADR 028), so a sketch always records
+/// version 1, as the other sidecars do.
+pub const SKETCH_LAYOUT_VERSION: u32 = 1;
 
 /// First and last eight bytes of every sketch segment.
 pub const MAGIC: [u8; 8] = *b"BWSKETCH";
@@ -446,7 +452,7 @@ impl FileSketcher {
 /// `extra` (ADR 017).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SketchHeader {
-    /// `STORAGE_VERSION` at write time.
+    /// [`SKETCH_LAYOUT_VERSION`] at write time.
     pub storage_version: u32,
     /// `ENCODING_VERSION` at write time.
     pub encoding_version: u32,
@@ -475,7 +481,7 @@ pub struct SketchHeader {
 impl SketchHeader {
     fn new(spec: &SketchSpec, item_types: Option<Vec<Vec<ColumnType>>>) -> Self {
         Self {
-            storage_version: STORAGE_VERSION,
+            storage_version: SKETCH_LAYOUT_VERSION,
             encoding_version: ENCODING_VERSION,
             kind: KIND.to_string(),
             items: spec.items.clone(),
@@ -500,11 +506,11 @@ impl SketchHeader {
     }
 
     fn validate(&self, storage: u32, encoding: u32) -> Result<()> {
-        if self.storage_version > STORAGE_VERSION {
+        if self.storage_version > SKETCH_LAYOUT_VERSION {
             return Err(Error::UnsupportedVersion {
                 what: "storage",
                 found: self.storage_version,
-                supported: STORAGE_VERSION,
+                supported: SKETCH_LAYOUT_VERSION,
             });
         }
         if self.encoding_version > ENCODING_VERSION {
@@ -680,7 +686,7 @@ impl SketchWriter {
         let mut out =
             Vec::with_capacity(PREAMBLE_LEN + header.len() + self.body.len() + FOOTER_LEN);
         out.extend_from_slice(&MAGIC);
-        out.extend_from_slice(&STORAGE_VERSION.to_le_bytes());
+        out.extend_from_slice(&SKETCH_LAYOUT_VERSION.to_le_bytes());
         out.extend_from_slice(&ENCODING_VERSION.to_le_bytes());
         out.extend_from_slice(&len_u32(header.len())?.to_le_bytes());
         out.extend_from_slice(&header);
@@ -811,11 +817,11 @@ impl<'a> SketchReader<'a> {
         let mut c = Cursor { buf: bytes, pos: 8 };
         let storage = c.u32()?;
         let encoding = c.u32()?;
-        if storage > STORAGE_VERSION {
+        if storage > SKETCH_LAYOUT_VERSION {
             return Err(Error::UnsupportedVersion {
                 what: "storage",
                 found: storage,
-                supported: STORAGE_VERSION,
+                supported: SKETCH_LAYOUT_VERSION,
             });
         }
         if encoding > ENCODING_VERSION {

@@ -100,6 +100,7 @@ An agent (or a person) may **observe** and **propose**. Only the engine may **sc
 - [How it works](#how-it-works)
 - [Results](#results)
 - [Highlights](#highlights)
+- [Index kinds](#index-kinds)
 - [How `fix` proves a change](#how-fix-proves-a-change)
 - [Questions over time](#questions-over-time)
 - [For a coding agent](#for-a-coding-agent)
@@ -195,6 +196,11 @@ Reproduce everything above, downloads included, with [`scripts/showcase.sh`](scr
 
 | Kind | Operator it serves | Declare | Planner |
 |---|---|---|---|
+| `exact` | key membership, `where key in (...)`, on one column or a composite key (prefix lookups too) | `index --key exact:col[,col]`; `exact:col@ts` also keeps each key's own time range per row group | `locate --keys`: exactly the row groups holding a key; with `--from`/`--to`, only those where that key's own times reach the window |
+| `bloom` | the same membership where an exact index would be too large | `index --key bloom:col@0.01` (the target false-positive rate) | `locate --keys`: a superset of the row groups holding a key, never short |
+| `range` | a range filter on one ordered column | `index --key range:col` | per-row-group min and max; a window lookup intersects it with the key specs |
+| `temporal` | latest and as-of: the newest version of each key, or the version current at an instant | `index --key temporal:col@ts`; on two clocks, `temporal2:col@valid,known` | `latest`, `asof --at`; `asof --valid --known` for what was known at one time about another |
+| `counts` (on `exact` and `temporal`) | `count(*) where key in (...)`: the count that precedes a gated query | `index --key exact:col,counts` or `temporal:col@ts,counts` | `count --keys`: exact rows and row groups from the index, no data file read; plans through the spec carry exact row counts |
 | `sketch` | `count(distinct col)`; "is this column a key" | `index --key sketch:col[,col][,a+b][,p=14][,minhash=K]` | never (approximate; read by `why`, `sketch cardinality`, `sketch overlap`) |
 
 ## How `fix` proves a change

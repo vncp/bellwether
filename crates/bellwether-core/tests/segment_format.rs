@@ -158,6 +158,127 @@ fn reader_src(r: &SegmentReader<Counting>) -> &Counting {
     r.source()
 }
 
+/// A 200k-key counted exact segment: one key's counts cost what its lookup
+/// costs, three range reads (bloom, key directory, value record), the
+/// counts riding in the value record (ADR 018).
+#[test]
+fn single_key_counts_on_a_200k_key_counted_segment_read_three_ranges() {
+    let spec = KeySpec::Exact {
+        columns: vec!["id".into(), "tag".into()],
+        counts: true,
+        bounds: None,
+    };
+    let mut w = SegmentWriter::new(spec, WriterOptions::default()).unwrap();
+    for i in 0..200_000u32 {
+        w.insert_rows(
+            &key(i64::from(i), "x"),
+            RowGroupId(i % 97),
+            u64::from(i % 5) + 1,
+        )
+        .unwrap();
+        w.insert_rows(&key(i64::from(i), "x"), RowGroupId(i % 13 + 200), 300)
+            .unwrap();
+    }
+    let seg = w.finish().unwrap();
+    let total = seg.bytes.len();
+    let r = SegmentReader::open(Counting {
+        bytes: seg.bytes,
+        reads: RefCell::new(Vec::new()),
+    })
+    .unwrap();
+    assert!(r.has_counts());
+    let opened: usize = r_reads(&r).iter().sum();
+    assert!(
+        opened < total / 20,
+        "open reads only header and index: {opened} of {total}"
+    );
+    clear(&r);
+    let k = key(123_456, "x");
+    let got = r.counts(std::slice::from_ref(&k)).unwrap().unwrap();
+    assert_eq!(
+        got[&k],
+        vec![
+            (RowGroupId(123_456 % 97), 2),
+            (RowGroupId(123_456 % 13 + 200), 300)
+        ]
+    );
+    let reads = r_reads(&r);
+    assert_eq!(reads.len(), 3, "bloom, key directory, value: {reads:?}");
+    assert!(reads.iter().sum::<usize>() < 128 * 1024, "{reads:?}");
+}
+
+/// A segment header edit.
+type Edit<'a> = &'a dyn Fn(&mut serde_json::Value);
+
+/// A storage version 2 segment header in a shape the next storage version
+/// 2 release writes (per-key bounds, the bitemporal kind or layout, a
+/// header `bounds` field) is refused by name with `UnsupportedShape`, which
+/// says to upgrade, before anything is misread.
+#[test]
+fn later_storage_version_2_segment_shapes_are_refused_by_name() {
+    let seg = SegmentWriter::new(
+        KeySpec::Exact {
+            columns: vec!["id".into(), "tag".into()],
+            counts: true,
+            bounds: None,
+        },
+        WriterOptions::default(),
+    )
+    .unwrap()
+    .finish()
+    .unwrap()
+    .bytes;
+    let header_len = u32::from_le_bytes(seg[16..20].try_into().unwrap()) as usize;
+    let header: serde_json::Value =
+        serde_json::from_slice(&seg[PREAMBLE_LEN..PREAMBLE_LEN + header_len]).unwrap();
+    let with = |edit: &dyn Fn(&mut serde_json::Value)| {
+        let mut h = header.clone();
+        edit(&mut h);
+        let json = serde_json::to_vec(&h).unwrap();
+        let mut b = seg[..16].to_vec();
+        b.extend(u32::try_from(json.len()).unwrap().to_le_bytes());
+        b.extend(json);
+        b.extend(&seg[PREAMBLE_LEN + header_len..]);
+        SegmentReader::open(b)
+    };
+    let cases: [(&str, &str, Edit<'_>); 4] = [
+        (
+            "key spec with per-key bounds",
+            "exact:id,tag@ts,counts",
+            &|h| {
+                h["key_spec"]["bounds"] = "ts".into();
+            },
+        ),
+        ("bitemporal key spec", "temporal2:id@valid,known", &|h| {
+            h["key_spec"] = serde_json::json!({"kind": "bitemporal", "columns": ["id"],
+                "valid_column": "valid", "known_column": "known"});
+        }),
+        ("segment layout", "bitemporal", &|h| {
+            h["layout"] = "bitemporal".into();
+        }),
+        ("segment header field", "bounds", &|h| {
+            h["bounds"] = serde_json::json!({"column": "ts", "time_type": {"type": "int64"}});
+        }),
+    ];
+    for (what, found, edit) in cases {
+        match with(edit) {
+            Err(e @ Error::UnsupportedShape { .. }) => {
+                let text = e.to_string();
+                assert!(
+                    matches!(&e, Error::UnsupportedShape { what: w, found: f }
+                        if *w == what && f == found),
+                    "{text}"
+                );
+                assert!(
+                    text.contains("not supported by this binary; upgrade"),
+                    "{text}"
+                );
+            }
+            other => panic!("{what}: expected UnsupportedShape, got {:?}", other.err()),
+        }
+    }
+}
+
 #[test]
 fn merge_equals_union_and_rejects_mixed_specs() {
     let mut a = SegmentWriter::new(temporal(), WriterOptions::default()).unwrap();
@@ -203,9 +324,46 @@ fn writer_rules() {
         .is_err());
     assert!(SegmentWriter::new(bloom(1.0), WriterOptions::default()).is_err());
     assert!(SegmentWriter::new(bloom(0.0), WriterOptions::default()).is_err());
-    assert!(
-        SegmentWriter::new(KeySpec::Exact { columns: vec![] }, WriterOptions::default()).is_err()
-    );
+    assert!(SegmentWriter::new(
+        KeySpec::Exact {
+            columns: vec![],
+            counts: false,
+            bounds: None,
+        },
+        WriterOptions::default()
+    )
+    .is_err());
+    // `exact:a,counts` is the spec on `a` storing counts, so a composite
+    // whose last column is named `counts` would share its identity; and a
+    // column containing an identity separator: both refused as new
+    // declarations (`check_names`), while the writer indexes a spec an
+    // index already declares as it is (a storage version 1 spec on `a,b`).
+    for (columns, needle) in [
+        (vec!["a", "counts"], "exact:counts,a"),
+        (vec!["a,counts"], "',' or '@'"),
+        (vec!["a@b"], "',' or '@'"),
+    ] {
+        let spec = KeySpec::Exact {
+            columns: columns.iter().map(|c| (*c).to_string()).collect(),
+            counts: false,
+            bounds: None,
+        };
+        match spec.check_names() {
+            Err(Error::KeySpec(m)) => assert!(m.contains(needle), "{m}"),
+            other => panic!("{columns:?}: expected a key spec refusal, got {other:?}"),
+        }
+        assert!(SegmentWriter::new(spec, WriterOptions::default()).is_ok());
+    }
+    // A spec whose first column is named `counts` is a plain composite.
+    assert!(SegmentWriter::new(
+        KeySpec::Exact {
+            columns: vec!["counts".into(), "a".into()],
+            counts: false,
+            bounds: None,
+        },
+        WriterOptions::default()
+    )
+    .is_ok());
     // Range lookups are refused on bloom segments; latest on non-temporal.
     let mut b = SegmentWriter::new(bloom(0.01), WriterOptions::default()).unwrap();
     b.insert(&key(1, "a"), RowGroupId(3)).unwrap();
@@ -281,7 +439,7 @@ fn header_records_bloom_hash_per_layout_and_refuses_unknown_values() {
 #[test]
 fn header_versions_must_agree_with_the_preamble() {
     let seg = big_exact(10);
-    let b = patch_header(&seg.bytes, "\"storage_version\":1", "\"storage_version\":0");
+    let b = patch_header(&seg.bytes, "\"storage_version\":2", "\"storage_version\":1");
     assert!(SegmentReader::open(b).is_err());
     let b = patch_header(
         &seg.bytes,
@@ -304,6 +462,7 @@ fn reused_parquet_filters_are_probed_only_with_plain_hashes() {
     let single = KeySpec::Bloom {
         columns: vec!["id".into()],
         fpr: 0.01,
+        bounds: None,
     };
     let mut w = SegmentWriter::new(single.clone(), WriterOptions::default()).unwrap();
     w.insert_filter(RowGroupId(2), 3, &plain_filter(&[10, 20, 30]))
@@ -492,6 +651,8 @@ fn add_batch_is_all_or_nothing_and_leaves_the_writer_usable() {
     let dataset = DataType::Decimal128(10, 2);
     let spec = KeySpec::Exact {
         columns: vec!["amt".into()],
+        counts: false,
+        bounds: None,
     };
     let mut w = SegmentWriter::for_dataset(
         spec,
@@ -522,6 +683,8 @@ fn add_batch_is_all_or_nothing_and_leaves_the_writer_usable() {
 fn headers_record_key_types_and_differing_types_never_merge() {
     let spec = KeySpec::Exact {
         columns: vec!["amt".into()],
+        counts: false,
+        bounds: None,
     };
     let build = |dt: DataType, rg: u32| {
         let mut w =
@@ -589,6 +752,8 @@ fn temporal_headers_record_the_ts_type_and_unit() {
 fn open_for_dataset_refuses_segments_encoded_under_other_types() {
     let spec = KeySpec::Exact {
         columns: vec!["amt".into()],
+        counts: false,
+        bounds: None,
     };
     let (d102, d123) = (DataType::Decimal128(10, 2), DataType::Decimal128(12, 3));
     let mut w = SegmentWriter::for_dataset(

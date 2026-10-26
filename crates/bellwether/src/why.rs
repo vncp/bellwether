@@ -624,8 +624,11 @@ impl Engine {
     ///    each candidate written as an engine Proposal citing the Evidence
     ///    and scored by a Replay record computed immediately before it is
     ///    written. Candidates are the exact key on each run's own key
-    ///    columns (the floor), then the profile's measured candidates that
-    ///    serve a run, at most `max_candidates`, minus specs already
+    ///    columns (the floor); for the columns of `count` runs, the exact
+    ///    key on them storing counts (`exact:<cols>,counts`, which answers a
+    ///    count from the index with no data file read), unless a current
+    ///    spec already counts them; then the profile's measured candidates
+    ///    that serve a run, at most `max_candidates`, minus specs already
     ///    current. A workload needs a writable index location: Proposals
     ///    cite a recorded Evidence.
     ///
@@ -1569,6 +1572,7 @@ impl Engine {
                 let spec = KeySpec::Temporal {
                     columns: c.clone(),
                     ts_column: t.ts_column.clone(),
+                    counts: false,
                 };
                 if !current_names.contains(&label(&spec)) && names.insert(label(&spec)) {
                     chosen.push((spec, CandidateOrigin::Workload));
@@ -1576,9 +1580,41 @@ impl Engine {
             }
         }
         for c in &run_columns {
-            let spec = KeySpec::Exact { columns: c.clone() };
+            let spec = KeySpec::Exact {
+                columns: c.clone(),
+                counts: false,
+                bounds: None,
+            };
             if !current_names.contains(&label(&spec)) && names.insert(label(&spec)) {
                 chosen.push((spec, CandidateOrigin::Workload));
+            }
+        }
+        // A count run: the exact key on its columns storing counts answers
+        // the count from the index with no data file read, so it is priced
+        // whenever no current spec counts those columns already (one that
+        // stores counts on exactly the run's columns, in any order).
+        if temporal.is_none() {
+            let counted: BTreeSet<Vec<String>> = workload
+                .runs()
+                .iter()
+                .filter(|r| matches!(r.query(), Ok(RunQuery::Count)))
+                .map(|r| r.columns.clone())
+                .collect();
+            for c in counted {
+                let answered = report.current_specs.iter().any(|s| {
+                    s.counts()
+                        && s.columns().len() == c.len()
+                        && s.columns().iter().all(|x| c.contains(x))
+                });
+                let spec = KeySpec::Exact {
+                    columns: c,
+                    counts: true,
+                    bounds: None,
+                };
+                if !answered && !current_names.contains(&label(&spec)) && names.insert(label(&spec))
+                {
+                    chosen.push((spec, CandidateOrigin::Workload));
+                }
             }
         }
         // A window run: the temporal key on its key columns and the
@@ -1600,7 +1636,11 @@ impl Engine {
             if !orderable || columns.contains(&ts_column) {
                 continue;
             }
-            let spec = KeySpec::Temporal { columns, ts_column };
+            let spec = KeySpec::Temporal {
+                columns,
+                ts_column,
+                counts: false,
+            };
             if !current_names.contains(&label(&spec)) && names.insert(label(&spec)) {
                 chosen.push((spec, CandidateOrigin::Window));
             }
@@ -1610,6 +1650,8 @@ impl Engine {
             let cols = &entry.fanout.columns;
             let exact_spec = KeySpec::Exact {
                 columns: cols.clone(),
+                counts: false,
+                bounds: None,
             };
             if !serves(&exact_spec) {
                 if !current_names.contains(&label(&exact_spec))
@@ -1627,6 +1669,7 @@ impl Engine {
                     let tspec = KeySpec::Temporal {
                         columns: cols.clone(),
                         ts_column: t.ts_column.clone(),
+                        counts: false,
                     };
                     if !current_names.contains(&label(&tspec))
                         && !names.contains(&label(&tspec))
@@ -1654,7 +1697,10 @@ impl Engine {
                 evidence: vec![evidence],
                 proposed_by: ENGINE_PROPOSER.to_string(),
                 created_at: self.now(),
-                body: ProposalBody::Key { spec: spec.clone() },
+                body: ProposalBody::Key {
+                    spec: spec.clone(),
+                    sidecars: Vec::new(),
+                },
             }))?;
             let (replay_hash, scored) = if self.is_table() {
                 // Over a table every cost is measured: scored, marked so,
@@ -1708,7 +1754,47 @@ impl Engine {
             } else {
                 None
             };
-            let kind_column = sketch_column(&report.sketch, spec.columns());
+            // The kind column: the sketch's rows per value where a sketch
+            // holds the candidate's columns; otherwise the `counts` column: for an exact candidate on exactly the
+            // workload's key columns, the rows its keys hold, from a replay
+            // with that key storing counts (the counts replay computes for
+            // `exact:<cols>,counts`; exact).
+            let kind_column = match sketch_column(&report.sketch, spec.columns()) {
+                Some(c) => Some(c),
+                None => match &spec {
+                    KeySpec::Exact {
+                        columns,
+                        bounds: None,
+                        ..
+                    } if temporal.is_none()
+                        && workload.runs().iter().all(|r| {
+                            &r.columns == columns && matches!(r.query(), Ok(RunQuery::Locate))
+                        }) =>
+                    {
+                        let counted = KeySpec::Exact {
+                            columns: columns.clone(),
+                            counts: true,
+                            bounds: None,
+                        };
+                        let specs = proposed_specs(replayer.current_specs(), &counted);
+                        let costs = replayer.replay_specs(&specs, workload, cache)?;
+                        costs
+                            .iter()
+                            .map(|c| c.rows.as_ref().map(|q| q.value))
+                            .sum::<Option<u64>>()
+                            .map(|rows| bellwether_types::KindColumn {
+                                kind: "counts".into(),
+                                label: format!(
+                                    "rows holding the keys over every run, as {} counts them",
+                                    counted.identity()
+                                ),
+                                value: rows.to_string(),
+                                exactness: bellwether_types::Exactness::Exact,
+                            })
+                    }
+                    _ => None,
+                },
+            };
             report.candidates.push(Candidate {
                 spec,
                 origin,
@@ -2099,9 +2185,13 @@ fn infer_workload_temporal(
         return Ok(None);
     };
     let query = first.query()?;
-    // A window run reads every row of its keys in a fixed window: no
-    // version is chosen, so there is no temporal lookup to infer.
-    if matches!(query, RunQuery::Locate | RunQuery::Window(_)) {
+    // A window run reads every row of its keys in a fixed window, and a
+    // count run counts every row of its keys: no version is chosen, so
+    // there is no temporal lookup to infer.
+    if matches!(
+        query,
+        RunQuery::Locate | RunQuery::Window(_) | RunQuery::Count
+    ) {
         return Ok(None);
     }
     let ts_column = current_specs
@@ -2161,6 +2251,7 @@ mod tests {
             message: format!("{rule} on {column}"),
             confidence,
             site: None,
+            fix: None,
         }
     }
 
@@ -2187,6 +2278,8 @@ mod tests {
     fn exact(c: &str) -> KeySpec {
         KeySpec::Exact {
             columns: vec![c.into()],
+            counts: false,
+            bounds: None,
         }
     }
 

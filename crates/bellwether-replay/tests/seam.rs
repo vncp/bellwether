@@ -43,10 +43,12 @@ fn a_changed_fpr_or_ts_column_is_a_miss() {
     let t1 = KeySpec::Temporal {
         columns: cols(&["k_i64"]),
         ts_column: "ts".into(),
+        counts: false,
     };
     let t2 = KeySpec::Temporal {
         columns: cols(&["k_i64"]),
         ts_column: "k_u32".into(),
+        counts: false,
     };
     assert_eq!(t1.name(), t2.name());
     let a = r.transient(&t1).unwrap();
@@ -55,10 +57,12 @@ fn a_changed_fpr_or_ts_column_is_a_miss() {
     let b1 = KeySpec::Bloom {
         columns: cols(&["k_i64"]),
         fpr: 0.1,
+        bounds: None,
     };
     let b2 = KeySpec::Bloom {
         columns: cols(&["k_i64"]),
         fpr: 0.2,
+        bounds: None,
     };
     r.transient(&b1).unwrap();
     r.transient(&b2).unwrap();
@@ -78,6 +82,8 @@ fn version_zero_folders_are_keyed_apart_and_cross_catalog_indexes_refused() {
     assert_ne!(ca.digest(), cb.digest());
     let spec = KeySpec::Exact {
         columns: cols(&["k_i64"]),
+        counts: false,
+        bounds: None,
     };
     let cache = TransientCache::new(1 << 30);
     let lim = TransientLimits::default();
@@ -111,6 +117,8 @@ fn key_types_are_part_of_the_cache_key_and_the_seam_refuses_a_mismatch() {
     assert_ne!(c3.digest(), c4.digest(), "the schema is part of the digest");
     let spec = KeySpec::Exact {
         columns: cols(&["k_dec"]),
+        counts: false,
+        bounds: None,
     };
     let lim = TransientLimits::default();
     let cache = TransientCache::new(1 << 30);
@@ -185,6 +193,7 @@ fn bloom_fpr_survives_the_segment_header_round_trip() {
         let s = KeySpec::Bloom {
             columns: cols(&["a"]),
             fpr,
+            bounds: None,
         };
         let back: KeySpec = serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
         assert_eq!(back, s, "fpr {fpr:e} does not survive the round trip");
@@ -201,6 +210,7 @@ fn bloom_fpr_survives_the_segment_header_round_trip() {
         let spec = KeySpec::Bloom {
             columns: cols(&["k_i64"]),
             fpr,
+            bounds: None,
         };
         assert_eq!(r.transient(&spec).unwrap().spec(), &spec);
     }
