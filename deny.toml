@@ -5,11 +5,24 @@ all-features = true
 [advisories]
 version = 2
 yanked = "deny"
-# No advisory is ignored. The Phase 3 dependency upgrade (2026-10-24) removed
-# the five transitive ignores that the arrow 53 / object_store 0.11 /
-# DataFusion 43 pins required; a new ignore needs a dated reason naming the
-# crate that pulls it and the upstream issue.
-ignore = []
+# The Phase 3 dependency upgrade (2026-10-24) removed the five transitive
+# ignores that the arrow 53 / object_store 0.11 / DataFusion 43 pins
+# required; a new ignore needs a dated reason naming the crate that pulls it
+# and the upstream issue.
+ignore = [
+  # 2026-10-26: parquet 59 and arrow-ipc 59 pin zstd ^0.13 (zstd-safe 7);
+  # the fixes are in zstd 0.14.3 / zstd-safe 8.2.0, which only parquet and
+  # arrow 60 accept. The parquet 60 upgrade is tracked in
+  # https://github.com/vncp/bellwether/issues/28 and also waits on
+  # DataFusion 56 (the bench `datafusion` baseline; DataFusion 55.2, the
+  # latest release, pins parquet 59). Not reachable from Bellwether: parquet
+  # and arrow-ipc 59 call only zstd::bulk (CCtx::compress2,
+  # DCtx::decompress), never the affected stream `with_context` constructors
+  # (0391) or DCtx::decompress_stream (0403). RUSTSEC-2026-0410 (zstd-sys) is
+  # fixed in the lock: zstd-sys 2.1.2 is semver-compatible with zstd-safe 7.
+  { id = "RUSTSEC-2026-0391", reason = "parquet 59 pins zstd 0.13; parquet 60 upgrade tracked in #28 (2026-10-26); unreachable: only zstd::bulk is used" },
+  { id = "RUSTSEC-2026-0403", reason = "parquet 59 pins zstd-safe 7; parquet 60 upgrade tracked in #28 (2026-10-26); unreachable: DCtx::decompress_stream is not called" },
+]
 
 [licenses]
 version = 2
