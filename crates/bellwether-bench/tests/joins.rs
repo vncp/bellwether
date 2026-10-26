@@ -1,7 +1,12 @@
 //! The join corpora (B3): deterministic, skewed as documented, and their
 //! truth equal to an independent decode of both datasets' files.
 
-#![allow(clippy::unwrap_used, missing_docs, clippy::cast_possible_truncation)]
+#![allow(
+    clippy::unwrap_used,
+    missing_docs,
+    clippy::cast_possible_truncation,
+    clippy::many_single_char_names
+)]
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;

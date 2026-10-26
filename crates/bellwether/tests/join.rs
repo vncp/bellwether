@@ -6,7 +6,13 @@
 //! the loop why --mode semijoin -> fix -> receipt -> semijoin, where the
 //! plan after the fix is the one why priced.
 
-#![allow(clippy::unwrap_used, clippy::too_many_lines, missing_docs)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::too_many_lines,
+    clippy::many_single_char_names,
+    clippy::cast_possible_wrap,
+    missing_docs
+)]
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
@@ -716,10 +722,10 @@ fn repeated_semijoins_without_a_join_key_raise_r_join_1() {
         .inputs
         .contains(&w.workload.as_ref().unwrap().hash));
     // One run: not repeated.
-    assert!(rules(&left.why(&req(false)).unwrap()).is_empty());
+    assert_eq!(rules(&left.why(&req(false)).unwrap()), vec![]);
     // With the join key: silent.
     left.index(&[join()]).unwrap();
-    assert!(rules(&left.why(&req(true)).unwrap()).is_empty());
+    assert_eq!(rules(&left.why(&req(true)).unwrap()), vec![]);
     // A locate workload on the same column: silent.
     let plain = left
         .why(&WhyRequest {
@@ -728,5 +734,5 @@ fn repeated_semijoins_without_a_join_key_raise_r_join_1() {
             ..WhyRequest::default()
         })
         .unwrap();
-    assert!(rules(&plain).is_empty());
+    assert_eq!(rules(&plain), vec![]);
 }

@@ -1253,7 +1253,7 @@ impl Engine {
     /// groups (the union over runs of the two-step plan under the current
     /// keys plus the join key). The right certificate is written first;
     /// the left one, which a receipt cites, cites it.
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     fn verify_join(
         &self,
         proposal: &Hash,
@@ -1265,6 +1265,7 @@ impl Engine {
         pinned: Option<&Pinned>,
         pair: &WhyPair,
     ) -> Result<(Written, Written, Reconciliation, JoinCheck)> {
+        type Selected = BTreeMap<String, (FileFingerprint, RoaringBitmap)>;
         let KeySpec::Join {
             columns,
             right,
@@ -1275,8 +1276,7 @@ impl Engine {
             return Err(Error::KeySpec(format!("{} is not a join key", spec.name())));
         };
         let specs = proposed_specs(replayer.current_specs(), spec);
-        let rreplayer = replayer_of(pair)?;
-        type Selected = BTreeMap<String, (FileFingerprint, RoaringBitmap)>;
+        let right_replayer = replayer_of(pair)?;
         let (mut lsel, mut rsel): (Selected, Selected) = (BTreeMap::new(), BTreeMap::new());
         let mut asked: std::collections::BTreeSet<Vec<u8>> = std::collections::BTreeSet::new();
         for run in workload.runs() {
@@ -1330,8 +1330,8 @@ impl Engine {
         )?;
         let rhas = present_keys(
             pair.source(),
-            rreplayer.catalog(),
-            rreplayer.schema(),
+            right_replayer.catalog(),
+            right_replayer.schema(),
             right_columns,
             &asked,
         )?;
@@ -1345,13 +1345,16 @@ impl Engine {
             None => cache.get_cached(&workload.hash())?,
         };
         let age = cached.map_or(Duration::ZERO, |(_, age)| age);
-        let right_plan =
-            self.plan_evidence(&rreplayer, workload, union_plan(&rreplayer, &rsel)?)?;
+        let right_plan = self.plan_evidence(
+            &right_replayer,
+            workload,
+            union_plan(&right_replayer, &rsel)?,
+        )?;
         let (right_cert, right_outcome) = self.certify_side(
             proposal,
             right_columns,
             &matched,
-            (&rreplayer, pair.source(), pair.right().root()),
+            (&right_replayer, pair.source(), pair.right().root()),
             rsel,
             Some(anchor(pair.rpin())),
             vec![right_plan.hash],
@@ -1599,53 +1602,50 @@ impl Engine {
     ) -> Result<(FixOutcome, Vec<SignatureWritten>)> {
         #[cfg(test)]
         test_seam::before_apply(self);
-        let committed = match join {
-            // A join key (B3) is declared and built whole in one commit
-            // from both datasets' exact keys, pinned to the right manifest
-            // the right certificate verified; a right commit since then is
-            // refused before anything is written.
-            Some((pair, right_cert)) => {
-                let certified = pair.rpin().sequence();
-                let current = pair.right().manifest()?.map_or(0, |m| m.sequence);
-                if current != certified {
+        // A join key (B3) is declared and built whole in one commit from
+        // both datasets' exact keys, pinned to the right manifest the right
+        // certificate verified; a right commit since then is refused before
+        // anything is written.
+        let committed = if let Some((pair, right_cert)) = join {
+            let certified = pair.rpin().sequence();
+            let current = pair.right().manifest()?.map_or(0, |m| m.sequence);
+            if current != certified {
+                return Ok((
+                    refused(Refusal::StaleManifest {
+                        certificate: right_cert,
+                        certified: certified.to_string(),
+                        current: current.to_string(),
+                    }),
+                    Vec::new(),
+                ));
+            }
+            match Builder::new(Arc::clone(self.store()?), "").refresh_join(
+                spec,
+                pair.right().store()?,
+                "",
+            )? {
+                bellwether_build::JoinRefresh::Built {
+                    sequence,
+                    right_sequence,
+                    ..
+                } if right_sequence == certified => Some(sequence),
+                bellwether_build::JoinRefresh::Built { right_sequence, .. } => {
                     return Ok((
                         refused(Refusal::StaleManifest {
                             certificate: right_cert,
                             certified: certified.to_string(),
-                            current: current.to_string(),
+                            current: right_sequence.to_string(),
                         }),
                         Vec::new(),
                     ));
                 }
-                match Builder::new(Arc::clone(self.store()?), "").refresh_join(
-                    spec,
-                    Arc::clone(pair.right().store()?),
-                    "",
-                )? {
-                    bellwether_build::JoinRefresh::Built {
-                        sequence,
-                        right_sequence,
-                        ..
-                    } if right_sequence == certified => Some(sequence),
-                    bellwether_build::JoinRefresh::Built { right_sequence, .. } => {
-                        return Ok((
-                            refused(Refusal::StaleManifest {
-                                certificate: right_cert,
-                                certified: certified.to_string(),
-                                current: right_sequence.to_string(),
-                            }),
-                            Vec::new(),
-                        ));
-                    }
-                    bellwether_build::JoinRefresh::Fresh { .. } => None,
-                }
+                bellwether_build::JoinRefresh::Fresh { .. } => None,
             }
-            None => {
-                let options = self.build_options(Vec::new());
-                Builder::new(Arc::clone(self.store()?), "")
-                    .build(self.root(), std::slice::from_ref(spec), &options)?
-                    .sequence
-            }
+        } else {
+            let options = self.build_options(Vec::new());
+            Builder::new(Arc::clone(self.store()?), "")
+                .build(self.root(), std::slice::from_ref(spec), &options)?
+                .sequence
         };
         let after = match advance(before, committed) {
             Ok(after) => after,

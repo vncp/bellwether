@@ -403,19 +403,17 @@ pub fn build_pair<RL: ReadAt, RR: ReadAt>(
                     if null(lk) {
                         left_only += 1;
                         right_only += 1;
+                    } else if *counts {
+                        out.push_join(lk, lv, rv)?;
                     } else {
-                        if *counts {
-                            out.push_join(lk, lv, rv)?;
-                        } else {
-                            // Counted exact keys serve an uncounted join
-                            // key too; their counts are not stored.
-                            let bare = |v: &KeyValue| KeyValue {
-                                bitmap: v.bitmap.clone(),
-                                chain: v.chain.clone(),
-                                counts: None,
-                            };
-                            out.push_join(lk, &bare(lv), &bare(rv))?;
-                        }
+                        // Counted exact keys serve an uncounted join key
+                        // too; their counts are not stored.
+                        let bare = |v: &KeyValue| KeyValue {
+                            bitmap: v.bitmap.clone(),
+                            chain: v.chain.clone(),
+                            counts: None,
+                        };
+                        out.push_join(lk, &bare(lv), &bare(rv))?;
                     }
                     l = ls.next()?;
                     r = rs.next()?;

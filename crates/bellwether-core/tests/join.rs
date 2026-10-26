@@ -6,7 +6,9 @@
     clippy::unwrap_used,
     missing_docs,
     clippy::cast_possible_truncation,
-    clippy::too_many_lines
+    clippy::too_many_lines,
+    clippy::many_single_char_names,
+    clippy::cast_sign_loss
 )]
 
 use std::cell::Cell;
@@ -521,7 +523,7 @@ fn every_byte_of_a_pair_segment_corrupted_is_refused_never_misread() {
         let got = catch_unwind(AssertUnwindSafe(|| read_all(bad)));
         QUIET.with(|q| q.set(false));
         match got {
-            Err(_) => panic!("{what}: a read panicked"),
+            Err(panic) => panic!("{what}: a read panicked: {panic:?}"),
             Ok(Some(answer)) => assert!(answer == want, "{what}: read a different answer"),
             Ok(None) => {}
         }

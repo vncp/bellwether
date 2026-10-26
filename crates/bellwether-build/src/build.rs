@@ -313,6 +313,7 @@ impl<S: StoreExt + ?Sized> Builder<S> {
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     fn attempt(&self, root: &str, key_specs: &[KeySpec], opts: &BuildOptions) -> Result<Attempt> {
         let base = read_manifest(&*self.store, &self.index_root)?.map(|(m, _)| m);
         if let Some(m) = &base {

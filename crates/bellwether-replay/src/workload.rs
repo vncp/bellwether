@@ -341,6 +341,7 @@ pub struct RecordedRun {
 impl RecordedRun {
     /// The typed query kind of this run, or an error if `query_kind`,
     /// `asof`, `lookback`, and `window` disagree or name an unknown kind.
+    #[allow(clippy::too_many_lines)]
     pub fn query(&self) -> Result<RunQuery> {
         if self.query_kind == QUERY_KIND_WINDOW {
             return match (&self.window, self.asof, self.lookback) {

@@ -94,6 +94,7 @@ impl JoinState {
 
 /// What [`Builder::refresh_join`] did.
 #[derive(Clone, Debug, PartialEq)]
+#[allow(clippy::large_enum_variant)]
 pub enum JoinRefresh {
     /// The pair index was already fresh; nothing was committed.
     Fresh {
@@ -366,12 +367,12 @@ impl<S: StoreExt + ?Sized> Builder<S> {
     pub fn refresh_join<R: StoreExt + ?Sized>(
         &self,
         spec: &KeySpec,
-        right_store: Arc<R>,
+        right_store: &Arc<R>,
         right_root: &str,
     ) -> Result<JoinRefresh> {
         let mut restarts = 0u32;
         loop {
-            if let Some(done) = self.try_refresh_join(spec, &right_store, right_root)? {
+            if let Some(done) = self.try_refresh_join(spec, right_store, right_root)? {
                 return Ok(done);
             }
             restarts += 1;

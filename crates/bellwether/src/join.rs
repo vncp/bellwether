@@ -17,6 +17,7 @@
 //! that rebuilds it, and [`Engine::join_verify`] reports each key's state.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt::Write as _;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -241,7 +242,7 @@ impl Engine {
             )));
         }
         let options = EngineOptions {
-            format: self.options().format.clone(),
+            format: self.options().format,
             clock: self.options().clock.clone(),
             threads: self.options().threads,
             ..EngineOptions::default()
@@ -350,7 +351,7 @@ impl Engine {
             let rpin = right.pin_required("a join key")?;
             right.refuse_stale(&rpin, "a join key")?;
             let done = builder
-                .refresh_join(&spec, Arc::clone(right.store()?), "")
+                .refresh_join(&spec, right.store()?, "")
                 .map_err(|e| self.side_hint(&right, e))?;
             let pinned = self.pin_required("index")?;
             let mut state = self.join_key_state(&pinned, &spec, &right)?;
@@ -857,12 +858,13 @@ pub(crate) fn join_column(
     );
     for g in gates {
         let fits = if matched <= g.limit { "within" } else { "over" };
-        value.push_str(&format!(
+        let _ = write!(
+            value,
             "; {} shared keys {fits} {} ({})",
             thousands(matched),
             g.name,
             thousands(g.limit)
-        ));
+        );
     }
     Ok(KindColumn {
         kind: "join".into(),

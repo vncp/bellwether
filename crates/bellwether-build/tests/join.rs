@@ -20,7 +20,10 @@
     clippy::too_many_lines,
     clippy::cast_possible_truncation,
     clippy::cast_sign_loss,
-    clippy::similar_names
+    clippy::similar_names,
+    clippy::cast_precision_loss,
+    clippy::cast_possible_wrap,
+    clippy::type_complexity
 )]
 
 mod common;
@@ -148,7 +151,7 @@ impl Pair {
 
     fn refresh(&self, spec: &KeySpec) -> JoinRefresh {
         builder(&self.left)
-            .refresh_join(spec, Arc::clone(&self.right), "idx")
+            .refresh_join(spec, &self.right, "idx")
             .unwrap()
     }
 
@@ -579,7 +582,7 @@ fn a_missing_exact_key_on_either_side_is_refused_naming_it() {
     let p = Pair::new(false);
     // Counted join, uncounted exact keys on both sides: the left is named.
     let err = builder(&p.left)
-        .refresh_join(&join(true), Arc::clone(&p.right), "idx")
+        .refresh_join(&join(true), &p.right, "idx")
         .unwrap_err();
     match &err {
         Error::NotIndexed { needs: Some(n), .. } => {
@@ -596,7 +599,7 @@ fn a_missing_exact_key_on_either_side_is_refused_naming_it() {
         &parquet_opts(&left_schema()),
     );
     let err = builder(&p.left)
-        .refresh_join(&join(true), Arc::clone(&p.right), "idx")
+        .refresh_join(&join(true), &p.right, "idx")
         .unwrap_err();
     match &err {
         Error::NotIndexed {
@@ -622,7 +625,7 @@ fn a_missing_exact_key_on_either_side_is_refused_naming_it() {
         counts: false,
     };
     let err = builder(&fresh.left)
-        .refresh_join(&other, Arc::clone(&fresh.right), "idx")
+        .refresh_join(&other, &fresh.right, "idx")
         .unwrap_err();
     assert!(
         matches!(&err, Error::NotIndexed { needs: Some(n), .. } if n.starts_with("exact:amount")),
@@ -648,7 +651,7 @@ fn a_float_column_or_another_left_folder_is_refused_before_anything_is_built() {
     };
     let seq = planner(&p.left).sequence();
     let err = builder(&p.left)
-        .refresh_join(&float, Arc::clone(&p.right), "idx")
+        .refresh_join(&float, &p.right, "idx")
         .unwrap_err();
     assert!(err.to_string().contains("is a float"), "{err}");
     let elsewhere = KeySpec::Join {
@@ -659,7 +662,7 @@ fn a_float_column_or_another_left_folder_is_refused_before_anything_is_built() {
         counts: false,
     };
     let err = builder(&p.left)
-        .refresh_join(&elsewhere, Arc::clone(&p.right), "idx")
+        .refresh_join(&elsewhere, &p.right, "idx")
         .unwrap_err();
     assert!(err.to_string().contains("the folder \"orders\""), "{err}");
     assert_eq!(planner(&p.left).sequence(), seq, "nothing committed");

@@ -548,16 +548,15 @@ impl<'a> Replayer<'a> {
                     recorded = run.query()?;
                     &recorded
                 };
-                let (cost, unserved) = match query.join() {
-                    Some(j) => self.semijoin_cost(planner.as_ref(), specs, &run.run_id, &rk, j)?,
-                    None => {
-                        let (plan, unserved) =
-                            self.verified_plan(planner.as_ref(), specs, &rk, query)?;
-                        (
-                            cost_of(query, &run.run_id, rk.len() as u64, &plan),
-                            unserved,
-                        )
-                    }
+                let (cost, unserved) = if let Some(j) = query.join() {
+                    self.semijoin_cost(planner.as_ref(), specs, &run.run_id, &rk, j)?
+                } else {
+                    let (plan, unserved) =
+                        self.verified_plan(planner.as_ref(), specs, &rk, query)?;
+                    (
+                        cost_of(query, &run.run_id, rk.len() as u64, &plan),
+                        unserved,
+                    )
                 };
                 stats |= unserved;
                 Ok(cost)

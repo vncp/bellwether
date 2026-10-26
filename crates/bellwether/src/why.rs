@@ -1462,6 +1462,7 @@ impl Engine {
 
     /// Refuses a `why` request whose flags contradict each other, before any
     /// work. Returns whether it carries a workload.
+    #[allow(clippy::too_many_lines)]
     fn check_why_request(&self, req: &WhyRequest) -> Result<bool> {
         let given = [
             req.keys.is_some(),
@@ -1714,6 +1715,7 @@ impl Engine {
         Ok((profile, out))
     }
 
+    #[allow(clippy::too_many_lines)]
     fn record_workload(
         &self,
         req: &WhyRequest,

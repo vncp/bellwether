@@ -238,7 +238,7 @@ fn semijoin_runs_price_what_the_build_planner_plans() {
 
         // The committed pair: what `semijoin` plans.
         Builder::new(Arc::clone(&ls), "idx")
-            .refresh_join(&spec, Arc::clone(&rs), "idx")
+            .refresh_join(&spec, &rs, "idx")
             .unwrap();
         let (lp, rp) = (
             Planner::open(Arc::clone(&ls), "idx").unwrap(),

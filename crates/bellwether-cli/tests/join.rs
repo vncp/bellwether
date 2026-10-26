@@ -7,7 +7,13 @@
 //! tool argument. The human output names both steps, the `join` column,
 //! and, for a stale key, the command that rebuilds it.
 
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::too_many_lines)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::too_many_lines,
+    clippy::many_single_char_names,
+    clippy::cast_possible_wrap
+)]
 
 mod common;
 
