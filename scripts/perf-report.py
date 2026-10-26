@@ -73,8 +73,10 @@ class Doc:
                         ctxl = self.c.get(base)
                         if not ctxl:
                             continue
-                        cell = lambda what: (f"{fmt_ms(self.v(f'{base}/{what}/{cache}/p50'))} / "
-                                             f"{fmt_ms(self.v(f'{base}/{what}/{cache}/p95'))}")
+                        # DuckDB's .timer has 1 ms resolution: whole ms.
+                        f = lambda what, v: (f"{v:,.0f}" if what == "duckdb" and v is not None else fmt_ms(v))
+                        cell = lambda what: (f"{f(what, self.v(f'{base}/{what}/{cache}/p50'))} / "
+                                             f"{f(what, self.v(f'{base}/{what}/{cache}/p95'))}")
                         out.append(f"| `{name}` | {k:,} | {ctxl['planned']['row_groups']:,} of "
                                    f"{ctxl['row_groups_total']:,} | {ctxl['planned']['bytes']:,} | "
                                    f"{cell('plan')} | {cell('e2e')} | {cell('duckdb')} |")
@@ -118,8 +120,8 @@ class Doc:
             first = next(v for k, v in self.c.items() if k.startswith(f"reconcile/{ds}/") and isinstance(v, dict) and "memory" in v)
             out.append(f"#### {ds}: {first['rows'][0]:,} rows left, {first['rows'][1]:,} right ({first['what']}); "
                        f"pass: {first['pass']}\n")
-            out.append("| budget | wall (s) | rows / s per side | passes | meter peak (MiB) | peak RSS (MiB) |")
-            out.append("|---|---:|---:|---:|---:|---:|")
+            out.append("| budget | wall (s, n = 1) | rows / s per side | passes | meter peak (MiB) | peak RSS (MiB) | peak footprint (MiB) | stated bound (MiB) |")
+            out.append("|---|---:|---:|---:|---:|---:|---:|---:|")
             skipped = []
             for b in ("64M", "256M", "1G", "8G"):
                 w = self.v(f"reconcile/{ds}/{b}/wall")
@@ -128,9 +130,14 @@ class Doc:
                     if nr:
                         skipped.append(f"{b}: not run, {nr}")
                     continue
+                mem = self.c[f"reconcile/{ds}/{b}"]["memory"]
+                bound = mem["budget_bytes"] + mem["peak_batch_bytes"] + (256 << 20)
+                foot = self.v(f"reconcile/{ds}/{b}/peak-footprint")
+                rss = self.v(f"reconcile/{ds}/{b}/peak-rss")
+                over = " **(over)**" if max(rss, foot or 0) > bound else ""
                 out.append(f"| {b} | {w / 1000:,.1f} | {self.v(f'reconcile/{ds}/{b}/rows-per-s-per-side'):,} | "
                            f"{self.v(f'reconcile/{ds}/{b}/passes')} | {mib(self.v(f'reconcile/{ds}/{b}/meter-peak'))} | "
-                           f"{mib(self.v(f'reconcile/{ds}/{b}/peak-rss'))} |")
+                           f"{mib(rss)}{over} | {mib(foot) if foot is not None else 'not recorded'} | {mib(bound)} |")
             if skipped:
                 out.append("\n" + "; ".join(skipped) + ".")
             one = self.c.get(f"reconcile/{ds}/smallest-one-pass")
@@ -172,15 +179,30 @@ class Doc:
                 continue
             name = k.split("/", 1)[1]
             idle = v["idle_weight"] / max(1, v["idle_weight"] + v["on_cpu_weight"]) * 100
+            cpu = f"{v['cpu_seconds']:,.1f} s of CPU sampled" if v.get("cpu_seconds") is not None else "CPU sampled"
             out.append(f"#### {name}\n")
             out.append(f"`{v['command']}`, {v['iterations']} iteration(s) at {v['rate_hz']} Hz"
                        + (f", {v['passes']} passes" if "passes" in v else "")
-                       + f"; idle waits are {idle:.0f}% of sampled weight and are not ranked.\n")
+                       + f"; {cpu}. Each sample's CPU delta is credited to the stack the thread had at the "
+                       f"previous sample (the CPU was used in between); {idle:.0f}% of it is still charged to a "
+                       "wait primitive, which is the kernel time spent sleeping and waking threads. The self "
+                       "and inclusive tables below rank the rest.\n")
             out.append("| # | self % (on CPU) | frame |")
             out.append("|---:|---:|---|")
             for i, t in enumerate(v["top"], 1):
                 frame = t["frame"].replace("|", "\\|")
                 out.append(f"| {i} | {t['self_pct']} | `{frame}` |")
+            u = v.get("unprofiled")
+            if u:
+                out.append(f"Run once more without the profiler under `/usr/bin/time -p`: {u['wall_s']:.2f} s wall, "
+                           f"{u['user_s']:.2f} s user, {u['sys_s']:.2f} s system, so {u['cores_busy']:.2f} cores "
+                           "busy on average.\n")
+            if v.get("waits") and idle >= 5:
+                out.append("CPU charged to wait primitives (% of all sampled CPU), and the code that waited:\n")
+                for wt in v["waits"]:
+                    out.append(f"- `{wt['frame']}` {wt['cpu_pct']}: " + ("; ".join(
+                        f"`{c['frame']}` {c['cpu_pct']}" for c in wt["callers"]) or "no caller named"))
+                out.append("")
             callers = v.get("callers") or {}
             if any(callers.values()):
                 out.append("\nWho called the top self frames that are not bellwether's own: the nearest "
@@ -191,10 +213,11 @@ class Doc:
                         out.append(f"- `{frame}`: " + "; ".join(f"`{c['frame']}` {c['pct']}" for c in cs))
             if v.get("inclusive"):
                 out.append("\nbellwether functions by inclusive on-CPU time (every thread):\n")
-                out.append("| # | total % (on CPU) | function |")
-                out.append("|---:|---:|---|")
+                out.append("| # | total % (on CPU) | without store reads % | function |")
+                out.append("|---:|---:|---:|---|")
                 for i, t in enumerate(v["inclusive"], 1):
-                    out.append(f"| {i} | {t['total_pct']} | `{t['frame']}` |")
+                    nr = t.get("without_store_reads_pct", "-")
+                    out.append(f"| {i} | {t['total_pct']} | {nr} | `{t['frame']}` |")
             if v.get("main_thread_wall"):
                 out.append(f"\nMain thread wall time ({v['main_thread_wall_samples']:,} samples, on CPU or "
                            "waiting), by bellwether function on the stack:\n")
