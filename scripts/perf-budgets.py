@@ -19,6 +19,24 @@ import sys
 
 FACTOR = 1.25
 
+# Which section of scripts/perf.py measured a metric, by id prefix.
+SECTION = {"lookup": "lookups", "process": "lookups", "build": "build", "reconcile": "reconcile",
+           "replay": "latency", "observe": "latency", "mcp": "latency", "why": "latency",
+           "resident": "latency", "profile": "profiles"}
+
+
+def section_of(mid, sections):
+    """The section record (when, at which commit, under what load) behind a
+    metric; reconcile pairs measured in separate slots have their own."""
+    parts = mid.split("/")
+    name = SECTION.get(parts[0])
+    if name == "reconcile":
+        short = parts[1].split("-")[0]
+        for key, rec in sections.items():
+            if key.startswith("reconcile ") and short in key.split(" ", 1)[1].split(","):
+                return rec
+    return sections.get(name)
+
 
 def q(s):
     return json.dumps(s, ensure_ascii=False)
@@ -55,6 +73,7 @@ def main():
         if v is None:
             continue
         budget = v * FACTOR if m["direction"] == "lower" else v / FACTOR
+        sec = section_of(m["id"], env.get("sections", {}))
         out += [
             "[[budget]]",
             f"id = {q(m['id'])}",
@@ -62,8 +81,10 @@ def main():
             f"direction = {q(m['direction'])}",
             f"measured = {round(v, 3)}",
             f"budget = {round(budget, 3)}",
-            "",
         ]
+        if sec:
+            out += [f"measured_at = {q(sec['started_at'])}", f"commit = {q(sec['commit'])}"]
+        out.append("")
         n += 1
     out += [
         "# The CI runner's own baseline: hosted runners are slower and noisier than the",
