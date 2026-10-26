@@ -174,7 +174,7 @@ On 2 of these 4 questions Bellwether said so before building anything: `why` pri
 | ClickBench | page views of 3 sites (CounterID) | 974,143 | 384.6 MB (5 rg) | 383.5 MB (5 rg) | same | 1.5 GB (28 rg) | DuckDB's min/max statistics skip to 5 row groups, as many as `exact:CounterID` plans; `why` compared the key against a full scan (28 row groups), not that min/max baseline, so it recommended the key and `fix` attested it |
 <!-- results:showcase-headline:end -->
 
-Reproduce everything above, downloads included, with [`scripts/showcase.sh`](scripts/showcase.sh); it rewrites the results file, and [`scripts/render_charts.py`](scripts/render_charts.py) redraws every chart and table from it (CI fails if a committed chart no longer matches the committed numbers). Earlier runs, with their transcripts: [every CLI verb on taxi and GH Archive data](docs/measured/2026-10-24-realdata.md) and [a ClickBench slice before any index existed](docs/measured/2026-10-24-clickbench.md).
+Reproduce everything above, downloads included, with [`scripts/showcase.sh`](scripts/showcase.sh); it rewrites the results file, and [`scripts/render_charts.py`](scripts/render_charts.py) redraws every chart and table from it (CI fails if a committed chart no longer matches the committed numbers). Earlier runs, with their transcripts: [every CLI verb on taxi and GH Archive data](docs/measured/2026-10-24-realdata.md) and [a ClickBench slice before any index existed](docs/measured/2026-10-24-clickbench.md). Performance of the engine itself (lookup latency, index build, reconcile memory budgets): [docs/measured/2026-10-26-performance.md](docs/measured/2026-10-26-performance.md).
 
 ## Highlights
 

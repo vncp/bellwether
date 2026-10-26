@@ -128,6 +128,951 @@ Load does not affect counts: row groups, bytes, passes, segments, meter peaks, a
    The build and replay READMEs now state both constants.
 
 
+## Charts
+
+[`scripts/render_charts.py`](../../scripts/render_charts.py) draws the charts, and the table of every chart row, from [`results/perf.json`](results/perf.json), and CI checks that they match the committed numbers. The lookup chart shows the negative result from finding 2: on these local, warm files, no lookup beat a full scan or DuckDB.
+
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="../assets/results-perf-lookup-latency-dark.svg">
+    <img alt="Lookup wall time, warm, p50 of 20 (plan, plan + read, full scan, DuckDB). Planning with the index and reading only the planned row groups beat a full scan in 0 of 42 lookups and DuckDB in 0 of 42; the plan alone (one bellwether process) took 83 ms at the median, of which 4 ms is starting any bellwether process." src="../assets/results-perf-lookup-latency-light.svg">
+  </picture>
+</p>
+
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="../assets/results-perf-build-dark.svg">
+    <img alt="Index build throughput by --threads, row groups per second. ledger-small went from 15 row groups per second on one thread to 18 on all (1.2x; best 18 at 8); market-10x went from 889 row groups per second on one thread to 2,189 on all (2.5x; best 2,189 at all); market-default went from 1,083 row groups per second on one thread to 1,516 on all (1.4x; best 1,677 at 4)." src="../assets/results-perf-build-light.svg">
+  </picture>
+</p>
+
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="../assets/results-perf-reconcile-dark.svg">
+    <img alt="Reconcile throughput by memory budget, rows per second per side. ledger-small compared 648,758 rows per second per side at 8 GiB and 330,455 at 64 MiB (10 passes); taxi compared 372,364 rows per second per side at 8 GiB and 22,737 at 64 MiB (224 passes)." src="../assets/results-perf-reconcile-light.svg">
+  </picture>
+</p>
+
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="../assets/results-perf-observe-dark.svg">
+    <img alt="Observe tier (why, no workload) on replay-small, p50. Every way of asking why with no workload answered within 24 ms at the median, against the 100 ms observe budget (the CLI figure includes process start)." src="../assets/results-perf-observe-light.svg">
+  </picture>
+</p>
+
+<details><summary>Every chart row (902 rows)</summary>
+
+<!-- results:perf:begin -->
+| Dataset | Query | Side | Metric | Value | Unit | Exactness |
+|---|---|---|---|---:|---|---|
+| taxi | reconcile | bellwether-budget-64M | reconcile_rows_per_s_per_side | 22,737 | rows/s | measured |
+| taxi | reconcile | bellwether-budget-64M | reconcile_passes | 224 | passes | exact |
+| ledger-small | index | bellwether-threads-1 | build_row_groups_per_s | 15.1 | row groups/s | measured |
+| ledger-small | index | bellwether-threads-1 | build_peak_rss_bytes | 282,705,920 | bytes | measured |
+| ledger-small | index | bellwether-threads-2 | build_row_groups_per_s | 17.6 | row groups/s | measured |
+| ledger-small | index | bellwether-threads-2 | build_peak_rss_bytes | 325,943,296 | bytes | measured |
+| ledger-small | index | bellwether-threads-4 | build_row_groups_per_s | 17.7 | row groups/s | measured |
+| ledger-small | index | bellwether-threads-4 | build_peak_rss_bytes | 348,585,984 | bytes | measured |
+| ledger-small | index | bellwether-threads-8 | build_row_groups_per_s | 17.8 | row groups/s | measured |
+| ledger-small | index | bellwether-threads-8 | build_peak_rss_bytes | 357,023,744 | bytes | measured |
+| ledger-small | index | bellwether-threads-all | build_row_groups_per_s | 17.7 | row groups/s | measured |
+| ledger-small | index | bellwether-threads-all | build_peak_rss_bytes | 356,630,528 | bytes | measured |
+| market-default | index | bellwether-threads-1 | build_row_groups_per_s | 1083.3 | row groups/s | measured |
+| market-default | index | bellwether-threads-1 | build_peak_rss_bytes | 18,235,392 | bytes | measured |
+| market-default | index | bellwether-threads-2 | build_row_groups_per_s | 1299.0 | row groups/s | measured |
+| market-default | index | bellwether-threads-2 | build_peak_rss_bytes | 20,021,248 | bytes | measured |
+| market-default | index | bellwether-threads-4 | build_row_groups_per_s | 1676.8 | row groups/s | measured |
+| market-default | index | bellwether-threads-4 | build_peak_rss_bytes | 23,445,504 | bytes | measured |
+| market-default | index | bellwether-threads-8 | build_row_groups_per_s | 1629.5 | row groups/s | measured |
+| market-default | index | bellwether-threads-8 | build_peak_rss_bytes | 23,085,056 | bytes | measured |
+| market-default | index | bellwether-threads-all | build_row_groups_per_s | 1515.9 | row groups/s | measured |
+| market-default | index | bellwether-threads-all | build_peak_rss_bytes | 23,265,280 | bytes | measured |
+| market-10x | index | bellwether-threads-1 | build_row_groups_per_s | 888.6 | row groups/s | measured |
+| market-10x | index | bellwether-threads-1 | build_peak_rss_bytes | 24,543,232 | bytes | measured |
+| market-10x | index | bellwether-threads-2 | build_row_groups_per_s | 1368.1 | row groups/s | measured |
+| market-10x | index | bellwether-threads-2 | build_peak_rss_bytes | 27,082,752 | bytes | measured |
+| market-10x | index | bellwether-threads-4 | build_row_groups_per_s | 1593.9 | row groups/s | measured |
+| market-10x | index | bellwether-threads-4 | build_peak_rss_bytes | 33,603,584 | bytes | measured |
+| market-10x | index | bellwether-threads-8 | build_row_groups_per_s | 2090.1 | row groups/s | measured |
+| market-10x | index | bellwether-threads-8 | build_peak_rss_bytes | 42,745,856 | bytes | measured |
+| market-10x | index | bellwether-threads-all | build_row_groups_per_s | 2188.9 | row groups/s | measured |
+| market-10x | index | bellwether-threads-all | build_peak_rss_bytes | 50,724,864 | bytes | measured |
+| ledger-small | reconcile | bellwether-budget-8G | reconcile_rows_per_s_per_side | 648,758 | rows/s | measured |
+| ledger-small | reconcile | bellwether-budget-8G | reconcile_passes | 1 | passes | exact |
+| ledger-small | reconcile | bellwether-budget-1G | reconcile_rows_per_s_per_side | 686,984 | rows/s | measured |
+| ledger-small | reconcile | bellwether-budget-1G | reconcile_passes | 1 | passes | exact |
+| ledger-small | reconcile | bellwether-budget-256M | reconcile_rows_per_s_per_side | 571,665 | rows/s | measured |
+| ledger-small | reconcile | bellwether-budget-256M | reconcile_passes | 3 | passes | exact |
+| ledger-small | reconcile | bellwether-budget-64M | reconcile_rows_per_s_per_side | 330,455 | rows/s | measured |
+| ledger-small | reconcile | bellwether-budget-64M | reconcile_passes | 10 | passes | exact |
+| in-test corpus | in-test-corpus-one-cached-candidate | bellwether | replay_p50_run_ms | 0.003 | ms | measured |
+| in-test corpus | in-test-corpus-committed-index-through-the-build-planner | bellwether | replay_p50_run_ms | 0.03 | ms | measured |
+| replay-small | bench-corpus-exact-entity-id-one-cached-candidate | bellwether | replay_p50_run_ms | 0.025 | ms | measured |
+| replay-small | bench-corpus-exact-entity-id-committed-index-through-the-build-planner | bellwether | replay_p50_run_ms | 0.343 | ms | measured |
+| replay-small | bench-corpus-bloom-entity-id-one-cached-candidate | bellwether | replay_p50_run_ms | 0.039 | ms | measured |
+| replay-small | bench-corpus-bloom-entity-id-committed-index-through-the-build-planner | bellwether | replay_p50_run_ms | 0.439 | ms | measured |
+| replay-small | why-no-workload | bellwether-facade | observe_p50_ms | 16.216 | ms | measured |
+| replay-small | why-no-workload | bellwether-mcp-in-process | observe_p50_ms | 15.988 | ms | measured |
+| replay-small | why-no-workload | bellwether-mcp-stdio | observe_p50_ms | 17.06 | ms | measured |
+| replay-small | why-no-workload | bellwether-cli | observe_p50_ms | 23.651 | ms | measured |
+| ledger-small | why-preregistered | bellwether-cold | why_p50_ms | 7325.636 | ms | measured |
+| ledger-small | why-preregistered | bellwether-cold | why_p95_ms | 7344.969 | ms | measured |
+| ledger-small | why-preregistered | bellwether-warm | why_p50_ms | 6021.034 | ms | measured |
+| ledger-small | why-preregistered | bellwether-warm | why_p95_ms | 6122.937 | ms | measured |
+| in-process UInt64 keys | open_writer_exact_u64 | bellwether | resident_bytes_per_key | 319.8 | bytes | measured |
+| in-process UInt64 keys | layout_map_9_byte_keys | bellwether | resident_bytes_per_key | 84.3 | bytes | measured |
+| taxi | reconcile | bellwether-budget-8G | reconcile_rows_per_s_per_side | 372,364 | rows/s | measured |
+| taxi | reconcile | bellwether-budget-8G | reconcile_passes | 2 | passes | exact |
+| taxi | reconcile | bellwether-budget-1G | reconcile_rows_per_s_per_side | 214,183 | rows/s | measured |
+| taxi | reconcile | bellwether-budget-1G | reconcile_passes | 14 | passes | exact |
+| taxi | reconcile | bellwether-budget-256M | reconcile_rows_per_s_per_side | 79,089 | rows/s | measured |
+| taxi | reconcile | bellwether-budget-256M | reconcile_passes | 56 | passes | exact |
+| market-default | locate-window-1d-k10 | bellwether-plan | lookup_p50_ms_warm | 30.868 | ms | measured |
+| market-default | locate-window-1d-k10 | full-scan | lookup_p50_ms_warm | 3.888 | ms | measured |
+| market-default | locate-window-1d-k10 | bellwether-plan | row_groups | 36 | row groups | exact |
+| market-default | locate-window-1d-k10 | bellwether-plan | bytes | 488,080 | bytes | exact |
+| market-default | locate-window-1d-k10 | full-scan | row_groups | 216 | row groups | exact |
+| market-default | locate-window-1d-k10 | full-scan | bytes | 2,868,637 | bytes | exact |
+| market-default | locate-window-1d-k10 | bellwether-plan | lookup_p95_ms_warm | 32.995 | ms | measured |
+| market-default | locate-window-1d-k10 | full-scan | lookup_p95_ms_warm | 4.08 | ms | measured |
+| market-default | locate-window-1d-k10 | bellwether-end-to-end | lookup_p50_ms_warm | 32.0 | ms | measured |
+| market-default | locate-window-1d-k10 | bellwether-end-to-end | lookup_p95_ms_warm | 34.169 | ms | measured |
+| market-default | locate-window-1d-k10 | bellwether-plan | lookup_p50_ms_cold | 32.24 | ms | measured |
+| market-default | locate-window-1d-k10 | full-scan | lookup_p50_ms_cold | 4.044 | ms | measured |
+| market-default | locate-window-1d-k10 | bellwether-plan | lookup_p95_ms_cold | 36.851 | ms | measured |
+| market-default | locate-window-1d-k10 | full-scan | lookup_p95_ms_cold | 4.085 | ms | measured |
+| market-default | locate-window-1d-k10 | bellwether-end-to-end | lookup_p50_ms_cold | 33.316 | ms | measured |
+| market-default | locate-window-1d-k10 | bellwether-end-to-end | lookup_p95_ms_cold | 37.916 | ms | measured |
+| market-default | locate-window-1d-k10 | duckdb | lookup_p50_ms_warm | 3.0 | ms | measured |
+| market-default | locate-window-1d-k10 | duckdb | lookup_p95_ms_warm | 3.0 | ms | measured |
+| market-default | locate-window-1d-k10 | duckdb | lookup_p50_ms_cold | 6.0 | ms | measured |
+| market-default | locate-window-1d-k10 | duckdb | lookup_p95_ms_cold | 6.0 | ms | measured |
+| market-default | locate-window-30d-k10 | bellwether-plan | lookup_p50_ms_warm | 30.339 | ms | measured |
+| market-default | locate-window-30d-k10 | full-scan | lookup_p50_ms_warm | 3.888 | ms | measured |
+| market-default | locate-window-30d-k10 | bellwether-plan | row_groups | 78 | row groups | exact |
+| market-default | locate-window-30d-k10 | bellwether-plan | bytes | 1,042,140 | bytes | exact |
+| market-default | locate-window-30d-k10 | full-scan | row_groups | 216 | row groups | exact |
+| market-default | locate-window-30d-k10 | full-scan | bytes | 2,868,637 | bytes | exact |
+| market-default | locate-window-30d-k10 | bellwether-plan | lookup_p95_ms_warm | 33.11 | ms | measured |
+| market-default | locate-window-30d-k10 | full-scan | lookup_p95_ms_warm | 4.08 | ms | measured |
+| market-default | locate-window-30d-k10 | bellwether-end-to-end | lookup_p50_ms_warm | 32.194 | ms | measured |
+| market-default | locate-window-30d-k10 | bellwether-end-to-end | lookup_p95_ms_warm | 34.768 | ms | measured |
+| market-default | locate-window-30d-k10 | bellwether-plan | lookup_p50_ms_cold | 29.705 | ms | measured |
+| market-default | locate-window-30d-k10 | full-scan | lookup_p50_ms_cold | 4.044 | ms | measured |
+| market-default | locate-window-30d-k10 | bellwether-plan | lookup_p95_ms_cold | 33.212 | ms | measured |
+| market-default | locate-window-30d-k10 | full-scan | lookup_p95_ms_cold | 4.085 | ms | measured |
+| market-default | locate-window-30d-k10 | bellwether-end-to-end | lookup_p50_ms_cold | 31.508 | ms | measured |
+| market-default | locate-window-30d-k10 | bellwether-end-to-end | lookup_p95_ms_cold | 35.008 | ms | measured |
+| market-default | locate-window-30d-k10 | duckdb | lookup_p50_ms_warm | 4.0 | ms | measured |
+| market-default | locate-window-30d-k10 | duckdb | lookup_p95_ms_warm | 4.0 | ms | measured |
+| market-default | locate-window-30d-k10 | duckdb | lookup_p50_ms_cold | 6.0 | ms | measured |
+| market-default | locate-window-30d-k10 | duckdb | lookup_p95_ms_cold | 6.0 | ms | measured |
+| market-default | latest-k10 | bellwether-plan | lookup_p50_ms_warm | 28.294 | ms | measured |
+| market-default | latest-k10 | full-scan | lookup_p50_ms_warm | 3.888 | ms | measured |
+| market-default | latest-k10 | bellwether-plan | row_groups | 8 | row groups | exact |
+| market-default | latest-k10 | bellwether-plan | bytes | 104,112 | bytes | exact |
+| market-default | latest-k10 | full-scan | row_groups | 216 | row groups | exact |
+| market-default | latest-k10 | full-scan | bytes | 2,868,637 | bytes | exact |
+| market-default | latest-k10 | bellwether-plan | lookup_p95_ms_warm | 31.065 | ms | measured |
+| market-default | latest-k10 | full-scan | lookup_p95_ms_warm | 4.08 | ms | measured |
+| market-default | latest-k10 | bellwether-end-to-end | lookup_p50_ms_warm | 28.785 | ms | measured |
+| market-default | latest-k10 | bellwether-end-to-end | lookup_p95_ms_warm | 31.522 | ms | measured |
+| market-default | latest-k10 | bellwether-plan | lookup_p50_ms_cold | 28.777 | ms | measured |
+| market-default | latest-k10 | full-scan | lookup_p50_ms_cold | 4.044 | ms | measured |
+| market-default | latest-k10 | bellwether-plan | lookup_p95_ms_cold | 30.172 | ms | measured |
+| market-default | latest-k10 | full-scan | lookup_p95_ms_cold | 4.085 | ms | measured |
+| market-default | latest-k10 | bellwether-end-to-end | lookup_p50_ms_cold | 29.276 | ms | measured |
+| market-default | latest-k10 | bellwether-end-to-end | lookup_p95_ms_cold | 30.707 | ms | measured |
+| market-default | latest-k10 | duckdb | lookup_p50_ms_warm | 4.0 | ms | measured |
+| market-default | latest-k10 | duckdb | lookup_p95_ms_warm | 5.0 | ms | measured |
+| market-default | latest-k10 | duckdb | lookup_p50_ms_cold | 7.0 | ms | measured |
+| market-default | latest-k10 | duckdb | lookup_p95_ms_cold | 7.0 | ms | measured |
+| market-default | asof-k10 | bellwether-plan | lookup_p50_ms_warm | 32.011 | ms | measured |
+| market-default | asof-k10 | full-scan | lookup_p50_ms_warm | 3.888 | ms | measured |
+| market-default | asof-k10 | bellwether-plan | row_groups | 9 | row groups | exact |
+| market-default | asof-k10 | bellwether-plan | bytes | 119,122 | bytes | exact |
+| market-default | asof-k10 | full-scan | row_groups | 216 | row groups | exact |
+| market-default | asof-k10 | full-scan | bytes | 2,868,637 | bytes | exact |
+| market-default | asof-k10 | bellwether-plan | lookup_p95_ms_warm | 34.469 | ms | measured |
+| market-default | asof-k10 | full-scan | lookup_p95_ms_warm | 4.08 | ms | measured |
+| market-default | asof-k10 | bellwether-end-to-end | lookup_p50_ms_warm | 32.596 | ms | measured |
+| market-default | asof-k10 | bellwether-end-to-end | lookup_p95_ms_warm | 35.189 | ms | measured |
+| market-default | asof-k10 | bellwether-plan | lookup_p50_ms_cold | 30.382 | ms | measured |
+| market-default | asof-k10 | full-scan | lookup_p50_ms_cold | 4.044 | ms | measured |
+| market-default | asof-k10 | bellwether-plan | lookup_p95_ms_cold | 33.978 | ms | measured |
+| market-default | asof-k10 | full-scan | lookup_p95_ms_cold | 4.085 | ms | measured |
+| market-default | asof-k10 | bellwether-end-to-end | lookup_p50_ms_cold | 30.981 | ms | measured |
+| market-default | asof-k10 | bellwether-end-to-end | lookup_p95_ms_cold | 34.595 | ms | measured |
+| market-default | asof-k10 | duckdb | lookup_p50_ms_warm | 4.0 | ms | measured |
+| market-default | asof-k10 | duckdb | lookup_p95_ms_warm | 4.0 | ms | measured |
+| market-default | asof-k10 | duckdb | lookup_p50_ms_cold | 7.0 | ms | measured |
+| market-default | asof-k10 | duckdb | lookup_p95_ms_cold | 7.0 | ms | measured |
+| market-default | asof-lookback-1d-k10 | bellwether-plan | lookup_p50_ms_warm | 30.861 | ms | measured |
+| market-default | asof-lookback-1d-k10 | full-scan | lookup_p50_ms_warm | 3.888 | ms | measured |
+| market-default | asof-lookback-1d-k10 | bellwether-plan | row_groups | 36 | row groups | exact |
+| market-default | asof-lookback-1d-k10 | bellwether-plan | bytes | 488,080 | bytes | exact |
+| market-default | asof-lookback-1d-k10 | full-scan | row_groups | 216 | row groups | exact |
+| market-default | asof-lookback-1d-k10 | full-scan | bytes | 2,868,637 | bytes | exact |
+| market-default | asof-lookback-1d-k10 | bellwether-plan | lookup_p95_ms_warm | 34.674 | ms | measured |
+| market-default | asof-lookback-1d-k10 | full-scan | lookup_p95_ms_warm | 4.08 | ms | measured |
+| market-default | asof-lookback-1d-k10 | bellwether-end-to-end | lookup_p50_ms_warm | 31.952 | ms | measured |
+| market-default | asof-lookback-1d-k10 | bellwether-end-to-end | lookup_p95_ms_warm | 35.894 | ms | measured |
+| market-default | asof-lookback-1d-k10 | bellwether-plan | lookup_p50_ms_cold | 28.301 | ms | measured |
+| market-default | asof-lookback-1d-k10 | full-scan | lookup_p50_ms_cold | 4.044 | ms | measured |
+| market-default | asof-lookback-1d-k10 | bellwether-plan | lookup_p95_ms_cold | 30.018 | ms | measured |
+| market-default | asof-lookback-1d-k10 | full-scan | lookup_p95_ms_cold | 4.085 | ms | measured |
+| market-default | asof-lookback-1d-k10 | bellwether-end-to-end | lookup_p50_ms_cold | 29.372 | ms | measured |
+| market-default | asof-lookback-1d-k10 | bellwether-end-to-end | lookup_p95_ms_cold | 31.009 | ms | measured |
+| market-default | asof-lookback-1d-k10 | duckdb | lookup_p50_ms_warm | 3.0 | ms | measured |
+| market-default | asof-lookback-1d-k10 | duckdb | lookup_p95_ms_warm | 4.0 | ms | measured |
+| market-default | asof-lookback-1d-k10 | duckdb | lookup_p50_ms_cold | 6.0 | ms | measured |
+| market-default | asof-lookback-1d-k10 | duckdb | lookup_p95_ms_cold | 6.0 | ms | measured |
+| market-default | asof-lookback-30d-k10 | bellwether-plan | lookup_p50_ms_warm | 31.121 | ms | measured |
+| market-default | asof-lookback-30d-k10 | full-scan | lookup_p50_ms_warm | 3.888 | ms | measured |
+| market-default | asof-lookback-30d-k10 | bellwether-plan | row_groups | 78 | row groups | exact |
+| market-default | asof-lookback-30d-k10 | bellwether-plan | bytes | 1,042,140 | bytes | exact |
+| market-default | asof-lookback-30d-k10 | full-scan | row_groups | 216 | row groups | exact |
+| market-default | asof-lookback-30d-k10 | full-scan | bytes | 2,868,637 | bytes | exact |
+| market-default | asof-lookback-30d-k10 | bellwether-plan | lookup_p95_ms_warm | 34.119 | ms | measured |
+| market-default | asof-lookback-30d-k10 | full-scan | lookup_p95_ms_warm | 4.08 | ms | measured |
+| market-default | asof-lookback-30d-k10 | bellwether-end-to-end | lookup_p50_ms_warm | 32.903 | ms | measured |
+| market-default | asof-lookback-30d-k10 | bellwether-end-to-end | lookup_p95_ms_warm | 35.943 | ms | measured |
+| market-default | asof-lookback-30d-k10 | bellwether-plan | lookup_p50_ms_cold | 30.793 | ms | measured |
+| market-default | asof-lookback-30d-k10 | full-scan | lookup_p50_ms_cold | 4.044 | ms | measured |
+| market-default | asof-lookback-30d-k10 | bellwether-plan | lookup_p95_ms_cold | 32.361 | ms | measured |
+| market-default | asof-lookback-30d-k10 | full-scan | lookup_p95_ms_cold | 4.085 | ms | measured |
+| market-default | asof-lookback-30d-k10 | bellwether-end-to-end | lookup_p50_ms_cold | 32.613 | ms | measured |
+| market-default | asof-lookback-30d-k10 | bellwether-end-to-end | lookup_p95_ms_cold | 34.191 | ms | measured |
+| market-default | asof-lookback-30d-k10 | duckdb | lookup_p50_ms_warm | 4.0 | ms | measured |
+| market-default | asof-lookback-30d-k10 | duckdb | lookup_p95_ms_warm | 4.0 | ms | measured |
+| market-default | asof-lookback-30d-k10 | duckdb | lookup_p50_ms_cold | 6.0 | ms | measured |
+| market-default | asof-lookback-30d-k10 | duckdb | lookup_p95_ms_cold | 7.0 | ms | measured |
+| market-10x | locate-window-1d-k10 | bellwether-plan | lookup_p50_ms_warm | 78.276 | ms | measured |
+| market-10x | locate-window-1d-k10 | full-scan | lookup_p50_ms_warm | 37.977 | ms | measured |
+| market-10x | locate-window-1d-k10 | bellwether-plan | row_groups | 17 | row groups | exact |
+| market-10x | locate-window-1d-k10 | bellwether-plan | bytes | 241,358 | bytes | exact |
+| market-10x | locate-window-1d-k10 | full-scan | row_groups | 2,268 | row groups | exact |
+| market-10x | locate-window-1d-k10 | full-scan | bytes | 31,932,514 | bytes | exact |
+| market-10x | locate-window-1d-k10 | bellwether-plan | lookup_p95_ms_warm | 82.019 | ms | measured |
+| market-10x | locate-window-1d-k10 | full-scan | lookup_p95_ms_warm | 39.66 | ms | measured |
+| market-10x | locate-window-1d-k10 | bellwether-end-to-end | lookup_p50_ms_warm | 79.077 | ms | measured |
+| market-10x | locate-window-1d-k10 | bellwether-end-to-end | lookup_p95_ms_warm | 82.711 | ms | measured |
+| market-10x | locate-window-1d-k10 | bellwether-plan | lookup_p50_ms_cold | 81.233 | ms | measured |
+| market-10x | locate-window-1d-k10 | full-scan | lookup_p50_ms_cold | 37.628 | ms | measured |
+| market-10x | locate-window-1d-k10 | bellwether-plan | lookup_p95_ms_cold | 85.514 | ms | measured |
+| market-10x | locate-window-1d-k10 | full-scan | lookup_p95_ms_cold | 39.481 | ms | measured |
+| market-10x | locate-window-1d-k10 | bellwether-end-to-end | lookup_p50_ms_cold | 81.94 | ms | measured |
+| market-10x | locate-window-1d-k10 | bellwether-end-to-end | lookup_p95_ms_cold | 86.324 | ms | measured |
+| market-10x | locate-window-1d-k10 | duckdb | lookup_p50_ms_warm | 15.0 | ms | measured |
+| market-10x | locate-window-1d-k10 | duckdb | lookup_p95_ms_warm | 16.0 | ms | measured |
+| market-10x | locate-window-1d-k10 | duckdb | lookup_p50_ms_cold | 20.0 | ms | measured |
+| market-10x | locate-window-1d-k10 | duckdb | lookup_p95_ms_cold | 20.0 | ms | measured |
+| market-10x | locate-window-30d-k10 | bellwether-plan | lookup_p50_ms_warm | 82.474 | ms | measured |
+| market-10x | locate-window-30d-k10 | full-scan | lookup_p50_ms_warm | 37.977 | ms | measured |
+| market-10x | locate-window-30d-k10 | bellwether-plan | row_groups | 128 | row groups | exact |
+| market-10x | locate-window-30d-k10 | bellwether-plan | bytes | 1,818,195 | bytes | exact |
+| market-10x | locate-window-30d-k10 | full-scan | row_groups | 2,268 | row groups | exact |
+| market-10x | locate-window-30d-k10 | full-scan | bytes | 31,932,514 | bytes | exact |
+| market-10x | locate-window-30d-k10 | bellwether-plan | lookup_p95_ms_warm | 86.001 | ms | measured |
+| market-10x | locate-window-30d-k10 | full-scan | lookup_p95_ms_warm | 39.66 | ms | measured |
+| market-10x | locate-window-30d-k10 | bellwether-end-to-end | lookup_p50_ms_warm | 85.522 | ms | measured |
+| market-10x | locate-window-30d-k10 | bellwether-end-to-end | lookup_p95_ms_warm | 89.035 | ms | measured |
+| market-10x | locate-window-30d-k10 | bellwether-plan | lookup_p50_ms_cold | 86.744 | ms | measured |
+| market-10x | locate-window-30d-k10 | full-scan | lookup_p50_ms_cold | 37.628 | ms | measured |
+| market-10x | locate-window-30d-k10 | bellwether-plan | lookup_p95_ms_cold | 87.622 | ms | measured |
+| market-10x | locate-window-30d-k10 | full-scan | lookup_p95_ms_cold | 39.481 | ms | measured |
+| market-10x | locate-window-30d-k10 | bellwether-end-to-end | lookup_p50_ms_cold | 89.8 | ms | measured |
+| market-10x | locate-window-30d-k10 | bellwether-end-to-end | lookup_p95_ms_cold | 90.817 | ms | measured |
+| market-10x | locate-window-30d-k10 | duckdb | lookup_p50_ms_warm | 16.0 | ms | measured |
+| market-10x | locate-window-30d-k10 | duckdb | lookup_p95_ms_warm | 17.0 | ms | measured |
+| market-10x | locate-window-30d-k10 | duckdb | lookup_p50_ms_cold | 20.0 | ms | measured |
+| market-10x | locate-window-30d-k10 | duckdb | lookup_p95_ms_cold | 21.0 | ms | measured |
+| market-10x | latest-k10 | bellwether-plan | lookup_p50_ms_warm | 54.099 | ms | measured |
+| market-10x | latest-k10 | full-scan | lookup_p50_ms_warm | 37.977 | ms | measured |
+| market-10x | latest-k10 | bellwether-plan | row_groups | 7 | row groups | exact |
+| market-10x | latest-k10 | bellwether-plan | bytes | 99,362 | bytes | exact |
+| market-10x | latest-k10 | full-scan | row_groups | 2,268 | row groups | exact |
+| market-10x | latest-k10 | full-scan | bytes | 31,932,514 | bytes | exact |
+| market-10x | latest-k10 | bellwether-plan | lookup_p95_ms_warm | 57.006 | ms | measured |
+| market-10x | latest-k10 | full-scan | lookup_p95_ms_warm | 39.66 | ms | measured |
+| market-10x | latest-k10 | bellwether-end-to-end | lookup_p50_ms_warm | 54.641 | ms | measured |
+| market-10x | latest-k10 | bellwether-end-to-end | lookup_p95_ms_warm | 57.502 | ms | measured |
+| market-10x | latest-k10 | bellwether-plan | lookup_p50_ms_cold | 53.456 | ms | measured |
+| market-10x | latest-k10 | full-scan | lookup_p50_ms_cold | 37.628 | ms | measured |
+| market-10x | latest-k10 | bellwether-plan | lookup_p95_ms_cold | 56.751 | ms | measured |
+| market-10x | latest-k10 | full-scan | lookup_p95_ms_cold | 39.481 | ms | measured |
+| market-10x | latest-k10 | bellwether-end-to-end | lookup_p50_ms_cold | 53.996 | ms | measured |
+| market-10x | latest-k10 | bellwether-end-to-end | lookup_p95_ms_cold | 57.268 | ms | measured |
+| market-10x | latest-k10 | duckdb | lookup_p50_ms_warm | 15.0 | ms | measured |
+| market-10x | latest-k10 | duckdb | lookup_p95_ms_warm | 15.0 | ms | measured |
+| market-10x | latest-k10 | duckdb | lookup_p50_ms_cold | 19.0 | ms | measured |
+| market-10x | latest-k10 | duckdb | lookup_p95_ms_cold | 19.0 | ms | measured |
+| market-10x | asof-k10 | bellwether-plan | lookup_p50_ms_warm | 56.452 | ms | measured |
+| market-10x | asof-k10 | full-scan | lookup_p50_ms_warm | 37.977 | ms | measured |
+| market-10x | asof-k10 | bellwether-plan | row_groups | 7 | row groups | exact |
+| market-10x | asof-k10 | bellwether-plan | bytes | 99,410 | bytes | exact |
+| market-10x | asof-k10 | full-scan | row_groups | 2,268 | row groups | exact |
+| market-10x | asof-k10 | full-scan | bytes | 31,932,514 | bytes | exact |
+| market-10x | asof-k10 | bellwether-plan | lookup_p95_ms_warm | 61.112 | ms | measured |
+| market-10x | asof-k10 | full-scan | lookup_p95_ms_warm | 39.66 | ms | measured |
+| market-10x | asof-k10 | bellwether-end-to-end | lookup_p50_ms_warm | 56.96 | ms | measured |
+| market-10x | asof-k10 | bellwether-end-to-end | lookup_p95_ms_warm | 61.664 | ms | measured |
+| market-10x | asof-k10 | bellwether-plan | lookup_p50_ms_cold | 56.716 | ms | measured |
+| market-10x | asof-k10 | full-scan | lookup_p50_ms_cold | 37.628 | ms | measured |
+| market-10x | asof-k10 | bellwether-plan | lookup_p95_ms_cold | 61.044 | ms | measured |
+| market-10x | asof-k10 | full-scan | lookup_p95_ms_cold | 39.481 | ms | measured |
+| market-10x | asof-k10 | bellwether-end-to-end | lookup_p50_ms_cold | 57.292 | ms | measured |
+| market-10x | asof-k10 | bellwether-end-to-end | lookup_p95_ms_cold | 61.605 | ms | measured |
+| market-10x | asof-k10 | duckdb | lookup_p50_ms_warm | 15.0 | ms | measured |
+| market-10x | asof-k10 | duckdb | lookup_p95_ms_warm | 16.0 | ms | measured |
+| market-10x | asof-k10 | duckdb | lookup_p50_ms_cold | 19.0 | ms | measured |
+| market-10x | asof-k10 | duckdb | lookup_p95_ms_cold | 20.0 | ms | measured |
+| market-10x | asof-lookback-1d-k10 | bellwether-plan | lookup_p50_ms_warm | 79.608 | ms | measured |
+| market-10x | asof-lookback-1d-k10 | full-scan | lookup_p50_ms_warm | 37.977 | ms | measured |
+| market-10x | asof-lookback-1d-k10 | bellwether-plan | row_groups | 17 | row groups | exact |
+| market-10x | asof-lookback-1d-k10 | bellwether-plan | bytes | 241,358 | bytes | exact |
+| market-10x | asof-lookback-1d-k10 | full-scan | row_groups | 2,268 | row groups | exact |
+| market-10x | asof-lookback-1d-k10 | full-scan | bytes | 31,932,514 | bytes | exact |
+| market-10x | asof-lookback-1d-k10 | bellwether-plan | lookup_p95_ms_warm | 82.905 | ms | measured |
+| market-10x | asof-lookback-1d-k10 | full-scan | lookup_p95_ms_warm | 39.66 | ms | measured |
+| market-10x | asof-lookback-1d-k10 | bellwether-end-to-end | lookup_p50_ms_warm | 80.332 | ms | measured |
+| market-10x | asof-lookback-1d-k10 | bellwether-end-to-end | lookup_p95_ms_warm | 83.557 | ms | measured |
+| market-10x | asof-lookback-1d-k10 | bellwether-plan | lookup_p50_ms_cold | 79.811 | ms | measured |
+| market-10x | asof-lookback-1d-k10 | full-scan | lookup_p50_ms_cold | 37.628 | ms | measured |
+| market-10x | asof-lookback-1d-k10 | bellwether-plan | lookup_p95_ms_cold | 80.09 | ms | measured |
+| market-10x | asof-lookback-1d-k10 | full-scan | lookup_p95_ms_cold | 39.481 | ms | measured |
+| market-10x | asof-lookback-1d-k10 | bellwether-end-to-end | lookup_p50_ms_cold | 80.48 | ms | measured |
+| market-10x | asof-lookback-1d-k10 | bellwether-end-to-end | lookup_p95_ms_cold | 80.941 | ms | measured |
+| market-10x | asof-lookback-1d-k10 | duckdb | lookup_p50_ms_warm | 15.0 | ms | measured |
+| market-10x | asof-lookback-1d-k10 | duckdb | lookup_p95_ms_warm | 16.0 | ms | measured |
+| market-10x | asof-lookback-1d-k10 | duckdb | lookup_p50_ms_cold | 20.0 | ms | measured |
+| market-10x | asof-lookback-1d-k10 | duckdb | lookup_p95_ms_cold | 20.0 | ms | measured |
+| market-10x | asof-lookback-30d-k10 | bellwether-plan | lookup_p50_ms_warm | 83.138 | ms | measured |
+| market-10x | asof-lookback-30d-k10 | full-scan | lookup_p50_ms_warm | 37.977 | ms | measured |
+| market-10x | asof-lookback-30d-k10 | bellwether-plan | row_groups | 128 | row groups | exact |
+| market-10x | asof-lookback-30d-k10 | bellwether-plan | bytes | 1,818,195 | bytes | exact |
+| market-10x | asof-lookback-30d-k10 | full-scan | row_groups | 2,268 | row groups | exact |
+| market-10x | asof-lookback-30d-k10 | full-scan | bytes | 31,932,514 | bytes | exact |
+| market-10x | asof-lookback-30d-k10 | bellwether-plan | lookup_p95_ms_warm | 86.099 | ms | measured |
+| market-10x | asof-lookback-30d-k10 | full-scan | lookup_p95_ms_warm | 39.66 | ms | measured |
+| market-10x | asof-lookback-30d-k10 | bellwether-end-to-end | lookup_p50_ms_warm | 86.076 | ms | measured |
+| market-10x | asof-lookback-30d-k10 | bellwether-end-to-end | lookup_p95_ms_warm | 89.071 | ms | measured |
+| market-10x | asof-lookback-30d-k10 | bellwether-plan | lookup_p50_ms_cold | 83.175 | ms | measured |
+| market-10x | asof-lookback-30d-k10 | full-scan | lookup_p50_ms_cold | 37.628 | ms | measured |
+| market-10x | asof-lookback-30d-k10 | bellwether-plan | lookup_p95_ms_cold | 84.454 | ms | measured |
+| market-10x | asof-lookback-30d-k10 | full-scan | lookup_p95_ms_cold | 39.481 | ms | measured |
+| market-10x | asof-lookback-30d-k10 | bellwether-end-to-end | lookup_p50_ms_cold | 86.132 | ms | measured |
+| market-10x | asof-lookback-30d-k10 | bellwether-end-to-end | lookup_p95_ms_cold | 87.571 | ms | measured |
+| market-10x | asof-lookback-30d-k10 | duckdb | lookup_p50_ms_warm | 16.0 | ms | measured |
+| market-10x | asof-lookback-30d-k10 | duckdb | lookup_p95_ms_warm | 17.0 | ms | measured |
+| market-10x | asof-lookback-30d-k10 | duckdb | lookup_p50_ms_cold | 21.0 | ms | measured |
+| market-10x | asof-lookback-30d-k10 | duckdb | lookup_p95_ms_cold | 21.0 | ms | measured |
+| market-10x | locate-window-1d-k300 | bellwether-plan | lookup_p50_ms_warm | 621.537 | ms | measured |
+| market-10x | locate-window-1d-k300 | full-scan | lookup_p50_ms_warm | 37.977 | ms | measured |
+| market-10x | locate-window-1d-k300 | bellwether-plan | row_groups | 237 | row groups | exact |
+| market-10x | locate-window-1d-k300 | bellwether-plan | bytes | 3,341,246 | bytes | exact |
+| market-10x | locate-window-1d-k300 | full-scan | row_groups | 2,268 | row groups | exact |
+| market-10x | locate-window-1d-k300 | full-scan | bytes | 31,932,514 | bytes | exact |
+| market-10x | locate-window-1d-k300 | bellwether-plan | lookup_p95_ms_warm | 630.964 | ms | measured |
+| market-10x | locate-window-1d-k300 | full-scan | lookup_p95_ms_warm | 39.66 | ms | measured |
+| market-10x | locate-window-1d-k300 | bellwether-end-to-end | lookup_p50_ms_warm | 625.872 | ms | measured |
+| market-10x | locate-window-1d-k300 | bellwether-end-to-end | lookup_p95_ms_warm | 635.332 | ms | measured |
+| market-10x | locate-window-1d-k300 | bellwether-plan | lookup_p50_ms_cold | 628.081 | ms | measured |
+| market-10x | locate-window-1d-k300 | full-scan | lookup_p50_ms_cold | 37.628 | ms | measured |
+| market-10x | locate-window-1d-k300 | bellwether-plan | lookup_p95_ms_cold | 631.012 | ms | measured |
+| market-10x | locate-window-1d-k300 | full-scan | lookup_p95_ms_cold | 39.481 | ms | measured |
+| market-10x | locate-window-1d-k300 | bellwether-end-to-end | lookup_p50_ms_cold | 632.478 | ms | measured |
+| market-10x | locate-window-1d-k300 | bellwether-end-to-end | lookup_p95_ms_cold | 635.46 | ms | measured |
+| market-10x | locate-window-1d-k300 | duckdb | lookup_p50_ms_warm | 16.0 | ms | measured |
+| market-10x | locate-window-1d-k300 | duckdb | lookup_p95_ms_warm | 17.0 | ms | measured |
+| market-10x | locate-window-1d-k300 | duckdb | lookup_p50_ms_cold | 20.0 | ms | measured |
+| market-10x | locate-window-1d-k300 | duckdb | lookup_p95_ms_cold | 20.0 | ms | measured |
+| market-10x | locate-window-30d-k300 | bellwether-plan | lookup_p50_ms_warm | 631.135 | ms | measured |
+| market-10x | locate-window-30d-k300 | full-scan | lookup_p50_ms_warm | 37.977 | ms | measured |
+| market-10x | locate-window-30d-k300 | bellwether-plan | row_groups | 1,296 | row groups | exact |
+| market-10x | locate-window-30d-k300 | bellwether-plan | bytes | 18,233,893 | bytes | exact |
+| market-10x | locate-window-30d-k300 | full-scan | row_groups | 2,268 | row groups | exact |
+| market-10x | locate-window-30d-k300 | full-scan | bytes | 31,932,514 | bytes | exact |
+| market-10x | locate-window-30d-k300 | bellwether-plan | lookup_p95_ms_warm | 635.606 | ms | measured |
+| market-10x | locate-window-30d-k300 | full-scan | lookup_p95_ms_warm | 39.66 | ms | measured |
+| market-10x | locate-window-30d-k300 | bellwether-end-to-end | lookup_p50_ms_warm | 653.649 | ms | measured |
+| market-10x | locate-window-30d-k300 | bellwether-end-to-end | lookup_p95_ms_warm | 659.11 | ms | measured |
+| market-10x | locate-window-30d-k300 | bellwether-plan | lookup_p50_ms_cold | 635.336 | ms | measured |
+| market-10x | locate-window-30d-k300 | full-scan | lookup_p50_ms_cold | 37.628 | ms | measured |
+| market-10x | locate-window-30d-k300 | bellwether-plan | lookup_p95_ms_cold | 638.967 | ms | measured |
+| market-10x | locate-window-30d-k300 | full-scan | lookup_p95_ms_cold | 39.481 | ms | measured |
+| market-10x | locate-window-30d-k300 | bellwether-end-to-end | lookup_p50_ms_cold | 657.817 | ms | measured |
+| market-10x | locate-window-30d-k300 | bellwether-end-to-end | lookup_p95_ms_cold | 659.843 | ms | measured |
+| market-10x | locate-window-30d-k300 | duckdb | lookup_p50_ms_warm | 28.0 | ms | measured |
+| market-10x | locate-window-30d-k300 | duckdb | lookup_p95_ms_warm | 31.0 | ms | measured |
+| market-10x | locate-window-30d-k300 | duckdb | lookup_p50_ms_cold | 31.0 | ms | measured |
+| market-10x | locate-window-30d-k300 | duckdb | lookup_p95_ms_cold | 31.0 | ms | measured |
+| market-10x | latest-k300 | bellwether-plan | lookup_p50_ms_warm | 412.553 | ms | measured |
+| market-10x | latest-k300 | full-scan | lookup_p50_ms_warm | 37.977 | ms | measured |
+| market-10x | latest-k300 | bellwether-plan | row_groups | 74 | row groups | exact |
+| market-10x | latest-k300 | bellwether-plan | bytes | 1,045,363 | bytes | exact |
+| market-10x | latest-k300 | full-scan | row_groups | 2,268 | row groups | exact |
+| market-10x | latest-k300 | full-scan | bytes | 31,932,514 | bytes | exact |
+| market-10x | latest-k300 | bellwether-plan | lookup_p95_ms_warm | 417.86 | ms | measured |
+| market-10x | latest-k300 | full-scan | lookup_p95_ms_warm | 39.66 | ms | measured |
+| market-10x | latest-k300 | bellwether-end-to-end | lookup_p50_ms_warm | 414.131 | ms | measured |
+| market-10x | latest-k300 | bellwether-end-to-end | lookup_p95_ms_warm | 419.451 | ms | measured |
+| market-10x | latest-k300 | bellwether-plan | lookup_p50_ms_cold | 419.66 | ms | measured |
+| market-10x | latest-k300 | full-scan | lookup_p50_ms_cold | 37.628 | ms | measured |
+| market-10x | latest-k300 | bellwether-plan | lookup_p95_ms_cold | 422.745 | ms | measured |
+| market-10x | latest-k300 | full-scan | lookup_p95_ms_cold | 39.481 | ms | measured |
+| market-10x | latest-k300 | bellwether-end-to-end | lookup_p50_ms_cold | 421.21 | ms | measured |
+| market-10x | latest-k300 | bellwether-end-to-end | lookup_p95_ms_cold | 424.442 | ms | measured |
+| market-10x | latest-k300 | duckdb | lookup_p50_ms_warm | 34.0 | ms | measured |
+| market-10x | latest-k300 | duckdb | lookup_p95_ms_warm | 35.0 | ms | measured |
+| market-10x | latest-k300 | duckdb | lookup_p50_ms_cold | 38.0 | ms | measured |
+| market-10x | latest-k300 | duckdb | lookup_p95_ms_cold | 39.0 | ms | measured |
+| market-10x | asof-k300 | bellwether-plan | lookup_p50_ms_warm | 409.005 | ms | measured |
+| market-10x | asof-k300 | full-scan | lookup_p50_ms_warm | 37.977 | ms | measured |
+| market-10x | asof-k300 | bellwether-plan | row_groups | 103 | row groups | exact |
+| market-10x | asof-k300 | bellwether-plan | bytes | 1,455,019 | bytes | exact |
+| market-10x | asof-k300 | full-scan | row_groups | 2,268 | row groups | exact |
+| market-10x | asof-k300 | full-scan | bytes | 31,932,514 | bytes | exact |
+| market-10x | asof-k300 | bellwether-plan | lookup_p95_ms_warm | 415.515 | ms | measured |
+| market-10x | asof-k300 | full-scan | lookup_p95_ms_warm | 39.66 | ms | measured |
+| market-10x | asof-k300 | bellwether-end-to-end | lookup_p50_ms_warm | 411.234 | ms | measured |
+| market-10x | asof-k300 | bellwether-end-to-end | lookup_p95_ms_warm | 417.828 | ms | measured |
+| market-10x | asof-k300 | bellwether-plan | lookup_p50_ms_cold | 414.094 | ms | measured |
+| market-10x | asof-k300 | full-scan | lookup_p50_ms_cold | 37.628 | ms | measured |
+| market-10x | asof-k300 | bellwether-plan | lookup_p95_ms_cold | 416.129 | ms | measured |
+| market-10x | asof-k300 | full-scan | lookup_p95_ms_cold | 39.481 | ms | measured |
+| market-10x | asof-k300 | bellwether-end-to-end | lookup_p50_ms_cold | 416.339 | ms | measured |
+| market-10x | asof-k300 | bellwether-end-to-end | lookup_p95_ms_cold | 418.334 | ms | measured |
+| market-10x | asof-k300 | duckdb | lookup_p50_ms_warm | 26.0 | ms | measured |
+| market-10x | asof-k300 | duckdb | lookup_p95_ms_warm | 27.0 | ms | measured |
+| market-10x | asof-k300 | duckdb | lookup_p50_ms_cold | 30.0 | ms | measured |
+| market-10x | asof-k300 | duckdb | lookup_p95_ms_cold | 30.0 | ms | measured |
+| market-10x | asof-lookback-1d-k300 | bellwether-plan | lookup_p50_ms_warm | 620.923 | ms | measured |
+| market-10x | asof-lookback-1d-k300 | full-scan | lookup_p50_ms_warm | 37.977 | ms | measured |
+| market-10x | asof-lookback-1d-k300 | bellwether-plan | row_groups | 237 | row groups | exact |
+| market-10x | asof-lookback-1d-k300 | bellwether-plan | bytes | 3,341,246 | bytes | exact |
+| market-10x | asof-lookback-1d-k300 | full-scan | row_groups | 2,268 | row groups | exact |
+| market-10x | asof-lookback-1d-k300 | full-scan | bytes | 31,932,514 | bytes | exact |
+| market-10x | asof-lookback-1d-k300 | bellwether-plan | lookup_p95_ms_warm | 625.763 | ms | measured |
+| market-10x | asof-lookback-1d-k300 | full-scan | lookup_p95_ms_warm | 39.66 | ms | measured |
+| market-10x | asof-lookback-1d-k300 | bellwether-end-to-end | lookup_p50_ms_warm | 625.439 | ms | measured |
+| market-10x | asof-lookback-1d-k300 | bellwether-end-to-end | lookup_p95_ms_warm | 630.022 | ms | measured |
+| market-10x | asof-lookback-1d-k300 | bellwether-plan | lookup_p50_ms_cold | 618.518 | ms | measured |
+| market-10x | asof-lookback-1d-k300 | full-scan | lookup_p50_ms_cold | 37.628 | ms | measured |
+| market-10x | asof-lookback-1d-k300 | bellwether-plan | lookup_p95_ms_cold | 631.442 | ms | measured |
+| market-10x | asof-lookback-1d-k300 | full-scan | lookup_p95_ms_cold | 39.481 | ms | measured |
+| market-10x | asof-lookback-1d-k300 | bellwether-end-to-end | lookup_p50_ms_cold | 622.996 | ms | measured |
+| market-10x | asof-lookback-1d-k300 | bellwether-end-to-end | lookup_p95_ms_cold | 636.252 | ms | measured |
+| market-10x | asof-lookback-1d-k300 | duckdb | lookup_p50_ms_warm | 16.0 | ms | measured |
+| market-10x | asof-lookback-1d-k300 | duckdb | lookup_p95_ms_warm | 17.0 | ms | measured |
+| market-10x | asof-lookback-1d-k300 | duckdb | lookup_p50_ms_cold | 21.0 | ms | measured |
+| market-10x | asof-lookback-1d-k300 | duckdb | lookup_p95_ms_cold | 21.0 | ms | measured |
+| market-10x | asof-lookback-30d-k300 | bellwether-plan | lookup_p50_ms_warm | 629.588 | ms | measured |
+| market-10x | asof-lookback-30d-k300 | full-scan | lookup_p50_ms_warm | 37.977 | ms | measured |
+| market-10x | asof-lookback-30d-k300 | bellwether-plan | row_groups | 1,296 | row groups | exact |
+| market-10x | asof-lookback-30d-k300 | bellwether-plan | bytes | 18,233,893 | bytes | exact |
+| market-10x | asof-lookback-30d-k300 | full-scan | row_groups | 2,268 | row groups | exact |
+| market-10x | asof-lookback-30d-k300 | full-scan | bytes | 31,932,514 | bytes | exact |
+| market-10x | asof-lookback-30d-k300 | bellwether-plan | lookup_p95_ms_warm | 633.304 | ms | measured |
+| market-10x | asof-lookback-30d-k300 | full-scan | lookup_p95_ms_warm | 39.66 | ms | measured |
+| market-10x | asof-lookback-30d-k300 | bellwether-end-to-end | lookup_p50_ms_warm | 651.061 | ms | measured |
+| market-10x | asof-lookback-30d-k300 | bellwether-end-to-end | lookup_p95_ms_warm | 655.757 | ms | measured |
+| market-10x | asof-lookback-30d-k300 | bellwether-plan | lookup_p50_ms_cold | 633.449 | ms | measured |
+| market-10x | asof-lookback-30d-k300 | full-scan | lookup_p50_ms_cold | 37.628 | ms | measured |
+| market-10x | asof-lookback-30d-k300 | bellwether-plan | lookup_p95_ms_cold | 640.21 | ms | measured |
+| market-10x | asof-lookback-30d-k300 | full-scan | lookup_p95_ms_cold | 39.481 | ms | measured |
+| market-10x | asof-lookback-30d-k300 | bellwether-end-to-end | lookup_p50_ms_cold | 655.588 | ms | measured |
+| market-10x | asof-lookback-30d-k300 | bellwether-end-to-end | lookup_p95_ms_cold | 660.798 | ms | measured |
+| market-10x | asof-lookback-30d-k300 | duckdb | lookup_p50_ms_warm | 26.0 | ms | measured |
+| market-10x | asof-lookback-30d-k300 | duckdb | lookup_p95_ms_warm | 28.0 | ms | measured |
+| market-10x | asof-lookback-30d-k300 | duckdb | lookup_p50_ms_cold | 30.0 | ms | measured |
+| market-10x | asof-lookback-30d-k300 | duckdb | lookup_p95_ms_cold | 30.0 | ms | measured |
+| market-10x | locate-window-1d-k3000 | bellwether-plan | lookup_p50_ms_warm | 5572.924 | ms | measured |
+| market-10x | locate-window-1d-k3000 | full-scan | lookup_p50_ms_warm | 37.977 | ms | measured |
+| market-10x | locate-window-1d-k3000 | bellwether-plan | row_groups | 304 | row groups | exact |
+| market-10x | locate-window-1d-k3000 | bellwether-plan | bytes | 4,282,693 | bytes | exact |
+| market-10x | locate-window-1d-k3000 | full-scan | row_groups | 2,268 | row groups | exact |
+| market-10x | locate-window-1d-k3000 | full-scan | bytes | 31,932,514 | bytes | exact |
+| market-10x | locate-window-1d-k3000 | bellwether-plan | lookup_p95_ms_warm | 5686.248 | ms | measured |
+| market-10x | locate-window-1d-k3000 | full-scan | lookup_p95_ms_warm | 39.66 | ms | measured |
+| market-10x | locate-window-1d-k3000 | bellwether-end-to-end | lookup_p50_ms_warm | 5578.418 | ms | measured |
+| market-10x | locate-window-1d-k3000 | bellwether-end-to-end | lookup_p95_ms_warm | 5691.719 | ms | measured |
+| market-10x | locate-window-1d-k3000 | bellwether-plan | lookup_p50_ms_cold | 5636.51 | ms | measured |
+| market-10x | locate-window-1d-k3000 | full-scan | lookup_p50_ms_cold | 37.628 | ms | measured |
+| market-10x | locate-window-1d-k3000 | bellwether-plan | lookup_p95_ms_cold | 5689.897 | ms | measured |
+| market-10x | locate-window-1d-k3000 | full-scan | lookup_p95_ms_cold | 39.481 | ms | measured |
+| market-10x | locate-window-1d-k3000 | bellwether-end-to-end | lookup_p50_ms_cold | 5642.076 | ms | measured |
+| market-10x | locate-window-1d-k3000 | bellwether-end-to-end | lookup_p95_ms_cold | 5695.469 | ms | measured |
+| market-10x | locate-window-1d-k3000 | duckdb | lookup_p50_ms_warm | 17.0 | ms | measured |
+| market-10x | locate-window-1d-k3000 | duckdb | lookup_p95_ms_warm | 17.0 | ms | measured |
+| market-10x | locate-window-1d-k3000 | duckdb | lookup_p50_ms_cold | 21.0 | ms | measured |
+| market-10x | locate-window-1d-k3000 | duckdb | lookup_p95_ms_cold | 22.0 | ms | measured |
+| market-10x | locate-window-30d-k3000 | bellwether-plan | lookup_p50_ms_warm | 5530.441 | ms | measured |
+| market-10x | locate-window-30d-k3000 | full-scan | lookup_p50_ms_warm | 37.977 | ms | measured |
+| market-10x | locate-window-30d-k3000 | bellwether-plan | row_groups | 1,356 | row groups | exact |
+| market-10x | locate-window-30d-k3000 | bellwether-plan | bytes | 19,075,744 | bytes | exact |
+| market-10x | locate-window-30d-k3000 | full-scan | row_groups | 2,268 | row groups | exact |
+| market-10x | locate-window-30d-k3000 | full-scan | bytes | 31,932,514 | bytes | exact |
+| market-10x | locate-window-30d-k3000 | bellwether-plan | lookup_p95_ms_warm | 5677.539 | ms | measured |
+| market-10x | locate-window-30d-k3000 | full-scan | lookup_p95_ms_warm | 39.66 | ms | measured |
+| market-10x | locate-window-30d-k3000 | bellwether-end-to-end | lookup_p50_ms_warm | 5553.57 | ms | measured |
+| market-10x | locate-window-30d-k3000 | bellwether-end-to-end | lookup_p95_ms_warm | 5699.907 | ms | measured |
+| market-10x | locate-window-30d-k3000 | bellwether-plan | lookup_p50_ms_cold | 5556.935 | ms | measured |
+| market-10x | locate-window-30d-k3000 | full-scan | lookup_p50_ms_cold | 37.628 | ms | measured |
+| market-10x | locate-window-30d-k3000 | bellwether-plan | lookup_p95_ms_cold | 5606.294 | ms | measured |
+| market-10x | locate-window-30d-k3000 | full-scan | lookup_p95_ms_cold | 39.481 | ms | measured |
+| market-10x | locate-window-30d-k3000 | bellwether-end-to-end | lookup_p50_ms_cold | 5580.602 | ms | measured |
+| market-10x | locate-window-30d-k3000 | bellwether-end-to-end | lookup_p95_ms_cold | 5628.795 | ms | measured |
+| market-10x | locate-window-30d-k3000 | duckdb | lookup_p50_ms_warm | 28.0 | ms | measured |
+| market-10x | locate-window-30d-k3000 | duckdb | lookup_p95_ms_warm | 30.0 | ms | measured |
+| market-10x | locate-window-30d-k3000 | duckdb | lookup_p50_ms_cold | 33.0 | ms | measured |
+| market-10x | locate-window-30d-k3000 | duckdb | lookup_p95_ms_cold | 33.0 | ms | measured |
+| market-10x | latest-k3000 | bellwether-plan | lookup_p50_ms_warm | 3615.519 | ms | measured |
+| market-10x | latest-k3000 | full-scan | lookup_p50_ms_warm | 37.977 | ms | measured |
+| market-10x | latest-k3000 | bellwether-plan | row_groups | 76 | row groups | exact |
+| market-10x | latest-k3000 | bellwether-plan | bytes | 1,073,793 | bytes | exact |
+| market-10x | latest-k3000 | full-scan | row_groups | 2,268 | row groups | exact |
+| market-10x | latest-k3000 | full-scan | bytes | 31,932,514 | bytes | exact |
+| market-10x | latest-k3000 | bellwether-plan | lookup_p95_ms_warm | 3733.643 | ms | measured |
+| market-10x | latest-k3000 | full-scan | lookup_p95_ms_warm | 39.66 | ms | measured |
+| market-10x | latest-k3000 | bellwether-end-to-end | lookup_p50_ms_warm | 3617.14 | ms | measured |
+| market-10x | latest-k3000 | bellwether-end-to-end | lookup_p95_ms_warm | 3735.418 | ms | measured |
+| market-10x | latest-k3000 | bellwether-plan | lookup_p50_ms_cold | 3628.533 | ms | measured |
+| market-10x | latest-k3000 | full-scan | lookup_p50_ms_cold | 37.628 | ms | measured |
+| market-10x | latest-k3000 | bellwether-plan | lookup_p95_ms_cold | 3633.75 | ms | measured |
+| market-10x | latest-k3000 | full-scan | lookup_p95_ms_cold | 39.481 | ms | measured |
+| market-10x | latest-k3000 | bellwether-end-to-end | lookup_p50_ms_cold | 3630.176 | ms | measured |
+| market-10x | latest-k3000 | bellwether-end-to-end | lookup_p95_ms_cold | 3635.458 | ms | measured |
+| market-10x | latest-k3000 | duckdb | lookup_p50_ms_warm | 52.0 | ms | measured |
+| market-10x | latest-k3000 | duckdb | lookup_p95_ms_warm | 59.0 | ms | measured |
+| market-10x | latest-k3000 | duckdb | lookup_p50_ms_cold | 66.0 | ms | measured |
+| market-10x | latest-k3000 | duckdb | lookup_p95_ms_cold | 69.0 | ms | measured |
+| market-10x | asof-k3000 | bellwether-plan | lookup_p50_ms_warm | 3526.949 | ms | measured |
+| market-10x | asof-k3000 | full-scan | lookup_p50_ms_warm | 37.977 | ms | measured |
+| market-10x | asof-k3000 | bellwether-plan | row_groups | 250 | row groups | exact |
+| market-10x | asof-k3000 | bellwether-plan | bytes | 3,521,568 | bytes | exact |
+| market-10x | asof-k3000 | full-scan | row_groups | 2,268 | row groups | exact |
+| market-10x | asof-k3000 | full-scan | bytes | 31,932,514 | bytes | exact |
+| market-10x | asof-k3000 | bellwether-plan | lookup_p95_ms_warm | 7075.711 | ms | measured |
+| market-10x | asof-k3000 | full-scan | lookup_p95_ms_warm | 39.66 | ms | measured |
+| market-10x | asof-k3000 | bellwether-end-to-end | lookup_p50_ms_warm | 3532.607 | ms | measured |
+| market-10x | asof-k3000 | bellwether-end-to-end | lookup_p95_ms_warm | 7081.553 | ms | measured |
+| market-10x | asof-k3000 | bellwether-plan | lookup_p50_ms_cold | 6590.701 | ms | measured |
+| market-10x | asof-k3000 | full-scan | lookup_p50_ms_cold | 37.628 | ms | measured |
+| market-10x | asof-k3000 | bellwether-plan | lookup_p95_ms_cold | 6959.277 | ms | measured |
+| market-10x | asof-k3000 | full-scan | lookup_p95_ms_cold | 39.481 | ms | measured |
+| market-10x | asof-k3000 | bellwether-end-to-end | lookup_p50_ms_cold | 6600.025 | ms | measured |
+| market-10x | asof-k3000 | bellwether-end-to-end | lookup_p95_ms_cold | 6967.131 | ms | measured |
+| market-10x | asof-k3000 | duckdb | lookup_p50_ms_warm | 39.0 | ms | measured |
+| market-10x | asof-k3000 | duckdb | lookup_p95_ms_warm | 48.0 | ms | measured |
+| market-10x | asof-k3000 | duckdb | lookup_p50_ms_cold | 45.0 | ms | measured |
+| market-10x | asof-k3000 | duckdb | lookup_p95_ms_cold | 47.0 | ms | measured |
+| market-10x | asof-lookback-1d-k3000 | bellwether-plan | lookup_p50_ms_warm | 5320.452 | ms | measured |
+| market-10x | asof-lookback-1d-k3000 | full-scan | lookup_p50_ms_warm | 37.977 | ms | measured |
+| market-10x | asof-lookback-1d-k3000 | bellwether-plan | row_groups | 304 | row groups | exact |
+| market-10x | asof-lookback-1d-k3000 | bellwether-plan | bytes | 4,282,693 | bytes | exact |
+| market-10x | asof-lookback-1d-k3000 | full-scan | row_groups | 2,268 | row groups | exact |
+| market-10x | asof-lookback-1d-k3000 | full-scan | bytes | 31,932,514 | bytes | exact |
+| market-10x | asof-lookback-1d-k3000 | bellwether-plan | lookup_p95_ms_warm | 5477.612 | ms | measured |
+| market-10x | asof-lookback-1d-k3000 | full-scan | lookup_p95_ms_warm | 39.66 | ms | measured |
+| market-10x | asof-lookback-1d-k3000 | bellwether-end-to-end | lookup_p50_ms_warm | 5326.266 | ms | measured |
+| market-10x | asof-lookback-1d-k3000 | bellwether-end-to-end | lookup_p95_ms_warm | 5483.633 | ms | measured |
+| market-10x | asof-lookback-1d-k3000 | bellwether-plan | lookup_p50_ms_cold | 5265.043 | ms | measured |
+| market-10x | asof-lookback-1d-k3000 | full-scan | lookup_p50_ms_cold | 37.628 | ms | measured |
+| market-10x | asof-lookback-1d-k3000 | bellwether-plan | lookup_p95_ms_cold | 5393.613 | ms | measured |
+| market-10x | asof-lookback-1d-k3000 | full-scan | lookup_p95_ms_cold | 39.481 | ms | measured |
+| market-10x | asof-lookback-1d-k3000 | bellwether-end-to-end | lookup_p50_ms_cold | 5270.903 | ms | measured |
+| market-10x | asof-lookback-1d-k3000 | bellwether-end-to-end | lookup_p95_ms_cold | 5399.038 | ms | measured |
+| market-10x | asof-lookback-1d-k3000 | duckdb | lookup_p50_ms_warm | 17.0 | ms | measured |
+| market-10x | asof-lookback-1d-k3000 | duckdb | lookup_p95_ms_warm | 18.0 | ms | measured |
+| market-10x | asof-lookback-1d-k3000 | duckdb | lookup_p50_ms_cold | 22.0 | ms | measured |
+| market-10x | asof-lookback-1d-k3000 | duckdb | lookup_p95_ms_cold | 22.0 | ms | measured |
+| market-10x | asof-lookback-30d-k3000 | bellwether-plan | lookup_p50_ms_warm | 5239.468 | ms | measured |
+| market-10x | asof-lookback-30d-k3000 | full-scan | lookup_p50_ms_warm | 37.977 | ms | measured |
+| market-10x | asof-lookback-30d-k3000 | bellwether-plan | row_groups | 1,356 | row groups | exact |
+| market-10x | asof-lookback-30d-k3000 | bellwether-plan | bytes | 19,075,744 | bytes | exact |
+| market-10x | asof-lookback-30d-k3000 | full-scan | row_groups | 2,268 | row groups | exact |
+| market-10x | asof-lookback-30d-k3000 | full-scan | bytes | 31,932,514 | bytes | exact |
+| market-10x | asof-lookback-30d-k3000 | bellwether-plan | lookup_p95_ms_warm | 8375.869 | ms | measured |
+| market-10x | asof-lookback-30d-k3000 | full-scan | lookup_p95_ms_warm | 39.66 | ms | measured |
+| market-10x | asof-lookback-30d-k3000 | bellwether-end-to-end | lookup_p50_ms_warm | 5262.619 | ms | measured |
+| market-10x | asof-lookback-30d-k3000 | bellwether-end-to-end | lookup_p95_ms_warm | 8398.537 | ms | measured |
+| market-10x | asof-lookback-30d-k3000 | bellwether-plan | lookup_p50_ms_cold | 5290.439 | ms | measured |
+| market-10x | asof-lookback-30d-k3000 | full-scan | lookup_p50_ms_cold | 37.628 | ms | measured |
+| market-10x | asof-lookback-30d-k3000 | bellwether-plan | lookup_p95_ms_cold | 5460.901 | ms | measured |
+| market-10x | asof-lookback-30d-k3000 | full-scan | lookup_p95_ms_cold | 39.481 | ms | measured |
+| market-10x | asof-lookback-30d-k3000 | bellwether-end-to-end | lookup_p50_ms_cold | 5313.885 | ms | measured |
+| market-10x | asof-lookback-30d-k3000 | bellwether-end-to-end | lookup_p95_ms_cold | 5484.287 | ms | measured |
+| market-10x | asof-lookback-30d-k3000 | duckdb | lookup_p50_ms_warm | 28.0 | ms | measured |
+| market-10x | asof-lookback-30d-k3000 | duckdb | lookup_p95_ms_warm | 29.0 | ms | measured |
+| market-10x | asof-lookback-30d-k3000 | duckdb | lookup_p50_ms_cold | 32.0 | ms | measured |
+| market-10x | asof-lookback-30d-k3000 | duckdb | lookup_p95_ms_cold | 33.0 | ms | measured |
+| gh-events | locate-window-1d-k10 | bellwether-plan | lookup_p50_ms_warm | 32.096 | ms | measured |
+| gh-events | locate-window-1d-k10 | full-scan | lookup_p50_ms_warm | 5.698 | ms | measured |
+| gh-events | locate-window-1d-k10 | bellwether-plan | row_groups | 1 | row groups | exact |
+| gh-events | locate-window-1d-k10 | bellwether-plan | bytes | 857,970 | bytes | exact |
+| gh-events | locate-window-1d-k10 | full-scan | row_groups | 24 | row groups | exact |
+| gh-events | locate-window-1d-k10 | full-scan | bytes | 12,817,897 | bytes | exact |
+| gh-events | locate-window-1d-k10 | bellwether-plan | lookup_p95_ms_warm | 41.016 | ms | measured |
+| gh-events | locate-window-1d-k10 | full-scan | lookup_p95_ms_warm | 9.377 | ms | measured |
+| gh-events | locate-window-1d-k10 | bellwether-end-to-end | lookup_p50_ms_warm | 34.557 | ms | measured |
+| gh-events | locate-window-1d-k10 | bellwether-end-to-end | lookup_p95_ms_warm | 43.486 | ms | measured |
+| gh-events | locate-window-1d-k10 | bellwether-plan | lookup_p50_ms_cold | 29.427 | ms | measured |
+| gh-events | locate-window-1d-k10 | full-scan | lookup_p50_ms_cold | 5.592 | ms | measured |
+| gh-events | locate-window-1d-k10 | bellwether-plan | lookup_p95_ms_cold | 32.949 | ms | measured |
+| gh-events | locate-window-1d-k10 | full-scan | lookup_p95_ms_cold | 5.998 | ms | measured |
+| gh-events | locate-window-1d-k10 | bellwether-end-to-end | lookup_p50_ms_cold | 31.779 | ms | measured |
+| gh-events | locate-window-1d-k10 | bellwether-end-to-end | lookup_p95_ms_cold | 35.333 | ms | measured |
+| gh-events | locate-window-1d-k10 | duckdb | lookup_p50_ms_warm | 3.0 | ms | measured |
+| gh-events | locate-window-1d-k10 | duckdb | lookup_p95_ms_warm | 3.0 | ms | measured |
+| gh-events | locate-window-1d-k10 | duckdb | lookup_p50_ms_cold | 5.0 | ms | measured |
+| gh-events | locate-window-1d-k10 | duckdb | lookup_p95_ms_cold | 6.0 | ms | measured |
+| gh-events | locate-window-30d-k10 | bellwether-plan | lookup_p50_ms_warm | 28.377 | ms | measured |
+| gh-events | locate-window-30d-k10 | full-scan | lookup_p50_ms_warm | 5.698 | ms | measured |
+| gh-events | locate-window-30d-k10 | bellwether-plan | row_groups | 1 | row groups | exact |
+| gh-events | locate-window-30d-k10 | bellwether-plan | bytes | 857,970 | bytes | exact |
+| gh-events | locate-window-30d-k10 | full-scan | row_groups | 24 | row groups | exact |
+| gh-events | locate-window-30d-k10 | full-scan | bytes | 12,817,897 | bytes | exact |
+| gh-events | locate-window-30d-k10 | bellwether-plan | lookup_p95_ms_warm | 30.732 | ms | measured |
+| gh-events | locate-window-30d-k10 | full-scan | lookup_p95_ms_warm | 9.377 | ms | measured |
+| gh-events | locate-window-30d-k10 | bellwether-end-to-end | lookup_p50_ms_warm | 30.782 | ms | measured |
+| gh-events | locate-window-30d-k10 | bellwether-end-to-end | lookup_p95_ms_warm | 33.079 | ms | measured |
+| gh-events | locate-window-30d-k10 | bellwether-plan | lookup_p50_ms_cold | 29.383 | ms | measured |
+| gh-events | locate-window-30d-k10 | full-scan | lookup_p50_ms_cold | 5.592 | ms | measured |
+| gh-events | locate-window-30d-k10 | bellwether-plan | lookup_p95_ms_cold | 32.82 | ms | measured |
+| gh-events | locate-window-30d-k10 | full-scan | lookup_p95_ms_cold | 5.998 | ms | measured |
+| gh-events | locate-window-30d-k10 | bellwether-end-to-end | lookup_p50_ms_cold | 31.734 | ms | measured |
+| gh-events | locate-window-30d-k10 | bellwether-end-to-end | lookup_p95_ms_cold | 35.197 | ms | measured |
+| gh-events | locate-window-30d-k10 | duckdb | lookup_p50_ms_warm | 3.0 | ms | measured |
+| gh-events | locate-window-30d-k10 | duckdb | lookup_p95_ms_warm | 4.0 | ms | measured |
+| gh-events | locate-window-30d-k10 | duckdb | lookup_p50_ms_cold | 5.0 | ms | measured |
+| gh-events | locate-window-30d-k10 | duckdb | lookup_p95_ms_cold | 6.0 | ms | measured |
+| gh-events | latest-k10 | bellwether-plan | lookup_p50_ms_warm | 28.304 | ms | measured |
+| gh-events | latest-k10 | full-scan | lookup_p50_ms_warm | 5.698 | ms | measured |
+| gh-events | latest-k10 | bellwether-plan | row_groups | 8 | row groups | exact |
+| gh-events | latest-k10 | bellwether-plan | bytes | 5,190,369 | bytes | exact |
+| gh-events | latest-k10 | full-scan | row_groups | 24 | row groups | exact |
+| gh-events | latest-k10 | full-scan | bytes | 12,817,897 | bytes | exact |
+| gh-events | latest-k10 | bellwether-plan | lookup_p95_ms_warm | 32.027 | ms | measured |
+| gh-events | latest-k10 | full-scan | lookup_p95_ms_warm | 9.377 | ms | measured |
+| gh-events | latest-k10 | bellwether-end-to-end | lookup_p50_ms_warm | 31.663 | ms | measured |
+| gh-events | latest-k10 | bellwether-end-to-end | lookup_p95_ms_warm | 34.954 | ms | measured |
+| gh-events | latest-k10 | bellwether-plan | lookup_p50_ms_cold | 28.766 | ms | measured |
+| gh-events | latest-k10 | full-scan | lookup_p50_ms_cold | 5.592 | ms | measured |
+| gh-events | latest-k10 | bellwether-plan | lookup_p95_ms_cold | 35.179 | ms | measured |
+| gh-events | latest-k10 | full-scan | lookup_p95_ms_cold | 5.998 | ms | measured |
+| gh-events | latest-k10 | bellwether-end-to-end | lookup_p50_ms_cold | 31.737 | ms | measured |
+| gh-events | latest-k10 | bellwether-end-to-end | lookup_p95_ms_cold | 38.25 | ms | measured |
+| gh-events | latest-k10 | duckdb | lookup_p50_ms_warm | 5.0 | ms | measured |
+| gh-events | latest-k10 | duckdb | lookup_p95_ms_warm | 5.0 | ms | measured |
+| gh-events | latest-k10 | duckdb | lookup_p50_ms_cold | 8.0 | ms | measured |
+| gh-events | latest-k10 | duckdb | lookup_p95_ms_cold | 8.0 | ms | measured |
+| gh-events | asof-k10 | bellwether-plan | lookup_p50_ms_warm | 29.213 | ms | measured |
+| gh-events | asof-k10 | full-scan | lookup_p50_ms_warm | 5.698 | ms | measured |
+| gh-events | asof-k10 | bellwether-plan | row_groups | 1 | row groups | exact |
+| gh-events | asof-k10 | bellwether-plan | bytes | 857,970 | bytes | exact |
+| gh-events | asof-k10 | full-scan | row_groups | 24 | row groups | exact |
+| gh-events | asof-k10 | full-scan | bytes | 12,817,897 | bytes | exact |
+| gh-events | asof-k10 | bellwether-plan | lookup_p95_ms_warm | 32.15 | ms | measured |
+| gh-events | asof-k10 | full-scan | lookup_p95_ms_warm | 9.377 | ms | measured |
+| gh-events | asof-k10 | bellwether-end-to-end | lookup_p50_ms_warm | 31.696 | ms | measured |
+| gh-events | asof-k10 | bellwether-end-to-end | lookup_p95_ms_warm | 34.608 | ms | measured |
+| gh-events | asof-k10 | bellwether-plan | lookup_p50_ms_cold | 27.449 | ms | measured |
+| gh-events | asof-k10 | full-scan | lookup_p50_ms_cold | 5.592 | ms | measured |
+| gh-events | asof-k10 | bellwether-plan | lookup_p95_ms_cold | 40.701 | ms | measured |
+| gh-events | asof-k10 | full-scan | lookup_p95_ms_cold | 5.998 | ms | measured |
+| gh-events | asof-k10 | bellwether-end-to-end | lookup_p50_ms_cold | 29.871 | ms | measured |
+| gh-events | asof-k10 | bellwether-end-to-end | lookup_p95_ms_cold | 43.15 | ms | measured |
+| gh-events | asof-k10 | duckdb | lookup_p50_ms_warm | 3.0 | ms | measured |
+| gh-events | asof-k10 | duckdb | lookup_p95_ms_warm | 4.0 | ms | measured |
+| gh-events | asof-k10 | duckdb | lookup_p50_ms_cold | 6.0 | ms | measured |
+| gh-events | asof-k10 | duckdb | lookup_p95_ms_cold | 6.0 | ms | measured |
+| gh-events | asof-lookback-1d-k10 | bellwether-plan | lookup_p50_ms_warm | 27.08 | ms | measured |
+| gh-events | asof-lookback-1d-k10 | full-scan | lookup_p50_ms_warm | 5.698 | ms | measured |
+| gh-events | asof-lookback-1d-k10 | bellwether-plan | row_groups | 1 | row groups | exact |
+| gh-events | asof-lookback-1d-k10 | bellwether-plan | bytes | 857,970 | bytes | exact |
+| gh-events | asof-lookback-1d-k10 | full-scan | row_groups | 24 | row groups | exact |
+| gh-events | asof-lookback-1d-k10 | full-scan | bytes | 12,817,897 | bytes | exact |
+| gh-events | asof-lookback-1d-k10 | bellwether-plan | lookup_p95_ms_warm | 30.486 | ms | measured |
+| gh-events | asof-lookback-1d-k10 | full-scan | lookup_p95_ms_warm | 9.377 | ms | measured |
+| gh-events | asof-lookback-1d-k10 | bellwether-end-to-end | lookup_p50_ms_warm | 29.645 | ms | measured |
+| gh-events | asof-lookback-1d-k10 | bellwether-end-to-end | lookup_p95_ms_warm | 32.98 | ms | measured |
+| gh-events | asof-lookback-1d-k10 | bellwether-plan | lookup_p50_ms_cold | 28.152 | ms | measured |
+| gh-events | asof-lookback-1d-k10 | full-scan | lookup_p50_ms_cold | 5.592 | ms | measured |
+| gh-events | asof-lookback-1d-k10 | bellwether-plan | lookup_p95_ms_cold | 30.848 | ms | measured |
+| gh-events | asof-lookback-1d-k10 | full-scan | lookup_p95_ms_cold | 5.998 | ms | measured |
+| gh-events | asof-lookback-1d-k10 | bellwether-end-to-end | lookup_p50_ms_cold | 30.51 | ms | measured |
+| gh-events | asof-lookback-1d-k10 | bellwether-end-to-end | lookup_p95_ms_cold | 33.204 | ms | measured |
+| gh-events | asof-lookback-1d-k10 | duckdb | lookup_p50_ms_warm | 3.0 | ms | measured |
+| gh-events | asof-lookback-1d-k10 | duckdb | lookup_p95_ms_warm | 3.0 | ms | measured |
+| gh-events | asof-lookback-1d-k10 | duckdb | lookup_p50_ms_cold | 5.0 | ms | measured |
+| gh-events | asof-lookback-1d-k10 | duckdb | lookup_p95_ms_cold | 5.0 | ms | measured |
+| gh-events | asof-lookback-30d-k10 | bellwether-plan | lookup_p50_ms_warm | 27.93 | ms | measured |
+| gh-events | asof-lookback-30d-k10 | full-scan | lookup_p50_ms_warm | 5.698 | ms | measured |
+| gh-events | asof-lookback-30d-k10 | bellwether-plan | row_groups | 1 | row groups | exact |
+| gh-events | asof-lookback-30d-k10 | bellwether-plan | bytes | 857,970 | bytes | exact |
+| gh-events | asof-lookback-30d-k10 | full-scan | row_groups | 24 | row groups | exact |
+| gh-events | asof-lookback-30d-k10 | full-scan | bytes | 12,817,897 | bytes | exact |
+| gh-events | asof-lookback-30d-k10 | bellwether-plan | lookup_p95_ms_warm | 32.887 | ms | measured |
+| gh-events | asof-lookback-30d-k10 | full-scan | lookup_p95_ms_warm | 9.377 | ms | measured |
+| gh-events | asof-lookback-30d-k10 | bellwether-end-to-end | lookup_p50_ms_warm | 30.294 | ms | measured |
+| gh-events | asof-lookback-30d-k10 | bellwether-end-to-end | lookup_p95_ms_warm | 35.212 | ms | measured |
+| gh-events | asof-lookback-30d-k10 | bellwether-plan | lookup_p50_ms_cold | 28.761 | ms | measured |
+| gh-events | asof-lookback-30d-k10 | full-scan | lookup_p50_ms_cold | 5.592 | ms | measured |
+| gh-events | asof-lookback-30d-k10 | bellwether-plan | lookup_p95_ms_cold | 30.749 | ms | measured |
+| gh-events | asof-lookback-30d-k10 | full-scan | lookup_p95_ms_cold | 5.998 | ms | measured |
+| gh-events | asof-lookback-30d-k10 | bellwether-end-to-end | lookup_p50_ms_cold | 31.17 | ms | measured |
+| gh-events | asof-lookback-30d-k10 | bellwether-end-to-end | lookup_p95_ms_cold | 33.115 | ms | measured |
+| gh-events | asof-lookback-30d-k10 | duckdb | lookup_p50_ms_warm | 3.0 | ms | measured |
+| gh-events | asof-lookback-30d-k10 | duckdb | lookup_p95_ms_warm | 3.0 | ms | measured |
+| gh-events | asof-lookback-30d-k10 | duckdb | lookup_p50_ms_cold | 5.0 | ms | measured |
+| gh-events | asof-lookback-30d-k10 | duckdb | lookup_p95_ms_cold | 6.0 | ms | measured |
+| gh-events | locate-window-1d-k300 | bellwether-plan | lookup_p50_ms_warm | 83.283 | ms | measured |
+| gh-events | locate-window-1d-k300 | full-scan | lookup_p50_ms_warm | 5.698 | ms | measured |
+| gh-events | locate-window-1d-k300 | bellwether-plan | row_groups | 10 | row groups | exact |
+| gh-events | locate-window-1d-k300 | bellwether-plan | bytes | 5,062,111 | bytes | exact |
+| gh-events | locate-window-1d-k300 | full-scan | row_groups | 24 | row groups | exact |
+| gh-events | locate-window-1d-k300 | full-scan | bytes | 12,817,897 | bytes | exact |
+| gh-events | locate-window-1d-k300 | bellwether-plan | lookup_p95_ms_warm | 91.852 | ms | measured |
+| gh-events | locate-window-1d-k300 | full-scan | lookup_p95_ms_warm | 9.377 | ms | measured |
+| gh-events | locate-window-1d-k300 | bellwether-end-to-end | lookup_p50_ms_warm | 86.511 | ms | measured |
+| gh-events | locate-window-1d-k300 | bellwether-end-to-end | lookup_p95_ms_warm | 95.084 | ms | measured |
+| gh-events | locate-window-1d-k300 | bellwether-plan | lookup_p50_ms_cold | 89.512 | ms | measured |
+| gh-events | locate-window-1d-k300 | full-scan | lookup_p50_ms_cold | 5.592 | ms | measured |
+| gh-events | locate-window-1d-k300 | bellwether-plan | lookup_p95_ms_cold | 95.89 | ms | measured |
+| gh-events | locate-window-1d-k300 | full-scan | lookup_p95_ms_cold | 5.998 | ms | measured |
+| gh-events | locate-window-1d-k300 | bellwether-end-to-end | lookup_p50_ms_cold | 92.695 | ms | measured |
+| gh-events | locate-window-1d-k300 | bellwether-end-to-end | lookup_p95_ms_cold | 99.169 | ms | measured |
+| gh-events | locate-window-1d-k300 | duckdb | lookup_p50_ms_warm | 4.0 | ms | measured |
+| gh-events | locate-window-1d-k300 | duckdb | lookup_p95_ms_warm | 4.0 | ms | measured |
+| gh-events | locate-window-1d-k300 | duckdb | lookup_p50_ms_cold | 6.0 | ms | measured |
+| gh-events | locate-window-1d-k300 | duckdb | lookup_p95_ms_cold | 6.0 | ms | measured |
+| gh-events | locate-window-30d-k300 | bellwether-plan | lookup_p50_ms_warm | 83.013 | ms | measured |
+| gh-events | locate-window-30d-k300 | full-scan | lookup_p50_ms_warm | 5.698 | ms | measured |
+| gh-events | locate-window-30d-k300 | bellwether-plan | row_groups | 10 | row groups | exact |
+| gh-events | locate-window-30d-k300 | bellwether-plan | bytes | 5,062,111 | bytes | exact |
+| gh-events | locate-window-30d-k300 | full-scan | row_groups | 24 | row groups | exact |
+| gh-events | locate-window-30d-k300 | full-scan | bytes | 12,817,897 | bytes | exact |
+| gh-events | locate-window-30d-k300 | bellwether-plan | lookup_p95_ms_warm | 87.884 | ms | measured |
+| gh-events | locate-window-30d-k300 | full-scan | lookup_p95_ms_warm | 9.377 | ms | measured |
+| gh-events | locate-window-30d-k300 | bellwether-end-to-end | lookup_p50_ms_warm | 86.085 | ms | measured |
+| gh-events | locate-window-30d-k300 | bellwether-end-to-end | lookup_p95_ms_warm | 90.915 | ms | measured |
+| gh-events | locate-window-30d-k300 | bellwether-plan | lookup_p50_ms_cold | 84.671 | ms | measured |
+| gh-events | locate-window-30d-k300 | full-scan | lookup_p50_ms_cold | 5.592 | ms | measured |
+| gh-events | locate-window-30d-k300 | bellwether-plan | lookup_p95_ms_cold | 88.393 | ms | measured |
+| gh-events | locate-window-30d-k300 | full-scan | lookup_p95_ms_cold | 5.998 | ms | measured |
+| gh-events | locate-window-30d-k300 | bellwether-end-to-end | lookup_p50_ms_cold | 87.805 | ms | measured |
+| gh-events | locate-window-30d-k300 | bellwether-end-to-end | lookup_p95_ms_cold | 91.332 | ms | measured |
+| gh-events | locate-window-30d-k300 | duckdb | lookup_p50_ms_warm | 3.0 | ms | measured |
+| gh-events | locate-window-30d-k300 | duckdb | lookup_p95_ms_warm | 4.0 | ms | measured |
+| gh-events | locate-window-30d-k300 | duckdb | lookup_p50_ms_cold | 6.0 | ms | measured |
+| gh-events | locate-window-30d-k300 | duckdb | lookup_p95_ms_cold | 6.0 | ms | measured |
+| gh-events | latest-k300 | bellwether-plan | lookup_p50_ms_warm | 55.204 | ms | measured |
+| gh-events | latest-k300 | full-scan | lookup_p50_ms_warm | 5.698 | ms | measured |
+| gh-events | latest-k300 | bellwether-plan | row_groups | 23 | row groups | exact |
+| gh-events | latest-k300 | bellwether-plan | bytes | 12,764,922 | bytes | exact |
+| gh-events | latest-k300 | full-scan | row_groups | 24 | row groups | exact |
+| gh-events | latest-k300 | full-scan | bytes | 12,817,897 | bytes | exact |
+| gh-events | latest-k300 | bellwether-plan | lookup_p95_ms_warm | 58.885 | ms | measured |
+| gh-events | latest-k300 | full-scan | lookup_p95_ms_warm | 9.377 | ms | measured |
+| gh-events | latest-k300 | bellwether-end-to-end | lookup_p50_ms_warm | 60.809 | ms | measured |
+| gh-events | latest-k300 | bellwether-end-to-end | lookup_p95_ms_warm | 64.186 | ms | measured |
+| gh-events | latest-k300 | bellwether-plan | lookup_p50_ms_cold | 58.183 | ms | measured |
+| gh-events | latest-k300 | full-scan | lookup_p50_ms_cold | 5.592 | ms | measured |
+| gh-events | latest-k300 | bellwether-plan | lookup_p95_ms_cold | 58.741 | ms | measured |
+| gh-events | latest-k300 | full-scan | lookup_p95_ms_cold | 5.998 | ms | measured |
+| gh-events | latest-k300 | bellwether-end-to-end | lookup_p50_ms_cold | 63.315 | ms | measured |
+| gh-events | latest-k300 | bellwether-end-to-end | lookup_p95_ms_cold | 64.335 | ms | measured |
+| gh-events | latest-k300 | duckdb | lookup_p50_ms_warm | 6.0 | ms | measured |
+| gh-events | latest-k300 | duckdb | lookup_p95_ms_warm | 6.0 | ms | measured |
+| gh-events | latest-k300 | duckdb | lookup_p50_ms_cold | 8.0 | ms | measured |
+| gh-events | latest-k300 | duckdb | lookup_p95_ms_cold | 9.0 | ms | measured |
+| gh-events | asof-k300 | bellwether-plan | lookup_p50_ms_warm | 54.659 | ms | measured |
+| gh-events | asof-k300 | full-scan | lookup_p50_ms_warm | 5.698 | ms | measured |
+| gh-events | asof-k300 | bellwether-plan | row_groups | 10 | row groups | exact |
+| gh-events | asof-k300 | bellwether-plan | bytes | 5,062,111 | bytes | exact |
+| gh-events | asof-k300 | full-scan | row_groups | 24 | row groups | exact |
+| gh-events | asof-k300 | full-scan | bytes | 12,817,897 | bytes | exact |
+| gh-events | asof-k300 | bellwether-plan | lookup_p95_ms_warm | 57.144 | ms | measured |
+| gh-events | asof-k300 | full-scan | lookup_p95_ms_warm | 9.377 | ms | measured |
+| gh-events | asof-k300 | bellwether-end-to-end | lookup_p50_ms_warm | 57.679 | ms | measured |
+| gh-events | asof-k300 | bellwether-end-to-end | lookup_p95_ms_warm | 60.126 | ms | measured |
+| gh-events | asof-k300 | bellwether-plan | lookup_p50_ms_cold | 57.108 | ms | measured |
+| gh-events | asof-k300 | full-scan | lookup_p50_ms_cold | 5.592 | ms | measured |
+| gh-events | asof-k300 | bellwether-plan | lookup_p95_ms_cold | 58.41 | ms | measured |
+| gh-events | asof-k300 | full-scan | lookup_p95_ms_cold | 5.998 | ms | measured |
+| gh-events | asof-k300 | bellwether-end-to-end | lookup_p50_ms_cold | 60.066 | ms | measured |
+| gh-events | asof-k300 | bellwether-end-to-end | lookup_p95_ms_cold | 61.378 | ms | measured |
+| gh-events | asof-k300 | duckdb | lookup_p50_ms_warm | 4.0 | ms | measured |
+| gh-events | asof-k300 | duckdb | lookup_p95_ms_warm | 4.0 | ms | measured |
+| gh-events | asof-k300 | duckdb | lookup_p50_ms_cold | 7.0 | ms | measured |
+| gh-events | asof-k300 | duckdb | lookup_p95_ms_cold | 7.0 | ms | measured |
+| gh-events | asof-lookback-1d-k300 | bellwether-plan | lookup_p50_ms_warm | 82.442 | ms | measured |
+| gh-events | asof-lookback-1d-k300 | full-scan | lookup_p50_ms_warm | 5.698 | ms | measured |
+| gh-events | asof-lookback-1d-k300 | bellwether-plan | row_groups | 10 | row groups | exact |
+| gh-events | asof-lookback-1d-k300 | bellwether-plan | bytes | 5,062,111 | bytes | exact |
+| gh-events | asof-lookback-1d-k300 | full-scan | row_groups | 24 | row groups | exact |
+| gh-events | asof-lookback-1d-k300 | full-scan | bytes | 12,817,897 | bytes | exact |
+| gh-events | asof-lookback-1d-k300 | bellwether-plan | lookup_p95_ms_warm | 84.819 | ms | measured |
+| gh-events | asof-lookback-1d-k300 | full-scan | lookup_p95_ms_warm | 9.377 | ms | measured |
+| gh-events | asof-lookback-1d-k300 | bellwether-end-to-end | lookup_p50_ms_warm | 85.449 | ms | measured |
+| gh-events | asof-lookback-1d-k300 | bellwether-end-to-end | lookup_p95_ms_warm | 87.852 | ms | measured |
+| gh-events | asof-lookback-1d-k300 | bellwether-plan | lookup_p50_ms_cold | 84.596 | ms | measured |
+| gh-events | asof-lookback-1d-k300 | full-scan | lookup_p50_ms_cold | 5.592 | ms | measured |
+| gh-events | asof-lookback-1d-k300 | bellwether-plan | lookup_p95_ms_cold | 87.778 | ms | measured |
+| gh-events | asof-lookback-1d-k300 | full-scan | lookup_p95_ms_cold | 5.998 | ms | measured |
+| gh-events | asof-lookback-1d-k300 | bellwether-end-to-end | lookup_p50_ms_cold | 87.468 | ms | measured |
+| gh-events | asof-lookback-1d-k300 | bellwether-end-to-end | lookup_p95_ms_cold | 90.837 | ms | measured |
+| gh-events | asof-lookback-1d-k300 | duckdb | lookup_p50_ms_warm | 3.0 | ms | measured |
+| gh-events | asof-lookback-1d-k300 | duckdb | lookup_p95_ms_warm | 4.0 | ms | measured |
+| gh-events | asof-lookback-1d-k300 | duckdb | lookup_p50_ms_cold | 6.0 | ms | measured |
+| gh-events | asof-lookback-1d-k300 | duckdb | lookup_p95_ms_cold | 6.0 | ms | measured |
+| gh-events | asof-lookback-30d-k300 | bellwether-plan | lookup_p50_ms_warm | 85.29 | ms | measured |
+| gh-events | asof-lookback-30d-k300 | full-scan | lookup_p50_ms_warm | 5.698 | ms | measured |
+| gh-events | asof-lookback-30d-k300 | bellwether-plan | row_groups | 10 | row groups | exact |
+| gh-events | asof-lookback-30d-k300 | bellwether-plan | bytes | 5,062,111 | bytes | exact |
+| gh-events | asof-lookback-30d-k300 | full-scan | row_groups | 24 | row groups | exact |
+| gh-events | asof-lookback-30d-k300 | full-scan | bytes | 12,817,897 | bytes | exact |
+| gh-events | asof-lookback-30d-k300 | bellwether-plan | lookup_p95_ms_warm | 90.181 | ms | measured |
+| gh-events | asof-lookback-30d-k300 | full-scan | lookup_p95_ms_warm | 9.377 | ms | measured |
+| gh-events | asof-lookback-30d-k300 | bellwether-end-to-end | lookup_p50_ms_warm | 88.435 | ms | measured |
+| gh-events | asof-lookback-30d-k300 | bellwether-end-to-end | lookup_p95_ms_warm | 93.254 | ms | measured |
+| gh-events | asof-lookback-30d-k300 | bellwether-plan | lookup_p50_ms_cold | 85.323 | ms | measured |
+| gh-events | asof-lookback-30d-k300 | full-scan | lookup_p50_ms_cold | 5.592 | ms | measured |
+| gh-events | asof-lookback-30d-k300 | bellwether-plan | lookup_p95_ms_cold | 88.084 | ms | measured |
+| gh-events | asof-lookback-30d-k300 | full-scan | lookup_p95_ms_cold | 5.998 | ms | measured |
+| gh-events | asof-lookback-30d-k300 | bellwether-end-to-end | lookup_p50_ms_cold | 88.689 | ms | measured |
+| gh-events | asof-lookback-30d-k300 | bellwether-end-to-end | lookup_p95_ms_cold | 91.162 | ms | measured |
+| gh-events | asof-lookback-30d-k300 | duckdb | lookup_p50_ms_warm | 5.0 | ms | measured |
+| gh-events | asof-lookback-30d-k300 | duckdb | lookup_p95_ms_warm | 6.0 | ms | measured |
+| gh-events | asof-lookback-30d-k300 | duckdb | lookup_p50_ms_cold | 9.0 | ms | measured |
+| gh-events | asof-lookback-30d-k300 | duckdb | lookup_p95_ms_cold | 14.0 | ms | measured |
+| gh-events | locate-window-1d-k3000 | bellwether-plan | lookup_p50_ms_warm | 285.743 | ms | measured |
+| gh-events | locate-window-1d-k3000 | full-scan | lookup_p50_ms_warm | 5.698 | ms | measured |
+| gh-events | locate-window-1d-k3000 | bellwether-plan | row_groups | 11 | row groups | exact |
+| gh-events | locate-window-1d-k3000 | bellwether-plan | bytes | 5,939,945 | bytes | exact |
+| gh-events | locate-window-1d-k3000 | full-scan | row_groups | 24 | row groups | exact |
+| gh-events | locate-window-1d-k3000 | full-scan | bytes | 12,817,897 | bytes | exact |
+| gh-events | locate-window-1d-k3000 | bellwether-plan | lookup_p95_ms_warm | 679.774 | ms | measured |
+| gh-events | locate-window-1d-k3000 | full-scan | lookup_p95_ms_warm | 9.377 | ms | measured |
+| gh-events | locate-window-1d-k3000 | bellwether-end-to-end | lookup_p50_ms_warm | 288.82 | ms | measured |
+| gh-events | locate-window-1d-k3000 | bellwether-end-to-end | lookup_p95_ms_warm | 682.936 | ms | measured |
+| gh-events | locate-window-1d-k3000 | bellwether-plan | lookup_p50_ms_cold | 278.782 | ms | measured |
+| gh-events | locate-window-1d-k3000 | full-scan | lookup_p50_ms_cold | 5.592 | ms | measured |
+| gh-events | locate-window-1d-k3000 | bellwether-plan | lookup_p95_ms_cold | 280.812 | ms | measured |
+| gh-events | locate-window-1d-k3000 | full-scan | lookup_p95_ms_cold | 5.998 | ms | measured |
+| gh-events | locate-window-1d-k3000 | bellwether-end-to-end | lookup_p50_ms_cold | 281.828 | ms | measured |
+| gh-events | locate-window-1d-k3000 | bellwether-end-to-end | lookup_p95_ms_cold | 283.924 | ms | measured |
+| gh-events | locate-window-1d-k3000 | duckdb | lookup_p50_ms_warm | 4.0 | ms | measured |
+| gh-events | locate-window-1d-k3000 | duckdb | lookup_p95_ms_warm | 4.0 | ms | measured |
+| gh-events | locate-window-1d-k3000 | duckdb | lookup_p50_ms_cold | 6.0 | ms | measured |
+| gh-events | locate-window-1d-k3000 | duckdb | lookup_p95_ms_cold | 6.0 | ms | measured |
+| gh-events | locate-window-30d-k3000 | bellwether-plan | lookup_p50_ms_warm | 276.266 | ms | measured |
+| gh-events | locate-window-30d-k3000 | full-scan | lookup_p50_ms_warm | 5.698 | ms | measured |
+| gh-events | locate-window-30d-k3000 | bellwether-plan | row_groups | 11 | row groups | exact |
+| gh-events | locate-window-30d-k3000 | bellwether-plan | bytes | 5,939,945 | bytes | exact |
+| gh-events | locate-window-30d-k3000 | full-scan | row_groups | 24 | row groups | exact |
+| gh-events | locate-window-30d-k3000 | full-scan | bytes | 12,817,897 | bytes | exact |
+| gh-events | locate-window-30d-k3000 | bellwether-plan | lookup_p95_ms_warm | 293.258 | ms | measured |
+| gh-events | locate-window-30d-k3000 | full-scan | lookup_p95_ms_warm | 9.377 | ms | measured |
+| gh-events | locate-window-30d-k3000 | bellwether-end-to-end | lookup_p50_ms_warm | 279.383 | ms | measured |
+| gh-events | locate-window-30d-k3000 | bellwether-end-to-end | lookup_p95_ms_warm | 296.408 | ms | measured |
+| gh-events | locate-window-30d-k3000 | bellwether-plan | lookup_p50_ms_cold | 277.33 | ms | measured |
+| gh-events | locate-window-30d-k3000 | full-scan | lookup_p50_ms_cold | 5.592 | ms | measured |
+| gh-events | locate-window-30d-k3000 | bellwether-plan | lookup_p95_ms_cold | 284.015 | ms | measured |
+| gh-events | locate-window-30d-k3000 | full-scan | lookup_p95_ms_cold | 5.998 | ms | measured |
+| gh-events | locate-window-30d-k3000 | bellwether-end-to-end | lookup_p50_ms_cold | 280.393 | ms | measured |
+| gh-events | locate-window-30d-k3000 | bellwether-end-to-end | lookup_p95_ms_cold | 287.091 | ms | measured |
+| gh-events | locate-window-30d-k3000 | duckdb | lookup_p50_ms_warm | 4.0 | ms | measured |
+| gh-events | locate-window-30d-k3000 | duckdb | lookup_p95_ms_warm | 4.0 | ms | measured |
+| gh-events | locate-window-30d-k3000 | duckdb | lookup_p50_ms_cold | 6.0 | ms | measured |
+| gh-events | locate-window-30d-k3000 | duckdb | lookup_p95_ms_cold | 6.0 | ms | measured |
+| gh-events | latest-k3000 | bellwether-plan | lookup_p50_ms_warm | 183.289 | ms | measured |
+| gh-events | latest-k3000 | full-scan | lookup_p50_ms_warm | 5.698 | ms | measured |
+| gh-events | latest-k3000 | bellwether-plan | row_groups | 24 | row groups | exact |
+| gh-events | latest-k3000 | bellwether-plan | bytes | 12,817,897 | bytes | exact |
+| gh-events | latest-k3000 | full-scan | row_groups | 24 | row groups | exact |
+| gh-events | latest-k3000 | full-scan | bytes | 12,817,897 | bytes | exact |
+| gh-events | latest-k3000 | bellwether-plan | lookup_p95_ms_warm | 195.268 | ms | measured |
+| gh-events | latest-k3000 | full-scan | lookup_p95_ms_warm | 9.377 | ms | measured |
+| gh-events | latest-k3000 | bellwether-end-to-end | lookup_p50_ms_warm | 188.723 | ms | measured |
+| gh-events | latest-k3000 | bellwether-end-to-end | lookup_p95_ms_warm | 200.829 | ms | measured |
+| gh-events | latest-k3000 | bellwether-plan | lookup_p50_ms_cold | 185.647 | ms | measured |
+| gh-events | latest-k3000 | full-scan | lookup_p50_ms_cold | 5.592 | ms | measured |
+| gh-events | latest-k3000 | bellwether-plan | lookup_p95_ms_cold | 188.47 | ms | measured |
+| gh-events | latest-k3000 | full-scan | lookup_p95_ms_cold | 5.998 | ms | measured |
+| gh-events | latest-k3000 | bellwether-end-to-end | lookup_p50_ms_cold | 190.609 | ms | measured |
+| gh-events | latest-k3000 | bellwether-end-to-end | lookup_p95_ms_cold | 193.639 | ms | measured |
+| gh-events | latest-k3000 | duckdb | lookup_p50_ms_warm | 7.0 | ms | measured |
+| gh-events | latest-k3000 | duckdb | lookup_p95_ms_warm | 8.0 | ms | measured |
+| gh-events | latest-k3000 | duckdb | lookup_p50_ms_cold | 11.0 | ms | measured |
+| gh-events | latest-k3000 | duckdb | lookup_p95_ms_cold | 11.0 | ms | measured |
+| gh-events | asof-k3000 | bellwether-plan | lookup_p50_ms_warm | 178.371 | ms | measured |
+| gh-events | asof-k3000 | full-scan | lookup_p50_ms_warm | 5.698 | ms | measured |
+| gh-events | asof-k3000 | bellwether-plan | row_groups | 11 | row groups | exact |
+| gh-events | asof-k3000 | bellwether-plan | bytes | 5,939,945 | bytes | exact |
+| gh-events | asof-k3000 | full-scan | row_groups | 24 | row groups | exact |
+| gh-events | asof-k3000 | full-scan | bytes | 12,817,897 | bytes | exact |
+| gh-events | asof-k3000 | bellwether-plan | lookup_p95_ms_warm | 211.363 | ms | measured |
+| gh-events | asof-k3000 | full-scan | lookup_p95_ms_warm | 9.377 | ms | measured |
+| gh-events | asof-k3000 | bellwether-end-to-end | lookup_p50_ms_warm | 181.993 | ms | measured |
+| gh-events | asof-k3000 | bellwether-end-to-end | lookup_p95_ms_warm | 215.124 | ms | measured |
+| gh-events | asof-k3000 | bellwether-plan | lookup_p50_ms_cold | 184.795 | ms | measured |
+| gh-events | asof-k3000 | full-scan | lookup_p50_ms_cold | 5.592 | ms | measured |
+| gh-events | asof-k3000 | bellwether-plan | lookup_p95_ms_cold | 187.334 | ms | measured |
+| gh-events | asof-k3000 | full-scan | lookup_p95_ms_cold | 5.998 | ms | measured |
+| gh-events | asof-k3000 | bellwether-end-to-end | lookup_p50_ms_cold | 188.021 | ms | measured |
+| gh-events | asof-k3000 | bellwether-end-to-end | lookup_p95_ms_cold | 190.438 | ms | measured |
+| gh-events | asof-k3000 | duckdb | lookup_p50_ms_warm | 5.0 | ms | measured |
+| gh-events | asof-k3000 | duckdb | lookup_p95_ms_warm | 6.0 | ms | measured |
+| gh-events | asof-k3000 | duckdb | lookup_p50_ms_cold | 8.0 | ms | measured |
+| gh-events | asof-k3000 | duckdb | lookup_p95_ms_cold | 8.0 | ms | measured |
+| gh-events | asof-lookback-1d-k3000 | bellwether-plan | lookup_p50_ms_warm | 285.308 | ms | measured |
+| gh-events | asof-lookback-1d-k3000 | full-scan | lookup_p50_ms_warm | 5.698 | ms | measured |
+| gh-events | asof-lookback-1d-k3000 | bellwether-plan | row_groups | 11 | row groups | exact |
+| gh-events | asof-lookback-1d-k3000 | bellwether-plan | bytes | 5,939,945 | bytes | exact |
+| gh-events | asof-lookback-1d-k3000 | full-scan | row_groups | 24 | row groups | exact |
+| gh-events | asof-lookback-1d-k3000 | full-scan | bytes | 12,817,897 | bytes | exact |
+| gh-events | asof-lookback-1d-k3000 | bellwether-plan | lookup_p95_ms_warm | 300.881 | ms | measured |
+| gh-events | asof-lookback-1d-k3000 | full-scan | lookup_p95_ms_warm | 9.377 | ms | measured |
+| gh-events | asof-lookback-1d-k3000 | bellwether-end-to-end | lookup_p50_ms_warm | 288.45 | ms | measured |
+| gh-events | asof-lookback-1d-k3000 | bellwether-end-to-end | lookup_p95_ms_warm | 304.003 | ms | measured |
+| gh-events | asof-lookback-1d-k3000 | bellwether-plan | lookup_p50_ms_cold | 280.626 | ms | measured |
+| gh-events | asof-lookback-1d-k3000 | full-scan | lookup_p50_ms_cold | 5.592 | ms | measured |
+| gh-events | asof-lookback-1d-k3000 | bellwether-plan | lookup_p95_ms_cold | 282.797 | ms | measured |
+| gh-events | asof-lookback-1d-k3000 | full-scan | lookup_p95_ms_cold | 5.998 | ms | measured |
+| gh-events | asof-lookback-1d-k3000 | bellwether-end-to-end | lookup_p50_ms_cold | 283.693 | ms | measured |
+| gh-events | asof-lookback-1d-k3000 | bellwether-end-to-end | lookup_p95_ms_cold | 285.898 | ms | measured |
+| gh-events | asof-lookback-1d-k3000 | duckdb | lookup_p50_ms_warm | 4.0 | ms | measured |
+| gh-events | asof-lookback-1d-k3000 | duckdb | lookup_p95_ms_warm | 4.0 | ms | measured |
+| gh-events | asof-lookback-1d-k3000 | duckdb | lookup_p50_ms_cold | 6.0 | ms | measured |
+| gh-events | asof-lookback-1d-k3000 | duckdb | lookup_p95_ms_cold | 6.0 | ms | measured |
+| gh-events | asof-lookback-30d-k3000 | bellwether-plan | lookup_p50_ms_warm | 277.842 | ms | measured |
+| gh-events | asof-lookback-30d-k3000 | full-scan | lookup_p50_ms_warm | 5.698 | ms | measured |
+| gh-events | asof-lookback-30d-k3000 | bellwether-plan | row_groups | 11 | row groups | exact |
+| gh-events | asof-lookback-30d-k3000 | bellwether-plan | bytes | 5,939,945 | bytes | exact |
+| gh-events | asof-lookback-30d-k3000 | full-scan | row_groups | 24 | row groups | exact |
+| gh-events | asof-lookback-30d-k3000 | full-scan | bytes | 12,817,897 | bytes | exact |
+| gh-events | asof-lookback-30d-k3000 | bellwether-plan | lookup_p95_ms_warm | 282.31 | ms | measured |
+| gh-events | asof-lookback-30d-k3000 | full-scan | lookup_p95_ms_warm | 9.377 | ms | measured |
+| gh-events | asof-lookback-30d-k3000 | bellwether-end-to-end | lookup_p50_ms_warm | 281.03 | ms | measured |
+| gh-events | asof-lookback-30d-k3000 | bellwether-end-to-end | lookup_p95_ms_warm | 285.401 | ms | measured |
+| gh-events | asof-lookback-30d-k3000 | bellwether-plan | lookup_p50_ms_cold | 279.624 | ms | measured |
+| gh-events | asof-lookback-30d-k3000 | full-scan | lookup_p50_ms_cold | 5.592 | ms | measured |
+| gh-events | asof-lookback-30d-k3000 | bellwether-plan | lookup_p95_ms_cold | 282.522 | ms | measured |
+| gh-events | asof-lookback-30d-k3000 | full-scan | lookup_p95_ms_cold | 5.998 | ms | measured |
+| gh-events | asof-lookback-30d-k3000 | bellwether-end-to-end | lookup_p50_ms_cold | 282.685 | ms | measured |
+| gh-events | asof-lookback-30d-k3000 | bellwether-end-to-end | lookup_p95_ms_cold | 285.819 | ms | measured |
+| gh-events | asof-lookback-30d-k3000 | duckdb | lookup_p50_ms_warm | 4.0 | ms | measured |
+| gh-events | asof-lookback-30d-k3000 | duckdb | lookup_p95_ms_warm | 4.0 | ms | measured |
+| gh-events | asof-lookback-30d-k3000 | duckdb | lookup_p50_ms_cold | 6.0 | ms | measured |
+| gh-events | asof-lookback-30d-k3000 | duckdb | lookup_p95_ms_cold | 6.0 | ms | measured |
+
+<sub>Apple M3 Pro, 12 cores, 36 GiB, macOS 26.4.1, local SSD. DuckDB v2.0.0 (Cyanoptera) d54cbbe3df for market-default, market-10x, gh-events; bellwether release build of sources at f809e5403d08 (rustc 1.99.1; sha256 3f05ece30dc0); bellwether-bench byte-counting reader in the same binary, sources at f809e5403d08 for market-default, market-10x, gh-events. Measured 2026-10-26.</sub>
+<!-- results:perf:end -->
+
+</details>
+
 ## Hypotheses for WP22b, ranked by expected gain
 
 **The ranking metric.** For each hypothesis, it is the upper bound on the share of the named benchmark's wall time that the fix could remove. It is read from the profile and from the same command run once without the profiler.
