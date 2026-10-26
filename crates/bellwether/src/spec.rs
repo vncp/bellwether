@@ -615,6 +615,49 @@ mod tests {
         assert_eq!(parse_declaration(&declaration_label(&d)).unwrap(), d);
     }
 
+    /// Agg keys (B7): functions in any order parse to the canonical one,
+    /// with `count` always stored; the label is the identity and reads back;
+    /// a function set is part of the identity, not of the name.
+    #[test]
+    fn agg_specs_parse_to_canonical_functions_and_read_back() {
+        use bellwether_types::AggregateFn;
+        for s in [
+            "agg:account@amount{sum,count}",
+            "agg:account,day@size{sum,count,min,max}",
+            "agg:a@v{count}",
+        ] {
+            let spec = parse(s).unwrap();
+            assert_eq!(label(&spec), s);
+            assert_eq!(spec.identity(), s);
+            assert_eq!(parse(&label(&spec)).unwrap(), spec);
+        }
+        let spec = parse("agg:a@v{max,sum}").unwrap();
+        assert_eq!(
+            spec,
+            KeySpec::Agg {
+                columns: vec!["a".into()],
+                value: "v".into(),
+                functions: vec![AggregateFn::Sum, AggregateFn::Count, AggregateFn::Max],
+            }
+        );
+        assert_eq!(spec.name(), "agg:a@v");
+        assert_eq!(spec.identity(), "agg:a@v{sum,count,max}");
+        assert_eq!(
+            parse("agg:a@v{sum,count}").unwrap().name(),
+            parse("agg:a@v{sum,count,min}").unwrap().name()
+        );
+        for bad in [
+            "agg:a",
+            "agg:a@v",
+            "agg:a@v{avg}",
+            "agg:@v{sum}",
+            "agg:a@{sum}",
+        ] {
+            let e = parse(bad).unwrap_err().to_string();
+            assert!(e.contains("agg"), "{bad}: {e}");
+        }
+    }
+
     #[test]
     fn malformed_specs_are_refused() {
         for s in [

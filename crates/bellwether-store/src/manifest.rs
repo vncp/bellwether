@@ -1234,6 +1234,40 @@ mod tests {
         );
     }
 
+    /// Agg keys (B7) are a storage version 2 kind: read and written back
+    /// as declared, and refused by name in a version 1 manifest.
+    #[test]
+    fn an_agg_key_is_a_storage_version_2_kind() {
+        let json = |version: u32| {
+            format!(
+                r#"{{"storage_version": {version}, "created_at": "x",
+                "schema": {{"key_specs": [{{"kind": "agg", "columns": ["account"],
+                "value": "amount", "functions": ["sum", "count"]}}]}}}}"#
+            )
+        };
+        let m = Manifest::from_slice(json(2).as_bytes()).unwrap();
+        assert_eq!(
+            m.schema.key_specs[0].identity(),
+            "agg:account@amount{sum,count}"
+        );
+        let back: Value = serde_json::from_slice(&m.to_vec().unwrap()).unwrap();
+        assert_eq!(back["schema"]["key_specs"][0]["kind"], "agg");
+        assert_eq!(back["schema"]["key_specs"][0]["value"], "amount");
+        assert!(key_spec_fields("agg", 1).is_none());
+        match Manifest::from_slice(json(1).as_bytes()) {
+            Err(Error::UnknownKind {
+                what: UNSUPPORTED_SHAPE,
+                ..
+            }) => {}
+            other => panic!("expected UnknownKind (shape), got {other:?}"),
+        }
+        expect_unsupported_shape(
+            r#"{"storage_version": 2, "created_at": "x",
+                "schema": {"key_specs": [{"kind": "agg", "columns": ["a"], "value": "v",
+                "functions": ["count"], "weights": true}]}}"#,
+        );
+    }
+
     #[test]
     fn legacy_manifest_without_kind_or_sidecars_serializes_byte_identically() {
         let mut m = Manifest::from_slice(WITH_UNKNOWN.as_bytes()).unwrap();
