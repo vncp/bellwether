@@ -303,10 +303,8 @@ DATASETS = {
         "ts": "ts",
         "ts_type": "TIMESTAMPTZ",
         "known": "known_at",
-        # Hive partitioning (`day=` directories) only with --market-hive:
-        # `fix` does not yet record --partitioning in the index it builds.
-        # The questions never filter on `day`, so the bytes are the same.
-        "hive": False,
+        # `day=` directories are a column on every side (`--partitioning hive`).
+        "hive": True,
     },
 }
 
@@ -704,14 +702,7 @@ def main():
         action="store_true",
         help="measure even though DuckDB's version or a downloaded file differs from what the results file records",
     )
-    ap.add_argument(
-        "--market-hive",
-        action="store_true",
-        help="read the market corpus with hive partitioning (`day=` directories) on every side; needs an "
-        "engine whose `fix` records --partitioning in the index it builds",
-    )
     a = ap.parse_args()
-    DATASETS["market"]["hive"] = a.market_hive
     a.machine = f"{machine()}, {a.disk}"
     a.date = time.strftime("%Y-%m-%d", time.gmtime())
     dv = subprocess.run([a.duckdb, "-no-agent", "--version"], capture_output=True, text=True).stdout.split()

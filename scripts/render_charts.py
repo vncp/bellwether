@@ -150,6 +150,16 @@ class Results:
         rows = [r for r in self.rows if qids is None or r["query"] in qids]
         machines = sorted({r["machine"] for r in rows})
         builds = sorted({r["build"] for r in rows if r["build"] != "footer statistics (no engine)"})
+        if len(builds) > 1:
+            # Say which build measured which datasets.
+            named = []
+            for b in builds:
+                ds = []
+                for r in rows:
+                    if r["build"] == b and r["dataset"] not in ds:
+                        ds.append(r["dataset"])
+                named.append(f"{b} for {', '.join(self.dataset_name(d) for d in ds)}" if len(ds) < len({r['dataset'] for r in rows}) else b)
+            builds = named
         dates = sorted({r["date"] for r in rows})
         line = f"{'; '.join(machines)}. {'; '.join(builds)}. Measured {', '.join(dates)}."
         if load and self.load_range(qids):
