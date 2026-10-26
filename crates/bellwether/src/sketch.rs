@@ -140,7 +140,7 @@ impl Engine {
         }
         self.check_items(&req.items, pinned.as_ref())?;
         let folded = match &pinned {
-            Some(p) => fold_complete_sketches(p)?,
+            Some(p) => self.read_sketches(p)?,
             None => Vec::new(),
         };
         let wanted = self.requested_items(req, pinned.as_ref(), &folded)?;
@@ -340,7 +340,7 @@ impl Engine {
             let pinned = e.pin_required("overlap")?;
             e.refuse_stale(&pinned, "overlap")?;
             e.check_items(&[label.to_string()], Some(&pinned))?;
-            let mut folded = fold_complete_sketches(&pinned)?;
+            let mut folded = e.read_sketches(&pinned)?;
             let Some(pos) = best_index(&folded, label) else {
                 return Err(Error::NotIndexed {
                     root: e.root().to_string(),
@@ -416,6 +416,32 @@ impl Engine {
             }
         }
         Ok(out)
+    }
+
+    /// Every complete sketch, folded ([`fold_complete_sketches`]); a sketch
+    /// that cannot be read (a segment missing from the store or damaged)
+    /// is an error naming the cause and the `index` declaration that
+    /// rebuilds it.
+    pub(crate) fn read_sketches(&self, pinned: &Pinned) -> Result<Vec<Folded>> {
+        fold_complete_sketches(pinned)
+            .map_err(|e| Error::Other(self.sketch_unavailable(pinned, &e)))
+    }
+
+    /// Why the index's sketches cannot be read (`e`), and the command that
+    /// rebuilds them: re-declaring a sketch whose segments are missing or
+    /// damaged sketches every file again.
+    pub(crate) fn sketch_unavailable(&self, pinned: &Pinned, e: &Error) -> String {
+        let labels: Vec<String> = declared_sketches(pinned.manifest())
+            .iter()
+            .map(SketchSpec::label)
+            .collect();
+        format!(
+            "the sketch is unavailable: {e}; rebuild it with `bellwether index {} --key {}` \
+             (re-declaring a sketch whose segments are missing or damaged sketches every file \
+             again; plans never read a sketch, so nothing else is affected)",
+            self.root(),
+            labels.join(" --key ")
+        )
     }
 }
 

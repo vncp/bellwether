@@ -342,3 +342,65 @@ fn sketch_refusals_name_real_columns() {
     assert!(e.contains("--column"), "{e}");
     assert!(e.contains("id, batch, payload"), "{e}");
 }
+
+/// A damaged sketch segment (one byte flipped) is refused by `sketch
+/// cardinality` and `sketch overlap`, on the CLI and over MCP, with the
+/// cause and the same next step `why` gives: `bellwether index ROOT --key
+/// <the declared sketch>`, which then rebuilds it.
+#[test]
+fn a_damaged_sketch_names_the_index_command_that_rebuilds_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    corpus(&data, 3, 2, 30, 50);
+    let d = path(&data);
+    run(&["index", d, "--key", "exact:id"], 0);
+    run(&["index", d, "--key", "sketch:id,batch"], 0);
+    let idx = data.join(".bellwether");
+    let m: Value =
+        serde_json::from_slice(&std::fs::read(idx.join("manifest.json")).unwrap()).unwrap();
+    let id = m["segments"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["kind"] == "sketch")
+        .unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let seg = idx.join("segments").join(format!("{id}.seg"));
+    let mut bytes = std::fs::read(&seg).unwrap();
+    bytes[20] ^= 0x01;
+    std::fs::write(&seg, bytes).unwrap();
+
+    let step = "--key sketch:id,batch` (re-declaring";
+    let srv = server(&data);
+    for (tool, args, cli_args) in [
+        (
+            "observe.cardinality",
+            json!({}),
+            vec!["sketch", "cardinality", d],
+        ),
+        (
+            "observe.overlap",
+            json!({"left": "id", "right": "batch"}),
+            vec!["sketch", "overlap", d, "id", "batch"],
+        ),
+    ] {
+        let out = common::bw().args(&cli_args).output().unwrap();
+        assert_eq!(out.status.code(), Some(4), "{tool}");
+        let e = String::from_utf8_lossy(&out.stderr);
+        assert!(e.contains("the sketch is unavailable"), "{tool}: {e}");
+        assert!(e.contains("bellwether index "), "{tool}: {e}");
+        assert!(e.contains(step), "{tool}: {e}");
+        let r = srv.call(tool, args);
+        assert!(r.text.contains(step), "{tool}: {}", r.text);
+    }
+    // `why` gives the same step and keeps working.
+    let h = run(&["why", d], 0);
+    assert!(h.contains(step), "{h}");
+    // The step works.
+    let h = run(&["index", d, "--key", "sketch:id,batch"], 0);
+    assert!(h.contains("rebuilt sketch:id,batch"), "{h}");
+    run(&["sketch", "cardinality", d], 0);
+    run(&["sketch", "overlap", d, "id", "batch"], 0);
+}

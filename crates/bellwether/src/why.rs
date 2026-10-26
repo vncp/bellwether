@@ -843,18 +843,7 @@ impl Engine {
             Ok(inputs) => Ok(inputs),
             Err(e @ Error::NotIndexed { .. }) if required => Err(e),
             Err(e) => {
-                let labels: Vec<String> = bellwether_build::declared_sketches(p.manifest())
-                    .iter()
-                    .map(bellwether_types::SketchSpec::label)
-                    .collect();
-                let why_not = format!(
-                    "the sketch column is unavailable: {e}; rebuild it with `bellwether index {} \
-                     --key {}` (re-declaring a sketch whose segments are missing or damaged \
-                     sketches every file again; plans never read a sketch, so nothing else is \
-                     affected)",
-                    self.root(),
-                    labels.join(" --key ")
-                );
+                let why_not = self.sketch_unavailable(p, &e);
                 if required {
                     return Err(Error::Other(why_not));
                 }
