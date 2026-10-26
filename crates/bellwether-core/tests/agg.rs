@@ -505,6 +505,11 @@ fn merging_folds_disjoint_row_groups_only() {
     assert_eq!(seen, vec![(key("a"), 2), (key("b"), 1), (key("c"), 1)]);
     let overlapping = [open(&build(0..2)), open(&build(1..3))];
     assert!(merge(&overlapping, &WriterOptions::default()).is_err());
+    // The reconcile's read path folds without writing, so it must refuse
+    // two inputs aggregating one (key, row group) itself, never pairing a
+    // row group with another's cell.
+    let e = visit_merged_values(&overlapping, |_, _| Ok(())).unwrap_err();
+    assert!(e.to_string().contains("both aggregate key"), "{e}");
 }
 
 // -- corruption sweep -------------------------------------------------------

@@ -313,4 +313,48 @@ fn reconcile_with_and_without_agg_keys_catches_one_unit_and_says_which_side() {
     assert!(r.outcome.pass);
     let sides: Vec<&str> = r.outcome.agg.iter().map(|a| a.side.as_str()).collect();
     assert_eq!(sides, ["left"]);
+
+    // The planted file replaced by the right one and the index updated:
+    // the retired row groups' cells (one of them a millionth off) still sit
+    // in the old segments and must not count. Both sides are answered from
+    // their agg keys again, with every live row and the oracle's total.
+    std::fs::copy(right.join("part-001.parquet"), bad.join("part-001.parquet")).unwrap();
+    index_agg(&bad);
+    let r = l
+        .reconcile(bad.to_str().unwrap(), &reconcile_req())
+        .unwrap();
+    assert!(r.outcome.pass, "{:?}", r.outcome.mismatches);
+    let sides: Vec<&str> = r.outcome.agg.iter().map(|a| a.side.as_str()).collect();
+    assert_eq!(sides, ["left", "right"]);
+    assert_eq!(r.outcome.agg[1].rows, 240);
+    assert_eq!(r.outcome.memory.rows_read, [0, 0]);
+    assert_eq!(r.outcome.totals[0].right.render(), dec6(total));
+}
+
+/// A side holding rows whose account is null is read, never answered from
+/// its agg key: those rows are in no cell (ADR 014), so the key's rows are
+/// not every row of the side, and a total from the cells would miss them.
+#[test]
+fn a_side_with_null_keys_is_read_not_answered_from_its_agg_key() {
+    let dir = tempfile::tempdir().unwrap();
+    let (left, right) = (dir.path().join("left"), dir.path().join("right"));
+    let null_every_50th = |r: &mut AggRow| {
+        if r.2 % 50 == 7 {
+            r.0 = None;
+        }
+    };
+    corpus_with(&left, 2, 3, 40, null_every_50th);
+    corpus_with(&right, 2, 3, 40, null_every_50th);
+    index_agg(&left);
+    index_agg(&right);
+    let r = open(&left)
+        .reconcile(right.to_str().unwrap(), &reconcile_req())
+        .unwrap();
+    assert!(r.outcome.pass, "{:?}", r.outcome.mismatches);
+    assert_eq!(r.outcome.agg.len(), 0, "{:?}", r.outcome.agg);
+    assert_eq!(r.outcome.memory.rows_read, [240, 240]);
+    let Record::Certificate(c) = &r.certificate.record else {
+        panic!()
+    };
+    assert_eq!(c.body.agg.len(), 0);
 }
