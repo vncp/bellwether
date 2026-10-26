@@ -5,7 +5,7 @@
 //! hash, exactly as the ledger stores it ([`Written`]).
 
 use bellwether_ledger::{RecordKind, SignatureStatus, Verdict};
-use bellwether_types::{Hash, KeySpec, Record};
+use bellwether_types::{Hash, KeySpec, Record, TextOp};
 use serde::{Deserialize, Serialize};
 
 /// A ledger record and its hash. `record` serializes to exactly the bytes
@@ -121,6 +121,25 @@ pub struct IndexResult {
     /// committed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub upgraded_from: Option<u32>,
+    /// Text keys this build rebuilt whole because their segments were built
+    /// under other Unicode tables (B5; after a deliberate upgrade of a
+    /// table crate). Absent (omitted in JSON) when none was.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub text_rebuilt: Vec<TextRebuilt>,
+}
+
+/// A text key `index` rebuilt because its segments recorded other Unicode
+/// tables ([`IndexResult::text_rebuilt`]).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TextRebuilt {
+    /// The key.
+    pub spec: String,
+    /// The case-folding tables its old segments recorded, and this
+    /// binary's (`crate version`).
+    pub case: [String; 2],
+    /// The word-boundary tables its old segments recorded, and this
+    /// binary's.
+    pub words: [String; 2],
 }
 
 #[allow(clippy::trivially_copy_pass_by_ref)] // serde passes a reference
@@ -196,6 +215,39 @@ pub enum LookupKind {
         valid_column: String,
         /// The known-time column.
         known_column: String,
+    },
+    /// Rows whose string column matches a text lookup (B5), both sides
+    /// case-folded.
+    Text {
+        /// `has_token`, `contains`, or `has_prefix`.
+        operator: TextOp,
+        /// The argument as given.
+        value: String,
+        /// The argument case-folded, as the index and the residual compare
+        /// it.
+        folded: String,
+        /// The string column.
+        column: String,
+        /// The text keys the plan intersected.
+        serving: Vec<KeySpec>,
+        /// `true`: every planned row group holds a matching row (a words
+        /// dictionary served); apply the residual for the rows. `false`:
+        /// the plan is a candidate set (trigrams or a bloom filter), a
+        /// planned row group may hold no match, and the residual is
+        /// mandatory.
+        exact_row_groups: bool,
+        /// Why nothing was pruned, when nothing was.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        unpruned: Option<String>,
+    },
+    /// A workload's text runs (B5), as `why` priced them: rows whose string
+    /// column matches one of each run's values, both sides case-folded.
+    TextRuns {
+        /// The string columns the runs look up, sorted.
+        columns: Vec<String>,
+        /// The matches the runs ask for (`contains`, `has_token`,
+        /// `has_prefix`), sorted.
+        operators: Vec<TextOp>,
     },
 }
 

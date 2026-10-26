@@ -52,7 +52,11 @@
 //!   `LatestPerKey`: every version in the key's window is returned. The
 //!   plan holds every live row group with a version of a key in its window;
 //! - windows: `In` over `C`, then `Between` on the time column;
-//! - range lookups: `Between`, widened for signed zero.
+//! - range lookups: `Between`, widened for signed zero;
+//! - text lookups: `Text`, the match itself. A plan through a trigram or
+//!   bloom text key is a candidate set (a planned row group may hold no
+//!   match), so the residual is mandatory; a words dictionary plans only
+//!   row groups holding a match.
 //!
 //! # Order
 //!
@@ -83,6 +87,7 @@ use bellwether_core::sidecar::{
     bitemporal_winner, BitemporalHit, RgBounds, SidecarDef, SidecarKind, SidecarReader, Triple,
 };
 use bellwether_core::temporal::{self, LookbackHit, VersionChain, VersionHit};
+use bellwether_core::text;
 use bellwether_core::SegmentReader;
 use bellwether_source::{
     fingerprint_with_policy, FingerprintPolicy, LocalFs, ParquetSource, Partitioning,
@@ -90,7 +95,7 @@ use bellwether_source::{
 use bellwether_store::{Manifest, SegmentRef, Snapshot, StoreExt};
 use bellwether_types::{
     ColumnBytes, Error, Hash, KeySpec, Predicate, Quantity, Result, RowGroupId, ScanEntry,
-    ScanPlan, Source,
+    ScanPlan, Source, TextOp,
 };
 use bytes::Bytes;
 use roaring::RoaringBitmap;
@@ -202,6 +207,20 @@ pub enum Lookup {
         /// Upper bound on known time, in the known column's unit.
         known: Option<i64>,
     },
+    /// Rows whose string `column` matches one of `values` under `op`, both
+    /// sides case-folded (core's `text` module). Per value, the complete
+    /// text keys on `column` that answer `op` (core's `text::Shape`) are
+    /// intersected (every live row group when none prunes); the values'
+    /// sets are united. No value plans no row group. The residual is
+    /// [`Predicate::Text`].
+    Text {
+        /// The string column.
+        column: String,
+        /// The match.
+        op: TextOp,
+        /// The arguments as given.
+        values: Vec<String>,
+    },
 }
 
 /// The answer of [`Planner::count`]: exact, from per-key counts.
@@ -279,6 +298,11 @@ enum Serve {
 }
 
 fn serve(spec: &KeySpec, columns: &[String]) -> Option<Serve> {
+    // A text key serves text lookups only ([`Lookup::Text`]); its
+    // dictionary holds tokens, not values, so it never serves a key.
+    if matches!(spec, KeySpec::Text { .. }) {
+        return None;
+    }
     let p = spec.columns();
     let positions: Option<Vec<usize>> = p
         .iter()
@@ -554,7 +578,7 @@ impl<S: StoreExt + ?Sized> Planner<S> {
                     Lookup::Lookback { columns, .. } => {
                         self.lookback_column(specs, columns).ok().flatten()
                     }
-                    Lookup::Keys { .. } => None,
+                    Lookup::Keys { .. } | Lookup::Text { .. } => None,
                 };
                 many.iter()
                     .find(|s| Some(&s.columns()[0]) == own.as_ref())
@@ -710,6 +734,7 @@ impl<S: StoreExt + ?Sized> Planner<S> {
                 let sidecars = self.sidecars_for(lookup);
                 self.plan_bitemporal(&sidecars, columns, keys, *valid, *known)
             }
+            Lookup::Text { column, op, values } => self.plan_text(&segs, column, *op, values),
         }
     }
 
@@ -2019,6 +2044,54 @@ impl<S: StoreExt + ?Sized> Planner<S> {
             },
         )?;
         self.finish(&selected, residual)
+    }
+
+    /// A text lookup (see [`Lookup::Text`]): per value, each serving text
+    /// key's segments, one at a time, through core's `text::select_one`,
+    /// the serving keys' sets intersected; the values' sets united.
+    fn plan_text(
+        &self,
+        segs: &[SpecSegments],
+        column: &str,
+        op: TextOp,
+        values: &[String],
+    ) -> Result<ScanPlan> {
+        let types = self.column_types(&[column.to_string()])?;
+        text::check_column_type(column, &types[0].1)?;
+        let specs: Vec<KeySpec> = segs.iter().map(|s| s.spec.clone()).collect();
+        let mut selected = RoaringBitmap::new();
+        for value in values {
+            let shape = text::Shape::of(&specs, column, op, value)?;
+            let mut acc: Option<RoaringBitmap> = None;
+            for (spec, probe) in &shape.serving {
+                if *probe == text::Probe::Unpruned {
+                    continue;
+                }
+                let Some(seg) = segs.iter().find(|s| &s.spec == spec) else {
+                    continue;
+                };
+                // Bloom segments are scanned whole, one at a time.
+                let whole = matches!(spec, KeySpec::Text { bloom: Some(_), .. });
+                let mut one = RoaringBitmap::new();
+                for src in &seg.sources {
+                    let r = self.open_segment(spec, src, whole)?;
+                    one |= text::select_one(&r, probe)?;
+                }
+                acc = Some(match acc {
+                    Some(a) => a & one,
+                    None => one,
+                });
+            }
+            selected |= acc.unwrap_or_else(|| self.locator.live().clone());
+        }
+        self.finish(
+            &selected,
+            Predicate::Text {
+                column: column.to_string(),
+                operator: op,
+                values: values.to_vec(),
+            },
+        )
     }
 
     // -- the plan --------------------------------------------------------------

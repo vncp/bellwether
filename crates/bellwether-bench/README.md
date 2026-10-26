@@ -18,6 +18,7 @@ cargo run -p bellwether-bench --release -- <subcommand>
 | `generate` | `<corpus>/data/day=YYYY-MM-DD/part-NNNNN.parquet`, `<corpus>/corpus.json`, `<corpus>/generator-stats.json` |
 | `workload` | `<corpus>/workload/run-NNNN.parquet`, `<corpus>/workload.json` |
 | `ground-truth` | `<corpus>/expected.json` |
+| `text --shape ledger\|market` | `<out>/data/day=YYYY-MM-DD/part-NNNN.parquet` (1–4 KB `body` documents with terms planted at 1% and 0.01% of rows) and `<out>/workload/text-truth.json` (per query, the rows and row groups holding a match); `scripts/text-funnels.py` |
 | `run` | `benches/out/results.json` (or `--out`) |
 | `report` | `benches/out/report.html` (or `--out`) |
 | `--assert-slo` | Exit status. With no subcommand (what CI runs), the tool generates a smoke corpus in `benches/out/slo/`, runs the harness, and asserts in **strict** mode: a skipped core check fails. With `--results PATH` it asserts on that file, leniently. `run --assert-slo` asserts on the results that run just wrote. On any other subcommand it is a usage error. |

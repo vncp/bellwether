@@ -39,7 +39,7 @@ mod sources;
 mod target;
 mod verify;
 
-pub use build::{BuildReport, Builder, MAX_KEY_SPECS};
+pub use build::{BuildReport, Builder, TextTablesReplaced, MAX_KEY_SPECS};
 pub use compact::CompactReport;
 pub use config::{
     BuildObserver, BuildOptions, CompactOptions, SourceKind, DEFAULT_MAX_RESTARTS,

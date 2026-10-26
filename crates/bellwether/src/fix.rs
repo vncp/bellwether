@@ -429,6 +429,7 @@ impl Engine {
                 )),
             }
         })
+        .map_err(|e| crate::engine::root_hint(self.root(), e))
     }
 
     /// The apply tier as a dry run: resolves `certificate` and its proposal
@@ -913,7 +914,7 @@ impl Engine {
     }
 
     /// Stage 2 for a Key proposal.
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     fn verify_key(
         &self,
         proposal: &Hash,
@@ -936,6 +937,20 @@ impl Engine {
                          from the keys a slow lookup ran"
                             .into(),
                 })?;
+        let text = runs
+            .iter()
+            .map(|r| r.query().map(|q| q.text_op().is_some()))
+            .collect::<Result<Vec<bool>>>()?;
+        if text.iter().any(|t| *t) && !text.iter().all(|t| *t) {
+            return Err(Error::InvalidArgument {
+                field: "workload",
+                reason: "the workload mixes text lookups (contains, has_token, has_prefix) with \
+                         key lookups; verify compares one kind at a time, so record each as its \
+                         own workload"
+                    .into(),
+            });
+        }
+        let text = text.first().copied().unwrap_or(false);
         if runs.iter().any(|r| r.columns != columns) {
             return Err(Error::InvalidArgument {
                 field: "workload",
@@ -961,9 +976,14 @@ impl Engine {
                     .1 |= &e.row_groups;
             }
             // Both encodings of a float zero, as the planner probes them:
-            // SQL equality matches a row stored under either zero.
-            let all: Vec<usize> = (0..rk.columns().len()).collect();
-            keys.extend(rk.all_probes(&all));
+            // SQL equality matches a row stored under either zero. A text
+            // run's values are words, substrings, or prefixes, not
+            // reconcile keys: its rows are chosen by the row filter
+            // (`rows_asked`).
+            if !text {
+                let all: Vec<usize> = (0..rk.columns().len()).collect();
+                keys.extend(rk.all_probes(&all));
+            }
             let column = replayer.planned_time_column(&specs, rk.columns(), &query)?;
             asked.push(AskedRun {
                 keys: rk,
@@ -990,15 +1010,38 @@ impl Engine {
             None => cache.get_cached(&workload.hash())?,
         };
         let workload_age = cached.map_or(Duration::ZERO, |(_, age)| age);
-        let ignored = unhashable(replayer.schema(), &columns);
-        let rec_spec =
-            ReconcileSpec::new(columns)
-                .ignore(ignored)
-                .coverage(CoverageRequest::Workload(WorkloadKeys {
+        // A text workload (B5) names words and substrings, not keys: rows
+        // are compared keyed by every hashable column, and chosen by the
+        // runs' text matches.
+        let (columns, coverage) = if text {
+            let hashable: Vec<String> = replayer
+                .schema()
+                .fields()
+                .iter()
+                .filter(|f| bellwether_core::encoding::check_supported(f.data_type()).is_ok())
+                .map(|f| f.name().clone())
+                .collect();
+            (
+                hashable,
+                CoverageRequest::WorkloadRows {
+                    workload: workload.hash(),
+                    age: workload_age,
+                },
+            )
+        } else {
+            (
+                columns,
+                CoverageRequest::Workload(WorkloadKeys {
                     workload: workload.hash(),
                     age: workload_age,
                     keys,
-                }));
+                }),
+            )
+        };
+        let ignored = unhashable(replayer.schema(), &columns);
+        let rec_spec = ReconcileSpec::new(columns)
+            .ignore(ignored)
+            .coverage(coverage);
         let rec_spec = rows_asked(source, replayer.catalog(), &asked, rec_spec)?;
         let ctx = CertificateContext {
             proposal: Some(*proposal),
@@ -1546,8 +1589,10 @@ struct AskedRun {
 /// run's own, and a `latest` lookback's window `[newest − N, newest]` is
 /// built from each key's newest time in `source` (the left side, every
 /// live row group of `catalog`). A row is compared, on both sides, when
-/// some run keeps it: one of the run's keys, within its window. Locate and
-/// plain `latest` runs keep every row of their keys, and `latest` and
+/// some run keeps it: one of the run's keys, within its window, or for a
+/// text run (B5) a row whose string matches one of the run's values.
+/// Locate and plain `latest` runs keep every row of their keys, and
+/// `latest` and
 /// `asof` compare the newest kept version per key (`latest_by`). An index
 /// whose bounds disagree with the data plans other row groups than these
 /// windows need, so its certificate fails.
@@ -1568,6 +1613,13 @@ fn rows_asked(
     let mut narrowed = false;
     let mut filter = Vec::with_capacity(runs.len());
     for run in runs {
+        if let Some(text) = bellwether_replay::text_residual(&run.keys, &run.query)? {
+            // The rows whose string matches the run's values, from the
+            // workload alone.
+            filter.push(text);
+            narrowed = true;
+            continue;
+        }
         let all: Vec<usize> = (0..run.keys.columns().len()).collect();
         let mut tests = vec![Predicate::In {
             columns: run.keys.columns().to_vec(),

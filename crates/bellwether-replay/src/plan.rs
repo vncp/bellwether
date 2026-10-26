@@ -61,9 +61,12 @@ use bellwether_build::encode_ts;
 use bellwether_core::encoding;
 use bellwether_core::segment::{ColumnType, ReadAt, SegmentReader};
 use bellwether_core::temporal::{self, LookbackHit, VersionChain, VersionHit};
+use bellwether_core::text;
 use bellwether_source::Partitioning;
 use bellwether_store::{Snapshot, StoreExt};
-use bellwether_types::{Error, Hash, KeySpec, Predicate, Quantity, Result, RunCost, ScanPlan};
+use bellwether_types::{
+    Error, Hash, KeySpec, Predicate, Quantity, Result, RunCost, ScanPlan, TextOp,
+};
 use bytes::Bytes;
 use roaring::RoaringBitmap;
 
@@ -90,7 +93,9 @@ pub enum Lookup {
 /// (module docs, rule (a) then rule (b)).
 #[must_use]
 pub fn servable(spec: &KeySpec, run_columns: &[String]) -> Option<Lookup> {
-    if run_columns.is_empty() {
+    // A text key serves text lookups only (`PlanSource::plan_text`), never
+    // a key: its dictionary holds tokens, not values.
+    if run_columns.is_empty() || matches!(spec, KeySpec::Text { .. }) {
         return None;
     }
     let p = spec.columns();
@@ -116,7 +121,7 @@ pub fn serves_window(spec: &KeySpec, ts_column: &str) -> bool {
         KeySpec::Exact { columns, .. } | KeySpec::Temporal { columns, .. } => {
             columns.first().is_some_and(|c| c == ts_column)
         }
-        KeySpec::Bloom { .. } | KeySpec::Bitemporal { .. } => false,
+        KeySpec::Bloom { .. } | KeySpec::Bitemporal { .. } | KeySpec::Text { .. } => false,
     }
 }
 
@@ -131,6 +136,10 @@ pub fn serves_window(spec: &KeySpec, ts_column: &str) -> bool {
 #[must_use]
 pub fn serves_query(spec: &KeySpec, run_columns: &[String], query: &RunQuery) -> bool {
     match query {
+        RunQuery::Text(op) => match run_columns {
+            [c] => text::serves(spec, c, *op),
+            _ => false,
+        },
         RunQuery::Locate | RunQuery::Count => servable(spec, run_columns).is_some(),
         RunQuery::Window(w) => {
             servable(spec, run_columns).is_some() || serves_window(spec, &w.ts_column)
@@ -186,7 +195,7 @@ pub fn planned_time_column(
         check_lookback(lookback)?;
     }
     match query {
-        RunQuery::Locate | RunQuery::Window(_) | RunQuery::Count => Ok(None),
+        RunQuery::Locate | RunQuery::Window(_) | RunQuery::Count | RunQuery::Text(_) => Ok(None),
         RunQuery::Latest | RunQuery::Asof { .. } => serving_temporal_column(specs, run_columns),
         RunQuery::Lookback { asof: None, .. } => planner.lookback_column(specs, run_columns),
         RunQuery::Lookback { asof: Some(_), .. } => {
@@ -321,12 +330,63 @@ pub trait PlanSource: Send + Sync {
         Ok(None)
     }
 
+    /// The plan for the text lookup `op(column, any of values)` under
+    /// `specs`: per value, the text keys among them that serve it (core's
+    /// `text::Shape`) intersected, every live row group when none prunes;
+    /// the values' sets united; residual [`Predicate::Text`]. Specs that are
+    /// not text keys take no part. A [`RunQuery::Text`] run plans through
+    /// it, its values decoded from its keys.
+    fn plan_text(
+        &self,
+        specs: &[KeySpec],
+        column: &str,
+        op: TextOp,
+        values: &[String],
+    ) -> Result<ScanPlan>;
+
     /// This source with hypothetical specs' transient segments added, so
     /// each plans exactly as committed segments of that spec would. A
     /// transient index covers every live row group of the pinned catalog,
     /// so it is complete by construction.
     fn with_transient(&self, transient: &[Arc<TransientIndex>])
         -> Result<Box<dyn PlanSource + '_>>;
+}
+
+/// A [`RunQuery::Text`] run as its text lookup: its one column, its match,
+/// and its values decoded from its keys; `None` for any other run.
+pub(crate) fn text_run<'k>(
+    keys: &'k RunKeys,
+    query: &RunQuery,
+) -> Result<Option<(&'k str, TextOp, Vec<String>)>> {
+    let Some(op) = query.text_op() else {
+        return Ok(None);
+    };
+    let [column] = keys.columns() else {
+        return Err(Error::KeySpec(format!(
+            "a {} run looks up one string column, and this one looks up {:?}",
+            query.kind_str(),
+            keys.columns()
+        )));
+    };
+    let values = keys
+        .tuples()
+        .map(text::arg_of_key)
+        .collect::<Result<Vec<_>>>()?;
+    Ok(Some((column.as_str(), op, values)))
+}
+
+/// The residual of a [`RunQuery::Text`] run (B5): the rows whose string
+/// column matches one of the run's values under its match, both sides
+/// case-folded, decoded from the workload alone. `None` for any other run.
+/// `fix` compares exactly these rows.
+pub fn text_residual(keys: &RunKeys, query: &RunQuery) -> Result<Option<Predicate>> {
+    Ok(
+        text_run(keys, query)?.map(|(column, operator, values)| Predicate::Text {
+            column: column.to_string(),
+            operator,
+            values,
+        }),
+    )
 }
 
 /// The cost of a `count` run ([`RunQuery::Count`]) under its verified
@@ -949,6 +1009,7 @@ impl SegmentPlanner {
             RunQuery::Locate
             | RunQuery::Count
             | RunQuery::Window(_)
+            | RunQuery::Text(_)
             | RunQuery::Lookback { asof: Some(_), .. } => {
                 return Err(Error::Other(format!(
                     "a {} run is not planned through version chains alone",
@@ -1125,6 +1186,9 @@ impl PlanSource for SegmentPlanner {
 
     fn plan_query(&self, specs: &[KeySpec], keys: &RunKeys, query: &RunQuery) -> Result<ScanPlan> {
         check_key_types(self.catalog.schema(), keys)?;
+        if let Some((column, op, values)) = text_run(keys, query)? {
+            return self.plan_text(specs, column, op, &values);
+        }
         // Every listed spec must be plannable, whether or not it serves
         // these keys, as in the build crate's planner.
         let mut listed = Vec::with_capacity(specs.len());
@@ -1192,6 +1256,43 @@ impl PlanSource for SegmentPlanner {
         let rows = Self::count_rows(&serving, keys, &self.catalog.all_ids())?;
         let mut plan = with_residual(self.catalog.plan_for(&selected)?, keys, None);
         plan.rows = rows.map(Quantity::exact);
+        Ok(plan)
+    }
+
+    fn plan_text(
+        &self,
+        specs: &[KeySpec],
+        column: &str,
+        op: TextOp,
+        values: &[String],
+    ) -> Result<ScanPlan> {
+        let schema = self.catalog.schema();
+        let dt = schema
+            .field_with_name(column)
+            .map_err(|_| Error::KeySpec(encoding::not_in_schema(schema, column)))?
+            .data_type();
+        text::check_column_type(column, dt)?;
+        let mut selected = RoaringBitmap::new();
+        for value in values {
+            let shape = text::Shape::of(specs, column, op, value)?;
+            let mut acc: Option<RoaringBitmap> = None;
+            for (spec, probe) in &shape.serving {
+                let segments = self.listed(spec)?;
+                if let Some(b) = text::select(segments.readers(), probe)? {
+                    acc = Some(match acc {
+                        Some(a) => a & b,
+                        None => b,
+                    });
+                }
+            }
+            selected |= acc.unwrap_or_else(|| self.catalog.all_ids());
+        }
+        let mut plan = self.catalog.plan_for(&selected)?;
+        plan.residual = Some(Predicate::Text {
+            column: column.to_string(),
+            operator: op,
+            values: values.to_vec(),
+        });
         Ok(plan)
     }
 

@@ -78,8 +78,8 @@ already holds.
 
 | Tier | Tool | Writes |
 |---|---|---|
-| observe | `observe.why` (no keys), `observe.cardinality`, `observe.overlap`, `observe.profile`, `observe.locate`, `observe.asof` | Evidence and cache entries only |
-| score (engine-scored) | `score.why` (with keys or a workload), `score.verify`, `score.record` (keys from the query engine, with `--twin-of`) | engine Proposals, Replays, plan Evidence, Certificates; `score.record` a workload in the cache |
+| observe | `observe.why` (no keys), `observe.cardinality`, `observe.overlap`, `observe.profile`, `observe.locate`, `observe.asof`, `observe.text` | Evidence and cache entries only |
+| score (engine-scored) | `score.why` (with keys, a workload, or `text` lookups), `score.verify`, `score.record` (keys from the query engine, with `--twin-of`) | engine Proposals, Replays, plan Evidence, Certificates; `score.record` a workload in the cache |
 | propose | `propose.key`, `propose.layout`, `propose.rewrite` | one Proposal, or nothing with `dry_run` |
 | apply | `apply.receipt` | Replay, the index commit, Receipt; nothing with `dry_run` or on a refusal, unless another commit lands during the apply (`concurrent_commit`: the key is built, the receipt withheld) |
 | jobs | `jobs.start`, `jobs.status`, `jobs.result` | whatever the started tool writes |
@@ -126,7 +126,7 @@ line. No refusal is prose only.
 | `attest_only` | The proposal verified and its target is a table (`sql://`): the engine applies nothing to a table and writes no receipt. For a key, `fields.run` lists the `CREATE INDEX` per table the engine wrote, for a human to run; for a rewrite, `fields.proposed_rewrite` is your own proposed text, which the engine never ran, for the human to review. Report the certificate and those fields to the human. The same gain gate as over files applies first (`nothing_to_gain`). |
 | `reserved_proposer` | The name in `by` is reserved for the engine. Pass your own name. |
 | `sidecar_not_proposable` | The key in `spec` declares a sidecar (`temporal2:id@valid,known`, or `exact:a@ts` with per-key time bounds), which a proposal cannot carry yet, so it has no replay, certificate, or receipt. `fields` has `declaration`, `sidecar`, `key` (the key spec it rides beside, or null), `root`, and `command` (the `bellwether index` command that builds it, shell-quoted, with this server's source flags; null when no command line spells them). Propose `fields.key` alone to reach a receipt, or ask the human to run `fields.command`. |
-| `no_workload` | Scoring needs input that was not given: `keys` or a recorded `workload` for `score.why`, `workload` for a key proposal, `rewrite` outputs for a rewrite; `fields.field` names it. |
+| `no_workload` | Scoring needs input that was not given: `keys`, a recorded `workload`, or `text` lookups for `score.why`, `workload` for a key proposal, `rewrite` outputs for a rewrite; `fields.field` names it. |
 | `stale_index` | Files landed, changed, or vanished since the index was built; `fields` lists them. Ask the human to run `bellwether index`. |
 | `not_indexed` | The lookup needs an index the folder does not have (none at all, or no complete key spec of the kind it plans with, in `fields.needs`). Ask the human to index the folder. |
 | `not_retained` | The lookup was pinned with `at_manifest` to a sequence the index does not retain (never committed, or pruned by garbage collection); `fields.oldest` and `fields.current` bound the sequences you may pass (both null when the folder is not indexed). Pass one of them, or omit `at_manifest`. |

@@ -135,6 +135,7 @@ Either probe silently misses. **Callers must encode probes with the typed encode
 | `Lookback` | `And[In, NotOlderThan(newest − lookback per key)]` |
 | `Between` | `Between` |
 | `Window` (also an `asof` lookback, the window `[asof − lookback, asof]`) | `And[In, Between(ts in window)]` |
+| `Text` (B5: `has_token`, `contains`, `has_prefix` on a string column through its text keys; a trigram or bloom plan is a candidate set) | `Text{column, operator, values}`, mandatory for candidates |
 | `Bitemporal` | `And[In, Between(valid), Between(known), NotOlderThan(valid), NotOlderThan(known), LatestPerKey(valid)]` |
 
 Details:

@@ -7,19 +7,22 @@ use arrow::datatypes::{DataType, TimeUnit};
 use bellwether_build::{Builder, Lookup, PlanOrder};
 use bellwether_core::encoding;
 use bellwether_core::sidecar::SidecarDef;
+use bellwether_core::text;
 use bellwether_store::parse_rfc3339;
 use bellwether_types::{
-    format, Error, Evidence, EvidenceBody, KeySpec, Predicate, Provenance, Record, Result, ScanPlan,
+    format, Error, Evidence, EvidenceBody, KeySpec, Predicate, Provenance, Record, Result,
+    ScanPlan, TextOp, Tokenizer,
 };
 use bytes::Bytes;
 
-use crate::engine::{folder_changes, guard, schema_hint, Engine, FolderChanges, Pinned};
+use crate::engine::{folder_changes, guard, root_hint, schema_hint, Engine, FolderChanges, Pinned};
 use crate::keys::KeyFile;
 use crate::lookback::Lookback;
 use crate::results::{
-    Cost, CountResult, IndexResult, LookupKind, PlanResult, SidecarState, SpecState,
+    Cost, CountResult, IndexResult, LookupKind, PlanResult, SidecarState, SpecState, TextRebuilt,
 };
 use crate::spec::Declaration;
+use crate::text::TextQuery;
 
 impl Engine {
     /// Builds or updates the index so it declares `specs` (in addition to
@@ -43,7 +46,7 @@ impl Engine {
     /// sidecars beside or instead of them (per-key time bounds
     /// `exact:symbol@ts`, bitemporal versions `temporal2:id@valid,known`).
     pub fn index_declared(&self, declared: &[Declaration]) -> Result<IndexResult> {
-        guard(|| self.index_inner(declared)).map_err(schema_hint)
+        guard(|| self.index_inner(declared)).map_err(|e| root_hint(self.root(), schema_hint(e)))
     }
 
     fn index_inner(&self, declared: &[Declaration]) -> Result<IndexResult> {
@@ -113,6 +116,15 @@ impl Engine {
             row_groups_retired: report.row_groups_retired,
             files_filled: report.files_filled,
             upgraded_from: report.upgraded_from,
+            text_rebuilt: report
+                .text_tables_replaced
+                .into_iter()
+                .map(|t| TextRebuilt {
+                    spec: t.spec,
+                    case: [t.recorded.case, t.current.case],
+                    words: [t.recorded.words, t.current.words],
+                })
+                .collect(),
         })
     }
 
@@ -121,14 +133,16 @@ impl Engine {
     /// Evidence of kind `plan`. The plan includes every row group holding a
     /// queried key (invariant 1) and carries an `In` residual (ADR 011).
     pub fn locate(&self, keys: &KeyFile) -> Result<PlanResult> {
-        guard(|| self.plan_lookup(keys, Mode::Locate, None)).map_err(schema_hint)
+        guard(|| self.plan_lookup(keys, Mode::Locate, None))
+            .map_err(|e| root_hint(self.root(), schema_hint(e)))
     }
 
     /// Plans the newest version of each key, through the one temporal spec
     /// that serves the key columns. The residual carries `NotOlderThan` and
     /// `LatestPerKey` (invariant 5).
     pub fn latest(&self, keys: &KeyFile) -> Result<PlanResult> {
-        guard(|| self.plan_lookup(keys, Mode::Latest, None)).map_err(schema_hint)
+        guard(|| self.plan_lookup(keys, Mode::Latest, None))
+            .map_err(|e| root_hint(self.root(), schema_hint(e)))
     }
 
     /// Plans the version of each key current at `at`: an RFC 3339 instant
@@ -137,7 +151,8 @@ impl Engine {
     /// exact. The residual carries `NotOlderThan` and `LatestPerKey`
     /// (invariant 5).
     pub fn asof(&self, keys: &KeyFile, at: &str) -> Result<PlanResult> {
-        guard(|| self.plan_lookup(keys, Mode::Asof(at), None)).map_err(schema_hint)
+        guard(|| self.plan_lookup(keys, Mode::Asof(at), None))
+            .map_err(|e| root_hint(self.root(), schema_hint(e)))
     }
 
     /// Plans the rows of the keys in `keys` whose time column lies in
@@ -166,7 +181,7 @@ impl Engine {
                 None,
             )
         })
-        .map_err(schema_hint)
+        .map_err(|e| root_hint(self.root(), schema_hint(e)))
     }
 
     /// The bitemporal as-of: per key, the newest row by valid time among
@@ -183,7 +198,7 @@ impl Engine {
         known: Option<&str>,
     ) -> Result<PlanResult> {
         guard(|| self.plan_lookup(keys, Mode::Bitemporal { valid, known }, None))
-            .map_err(schema_hint)
+            .map_err(|e| root_hint(self.root(), schema_hint(e)))
     }
 
     /// Plans the rows of the keys in `keys` in the lookback window ending at
@@ -217,7 +232,7 @@ impl Engine {
                 None,
             )
         })
-        .map_err(schema_hint)
+        .map_err(|e| root_hint(self.root(), schema_hint(e)))
     }
 
     /// Plans every version of each key in `keys` in its own lookback window
@@ -242,7 +257,114 @@ impl Engine {
                 None,
             )
         })
-        .map_err(schema_hint)
+        .map_err(|e| root_hint(self.root(), schema_hint(e)))
+    }
+
+    /// Plans the rows whose string column matches a text lookup (B5):
+    /// `has_token`, `contains`, or `has_prefix`, both sides case-folded,
+    /// through the complete text keys on the column that answer it (their
+    /// row groups intersected), and writes the plan as an Evidence of kind
+    /// `plan`. The residual is `Text`, the match itself; a plan through a
+    /// trigram or bloom text key is a candidate set (a planned row group
+    /// may hold no match), which [`LookupKind::Text`] says, so the residual
+    /// is mandatory. No complete text key answering the lookup is
+    /// [`Error::NotIndexed`], naming the key that would.
+    pub fn locate_text(&self, query: &TextQuery) -> Result<PlanResult> {
+        guard(|| self.plan_text_lookup(query)).map_err(|e| root_hint(self.root(), schema_hint(e)))
+    }
+
+    fn plan_text_lookup(&self, query: &TextQuery) -> Result<PlanResult> {
+        let verb = "locate";
+        let pinned = self.pin_required(verb)?;
+        self.refuse_stale(&pinned, verb)?;
+        self.check_columns(&[&query.column])?;
+        let dt = pinned
+            .planner
+            .column_types(std::slice::from_ref(&query.column))?
+            .remove(0)
+            .1;
+        text::check_column_type(&query.column, &dt)?;
+        let (specs, excluded) = pinned.specs();
+        let shape = text::Shape::of(&specs, &query.column, query.op, &query.value)?;
+        if shape.serving.is_empty() {
+            let pending: Vec<KeySpec> = excluded
+                .iter()
+                .filter(|s| text::probe(s, &query.column, query.op, &shape.folded).is_some())
+                .cloned()
+                .collect();
+            return Err(if pending.is_empty() {
+                Error::NotIndexed {
+                    root: self.root().to_string(),
+                    operation: verb,
+                    needs: Some(crate::spec::label(&text_key_for(&query.column, query.op))),
+                }
+            } else {
+                not_complete_yet(self.root(), verb, &pending)
+            });
+        }
+        let payload = serde_json::to_vec(query)?;
+        let key_set = bellwether_types::Hash::of(&payload);
+        self.cache()?.put_cached(&key_set, Bytes::from(payload))?;
+        let lookup = Lookup::Text {
+            column: query.column.clone(),
+            op: query.op,
+            values: vec![query.value.clone()],
+        };
+        let (plan, order) = pinned.planner.plan_ordered(&specs, &lookup)?;
+        let files_total = pinned.manifest().rowgroup_space.files.len() as u64;
+        let row_groups_total = plan.row_groups_total;
+        let planned = Cost {
+            files: plan.entries.len() as u64,
+            row_groups: plan.row_groups_selected,
+            bytes: plan.bytes,
+        };
+        let (ordered_by, unordered_reason) = match order {
+            PlanOrder::Ordered { column } => (Some(column), None),
+            PlanOrder::Unspecified { reason } => (None, Some(reason)),
+        };
+        let serving: Vec<KeySpec> = shape.serving.iter().map(|(s, _)| s.clone()).collect();
+        let (exact_row_groups, unpruned) = (shape.exact(), !shape.prunes());
+        let evidence = self.put(Record::Evidence(plan_evidence(
+            &pinned,
+            key_set,
+            plan,
+            self.now(),
+        )))?;
+        Ok(PlanResult {
+            lookup: LookupKind::Text {
+                operator: query.op,
+                value: query.value.clone(),
+                folded: shape.folded,
+                column: query.column.clone(),
+                serving,
+                exact_row_groups,
+                unpruned: unpruned.then(|| {
+                    format!(
+                        "the argument is shorter than {} bytes once case-folded, so no trigram \
+                         prunes; every row group is planned",
+                        text::TRIGRAM
+                    )
+                }),
+            },
+            columns: vec![query.column.clone()],
+            keys: 1,
+            null_tuples: 0,
+            key_set,
+            sequence: pinned.sequence(),
+            specs,
+            excluded_incomplete: excluded,
+            sidecars: Vec::new(),
+            path_values: None,
+            files_total,
+            row_groups_total,
+            planned,
+            ordered_by,
+            unordered_reason,
+            rows: None,
+            projected_bytes: None,
+            column_bytes_from_footers: 0,
+            evidence,
+        })
     }
 
     /// [`Engine::locate`], or [`Engine::locate_window`] when `window` is
@@ -837,6 +959,19 @@ fn plan_evidence(
             created_at,
         },
         body: EvidenceBody::Plan { plan },
+    }
+}
+
+/// The text key that answers `op` on `column`: a words dictionary for
+/// whole words and word prefixes, trigrams for substrings.
+pub(crate) fn text_key_for(column: &str, op: TextOp) -> KeySpec {
+    KeySpec::Text {
+        column: column.to_string(),
+        tokenizer: match op {
+            TextOp::HasToken | TextOp::HasPrefix => Tokenizer::Words,
+            TextOp::Contains => Tokenizer::Trigram,
+        },
+        bloom: None,
     }
 }
 

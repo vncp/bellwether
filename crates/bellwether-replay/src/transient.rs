@@ -15,7 +15,8 @@
 //! build crate accounts its segments: distinct key tuples and their
 //! canonical bytes (distinct `(key, ts)` pairs and 8 bytes more each for a
 //! temporal spec, 8 bytes per distinct key for a bloom spec, twice the
-//! longest key for a range spec). Summed over a segment's row groups these
+//! longest key for a range spec, distinct tokens and their bytes for a
+//! text spec). Summed over a segment's row groups these
 //! bound what its open writer holds from above. While building, the process
 //! holds:
 //!
@@ -141,6 +142,9 @@ pub(crate) fn spec_types(
         .iter()
         .map(|c| lookup(c))
         .collect::<Result<Vec<_>>>()?;
+    if let KeySpec::Text { column, .. } = spec {
+        bellwether_core::text::check_column_type(column, &keys[0])?;
+    }
     let ts = match spec {
         KeySpec::Temporal { ts_column, .. } => {
             let dt = lookup(ts_column)?;
@@ -165,6 +169,14 @@ pub(crate) fn measure(
             .cloned()
             .ok_or_else(|| Error::KeySpec(format!("column {name} not in batch")))
     };
+    if let KeySpec::Text {
+        column: c,
+        tokenizer,
+        bloom,
+    } = spec
+    {
+        return bellwether_core::text::measure(*tokenizer, bloom.is_some(), column(c)?.as_ref());
+    }
     let cols = spec
         .columns()
         .iter()

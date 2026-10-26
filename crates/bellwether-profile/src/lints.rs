@@ -9,6 +9,7 @@
 //! | `R-sketch-1` (low-cardinality key, [`low_cardinality_key`]) | from `sketch` sidecars, not the profile: a sketched column `B` whose values each cover at least [`LOW_CARDINALITY_MIN_ROWS_PER_VALUE`] rows, beside an id-like sketched column `K` with at least [`LOW_CARDINALITY_PARTNER_RATIO`] times `B`'s distinct values, present in at least [`LOW_CARDINALITY_COPRESENCE`] of the files `B` is present in |
 //! | `no_discriminating_column` | the dataset has at least 2 row groups and every measured single column (composites are not searched) has a median value touching at least [`NO_DISCRIMINATING_MIN_FRACTION`] of all row groups: the layout, not a missing index, sets the cost of a lookup |
 //! | `R-counts-1` (count before scan, [`COUNT_BEFORE_SCAN`]) | a recorded workload has a `count` run that a later run over the same keys follows ([`WorkloadSummary::counts_before_scan`]), and no declared `exact` spec on exactly the workload's key columns stores counts |
+//! | `R-text-1` | the workload records text runs (`contains`, `has_token`, `has_prefix`) on a string column, and for some of those matches no complete text key on the column serves it ([`text_lookups`]; the caller reads the workload's runs, so it is not part of [`run`]) |
 //!
 //! The two decisions the benchmark also makes are not reimplemented here:
 //! `batch_stamp_key` is `bellwether_source::stats::batch_stamp` and
@@ -50,7 +51,7 @@
 use bellwether_source::stats::{
     batch_stamp as batch_stamp_decision, partner_order, BatchStamp, PartnerCandidate,
 };
-use bellwether_types::{Lint, Result, RowGroupMeta};
+use bellwether_types::{KeySpec, Lint, Result, RowGroupMeta, TextOp};
 
 use crate::fanout::{is_id_like, DistinctSource, FanoutEntry, KeyPlan};
 use crate::manifest::ManifestInfo;
@@ -85,6 +86,9 @@ pub const LOW_CARDINALITY_PARTNER_RATIO: f64 = 10.0;
 /// `R-sketch-1`: files holding both columns over files holding the column,
 /// at least.
 pub const LOW_CARDINALITY_COPRESENCE: f64 = 0.9;
+
+/// Rule id (B5): text lookups on a string column no text key serves.
+pub const TEXT_LOOKUP: &str = "R-text-1";
 
 /// Confidence of a high finding.
 pub const HIGH: f64 = 0.9;
@@ -627,6 +631,97 @@ pub fn low_cardinality_key(columns: &[SketchedColumn]) -> Vec<Lint> {
     out
 }
 
+/// One string column a recorded workload looks up by text (B5): its runs
+/// per match.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TextUse {
+    /// The string column.
+    pub column: String,
+    /// Runs asking for rows that contain a substring (`contains`, `like
+    /// '%x%'`).
+    pub contains: u64,
+    /// Runs asking for rows holding a word (`has_token`, `has`).
+    pub has_token: u64,
+    /// Runs asking for rows holding a word with a prefix (`has_prefix`).
+    pub has_prefix: u64,
+}
+
+impl TextUse {
+    /// The runs of `op`.
+    #[must_use]
+    pub fn runs(&self, op: TextOp) -> u64 {
+        match op {
+            TextOp::Contains => self.contains,
+            TextOp::HasToken => self.has_token,
+            TextOp::HasPrefix => self.has_prefix,
+        }
+    }
+}
+
+/// `R-text-1` (B5): a recorded workload looks rows up by text (`contains`,
+/// `like '%x%'`, `has`, prefix match) on a string column, and for some of
+/// the matches it asks no complete text key in `complete` (the key specs
+/// complete at the current manifest) serves it on that column, so each such
+/// run reads every row group: Parquet statistics hold a string column's
+/// minimum and maximum, which say nothing about the words or substrings
+/// inside its values. An exact key on the column does not serve them
+/// either: it looks whole values up. Fires once per such column, high
+/// confidence (nothing is sampled: the runs are recorded and the specs are
+/// the manifest's). Does not fire when every match the runs ask has a
+/// serving text key (bloom or not), or without text runs.
+#[must_use]
+pub fn text_lookups(uses: &[TextUse], complete: &[KeySpec]) -> Vec<Lint> {
+    uses.iter()
+        .filter_map(|u| {
+            let c = &u.column;
+            let unserved: Vec<TextOp> = [TextOp::Contains, TextOp::HasToken, TextOp::HasPrefix]
+                .into_iter()
+                .filter(|op| u.runs(*op) > 0)
+                .filter(|op| {
+                    !complete
+                        .iter()
+                        .any(|s| bellwether_core::text::serves(s, c, *op))
+                })
+                .collect();
+            if unserved.is_empty() {
+                return None;
+            }
+            let runs: Vec<String> = unserved
+                .iter()
+                .map(|op| format!("{} {}", u.runs(*op), op.as_str()))
+                .collect();
+            // Only the keys for the unserved matches: trigrams for
+            // substrings, a words dictionary (exact) for words and prefixes.
+            let mut keys = Vec::new();
+            if unserved.contains(&TextOp::Contains) {
+                keys.push(format!("text:{c},tokenizer=trigram for substrings"));
+            }
+            if unserved.iter().any(|op| *op != TextOp::Contains) {
+                keys.push(format!(
+                    "text:{c},tokenizer=words for whole words and word prefixes"
+                ));
+            }
+            Some(Lint {
+                rule: TEXT_LOOKUP.into(),
+                columns: vec![c.clone()],
+                message: format!(
+                    "recorded runs look up rows of {c} by text ({}) and no text key serves \
+                     them, so each reads every row group: Parquet keeps a string column's \
+                     minimum and maximum, which say nothing about the words or substrings \
+                     inside it, and an exact key looks whole values up. A text key stores each \
+                     token's row groups: {}. `why` prices each on these runs, and `fix` builds \
+                     the one it recommends with a receipt.",
+                    runs.join(", "),
+                    keys.join(", ")
+                ),
+                confidence: HIGH,
+                site: None,
+                fix: None,
+            })
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -676,5 +771,118 @@ mod tests {
         assert!(lint.message.contains("20 of 22"), "{}", lint.message);
         let selective = [entry(&["id"], 1.0), entry(&["DOLocationID"], 21.0)];
         assert!(no_discriminating(&selective).is_none());
+    }
+
+    fn text_use(column: &str, contains: u64, has_token: u64, has_prefix: u64) -> TextUse {
+        TextUse {
+            column: column.into(),
+            contains,
+            has_token,
+            has_prefix,
+        }
+    }
+
+    fn text_key(column: &str, tokenizer: bellwether_types::Tokenizer) -> KeySpec {
+        KeySpec::Text {
+            column: column.into(),
+            tokenizer,
+            bloom: None,
+        }
+    }
+
+    /// `R-text-1` fires on text runs over a string column that no complete
+    /// text key serves, naming the matches, the keys, and how to price
+    /// them; an exact key on the column, or a text key on another column,
+    /// does not silence it, and a words key leaves `contains` unserved.
+    #[test]
+    fn text_lookups_fire_without_a_serving_text_key() {
+        use bellwether_types::Tokenizer;
+        let lints = text_lookups(
+            &[text_use("body", 3, 2, 0)],
+            &[
+                KeySpec::Exact {
+                    columns: vec!["body".into()],
+                    counts: false,
+                    bounds: None,
+                },
+                text_key("title", Tokenizer::Trigram),
+            ],
+        );
+        assert_eq!(lints.len(), 1);
+        let l = &lints[0];
+        assert_eq!(l.rule, TEXT_LOOKUP);
+        assert_eq!(l.columns, ["body".to_string()]);
+        assert!(
+            l.message.contains("(3 contains, 2 has_token)"),
+            "{}",
+            l.message
+        );
+        assert!(
+            l.message.contains("text:body,tokenizer=trigram"),
+            "{}",
+            l.message
+        );
+        assert!(
+            l.message.contains("text:body,tokenizer=words"),
+            "{}",
+            l.message
+        );
+        assert!((l.confidence - HIGH).abs() < f64::EPSILON);
+        // A words key serves has_token, not contains.
+        let partly = text_lookups(
+            &[text_use("body", 3, 2, 0)],
+            &[text_key("body", Tokenizer::Words)],
+        );
+        assert_eq!(partly.len(), 1);
+        assert!(
+            partly[0].message.contains("(3 contains)"),
+            "{}",
+            partly[0].message
+        );
+        // It names only the key for the unserved match, never one that exists.
+        assert!(
+            !partly[0].message.contains("tokenizer=words"),
+            "{}",
+            partly[0].message
+        );
+        assert!(
+            partly[0].message.contains("tokenizer=trigram"),
+            "{}",
+            partly[0].message
+        );
+        // Words only: the words dictionary, not trigrams.
+        let words = text_lookups(&[text_use("body", 0, 2, 1)], &[]);
+        let m = &words[0].message;
+        assert!(m.contains("(2 has_token, 1 has_prefix)"), "{m}");
+        assert!(
+            m.contains("tokenizer=words") && !m.contains("tokenizer=trigram"),
+            "{m}"
+        );
+        // contains only: no words key is named.
+        let only = text_lookups(&[text_use("body", 1, 0, 0)], &[]);
+        assert!(
+            !only[0].message.contains("tokenizer=words"),
+            "{}",
+            only[0].message
+        );
+    }
+
+    /// It does not fire when a complete text key serves every match the
+    /// runs ask (a trigram key serves all three), or without text runs.
+    #[test]
+    fn text_lookups_do_not_fire_when_served_or_without_runs() {
+        use bellwether_types::Tokenizer;
+        let served = text_lookups(
+            &[text_use("body", 3, 2, 1)],
+            &[text_key("body", Tokenizer::Trigram)],
+        );
+        assert!(served.is_empty(), "{served:?}");
+        let words = text_lookups(
+            &[text_use("body", 0, 2, 1)],
+            &[text_key("body", Tokenizer::Words)],
+        );
+        assert!(words.is_empty(), "{words:?}");
+        assert_eq!(text_lookups(&[text_use("body", 0, 0, 0)], &[]), []);
+        assert_eq!(text_lookups(&[], &[]), []);
     }
 }

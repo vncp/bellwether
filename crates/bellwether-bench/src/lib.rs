@@ -20,6 +20,9 @@
 //! - [`perf`] reads a lookup's planned row groups (or every row group under a
 //!   folder) through the byte-counting reader, for the release measurements
 //!   of `scripts/perf.sh`.
+//! - [`text`] writes a text corpus (1–4 KB documents with planted terms at
+//!   1% and 0.01% of rows) in the ledger or market shape, with exact ground
+//!   truth, for text keys (B5; `scripts/text-funnels.py`).
 
 #![forbid(unsafe_code)]
 // Benchmark arithmetic converts freely between counts, sizes, and floating
@@ -52,6 +55,7 @@ pub mod report;
 pub mod results;
 pub mod slo;
 pub mod stats;
+pub mod text;
 pub mod truth;
 pub mod workload;
 

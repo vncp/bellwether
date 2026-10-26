@@ -306,6 +306,57 @@ fn advance<R: ReadAt>(
     Ok(())
 }
 
+/// Visits every distinct key of the keyed segments `inputs` in ascending
+/// order with the union of its bitmaps across them: the merge's key stream,
+/// without writing a segment. Holds one block per input at a time
+/// (ADR 018). Bloom and range segments have no keys to visit.
+pub fn visit_merged_keys<R: ReadAt>(
+    inputs: &[SegmentReader<R>],
+    mut f: impl FnMut(&[u8], &roaring::RoaringBitmap) -> Result<()>,
+) -> Result<()> {
+    if let Some(s) = inputs.iter().find(|s| !matches!(s.index, Index::Keyed(_))) {
+        return Err(Error::KeySpec(format!(
+            "{} segments have no keys to visit",
+            s.header().key_spec.name()
+        )));
+    }
+    let mut cursors: Vec<KeyedCursor<'_, R>> = inputs
+        .iter()
+        .map(|seg| KeyedCursor {
+            seg,
+            block: 0,
+            pos: 0,
+            body: None,
+        })
+        .collect();
+    let mut heads: Vec<Option<KeyValue>> = Vec::with_capacity(cursors.len());
+    let mut heap = BinaryHeap::new();
+    for (i, c) in cursors.iter_mut().enumerate() {
+        match c.next()? {
+            Some((k, v)) => {
+                heap.push(Reverse((k, i)));
+                heads.push(Some(v));
+            }
+            None => heads.push(None),
+        }
+    }
+    while let Some(Reverse((key, i))) = heap.pop() {
+        let mut bitmap = heads[i].take().unwrap_or_default().bitmap;
+        advance(&mut cursors, &mut heads, &mut heap, i)?;
+        while heap.peek().is_some_and(|Reverse((k, _))| *k == key) {
+            let Some(Reverse((_, j))) = heap.pop() else {
+                break;
+            };
+            if let Some(v) = heads[j].take() {
+                bitmap |= v.bitmap;
+            }
+            advance(&mut cursors, &mut heads, &mut heap, j)?;
+        }
+        f(&key, &bitmap)?;
+    }
+    Ok(())
+}
+
 fn check_bitset_len(bits: &[u8]) -> Result<()> {
     if bits.is_empty() || !bits.len().is_multiple_of(BLOCK_BYTES) {
         return Err(Error::Other(format!(

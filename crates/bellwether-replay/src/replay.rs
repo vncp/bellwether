@@ -77,6 +77,7 @@ use std::sync::Arc;
 use arrow::datatypes::{Schema, SchemaRef};
 use bellwether_build::Planner;
 use bellwether_core::segment::validate_spec;
+use bellwether_core::text::{token_stats, TokenStats};
 use bellwether_ledger::{rfc3339::is_rfc3339, Ledger};
 use bellwether_source::{FingerprintPolicy, Partitioning};
 use bellwether_store::{Snapshot, StoreExt};
@@ -348,6 +349,11 @@ impl<'a> Replayer<'a> {
         query: &RunQuery,
     ) -> Result<(ScanPlan, bool)> {
         check_types(&self.catalog, keys)?;
+        // A text run's values are words, substrings, or prefixes, never
+        // whole values: no file statistic or Parquet bloom filter can
+        // exclude a row group for them, so an unserved text run reads what
+        // the planner plans (every row group), under either baseline.
+        let text = query.text_op().is_some();
         // A count is planned as the locate of its keys; [`cost_of`] prices it.
         let query = match query {
             RunQuery::Count => &RunQuery::Locate,
@@ -387,6 +393,9 @@ impl<'a> Replayer<'a> {
             ),
         };
         self.catalog.verify_plan(&plan)?;
+        if text {
+            return Ok((plan, false));
+        }
         let (Some(window), Baseline::ParquetStats) = (unserved, self.unserved) else {
             return Ok((plan, false));
         };
@@ -449,6 +458,15 @@ impl<'a> Replayer<'a> {
     ) -> Result<ScanPlan> {
         let planner = self.planner_for(specs)?;
         Ok(self.verified_plan(planner.as_ref(), specs, keys, query)?.0)
+    }
+
+    /// The exact counts of a keyed text spec's tokens over the pinned
+    /// catalog, from its transient segments (built now, or from the
+    /// cache): distinct tokens and row groups per token (core's
+    /// `text::token_stats`).
+    pub fn text_stats(&self, spec: &KeySpec) -> Result<TokenStats> {
+        let index = self.transient(spec)?;
+        token_stats(index.segments().readers())
     }
 
     /// Every run's exact cost under `specs`, in workload order, each run
@@ -543,7 +561,12 @@ impl<'a> Replayer<'a> {
             .map(|run| {
                 let rk = workload.run_keys(keys, run)?;
                 check_types(&self.catalog, &rk)?;
-                let plan = planner.plan(&rk, run.window.as_ref())?;
+                let query = run.query()?;
+                let plan = if query.text_op().is_some() {
+                    planner.plan_text(&rk, &query)?
+                } else {
+                    planner.plan(&rk, run.window.as_ref())?
+                };
                 self.catalog.verify_plan(&plan)?;
                 Ok(run_cost(&run.run_id, rk.len() as u64, &plan))
             })
@@ -586,6 +609,19 @@ impl<'a> Replayer<'a> {
                 (costs, None, stats)
             }
             ProposalBody::Layout { cluster_by } => {
+                if let Some(run) = workload
+                    .runs()
+                    .iter()
+                    .find(|r| r.query().is_ok_and(|q| q.text_op().is_some()))
+                {
+                    return Err(Error::Other(format!(
+                        "a layout proposal is priced by a model of key lookups, and run {:?} is \
+                         a {} text lookup, which only a text key prunes; propose a text key \
+                         (text:<column>,tokenizer=words or tokenizer=trigram) for it",
+                        run.run_id, run.query_kind
+                    ))
+                    .into());
+                }
                 if let Some(run) = workload.runs().iter().find(|r| r.window.is_some()) {
                     return Err(Error::Other(format!(
                         "a layout proposal is priced by a model of key lookups, and run {:?} \

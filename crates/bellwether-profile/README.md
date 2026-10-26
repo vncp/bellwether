@@ -22,6 +22,7 @@ Dependencies: `bellwether-types`, `-core` (canonical encoding), `-source` (sourc
 | `evidence(&report) -> Evidence` | Builds the `profile` Evidence. Refuses a report with no provenance inputs. |
 | `record(&ledger, &report)`, `profile_and_record(..)` | Write it through the ledger. |
 | `render(&report, evidence_hash) -> String` | The one-screen summary (below). |
+| `lints::text_lookups(uses, complete)` | `R-text-1` (B5): text runs on a string column with no complete text key serving their match. The caller reads the workload's runs (`why` does), so it is not part of `profile`. |
 | `ProfileReport` | `Serialize`, for `--json`. It carries more than the Evidence can: sampling detail per fanout, the candidates auto selection skipped, range statistics, time measures, provenance inputs with ages, the memory report. |
 | `bin/bellwether-profile` | A thin wrapper for running a profile by hand until WP9's facade calls `profile` directly (ADR 010). Its source configuration is `parquet`. |
 

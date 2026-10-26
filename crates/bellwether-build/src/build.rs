@@ -88,6 +88,11 @@ pub struct BuildReport {
     /// counted twice: a manifest no build writes (another tool's, or an
     /// edited one), which every planner refuses as a corrupt index.
     pub specs_repaired: Vec<String>,
+    /// Text keys rebuilt because their segments were built under other
+    /// Unicode tables than this binary's (after a deliberate upgrade of a
+    /// table crate), with the tables they recorded; each is also in
+    /// `specs_rebuilt`.
+    pub text_tables_replaced: Vec<TextTablesReplaced>,
     /// Key specs removed because [`BuildOptions::remove_unlisted`] was set
     /// and they were not listed; their segments were dropped.
     pub specs_removed: Vec<String>,
@@ -109,6 +114,18 @@ pub struct BuildReport {
     pub peak_segment_keys: u64,
     /// Wall time.
     pub elapsed: Duration,
+}
+
+/// A text key `index` rebuilt because its segments recorded other Unicode
+/// tables ([`BuildReport::text_tables_replaced`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TextTablesReplaced {
+    /// The key's name.
+    pub spec: String,
+    /// The tables its segments recorded.
+    pub recorded: bellwether_core::text::UnicodeTables,
+    /// This binary's tables, which the rebuilt segments record.
+    pub current: bellwether_core::text::UnicodeTables,
 }
 
 enum Attempt {
@@ -336,7 +353,8 @@ impl<S: StoreExt + ?Sized> Builder<S> {
             observer,
         )?;
         let live = live_ids(&files.space)?;
-        let work = plan_work(base.as_ref(), &specs, &cfg, &live);
+        let stale = stale_text_specs(&*self.store, &self.index_root, base.as_ref())?;
+        let work = plan_work(base.as_ref(), &specs, &cfg, &live, &stale);
         let mut report = files.report(&work);
         if is_noop(base.as_ref(), &files, &work, &cfg, &specs)? {
             // Nothing committed: a version 1 index stays at version 1 and
@@ -670,7 +688,7 @@ fn shared_identity(root: &str, base: Option<&Manifest>, a: &KeySpec, b: &KeySpec
                     fix(valid_column);
                     fix(known_column);
                 }
-                KeySpec::Range { .. } => {}
+                KeySpec::Range { .. } | KeySpec::Text { .. } => {}
             }
             format!(
                 "re-declare {} under its name with a time column whose name has no ',' or '@', \
@@ -831,6 +849,9 @@ fn plan_specs(
                 }
                 let t = column_type(c)?;
                 ColumnType::of(&t).map_err(|e| Error::KeySpec(format!("{name}: key column {c:?}: {e}")))?;
+                if matches!(spec, KeySpec::Text { .. }) {
+                    bellwether_core::text::check_column_type(c, &t)?;
+                }
                 key_types.push(t);
             }
             let mut columns = spec.columns().to_vec();
@@ -951,6 +972,7 @@ impl FilePlan {
             files_filled: self.counts.filled,
             specs_rebuilt: work.replaced.iter().cloned().collect(),
             specs_repaired: work.repaired.clone(),
+            text_tables_replaced: work.stale.clone(),
             specs_removed: work.removed.clone(),
             ..BuildReport::default()
         }
@@ -1149,6 +1171,9 @@ struct WorkPlan {
     /// Counted specs rebuilt because two of their base segments cover one
     /// live row group (also in `replaced`).
     repaired: Vec<String>,
+    /// Declared text keys replaced because they were built under other
+    /// Unicode tables.
+    stale: Vec<TextTablesReplaced>,
 }
 
 /// Whether two segments listed under `name` both cover one live row group.
@@ -1191,11 +1216,93 @@ fn types_differ(old: &Schema, new: &Schema, target: &Target) -> bool {
     })
 }
 
+/// The text keys of `m` built under Unicode tables other than this
+/// binary's, with the tables they recorded (core's `text::recorded_tables`):
+/// after a deliberate upgrade of either table crate, `index` rebuilds
+/// exactly these from scratch ([`plan_work`]). Every build keeps all of a
+/// text key's segments under one table version (a key on other tables is
+/// replaced whole, never extended), so one header per key tells: reads one
+/// segment's preamble and header per declared text key, whatever its
+/// segment count.
+fn stale_text_specs<S: StoreExt + ?Sized>(
+    store: &S,
+    index_root: &str,
+    m: Option<&Manifest>,
+) -> Result<BTreeMap<String, bellwether_core::text::UnicodeTables>> {
+    let now = bellwether_core::text::UnicodeTables::current();
+    let mut stale = BTreeMap::new();
+    let Some(m) = m else {
+        return Ok(stale);
+    };
+    for spec in m
+        .schema
+        .key_specs
+        .iter()
+        .filter(|s| matches!(s, KeySpec::Text { .. }))
+    {
+        let name = spec.identity();
+        let Some(seg) = m.key_spec_segments(&name).next() else {
+            continue;
+        };
+        let src = HeaderBytes {
+            store,
+            path: bellwether_store::segment_path(index_root, &seg.id),
+            size: seg.bytes,
+        };
+        match bellwether_core::text::recorded_tables(&src)? {
+            Some(t) if t == now => {}
+            Some(t) => {
+                stale.insert(name, t);
+            }
+            None => {
+                return Err(Error::Other(format!(
+                    "corrupt segment {}: a text segment records its Unicode tables",
+                    seg.id
+                )))
+            }
+        }
+    }
+    Ok(stale)
+}
+
+/// A committed segment read by range (its preamble and header only).
+struct HeaderBytes<'a, S: StoreExt + ?Sized> {
+    store: &'a S,
+    path: String,
+    size: u64,
+}
+
+impl<S: StoreExt + ?Sized> bellwether_core::segment::ReadAt for HeaderBytes<'_, S> {
+    fn size(&self) -> Result<u64> {
+        Ok(self.size)
+    }
+
+    fn read_at(&self, offset: u64, len: usize) -> Result<std::borrow::Cow<'_, [u8]>> {
+        let end = offset
+            .checked_add(len as u64)
+            .filter(|e| *e <= self.size)
+            .ok_or_else(|| Error::Other(format!("corrupt segment {}: range", self.path)))?;
+        let bytes = self
+            .store
+            .get_range(&self.path, offset..end)?
+            .ok_or_else(|| Error::Store(format!("segment {} is missing", self.path)))?;
+        if bytes.len() != len {
+            return Err(Error::Store(format!(
+                "segment {}: asked for {len} bytes at {offset}, got {}",
+                self.path,
+                bytes.len()
+            )));
+        }
+        Ok(std::borrow::Cow::Owned(bytes.to_vec()))
+    }
+}
+
 fn plan_work(
     base: Option<&Manifest>,
     specs: &[SpecPlan],
     cfg: &Config,
     live: &RoaringBitmap,
+    stale: &BTreeMap<String, bellwether_core::text::UnicodeTables>,
 ) -> WorkPlan {
     let mut work = WorkPlan {
         needed: Vec::with_capacity(specs.len()),
@@ -1203,6 +1310,7 @@ fn plan_work(
         keep: BTreeSet::new(),
         removed: Vec::new(),
         repaired: Vec::new(),
+        stale: Vec::new(),
     };
     let base_targets = base.map(declared_targets).unwrap_or_default();
     for p in specs {
@@ -1218,6 +1326,16 @@ fn plan_work(
         let replaced = old != Some(&p.target) || types_changed || double;
         if double && old == Some(&p.target) && !types_changed {
             work.repaired.push(p.name.clone());
+        }
+        // A text key built under other Unicode tables is rebuilt whole.
+        let recorded = stale.get(&p.name);
+        let replaced = replaced || recorded.is_some();
+        if let Some(t) = recorded {
+            work.stale.push(TextTablesReplaced {
+                spec: p.name.clone(),
+                recorded: t.clone(),
+                current: bellwether_core::text::UnicodeTables::current(),
+            });
         }
         let needed = match base {
             Some(m) if !replaced => live - &covered(m, &p.name),

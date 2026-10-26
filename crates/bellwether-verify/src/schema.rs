@@ -145,6 +145,13 @@ pub(crate) enum RowTest {
     },
     /// Every test keeps the row.
     And(Vec<RowTest>),
+    /// The string at `col` matches one of `args` (already case-folded)
+    /// under `op` (core's `text::matches_any`); a null never matches.
+    Text {
+        col: usize,
+        op: bellwether_types::TextOp,
+        args: Vec<String>,
+    },
 }
 
 impl RowTest {
@@ -188,6 +195,18 @@ impl RowTest {
                         .into(),
                 ))
             }
+            Predicate::Text {
+                column,
+                operator,
+                values,
+            } => Self::Text {
+                col: index(column),
+                op: *operator,
+                args: values
+                    .iter()
+                    .map(|v| bellwether_core::text::fold(v))
+                    .collect(),
+            },
         })
     }
 
@@ -239,6 +258,8 @@ impl RowTest {
                 }
                 true
             }
+            Self::Text { col, op, args } => bellwether_core::text::value_at(cols[*col], row)?
+                .is_some_and(|v| bellwether_core::text::matches_any(*op, args, v)),
         })
     }
 }
@@ -247,7 +268,7 @@ impl RowTest {
 fn predicate_columns<'p>(p: &'p Predicate, out: &mut Vec<&'p String>) {
     match p {
         Predicate::In { columns, .. } => out.extend(columns),
-        Predicate::Between { column, .. } => out.push(column),
+        Predicate::Between { column, .. } | Predicate::Text { column, .. } => out.push(column),
         Predicate::NotOlderThan {
             columns, ts_column, ..
         } => {

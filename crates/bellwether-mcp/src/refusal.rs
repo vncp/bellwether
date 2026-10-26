@@ -234,8 +234,8 @@ impl RefusalCode {
                  human to run the index command in `fields.command` (no receipt)"
             }
             Self::NoWorkload => {
-                "pass `keys` (a Parquet key file) or a recorded `workload` hash for a key, or the \
-                 rewrite outputs for a rewrite"
+                "pass `keys` (a Parquet key file), a recorded `workload` hash, or `text` lookups \
+                 (score.why) for a key, or the rewrite outputs for a rewrite"
             }
             Self::StaleIndex => {
                 "ask the human to run `bellwether index` on the data folder, then call the tool \

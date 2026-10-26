@@ -88,9 +88,13 @@ impl Layout {
     #[must_use]
     pub fn for_spec(spec: &KeySpec) -> Option<Self> {
         match spec {
-            KeySpec::Exact { bounds: None, .. } => Some(Self::Keyed),
+            KeySpec::Exact { bounds: None, .. } | KeySpec::Text { bloom: None, .. } => {
+                Some(Self::Keyed)
+            }
             KeySpec::Temporal { .. } => Some(Self::KeyedTemporal),
-            KeySpec::Bloom { bounds: None, .. } => Some(Self::BloomPerRowGroup),
+            KeySpec::Bloom { bounds: None, .. } | KeySpec::Text { bloom: Some(_), .. } => {
+                Some(Self::BloomPerRowGroup)
+            }
             KeySpec::Range { .. } => Some(Self::MinMax),
             KeySpec::Exact { .. } | KeySpec::Bloom { .. } | KeySpec::Bitemporal { .. } => None,
         }
@@ -336,6 +340,9 @@ pub(crate) fn spec_types(
         .iter()
         .map(|c| lookup(c))
         .collect::<Result<Vec<_>>>()?;
+    if let KeySpec::Text { column, .. } = spec {
+        crate::text::check_column_type(column, &keys[0])?;
+    }
     let ts = match spec {
         KeySpec::Temporal { ts_column, .. } => {
             let dt = lookup(ts_column)?;
@@ -380,6 +387,11 @@ pub struct SegmentHeader {
     /// together with `key_types` for temporal specs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ts_type: Option<ColumnType>,
+    /// For a text key (and only a text key): the Unicode tables its tokens
+    /// were folded and split under (`docs/format.md`, "Text keys"). A
+    /// reader built on other tables refuses the segment.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text_unicode: Option<crate::text::UnicodeTables>,
     /// Fields written by a newer minor writer, preserved verbatim.
     #[serde(flatten)]
     pub extra: serde_json::Map<String, serde_json::Value>,
@@ -393,6 +405,7 @@ impl SegmentHeader {
     #[must_use]
     pub fn new(spec: KeySpec) -> Self {
         let layout = Layout::for_spec(&spec).unwrap_or(Layout::Keyed);
+        let spec_is_text = matches!(spec, KeySpec::Text { .. });
         Self {
             storage_version: STORAGE_VERSION,
             encoding_version: ENCODING_VERSION,
@@ -402,6 +415,7 @@ impl SegmentHeader {
             codec: CODEC_NONE.to_string(),
             key_types: None,
             ts_type: None,
+            text_unicode: spec_is_text.then(crate::text::UnicodeTables::current),
             extra: serde_json::Map::new(),
         }
     }
@@ -471,6 +485,31 @@ impl SegmentHeader {
                 return Err(corrupt("ts_type without key_types"));
             }
             _ => {}
+        }
+        match (&self.key_spec, &self.text_unicode) {
+            (KeySpec::Text { .. }, None) => {
+                return Err(corrupt("a text segment records its Unicode tables"));
+            }
+            (KeySpec::Text { .. }, Some(t)) => {
+                let now = crate::text::UnicodeTables::current();
+                if *t != now {
+                    return Err(Error::KeySpec(format!(
+                        "this {} segment was built with the Unicode tables of {} (case folding) \
+                         and {} (word boundaries), and this binary folds and splits text with {} \
+                         and {}, so the same value could give other tokens; {}",
+                        self.key_spec.name(),
+                        t.case,
+                        t.words,
+                        now.case,
+                        now.words,
+                        crate::text::REBUILD_STEP
+                    )));
+                }
+            }
+            (_, Some(_)) => {
+                return Err(corrupt("text_unicode on a segment that is not a text key"))
+            }
+            (_, None) => {}
         }
         Ok(())
     }

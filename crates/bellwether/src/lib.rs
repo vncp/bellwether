@@ -45,6 +45,7 @@ mod results;
 mod signing;
 mod sketch;
 pub mod spec;
+mod text;
 mod twin;
 mod why;
 
@@ -82,7 +83,7 @@ pub use reconcile::{ReconcileProblem, ReconcileRequest, ReconcileResult};
 pub use results::{
     ChainLink, Cost, CountResult, IndexResult, LinkStatus, LookbackWindow, LookupKind, NotSigned,
     PlanResult, ProposeRefusal, ProposeResult, ReceiptResult, ReportResult, SidecarState,
-    SpecState, Written,
+    SpecState, TextRebuilt, Written,
 };
 pub use signing::{
     generate_key, load_signing_key, load_trusted_keys, public_path, read_public_key,
@@ -91,12 +92,13 @@ pub use signing::{
 pub use sketch::{
     CardinalityRequest, CardinalityResult, ItemCardinality, OverlapResult, SketchSource,
 };
+pub use text::{high_entropy, TextQuery, HIGH_ENTROPY_TOKENS_PER_ROW};
 pub use twin::{
     EngineWorkload, GateFit, TwinCandidate, TwinColumns, TwinReport, CARDINALITY_RATIO,
     LOW_CARDINALITY_ROWS, MEMBERSHIP_GATE, NARROW_PERCENT, SELECTIVE_FILES_PERCENT,
 };
 pub use why::{
     Candidate, CandidateOrigin, Culprit, CulpritReason, Dataset, DiagnosisReads, LookupMode,
-    ProfileEvidence, Recommendation, TimeWindow, WhyReport, WhyRequest, WorkloadInfo,
+    ProfileEvidence, Recommendation, TextMatch, TimeWindow, WhyReport, WhyRequest, WorkloadInfo,
     DEFAULT_MAX_CANDIDATES, ENGINE_PROPOSER, LAYOUT_BOUND_FRACTION, RESERVED_PROPOSERS,
 };

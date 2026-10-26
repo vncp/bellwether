@@ -115,6 +115,12 @@ enum Scope {
         age: Duration,
         keys: Vec<Vec<u8>>,
     },
+    /// The rows the row filter keeps, named after a workload
+    /// ([`CoverageRequest::WorkloadRows`]).
+    WorkloadRows {
+        workload: Hash,
+        age: Duration,
+    },
     Sampled {
         requested: f64,
         seed: u64,
@@ -125,7 +131,7 @@ enum Scope {
 impl Scope {
     fn includes(&self, key: &[u8]) -> bool {
         match self {
-            Self::Full => true,
+            Self::Full | Self::WorkloadRows { .. } => true,
             Self::Workload { keys, .. } => keys.binary_search_by(|k| k.as_slice().cmp(key)).is_ok(),
             Self::Sampled {
                 seed, threshold, ..
@@ -784,6 +790,10 @@ fn resolve_scope(coverage: &CoverageRequest, plan: &Plan) -> Result<Scope> {
                 t
             }),
         },
+        CoverageRequest::WorkloadRows { workload, age } => Scope::WorkloadRows {
+            workload: *workload,
+            age: *age,
+        },
         CoverageRequest::StaticProof { identity } => {
             return Err(VerifyError::StaticProofUnsupported {
                 identity: identity.clone(),
@@ -1285,6 +1295,12 @@ fn nothing_compared(scope: &Scope, seen: u64, unsampled: u64, filtered: bool) ->
              the dataset types (decimal scale is not visible in the bytes)",
             keys.len()
         ))),
+        Scope::WorkloadRows { .. } if seen == 0 => Err(VerifyError::NothingCompared(
+            "no row on either side holds what the workload's lookups ask for (the row filter \
+             keeps none), so there is nothing to verify; check the recorded values against the \
+             data"
+                .into(),
+        )),
         Scope::Sampled { requested, .. } if seen == 0 && unsampled > 0 => {
             Err(VerifyError::NothingCompared(format!(
                 "a sample at fraction {requested} selected none of the {unsampled} keys present; \
@@ -1310,6 +1326,13 @@ fn realized_coverage(scope: &Scope, counts: &mut Counts, seen: u64, unsampled: u
             Coverage::Workload {
                 workload: *workload,
                 keys: supplied,
+            }
+        }
+        Scope::WorkloadRows { workload, .. } => {
+            counts.keys_compared = seen;
+            Coverage::Workload {
+                workload: *workload,
+                keys: seen,
             }
         }
         Scope::Sampled { requested, .. } => {
@@ -1349,8 +1372,11 @@ fn provenance(prep: &Prepared<'_>, started: Instant) -> (Vec<Input>, Vec<u64>, V
             evidence.push(ev.clone());
         }
     }
-    if let Scope::Workload { workload, age, .. } = &prep.scope {
-        inputs.push((*workload, *age, started));
+    match &prep.scope {
+        Scope::Workload { workload, age, .. } | Scope::WorkloadRows { workload, age } => {
+            inputs.push((*workload, *age, started));
+        }
+        Scope::Full | Scope::Sampled { .. } => {}
     }
     (inputs, manifests, evidence)
 }
