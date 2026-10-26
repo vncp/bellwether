@@ -558,7 +558,7 @@ fn bellwether_mcp_takes_the_shared_engine_and_budget_flags() {
         assert!(help.contains(&long), "{long} missing from:\n{help}");
         flags += 1;
     }
-    assert_eq!(flags, 10);
+    assert_eq!(flags, 13);
 }
 
 /// `bellwether mcp <root>` is the same server: a handshake and one tool

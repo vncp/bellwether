@@ -20,10 +20,15 @@
 //!   provenance: non-empty inputs and an RFC 3339 `created_at`; a
 //!   certificate also names its manifest version.
 //! - **Invariant 3 support** (contract v2.1): every [`Replay`] names the
-//!   data it read (`inputs`, non-empty); its current costs are exact; it
-//!   names a cost model exactly when some proposed cost is inexact; and a
-//!   key proposal's replay is exact throughout. `put_receipt` re-runs these
-//!   checks on the resolved replay.
+//!   data it read (`inputs`, non-empty); its current costs are exact,
+//!   except a rewrite measured in a query engine or a table, which names
+//!   its model (ADR 033); it names a cost model exactly when some cost is
+//!   inexact; and a key proposal's replay is exact throughout.
+//!   `put_receipt` re-runs these checks on the resolved replay.
+//! - **Attest-only receipts** (ADR 033): a receipt marked `attest_only` is
+//!   for a rewrite and leaves the manifest unchanged; a receipt whose
+//!   replay is measured must be attest-only, and a receipt's prediction
+//!   must be its replay's.
 //! - **Write version**: `put` and `put_receipt` accept only the current
 //!   `record_version`; older versions stay readable (ADR 017).
 //!
@@ -256,11 +261,14 @@ fn all_exact(costs: &[RunCost]) -> bool {
     costs.iter().all(|c| c.exact)
 }
 
-/// Contract v2.1 replay rules, independent of where the replay is checked:
-/// inputs are non-empty; current costs are exact; a cost model is named
-/// exactly when some proposed cost is inexact, and it is a non-empty name
-/// with no surrounding whitespace; a key proposal's replay is exact
-/// throughout.
+/// Replay rules (contract v2.1, ADR 033), independent of where the replay
+/// is checked: inputs are non-empty; current costs are exact, except in a
+/// rewrite's replay that names its cost model (a rewrite measured in a
+/// query engine or a table, where there is no exact current cost); a cost
+/// model is named exactly when some cost is inexact, and it is a non-empty
+/// name with no surrounding whitespace; a key proposal's replay is exact
+/// throughout; a cost carrying an engine's query statistics is never
+/// exact; and a prediction belongs to a measured rewrite.
 fn check_replay_content(r: &Replay, proposal: &Proposal) -> Result<()> {
     if r.inputs.is_empty() {
         return Err(rule(
@@ -276,9 +284,23 @@ fn check_replay_content(r: &Replay, proposal: &Proposal) -> Result<()> {
             ));
         }
     }
-    if !all_exact(&r.current) {
+    if r.current
+        .iter()
+        .chain(&r.proposed)
+        .any(|c| c.exact && c.measured.is_some())
+    {
         return Err(rule(
-            "replay must be exact for the current configuration in every run (ADR 005)",
+            "a cost carrying an engine's query statistics is measured and must not be marked \
+             exact (ADR 033)",
+        ));
+    }
+    let rewrite = matches!(proposal.body, ProposalBody::Rewrite { .. });
+    let current_exact = all_exact(&r.current);
+    if !(current_exact || (rewrite && r.model.is_some())) {
+        return Err(rule(
+            "replay must be exact for the current configuration in every run (ADR 005); only \
+             a rewrite measured in a query engine or a table, naming its cost model, may \
+             carry measured current costs (ADR 033)",
         ));
     }
     let proposed_exact = all_exact(&r.proposed);
@@ -287,15 +309,55 @@ fn check_replay_content(r: &Replay, proposal: &Proposal) -> Result<()> {
             "replay of a key proposal must be exact in every run (ADR 005)",
         ));
     }
-    match (proposed_exact, r.model.is_some()) {
+    if r.prediction.is_some() && (!rewrite || current_exact) {
+        return Err(rule(
+            "a replay's prediction compares the twin with an engine's measurement, so it \
+             belongs to a rewrite measured in a query engine (ADR 033)",
+        ));
+    }
+    match (current_exact && proposed_exact, r.model.is_some()) {
         (true, true) => Err(rule(
             "replay must not name a cost model when every cost is exact",
         )),
         (false, false) => Err(rule(
-            "replay with an inexact proposed cost must name the cost model behind it",
+            "replay with an inexact cost must name the cost model behind it",
         )),
         _ => Ok(()),
     }
+}
+
+/// Attest-only (ADR 033): a measured replay backs only a receipt that
+/// applied nothing, and that receipt is a rewrite's; its prediction is its
+/// replay's, never a number of its own.
+fn check_attest_only(r: &Receipt, replay: &Replay, proposal: &Proposal) -> Result<()> {
+    if !all_exact(&replay.current) && !r.attest_only {
+        return Err(rule(format!(
+            "receipt's replay {} is measured, not exact, so the receipt can only attest \
+             (attest_only): the engine applied nothing it measured",
+            r.replay
+        )));
+    }
+    if r.attest_only && !matches!(proposal.body, ProposalBody::Rewrite { .. }) {
+        return Err(rule(format!(
+            "an attest-only receipt is for a rewrite, and this is a {} proposal",
+            proposal_kind(&proposal.body)
+        )));
+    }
+    if r.attest_only && r.manifest_after != r.manifest_before {
+        return Err(rule(format!(
+            "an attest-only receipt applied nothing, so manifest_after {:?} must be \
+             manifest_before {:?}",
+            r.manifest_after, r.manifest_before
+        )));
+    }
+    if r.prediction != replay.prediction {
+        return Err(rule(format!(
+            "receipt's prediction is not its replay {}'s; a receipt copies the replay's \
+             prediction and adds none",
+            r.replay
+        )));
+    }
+    Ok(())
 }
 
 /// A record written now carries the current record version; older versions
@@ -803,6 +865,7 @@ where
             Error::LedgerRule(m) => rule(format!("receipt's replay {}: {m}", r.replay)),
             other => other,
         })?;
+        check_attest_only(r, &replay, &proposal)?;
 
         // Manifest versions are sequences (ADR 020): u64s rendered as strings,
         // compared numerically.

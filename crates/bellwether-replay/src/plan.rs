@@ -333,6 +333,7 @@ pub trait PlanSource: Send + Sync {
 #[must_use]
 pub fn run_cost(run_id: &str, keys: u64, plan: &ScanPlan, exact: bool) -> RunCost {
     RunCost {
+        measured: None,
         run_id: run_id.to_string(),
         keys,
         files: plan.entries.len() as u64,

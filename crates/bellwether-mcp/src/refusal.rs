@@ -91,11 +91,17 @@ pub enum RefusalCode {
     SegmentClaimed,
     /// Any other engine error.
     EngineError,
+    /// A query engine refused to export a rewrite's results: no
+    /// certificate, no receipt; `fields.permission` names what to grant.
+    ExportDenied,
+    /// The arguments carried a score, cost, measurement, replay, verdict, or
+    /// certificate: a caller never supplies one.
+    CallerSuppliedCost,
 }
 
 impl RefusalCode {
     /// Every code, in `AGENTS.md` order.
-    pub const ALL: [Self; 34] = [
+    pub const ALL: [Self; 36] = [
         Self::CertificateFailed,
         Self::StaleManifest,
         Self::DataChanged,
@@ -130,6 +136,8 @@ impl RefusalCode {
         Self::UnknownKind,
         Self::SegmentClaimed,
         Self::EngineError,
+        Self::ExportDenied,
+        Self::CallerSuppliedCost,
     ];
 
     /// The code as it is serialized.
@@ -170,6 +178,8 @@ impl RefusalCode {
             Self::UnknownKind => "unknown_kind",
             Self::SegmentClaimed => "segment_claimed",
             Self::EngineError => "engine_error",
+            Self::ExportDenied => "export_denied",
+            Self::CallerSuppliedCost => "caller_supplied_cost",
         }
     }
 
@@ -259,6 +269,14 @@ impl RefusalCode {
             }
             Self::SegmentClaimed => "retry later, with `wait: true`",
             Self::EngineError => "read the message; it says what to do",
+            Self::ExportDenied => {
+                "tell the human which permission `fields.permission` names; without the export \
+                 there is no certificate and no receipt, and the measured replay stands"
+            }
+            Self::CallerSuppliedCost => {
+                "remove the field `fields.field` names and call again; the engine measures, \
+                 verifies, and attests on its own"
+            }
         }
     }
 }
@@ -333,6 +351,11 @@ fn typed_next(e: &Error) -> Option<String> {
             "rewrite" => Some(
                 "pass `rewrite` with the `before` and `after` output folders and the `key` \
                  columns to compare them by"
+                    .into(),
+            ),
+            "scratch" => Some(
+                "ask the human to start the server with --scratch <folder> (a folder of the \
+                 lake the engine's exports are written under), then call score.verify again"
                     .into(),
             ),
             _ => None,
@@ -463,6 +486,12 @@ pub fn from_error(e: &Error) -> Refusal {
             json!({ "root": root, "operation": operation }),
         ),
         Error::Store(_) => (RefusalCode::StoreError, json!({})),
+        Error::ExportDenied {
+            engine, permission, ..
+        } => (
+            RefusalCode::ExportDenied,
+            json!({ "engine": engine, "permission": permission }),
+        ),
         // No wildcard arm: a new `Error` variant must fail to compile here.
         Error::Serde(_) | Error::Other(_) => (RefusalCode::EngineError, json!({})),
     };
@@ -471,6 +500,52 @@ pub fn from_error(e: &Error) -> Refusal {
         r.next = next;
     }
     r
+}
+
+/// Fields a caller may never hand the engine: a score, a cost, a
+/// measurement, a replay, a verdict, or a certificate under any of these
+/// names. No tool's schema has one where the caller writes, so each can
+/// only arrive as an unknown field.
+pub const COST_FIELDS: &[&str] = &[
+    "score",
+    "scores",
+    "cost",
+    "costs",
+    "replay",
+    "replays",
+    "measured",
+    "measurement",
+    "measurements",
+    "stats",
+    "query_stats",
+    "read_rows",
+    "read_bytes",
+    "peak_memory_bytes",
+    "duration_ns",
+    "prediction",
+    "verdict",
+    "pass",
+    "receipt",
+    "certificate",
+];
+
+/// The first cost-like field an argument validation rejected as unknown
+/// (`'score' was unexpected`), if any.
+#[must_use]
+pub fn caller_supplied(errors: &[String]) -> Option<String> {
+    for e in errors {
+        let mut rest = e.as_str();
+        while let Some(i) = rest.find('\'') {
+            let after = &rest[i + 1..];
+            let Some(j) = after.find('\'') else { break };
+            let name = &after[..j];
+            if COST_FIELDS.contains(&name) {
+                return Some(name.to_string());
+            }
+            rest = &after[j + 1..];
+        }
+    }
+    None
 }
 
 /// A typed `propose` refusal.
@@ -640,6 +715,15 @@ pub fn from_fix(r: &FixRefusal, verification: Option<&Reconciliation>) -> Refusa
                 "run": run,
                 "proposed_rewrite": proposed_rewrite,
             }),
+        ),
+        FixRefusal::ExportDenied {
+            engine,
+            permission,
+            message,
+        } => Refusal::new(
+            RefusalCode::ExportDenied,
+            message.clone(),
+            json!({ "engine": engine, "permission": permission }),
         ),
         FixRefusal::NoReplay { certificate } => Refusal::new(
             RefusalCode::NoReplay,

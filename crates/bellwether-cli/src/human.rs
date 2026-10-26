@@ -73,9 +73,23 @@ pub(crate) fn label_width<'a>(labels: impl IntoIterator<Item = &'a str>, min: us
 
 /// One funnel row: label, files, row groups, bytes (exact and rounded).
 pub(crate) fn funnel_row(s: &mut String, w: usize, name: &str, c: &Cost, note: &str) {
+    funnel_row_kind(s, w, name, c, None, note);
+}
+
+/// A funnel row with the index kind's column (`KindColumn`) before the
+/// note: `Some((width, value))` when the table has one.
+pub(crate) fn funnel_row_kind(
+    s: &mut String,
+    w: usize,
+    name: &str,
+    c: &Cost,
+    kind: Option<(usize, &str)>,
+    note: &str,
+) {
+    let kind = kind.map_or_else(String::new, |(kw, v)| format!(" {v:>kw$}"));
     let _ = writeln!(
         s,
-        "  {name:<w$} {:>9} {:>12} {:>18} {:>10}  {note}",
+        "  {name:<w$} {:>9} {:>12} {:>18} {:>10}{kind}  {note}",
         num(c.files),
         num(c.row_groups),
         num(c.bytes),
@@ -84,9 +98,16 @@ pub(crate) fn funnel_row(s: &mut String, w: usize, name: &str, c: &Cost, note: &
 }
 
 pub(crate) fn funnel_header(s: &mut String, w: usize) {
+    funnel_header_kind(s, w, None);
+}
+
+/// The funnel header, with the index kind's column header when the table
+/// has one: `Some((width, kind))`.
+pub(crate) fn funnel_header_kind(s: &mut String, w: usize, kind: Option<(usize, &str)>) {
+    let kind = kind.map_or_else(String::new, |(kw, k)| format!(" {k:>kw$}"));
     let _ = writeln!(
         s,
-        "  {:<w$} {:>9} {:>12} {:>18} {:>10}",
+        "  {:<w$} {:>9} {:>12} {:>18} {:>10}{kind}",
         "", "files", "row groups", "bytes", ""
     );
 }
@@ -432,6 +453,9 @@ pub(crate) fn why(r: &bellwether::WhyReport, out: &Out, fix_command: &str) -> St
         )
     };
     let _ = writeln!(s, "{}", heading(out, &format!("why {}: {state}", r.root)));
+    if let Some(t) = &r.twin {
+        twin_header(&mut s, t);
+    }
     crate::verify_cmds::tables_human(&mut s, &r.tables);
     let basis = match (&r.model, r.exact) {
         (Some(model), false) => format!(
@@ -507,8 +531,25 @@ pub(crate) fn why(r: &bellwether::WhyReport, out: &Out, fix_command: &str) -> St
         }
         let labels: Vec<String> = r.candidates.iter().map(|c| label(&c.spec)).collect();
         let w_col = label_width(labels.iter().map(String::as_str), MIN_FUNNEL_LABEL);
-        funnel_header(&mut s, w_col);
-        funnel_row(&mut s, w_col, "dataset", &dataset, &rows);
+        // One trailing column for the index kind that contributes one
+        // (`KindColumn`), headed by the kind's name, before the notes.
+        let kind_head = r
+            .candidates
+            .iter()
+            .find_map(|c| c.kind_column.as_ref().map(|k| k.kind.clone()));
+        let kind_width = kind_head.as_ref().map(|h| {
+            r.candidates
+                .iter()
+                .filter_map(|c| c.kind_column.as_ref().map(|k| k.value.chars().count()))
+                .chain(std::iter::once(h.chars().count()))
+                .max()
+                .unwrap_or(0)
+        });
+        let kind_cell = |v: &str| kind_width.map(|kw| (kw, v.to_string()));
+        funnel_header_kind(&mut s, w_col, kind_width.zip(kind_head.as_deref()));
+        let blank = kind_cell("");
+        let blank = blank.as_ref().map(|(w, v)| (*w, v.as_str()));
+        funnel_row_kind(&mut s, w_col, "dataset", &dataset, blank, &rows);
         let current_name = if r.current_specs.is_empty() {
             "current (no index)"
         } else {
@@ -523,7 +564,7 @@ pub(crate) fn why(r: &bellwether::WhyReport, out: &Out, fix_command: &str) -> St
             ),
             _ => String::new(),
         };
-        funnel_row(&mut s, w_col, current_name, &current, &current_note);
+        funnel_row_kind(&mut s, w_col, current_name, &current, blank, &current_note);
         for c in &r.candidates {
             let mut notes = Vec::new();
             match (&c.origin, &c.spec, &kind_label) {
@@ -565,11 +606,25 @@ pub(crate) fn why(r: &bellwether::WhyReport, out: &Out, fix_command: &str) -> St
             if r.recommended.as_ref().is_some_and(|x| x.spec == c.spec) {
                 notes.push("recommended".to_string());
             }
-            funnel_row(
+            let cell = kind_cell(c.kind_column.as_ref().map_or("", |k| k.value.as_str()));
+            if let Some(k) = &c.kind_column {
+                notes.push(format!(
+                    "{}: {}{}",
+                    k.kind,
+                    k.label,
+                    if k.exactness.is_exact() {
+                        ""
+                    } else {
+                        " (not exact)"
+                    }
+                ));
+            }
+            funnel_row_kind(
                 &mut s,
                 w_col,
                 &label(&c.spec),
                 &c.proposed,
+                cell.as_ref().map(|(w, v)| (*w, v.as_str())),
                 &notes.join(", "),
             );
         }
@@ -694,6 +749,9 @@ pub(crate) fn why(r: &bellwether::WhyReport, out: &Out, fix_command: &str) -> St
                 );
             }
         }
+    }
+    if let Some(t) = &r.twin {
+        twin_table(&mut s, t);
     }
     let _ = writeln!(
         s,
@@ -915,4 +973,155 @@ pub(crate) fn scorecard(r: &bellwether::ScorecardResult, out: &Out) -> String {
     }
     unreadable_line(&mut s, &r.unreadable);
     s
+}
+
+pub(crate) fn engine_workload(r: &bellwether::EngineWorkload, _out: &Out) -> String {
+    format!(
+        "recorded workload {}: {} keys over ({}) from {} rows of {} (query {}){}\n  diagnose it: \
+         bellwether why <folder> --workload {} --twin-of {}\n",
+        r.workload,
+        num(r.keys),
+        r.columns.join(", "),
+        num(r.rows),
+        r.engine,
+        r.tag,
+        if r.null_tuples > 0 {
+            format!(
+                "; {} rows held a null and were dropped (ADR 014)",
+                num(r.null_tuples)
+            )
+        } else {
+            String::new()
+        },
+        r.workload,
+        r.engine
+    )
+}
+
+/// The twin's header (ADR 033): the diagnosis is on a copy, and how fresh
+/// the copy is against the engine's table identity.
+fn twin_header(s: &mut String, t: &bellwether::TwinReport) {
+    let of = &t.of;
+    let _ = writeln!(s, "  {}", t.note);
+    let behind = i128::from(of.engine_rows) - i128::from(of.lake_rows);
+    let fresh = match behind {
+        0 => "the same row count".to_string(),
+        d if d > 0 => format!(
+            "{} rows behind the engine",
+            num(u64::try_from(d).unwrap_or(0))
+        ),
+        d => format!(
+            "{} rows ahead of the engine",
+            num(u64::try_from(-d).unwrap_or(0))
+        ),
+    };
+    let _ = writeln!(
+        s,
+        "  freshness: the engine holds {} rows in {} units (identity {}); the lake at sequence \
+         {} holds {} rows: {fresh}",
+        num(of.engine_rows),
+        num(of.units),
+        short(&of.identity),
+        of.sequence,
+        num(of.lake_rows)
+    );
+}
+
+/// The twin's columns per candidate: fanout, files per key, and the keyset
+/// against each gate, then the twin lints.
+fn twin_table(s: &mut String, t: &bellwether::TwinReport) {
+    let Some(key) = &t.key else {
+        let _ = writeln!(
+            s,
+            "\ntwin: no key sample; pass --from <keys.parquet> or --workload <hash> for fanout, \
+             files per key, and gates"
+        );
+        return;
+    };
+    let _ = writeln!(
+        s,
+        "\ntwin: {} sampled keys hold {} rows in {} row groups and {} files of the lake (the \
+         prediction fix compares the engine with); the pass read {} rows of the key columns in \
+         {} row groups",
+        num(key.keyset),
+        num(key.rows),
+        num(key.row_groups),
+        num(key.files),
+        num(t.rows_read),
+        num(t.row_groups_read)
+    );
+    let gates: Vec<String> = key
+        .gates
+        .iter()
+        .map(|g| format!("{}<={}", g.name, num(g.limit)))
+        .collect();
+    let kind = t
+        .candidates
+        .iter()
+        .find_map(|c| c.kind_column.as_ref().map(|k| k.kind.clone()));
+    let _ = writeln!(
+        s,
+        "  {:<34} {:>10}  {:<24} {:<18} {:<}{}",
+        "candidate",
+        "keyset",
+        "rows/key p50/p95/max",
+        "files/key",
+        if gates.is_empty() {
+            String::new()
+        } else {
+            format!("gates ({})", gates.join(", "))
+        },
+        kind.as_ref().map_or_else(String::new, |k| format!("  {k}"))
+    );
+    let mut rows: Vec<(String, Option<&bellwether::TwinColumns>, Option<&str>)> =
+        vec![("the sample's key".to_string(), Some(key), None)];
+    for c in &t.candidates {
+        rows.push((
+            label(&c.spec),
+            c.twin.as_ref(),
+            c.kind_column.as_ref().map(|k| k.value.as_str()),
+        ));
+    }
+    for (name, cols, kind_value) in rows {
+        match cols {
+            Some(c) => {
+                let fit: Vec<String> = c
+                    .gates
+                    .iter()
+                    .map(|g| format!("{} {}", g.name, if g.fits { "fits" } else { "OVER" }))
+                    .collect();
+                let q = |v: &[u64; 3]| format!("{} / {} / {}", num(v[0]), num(v[1]), num(v[2]));
+                let _ = writeln!(
+                    s,
+                    "  {:<34} {:>10}  {:<24} {:<18} {}{}",
+                    tail(&name, 34),
+                    num(c.keyset),
+                    q(&c.rows_per_key),
+                    q(&c.files_per_key),
+                    fit.join(", "),
+                    kind_value.map_or_else(String::new, |k| format!("  {k}"))
+                );
+            }
+            None => {
+                let _ = writeln!(
+                    s,
+                    "  {:<34} {:>10}  its columns are not the sample's",
+                    tail(&name, 34),
+                    "-"
+                );
+            }
+        }
+    }
+    if !t.lints.is_empty() {
+        let _ = writeln!(s, "  twin lints (advice; they change no plan)");
+        for l in &t.lints {
+            let _ = writeln!(
+                s,
+                "    {} [{}]\n      {}",
+                l.rule,
+                l.columns.join(", "),
+                l.message
+            );
+        }
+    }
 }

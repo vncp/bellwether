@@ -30,6 +30,9 @@ bellwether-verify = { path = "../bellwether-verify" }
 # Tables as sources (`sql://` roots, ADR 027): reconcile, why, and fix
 # (verify, then an attest-only refusal) over a table.
 bellwether-source-sql = { path = "../bellwether-source-sql" }
+# Query engines as measured sources (ADR 033): the lake twin's engine, its
+# identity, and the measured score and exports of a rewrite proposal.
+bellwether-source-engine = { path = "../bellwether-source-engine" }
 arrow = { workspace = true }
 parquet = { workspace = true, features = ["arrow"] }
 roaring = { workspace = true }

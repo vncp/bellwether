@@ -31,6 +31,7 @@
 #![deny(clippy::unwrap_used, clippy::expect_used)]
 
 mod engine;
+mod engine_fix;
 mod fix;
 mod index;
 mod keys;
@@ -43,6 +44,7 @@ mod report;
 mod results;
 mod signing;
 pub mod spec;
+mod twin;
 mod why;
 
 pub use bellwether_ledger::{
@@ -51,6 +53,7 @@ pub use bellwether_ledger::{
 };
 pub use bellwether_profile::ProfileReport;
 pub use bellwether_source::{FingerprintPolicy, Partitioning, PathTemplate};
+pub use bellwether_source_engine as source_engine;
 pub use bellwether_source_sql::url::redact_db;
 pub use bellwether_source_sql::{
     is_sql_root, EngineKind, TableRun, MEASURED_AGGREGATES, MEASURED_PLAN, MEASURED_WALL,
@@ -60,9 +63,10 @@ pub use bellwether_verify::{
     ExactTotal, GroupTotal, KeyRepr, Mismatch, Reconciliation, TotalColumn,
 };
 pub use engine::{
-    schema_from_json, Engine, EngineOptions, FolderStatus, SourceFormat, DEFAULT_INDEX_DIR,
-    ISSUE_TRACKER,
+    schema_from_json, ConnectFn, Engine, EngineConnector, EngineOptions, FolderStatus,
+    SourceFormat, DEFAULT_INDEX_DIR, ISSUE_TRACKER,
 };
+pub use engine_fix::{EngineCompare, EngineRun, PairRun};
 pub use fix::{
     DataState, FixOutcome, FixRequest, FixResult, Refusal, RewriteOutputs, Score, SignatureWritten,
 };
@@ -71,6 +75,7 @@ pub use ledger_views::{
     Finding, FindingsResult, ReceiptEntry, ReceiptsResult, RuleScore, ScorecardResult, UNATTRIBUTED,
 };
 pub use lookback::{split_window, window_reversed, Lookback};
+pub use propose::engine_rewrite;
 pub use receipt::signature_summary;
 pub use reconcile::{ReconcileProblem, ReconcileRequest, ReconcileResult};
 pub use results::{
@@ -80,6 +85,10 @@ pub use results::{
 pub use signing::{
     generate_key, load_signing_key, load_trusted_keys, public_path, read_public_key,
     refuse_inside_index, trust_key, GeneratedKey, PublicKeyFile, TrustEntry, TrustResult,
+};
+pub use twin::{
+    EngineWorkload, GateFit, TwinCandidate, TwinColumns, TwinReport, CARDINALITY_RATIO,
+    LOW_CARDINALITY_ROWS, MEMBERSHIP_GATE, NARROW_PERCENT, SELECTIVE_FILES_PERCENT,
 };
 pub use why::{
     Candidate, CandidateOrigin, Culprit, CulpritReason, Dataset, LookupMode, ProfileEvidence,

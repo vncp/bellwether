@@ -404,6 +404,7 @@ fn modeled_costs(
                 .ok_or_else(|| Error::Other("byte total overflows u64".into()))?;
         }
         costs.push(RunCost {
+            measured: None,
             run_id: run.run_id.clone(),
             keys: rk.len() as u64,
             files: files.len() as u64,

@@ -13,13 +13,24 @@ fail if the two differ.
    result: the profile Evidence, with fanout per column and lints. If you have
    the keys the slow query looked up (a Parquet file), call `score.why` with
    `keys`: the engine replays them under every candidate key and returns the
-   funnel, the culprit, the recommended key, and `workload.hash`.
+   funnel, the culprit, the recommended key, and `workload.hash`. When the
+   server was started with `--twin-of` (the folder is the lake copy, the
+   *twin*, of tables a query engine stores), call `score.record` with a
+   `keys_query` in the engine's language to record the keys as a workload,
+   then `score.why` with that `workload` and any `gates` (`{"name": "in",
+   "limit": 1000}`): the report says the diagnosis is on a copy, records
+   the engine's table identity beside the lake's sequence, gives per
+   candidate the keyset against each gate, rows per key, and files per key,
+   and adds the twin lints (advice that names a rewrite pattern).
 2. **Read the evidence.** Quote the lint (`rule`, columns, message) and the
    fanout that explain the read. Every number is an exact sum of footer
    statistics; none is an estimate.
 3. **Propose.** Call `propose.key` (a key spec, as JSON or in the short form
    such as `"exact:id"`) or `propose.rewrite` (before, after, invariant: a
-   description, never code), citing the evidence hash in
+   description, never code; for a query engine, `shape.pairs` holds one or
+   more `{before, after}` query texts you wrote in the engine's language,
+   scored and verified as one set, and the proposal must cite the twin
+   Evidence), citing the evidence hash in
    `evidence` and your own name in `by`. Pass `dry_run: true` first if you
    want to see the Proposal without writing it. A proposal has no score
    field; anything that looks like one is rejected by the schema.
@@ -28,6 +39,14 @@ fail if the two differ.
    `rewrite` for a rewrite). The engine replays the workload, reconciles the
    plan against a full scan, and writes a Certificate, passing or failing. A
    long run returns a job id; poll `jobs.status` and read `jobs.result`.
+   For a rewrite of engine queries the engine submits every query under
+   its own tag, read-only, reads each one's statistics from the engine's
+   own query log (`measured`, never `exact`), writes that Replay with the
+   twin's prediction beside it first, then exports each pair's results to
+   the operator's scratch folder and reconciles them by the proposal's key
+   columns (`engine` sets latest-by and totals). You never supply a number:
+   any `score`, `cost`, `replay`, `stats`, or `verdict` field is refused
+   with `caller_supplied_cost`.
    Calling the same request again in the same state returns the same job,
    and once it has finished, its stored result; after a commit or a data
    change it runs again. Pass `wait: true` to run it again now.
@@ -36,7 +55,11 @@ fail if the two differ.
    answer. The engine refuses unverified applies: a failing certificate, a
    certificate computed against an older manifest, data that changed since
    verification, or a key that is already complete is refused with a typed
-   code before anything is written. On success it returns the Receipt.
+   code before anything is written. On success it returns the Receipt. For
+   a rewrite of engine queries the engine measures the queries again and
+   writes an attest-only Receipt (`attest_only: true`, the manifest
+   unchanged): nothing is deployed; a human or a CI gate deploys the
+   `after` queries.
 6. **Report.** Quote the receipt hash to the human verbatim, with the
    predicted and realized bytes. `bellwether receipt show <hash>` (or the
    `explain` chain in the result) shows every record behind it.
@@ -51,7 +74,7 @@ already holds.
 | Tier | Tool | Writes |
 |---|---|---|
 | observe | `observe.why` (no keys), `observe.profile`, `observe.locate`, `observe.asof` | Evidence and cache entries only |
-| score (engine-scored) | `score.why` (with keys or a workload), `score.verify` | engine Proposals, Replays, plan Evidence, Certificates |
+| score (engine-scored) | `score.why` (with keys or a workload), `score.verify`, `score.record` (keys from the query engine, with `--twin-of`) | engine Proposals, Replays, plan Evidence, Certificates; `score.record` a workload in the cache |
 | propose | `propose.key`, `propose.layout`, `propose.rewrite` | one Proposal, or nothing with `dry_run` |
 | apply | `apply.receipt` | Replay, the index commit, Receipt; nothing with `dry_run` or on a refusal, unless another commit lands during the apply (`concurrent_commit`: the key is built, the receipt withheld) |
 | jobs | `jobs.start`, `jobs.status`, `jobs.result` | whatever the started tool writes |
@@ -104,7 +127,7 @@ line. No refusal is prose only.
 | `not_retained` | The lookup was pinned with `at_manifest` to a sequence the index does not retain (never committed, or pruned by garbage collection); `fields.oldest` and `fields.current` bound the sequences you may pass (both null when the folder is not indexed). Pass one of them, or omit `at_manifest`. |
 | `wrong_kind` | The hash is a record of another kind than the tool takes; `fields.field` names the argument. Pass the hash the earlier step printed. |
 | `not_found` | The hash is not in this ledger (or, for a workload, the cache); `fields.kind` and `fields.field` say which argument. |
-| `invalid_input` | The arguments do not match the tool's schema (an unknown field such as `score` included). |
+| `invalid_input` | The arguments do not match the tool's schema (an unknown field included; a score, cost, or verdict field is `caller_supplied_cost`). |
 | `invalid_argument` | An argument matches the schema but cannot be used (an empty `by`, no `evidence`, an `at` that is not an instant, an unreadable `keys` file); `fields.field` names it. |
 | `invalid_spec` | The key spec or a column is not valid for this dataset. |
 | `budget_exceeded` | This session spent its replay, rows, or wall-time budget. Stop and ask the human. Every tool call is charged its wall time; score and apply calls run one at a time against the budget. |
@@ -121,13 +144,19 @@ line. No refusal is prose only.
 | `unknown_kind` | The index uses a kind this build does not know. |
 | `segment_claimed` | A segment is being garbage-collected. Retry later. |
 | `engine_error` | Any other engine error; `message` says what to do. |
+| `export_denied` | The query engine refused to export a rewrite's results, or the scratch folder cannot be written; `fields.engine` and `fields.permission` name what to grant. No certificate and no receipt; the measured Replay (with the prediction) stands. Tell the human which permission. |
+| `caller_supplied_cost` | The arguments carried a score, cost, measurement, replay, prediction, verdict, or certificate field (`fields.field`). The engine measures, verifies, and attests on its own; remove the field and call again. |
 
 ## What you may never do
 
 - Never write a Replay, a Certificate, or a Receipt yourself, and never
   supply a number the engine reports as measured. There is no field for it.
-- Never pass a file path to write, a shell command, or a query string to
-  execute; no tool accepts one. A rewrite is a description, never code.
+- Never pass a file path to write or a shell command; no tool accepts one.
+  A rewrite of lake outputs is a description, never code. The only query
+  text a tool takes is a `keys_query` and a rewrite's `shape.pairs`: the
+  engine submits it read-only, under its own tags, to the one query engine
+  the human started the server with (`--twin-of`), never to the lake or a
+  shell; no argument names an engine or a folder.
 - Never use the proposer name `engine`.
 - Never report a fix as done without a receipt hash, and never present a
   failing or refused certificate as a pass.

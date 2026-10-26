@@ -134,6 +134,8 @@ fn probe_adr010_cli_json_equals_in_process_facade() {
     let receipt = plant(
         &index,
         &Record::Receipt(Receipt {
+            attest_only: false,
+            prediction: None,
             record_version: format::RECORD_VERSION,
             evidence: vec![],
             proposal: cand.proposal.hash,

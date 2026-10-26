@@ -111,6 +111,36 @@ enum Command {
     /// Serve the engine over MCP on stdin and stdout, bound to one data
     /// folder (the same server as `bellwether-mcp`).
     Mcp(McpArgs),
+    /// Record workloads: the keys a diagnosis replays.
+    Workload {
+        #[command(subcommand)]
+        command: WorkloadCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum WorkloadCommand {
+    /// Run a query that produces keys in a query engine (read-only) and
+    /// record its rows as a workload over the folder that is the engine's
+    /// twin; prints the workload hash `why --workload` takes.
+    Record(RecordArgs),
+}
+
+#[derive(Args)]
+struct RecordArgs {
+    #[command(flatten)]
+    root: RootArg,
+    /// The engine: clickhouse://[user@]host[:port]/<db>[/<table>] or
+    /// kusto://<cluster>/<db>[/<table>] (a secret only as password=env:NAME).
+    #[arg(long, value_name = "URI")]
+    from_engine: String,
+    /// A file holding one query, in the engine's language, whose result
+    /// rows are the keys.
+    #[arg(long, value_name = "FILE")]
+    keys_query: PathBuf,
+    /// Result columns to take as the key, comma-separated [default: all].
+    #[arg(long, value_name = "COLS", value_delimiter = ',')]
+    key: Option<Vec<String>>,
 }
 
 #[derive(Args)]
@@ -196,6 +226,35 @@ struct WhyArgs {
     /// window (pass the same column to --latest-by).
     #[arg(long = "ts", value_name = "COLUMN")]
     ts: Option<String>,
+    /// With --twin-of: a limit to compare each candidate's keyset with,
+    /// NAME:N (repeat for several), for example in:1000000 (a membership
+    /// list the engine accepts) or join:200000 (a join's broadcast size).
+    #[arg(long = "gate", value_name = "NAME:N", value_parser = parse_gate)]
+    gates: Vec<bellwether::types::Gate>,
+}
+
+/// `--gate NAME:N`.
+fn parse_gate(given: &str) -> Result<bellwether::types::Gate, String> {
+    let (name, n) = given
+        .rsplit_once(':')
+        .ok_or_else(|| format!("{given:?} is not a gate; write NAME:N, for example in:1000000"))?;
+    let name = name.trim();
+    if name.is_empty()
+        || !name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    {
+        return Err(format!(
+            "{given:?} names no gate; write NAME:N with a name of letters, digits, '_', or '-'"
+        ));
+    }
+    let limit = n.trim().parse::<u64>().map_err(|_| {
+        format!("{given:?}: {n:?} is not a whole number; write NAME:N, for example in:1000000")
+    })?;
+    Ok(bellwether::types::Gate {
+        name: name.to_string(),
+        limit,
+    })
 }
 
 /// `why --mode`.
@@ -339,9 +398,20 @@ struct ProposeArgs {
     /// The rewrite's target shape.
     #[arg(long, value_name = "TEXT", requires = "before")]
     after: Option<String>,
-    /// What the rewrite must preserve.
-    #[arg(long, value_name = "TEXT", requires = "before")]
+    /// What the rewrite must preserve (with --rewrite: default, each pair
+    /// returns the same rows by the key columns).
+    #[arg(long, value_name = "TEXT")]
     invariant: Option<String>,
+    /// Propose a rewrite of queries in the engine the folder is a twin of:
+    /// BEFORE=AFTER, two files of one query each (repeat for several pairs,
+    /// scored and verified as one set). Cite the evidence `why --twin-of`
+    /// printed.
+    #[arg(long = "rewrite", value_name = "BEFORE=AFTER", group = "body")]
+    rewrite: Vec<String>,
+    /// With --rewrite: the columns each pair's before and after results are
+    /// compared by [default: the key sample's columns].
+    #[arg(long, value_name = "COLS", value_delimiter = ',', requires = "rewrite")]
+    key_columns: Option<Vec<String>>,
 }
 
 #[derive(Subcommand)]
@@ -654,6 +724,7 @@ fn index(g: &Global, out: &Out, a: &IndexArgs) -> Result<Outcome, Failure> {
     done(&r, human::index(&r, out), EXIT_OK)
 }
 
+#[allow(clippy::too_many_lines)]
 fn run(cli: &Cli, out: &Out) -> Result<Outcome, Failure> {
     let g = &cli.global;
     match &cli.command {
@@ -742,6 +813,23 @@ fn run(cli: &Cli, out: &Out) -> Result<Outcome, Failure> {
         }
         Command::Keys { command } => keys_cmds::run(g, command),
         Command::Mcp(a) => mcp(g, a),
+        Command::Workload {
+            command: WorkloadCommand::Record(a),
+        } => {
+            let query = std::fs::read_to_string(&a.keys_query).map_err(|e| {
+                Failure::Usage(format!(
+                    "cannot read the keys query {} ({e}); pass a readable file holding one query",
+                    a.keys_query.display()
+                ))
+            })?;
+            let options = EngineOptions {
+                twin_of: Some(a.from_engine.clone()),
+                ..engine_options(g)?
+            };
+            let r = Engine::open(&a.root.root, options)?
+                .record_from_engine(&query, a.key.as_deref())?;
+            done(&r, human::engine_workload(&r, out), EXIT_OK)
+        }
     }
 }
 
@@ -804,11 +892,28 @@ fn propose(g: &Global, out: &Out, a: &ProposeArgs) -> Result<Outcome, Failure> {
                 before: before.clone(),
                 after: after.clone(),
                 invariant: invariant.clone(),
+                pairs: Vec::new(),
+                key: Vec::new(),
+                keys: None,
             },
+        })
+    } else if !a.rewrite.is_empty() {
+        let pairs = a
+            .rewrite
+            .iter()
+            .map(|p| query_pair(p))
+            .collect::<Result<Vec<_>, _>>()?;
+        What::Body(ProposalBody::Rewrite {
+            shape: bellwether::engine_rewrite(
+                pairs,
+                a.key_columns.clone().unwrap_or_default(),
+                a.invariant.clone(),
+            ),
         })
     } else {
         return Err(Failure::Usage(
-            "say what to propose: --key <spec>, --layout <cols>, or --before/--after/--invariant"
+            "say what to propose: --key <spec>, --layout <cols>, --before/--after/--invariant, or \
+             --rewrite <before.sql>=<after.sql>"
                 .into(),
         ));
     };
@@ -828,6 +933,28 @@ fn propose(g: &Global, out: &Out, a: &ProposeArgs) -> Result<Outcome, Failure> {
         bellwether::ProposeResult::Refused { .. } => EXIT_REFUSED,
     };
     done(&r, human::propose(&r, out), code)
+}
+
+/// `--rewrite BEFORE=AFTER`: two files, each read whole as one query.
+fn query_pair(given: &str) -> Result<bellwether::types::QueryPair, Failure> {
+    let (b, a) = given.split_once('=').ok_or_else(|| {
+        Failure::Usage(format!(
+            "--rewrite {given:?} is not BEFORE=AFTER; give two files, the query as it runs and \
+             its rewrite, for example --rewrite before.sql=after.sql"
+        ))
+    })?;
+    let read = |p: &str| {
+        std::fs::read_to_string(p.trim()).map_err(|e| {
+            Failure::Usage(format!(
+                "--rewrite: cannot read the query file {p:?} ({e}); pass a readable file holding \
+                 one query"
+            ))
+        })
+    };
+    Ok(bellwether::types::QueryPair {
+        before: read(b)?,
+        after: read(a)?,
+    })
 }
 
 /// `locate`, in a window when one is given; a reversed window is a usage
@@ -927,6 +1054,7 @@ fn why(g: &Global, out: &Out, a: &WhyArgs) -> Result<Outcome, Failure> {
         ts_column: a.ts.clone(),
         columns: a.columns.clone(),
         max_candidates: a.max_candidates,
+        gates: a.gates.clone(),
     };
     let mode = request.lookup_mode().map_err(Failure::Usage)?;
     if mode != bellwether::LookupMode::Locate && a.from.is_none() && a.workload.is_none() {
