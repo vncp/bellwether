@@ -20,7 +20,7 @@ use bellwether_core::encoding::tag;
 /// Decodes a canonical tuple of `types` into one display string per element
 /// (`None` for a null marker). Returns `None` if the bytes do not decode as
 /// that tuple, which never happens for tuples this crate encoded.
-pub(crate) fn render_tuple(bytes: &[u8], types: &[DataType]) -> Option<Vec<Option<String>>> {
+pub fn render_tuple(bytes: &[u8], types: &[DataType]) -> Option<Vec<Option<String>>> {
     let mut out = Vec::with_capacity(types.len());
     let mut i = 0usize;
     for dt in types {

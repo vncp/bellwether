@@ -107,6 +107,9 @@ use crate::seg_io::SegmentBytes;
 use crate::sources::parquet_source;
 use crate::target::declared_sidecars;
 
+mod agg;
+pub use agg::{AggLookup, Aggregated, KeyAggregate};
+
 /// What to look up.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Lookup {
@@ -331,10 +334,11 @@ fn serve(spec: &KeySpec, columns: &[String]) -> Option<Serve> {
     // expr key serves only a lookup on its expression (`plan_expr`), never
     // one that names its virtual column. A list key answers membership
     // lookups only (`plan_contains`), never a lookup on the list column's
-    // value as a whole.
+    // value as a whole. An agg key answers aggregate lookups only
+    // (`Planner::aggregate`).
     if matches!(
         spec,
-        KeySpec::Text { .. } | KeySpec::Expr { .. } | KeySpec::List { .. }
+        KeySpec::Text { .. } | KeySpec::Expr { .. } | KeySpec::List { .. } | KeySpec::Agg { .. }
     ) {
         return None;
     }

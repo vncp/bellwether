@@ -821,6 +821,7 @@ impl Engine {
             // Each pair's exports are reconciled whole: every row of every
             // key is compared.
             row_filter: None,
+            agg: Vec::new(),
         };
         let mut inputs = vec![before.hash, after.hash, replay];
         let mut age = Duration::ZERO;

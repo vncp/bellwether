@@ -7,13 +7,14 @@ use std::collections::{BTreeMap, HashSet};
 use arrow::array::{ArrayRef, RecordBatch};
 use arrow::datatypes::{DataType, Schema};
 use bellwether_types::format::STORAGE_VERSION;
-use bellwether_types::{Error, Hash, KeySpec, Result, RowGroupId};
+use bellwether_types::{AggregateFn, Error, Hash, KeySpec, Result, RowGroupId};
 use roaring::RoaringBitmap;
 
 use super::format::{
     checksum, len_u32, put_leb128, spec_types, ColumnType, Layout, Put, SegmentHeader,
     FOOTER_LEN_V2, MAGIC,
 };
+use crate::agg::AggCell;
 use crate::bloom::{BloomHash, CanonicalHash, FilterHash, Sbbf};
 use crate::encoding::{self, KeyColumns, NEG_ZERO_KEY, POS_ZERO_KEY};
 use crate::temporal::{VersionBuffer, VersionChain};
@@ -217,6 +218,9 @@ pub struct KeyValue {
     /// rows of this key in each row group of `bitmap`, in ascending row
     /// group order, each at least 1. `None` for a segment without counts.
     pub counts: Option<Vec<u64>>,
+    /// For an agg key (B7): one aggregate cell per row group of `bitmap`,
+    /// in ascending row-group order. `None` for every other spec.
+    pub agg: Option<Vec<AggCell>>,
 }
 
 impl KeyValue {
@@ -234,9 +238,29 @@ impl KeyValue {
         )
     }
 
+    /// `(row group, cell)` for every row group holding the key, ascending;
+    /// `None` when the segment is not an agg key's.
+    #[must_use]
+    pub fn cells(&self) -> Option<Vec<(RowGroupId, &AggCell)>> {
+        let cells = self.agg.as_ref()?;
+        Some(
+            self.bitmap
+                .iter()
+                .zip(cells.iter())
+                .map(|(rg, c)| (RowGroupId(rg), c))
+                .collect(),
+        )
+    }
+
     /// The storage version 2 value record: `bitmap_len u32 | bitmap |
-    /// [counts] | [chain]` (`docs/format.md`).
-    pub(crate) fn encode(&self, temporal: bool, out: &mut Vec<u8>) -> Result<()> {
+    /// [counts] | [chain] | [cells]` (`docs/format.md`). `agg` is the agg
+    /// key's functions, for an agg key's segment.
+    pub(crate) fn encode(
+        &self,
+        temporal: bool,
+        agg: Option<&[AggregateFn]>,
+        out: &mut Vec<u8>,
+    ) -> Result<()> {
         let mut bm = Vec::with_capacity(self.bitmap.serialized_size());
         self.bitmap
             .serialize_into(&mut bm)
@@ -255,6 +279,21 @@ impl KeyValue {
         if temporal {
             self.chain.write_to(out)?;
         }
+        match (agg, &self.agg) {
+            (Some(functions), Some(cells)) if cells.len() as u64 == self.bitmap.len() => {
+                for c in cells {
+                    c.encode(functions, out)?;
+                }
+            }
+            (None, None) => {}
+            _ => {
+                return Err(Error::Other(
+                    "an agg key's value carries one aggregate cell per row group holding the \
+                     key, and no other key's value carries any"
+                        .into(),
+                ))
+            }
+        }
         Ok(())
     }
 
@@ -266,9 +305,16 @@ impl KeyValue {
     /// temporal one the length-prefixed bitmap and the chain. Version 2:
     /// always the length-prefixed bitmap, then, with `counts`, one shortest
     /// LEB128 count of at least 1 per row group, then the chain for temporal
-    /// specs; nothing may follow. Anything else is corruption and is
+    /// specs, then, for an agg key (`agg` its functions), one cell per row
+    /// group; nothing may follow. Anything else is corruption and is
     /// refused, never decoded into a wrong answer.
-    pub(crate) fn decode(bytes: &[u8], temporal: bool, counts: bool, storage: u32) -> Result<Self> {
+    pub(crate) fn decode(
+        bytes: &[u8],
+        temporal: bool,
+        counts: bool,
+        agg: Option<&[AggregateFn]>,
+        storage: u32,
+    ) -> Result<Self> {
         let read_bm = |b: &[u8]| -> Result<RoaringBitmap> {
             if b.get(..4) != Some(&NO_RUN_COOKIE[..]) {
                 return Err(Error::Other(
@@ -292,12 +338,14 @@ impl KeyValue {
                     bitmap,
                     chain: VersionChain::read_from(c.rest())?,
                     counts: None,
+                    agg: None,
                 })
             } else {
                 Ok(Self {
                     bitmap: read_bm(bytes)?,
                     chain: VersionChain::new(),
                     counts: None,
+                    agg: None,
                 })
             };
         }
@@ -323,17 +371,29 @@ impl KeyValue {
         let chain = if temporal {
             VersionChain::read_from(c.rest())?
         } else {
-            if !c.is_done() {
-                return Err(Error::Other(
-                    "corrupt segment: trailing bytes after a value record".into(),
-                ));
-            }
             VersionChain::new()
         };
+        let agg = match agg {
+            Some(functions) => {
+                let mut v =
+                    Vec::with_capacity(usize::try_from(bitmap.len()).unwrap_or(0).min(bytes.len()));
+                for _ in 0..bitmap.len() {
+                    v.push(AggCell::decode(&mut c, functions)?);
+                }
+                Some(v)
+            }
+            None => None,
+        };
+        if !c.is_done() {
+            return Err(Error::Other(
+                "corrupt segment: trailing bytes after a value record".into(),
+            ));
+        }
         Ok(Self {
             bitmap,
             chain,
             counts,
+            agg,
         })
     }
 }
@@ -343,6 +403,8 @@ pub(crate) struct KeyedEmitter {
     temporal: bool,
     /// Whether every value carries counts (the spec stores them).
     counts: bool,
+    /// An agg key's functions: every value carries one cell per row group.
+    agg: Option<Vec<AggregateFn>>,
     opts: WriterOptions,
     keys: Vec<Vec<u8>>,
     key_bytes: usize,
@@ -356,6 +418,8 @@ impl KeyedEmitter {
             f: Framing::start(header)?,
             temporal: header.layout == Layout::KeyedTemporal,
             counts: header.key_spec.counts(),
+            agg: (header.layout == Layout::KeyedAgg)
+                .then(|| crate::agg::functions(&header.key_spec).to_vec()),
             opts: opts.clone(),
             keys: Vec::new(),
             key_bytes: 0,
@@ -401,7 +465,7 @@ impl KeyedEmitter {
         }
         self.f.note_rg(lo, hi);
         let before = self.values.len();
-        value.encode(self.temporal, &mut self.values)?;
+        value.encode(self.temporal, self.agg.as_deref(), &mut self.values)?;
         self.value_lens.push(len_u32(self.values.len() - before)?);
         self.key_bytes += key.len();
         self.keys.push(key.to_vec());
@@ -641,6 +705,8 @@ struct KeyAcc {
     /// Rows per row group holding the key, kept only when the spec stores
     /// counts.
     rows: BTreeMap<u32, u64>,
+    /// Aggregates per row group holding the key, kept only for an agg key.
+    cells: BTreeMap<u32, AggCell>,
 }
 
 /// The accumulator of `key`, created on first sight. The key is copied only
@@ -676,6 +742,8 @@ struct DatasetTypes {
     recorded_ts: Option<ColumnType>,
     /// The checked expression of an `expr` key.
     expr: Option<crate::expr::Typed>,
+    /// An agg key's value column: its dataset type and recorded form.
+    value: Option<(DataType, ColumnType)>,
 }
 
 /// Builds one segment for one key spec.
@@ -726,6 +794,7 @@ pub fn validate_spec(spec: &KeySpec) -> Result<()> {
             return Err(Error::KeySpec("a text key needs a column name".into()));
         }
     }
+    crate::agg::check_spec(spec)?;
     crate::expr::check_spec(spec)
 }
 
@@ -736,7 +805,9 @@ impl SegmentWriter {
     pub fn new(spec: KeySpec, opts: WriterOptions) -> Result<Self> {
         validate_spec(&spec)?;
         let acc = match Layout::for_spec(&spec) {
-            Some(Layout::Keyed | Layout::KeyedTemporal) => Acc::Keyed(BTreeMap::new()),
+            Some(Layout::Keyed | Layout::KeyedTemporal | Layout::KeyedAgg) => {
+                Acc::Keyed(BTreeMap::new())
+            }
             Some(Layout::BloomPerRowGroup) => Acc::Bloom(BTreeMap::new()),
             Some(Layout::MinMax) => Acc::Range(BTreeMap::new()),
             None => {
@@ -770,12 +841,20 @@ impl SegmentWriter {
             KeySpec::Expr { .. } => Some(crate::expr::typed_spec(&w.spec, schema)?),
             _ => None,
         };
+        let value = match crate::agg::value_type(&w.spec, schema)? {
+            Some(dt) => {
+                let recorded = ColumnType::of(&dt)?;
+                Some((dt, recorded))
+            }
+            None => None,
+        };
         w.dataset = Some(DatasetTypes {
             keys,
             ts,
             recorded_keys,
             recorded_ts,
             expr,
+            value,
         });
         Ok(w)
     }
@@ -828,6 +907,47 @@ impl SegmentWriter {
         Ok(())
     }
 
+    /// Records rows of an agg key (B7): each `(key, value)` is one row of
+    /// `key` in row group `rg`, `value` the canonical encoding of its value
+    /// at the dataset type, or `None` for a null value. All or nothing: the
+    /// touched cells are updated on copies, so on error (a value that
+    /// cannot be summed, a sum past 128 bits) nothing is recorded. Rows
+    /// are added in the order given, which a float sum depends on.
+    pub fn insert_values(
+        &mut self,
+        rg: RowGroupId,
+        rows: &[(Vec<u8>, Option<Vec<u8>>)],
+    ) -> Result<()> {
+        let KeySpec::Agg { functions, .. } = &self.spec else {
+            return Err(Error::KeySpec(
+                "insert_values on a spec that is not an agg key".into(),
+            ));
+        };
+        let Acc::Keyed(m) = &mut self.acc else {
+            return Err(Error::KeySpec("an agg key's accumulator is keyed".into()));
+        };
+        let mut staged: BTreeMap<&[u8], AggCell> = BTreeMap::new();
+        for (key, value) in rows {
+            if !staged.contains_key(key.as_slice()) {
+                let current = m
+                    .get(key)
+                    .and_then(|a| a.cells.get(&rg.0))
+                    .cloned()
+                    .unwrap_or_else(AggCell::empty);
+                staged.insert(key.as_slice(), current);
+            }
+            if let Some(cell) = staged.get_mut(key.as_slice()) {
+                cell.add_row(value.as_deref(), functions)?;
+            }
+        }
+        for (key, cell) in staged {
+            let acc = key_acc(m, key)?;
+            acc.bitmap.insert(rg.0);
+            acc.cells.insert(rg.0, cell);
+        }
+        Ok(())
+    }
+
     /// Records that row group `rg` holds one row of `key`. For temporal
     /// specs use [`SegmentWriter::insert_version`]; calling this on one is
     /// an error. On error nothing is recorded.
@@ -843,6 +963,11 @@ impl SegmentWriter {
         if matches!(self.spec, KeySpec::Temporal { .. }) {
             return Err(Error::KeySpec(
                 "temporal segments need a timestamp; use insert_version".into(),
+            ));
+        }
+        if matches!(self.spec, KeySpec::Agg { .. }) {
+            return Err(Error::KeySpec(
+                "agg segments aggregate values; use insert_values".into(),
             ));
         }
         if rows == 0 {
@@ -1003,6 +1128,36 @@ impl SegmentWriter {
                 .cloned()
                 .ok_or_else(|| Error::KeySpec(format!("column {name} not in batch")))
         };
+        if let KeySpec::Agg { value, .. } = &self.spec {
+            // One row per indexed key tuple (ADR 014: a null leading key
+            // column is not aggregated), its value at the dataset type, in
+            // row order; every row converts before any is recorded.
+            let Some((declared, _)) = &dataset.value else {
+                return Err(Error::KeySpec(
+                    "an agg writer needs its value column's dataset type".into(),
+                ));
+            };
+            let cols = self
+                .spec
+                .columns()
+                .iter()
+                .map(|c| column(c))
+                .collect::<Result<Vec<_>>>()?;
+            let keys = KeyColumns::new(&cols, &dataset.keys)?;
+            let values = column(value)?;
+            encoding::check_convertible(values.data_type(), declared)?;
+            let mut staged = Vec::with_capacity(batch.num_rows());
+            let (mut kbuf, mut vbuf) = (Vec::new(), Vec::new());
+            for row in 0..batch.num_rows() {
+                if !keys.encode_into(row, &mut kbuf)? {
+                    continue;
+                }
+                let v = crate::agg::value_at(values.as_ref(), row, declared, &mut vbuf)?
+                    .then(|| vbuf.clone());
+                staged.push((kbuf.clone(), v));
+            }
+            return self.insert_values(rg, &staged);
+        }
         if let KeySpec::List { column: c } = &self.spec {
             // One key per distinct element: a null list, an empty list, and
             // a null element add nothing (ADR 014). Every element converts
@@ -1094,8 +1249,10 @@ impl SegmentWriter {
         if let Some(d) = &self.dataset {
             header.key_types = Some(d.recorded_keys.clone());
             header.ts_type.clone_from(&d.recorded_ts);
+            header.value_type = d.value.as_ref().map(|(_, r)| r.clone());
         }
         let counts = self.spec.counts();
+        let agg = matches!(self.spec, KeySpec::Agg { .. });
         match self.acc {
             Acc::Keyed(m) => {
                 let mut e = KeyedEmitter::new(&header, &self.opts)?;
@@ -1104,6 +1261,7 @@ impl SegmentWriter {
                         bitmap: acc.bitmap,
                         chain: acc.versions.finish(),
                         counts: counts.then(|| acc.rows.values().copied().collect()),
+                        agg: agg.then(|| acc.cells.into_values().collect()),
                     };
                     e.push(&k, &v)?;
                 }
@@ -1182,38 +1340,44 @@ mod tests {
         let bm: RoaringBitmap = [1u32, 7].into_iter().collect();
         let good = serialized(&bm);
         assert_eq!(good[..4], NO_RUN_COOKIE);
-        assert_eq!(KeyValue::decode(&good, false, false, 1).unwrap().bitmap, bm);
+        assert_eq!(
+            KeyValue::decode(&good, false, false, None, 1)
+                .unwrap()
+                .bitmap,
+            bm
+        );
         let mut run = good.clone();
         run[0] = 0x3b;
         assert!(
-            KeyValue::decode(&run, false, false, 1).is_err(),
+            KeyValue::decode(&run, false, false, None, 1).is_err(),
             "run cookie"
         );
         let empty = serialized(&RoaringBitmap::new());
         assert!(
-            KeyValue::decode(&empty, false, false, 1).is_err(),
+            KeyValue::decode(&empty, false, false, None, 1).is_err(),
             "empty bitmap"
         );
         let mut trailing = good.clone();
         trailing.push(0);
         assert!(
-            KeyValue::decode(&trailing, false, false, 1).is_err(),
+            KeyValue::decode(&trailing, false, false, None, 1).is_err(),
             "trailing bytes"
         );
         // version 1 bytes are not a version 2 record (no length prefix)
-        assert!(KeyValue::decode(&good, false, false, 2).is_err());
+        assert!(KeyValue::decode(&good, false, false, None, 2).is_err());
         // temporal records: a length-prefixed bitmap, then the chain
         let v = KeyValue {
             bitmap: bm,
             chain: VersionChain::from_versions(vec![(3, RowGroupId(1))]),
             counts: None,
+            agg: None,
         };
         let mut rec = Vec::new();
-        v.encode(true, &mut rec).unwrap();
-        assert_eq!(KeyValue::decode(&rec, true, false, 2).unwrap(), v);
-        assert_eq!(KeyValue::decode(&rec, true, false, 1).unwrap(), v);
+        v.encode(true, None, &mut rec).unwrap();
+        assert_eq!(KeyValue::decode(&rec, true, false, None, 2).unwrap(), v);
+        assert_eq!(KeyValue::decode(&rec, true, false, None, 1).unwrap(), v);
         rec[4] = 0x3b; // the bitmap's cookie, after its u32 length
-        assert!(KeyValue::decode(&rec, true, false, 2).is_err());
+        assert!(KeyValue::decode(&rec, true, false, None, 2).is_err());
     }
 
     /// Storage version 2 value records with counts: one shortest LEB128
@@ -1226,19 +1390,20 @@ mod tests {
             bitmap: bm.clone(),
             chain: VersionChain::new(),
             counts: Some(vec![3, 300]),
+            agg: None,
         };
         let mut rec = Vec::new();
-        v.encode(false, &mut rec).unwrap();
+        v.encode(false, None, &mut rec).unwrap();
         let bm_len = serialized(&bm).len();
         // 300 = 0b10_0101100 -> ac 02
         assert_eq!(rec[4 + bm_len..], [0x03, 0xac, 0x02]);
-        assert_eq!(KeyValue::decode(&rec, false, true, 2).unwrap(), v);
+        assert_eq!(KeyValue::decode(&rec, false, true, None, 2).unwrap(), v);
         assert_eq!(
             v.counted().unwrap(),
             vec![(RowGroupId(0), 3), (RowGroupId(2), 300)]
         );
         // read without counts: the counts are trailing bytes
-        assert!(KeyValue::decode(&rec, false, false, 2).is_err());
+        assert!(KeyValue::decode(&rec, false, false, None, 2).is_err());
         // a missing count, a zero count, an over-long count, trailing bytes
         let base = rec[..4 + bm_len].to_vec();
         for tail in [
@@ -1252,7 +1417,10 @@ mod tests {
         ] {
             let mut bad = base.clone();
             bad.extend_from_slice(&tail);
-            assert!(KeyValue::decode(&bad, false, true, 2).is_err(), "{tail:?}");
+            assert!(
+                KeyValue::decode(&bad, false, true, None, 2).is_err(),
+                "{tail:?}"
+            );
         }
         // the writer refuses counts that do not match the bitmap
         for counts in [vec![1], vec![1, 0], vec![1, 2, 3]] {
@@ -1260,17 +1428,18 @@ mod tests {
                 counts: Some(counts),
                 ..v.clone()
             };
-            assert!(bad.encode(false, &mut Vec::new()).is_err());
+            assert!(bad.encode(false, None, &mut Vec::new()).is_err());
         }
         // temporal: counts, then the chain
         let t = KeyValue {
             bitmap: bm,
             chain: VersionChain::from_versions(vec![(5, RowGroupId(0)), (9, RowGroupId(2))]),
             counts: Some(vec![1, 2]),
+            agg: None,
         };
         let mut rec = Vec::new();
-        t.encode(true, &mut rec).unwrap();
-        assert_eq!(KeyValue::decode(&rec, true, true, 2).unwrap(), t);
+        t.encode(true, None, &mut rec).unwrap();
+        assert_eq!(KeyValue::decode(&rec, true, true, None, 2).unwrap(), t);
     }
 
     /// A genuine run-format serialization (cookie `3b 30`): nine containers,
@@ -1302,7 +1471,7 @@ mod tests {
         let bm = RoaringBitmap::deserialize_from(&rec[..]).unwrap();
         assert_eq!(bm.len(), 10);
         assert_eq!(bm.serialized_size(), rec.len());
-        assert!(KeyValue::decode(&rec, false, false, 1).is_err());
+        assert!(KeyValue::decode(&rec, false, false, None, 1).is_err());
     }
 
     #[test]

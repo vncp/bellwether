@@ -764,6 +764,25 @@ pub enum KeySpec {
         /// The list or map column.
         column: String,
     },
+    /// Per-key, per-row-group aggregates of one value column (B7,
+    /// `agg:<key>[,<key>]@<value>{sum,count,min,max}`): for every key and
+    /// every row group holding it, the rows, the rows whose value is null,
+    /// and, as declared, the sum (exact for decimals at the dataset scale
+    /// and for integers; a Kahan-compensated pair for floats, which is
+    /// never exact), the minimum, and the maximum of the non-null values.
+    /// Declared beside an `exact:<key>,counts` spec, whose counts prove
+    /// which aggregates cover a lookup's rows. Serves `aggregate` lookups
+    /// only, never a key lookup. A row whose leading key column is null is
+    /// not aggregated (ADR 014).
+    Agg {
+        /// Key columns in prefix order.
+        columns: Vec<String>,
+        /// The aggregated column.
+        value: String,
+        /// The functions stored, in [`AggregateFn::canonical`] order; `count`
+        /// is always among them (the rows prove coverage).
+        functions: Vec<AggregateFn>,
+    },
 }
 
 /// How a [`KeySpec::Text`] splits a value into tokens. Both work on the
@@ -849,6 +868,7 @@ impl KeySpec {
                 std::slice::from_ref(column)
             }
             Self::Expr { over, .. } => over.columns(),
+            Self::Agg { columns, .. } => columns,
         }
     }
 
@@ -902,6 +922,7 @@ impl KeySpec {
                 return format!("expr:{name}={expr}:{inner}");
             }
             Self::List { .. } => "list",
+            Self::Agg { value, .. } => return format!("agg:{}@{value}", self.columns().join(",")),
         };
         format!("{kind}:{}", self.columns().join(","))
     }
@@ -922,6 +943,7 @@ impl KeySpec {
     /// | bitemporal | `temporal2:id@valid,known` |
     /// | expr | `expr:sym=json_get(payload,'$.symbol'):exact` (with counts `...:exact,counts`; bloom `...:bloom@0.01`) |
     /// | list (B4) | `list:tags` |
+    /// | agg (B7) | `agg:account@amount{sum,count,min,max}` (functions in canonical order) |
     ///
     /// The false-positive rate is Rust's shortest round-trip spelling of the
     /// `f64`. The identity is one-to-one: no key or time column a spec names
@@ -948,6 +970,19 @@ impl KeySpec {
             },
             Self::Range { column } => format!("range:{column}"),
             Self::List { column } => format!("list:{column}"),
+            Self::Agg {
+                columns,
+                value,
+                functions,
+            } => format!(
+                "agg:{}@{value}{{{}}}",
+                columns.join(","),
+                functions
+                    .iter()
+                    .map(|f| f.as_str())
+                    .collect::<Vec<_>>()
+                    .join(",")
+            ),
             Self::Temporal {
                 columns, ts_column, ..
             } => format!("temporal:{}@{ts_column}{counts}", columns.join(",")),
@@ -1004,6 +1039,7 @@ impl KeySpec {
             Self::Range { .. } | Self::Expr { .. } | Self::Text { .. } | Self::List { .. } => {
                 Vec::new()
             }
+            Self::Agg { value, .. } => vec![value],
         };
         if let Some(c) = self
             .columns()
@@ -1016,6 +1052,19 @@ impl KeySpec {
                  key spec's identity, so a new key spec cannot name it; index a column whose \
                  name has neither, or rename this one"
             )));
+        }
+        if let Self::Agg { columns, value, .. } = self {
+            if let Some(c) = columns
+                .iter()
+                .chain(std::iter::once(value))
+                .find(|c| c.contains(['{', '}']))
+            {
+                return Err(Error::KeySpec(format!(
+                    "the agg column \"{c}\" contains '{{' or '}}', which enclose an agg key's \
+                     functions in its identity, so a new agg key cannot name it; aggregate a \
+                     column whose name has neither, or rename this one"
+                )));
+            }
         }
         if let Self::Exact {
             columns,
@@ -1656,6 +1705,46 @@ pub enum AggregateFn {
     Max,
 }
 
+impl AggregateFn {
+    /// Every function, in the canonical order an agg key's identity lists
+    /// them: `sum`, `count`, `min`, `max`.
+    pub const CANONICAL: [Self; 4] = [Self::Sum, Self::Count, Self::Min, Self::Max];
+
+    /// The spelling in specs and results: `sum`, `count`, `min`, `max`.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Count => "count",
+            Self::Sum => "sum",
+            Self::Min => "min",
+            Self::Max => "max",
+        }
+    }
+
+    /// The function a spelling names, or `None`.
+    #[must_use]
+    pub fn parse(s: &str) -> Option<Self> {
+        Self::CANONICAL.into_iter().find(|f| f.as_str() == s)
+    }
+
+    /// The functions an agg key stores when `given` are declared: each
+    /// once, in [`AggregateFn::CANONICAL`] order, with `count` always among
+    /// them (an agg key's rows prove which aggregates cover a lookup).
+    #[must_use]
+    pub fn canonical(given: &[Self]) -> Vec<Self> {
+        Self::CANONICAL
+            .into_iter()
+            .filter(|f| *f == Self::Count || given.contains(f))
+            .collect()
+    }
+}
+
+/// The model every float sum of an `agg` key is labelled with: a sum of
+/// `f64` values with Kahan-Babuska (Neumaier) compensation, per row group
+/// and then across row groups in ascending row-group order. Never exact
+/// (B7); every float sum prints `Measured` with this model.
+pub const AGG_FLOAT_SUM_MODEL: &str = "agg.kahan_f64";
+
 /// What an agent may propose. There is no score field in any variant; scoring
 /// is the engine's (ADR 009).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -1978,6 +2067,27 @@ pub struct CertBody {
     /// was compared.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub row_filter: Option<Vec<Predicate>>,
+    /// The `agg` keys (B7) whose per-key rows and sums stood in for a scan
+    /// of a side, one entry per side served so: the certificate says when
+    /// its per-key totals came from an index rather than from reading the
+    /// rows. Omitted when every side was read.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub agg: Vec<AggServed>,
+}
+
+/// One side of a reconcile whose per-key rows and totals an index's `agg`
+/// keys answered (B7), instead of a scan.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct AggServed {
+    /// `left` or `right`.
+    pub side: String,
+    /// The identities ([`KeySpec::identity`]) of the agg keys read, one per
+    /// total column.
+    pub specs: Vec<String>,
+    /// The rows those keys aggregate, every live row of the side: the count
+    /// a scan would have read.
+    pub rows: u64,
 }
 
 #[allow(clippy::trivially_copy_pass_by_ref)] // serde's skip_serializing_if signature
@@ -2478,6 +2588,7 @@ mod tests {
                     uncomparable: 0,
                     totals: Vec::new(),
                     row_filter: None,
+                    agg: Vec::new(),
                 },
                 provenance: provenance(),
             }),
@@ -2722,6 +2833,7 @@ mod schema_feature {
                     uncomparable: 0,
                     totals: Vec::new(),
                     row_filter: None,
+                    agg: Vec::new(),
                 },
                 provenance,
             }),
@@ -3070,6 +3182,7 @@ mod schema_feature {
                         columns: cols(&["symbol"]),
                         keys_from: KeysFrom::Run,
                     }]),
+                    agg: Vec::new(),
                 },
                 provenance,
             }),

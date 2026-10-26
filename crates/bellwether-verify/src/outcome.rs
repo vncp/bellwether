@@ -2,7 +2,7 @@
 //! formatting beyond exact renderings of keys and decimals, so the facade
 //! can serialize it for `--json` or render it for a terminal.
 
-use bellwether_types::{Coverage, Hash, Predicate};
+use bellwether_types::{AggServed, Coverage, Hash, Predicate};
 use serde::{Deserialize, Serialize};
 
 use crate::totals::ExactTotal;
@@ -184,6 +184,14 @@ pub enum SidePath {
         /// Live row groups the plan considered.
         row_groups_total: u64,
     },
+    /// No row group was read: an index's `agg` key (B7) holds every row's
+    /// key and total, so its per-key rows and exact sums stand in for the
+    /// rows (every compared column is a key column, and the one total is
+    /// the agg key's sum).
+    Agg {
+        /// The agg key's identity.
+        spec: String,
+    },
 }
 
 /// What was read from one side. Independent of the pass count.
@@ -258,4 +266,8 @@ pub struct Reconciliation {
     pub sides: [SideReport; 2],
     /// The memory bound.
     pub memory: MemoryReport,
+    /// The sides whose per-key rows and totals an index's `agg` keys
+    /// answered instead of a scan (B7); empty when every side was read.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub agg: Vec<AggServed>,
 }

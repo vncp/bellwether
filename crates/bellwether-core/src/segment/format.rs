@@ -78,6 +78,9 @@ pub enum Layout {
     BloomPerRowGroup,
     /// Per-row-group `(min, max)`, sorted by `min`, in blocks. Range.
     MinMax,
+    /// As `Keyed`, and each key's value also carries one aggregate cell per
+    /// row group holding it (`crate::agg`). Agg (B7).
+    KeyedAgg,
 }
 
 impl Layout {
@@ -96,6 +99,7 @@ impl Layout {
                 Some(Self::BloomPerRowGroup)
             }
             KeySpec::Range { .. } => Some(Self::MinMax),
+            KeySpec::Agg { .. } => Some(Self::KeyedAgg),
             KeySpec::Exact { .. } | KeySpec::Bloom { .. } | KeySpec::Bitemporal { .. } => None,
             KeySpec::Expr { over, .. } => Self::for_spec(over),
         }
@@ -408,6 +412,12 @@ pub struct SegmentHeader {
     /// reader built on other tables refuses the segment.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub text_unicode: Option<crate::text::UnicodeTables>,
+    /// For an agg key (and only an agg key) written from a dataset schema:
+    /// the value column's dataset type, which its cells were encoded and
+    /// summed at (a decimal's scale is not visible in the bytes). Recorded
+    /// together with `key_types`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value_type: Option<ColumnType>,
     /// Fields written by a newer minor writer, preserved verbatim.
     #[serde(flatten)]
     pub extra: serde_json::Map<String, serde_json::Value>,
@@ -432,6 +442,7 @@ impl SegmentHeader {
             key_types: None,
             ts_type: None,
             text_unicode: spec_is_text.then(crate::text::UnicodeTables::current),
+            value_type: None,
             extra: serde_json::Map::new(),
         }
     }
@@ -502,6 +513,25 @@ impl SegmentHeader {
             }
             _ => {}
         }
+        let agg = matches!(self.key_spec, KeySpec::Agg { .. });
+        match (&self.value_type, &self.key_types) {
+            (Some(_), _) if !agg => {
+                return Err(corrupt("value_type on a segment that is not an agg key"));
+            }
+            (Some(_), None) => return Err(corrupt("value_type without key_types")),
+            (None, Some(_)) if agg => {
+                return Err(corrupt(
+                    "an agg segment records key_types without value_type",
+                ));
+            }
+            _ => {}
+        }
+        if agg && self.storage_version < 2 {
+            return Err(corrupt(
+                "a storage version 1 segment cannot hold an agg key (agg keys arrived in version 2)",
+            ));
+        }
+        crate::agg::check_spec(&self.key_spec)?;
         match (&self.key_spec, &self.text_unicode) {
             (KeySpec::Text { .. }, None) => {
                 return Err(corrupt("a text segment records its Unicode tables"));

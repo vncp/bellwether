@@ -7,8 +7,8 @@ use std::fmt::Write as _;
 use bellwether::spec::label;
 use bellwether::types::{EvidenceBody, Hash, Record, TextOp, Tokenizer};
 use bellwether::{
-    Cost, CountResult, IndexResult, LinkStatus, LookupKind, PlanResult, ProposeResult,
-    ReceiptResult, ReportResult,
+    AggValue, AggregateResult, Cost, CountResult, IndexResult, LinkStatus, LookupKind, PlanResult,
+    ProposeResult, ReceiptResult, ReportResult,
 };
 
 use crate::Out;
@@ -59,6 +59,140 @@ pub(crate) fn heading(out: &Out, s: &str) -> String {
     } else {
         s.to_string()
     }
+}
+
+/// The most keys `aggregate` lists in a terminal; `--json` lists every key.
+const AGGREGATE_ROWS_SHOWN: usize = 20;
+
+/// `aggregate`: per key its rows, count, nulls and the asked aggregates,
+/// then where they came from, whether any float sum is measured rather
+/// than exact, and the row groups still to read when the index answered
+/// only part.
+pub(crate) fn aggregate_result(r: &AggregateResult, out: &Out) -> String {
+    let mut s = String::new();
+    let _ = writeln!(
+        s,
+        "{}",
+        heading(
+            out,
+            &format!(
+                "aggregate: {} of {} by ({}) over {} at manifest sequence {}",
+                r.functions.join(", "),
+                r.value,
+                r.columns.join(", "),
+                count(r.keys, "key", "keys"),
+                r.sequence
+            )
+        )
+    );
+    let shown = |v: &Option<AggValue>| -> Option<String> {
+        v.as_ref()
+            .map(|v| v.value.clone().unwrap_or_else(|| "null".into()))
+    };
+    let mut header = format!(
+        "  {:<24} {:>12} {:>12} {:>8}",
+        "key", "rows", "count", "nulls"
+    );
+    let wants = |f: &str| r.functions.iter().any(|x| x == f);
+    for f in ["sum", "min", "max"] {
+        if wants(f) {
+            let _ = write!(header, " {f:>20}");
+        }
+    }
+    let _ = writeln!(s, "{}", header.trim_end());
+    for g in r.groups.iter().take(AGGREGATE_ROWS_SHOWN) {
+        let key: Vec<String> = g
+            .key
+            .iter()
+            .map(|v| v.clone().unwrap_or_else(|| "null".into()))
+            .collect();
+        let mut line = format!(
+            "  {:<24} {:>12} {:>12} {:>8}",
+            key.join(", "),
+            num(g.rows),
+            num(g.count),
+            num(g.nulls)
+        );
+        for v in [&g.sum, &g.min, &g.max] {
+            if let Some(text) = shown(v) {
+                let _ = write!(line, " {text:>20}");
+            }
+        }
+        if g.residual_rows > 0 {
+            let _ = write!(
+                line,
+                "  partial: {} in {} to read",
+                count(g.residual_rows, "row", "rows"),
+                count(g.residual_row_groups, "row group", "row groups")
+            );
+        }
+        let _ = writeln!(s, "{}", line.trim_end());
+    }
+    if r.groups.len() > AGGREGATE_ROWS_SHOWN {
+        let _ = writeln!(
+            s,
+            "  ... and {} more; --json lists every key",
+            count(
+                (r.groups.len() - AGGREGATE_ROWS_SHOWN) as u64,
+                "key",
+                "keys"
+            )
+        );
+    }
+    if r.null_tuples > 0 {
+        let _ = writeln!(
+            s,
+            "  {} key rows held a null and match nothing (ADR 014)",
+            num(r.null_tuples)
+        );
+    }
+    let measured = r
+        .groups
+        .iter()
+        .filter_map(|g| g.sum.as_ref())
+        .find_map(|v| match &v.exactness {
+            bellwether::types::Exactness::Measured { model } => Some(model.clone()),
+            _ => None,
+        });
+    if let Some(model) = measured {
+        let _ = writeln!(
+            s,
+            "  sums of {} are float sums, measured by {model}, never exact; counts, minimums and \
+             maximums are exact",
+            r.value
+        );
+    }
+    if r.complete {
+        let _ = writeln!(
+            s,
+            "  from {} ({} rows of the keys in {} of {}), checked against the counts of {}; no \
+             data file was read",
+            r.answered_by,
+            num(r.rows),
+            count(r.row_groups, "row group", "row groups"),
+            num(r.row_groups_total),
+            r.counted_by
+        );
+    } else {
+        let _ = writeln!(
+            s,
+            "  partial: {} aggregates by fewer columns than ({}), and in {} ({} in {}) its \
+             aggregate also holds rows of other keys",
+            r.answered_by,
+            r.columns.join(", "),
+            count(r.residual_row_groups, "row group", "row groups"),
+            size(r.residual_bytes),
+            count(r.residual_files, "file", "files")
+        );
+        let _ = writeln!(
+            s,
+            "  the values above are exact over the other rows; read those row groups, keep the \
+             rows of these keys, and add them, or declare agg:{}@{} to answer from the index alone",
+            r.columns.join(","),
+            r.value
+        );
+    }
+    s
 }
 
 /// The narrowest label column of the funnel.

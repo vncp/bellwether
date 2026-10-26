@@ -173,6 +173,7 @@ pub(crate) fn build(
             uncomparable: 0,
             totals: Vec::new(),
             row_filter: None,
+            agg: o.agg.clone(),
         },
         provenance: Provenance {
             inputs,

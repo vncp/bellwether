@@ -113,5 +113,6 @@ pub use writer::{
     segment_path, validate_spec, EncodedSegment, KeyValue, SegmentWriter, WriterOptions,
 };
 
+pub(crate) use format::{corrupt, put_leb128, Cursor, Put};
 pub(crate) use reader::{BlockView, Index};
 pub(crate) use writer::{stored_bounds, BloomEmitter, KeyedEmitter, RangeEmitter};

@@ -765,6 +765,7 @@ fn key_spec_fields(kind: &str, storage_version: u64) -> Option<&'static [&'stati
         // Storage version 2 on: a reader of version 1 refuses the kind.
         "expr" if v2 => Some(&["kind", "name", "expr", "over", "conformance"]),
         "text" if v2 => Some(&["kind", "column", "tokenizer", "bloom"]),
+        "agg" if v2 => Some(&["kind", "columns", "value", "functions"]),
         _ => None,
     }
 }
@@ -1026,6 +1027,11 @@ mod tests {
                 bloom: Some(0.01),
             },
             KeySpec::List { column: "a".into() },
+            KeySpec::Agg {
+                columns: vec!["a".into()],
+                value: "v".into(),
+                functions: bellwether_types::AggregateFn::CANONICAL.to_vec(),
+            },
         ];
         let mut kinds_seen = BTreeSet::new();
         for spec in &specs {
@@ -1039,7 +1045,8 @@ mod tests {
                 | KeySpec::Bitemporal { .. }
                 | KeySpec::Expr { .. }
                 | KeySpec::Text { .. }
-                | KeySpec::List { .. } => {}
+                | KeySpec::List { .. }
+                | KeySpec::Agg { .. } => {}
             }
             let v = serde_json::to_value(spec).unwrap();
             let kind = v["kind"].as_str().unwrap().to_string();

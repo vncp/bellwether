@@ -30,6 +30,7 @@
 #![forbid(unsafe_code)]
 #![deny(clippy::unwrap_used, clippy::expect_used)]
 
+mod agg;
 mod engine;
 mod engine_fix;
 mod fix;
@@ -49,6 +50,7 @@ mod text;
 mod twin;
 mod why;
 
+pub use agg::{AggValue, AggregateGroup, AggregateResult};
 pub use bellwether_ledger::{
     printable, InvalidReason, InvalidSignature, OutsideWindow, PublicKey, RecordKind,
     SignatureStatus, SignedBy, SigningKey, TrustError, TrustedKey, TrustedKeys, Verdict,

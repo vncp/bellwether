@@ -20,6 +20,11 @@
 //! `exact:counts,counts`.
 //! | `Text { column: body, tokenizer: words, bloom: None }` | `text:body,tokenizer=words` |
 //! | `Text { column: body, tokenizer: trigram, bloom: Some(0.01) }` | `text:body,tokenizer=trigram,bloom=0.01` |
+//! | `Agg { columns: [account], value: amount, functions: [sum, count] }` | `agg:account@amount{sum,count}` |
+//!
+//! An agg key's functions are listed in braces, each once, in any order;
+//! `count` is always stored and its label lists them in the order sum,
+//! count, min, max.
 //!
 //! An `expr` key's expression is in the closed language of
 //! `bellwether_core::expr`; it is stored normalized, so `label` gives the
@@ -44,7 +49,9 @@
 
 use bellwether_core::segment::validate_spec;
 use bellwether_core::sidecar::{SidecarDef, SidecarKind};
-use bellwether_types::{Error, KeySpec, Result, SketchSpec, Tokenizer, SKETCH_DEFAULT_PRECISION};
+use bellwether_types::{
+    AggregateFn, Error, KeySpec, Result, SketchSpec, Tokenizer, SKETCH_DEFAULT_PRECISION,
+};
 
 /// Parses the short form or the JSON form.
 pub fn parse(s: &str) -> Result<KeySpec> {
@@ -85,7 +92,8 @@ pub fn check(spec: &KeySpec) -> Result<()> {
 fn bad(s: &str, why: &str) -> Error {
     Error::KeySpec(format!(
         "{s:?} is not a key spec ({why}); write it as exact:a,b, temporal:a@ts, bloom:a@0.01, \
-         range:ts, text:body,tokenizer=words (or tokenizer=trigram), expr:name=<expression>:exact, or list:tags"
+         range:ts, text:body,tokenizer=words (or tokenizer=trigram), expr:name=<expression>:exact, \
+         list:tags, or agg:a@amount{{sum,count,min,max}}"
     ))
 }
 
@@ -238,8 +246,51 @@ fn parse_short(s: &str) -> Result<KeySpec> {
         )),
         ("text", None) => parse_text(s, cols),
         ("text", Some(_)) => Err(bad(s, "a text key takes no '@'")),
+        ("agg", Some(rest)) => parse_agg(s, cols, rest),
+        ("agg", None) => Err(bad(
+            s,
+            "an agg key names its value column after '@' and its functions in braces, \
+             agg:account@amount{sum,count,min,max}",
+        )),
         (other, _) => Err(bad(s, &format!("unknown kind {other:?}"))),
     }
+}
+
+/// `agg:<key>[,<key>]@<value>{<fn>[,<fn>]}`: key columns, the value
+/// column, and the functions (`sum`, `count`, `min`, `max`, each once, in
+/// any order; `count` is always stored).
+fn parse_agg(s: &str, cols: &str, rest: &str) -> Result<KeySpec> {
+    let (value, fns) = rest
+        .split_once('{')
+        .and_then(|(v, f)| Some((v.trim(), f.trim().strip_suffix('}')?)))
+        .ok_or_else(|| {
+            bad(
+                s,
+                "an agg key lists its functions in braces after the value column, \
+                 agg:account@amount{sum,count,min,max}",
+            )
+        })?;
+    if value.is_empty() {
+        return Err(bad(s, "an agg key names its value column after '@'"));
+    }
+    let mut functions = Vec::new();
+    for f in fns.split(',').map(str::trim) {
+        let parsed = AggregateFn::parse(f).ok_or_else(|| {
+            bad(
+                s,
+                &format!("{f:?} is not an agg function; use sum, count, min, or max"),
+            )
+        })?;
+        if functions.contains(&parsed) {
+            return Err(bad(s, &format!("{f} is listed twice")));
+        }
+        functions.push(parsed);
+    }
+    Ok(KeySpec::Agg {
+        columns: columns(s, cols)?,
+        value: value.to_string(),
+        functions: AggregateFn::canonical(&functions),
+    })
 }
 
 /// `text:<column>,tokenizer=words|trigram[,bloom=<fpr>]`: the column, then

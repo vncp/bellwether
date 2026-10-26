@@ -71,4 +71,32 @@ pub trait SidePlanner: Send + Sync {
     /// returned.
     fn plan_keys(&self, columns: &[String], keys: &[Vec<u8>])
         -> bellwether_types::Result<ScanPlan>;
+
+    /// The index's per-key rows and exact sums of `value` by exactly
+    /// `key_columns` (in that order), when a complete `agg` key stores them
+    /// (B7): a reconcile reads them instead of the side's rows when every
+    /// row it compares would contribute only its key and that total.
+    /// `None`, the default, when no such key exists.
+    fn agg_totals(
+        &self,
+        _key_columns: &[String],
+        _value: &str,
+    ) -> bellwether_types::Result<Option<Box<dyn AggTotals + '_>>> {
+        Ok(None)
+    }
+}
+
+/// One `agg` key's per-key totals over the live row groups (B7), as an
+/// index holds them.
+pub trait AggTotals {
+    /// The agg key's identity (`KeySpec::identity`).
+    fn spec(&self) -> String;
+
+    /// Visits every key with a live row, in ascending canonical order,
+    /// with its rows and the exact sum of its non-null values at the
+    /// dataset scale. Bounded memory: one block per segment at a time.
+    fn visit(
+        &self,
+        f: &mut dyn FnMut(&[u8], u64, i128) -> bellwether_types::Result<()>,
+    ) -> bellwether_types::Result<()>;
 }

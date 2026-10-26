@@ -19,6 +19,8 @@
 //!   tokenizers, the residual's row test, and the planning rule.
 //! - [`list`]: list keys (B4), an inverted index over a list column's
 //!   elements, and the `contains_any` / `contains_all` lookups.
+//! - [`agg`]: agg keys (B7), per-key, per-row-group aggregates of one value
+//!   column, and the rule that decides which row groups they answer.
 //!
 //! Invariants owned here: 1 (no false negatives in pruning,
 //! `tests/no_false_negatives.rs`) and 5 (stale-version rejection,
@@ -31,6 +33,7 @@
 // Proper names (HyperLogLog, MinHash, BLAKE3) read better without backticks.
 #![allow(clippy::doc_markdown)]
 
+pub mod agg;
 pub mod bloom;
 pub mod encoding;
 pub mod expr;

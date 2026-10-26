@@ -98,8 +98,14 @@ pub enum Lookup {
 pub fn servable(spec: &KeySpec, run_columns: &[String]) -> Option<Lookup> {
     // A text key serves text lookups only (`PlanSource::plan_text`), never
     // a key: its dictionary holds tokens, not values. A list key serves
-    // membership runs only (`serves_query`).
-    if run_columns.is_empty() || matches!(spec, KeySpec::Text { .. } | KeySpec::List { .. }) {
+    // membership runs only (`serves_query`). An agg key serves aggregate
+    // runs only (`PlanSource::aggregate`).
+    if run_columns.is_empty()
+        || matches!(
+            spec,
+            KeySpec::Text { .. } | KeySpec::List { .. } | KeySpec::Agg { .. }
+        )
+    {
         return None;
     }
     if let KeySpec::Expr { expr, .. } = spec {
@@ -133,7 +139,8 @@ pub fn serves_window(spec: &KeySpec, ts_column: &str) -> bool {
         | KeySpec::Bitemporal { .. }
         | KeySpec::Expr { .. }
         | KeySpec::Text { .. }
-        | KeySpec::List { .. } => false,
+        | KeySpec::List { .. }
+        | KeySpec::Agg { .. } => false,
     }
 }
 

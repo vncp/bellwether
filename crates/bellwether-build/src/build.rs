@@ -693,7 +693,8 @@ fn shared_identity(root: &str, base: Option<&Manifest>, a: &KeySpec, b: &KeySpec
                 KeySpec::Range { .. }
                 | KeySpec::Expr { .. }
                 | KeySpec::Text { .. }
-                | KeySpec::List { .. } => {}
+                | KeySpec::List { .. }
+                | KeySpec::Agg { .. } => {}
             }
             format!(
                 "re-declare {} under its name with a time column whose name has no ',' or '@', \
@@ -896,6 +897,31 @@ fn plan_specs(
                 }
                 _ => None,
             };
+            if let KeySpec::Agg { value, .. } = spec {
+                // The value column is read beside the key, at its dataset
+                // type, and the agg key needs a counted key on exactly its
+                // columns beside it: those counts prove which aggregates
+                // answer a lookup.
+                bellwether_core::agg::value_type(spec, schema)
+                    .map_err(|e| Error::KeySpec(format!("{name}: {e}")))?;
+                columns.push(value.clone());
+                let beside = specs.iter().any(|s| {
+                    matches!(s, KeySpec::Exact { .. } | KeySpec::Temporal { .. })
+                        && s.counts()
+                        && s.columns().len() == spec.columns().len()
+                        && s.columns().iter().all(|c| spec.columns().contains(c))
+                });
+                if !beside {
+                    let cols = spec.columns().join(",");
+                    return Err(Error::KeySpec(format!(
+                        "{} is declared beside a key that counts rows on exactly {cols}, whose \
+                         counts prove which aggregates answer a lookup; declare both, for \
+                         example `--key 'exact:{cols},counts' --key '{}'`",
+                        spec.identity(),
+                        spec.identity()
+                    )));
+                }
+            }
             Ok(SpecPlan {
                 target: Target::Key(spec.clone()),
                 name: spec.identity(),

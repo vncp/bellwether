@@ -81,6 +81,12 @@ enum Command {
     /// from the index's per-key counts (a key spec exact:COLS,counts); no
     /// data file is read.
     Count(CountArgs),
+    /// Aggregate a column per key over the keys (sum, count, min, max ...
+    /// group by key where key in ...), from the index's agg keys (a key spec
+    /// agg:COLS@VALUE{sum,count,min,max} beside exact:COLS,counts); no data
+    /// file is read, and the row groups still to read are named when the
+    /// index answers only part.
+    Aggregate(AggregateArgs),
     /// Plan the version of each key current at an instant (--at), or the
     /// bitemporal version valid at --valid as known at --known.
     Asof(AsofArgs),
@@ -426,6 +432,23 @@ struct CountArgs {
 }
 
 #[derive(Args)]
+struct AggregateArgs {
+    #[command(flatten)]
+    lookup: LookupArgs,
+    /// The column to aggregate.
+    #[arg(long, value_name = "COLUMN")]
+    value: String,
+    /// The functions, comma-separated: sum, count, min, max [default: sum,count].
+    #[arg(
+        long = "fn",
+        value_name = "FNS",
+        value_delimiter = ',',
+        default_value = "sum,count"
+    )]
+    functions: Vec<String>,
+}
+
+#[derive(Args)]
 struct LatestArgs {
     #[command(flatten)]
     lookup: LookupArgs,
@@ -695,6 +718,18 @@ fn hint(e: &Error) -> Option<String> {
                 ""
             }
         )),
+        Error::NotIndexed {
+            root,
+            needs: Some(agg),
+            ..
+        } if agg.starts_with("agg:") => Some(format!(
+            "run `bellwether index {root} --key 'exact:{},counts' --key '{agg}'` first (an agg \
+             key is declared beside the counted key on its columns)",
+            agg.trim_start_matches("agg:")
+                .split('@')
+                .next()
+                .unwrap_or_default()
+        )),
         Error::NotIndexed { root, needs, .. } => Some(format!(
             "run `bellwether index {root} --key {}` first",
             needs.as_deref().unwrap_or("<spec>")
@@ -849,6 +884,27 @@ fn run(cli: &Cli, out: &Out) -> Result<Outcome, Failure> {
             let engine = engine_at(g, &a.lookup.root.root, a.lookup.at_manifest)?;
             let r = engine.count(&key_file(&a.lookup.keys, a.lookup.key.as_ref()))?;
             done(&r, human::count_result(&r, out), EXIT_OK)
+        }
+        Command::Aggregate(a) => {
+            let functions = a
+                .functions
+                .iter()
+                .map(|f| {
+                    bellwether::types::AggregateFn::parse(f.trim()).ok_or_else(|| {
+                        Failure::Usage(format!(
+                            "--fn {f:?} is not an aggregate function; pass a comma-separated \
+                             list of sum, count, min, max, for example --fn sum,count"
+                        ))
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let engine = engine_at(g, &a.lookup.root.root, a.lookup.at_manifest)?;
+            let r = engine.aggregate(
+                &key_file(&a.lookup.keys, a.lookup.key.as_ref()),
+                &a.value,
+                &functions,
+            )?;
+            done(&r, human::aggregate_result(&r, out), EXIT_OK)
         }
         Command::Latest(a) => {
             check_lookback(a.lookback.as_deref())?;

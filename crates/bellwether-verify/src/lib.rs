@@ -57,8 +57,9 @@ pub use outcome::{
     Counts, GroupRepr, GroupTotal, KeyRepr, MemoryReport, Mismatch, Reconciliation, SidePath,
     SideReport, Sides, VersionDigest,
 };
-pub use planner::{ManifestIdentity, SidePlanner};
+pub use planner::{AggTotals, ManifestIdentity, SidePlanner};
 pub use reconcile::{Reconciler, Side, PARTITION_SEED};
+pub use render::render_tuple;
 pub use rowhash::{push_hashed_column, row_hash};
 pub use spec::{
     CoverageRequest, Options, ReconcileSpec, TotalColumn, WorkloadKeys, DEFAULT_MAX_EXAMPLES,
