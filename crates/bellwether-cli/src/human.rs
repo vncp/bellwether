@@ -95,14 +95,14 @@ pub(crate) fn funnel_row_kind(
     note: &str,
 ) {
     let kind = kind.map_or_else(String::new, |(kw, v)| format!(" {v:>kw$}"));
-    let _ = writeln!(
-        s,
+    let line = format!(
         "  {name:<w$} {:>9} {:>12} {:>18} {:>10}{kind}  {note}",
         num(c.files),
         num(c.row_groups),
         num(c.bytes),
         size(c.bytes)
     );
+    let _ = writeln!(s, "{}", line.trim_end());
 }
 
 pub(crate) fn funnel_header(s: &mut String, w: usize) {
@@ -113,11 +113,11 @@ pub(crate) fn funnel_header(s: &mut String, w: usize) {
 /// has one: `Some((width, kind))`.
 pub(crate) fn funnel_header_kind(s: &mut String, w: usize, kind: Option<(usize, &str)>) {
     let kind = kind.map_or_else(String::new, |(kw, k)| format!(" {k:>kw$}"));
-    let _ = writeln!(
-        s,
+    let line = format!(
         "  {:<w$} {:>9} {:>12} {:>18} {:>10}{kind}",
         "", "files", "row groups", "bytes", ""
     );
+    let _ = writeln!(s, "{}", line.trim_end());
 }
 
 pub(crate) fn index(r: &IndexResult, out: &Out) -> String {
@@ -1006,28 +1006,33 @@ pub(crate) fn why(r: &bellwether::WhyReport, out: &Out, fix_command: &str) -> St
             .find(|i| i.cardinality.columns == columns)
             .map_or_else(String::new, sketch_fanout)
     };
-    let _ = writeln!(
-        s,
-        "  {:<36} {:>12}  {:<22} {:<22} {:<8} {}",
+    // The sample and sketch cells are padded for the next column; a table
+    // without a sketch column ends at the sample cell, so trim the padding.
+    let mut row = |cells: [&str; 6]| {
+        let line = format!(
+            "  {:<36} {:>12}  {:<22} {:<22} {:<8} {}",
+            cells[0], cells[1], cells[2], cells[3], cells[4], cells[5]
+        );
+        let _ = writeln!(s, "{}", line.trim_end());
+    };
+    row([
         "key",
         "distinct",
         "files/value",
         "row groups/value",
         "sample",
-        if r.sketch.is_empty() { "" } else { "sketch" }
-    );
+        if r.sketch.is_empty() { "" } else { "sketch" },
+    ]);
     for e in &r.profile.fanout {
         let f = &e.fanout;
-        let _ = writeln!(
-            s,
-            "  {:<36} {:>12}  {:<22} {:<22} {:<8} {}",
-            tail(&f.columns.join(", "), 36),
-            num(f.distinct),
-            quantiles(&f.files_per_value),
-            quantiles(&f.row_groups_per_value),
+        row([
+            &tail(&f.columns.join(", "), 36),
+            &num(f.distinct),
+            &quantiles(&f.files_per_value),
+            &quantiles(&f.row_groups_per_value),
             if f.sampled { "sampled" } else { "exact" },
-            sketch_cell(&f.columns)
-        );
+            &sketch_cell(&f.columns),
+        ]);
     }
     for i in r.sketch.iter().filter(|i| {
         !r.profile
@@ -1035,16 +1040,14 @@ pub(crate) fn why(r: &bellwether::WhyReport, out: &Out, fix_command: &str) -> St
             .iter()
             .any(|e| e.fanout.columns == i.cardinality.columns)
     }) {
-        let _ = writeln!(
-            s,
-            "  {:<36} {:>12}  {:<22} {:<22} {:<8} {}",
-            tail(&i.cardinality.columns.join(", "), 36),
+        row([
+            &tail(&i.cardinality.columns.join(", "), 36),
             "-",
             "-",
             "-",
             "-",
-            sketch_fanout(i)
-        );
+            &sketch_fanout(i),
+        ]);
     }
     if !r.sketch.is_empty() {
         let _ = writeln!(

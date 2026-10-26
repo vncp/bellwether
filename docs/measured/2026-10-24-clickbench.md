@@ -6,16 +6,16 @@ Measured by WP9 on 2026-10-24. Machine: Apple M3 Pro, 12 cores, 36 GB, macOS 26.
 $ bellwether why hits
 why <scratch>/clickbench/hits: not indexed
 funnel: no workload; pass --from <keys.parquet> to replay a run under each candidate key
-                                         files   row groups              bytes           
+                                         files   row groups              bytes
   dataset                                   10           28      1,486,306,919     1.5 GB  10,000,000 rows
 exit 0  (.159047000 s)
 
 $ bellwether why hits --from userid_keys.parquet
 why <scratch>/clickbench/hits: not indexed
 funnel: 1 run(s), keys p50/p95/max 1,000/1,000/1,000; exact sums of row-group statistics, summed over runs
-                                         files   row groups              bytes           
+                                         files   row groups              bytes
   dataset                                   10           28      1,486,306,919     1.5 GB  10,000,000 rows
-  current (no index)                        10           28      1,486,306,919     1.5 GB  
+  current (no index)                        10           28      1,486,306,919     1.5 GB
   exact:UserID                              10           27      1,485,098,816     1.5 GB  floor: only row groups holding a key, recommended
 
 culprit (UserID): no index serves this lookup, so it reads every row group
@@ -61,9 +61,9 @@ exit 0  (.685103000 s)
 $ bellwether why hits --from userid_keys.parquet
 why <scratch>/clickbench/hits: manifest sequence 1, current keys: exact:UserID
 funnel: 1 run(s), keys p50/p95/max 1,000/1,000/1,000; exact sums of row-group statistics, summed over runs
-                                         files   row groups              bytes           
+                                         files   row groups              bytes
   dataset                                   10           28      1,486,306,919     1.5 GB  10,000,000 rows
-  current                                   10           27      1,485,098,816     1.5 GB  
+  current                                   10           27      1,485,098,816     1.5 GB
 
 culprit (UserID): the serving key exact:UserID
 recommended: none; no candidate reads fewer bytes than the current configuration
