@@ -48,6 +48,6 @@ pub use config::{
 pub use coverage::{completeness, sidecar_completeness};
 pub use keys::encode_ts;
 pub use plan::{
-    default_window_column, partition_columns, Lookup, PlanOrder, Planner, TransientSpec,
+    default_window_column, partition_columns, KeyCount, Lookup, PlanOrder, Planner, TransientSpec,
 };
 pub use verify::Drift;

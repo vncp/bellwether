@@ -66,6 +66,27 @@ pub struct ObserveLocate {
     /// longer retains is refused with `not_retained`.
     #[serde(default)]
     pub at_manifest: Option<u64>,
+    /// The columns the reader reads: each planned file also reports those
+    /// columns' compressed bytes, and the plan their sum
+    /// (`projected_bytes`), from the index. Default: no projection.
+    #[serde(default)]
+    pub columns: Option<Vec<String>>,
+}
+
+/// `observe.count`: the rows holding the keys, exact, from the index's
+/// per-key counts.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ObserveCount {
+    /// A Parquet file of keys (read, never written); an absolute path.
+    pub keys: String,
+    /// Key columns to take from the file, in tuple order; default: all.
+    #[serde(default)]
+    pub key_columns: Option<Vec<String>>,
+    /// Count against the committed manifest at this sequence instead of the
+    /// current one. Default: the current manifest.
+    #[serde(default)]
+    pub at_manifest: Option<u64>,
 }
 
 /// `observe.asof`: the version of each key current at an instant.
@@ -292,6 +313,15 @@ pub fn catalog() -> Vec<ToolDef> {
             "Plan which files and row groups hold the keys in a Parquet key file, against the \
              current manifest or a committed one (at_manifest). Writes the plan Evidence and \
              the key set to the cache only.",
+        ),
+        def::<ObserveCount>(
+            "observe.count",
+            Tier::Observe,
+            true,
+            "Count the rows holding the keys in a Parquet key file (count(*) where key in ...), \
+             exact, from the per-key counts of a key spec with counts on exactly those columns \
+             (exact:<cols>,counts): rows, row groups, files. No data file is read. Writes \
+             nothing; refused with not_indexed when no such spec is complete.",
         ),
         def::<ObserveAsof>(
             "observe.asof",

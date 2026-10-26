@@ -222,8 +222,47 @@ pub struct PlanResult {
     pub ordered_by: Option<String>,
     /// Why the order is unspecified, when it is.
     pub unordered_reason: Option<String>,
+    /// The rows holding the keys in the planned row groups, exact from the
+    /// per-key counts of a spec on exactly the lookup's columns that stores
+    /// them (`exact:…,counts`; storage version 2). Absent otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rows: Option<u64>,
+    /// With `--columns`: the compressed bytes of only those columns over the
+    /// planned row groups, from the manifest's per-column bytes (a text
+    /// source has none and counts its whole chunks). Absent otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub projected_bytes: Option<u64>,
     /// The `plan` Evidence.
     pub evidence: Written,
+}
+
+/// What [`crate::Engine::count`] answered: `count(*) where (columns) in
+/// keys`, exact, from the per-key counts of one spec. Writes nothing.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct CountResult {
+    /// Key columns, in tuple order.
+    pub columns: Vec<String>,
+    /// Distinct non-null key tuples counted.
+    pub keys: u64,
+    /// Input rows dropped because their tuple held a null (ADR 014).
+    pub null_tuples: u64,
+    /// BLAKE3 of the canonical key set (the one `locate` cites for the same
+    /// keys).
+    pub key_set: Hash,
+    /// The manifest sequence counted against.
+    pub sequence: u64,
+    /// The spec whose counts answered (its identity, `exact:…,counts`).
+    pub counted_by: String,
+    /// Rows whose key tuple is one of the keys.
+    pub rows: u64,
+    /// Live row groups holding at least one of the keys.
+    pub row_groups: u64,
+    /// Live row groups in the index.
+    pub row_groups_total: u64,
+    /// Files holding those row groups.
+    pub files: u64,
+    /// Live files in the index.
+    pub files_total: u64,
 }
 
 /// What [`crate::Engine::propose`] did: wrote the Proposal, or refused at

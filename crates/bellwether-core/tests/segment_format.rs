@@ -287,7 +287,7 @@ fn header_records_bloom_hash_per_layout_and_refuses_unknown_values() {
 #[test]
 fn header_versions_must_agree_with_the_preamble() {
     let seg = big_exact(10);
-    let b = patch_header(&seg.bytes, "\"storage_version\":1", "\"storage_version\":0");
+    let b = patch_header(&seg.bytes, "\"storage_version\":2", "\"storage_version\":1");
     assert!(SegmentReader::open(b).is_err());
     let b = patch_header(
         &seg.bytes,

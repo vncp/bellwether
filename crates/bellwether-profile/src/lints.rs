@@ -396,10 +396,11 @@ fn declared_but_unused(inputs: &LintInputs<'_>) -> Vec<Lint> {
             continue;
         }
         let name = spec.name();
+        let identity = spec.identity();
         let bytes: u64 = manifest
             .segment_bytes
             .iter()
-            .filter(|(n, _)| *n == name)
+            .filter(|(n, _)| *n == identity)
             .map(|(_, b)| *b)
             .sum();
         out.push(Lint {

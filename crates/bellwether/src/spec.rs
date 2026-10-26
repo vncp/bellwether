@@ -6,6 +6,14 @@
 //! | `Bloom { columns: [a], fpr: 0.01 }` | `bloom:a@0.01` |
 //! | `Range { column: ts }` | `range:ts` |
 //! | `Temporal { columns: [id], ts_column: ts }` | `temporal:id@ts` |
+//! | `Exact { columns: [a, b], counts: true }` | `exact:a,b,counts` |
+//! | `Temporal { columns: [id], ts_column: ts, counts: true }` | `temporal:id@ts,counts` |
+//!
+//! A trailing `,counts` asks the spec to store, per key and per row group,
+//! the number of rows (storage version 2, ADR 028); it is the last element
+//! after the columns (exact) or the timestamp column (temporal). A spec of
+//! one column named `counts` is `exact:counts`; with counts,
+//! `exact:counts,counts`.
 //!
 //! A spec may also be given as its JSON form (`{"kind":"exact",...}`).
 //! [`label`] and [`parse`] are inverses. Specs are validated by core's
@@ -70,6 +78,16 @@ fn columns(s: &str, list: &str) -> Result<Vec<String>> {
     Ok(cols)
 }
 
+/// `list` without a trailing `,counts` element, and whether it had one.
+/// The element counts only after at least one other: `counts` alone is a
+/// column name.
+fn strip_counts(list: &str) -> (&str, bool) {
+    match list.trim_end().rsplit_once(',') {
+        Some((head, "counts")) if !head.trim().is_empty() => (head, true),
+        _ => (list, false),
+    }
+}
+
 fn parse_short(s: &str) -> Result<KeySpec> {
     let (kind, rest) = s
         .split_once(':')
@@ -79,11 +97,14 @@ fn parse_short(s: &str) -> Result<KeySpec> {
         None => (rest, None),
     };
     match (kind.trim(), extra) {
-        ("exact", None) => Ok(KeySpec::Exact {
-            columns: columns(s, cols)?,
-            counts: false,
-            bounds: None,
-        }),
+        ("exact", None) => {
+            let (cols, counts) = strip_counts(cols);
+            Ok(KeySpec::Exact {
+                columns: columns(s, cols)?,
+                counts,
+                bounds: None,
+            })
+        }
         ("bloom", Some(fpr)) => {
             let fpr: f64 = fpr
                 .parse()
@@ -107,11 +128,21 @@ fn parse_short(s: &str) -> Result<KeySpec> {
                 _ => Err(bad(s, "a range spec has exactly one column")),
             }
         }
-        ("temporal", Some(ts)) if !ts.is_empty() => Ok(KeySpec::Temporal {
-            columns: columns(s, cols)?,
-            ts_column: ts.to_string(),
-            counts: false,
-        }),
+        ("temporal", Some(ts)) if !ts.is_empty() => {
+            let (ts, counts) = strip_counts(ts);
+            match columns(s, ts)?.as_slice() {
+                [one] => Ok(KeySpec::Temporal {
+                    columns: columns(s, cols)?,
+                    ts_column: one.clone(),
+                    counts,
+                }),
+                _ => Err(bad(
+                    s,
+                    "a temporal spec has one timestamp column, then optionally counts: \
+                     temporal:id@ts or temporal:id@ts,counts",
+                )),
+            }
+        }
         ("temporal", _) => Err(bad(
             s,
             "a temporal spec needs a timestamp column, temporal:id@ts",
@@ -176,9 +207,16 @@ pub fn parse_declaration(s: &str) -> Result<Declaration> {
         });
     }
     let bounded = match t.split_once(':') {
-        Some(("exact", rest)) => rest
-            .split_once('@')
-            .map(|(cols, ts)| (format!("exact:{cols}"), cols.to_string(), ts.to_string())),
+        // exact:a@ts,counts: the counts option belongs to the key spec.
+        Some(("exact", rest)) => rest.split_once('@').map(|(cols, ts)| {
+            let (ts, counts) = strip_counts(ts);
+            let key = if counts {
+                format!("exact:{cols},counts")
+            } else {
+                format!("exact:{cols}")
+            };
+            (key, cols.to_string(), ts.to_string())
+        }),
         Some(("bloom", rest)) => {
             let parts: Vec<&str> = rest.split('@').collect();
             match parts.as_slice() {
@@ -221,7 +259,13 @@ pub fn sidecar_label(def: &SidecarDef) -> String {
 pub fn declaration_label(declared: &Declaration) -> String {
     match (&declared.key, &declared.sidecar) {
         (Some(key), Some(def)) if def.kind == SidecarKind::Bounds => {
-            format!("{}@{}", label(key), def.time_columns.join(","))
+            // exact:a@ts,counts: the counts option follows the time column.
+            let mut bare = key.clone();
+            if let KeySpec::Exact { counts, .. } = &mut bare {
+                *counts = false;
+            }
+            let counts = if key.counts() { ",counts" } else { "" };
+            format!("{}@{}{counts}", label(&bare), def.time_columns.join(","))
         }
         (_, Some(def)) => def.name(),
         (Some(key), None) => label(key),
@@ -265,6 +309,12 @@ mod tests {
             "range:ts",
             "temporal:id@ts",
             "temporal:id,v@ts",
+            "exact:a,counts",
+            "exact:a,b,counts",
+            "exact:counts",
+            "exact:counts,counts",
+            "temporal:id@ts,counts",
+            "temporal:id@counts",
         ] {
             let spec = parse(s).unwrap();
             assert_eq!(label(&spec), s);
@@ -272,6 +322,27 @@ mod tests {
         }
         let json = r#"{"kind":"exact","columns":["order_id"]}"#;
         assert_eq!(label(&parse(json).unwrap()), "exact:order_id");
+        assert_eq!(
+            parse("exact:a,b,counts").unwrap(),
+            KeySpec::Exact {
+                columns: vec!["a".into(), "b".into()],
+                counts: true,
+                bounds: None,
+            }
+        );
+        assert_eq!(
+            parse("temporal:id@ts,counts").unwrap(),
+            KeySpec::Temporal {
+                columns: vec!["id".into()],
+                ts_column: "ts".into(),
+                counts: true,
+            }
+        );
+        assert!(parse("temporal:id@ts,known").is_err());
+        let d = parse_declaration("exact:a@ts,counts").unwrap();
+        assert_eq!(d.key.as_ref().map(KeySpec::counts), Some(true));
+        assert_eq!(declaration_label(&d), "exact:a@ts,counts");
+        assert_eq!(parse_declaration(&declaration_label(&d)).unwrap(), d);
     }
 
     #[test]

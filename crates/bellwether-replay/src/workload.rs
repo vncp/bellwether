@@ -86,6 +86,9 @@ pub const QUERY_KIND_ASOF: &str = "asof";
 /// The query kind of a recorded run that looks keys up in a time window
 /// (`window`, [`RunWindow`]).
 pub const QUERY_KIND_WINDOW: &str = "window";
+/// The query kind of a recorded run that counts the rows holding its keys
+/// (`count(*) where key in ...`, `bellwether count`).
+pub const QUERY_KIND_COUNT: &str = "count";
 
 /// The time window of a `window` run: the rows of its keys whose
 /// `ts_column` lies in `[lo, hi]`, both inclusive and in the column's
@@ -132,6 +135,10 @@ pub enum RunQuery {
     /// The rows of the keys whose time column lies in a fixed window
     /// ([`QUERY_KIND_WINDOW`]).
     Window(RunWindow),
+    /// The number of rows holding the keys ([`QUERY_KIND_COUNT`]): planned
+    /// as a `locate`, and read from the index at no file cost when a
+    /// serving spec stores counts on exactly the run's key columns.
+    Count,
 }
 
 impl RunQuery {
@@ -143,6 +150,7 @@ impl RunQuery {
             Self::Latest | Self::Lookback { asof: None, .. } => QUERY_KIND_LATEST,
             Self::Asof { .. } | Self::Lookback { asof: Some(_), .. } => QUERY_KIND_ASOF,
             Self::Window(_) => QUERY_KIND_WINDOW,
+            Self::Count => QUERY_KIND_COUNT,
         }
     }
 
@@ -153,7 +161,7 @@ impl RunQuery {
         match self {
             Self::Asof { ts } => Some(*ts),
             Self::Lookback { asof, .. } => *asof,
-            Self::Locate | Self::Latest | Self::Window(_) => None,
+            Self::Locate | Self::Latest | Self::Window(_) | Self::Count => None,
         }
     }
 
@@ -162,7 +170,7 @@ impl RunQuery {
     pub fn lookback(&self) -> Option<i64> {
         match self {
             Self::Lookback { lookback, .. } => Some(*lookback),
-            Self::Locate | Self::Latest | Self::Asof { .. } | Self::Window(_) => None,
+            Self::Locate | Self::Latest | Self::Asof { .. } | Self::Window(_) | Self::Count => None,
         }
     }
 
@@ -256,9 +264,10 @@ impl RecordedRun {
         }
         let point = match (self.query_kind.as_str(), self.asof) {
             (QUERY_KIND_LOCATE, None) => RunQuery::Locate,
+            (QUERY_KIND_COUNT, None) => RunQuery::Count,
             (QUERY_KIND_LATEST, None) => RunQuery::Latest,
             (QUERY_KIND_ASOF, Some(ts)) => RunQuery::Asof { ts },
-            (QUERY_KIND_LOCATE | QUERY_KIND_LATEST, Some(_)) => {
+            (QUERY_KIND_LOCATE | QUERY_KIND_LATEST | QUERY_KIND_COUNT, Some(_)) => {
                 return Err(Error::Other(format!(
                     "run {:?} has query_kind {:?} but sets asof",
                     self.run_id, self.query_kind
@@ -279,10 +288,11 @@ impl RecordedRun {
         };
         match (point, self.lookback) {
             (q, None) => Ok(q),
-            (RunQuery::Locate, Some(_)) => Err(Error::Other(format!(
-                "run {:?} has query_kind \"locate\" but sets a lookback; a lookback window \
-                 applies to latest and asof runs",
-                self.run_id
+            (q @ (RunQuery::Locate | RunQuery::Count), Some(_)) => Err(Error::Other(format!(
+                "run {:?} has query_kind {:?} but sets a lookback; a lookback window applies \
+                 to latest and asof runs",
+                self.run_id,
+                q.kind_str()
             ))),
             (_, Some(l)) if l < 0 => Err(Error::Other(format!(
                 "run {:?} has a negative lookback {l}",
@@ -855,6 +865,25 @@ struct BenchRun {
     file: String,
     keys: u64,
     hash: Hash,
+    /// `locate` (the default when absent) or `count`: a gated workload
+    /// counts a key set before it looks the same keys up.
+    #[serde(default)]
+    query: Option<String>,
+}
+
+impl BenchRun {
+    /// The run's query kind: [`RunQuery::Locate`] unless it records
+    /// `count`.
+    fn query(&self) -> ReplayResult<RunQuery> {
+        match self.query.as_deref() {
+            None | Some(QUERY_KIND_LOCATE) => Ok(RunQuery::Locate),
+            Some(QUERY_KIND_COUNT) => Ok(RunQuery::Count),
+            Some(other) => Err(bench_err(
+                Some(&self.run_id),
+                format!("query {other:?} is not one a bench run records (locate or count)"),
+            )),
+        }
+    }
 }
 
 /// What [`record_bench_workload`] verified and recorded.
@@ -942,6 +971,7 @@ pub fn record_bench_workload(
             return Err(bench_err(Some(&run.run_id), "the run id appears twice"));
         }
         recorder.check_new(&run.run_id)?;
+        run.query()?;
         let path = run_path(root, run)?;
         verified_keys(&path, run)?;
         paths.push(path);
@@ -960,7 +990,7 @@ pub fn record_bench_workload(
             vec![Arc::new(UInt64Array::from(keys)) as ArrayRef],
         )
         .map_err(|e| bench_err(Some(&run.run_id), e.to_string()))?;
-        let p = recorder.prepare(&run.run_id, KeyInput::Batch(&batch), RunQuery::Locate, None)?;
+        let p = recorder.prepare(&run.run_id, KeyInput::Batch(&batch), run.query()?, None)?;
         recorder.sink.put(&p.run.key_set, Bytes::from(p.payload))?;
         prepared.push(p.run);
     }

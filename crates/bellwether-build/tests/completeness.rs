@@ -61,7 +61,7 @@ fn adding_a_spec_builds_every_row_group_and_records_completeness_at_its_commit()
     };
     let r = build_ok(&b, &s.root_str(), &[exact(&["id"]), bloom(&["grp"])], &opts);
     assert_eq!(r.sequence, Some(2));
-    assert_eq!(r.specs_rebuilt, vec!["bloom:grp".to_string()]);
+    assert_eq!(r.specs_rebuilt, vec!["bloom:grp@0.01".to_string()]);
     assert_eq!(r.row_groups_read, 9, "every tracked row group, read once");
     // only the new spec's column is read: the exact spec is already complete
     let read_cols = probe.columns.lock().unwrap().clone();
@@ -221,17 +221,17 @@ fn a_definition_change_under_the_same_name_rebuilds_the_spec() {
     };
     assert_eq!(by_ts.name(), by_grp.name());
     build_ok(&b, &s.root_str(), std::slice::from_ref(&by_ts), &opts);
-    // declaring both is refused: the manifest keys segments by name
+    // declaring both is refused: an index holds one spec per name
     let err = b
         .build(&s.root_str(), &[by_ts.clone(), by_grp.clone()], &opts)
         .unwrap_err();
     assert!(matches!(err, Error::KeySpec(_)), "{err}");
     let r = build_ok(&b, &s.root_str(), std::slice::from_ref(&by_grp), &opts);
-    assert_eq!(r.specs_rebuilt, vec!["temporal:id".to_string()]);
+    assert_eq!(r.specs_rebuilt, vec!["temporal:id@id".to_string()]);
     let m = b.manifest().unwrap().unwrap();
     assert_eq!(completeness(&m, &by_grp), Some(2));
     assert_eq!(completeness(&m, &by_ts), None);
-    let specs = segment_specs(&store, "temporal:id");
+    let specs = segment_specs(&store, "temporal:id@id");
     assert!(!specs.is_empty());
     assert!(
         specs.iter().all(|k| k == &by_grp),
@@ -253,7 +253,7 @@ fn removing_a_spec_takes_remove_unlisted_and_drops_its_segments_and_completeness
         .unwrap()
         .segments
         .iter()
-        .filter(|x| x.key_spec == "bloom:grp")
+        .filter(|x| x.key_spec == "bloom:grp@0.01")
         .map(|x| x.id)
         .collect();
     // listing only exact:id keeps bloom:grp; nothing to do, nothing committed
@@ -266,11 +266,11 @@ fn removing_a_spec_takes_remove_unlisted_and_drops_its_segments_and_completeness
         ..opts.clone()
     };
     let r = build_ok(&b, &s.root_str(), &[exact(&["id"])], &removing);
-    assert_eq!(r.specs_removed, vec!["bloom:grp".to_string()]);
+    assert_eq!(r.specs_removed, vec!["bloom:grp@0.01".to_string()]);
     assert_eq!(r.row_groups_read, 0);
     let m = b.manifest().unwrap().unwrap();
     assert!(m.segments.iter().all(|x| x.key_spec == "exact:id"));
-    assert!(!m.key_spec_completeness.contains_key("bloom:grp"));
+    assert!(!m.key_spec_completeness.contains_key("bloom:grp@0.01"));
     assert_eq!(m.schema.key_specs, vec![exact(&["id"])]);
     for id in bloom_ids {
         assert!(m.is_tombstoned(&id), "dropped segments wait for GC");
@@ -309,7 +309,7 @@ fn remove_spec_removes_exactly_the_declared_spec() {
     let m = b.manifest().unwrap().unwrap();
     assert_eq!(m.schema.key_specs, vec![exact(&["id"])]);
     assert!(m.segments.iter().all(|x| x.key_spec == "exact:id"));
-    assert!(!m.key_spec_completeness.contains_key("temporal:id"));
+    assert!(!m.key_spec_completeness.contains_key("temporal:id@ts"));
     assert_eq!(completeness(&m, &exact(&["id"])), Some(1));
     // later builds no longer index it
     write_numbered(&s.path("d.parquet"), 300, 12, 4);

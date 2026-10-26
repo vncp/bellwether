@@ -7,8 +7,8 @@ use std::fmt::Write as _;
 use bellwether::spec::label;
 use bellwether::types::{EvidenceBody, Hash, Record};
 use bellwether::{
-    Cost, IndexResult, LinkStatus, LookupKind, PlanResult, ProposeResult, ReceiptResult,
-    ReportResult,
+    Cost, CountResult, IndexResult, LinkStatus, LookupKind, PlanResult, ProposeResult,
+    ReceiptResult, ReportResult,
 };
 
 use crate::Out;
@@ -73,9 +73,23 @@ pub(crate) fn label_width<'a>(labels: impl IntoIterator<Item = &'a str>, min: us
 
 /// One funnel row: label, files, row groups, bytes (exact and rounded).
 pub(crate) fn funnel_row(s: &mut String, w: usize, name: &str, c: &Cost, note: &str) {
+    funnel_row_kind(s, w, name, c, None, note);
+}
+
+/// A funnel row with the index kind's column (`KindColumn`) before the
+/// note: `Some((width, value))` when the table has one.
+pub(crate) fn funnel_row_kind(
+    s: &mut String,
+    w: usize,
+    name: &str,
+    c: &Cost,
+    kind: Option<(usize, &str)>,
+    note: &str,
+) {
+    let kind = kind.map_or_else(String::new, |(kw, v)| format!(" {v:>kw$}"));
     let _ = writeln!(
         s,
-        "  {name:<w$} {:>9} {:>12} {:>18} {:>10}  {note}",
+        "  {name:<w$} {:>9} {:>12} {:>18} {:>10}{kind}  {note}",
         num(c.files),
         num(c.row_groups),
         num(c.bytes),
@@ -84,9 +98,16 @@ pub(crate) fn funnel_row(s: &mut String, w: usize, name: &str, c: &Cost, note: &
 }
 
 pub(crate) fn funnel_header(s: &mut String, w: usize) {
+    funnel_header_kind(s, w, None);
+}
+
+/// The funnel header, with the index kind's column header when the table
+/// has one: `Some((width, kind))`.
+pub(crate) fn funnel_header_kind(s: &mut String, w: usize, kind: Option<(usize, &str)>) {
+    let kind = kind.map_or_else(String::new, |(kw, k)| format!(" {k:>kw$}"));
     let _ = writeln!(
         s,
-        "  {:<w$} {:>9} {:>12} {:>18} {:>10}",
+        "  {:<w$} {:>9} {:>12} {:>18} {:>10}{kind}",
         "", "files", "row groups", "bytes", ""
     );
 }
@@ -206,6 +227,49 @@ fn lookup_label(lookup: &LookupKind) -> String {
     }
 }
 
+pub(crate) fn count(r: &CountResult, out: &Out) -> String {
+    let mut s = String::new();
+    let _ = writeln!(
+        s,
+        "{}",
+        heading(
+            out,
+            &format!(
+                "count: {} keys on ({}) at manifest sequence {}",
+                num(r.keys),
+                r.columns.join(", "),
+                r.sequence
+            )
+        )
+    );
+    let _ = writeln!(s, "  rows        {:>14}", num(r.rows));
+    let _ = writeln!(
+        s,
+        "  row groups  {:>14} of {}",
+        num(r.row_groups),
+        num(r.row_groups_total)
+    );
+    let _ = writeln!(
+        s,
+        "  files       {:>14} of {}",
+        num(r.files),
+        num(r.files_total)
+    );
+    if r.null_tuples > 0 {
+        let _ = writeln!(
+            s,
+            "  {} key rows held a null and match nothing (ADR 014)",
+            num(r.null_tuples)
+        );
+    }
+    let _ = writeln!(
+        s,
+        "  exact, from the per-key counts of {}; no data file was read",
+        r.counted_by
+    );
+    s
+}
+
 pub(crate) fn plan(r: &PlanResult, out: &Out) -> String {
     let mut s = String::new();
     let what = lookup_label(&r.lookup);
@@ -244,6 +308,24 @@ pub(crate) fn plan(r: &PlanResult, out: &Out) -> String {
         num(r.planned.bytes),
         size(r.planned.bytes)
     );
+    if let Some(p) = r.projected_bytes {
+        let _ = writeln!(
+            s,
+            "  {:<34} {:>9} {:>12} {:>18} {:>10}",
+            "planned, projected columns",
+            "",
+            "",
+            num(p),
+            size(p)
+        );
+    }
+    if let Some(rows) = r.rows {
+        let _ = writeln!(
+            s,
+            "  rows: {} hold the keys (exact, from the index's per-key counts)",
+            num(rows)
+        );
+    }
     if r.null_tuples > 0 {
         let _ = writeln!(
             s,
@@ -507,8 +589,25 @@ pub(crate) fn why(r: &bellwether::WhyReport, out: &Out, fix_command: &str) -> St
         }
         let labels: Vec<String> = r.candidates.iter().map(|c| label(&c.spec)).collect();
         let w_col = label_width(labels.iter().map(String::as_str), MIN_FUNNEL_LABEL);
-        funnel_header(&mut s, w_col);
-        funnel_row(&mut s, w_col, "dataset", &dataset, &rows);
+        // One trailing column for the index kind that contributes one
+        // (`KindColumn`), headed by the kind's name, before the notes.
+        let kind_head = r
+            .candidates
+            .iter()
+            .find_map(|c| c.kind_column.as_ref().map(|k| k.kind.clone()));
+        let kind_width = kind_head.as_ref().map(|h| {
+            r.candidates
+                .iter()
+                .filter_map(|c| c.kind_column.as_ref().map(|k| k.value.chars().count()))
+                .chain(std::iter::once(h.chars().count()))
+                .max()
+                .unwrap_or(0)
+        });
+        let kind_cell = |v: &str| kind_width.map(|kw| (kw, v.to_string()));
+        funnel_header_kind(&mut s, w_col, kind_width.zip(kind_head.as_deref()));
+        let blank = kind_cell("");
+        let blank = blank.as_ref().map(|(w, v)| (*w, v.as_str()));
+        funnel_row_kind(&mut s, w_col, "dataset", &dataset, blank, &rows);
         let current_name = if r.current_specs.is_empty() {
             "current (no index)"
         } else {
@@ -523,7 +622,7 @@ pub(crate) fn why(r: &bellwether::WhyReport, out: &Out, fix_command: &str) -> St
             ),
             _ => String::new(),
         };
-        funnel_row(&mut s, w_col, current_name, &current, &current_note);
+        funnel_row_kind(&mut s, w_col, current_name, &current, blank, &current_note);
         for c in &r.candidates {
             let mut notes = Vec::new();
             match (&c.origin, &c.spec, &kind_label) {
@@ -565,11 +664,25 @@ pub(crate) fn why(r: &bellwether::WhyReport, out: &Out, fix_command: &str) -> St
             if r.recommended.as_ref().is_some_and(|x| x.spec == c.spec) {
                 notes.push("recommended".to_string());
             }
-            funnel_row(
+            let cell = kind_cell(c.kind_column.as_ref().map_or("", |k| k.value.as_str()));
+            if let Some(k) = &c.kind_column {
+                notes.push(format!(
+                    "{}: {}{}",
+                    k.kind,
+                    k.label,
+                    if k.exactness.is_exact() {
+                        ""
+                    } else {
+                        " (not exact)"
+                    }
+                ));
+            }
+            funnel_row_kind(
                 &mut s,
                 w_col,
                 &label(&c.spec),
                 &c.proposed,
+                cell.as_ref().map(|(w, v)| (*w, v.as_str())),
                 &notes.join(", "),
             );
         }

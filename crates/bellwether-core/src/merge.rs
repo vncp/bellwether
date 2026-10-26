@@ -78,8 +78,8 @@ fn merged_header<R: ReadAt>(inputs: &[SegmentReader<R>]) -> Result<SegmentHeader
         if h.key_spec != h0.key_spec {
             return Err(Error::KeySpec(format!(
                 "cannot merge segments of different key specs: {} and {}",
-                h0.key_spec.name(),
-                h.key_spec.name()
+                h0.key_spec.identity(),
+                h.key_spec.identity()
             )));
         }
         if h.bloom_hash != h0.bloom_hash {

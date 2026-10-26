@@ -334,6 +334,10 @@ pub struct Candidate {
     /// The Replay scoring that Proposal (`inputs`: the catalog digest; a
     /// key replay is exact, so no `model`; contract v2.1).
     pub replay: Written,
+    /// This candidate's index-kind column (`bellwether_types::KindColumn`),
+    /// when its kind contributes one; absent (omitted in JSON) otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind_column: Option<bellwether_types::KindColumn>,
 }
 
 /// The candidate that reads the least under the requested lookup kind
@@ -1192,6 +1196,43 @@ impl Engine {
             } else {
                 None
             };
+            // The `counts` column: for an exact candidate on exactly the
+            // workload's key columns, the rows its keys hold, from a replay
+            // with that key storing counts (the counts replay computes for
+            // `exact:<cols>,counts`; exact).
+            let kind_column = match &spec {
+                KeySpec::Exact {
+                    columns,
+                    bounds: None,
+                    ..
+                } if temporal.is_none()
+                    && workload.runs().iter().all(|r| {
+                        &r.columns == columns && matches!(r.query(), Ok(RunQuery::Locate))
+                    }) =>
+                {
+                    let counted = KeySpec::Exact {
+                        columns: columns.clone(),
+                        counts: true,
+                        bounds: None,
+                    };
+                    let specs = proposed_specs(replayer.current_specs(), &counted);
+                    let costs = replayer.replay_specs(&specs, workload, cache)?;
+                    costs
+                        .iter()
+                        .map(|c| c.rows.as_ref().map(|q| q.value))
+                        .sum::<Option<u64>>()
+                        .map(|rows| bellwether_types::KindColumn {
+                            kind: "counts".into(),
+                            label: format!(
+                                "rows holding the keys over every run, as {} counts them",
+                                counted.identity()
+                            ),
+                            value: rows.to_string(),
+                            exactness: bellwether_types::Exactness::Exact,
+                        })
+                }
+                _ => None,
+            };
             report.candidates.push(Candidate {
                 spec,
                 origin,
@@ -1202,6 +1243,7 @@ impl Engine {
                     hash: replay_hash,
                     record: Record::Replay(scored.replay),
                 },
+                kind_column,
             });
         }
         let current = match report.candidates.first() {

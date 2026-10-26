@@ -76,6 +76,10 @@ enum Command {
     /// Plan the newest version of each key (newest valid version known by
     /// an instant with --known).
     Latest(LatestArgs),
+    /// Count the rows holding the keys (count(*) where key in ...), exact,
+    /// from the index's per-key counts (a key spec exact:COLS,counts); no
+    /// data file is read.
+    Count(CountArgs),
     /// Plan the version of each key current at an instant (--at), or the
     /// bitemporal version valid at --valid as known at --known.
     Asof(AsofArgs),
@@ -221,6 +225,7 @@ struct IndexArgs {
     #[command(flatten)]
     root: RootArg,
     /// A key spec: exact:a,b  temporal:id@ts  bloom:a@0.01  range:ts; with
+    /// per-key row counts exact:a,b,counts or temporal:id@ts,counts; with
     /// per-key time bounds exact:a@ts or bloom:a@0.01@ts; or a bitemporal
     /// key temporal2:id@valid,known. Repeat for several.
     #[arg(long = "key", value_name = "SPEC")]
@@ -270,6 +275,17 @@ struct LocateArgs {
     /// names].
     #[arg(long = "ts", value_name = "COLUMN")]
     ts: Option<String>,
+    /// The columns the reader reads, comma-separated: each planned file also
+    /// reports those columns' compressed bytes, and the plan their sum
+    /// (from the index, no footer read).
+    #[arg(long, value_name = "COLS", value_delimiter = ',')]
+    columns: Option<Vec<String>>,
+}
+
+#[derive(Args)]
+struct CountArgs {
+    #[command(flatten)]
+    lookup: LookupArgs,
 }
 
 #[derive(Args)]
@@ -660,6 +676,11 @@ fn run(cli: &Cli, out: &Out) -> Result<Outcome, Failure> {
         Command::Why(a) => why(g, out, a),
         Command::Index(a) => index(g, out, a),
         Command::Locate(a) => locate(g, out, a),
+        Command::Count(a) => {
+            let engine = engine_at(g, &a.lookup.root.root, a.lookup.at_manifest)?;
+            let r = engine.count(&key_file(&a.lookup.keys, a.lookup.key.as_ref()))?;
+            done(&r, human::count(&r, out), EXIT_OK)
+        }
         Command::Latest(a) => {
             check_lookback(a.lookback.as_deref())?;
             lookup(g, out, &a.lookup, |e, keys| match (&a.known, &a.lookback) {
@@ -861,9 +882,12 @@ fn locate(g: &Global, out: &Out, a: &LocateArgs) -> Result<Outcome, Failure> {
                 .into(),
         ));
     }
-    lookup(g, out, &a.lookup, |e, keys| match window {
-        Some((from, to)) => e.locate_window(keys, from, to, a.ts.as_deref()),
-        None => e.locate(keys),
+    lookup(g, out, &a.lookup, |e, keys| match (window, &a.columns) {
+        (w, Some(columns)) => {
+            e.locate_columns(keys, w.map(|(f, t)| (f, t, a.ts.as_deref())), columns)
+        }
+        (Some((from, to)), None) => e.locate_window(keys, from, to, a.ts.as_deref()),
+        (None, None) => e.locate(keys),
     })
 }
 

@@ -80,8 +80,8 @@ use std::fmt;
 use std::ops::Deref;
 
 use bellwether_types::{
-    format, CertBody, Certificate, Error, Hash, Proposal, ProposalBody, Provenance, Receipt,
-    Record, Replay, Result, RunCost, Store,
+    format, CertBody, Certificate, Error, Exactness, Hash, Proposal, ProposalBody, Provenance,
+    Receipt, Record, Replay, Result, RunCost, Store,
 };
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
@@ -256,6 +256,72 @@ fn all_exact(costs: &[RunCost]) -> bool {
     costs.iter().all(|c| c.exact)
 }
 
+/// Record version 3: every cost's `exact` agrees with its `exactness`
+/// (`exact` is true exactly when `exactness` is `Exact`), a measured cost
+/// is measured by a named model, a bounded cost's interval is ordered, and
+/// so is every `rows` quantity's. A version 2 replay has no `exactness`
+/// (it reads as `Exact`), so only version 3 replays are held to it.
+fn check_exactness(r: &Replay) -> Result<()> {
+    if r.record_version < 3 {
+        return Ok(());
+    }
+    let check = |what: &str, e: &Exactness| -> Result<()> {
+        match e {
+            Exactness::Exact => Ok(()),
+            Exactness::Bounded { low, high } if low > high => Err(rule(format!(
+                "replay {what} is bounded by [{low}, {high}], an empty interval"
+            ))),
+            Exactness::Bounded { .. } => Ok(()),
+            Exactness::Measured { model } if model.trim().is_empty() || model.trim() != model => {
+                Err(rule(format!(
+                    "replay {what} is measured by a model with no name, or with surrounding \
+                     whitespace; name the model"
+                )))
+            }
+            Exactness::Measured { .. } => Ok(()),
+        }
+    };
+    for c in r.current.iter().chain(&r.proposed) {
+        if c.exact != c.exactness.is_exact() {
+            return Err(rule(format!(
+                "replay run {} says exact={} but its exactness is {}; exact is true exactly \
+                 when exactness is exact (record version 3)",
+                c.run_id,
+                c.exact,
+                exactness_name(&c.exactness)
+            )));
+        }
+        check(&format!("run {} cost", c.run_id), &c.exactness)?;
+        if matches!(c.exactness, Exactness::Measured { .. }) && r.model.is_none() {
+            return Err(rule(format!(
+                "replay run {} is measured by a model but the replay names no model",
+                c.run_id
+            )));
+        }
+        if let Some(rows) = &c.rows {
+            check(&format!("run {} rows", c.run_id), &rows.exactness)?;
+            if let Exactness::Bounded { low, high } = rows.exactness {
+                if rows.value != high {
+                    return Err(rule(format!(
+                        "replay run {} rows are bounded by [{low}, {high}] but record {}; a \
+                         bounded quantity records its upper bound",
+                        c.run_id, rows.value
+                    )));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn exactness_name(e: &Exactness) -> &'static str {
+    match e {
+        Exactness::Exact => "exact",
+        Exactness::Bounded { .. } => "bounded",
+        Exactness::Measured { .. } => "measured",
+    }
+}
+
 /// Contract v2.1 replay rules, independent of where the replay is checked:
 /// inputs are non-empty; current costs are exact; a cost model is named
 /// exactly when some proposed cost is inexact, and it is a non-empty name
@@ -294,7 +360,7 @@ fn check_replay_content(r: &Replay, proposal: &Proposal) -> Result<()> {
         (false, false) => Err(rule(
             "replay with an inexact proposed cost must name the cost model behind it",
         )),
-        _ => Ok(()),
+        _ => check_exactness(r),
     }
 }
 
@@ -376,15 +442,18 @@ fn check_pass_consistent(hash: Option<&Hash>, c: &CertBody, pass: bool) -> Resul
     let clean = c.missing_left == 0
         && c.missing_right == 0
         && c.mismatched == 0
+        && c.uncomparable == 0
         && c.totals_delta.is_empty();
     if pass && !clean {
         let name = hash.map_or_else(String::new, |h| format!(" {h}"));
         return Err(rule(format!(
             "certificate{name} says pass but reports differences \
-             (missing_left={}, missing_right={}, mismatched={}, totals_delta={})",
+             (missing_left={}, missing_right={}, mismatched={}, uncomparable={}, \
+             totals_delta={})",
             c.missing_left,
             c.missing_right,
             c.mismatched,
+            c.uncomparable,
             c.totals_delta.len()
         )));
     }

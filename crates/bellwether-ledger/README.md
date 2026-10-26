@@ -93,13 +93,13 @@ Durations (`oldest_input_age`) are encoded as integer nanoseconds (contract v2),
 
 7. `proposal` must resolve to a stored Proposal. A missing record and a record of another kind are both refused.
 7a. `inputs` must not be empty: a replay names the identity of the data it read, at least the catalog digest over the discovered fingerprints and footers, so two replays of one proposal against different data never share a record even when the folder has no index yet and `manifest_version` is `"0"` (invariant 3).
-7b. Exactness. Every `current` cost is exact. `model` is present exactly when some `proposed` cost is inexact, naming the cost model behind it, and it is a non-empty name with no surrounding whitespace. A Key proposal's replay is exact throughout, so it never names a model. A layout proposal and a rewrite with a measured cost (ADR 027) are the inexact cases.
+7b. Exactness. Every `current` cost is exact. `model` is present exactly when some `proposed` cost is inexact, naming the cost model behind it, and it is a non-empty name with no surrounding whitespace. A Key proposal's replay is exact throughout, so it never names a model. A layout proposal and a rewrite with a measured cost (ADR 027) are the inexact cases. From record version 3 (ADR 028) every cost's `exact` is true exactly when its `exactness` is `exact`, so a reader may use either field; a `measured` cost names its model in `exactness` and requires the replay's `model`; a `bounded` interval is ordered; and a cost's `rows`, when present, obeys the same rules (a bounded `rows` records its upper bound as `value`). A version 2 replay has no `exactness` and is read as before.
 7c. Writes carry the current `record_version` only; older versions stay readable but are never produced, so an older build cannot misread a record carrying fields its version lacks (ADR 017). `put_receipt` re-runs 7a and 7b on the resolved replay, as rule 12 re-runs rule 9 on the certificate.
 
 **Certificate** (invariant 6)
 
 8. `provenance.inputs` must not be empty, and `provenance.manifest_version` must be `Some`, because a certificate is always computed against a manifest.
-9. `pass == true` requires `missing_left == 0`, `missing_right == 0`, `mismatched == 0`, and an empty `totals_delta`.
+9. `pass == true` requires `missing_left == 0`, `missing_right == 0`, `mismatched == 0`, `uncomparable == 0` (record version 3: keys whose rows could not be compared, counted apart from `mismatched`), and an empty `totals_delta`.
 10. If `proposal` is `Some(h)`, `h` must resolve to a stored Proposal.
 
 A certificate with `pass == false` is a legitimate record and is stored. So is a plain reconcile with `proposal: None`. Neither can back a Receipt.

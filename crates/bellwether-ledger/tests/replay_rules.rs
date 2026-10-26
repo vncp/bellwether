@@ -6,8 +6,23 @@
 mod common;
 
 use bellwether_ledger::{record_path, Ledger};
-use bellwether_types::{Hash, ProposalBody, Record, RewriteShape};
+use bellwether_types::{Exactness, Hash, ProposalBody, Quantity, Record, RewriteShape, RunCost};
 use common::{assert_rule, evidence, proposal, replay, MemStore};
+
+/// Marks a cost measured by a model: `exact` false and its `exactness`
+/// saying so, as record version 3 requires of both fields together.
+fn inexact(c: &mut RunCost) {
+    c.exact = false;
+    c.exactness = Exactness::Measured {
+        model: "layout.v1".into(),
+    };
+}
+
+/// Marks a cost exact again.
+fn exact(c: &mut RunCost) {
+    c.exact = true;
+    c.exactness = Exactness::Exact;
+}
 
 fn key_proposal_hash(ledger: &Ledger<&MemStore>) -> Hash {
     let e = ledger.put(&Record::Evidence(evidence())).unwrap();
@@ -41,10 +56,10 @@ fn a_key_proposal_replay_must_be_exact_in_every_run() {
     let ledger = Ledger::new(&store);
     let p = key_proposal_hash(&ledger);
     let mut r = replay(p);
-    r.proposed[1].exact = false;
+    inexact(&mut r.proposed[1]);
     assert_rule(ledger.put(&Record::Replay(r)), "must be exact in every run");
     let mut r = replay(p);
-    r.current[0].exact = false;
+    inexact(&mut r.current[0]);
     assert_rule(
         ledger.put(&Record::Replay(r)),
         "exact for the current configuration",
@@ -91,7 +106,7 @@ fn a_receipt_rechecks_its_replay() {
     // A key replay with an inexact cost and no model, planted straight into
     // the store as if by an older build or an attacker with store access.
     let mut bad = replay(p);
-    bad.proposed[0].exact = false;
+    inexact(&mut bad.proposed[0]);
     let bytes = serde_json::to_vec(&Record::Replay(bad)).unwrap();
     let bad_h = Hash::of(&bytes);
     store.raw_put(&record_path(&bad_h), bytes);
@@ -154,23 +169,23 @@ fn a_layout_proposal_replay_needs_a_model_and_exact_current_costs() {
         },
     );
     let mut r = replay(p);
-    r.proposed[0].exact = false;
+    inexact(&mut r.proposed[0]);
     assert_rule(
         ledger.put(&Record::Replay(r.clone())),
         "must name the cost model",
     );
     r.model = Some("perfectly clustered by order_id".into());
-    r.current[1].exact = false;
+    inexact(&mut r.current[1]);
     assert_rule(
         ledger.put(&Record::Replay(r.clone())),
         "exact for the current configuration",
     );
-    r.current[1].exact = true;
+    exact(&mut r.current[1]);
     let h = ledger.put(&Record::Replay(r.clone())).unwrap();
     match ledger.get(&h).unwrap() {
         Record::Replay(back) => {
             assert_eq!(back, r, "inputs and model round-trip exactly");
-            assert_eq!(back.record_version, 2);
+            assert_eq!(back.record_version, 3);
         }
         other => panic!("expected a replay, got {other:?}"),
     }
@@ -201,7 +216,7 @@ fn a_rewrite_proposal_replay_follows_the_same_exactness_rule() {
     assert_rule(ledger.put(&Record::Replay(r)), "must not name a cost model");
     // An inexact proposed cost without a model: refused; with one: accepted.
     let mut r = replay(p);
-    r.proposed[0].exact = false;
+    inexact(&mut r.proposed[0]);
     assert_rule(
         ledger.put(&Record::Replay(r.clone())),
         "must name the cost model",
@@ -250,7 +265,7 @@ fn a_blank_model_never_satisfies_an_inexact_replay() {
     );
     for bad in ["", "   ", "\t\n", "  padded  "] {
         let mut r = replay(p);
-        r.proposed[0].exact = false;
+        inexact(&mut r.proposed[0]);
         r.model = Some(bad.into());
         let before = store.len();
         assert_rule(ledger.put(&Record::Replay(r)), "non-empty name");
@@ -270,7 +285,7 @@ fn explain_shows_the_model_only_when_a_replay_has_one() {
     };
     let layout_proposal = ledger.put(&Record::Proposal(pr)).unwrap();
     let mut scored = replay(layout_proposal);
-    scored.proposed[0].exact = false;
+    inexact(&mut scored.proposed[0]);
     scored.model = Some("perfectly clustered by order_id".into());
     let replay_hash = ledger.put(&Record::Replay(scored)).unwrap();
     let certificate_hash = ledger
@@ -302,4 +317,55 @@ fn explain_shows_the_model_only_when_a_replay_has_one() {
     assert_ne!(key_receipt, layout_receipt);
     let text = ledger.explain(&key_receipt).unwrap().render();
     assert!(!text.contains("model="), "{text}");
+}
+
+/// Rule 7b, record version 3: `exact` agrees with `exactness`, a measured
+/// cost needs the replay's model, a bounded interval is ordered, and a
+/// bounded `rows` records its upper bound.
+#[test]
+fn exactness_agrees_with_exact_and_a_measured_cost_names_the_model() {
+    let store = MemStore::default();
+    let ledger = Ledger::new(&store);
+    let p = proposal_of(
+        &ledger,
+        ProposalBody::Layout {
+            cluster_by: vec!["order_id".into()],
+        },
+    );
+    let mut r = replay(p);
+    r.model = Some("perfectly clustered by order_id".into());
+    // exact=false with exactness left Exact: the two fields disagree
+    r.proposed[0].exact = false;
+    assert_rule(
+        ledger.put(&Record::Replay(r.clone())),
+        "exact is true exactly when exactness is exact",
+    );
+    // exactness measured with exact still true: disagree the other way
+    exact(&mut r.proposed[0]);
+    r.proposed[0].exactness = Exactness::Measured {
+        model: "layout.v1".into(),
+    };
+    assert_rule(
+        ledger.put(&Record::Replay(r.clone())),
+        "exact is true exactly when exactness is exact",
+    );
+    // a measured cost with an unnamed model
+    inexact(&mut r.proposed[0]);
+    r.proposed[0].exactness = Exactness::Measured { model: " ".into() };
+    assert_rule(ledger.put(&Record::Replay(r.clone())), "name the model");
+    // an empty bounded interval
+    r.proposed[0].exactness = Exactness::Bounded { low: 5, high: 4 };
+    assert_rule(ledger.put(&Record::Replay(r.clone())), "an empty interval");
+    // bounded rows must record their upper bound
+    inexact(&mut r.proposed[0]);
+    r.proposed[0].rows = Some(Quantity {
+        value: 3,
+        exactness: Exactness::Bounded { low: 1, high: 9 },
+    });
+    assert_rule(
+        ledger.put(&Record::Replay(r.clone())),
+        "records its upper bound",
+    );
+    r.proposed[0].rows = Some(Quantity::exact(7));
+    ledger.put(&Record::Replay(r.clone())).unwrap();
 }

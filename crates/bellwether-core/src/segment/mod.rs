@@ -93,8 +93,8 @@ mod reader;
 mod writer;
 
 pub use format::{
-    types, ColumnType, FileRange, Layout, ReadAt, RecordedUnit, SegmentHeader, CODEC_NONE,
-    FOOTER_LEN, MAGIC, PREAMBLE_LEN,
+    checksum, footer_len, types, ColumnType, FileRange, Layout, ReadAt, RecordedUnit,
+    SegmentHeader, CODEC_NONE, FOOTER_LEN, FOOTER_LEN_V2, MAGIC, PREAMBLE_LEN,
 };
 pub use reader::SegmentReader;
 pub use writer::{

@@ -86,23 +86,18 @@ pub(crate) fn is_complete(manifest: &Manifest, name: &str, live: &RoaringBitmap)
 /// The sequence at which `spec` became complete in `manifest`, or `None`.
 ///
 /// `Some` only when all of these hold: the manifest declares exactly this
-/// spec under its name ([`KeySpec::name`] omits `ts_column` and `fpr`, so a
-/// different spec can share a name), it records a completeness sequence for
-/// that name, and its live segments cover every live row group. Coverage is
-/// recomputed here rather than trusted, so a manifest edited by another
-/// writer cannot make a partial spec look complete.
+/// spec, it records a completeness sequence under the spec's
+/// [`KeySpec::identity`] (storage version 2; every field of the spec, so
+/// `bloom:id@0.01` and `bloom:id@0.05` never share an entry), and its live
+/// segments cover every live row group. Coverage is recomputed here rather
+/// than trusted, so a manifest edited by another writer cannot make a
+/// partial spec look complete.
 #[must_use]
 pub fn completeness(manifest: &Manifest, spec: &KeySpec) -> Option<u64> {
-    let name = spec.name();
-    let declared = manifest
-        .schema
-        .key_specs
-        .iter()
-        .find(|s| s.name() == name)?;
-    if declared != spec {
+    if !manifest.schema.key_specs.contains(spec) {
         return None;
     }
-    recorded_and_covered(manifest, &name)
+    recorded_and_covered(manifest, &spec.identity())
 }
 
 /// The sequence at which the sidecar `def` became complete in `manifest`,
@@ -383,8 +378,8 @@ mod tests {
             counts: false,
         };
         m.schema.key_specs = vec![temporal.clone()];
-        m.key_spec_completeness.insert("temporal:id".into(), 3);
-        m.segments[0].key_spec = "temporal:id".into();
+        m.key_spec_completeness.insert("temporal:id@ts".into(), 3);
+        m.segments[0].key_spec = "temporal:id@ts".into();
         let other_ts = KeySpec::Temporal {
             columns: vec!["id".into()],
             ts_column: "updated_at".into(),
@@ -396,6 +391,30 @@ mod tests {
         // recorded but a segment went missing
         m.segments.clear();
         assert_eq!(completeness(&m, &temporal), None);
+    }
+
+    /// Completeness and segments are keyed by the full identity (storage
+    /// version 2): a bloom spec at another false-positive rate, which
+    /// shares its name, never inherits the old spec's entry or segments.
+    #[test]
+    fn completeness_is_keyed_by_identity_not_name() {
+        let at = |fpr: f64| KeySpec::Bloom {
+            columns: vec!["id".into()],
+            fpr,
+            bounds: None,
+        };
+        let (old, new) = (at(0.01), at(0.05));
+        assert_eq!(old.name(), new.name());
+        let mut m = manifest(vec![seg("bloom:id@0.01", 0, 10)]);
+        m.schema.key_specs = vec![old.clone()];
+        m.key_spec_completeness.insert("bloom:id@0.01".into(), 3);
+        assert_eq!(completeness(&m, &old), Some(3));
+        // the redefinition is declared, the old entry and segments remain
+        m.schema.key_specs = vec![new.clone()];
+        assert_eq!(completeness(&m, &new), None);
+        let declared = vec![Target::Key(new)];
+        let map = completeness_map(&m, &m, &declared, &BTreeSet::new()).unwrap();
+        assert!(map.is_empty(), "{map:?}");
     }
 
     #[test]

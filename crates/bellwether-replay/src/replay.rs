@@ -80,7 +80,8 @@ use crate::error::{ReplayError, ReplayResult};
 use crate::keys::RunKeys;
 use crate::layout::{replay_layout, LayoutModel, LayoutReplay};
 use crate::plan::{
-    lookback_window, planned_time_column, run_cost, serves_query, PlanSource, SegmentPlanner,
+    count_cost, lookback_window, planned_time_column, run_cost, serves_query, PlanSource,
+    SegmentPlanner,
 };
 use crate::transient::{CacheStats, TransientCache, TransientIndex, TransientLimits};
 use crate::workload::{KeySetSource, RunQuery, Workload};
@@ -300,6 +301,11 @@ impl<'a> Replayer<'a> {
         query: &RunQuery,
     ) -> Result<ScanPlan> {
         check_types(&self.catalog, keys)?;
+        // A count is planned as the locate of its keys; [`cost_of`] prices it.
+        let query = match query {
+            RunQuery::Count => &RunQuery::Locate,
+            q => q,
+        };
         let column = planned_time_column(planner, specs, keys.columns(), query)?;
         let query = match (query, column) {
             (
@@ -361,7 +367,7 @@ impl<'a> Replayer<'a> {
     ) -> Result<RunCost> {
         let planner = self.planner_for(specs)?;
         let plan = self.verified_plan(planner.as_ref(), specs, keys, query)?;
-        Ok(run_cost(run_id, keys.len() as u64, &plan, true))
+        Ok(cost_of(query, run_id, keys.len() as u64, &plan))
     }
 
     /// The plan for one ad hoc `locate` key set under `specs`, as costed.
@@ -397,7 +403,7 @@ impl<'a> Replayer<'a> {
                 let rk = workload.run_keys(keys, run)?;
                 let query = run.query()?;
                 let plan = self.verified_plan(planner.as_ref(), specs, &rk, &query)?;
-                Ok(run_cost(&run.run_id, rk.len() as u64, &plan, true))
+                Ok(cost_of(&query, &run.run_id, rk.len() as u64, &plan))
             })
             .collect()
     }
@@ -419,7 +425,7 @@ impl<'a> Replayer<'a> {
             .map(|run| {
                 let rk = workload.run_keys(keys, run)?;
                 let plan = self.verified_plan(planner.as_ref(), specs, &rk, query)?;
-                Ok(run_cost(&run.run_id, rk.len() as u64, &plan, true))
+                Ok(cost_of(query, &run.run_id, rk.len() as u64, &plan))
             })
             .collect()
     }
@@ -461,7 +467,7 @@ impl<'a> Replayer<'a> {
                 check_types(&self.catalog, &rk)?;
                 let plan = planner.plan(&rk, run.window.as_ref())?;
                 self.catalog.verify_plan(&plan)?;
-                Ok(run_cost(&run.run_id, rk.len() as u64, &plan, true))
+                Ok(run_cost(&run.run_id, rk.len() as u64, &plan))
             })
             .collect()
     }
@@ -747,4 +753,13 @@ fn distinct_columns(workload: &Workload) -> Vec<Vec<String>> {
     out.sort();
     out.dedup();
     out
+}
+
+/// A run's cost under its verified plan: [`count_cost`] for a `count` run,
+/// [`run_cost`] for every other kind.
+fn cost_of(query: &RunQuery, run_id: &str, keys: u64, plan: &ScanPlan) -> RunCost {
+    match query {
+        RunQuery::Count => count_cost(run_id, keys, plan),
+        _ => run_cost(run_id, keys, plan),
+    }
 }

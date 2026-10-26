@@ -40,7 +40,7 @@ use std::fmt;
 
 use arrow::array::{ArrayRef, RecordBatch};
 use arrow::datatypes::{DataType, Schema};
-use bellwether_types::format::{ENCODING_VERSION, STORAGE_VERSION};
+use bellwether_types::format::ENCODING_VERSION;
 use bellwether_types::{Error, Hash, Result, RowGroupId};
 use roaring::RoaringBitmap;
 use serde::{Deserialize, Serialize};
@@ -48,6 +48,11 @@ use serde::{Deserialize, Serialize};
 use crate::encoding::{self, tuple_has_null, KeyColumns};
 use crate::segment::{segment_path, ColumnType, ReadAt, CODEC_NONE, FOOTER_LEN, PREAMBLE_LEN};
 
+/// The storage version of the sidecar layout this module reads and writes.
+/// Sidecars are the storage version 1 form of per-key time bounds and
+/// bitemporal versions; storage version 2 keeps their bytes unchanged
+/// (ADR 028), so a sidecar always records version 1.
+pub const SIDECAR_LAYOUT_VERSION: u32 = 1;
 /// First and last eight bytes of every sidecar segment file.
 pub const MAGIC: [u8; 8] = *b"BWSIDECR";
 
@@ -73,11 +78,11 @@ fn len_u32(n: usize) -> Result<u32> {
 }
 
 fn check_versions(storage: u32, encoding: u32) -> Result<()> {
-    if storage > STORAGE_VERSION {
+    if storage > SIDECAR_LAYOUT_VERSION {
         return Err(Error::UnsupportedVersion {
             what: "storage",
             found: storage,
-            supported: STORAGE_VERSION,
+            supported: SIDECAR_LAYOUT_VERSION,
         });
     }
     if encoding > ENCODING_VERSION {
@@ -447,7 +452,8 @@ fn describe_unit(u: crate::segment::RecordedUnit) -> &'static str {
 /// preserved in `extra` (ADR 017).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SidecarHeader {
-    /// `bellwether_types::format::STORAGE_VERSION` at write time.
+    /// The storage version whose layout the body has: always
+    /// [`SIDECAR_LAYOUT_VERSION`] when written by this crate.
     pub storage_version: u32,
     /// `bellwether_types::format::ENCODING_VERSION` at write time.
     pub encoding_version: u32,
@@ -473,11 +479,12 @@ pub struct SidecarHeader {
 }
 
 impl SidecarHeader {
-    /// A header for `def` at the current storage and encoding versions.
+    /// A header for `def` at the sidecar layout's storage version and the
+    /// current encoding version.
     #[must_use]
     pub fn new(def: &SidecarDef) -> Self {
         Self {
-            storage_version: STORAGE_VERSION,
+            storage_version: SIDECAR_LAYOUT_VERSION,
             encoding_version: ENCODING_VERSION,
             kind: def.kind,
             columns: def.columns.clone(),

@@ -17,6 +17,7 @@ use bellwether_store::{
     FileEntry, Manifest, RowGroupSpace, RowGroupTombstone, SchemaInfo, SegmentRef, SourceInfo,
     StagedSegments, StoreExt,
 };
+use bellwether_types::format::STORAGE_VERSION;
 use bellwether_types::{Error, FileFingerprint, KeySpec, Result, RowGroupId};
 use roaring::RoaringBitmap;
 
@@ -81,6 +82,16 @@ pub struct BuildReport {
     /// Key specs removed because [`BuildOptions::remove_unlisted`] was set
     /// and they were not listed; their segments were dropped.
     pub specs_removed: Vec<String>,
+    /// Unchanged files whose per-row-group statistics (storage version 2:
+    /// rows, bytes, column bytes) this build recorded, each from one
+    /// `Source::row_groups` call: every file of a version 1 manifest on the
+    /// first build by this binary, and every file when the schema's columns
+    /// changed.
+    pub files_filled: u64,
+    /// The storage version of the manifest this build committed over, when
+    /// older than this binary's: the commit upgraded the index to
+    /// [`bellwether_types::format::STORAGE_VERSION`] (ADR 028).
+    pub upgraded_from: Option<u32>,
     /// Restarts after a conflicting concurrent commit.
     pub restarts: u32,
     /// Most row groups held by workers at once (at most the thread count).
@@ -158,10 +169,13 @@ impl<S: StoreExt + ?Sized> Builder<S> {
                     }
                     Some(_) => {}
                 }
+                // Segments and completeness are keyed by the declared
+                // spec's identity (storage version 2).
+                let identity = spec.identity();
                 let mut next = m.clone();
                 next.schema.key_specs.retain(|s| s.name() != name);
-                next.segments.retain(|s| s.key_spec != name);
-                next.key_spec_completeness.remove(&name);
+                next.segments.retain(|s| s.key_spec != identity);
+                next.key_spec_completeness.remove(&identity);
                 Ok(next)
             },
         );
@@ -324,6 +338,10 @@ impl<S: StoreExt + ?Sized> Builder<S> {
         match committed {
             Ok(c) => {
                 report.sequence = Some(c.sequence);
+                report.upgraded_from = base
+                    .as_ref()
+                    .map(|m| m.storage_version)
+                    .filter(|&v| v < STORAGE_VERSION);
                 report.segments = written.segments;
                 Ok(Attempt::Done(report))
             }
@@ -657,7 +675,7 @@ fn plan_specs(
             };
             Ok(SpecPlan {
                 target: Target::Key(spec.clone()),
-                name,
+                name: spec.identity(),
                 key_types,
                 ts_type,
                 time_types: Vec::new(),
@@ -707,6 +725,8 @@ struct FileCounts {
     unchanged: u64,
     assigned: u64,
     retired: u64,
+    /// Unchanged files whose storage version 2 statistics were filled.
+    filled: u64,
 }
 
 /// The tracked files and row-group space after this build.
@@ -725,6 +745,7 @@ impl FilePlan {
             files_unchanged: self.counts.unchanged,
             row_groups_assigned: self.counts.assigned,
             row_groups_retired: self.counts.retired,
+            files_filled: self.counts.filled,
             specs_rebuilt: work.replaced.iter().cloned().collect(),
             specs_removed: work.removed.clone(),
             ..BuildReport::default()
@@ -763,14 +784,41 @@ fn plan_files(
             counts.removed += 1;
         }
     }
+    let columns: Vec<String> = cfg.columns.iter().map(|c| c.name.clone()).collect();
+    // Column bytes are aligned with the schema's columns, so a schema whose
+    // columns changed refills them for every file.
+    let columns_changed =
+        base.is_some_and(|m| !m.schema.columns.iter().map(|c| &c.name).eq(columns.iter()));
     let mut next = base_space.next_id;
     let mut entries = Vec::with_capacity(discovered.len());
     for fp in discovered {
         if let Some(old) = by_path.get(fp.path.as_str()) {
             if old.fingerprint == *fp {
-                entries.push((*old).clone());
-                counts.unchanged += 1;
-                continue;
+                let current = old.has_rowgroup_stats()
+                    && (old.column_bytes.is_none() == cfg.kind.text_format().is_some())
+                    && !columns_changed;
+                if current {
+                    entries.push((*old).clone());
+                    counts.unchanged += 1;
+                    continue;
+                }
+                // A version 1 entry, or one whose column bytes no longer
+                // align: fill the statistics from one `row_groups` call. A
+                // footer that disagrees with the recorded row-group count
+                // is drift under an unchanged fingerprint (ADR 013): the
+                // file's ids are retired and reassigned like a changed
+                // file's.
+                let stats = sources.rowgroup_stats(fp, old.chunk_size, &columns)?;
+                if stats.rows.len() == old.rowgroup_ids.len() {
+                    let mut e = (*old).clone();
+                    e.rowgroup_rows = Some(stats.rows);
+                    e.rowgroup_bytes = Some(stats.bytes);
+                    e.column_bytes = stats.column_bytes;
+                    entries.push(e);
+                    counts.unchanged += 1;
+                    counts.filled += 1;
+                    continue;
+                }
             }
             retired.extend(&old.rowgroup_ids);
             counts.changed += 1;
@@ -781,6 +829,16 @@ fn plan_files(
         let layout = sources.layout(fp, chunk_size)?;
         if let Some(o) = observer {
             o.file_laid_out(fp);
+        }
+        let stats = sources.rowgroup_stats(fp, chunk_size, &columns)?;
+        if stats.rows.len() != layout.row_groups {
+            return Err(Error::Source(format!(
+                "{}: the file lists {} row groups, then {}; it changed while the build read it, \
+                 so run the build again",
+                fp.path,
+                layout.row_groups,
+                stats.rows.len()
+            )));
         }
         let n = u32::try_from(layout.row_groups)
             .map_err(|_| Error::Other(format!("{}: too many row groups", fp.path)))?;
@@ -802,9 +860,9 @@ fn plan_files(
                     .collect()
             }),
             extra: Extra::new(),
-            rowgroup_rows: None,
-            rowgroup_bytes: None,
-            column_bytes: None,
+            rowgroup_rows: Some(stats.rows),
+            rowgroup_bytes: Some(stats.bytes),
+            column_bytes: stats.column_bytes,
         });
         next = end;
     }
@@ -916,7 +974,7 @@ fn plan_work(
     };
     let base_targets = base.map(declared_targets).unwrap_or_default();
     for p in specs {
-        let old = base_targets.iter().find(|t| t.name() == p.name);
+        let old = base_targets.iter().find(|t| t.slot() == p.target.slot());
         let types_changed = match &cfg.base_schema {
             Some(bs) => types_differ(bs, &cfg.schema, &p.target),
             None => old.is_some(),
@@ -933,11 +991,12 @@ fn plan_work(
             work.keep.insert(p.name.clone());
         }
     }
-    let declared: BTreeSet<&str> = specs.iter().map(|p| p.name.as_str()).collect();
+    // A spec redefined under its slot is rebuilt, not removed.
+    let declared: BTreeSet<String> = specs.iter().map(|p| p.target.slot()).collect();
     work.removed = base_targets
         .iter()
+        .filter(|t| !declared.contains(&t.slot()))
         .map(Target::name)
-        .filter(|n| !declared.contains(n.as_str()))
         .collect();
     work
 }
@@ -957,6 +1016,8 @@ fn is_noop(
     let unchanged = files.counts.new == 0
         && files.counts.changed == 0
         && files.counts.removed == 0
+        && files.counts.filled == 0
+        && m.storage_version == STORAGE_VERSION
         && work.needed.iter().all(RoaringBitmap::is_empty)
         && work.replaced.is_empty()
         && work.removed.is_empty()

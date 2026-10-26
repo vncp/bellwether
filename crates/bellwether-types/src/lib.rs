@@ -1262,38 +1262,6 @@ pub struct Proposal {
     pub body: ProposalBody,
 }
 
-/// How a number was obtained (contract v3, ADR 026): computed exactly from
-/// the index and recorded statistics, bounded by an interval the statistics
-/// prove, or measured by a named model. Never estimated (ADR 005).
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum Exactness {
-    /// A sum of recorded statistics and index contents.
-    #[default]
-    Exact,
-    /// The true value lies in `[low, high]`, both proven.
-    Bounded {
-        /// Proven lower bound.
-        low: u64,
-        /// Proven upper bound.
-        high: u64,
-    },
-    /// Measured or predicted by the named model (ADR 027).
-    Measured {
-        /// The model, for example `layout.v1` or a database's measured cost.
-        model: String,
-    },
-}
-
-impl Exactness {
-    /// Whether this is [`Exactness::Exact`].
-    #[must_use]
-    pub fn is_exact(&self) -> bool {
-        matches!(self, Self::Exact)
-    }
-}
-
 /// A number with how it was obtained (contract v3).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
@@ -1347,8 +1315,10 @@ pub struct RunCost {
     #[serde(default, skip_serializing_if = "Exactness::is_exact")]
     pub exactness: Exactness,
     /// Rows holding the run's keys in the row groups it reads (contract
-    /// v3): Exact when the serving spec stores counts, Bounded otherwise.
-    /// Absent when not computed.
+    /// v3): exact, from the per-key counts of a serving spec that stores
+    /// them on exactly the run's key columns (`ScanPlan.rows`). Absent when
+    /// no serving spec counts. `Bounded` and `Measured` are reserved for
+    /// costs priced without counts (relational replay, WP15).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rows: Option<Quantity>,
 }
@@ -1607,6 +1577,57 @@ impl Record {
             Self::Receipt(r) => r.record_version,
         }
     }
+}
+
+// --- phase 5: one `why` column per index kind ---
+
+/// How a number was obtained (contract v3, ADR 026): computed exactly from
+/// the index and recorded statistics, bounded by an interval the statistics
+/// prove, or measured by a named model. Never estimated (ADR 005).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum Exactness {
+    /// A sum of recorded statistics and index contents.
+    #[default]
+    Exact,
+    /// The true value lies in `[low, high]`, both proven.
+    Bounded {
+        /// Proven lower bound.
+        low: u64,
+        /// Proven upper bound.
+        high: u64,
+    },
+    /// Measured or predicted by the named model (ADR 027).
+    Measured {
+        /// The model, for example `layout.v1` or a database's measured cost.
+        model: String,
+    },
+}
+
+impl Exactness {
+    /// Whether this is [`Exactness::Exact`].
+    #[must_use]
+    pub fn is_exact(&self) -> bool {
+        matches!(self, Self::Exact)
+    }
+}
+
+/// One index kind's column in a `why` report row: the one number the kind
+/// contributes for a candidate (for example, for an `expr` key, the rows
+/// whose expression is null and the distinct derived values), rendered as
+/// one trailing funnel column headed `kind`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct KindColumn {
+    /// The index kind, the column's header (`expr`, `list`, `text`, ...).
+    pub kind: String,
+    /// What the value is, in a few words.
+    pub label: String,
+    /// The value, rendered.
+    pub value: String,
+    /// How the value was obtained.
+    pub exactness: Exactness,
 }
 
 #[cfg(test)]

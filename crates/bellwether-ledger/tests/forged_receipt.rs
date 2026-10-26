@@ -308,6 +308,8 @@ fn passing_certificate_with_differences_is_rejected() {
         |c: &mut bellwether_types::Certificate| c.body.mismatched = 1,
         |c: &mut bellwether_types::Certificate| c.body.missing_left = 1,
         |c: &mut bellwether_types::Certificate| c.body.missing_right = 1,
+        // rule 9, record version 3: an uncomparable key is not a pass
+        |c: &mut bellwether_types::Certificate| c.body.uncomparable = 1,
         |c: &mut bellwether_types::Certificate| {
             c.body.totals_delta = vec![("g".into(), "1.00".into(), "2.00".into())];
         },
