@@ -42,7 +42,7 @@ Dependencies today: `types`, `core` (spec validation), `source` (sources, finger
 | `EngineOptions` field | CLI | Meaning |
 |---|---|---|
 | `index` | `--index` | The index location; default `<root>/.bellwether/`. |
-| `format`, `chunk_size` | `--format`, `--chunk-size` | Parquet, CSV, or JSON lines; the text chunk size for new files. |
+| `format`, `chunk_size` | `--format`, `--chunk-size` | Parquet, CSV, or JSON lines; the text chunk size for new files. `--chunk-size` with Parquet is a usage error (exit 2) for every verb, at option parsing (`EngineArgs::options`). |
 | `fingerprint_policy` | `--fingerprint-policy tail64k\|full` | Which bytes a file fingerprint hashes when a new index is built (ADR 013). An existing index keeps its recorded policy. |
 | `schema` | `--schema <file>` | The dataset schema, instead of inferring it from the first file in sorted order. Needed when files store a column at different decimal scales or time units; a value that does not fit the inferred type is refused with an error naming `--schema`. The file is a JSON list of `{"name", "type", "nullable"}` with Arrow type spellings, as the manifest records them (`schema_from_json`). |
 | `partitioning` | `--partitioning none\|hive`, `--path-template <PATTERN>` | When a new index is built, by `index` or by `fix`'s apply stage (one set of build options, `Engine::build_options`), or an unindexed folder read: `hive` makes `name=value` directories below the root columns, and a path template (`Partitioning::Template`, for example `{day:date}.parquet`) makes its placeholders columns, for every source format. An existing index keeps its recorded scheme; another one (a changed template included) is refused. `bellwether-mcp` and `bellwether mcp` take the same two flags. |

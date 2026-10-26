@@ -4,7 +4,7 @@
 //! every ledger record a command wrote or read is embedded whole, with its
 //! hash, exactly as the ledger stores it ([`Written`]).
 
-use bellwether_ledger::RecordKind;
+use bellwether_ledger::{RecordKind, SignatureStatus, Verdict};
 use bellwether_types::{Hash, KeySpec, Record};
 use serde::{Deserialize, Serialize};
 
@@ -335,6 +335,16 @@ pub struct ChainLink {
     pub status: LinkStatus,
     /// Key facts, as ordered `(name, value)` pairs.
     pub facts: Vec<(String, String)>,
+    /// For the receipt and its certificate, when they resolved: every
+    /// signature object beside the record, each verified on its own (ADR
+    /// 029). Absent for the other links and for flagged ones.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signatures: Option<Vec<SignatureStatus>>,
+    /// For the receipt and its certificate, when the engine was given
+    /// trusted keys: those signatures folded against them (`signed`,
+    /// `untrusted`, `unsigned`, or `invalid`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verdict: Option<Verdict>,
 }
 
 /// What [`crate::Engine::receipt`] found: the chain behind a receipt, with
@@ -351,6 +361,50 @@ pub struct ReceiptResult {
     pub chain: Vec<ChainLink>,
     /// Every link's record that resolved, in chain order.
     pub records: Vec<Written>,
+    /// The data roots the chain's resolved evidence is about: a profile's
+    /// root, and the folder of every file a plan names outside this
+    /// engine's root. Sorted, each once.
+    pub roots: Vec<String>,
+    /// With trusted keys: whether the chain is signed, which needs all of
+    /// every link intact, the receipt and its certificate each signed by a
+    /// trusted key within its window, and the evidence about this engine's
+    /// data root. `None` without trusted keys. A receipt alone does not
+    /// count: a certificate planted in the store and applied would otherwise
+    /// ride on a signed receipt. Signatures bind content, not location, so a
+    /// chain copied from another index is refused by its root.
+    pub signed: Option<bool>,
+    /// With trusted keys, when `signed` is false: the first reason.
+    pub not_signed: Option<NotSigned>,
+}
+
+/// Why a chain is not signed against trusted keys, in the order checked.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum NotSigned {
+    /// A link is missing, of the wrong kind, or unreadable, so the chain
+    /// does not stand whatever its signatures say.
+    LinksFlagged {
+        /// The first flagged link.
+        link: Hash,
+        /// The kind the chain expects there.
+        link_kind: RecordKind,
+        /// How it is flagged.
+        status: LinkStatus,
+    },
+    /// The receipt or the certificate is not signed by a trusted key in
+    /// its window; their links' `verdict`s say how.
+    Verdicts,
+    /// Both are signed by trusted keys, but the evidence is about another
+    /// data root: a signed chain copied from another index.
+    OtherRoot {
+        /// The roots the evidence names.
+        roots: Vec<String>,
+        /// This engine's data root.
+        expected: String,
+    },
+    /// Both are signed, but no resolved evidence names a data root, so the
+    /// chain cannot be tied to this one.
+    NoRoot,
 }
 
 /// Costs summed over runs.
@@ -380,4 +434,9 @@ pub struct ReportResult {
     pub realized: u64,
     /// Records this build could not read, listed and skipped.
     pub unreadable: Vec<Hash>,
+    /// With trusted keys: how many of `receipts` are signed, by the rule of
+    /// [`ReceiptResult::signed`] (intact links, receipt and certificate each
+    /// signed by a trusted key in its window, evidence about this data
+    /// root). `None` without trusted keys.
+    pub signed: Option<u64>,
 }

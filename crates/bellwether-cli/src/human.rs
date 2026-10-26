@@ -385,7 +385,10 @@ pub(crate) fn receipt(r: &ReceiptResult, out: &Out) -> String {
             }
             LinkStatus::Unreadable { reason } => format!("  UNREADABLE ({reason})"),
         };
-        let facts: Vec<String> = l.facts.iter().map(|(k, v)| format!("{k}={v}")).collect();
+        let mut facts: Vec<String> = l.facts.iter().map(|(k, v)| format!("{k}={v}")).collect();
+        if let Some(v) = &l.verdict {
+            facts.push(format!("sig={}", v.token()));
+        }
         let _ = writeln!(
             s,
             "  {}  {:<11}  {:<24}{flag}  {}",
@@ -395,6 +398,8 @@ pub(crate) fn receipt(r: &ReceiptResult, out: &Out) -> String {
             facts.join("  ")
         );
     }
+    let _ = writeln!(s, "signatures");
+    crate::keys_cmds::signature_lines(&mut s, r);
     s
 }
 
@@ -719,8 +724,15 @@ pub(crate) fn why(r: &bellwether::WhyReport, out: &Out) -> String {
 }
 
 pub(crate) fn report(r: &ReportResult, _out: &Out) -> String {
+    let signed = r.signed.map_or_else(String::new, |n| {
+        format!(
+            "; {n} of {} receipts signed (receipt and certificate) by a trusted key",
+            r.receipts.len()
+        )
+    });
     format!(
-        "wrote {} ({} bytes): {} receipts ({} with realized bytes), {} profile evidence records\n",
+        "wrote {} ({} bytes): {} receipts ({} with realized bytes), {} profile evidence \
+         records{signed}\n",
         r.path,
         num(r.bytes),
         r.receipts.len(),
@@ -795,13 +807,41 @@ pub(crate) fn receipts(r: &bellwether::ReceiptsResult, out: &Out) -> String {
         } else {
             "LINKS FLAGGED"
         };
+        let signature = match (e.signed, &e.not_signed) {
+            (None, _) => String::new(),
+            (Some(true), _) => "  signed".to_string(),
+            (Some(false), Some(bellwether::NotSigned::LinksFlagged { .. })) => {
+                "  NOT SIGNED (links flagged)".to_string()
+            }
+            (Some(false), Some(bellwether::NotSigned::OtherRoot { roots, .. })) => format!(
+                "  NOT SIGNED (signed, but for {})",
+                bellwether::printable(&roots.join(", "))
+            ),
+            (Some(false), Some(bellwether::NotSigned::NoRoot)) => {
+                "  NOT SIGNED (no evidence names a data root)".to_string()
+            }
+            (Some(false), _) => {
+                let word = |k: bellwether::RecordKind| {
+                    e.chain
+                        .iter()
+                        .find(|l| l.kind == k)
+                        .and_then(|l| l.verdict.as_ref())
+                        .map_or("not readable", |v| v.word())
+                };
+                format!(
+                    "  NOT SIGNED (receipt {}, certificate {})",
+                    word(bellwether::RecordKind::Receipt),
+                    word(bellwether::RecordKind::Certificate)
+                )
+            }
+        };
         let _ = writeln!(
             s,
-            "  {}  {}  manifest {} -> {}  {state}",
+            "  {}  {}  manifest {} -> {}  {state}{signature}",
             short(&e.receipt.hash),
-            rc.created_at,
-            rc.manifest_before,
-            rc.manifest_after
+            bellwether::printable(&rc.created_at),
+            bellwether::printable(&rc.manifest_before),
+            bellwether::printable(&rc.manifest_after)
         );
     }
     unreadable_line(&mut s, &r.unreadable);
