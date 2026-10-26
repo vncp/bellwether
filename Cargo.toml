@@ -11,6 +11,7 @@ members = [
     "crates/bellwether-profile",
     "crates/bellwether-replay",
     "crates/bellwether-source",
+    "crates/bellwether-source-sql",
     "crates/bellwether-store",
     "crates/bellwether-types",
     "crates/bellwether-verify",

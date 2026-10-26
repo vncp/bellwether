@@ -17,11 +17,10 @@ One crate, one owner, one interface contract each. WP0 ships first and alone. Af
 | WP9 facade and cli | merged: why, index, locate, latest, asof, propose, reconcile, fix, receipt, report; profile wired into `why` |
 | Dependency upgrade | merged: arrow/parquet 59, object_store 0.14, DataFusion 55 (bench feature); `deny.toml` has no advisory ignores |
 | WP12 mcp | merged: observe, score, propose, apply, and jobs tools; resources; the prompt generated from `AGENTS.md`; typed refusals, dry runs, per-session budgets; ADR 010 against the CLI |
-| WP20 sql | next |
+| WP20 sql | in review: `bellwether-source-sql`, `sql://` roots through the facade, CLI, and MCP; reconcile a table against files; measured `why`; attest-only `fix` |
 | WP13 evolve | after M3 |
 | WP14 counted segments and column bytes, WP15 relational replay, WP16 engine adapters, WP17 CI receipts, WP18 transfer evaluation | planned 2026-10-24 (ADR 026) |
 | WP19 signed receipts | merged in wave A: detached ed25519 signatures beside receipts and certificates (ADR 029), no record or format version change; M8's signing half done |
-| WP20 SQL sources | planned 2026-10-24 (ADR 027); runs right after WP12 |
 | WP21 time-series keys | merged: partition values from Hive-style paths, ordered plans, `--at-manifest` pinned lookups over a manifest history, per-key time bounds (`bounds` sidecar), bitemporal as-of (`temporal2` sidecar), the `market` bench corpus with measured funnels |
 | WP22 performance | next after WP21; measured in release builds |
 

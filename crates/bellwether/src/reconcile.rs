@@ -7,7 +7,17 @@ use bellwether_verify::{
 };
 use serde::{Deserialize, Serialize};
 
-use crate::engine::{guard, Engine};
+use std::time::Duration;
+
+use bellwether_source_sql::{is_sql_root, SqlUrl, TableRun};
+use bellwether_types::Source;
+use bellwether_verify::AgedInput;
+
+use std::sync::Arc;
+
+use bellwether_source_sql::SqlSource;
+
+use crate::engine::{guard, Engine, Pinned, TableSource};
 use crate::results::Written;
 
 /// How to reconcile two folders.
@@ -45,6 +55,11 @@ pub struct ReconcileResult {
     pub certificate: Written,
     /// The typed outcome: counts, the first mismatches, totals, sides.
     pub outcome: Reconciliation,
+    /// Each side that is a table (ADR 027): its units and rows, and the
+    /// snapshot the run held or the re-read of every unit's identity that
+    /// stood in for one. Empty (and omitted) when both sides are folders.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tables: Vec<TableRun>,
 }
 
 /// A reconcile request the engine would refuse for what it asks, not for
@@ -163,17 +178,27 @@ impl Engine {
                 "a reconcile compares rows by key; pass --key <columns>".into(),
             ));
         }
-        let right = std::fs::canonicalize(right)
-            .map_err(|e| {
-                Error::Source(format!(
-                    "cannot open the right side {right:?} ({e}); pass an existing folder"
-                ))
-            })?
-            .to_string_lossy()
-            .into_owned();
+        let right = if is_sql_root(right) {
+            right.to_string()
+        } else {
+            std::fs::canonicalize(right)
+                .map_err(|e| {
+                    Error::Source(format!(
+                        "cannot open the right side {right:?} ({e}); pass an existing folder or \
+                         a sql:// table"
+                    ))
+                })?
+                .to_string_lossy()
+                .into_owned()
+        };
+        let right_root = if is_sql_root(&right) {
+            SqlUrl::parse(&right)?.root()
+        } else {
+            right.clone()
+        };
         let pinned = self.pin()?;
-        let left_source = self.source(pinned.as_ref())?;
-        let right_source = self.output_source(&right)?;
+        let (left_source, right_source, identities) =
+            self.reconcile_sides(pinned.as_ref(), &right, &right_root)?;
         let mut spec = ReconcileSpec::new(req.key.clone())
             .ignore(req.ignore.clone())
             .with_totals(total_columns(&req.totals)?)
@@ -191,7 +216,13 @@ impl Engine {
                 hash: p.hash,
                 age: p.age,
             }),
-            inputs: Vec::new(),
+            inputs: identities
+                .into_iter()
+                .map(|hash| AgedInput {
+                    hash,
+                    age: Duration::ZERO,
+                })
+                .collect(),
             clock: self.options().clock.clone(),
         };
         let mut options = Options::default();
@@ -200,15 +231,118 @@ impl Engine {
         }
         let certified = self.reconciler(spec, options)?.certify(
             &Side::new(&*left_source, self.root()),
-            &Side::new(&*right_source, &right),
+            &Side::new(&*right_source, &right_root),
             &ctx,
         )?;
         let certificate = self.record_certified(&certified)?;
         Ok(ReconcileResult {
             certificate,
             outcome: certified.outcome,
+            tables: self.finish_tables()?,
         })
     }
+
+    /// The two sides' sources, and each table side's identity (cited by the
+    /// certificate beside the catalog digests). When one side is a table and
+    /// the other a folder, the table is read at the folder's dataset types
+    /// where the two differ only in decimal scale, time unit, or integer or
+    /// float width (every value converted exactly or refused; ADR 016), so
+    /// the comparison is at one type per column. A `--schema` given for the
+    /// data root wins over that.
+    #[allow(clippy::type_complexity)]
+    fn reconcile_sides(
+        &self,
+        pinned: Option<&Pinned>,
+        right: &str,
+        right_root: &str,
+    ) -> Result<(
+        Box<dyn Source>,
+        Box<dyn Source>,
+        Vec<bellwether_types::Hash>,
+    )> {
+        let table = |url: &str, schema| -> Result<(Box<dyn Source>, Arc<SqlSource>)> {
+            let s = self.open_table_source(url, schema)?;
+            Ok((Box::new(TableSource(Arc::clone(&s))), s))
+        };
+        let given = self.options().schema.clone();
+        let (left, right_src, handles) = match (self.table_url(), is_sql_root(right)) {
+            (Some(url), false) => {
+                let files = self.output_source(right)?;
+                let (probe, _) = table(url, given.clone())?;
+                let schema = adopt(
+                    &*probe.schema(self.root())?,
+                    &*files.schema(right_root)?,
+                    given.as_deref(),
+                );
+                drop(probe);
+                let (l, h) = table(url, schema.or(given))?;
+                (l, files, vec![h])
+            }
+            (None, true) => {
+                let files = self.source(pinned)?;
+                let (probe, _) = table(right, None)?;
+                let schema = adopt(
+                    &*probe.schema(right_root)?,
+                    &*files.schema(self.root())?,
+                    None,
+                );
+                drop(probe);
+                let (r, h) = table(right, schema)?;
+                (files, r, vec![h])
+            }
+            (Some(url), true) => {
+                let (l, hl) = table(url, given)?;
+                let (r, hr) = table(right, None)?;
+                (l, r, vec![hl, hr])
+            }
+            (None, false) => (self.source(pinned)?, self.output_source(right)?, Vec::new()),
+        };
+        let identities = handles
+            .iter()
+            .map(|h| h.identity())
+            .collect::<Result<Vec<_>>>()?;
+        Ok((left, right_src, identities))
+    }
+}
+
+/// The dataset types a table side takes from the folder it is compared
+/// with: each column both have whose types differ only in decimal scale,
+/// time unit or zone, integer width, float width, or string or binary
+/// representation, at the folder's type; columns `given` names keep the
+/// given type. `None` when nothing changes.
+fn adopt(
+    table: &arrow::datatypes::Schema,
+    files: &arrow::datatypes::Schema,
+    given: Option<&arrow::datatypes::Schema>,
+) -> Option<arrow::datatypes::SchemaRef> {
+    use arrow::datatypes::DataType as D;
+    let family = |d: &D| match d {
+        D::Decimal128(..) | D::Decimal256(..) => 1,
+        D::Timestamp(..) => 2,
+        d if d.is_integer() => 3,
+        D::Float32 | D::Float64 => 4,
+        D::Utf8 | D::LargeUtf8 | D::Utf8View => 5,
+        D::Binary | D::LargeBinary | D::BinaryView => 6,
+        _ => 0,
+    };
+    let mut fields: Vec<arrow::datatypes::Field> = given
+        .map(|g| g.fields().iter().map(|f| f.as_ref().clone()).collect())
+        .unwrap_or_default();
+    let before = fields.len();
+    for t in table.fields() {
+        if fields.iter().any(|f| f.name() == t.name()) {
+            continue;
+        }
+        if let Ok(f) = files.field_with_name(t.name()) {
+            let (a, b) = (t.data_type(), f.data_type());
+            let decimal256 = matches!(b, D::Decimal256(..));
+            if a != b && family(a) != 0 && family(a) == family(b) && !decimal256 {
+                fields.push(arrow::datatypes::Field::new(t.name(), b.clone(), true));
+            }
+        }
+    }
+    (fields.len() > before || given.is_some())
+        .then(|| std::sync::Arc::new(arrow::datatypes::Schema::new(fields)))
 }
 
 /// Whether the verifier totals a column of type `dt` as given: a 128- or

@@ -387,6 +387,23 @@ python3 scripts/render_terminal.py --check    # README captures match their comm
 
 CI also asserts the latency budgets in release builds (the bench SLOs, replay's p50-run budget, and `observe.why` under 100 ms in process and over stdio) and checks that a frozen format fixture still reads once one exists (M5). The README's captures come from [`scripts/readme-captures.sh`](scripts/readme-captures.sh): it generates its data with `bellwether bench`, runs every command shown in a pseudo-terminal, stores the text beside each image, and redraws them.
 
+## Tables as sources
+
+A SQL table reads like a folder (ADR 027, `bellwether-source-sql`): SQLite in process, DuckDB, Postgres, and Flight SQL through ADBC, SQL Server through ODBC. A run without a snapshot re-reads each unit's identity at the end, and that identity is a checksum of the unit's statistics unless the root names a version column (`version=<column>`): an in-place update that keeps every column's bounds, null count, and bytes is not seen without one. Reconcile a table against the files it came from, ask `why` a lookup over it is slow (every cost measured, and labeled so), and `fix` verifies a key and names the `CREATE INDEX` a human runs: the engine changes nothing in a database and writes no receipt for it.
+
+```bash
+# the table against the Parquet files it was loaded from: a certificate naming both
+bellwether reconcile 'sql://duckdb/main.trips?db=taxi.duckdb&range=tpep_pickup_datetime&units=24' ./taxi/ \
+    --key VendorID,tpep_pickup_datetime,PULocationID,fare_amount --totals fare_amount:dec(2) --index ./ledger
+# why these lookups read what they read in the table, costs measured
+bellwether why 'sql://duckdb/main.trips?db=taxi.duckdb&range=tpep_pickup_datetime&units=24' \
+    --from keys/taxi_pu.parquet --index ./ledger
+# reproduce the measured run over 20 million NYC taxi rows in DuckDB and SQLite
+scripts/sql-demo.sh
+```
+
+Measured 2026-10-26 (UTC) on an Apple M3 Pro (12 cores, 36 GB, macOS 26.4.1), release build: reconciling 20,314,139 keys took 42 s from the DuckDB table and 105 s from the SQLite table against 42 s between two Parquet copies (host load average about 6), each PASS inside one snapshot; with one changed, one deleted, and one added row each table FAILed with exactly 1 mismatched, 1 missing on each side. Results: [`docs/measured/results/sql.json`](docs/measured/results/sql.json), written by [`scripts/sql-demo.sh`](scripts/sql-demo.sh). Which numbers over a table are counts, bounds, or measured: [the crate README](crates/bellwether-source-sql/README.md). A run without a snapshot re-reads every unit's identity at the end; that identity is a checksum of the unit's statistics unless the root names a version column (`version=<column>`), so an in-place update that keeps every column's bounds, null count, and bytes is not seen.
+
 ## Status
 
 Pre-alpha. The architecture and on-disk format are fixed and documented; the crates are being built against them, each landing by reviewed pull request. Milestones as [`docs/work-packages.md`](docs/work-packages.md) defines them:

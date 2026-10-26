@@ -16,6 +16,10 @@ path = "src/main.rs"
 # would collide with the library of the same name.
 doc = false
 
+[features]
+# SQL Server tables through ODBC (links the system ODBC driver manager).
+odbc = ["bellwether/odbc"]
+
 [dependencies]
 # The one engine surface (ADR 010).
 bellwether = { path = "../bellwether" }

@@ -44,6 +44,7 @@ impl Engine {
     }
 
     fn index_inner(&self, declared: &[Declaration]) -> Result<IndexResult> {
+        self.require_folder("index")?;
         self.require_current("index")?;
         if declared.is_empty() && self.manifest()?.is_none() {
             return Err(Error::KeySpec(
@@ -249,6 +250,7 @@ impl Engine {
             | Mode::Lookback { at: None, .. } => "latest",
             Mode::Asof(_) | Mode::Bitemporal { .. } | Mode::Lookback { .. } => "asof",
         };
+        self.require_folder(verb)?;
         let pinned = self.pin_required(verb)?;
         self.refuse_stale(&pinned, verb)?;
         let (specs, excluded) = pinned.specs();

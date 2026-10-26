@@ -115,7 +115,9 @@ enum Command {
 
 #[derive(Args)]
 pub(crate) struct RootArg {
-    /// The folder of data files.
+    /// The folder of data files, or a table:
+    /// sql://<engine>/<schema>.<table>?db=<connection> (needs --index;
+    /// lookups and index builds take a folder only).
     pub(crate) root: String,
 }
 
@@ -471,9 +473,14 @@ impl From<Error> for Failure {
             Error::InvalidArgument {
                 field:
                     "lookback" | "latest_by" | "signing_key" | "trusted_keys" | "public_key" | "out"
-                    | "name" | "valid_from" | "revoked_at",
+                    | "name" | "valid_from" | "revoked_at" | "index" | "root",
                 ..
-            } => Self::Usage(e.to_string()),
+            } => Self::Usage(match hint(&e) {
+                Some(h) => format!("{e}; {h}"),
+                None => e.to_string(),
+            }),
+            // A table given where a folder is needed: the caller's to fix.
+            Error::NotAFolder { .. } => Self::Usage(e.to_string()),
             e => Self::Engine(e),
         }
     }
@@ -529,6 +536,7 @@ fn hint(e: &Error) -> Option<String> {
                 "shape" => "--before, --after, and --invariant",
                 "workload" => "--from, --bench-workload, or --workload",
                 "rewrite" => "--before-output and --after-output",
+                "index" => "--index <dir>",
                 _ => return None,
             };
             Some(format!("check {flag}"))
@@ -935,6 +943,16 @@ fn why(g: &Global, out: &Out, a: &WhyArgs) -> Result<Outcome, Failure> {
                 .into(),
         ));
     }
-    let r = engine_at(g, &a.root.root, a.at_manifest)?.why(&request)?;
-    done(&r, human::why(&r, out), EXIT_OK)
+    let e = engine_at(g, &a.root.root, a.at_manifest)?;
+    let r = e.why(&request)?;
+    let fix_command = if e.is_table() {
+        format!(
+            "bellwether fix '{}' --index {}",
+            bellwether::redact_db(&a.root.root),
+            e.index_location()
+        )
+    } else {
+        format!("bellwether fix {}", r.root)
+    };
+    done(&r, human::why(&r, out, &fix_command), EXIT_OK)
 }

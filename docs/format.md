@@ -135,6 +135,36 @@ The pinned digests in `bellwether_source::catalog`'s tests were refreshed with t
 
 **Downgrade is one-way.** Once a newer binary has committed to an index, a binary built on Arrow 53 refuses that index. The commit rewrites the manifest's type spellings (see "Manifest column types") into a form Arrow 53 does not parse. Strictly, this happens only when the dataset has a time or timestamp column; an index with neither is spelled the same by both. Nothing converts an index back. An index the newer binary has only read stays readable by both.
 
+## SQL sources: the `sql://` identity scheme (2026-10-25, ADR 027)
+
+A table is read through the same `Source` trait as a folder of files (`bellwether-source-sql`). Nothing in storage version 1 changes: a table never has an index (the engine builds none over a database), so these identities appear only in what a reconcile, `why`, or `fix` over a table records, through the catalog digest above and the source identity below.
+
+**Root.** `sql://<engine>/<schema>.<table>[,<schema>.<table>...]` with `engine` one of `sqlite`, `duckdb`, `postgres`, `flightsql`, `mssql`. The connection and the unit configuration follow `?` (`db=`, `driver=`, `range=`, `units=`, `version=`, `snapshot=`) and are never part of a recorded root: a record names `sql://<engine>/<tables>` only, so a password in a connection string never reaches the ledger. Every table of one root holds the same columns and declared types.
+
+**Units.** A unit plays a file of exactly one row group (`index_in_file` 0). Each table is cut, in order of preference, into its declared partitions (Postgres leaf partitions), else key ranges of `range=<column>` into at most `units=<n>` ranges plus one unit for its nulls, else one unit. Range boundaries are the column's values at ranks `k * count / n` in the engine's own order, so the ranges are `column < b1`, `b1 <= column < b2`, ..., `column >= bk`, and `column IS NULL`: every row in exactly one unit, which discovery checks (the units' row counts must sum to the table's `COUNT(*)`, else the cut is refused). Unit paths:
+
+```
+sql://<engine>/<schema>.<table>/all
+sql://<engine>/<schema>.<table>/partition=<schema>.<child>
+sql://<engine>/<schema>.<table>/<column>=null
+sql://<engine>/<schema>.<table>/<column>=[<lo>,<hi>)        lo = -inf for the first, hi = +inf for the last
+```
+
+**Fingerprint.** `path` is the unit path; `size` is the unit's row count (a count from the engine, not bytes); `etag` is the unit's identity string; `tail_blake3` is BLAKE3 of the identity string's UTF-8 bytes. The identity string is
+
+```
+v1;rows=<count>;version=<hex>      with version=<column>: BLAKE3 hex of the canonical encoding of MAX(<column>) over the unit, or "null"
+v1;rows=<count>;stats=<hex>        otherwise: Hash::of_record((rows, [ColumnStats, ...])), the unit's statistics as reported below
+```
+
+No engine this release reads exposes a per-table snapshot id, so ADR 027's second identity source is not used yet. The statistics checksum detects a change to the row count or to any column's minimum, maximum, null count, or byte count; an in-place update that keeps all of them is not detected by it, so a table updated in place should name a version column (one that increases on every write), or be read inside a snapshot.
+
+**Statistics.** One aggregate query per unit gives each column `COUNT(*) - COUNT(col)` (the null count, exact) and, where the engine can order in the canonical order, `MIN` and `MAX`, encoded as the dataset type (ADR 016): bounds attained by the data, never a sample. Strings are bounded in UTF-8 byte order (`COLLATE "C"` in Postgres, `COLLATE BINARY` in SQLite, `COLLATE "binary"` in DuckDB); SQL Server and Flight SQL report no string bounds (`None`), since their order is not byte order. Float bounds follow "Statistics semantics" above (a NaN bound is dropped). `distinct_count` is `None` and `has_bloom` false. `bytes` per column is the unit's logical bytes: for fixed-width types the non-null count times the type's width, for strings and binaries the engine's octet length summed; the unit's `RowGroupMeta.bytes` is their sum. They are measured, not storage bytes, which is why costs over a table are measured (ADR 027) and never stored as exact. Planner statistics (`pg_stats`, `sqlite_stat4`, BRIN summaries, DuckDB zone maps, columnstore segments) are not used as bounds: they are samples, or cover block ranges and row groups that are not the unit.
+
+**Source identity.** `SqlSource::identity` is `Hash::of_record((root, connection_identity, [(unit path, identity string), ...]))` in unit path order, where `connection_identity` is BLAKE3 of the connection with its credentials removed (a URI's `user:password@`, and query parameters or ODBC keys naming a password, token, secret, or key), so two databases holding a table of one name are two identities: the first implementation of contract v3 backlog #10. A certificate over a table cites it after the two catalog digests.
+
+**Snapshot.** A run over a table holds one read transaction where the engine has a snapshot (`BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY` in Postgres, `BEGIN TRANSACTION` in DuckDB, a deferred read transaction in SQLite, `SNAPSHOT` isolation in SQL Server when the database allows it) and rolls it back at the end. Otherwise (`snapshot=reread`, Flight SQL, or SQL Server without snapshot isolation) every unit's identity, and the list of partitions, is read again when the run ends, and any difference is refused (`Error::SourceChanged`) before anything is recorded. A unit read returning another row count than its identity says is refused either way.
+
 ## Build-side memory (ADR 018 note)
 
 The lookup bound is one block index plus the bitmaps for the keys asked. The build bound is one segment: a writer holds a segment's distinct keys until the segment is finished, because the segment's name is the hash of its bytes. The build crate therefore caps segment size (keys and bytes) and emits many segments rather than one large one; merge compacts them later.

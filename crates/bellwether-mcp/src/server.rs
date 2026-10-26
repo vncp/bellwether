@@ -364,6 +364,23 @@ impl Server {
             }
             "score.verify" => {
                 let a = parse!(ScoreVerify);
+                // A tool argument never names a database to connect to: a
+                // table is a data root the human gives at start (threat
+                // model).
+                if let Some(r) = &a.rewrite {
+                    if [&r.before, &r.after]
+                        .iter()
+                        .any(|p| bellwether::is_sql_root(p))
+                    {
+                        return failed(&bellwether::types::Error::InvalidArgument {
+                            field: "rewrite",
+                            reason: "a rewrite's outputs are folders of files here; a table \
+                                     (sql://) is read only as the data root the human starts \
+                                     the server with"
+                                .into(),
+                        });
+                    }
+                }
                 let request = FixRequest {
                     proposal: Some(a.proposal),
                     certificate: None,
