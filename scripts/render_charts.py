@@ -800,8 +800,9 @@ def no_gain_text(res, qids):
     which = f"all {len(qids)} of these questions" if len(refused) == len(qids) else f"{len(refused)} of these {len(qids)} questions"
     text = (
         f"On {which} Bellwether said so before building anything: `why` priced every candidate key by exact replay "
-        "over the footers against what the files' own min/max statistics already skip without an index, recommended "
-        "nothing, and `fix` refused to attest a key that saves nothing (`nothing_to_gain`)."
+        "over the footers against what the files' own min/max statistics already skip without an index (the full "
+        "scan where the files carry none), recommended nothing, and `fix` refused to attest a key that saves nothing "
+        "(`nothing_to_gain`)."
     )
     if attested:
         other = "On the remaining one" if len(attested) == 1 else f"On the other {len(attested)}"
@@ -810,6 +811,13 @@ def no_gain_text(res, qids):
             "plan read about as much as DuckDB alone."
         )
     return text + " The last column gives each cause."
+
+
+def timed_at(res, qids):
+    """` Timed at a 1-minute load average of a to b on n cores.`, or nothing
+    when the rows record no load."""
+    load = res.load_range(qids)
+    return f" Timed at a 1-minute load average of {load[0]:.1f} to {load[1]:.1f} on {load[2]} cores." if load else ""
 
 
 def readme_block(res):
@@ -852,8 +860,8 @@ def readme_block(res):
             f"<sub>{res.provenance_line(recs, load=True)}</sub>", "",
         ]
     parts += [
-        f"**Time.** {latency_takeaway(res)} Per-question times, the throughput chart, receipts, and the SQL: "
-        f"[the measured page]({MEASURED_PAGE}).",
+        f"**Time.** {latency_takeaway(res)}{timed_at(res, lookups(res))} Per-question "
+        f"times, the throughput chart, receipts, and the SQL: [the measured page]({MEASURED_PAGE}).",
     ]
     if rest:
         parts += [
@@ -930,6 +938,9 @@ def detail_block(res):
             f"{human_ms(res.v(q, 'duckdb', 'wall_ms'))}, {human_rate(res.v(q, 'duckdb', 'rows_per_s'))} | "
             f"{res.v(q, 'duckdb', 'differing_rows')} |"
         )
+    if res.ids({"reconcile"}):
+        rows += ["", "Bellwether: the `reconcile` process, certificate included; DuckDB: one `EXCEPT ALL` query both ways. "
+                 + res.provenance_line(res.ids({"reconcile"}), load=True)]
     rows += ["", "### Datasets", "", "| Dataset | Files | Row groups | Rows | Bytes | Column chunks with min/max statistics |",
              "|---|---:|---:|---:|---:|---:|"]
     for ds, meta in res.doc.get("datasets", {}).items():

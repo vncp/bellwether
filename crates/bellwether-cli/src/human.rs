@@ -95,14 +95,14 @@ pub(crate) fn funnel_row_kind(
     note: &str,
 ) {
     let kind = kind.map_or_else(String::new, |(kw, v)| format!(" {v:>kw$}"));
-    let _ = writeln!(
-        s,
+    let line = format!(
         "  {name:<w$} {:>9} {:>12} {:>18} {:>10}{kind}  {note}",
         num(c.files),
         num(c.row_groups),
         num(c.bytes),
         size(c.bytes)
     );
+    let _ = writeln!(s, "{}", line.trim_end());
 }
 
 pub(crate) fn funnel_header(s: &mut String, w: usize) {
