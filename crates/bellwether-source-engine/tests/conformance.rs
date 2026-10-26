@@ -74,10 +74,11 @@ impl MeasuredEngine for Listing {
 
 impl Source for Listing {
     fn discover(&self, _root: &str) -> Result<Vec<FileFingerprint>> {
-        // Listed out of order: the identity sorts by path.
+        // Listed out of order, and the identity strings sort the other way
+        // round from the paths: the identity sorts by path.
         Ok([
-            ("1", "v1;rows=500;blocks=4-4;mutation=0", 500),
-            ("0", "v1;rows=1000;blocks=1-3;mutation=0", 1000),
+            ("1", "v1;rows=1000;blocks=2-4;mutation=0", 1000),
+            ("0", "v1;rows=500;blocks=1-1;mutation=0", 500),
         ]
         .into_iter()
         .map(|(p, etag, rows)| FileFingerprint {
@@ -102,7 +103,7 @@ impl Source for Listing {
 #[test]
 fn an_engine_identity_hashes_the_root_and_the_sorted_unit_list() {
     let id = identity(&Listing).unwrap();
-    let canonical = r#"["clickhouse://h:8123/db/orders",[["clickhouse://h:8123/db/orders/0","v1;rows=1000;blocks=1-3;mutation=0"],["clickhouse://h:8123/db/orders/1","v1;rows=500;blocks=4-4;mutation=0"]]]"#;
+    let canonical = r#"["clickhouse://h:8123/db/orders",[["clickhouse://h:8123/db/orders/0","v1;rows=500;blocks=1-1;mutation=0"],["clickhouse://h:8123/db/orders/1","v1;rows=1000;blocks=2-4;mutation=0"]]]"#;
     assert_eq!(id.hash, Hash::of(canonical.as_bytes()));
     assert_eq!(id.hash.to_hex(), IDENTITY);
     assert_eq!((id.units, id.rows), (2, 1500));
@@ -113,7 +114,7 @@ fn an_engine_identity_hashes_the_root_and_the_sorted_unit_list() {
     );
 }
 
-const IDENTITY: &str = "4fda5d3e3bf1bb91fd0df06f688127d1b0545d8661f916e800e5b09fb42d2f46";
+const IDENTITY: &str = "2dfe8d56adbc1ecb0e1c9f5ebd4bcc91de6dedde8eeafe233aef35fc6c0aa8b1";
 const UNIT_TAIL: &str = "97ddb63656c5d7e616b9f7d953d66097a154551af091837730c0ef76563f58c7";
 
 fn h(c: char) -> Hash {

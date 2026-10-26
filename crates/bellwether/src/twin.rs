@@ -16,6 +16,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 
 use arrow::datatypes::DataType;
+use bellwether_profile::render::thousands;
 use bellwether_replay::{Catalog, RunKeys, Workload};
 use bellwether_source_engine::{EngineAdapter, EngineIdentity};
 use bellwether_store::{Cache, ObjectStoreBackend};
@@ -412,9 +413,9 @@ pub(crate) fn lints(p: &TwinPass, gates: &[Gate], latest_per_key: bool, fresh: b
                      the twin, while {} covers {}; a lookup by {} alone reads every row of each \
                      value, so key it by the composite ({}, {})",
                     low.columns[0],
-                    low.rows_per_key[0],
+                    thousands(low.rows_per_key[0]),
                     high.columns[0],
-                    high.rows_per_key[0],
+                    thousands(high.rows_per_key[0]),
                     low.columns[0],
                     high.columns[0],
                     low.columns[0]
@@ -436,7 +437,8 @@ pub(crate) fn lints(p: &TwinPass, gates: &[Gate], latest_per_key: bool, fresh: b
                     "the key sample holds {} distinct keys, above the membership gate of {}: a \
                      membership list of that size fails or degrades; count the keys first and \
                      branch, a membership list under the gate and a join above it",
-                    whole.keyset, g.limit
+                    thousands(whole.keyset),
+                    thousands(g.limit)
                 ),
                 fresh,
             ));
@@ -457,11 +459,11 @@ pub(crate) fn lints(p: &TwinPass, gates: &[Gate], latest_per_key: bool, fresh: b
                      bytes: a dedup or filter over every column reads about {}x what the key \
                      columns need; project the key columns first, select, then join the wide \
                      columns back",
-                    whole.rows,
-                    p.rows_total,
-                    key_bytes,
-                    all_bytes,
-                    all_bytes / key_bytes.max(1)
+                    thousands(whole.rows),
+                    thousands(p.rows_total),
+                    thousands(key_bytes),
+                    thousands(all_bytes),
+                    thousands(all_bytes / key_bytes.max(1))
                 ),
                 fresh,
             ));
@@ -479,7 +481,8 @@ pub(crate) fn lints(p: &TwinPass, gates: &[Gate], latest_per_key: bool, fresh: b
                 "the key sample is in {} of the twin's {} files (under {SELECTIVE_FILES_PERCENT}%), \
                  and the lookup asks for the latest row per key: taking the latest over the whole \
                  table first reads every file; filter by the keys first, then take the latest",
-                whole.files, p.files_total
+                thousands(whole.files),
+                thousands(p.files_total)
             ),
             fresh,
         ));
