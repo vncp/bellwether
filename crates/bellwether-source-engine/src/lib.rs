@@ -125,6 +125,12 @@ pub struct Exported {
     pub files: Vec<PathBuf>,
     /// Their bytes, summed.
     pub bytes: u64,
+    /// The rows the engine reported exporting in the same run's own
+    /// response, for an engine whose export is a command its query log
+    /// does not count the query's rows for (Kusto `.export`: `NumRecords`);
+    /// `None` when the log's result rows are the run's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rows: Option<u64>,
 }
 
 /// A query engine as a measured source: three primitives (module docs).
@@ -333,7 +339,11 @@ pub(crate) fn listed(dir: &Path) -> Result<Exported> {
         }
     }
     files.sort();
-    Ok(Exported { files, bytes })
+    Ok(Exported {
+        files,
+        bytes,
+        rows: None,
+    })
 }
 
 /// Creates `dir` for an export, or refuses: it exists and is not empty, or

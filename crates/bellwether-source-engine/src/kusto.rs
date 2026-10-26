@@ -50,7 +50,9 @@ use serde_json::{json, Map, Value};
 
 use crate::http::{self, METADATA};
 use crate::uri::EngineUri;
-use crate::{check_query, denied_scratch, listed, refused, MeasuredEngine, ResultHandle, Tag};
+use crate::{
+    check_query, denied_scratch, listed, refused, Exported, MeasuredEngine, ResultHandle, Tag,
+};
 
 /// The model of every Kusto cost.
 pub const MODEL: &str = "kusto.query_log";
@@ -490,8 +492,15 @@ fn num(v: &Value) -> Option<u64> {
 }
 
 /// The statistics of one `.show commands-and-queries` row, or the refusal
-/// of a row missing one (module docs).
-pub fn stats_of(root: &str, tag: &Tag, row: &Map<String, Value>) -> Result<QueryStats> {
+/// of a row missing one (module docs). `exported` is the record count the
+/// same run's `.export` response reported: an export's result rows, which
+/// the log's `ResultSetStatistics` (the command's own summary) are not.
+pub fn stats_of(
+    root: &str,
+    tag: &Tag,
+    row: &Map<String, Value>,
+    exported: Option<u64>,
+) -> Result<QueryStats> {
     let scanned = dynamic(row.get("ScannedExtentsStatistics").unwrap_or(&Value::Null));
     let cache = dynamic(row.get("CacheStatistics").unwrap_or(&Value::Null));
     let result = dynamic(row.get("ResultSetStatistics").unwrap_or(&Value::Null));
@@ -521,16 +530,21 @@ pub fn stats_of(root: &str, tag: &Tag, row: &Map<String, Value>) -> Result<Query
         &cache["Shards"]["BypassBytes"],
         "CacheStatistics.Shards.BypassBytes",
     )?);
-    let tables = result["TablesStatistics"]
-        .as_array()
-        .ok_or_else(|| missing("ResultSetStatistics.TablesStatistics"))?;
-    let mut result_rows = 0u64;
-    for t in tables {
-        result_rows = result_rows.saturating_add(need(
-            &t["RowCount"],
-            "ResultSetStatistics.TablesStatistics.RowCount",
-        )?);
-    }
+    let result_rows = if let Some(rows) = exported {
+        rows
+    } else {
+        let tables = result["TablesStatistics"]
+            .as_array()
+            .ok_or_else(|| missing("ResultSetStatistics.TablesStatistics"))?;
+        let mut rows = 0u64;
+        for t in tables {
+            rows = rows.saturating_add(need(
+                &t["RowCount"],
+                "ResultSetStatistics.TablesStatistics.RowCount",
+            )?);
+        }
+        rows
+    };
     let span = |k: &str| row.get(k).and_then(Value::as_str).and_then(timespan_ns);
     Ok(QueryStats {
         tag: tag.to_string(),
@@ -1062,7 +1076,10 @@ impl MeasuredEngine for Kusto {
             tag: tag.clone(),
             query: q.to_string(),
             logged: csl,
-            exported: Some(listed(dir)?),
+            exported: Some(Exported {
+                rows: Some(records),
+                ..listed(dir)?
+            }),
         })
     }
 
@@ -1104,7 +1121,12 @@ impl MeasuredEngine for Kusto {
                     ));
                 }
                 return match r["State"].as_str() {
-                    Some("Completed") => stats_of(&self.root, tag, r),
+                    Some("Completed") => stats_of(
+                        &self.root,
+                        tag,
+                        r,
+                        run.exported.as_ref().and_then(|x| x.rows),
+                    ),
                     state => Err(Error::Source(format!(
                         "{}: query {tag} ended {} in the engine, so it has no cost to read: {}",
                         self.root,
@@ -1310,7 +1332,14 @@ mod tests {
         }))
         .unwrap();
         let tag = Tag::new("r", "p0-before").unwrap();
-        let s = stats_of("kusto://c/db", &tag, &row).unwrap();
+        let s = stats_of("kusto://c/db", &tag, &row, None).unwrap();
+        // An export's result rows are its response's record count.
+        assert_eq!(
+            stats_of("kusto://c/db", &tag, &row, Some(5))
+                .unwrap()
+                .result_rows,
+            5
+        );
         assert_eq!(s.read_rows, 1000);
         assert_eq!(s.read_bytes, 18);
         assert_eq!(s.peak_memory_bytes, 123_456_789);
@@ -1383,7 +1412,10 @@ mod tests {
         });
         let tag = Tag::new("r", "p0-before").unwrap();
         let row = |v: &Value| -> Map<String, Value> { serde_json::from_value(v.clone()).unwrap() };
-        assert_eq!(stats_of("k", &tag, &row(&full)).unwrap().read_bytes, 5);
+        assert_eq!(
+            stats_of("k", &tag, &row(&full), None).unwrap().read_bytes,
+            5
+        );
         for drop in [
             "/CacheStatistics",
             "/CacheStatistics/Shards/Cold",
@@ -1399,7 +1431,7 @@ mod tests {
                 .as_object_mut()
                 .unwrap()
                 .remove(key);
-            match stats_of("k", &tag, &row(&v)) {
+            match stats_of("k", &tag, &row(&v), None) {
                 Err(Error::MeasurementRefused { reason, .. }) => {
                     assert_eq!(reason, "statistics_missing", "{drop}");
                 }
@@ -1465,6 +1497,26 @@ mod tests {
         };
         let ok = stats(log_rows(&[("Completed", "T | count")])).unwrap();
         assert_eq!((ok.tag.as_str(), ok.read_rows), (tag.as_str(), 1));
+        // An export's result rows are the record count its own response
+        // reported (the same run), not the log row's result statistics.
+        let export = ResultHandle {
+            exported: Some(Exported {
+                files: Vec::new(),
+                bytes: 0,
+                rows: Some(5),
+            }),
+            ..run.clone()
+        };
+        let k = Kusto::with_transport(
+            &uri,
+            None,
+            Box::new(Canned(Mutex::new(vec![log_rows(&[(
+                "Completed",
+                "T | count",
+            )])]))),
+        )
+        .unwrap();
+        assert_eq!(k.stats(&export).unwrap().result_rows, 5);
         assert_eq!(
             stats(log_rows(&[("Completed", "T | take 1")])).unwrap_err(),
             "not_the_query_submitted"

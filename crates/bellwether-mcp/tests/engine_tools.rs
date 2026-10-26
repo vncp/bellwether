@@ -106,6 +106,7 @@ impl MeasuredEngine for Fake {
         handle.exported = Some(Exported {
             files: vec![path],
             bytes,
+            rows: None,
         });
         Ok(handle)
     }

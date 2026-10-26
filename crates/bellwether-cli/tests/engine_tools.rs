@@ -579,17 +579,25 @@ fn the_review_s_probes_are_refused_end_to_end() {
     assert!(out.contains("measurement_changed"), "{out}");
     assert_eq!(receipts(), 0);
 
-    // Probe 2: the after query turns the query cache on. Each run is
-    // refused, the one that fills the cache and the one it serves.
-    let cached = format!(
-        "{honest} SETTINGS use_query_cache = 1, query_cache_min_query_runs = 0, \
-         query_cache_ttl = 600"
-    );
-    let p = propose(&cached, "cached");
-    for _ in 0..2 {
-        let (code, out, err) = fix(&p, &[]);
-        assert_eq!(code, 4, "{out}{err}");
-        assert!(err.contains("cache_served"), "{err}");
+    // Probe 2: the after query changes settings in its text: the query
+    // cache on (round 1), the same with the logging of profile events and
+    // settings off so the cache counters read 0 (round 2), or the query
+    // condition cache on. Every run is readonly=1, so the engine refuses
+    // the text each time, before anything is measured.
+    let variants = [
+        "SETTINGS use_query_cache = 1, query_cache_min_query_runs = 0, query_cache_ttl = 600",
+        "SETTINGS use_query_cache = 1, query_cache_min_query_runs = 0, query_cache_ttl = 600, \
+         log_profile_events = 0, log_query_settings = 0",
+        "SETTINGS use_query_condition_cache = 1",
+    ];
+    for (i, settings) in variants.iter().enumerate() {
+        let p = propose(&format!("{honest} {settings}"), &format!("settings{i}"));
+        for _ in 0..2 {
+            let (code, out, err) = fix(&p, &[]);
+            assert_eq!(code, 4, "{out}{err}");
+            assert!(err.contains("read-only mode"), "{err}");
+            assert!(err.contains("propose the rewrite again"), "{err}");
+        }
     }
     assert_eq!(receipts(), 0);
 

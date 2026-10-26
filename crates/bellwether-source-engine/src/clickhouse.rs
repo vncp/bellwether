@@ -1,10 +1,12 @@
 //! The reference adapter: ClickHouse over its HTTP interface.
 //!
 //! - **submit**: the query text as the request body, `query_id` = the tag,
-//!   `readonly=2` (no write, no DDL), `default_format=Null` (the engine
-//!   produces and discards the rows), and the caches that change what a
-//!   run reads turned off: `use_query_cache=0`, and
-//!   `use_query_condition_cache=0` where the server has it.
+//!   `readonly=1` (no write, no DDL, and no setting changed by the query
+//!   text: a `SETTINGS` clause in the agent's text is refused by the
+//!   engine), `default_format=Null` (the engine produces and discards the
+//!   rows), and the caches that change what a run reads turned off:
+//!   `use_query_cache=0`, and `use_query_condition_cache=0` where the
+//!   server has it. The request's own parameters apply under `readonly=1`.
 //! - **export**: the same request with `default_format=Parquet`, streamed
 //!   into `<dir>/part-0.parquet` and checked to be whole Parquet: one run,
 //!   logged under its own tag.
@@ -13,10 +15,11 @@
 //!   from `ProfileEvents`), after `SYSTEM FLUSH LOGS` where the user may,
 //!   else by waiting for the log's flush (bounded). The finished entry
 //!   must be the only one under the tag, logged for this user with the
-//!   exact text submitted, and not served from a cache: a `SETTINGS`
-//!   clause in the agent's text overrides the request's settings, so a
-//!   run that hit the query cache or the query condition cache, or that
-//!   turned the query cache on, is refused (`cache_served`).
+//!   exact text submitted, fully logged (`ProfileEvents` not empty, and
+//!   `Settings` holding the request's `readonly=1`; a run that turned
+//!   `log_profile_events` or `log_query_settings` off is refused,
+//!   `statistics_missing`), and not served from a cache (`cache_served`:
+//!   a query cache or query condition cache hit, or the query cache on).
 //! - **units**: one per partition of each MergeTree table, from
 //!   `system.parts` (active parts). Identity: rows, the lowest and highest
 //!   block numbers, and the highest mutation version, which an insert, a
@@ -54,6 +57,10 @@ const LOG_WAIT: Duration = Duration::from_secs(30);
 
 /// ClickHouse's error code for a refused privilege.
 const ACCESS_DENIED: i64 = 497;
+
+/// ClickHouse's error code for a write or a setting change refused in
+/// read-only mode.
+const READONLY: i64 = 164;
 
 /// One partition of one table: a unit.
 #[derive(Clone, Debug)]
@@ -283,12 +290,13 @@ impl ClickHouse {
         Ok(ch)
     }
 
-    /// Runs the agent's query once under `tag` in `format`, read-only, with
-    /// the caches off; the response streams the rows.
+    /// Runs the agent's query once under `tag` in `format`, read-only with
+    /// no setting the text may change (`readonly=1`), with the caches off;
+    /// the response streams the rows.
     fn run(&self, q: &str, tag: &Tag, format: &str) -> Result<reqwest::blocking::Response> {
         let mut params: Vec<(&str, &str)> = vec![
             ("query_id", tag.as_str()),
-            ("readonly", "2"),
+            ("readonly", "1"),
             ("default_format", format),
         ];
         params.extend_from_slice(&self.caches_off);
@@ -343,6 +351,14 @@ impl ClickHouse {
             Some(516 | 192 | 193 | 194) => Error::Source(format!(
                 "{}: ClickHouse refused the credentials ({line}); give the user in the root and \
                  its password as password=env:NAME",
+                self.root
+            )),
+            // Only the agent's text runs under readonly=1.
+            Some(READONLY) => Error::Source(format!(
+                "{}: ClickHouse refused the query in read-only mode ({line}); bellwether runs \
+                 every query with readonly=1, so the query text may neither write nor change a \
+                 setting (a SETTINGS clause included, which could turn a cache or the query \
+                 log off); propose the rewrite again without it",
                 self.root
             )),
             _ => Error::Source(format!(
@@ -626,7 +642,9 @@ impl MeasuredEngine for ClickHouse {
                  ProfileEvents['SelectedPartsTotal'] AS parts_total, \
                  ProfileEvents['QueryCacheHits'] AS cache_hits, \
                  ProfileEvents['QueryConditionCacheHits'] AS condition_cache_hits, \
-                 Settings['use_query_cache'] AS use_query_cache, exception \
+                 Settings['use_query_cache'] AS use_query_cache, \
+                 length(ProfileEvents) AS profile_events, \
+                 Settings['readonly'] AS readonly_setting, exception \
                  FROM system.query_log WHERE query_id = {tag:String} AND type IN \
                  ('QueryFinish', 'ExceptionBeforeStart', 'ExceptionWhileProcessing') \
                  ORDER BY event_time_microseconds LIMIT 16",
@@ -686,6 +704,29 @@ impl ClickHouse {
                 self.root,
                 first_line(str_of(r, "exception").unwrap_or(""))
             )));
+        }
+        // A run that turned its own logging off (`log_profile_events=0`,
+        // `log_query_settings=0`) leaves the cache counters and settings
+        // empty, so their absence would read as "no cache": refused.
+        let events = u64_of(r, "profile_events")?;
+        let readonly = str_of(r, "readonly_setting")?;
+        if events == 0 || readonly != "1" {
+            return Err(refused(
+                &self.root,
+                tag,
+                "statistics_missing",
+                &format!(
+                    "the entry is not fully logged ({events} profile events, readonly={}), so \
+                     what the run read and whether a cache served it are unknown; the server \
+                     must log profile events and query settings (log_profile_events=1, \
+                     log_query_settings=1 for the user), and the query text may change neither",
+                    if readonly.is_empty() {
+                        "not logged"
+                    } else {
+                        readonly
+                    }
+                ),
+            ));
         }
         let cache_on = str_of(r, "use_query_cache")?;
         let (hits, condition_hits) = (u64_of(r, "cache_hits")?, u64_of(r, "condition_cache_hits")?);

@@ -645,6 +645,7 @@ impl Engine {
                     .unwrap_or_else(|| bellwether_source_engine::Exported {
                         files: Vec::new(),
                         bytes: 0,
+                        rows: None,
                     });
                 let mut batches = Vec::new();
                 for f in &exported.files {

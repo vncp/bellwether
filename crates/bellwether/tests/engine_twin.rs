@@ -124,6 +124,7 @@ impl MeasuredEngine for Fake {
             exported: Some(Exported {
                 files: vec![path],
                 bytes,
+                rows: None,
             }),
         })
     }

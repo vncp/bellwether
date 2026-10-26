@@ -265,32 +265,98 @@ fn export_is_the_measured_run_and_is_refused_without_the_permission() {
     );
 }
 
-/// The reviewer's probe: `SETTINGS use_query_cache=1` in the agent's text
-/// overrides the request's `use_query_cache=0`, so the second run reads
-/// what the cache serves. Both runs are refused: the first turned the
-/// cache on, the second was served from it.
+/// The review's probes: a `SETTINGS` clause in the agent's text turns the
+/// query cache on (round 1), and also turns the logging of profile events
+/// and settings off, so the cache counters read 0 (round 2); or it turns
+/// the query condition cache on. Every run is `readonly=1`, so the engine
+/// refuses the text; and a log entry that is not fully logged (as a run
+/// with those settings leaves it) is refused even when another route lets
+/// it through.
 #[test]
-fn a_run_that_turns_a_cache_on_or_is_served_from_one_is_refused() {
+fn a_query_text_that_changes_a_setting_or_an_entry_not_fully_logged_is_refused() {
     let Some(s) = Server::new() else { return };
     orders(&s);
     let e = connect(&s.table("orders"), None).unwrap();
     let run = Tag::run();
-    let q = format!(
-        "SELECT count(), sum(amount) FROM {}.orders WHERE id % 11 = 3 SETTINGS \
-         use_query_cache = 1, query_cache_min_query_runs = 0, query_cache_ttl = 600",
+    let base = format!(
+        "SELECT count(), sum(amount) FROM {}.orders WHERE id % 11 = 3",
         s.db
     );
-    for i in 0..2 {
-        let t = Tag::new(&run, &format!("c{i}")).unwrap();
-        let h = e.submit(&q, &t).unwrap();
-        assert_eq!(reason(e.stats(&h)).unwrap_err(), "cache_served", "run {i}");
+    let hidden = format!(
+        "{base} SETTINGS use_query_cache = 1, query_cache_min_query_runs = 0, \
+         query_cache_ttl = 600, log_profile_events = 0, log_query_settings = 0"
+    );
+    let condition = format!("{base} SETTINGS use_query_condition_cache = 1");
+    let cached = format!(
+        "{base} SETTINGS use_query_cache = 1, query_cache_min_query_runs = 0, \
+         query_cache_ttl = 600"
+    );
+    for (i, q) in [&hidden, &condition, &cached].into_iter().enumerate() {
+        for run_kind in ["submit", "export"] {
+            let t = Tag::new(&run, &format!("s{i}-{run_kind}")).unwrap();
+            let dir = tempfile::tempdir().unwrap();
+            let err = if run_kind == "submit" {
+                e.submit(q, &t).unwrap_err()
+            } else {
+                e.export(q, &t, &dir.path().join("x")).unwrap_err()
+            }
+            .to_string();
+            assert!(err.contains("read-only mode"), "{q}: {err}");
+            assert!(err.contains("propose the rewrite again"), "{err}");
+        }
     }
-    s.sql("SYSTEM FLUSH LOGS");
-    let hits = s.sql(&format!(
-        "SELECT sum(ProfileEvents['QueryCacheHits']) FROM system.query_log WHERE \
-         type = 'QueryFinish' AND startsWith(query_id, 'bw-{run}-c')"
+    // The same text run by another route (the old readonly=2), twice, so
+    // the second run is served from the cache with nothing logged: its
+    // entry is refused as not fully logged.
+    for i in 0..2 {
+        let t = Tag::new(&run, &format!("r{i}")).unwrap();
+        let body = reqwest::blocking::Client::new()
+            .post(format!(
+                "{}?query_id={t}&readonly=2&use_query_cache=0&default_format=Null",
+                s.http
+            ))
+            .body(hidden.clone())
+            .send()
+            .unwrap()
+            .text()
+            .unwrap();
+        assert!(!body.contains("Exception"), "{body}");
+        assert_eq!(
+            reason(e.stats(&handle(&t, &hidden))).unwrap_err(),
+            "statistics_missing",
+            "run {i}"
+        );
+    }
+}
+
+/// A server or user that does not log profile events: every entry is
+/// refused as not fully logged, never read as "no cache, nothing read".
+#[test]
+fn a_user_whose_queries_are_not_fully_logged_is_refused() {
+    let Some(s) = Server::new() else { return };
+    orders(&s);
+    let user = format!("{}_unlogged", s.db);
+    s.sql(&format!(
+        "CREATE USER {user} IDENTIFIED WITH no_password SETTINGS log_profile_events = 0"
     ));
-    assert_ne!(hits.trim(), "0", "the second run was served from the cache");
+    s.sql(&format!("GRANT SELECT ON {}.* TO {user}", s.db));
+    s.sql(&format!("GRANT SELECT ON system.* TO {user}"));
+    s.sql(&format!("GRANT SYSTEM FLUSH LOGS ON *.* TO {user}"));
+    let e = connect(
+        &format!(
+            "clickhouse://{user}@{}",
+            s.root.trim_start_matches("clickhouse://")
+        ),
+        None,
+    )
+    .unwrap();
+    let q = format!("SELECT count() FROM {}.orders", s.db);
+    let h = e
+        .submit(&q, &Tag::new(&Tag::run(), "p0-before").unwrap())
+        .unwrap();
+    let refused = reason(e.stats(&h));
+    s.sql(&format!("DROP USER {user}"));
+    assert_eq!(refused.unwrap_err(), "statistics_missing");
 }
 
 /// The user's own settings turn the query cache on (and the query
