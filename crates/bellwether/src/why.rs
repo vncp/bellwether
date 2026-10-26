@@ -2485,15 +2485,13 @@ fn check_value_runs(h: &Hash, w: &Workload, mode: Option<LookupMode>) -> Result<
         return Ok(());
     };
     let name = mode.map_or("", LookupMode::as_str);
-    let asks = if mode.is_some_and(LookupMode::is_membership) {
-        "list membership"
-    } else {
-        "text lookups"
-    };
+    // The mode's own run kind (`contains_all`, `has_token`), so a refusal
+    // between two modes of one family says which.
+    let asks = want.as_ref().map_or("", RunQuery::kind_str);
     Err(Error::KeySpec(format!(
-        "workload {h} records its runs as {} lookups, and --mode {name} asks for {asks}; drop \
-         --mode to price them as recorded, or record the values again with `bellwether why \
-         --from <values.parquet> --mode {name}`",
+        "workload {h} records its runs as {} lookups, and --mode {name} asks for {asks} \
+         lookups; drop --mode to price them as recorded, or record the values again with \
+         `bellwether why --from <values.parquet> --mode {name}`",
         describe(&r.query()?),
     )))
 }

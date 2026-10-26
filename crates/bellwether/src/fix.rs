@@ -1027,6 +1027,17 @@ impl Engine {
                 .filter(|f| bellwether_core::encoding::check_supported(f.data_type()).is_ok())
                 .map(|f| f.name().clone())
                 .collect();
+            if hashable.is_empty() {
+                return Err(Error::Other(format!(
+                    "every column of {} is nested (a list, map, or struct), so verify has no \
+                     column to compare rows by and cannot certify {}; build it without a \
+                     receipt with `bellwether index {} --key {}`",
+                    self.root(),
+                    crate::spec::label(spec),
+                    self.root(),
+                    crate::spec::label(spec)
+                )));
+            }
             (
                 hashable,
                 CoverageRequest::WorkloadRows {

@@ -465,6 +465,67 @@ fn the_layout_culprit_names_where_the_values_sit_before_and_after_the_key() {
     assert_eq!(after, before);
 }
 
+/// A dataset whose every column is a list: `fix` has no column to compare
+/// rows by, so it refuses before any receipt, naming the cause and the
+/// `index` command that builds the key without one; that command works.
+#[test]
+fn fix_refuses_a_dataset_of_lists_only_and_names_the_index_command() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    std::fs::create_dir_all(&data).unwrap();
+    let mut b = ListBuilder::new(StringBuilder::new());
+    for i in 0..20 {
+        b.values().append_value(format!("t{}", i / 5));
+        b.append(true);
+    }
+    let tags: ArrayRef = Arc::new(b.finish());
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "tags",
+        tags.data_type().clone(),
+        true,
+    )]));
+    let props = WriterProperties::builder()
+        .set_max_row_group_row_count(Some(5))
+        .build();
+    let mut w = ArrowWriter::try_new(
+        File::create(data.join("part.parquet")).unwrap(),
+        Arc::clone(&schema),
+        Some(props),
+    )
+    .unwrap();
+    w.write(&RecordBatch::try_new(schema, vec![tags]).unwrap())
+        .unwrap();
+    w.close().unwrap();
+    let values = dir.path().join("values.parquet");
+    write_values(&values, &[Some("t1")]);
+    let e = engine(&data);
+    let w = e
+        .why(&WhyRequest {
+            keys: Some(KeyFile::new(&values)),
+            mode: Some(LookupMode::ContainsAny),
+            ..WhyRequest::default()
+        })
+        .unwrap();
+    let floor = &w.candidates[0];
+    assert_eq!(floor.spec, list_tags());
+    let err = e
+        .fix(&FixRequest {
+            proposal: Some(floor.proposal.hash),
+            workload: Some(w.workload.as_ref().unwrap().hash),
+            ..FixRequest::default()
+        })
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("every column"), "{err}");
+    assert!(err.contains("--key list:tags"), "{err}");
+    assert!(!err.contains("reconcile spec"), "{err}");
+    assert_eq!(e.receipts().unwrap().receipts.len(), 0, "no receipt");
+    // The named step works.
+    e.index(&[list_tags()]).unwrap();
+    let plan = e.locate_contains(&KeyFile::new(&values), false).unwrap();
+    assert_eq!(plan.specs, vec![list_tags()]);
+}
+
 #[test]
 fn why_membership_modes_refuse_what_they_cannot_price() {
     let dir = tempfile::tempdir().unwrap();
@@ -519,6 +580,7 @@ fn why_membership_modes_refuse_what_they_cannot_price() {
         .unwrap_err()
         .to_string();
     assert!(err.contains("contains_any"), "{err}");
+    assert!(err.contains("asks for contains_all lookups"), "{err}");
     let again = e
         .why(&WhyRequest {
             workload: Some(h),
