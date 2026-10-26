@@ -65,7 +65,7 @@ class Duck:
     def one(self, sql):
         return self.rows(sql)[0][0]
 
-    def profile(self, sql, label):
+    def profile(self, sql, label, repeats=REPEATS):
         """Run `sql` REPEATS times under the JSON profiler.
 
         Returns bytes read, row groups scanned (and to scan), seconds (median),
@@ -75,7 +75,7 @@ class Duck:
         with tempfile.TemporaryDirectory() as tmp:
             prof = os.path.join(tmp, "profile.json")
             q = f"SELECT count(*), bit_xor(hash(q)) FROM ({sql}) q"
-            for _ in range(REPEATS):
+            for _ in range(repeats):
                 setup = (
                     f"{TZ} SET enable_profiling='json'; SET profiling_output='{prof}';"
                     " SET tracked_metrics=['*'];"
@@ -622,7 +622,9 @@ class Showcase:
             f"SELECT * FROM ((SELECT *, 'left' AS side FROM (SELECT * FROM {a} EXCEPT ALL SELECT * FROM {b}))"
             f" UNION ALL (SELECT *, 'right' AS side FROM (SELECT * FROM {b} EXCEPT ALL SELECT * FROM {a})))"
         )
-        m = self.duck.profile(diff, f"{rid} duckdb")
+        # One run each side, like `bellwether reconcile` (which writes a
+        # certificate per run): both read every row of both copies.
+        m = self.duck.profile(diff, f"{rid} duckdb", repeats=1)
         self.row(ds, rid, "duckdb", "rows_per_s", round(rows / m["seconds"]), "rows/s", "measured")
         self.row(ds, rid, "duckdb", "wall_ms", round(m["seconds"] * 1000, 1), "ms", "measured")
         self.row(ds, rid, "duckdb", "rows_compared", rows, "rows", "exact")
