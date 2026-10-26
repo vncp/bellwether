@@ -19,11 +19,12 @@ use std::sync::Once;
 use arrow::datatypes::DataType;
 use bellwether_core::encoding::{encode_tuple_as, Value};
 use bellwether_core::join::{
-    build_pair, check_comparable, decode_pair, one_sided, overlap_stats, pair_entries,
-    pinned_sequence, semijoin, JoinValue, OverlapStats, PairRows, Pins, Side,
+    build_pair, check_comparable, decode_pair, header_pins, live_identity, one_sided,
+    overlap_stats, pair_entries, pinned, semijoin, HeaderPins, JoinValue, OverlapStats, PairCaps,
+    PairRows, Pins, Side,
 };
 use bellwether_core::segment::{ColumnType, Layout};
-use bellwether_core::{merge, SegmentReader, SegmentWriter, WriterOptions};
+use bellwether_core::{merge, EncodedSegment, SegmentReader, SegmentWriter, WriterOptions};
 use bellwether_types::{Hash, KeySpec, RowGroupId};
 use proptest::prelude::*;
 use roaring::RoaringBitmap;
@@ -90,11 +91,65 @@ fn open(bytes: &[u8]) -> SegmentReader<Vec<u8>> {
     SegmentReader::open(bytes.to_vec()).unwrap()
 }
 
+/// The pins a test pair is built at: left sequence `left`, right sequence
+/// `right`, and a right manifest identity derived from `right`.
+fn pins(left: u64, right: u64) -> Pins {
+    Pins {
+        left,
+        right,
+        right_manifest: Hash::of(&right.to_le_bytes()),
+    }
+}
+
+/// No cap: a pair is one segment.
+const UNCAPPED: PairCaps = PairCaps {
+    max_keys: u64::MAX,
+    max_bytes: u64::MAX,
+};
+
+/// A pair's segments under `caps`, in the order `build_pair` emits them.
+fn build_segments<RL: bellwether_core::segment::ReadAt, RR: bellwether_core::segment::ReadAt>(
+    spec: &KeySpec,
+    left: &Side<'_, RL>,
+    right: &Side<'_, RR>,
+    left_range: Option<(u32, u32)>,
+    pins: Pins,
+    opts: &WriterOptions,
+    caps: PairCaps,
+) -> bellwether_types::Result<Vec<EncodedSegment>> {
+    let mut out = Vec::new();
+    let n = build_pair(spec, left, right, left_range, pins, opts, caps, |s| {
+        out.push(s);
+        Ok(())
+    })?;
+    assert_eq!(
+        n,
+        out.len() as u64,
+        "build_pair counts the segments it emits"
+    );
+    Ok(out)
+}
+
+/// An uncapped pair: its one segment.
+fn build_one<RL: bellwether_core::segment::ReadAt, RR: bellwether_core::segment::ReadAt>(
+    spec: &KeySpec,
+    left: &Side<'_, RL>,
+    right: &Side<'_, RR>,
+    left_range: Option<(u32, u32)>,
+    pins: Pins,
+    opts: &WriterOptions,
+) -> bellwether_types::Result<EncodedSegment> {
+    let mut segs = build_segments(spec, left, right, left_range, pins, opts, UNCAPPED)?;
+    assert_eq!(segs.len(), 1, "an uncapped pair is one segment");
+    Ok(segs.pop().unwrap())
+}
+
 /// The pinned pair: left `orders.id` A=1 in rg 0 (3 rows) and rg 2 (1), B=2
 /// in rg 1 (2), C=3 in rg 3 (1); right `payables.order_id` (its own ids)
 /// A in rg 10 (1), C in rg 11 (4) and rg 12 (1), D=4 in rg 12 (2). Left
-/// live 0..4, right live 10..13, pinned at left 5, right 7.
-fn pinned(counts: bool) -> Vec<u8> {
+/// live 0..4, right live 10..13, pinned at left 5, right 7 (right manifest
+/// identity `blake3(7u64 little-endian)`).
+fn pinned_pair(counts: bool) -> Vec<u8> {
     let left = exact_segment(
         "id",
         counts,
@@ -121,7 +176,7 @@ fn pinned(counts: bool) -> Vec<u8> {
     );
     let (l, r) = ([open(&left)], [open(&right)]);
     let (llive, rlive) = (rgs(&[0, 1, 2, 3]), rgs(&[10, 11, 12]));
-    build_pair(
+    build_one(
         &join(counts),
         &Side {
             segments: &l,
@@ -134,7 +189,7 @@ fn pinned(counts: bool) -> Vec<u8> {
             types: Some(vec![ColumnType::Int32]),
         },
         Some((0, 3)),
-        Pins { left: 5, right: 7 },
+        pins(5, 7),
         &WriterOptions::default(),
     )
     .unwrap()
@@ -143,7 +198,7 @@ fn pinned(counts: bool) -> Vec<u8> {
 
 #[test]
 fn a_pair_segment_stores_shared_keys_per_side_and_counts_one_sided_keys() {
-    let bytes = pinned(true);
+    let bytes = pinned_pair(true);
     let r = open(&bytes);
     assert_eq!(r.header().layout, Layout::KeyedJoin);
     assert_eq!(r.key_spec(), &join(true));
@@ -167,7 +222,14 @@ fn a_pair_segment_stores_shared_keys_per_side_and_counts_one_sided_keys() {
     assert_eq!(c.left.bitmap, rgs(&[3]));
     assert_eq!(c.right.bitmap, rgs(&[11, 12]));
     assert_eq!(c.right.counts, Some(vec![4, 1]));
-    assert_eq!(pinned_sequence(&[r]).unwrap(), Some(7));
+    let want_pins = HeaderPins {
+        left_sequence: 5,
+        left_live: live_identity(&rgs(&[0, 1, 2, 3])),
+        right_sequence: 7,
+        right_manifest: Hash::of(&7u64.to_le_bytes()),
+    };
+    assert_eq!(header_pins(&r).unwrap(), want_pins);
+    assert_eq!(pinned(&[r]).unwrap(), Some(want_pins));
     let r = open(&bytes);
     assert_eq!(
         overlap_stats(&[r]).unwrap(),
@@ -193,7 +255,7 @@ fn a_pair_segment_stores_shared_keys_per_side_and_counts_one_sided_keys() {
     let hits = semijoin(&[r], &[int(1), int(2), int(4), int(9)]).unwrap();
     assert_eq!(hits.keys().cloned().collect::<Vec<_>>(), vec![int(1)]);
     // Uncounted: the same bitmaps, no counts, no rows.
-    let u = open(&pinned(false));
+    let u = open(&pinned_pair(false));
     let s = overlap_stats(std::slice::from_ref(&u)).unwrap();
     assert_eq!((s.both, s.left_only, s.right_only, s.rows), (2, 1, 1, None));
     assert!(pair_entries(&u)
@@ -207,7 +269,7 @@ fn a_pair_segment_stores_shared_keys_per_side_and_counts_one_sided_keys() {
 /// | counts`), the index's one-sided counts, and the segment's blake3.
 #[test]
 fn join_conformance_vectors() {
-    let bytes = pinned(true);
+    let bytes = pinned_pair(true);
     let r = open(&bytes);
     let entries = pair_entries(&r).unwrap();
     let mut record = Vec::new();
@@ -298,7 +360,7 @@ fn tuples_with_a_null_never_pair_and_null_probes_match_nothing() {
     let l = [seg(&[(composite(1, None), 0), (composite(1, Some(2)), 1)])];
     let r = [seg(&[(composite(1, None), 0), (composite(1, Some(2)), 0)])];
     let live = rgs(&[0, 1]);
-    let bytes = build_pair(
+    let bytes = build_one(
         &spec,
         &Side {
             segments: &l,
@@ -311,7 +373,7 @@ fn tuples_with_a_null_never_pair_and_null_probes_match_nothing() {
             types: None,
         },
         Some((0, 1)),
-        Pins { left: 1, right: 1 },
+        pins(1, 1),
         &WriterOptions::default(),
     )
     .unwrap()
@@ -343,7 +405,7 @@ fn retired_row_groups_are_dropped_from_both_sides() {
         1024,
     );
     let (l, r) = ([open(&left)], [open(&right)]);
-    let bytes = build_pair(
+    let bytes = build_one(
         &join(true),
         &Side {
             segments: &l,
@@ -356,7 +418,7 @@ fn retired_row_groups_are_dropped_from_both_sides() {
             types: None,
         },
         Some((0, 0)),
-        Pins { left: 2, right: 1 },
+        pins(2, 1),
         &WriterOptions::default(),
     )
     .unwrap()
@@ -392,7 +454,7 @@ fn incomparable_and_float_join_columns_and_wrong_sides_are_refused() {
     let counted = exact_segment("order_id", true, &[(int(1), 0, 1)], 0..1, 1024);
     let live = rgs(&[0]);
     let (l, r) = ([open(&uncounted)], [open(&counted)]);
-    let err = build_pair(
+    let err = build_one(
         &join(true),
         &Side {
             segments: &l,
@@ -405,7 +467,7 @@ fn incomparable_and_float_join_columns_and_wrong_sides_are_refused() {
             types: None,
         },
         Some((0, 0)),
-        Pins { left: 1, right: 1 },
+        pins(1, 1),
         &WriterOptions::default(),
     )
     .unwrap_err();
@@ -413,7 +475,7 @@ fn incomparable_and_float_join_columns_and_wrong_sides_are_refused() {
     // An exact key on other columns is not a side of this join key.
     let other = exact_segment("other", false, &[(int(1), 0, 1)], 0..1, 1024);
     let o = [open(&other)];
-    let err = build_pair(
+    let err = build_one(
         &join(false),
         &Side {
             segments: &o,
@@ -426,14 +488,14 @@ fn incomparable_and_float_join_columns_and_wrong_sides_are_refused() {
             types: None,
         },
         Some((0, 0)),
-        Pins { left: 1, right: 1 },
+        pins(1, 1),
         &WriterOptions::default(),
     )
     .unwrap_err();
     assert!(err.to_string().contains("exact key on id"), "{err}");
     // A join key is never written row by row, and never merged.
     assert!(SegmentWriter::new(join(false), WriterOptions::default()).is_err());
-    let p = pinned(false);
+    let p = pinned_pair(false);
     assert!(merge(&[open(&p), open(&p)], &WriterOptions::default()).is_err());
     // Its values are pairs: a key lookup on it is refused, not misread.
     assert!(open(&p).get(&[int(1)]).is_err());
@@ -495,7 +557,7 @@ fn every_byte_of_a_pair_segment_corrupted_is_refused_never_misread() {
     let right = exact_segment("order_id", true, &rows[2..], 0..3, 2);
     let (l, r) = ([open(&left)], [open(&right)]);
     let live = rgs(&[0, 1, 2]);
-    let clean = build_pair(
+    let clean = build_one(
         &join(true),
         &Side {
             segments: &l,
@@ -508,7 +570,7 @@ fn every_byte_of_a_pair_segment_corrupted_is_refused_never_misread() {
             types: None,
         },
         Some((0, 2)),
-        Pins { left: 3, right: 4 },
+        pins(3, 4),
         &WriterOptions {
             block_keys: 2,
             ..WriterOptions::default()
@@ -600,6 +662,9 @@ proptest! {
     /// rows; the one-sided counts; the overlap statistics; and
     /// `semijoin(probes)` keeps exactly the probes both sides hold, with
     /// every row group holding them on each side (invariant 1 per side).
+    /// Under a key cap (ADR 018) the pair splits by key range into
+    /// `ceil(|L ∩ R| / cap)` segments (at least one), in key order, that
+    /// together give the same answers.
     #[test]
     fn the_pair_index_equals_the_oracle(
         left in side_rows(),
@@ -608,25 +673,38 @@ proptest! {
         rretired in prop::collection::btree_set(0u32..6, 0..2),
         probes in prop::collection::btree_set(0u8..20, 0..10),
         block_keys in 1usize..4,
+        max_keys in prop_oneof![Just(u64::MAX), 1u64..4],
     ) {
         let llive: RoaringBitmap = (0u32..6).filter(|i| !lretired.contains(i)).collect();
         let rlive: RoaringBitmap = (0u32..6).filter(|i| !rretired.contains(i)).collect();
         let l: Vec<_> = side_segments("id", &left).iter().map(|b| open(b)).collect();
         let r: Vec<_> = side_segments("order_id", &right).iter().map(|b| open(b)).collect();
-        let bytes = build_pair(
+        let segs = build_segments(
             &join(true),
             &Side { segments: &l, live: &llive, types: None },
             &Side { segments: &r, live: &rlive, types: None },
             Some((0, 5)),
-            Pins { left: 1, right: 1 },
+            pins(1, 1),
             &WriterOptions { block_keys, ..WriterOptions::default() },
+            PairCaps { max_keys, max_bytes: u64::MAX },
         )
-        .unwrap()
-        .bytes;
+        .unwrap();
         let (ol, or) = (oracle_side(&left, &llive), oracle_side(&right, &rlive));
         let both: BTreeSet<u8> = ol.keys().filter(|k| or.contains_key(k)).copied().collect();
-        let p = open(&bytes);
-        let entries = pair_entries(&p).unwrap();
+        let n = both.len() as u64;
+        prop_assert_eq!(segs.len() as u64, if n == 0 { 1 } else { n.div_ceil(max_keys) });
+        let p: Vec<_> = segs.iter().map(|s| open(&s.bytes)).collect();
+        let mut entries = Vec::new();
+        let mut one = (0u64, 0u64);
+        for s in &p {
+            prop_assert!(s.entries() <= max_keys);
+            prop_assert_eq!(s.rowgroup_range(), Some((RowGroupId(0), RowGroupId(5))));
+            let (lo, ro) = one_sided(s).unwrap();
+            one = (one.0 + lo, one.1 + ro);
+            entries.extend(pair_entries(s).unwrap());
+        }
+        prop_assert_eq!(one, ((ol.len() - both.len()) as u64, (or.len() - both.len()) as u64));
+        prop_assert!(pinned(&p).unwrap().is_some());
         prop_assert_eq!(entries.len(), both.len());
         let mut join_rows = 0u64;
         for ((key, v), k) in entries.iter().zip(&both) {
@@ -638,7 +716,7 @@ proptest! {
             prop_assert_eq!(v.right.counts.clone().unwrap(), rw.values().copied().collect::<Vec<_>>());
             join_rows += lw.values().sum::<u64>() * rw.values().sum::<u64>();
         }
-        let stats = overlap_stats(std::slice::from_ref(&p)).unwrap();
+        let stats = overlap_stats(&p).unwrap();
         prop_assert_eq!(stats.both, both.len() as u64);
         prop_assert_eq!(stats.left_only, (ol.len() - both.len()) as u64);
         prop_assert_eq!(stats.right_only, (or.len() - both.len()) as u64);
@@ -648,7 +726,7 @@ proptest! {
             both.iter().map(|k| or[k].len() as u64).max().unwrap_or(0)
         );
         let asked: Vec<Vec<u8>> = probes.iter().map(|k| int(i64::from(*k))).collect();
-        let hits = semijoin(&[p], &asked).unwrap();
+        let hits = semijoin(&p, &asked).unwrap();
         let want: BTreeSet<u8> = probes.intersection(&both).copied().collect();
         prop_assert_eq!(hits.len(), want.len());
         for k in &want {
@@ -662,4 +740,84 @@ proptest! {
             }
         }
     }
+}
+
+/// ADR 018: a byte cap splits the pair too, before the key that would take
+/// the open segment past it, so the open segment stays near the cap
+/// whatever `|L ∩ R|` is; every segment carries the same pins and the
+/// whole left range, and together they answer as the uncapped pair does.
+#[test]
+fn a_small_byte_cap_splits_the_pair_into_bounded_segments_with_the_same_answers() {
+    let rows: Vec<(Vec<u8>, u32, u64)> = (0..200)
+        .map(|k| (int(k), (k % 4) as u32, 1 + k as u64 % 3))
+        .collect();
+    let left = exact_segment("id", true, &rows, 0..4, 16);
+    let right = exact_segment("order_id", true, &rows[50..], 0..4, 16);
+    let (l, r) = ([open(&left)], [open(&right)]);
+    let live = rgs(&[0, 1, 2, 3]);
+    let side = |s| Side {
+        segments: s,
+        live: &live,
+        types: None,
+    };
+    let opts = WriterOptions {
+        block_keys: 8,
+        ..WriterOptions::default()
+    };
+    let whole = build_one(
+        &join(true),
+        &side(&l),
+        &side(&r),
+        Some((0, 3)),
+        pins(2, 9),
+        &opts,
+    )
+    .unwrap();
+    let caps = PairCaps {
+        max_keys: u64::MAX,
+        max_bytes: 512,
+    };
+    let segs = build_segments(
+        &join(true),
+        &side(&l),
+        &side(&r),
+        Some((0, 3)),
+        pins(2, 9),
+        &opts,
+        caps,
+    )
+    .unwrap();
+    assert!(
+        segs.len() > 4,
+        "150 shared keys under 512 bytes: {} segments",
+        segs.len()
+    );
+    let whole = open(&whole.bytes);
+    let parts: Vec<_> = segs.iter().map(|s| open(&s.bytes)).collect();
+    let mut last: Option<Vec<u8>> = None;
+    for (s, p) in segs.iter().zip(&parts) {
+        // The open segment is finished at the first key past the cap: one
+        // key's record (a few dozen bytes here) and the footer over it.
+        assert!(s.bytes.len() < 1024, "segment of {} bytes", s.bytes.len());
+        assert_eq!(header_pins(p).unwrap(), header_pins(&whole).unwrap());
+        assert_eq!(p.rowgroup_range(), Some((RowGroupId(0), RowGroupId(3))));
+        let keys: Vec<Vec<u8>> = pair_entries(p).unwrap().into_iter().map(|e| e.0).collect();
+        // Key ranges ascend and never overlap: each key is in one segment.
+        assert!(last.as_ref().is_none_or(|k| k < &keys[0]));
+        last = keys.last().cloned();
+    }
+    let all: Vec<_> = parts
+        .iter()
+        .flat_map(|p| pair_entries(p).unwrap())
+        .collect();
+    assert_eq!(all, pair_entries(&whole).unwrap());
+    assert_eq!(
+        overlap_stats(&parts).unwrap(),
+        overlap_stats(std::slice::from_ref(&whole)).unwrap()
+    );
+    let probes: Vec<Vec<u8>> = (0..210).map(int).collect();
+    assert_eq!(
+        semijoin(&parts, &probes).unwrap(),
+        semijoin(std::slice::from_ref(&whole), &probes).unwrap()
+    );
 }

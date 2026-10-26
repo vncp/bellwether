@@ -27,3 +27,5 @@ Rejected alternative: indexing the empty list as a sentinel element, so `cardina
 ## Amendment 2026-10-26: join keys (B3)
 
 A join key pairs the tuples two datasets' exact keys hold. A tuple holding a null (in any column; a trailing null is the null marker of the 2026-10-24 amendment) equals nothing in SQL, so it is never paired: it counts as a key of its side alone (`|L \ R|` or `|R \ L|`), and a probe holding a null matches nothing. Float columns are refused as join columns: `-0.0` and `0.0` are equal in SQL and encode differently, and engines disagree on whether `NaN` equals itself, so a pairing would be a guess.
+
+A pair split into segments by key range (ADR 018) counts a null-holding tuple, like any one-sided key, in the one segment whose stretch of the merge it fell in, so the one-sided counts summed over a key's segments are the pair's and a null tuple is never counted twice or paired across segments.

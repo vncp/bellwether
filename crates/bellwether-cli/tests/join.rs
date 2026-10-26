@@ -358,6 +358,32 @@ fn join_human_output_and_usage_errors() {
         .find(|l| l.contains("row groups") && l.contains("bytes"))
         .unwrap();
     assert!(header.trim_end().ends_with("join"), "{header}");
+    // Review item 7e: the join cell is short (asked keys both hold, of
+    // those asked), its meaning is printed once under the table, and the
+    // dataset row's cell says why it holds no join value.
+    let row = w
+        .lines()
+        .find(|l| l.trim_start().starts_with(JOIN))
+        .unwrap();
+    assert!(row.contains(" 2 of 3  floor (semijoin)"), "{row}");
+    assert_eq!(
+        w.matches("join: asked keys both datasets hold, of those asked")
+            .count(),
+        1,
+        "{w}"
+    );
+    let dataset = w
+        .lines()
+        .find(|l| l.trim_start().starts_with("dataset"))
+        .unwrap();
+    assert!(
+        dataset.ends_with("200 rows (no join value: the dataset, not a candidate)"),
+        "{dataset}"
+    );
+    assert!(
+        !w.lines().any(|l| l != l.trim_end()),
+        "trailing blanks: {w}"
+    );
     // Declaring the join key with the left exact key in one call.
     let idx = human(&["index", d, "--key", "exact:order_id", "--key", JOIN], 0);
     assert!(idx.contains("join keys"), "{idx}");
@@ -417,14 +443,23 @@ fn join_human_output_and_usage_errors() {
     );
     run(&["why", d, "--from", kp, "--mode", "semijoin"], 2);
     run(&["join", "semijoin", d, "--keys", kp], 2);
-    let out = assert_cmd::Command::cargo_bin("bellwether")
-        .unwrap()
-        .args(["join", "overlap", d, "--join", "payables"])
-        .output()
-        .unwrap();
-    assert_eq!(out.status.code(), Some(4));
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(stderr.contains("payables.order_id"), "{stderr}");
+    // Review item 7f: a --join mistake is a usage error (exit 2), with the
+    // spelling to use.
+    for args in [
+        vec!["join", "overlap", d, "--join", "payables"],
+        vec![
+            "why", d, "--from", kp, "--mode", "semijoin", "--join", "payables",
+        ],
+    ] {
+        let out = assert_cmd::Command::cargo_bin("bellwether")
+            .unwrap()
+            .args(&args)
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(2), "{args:?}");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.contains("payables.order_id"), "{stderr}");
+    }
 }
 
 #[test]
@@ -464,4 +499,138 @@ fn fix_on_a_join_proposal_prints_both_certificates() {
     assert!(fixed.contains("receipt"), "{fixed}");
     let v = human(&["join", "verify", d], 0);
     assert!(v.contains("every join key is fresh"), "{v}");
+}
+
+/// Review of PR #32, reader items a, b, g, and i, on the command line.
+#[test]
+fn join_reader_pass_states_the_cause_and_the_next_step() {
+    let dir = tempfile::tempdir().unwrap();
+    let (l, r) = corpus(dir.path());
+    let (d, rd) = (path(&l), path(&r));
+    let counted = format!("{JOIN},counts");
+    run(&["index", rd, "--key", "exact:paid_order,counts"], 0);
+    // g: a counted key's index line names it with `,counts`.
+    let idx = human(
+        &[
+            "index",
+            d,
+            "--key",
+            "exact:order_id,counts",
+            "--key",
+            &counted,
+        ],
+        0,
+    );
+    assert!(idx.contains(&format!("rebuilt; {counted}: fresh")), "{idx}");
+    // a: a right file nobody indexed: `join verify` says stale on the right,
+    // why, and both commands, and exits 1.
+    write(&r.join("p2.parquet"), "paid_order", &[5], 25);
+    let v = human(&["join", "verify", d], 1);
+    assert!(v.contains("1 join key is stale"), "{v}");
+    assert!(v.contains("stale on the right"), "{v}");
+    assert!(
+        v.contains("1 new file the index does not cover (p2.parquet)"),
+        "{v}"
+    );
+    assert!(
+        v.contains(&format!("bellwether index {rd} && bellwether index {d}")),
+        "{v}"
+    );
+    // b: the left's own commit is reported beside the join key it could
+    // not rebuild, with the cause and the command; exit 1.
+    write(&l.join("o2.parquet"), "order_id", &[1000], 10);
+    let idx = human(&["index", d], 1);
+    assert!(idx.contains("committed manifest sequence 3"), "{idx}");
+    assert!(
+        idx.contains(&format!("{counted}: not rebuilt: {rd} has 1 new file")),
+        "{idx}"
+    );
+    assert!(
+        idx.contains(&format!("run `bellwether index {d}`")),
+        "{idx}"
+    );
+    run(&["index", rd], 0);
+    let idx = human(&["index", d], 0);
+    assert!(idx.contains(&format!("rebuilt; {counted}: fresh")), "{idx}");
+    assert!(human(&["join", "verify", d], 0).contains("every join key is fresh"));
+    // i: a link beside the root to a folder elsewhere is refused by name,
+    // as a usage error.
+    let outside = dir.path().join("outside").join("extern");
+    std::fs::create_dir_all(&outside).unwrap();
+    write(&outside.join("x.parquet"), "paid_order", &[1, 2], 10);
+    run(
+        &["index", path(&outside), "--key", "exact:paid_order,counts"],
+        0,
+    );
+    std::os::unix::fs::symlink(&outside, l.parent().unwrap().join("linked")).unwrap();
+    let out = assert_cmd::Command::cargo_bin("bellwether")
+        .unwrap()
+        .args([
+            "index",
+            d,
+            "--key",
+            "join:orders.order_id=linked.paid_order,counts",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("the right dataset linked is") && stderr.contains("a link to"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("not beside the data root"), "{stderr}");
+    assert!(stderr.contains("move or copy linked there"), "{stderr}");
+}
+
+/// Review of PR #32, reader item d, on the time-series corpus: a semi-join
+/// workload's culprit is the missing join key, never a single-column key
+/// lint advising a key the dataset already has.
+#[test]
+fn a_semijoin_culprit_is_the_missing_join_key_on_the_market_corpus() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = dir.path().join("market");
+    let o = path(&out);
+    run(
+        &[
+            "bench",
+            "joins",
+            "--shape",
+            "market",
+            "--out",
+            o,
+            "--size",
+            "200",
+            "--symbols",
+            "40",
+            "--rows-per-row-group",
+            "500",
+            "--keysets",
+            "300",
+        ],
+        0,
+    );
+    let (t, q) = (out.join("trades"), out.join("quotes"));
+    run(&["index", path(&q), "--key", "exact:symbol,minute"], 0);
+    run(&["index", path(&t), "--key", "exact:symbol,minute"], 0);
+    let keys = out.join("workload").join("semi-300.parquet");
+    let w = human(
+        &[
+            "why",
+            path(&t),
+            "--from",
+            path(&keys),
+            "--mode",
+            "semijoin",
+            "--join",
+            "quotes.symbol,minute",
+        ],
+        0,
+    );
+    let culprit = w.lines().find(|l| l.starts_with("culprit")).unwrap();
+    assert!(
+        culprit.starts_with("culprit (symbol, minute): no join key serves this semi-join"),
+        "{culprit}"
+    );
+    assert!(culprit.contains("join:trades.symbol,minute=quotes.symbol,minute is not declared"));
 }

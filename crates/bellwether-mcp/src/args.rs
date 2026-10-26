@@ -201,6 +201,9 @@ impl EngineArgs {
             twin_of: self.twin_of.clone(),
             scratch: self.scratch.clone(),
             keep_exports: self.keep,
+            // Any right side: the CLI's human names it. The MCP server
+            // narrows it to its `--join` (`Server::new`).
+            join_scope: bellwether::JoinScope::Any,
             engine_adapter: None,
         })
     }

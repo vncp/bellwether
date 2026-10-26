@@ -423,10 +423,7 @@ impl Engine {
                 ("right", *right_sequence, *right_sequence)
             }
         };
-        let rebuild = s
-            .next
-            .clone()
-            .unwrap_or_else(|| self.refresh_command());
+        let rebuild = s.next.clone().unwrap_or_else(|| self.refresh_command());
         Error::StaleJoin {
             spec: s.spec.name(),
             side,

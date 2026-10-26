@@ -432,11 +432,12 @@ pub fn transient_pair<S: StoreExt + ?Sized, R: StoreExt + ?Sized>(
         held = held.saturating_add(seg.bytes.len() as u64);
         if held > max_bytes {
             return Err(Error::Other(format!(
-                "the transient pair index of {} would hold more than {max_bytes} bytes, past \
-                 its cap on a transient index (TransientLimits::max_index_bytes), so it is not \
-                 priced in memory; declare it with `bellwether index <left folder> --key {}` to \
-                 build it into the index, segment by segment, and measure it there",
+                "the pair index of {} would hold more than {max_bytes} bytes, past the cap on an \
+                 index built only to price it, so it is not priced in memory; build it into the \
+                 index, segment by segment, with `bellwether index {} --key {}`, then run the \
+                 command again",
                 spec.name(),
+                left.manifest().source.root,
                 spec.identity()
             )));
         }
@@ -506,7 +507,9 @@ impl<S: StoreExt + ?Sized> Builder<S> {
     ) -> Result<JoinRefresh> {
         let mut restarts = 0u32;
         loop {
-            if let Some(done) = self.try_refresh_join(spec, right_store, right_root, expect, caps)? {
+            if let Some(done) =
+                self.try_refresh_join(spec, right_store, right_root, expect, caps)?
+            {
                 return Ok(done);
             }
             restarts += 1;
@@ -564,7 +567,7 @@ impl<S: StoreExt + ?Sized> Builder<S> {
                 id,
                 kind: None,
                 key_spec: identity.clone(),
-                rowgroup_range: meta.rowgroup_range,
+                rowgroup_range: meta.rowgroup_range.clone(),
                 bytes,
                 join: Some(meta.pin.clone()),
                 extra: Extra::new(),
@@ -867,5 +870,30 @@ impl<S: StoreExt + ?Sized> Planner<S> {
     ) -> Result<OverlapStats> {
         let readers = self.pair_readers(spec, right)?;
         cj::overlap_stats(&readers)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Review of PR #32, item 7h: a key-type mismatch names the types in
+    /// words, never their Debug form.
+    #[test]
+    fn types_are_named_in_words() {
+        let t = [
+            ColumnType::Int64,
+            ColumnType::Utf8,
+            ColumnType::Decimal128 {
+                precision: 18,
+                scale: 2,
+            },
+        ];
+        let words = types_in_words(&t);
+        assert!(words.starts_with("Int64, Utf8, "), "{words}");
+        assert!(
+            !words.contains('{') && !words.contains("precision"),
+            "{words}"
+        );
     }
 }

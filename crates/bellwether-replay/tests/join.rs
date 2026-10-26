@@ -31,7 +31,9 @@ use std::sync::Arc;
 
 use arrow::array::{ArrayRef, Int64Array, RecordBatch, StringArray};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
-use bellwether_build::{transient_pair, BuildOptions, Builder, Lookup, Planner};
+use bellwether_build::{
+    transient_pair, BuildOptions, Builder, Lookup, PairCaps, Planner, DEFAULT_PAIR_CAPS,
+};
 use bellwether_replay::{
     pair_cost, Baseline, KeyInput, MemoryKeySets, PairInput, Replayer, RunJoin, RunQuery,
     WorkloadRecorder,
@@ -201,7 +203,14 @@ fn semijoin_runs_price_what_the_build_planner_plans() {
         let spec = join(counts);
         let lsnap = Snapshot::open(Arc::clone(&ls), "idx").unwrap();
         let rsnap = Snapshot::open(Arc::clone(&rs), "idx").unwrap();
-        let pair = transient_pair(&lsnap, &rsnap, &spec).unwrap();
+        // Priced from a pair split into many segments (ADR 018), planned
+        // from the committed one-segment pair: the answers are equal.
+        let caps = PairCaps {
+            max_keys: 37,
+            max_bytes: u64::MAX,
+        };
+        let pair = transient_pair(&lsnap, &rsnap, &spec, caps, u64::MAX).unwrap();
+        assert!(pair.segments.len() > 1, "{} segments", pair.segments.len());
         let lsource = ParquetSource::new().with_schema(left_schema());
         let rsource = ParquetSource::new().with_schema(right_schema());
 
@@ -230,7 +239,10 @@ fn semijoin_runs_price_what_the_build_planner_plans() {
             .with_pair(PairInput {
                 right: "payables".into(),
                 replayer: right_replayer,
-                pairs: BTreeMap::from([(spec.identity(), Bytes::from(pair.bytes.clone()))]),
+                pairs: BTreeMap::from([(
+                    spec.identity(),
+                    pair.segments.iter().cloned().map(Bytes::from).collect(),
+                )]),
             });
         let current = replayer.current_specs().to_vec();
         assert_eq!(current, vec![exact("order_id", counts)]);
@@ -238,7 +250,7 @@ fn semijoin_runs_price_what_the_build_planner_plans() {
 
         // The committed pair: what `semijoin` plans.
         Builder::new(Arc::clone(&ls), "idx")
-            .refresh_join(&spec, &rs, "idx")
+            .refresh_join(&spec, &rs, "idx", None, DEFAULT_PAIR_CAPS)
             .unwrap();
         let (lp, rp) = (
             Planner::open(Arc::clone(&ls), "idx").unwrap(),

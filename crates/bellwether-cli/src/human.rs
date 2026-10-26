@@ -1113,14 +1113,15 @@ pub(crate) fn why(r: &bellwether::WhyReport, out: &Out, fix_command: &str) -> St
             CulpritReason::Lint {
                 rule, confidence, ..
             } => format!("lint {rule} (confidence {confidence:.2})"),
-            CulpritReason::NoIndexServes => match r.workload.as_ref().and_then(|w| match &w.lookup {
-                Some(LookupKind::SemiJoin {
-                    right,
-                    right_columns,
-                }) => Some((right, right_columns)),
-                _ => None,
-            }) {
-                Some((right, right_columns)) => format!(
+            CulpritReason::NoIndexServes => {
+                match r.workload.as_ref().and_then(|w| match &w.lookup {
+                    Some(LookupKind::SemiJoin {
+                        right,
+                        right_columns,
+                    }) => Some((right, right_columns)),
+                    _ => None,
+                }) {
+                    Some((right, right_columns)) => format!(
                     "no join key serves this semi-join (join:{}.{}={right}.{} is not declared), \
                      so each step locates every asked key in its own dataset, whether the other \
                      dataset holds it or not",
@@ -1131,8 +1132,9 @@ pub(crate) fn why(r: &bellwether::WhyReport, out: &Out, fix_command: &str) -> St
                     c.columns.join(","),
                     right_columns.join(",")
                 ),
-                None => no_index_serves(r),
-            },
+                    None => no_index_serves(r),
+                }
+            }
             CulpritReason::Layout {
                 least_row_groups,
                 row_groups,

@@ -487,7 +487,18 @@ mod tests {
         ids.insert(3);
         assert!(loc.check_known(&ids).is_ok());
         ids.insert(10);
-        assert!(loc.check_known(&ids).is_err());
+        // Review of PR #32, item 7c: the true cause and the next step.
+        let msg = loc.check_known(&ids).unwrap_err().to_string();
+        assert!(msg.contains("row-group id 10"), "{msg}");
+        assert!(msg.contains("built against another manifest"), "{msg}");
+        assert!(
+            msg.contains("restore the manifest from manifests/"),
+            "{msg}"
+        );
+        assert!(
+            msg.contains("`bellwether index` on the data folder"),
+            "{msg}"
+        );
 
         let mut dup = m.clone();
         dup.rowgroup_space.files[1].rowgroup_ids[0] = RowGroupId(0);

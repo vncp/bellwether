@@ -898,9 +898,21 @@ impl Engine {
                     sequence: before.to_string(),
                 });
             }
-            ProposalBody::Key { .. } if dry_run => {
+            ProposalBody::Key { spec, .. } if dry_run => {
                 if !matches!(certificate.coverage, Coverage::Workload { .. }) {
                     return Err(not_workload_covered(cert_hash));
+                }
+                // A join key's right certificate is checked as the real
+                // apply checks it, so the two agree.
+                if let KeySpec::Join { right, .. } = spec {
+                    let r = self.right_engine(right)?;
+                    let rpin = r.pin_required("a join key")?;
+                    if let Err(refusal) =
+                        self.right_certificate(cert_hash, &certificate, r.root(), &rpin)?
+                    {
+                        result.outcome = refused(refusal);
+                        return Ok(result);
+                    }
                 }
                 result.outcome = FixOutcome::WouldApply {
                     sequence: before,
@@ -915,7 +927,12 @@ impl Engine {
                 let source = self.source(pinned.as_ref())?;
                 let pair = self.pair_of(pinned.as_ref(), spec)?;
                 let right_cert = match &pair {
-                    Some(p) => match self.right_certificate(cert_hash, &certificate, p)? {
+                    Some(p) => match self.right_certificate(
+                        cert_hash,
+                        &certificate,
+                        p.right().root(),
+                        p.rpin(),
+                    )? {
                         Ok(h) => Some(h),
                         Err(r) => {
                             result.outcome = refused(r);
@@ -1217,15 +1234,16 @@ impl Engine {
 
     /// The right certificate a join key's (left) certificate cites (B3):
     /// it must be in the ledger, pass, and be of the right dataset's
-    /// current manifest, by sequence and by content (a right index deleted
-    /// and rebuilt to the same sequence is another manifest); or the
-    /// refusal.
+    /// current manifest (at `right_root`, pinned by `rpin`), by sequence and
+    /// by content (a right index deleted and rebuilt to the same sequence
+    /// is another manifest); or the refusal.
     #[allow(clippy::result_large_err)]
     fn right_certificate(
         &self,
         cert_hash: &Hash,
         certificate: &Certificate,
-        pair: &WhyPair,
+        right_root: &str,
+        rpin: &Pinned,
     ) -> Result<std::result::Result<Hash, Refusal>> {
         let ledger = self.ledger()?;
         for input in &certificate.provenance.inputs {
@@ -1240,14 +1258,13 @@ impl Engine {
                 .manifest_version
                 .clone()
                 .unwrap_or_default();
-            let rpin = pair.rpin();
             // The certificate cites the manifest it verified by content.
             if certified != rpin.sequence().to_string()
                 || !right.provenance.inputs.contains(&rpin.hash)
             {
                 return Ok(Err(stale_right(
                     *input,
-                    pair.right().root(),
+                    right_root,
                     &certified,
                     rpin.sequence(),
                 )));
@@ -2717,6 +2734,75 @@ mod tests {
             }
         );
         assert_eq!(receipts(&data.join(".bellwether")), 0);
+    }
+
+    /// Review of PR #32, mutant MC and item 6: a commit on a join key's
+    /// right dataset that lands between the gate and the apply (the right
+    /// certificate verified the manifest before it) is refused
+    /// `stale_manifest` before the left commits anything: the key is not
+    /// declared, no pair is built, and no receipt is written. The same
+    /// proposal verified again then applies.
+    #[test]
+    fn a_right_commit_between_the_gate_and_the_apply_refuses_before_committing() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let (orders, payables) = (root.join("orders"), root.join("payables"));
+        common::scattered_corpus(&orders, 3, 4, 25, 400);
+        common::scattered_corpus(&payables, 2, 4, 25, 41);
+        let exact = crate::spec::parse("exact:id").unwrap();
+        let open = |p: &Path| Engine::open(p.to_str().unwrap(), EngineOptions::default()).unwrap();
+        open(&payables).index(std::slice::from_ref(&exact)).unwrap();
+        let e = open(&orders);
+        e.index(std::slice::from_ref(&exact)).unwrap();
+        let kf = root.join("k.parquet");
+        common::write_keys(&kf, "id", &[5, 7, 77, 123, 300]);
+        let w = e
+            .why(&WhyRequest {
+                keys: Some(KeyFile::new(&kf)),
+                mode: Some(crate::LookupMode::SemiJoin),
+                join: Some("payables.id".into()),
+                ..WhyRequest::default()
+            })
+            .unwrap();
+        let p = w.recommended.as_ref().unwrap().proposal;
+        let wl = w.workload.as_ref().unwrap().hash;
+        let right = payables.clone();
+        test_seam::set_before_apply(move |_| {
+            Engine::open(right.to_str().unwrap(), EngineOptions::default())
+                .unwrap()
+                .index(&[crate::spec::parse("exact:batch").unwrap()])
+                .unwrap();
+        });
+        let r = fix_key(&e, p, wl, false);
+        test_seam::clear_before_apply();
+        let root_of = payables.to_str().unwrap();
+        assert_eq!(
+            r.outcome,
+            FixOutcome::Refused {
+                refusal: Refusal::StaleManifest {
+                    certificate: r.join.as_ref().unwrap().certificate.hash,
+                    certified: format!("1 of {root_of}"),
+                    current: format!("2 of {root_of}"),
+                }
+            }
+        );
+        let index = orders.join(".bellwether");
+        assert_eq!(receipts(&index), 0);
+        let pin = e.pin().unwrap().unwrap();
+        assert_eq!(pin.sequence(), 1, "the left committed nothing");
+        assert!(pin
+            .planner
+            .declared_specs()
+            .iter()
+            .all(|s| !matches!(s, KeySpec::Join { .. })));
+        // Verified again against the right as it is now, it applies.
+        let again = fix_key(&e, p, wl, false);
+        assert!(
+            matches!(again.outcome, FixOutcome::Applied { .. }),
+            "{:?}",
+            again.outcome
+        );
+        assert_eq!(receipts(&index), 1);
     }
 
     /// Signed zero: a workload key 0.0 matches rows stored under -0.0 too.

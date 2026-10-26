@@ -180,7 +180,22 @@ fn index_declares_the_join_key_and_refuses_a_missing_exact_key_with_its_command(
     // Never indexed, only the join key: the exact key is named.
     let err = left.index(&[join()]).unwrap_err();
     assert!(err.to_string().contains("--key exact:order_id"), "{err}");
-    // The right dataset has no index.
+    // The right dataset has no index: the left's own build still commits,
+    // and the join key is reported not rebuilt beside that commit (review
+    // item 7b), with the cause (the right's root) and the command.
+    let done = left.index(&[exact("order_id"), join()]).unwrap();
+    assert_eq!(done.committed, Some(1), "the left commit is reported");
+    assert_eq!(done.joins.len(), 1);
+    let j = &done.joins[0];
+    assert_eq!(j.state, JoinFreshness::NotRebuilt);
+    assert!(!j.refreshed);
+    assert!(j.message.contains(r.to_str().unwrap()), "{}", j.message);
+    assert!(j.message.contains("not rebuilt"), "{}", j.message);
+    assert!(
+        j.next.as_deref().unwrap().starts_with("bellwether index "),
+        "{j:?}"
+    );
+    // Nothing else to commit: the refusal itself, typed.
     let err = left.index(&[exact("order_id"), join()]).unwrap_err();
     match &err {
         Error::NotIndexed {
@@ -433,14 +448,22 @@ fn why_prices_the_join_key_and_fix_applies_it_with_both_certificates() {
         .copied()
         .filter(|k| lk.contains_key(k) && rk.contains_key(k))
         .collect();
+    // The cell is the asked keys both hold, of those asked; its meaning and
+    // the pair's shape are the label (review items 7e and 8).
+    assert_eq!(kc.value, format!("{} of {}", matched.len(), asked.len()));
+    let both: Vec<&i64> = lk.keys().filter(|k| rk.contains_key(*k)).collect();
+    let sum_r: usize = both.iter().map(|k| rk[*k].len()).sum();
+    #[allow(clippy::cast_precision_loss)]
+    let (per_shared, per_left) = (
+        sum_r as f64 / both.len() as f64,
+        sum_r as f64 / lk.len() as f64,
+    );
     assert!(
-        kc.value.starts_with(&format!(
-            "{} of {} keys on both",
-            matched.len(),
-            asked.len()
+        kc.label.contains(&format!(
+            "mean {per_shared:.2} per shared key, {per_left:.2} per left key"
         )),
         "{}",
-        kc.value
+        kc.label
     );
     // Current: two locates (every asked key on each side); proposed: the
     // shared keys' row groups only.
@@ -735,4 +758,139 @@ fn repeated_semijoins_without_a_join_key_raise_r_join_1() {
         })
         .unwrap();
     assert_eq!(rules(&plain), vec![]);
+}
+
+/// How the right dataset changes after a join key was verified against it.
+#[derive(Clone, Copy, Debug)]
+enum RightChange {
+    /// Another commit (a key declared; its files unchanged).
+    Commit,
+    /// Its index deleted and rebuilt over the same files, back to the
+    /// sequence verified: another manifest at that sequence.
+    Rebuilt,
+}
+
+fn change_right(r: &Path, how: RightChange) {
+    match how {
+        RightChange::Commit => {
+            engine(r).index(&[exact("amount")]).unwrap();
+        }
+        RightChange::Rebuilt => {
+            std::fs::remove_dir_all(r.join(".bellwether")).unwrap();
+            engine(r).index(&[exact("paid_order")]).unwrap();
+        }
+    }
+}
+
+/// Review of PR #32, mutant MB and item 1: `fix --certificate` of a join
+/// key (not declared yet) after the right dataset changed since its right
+/// certificate (a commit, or its index deleted and rebuilt to the same
+/// sequence) is refused `stale_manifest`, naming the right and, for a
+/// rebuild, saying so; nothing is declared, built, or attested.
+#[test]
+fn a_certificate_of_a_right_manifest_no_longer_current_is_refused() {
+    for how in [RightChange::Commit, RightChange::Rebuilt] {
+        let dir = tempfile::tempdir().unwrap();
+        let (l, r) = corpus(dir.path());
+        engine(&r).index(&[exact("paid_order")]).unwrap();
+        let left = engine(&l);
+        left.index(&[exact("order_id")]).unwrap();
+        let keys = dir.path().join("keys.parquet");
+        write_keys(&keys, &(0..40).map(|i| Some(i * 11)).collect::<Vec<_>>());
+        let w = left
+            .why(&WhyRequest {
+                keys: Some(KeyFile::new(&keys)),
+                mode: Some(LookupMode::SemiJoin),
+                join: Some("payables.paid_order".into()),
+                ..WhyRequest::default()
+            })
+            .unwrap();
+        let rec = w.recommended.as_ref().unwrap();
+        let verified = left
+            .fix(&FixRequest {
+                proposal: Some(rec.proposal),
+                workload: Some(w.workload.as_ref().unwrap().hash),
+                verify_only: true,
+                ..FixRequest::default()
+            })
+            .unwrap();
+        let cert = verified.certificate.as_ref().unwrap().hash;
+        let before = left.index(&[]).unwrap();
+        assert_eq!(before.committed, None);
+        change_right(&r, how);
+        let root = r.to_str().unwrap();
+        let current = match how {
+            RightChange::Commit => format!("2 of {root}"),
+            RightChange::Rebuilt => format!(
+                "1 of {root}, another manifest at that sequence (its index was deleted and \
+                 rebuilt since)"
+            ),
+        };
+        let want = bellwether::Refusal::StaleManifest {
+            certificate: verified.join.as_ref().unwrap().certificate.hash,
+            certified: format!("1 of {root}"),
+            current,
+        };
+        let dry = left.apply_dry_run(&cert).unwrap();
+        let applied = left
+            .fix(&FixRequest {
+                certificate: Some(cert),
+                ..FixRequest::default()
+            })
+            .unwrap();
+        for outcome in [&dry.outcome, &applied.outcome] {
+            assert_eq!(
+                outcome,
+                &FixOutcome::Refused {
+                    refusal: want.clone()
+                },
+                "{how:?}"
+            );
+        }
+        // `index` with nothing to do: no commit since, and no join key.
+        let v = left.index(&[]).unwrap();
+        assert_eq!(v.committed, None, "{how:?}");
+        assert_eq!(v.sequence, before.sequence, "{how:?}: nothing committed");
+        assert!(v.joins.is_empty(), "{how:?}: nothing declared");
+    }
+}
+
+/// Review of PR #32, mutant MK: `why` never prices a declared join key
+/// that is stale (its right committed again, or was deleted and rebuilt to
+/// the pinned sequence): it is refused `stale_join` with the refresh
+/// command, since no price of it would be the plan.
+#[test]
+fn why_refuses_a_stale_declared_join_key() {
+    for how in [RightChange::Commit, RightChange::Rebuilt] {
+        let (dir, l, r) = ready();
+        let left = engine(&l);
+        assert!(left.join_verify(None).unwrap().pass);
+        change_right(&r, how);
+        let keys = dir.path().join("keys.parquet");
+        write_keys(&keys, &[Some(5), Some(160), Some(200)]);
+        let err = left
+            .why(&WhyRequest {
+                keys: Some(KeyFile::new(&keys)),
+                mode: Some(LookupMode::SemiJoin),
+                join: Some("payables.paid_order".into()),
+                ..WhyRequest::default()
+            })
+            .unwrap_err();
+        match &err {
+            Error::StaleJoin { side, message, .. } => {
+                assert_eq!(*side, "right", "{how:?}");
+                assert!(
+                    message.contains(&format!("`bellwether index {}`", l.to_str().unwrap())),
+                    "{message}"
+                );
+                if matches!(how, RightChange::Rebuilt) {
+                    assert!(message.contains("deleted and rebuilt"), "{message}");
+                }
+            }
+            other => panic!("{how:?}: {other:?}"),
+        }
+        // Following the refusal makes it fresh, and `why` prices it.
+        left.index(&[]).unwrap();
+        assert!(left.join_verify(None).unwrap().pass, "{how:?}");
+    }
 }

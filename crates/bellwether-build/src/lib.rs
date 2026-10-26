@@ -40,6 +40,7 @@ mod sources;
 mod target;
 mod verify;
 
+pub use bellwether_core::join::PairCaps;
 pub use build::{BuildReport, Builder, TextTablesReplaced, MAX_KEY_SPECS};
 pub use compact::CompactReport;
 pub use config::{
@@ -47,10 +48,9 @@ pub use config::{
     DEFAULT_MAX_SEGMENT_BYTES, DEFAULT_MAX_SEGMENT_KEYS, DEFAULT_MAX_SEGMENT_ROW_GROUPS,
 };
 pub use coverage::{completeness, sidecar_completeness, sketch_completeness};
-pub use bellwether_core::join::PairCaps;
 pub use join::{
-    join_side_spec, transient_pair, JoinRefresh, JoinState, PairBuild, RightManifest,
-    SemiJoinPlan, DEFAULT_PAIR_CAPS,
+    join_side_spec, transient_pair, JoinRefresh, JoinState, PairBuild, RightManifest, SemiJoinPlan,
+    DEFAULT_PAIR_CAPS,
 };
 pub use keys::encode_ts;
 pub use plan::{

@@ -34,7 +34,9 @@ use std::sync::Arc;
 
 use arrow::array::{ArrayRef, Float64Array, Int64Array, RecordBatch, StringArray};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
-use bellwether_build::{transient_pair, CompactOptions, JoinRefresh, JoinState, Planner};
+use bellwether_build::{
+    transient_pair, CompactOptions, JoinRefresh, JoinState, PairCaps, Planner, DEFAULT_PAIR_CAPS,
+};
 use bellwether_store::{ObjectStoreBackend, Snapshot};
 use bellwether_types::{Error, KeySpec, Predicate, Quantity};
 use common::*;
@@ -150,9 +152,11 @@ impl Pair {
     }
 
     fn refresh(&self, spec: &KeySpec) -> JoinRefresh {
-        builder(&self.left)
-            .refresh_join(spec, &self.right, "idx")
-            .unwrap()
+        self.try_refresh(spec).unwrap()
+    }
+
+    fn try_refresh(&self, spec: &KeySpec) -> bellwether_types::Result<JoinRefresh> {
+        builder(&self.left).refresh_join(spec, &self.right, "idx", None, DEFAULT_PAIR_CAPS)
     }
 
     fn left_rows(&self) -> Vec<Row> {
@@ -165,7 +169,7 @@ impl Pair {
 
     fn state(&self, spec: &KeySpec) -> JoinState {
         planner(&self.left)
-            .join_state(spec, planner(&self.right).sequence())
+            .join_state(spec, &planner(&self.right))
             .unwrap()
     }
 }
@@ -389,7 +393,7 @@ fn a_refresh_declares_and_builds_in_one_commit_and_is_a_no_op_when_fresh() {
         right_sequence,
         left_exact,
         right_exact,
-        segment,
+        segments,
     } = p.refresh(&spec)
     else {
         panic!("expected a build")
@@ -398,7 +402,15 @@ fn a_refresh_declares_and_builds_in_one_commit_and_is_a_no_op_when_fresh() {
     assert_eq!(right_sequence, planner(&p.right).sequence());
     assert_eq!(left_exact, exact_counts(&["order_id"], false));
     assert_eq!(right_exact, exact_counts(&["paid_order"], false));
-    assert_eq!(segment.right_sequence, Some(right_sequence));
+    assert_eq!(
+        segments.len(),
+        1,
+        "the default caps hold this pair in one segment"
+    );
+    let rsnap = Snapshot::open(Arc::clone(&p.right), "idx").unwrap();
+    let pin = segments[0].join.as_ref().unwrap();
+    assert_eq!(pin.right_sequence, right_sequence);
+    assert_eq!(pin.right_manifest, rsnap.content_hash());
     let lp = planner(&p.left);
     assert!(lp.declared_specs().contains(&spec));
     assert_eq!(
@@ -412,20 +424,21 @@ fn a_refresh_declares_and_builds_in_one_commit_and_is_a_no_op_when_fresh() {
     assert_eq!(planner(&p.left).sequence(), sequence, "nothing committed");
     // The transient pair `why` prices with is the committed segment.
     let lsnap = Snapshot::open(Arc::clone(&p.left), "idx").unwrap();
-    let rsnap = Snapshot::open(Arc::clone(&p.right), "idx").unwrap();
-    let t = transient_pair(&lsnap, &rsnap, &spec).unwrap();
+    let t = transient_pair(&lsnap, &rsnap, &spec, DEFAULT_PAIR_CAPS, u64::MAX).unwrap();
+    assert_eq!(t.segments.len(), 1);
     let stored = bellwether_types::Store::get(
         &*p.left,
         &format!(
             "idx/{}",
-            bellwether_core::segment::segment_path(&segment.id)
+            bellwether_core::segment::segment_path(&segments[0].id)
         ),
     )
     .unwrap()
     .0;
     // The left sequence in the header differs (built at `before`, now at
     // `sequence`); everything a plan reads is equal.
-    let a = bellwether_core::SegmentReader::open(bytes::Bytes::from(t.bytes)).unwrap();
+    let a =
+        bellwether_core::SegmentReader::open(bytes::Bytes::from(t.segments[0].clone())).unwrap();
     let b = bellwether_core::SegmentReader::open(stored).unwrap();
     assert_eq!(
         bellwether_core::join::pair_entries(&a).unwrap(),
@@ -435,6 +448,86 @@ fn a_refresh_declares_and_builds_in_one_commit_and_is_a_no_op_when_fresh() {
         bellwether_core::join::one_sided(&a).unwrap(),
         bellwether_core::join::one_sided(&b).unwrap()
     );
+}
+
+/// ADR 018: a refresh under small caps splits the pair by key range into
+/// several segments, each listed with the same pins, and plans exactly as
+/// the one-segment pair does; `why`'s transient pair under the same caps
+/// is the same segments, and one past its byte cap is refused, never
+/// truncated.
+#[test]
+fn small_caps_split_the_pair_and_a_transient_pair_past_its_cap_is_refused() {
+    let p = Pair::new(true);
+    let spec = join(true);
+    let asked: Vec<Vec<u8>> = (100..380i64).map(enc_i64).collect();
+    p.refresh(&spec);
+    let whole_semi = planner(&p.left)
+        .plan_semijoin(&spec, &asked, &planner(&p.right))
+        .unwrap();
+    let whole_overlap = planner(&p.left)
+        .join_overlap(&spec, &planner(&p.right))
+        .unwrap();
+    // A new right commit makes it stale, so the capped refresh rebuilds.
+    build_ok(
+        &builder(&p.right),
+        &p.right_root,
+        &[exact_counts(&["amount"], false)],
+        &parquet_opts(&right_schema()),
+    );
+    let caps = PairCaps {
+        max_keys: 7,
+        max_bytes: u64::MAX,
+    };
+    let JoinRefresh::Built { segments, .. } = builder(&p.left)
+        .refresh_join(&spec, &p.right, "idx", None, caps)
+        .unwrap()
+    else {
+        panic!("expected a build")
+    };
+    // 120 shared keys (120..240), 7 per segment.
+    assert_eq!(segments.len(), 120usize.div_ceil(7));
+    let m = planner(&p.left);
+    let listed: Vec<_> = m
+        .manifest()
+        .segments
+        .iter()
+        .filter(|s| s.key_spec == spec.identity())
+        .collect();
+    assert_eq!(listed.len(), segments.len());
+    assert!(listed.iter().all(|s| s.join == segments[0].join));
+    assert!(matches!(p.state(&spec), JoinState::Fresh { .. }));
+    let semi = planner(&p.left)
+        .plan_semijoin(&spec, &asked, &planner(&p.right))
+        .unwrap();
+    assert_eq!(semi.matched, whole_semi.matched);
+    assert_eq!(semi.left.entries, whole_semi.left.entries);
+    assert_eq!(semi.right.entries, whole_semi.right.entries);
+    assert_eq!(semi.left.rows, whole_semi.left.rows);
+    assert_eq!(semi.right.rows, whole_semi.right.rows);
+    assert_eq!(
+        planner(&p.left)
+            .join_overlap(&spec, &planner(&p.right))
+            .unwrap(),
+        whole_overlap
+    );
+    check_semijoin(&p, &spec, &asked);
+    // The transient pair under the same caps: the same segments.
+    let lsnap = Snapshot::open(Arc::clone(&p.left), "idx").unwrap();
+    let rsnap = Snapshot::open(Arc::clone(&p.right), "idx").unwrap();
+    let t = transient_pair(&lsnap, &rsnap, &spec, caps, u64::MAX).unwrap();
+    assert_eq!(t.segments.len(), segments.len());
+    // Past its byte cap (less than the pair's bytes): refused naming the
+    // command that builds it into the index, and nothing is returned.
+    let total: u64 = t.segments.iter().map(|s| s.len() as u64).sum();
+    let err = transient_pair(&lsnap, &rsnap, &spec, caps, total - 1).unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains("bellwether index"), "{msg}");
+    assert!(msg.contains(&spec.identity()), "{msg}");
+    assert!(
+        !msg.contains("TransientLimits") && !msg.contains('{'),
+        "no internals: {msg}"
+    );
+    transient_pair(&lsnap, &rsnap, &spec, caps, total).unwrap();
 }
 
 #[test]
@@ -523,6 +616,197 @@ fn the_right_committing_again_makes_the_key_stale_until_refreshed() {
     check_semijoin(&p, &spec, &[enc_i64(5), enc_i64(6), enc_i64(7)]);
 }
 
+/// The overlap a fresh key reports equals the decoded key sets'.
+fn check_overlap(p: &Pair, spec: &KeySpec) {
+    let (lk, rk) = (
+        keys_of(&p.left_rows(), "order_id"),
+        keys_of(&p.right_rows(), "paid_order"),
+    );
+    let both = lk.intersection(&rk).count() as u64;
+    let s = planner(&p.left)
+        .join_overlap(spec, &planner(&p.right))
+        .unwrap();
+    assert_eq!(
+        (s.both, s.left_only, s.right_only),
+        (both, lk.len() as u64 - both, rk.len() as u64 - both)
+    );
+}
+
+/// Review probe (PR #32): a left file removed retires row groups and adds
+/// none, so the pair's range still covers every live left row group; the
+/// key must still go stale on the left (its pair pins the left's live
+/// set), and a refresh must answer for the files that remain.
+#[test]
+fn a_left_file_removed_makes_the_key_stale_on_the_left() {
+    let p = Pair::new(true);
+    let spec = join(true);
+    p.refresh(&spec);
+    // orders-3 holds ids 180..240, every one shared with payables.
+    std::fs::remove_file(Path::new(&p.left_root).join("orders-3.parquet")).unwrap();
+    let r = build_ok(
+        &builder(&p.left),
+        &p.left_root,
+        &[],
+        &parquet_opts(&left_schema()),
+    );
+    assert!(r.row_groups_retired > 0, "{r:?}");
+    let now = planner(&p.left).sequence();
+    match p.state(&spec) {
+        JoinState::LeftChanged { current, .. } => assert_eq!(current, now),
+        other => panic!("a left file removed must leave the key stale, got {other:?}"),
+    }
+    let err = planner(&p.left)
+        .plan_semijoin(&spec, &[enc_i64(200)], &planner(&p.right))
+        .unwrap_err();
+    assert!(err.to_string().contains("stale on the left"), "{err}");
+    let err = planner(&p.left)
+        .join_overlap(&spec, &planner(&p.right))
+        .unwrap_err();
+    assert!(err.to_string().contains("stale on the left"), "{err}");
+    assert!(matches!(p.refresh(&spec), JoinRefresh::Built { .. }));
+    assert!(matches!(p.state(&spec), JoinState::Fresh { .. }));
+    let asked: Vec<Vec<u8>> = (-2..400i64).map(enc_i64).collect();
+    check_semijoin(&p, &spec, &asked);
+    check_overlap(&p, &spec);
+}
+
+/// Review probe (PR #32): the right index deleted and rebuilt over other
+/// data reaches the pinned sequence again; its row-group ids now name
+/// other rows. The key must be stale on the right (its pair pins the right
+/// manifest's content, not only its sequence), and a refresh must answer
+/// for the new right.
+#[test]
+fn a_right_index_rebuilt_to_the_pinned_sequence_is_stale_on_the_right() {
+    let mut p = Pair::new(false);
+    let spec = join(false);
+    let JoinRefresh::Built { right_sequence, .. } = p.refresh(&spec) else {
+        panic!("expected a build")
+    };
+    // The right's data changes and its index is deleted: pay-0 gone, a new
+    // file sorting first holds ids 0..60 (shared with orders) four times
+    // each, in more row groups than pay-0 had.
+    std::fs::remove_file(Path::new(&p.right_root).join("pay-0.parquet")).unwrap();
+    write_right(
+        &Path::new(&p.right_root).join("a-0.parquet"),
+        &(0..240).map(|i| Some(i % 60)).collect::<Vec<_>>(),
+        4,
+    );
+    p.right = memory_store();
+    build_ok(
+        &builder(&p.right),
+        &p.right_root,
+        &[exact_counts(&["paid_order"], false)],
+        &parquet_opts(&right_schema()),
+    );
+    assert_eq!(
+        planner(&p.right).sequence(),
+        right_sequence,
+        "same sequence"
+    );
+    assert_eq!(
+        p.state(&spec),
+        JoinState::RightRebuilt {
+            pinned: right_sequence,
+            current: right_sequence
+        }
+    );
+    let err = planner(&p.left)
+        .plan_semijoin(&spec, &[enc_i64(5)], &planner(&p.right))
+        .unwrap_err();
+    assert!(err.to_string().contains("deleted and rebuilt"), "{err}");
+    assert!(matches!(p.refresh(&spec), JoinRefresh::Built { .. }));
+    assert!(matches!(p.state(&spec), JoinState::Fresh { .. }));
+    let asked: Vec<Vec<u8>> = (-2..400i64).map(enc_i64).collect();
+    check_semijoin(&p, &spec, &asked);
+    check_overlap(&p, &spec);
+}
+
+/// Item 6 of the review: a refresh told which right manifest the caller
+/// verified (`expect`) refuses once the right's current manifest is
+/// another, before it builds or commits anything.
+#[test]
+fn a_refresh_expecting_another_right_manifest_refuses_before_committing() {
+    let p = Pair::new(false);
+    let spec = join(false);
+    let verified = Snapshot::open(Arc::clone(&p.right), "idx")
+        .unwrap()
+        .content_hash();
+    // The right commits after the caller verified it.
+    build_ok(
+        &builder(&p.right),
+        &p.right_root,
+        &[exact_counts(&["amount"], false)],
+        &parquet_opts(&right_schema()),
+    );
+    let before = planner(&p.left).manifest().clone();
+    let r = builder(&p.left)
+        .refresh_join(&spec, &p.right, "idx", Some(verified), DEFAULT_PAIR_CAPS)
+        .unwrap();
+    let now = Snapshot::open(Arc::clone(&p.right), "idx").unwrap();
+    match r {
+        JoinRefresh::RightChanged { expected, found } => {
+            assert_eq!(expected, verified);
+            assert_eq!(found.hash, now.content_hash());
+            assert_eq!(found.sequence, now.sequence());
+        }
+        other => panic!("expected RightChanged, got {other:?}"),
+    }
+    let after = planner(&p.left).manifest().clone();
+    assert_eq!(after, before, "nothing declared, built, or committed");
+    // Expecting the current manifest builds.
+    assert!(matches!(
+        builder(&p.left)
+            .refresh_join(
+                &spec,
+                &p.right,
+                "idx",
+                Some(now.content_hash()),
+                DEFAULT_PAIR_CAPS
+            )
+            .unwrap(),
+        JoinRefresh::Built { .. }
+    ));
+}
+
+/// A left commit that lands while a refresh builds (between its read of
+/// the left and its commit) and changes the left's row groups: the refresh
+/// starts over from the new left, so the key it commits is fresh and
+/// answers for the new file.
+#[test]
+fn a_left_commit_during_a_refresh_restarts_it_from_the_new_left() {
+    let p = Pair::new(false);
+    let spec = join(false);
+    let (root, store) = (p.left_root.clone(), Arc::clone(&p.left));
+    let hook = Box::new(move || {
+        write_left(
+            &Path::new(&root).join("orders-9.parquet"),
+            &[Some(300), Some(301), Some(5)],
+            8,
+        );
+        let r = builder(&store)
+            .build(&root, &[], &parquet_opts(&left_schema()))
+            .unwrap();
+        assert!(r.row_groups_read > 0, "{r:?}");
+    });
+    let x =
+        bellwether_build::Builder::new(Arc::new(HookStore::new(Arc::clone(&p.left), hook)), "idx");
+    let JoinRefresh::Built { sequence, .. } = x
+        .refresh_join(&spec, &p.right, "idx", None, DEFAULT_PAIR_CAPS)
+        .unwrap()
+    else {
+        panic!("expected a build")
+    };
+    assert_eq!(planner(&p.left).sequence(), sequence);
+    assert!(
+        matches!(p.state(&spec), JoinState::Fresh { .. }),
+        "{:?}",
+        p.state(&spec)
+    );
+    let asked: Vec<Vec<u8>> = (-2..400i64).map(enc_i64).collect();
+    check_semijoin(&p, &spec, &asked);
+    check_overlap(&p, &spec);
+}
+
 #[test]
 fn left_compaction_keeps_the_key_fresh_and_its_plans_equal() {
     let p = Pair::new(true);
@@ -581,9 +865,7 @@ fn left_compaction_keeps_the_key_fresh_and_its_plans_equal() {
 fn a_missing_exact_key_on_either_side_is_refused_naming_it() {
     let p = Pair::new(false);
     // Counted join, uncounted exact keys on both sides: the left is named.
-    let err = builder(&p.left)
-        .refresh_join(&join(true), &p.right, "idx")
-        .unwrap_err();
+    let err = p.try_refresh(&join(true)).unwrap_err();
     match &err {
         Error::NotIndexed { needs: Some(n), .. } => {
             assert!(n.starts_with("exact:order_id,counts"), "{n}");
@@ -598,9 +880,7 @@ fn a_missing_exact_key_on_either_side_is_refused_naming_it() {
         &[exact_counts(&["order_id"], true)],
         &parquet_opts(&left_schema()),
     );
-    let err = builder(&p.left)
-        .refresh_join(&join(true), &p.right, "idx")
-        .unwrap_err();
+    let err = p.try_refresh(&join(true)).unwrap_err();
     match &err {
         Error::NotIndexed {
             root,
@@ -624,9 +904,7 @@ fn a_missing_exact_key_on_either_side_is_refused_naming_it() {
         right_columns: cols(&["amount"]),
         counts: false,
     };
-    let err = builder(&fresh.left)
-        .refresh_join(&other, &fresh.right, "idx")
-        .unwrap_err();
+    let err = fresh.try_refresh(&other).unwrap_err();
     assert!(
         matches!(&err, Error::NotIndexed { needs: Some(n), .. } if n.starts_with("exact:amount")),
         "{err:?}"
@@ -655,9 +933,7 @@ fn a_missing_exact_key_on_either_side_is_refused_naming_it() {
             .declared_specs()
             .iter()
             .any(|s| s.identity() == name));
-        let err = builder(&fresh.left)
-            .refresh_join(&join(false), &fresh.right, "idx")
-            .unwrap_err();
+        let err = fresh.try_refresh(&join(false)).unwrap_err();
         assert!(
             matches!(&err, Error::NotIndexed { needs: Some(n), .. }
                 if n.starts_with(name) && n.contains(&format!("{side} side"))),
@@ -667,7 +943,7 @@ fn a_missing_exact_key_on_either_side_is_refused_naming_it() {
         let rsnap = Snapshot::open(Arc::clone(&fresh.right), "idx").unwrap();
         assert!(
             matches!(
-                transient_pair(&lsnap, &rsnap, &join(false)),
+                transient_pair(&lsnap, &rsnap, &join(false), DEFAULT_PAIR_CAPS, u64::MAX),
                 Err(Error::NotIndexed { .. })
             ),
             "{side}: the price is refused too"
@@ -692,9 +968,7 @@ fn a_float_column_or_another_left_folder_is_refused_before_anything_is_built() {
         counts: false,
     };
     let seq = planner(&p.left).sequence();
-    let err = builder(&p.left)
-        .refresh_join(&float, &p.right, "idx")
-        .unwrap_err();
+    let err = p.try_refresh(&float).unwrap_err();
     assert!(err.to_string().contains("is a float"), "{err}");
     let elsewhere = KeySpec::Join {
         dataset: "invoices".into(),
@@ -703,9 +977,7 @@ fn a_float_column_or_another_left_folder_is_refused_before_anything_is_built() {
         right_columns: cols(&["paid_order"]),
         counts: false,
     };
-    let err = builder(&p.left)
-        .refresh_join(&elsewhere, &p.right, "idx")
-        .unwrap_err();
+    let err = p.try_refresh(&elsewhere).unwrap_err();
     assert!(err.to_string().contains("the folder \"orders\""), "{err}");
     assert_eq!(planner(&p.left).sequence(), seq, "nothing committed");
 }

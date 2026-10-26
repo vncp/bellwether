@@ -109,11 +109,15 @@ pub enum RefusalCode {
     /// A join key's pair index is stale (B3): its left or right dataset
     /// changed since it was built; `fields.side` names which.
     StaleJoin,
+    /// A join key (B3) names a right dataset this server does not serve:
+    /// only the operator's `--join` is read; `fields.served` names it (null
+    /// without `--join`). Refused before any folder is read.
+    JoinNotServed,
 }
 
 impl RefusalCode {
     /// Every code, in `AGENTS.md` order.
-    pub const ALL: [Self; 39] = [
+    pub const ALL: [Self; 40] = [
         Self::CertificateFailed,
         Self::StaleManifest,
         Self::DataChanged,
@@ -153,6 +157,7 @@ impl RefusalCode {
         Self::MeasurementRefused,
         Self::MeasurementChanged,
         Self::StaleJoin,
+        Self::JoinNotServed,
     ];
 
     /// The code as it is serialized.
@@ -198,6 +203,7 @@ impl RefusalCode {
             Self::MeasurementRefused => "measurement_refused",
             Self::MeasurementChanged => "measurement_changed",
             Self::StaleJoin => "stale_join",
+            Self::JoinNotServed => "join_not_served",
         }
     }
 
@@ -311,6 +317,11 @@ impl RefusalCode {
             Self::StaleJoin => {
                 "ask the human to run `bellwether index` on the data folder (the left dataset), \
                  which rebuilds the join key's pair index, then call the tool again"
+            }
+            Self::JoinNotServed => {
+                "use only the join key on the right side `fields.served` names; when it is null, \
+                 or another right dataset is needed, ask the human to restart the server naming \
+                 that right dataset"
             }
         }
     }
@@ -565,6 +576,9 @@ pub fn from_error(e: &Error) -> Refusal {
             RefusalCode::StaleJoin,
             json!({ "spec": spec, "side": side, "pinned": pinned, "current": current }),
         ),
+        Error::JoinNotServed { served, .. } => {
+            (RefusalCode::JoinNotServed, json!({ "served": served }))
+        }
         // No wildcard arm: a new `Error` variant must fail to compile here.
         Error::Serde(_) | Error::Other(_) => (RefusalCode::EngineError, json!({})),
     };
