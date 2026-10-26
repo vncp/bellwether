@@ -203,6 +203,8 @@ pub fn check_id_space(m: &bellwether_store::Manifest) -> (BTreeSet<u32>, BTreeSe
 pub fn exact(cols: &[&str]) -> KeySpec {
     KeySpec::Exact {
         columns: cols.iter().map(|c| (*c).to_string()).collect(),
+        counts: false,
+        bounds: None,
     }
 }
 
@@ -210,6 +212,7 @@ pub fn bloom(cols: &[&str]) -> KeySpec {
     KeySpec::Bloom {
         columns: cols.iter().map(|c| (*c).to_string()).collect(),
         fpr: 0.01,
+        bounds: None,
     }
 }
 
@@ -221,6 +224,7 @@ pub fn temporal(cols: &[&str], ts: &str) -> KeySpec {
     KeySpec::Temporal {
         columns: cols.iter().map(|c| (*c).to_string()).collect(),
         ts_column: ts.into(),
+        counts: false,
     }
 }
 
@@ -262,6 +266,9 @@ pub struct Row {
     pub rg: u32,
     pub row: usize,
     pub cols: BTreeMap<String, Option<Vec<u8>>>,
+    /// List and map columns (B4): each non-null element's canonical bytes
+    /// at the element type (a map's keys), in order; `None` for a null list.
+    pub lists: BTreeMap<String, Option<Vec<Vec<u8>>>>,
 }
 
 impl Row {
@@ -288,11 +295,33 @@ fn rows_of(
 ) -> Vec<Row> {
     (0..batch.num_rows())
         .map(|r| {
+            let mut lists = BTreeMap::new();
             let cols = schema
                 .fields()
                 .iter()
                 .filter_map(|f| {
                     let array = batch.column_by_name(f.name())?;
+                    if let Some(element) = bellwether_core::list::element_type(f.data_type()) {
+                        let items = bellwether_core::list::row_elements(array.as_ref(), r)
+                            .unwrap()
+                            .map(|items| {
+                                (0..items.len())
+                                    .filter_map(|i| {
+                                        let mut out = Vec::new();
+                                        encoding::encode_array_value_as(
+                                            items.as_ref(),
+                                            i,
+                                            element,
+                                            &mut out,
+                                        )
+                                        .unwrap()
+                                        .then_some(out)
+                                    })
+                                    .collect()
+                            });
+                        lists.insert(f.name().clone(), items);
+                        return None;
+                    }
                     let mut out = Vec::new();
                     let present =
                         encoding::encode_array_value_as(array.as_ref(), r, f.data_type(), &mut out)
@@ -305,6 +334,7 @@ fn rows_of(
                 rg,
                 row: first_row + r,
                 cols,
+                lists,
             }
         })
         .collect()
@@ -462,7 +492,67 @@ pub fn apply_residual(pred: &Predicate, rows: Vec<Row>) -> Vec<Row> {
                 .collect()
         }
         Predicate::And { all } => all.iter().fold(rows, |rows, p| apply_residual(p, rows)),
+        Predicate::Text {
+            column,
+            operator,
+            values,
+        } => rows
+            .into_iter()
+            .filter(|r| {
+                r.get(column).map(|v| decode_utf8(v)).is_some_and(|v| {
+                    values
+                        .iter()
+                        .any(|a| bellwether_core::text::matches(*operator, a, &v))
+                })
+            })
+            .collect(),
+        Predicate::SemiJoin { .. } | Predicate::Join { .. } | Predicate::WindowPartition { .. } => {
+            panic!("a lookup's residual is never relational: {pred:?}")
+        }
+        // Rows here hold canonical bytes; an expression residual is checked
+        // against decoded files in `tests/expr.rs`.
+        Predicate::ExprIn { .. } => panic!("apply_residual does not evaluate expressions"),
+        Predicate::ContainsAny { column, values } => rows
+            .into_iter()
+            .filter(|r| {
+                r.lists
+                    .get(column)
+                    .and_then(Option::as_ref)
+                    .is_some_and(|items| items.iter().any(|e| values.contains(e)))
+            })
+            .collect(),
+        Predicate::ContainsAll { column, values } => rows
+            .into_iter()
+            .filter(|r| {
+                r.lists
+                    .get(column)
+                    .and_then(Option::as_ref)
+                    .is_some_and(|items| values.iter().all(|g| items.iter().any(|e| g.contains(e))))
+            })
+            .collect(),
     }
+}
+
+/// The string a canonical `Utf8` encoding holds (`0x06`, the bytes with
+/// `0x00` escaped as `0x00 0xFF`, then `0x00 0x00`).
+pub fn decode_utf8(enc: &[u8]) -> String {
+    assert_eq!(enc.first(), Some(&0x06), "not a canonical Utf8 encoding");
+    let mut out = Vec::new();
+    let mut i = 1;
+    while i < enc.len() {
+        match (enc[i], enc.get(i + 1)) {
+            (0x00, Some(0xFF)) => {
+                out.push(0);
+                i += 2;
+            }
+            (0x00, Some(0x00)) => break,
+            (b, _) => {
+                out.push(b);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8(out).expect("canonical Utf8 holds UTF-8")
 }
 
 /// The rows a lookup must return, by definition: rows whose `columns` tuple

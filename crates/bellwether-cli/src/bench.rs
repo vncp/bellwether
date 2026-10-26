@@ -5,13 +5,17 @@ use std::path::{Path, PathBuf};
 
 use bellwether::types::{Error, Hash};
 use bellwether_bench::corpus::{GenParams, Rung};
+use bellwether_bench::expr::{generate_expr, ExprParams, ExprShape, ExprSummary};
 use bellwether_bench::harness::{run_all, DuckDbMode, RunOptions, ScanFault};
+use bellwether_bench::lists::{generate_lists, ListParams, ListShape, ListSummary};
 use bellwether_bench::market::{
     generate_market, parse_ymd, MarketParams, MarketRung, MarketSummary,
 };
+use bellwether_bench::perf::{all_cells, plan_cells, read_row_groups, ReadReport};
 use bellwether_bench::report::write_report;
 use bellwether_bench::results::Results;
 use bellwether_bench::slo::{assert_slo, Mode};
+use bellwether_bench::text::{generate_text, TextParams, TextShape, TextSummary};
 use bellwether_bench::truth::write_ground_truth;
 use bellwether_bench::workload::{generate_workload, WorkloadParams};
 use clap::{Args, Subcommand, ValueEnum};
@@ -49,6 +53,135 @@ pub(crate) enum BenchCommand {
     },
     /// Write the synthetic bitemporal market trade corpus, workload, and ground truth.
     Market(MarketArgs),
+    /// Write a text corpus (1–4 KB documents with planted terms at 1% and
+    /// 0.01% of rows) in the ledger or market shape, with ground truth, for
+    /// text keys (`text:body,tokenizer=words|trigram`).
+    Text(TextArgs),
+    /// Read row groups through the benchmark's byte-counting reader and
+    /// report the time and bytes: the planned row groups of a lookup's
+    /// --json output (--plan), or every row group under a folder (--all).
+    Read(ReadArgs),
+    /// Write a corpus with a JSON attribute column (ledger or market shape),
+    /// key files for equality on a JSON path at three selectivities, and
+    /// exact ground truth: the `expr` key benchmark.
+    Expr(ExprArgs),
+    /// Write a list-column corpus (ledger attributes or market holdings)
+    /// with skewed element cardinality, membership runs of 10, 10^3, and
+    /// 10^5 terms, and ground truth, for list keys.
+    Lists(ListsArgs),
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+pub(crate) enum ExprShapeArg {
+    /// A versioned ledger whose `attrs` JSON holds an `account` join key.
+    Ledger,
+    /// Market prints whose vendor `payload` JSON holds the `symbol`.
+    Market,
+}
+
+#[derive(Args)]
+pub(crate) struct ExprArgs {
+    /// Output directory (`data/` and `workload/`).
+    #[arg(long)]
+    out: PathBuf,
+    /// The shape.
+    #[arg(long, value_enum)]
+    shape: ExprShapeArg,
+    /// RNG seed.
+    #[arg(long)]
+    seed: Option<u64>,
+    /// Files [default: 10].
+    #[arg(long)]
+    files: Option<u64>,
+    /// Row groups per file [default: 20].
+    #[arg(long)]
+    row_groups_per_file: Option<u64>,
+    /// Rows per row group, a multiple of 4 [default: 1000].
+    #[arg(long)]
+    rows_per_row_group: Option<u64>,
+    /// Keys per rare or medium query [default: 3].
+    #[arg(long)]
+    keys_per_query: Option<u64>,
+}
+
+#[derive(Args)]
+#[command(group(clap::ArgGroup::new("what").required(true).args(["plan", "all"])))]
+pub(crate) struct ReadArgs {
+    /// The --json output of `locate`, `latest`, or `asof`, saved to a file;
+    /// its plan's row groups are read.
+    #[arg(long, value_name = "FILE")]
+    plan: Option<PathBuf>,
+    /// A data folder: every row group of every .parquet file under it (a
+    /// full scan; directories starting with `.` are skipped).
+    #[arg(long, value_name = "DIR")]
+    all: Option<PathBuf>,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+pub(crate) enum TextShapeArg {
+    /// `entity_id`, `version_ts`, `body`: attribute blobs on a ledger.
+    Ledger,
+    /// `symbol`, `ts`, `body`: documents keyed by symbol and date.
+    Market,
+}
+
+#[derive(Args)]
+pub(crate) struct TextArgs {
+    /// Output directory (`data/` and `workload/text-truth.json`).
+    #[arg(long)]
+    out: PathBuf,
+    /// The shape the documents ride on.
+    #[arg(long, value_enum)]
+    shape: TextShapeArg,
+    /// RNG seed [default: 5].
+    #[arg(long)]
+    seed: Option<u64>,
+    /// Day partitions [default: 3].
+    #[arg(long)]
+    days: Option<u32>,
+    /// Files per day [default: 2].
+    #[arg(long)]
+    files_per_day: Option<u32>,
+    /// Row groups per file [default: 4].
+    #[arg(long)]
+    row_groups_per_file: Option<u32>,
+    /// Rows per row group [default: 500].
+    #[arg(long)]
+    rows_per_row_group: Option<u32>,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+pub(crate) enum ListShapeArg {
+    /// `attributes: List<Int64>` on ledger rows, flat files.
+    Ledger,
+    /// `holdings: List<Utf8>` on market baskets, one `day=` directory per day.
+    Market,
+}
+
+#[derive(Args)]
+pub(crate) struct ListsArgs {
+    /// Output directory (`data/` and `workload/`); must not hold a corpus.
+    #[arg(long)]
+    out: PathBuf,
+    /// The shape.
+    #[arg(long, value_enum)]
+    shape: ListShapeArg,
+    /// Files (ledger) or days (market) [default: 40].
+    #[arg(long)]
+    files: Option<u32>,
+    /// Row groups per file [default: 4].
+    #[arg(long)]
+    row_groups_per_file: Option<u32>,
+    /// Rows per row group [default: 5000].
+    #[arg(long)]
+    rows_per_row_group: Option<u32>,
+    /// Distinct element values drawn from [default: 200000].
+    #[arg(long)]
+    vocabulary: Option<u32>,
+    /// Term counts of the `contains_any` runs, comma-separated [default:
+    /// 10,1000,100000].
+    #[arg(long, value_delimiter = ',')]
+    terms: Option<Vec<u32>>,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -202,6 +335,18 @@ pub(crate) struct Wrote {
     /// Market corpus summary (`market` only).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub market: Option<MarketSummary>,
+    /// What the read cost (`read` only).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub read: Option<ReadReport>,
+    /// Text corpus summary and ground truth (`text` only).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub text: Option<TextSummary>,
+    /// Expr corpus summary (`expr` only).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expr: Option<ExprSummary>,
+    /// List corpus summary (`lists` only).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lists: Option<ListSummary>,
 }
 
 fn bench_err(e: &bellwether_bench::BenchError) -> Error {
@@ -295,6 +440,10 @@ pub(crate) fn run(cmd: &BenchCommand) -> Result<Wrote, Error> {
             ("slo", results.clone(), failed, None)
         }
         BenchCommand::Market(a) => return market(a),
+        BenchCommand::Text(a) => return text(a),
+        BenchCommand::Read(a) => return read(a),
+        BenchCommand::Expr(a) => return expr(a),
+        BenchCommand::Lists(a) => return lists(a),
     };
     Ok(Wrote {
         what,
@@ -302,10 +451,108 @@ pub(crate) fn run(cmd: &BenchCommand) -> Result<Wrote, Error> {
         blake3: file_hash(&path)?,
         failed,
         market,
+        read: None,
+        text: None,
+        expr: None,
+        lists: None,
+    })
+}
+
+/// `bench lists`: the preset for the shape, each flag given overriding one.
+fn lists(a: &ListsArgs) -> Result<Wrote, Error> {
+    let shape = match a.shape {
+        ListShapeArg::Ledger => ListShape::Ledger,
+        ListShapeArg::Market => ListShape::Market,
+    };
+    let mut params = ListParams::preset(shape);
+    if let Some(v) = a.files {
+        params.files = v;
+    }
+    if let Some(v) = a.row_groups_per_file {
+        params.row_groups_per_file = v;
+    }
+    if let Some(v) = a.rows_per_row_group {
+        params.rows_per_row_group = v;
+    }
+    if let Some(v) = a.vocabulary {
+        params.vocabulary = v;
+    }
+    if let Some(v) = &a.terms {
+        params.terms.clone_from(v);
+    }
+    let truth = generate_lists(&a.out, &params).map_err(|e| bench_err(&e))?;
+    let s = &truth.summary;
+    let where_summary = format!(
+        "{} ({} files, {} row groups, {} rows, {} distinct {} elements, row groups per element \
+         p50/p95/max {}/{}/{}, {} bytes)",
+        a.out.display(),
+        s.files,
+        s.row_groups,
+        s.rows,
+        s.distinct_elements,
+        s.column,
+        s.row_groups_per_element[0],
+        s.row_groups_per_element[1],
+        s.row_groups_per_element[2],
+        s.bytes,
+    );
+    let truth_path = a.out.join("workload").join("truth.json");
+    Ok(Wrote {
+        what: "list corpus",
+        path: where_summary,
+        blake3: file_hash(&truth_path)?,
+        failed: Vec::new(),
+        market: None,
+        read: None,
+        expr: None,
+        text: None,
+        lists: Some(truth.summary),
     })
 }
 
 /// `bench market`: the rung's parameters, each flag given overriding one.
+fn text(a: &TextArgs) -> Result<Wrote, Error> {
+    let mut params = TextParams::small(match a.shape {
+        TextShapeArg::Ledger => TextShape::Ledger,
+        TextShapeArg::Market => TextShape::Market,
+    });
+    if let Some(v) = a.seed {
+        params.seed = v;
+    }
+    if let Some(v) = a.days {
+        params.days = v;
+    }
+    if let Some(v) = a.files_per_day {
+        params.files_per_day = v;
+    }
+    if let Some(v) = a.row_groups_per_file {
+        params.row_groups_per_file = v;
+    }
+    if let Some(v) = a.rows_per_row_group {
+        params.rows_per_row_group = v;
+    }
+    let summary = generate_text(&a.out, &params).map_err(|e| bench_err(&e))?;
+    let truth = a.out.join("workload").join("text-truth.json");
+    Ok(Wrote {
+        what: "text corpus",
+        path: format!(
+            "{} ({} files, {} row groups, {} rows, {} bytes of text)",
+            a.out.display(),
+            summary.files,
+            summary.row_groups,
+            summary.rows,
+            summary.body_bytes
+        ),
+        blake3: file_hash(&truth)?,
+        failed: Vec::new(),
+        market: None,
+        read: None,
+        expr: None,
+        text: Some(summary),
+        lists: None,
+    })
+}
+
 fn market(a: &MarketArgs) -> Result<Wrote, Error> {
     let mut params = match a.rung.unwrap_or(MarketRungArg::Small) {
         MarketRungArg::Small => MarketParams::rung(MarketRung::Small),
@@ -357,5 +604,101 @@ fn market(a: &MarketArgs) -> Result<Wrote, Error> {
         blake3: file_hash(&truth_path)?,
         failed: Vec::new(),
         market: Some(summary),
+        read: None,
+        expr: None,
+        text: None,
+        lists: None,
+    })
+}
+
+/// `bench expr`: the preset for the shape, each flag given overriding one.
+fn expr(a: &ExprArgs) -> Result<Wrote, Error> {
+    let shape = match a.shape {
+        ExprShapeArg::Ledger => ExprShape::Ledger,
+        ExprShapeArg::Market => ExprShape::Market,
+    };
+    let mut params = ExprParams::small(shape);
+    if let Some(v) = a.seed {
+        params.seed = v;
+    }
+    if let Some(v) = a.files {
+        params.files = v;
+    }
+    if let Some(v) = a.row_groups_per_file {
+        params.row_groups_per_file = v;
+    }
+    if let Some(v) = a.rows_per_row_group {
+        params.rows_per_row_group = v;
+    }
+    if let Some(v) = a.keys_per_query {
+        params.keys_per_query = v;
+    }
+    let summary = generate_expr(&a.out, &params).map_err(|e| bench_err(&e))?;
+    let truth_path = a.out.join("workload").join("truth.json");
+    Ok(Wrote {
+        what: "expr corpus",
+        path: format!(
+            "{} ({} shape, {} files, {} row groups, {} rows, {} rows without the keyed member, \
+             {} bytes, {} queries)",
+            a.out.display(),
+            shape.as_str(),
+            summary.files,
+            summary.row_groups,
+            summary.rows,
+            summary.null_rows,
+            summary.bytes,
+            summary.queries
+        ),
+        blake3: file_hash(&truth_path)?,
+        failed: Vec::new(),
+        market: None,
+        read: None,
+        expr: Some(summary),
+        text: None,
+        lists: None,
+    })
+}
+
+/// `bench read`: the row groups of a plan, or of a whole folder, through the
+/// byte-counting reader.
+fn read(a: &ReadArgs) -> Result<Wrote, Error> {
+    let (source, cells) = match (&a.plan, &a.all) {
+        (Some(plan), _) => {
+            let bytes = std::fs::read(plan)
+                .map_err(|e| Error::Other(format!("cannot read {} ({e})", plan.display())))?;
+            let value: serde_json::Value = serde_json::from_slice(&bytes).map_err(|e| {
+                Error::Other(format!(
+                    "{} is not JSON ({e}); save the --json output of locate, latest, or asof",
+                    plan.display()
+                ))
+            })?;
+            (plan, plan_cells(&value).map_err(|e| bench_err(&e))?)
+        }
+        (None, Some(dir)) => (dir, all_cells(dir).map_err(|e| bench_err(&e))?),
+        (None, None) => {
+            return Err(Error::Other(
+                "bench read needs --plan FILE or --all DIR".into(),
+            ))
+        }
+    };
+    let report = read_row_groups(&cells).map_err(|e| bench_err(&e))?;
+    Ok(Wrote {
+        what: "read",
+        path: format!(
+            "{} ({} files, {} row groups, {} rows, {} bytes fetched, {:.1} ms)",
+            source.display(),
+            report.files,
+            report.row_groups,
+            report.rows,
+            report.bytes_fetched,
+            report.total_ms
+        ),
+        blake3: None,
+        failed: Vec::new(),
+        market: None,
+        read: Some(report),
+        text: None,
+        expr: None,
+        lists: None,
     })
 }

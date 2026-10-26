@@ -86,7 +86,7 @@ fn human_output_leads_with_the_funnel_and_quiet_prints_nothing() {
     run(&["index", path(&data), "--key", "exact:id"], 0);
     let out = run(&["locate", path(&data), "--keys", path(&kf)], 0);
     let lines: Vec<&str> = out.lines().collect();
-    assert!(lines[0].starts_with("locate: 1 keys on (id)"), "{out}");
+    assert!(lines[0].starts_with("locate: 1 key on (id)"), "{out}");
     assert!(lines[1].contains("files") && lines[1].contains("row groups"));
     assert!(lines[2].trim_start().starts_with("live"));
     assert!(lines[3].trim_start().starts_with("planned"));
@@ -216,4 +216,46 @@ fn schema_flag_supplies_the_dataset_schema() {
     );
     let r: IndexResult = typed(&out);
     assert_eq!(r.committed, Some(1));
+}
+
+/// `--chunk-size` names a text chunk; Parquet row groups are the files'
+/// own. On a Parquet folder every verb refuses it at option parsing (usage,
+/// exit 2) with the same sentence, before any work: none ignores it while
+/// another refuses it, and nothing is written.
+#[test]
+fn chunk_size_on_a_parquet_folder_is_a_usage_error_for_every_verb() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    corpus(&data, 1, 2, 20, 10);
+    let kf = dir.path().join("k.parquet");
+    keys(&kf, "id", &[1]);
+    let (d, k) = (path(&data), path(&kf));
+    let zero = "0".repeat(64);
+    let verbs: [&[&str]; 8] = [
+        &["why", d],
+        &["why", d, "--from", k],
+        &["index", d, "--key", "exact:id"],
+        &["locate", d, "--keys", k],
+        &["latest", d, "--keys", k],
+        &["propose", d, "--evidence", &zero, "--key", "exact:id@ts"],
+        &["fix", d, "--proposal", &zero, "--workload", &zero],
+        &["mcp", d],
+    ];
+    for args in verbs {
+        let out = common::bw()
+            .args([&["--chunk-size", "64"][..], args].concat())
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(2), "{args:?}");
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            err.contains("--chunk-size 64 applies to CSV and JSON lines files only")
+                && err.contains("--format csv"),
+            "{args:?}: {err}"
+        );
+    }
+    assert!(
+        !index_dir(&data).exists(),
+        "a refused option wrote an index"
+    );
 }

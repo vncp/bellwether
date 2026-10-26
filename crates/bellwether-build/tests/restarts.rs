@@ -46,6 +46,8 @@ mod winner_changes_the_row_group_space {
     fn exact(c: &[&str]) -> KeySpec {
         KeySpec::Exact {
             columns: c.iter().map(|s| (*s).to_string()).collect(),
+            counts: false,
+            bounds: None,
         }
     }
 
@@ -53,6 +55,7 @@ mod winner_changes_the_row_group_space {
         KeySpec::Bloom {
             columns: vec![c.into()],
             fpr: 0.01,
+            bounds: None,
         }
     }
 
@@ -246,6 +249,8 @@ mod winner_changes_the_schema {
     fn exact(c: &str) -> KeySpec {
         KeySpec::Exact {
             columns: vec![c.into()],
+            counts: false,
+            bounds: None,
         }
     }
 
@@ -360,6 +365,8 @@ mod incomplete_after_rebase {
         let inner = memory_store();
         let spec = KeySpec::Exact {
             columns: vec!["id".into()],
+            counts: false,
+            bounds: None,
         };
         let o = BuildOptions {
             schema: Some(simple_schema()),

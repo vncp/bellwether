@@ -387,6 +387,7 @@ impl Catalog {
                 file: self.files[fi].clone(),
                 row_groups,
                 bytes: file_bytes,
+                columns: None,
             });
         }
         Ok(ScanPlan {
@@ -396,7 +397,30 @@ impl Catalog {
             bytes,
             row_groups_total: self.row_groups.len() as u64,
             row_groups_selected: count,
+            projected_bytes: None,
+            order: None,
+            rows: None,
         })
+    }
+
+    /// The ids of the live row groups `plan` reads; a file or row group
+    /// outside the catalog contributes none ([`Catalog::verify_plan`]
+    /// refuses such a plan).
+    #[must_use]
+    pub fn ids_of(&self, plan: &ScanPlan) -> RoaringBitmap {
+        let read: HashMap<usize, &RoaringBitmap> = plan
+            .entries
+            .iter()
+            .filter_map(|e| self.file_index.get(&e.file).map(|fi| (*fi, &e.row_groups)))
+            .collect();
+        self.row_groups
+            .iter()
+            .filter(|rg| {
+                read.get(&rg.file)
+                    .is_some_and(|b| b.contains(rg.meta.index_in_file))
+            })
+            .map(|rg| rg.id.0)
+            .collect()
     }
 
     /// Checks that `plan` is internally consistent and that every entry's

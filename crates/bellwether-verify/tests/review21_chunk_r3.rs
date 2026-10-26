@@ -140,6 +140,8 @@ fn an_equal_count_chunking_with_shifted_starts_is_not_a_pass() {
             &canonical,
             &[KeySpec::Exact {
                 columns: vec!["id".into()],
+                counts: false,
+                bounds: None,
             }],
             &opts,
         )

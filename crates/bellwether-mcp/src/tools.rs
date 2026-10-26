@@ -11,7 +11,8 @@
 //! paths name files the engine reads (key files, rewrite outputs), and a
 //! rewrite is `RewriteShape` data.
 
-use bellwether::types::{Hash, KeySpec, RewriteShape};
+use bellwether::types::{Gate, Hash, KeySpec, RewriteShape, TextOp};
+use bellwether::TextQuery;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -42,6 +43,73 @@ pub struct ObserveWhy {
     /// Candidate key columns for the profile; default: every id-like column.
     #[serde(default)]
     pub columns: Option<Vec<String>>,
+    /// Diagnose from the index's manifest and complete sketches alone: no
+    /// data file is opened, footers included, the profile measures nothing,
+    /// and the `sketch` column and the `R-sketch-1` lint carry the
+    /// (approximate) diagnosis. Refused with `columns`, without a complete
+    /// sketch, and over files that changed since the index was built.
+    #[serde(default)]
+    pub sketches_only: bool,
+}
+
+/// `observe.cardinality`: approximate distinct counts from sketches.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ObserveCardinality {
+    /// Items to count: a column, or columns joined by `+` (`symbol+ts`);
+    /// default: every item of every complete sketch.
+    #[serde(default)]
+    pub items: Vec<String>,
+    /// Read the files now for items no complete sketch holds, instead of
+    /// refusing with `not_indexed`; the result says how many were read.
+    #[serde(default)]
+    pub transient: bool,
+}
+
+/// `observe.overlap`: approximate Jaccard similarity of two sketched items.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ObserveOverlap {
+    /// The left item: a column, or columns joined by `+`.
+    pub left: String,
+    /// The right item, in the same data folder.
+    pub right: String,
+}
+
+/// The comparison of a rewrite of engine queries' before and after
+/// results (the key columns are the proposal's).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct EngineCompare {
+    /// Compare the newest version per key by this column.
+    #[serde(default)]
+    pub latest_by: Option<String>,
+    /// Columns left out of the row hash.
+    #[serde(default)]
+    pub ignore: Vec<String>,
+    /// Columns totalled exactly (`col` decimal, `col:dec(S)` float).
+    #[serde(default)]
+    pub totals: Vec<String>,
+    /// Columns grouping the totals.
+    #[serde(default)]
+    pub group_by: Vec<String>,
+}
+
+/// `score.record`: the engine runs a query that produces keys in the query
+/// engine the server was started with (`--twin-of`), read-only, and
+/// records its result as a workload.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ScoreRecord {
+    /// One query in the engine's language whose result rows are the keys.
+    /// It runs read-only, under a tag the engine chooses.
+    pub keys_query: String,
+    /// Result columns to take as the key, in tuple order; default: all.
+    #[serde(default)]
+    pub key_columns: Option<Vec<String>>,
+    /// Run in this call instead of returning a job id.
+    #[serde(default)]
+    pub wait: bool,
 }
 
 /// `observe.profile`: the newest recorded profile Evidence per root, with
@@ -64,6 +132,44 @@ pub struct ObserveLocate {
     /// grown folder reads exactly what it read then: files indexed since are
     /// ignored. Default: the current manifest. A sequence the index no
     /// longer retains is refused with `not_retained`.
+    #[serde(default)]
+    pub at_manifest: Option<u64>,
+    /// The columns the reader reads: each planned file also reports those
+    /// columns' compressed bytes, and the plan their sum
+    /// (`projected_bytes`), from the index. Default: no projection.
+    #[serde(default)]
+    pub columns: Option<Vec<String>>,
+    /// List membership (B4; `locate --any` / `--all`): the key file holds
+    /// one column, named after a list (or map) column, of its element
+    /// type, and the plan is the rows whose list holds `any` of the values
+    /// or `all` of them, through the list key on that column. Default: a
+    /// point lookup of the key tuples.
+    #[serde(default)]
+    pub contains: Option<Membership>,
+}
+
+/// Which rows a list-membership lookup keeps.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum Membership {
+    /// Rows whose list holds at least one of the values.
+    Any,
+    /// Rows whose list holds every one of the values.
+    All,
+}
+
+/// `observe.count`: the rows holding the keys, exact, from the index's
+/// per-key counts.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ObserveCount {
+    /// A Parquet file of keys (read, never written); an absolute path.
+    pub keys: String,
+    /// Key columns to take from the file, in tuple order; default: all.
+    #[serde(default)]
+    pub key_columns: Option<Vec<String>>,
+    /// Count against the committed manifest at this sequence instead of the
+    /// current one. Default: the current manifest.
     #[serde(default)]
     pub at_manifest: Option<u64>,
 }
@@ -89,6 +195,50 @@ pub struct ObserveAsof {
     pub at_manifest: Option<u64>,
 }
 
+/// One text lookup (B5): rows whose string `column` matches `value` under
+/// `op` (`has_token`, `contains`, or `has_prefix`), both case-folded.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct TextLookup {
+    /// The string column.
+    pub column: String,
+    /// `has_token` (one word), `contains` (a substring), or `has_prefix`
+    /// (a word starting with `value`).
+    pub op: TextOp,
+    /// The word, substring, or prefix.
+    pub value: String,
+}
+
+impl From<TextLookup> for TextQuery {
+    fn from(t: TextLookup) -> Self {
+        Self {
+            column: t.column,
+            op: t.op,
+            value: t.value,
+        }
+    }
+}
+
+/// `observe.text`: which files and row groups hold rows matching a text
+/// lookup, through the folder's text keys.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ObserveText {
+    /// The string column.
+    pub column: String,
+    /// `has_token` (one word), `contains` (a substring), or `has_prefix`
+    /// (a word starting with `value`).
+    pub op: TextOp,
+    /// The word, substring, or prefix.
+    pub value: String,
+    /// Plan against the committed manifest at this sequence (a plan's
+    /// `sequence`) instead of the current one. Default: the current
+    /// manifest. A sequence the index no longer retains is refused with
+    /// `not_retained`.
+    #[serde(default)]
+    pub at_manifest: Option<u64>,
+}
+
 /// `score.why`: replay a workload under every candidate key. Writes engine
 /// Proposals and Replays.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -110,16 +260,35 @@ pub struct ScoreWhy {
     /// columns; default 8.
     #[serde(default)]
     pub max_candidates: Option<u32>,
+    /// With a twin (the server's `--twin-of`): limits each candidate's
+    /// keyset is compared against, such as `{"name": "in", "limit":
+    /// 1000000}`.
+    #[serde(default)]
+    pub gates: Vec<Gate>,
+    /// Price `keys` as list membership (B4; `why --mode contains-any` /
+    /// `contains-all`): the key file holds one column, named after a list
+    /// (or map) column, of its element type, and the floor candidate is
+    /// the list key on it. With `workload`, its runs must already be
+    /// membership runs of that kind.
+    #[serde(default)]
+    pub contains: Option<Membership>,
     /// Run in this call instead of returning a job id.
     #[serde(default)]
     pub wait: bool,
+    /// Text lookups (B5), recorded as the workload instead of `keys` or
+    /// `workload`: one run each, priced under the current configuration and
+    /// each candidate text key (`text:<column>,tokenizer=words` for words
+    /// and word prefixes, `tokenizer=trigram` for substrings); default:
+    /// none.
+    #[serde(default)]
+    pub text: Vec<TextLookup>,
 }
 
 /// The outputs a rewrite proposal is verified on (folders the engine reads).
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct RewriteOutputs {
-    /// The output before the rewrite (a folder of files).
+    /// The output before the rewrite (a folder of files; never a table).
     pub before: String,
     /// The output after it.
     pub after: String,
@@ -152,6 +321,10 @@ pub struct ScoreVerify {
     /// For a rewrite proposal: the outputs it is verified on.
     #[serde(default)]
     pub rewrite: Option<RewriteOutputs>,
+    /// For a rewrite of engine queries: how the exported results compare
+    /// (default: by the proposal's key columns alone).
+    #[serde(default)]
+    pub engine: Option<EngineCompare>,
     /// Run in this call instead of returning a job id.
     #[serde(default)]
     pub wait: bool,
@@ -162,7 +335,7 @@ pub struct ScoreVerify {
 #[serde(deny_unknown_fields)]
 pub struct ProposeKey {
     /// The key.
-    pub spec: KeySpec,
+    pub spec: KeyArg,
     /// Evidence hashes the proposal cites; at least one.
     pub evidence: Vec<Hash>,
     /// Who proposes: your agent name. `engine` is reserved.
@@ -170,6 +343,20 @@ pub struct ProposeKey {
     /// Return what would be written, and write nothing.
     #[serde(default)]
     pub dry_run: bool,
+}
+
+/// The key `propose.key` proposes: the contract's `KeySpec` as JSON, or the
+/// short form `bellwether index --key` and `bellwether propose --key` read.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(untagged)]
+pub enum KeyArg {
+    /// The short form: exact:a,b, bloom:a@0.01, range:ts, or temporal:id@ts.
+    /// A sidecar declaration (temporal2:id@valid,known, or exact:a@ts with
+    /// its per-key time bounds) is refused with `sidecar_not_proposable`:
+    /// a proposal carries a key spec only.
+    Short(String),
+    /// The key spec's JSON form.
+    Spec(KeySpec),
 }
 
 /// `propose.layout`: propose clustering files by columns.
@@ -187,7 +374,10 @@ pub struct ProposeLayout {
     pub dry_run: bool,
 }
 
-/// `propose.rewrite`: propose a rewrite, as data (never code).
+/// `propose.rewrite`: propose a rewrite, as data. A rewrite of engine
+/// queries carries the (before, after) query pairs in `shape.pairs`; the
+/// engine submits them, read-only, only to the engine the server was
+/// started with, and only in `score.verify`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ProposeRewrite {
@@ -253,6 +443,7 @@ pub struct ToolDef {
 
 /// Every tool, in listing order.
 #[must_use]
+#[allow(clippy::too_many_lines)] // one entry per tool
 pub fn catalog() -> Vec<ToolDef> {
     vec![
         def::<ObserveWhy>(
@@ -263,6 +454,24 @@ pub fn catalog() -> Vec<ToolDef> {
              fanout per column, and lints, as a profile Evidence (evidence.hash). No workload. \
              Writes the Evidence and cache entries only; with an unwritable index it writes \
              nothing (recorded: false).",
+        ),
+        def::<ObserveCardinality>(
+            "observe.cardinality",
+            Tier::Observe,
+            true,
+            "Approximate count(distinct) per item from the index's sketches (no data file read): \
+             the estimate with its 99.7% interval, exact sketched and null rows, rows per value \
+             (fanout), files per value, and files that repeat a value. Labelled approximate; \
+             exact_distinct is set where an exact key on the same columns holds the count. With \
+             transient, reads the files for items no sketch holds. Writes nothing.",
+        ),
+        def::<ObserveOverlap>(
+            "observe.overlap",
+            Tier::Observe,
+            true,
+            "Approximate Jaccard similarity of two sketched items' value sets (MinHash when both \
+             sketches keep signatures, else HyperLogLog inclusion-exclusion), with its interval. \
+             Labelled approximate. Writes nothing.",
         ),
         def::<ObserveProfile>(
             "observe.profile",
@@ -275,9 +484,18 @@ pub fn catalog() -> Vec<ToolDef> {
             "observe.locate",
             Tier::Observe,
             true,
-            "Plan which files and row groups hold the keys in a Parquet key file, against the \
-             current manifest or a committed one (at_manifest). Writes the plan Evidence and \
-             the key set to the cache only.",
+            "Plan which files and row groups hold the keys in a Parquet key file (or, with \
+             contains, the rows whose list holds them), against the current or a committed \
+             manifest (at_manifest). Writes the plan Evidence and the key set to the cache only.",
+        ),
+        def::<ObserveCount>(
+            "observe.count",
+            Tier::Observe,
+            true,
+            "Count the rows holding the keys in a Parquet key file (count(*) where key in ...), \
+             exact, from the per-key counts of a key spec with counts on exactly those columns \
+             (exact:<cols>,counts): rows, row groups, files. No data file is read. Writes \
+             nothing; refused with not_indexed when no such spec is complete.",
         ),
         def::<ObserveAsof>(
             "observe.asof",
@@ -286,6 +504,15 @@ pub fn catalog() -> Vec<ToolDef> {
             "Plan the version of each key current at an instant, against the current manifest \
              or a committed one (at_manifest). Writes the plan Evidence and the key set to the \
              cache only.",
+        ),
+        def::<ObserveText>(
+            "observe.text",
+            Tier::Observe,
+            true,
+            "Plan which files and row groups hold rows whose string column matches a text \
+             lookup (has_token, contains, has_prefix; case-folded), through the folder's text \
+             keys. The result says when the plan is a candidate set and the residual is \
+             mandatory. Writes the plan Evidence and the lookup to the cache only.",
         ),
         def::<ScoreWhy>(
             "score.why",
@@ -304,12 +531,21 @@ pub fn catalog() -> Vec<ToolDef> {
              passing or failing); nothing is applied. Pass the certificate hash to \
              apply.receipt. Charged to the session budget. Returns a job id unless wait is true.",
         ),
+        def::<ScoreRecord>(
+            "score.record",
+            Tier::Score,
+            false,
+            "Run a query that produces keys in the query engine the server was started with \
+             (--twin-of), read-only, and record its rows as a workload (workload.hash) for \
+             score.why. Writes the workload to the cache. Charged to the session budget. Returns \
+             a job id unless wait is true.",
+        ),
         def::<ProposeKey>(
             "propose.key",
             Tier::Propose,
             false,
-            "Propose an index key citing Evidence. Writes one Proposal (no score field exists), \
-             or nothing with dry_run.",
+            "Propose an index key (JSON, or the short form such as exact:id) citing Evidence. \
+             Writes one Proposal (no score field exists), or nothing with dry_run.",
         ),
         def::<ProposeLayout>(
             "propose.layout",
@@ -322,8 +558,11 @@ pub fn catalog() -> Vec<ToolDef> {
             "propose.rewrite",
             Tier::Propose,
             false,
-            "Propose a rewrite as data (before, after, invariant; never code), citing Evidence. \
-             Writes one Proposal, or nothing with dry_run.",
+            "Propose a rewrite as data (before, after, invariant), citing Evidence. A rewrite of \
+             queries in the server's query engine carries them as shape.pairs (before and after \
+             query text) and shape.key (the columns their results are compared by), citing the \
+             twin Evidence observe.why or score.why returned. Writes one Proposal, or nothing \
+             with dry_run.",
         ),
         def::<ApplyReceipt>(
             "apply.receipt",

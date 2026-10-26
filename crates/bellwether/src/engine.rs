@@ -3,16 +3,18 @@
 
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use arrow::datatypes::SchemaRef;
-use bellwether_build::{Planner, SourceKind};
+use bellwether_build::{BuildOptions, Planner, SourceKind};
+use bellwether_core::sidecar::SidecarDef;
 use bellwether_ledger::Ledger;
 use bellwether_source::{
     fingerprint_with_policy, ChunkedTextSource, FingerprintPolicy, LocalFs, ParquetSource,
     Partitioning, Storage as _, TextFormat,
 };
+use bellwether_source_sql::{is_sql_root, SqlOptions, SqlSource, SqlUrl, TableRun};
 use bellwether_store::{
     manifest_history_path, manifest_path, now_rfc3339, parse_rfc3339, retained_sequences,
     rfc3339_millis, Cache, Manifest, ObjectStoreBackend, Snapshot, StoreExt,
@@ -141,7 +143,75 @@ pub struct EngineOptions {
     /// "now" when ages are computed, so two runs over the same inputs write
     /// byte-identical records. `None` uses the system clock.
     pub clock: Option<String>,
+    /// The command-line flags that shaped how this engine reads the folder
+    /// and where its index is (`--index`, `--format`, `--chunk-size`,
+    /// `--schema`, `--fingerprint-policy`, `--partitioning` or
+    /// `--path-template`), one argument per element, unquoted, paths made
+    /// absolute, as the shared flag definition (`bellwether_mcp::EngineArgs`)
+    /// renders them. The facade only assembles them into the `bellwether
+    /// index` command a refusal names (`ProposeRefusal::SidecarNotProposable`).
+    /// `None` for an engine a library caller opened: that command is then
+    /// given only when every source option above is the default.
+    pub source_flags: Option<Vec<String>>,
+    /// The key `fix` signs with (ADR 029): right after it writes a Receipt
+    /// it signs that Receipt and, when the same call wrote it, the
+    /// Certificate; a verify-only run signs its passing Certificate. Only
+    /// records the same call wrote are signed. `None` signs nothing.
+    /// Load it with [`crate::load_signing_key`].
+    pub signing_key: Option<bellwether_ledger::SigningKey>,
+    /// The keys a reader trusts (ADR 029): with them, `receipt`,
+    /// `receipts`, and `report` fold each receipt's and certificate's
+    /// signatures into a verdict. Load them with
+    /// [`crate::load_trusted_keys`].
+    pub trusted_keys: Option<bellwether_ledger::TrustedKeys>,
+    /// Worker threads for builds (`index`, and the apply step of `fix`).
+    /// `None` uses the available parallelism. The segments a build writes
+    /// do not depend on it.
+    pub threads: Option<usize>,
+    /// The query engine whose tables the data root copies (ADR 033): a
+    /// `clickhouse://` or `kusto://` root, connection parameters included
+    /// (records name it without them). With it, `why` reports the twin's
+    /// diagnosis beside the engine's table identity, and `fix` scores and
+    /// verifies a rewrite of engine queries in that engine.
+    pub twin_of: Option<String>,
+    /// The scratch folder a query engine's exports are written under (ADR
+    /// 033): a folder of the lake, under the same account and permissions,
+    /// named by whoever runs the engine (never by a tool argument). Each run
+    /// writes a fresh `bellwether-<run>` folder in it.
+    pub scratch: Option<String>,
+    /// Keep the exports after the certificate is written; by default they
+    /// are deleted.
+    pub keep_exports: bool,
+    /// An engine adapter to use instead of the built-in ones for
+    /// `twin_of`: a one-file adapter for another engine
+    /// (`bellwether_source_engine` README), or a test double.
+    pub engine_adapter: Option<EngineConnector>,
 }
+
+/// Opens an engine adapter for a `twin_of` root and an optional scratch
+/// folder ([`EngineOptions::engine_adapter`]).
+pub type ConnectFn = dyn Fn(&str, Option<&Path>) -> Result<Box<dyn bellwether_source_engine::EngineAdapter>>
+    + Send
+    + Sync;
+
+/// A custom engine adapter's constructor. Two connectors are equal when
+/// they are the same function object.
+#[derive(Clone)]
+pub struct EngineConnector(pub Arc<ConnectFn>);
+
+impl std::fmt::Debug for EngineConnector {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("EngineConnector(..)")
+    }
+}
+
+impl PartialEq for EngineConnector {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for EngineConnector {}
 
 /// The pinned current manifest: its planner, its snapshot, and its content
 /// hash and age, read together so they describe one commit.
@@ -206,6 +276,12 @@ pub struct Engine {
     /// creates a local index directory.
     store: OnceLock<Arc<ObjectStoreBackend>>,
     options: EngineOptions,
+    /// The data root as given, when it is a table (`sql://`, ADR 027): the
+    /// connection parameters stay here and never reach a record.
+    table: Option<String>,
+    /// Every table source this engine opened that is still alive, so the
+    /// run can end each before anything is recorded (`finish_tables`).
+    tables_open: Mutex<Vec<Weak<SqlSource>>>,
 }
 
 impl std::fmt::Debug for Engine {
@@ -228,7 +304,34 @@ impl Engine {
         guard(|| Self::open_inner(root, options))
     }
 
+    #[allow(clippy::too_many_lines)]
     fn open_inner(root: &str, options: EngineOptions) -> Result<Self> {
+        if bellwether_source_engine::is_engine_uri(root) {
+            let r = bellwether_source_engine::redact(root);
+            return Err(Error::InvalidArgument {
+                field: "root",
+                reason: format!(
+                    "{r} is a query engine, which bellwether reads through its lake twin: give the \
+                     folder that copies its tables as the root and name the engine with --twin-of \
+                     {r} (why, propose, fix), or record keys from it with `bellwether workload \
+                     record <folder> --from-engine {r}`"
+                ),
+            });
+        }
+        if let Some(t) = &options.twin_of {
+            bellwether_source_engine::EngineUri::parse(t)?;
+            if is_sql_root(root) {
+                return Err(Error::InvalidArgument {
+                    field: "twin_of",
+                    reason: "a twin is a folder of files copying an engine's tables; a table root \
+                             takes no --twin-of"
+                        .into(),
+                });
+            }
+        }
+        if is_sql_root(root) {
+            return Self::open_table(root, options);
+        }
         let local = match root.split_once("://") {
             None => root,
             Some(("file", rest)) => rest,
@@ -280,6 +383,8 @@ impl Engine {
             local_index,
             store: OnceLock::new(),
             options,
+            table: None,
+            tables_open: Mutex::new(Vec::new()),
         };
         if let Some(m) = engine.manifest()? {
             let recorded = SourceKind::parse(&m.source.kind)?;
@@ -312,6 +417,143 @@ impl Engine {
             }
         }
         Ok(engine)
+    }
+
+    /// [`Engine::open`] over a table root (`sql://`, ADR 027). There is no
+    /// folder to hold an index, so the ledger's location must be given
+    /// (`--index`); options that describe files are refused.
+    fn open_table(root: &str, options: EngineOptions) -> Result<Self> {
+        let url = SqlUrl::parse(root)?;
+        let refuse = |flag: &str| {
+            Err(Error::InvalidArgument {
+                field: "root",
+                reason: format!(
+                    "{} is a table, and {flag} describes a folder of files; leave it out",
+                    url.root()
+                ),
+            })
+        };
+        if options.partitioning.is_some() {
+            return refuse("the partitioning");
+        }
+        if options.fingerprint_policy.is_some() {
+            return refuse("the fingerprint policy");
+        }
+        if options.chunk_size.is_some() {
+            return refuse("the chunk size");
+        }
+        if options.format != SourceFormat::default() {
+            return refuse("the file format");
+        }
+        if options.at_manifest.is_some() {
+            return Err(Error::NotAFolder {
+                root: url.root(),
+                operation: "pinning a manifest",
+            });
+        }
+        let Some(index) = options.index.clone() else {
+            return Err(Error::InvalidArgument {
+                field: "index",
+                reason: format!(
+                    "{} is a table, so there is no folder to hold the ledger: give the index \
+                     location, where certificates and evidence are written",
+                    url.root()
+                ),
+            });
+        };
+        let mut options = options;
+        if let Some(c) = &options.clock {
+            let normalized = rfc3339_millis(c).map_err(|e| {
+                Error::Other(format!("the clock {c:?} is not an RFC 3339 time ({e})"))
+            })?;
+            options.clock = Some(normalized);
+        }
+        let engine = Self {
+            root: url.root(),
+            local_index: local_path(&index)?,
+            index,
+            store: OnceLock::new(),
+            options,
+            table: Some(root.to_string()),
+            tables_open: Mutex::new(Vec::new()),
+        };
+        if let Some(m) = engine.manifest()? {
+            return Err(Error::Source(format!(
+                "the index at {} indexes {}, not the table {}; pass another --index",
+                engine.index, m.source.root, engine.root
+            )));
+        }
+        Ok(engine)
+    }
+
+    /// The data root as given, when it is a table (with its connection
+    /// parameters: never recorded).
+    pub(crate) fn table_url(&self) -> Option<&str> {
+        self.table.as_deref()
+    }
+
+    /// Whether the data root is a table (`sql://`).
+    #[must_use]
+    pub fn is_table(&self) -> bool {
+        self.table.is_some()
+    }
+
+    /// Refuses `operation` on a table root: it needs a folder of files.
+    pub(crate) fn require_folder(&self, operation: &'static str) -> Result<()> {
+        if self.is_table() {
+            return Err(Error::NotAFolder {
+                root: self.root.clone(),
+                operation,
+            });
+        }
+        Ok(())
+    }
+
+    /// Opens a table source over `url` (a `sql://` root) with `schema` as
+    /// its dataset types where given, and registers it so the run ends it
+    /// before anything is recorded.
+    pub(crate) fn open_table_source(
+        &self,
+        url: &str,
+        schema: Option<SchemaRef>,
+    ) -> Result<Arc<SqlSource>> {
+        let src = Arc::new(SqlSource::connect(
+            url,
+            SqlOptions {
+                schema,
+                ..SqlOptions::default()
+            },
+        )?);
+        let mut open = self
+            .tables_open
+            .lock()
+            .map_err(|_| Error::Other("the open-table list is poisoned".into()))?;
+        open.retain(|w| w.strong_count() > 0);
+        open.push(Arc::downgrade(&src));
+        Ok(src)
+    }
+
+    /// Ends the run over every table source still open (ADR 027): one held
+    /// a snapshot, or each unit's identity is re-read and a change refused
+    /// ([`Error::SourceChanged`]). Called before every record a run over a
+    /// table writes, and when it returns. The reports, by root.
+    pub(crate) fn finish_tables(&self) -> Result<Vec<TableRun>> {
+        let open: Vec<Arc<SqlSource>> = {
+            let mut open = self
+                .tables_open
+                .lock()
+                .map_err(|_| Error::Other("the open-table list is poisoned".into()))?;
+            open.retain(|w| w.strong_count() > 0);
+            open.iter().filter_map(Weak::upgrade).collect()
+        };
+        let mut runs = Vec::with_capacity(open.len());
+        for s in open {
+            let run = s.finish()?;
+            if run.units > 0 && !runs.contains(&run) {
+                runs.push(run);
+            }
+        }
+        Ok(runs)
     }
 
     /// The canonical data root.
@@ -565,6 +807,10 @@ impl Engine {
     /// [`Engine::source`] builds: `parquet`, or the text format and its
     /// effective chunk size.
     pub(crate) fn source_config(&self, pinned: Option<&Pinned>) -> Result<String> {
+        if let Some(t) = &self.table {
+            let url = SqlUrl::parse(t)?;
+            return Ok(format!("sql:{}{}", url.engine, url.unit_config()));
+        }
         let format = SourceFormat::from_kind(self.options.format.kind());
         let chunk = match pinned {
             Some(p) => recorded_chunk_size(p.manifest())?,
@@ -611,6 +857,14 @@ impl Engine {
     /// [`Engine::source`] over the folder `root`, which partitioning reads
     /// the paths below.
     pub(crate) fn source_at(&self, pinned: Option<&Pinned>, root: &str) -> Result<Box<dyn Source>> {
+        if let Some(t) = self.table.as_ref().filter(|_| root == self.root) {
+            let src = self.open_table_source(t, self.options.schema.clone())?;
+            return Ok(Box::new(TableSource(src)));
+        }
+        if is_sql_root(root) {
+            let src = self.open_table_source(root, None)?;
+            return Ok(Box::new(TableSource(src)));
+        }
         let partitioning = self.partitioning(pinned)?;
         let (schema, policy, chunk) = match pinned {
             Some(p) => (
@@ -636,6 +890,9 @@ impl Engine {
                 Box::new(s)
             }
             Some(text) => {
+                // The text decoders take offset zones only: a supplied
+                // "UTC" is read as "+00:00", the same instants.
+                let schema = schema.map(|s| utc_as_offset(&s));
                 let mut s = ChunkedTextSource::new(text).with_fingerprint_policy(policy);
                 for dir in self.excluded() {
                     s = s.with_excluded(dir);
@@ -926,6 +1183,29 @@ pub(crate) fn commit_age(m: &Manifest, now_nanos: i64) -> Result<Duration> {
 }
 
 impl Engine {
+    /// The build options every index commit uses (`index` and the apply
+    /// stage of `fix` alike), from this engine's options: the source format
+    /// (a CSV dialect included), chunk size, dataset schema, fingerprint
+    /// policy, and partitioning (hive or a path template), so whichever verb
+    /// builds an index first records the same `manifest.source`; plus
+    /// `sidecars` to declare and the index directory to exclude.
+    pub(crate) fn build_options(&self, sidecars: Vec<SidecarDef>) -> BuildOptions {
+        let mut options = BuildOptions::new(self.format().kind());
+        options.chunk_size = self.options.chunk_size;
+        // A text index records the schema its decoders read ("UTC" as
+        // "+00:00"); a Parquet index records it as given.
+        options.schema = match self.format().text() {
+            Some(_) => self.options.schema.as_ref().map(utc_as_offset),
+            None => self.options.schema.clone(),
+        };
+        options.fingerprint_policy = self.options.fingerprint_policy;
+        options.partitioning.clone_from(&self.options.partitioning);
+        options.sidecars = sidecars;
+        options.exclude = self.excluded();
+        options.threads = self.options.threads;
+        options
+    }
+
     /// Directories under the data root whose files are never data: the
     /// index location, when it is local and lies inside the root (its own
     /// `.json` files would otherwise pass for JSON lines). Spelled as the
@@ -960,8 +1240,34 @@ impl Engine {
     }
 }
 
+/// A table source as a boxed `Source`, kept alive by the engine's
+/// registry only weakly: dropping the box ends the source.
+pub(crate) struct TableSource(pub Arc<SqlSource>);
+
+impl Source for TableSource {
+    fn discover(&self, root: &str) -> Result<Vec<FileFingerprint>> {
+        self.0.discover(root)
+    }
+
+    fn row_groups(&self, file: &FileFingerprint) -> Result<Vec<bellwether_types::RowGroupMeta>> {
+        self.0.row_groups(file)
+    }
+
+    fn read_columns(
+        &self,
+        rg: &bellwether_types::RowGroupMeta,
+        columns: &[String],
+    ) -> Result<arrow::array::RecordBatch> {
+        self.0.read_columns(rg, columns)
+    }
+
+    fn schema(&self, root: &str) -> Result<SchemaRef> {
+        self.0.schema(root)
+    }
+}
+
 /// The index location as a local directory, or `None` for an object store.
-fn local_path(index: &str) -> Result<Option<PathBuf>> {
+pub(crate) fn local_path(index: &str) -> Result<Option<PathBuf>> {
     let path = match index.split_once("://") {
         None => index,
         Some(("file", rest)) => rest,
@@ -995,7 +1301,11 @@ fn nullable_default() -> bool {
 /// of `{"name": ..., "type": ..., "nullable": ...}` objects in column order,
 /// each `type` spelled as Arrow prints it and as the manifest records it
 /// (`"Int64"`, `"Decimal128(12, 4)"`, `"Timestamp(Microsecond, Some(\"UTC\"))"`).
-/// `nullable` defaults to true.
+/// `nullable` defaults to true. The types are kept as written; over CSV
+/// and JSON lines a timestamp in the named zone `"UTC"` is read as the
+/// offset `"+00:00"` (the same instants), because their decoders take only
+/// offset zones, and another named zone is refused when those sources open
+/// the folder (`why` and `index` alike). Parquet keeps `"UTC"` as written.
 pub fn schema_from_json(json: &str) -> Result<SchemaRef> {
     use std::str::FromStr;
     let cols: Vec<SchemaColumn> = serde_json::from_str(json).map_err(|e| {
@@ -1029,6 +1339,33 @@ pub fn schema_from_json(json: &str) -> Result<SchemaRef> {
     Ok(Arc::new(arrow::datatypes::Schema::new(fields)))
 }
 
+/// `schema` with every timestamp in the named zone `"UTC"` given the
+/// offset `"+00:00"` instead (the same instants), for the CSV and JSON
+/// lines decoders, which take offset zones only.
+fn utc_as_offset(schema: &SchemaRef) -> SchemaRef {
+    use arrow::datatypes::{DataType, Field};
+    let utc =
+        |f: &Field| matches!(f.data_type(), DataType::Timestamp(_, Some(tz)) if &**tz == "UTC");
+    if !schema.fields().iter().any(|f| utc(f)) {
+        return SchemaRef::clone(schema);
+    }
+    let fields: Vec<Field> = schema
+        .fields()
+        .iter()
+        .map(|f| match f.data_type() {
+            DataType::Timestamp(unit, Some(tz)) if &**tz == "UTC" => f
+                .as_ref()
+                .clone()
+                .with_data_type(DataType::Timestamp(*unit, Some("+00:00".into()))),
+            _ => f.as_ref().clone(),
+        })
+        .collect();
+    Arc::new(arrow::datatypes::Schema::new_with_metadata(
+        fields,
+        schema.metadata().clone(),
+    ))
+}
+
 /// A value that does not fit the dataset type usually means the dataset
 /// schema was inferred from a file that does not represent every file (for
 /// example the first file's decimal scale); the error then says how to
@@ -1041,6 +1378,25 @@ pub(crate) fn schema_hint(e: Error) -> Error {
         Error::Source(m) if needs(&m) => Error::Source(m + HINT),
         Error::KeySpec(m) if needs(&m) => Error::KeySpec(m + HINT),
         Error::Other(m) if needs(&m) => Error::Other(m + HINT),
+        other => other,
+    }
+}
+
+/// `e`, with a text key's rebuild step (core's `text::REBUILD_STEP`)
+/// naming the data root instead of "the data folder".
+pub(crate) fn root_hint(root: &str, e: Error) -> Error {
+    let step = bellwether_core::text::REBUILD_STEP;
+    let named = |m: String| {
+        m.replace(
+            step,
+            &step.replace(
+                "`bellwether index` on the data folder",
+                &format!("`bellwether index {}`", crate::spec::shell_quote(root)),
+            ),
+        )
+    };
+    match e {
+        Error::KeySpec(m) if m.contains(step) => Error::KeySpec(named(m)),
         other => other,
     }
 }

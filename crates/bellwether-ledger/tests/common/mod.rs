@@ -129,6 +129,7 @@ pub fn evidence() -> Evidence {
         record_version: format::RECORD_VERSION,
         provenance: provenance(),
         body: EvidenceBody::Profile {
+            twin: None,
             root: "./orders".into(),
             fanout: vec![],
             lints: vec![],
@@ -146,24 +147,31 @@ pub fn proposal(evidence: Vec<Hash>, by: &str) -> Proposal {
         body: ProposalBody::Key {
             spec: KeySpec::Exact {
                 columns: vec!["order_id".into()],
+                counts: false,
+                bounds: None,
             },
+            sidecars: Vec::new(),
         },
     }
 }
 
 pub fn run(id: &str, bytes: u64) -> RunCost {
     RunCost {
+        measured: None,
         run_id: id.into(),
         keys: 40,
         files: 3,
         row_groups: 9,
         bytes,
         exact: true,
+        exactness: bellwether_types::Exactness::Exact,
+        rows: None,
     }
 }
 
 pub fn replay(proposal: Hash) -> Replay {
     Replay {
+        prediction: None,
         record_version: format::RECORD_VERSION,
         proposal,
         manifest_version: BEFORE.into(),
@@ -172,7 +180,10 @@ pub fn replay(proposal: Hash) -> Replay {
         current: vec![run("p50", 900_000), run("p95", 100_000)],
         proposed: vec![run("p50", 4_000), run("p95", 1_000)],
         model: None,
+        unserved: None,
         created_at: "2026-10-24T00:02:00Z".into(),
+        configuration: Vec::new(),
+        operators: Vec::new(),
     }
 }
 
@@ -193,6 +204,10 @@ pub fn certificate(proposal: Option<Hash>, pass: bool) -> Certificate {
             mismatched: u64::from(!pass),
             ignored_columns: vec!["updated_at".into()],
             totals_delta: vec![],
+            examples: Vec::new(),
+            uncomparable: 0,
+            totals: Vec::new(),
+            row_filter: None,
         },
         provenance,
     }
@@ -225,6 +240,8 @@ where
         )))
         .unwrap();
     let receipt = Receipt {
+        attest_only: false,
+        prediction: None,
         record_version: format::RECORD_VERSION,
         evidence: vec![evidence],
         proposal,

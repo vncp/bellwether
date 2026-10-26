@@ -13,21 +13,25 @@ use bellwether_core::segment::{validate_spec, ColumnType};
 use bellwether_core::sidecar::SidecarDef;
 use bellwether_source::{FingerprintPolicy, Partitioning, DEFAULT_CHUNK_SIZE};
 use bellwether_store::{
-    commit_with, now_rfc3339, read_manifest, ChunkRange, ColumnDef, CommitOptions, Extra,
-    FileEntry, Manifest, RowGroupSpace, RowGroupTombstone, SchemaInfo, SegmentRef, SourceInfo,
-    StagedSegments, StoreExt,
+    commit_with, now_rfc3339, read_manifest, spec_json, ChunkRange, ColumnDef, CommitOptions,
+    Extra, FileEntry, Manifest, RowGroupSpace, RowGroupTombstone, SchemaInfo, SegmentRef,
+    SourceInfo, StagedSegments, StoreExt,
 };
-use bellwether_types::{Error, FileFingerprint, KeySpec, Result, RowGroupId};
+use bellwether_types::format::STORAGE_VERSION;
+use bellwether_types::{Error, FileFingerprint, KeySpec, Result, RowGroupId, SketchSpec};
 use roaring::RoaringBitmap;
 
 use crate::config::{
     columns_to_schema, parse_policy, persistable, policy_name, schema_to_columns, BuildObserver,
     BuildOptions, SourceKind,
 };
-use crate::coverage::{completeness, completeness_map, covered, live_ids, Locator};
+use crate::coverage::{completeness, completeness_map, covered, live_ids, segment_of, Locator};
 use crate::segments::{self, Ctx, FileRow, SpecPlan};
 use crate::sources::{infer_schema, DataSource};
-use crate::target::{decl_of, declared_sidecars, declared_targets, def_of, unknown_kind, Target};
+use crate::target::{
+    decl_of, declared_sidecars, declared_sketches, declared_targets, known_decl, sketch_columns,
+    sketch_decl, unknown_kind, Target, SKETCH_KIND,
+};
 
 /// Most key specs one index may declare.
 pub const MAX_KEY_SPECS: usize = 64;
@@ -76,11 +80,32 @@ pub struct BuildReport {
     pub segments: Vec<SegmentRef>,
     /// Key specs whose segments were rebuilt over every live row group: new
     /// specs, specs whose definition changed under the same name, and specs
-    /// whose key or timestamp column changed type.
+    /// whose key or timestamp column changed type, and the specs in
+    /// `specs_repaired`.
     pub specs_rebuilt: Vec<String>,
+    /// Counted key specs (by identity) rebuilt because two of their
+    /// segments covered one live row group, so their rows would have been
+    /// counted twice: a manifest no build writes (another tool's, or an
+    /// edited one), which every planner refuses as a corrupt index.
+    pub specs_repaired: Vec<String>,
+    /// Text keys rebuilt because their segments were built under other
+    /// Unicode tables than this binary's (after a deliberate upgrade of a
+    /// table crate), with the tables they recorded; each is also in
+    /// `specs_rebuilt`.
+    pub text_tables_replaced: Vec<TextTablesReplaced>,
     /// Key specs removed because [`BuildOptions::remove_unlisted`] was set
     /// and they were not listed; their segments were dropped.
     pub specs_removed: Vec<String>,
+    /// Unchanged files whose per-row-group statistics (storage version 2:
+    /// rows, bytes, column bytes) this build recorded, each from one
+    /// `Source::row_groups` call: every file of a version 1 manifest on the
+    /// first build by this binary that commits, and every file when the
+    /// schema's columns changed. Zero when nothing was committed.
+    pub files_filled: u64,
+    /// The storage version of the manifest this build committed over, when
+    /// older than this binary's: the commit upgraded the index to
+    /// [`bellwether_types::format::STORAGE_VERSION`] (ADR 028).
+    pub upgraded_from: Option<u32>,
     /// Restarts after a conflicting concurrent commit.
     pub restarts: u32,
     /// Most row groups held by workers at once (at most the thread count).
@@ -91,8 +116,20 @@ pub struct BuildReport {
     pub elapsed: Duration,
 }
 
+/// A text key `index` rebuilt because its segments recorded other Unicode
+/// tables ([`BuildReport::text_tables_replaced`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TextTablesReplaced {
+    /// The key's name.
+    pub spec: String,
+    /// The tables its segments recorded.
+    pub recorded: bellwether_core::text::UnicodeTables,
+    /// This binary's tables, which the rebuilt segments record.
+    pub current: bellwether_core::text::UnicodeTables,
+}
+
 enum Attempt {
-    Done(BuildReport),
+    Done(Box<BuildReport>),
     Restart { claimed: bool },
 }
 
@@ -153,14 +190,53 @@ impl<S: StoreExt + ?Sized> Builder<S> {
                     }
                     Some(d) if d != spec => {
                         return Err(Error::KeySpec(format!(
-                            "the index declares {d:?} under the name {name}, not {spec:?}"
+                            "the index declares {} under the name {name}, not {}",
+                            d.identity(),
+                            spec.identity()
                         )))
                     }
                     Some(_) => {}
                 }
+                // Segments and completeness are keyed by the declared
+                // spec's identity (storage version 2).
+                let identity = spec.identity();
                 let mut next = m.clone();
                 next.schema.key_specs.retain(|s| s.name() != name);
-                next.segments.retain(|s| s.key_spec != name);
+                next.segments.retain(|s| s.key_spec != identity);
+                next.key_spec_completeness.remove(&identity);
+                Ok(next)
+            },
+        );
+        match committed {
+            Ok(c) => Ok(Some(c.sequence)),
+            Err(_) if absent.get() => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Drops the segments and the completeness entry of the declared
+    /// sketch `spec`, keeping its declaration, in one manifest commit that
+    /// reads no source file: the next build then sketches every live row
+    /// group again. For a sketch whose segments are missing from the store
+    /// or damaged (a sketch is never planned with, so nothing else depends
+    /// on them). Returns the committed sequence, or `None` if the index does
+    /// not declare `spec`.
+    pub fn reset_sketch(&self, spec: &SketchSpec) -> Result<Option<u64>> {
+        let name = spec.name();
+        let absent = Cell::new(false);
+        let committed = commit_with(
+            &*self.store,
+            &self.index_root,
+            &StagedSegments::new(),
+            CommitOptions::default(),
+            |m| {
+                if !declared_sketches(m).contains(spec) {
+                    absent.set(true);
+                    return Err(Error::KeySpec(format!("sketch {name} is not declared")));
+                }
+                let mut next = m.clone();
+                next.segments
+                    .retain(|s| !(s.kind.as_deref() == Some(SKETCH_KIND) && s.key_spec == name));
                 next.key_spec_completeness.remove(&name);
                 Ok(next)
             },
@@ -218,7 +294,7 @@ impl<S: StoreExt + ?Sized> Builder<S> {
                 Attempt::Done(mut report) => {
                     report.restarts = restarts;
                     report.elapsed = started.elapsed();
-                    return Ok(report);
+                    return Ok(*report);
                 }
                 Attempt::Restart { claimed } => {
                     restarts += 1;
@@ -247,8 +323,12 @@ impl<S: StoreExt + ?Sized> Builder<S> {
         }
         let cfg = Config::resolve(base.as_ref(), root, opts)?;
         let declared = declared_specs(base.as_ref(), key_specs, opts.remove_unlisted)?;
+        if let Some((a, b)) = KeySpec::shared_identity(&declared) {
+            return Err(shared_identity(root, base.as_ref(), a, b));
+        }
         let sidecars = declared_sidecar_defs(base.as_ref(), &opts.sidecars, opts.remove_unlisted)?;
-        let specs = plan_specs(&declared, &sidecars, &cfg.schema)?;
+        let sketches = declared_sketch_specs(base.as_ref(), &opts.sketches, opts.remove_unlisted)?;
+        let specs = plan_specs(&declared, &sidecars, &sketches, &cfg.schema)?;
         let chunk_sizes = base_chunk_sizes(base.as_ref())
             .into_iter()
             .chain(cfg.new_chunk_size.size());
@@ -273,10 +353,14 @@ impl<S: StoreExt + ?Sized> Builder<S> {
             observer,
         )?;
         let live = live_ids(&files.space)?;
-        let work = plan_work(base.as_ref(), &specs, &cfg, &live);
+        let stale = stale_text_specs(&*self.store, &self.index_root, base.as_ref())?;
+        let work = plan_work(base.as_ref(), &specs, &cfg, &live, &stale);
         let mut report = files.report(&work);
         if is_noop(base.as_ref(), &files, &work, &cfg, &specs)? {
-            return Ok(Attempt::Done(report));
+            // Nothing committed: a version 1 index stays at version 1 and
+            // keeps planning as before (ADR 028); no statistics were recorded.
+            report.files_filled = 0;
+            return Ok(Attempt::Done(Box::new(report)));
         }
         let items = segments::items(&files.rows, &work.needed, opts.max_segment_row_groups)?;
         let ctx = Ctx {
@@ -307,7 +391,7 @@ impl<S: StoreExt + ?Sized> Builder<S> {
             planned_schema: base.as_ref().map(|m| m.schema.clone()).unwrap_or_default(),
             planned_source: base.as_ref().map(|m| m.source.clone()).unwrap_or_default(),
             source: cfg.source_info.clone(),
-            schema: schema_info(base.as_ref(), &cfg, &declared, &sidecars),
+            schema: schema_info(base.as_ref(), &cfg, &declared, &sidecars, &sketches),
             space: files.space.clone(),
             keep: &work.keep,
             replaced: &work.replaced,
@@ -324,8 +408,12 @@ impl<S: StoreExt + ?Sized> Builder<S> {
         match committed {
             Ok(c) => {
                 report.sequence = Some(c.sequence);
+                report.upgraded_from = base
+                    .as_ref()
+                    .map(|m| m.storage_version)
+                    .filter(|&v| v < STORAGE_VERSION);
                 report.segments = written.segments;
-                Ok(Attempt::Done(report))
+                Ok(Attempt::Done(Box::new(report)))
             }
             Err(_) if restart.get() => Ok(Attempt::Restart { claimed: false }),
             Err(Error::SegmentClaimed(_)) => Ok(Attempt::Restart { claimed: true }),
@@ -507,12 +595,16 @@ fn recorded_chunk_size(base: Option<&Manifest>) -> NewChunkSize {
 /// The specs a build declares: `key_specs`, plus, unless `remove_unlisted`,
 /// every spec the base declares under a name `key_specs` does not use. The
 /// base's specs keep their order, a given spec under an existing name
-/// replaces that definition in place, and new specs follow.
+/// replaces that definition in place, and new specs follow. A given spec
+/// the base does not already declare is a new declaration and must meet
+/// [`KeySpec::check_names`]; one it declares (a storage version 1 spec on a
+/// column named `a,b`) is indexed as it is.
 fn declared_specs(
     base: Option<&Manifest>,
     key_specs: &[KeySpec],
     remove_unlisted: bool,
 ) -> Result<Vec<KeySpec>> {
+    let base_specs = base.map_or(&[][..], |m| m.schema.key_specs.as_slice());
     let mut given: BTreeMap<String, &KeySpec> = BTreeMap::new();
     for spec in key_specs {
         if given.insert(spec.name(), spec).is_some() {
@@ -522,12 +614,15 @@ fn declared_specs(
                 spec.name()
             )));
         }
+        if !base_specs.contains(spec) {
+            spec.check_names()?;
+        }
     }
     if remove_unlisted {
         return Ok(key_specs.to_vec());
     }
     let mut out: Vec<KeySpec> = Vec::with_capacity(key_specs.len());
-    for spec in base.map_or(&[][..], |m| m.schema.key_specs.as_slice()) {
+    for spec in base_specs {
         out.push(
             given
                 .get(&spec.name())
@@ -542,15 +637,95 @@ fn declared_specs(
     Ok(out)
 }
 
+/// The refusal for two declared specs that share an identity, before
+/// anything is read or written: storage version 2 files segments by
+/// identity, so their segments could not be told apart. Either both come
+/// from a storage version 1 index (which allowed it), and the index cannot
+/// be upgraded until one is re-declared under its name (a spec declared
+/// under an existing name replaces it), or one is a new declaration
+/// colliding with a spec the index already declares.
+fn shared_identity(root: &str, base: Option<&Manifest>, a: &KeySpec, b: &KeySpec) -> Error {
+    let declared = |s: &KeySpec| base.is_some_and(|m| m.schema.key_specs.contains(s));
+    let both = format!(
+        "the key specs {} and {} share the identity {}, and storage version 2 files segments by \
+         identity, so their segments could not be told apart; nothing was read or written",
+        spec_json(a),
+        spec_json(b),
+        a.identity()
+    );
+    if !(declared(a) && declared(b)) {
+        let (new, old) = if declared(a) { (b, a) } else { (a, b) };
+        return Error::KeySpec(format!(
+            "{both}. {} is a new declaration and {} is already declared, so declare a spec \
+             over other columns instead",
+            spec_json(new),
+            spec_json(old)
+        ));
+    }
+    // A spec re-declared under its name replaces it; the replacement is a
+    // new declaration, so its key columns (its name) must be free of the
+    // separators. Its other columns (a time column) are the ones to change.
+    let clean = |s: &KeySpec| !s.columns().iter().any(|c| c.contains([',', '@']));
+    let step = match [a, b].into_iter().find(|s| clean(s)) {
+        Some(s) => {
+            let placeholder = "<a time column whose name has no ',' or '@'>";
+            let fix = |c: &mut String| {
+                if c.contains([',', '@']) {
+                    *c = placeholder.to_string();
+                }
+            };
+            let mut example = s.clone();
+            match &mut example {
+                KeySpec::Exact { bounds, .. } | KeySpec::Bloom { bounds, .. } => {
+                    bounds.iter_mut().for_each(fix);
+                }
+                KeySpec::Temporal { ts_column, .. } => fix(ts_column),
+                KeySpec::Bitemporal {
+                    valid_column,
+                    known_column,
+                    ..
+                } => {
+                    fix(valid_column);
+                    fix(known_column);
+                }
+                // An expr key's column is an identifier; it names no time
+                // column.
+                KeySpec::Range { .. }
+                | KeySpec::Expr { .. }
+                | KeySpec::Text { .. }
+                | KeySpec::List { .. } => {}
+            }
+            format!(
+                "re-declare {} under its name with a time column whose name has no ',' or '@', \
+                 for example `bellwether index {root} --key '{}'`: a spec declared under an \
+                 existing name replaces it, and that build upgrades the index",
+                s.name(),
+                spec_json(&example)
+            )
+        }
+        None => format!(
+            "both specs' key columns hold ',' or '@', so neither can be re-declared under its \
+             name; move the index folder of {root} aside and index again with key specs whose \
+             columns have neither"
+        ),
+    };
+    Error::KeySpec(format!(
+        "cannot upgrade this storage version 1 index to storage version {STORAGE_VERSION}: {both}. \
+         To upgrade it, {step}. Until then the index stays at storage version 1, and every other \
+         spec still plans"
+    ))
+}
+
 /// The schema this build commits: the dataset columns, the declared key
-/// specs and sidecars, the base's declarations of sidecar kinds this binary
-/// does not know (kept unchanged, as their segments are), and the base's
-/// unknown fields.
+/// specs, sidecars, and sketches, the base's declarations of sidecar kinds
+/// this binary does not know (kept unchanged, as their segments are), and
+/// the base's unknown fields.
 fn schema_info(
     base: Option<&Manifest>,
     cfg: &Config,
     declared: &[KeySpec],
     sidecars: &[SidecarDef],
+    sketches: &[SketchSpec],
 ) -> SchemaInfo {
     SchemaInfo {
         columns: cfg.columns.clone(),
@@ -558,13 +733,11 @@ fn schema_info(
         sidecars: sidecars
             .iter()
             .map(decl_of)
-            .chain(base.iter().flat_map(|m| {
-                m.schema
-                    .sidecars
-                    .iter()
-                    .filter(|d| def_of(d).is_none())
-                    .cloned()
-            }))
+            .chain(sketches.iter().map(sketch_decl))
+            .chain(
+                base.iter()
+                    .flat_map(|m| m.schema.sidecars.iter().filter(|d| !known_decl(d)).cloned()),
+            )
             .collect(),
         extra: base.map(|m| m.schema.extra.clone()).unwrap_or_default(),
     }
@@ -599,19 +772,62 @@ fn declared_sidecar_defs(
     Ok(out)
 }
 
-/// Validates the declared key specs and sidecars against the dataset
-/// schema: key specs first, in declaration order, then sidecars.
+/// The sketches a build declares, by the rules of [`declared_specs`]:
+/// `given`, plus, unless `remove_unlisted`, every sketch the base declares
+/// under another name (a given one under an existing name replaces it).
+fn declared_sketch_specs(
+    base: Option<&Manifest>,
+    given: &[SketchSpec],
+    remove_unlisted: bool,
+) -> Result<Vec<SketchSpec>> {
+    let mut names = BTreeSet::new();
+    for s in given {
+        if !names.insert(s.name()) {
+            return Err(Error::KeySpec(format!(
+                "the sketch {} is given twice",
+                s.name()
+            )));
+        }
+    }
+    if remove_unlisted {
+        return Ok(given.to_vec());
+    }
+    let mut out: Vec<SketchSpec> = Vec::new();
+    for s in base.map(declared_sketches).unwrap_or_default() {
+        out.push(
+            given
+                .iter()
+                .find(|g| g.name() == s.name())
+                .cloned()
+                .unwrap_or(s),
+        );
+    }
+    for s in given {
+        if !out.iter().any(|o| o.name() == s.name()) {
+            out.push(s.clone());
+        }
+    }
+    Ok(out)
+}
+
+/// Validates the declared key specs, sidecars, and sketches against the
+/// dataset schema: key specs first, in declaration order, then sidecars,
+/// then sketches.
+// One arm per kind of target (key spec, expr key, sidecar, sketch).
+#[allow(clippy::too_many_lines)]
 fn plan_specs(
     specs: &[KeySpec],
     sidecars: &[SidecarDef],
+    sketches: &[SketchSpec],
     schema: &Schema,
 ) -> Result<Vec<SpecPlan>> {
-    if specs.len() + sidecars.len() > MAX_KEY_SPECS {
+    if specs.len() + sidecars.len() + sketches.len() > MAX_KEY_SPECS {
         return Err(Error::KeySpec(format!(
-            "{} key specs and {} sidecars declared; at most {MAX_KEY_SPECS} together are \
-             supported",
+            "{} key specs, {} sidecars, and {} sketches declared; at most {MAX_KEY_SPECS} \
+             together are supported",
             specs.len(),
-            sidecars.len()
+            sidecars.len(),
+            sketches.len()
         )));
     }
     let column_type = |c: &str| {
@@ -632,6 +848,22 @@ fn plan_specs(
                      so at most one of them can be declared"
                 )));
             }
+            if let KeySpec::Expr { .. } = spec {
+                // The one key column is the virtual column, at the
+                // expression's type; the worker reads the expression's
+                // inputs and derives it per row group.
+                let typed = bellwether_core::expr::typed_spec(spec, schema)?;
+                ColumnType::of(typed.data_type())
+                    .map_err(|e| Error::KeySpec(format!("{name}: {e}")))?;
+                return Ok(SpecPlan {
+                    target: Target::Key(spec.clone()),
+                    name: spec.identity(),
+                    key_types: vec![typed.data_type().clone()],
+                    ts_type: None,
+                    time_types: Vec::new(),
+                    columns: typed.input_columns(),
+                });
+            }
             let mut seen = BTreeSet::new();
             let mut key_types = Vec::new();
             for c in spec.columns() {
@@ -639,7 +871,16 @@ fn plan_specs(
                     return Err(Error::KeySpec(format!("{name} lists column {c:?} twice")));
                 }
                 let t = column_type(c)?;
+                // A list key's elements are its keys: the element type is
+                // the one its segments encode at and record.
+                let t = match spec {
+                    KeySpec::List { .. } => bellwether_core::list::check_list_column(c, &t)?,
+                    _ => t,
+                };
                 ColumnType::of(&t).map_err(|e| Error::KeySpec(format!("{name}: key column {c:?}: {e}")))?;
+                if matches!(spec, KeySpec::Text { .. }) {
+                    bellwether_core::text::check_column_type(c, &t)?;
+                }
                 key_types.push(t);
             }
             let mut columns = spec.columns().to_vec();
@@ -657,7 +898,7 @@ fn plan_specs(
             };
             Ok(SpecPlan {
                 target: Target::Key(spec.clone()),
-                name,
+                name: spec.identity(),
                 key_types,
                 ts_type,
                 time_types: Vec::new(),
@@ -692,7 +933,37 @@ fn plan_specs(
                 .collect(),
         });
     }
+    plan_sketches(sketches, schema, &mut names, &mut out)?;
     Ok(out)
+}
+
+/// Validates each sketch against the dataset schema (every item column
+/// present with a canonical encoding) and appends its plan.
+fn plan_sketches(
+    sketches: &[SketchSpec],
+    schema: &Schema,
+    names: &mut BTreeSet<String>,
+    out: &mut Vec<SpecPlan>,
+) -> Result<()> {
+    for spec in sketches {
+        bellwether_core::sketch::validate(spec)?;
+        let name = spec.name();
+        if !names.insert(name.clone()) {
+            return Err(Error::KeySpec(format!(
+                "the sketch {name} is declared twice"
+            )));
+        }
+        bellwether_core::sketch::item_types(spec, schema)?;
+        out.push(SpecPlan {
+            target: Target::Sketch(spec.clone()),
+            name,
+            key_types: Vec::new(),
+            ts_type: None,
+            time_types: Vec::new(),
+            columns: sketch_columns(spec),
+        });
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -707,6 +978,8 @@ struct FileCounts {
     unchanged: u64,
     assigned: u64,
     retired: u64,
+    /// Unchanged files whose storage version 2 statistics were filled.
+    filled: u64,
 }
 
 /// The tracked files and row-group space after this build.
@@ -725,7 +998,10 @@ impl FilePlan {
             files_unchanged: self.counts.unchanged,
             row_groups_assigned: self.counts.assigned,
             row_groups_retired: self.counts.retired,
+            files_filled: self.counts.filled,
             specs_rebuilt: work.replaced.iter().cloned().collect(),
+            specs_repaired: work.repaired.clone(),
+            text_tables_replaced: work.stale.clone(),
             specs_removed: work.removed.clone(),
             ..BuildReport::default()
         }
@@ -735,6 +1011,7 @@ impl FilePlan {
 /// Pairs discovered files with tracked ones by path, retires the ids of
 /// changed and vanished files, and assigns fresh ids, in path order, to
 /// every file seen for the first time or changed.
+#[allow(clippy::too_many_lines)]
 fn plan_files(
     base: Option<&Manifest>,
     discovered: &[FileFingerprint],
@@ -763,14 +1040,41 @@ fn plan_files(
             counts.removed += 1;
         }
     }
+    let columns: Vec<String> = cfg.columns.iter().map(|c| c.name.clone()).collect();
+    // Column bytes are aligned with the schema's columns, so a schema whose
+    // columns changed refills them for every file.
+    let columns_changed =
+        base.is_some_and(|m| !m.schema.columns.iter().map(|c| &c.name).eq(columns.iter()));
     let mut next = base_space.next_id;
     let mut entries = Vec::with_capacity(discovered.len());
     for fp in discovered {
         if let Some(old) = by_path.get(fp.path.as_str()) {
             if old.fingerprint == *fp {
-                entries.push((*old).clone());
-                counts.unchanged += 1;
-                continue;
+                let current = old.has_rowgroup_stats()
+                    && (old.column_bytes.is_none() == cfg.kind.text_format().is_some())
+                    && !columns_changed;
+                if current {
+                    entries.push((*old).clone());
+                    counts.unchanged += 1;
+                    continue;
+                }
+                // A version 1 entry, or one whose column bytes no longer
+                // align: fill the statistics from one `row_groups` call. A
+                // footer that disagrees with the recorded row-group count
+                // is drift under an unchanged fingerprint (ADR 013): the
+                // file's ids are retired and reassigned like a changed
+                // file's.
+                let stats = sources.rowgroup_stats(fp, old.chunk_size, &columns)?;
+                if stats.rows.len() == old.rowgroup_ids.len() {
+                    let mut e = (*old).clone();
+                    e.rowgroup_rows = Some(stats.rows);
+                    e.rowgroup_bytes = Some(stats.bytes);
+                    e.column_bytes = stats.column_bytes;
+                    entries.push(e);
+                    counts.unchanged += 1;
+                    counts.filled += 1;
+                    continue;
+                }
             }
             retired.extend(&old.rowgroup_ids);
             counts.changed += 1;
@@ -781,6 +1085,16 @@ fn plan_files(
         let layout = sources.layout(fp, chunk_size)?;
         if let Some(o) = observer {
             o.file_laid_out(fp);
+        }
+        let stats = sources.rowgroup_stats(fp, chunk_size, &columns)?;
+        if stats.rows.len() != layout.row_groups {
+            return Err(Error::Source(format!(
+                "{}: the file lists {} row groups, then {}; it changed while the build read it, \
+                 so run the build again",
+                fp.path,
+                layout.row_groups,
+                stats.rows.len()
+            )));
         }
         let n = u32::try_from(layout.row_groups)
             .map_err(|_| Error::Other(format!("{}: too many row groups", fp.path)))?;
@@ -802,6 +1116,9 @@ fn plan_files(
                     .collect()
             }),
             extra: Extra::new(),
+            rowgroup_rows: Some(stats.rows),
+            rowgroup_bytes: Some(stats.bytes),
+            column_bytes: stats.column_bytes,
         });
         next = end;
     }
@@ -880,17 +1197,52 @@ struct WorkPlan {
     keep: BTreeSet<String>,
     /// Base specs no longer declared.
     removed: Vec<String>,
+    /// Counted specs rebuilt because two of their base segments cover one
+    /// live row group (also in `replaced`).
+    repaired: Vec<String>,
+    /// Declared text keys replaced because they were built under other
+    /// Unicode tables.
+    stale: Vec<TextTablesReplaced>,
+}
+
+/// Whether two segments listed under `name` both cover one live row group.
+/// No build commits that (a build indexes each live row group in one
+/// segment per spec, and compaction merges only contiguous ranges), so the
+/// manifest was written by another tool or edited. A counted spec's rows
+/// would then be counted twice, which every planner refuses
+/// ([`crate::overlapping_counts`]); the build rebuilds the spec instead.
+fn double_covered(m: &Manifest, name: &str, live: &RoaringBitmap) -> bool {
+    let mut seen = RoaringBitmap::new();
+    for s in m.segments.iter().filter(|s| segment_of(s, name)) {
+        let (start, end) = (s.rowgroup_range.start.0, s.rowgroup_range.end.0);
+        let mut covers = RoaringBitmap::new();
+        if start < end {
+            covers.insert_range(start..end);
+        }
+        covers &= live;
+        if !seen.is_disjoint(&covers) {
+            return true;
+        }
+        seen |= covers;
+    }
+    false
 }
 
 /// Whether any column of `target` whose type its segments record (key
-/// columns, a temporal timestamp, a sidecar's time columns) has a different
-/// recorded type under `new` than under `old`.
+/// columns, a temporal timestamp, a sidecar's time columns; a list key's
+/// element type) has a different recorded type under `new` than under
+/// `old`.
 fn types_differ(old: &Schema, new: &Schema, target: &Target) -> bool {
+    let list = matches!(target, Target::Key(KeySpec::List { .. }));
     target.typed_columns().iter().any(|c| {
         let recorded = |s: &Schema| {
-            s.field_with_name(c)
-                .ok()
-                .and_then(|f| ColumnType::of(f.data_type()).ok())
+            let dt = s.field_with_name(c).ok()?.data_type();
+            let dt = if list {
+                bellwether_core::list::element_type(dt)?
+            } else {
+                dt
+            };
+            ColumnType::of(dt).ok()
         };
         match (recorded(old), recorded(new)) {
             (Some(a), Some(b)) => a != b,
@@ -899,26 +1251,127 @@ fn types_differ(old: &Schema, new: &Schema, target: &Target) -> bool {
     })
 }
 
+/// The text keys of `m` built under Unicode tables other than this
+/// binary's, with the tables they recorded (core's `text::recorded_tables`):
+/// after a deliberate upgrade of either table crate, `index` rebuilds
+/// exactly these from scratch ([`plan_work`]). Every build keeps all of a
+/// text key's segments under one table version (a key on other tables is
+/// replaced whole, never extended), so one header per key tells: reads one
+/// segment's preamble and header per declared text key, whatever its
+/// segment count.
+fn stale_text_specs<S: StoreExt + ?Sized>(
+    store: &S,
+    index_root: &str,
+    m: Option<&Manifest>,
+) -> Result<BTreeMap<String, bellwether_core::text::UnicodeTables>> {
+    let now = bellwether_core::text::UnicodeTables::current();
+    let mut stale = BTreeMap::new();
+    let Some(m) = m else {
+        return Ok(stale);
+    };
+    for spec in m
+        .schema
+        .key_specs
+        .iter()
+        .filter(|s| matches!(s, KeySpec::Text { .. }))
+    {
+        let name = spec.identity();
+        let Some(seg) = m.key_spec_segments(&name).next() else {
+            continue;
+        };
+        let src = HeaderBytes {
+            store,
+            path: bellwether_store::segment_path(index_root, &seg.id),
+            size: seg.bytes,
+        };
+        match bellwether_core::text::recorded_tables(&src)? {
+            Some(t) if t == now => {}
+            Some(t) => {
+                stale.insert(name, t);
+            }
+            None => {
+                return Err(Error::Other(format!(
+                    "corrupt segment {}: a text segment records its Unicode tables",
+                    seg.id
+                )))
+            }
+        }
+    }
+    Ok(stale)
+}
+
+/// A committed segment read by range (its preamble and header only).
+struct HeaderBytes<'a, S: StoreExt + ?Sized> {
+    store: &'a S,
+    path: String,
+    size: u64,
+}
+
+impl<S: StoreExt + ?Sized> bellwether_core::segment::ReadAt for HeaderBytes<'_, S> {
+    fn size(&self) -> Result<u64> {
+        Ok(self.size)
+    }
+
+    fn read_at(&self, offset: u64, len: usize) -> Result<std::borrow::Cow<'_, [u8]>> {
+        let end = offset
+            .checked_add(len as u64)
+            .filter(|e| *e <= self.size)
+            .ok_or_else(|| Error::Other(format!("corrupt segment {}: range", self.path)))?;
+        let bytes = self
+            .store
+            .get_range(&self.path, offset..end)?
+            .ok_or_else(|| Error::Store(format!("segment {} is missing", self.path)))?;
+        if bytes.len() != len {
+            return Err(Error::Store(format!(
+                "segment {}: asked for {len} bytes at {offset}, got {}",
+                self.path,
+                bytes.len()
+            )));
+        }
+        Ok(std::borrow::Cow::Owned(bytes.to_vec()))
+    }
+}
+
 fn plan_work(
     base: Option<&Manifest>,
     specs: &[SpecPlan],
     cfg: &Config,
     live: &RoaringBitmap,
+    stale: &BTreeMap<String, bellwether_core::text::UnicodeTables>,
 ) -> WorkPlan {
     let mut work = WorkPlan {
         needed: Vec::with_capacity(specs.len()),
         replaced: BTreeSet::new(),
         keep: BTreeSet::new(),
         removed: Vec::new(),
+        repaired: Vec::new(),
+        stale: Vec::new(),
     };
     let base_targets = base.map(declared_targets).unwrap_or_default();
     for p in specs {
-        let old = base_targets.iter().find(|t| t.name() == p.name);
+        let old = base_targets.iter().find(|t| t.slot() == p.target.slot());
         let types_changed = match &cfg.base_schema {
             Some(bs) => types_differ(bs, &cfg.schema, &p.target),
             None => old.is_some(),
         };
-        let replaced = old != Some(&p.target) || types_changed;
+        let double = match (base, &p.target) {
+            (Some(m), Target::Key(spec)) if spec.counts() => double_covered(m, &p.name, live),
+            _ => false,
+        };
+        let replaced = old != Some(&p.target) || types_changed || double;
+        if double && old == Some(&p.target) && !types_changed {
+            work.repaired.push(p.name.clone());
+        }
+        // A text key built under other Unicode tables is rebuilt whole.
+        let recorded = stale.get(&p.name);
+        let replaced = replaced || recorded.is_some();
+        if let Some(t) = recorded {
+            work.stale.push(TextTablesReplaced {
+                spec: p.name.clone(),
+                recorded: t.clone(),
+                current: bellwether_core::text::UnicodeTables::current(),
+            });
+        }
         let needed = match base {
             Some(m) if !replaced => live - &covered(m, &p.name),
             _ => live.clone(),
@@ -930,16 +1383,20 @@ fn plan_work(
             work.keep.insert(p.name.clone());
         }
     }
-    let declared: BTreeSet<&str> = specs.iter().map(|p| p.name.as_str()).collect();
+    // A spec redefined under its slot is rebuilt, not removed.
+    let declared: BTreeSet<String> = specs.iter().map(|p| p.target.slot()).collect();
     work.removed = base_targets
         .iter()
+        .filter(|t| !declared.contains(&t.slot()))
         .map(Target::name)
-        .filter(|n| !declared.contains(n.as_str()))
         .collect();
     work
 }
 
-/// Whether committing would change nothing.
+/// Whether committing would change nothing. Filling the storage version 2
+/// statistics of a version 1 manifest is not a change on its own: a build
+/// with nothing else to do commits nothing and leaves the index at version
+/// 1; the next commit that changes anything upgrades it.
 fn is_noop(
     base: Option<&Manifest>,
     files: &FilePlan,
@@ -1026,6 +1483,7 @@ impl Delta<'_> {
             let what = match missing {
                 Target::Key(_) => "key spec",
                 Target::Sidecar(_) => "sidecar",
+                Target::Sketch(_) => "sketch",
             };
             return Err(Error::Other(format!(
                 "the build would leave {what} {} incomplete; nothing was committed",

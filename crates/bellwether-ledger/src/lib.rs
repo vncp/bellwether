@@ -20,17 +20,24 @@
 //!   provenance: non-empty inputs and an RFC 3339 `created_at`; a
 //!   certificate also names its manifest version.
 //! - **Invariant 3 support** (contract v2.1): every [`Replay`] names the
-//!   data it read (`inputs`, non-empty); its current costs are exact; it
-//!   names a cost model exactly when some proposed cost is inexact; and a
-//!   key proposal's replay is exact throughout. `put_receipt` re-runs these
-//!   checks on the resolved replay.
+//!   data it read (`inputs`, non-empty); its current costs are exact,
+//!   except a rewrite measured in a query engine or a table, which names
+//!   its model (ADR 033); it names a cost model exactly when some cost is
+//!   inexact; and a key proposal's replay is exact throughout.
+//!   `put_receipt` re-runs these checks on the resolved replay.
+//! - **Attest-only receipts** (ADR 033): a receipt marked `attest_only` is
+//!   for a rewrite and leaves the manifest unchanged; a receipt whose
+//!   replay is measured must be attest-only, and a receipt's prediction
+//!   must be its replay's.
 //! - **Write version**: `put` and `put_receipt` accept only the current
 //!   `record_version`; older versions stay readable (ADR 017).
 //!
 //! # Write paths
 //!
-//! The only ways to write are [`Ledger::put`] and [`Ledger::put_receipt`].
-//! The wrapped store is not reachable through the ledger:
+//! The only ways to write are [`Ledger::put`], [`Ledger::put_receipt`], and
+//! [`Ledger::sign`], which writes a detached signature object beside a
+//! stored receipt or certificate (ADR 029). The wrapped store is not
+//! reachable through the ledger:
 //!
 //! ```compile_fail
 //! fn bypass<S, T>(ledger: &bellwether_ledger::Ledger<S>)
@@ -41,6 +48,15 @@
 //!     let _ = ledger.store();
 //! }
 //! ```
+//!
+//! # Signatures
+//!
+//! A signature is an object beside the record, never a record kind or a
+//! field ([`signature`] module docs). [`Ledger::signatures`] verifies every
+//! object beside a record on its own; [`Ledger::verify_against`] folds them
+//! against a reader's [`TrustedKeys`] into a [`Verdict`]. A [`SigningKey`]
+//! goes in by reference and never comes back out: no call returns secret
+//! key material, and nothing secret is written.
 //!
 //! # Append-only, no garbage collection
 //!
@@ -63,18 +79,24 @@
 
 mod explain;
 pub mod rfc3339;
+pub mod signature;
 
 use std::fmt;
 use std::ops::Deref;
 
 use bellwether_types::{
-    format, CertBody, Certificate, Error, Hash, Proposal, ProposalBody, Provenance, Receipt,
-    Record, Replay, Result, RunCost, Store,
+    format, CertBody, Certificate, Error, Exactness, Hash, Proposal, ProposalBody, Provenance,
+    Receipt, Record, Replay, Result, RunCost, Store,
 };
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 
 pub use explain::{Chain, Link, LinkStatus};
+pub use signature::{
+    is_utc_millis, printable, signature_message, InvalidReason, InvalidSignature, OutsideWindow,
+    PublicKey, SignaturePath, SignatureStatus, SignedBy, SigningKey, TrustError, TrustedKey,
+    TrustedKeys, Verdict, SIGNATURE_ALG, SIGNATURE_DOMAIN, SIGNATURE_VERSION,
+};
 
 /// Directory under the index root that holds ledger records.
 pub const LEDGER_PREFIX: &str = "ledger/";
@@ -239,11 +261,82 @@ fn all_exact(costs: &[RunCost]) -> bool {
     costs.iter().all(|c| c.exact)
 }
 
-/// Contract v2.1 replay rules, independent of where the replay is checked:
-/// inputs are non-empty; current costs are exact; a cost model is named
-/// exactly when some proposed cost is inexact, and it is a non-empty name
-/// with no surrounding whitespace; a key proposal's replay is exact
-/// throughout.
+/// The one value `Replay.unserved` may take: runs no spec serves were
+/// priced as the files' own min/max statistics read them.
+const UNSERVED_PARQUET_STATS: &str = "parquet_stats";
+
+/// Record version 3: every cost's `exact` agrees with its `exactness`
+/// (`exact` is true exactly when `exactness` is `Exact`), a measured cost
+/// is measured by a named model, a bounded cost's interval is ordered, and
+/// so is every `rows` quantity's. A version 2 replay has no `exactness`
+/// (it reads as `Exact`), so only version 3 replays are held to it.
+fn check_exactness(r: &Replay) -> Result<()> {
+    if r.record_version < 3 {
+        return Ok(());
+    }
+    let check = |what: &str, e: &Exactness| -> Result<()> {
+        match e {
+            Exactness::Bounded { low, high } if low > high => Err(rule(format!(
+                "replay {what} is bounded by [{low}, {high}], an empty interval"
+            ))),
+            Exactness::Measured { model } if model.trim().is_empty() || model.trim() != model => {
+                Err(rule(format!(
+                    "replay {what} is measured by a model with no name, or with surrounding \
+                     whitespace; name the model"
+                )))
+            }
+            Exactness::Exact | Exactness::Bounded { .. } | Exactness::Measured { .. } => Ok(()),
+        }
+    };
+    for c in r.current.iter().chain(&r.proposed) {
+        if c.exact != c.exactness.is_exact() {
+            return Err(rule(format!(
+                "replay run {} says exact={} but its exactness is {}; exact is true exactly \
+                 when exactness is exact (record version 3)",
+                c.run_id,
+                c.exact,
+                exactness_name(&c.exactness)
+            )));
+        }
+        check(&format!("run {} cost", c.run_id), &c.exactness)?;
+        if matches!(c.exactness, Exactness::Measured { .. }) && r.model.is_none() {
+            return Err(rule(format!(
+                "replay run {} is measured by a model but the replay names no model",
+                c.run_id
+            )));
+        }
+        if let Some(rows) = &c.rows {
+            check(&format!("run {} rows", c.run_id), &rows.exactness)?;
+            if let Exactness::Bounded { low, high } = rows.exactness {
+                if rows.value != high {
+                    return Err(rule(format!(
+                        "replay run {} rows are bounded by [{low}, {high}] but record {}; a \
+                         bounded quantity records its upper bound",
+                        c.run_id, rows.value
+                    )));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn exactness_name(e: &Exactness) -> &'static str {
+    match e {
+        Exactness::Exact => "exact",
+        Exactness::Bounded { .. } => "bounded",
+        Exactness::Measured { .. } => "measured",
+    }
+}
+
+/// Replay rules (contract v2.1, ADR 033), independent of where the replay
+/// is checked: inputs are non-empty; current costs are exact, except in a
+/// rewrite's replay that names its cost model (a rewrite measured in a
+/// query engine or a table, where there is no exact current cost); a cost
+/// model is named exactly when some cost is inexact, and it is a non-empty
+/// name with no surrounding whitespace; a key proposal's replay is exact
+/// throughout; a cost carrying an engine's query statistics is never
+/// exact; and a prediction belongs to a measured rewrite.
 fn check_replay_content(r: &Replay, proposal: &Proposal) -> Result<()> {
     if r.inputs.is_empty() {
         return Err(rule(
@@ -259,9 +352,31 @@ fn check_replay_content(r: &Replay, proposal: &Proposal) -> Result<()> {
             ));
         }
     }
-    if !all_exact(&r.current) {
+    if r.unserved
+        .as_deref()
+        .is_some_and(|u| u != UNSERVED_PARQUET_STATS)
+    {
+        return Err(rule(format!(
+            "replay unserved must be {UNSERVED_PARQUET_STATS:?} or absent (absent is a raw scan)"
+        )));
+    }
+    if r.current
+        .iter()
+        .chain(&r.proposed)
+        .any(|c| c.exact && c.measured.is_some())
+    {
         return Err(rule(
-            "replay must be exact for the current configuration in every run (ADR 005)",
+            "a cost carrying an engine's query statistics is measured and must not be marked \
+             exact (ADR 033)",
+        ));
+    }
+    let rewrite = matches!(proposal.body, ProposalBody::Rewrite { .. });
+    let current_exact = all_exact(&r.current);
+    if !(current_exact || (rewrite && r.model.is_some())) {
+        return Err(rule(
+            "replay must be exact for the current configuration in every run (ADR 005); only \
+             a rewrite measured in a query engine or a table, naming its cost model, may \
+             carry measured current costs (ADR 033)",
         ));
     }
     let proposed_exact = all_exact(&r.proposed);
@@ -270,15 +385,55 @@ fn check_replay_content(r: &Replay, proposal: &Proposal) -> Result<()> {
             "replay of a key proposal must be exact in every run (ADR 005)",
         ));
     }
-    match (proposed_exact, r.model.is_some()) {
+    if r.prediction.is_some() && (!rewrite || current_exact) {
+        return Err(rule(
+            "a replay's prediction compares the twin with an engine's measurement, so it \
+             belongs to a rewrite measured in a query engine (ADR 033)",
+        ));
+    }
+    match (current_exact && proposed_exact, r.model.is_some()) {
         (true, true) => Err(rule(
             "replay must not name a cost model when every cost is exact",
         )),
         (false, false) => Err(rule(
-            "replay with an inexact proposed cost must name the cost model behind it",
+            "replay with an inexact cost must name the cost model behind it",
         )),
-        _ => Ok(()),
+        _ => check_exactness(r),
     }
+}
+
+/// Attest-only (ADR 033): a measured replay backs only a receipt that
+/// applied nothing, and that receipt is a rewrite's; its prediction is its
+/// replay's, never a number of its own.
+fn check_attest_only(r: &Receipt, replay: &Replay, proposal: &Proposal) -> Result<()> {
+    if !all_exact(&replay.current) && !r.attest_only {
+        return Err(rule(format!(
+            "receipt's replay {} is measured, not exact, so the receipt can only attest \
+             (attest_only): the engine applied nothing it measured",
+            r.replay
+        )));
+    }
+    if r.attest_only && !matches!(proposal.body, ProposalBody::Rewrite { .. }) {
+        return Err(rule(format!(
+            "an attest-only receipt is for a rewrite, and this is a {} proposal",
+            proposal_kind(&proposal.body)
+        )));
+    }
+    if r.attest_only && r.manifest_after != r.manifest_before {
+        return Err(rule(format!(
+            "an attest-only receipt applied nothing, so manifest_after {:?} must be \
+             manifest_before {:?}",
+            r.manifest_after, r.manifest_before
+        )));
+    }
+    if r.prediction != replay.prediction {
+        return Err(rule(format!(
+            "receipt's prediction is not its replay {}'s; a receipt copies the replay's \
+             prediction and adds none",
+            r.replay
+        )));
+    }
+    Ok(())
 }
 
 /// A record written now carries the current record version; older versions
@@ -359,15 +514,18 @@ fn check_pass_consistent(hash: Option<&Hash>, c: &CertBody, pass: bool) -> Resul
     let clean = c.missing_left == 0
         && c.missing_right == 0
         && c.mismatched == 0
+        && c.uncomparable == 0
         && c.totals_delta.is_empty();
     if pass && !clean {
         let name = hash.map_or_else(String::new, |h| format!(" {h}"));
         return Err(rule(format!(
             "certificate{name} says pass but reports differences \
-             (missing_left={}, missing_right={}, mismatched={}, totals_delta={})",
+             (missing_left={}, missing_right={}, mismatched={}, uncomparable={}, \
+             totals_delta={})",
             c.missing_left,
             c.missing_right,
             c.mismatched,
+            c.uncomparable,
             c.totals_delta.len()
         )));
     }
@@ -496,7 +654,132 @@ where
     /// of the wrong kind, or unreadable is flagged, never an error; only a
     /// store failure or a `receipt` that is not a receipt fails.
     pub fn explain(&self, receipt: &Hash) -> Result<Chain> {
-        explain::explain(self, receipt)
+        explain::explain(self, receipt, None)
+    }
+
+    /// [`Ledger::explain`], with the receipt's and the certificate's
+    /// signatures folded against `trusted` ([`Link::verdict`]); the
+    /// rendering adds `sig=valid(<name>)`, `sig=untrusted(<id prefix>)`,
+    /// `sig=none`, or `sig=INVALID` to those two lines.
+    pub fn explain_verified(&self, receipt: &Hash, trusted: &TrustedKeys) -> Result<Chain> {
+        explain::explain(self, receipt, Some(trusted))
+    }
+
+    /// Signs the stored receipt or certificate `record` with `key` at
+    /// `signed_at` (RFC 3339 UTC with milliseconds), writing the detached
+    /// object `ledger/<record>.sig.<key id>.json` (ADR 029), and returns
+    /// where.
+    ///
+    /// Refused, writing nothing: a `signed_at` in another spelling; a hash
+    /// that is not a stored, readable Receipt or Certificate; a Receipt that
+    /// [`Ledger::put_receipt`] would refuse now (rules 11 to 18 re-run
+    /// against the stored chain, with the receipt's own `manifest_after` as
+    /// the current sequence, since the upper bound was checked when it was
+    /// written); a Certificate that [`Ledger::put`] would refuse now (rules
+    /// 8 to 10). A signature is therefore only made over a chain that passes
+    /// the rules at signing time.
+    ///
+    /// The object is written with `put_if_absent`: signing again with the
+    /// same key is idempotent only if the bytes are identical (ed25519 is
+    /// deterministic, so the same key, record, and `signed_at` give the
+    /// same bytes); a differing object already there is refused, never
+    /// overwritten.
+    pub fn sign(&self, record: &Hash, key: &SigningKey, signed_at: &str) -> Result<SignaturePath> {
+        if !is_utc_millis(signed_at) {
+            return Err(rule(format!(
+                "cannot sign {record}: signed_at {signed_at:?} is not RFC 3339 UTC with \
+                 milliseconds (2026-10-25T00:00:00.000Z)"
+            )));
+        }
+        let refuse = |why: String| rule(format!("cannot sign {record}: {why}"));
+        let bytes = match self.read_verified(record) {
+            Err(Error::NotFound(_)) => {
+                return Err(refuse("no such record in the ledger".to_string()))
+            }
+            other => other?,
+        };
+        let reason = |e: Error| match e {
+            Error::LedgerRule(m) => refuse(m),
+            other => other,
+        };
+        let kind = match decode(&bytes)? {
+            Record::Receipt(r) => {
+                check_write_version(r.record_version)
+                    .and_then(|()| self.check_receipt(&r, &r.manifest_after))
+                    .map_err(reason)?;
+                RecordKind::Receipt
+            }
+            Record::Certificate(c) => {
+                check_write_version(c.record_version)
+                    .and_then(|()| self.check_certificate(&c))
+                    .map_err(reason)?;
+                RecordKind::Certificate
+            }
+            other => {
+                return Err(refuse(format!(
+                    "it is {}; only receipts and certificates are signed",
+                    RecordKind::of(&other).with_article()
+                )))
+            }
+        };
+        let object = signature::signature_bytes(record, kind, key, signed_at)?;
+        let at = SignaturePath {
+            record: *record,
+            key_id: key.key_id(),
+        };
+        let path = at.path();
+        match self.store.put_if_absent(&path, Bytes::from(object.clone())) {
+            Ok(_) => Ok(at),
+            // Refused because something is already there (a store reports
+            // that as a version conflict, or in its own words): identical
+            // bytes are this signature again; anything else is refused.
+            Err(e) => match self.store.get(&path) {
+                Ok((existing, _)) if existing.as_ref() == object.as_slice() => Ok(at),
+                Ok(_) => Err(refuse(format!(
+                    "key {} already signed it with different bytes ({path}); a signature is \
+                     never overwritten",
+                    at.key_id
+                ))),
+                Err(_) => Err(e),
+            },
+        }
+    }
+
+    /// Every signature object beside `record`, each verified on its own
+    /// (no trust set), sorted by key id. A corrupt object is
+    /// [`SignatureStatus::Invalid`], never a panic or an error. The record
+    /// itself is read first: absent is [`Error::NotFound`], and bytes that
+    /// do not hash to its name are the ledger's tamper error, so an altered
+    /// record never reports a signature status at all. Writes nothing.
+    pub fn signatures(&self, record: &Hash) -> Result<Vec<SignatureStatus>> {
+        let bytes = self.read_verified(record)?;
+        let kind = peek(&bytes)?.into_kind()?;
+        let mut at: Vec<SignaturePath> = self
+            .store
+            .list(LEDGER_PREFIX)?
+            .iter()
+            .filter_map(|p| SignaturePath::parse(p))
+            .filter(|s| s.record == *record)
+            .collect();
+        at.sort();
+        at.dedup();
+        let mut out = Vec::with_capacity(at.len());
+        for a in &at {
+            match self.store.get(&a.path()) {
+                Ok((b, _)) => out.push(signature::check_object(&b, a, kind)),
+                Err(Error::NotFound(_)) => {}
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(out)
+    }
+
+    /// [`Ledger::signatures`] folded against `trusted` ([`Verdict::of`]).
+    /// Only a key in `trusted`, signing within its window, makes a record
+    /// [`Verdict::Signed`]; the public key an object carries proves only
+    /// that the object is self-consistent. Writes nothing.
+    pub fn verify_against(&self, record: &Hash, trusted: &TrustedKeys) -> Result<Verdict> {
+        Ok(Verdict::of(&self.signatures(record)?, trusted))
     }
 
     // -- internals ---------------------------------------------------------
@@ -661,6 +944,7 @@ where
             Error::LedgerRule(m) => rule(format!("receipt's replay {}: {m}", r.replay)),
             other => other,
         })?;
+        check_attest_only(r, &replay, &proposal)?;
 
         // Manifest versions are sequences (ADR 020): u64s rendered as strings,
         // compared numerically.

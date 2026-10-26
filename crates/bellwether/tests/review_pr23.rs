@@ -15,7 +15,7 @@ use bellwether::{
     spec, Engine, EngineOptions, FixOutcome, FixRequest, KeyFile, ProposeResult, ReconcileRequest,
     Refusal, RewriteOutputs, WhyRequest,
 };
-use common::{ledger_corpus, write_file, write_keys};
+use common::{ledger_corpus, scattered_corpus, write_file, write_keys};
 
 fn open(root: &Path) -> Engine {
     Engine::open(root.to_str().unwrap(), EngineOptions::default()).unwrap()
@@ -165,9 +165,14 @@ fn probe_reconcile_anchor_and_rewrite_layout() {
         .propose(
             ProposalBody::Rewrite {
                 shape: RewriteShape {
+                    pairs: Vec::new(),
+                    key: Vec::new(),
+                    keys: None,
                     before: "a".into(),
                     after: "b".into(),
                     invariant: "same rows by id".into(),
+                    before_plan: None,
+                    after_plan: None,
                 },
             },
             &[ev],
@@ -237,7 +242,7 @@ fn probe_reconcile_anchor_and_rewrite_layout() {
 fn probe_selective_key_leaves_files_unplanned() {
     let dir = tempfile::tempdir().unwrap();
     let data = dir.path().join("data");
-    ledger_corpus(&data, 3, 4, 25, 400);
+    scattered_corpus(&data, 3, 4, 25, 400);
     let kf = dir.path().join("k.parquet");
     write_keys(&kf, "id", &[5]);
     let (e, wl, p) = setup(&data, &kf);

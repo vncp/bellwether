@@ -7,9 +7,19 @@
 //! A configuration is a set of key specs. A run's cost under it is the cost
 //! of the plan over the specs that serve the run's key columns
 //! ([`crate::servable`]), intersected per key tuple (ADR 001). A run that no
-//! spec of the configuration serves reads every live row group: the index
-//! cannot narrow it, and the plan says so rather than guessing at what a
-//! consumer would do instead.
+//! spec of the configuration serves is priced under the replayer's
+//! unserved baseline ([`Replayer::with_unserved`]): by default
+//! [`Baseline::RawScan`], every live row group the planner leaves (a
+//! window run's partitions), since the index cannot narrow it and the plan
+//! says so rather than guessing at what a consumer would do instead; with
+//! [`Baseline::ParquetStats`], of those, the row groups the files' own
+//! footer min/max and embedded bloom filters keep for the run's keys (and
+//! window), what any Parquet reader skips to without an index. An `asof`
+//! or `latest` run that no temporal spec serves is planned on its keys
+//! alone, never bounded by an instant: a recorded run does not name a time
+//! column, so two callers could not agree on one. The [`Replay`] names that
+//! baseline in `unserved` when it priced some run, so a record's number is
+//! never read as a raw scan's.
 //!
 //! - **Current** ([`Replayer::replay_current`]): the manifest's declared key
 //!   specs, each complete at the pinned sequence (ADR 012). With none, every
@@ -61,11 +71,13 @@
 
 use std::borrow::Cow;
 use std::ops::Deref;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use arrow::datatypes::{Schema, SchemaRef};
 use bellwether_build::Planner;
 use bellwether_core::segment::validate_spec;
+use bellwether_core::text::{token_stats, TokenStats};
 use bellwether_ledger::{rfc3339::is_rfc3339, Ledger};
 use bellwether_source::{FingerprintPolicy, Partitioning};
 use bellwether_store::{Snapshot, StoreExt};
@@ -74,13 +86,14 @@ use bellwether_types::{
     Error, Hash, KeySpec, ProposalBody, Record, Replay, Result, RunCost, ScanPlan, Source, Store,
 };
 
-use crate::baseline::{Baseline, BaselinePlanner};
+use crate::baseline::{unserved_selection, Baseline, BaselinePlanner};
 use crate::catalog::Catalog;
 use crate::error::{ReplayError, ReplayResult};
 use crate::keys::RunKeys;
 use crate::layout::{replay_layout, LayoutModel, LayoutReplay};
 use crate::plan::{
-    lookback_window, planned_time_column, run_cost, serves_query, PlanSource, SegmentPlanner,
+    count_cost, lookback_window, planned_time_column, run_cost, serves_query, PlanSource,
+    SegmentPlanner,
 };
 use crate::transient::{CacheStats, TransientCache, TransientIndex, TransientLimits};
 use crate::workload::{KeySetSource, RunQuery, Workload};
@@ -111,6 +124,10 @@ pub struct Replayer<'a> {
     policy: FingerprintPolicy,
     limits: TransientLimits,
     cache: TransientCache,
+    unserved: Baseline,
+    /// Embedded bloom filters read pricing unserved runs, for
+    /// [`Replayer::bloom_filters_read`].
+    filters_read: AtomicU64,
 }
 
 impl std::fmt::Debug for Replayer<'_> {
@@ -145,7 +162,8 @@ impl<'a> Replayer<'a> {
         for spec in &current {
             if !have.contains(spec) {
                 return Err(Error::KeySpec(format!(
-                    "the planner has no segments for current spec {spec:?}"
+                    "the planner has no segments for current spec {}",
+                    spec.identity()
                 )));
             }
         }
@@ -157,6 +175,8 @@ impl<'a> Replayer<'a> {
             policy: FingerprintPolicy::default(),
             limits: TransientLimits::default(),
             cache: TransientCache::new(DEFAULT_CACHE_BYTES),
+            unserved: Baseline::RawScan,
+            filters_read: AtomicU64::new(0),
         })
     }
 
@@ -234,6 +254,31 @@ impl<'a> Replayer<'a> {
         self
     }
 
+    /// Sets the baseline a run that no spec of a configuration serves is
+    /// priced under (module docs); [`Baseline::RawScan`] by default.
+    /// [`Baseline::ParquetStats`] reads a row group's embedded bloom filters
+    /// only when its footer min/max keeps it, one file at a time, and drops
+    /// them after the run (ADR 018).
+    #[must_use]
+    pub fn with_unserved(mut self, baseline: Baseline) -> Self {
+        self.unserved = baseline;
+        self
+    }
+
+    /// The baseline unserved runs are priced under.
+    #[must_use]
+    pub fn unserved(&self) -> Baseline {
+        self.unserved
+    }
+
+    /// How many embedded bloom filters pricing unserved runs has read so
+    /// far: never more than the row groups the footer min/max kept times
+    /// the run's key columns (ADR 018).
+    #[must_use]
+    pub fn bloom_filters_read(&self) -> u64 {
+        self.filters_read.load(Ordering::Relaxed)
+    }
+
     /// The manifest sequence every replay is pinned to, as a string.
     #[must_use]
     pub fn manifest_version(&self) -> String {
@@ -286,20 +331,35 @@ impl<'a> Replayer<'a> {
     }
 
     /// The specs of `specs` that serve `keys` under `query`, and the verified
-    /// plan over them: every row group when none serves, or when a
-    /// temporal run has no time column to plan on
-    /// ([`planned_time_column`]: the serving temporal spec's, else, for a
-    /// lookback, the planner's per-key bounds or window column, as the
-    /// lookup verbs take it). An `asof` lookback run is planned as its
-    /// window on that column.
+    /// plan over them, with whether it is an unserved run's plan under
+    /// [`Baseline::ParquetStats`]. When none serves, or when a temporal run
+    /// has no time column to plan on ([`planned_time_column`]: the serving
+    /// temporal spec's, else, for a lookback, the planner's per-key bounds
+    /// or window column, as the lookup verbs take it), the planner's plan
+    /// reads every row group it cannot exclude (a window run's partitions),
+    /// and under `ParquetStats` only those of them the files' statistics
+    /// keep for the keys and the window, if any: both keep every row group
+    /// holding a key, so their intersection does (invariant 1). An `asof`
+    /// lookback run is planned as its window on that column.
     fn verified_plan(
         &self,
         planner: &dyn PlanSource,
         specs: &[KeySpec],
         keys: &RunKeys,
         query: &RunQuery,
-    ) -> Result<ScanPlan> {
+    ) -> Result<(ScanPlan, bool)> {
         check_types(&self.catalog, keys)?;
+        // A text run's values are words, substrings, or prefixes, never
+        // whole values: no file statistic or Parquet bloom filter can
+        // exclude a row group for them, so an unserved text run reads what
+        // the planner plans (every row group), under either baseline.
+        let text = query.text_op().is_some();
+        let query_is_membership = query.is_membership();
+        // A count is planned as the locate of its keys; [`cost_of`] prices it.
+        let query = match query {
+            RunQuery::Count => &RunQuery::Locate,
+            q => q,
+        };
         let column = planned_time_column(planner, specs, keys.columns(), query)?;
         let query = match (query, column) {
             (
@@ -317,19 +377,47 @@ impl<'a> Replayer<'a> {
             (q, column) if !q.is_temporal() || column.is_some() => Some(Cow::Borrowed(q)),
             _ => None,
         };
-        let plan = match query {
+        // The window an unserved run's plan keeps, when it is unserved.
+        let (plan, unserved) = match query {
             Some(q) => {
                 let serving: Vec<KeySpec> = specs
                     .iter()
                     .filter(|s| serves_query(s, keys.columns(), &q))
                     .cloned()
                     .collect();
-                planner.plan_query(&serving, keys, &q)?
+                let plan = planner.plan_query(&serving, keys, &q)?;
+                (plan, serving.is_empty().then(|| q.window().cloned()))
             }
-            None => planner.plan_query(&[], keys, &RunQuery::Locate)?,
+            None => (
+                planner.plan_query(&[], keys, &RunQuery::Locate)?,
+                Some(None),
+            ),
         };
         self.catalog.verify_plan(&plan)?;
-        Ok(plan)
+        if text {
+            return Ok((plan, false));
+        }
+        let (Some(window), Baseline::ParquetStats) = (unserved, self.unserved) else {
+            return Ok((plan, false));
+        };
+        // A membership run (B4) no list key serves: a list's footer
+        // statistics are on its nested leaf, which the catalog reports as
+        // unknown, so min/max keeps every row group the plan holds; its
+        // values are elements, never compared with a column's bounds.
+        if query_is_membership {
+            return Ok((plan, true));
+        }
+        let (kept, filters) =
+            unserved_selection(&self.catalog, keys, window.as_ref(), self.policy)?;
+        self.filters_read.fetch_add(filters, Ordering::Relaxed);
+        let read = if plan.row_groups_selected == plan.row_groups_total {
+            kept
+        } else {
+            self.catalog.ids_of(&plan) & kept
+        };
+        let mut narrowed = self.catalog.plan_for(&read)?;
+        narrowed.residual = plan.residual;
+        Ok((narrowed, true))
     }
 
     /// The time column `query` is planned on for a run keyed on
@@ -360,8 +448,8 @@ impl<'a> Replayer<'a> {
         query: &RunQuery,
     ) -> Result<RunCost> {
         let planner = self.planner_for(specs)?;
-        let plan = self.verified_plan(planner.as_ref(), specs, keys, query)?;
-        Ok(run_cost(run_id, keys.len() as u64, &plan, true))
+        let (plan, _) = self.verified_plan(planner.as_ref(), specs, keys, query)?;
+        Ok(cost_of(query, run_id, keys.len() as u64, &plan))
     }
 
     /// The plan for one ad hoc `locate` key set under `specs`, as costed.
@@ -377,7 +465,16 @@ impl<'a> Replayer<'a> {
         query: &RunQuery,
     ) -> Result<ScanPlan> {
         let planner = self.planner_for(specs)?;
-        self.verified_plan(planner.as_ref(), specs, keys, query)
+        Ok(self.verified_plan(planner.as_ref(), specs, keys, query)?.0)
+    }
+
+    /// The exact counts of a keyed text spec's tokens over the pinned
+    /// catalog, from its transient segments (built now, or from the
+    /// cache): distinct tokens and row groups per token (core's
+    /// `text::token_stats`).
+    pub fn text_stats(&self, spec: &KeySpec) -> Result<TokenStats> {
+        let index = self.transient(spec)?;
+        token_stats(index.segments().readers())
     }
 
     /// Every run's exact cost under `specs`, in workload order, each run
@@ -389,17 +486,7 @@ impl<'a> Replayer<'a> {
         workload: &Workload,
         keys: &dyn KeySetSource,
     ) -> Result<Vec<RunCost>> {
-        let planner = self.planner_for(specs)?;
-        workload
-            .runs()
-            .iter()
-            .map(|run| {
-                let rk = workload.run_keys(keys, run)?;
-                let query = run.query()?;
-                let plan = self.verified_plan(planner.as_ref(), specs, &rk, &query)?;
-                Ok(run_cost(&run.run_id, rk.len() as u64, &plan, true))
-            })
-            .collect()
+        Ok(self.costs(specs, workload, keys, None)?.0)
     }
 
     /// Every run's exact cost under `specs` when every run is planned with
@@ -412,16 +499,39 @@ impl<'a> Replayer<'a> {
         keys: &dyn KeySetSource,
         query: &RunQuery,
     ) -> Result<Vec<RunCost>> {
+        Ok(self.costs(specs, workload, keys, Some(query))?.0)
+    }
+
+    /// Every run's exact cost under `specs`, each planned with `query` or
+    /// else its recorded query kind, and whether some run was priced under
+    /// [`Baseline::ParquetStats`] as unserved.
+    fn costs(
+        &self,
+        specs: &[KeySpec],
+        workload: &Workload,
+        keys: &dyn KeySetSource,
+        query: Option<&RunQuery>,
+    ) -> Result<(Vec<RunCost>, bool)> {
         let planner = self.planner_for(specs)?;
-        workload
+        let mut stats = false;
+        let costs = workload
             .runs()
             .iter()
             .map(|run| {
                 let rk = workload.run_keys(keys, run)?;
-                let plan = self.verified_plan(planner.as_ref(), specs, &rk, query)?;
-                Ok(run_cost(&run.run_id, rk.len() as u64, &plan, true))
+                let recorded;
+                let query = if let Some(q) = query {
+                    q
+                } else {
+                    recorded = run.query()?;
+                    &recorded
+                };
+                let (plan, unserved) = self.verified_plan(planner.as_ref(), specs, &rk, query)?;
+                stats |= unserved;
+                Ok(cost_of(query, &run.run_id, rk.len() as u64, &plan))
             })
-            .collect()
+            .collect::<Result<Vec<_>>>()?;
+        Ok((costs, stats))
     }
 
     /// Every run's exact cost under the current configuration.
@@ -459,9 +569,16 @@ impl<'a> Replayer<'a> {
             .map(|run| {
                 let rk = workload.run_keys(keys, run)?;
                 check_types(&self.catalog, &rk)?;
-                let plan = planner.plan(&rk, run.window.as_ref())?;
+                let query = run.query()?;
+                let plan = if query.is_membership() {
+                    planner.plan_membership(&rk, matches!(query, RunQuery::ContainsAll))?
+                } else if query.text_op().is_some() {
+                    planner.plan_text(&rk, &query)?
+                } else {
+                    planner.plan(&rk, run.window.as_ref())?
+                };
                 self.catalog.verify_plan(&plan)?;
-                Ok(run_cost(&run.run_id, rk.len() as u64, &plan, true))
+                Ok(run_cost(&run.run_id, rk.len() as u64, &plan))
             })
             .collect()
     }
@@ -484,8 +601,8 @@ impl<'a> Replayer<'a> {
             ))
             .into());
         }
-        let (proposed, layout) = match body {
-            ProposalBody::Key { spec } => {
+        let (proposed, layout, proposed_stats) = match body {
+            ProposalBody::Key { spec, .. } => {
                 validate_spec(spec)?;
                 if !workload
                     .runs()
@@ -498,9 +615,23 @@ impl<'a> Replayer<'a> {
                     });
                 }
                 let specs = proposed_specs(&self.current, spec);
-                (self.replay_specs(&specs, workload, keys)?, None)
+                let (costs, stats) = self.costs(&specs, workload, keys, None)?;
+                (costs, None, stats)
             }
             ProposalBody::Layout { cluster_by } => {
+                if let Some(run) = workload
+                    .runs()
+                    .iter()
+                    .find(|r| r.query().is_ok_and(|q| q.text_op().is_some()))
+                {
+                    return Err(Error::Other(format!(
+                        "a layout proposal is priced by a model of key lookups, and run {:?} is \
+                         a {} text lookup, which only a text key prunes; propose a text key \
+                         (text:<column>,tokenizer=words or tokenizer=trigram) for it",
+                        run.run_id, run.query_kind
+                    ))
+                    .into());
+                }
                 if let Some(run) = workload.runs().iter().find(|r| r.window.is_some()) {
                     return Err(Error::Other(format!(
                         "a layout proposal is priced by a model of key lookups, and run {:?} \
@@ -519,11 +650,11 @@ impl<'a> Replayer<'a> {
                     keys,
                     &self.limits,
                 )?;
-                (lr.costs.clone(), Some(lr))
+                (lr.costs.clone(), Some(lr), false)
             }
             ProposalBody::Rewrite { .. } => return Err(ReplayError::RewriteNotScorable),
         };
-        let current = self.replay_current(workload, keys)?;
+        let (current, current_stats) = self.costs(&self.current, workload, keys, None)?;
         // A cost model is named exactly when some proposed cost comes from
         // it (contract v2.1): a layout replay of a workload with runs.
         let model = layout
@@ -532,6 +663,7 @@ impl<'a> Replayer<'a> {
             .map(|l| l.description.clone());
         Ok(Scored {
             replay: Replay {
+                prediction: None,
                 record_version: RECORD_VERSION,
                 proposal: *proposal,
                 manifest_version: self.manifest_version(),
@@ -541,6 +673,10 @@ impl<'a> Replayer<'a> {
                 created_at: created_at.to_string(),
                 inputs: vec![self.catalog.digest()],
                 model,
+                configuration: Vec::new(),
+                operators: Vec::new(),
+                unserved: (current_stats || proposed_stats)
+                    .then(|| Baseline::ParquetStats.name().to_string()),
             },
             body: Hash::of_record(body)?,
             layout,
@@ -725,12 +861,10 @@ fn check_same_columns(source: &Schema, index: &Schema) -> Result<()> {
 /// Checks that a run's keys were encoded at the dataset's types.
 fn check_types(catalog: &Catalog, keys: &RunKeys) -> Result<()> {
     for (c, recorded) in keys.columns().iter().zip(keys.key_types()) {
-        let declared = catalog
-            .schema()
-            .field_with_name(c)
-            .map_err(|_| Error::KeySpec(format!("key column {c:?} is not in the dataset")))?
-            .data_type();
-        if &bellwether_core::segment::ColumnType::of(declared)? != recorded {
+        let declared = crate::keys::declared_type(catalog.schema(), c)?;
+        if bellwether_core::segment::ColumnType::of(bellwether_core::list::value_type(&declared))?
+            != *recorded
+        {
             return Err(Error::KeySpec(format!(
                 "keys on {c:?} were recorded as {recorded}, but the dataset declares \
                  {declared}; re-record the workload"
@@ -745,4 +879,13 @@ fn distinct_columns(workload: &Workload) -> Vec<Vec<String>> {
     out.sort();
     out.dedup();
     out
+}
+
+/// A run's cost under its verified plan: [`count_cost`] for a `count` run,
+/// [`run_cost`] for every other kind.
+fn cost_of(query: &RunQuery, run_id: &str, keys: u64, plan: &ScanPlan) -> RunCost {
+    match query {
+        RunQuery::Count => count_cost(run_id, keys, plan),
+        _ => run_cost(run_id, keys, plan),
+    }
 }

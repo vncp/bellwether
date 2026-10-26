@@ -1,0 +1,40 @@
+#! title: bellwether mcp (stdio)
+#! caption: A JSON-RPC session with bellwether mcp over stdio on the bench ledger corpus (bench generate --seed 42: 16 files, 64 row groups, 128,000 rows; bench workload: 12 recorded runs): observe.why, then propose.key with a score smuggled in; the request as sent, the reply pretty-printed with its session budget block elided, nothing else edited; release build of 3a0c26a, 2026-10-26.
+$ bellwether mcp ledger/data
+#! (initialize, then observe.why, which returned evidence 4cdbff1e45e6...)
+#! client -> server, the line as sent
+{"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "propose.key", "arguments": {"spec": {"kind": "exact", "columns": ["entity_id"]}, "evidence": ["4cdbff1e45e6737cee98ee43f60567bd7dc342cb670d78c39ebb66aab047fe32"], "by": "coding-agent", "score": 0.99}}}
+#! server -> client, pretty-printed; the session budget block elided
+{
+  "jsonrpc": "2.0",
+  "id": 3,
+  "result": {
+    "content": [
+      {
+        "type": "text",
+        "text": "{\"code\":\"caller_supplied_cost\",\"message\":\"propose.key was given `score`: a caller cannot supply a cost, a measurement, a replay, a verdict, or a certificate; the engine measures and verifies itself\",\"next\":\"remove the field `fields.field` names and call again; the engine measures, verifies, and attests on its own\",\"fields\":{\"errors\":[\"Additional properties are not allowed ('score' was unexpected)\"],\"field\":\"score\"}}"
+      }
+    ],
+    "structuredContent": {
+      "budget": { … },
+      "chains": [],
+      "cites": [],
+      "job": null,
+      "refusal": {
+        "code": "caller_supplied_cost",
+        "fields": {
+          "errors": [
+            "Additional properties are not allowed ('score' was unexpected)"
+          ],
+          "field": "score"
+        },
+        "message": "propose.key was given `score`: a caller cannot supply a cost, a measurement, a replay, a verdict, or a certificate; the engine measures and verifies itself",
+        "next": "remove the field `fields.field` names and call again; the engine measures, verifies, and attests on its own"
+      },
+      "status": "refused",
+      "tier": "propose",
+      "tool": "propose.key"
+    },
+    "isError": true
+  }
+}

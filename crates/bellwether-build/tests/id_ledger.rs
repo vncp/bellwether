@@ -93,6 +93,8 @@ impl IdLedger {
 fn exact(c: &[&str]) -> KeySpec {
     KeySpec::Exact {
         columns: c.iter().map(|s| (*s).to_string()).collect(),
+        counts: false,
+        bounds: None,
     }
 }
 
@@ -100,6 +102,7 @@ fn temporal() -> KeySpec {
     KeySpec::Temporal {
         columns: vec!["id".into()],
         ts_column: "ts".into(),
+        counts: false,
     }
 }
 

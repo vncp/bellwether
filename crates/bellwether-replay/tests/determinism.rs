@@ -56,7 +56,7 @@ const CHILD_CORPUS: &str = "BELLWETHER_REPLAY_DETERMINISM_CORPUS";
 /// parquet 53 -> 59 upgrade: every run's files and row groups are unchanged;
 /// only `bytes` moved, because the new writer omits page-header statistics,
 /// so the fixture's column chunks are smaller (docs/benchmark.md).
-const GOLDEN: &str = "7da78de5e096bc52a472f1ab71cb6e562474ab2f0657f9296dda4874c21e9030";
+const GOLDEN: &str = "d314032d2f3fc97fc8064175568d8c525a34ab40bfc39d3b578e5978b056a166";
 
 fn cols(c: &[&str]) -> Vec<String> {
     c.iter().map(|s| (*s).to_string()).collect()
@@ -77,6 +77,8 @@ fn replay_bytes(mode: &str, corpus: &common::Corpus) -> Vec<u8> {
         },
         KeySpec::Exact {
             columns: cols(&["batch_id"]),
+            counts: false,
+            bounds: None,
         },
     ];
     let sequence = common::build_index(
@@ -116,7 +118,10 @@ fn replay_bytes(mode: &str, corpus: &common::Corpus) -> Vec<u8> {
             body: ProposalBody::Key {
                 spec: KeySpec::Exact {
                     columns: cols(&["entity_id", "batch_id"]),
+                    counts: false,
+                    bounds: None,
                 },
+                sidecars: Vec::new(),
             },
         }))
         .unwrap();
@@ -133,6 +138,8 @@ fn replay_bytes(mode: &str, corpus: &common::Corpus) -> Vec<u8> {
             replayer
                 .transient(&KeySpec::Exact {
                     columns: cols(&["payload"]),
+                    counts: false,
+                    bounds: None,
                 })
                 .unwrap();
         }

@@ -31,7 +31,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use arrow::array::{RecordBatch, RecordBatchOptions};
 use arrow::compute::concat_batches;
-use arrow::datatypes::{Schema, SchemaRef};
+use arrow::datatypes::{DataType, Schema, SchemaRef};
 use bellwether_types::{ColumnStats, Error, FileFingerprint, Result, RowGroupMeta, Source};
 use bytes::Bytes;
 use parquet::file::reader::ChunkReader;
@@ -313,6 +313,27 @@ fn get_bytes<R: ChunkReader>(reader: &R, path: &str, range: Range<u64>) -> Resul
         .map_err(|e| src_err(path, e))
 }
 
+/// Refuses a supplied dataset schema with a timestamp time zone the CSV and
+/// JSON lines decoders cannot parse (without Arrow's `chrono-tz` feature,
+/// offsets such as `+05:30` only), with the decoder's own message: the same
+/// refusal whichever verb opens the folder first, before any row is read,
+/// rather than one verb succeeding on columns it never decodes.
+fn check_time_zones(schema: &Schema) -> Result<()> {
+    for f in schema.fields() {
+        if let DataType::Timestamp(_, Some(tz)) = f.data_type() {
+            tz.parse::<arrow::array::timezone::Tz>().map_err(|e| {
+                Error::Source(format!(
+                    "the dataset schema gives column {:?} the time zone {tz:?}: {e}; write it as \
+                     a UTC offset such as \"+05:30\" (a schema file read by \
+                     `bellwether::schema_from_json` may say \"UTC\", loaded as \"+00:00\")",
+                    f.name()
+                ))
+            })?;
+        }
+    }
+    Ok(())
+}
+
 impl<S: Storage> ChunkedTextSource<S> {
     /// A source over any [`Storage`].
     pub fn with_storage(storage: S, format: TextFormat) -> Self {
@@ -455,6 +476,7 @@ impl<S: Storage> ChunkedTextSource<S> {
         }
         let chunks = self.compute_chunks(reader, &file.path, file.size)?;
         let schema = if let Some(s) = &self.dataset {
+            check_time_zones(s)?;
             self.check_csv_header(reader, &file.path, file.size, s)?;
             Arc::clone(s)
         } else if file.size == 0 {
@@ -854,6 +876,7 @@ impl<S: Storage> Source for ChunkedTextSource<S> {
 
     fn schema(&self, root: &str) -> Result<SchemaRef> {
         if let Some(s) = &self.dataset {
+            check_time_zones(s)?;
             return Ok(Arc::clone(s));
         }
         let mut first = None;

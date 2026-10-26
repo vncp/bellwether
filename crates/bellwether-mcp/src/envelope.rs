@@ -10,7 +10,7 @@
 //! leaves exactly the CLI's record.
 
 use bellwether::types::Hash;
-use bellwether::{LinkStatus, ReceiptResult};
+use bellwether::{LinkStatus, NotSigned, ReceiptResult, RecordKind, SignatureStatus};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -54,6 +54,25 @@ pub struct Link {
     pub status: String,
 }
 
+/// One signature object beside a receipt or its certificate (ADR 029),
+/// verified on its own.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct Signature {
+    /// The record signed.
+    pub record: Hash,
+    /// `receipt` or `certificate`.
+    pub kind: String,
+    /// The signing key's id (BLAKE3 of its public key).
+    pub key_id: Hash,
+    /// `valid` (verifies under its own public key; whether that key is
+    /// trusted is `verdict`'s question) or `invalid`.
+    pub status: String,
+    /// When it was signed, for a valid signature.
+    pub signed_at: Option<String>,
+    /// Why it is invalid, for an invalid one.
+    pub reason: Option<String>,
+}
+
 /// A receipt's `explain` chain.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct Chain {
@@ -63,10 +82,51 @@ pub struct Chain {
     pub intact: bool,
     /// Evidence, proposal, replay, certificate, receipt.
     pub links: Vec<Link>,
+    /// Every signature beside the receipt and its certificate.
+    pub signatures: Vec<Signature>,
+    /// With the server's `--trusted-keys`: `signed` when every link is
+    /// intact, the receipt and its certificate are each signed by a trusted
+    /// key within its window, and the evidence is about this server's data
+    /// root. Otherwise the first reason: `links_flagged` (a link is
+    /// missing, of the wrong kind, or unreadable), the worse of the two
+    /// records' verdicts (`invalid`, a signature does not verify;
+    /// `untrusted`, signed by no trusted key in its window; `unsigned`),
+    /// `other_root` (signed, but for another data root: a chain copied from
+    /// another index), or `no_root` (no evidence names a data root). Absent
+    /// without trusted keys.
+    pub verdict: Option<String>,
 }
 
 impl From<&ReceiptResult> for Chain {
     fn from(r: &ReceiptResult) -> Self {
+        let signatures = r
+            .chain
+            .iter()
+            .filter(|l| matches!(l.kind, RecordKind::Receipt | RecordKind::Certificate))
+            .flat_map(|l| {
+                l.signatures.iter().flatten().map(|s| match s {
+                    SignatureStatus::Valid {
+                        key_id, signed_at, ..
+                    } => Signature {
+                        record: l.hash,
+                        kind: l.kind.as_str().to_string(),
+                        key_id: *key_id,
+                        status: "valid".to_string(),
+                        signed_at: Some(signed_at.clone()),
+                        reason: None,
+                    },
+                    SignatureStatus::Invalid { key_id, reason } => Signature {
+                        record: l.hash,
+                        kind: l.kind.as_str().to_string(),
+                        key_id: *key_id,
+                        status: "invalid".to_string(),
+                        signed_at: None,
+                        reason: Some(reason.to_string()),
+                    },
+                })
+            })
+            .collect();
+        let verdict = chain_verdict(r);
         Self {
             receipt: r.receipt,
             intact: r.intact,
@@ -85,6 +145,113 @@ impl From<&ReceiptResult> for Chain {
                     .to_string(),
                 })
                 .collect(),
+            signatures,
+            verdict,
+        }
+    }
+}
+
+/// The envelope's verdict word for a chain ([`Chain::verdict`]).
+#[must_use]
+pub fn chain_verdict(r: &ReceiptResult) -> Option<String> {
+    let signed = r.signed?;
+    Some(
+        match (&r.not_signed, signed) {
+            (_, true) => "signed",
+            (Some(NotSigned::LinksFlagged { .. }), _) => "links_flagged",
+            (Some(NotSigned::OtherRoot { .. }), _) => "other_root",
+            (Some(NotSigned::NoRoot), _) => "no_root",
+            // The worse of the receipt's and the certificate's; a link
+            // with no verdict is unsigned.
+            (Some(NotSigned::Verdicts) | None, _) => [RecordKind::Receipt, RecordKind::Certificate]
+                .iter()
+                .map(|k| {
+                    r.chain
+                        .iter()
+                        .find(|l| l.kind == *k)
+                        .and_then(|l| l.verdict.as_ref())
+                        .map_or("unsigned", |v| v.word())
+                })
+                .fold("signed", worse),
+        }
+        .to_string(),
+    )
+}
+
+/// The worse of two verdict words: `invalid` over `untrusted` over
+/// `unsigned` over `signed`.
+#[must_use]
+pub fn worse<'a>(a: &'a str, b: &'a str) -> &'a str {
+    let rank = |w: &str| match w {
+        "invalid" => 3,
+        "untrusted" => 2,
+        "unsigned" => 1,
+        _ => 0,
+    };
+    if rank(b) > rank(a) {
+        b
+    } else {
+        a
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{chain_verdict, worse};
+    use bellwether::types::Hash;
+    use bellwether::{LinkStatus, NotSigned, ReceiptResult, RecordKind};
+
+    fn result(signed: Option<bool>, not_signed: Option<NotSigned>) -> ReceiptResult {
+        ReceiptResult {
+            receipt: Hash::of(b"r"),
+            intact: true,
+            chain: Vec::new(),
+            records: Vec::new(),
+            roots: Vec::new(),
+            signed,
+            not_signed,
+        }
+    }
+
+    #[test]
+    fn each_reason_has_its_verdict_word() {
+        let cases = [
+            (Some(true), None, Some("signed")),
+            (None, None, None),
+            (Some(false), Some(NotSigned::NoRoot), Some("no_root")),
+            (
+                Some(false),
+                Some(NotSigned::OtherRoot {
+                    roots: vec!["/a".into()],
+                    expected: "/b".into(),
+                }),
+                Some("other_root"),
+            ),
+            (
+                Some(false),
+                Some(NotSigned::LinksFlagged {
+                    link: Hash::of(b"x"),
+                    link_kind: RecordKind::Replay,
+                    status: LinkStatus::Missing,
+                }),
+                Some("links_flagged"),
+            ),
+            // No link carries a verdict: unsigned.
+            (Some(false), Some(NotSigned::Verdicts), Some("unsigned")),
+        ];
+        for (signed, why, want) in cases {
+            let got = chain_verdict(&result(signed, why.clone()));
+            assert_eq!(got.as_deref(), want, "{signed:?} {why:?}");
+        }
+    }
+
+    #[test]
+    fn invalid_outranks_untrusted_outranks_unsigned_outranks_signed() {
+        let order = ["signed", "unsigned", "untrusted", "invalid"];
+        for (i, a) in order.iter().enumerate() {
+            for (j, b) in order.iter().enumerate() {
+                assert_eq!(worse(a, b), order[i.max(j)], "{a} vs {b}");
+            }
         }
     }
 }

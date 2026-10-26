@@ -90,6 +90,7 @@ fn every_profile_evidence_carries_resolvable_provenance() {
         fanout,
         lints,
         workload_keys,
+        ..
     } = &e.body
     else {
         panic!("expected a profile body");
@@ -146,6 +147,8 @@ fn an_indexed_folder_cites_the_manifest_and_its_sequence() {
             m.source.root.clone_from(&root);
             m.schema.key_specs = vec![KeySpec::Exact {
                 columns: vec!["entity_id".into()],
+                counts: false,
+                bounds: None,
             }];
             Ok(m)
         })

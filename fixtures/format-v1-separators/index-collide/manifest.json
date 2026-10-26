@@ -1,0 +1,107 @@
+{
+  "commit_nonce": 9584174854350376177,
+  "committed_at": "2026-10-26T12:22:38.527Z",
+  "created_at": "2026-10-26T12:22:38.527Z",
+  "deleting": [],
+  "key_spec_completeness": {
+    "temporal:id": 1,
+    "temporal:id@ts": 1
+  },
+  "rowgroup_space": {
+    "files": [
+      {
+        "fingerprint": {
+          "etag": "2026-10-25T00:00:00.000000000Z",
+          "path": "/private/tmp/b1r2/fx/data/part-0.parquet",
+          "size": 4583,
+          "tail_blake3": "37710581aed39562ff8d263fac4535ec4299395fcc693ef3a650c05130334133"
+        },
+        "rowgroup_ids": [
+          0,
+          1,
+          2
+        ]
+      }
+    ],
+    "next_id": 3,
+    "tombstones": []
+  },
+  "schema": {
+    "columns": [
+      {
+        "data_type": "Int64",
+        "name": "a,b",
+        "nullable": true
+      },
+      {
+        "data_type": "Int64",
+        "name": "id",
+        "nullable": true
+      },
+      {
+        "data_type": "Timestamp(ms)",
+        "name": "ts",
+        "nullable": true
+      },
+      {
+        "data_type": "Timestamp(ms)",
+        "name": "ts@x",
+        "nullable": true
+      },
+      {
+        "data_type": "Int64",
+        "name": "id@ts",
+        "nullable": true
+      },
+      {
+        "data_type": "Timestamp(ms)",
+        "name": "x",
+        "nullable": true
+      }
+    ],
+    "key_specs": [
+      {
+        "columns": [
+          "id"
+        ],
+        "kind": "temporal",
+        "ts_column": "ts@x"
+      },
+      {
+        "columns": [
+          "id@ts"
+        ],
+        "kind": "temporal",
+        "ts_column": "x"
+      }
+    ]
+  },
+  "segment_tombstones": [],
+  "segments": [
+    {
+      "bytes": 741,
+      "id": "a5f7a364aecb499d536b4300ec5355469035513f279650fa826a26f1ed30c9f6",
+      "key_spec": "temporal:id",
+      "rowgroup_range": {
+        "end": 3,
+        "start": 0
+      }
+    },
+    {
+      "bytes": 741,
+      "id": "9f000fe26953661f7ee264e0e4a2ab696e6b81d9ac60a02265308cf15f1f6d6c",
+      "key_spec": "temporal:id@ts",
+      "rowgroup_range": {
+        "end": 3,
+        "start": 0
+      }
+    }
+  ],
+  "sequence": 1,
+  "source": {
+    "fingerprint_policy": "tail64k",
+    "kind": "parquet",
+    "root": "/private/tmp/b1r2/fx/data"
+  },
+  "storage_version": 1
+}

@@ -20,6 +20,9 @@
 //!   through it.
 //! - [`transient`]: a hypothetical spec's segments, built over key reads,
 //!   and their cache.
+//! - [`sketch`](mod@sketch): a transient `sketch` (approximate distinct
+//!   counts) over item-column reads, equal to what a built sketch holds. No
+//!   plan reads it.
 //! - [`baseline`]: raw scan and Parquet-native statistics plus embedded
 //!   bloom filters.
 //! - [`layout`]: layout proposals under a stated model (`exact: false`).
@@ -50,6 +53,7 @@ pub mod layout;
 pub mod plan;
 pub mod replay;
 pub mod report;
+pub mod sketch;
 pub mod slo;
 pub mod transient;
 pub mod workload;
@@ -61,14 +65,15 @@ pub use error::{ReplayError, ReplayResult};
 pub use keys::{RunKeys, RunKeysBuilder};
 pub use layout::{replay_layout, LayoutModel, LayoutReplay, LAYOUT_MODEL_VERSION};
 pub use plan::{
-    asof_lookback_window, planned_time_column, run_cost, servable, serves_query, serves_window,
-    serving_temporal_column, Lookup, PlanSource, RangeRead, SegmentBytes, SegmentPlanner,
-    SpecSegments,
+    asof_lookback_window, count_cost, membership_residual, planned_time_column, run_cost, servable,
+    serves_query, serves_window, serving_temporal_column, text_residual, Lookup, PlanSource,
+    RangeRead, SegmentBytes, SegmentPlanner, SpecSegments,
 };
 pub use replay::{proposed_specs, write_replay, Replayer, Scored, DEFAULT_CACHE_BYTES};
 pub use report::{
     nearest_rank, p50_p95_max, report, CostQuantiles, Report, RunRow, TemplateSummary,
 };
+pub use sketch::TransientSketch;
 pub use slo::REPLAY_RUN_P50_BUDGET;
 pub use transient::{
     BuildStats, CacheStats, TransientCache, TransientIndex, TransientLimits, CLUSTER_KEY_OVERHEAD,
@@ -76,6 +81,6 @@ pub use transient::{
 pub use workload::{
     record_bench_workload, BenchWorkloadSummary, KeyInput, KeySetSink, KeySetSource, MemoryKeySets,
     RecordedRun, RunQuery, RunWindow, Workload, WorkloadFile, WorkloadManifest, WorkloadRecorder,
-    BENCH_WORKLOAD_FORMAT, QUERY_KIND_ASOF, QUERY_KIND_LATEST, QUERY_KIND_LOCATE,
+    BENCH_WORKLOAD_FORMAT, QUERY_KIND_ASOF, QUERY_KIND_COUNT, QUERY_KIND_LATEST, QUERY_KIND_LOCATE,
     QUERY_KIND_WINDOW, WORKLOAD_FORMAT,
 };

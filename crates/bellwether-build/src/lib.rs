@@ -39,15 +39,17 @@ mod sources;
 mod target;
 mod verify;
 
-pub use build::{BuildReport, Builder, MAX_KEY_SPECS};
+pub use build::{BuildReport, Builder, TextTablesReplaced, MAX_KEY_SPECS};
 pub use compact::CompactReport;
 pub use config::{
     BuildObserver, BuildOptions, CompactOptions, SourceKind, DEFAULT_MAX_RESTARTS,
     DEFAULT_MAX_SEGMENT_BYTES, DEFAULT_MAX_SEGMENT_KEYS, DEFAULT_MAX_SEGMENT_ROW_GROUPS,
 };
-pub use coverage::{completeness, sidecar_completeness};
+pub use coverage::{completeness, sidecar_completeness, sketch_completeness};
 pub use keys::encode_ts;
 pub use plan::{
-    default_window_column, partition_columns, Lookup, PlanOrder, Planner, TransientSpec,
+    default_window_column, overlapping_counts, partition_columns, KeyCount, Lookup, PlanOrder,
+    Planner, TransientSpec,
 };
+pub use target::declared_sketches;
 pub use verify::Drift;

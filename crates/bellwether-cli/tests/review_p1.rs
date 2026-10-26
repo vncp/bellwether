@@ -29,7 +29,7 @@ use bellwether::{
     spec, CandidateOrigin, Engine, EngineOptions, FixOutcome, FixRequest, KeyFile, WhyReport,
     WhyRequest,
 };
-use common::{bw, corpus, keys, path, run};
+use common::{bw, corpus, keys, path, run, scattered};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::arrow::ArrowWriter;
 
@@ -331,7 +331,9 @@ fn probe_cache_invalidation_on_data_and_chunk_changes() {
 fn probe_evidence_provenance_and_receipt_chain() {
     let dir = tempfile::tempdir().unwrap();
     let data = dir.path().join("data");
-    corpus(&data, 3, 4, 25, 400);
+    // Ids scattered over row groups (37k mod 400): the files' min/max
+    // statistics skip nothing, so a key is recommended and applied.
+    scattered(&data, 3, 4, 25, 400);
     let kf = dir.path().join("k.parquet");
     keys(&kf, "id", &[5, 77, 123]);
     let e = Engine::open(path(&data), EngineOptions::default()).unwrap();

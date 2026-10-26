@@ -9,7 +9,11 @@ Work package WP1. This crate holds canonical key encoding, split-block bloom fil
 | `segment` | `SegmentWriter` (`for_dataset` for Arrow batches), `SegmentReader<R: ReadAt>`, `FileRange`, and `EncodedSegment::path()` = `segments/<blake3>.seg` |
 | `temporal` | `latest` and `asof` across every segment of a key spec, plus `VersionChain`, `VersionHit`, and `is_stale` |
 | `merge` | `merge(&[SegmentReader], &WriterOptions)` |
+| `expr` | The `expr` key language (`json_get`, `lower`, `substr`, `cast`, `date_trunc`, `hash`): `Expr::parse` and the normalized form (`normalize`), `Typed::eval` (one batch's derived column, row at a time, JSON scanned without a tree and capped at `MAX_JSON_DEPTH`), the pinned `VECTORS` and `verify_vectors`, and the `KeySpec::Expr` rules (`spec`, `check_spec`, `typed_spec`, `with_derived`, `suggested_name`). A segment of an `expr` key is the inner exact or bloom layout over the virtual column; its header carries the expression and vectors, which a reader recomputes before opening it. |
 | `sidecar` | `bounds` and `temporal2` sidecar segment writer (`SidecarWriter`), reader (`SidecarReader<R: ReadAt>`), `bitemporal_winner`, and `measure` |
+| `sketch` | `sketch` sidecar segments (approximate, never planned with): `FileSketcher` (one file's per-item HyperLogLog and optional MinHash), `SketchWriter`/`SketchReader` (one entry per file stretch, BLAKE3-sealed), `SketchTotals` (folds entries; `cardinality(i, exact)` with its interval, `copresent`), `overlap` (MinHash or HyperLogLog Jaccard with bounds), `value_hash`, `validate`, `item_types` |
+| `hll` | The one HyperLogLog (Ertl's improved raw estimator, `p` in 4..=18), shared by the profiler's fanout pass and the `sketch` sidecar; `merge` is the register-wise maximum (lossless union) |
+| `text` | Text keys (B5): full case folding (`unicase`, pinned) and the words (UAX #29, `unicode-segmentation`, pinned) and trigram tokenizers, the tables a segment records (`UnicodeTables`), the residual's row test (`matches`, `matches_any`), how a text spec serves `has_token`, `contains`, `has_prefix` (`probe`, `Shape`), row-group selection (`select`), and exact token counts (`token_stats`) |
 
 Tests:
 
@@ -22,8 +26,15 @@ Tests:
 | `tests/segment_format.rs` | Format rules |
 | `tests/corrupt_sweep.rs` | Every truncation and a byte-flip sweep never panic |
 | `tests/conformance.rs` | The pinned test vectors of `docs/format.md`, through both the scalar and the Arrow encoder paths; the test also requires the document's table to list exactly these vectors |
+| `tests/expr_conformance.rs` | Every `expr` conformance vector reproduces, each function has at least two, and `docs/format.md` lists exactly the code's table |
+| `tests/expr_language.rs` | Differently spelled equal expressions normalize equal and near misses do not; parse and type refusals; each function property-tested against an independent oracle (`serde_json` for `json_get`) |
+| `tests/expr_segments.rs` | `expr` segments: round trip, nulls (ADR 014), a brute-force oracle, truncation and byte-corruption sweeps, and a header whose vector or expression changed refused typed |
 | `tests/sidecar_conformance.rs` | Pinned byte and record conformance for `bounds` and `temporal2` sidecar segments, `measure`, `add_batch` atomicity, and corruption sweeps |
+| `tests/text_keys.rs` | Text keys: a property test of every lookup through every text spec against a brute-force oracle with its own case folding (multi-byte UTF-8, sharp s, the sigmas, dotted and dotless i, the Kelvin sign, decomposed accents, CJK, NUL, nulls), round trip and merge, nulls (ADR 014), the Unicode-tables refusal, and the conformance vectors of `docs/format.md` |
+| `tests/text_corrupt_sweep.rs` | Corrupt text segments never panic: every header byte and a sample of the rest in the gate, every truncation, position, and byte value under `--ignored` |
 | `tests/sidecar_oracle.rs` | Oracle property tests for `bounds`, `temporal2`, and `bitemporal_winner` across row groups, nulls, composite keys, and sentinel timestamps |
+| `tests/sketch.rs` | `sketch` segments: round trip against a brute-force oracle (rows, nulls, distinct counts inside the interval; property test); split files merge losslessly; the HyperLogLog error bound over 312 trials at precisions 10, 12, and 14 (1 to 300,000 distinct values) against exact counts; MinHash and HyperLogLog overlap intervals against the exact Jaccard; nulls per ADR 014; determinism; layout rules behind the checksum; every-byte corruption refused; the `docs/format.md` conformance table byte for byte |
+| `tests/counts_conformance.rs` | Storage version 2 counts: the pinned value records and their directory checksums (the table in `docs/format.md`, "Counts conformance vectors"); every fixture segment named by its hash, read by the reader of its magic, and counted only when it stores counts; merge sums disjoint counts and refuses overlapping ones; every byte value at every body position of a counted exact and temporal segment never panics or reads a wrong count |
 
 Benchmark: `cargo bench -p bellwether-core --bench lookup` measures single-key lookup latency against segment size.
 
@@ -89,7 +100,7 @@ A missing or unknown value is refused on open.
 
 A bloom segment with `parquet_plain` filters (from `SegmentWriter::insert_filter`) covers one column. It answers only `lookup_hashes::<PlainHash>`, and `lookup` with canonical keys is an error, never a silent miss.
 
-## Segment format (`docs/format.md`, storage version 1)
+## Segment format (`docs/format.md`, storage version 2)
 
 All integers are little-endian.
 
@@ -99,11 +110,12 @@ header     JSON {storage_version, encoding_version, key_spec, codec, layout, blo
                  key_types?, ts_type?, ..unknown}
 body       blocks (layout-specific)
 index      entries u64 | has_rg u8 | rg_min u32 | rg_max u32 | block_count u32 | entries
-footer     index_offset u64 | index_len u64 | "BWSEGMNT"
+footer     index_offset u64 | index_len u64 | checksum u64 | "BWSEGMNT"
 ```
 
 - **Versions before JSON.** The versions sit in a fixed binary preamble, so a newer file is refused with `Error::UnsupportedVersion` before the header is parsed (ADR 017). The JSON header repeats them and must agree with the preamble. Unknown header fields are kept in `SegmentHeader::extra`, and merge carries them through when every input agrees, refusing otherwise.
-- **Codec.** The codec is `"none"` in storage version 1, and any other codec is refused.
+- **Checksums (storage version 2).** Every region a read touches carries an XXH3-64 checksum (`segment::checksum`): the footer covers the preamble, header and index; each index entry covers its filter, block or row-group region; each directory entry covers its value record. The reader verifies each before decoding it, so a corrupt byte is `Error::Corrupt`, never a wrong answer. A storage version 1 segment (24-byte footer, no checksums) is still read; this build writes only version 2.
+- **Codec.** The codec is `"none"` in storage versions 1 and 2, and any other codec is refused.
 - **Recorded types.** A segment built with `for_dataset` records each key column's dataset type (`key_types`) and, for temporal specs, the timestamp column's type and unit (`ts_type`). The spelling is Bellwether's own `ColumnType`, for example `{"type":"decimal128","precision":10,"scale":2}` or `{"type":"timestamp","unit":"millisecond","tz":"UTC"}`, so the frozen format does not depend on Arrow's serde. A dictionary column is recorded as its value type. Keys encoded under different types would split silently, so:
   - segments whose recorded types differ never merge, and the temporal fold refuses them
   - `SegmentReader::open_for_dataset` (or `check_dataset`) refuses a segment whose recorded types differ from the dataset schema's, or which records none
@@ -118,10 +130,12 @@ footer     index_offset u64 | index_len u64 | "BWSEGMNT"
   - **Exact.** Sorted key blocks of at most 1024 keys or 64 KiB of key bytes. Each block is written as:
     1. its value records
     2. an SBBF over its canonical keys at 1% FPP
-    3. a key directory: `n`, `n+1` end offsets, the key bytes, then `n` × `(value_offset u64, value_len u32)`
+    3. a key directory: `n`, `n+1` end offsets, the key bytes, then `n` × `(value_offset u64, value_len u32, value_checksum u64)`
 
-    A value is a roaring bitmap over global `RowGroupId`, always in the no-run serialized form (cookie `3a 30 00 00`) and never empty. A reader refuses any other cookie, an empty bitmap, or a bitmap that does not fill its record, so corruption is an error rather than a wrong or empty answer.
-  - **Temporal.** The exact layout, except that each value is a length-prefixed bitmap followed by a version chain: `count u32 | has_max u8 | max_ts i64 | count × (ts i64, rg u32)`, ascending and deduplicated. The bitmap includes row groups whose rows have a null timestamp, because membership is still true. The chain leaves them out, because they never win.
+    A value is `bitmap_len u32 | bitmap`, a roaring bitmap over global `RowGroupId`, always in the no-run serialized form (cookie `3a 30 00 00`) and never empty. A reader refuses any other cookie, an empty bitmap, or a bitmap that does not fill its length, so corruption is an error rather than a wrong or empty answer. (A version 1 exact value is the bare bitmap.)
+
+    **Counts.** For a spec with `counts` (`exact:a,counts`), the bitmap is followed by one shortest-form LEB128 row count per row group in it, ascending, each at least 1: the rows of that row group whose key tuple is this key (`SegmentWriter::insert_rows`). `SegmentReader::counts(keys)` returns them, or `None` for a segment that stores none, never zeros. Merge sums the counts of one (key, row group) only across inputs over disjoint row groups and refuses otherwise.
+  - **Temporal.** The exact layout, except that each value is the length-prefixed bitmap, then the counts when the spec stores them (rows over all versions, null times included), then a version chain: `count u32 | has_max u8 | max_ts i64 | count × (ts i64, rg u32)`, ascending and deduplicated. The bitmap includes row groups whose rows have a null timestamp, because membership is still true. The chain leaves them out, because they never win.
   - **Bloom.** One SBBF per row group over that row group's distinct keys, sized from the spec's `fpr` with Parquet's formula. Merge ORs the filters of one row group when they are the same size and keeps them as separate entries otherwise, and a lookup unions over them.
   - **Range.** One `(min, max)` per row group, sorted by `(min, max, rg)`, in blocks of 256 entries. Bounds may come from statistics, which exclude NaN, so a probe that includes the canonical NaN matches every row group. Signed zero follows the Parquet statistics reading rule: a stored minimum of +0.0 is widened to -0.0 and a maximum of -0.0 to +0.0, on write and on merge, so a probe for either zero never prunes a row group holding the other.
 - **Lookups.**
@@ -130,6 +144,17 @@ footer     index_offset u64 | index_len u64 | "BWSEGMNT"
   - `lookup_prefix` selects every extension of a leading-column prefix.
   - `lookup_prefix_range(lo, hi)` selects keys whose leading columns lie between two prefixes, inclusive. This is `Between` on the leading column of a composite key.
 - **Temporal results are index-wide.** `temporal::latest` and `temporal::asof` fold every segment of the key spec with `VersionHit::combine`. `SegmentReader::latest` and `SegmentReader::asof` answer for one segment only. Ties are kept: a `VersionHit { ts, row_groups }` holds every row group with a version at the winning timestamp. A key whose versions all have null timestamps has no `latest`. `ts` and `asof`'s argument are in the dataset column's unit.
+
+## List keys (B4, `list:<column>`; `docs/format.md`, "List keys")
+
+`list` holds the inverted index over a list column: per distinct element (its canonical encoding at the dataset's element type), the row groups holding a row whose list contains it, in the exact layout unchanged. A column qualifies when it is a `List<T>` or `LargeList<T>` of a type with a canonical encoding, or a `Map<K, V>` by its keys (`list::check_list_column` says why anything else does not). `SegmentWriter` adds a row group's distinct elements; a null list, an empty list, and a null element add nothing (ADR 014); a duplicate element is one key.
+
+- `list::contains_any(readers, values)`: the union of each value's row groups over every segment of the key.
+- `list::contains_all(readers, groups)`: the intersection, one group per queried value (both encodings of a float zero in one group); no group at all is refused.
+- `list::distinct_elements(readers)`: the exact distinct elements over every segment, merged in key order so an element in several segments counts once; holds one block per segment. `why` reports it as the `list` column.
+- `list::row_element_keys(array, row, element)`: one row's element encodings, for the residual (`Predicate::ContainsAny` / `ContainsAll`).
+
+Tests (`tests/list.rs`): round trip, the pinned conformance vectors, nulls and empty lists, float zero and NaN, type conversion and refusals, an every-byte corruption sweep, and a property test of both lookups and `distinct_elements` against a brute-force oracle over random multi-segment layouts with duplicates.
 
 ## Lookup cost and memory bound (ADR 018)
 
@@ -172,3 +197,11 @@ footer    index_offset u64 | index_len u64 | magic "BWSIDECR"
 ```
 
 Sidecar memory bound (ADR 018): a lookup holds the block index, one block at a time, and the results for the keys asked; `SidecarWriter` holds every distinct `(key, rg)` (for `bounds`) or `(key, valid, known, rg)` (for `temporal2`) until `finish`, and the build crate caps segment size with `sidecar::measure`.
+
+## Sketch segment format (`docs/format.md`, "Sketch segments")
+
+A `sketch` segment (`segments/<blake3>.seg`, magic `"BWSKETCH"`) holds, per sketched item (a column or a `+`-joined tuple, encoded like a composite key, ADR 014) and per file, the row count, the null count, the HyperLogLog registers (sparse or dense), and optionally a MinHash signature of `k` slots. It is a sidecar declared in `schema.sidecars[]` with kind `sketch`; **no planner path reads it**: every number it yields is approximate (`ApproxCardinality`, `ApproxOverlap`, `approximate: true`), and an approximate number in a plan would break invariant 1. The build crate's planner never opens these segments (its `tests/sketch.rs` proves plans are equal with and without them).
+
+A footer checksum (BLAKE3 over every byte before it) makes every damaged byte a typed refusal rather than a silently different estimate. Merging is exact: registers by maximum, slots by minimum, so the union of a file's stretches equals sketching the file whole. Intervals are three standard errors (`SKETCH_CONFIDENCE`) either side, clamped to `[1, rows]`.
+
+Sketch memory bound (ADR 018): a writer holds one open entry (`2^p` registers and `k` slots per item) and the finished entries encoded; `max_entry_bytes` bounds one entry so the build caps a segment's entries and bytes. A reader holds the segment bytes and decodes one entry at a time; `SketchTotals` holds `2^p` registers and `k` slots per item, whatever the file count.

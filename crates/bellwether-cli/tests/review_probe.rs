@@ -122,6 +122,10 @@ fn probe_adr010_cli_json_equals_in_process_facade() {
                 mismatched: 0,
                 ignored_columns: vec![],
                 totals_delta: vec![],
+                examples: Vec::new(),
+                uncomparable: 0,
+                totals: Vec::new(),
+                row_filter: None,
             },
             provenance: Provenance {
                 inputs: vec![Hash::of(b"fixture")],
@@ -134,6 +138,8 @@ fn probe_adr010_cli_json_equals_in_process_facade() {
     let receipt = plant(
         &index,
         &Record::Receipt(Receipt {
+            attest_only: false,
+            prediction: None,
             record_version: format::RECORD_VERSION,
             evidence: vec![],
             proposal: cand.proposal.hash,

@@ -1,0 +1,43 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1668 371" width="1668" height="371" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif">
+<rect width="1668" height="371" fill="#ffffff" rx="12"/>
+<text x="24.0" y="34.0" fill="#1f2328" font-size="18" font-weight="600">Reconcile 20 million taxi trips: a table against its Parquet files</text>
+<text x="24.0" y="58.0" fill="#1f2328" font-size="15">Reconciling 20,314,139 keys took 42 s from a DuckDB table and 105 s from a SQLite table, against 42 s between two Parquet copies; each run read inside one snapshot and wrote a certificate naming both sides.</text>
+<text x="24.0" y="76.0" fill="#656d76" font-size="12">wall_ms (ms). Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1. bellwether release build b4bc771; v2.0.0 d54cbbe3df. Measured 2026-10-26.</text>
+<rect x="24.0" y="94.0" width="12.0" height="12.0" rx="2" fill="#1a7f37"/>
+<text x="42.0" y="104.0" fill="#1f2328" font-size="13">files-vs-files</text>
+<rect x="170.8" y="94.0" width="12.0" height="12.0" rx="2" fill="#8250df"/>
+<text x="188.8" y="104.0" fill="#1f2328" font-size="13">duckdb-table</text>
+<rect x="303.2" y="94.0" width="12.0" height="12.0" rx="2" fill="#bc4c00"/>
+<text x="321.2" y="104.0" fill="#1f2328" font-size="13">sqlite-table</text>
+<text x="24.0" y="148.0" fill="#1f2328" font-size="14" font-weight="600">NYC taxi</text>
+<text x="906.0" y="168.0" fill="#1f2328" font-size="13" text-anchor="end">reconcile &lt;side&gt; &lt;taxi Parquet files&gt; --key VendorID,tpep_pickup_datetime,PULocationID,fare_amount --totals fare_amount:dec(2)</text>
+<rect x="918.0" y="156.0" width="179.9" height="11.0" rx="2" fill="#1a7f37"/>
+<text x="1103.9" y="166.0" fill="#1f2328" font-size="11"><tspan font-weight="600">41.50 s</tspan><tspan fill="#656d76" font-size="10"></tspan></text>
+<rect x="918.0" y="170.0" width="182.3" height="11.0" rx="2" fill="#8250df"/>
+<text x="1106.3" y="180.0" fill="#1f2328" font-size="11"><tspan font-weight="600">42.08 s</tspan><tspan fill="#656d76" font-size="10"></tspan></text>
+<rect x="918.0" y="184.0" width="456.3" height="11.0" rx="2" fill="#bc4c00"/>
+<text x="1380.3" y="194.0" fill="#1f2328" font-size="11"><tspan font-weight="600">105.30 s</tspan><tspan fill="#656d76" font-size="10"></tspan></text>
+<text x="906.0" y="223.0" fill="#1f2328" font-size="13" text-anchor="end">the same, against a copy of the table with one changed tip_amount, one deleted row, and one added row</text>
+<text x="924.0" y="221.0" fill="#656d76" font-size="11">not measured</text>
+<rect x="918.0" y="225.0" width="183.2" height="11.0" rx="2" fill="#8250df"/>
+<text x="1107.2" y="235.0" fill="#1f2328" font-size="11"><tspan font-weight="600">42.27 s</tspan><tspan fill="#656d76" font-size="10"></tspan></text>
+<rect x="918.0" y="239.0" width="472.9" height="11.0" rx="2" fill="#bc4c00"/>
+<text x="1396.9" y="249.0" fill="#1f2328" font-size="11"><tspan font-weight="600">109.13 s</tspan><tspan fill="#656d76" font-size="10"></tspan></text>
+<text x="906.0" y="278.0" fill="#1f2328" font-size="13" text-anchor="end">why &lt;side&gt; --from keys/taxi_pu.parquet (every pickup zone, as scripts/realdata.sh)</text>
+<text x="924.0" y="276.0" fill="#656d76" font-size="11">not measured</text>
+<rect x="918.0" y="280.0" width="56.2" height="11.0" rx="2" fill="#8250df"/>
+<text x="980.2" y="290.0" fill="#1f2328" font-size="11"><tspan font-weight="600">12.97 s</tspan><tspan fill="#656d76" font-size="10"></tspan></text>
+<rect x="918.0" y="294.0" width="239.7" height="11.0" rx="2" fill="#bc4c00"/>
+<text x="1163.7" y="304.0" fill="#1f2328" font-size="11"><tspan font-weight="600">55.31 s</tspan><tspan fill="#656d76" font-size="10"></tspan></text>
+<line x1="918.0" y1="124.0" x2="918.0" y2="321.0" stroke="#656d76" stroke-opacity="0.25" stroke-dasharray="3 4"/>
+<text x="918.0" y="339.0" fill="#656d76" font-size="11" text-anchor="middle">0</text>
+<line x1="1048.0" y1="124.0" x2="1048.0" y2="321.0" stroke="#656d76" stroke-opacity="0.25" stroke-dasharray="3 4"/>
+<text x="1048.0" y="339.0" fill="#656d76" font-size="11" text-anchor="middle">30.00 s</text>
+<line x1="1178.0" y1="124.0" x2="1178.0" y2="321.0" stroke="#656d76" stroke-opacity="0.25" stroke-dasharray="3 4"/>
+<text x="1178.0" y="339.0" fill="#656d76" font-size="11" text-anchor="middle">60.00 s</text>
+<line x1="1308.0" y1="124.0" x2="1308.0" y2="321.0" stroke="#656d76" stroke-opacity="0.25" stroke-dasharray="3 4"/>
+<text x="1308.0" y="339.0" fill="#656d76" font-size="11" text-anchor="middle">90.00 s</text>
+<line x1="1438.0" y1="124.0" x2="1438.0" y2="321.0" stroke="#656d76" stroke-opacity="0.25" stroke-dasharray="3 4"/>
+<text x="1438.0" y="339.0" fill="#656d76" font-size="11" text-anchor="middle">120.00 s</text>
+<text x="918.0" y="357.0" fill="#656d76" font-size="11">linear scale</text>
+</svg>

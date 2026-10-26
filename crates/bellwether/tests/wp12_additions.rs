@@ -20,7 +20,7 @@ use bellwether::{
     spec, Engine, EngineOptions, FixOutcome, FixRequest, KeyFile, ProposeRefusal, ProposeResult,
     Refusal, WhyRequest, UNATTRIBUTED,
 };
-use common::{ledger_corpus, write_file, write_keys};
+use common::{ledger_corpus, scattered_corpus, write_file, write_keys};
 
 fn open(root: &Path) -> Engine {
     Engine::open(root.to_str().unwrap(), EngineOptions::default()).unwrap()
@@ -61,7 +61,7 @@ struct Fixture {
 fn fixture(indexed: bool) -> Fixture {
     let dir = tempfile::tempdir().unwrap();
     let data = dir.path().join("data");
-    ledger_corpus(&data, 3, 4, 25, 400);
+    scattered_corpus(&data, 3, 4, 25, 400);
     let kf = dir.path().join("k.parquet");
     write_keys(&kf, "id", &[5, 77, 123]);
     if indexed {
@@ -220,7 +220,10 @@ fn propose_dry_run_writes_nothing_and_predicts_the_hash() {
     let body = ProposalBody::Key {
         spec: KeySpec::Exact {
             columns: vec!["id".into()],
+            counts: false,
+            bounds: None,
         },
+        sidecars: Vec::new(),
     };
     let err = e
         .propose_dry_run(body.clone(), &[Hash::of(b"x")], "agent")

@@ -17,10 +17,12 @@ Dependencies: `bellwether-types`, `-core` (canonical encoding), `-source` (sourc
 | Item | What it does |
 |---|---|
 | `profile(source, root, store, &ProfileOptions) -> ProfileReport` | Measures everything below. `store` is rooted at the index root (`docs/format.md`): the cache is at `cache/`, the manifest, if any, at `manifest.json`. The folder need not be indexed. |
+| `manifest_profile(root, store, &ProfileOptions, DatasetTotals) -> ProfileReport` | A profile that reads no data file, footers included: the caller's totals (files, live row groups, rows; the facade takes them from the manifest and a sketch) stand in for the footer pass, nothing is measured, and the only provenance input is the manifest at the store root, which must exist. For `why --sketches-only`, whose lints come from sketches. |
 | `ProfileOptions::for_source(config)` | The defaults with the required `source_config` set. `ProfileOptions::default()` leaves it unset, and `profile` refuses that. |
 | `evidence(&report) -> Evidence` | Builds the `profile` Evidence. Refuses a report with no provenance inputs. |
 | `record(&ledger, &report)`, `profile_and_record(..)` | Write it through the ledger. |
 | `render(&report, evidence_hash) -> String` | The one-screen summary (below). |
+| `lints::text_lookups(uses, complete)` | `R-text-1` (B5): text runs on a string column with no complete text key serving their match. The caller reads the workload's runs (`why` does), so it is not part of `profile`. |
 | `ProfileReport` | `Serialize`, for `--json`. It carries more than the Evidence can: sampling detail per fanout, the candidates auto selection skipped, range statistics, time measures, provenance inputs with ages, the memory report. |
 | `bin/bellwether-profile` | A thin wrapper for running a profile by hand until WP9's facade calls `profile` directly (ADR 010). Its source configuration is `parquet`. |
 
@@ -39,6 +41,7 @@ Dependencies: `bellwether-types`, `-core` (canonical encoding), `-source` (sourc
 | `workload` | none | A bench-format workload directory. |
 | `source_config` | **none: required** | Folded into the footer cache key; unset is an error. It must change whenever the source would report other row groups for the same files, for example a text source's chunk size (`csv:chunk=67108864`). A Parquet source is `parquet`. |
 | `reuse_cache` | true | `false` recomputes and overwrites the cached artifacts. |
+| `now_millis` | `None` | The instant the manifest's commit age is measured at (milliseconds since the epoch); `None` is the system clock. The facade passes its fixed `--clock` here, so an indexed folder's Evidence is byte-identical across runs. |
 
 ## Fanout
 
@@ -90,6 +93,8 @@ From footers only, so nothing here reads row data:
 | `low_selectivity_single_column` | C's median value touches ≥ 50 % of row groups, an id-like O that is not a batch stamp makes the composite's p95 ≤ half that median, and `batch_stamp_key` does not fire on C (a batch stamp is not a key at all, so neither the column nor the partner). | high if the workload supplies both columns; medium if it supplies one (which then leads), or with no workload; low if it supplies neither, or if sampled |
 | `scattered_time_column` | A date or timestamp column's overlap depth is ≥ 1.5 and its sortedness < 0.9 (`bellwether_source::stats`). | medium (statistics alone; the bench workload records key sets, not range queries) |
 | `declared_but_unused_key` | A manifest declares a spec, a workload exists, and no run supplies the spec's leading column. | medium (whether the workload covers the full usage window is unknown) |
+| `R-sketch-1` (low-cardinality key, `low_cardinality_key`) | From `sketch` sidecars, not from this crate's own pass (the facade folds the sketch segments into `SketchedColumn`s and adds the lints to the profile before its Evidence is built): a sketched column B whose values each cover ≥ 100,000 rows on average (rows ÷ distinct), beside an id-like sketched column K with ≥ 10 × B's distinct values, in ≥ 90 % of the files B is in. Every threshold is inclusive. The advice is the composite (K, B); the partner with the most values is named. No data file is read. | medium (the distinct counts are approximate); high when both counts are exact (a complete `exact` key spec on the column) |
+| `R-expr-1` | lookups supply a function of a dataset column (a run or key-file column named by an expression such as `json_get(payload,'$.symbol')`) and no declared `expr` key is over that expression, normalized; names the suggested `expr` key spec and the declared ones that do not match. `declared_but_unused_key` counts an `expr` key as used when a run supplies its expression | high |
 
 How the thresholds and choices were made:
 
@@ -108,6 +113,10 @@ How the thresholds and choices were made:
 - **Composite order.** A recommended composite is the measured one, its supplied columns first. Without a workload the message says which column the order assumes lookups supply.
 - **Confidence scale.** High, medium, and low map to 0.9, 0.6, and 0.3. Every message is one sentence and `site` is `None`.
 - **Out of scope.** `unprefiltered_window`, `lookback_unbounded`, and `wide_projection_before_filter` need a consumer's query plan, and no `EvidenceBody` carries one. This crate never emits them.
+
+### `R-list-1` (list keys, B4)
+
+`lints::list_membership(uses, complete)` fires once per list column that recorded runs look up by membership (`array_contains`, `has_any`, `exists(unnest)`) when no complete `list:<column>` serves it, high confidence, naming the key and the `why --mode` command that prices it. It reads the workload's runs, which the profile does not, so `why` calls it and adds its lints to the same `profile` Evidence, citing the key set or workload. It is not part of `lints::run`.
 
 ## Workload summary
 
@@ -150,7 +159,7 @@ On a cache hit, a profile reads exactly this:
 
 The other provenance fields:
 
-- `oldest_input_age` is the largest of their ages: the cache sidecar age, the workload manifest's mtime age, and the manifest's commit age. Tests back-date a workload and a manifest and check each becomes the oldest age.
+- `oldest_input_age` is the largest of their ages: the cache sidecar age, the workload manifest's mtime age, and the manifest's commit age (measured at `now_millis` when given, zero when that is before the commit). Tests back-date a workload and a manifest and check each becomes the oldest age.
 - `manifest_version` is the manifest sequence (ADR 020), or `None` for an unindexed folder.
 - `created_at` is RFC 3339 UTC.
 
@@ -227,9 +236,10 @@ This is the benchmark's planted layout: 3 days, 8 files per day, late rows, with
 | `tests/memory_bound.rs` | The stated table bound on 1× and 8× data, a control without eviction that breaks it, and one read per row group of only the candidate key columns (spy source; a blob column is skipped and never read). |
 | `tests/cache.rs` | A hit performs no data or footer reads, reports its age, and produces identical evidence. A rewritten file, another schema, and other options change the right keys. Changed time columns never serve a stale measure. A workload that reorders a tuple changes the fanout key. A rewritten run file is reread and refused. |
 | `tests/provenance.rs` | Invariant 6: <ul><li>every input resolves;</li><li>RFC 3339 time and the oldest age, including a back-dated workload and manifest;</li><li>the manifest sequence and hash when indexed;</li><li>refusal without inputs writes nothing;</li><li>a foreign manifest is an error.</li></ul> |
+| `tests/sketch_lint.rs` | `R-sketch-1`: fires on a stamp beside an id (message, partner, composite, approximate label, confidence raised by exact counts); quiet one step short of each threshold, beside a non-id partner, and alone; each threshold inclusive at its exact value; the partner with the most values named. |
 | `tests/lints.rs` | `declared_but_unused_key` needs both a manifest and a workload; the confidence rubric; one sentence per message. |
 | `tests/workload.rs` | Each run is verified against `workload.json`; any disagreement is refused. |
-| unit tests | <ul><li>`sampler`: exact counts, sampled and unsampled, and the capacity bound;</li><li>`hll`: accuracy across the range;</li><li>`ranges`: overlap and sortedness;</li><li>`fanout`: tuple bytes equal `KeyColumns`, cached entries round-trip bit for bit, and supplied columns lead each tuple;</li><li>the cached fanout layout pinned to its format;</li><li>`quantile`;</li><li>`footer` cache round trip.</li></ul> |
+| unit tests | <ul><li>`sampler`: exact counts, sampled and unsampled, and the capacity bound;</li><li>`ranges`: overlap and sortedness;</li><li>`fanout`: tuple bytes equal `KeyColumns`, cached entries round-trip bit for bit, and supplied columns lead each tuple;</li><li>the cached fanout layout pinned to its format;</li><li>`quantile`;</li><li>`footer` cache round trip.</li></ul> The HyperLogLog moved to `bellwether_core::hll` (shared with the `sketch` sidecar) with its accuracy tests. |
 
 The shared measures have their own unit tests in `bellwether-source` (`stats`), and the benchmark's `tests/bench.rs` recomputes them independently from row-derived ranges.
 

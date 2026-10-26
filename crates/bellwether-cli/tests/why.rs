@@ -78,7 +78,14 @@ fn why_over_a_batch_stamp_index_recommends_the_true_key() {
     let rec = r.recommended.as_ref().unwrap();
     assert_eq!(rec.spec.columns(), ["entity_id".to_string()]);
     assert!(rec.proposed.bytes < rec.current.bytes);
-    assert_eq!(rec.current.row_groups, 6 * r.dataset.row_groups);
+    // The batch-stamp index serves no entity_id run, so each run is priced
+    // as the files' own min/max statistics read it: at most every row
+    // group, and the replay says so.
+    assert_eq!(Some(rec.current), r.current);
+    assert!(rec.current.row_groups <= 6 * r.dataset.row_groups);
+    assert!(r.full_scan.is_none(), "a key spec is current");
+    let floor = r.candidates.iter().find(|c| c.spec == rec.spec).unwrap();
+    assert!(matches!(&floor.replay.record, Record::Replay(rp) if rp.unserved.is_some()));
     // Human output leads with the funnel.
     let human = run(
         &["why", path(&data), "--bench-workload", path(&workload)],
@@ -113,4 +120,39 @@ fn why_on_a_read_only_folder_exits_0_with_the_evidence_unrecorded() {
     assert!(human.contains("evidence  not recorded: "), "{human}");
     assert!(human.contains("--index"), "{human}");
     assert!(!index_dir(&data).exists());
+}
+
+/// Count runs ahead of their locates, over an index on the key without
+/// counts: the counts candidate's funnel row says what it is priced for
+/// (count runs read nothing), not the floor note of a plain exact key,
+/// which it no longer is.
+#[test]
+fn the_counts_candidate_names_what_it_is_priced_for() {
+    let dir = tempfile::tempdir().unwrap();
+    let corpus_dir = dir.path().join("corpus");
+    let data = planted(&corpus_dir, 6);
+    run(&["index", path(&data), "--key", "exact:entity_id"], 0);
+    // Every other run counts its keys (`query` is the bench workload's
+    // optional run field; the workload hash covers only the key sets).
+    let wl = corpus_dir.join("workload.json");
+    let mut v: serde_json::Value = serde_json::from_slice(&std::fs::read(&wl).unwrap()).unwrap();
+    for (i, r) in v["runs"].as_array_mut().unwrap().iter_mut().enumerate() {
+        if i % 2 == 0 {
+            r["query"] = "count".into();
+        }
+    }
+    std::fs::write(&wl, serde_json::to_vec(&v).unwrap()).unwrap();
+    let human = run(
+        &["why", path(&data), "--bench-workload", path(&corpus_dir)],
+        0,
+    );
+    let row = human
+        .lines()
+        .find(|l| l.trim_start().starts_with("exact:entity_id,counts "))
+        .unwrap_or_else(|| panic!("no counts candidate row:\n{human}"));
+    assert!(
+        row.contains("count runs answered from per-key counts, no data read"),
+        "{row}"
+    );
+    assert!(!row.contains("floor"), "{row}");
 }

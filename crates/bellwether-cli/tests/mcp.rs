@@ -14,7 +14,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
 use std::process::{Command, Stdio};
 
-use common::{corpus, index_dir, keys, path, run};
+use common::{corpus, index_dir, keys, path, run, scattered};
 use serde_json::{json, Value};
 
 /// The fixed clock both sides use.
@@ -105,7 +105,7 @@ fn copy_tree(from: &Path, to: &Path) {
 fn every_tool_with_a_cli_counterpart_returns_the_cli_json_line() {
     let dir = tempfile::tempdir().unwrap();
     let data = dir.path().join("data");
-    corpus(&data, 2, 3, 30, 200);
+    scattered(&data, 2, 3, 30, 200);
     let kf = dir.path().join("k.parquet");
     keys(&kf, "id", &[7, 8, 150]);
     let (d, k) = (path(&data), path(&kf));
@@ -161,6 +161,92 @@ fn every_tool_with_a_cli_counterpart_returns_the_cli_json_line() {
         3,
     );
     assert_eq!(refused["outcome"], "refused");
+    let canon = std::fs::canonicalize(&data).unwrap();
+    let canon = path(&canon);
+    // A sidecar declaration, in the short form `index --key` reads: the
+    // same typed refusal from both sides (exit 3), with its code, facts, and
+    // a next line naming the index command and, beside a key, the key to
+    // propose alone. The short form of a key spec proposes it.
+    for (declaration, key) in [
+        ("temporal2:id@ts,batch", None),
+        ("exact:id@ts", Some("exact:id")),
+    ] {
+        let args = json!({"spec": declaration, "evidence": [ev], "by": "agent"});
+        let refused = both(
+            &srv,
+            "propose.key",
+            args.clone(),
+            &[
+                "propose",
+                d,
+                "--evidence",
+                &ev,
+                "--by",
+                "agent",
+                "--key",
+                declaration,
+            ],
+            3,
+        );
+        assert_eq!(refused["outcome"], "refused");
+        assert_eq!(refused["refusal"]["kind"], "sidecar_not_proposable");
+        assert_eq!(refused["refusal"]["declaration"], declaration);
+        let r = srv.call("propose.key", args);
+        let refusal = r.envelope.refusal.unwrap();
+        assert_eq!(refusal.code.as_str(), "sidecar_not_proposable");
+        assert_eq!(refusal.fields["key"], json!(key));
+        assert_eq!(
+            refusal.fields["command"],
+            json!(format!("bellwether index {canon} --key {declaration}"))
+        );
+        // The next line names MCP fields and tools, never a CLI flag.
+        assert!(
+            refusal
+                .next
+                .contains(&format!("index {canon} with the declaration {declaration}")),
+            "{}",
+            refusal.next
+        );
+        assert!(!refusal.next.contains("--"), "{}", refusal.next);
+        if let Some(k) = key {
+            assert!(
+                refusal
+                    .next
+                    .contains(&format!("propose.key with `spec` \"{k}\"")),
+                "{}",
+                refusal.next
+            );
+        }
+        // The human line says the same and what to do.
+        let human = run(&["propose", d, "--evidence", &ev, "--key", declaration], 3);
+        assert!(
+            human.contains(&format!("bellwether index {canon} --key {declaration}")),
+            "{human}"
+        );
+        if let Some(k) = key {
+            assert!(
+                human.contains(&format!("alone with --key {k}\n")),
+                "{human}"
+            );
+        }
+    }
+    let short = both(
+        &srv,
+        "propose.key",
+        json!({"spec": "exact:id", "evidence": [ev], "by": "agent"}),
+        &[
+            "propose",
+            d,
+            "--evidence",
+            &ev,
+            "--by",
+            "agent",
+            "--key",
+            "exact:id",
+        ],
+        0,
+    );
+    assert_eq!(short["outcome"], "written");
     // propose.layout and propose.rewrite.
     both(
         &srv,
@@ -472,7 +558,7 @@ fn bellwether_mcp_takes_the_shared_engine_and_budget_flags() {
         assert!(help.contains(&long), "{long} missing from:\n{help}");
         flags += 1;
     }
-    assert_eq!(flags, 10);
+    assert_eq!(flags, 13);
 }
 
 /// `bellwether mcp <root>` is the same server: a handshake and one tool
@@ -522,4 +608,75 @@ fn bellwether_mcp_serves_over_stdio() {
     drop(send);
     drop(stdin);
     assert!(child.wait().unwrap().success());
+}
+
+/// `observe.count` = `count` and `observe.locate` with `columns` = `locate
+/// --columns`, byte for byte, and a count with no counting spec is refused
+/// by both naming the same `index --key`.
+#[test]
+fn count_and_a_projected_locate_return_the_cli_json_line() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    // 180 rows, ids 0..20, nine rows each; keys 7 and 8 hold 18, 150 none.
+    corpus(&data, 2, 3, 30, 20);
+    let kf = dir.path().join("k.parquet");
+    keys(&kf, "id", &[7, 8, 150]);
+    let (d, k) = (path(&data), path(&kf));
+    let srv = server(&data);
+    cli(&["index", d, "--key", "exact:id"], 0);
+
+    // No counting spec: the server refuses with not_indexed and the CLI
+    // exits 4, both naming `exact:id,counts` (the CLI as the `index --key`
+    // to run).
+    let r = srv.call("observe.count", json!({"keys": k}));
+    let refusal = r.envelope.refusal.as_ref().unwrap();
+    assert_eq!(refusal.code.as_str(), "not_indexed", "{refusal:?}");
+    assert_eq!(refusal.fields["needs"], "exact:id,counts", "{refusal:?}");
+    assert!(refusal.next.contains("exact:id,counts"), "{refusal:?}");
+    let out = common::bw()
+        .args(["--clock", CLOCK, "count", d, "--keys", k])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(4));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("--key exact:id,counts"), "{stderr}");
+
+    cli(&["index", d, "--key", "exact:id,counts"], 0);
+    let counted = both(
+        &srv,
+        "observe.count",
+        json!({"keys": k}),
+        &["count", d, "--keys", k],
+        0,
+    );
+    assert_eq!(counted["rows"], 18, "{counted}");
+    assert_eq!(counted["keys"], 3);
+    assert_eq!(counted["counted_by"], "exact:id,counts");
+    assert_eq!(counted["row_groups_total"], 6);
+
+    // The plan carries the same exact rows, and a projection's bytes.
+    let located = both(
+        &srv,
+        "observe.locate",
+        json!({"keys": k, "columns": ["id", "ts"]}),
+        &["locate", d, "--keys", k, "--columns", "id,ts"],
+        0,
+    );
+    assert_eq!(located["rows"], 18, "{located}");
+    let projected = located["projected_bytes"].as_u64().unwrap();
+    let planned = located["planned"]["bytes"].as_u64().unwrap();
+    assert!(
+        projected > 0 && projected < planned,
+        "{projected} {planned}"
+    );
+    // Without a projection: no projected bytes, no per-column bytes.
+    let plain = both(
+        &srv,
+        "observe.locate",
+        json!({"keys": k}),
+        &["locate", d, "--keys", k],
+        0,
+    );
+    assert!(plain.get("projected_bytes").is_none(), "{plain}");
+    assert_eq!(plain["planned"], located["planned"]);
 }

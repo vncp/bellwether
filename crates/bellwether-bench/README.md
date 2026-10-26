@@ -18,6 +18,8 @@ cargo run -p bellwether-bench --release -- <subcommand>
 | `generate` | `<corpus>/data/day=YYYY-MM-DD/part-NNNNN.parquet`, `<corpus>/corpus.json`, `<corpus>/generator-stats.json` |
 | `workload` | `<corpus>/workload/run-NNNN.parquet`, `<corpus>/workload.json` |
 | `ground-truth` | `<corpus>/expected.json` |
+| `text --shape ledger\|market` | `<out>/data/day=YYYY-MM-DD/part-NNNN.parquet` (1–4 KB `body` documents with terms planted at 1% and 0.01% of rows) and `<out>/workload/text-truth.json` (per query, the rows and row groups holding a match); `scripts/text-funnels.py` |
+| `bellwether bench expr --shape ledger\|market --out DIR` | `DIR/data/part-NNNN.parquet` with a JSON attribute column (`attrs` holding an `account` join key, or a vendor `payload` holding `symbol`), `DIR/workload/keys-{rare,medium,wide}.parquet` (and `keys-day.parquet` for `date_trunc(ts,day)` on market), each with one column named by the expression, and `DIR/workload/truth.json`: per query, the row groups and rows holding a key. Rare values live in one row group, medium values in one span of ten, wide values in every row group (the case no index improves). `scripts/expr-funnels.py` measures the `expr` key funnel on both shapes. |
 | `run` | `benches/out/results.json` (or `--out`) |
 | `report` | `benches/out/report.html` (or `--out`) |
 | `--assert-slo` | Exit status. With no subcommand (what CI runs), the tool generates a smoke corpus in `benches/out/slo/`, runs the harness, and asserts in **strict** mode: a skipped core check fails. With `--results PATH` it asserts on that file, leniently. `run --assert-slo` asserts on the results that run just wrote. On any other subcommand it is a usage error. |
@@ -342,3 +344,32 @@ bellwether bench market --out benches/out/market-small --rung small
 **Workload and ground truth.** `generate_market` also writes:
 - `<out>/workload/market.json` and single-column `symbol` key files `<out>/workload/keys/qNNNN.parquet` covering `window` queries (1-hour intraday, 1-day, and 5-day windows across symbol sets of 1, 10, and 50), bitemporal `asof` queries (including `K` before and after restatements and late arrivals), and `latest_known` queries.
 - `<out>/workload/truth.json`: exact ground truth computed directly from the generator's in-memory rows (for `window`: `matching_row_groups`, `matching_rows`, `symbol_row_groups`, `ts_overlap_row_groups`, and `partition_days_touched`; for `asof` and `latest_known`: per-symbol winning `(ts, known_at, price)` and every `(file, row_group)` holding it).
+
+## Reading planned row groups (`bellwether bench read`, WP22)
+
+`bellwether_bench::perf` reads row groups through the harness's byte-counting reader, for the release measurements of [`scripts/perf.sh`](../../scripts/perf.sh):
+
+```sh
+bellwether locate data/ --keys keys.parquet --json > plan.json
+bellwether bench read --plan plan.json --json   # the plan's row groups
+bellwether bench read --all data/ --json        # every row group: the full scan
+```
+
+- **What it reads.** Every column of every named row group (the plan inside a lookup's `--json` output, `evidence.record.body.plan.entries`, or every row group of every `.parquet` file under a folder, skipping directories that start with `.`), files opened and row groups read in parallel on the rayon pool. Rows are decoded but not filtered to the keys.
+- **What it reports** (`read` in the JSON): `files`, `row_groups`, `rows`, `bytes_fetched` and `bytes_consumed` (counted inside the reader, as in `results.json`), `footer_ms` (parsing the footers of the files read), `read_ms`, and `total_ms`.
+- **Refusals.** JSON without a plan is refused, naming the output to pass; one of `--plan` or `--all` is required.
+
+## Sketch funnel (B2): "is this column a key?" over 10⁴ small files
+
+`scripts/sketch-funnels.py --bin <bellwether>` measures, through the CLI only, how many data files and footers a `why` diagnosis reads with and without a `sketch` sidecar, on both bench shapes, each over at least 10⁴ files:
+
+| Shape | Corpus | The question |
+|---|---|---|
+| ledger | `bench generate --files 10000 --days 1 --row-groups-per-file 1 --rows-per-row-group 1000 --entities 1000000 --churn 1 --payload-bytes 16`: 10⁷ rows, one 1,000-row row group per file, so the day's 72 twenty-minute `batch_id` windows each cover about 139,000 rows beside `entity_id` | is `batch_id` a key, or a batch timestamp shared by many rows (`R-sketch-1`, the low-cardinality key)? |
+| time series | `bench market --rung small --files-per-day 1000`: 10 days × 1,000 files | is `(symbol, ts)` unique per file (vendor onboarding)? |
+
+For each it records `reads.files`, `reads.row_groups`, and `reads.footers` of `why` with no index, `why --sketches-only` (run with every data file made unreadable, mode 000, so a single open would fail it; it must report zero of each), and `why` with the sketch present; the row groups the one sketch build read; and every item's approximate distinct count and interval from `sketch cardinality` beside an independent oracle (pyarrow over the decoded files: exact distinct values and the files that repeat a value), with the detection floor under which a file's repeats go unflagged (`duplicate_floor`). Read counts are exact; distinct counts from a sketch are approximate and printed with their interval. No timing is measured. The measured tables, labelled with machine and build, are in the B2 pull request.
+
+## List corpora (`bench lists`, B4)
+
+`bellwether bench lists --shape ledger|market --out DIR` writes a corpus with a list column of skewed element cardinality (`src/lists.rs` documents the model): the ledger shape's `attributes: List<Int64>` on flat files, the market shape's `holdings: List<Utf8>` under one `day=` directory per day. The preset is 40 files (or days) of 4 row groups of 5,000 rows, 200,000 element values with a head of 50 shared by every row group and a long tail clustered by position, 2% null and 3% empty lists. `workload/near-{10,1000,100000}.parquet` are `contains_any` runs whose terms belong to one period (consecutive tail values), `workload/any-{10,1000,100000}.parquet` `contains_any` runs whose terms are drawn uniformly from the whole vocabulary, and `workload/all-2.parquet` a `contains_all` run, each one column named after the list column; `workload/truth.json` gives every matching row group and row count, computed while the rows are generated. `scripts/list-funnels.py --bin target/debug/bellwether` drives the CLI over both shapes (why on the values, `index --key list:<column>`, `locate --any/--all`), asserts invariant 1 against the truth and that `why` predicted what `locate` planned, and prints the funnel labelled with the machine and build. The Parquet-statistics baseline reads every row group for a membership run: a list's statistics are on its nested leaf.

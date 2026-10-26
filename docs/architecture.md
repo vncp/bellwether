@@ -50,6 +50,7 @@ flowchart LR
 | `bellwether-types` | records, traits, format constants; no logic | — |
 | `bellwether-core` | memcomparable keys, segment reader/writer, SBBF blooms, roaring bitmaps, temporal chains, merge | 1, 5 |
 | `bellwether-source` | `Source` for Parquet (real row groups) and CSV/JSON lines (byte-range chunks); fingerprints | — |
+| `bellwether-source-sql` | `Source` over SQL tables (ADR 027): partitions or key ranges as units with an identity, statistics as bounds from one aggregate per unit, ADBC/SQLite/ODBC reads as Arrow, snapshot discipline, measured costs | — |
 | `bellwether-store` | `Store` over `object_store`; conditional PUT per backend; manifest commit protocol; cache | 4 |
 | `bellwether-build` | discover → fingerprint → assign ids → parallel segments → one manifest commit; incremental; compaction | — |
 | `bellwether-profile` | fanout, sortedness, range gaps, lints, candidate composites | 6 |
@@ -119,6 +120,8 @@ flowchart TB
     PROF & REP & VER & BLD --> LED["ledger"]
     PROF & REP & VER & BLD --> CORE["core<br/>encoding · segments · blooms · temporal"]
     PROF & REP & VER & BLD --> SRC["source<br/>Parquet · text · fingerprints · catalog"]
+    FAC --> SQL["source-sql<br/>tables via ADBC · SQLite · ODBC"]
+    SQL --> SRC
     PROF & REP & VER & BLD --> STO["store<br/>object stores · manifest commits · GC"]
     LED & CORE & SRC & STO --> TY["types (the contract)"]
     style TY fill:#f3f0ff,stroke:#6f4bd8,color:#000

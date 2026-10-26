@@ -1,0 +1,45 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 568" width="1000" height="568" role="img" aria-labelledby="title desc">
+<title id="title">bellwether report</title>
+<desc id="desc">bellwether report over the ledger after the fix capture; below it, the receipt's section of the report.html it wrote, drawn from that HTML (funnel bars and table as the report renders them, plus a before/after legend in the table's words); release build of 3a0c26a, 2026-10-26.</desc>
+<rect x="0.5" y="0.5" width="999" height="567" rx="10" fill="#f6f8fa" stroke="#d0d7de"/>
+<path d="M0.5 40V10.5a10 10 0 0 1 10-10H989.5a10 10 0 0 1 10 10V40Z" fill="#eaeef2"/>
+<line x1="0.5" y1="40" x2="999.5" y2="40" stroke="#d0d7de"/>
+<circle cx="22" cy="20.0" r="5.5" fill="#d0d7de"/>
+<circle cx="40" cy="20.0" r="5.5" fill="#d0d7de"/>
+<circle cx="58" cy="20.0" r="5.5" fill="#d0d7de"/>
+<text x="500.0" y="24.5" text-anchor="middle" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" fill="#656d76">bellwether report</text>
+<g font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="13" fill="#1f2328">
+<text x="24.0" y="77" textLength="390.0" lengthAdjust="spacing" xml:space="preserve" style="white-space:pre"><tspan fill="#1a7f37">$ </tspan><tspan fill="#0969da">bellwether report ledger/data --html report.html</tspan></text>
+<text x="24.0" y="95" textLength="725.4" lengthAdjust="spacing" xml:space="preserve" style="white-space:pre">wrote report.html (6,414 bytes): 1 receipt (1 with realized bytes), 1 profile evidence record</text>
+</g>
+<rect x="24" y="108" width="952" height="372.0" rx="8" fill="#ffffff" stroke="#d0d7de"/>
+<text x="44" y="132" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#656d76">report.html</text>
+<line x1="24" y1="142" x2="976" y2="142" stroke="#d0d7de"/>
+<text x="44" y="163" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif" font-size="15" font-weight="600" fill="#1d2330">key exact:entity_id <tspan font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="14">9a8bee8992c8</tspan></text>
+<text x="44" y="189" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" fill="#5b6475">manifest 0 → 1, 2026-10-26T12:51:08.203Z by engine</text>
+<text x="44" y="211" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" fill="#1d2330">Certificate <tspan font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12">17f55f748b7a</tspan>: <tspan fill="#2e7d4f" font-weight="600">pass</tspan>, coverage workload, 935 keys, 0 mismatched, 0 missing left, 0 missing right.</text>
+<text x="44" y="233" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" fill="#5b6475">Replay <tspan font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12">8d75b102abba</tspan> over workload <tspan font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12">3a1921721b73</tspan>, 12 runs.</text>
+<svg x="44" y="246" width="640" height="140" viewBox="0 0 640 140"><text fill="#1d2330" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" x="0" y="26">files</text><rect x="110" y="10" width="440.0" height="12" fill="#b54a3c"><title>before: 111</title></rect><rect x="110" y="24" width="428.1" height="12" fill="#2f6f9f"><title>after: 108</title></rect><text fill="#1d2330" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" x="556" y="26">97.30%</text><text fill="#1d2330" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" x="0" y="66">row groups</text><rect x="110" y="50" width="440.0" height="12" fill="#b54a3c"><title>before: 444</title></rect><rect x="110" y="64" width="428.1" height="12" fill="#2f6f9f"><title>after: 432</title></rect><text fill="#1d2330" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" x="556" y="66">97.30%</text><text fill="#1d2330" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" x="0" y="106">bytes</text><rect x="110" y="90" width="440.0" height="12" fill="#b54a3c"><title>before: 133,956,413</title></rect><rect x="110" y="104" width="428.1" height="12" fill="#2f6f9f"><title>after: 130,336,047</title></rect><text fill="#1d2330" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" x="556" y="106">97.30%</text></svg>
+<rect x="714.0" y="260" width="14" height="10" fill="#b54a3c"/>
+<text x="736.0" y="270" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#1d2330">before</text>
+<rect x="714.0" y="282" width="14" height="10" fill="#2f6f9f"/>
+<text x="736.0" y="292" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#1d2330">after (predicted)</text>
+<text x="44" y="405.0" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" fill="#1d2330" font-weight="600">summed over runs</text>
+<text x="516" y="405.0" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" fill="#1d2330" text-anchor="end" font-weight="600">files</text>
+<text x="676" y="405.0" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" fill="#1d2330" text-anchor="end" font-weight="600">row groups</text>
+<text x="936" y="405.0" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" fill="#1d2330" text-anchor="end" font-weight="600">bytes</text>
+<line x1="44" y1="412.0" x2="956" y2="412.0" stroke="#d9dde5"/>
+<text x="44" y="429.0" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" fill="#1d2330">before</text>
+<text x="516" y="429.0" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" fill="#1d2330" text-anchor="end">111</text>
+<text x="676" y="429.0" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" fill="#1d2330" text-anchor="end">444</text>
+<text x="936" y="429.0" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" fill="#1d2330" text-anchor="end">133,956,413</text>
+<line x1="44" y1="436.0" x2="956" y2="436.0" stroke="#d9dde5"/>
+<text x="44" y="453.0" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" fill="#1d2330">after (predicted)</text>
+<text x="516" y="453.0" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" fill="#1d2330" text-anchor="end">108</text>
+<text x="676" y="453.0" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" fill="#1d2330" text-anchor="end">432</text>
+<text x="936" y="453.0" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" fill="#1d2330" text-anchor="end">130,336,047</text>
+<line x1="44" y1="460.0" x2="956" y2="460.0" stroke="#d9dde5"/>
+<line x1="24" y1="508.0" x2="976" y2="508.0" stroke="#d0d7de"/>
+<text x="24" y="530.0" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" font-style="italic" fill="#656d76">bellwether report over the ledger after the fix capture; below it, the receipt's section of the report.html it wrote, drawn from that HTML (funnel bars</text>
+<text x="24" y="547.0" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" font-style="italic" fill="#656d76">and table as the report renders them, plus a before/after legend in the table's words); release build of 3a0c26a, 2026-10-26.</text>
+</svg>

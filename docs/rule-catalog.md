@@ -8,7 +8,8 @@ request, and a new rule id is never reused for a different pattern.
 Status (2026-10-24): the five statistics rules (`batch_stamp_key`,
 `low_selectivity_single_column`, `declared_but_unused_key`,
 `scattered_time_column`, `no_discriminating_column`) are implemented in
-`bellwether-profile` (WP5), with
+`bellwether-profile` (WP5), and so are the workload rule `R-counts-1`
+(storage version 2) and `R-expr-1` (the `expr` key kind), with
 the detectors and thresholds stated in their entries below. Two decisions
 are defined once in `bellwether_source::stats` and called by both the
 profiler and the benchmark's ground truth: `overlap_depth` decides
@@ -22,6 +23,10 @@ and the two agree by construction; without such a workload the profiler
 may judge against another partner. The three plan
 rules describe intended behavior until an `EvidenceBody` carries a consumer
 plan.
+
+`R-list-1` (2026-10-26, list keys) reads the recorded workload's
+membership runs rather than footer statistics; `why` raises it into the
+same `profile` Evidence.
 
 ## How to read an entry
 
@@ -259,6 +264,40 @@ of 22 row groups, and no rule said so (defect 8 of
 - **Confidence rubric**: high when every fanout it rests on is exact; low
   when any is sampled.
 
+### R-text-1
+
+- **id**: `R-text-1` (B5)
+- **Detector**: the workload `why` replays records text runs (`contains`,
+  `like '%x%'`, `has`, prefix match: query kinds `contains`, `has_token`,
+  `has_prefix`) on a string column, and for at least one of the matches the
+  runs ask, no text key complete at the current manifest serves it on that
+  column (`bellwether_profile::lints::text_lookups`). An exact key on the
+  column does not count: it looks whole values up. A words key serves
+  `has_token` and `has_prefix`; a trigram key serves all three. Fires once
+  per column; silent without text runs or when every match has a serving
+  text key. The message names only the keys for the unserved matches: a
+  trigram key for `contains`, a words key for `has_token` and `has_prefix`.
+- **Estimator**: `why` replays the same runs under each candidate text key
+  (`text:<column>,tokenizer=words` when some run asks for words or
+  prefixes, `text:<column>,tokenizer=trigram` always) from transient
+  segments, exact sums of row-group statistics like every replay, and shows
+  each key's distinct tokens in its `text` column: for a trigram key, how
+  many row groups the median trigram is in (a substring prunes only by its
+  rarer trigrams); "high entropy" when the key holds at least one distinct
+  token per two rows (its dictionary is about as large as the column); and
+  when the replay shows it reads no fewer bytes on the runs.
+- **Guidance template**: file `<consumer>`, step `<filter on the string
+  column>`. Before: `scan every row group, then filter contains(<column>,
+  <text>)`. After: `plan through text:<column>,tokenizer=trigram, then
+  apply the residual`. Invariant: `the rows the filter keeps are unchanged`
+  (a trigram plan is a candidate set; the residual is mandatory).
+- **Verification method**: reconcile over the rows the recorded text runs
+  ask for (the workload's text residual chooses the rows on both sides).
+- **Confidence rubric**: high (0.9): the runs are recorded and the specs are
+  the manifest's; nothing is sampled.
+- **Lives in**: the `profile` Evidence `why` writes, which then cites the
+  workload.
+
 ### unprefiltered_window
 
 - **id**: `unprefiltered_window`
@@ -315,5 +354,214 @@ of 22 row groups, and no rule said so (defect 8 of
   plan. Low when the step is opaque code.
 
 Note: `RowGroupMeta.bytes` is a single total per row group. The estimator
-for this rule needs per-column chunk sizes, which `ColumnStats` does not
-carry today.
+for this rule needs per-column chunk sizes: storage version 2 records them
+in the manifest (`column_bytes`, `docs/format.md`), and `locate --columns`
+prices a projection from them; no detector reads them yet.
+
+### R-counts-1
+
+- **id**: `R-counts-1` (count before scan; `bellwether_profile::lints`,
+  `COUNT_BEFORE_SCAN`).
+- **Detector**: a recorded bench workload holds a run with `query: "count"`
+  that a later run over the same keys follows (the same run hash, so the
+  same key set on the same key column), and no declared spec counts the
+  workload's key columns. A spec counts them when it stores counts and its
+  key is exactly those columns in any order, exact or temporal
+  (`exact:a,b,counts`, `exact:b,a,counts`, `temporal:a@ts,counts` for a
+  workload on `a`): the specs the planner answers a count with. The pattern
+  is the count pass that gates a query: count the rows of a key set,
+  decide, then read them. Without a recorded workload it is not raised.
+- **Estimator**: exact, from the workload. Without a counting spec a count
+  run costs what the `locate` of the same keys costs (replay prices a
+  `count` run that way); with one it reads no data file
+  (`RunCost.bytes == 0`, rows exact). The lint reports the number of count
+  passes (`WorkloadSummary.counts_before_scan`); the bytes saved come from
+  replaying the workload under the counting spec: `why` adds
+  `exact:<cols>,counts` to its candidates for the columns of every count
+  run that no current spec counts, prices it, and recommends it when it
+  reads fewer bytes (`why --from`).
+- **Guidance template**: file `bellwether.toml`, step `key_specs`. Before:
+  `exact:<cols>` or nothing. After: `exact:<cols>,counts`. Invariant: `every
+  count equals the rows a locate of the same keys reads that hold the key`.
+- **Verification method**: static algebraic identity: a count from the
+  index is the sum of the per-row-group counts the build wrote from the
+  same rows (`docs/format.md`, the counts oracle test); no output of the
+  gated query changes.
+- **Confidence rubric**: high: both inputs are exact (verified run hashes,
+  declared specs).
+
+### R-sketch-1
+
+- **id**: `R-sketch-1` (the low-cardinality-key lint, read from sketches;
+  `bellwether_profile::lints::low_cardinality_key`).
+- **Detector**: from a complete `sketch` sidecar, no data file read: a
+  sketched column `B` whose values each cover at least 100,000 rows on
+  average (sketched rows over approximate distinct values), beside an
+  id-like sketched column `K` of the same sketch (integer, string, or
+  binary) with at least ten times `B`'s distinct values, present in at least
+  90 % of the files `B` is present in. `B` behaves like a batch timestamp
+  shared by many rows; `K` is the real id. When several columns qualify as
+  `K`, the one with the most distinct values is named. Runs in every `why`
+  over an index with a complete sketch, and is the diagnosis of `why
+  --sketches-only`.
+- **Estimator**: approximate: rows per value of `B` (rows over its
+  HyperLogLog estimate, or over the exact count where a complete
+  `exact:B` key spec holds it) and `K`'s distinct count. No byte figure: a
+  sketch prices nothing; bytes come from replaying a recorded workload under
+  the composite (`why --from`).
+- **Guidance template**: file `<consumer>`, step `<lookup or join on B>`.
+  Before: `key on <B>`. After: `key on (<K>, <B>)`. Invariant: `the rows
+  selected per (<K>, <B>) are the rows selected per <B> restricted to the
+  keys the run supplies`.
+- **Verification method**: reconcile over touched keys (after `why --from`
+  prices the composite and `fix` builds it).
+- **Confidence rubric**: medium (the counts are approximate); high when
+  both distinct counts are exact. It never reaches a plan; it recommends a
+  key that the planner then prices exactly.
+
+### R-expr-1
+
+- **id**: `R-expr-1`
+- **Detector**: lookups supply a function of a dataset column: a recorded
+  workload's run, or a key file's column, is named by an expression over
+  dataset columns (`bellwether_core::expr`, for example
+  `json_get(payload,'$.symbol')` or `date_trunc(ts,day)`), and no declared
+  `expr` key is over that expression after normalization. Implemented in
+  `bellwether-profile` (`lints::EXPR_RULE`). Plain columns never fire it,
+  and neither does an expression a declared `expr` key serves, however it is
+  spelled.
+- **Estimator**: not a fanout rule, since no column holds the derived
+  values. Bytes come from exact replay: `bellwether why --from <keys>`
+  prices the `expr` key on the expression from a transient derived column
+  per row group, and its `expr` column states the rows whose expression is
+  null and the distinct derived values.
+- **Guidance template**: Before: `filter json_get(payload,'$.symbol') in
+  keys` over every row group, recomputing the expression per row. After:
+  `bellwether index --key "expr:<name>=<expression>:exact"`, then `locate`
+  with a key file whose column is named by the same expression; the
+  residual `ExprIn` recomputes it per row. Invariant: `a row group holding a
+  row whose expression equals a key is planned` (invariant 1). The lint
+  names the suggested key spec and, when other `expr` keys are declared,
+  says that a lookup matches one only when its expression normalizes to the
+  key's.
+- **Verification method**: reconcile over touched keys. `fix` certifies the
+  key with workload coverage over the expression's values.
+- **Confidence rubric**: high: the runs state the predicate; nothing is
+  inferred.
+
+## Twin lints
+
+Four lints fire from the `why` report of a lake twin (`why --twin-of`, ADR
+033), from the twin pass's exact counts over the key sample. Each names a
+rewrite pattern for the query the agent rewrites in the engine. They are
+advice: they change no plan, write no Proposal, and choose no key; they are
+recorded in the profile Evidence's `lints` and the report's `twin.lints`.
+They use no engine's vocabulary: the agent writes the engine's language.
+
+Confidence: high (0.9) when the twin holds the engine's row count at the
+time of the diagnosis (`TwinOf.engine_rows == lake_rows`), medium (0.6)
+otherwise. Every count is exact for the lake; the engine stores its tables
+differently, which is why `fix` measures the rewrite in the engine.
+
+Thresholds are constants of the facade (`bellwether::LOW_CARDINALITY_ROWS`,
+`CARDINALITY_RATIO`, `NARROW_PERCENT`, `SELECTIVE_FILES_PERCENT`,
+`MEMBERSHIP_GATE`), stated here.
+
+### low_cardinality_key
+
+- **id**: `low_cardinality_key`
+- **Detector**: a single key column of the sample whose values each cover
+  more than 10⁵ rows of the twin (median rows per sampled value), while
+  another key column of the sample covers at least 100 times fewer rows per
+  value (a high-cardinality partner): for example a batch or load
+  timestamp shared by many rows beside an id.
+- **Estimator**: the twin's rows per key value for both columns, exact.
+- **Guidance template**: key the lookup by the composite (partner, column)
+  instead of the column alone. Before: `filter or join by <column>`. After:
+  `filter or join by (<partner>, <column>)`. Invariant: `the rows selected
+  are those whose (partner, column) is in the sample`.
+- **Verification method**: reconcile over the exported results (`fix` on
+  the rewrite).
+- **Confidence rubric**: as above.
+
+### unbounded_membership
+
+- **id**: `unbounded_membership`
+- **Detector**: the sample's distinct keys exceed the gate named `in`
+  (`--gate in:<n>`), the size of a membership list the engine accepts.
+- **Estimator**: the keyset size, exact.
+- **Guidance template**: count the keys first and branch: a membership list
+  under the gate, a join above it. Invariant: `both branches select the
+  same rows`.
+- **Verification method**: reconcile over the exported results.
+- **Confidence rubric**: as above.
+
+### wide_before_narrow
+
+- **id**: `wide_before_narrow`
+- **Detector**: the sampled keys select at most 10% of the twin's rows and
+  the key columns hold at most 10% of its bytes (footer column-chunk
+  bytes; the lint does not fire when a footer lacks them): a dedup or
+  filter over every column reads about bytes/key-bytes times what the key
+  columns need. (The plan rule `wide_projection_before_filter` above reads
+  the consumer's plan; this lint reads only the data's shape.)
+- **Estimator**: the key columns' share of the twin's bytes, exact.
+- **Guidance template**: project the key columns first, select, then join
+  the wide columns back. Invariant: `projection commutes with a selection
+  on the projected columns`.
+- **Verification method**: reconcile over the exported results.
+- **Confidence rubric**: as above.
+
+### dedup_before_filter
+
+- **id**: `dedup_before_filter`
+- **Detector**: the lookup asks for the latest row per key (`--latest-by`,
+  a latest or asof workload) and the sampled keys are in under 1% of the
+  twin's files.
+- **Estimator**: files holding a sampled key over all files, exact.
+- **Guidance template**: filter by the keys first, then take the latest per
+  key. Invariant: `the newest version per sampled key is unchanged`.
+- **Verification method**: reconcile over the exported results, with
+  `--latest-by`.
+- **Confidence rubric**: as above.
+
+### Kill criterion
+
+If after five receipts across two engines none of the four lints fired on a
+case where the agent found the rewrite anyway, the lints are wrong-shaped:
+fix or remove them before adding more. The receipts' twin Evidence records
+which lints fired (`bellwether ledger scorecard` counts them per rule id), so
+the count is read from the ledger, not remembered.
+
+### R-list-1
+
+Added 2026-10-26 with list keys (B4), the detector that recommends the
+kind (`docs/adding-an-index-kind.md`: no kind without its detector).
+
+- **id**: `R-list-1`
+- **Detector**: from the recorded workload. Some run asks for list
+  membership on a column (`contains_any`: `array_contains`, `has_any`,
+  `exists(unnest)`; `contains_all`: `has_all`), recorded by `why --from
+  <values.parquet> --mode contains-any|contains-all` or found in a recorded
+  workload, and no key spec complete at the current manifest is
+  `list:<column>`. One lint per such column
+  (`bellwether_profile::lints::list_membership`, raised by `why` into the
+  same `profile` Evidence, which then cites the key set or workload it was
+  read from).
+- **Estimator**: every such run reads every live row group today: Parquet
+  keeps a list's statistics on its nested elements, which the catalog
+  reports as unknown and readers do not prune by membership, so both
+  baselines read everything (`bellwether_replay::BaselinePlanner::plan_membership`).
+  Bytes: `why --mode contains-any|contains-all` replays the runs under the
+  transient `list:<column>` and reports the exact row groups and bytes, and
+  the column's distinct elements in the `list` column.
+- **Guidance template**: file `bellwether.toml` (or `bellwether index`),
+  step `key_specs`. Before: no list key on `<column>`. After:
+  `list:<column>`. Invariant: `every row group holding a row whose list
+  holds a queried value is still selected` (invariant 1).
+- **Verification method**: reconcile of the rows the runs ask for (the
+  membership residual over the workload's own values), keyed by every
+  hashable column, with the plan's row groups on one side and every live
+  row group on the other (`fix`, workload-rows coverage).
+- **Confidence rubric**: high: the runs are recorded and the specs are the
+  manifest's; nothing is sampled. Advice only: it changes no plan.

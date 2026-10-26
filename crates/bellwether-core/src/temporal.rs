@@ -240,8 +240,8 @@ fn same_spec<R: ReadAt>(segments: &[SegmentReader<R>]) -> Result<()> {
         if h.key_spec != h0.key_spec {
             return Err(Error::KeySpec(format!(
                 "segments of different key specs: {} and {}",
-                h0.key_spec.name(),
-                h.key_spec.name()
+                h0.key_spec.identity(),
+                h.key_spec.identity()
             )));
         }
         if h.key_types != h0.key_types || h.ts_type != h0.ts_type {

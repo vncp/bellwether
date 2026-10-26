@@ -6,6 +6,25 @@
 //! | `Bloom { columns: [a], fpr: 0.01 }` | `bloom:a@0.01` |
 //! | `Range { column: ts }` | `range:ts` |
 //! | `Temporal { columns: [id], ts_column: ts }` | `temporal:id@ts` |
+//! | `Exact { columns: [a, b], counts: true }` | `exact:a,b,counts` |
+//! | `Temporal { columns: [id], ts_column: ts, counts: true }` | `temporal:id@ts,counts` |
+//! | `Expr { name: sym, expr: json_get(payload,'$.symbol'), over: Exact }` | `expr:sym=json_get(payload,'$.symbol'):exact` |
+//! | `Expr { .., over: Exact { counts: true } }` | `expr:sym=json_get(payload,'$.symbol'):exact,counts` |
+//! | `Expr { .., over: Bloom { fpr: 0.01 } }` | `expr:sym=json_get(payload,'$.symbol'):bloom@0.01` |
+//! | `List { column: tags }` | `list:tags` |
+//!
+//! A trailing `,counts` asks the spec to store, per key and per row group,
+//! the number of rows (storage version 2, ADR 028); it is the last element
+//! after the columns (exact) or the timestamp column (temporal). A spec of
+//! one column named `counts` is `exact:counts`; with counts,
+//! `exact:counts,counts`.
+//! | `Text { column: body, tokenizer: words, bloom: None }` | `text:body,tokenizer=words` |
+//! | `Text { column: body, tokenizer: trigram, bloom: Some(0.01) }` | `text:body,tokenizer=trigram,bloom=0.01` |
+//!
+//! An `expr` key's expression is in the closed language of
+//! `bellwether_core::expr`; it is stored normalized, so `label` gives the
+//! normalized spelling, and the kind after the last `:` outside quotes is
+//! `exact`, `exact,counts`, or `bloom@<fpr>`.
 //!
 //! A spec may also be given as its JSON form (`{"kind":"exact",...}`).
 //! [`label`] and [`parse`] are inverses. Specs are validated by core's
@@ -17,10 +36,15 @@
 //! (`bounds:a@ts`); `temporal2:id@valid,known` declares a bitemporal
 //! sidecar alone. A key spec itself never carries the bound, so `parse`
 //! refuses `exact:a@ts` and names `index --key`.
+//!
+//! `index --key` also takes `sketch:a,b,a+b[,p=12][,minhash=64]`
+//! ([`parse_sketch`]): an approximate per-file distinct-count sketch
+//! (`bellwether_types::SketchSpec`) that no planner reads. It is not a key
+//! spec, so `parse` refuses it and names `index --key`.
 
 use bellwether_core::segment::validate_spec;
 use bellwether_core::sidecar::{SidecarDef, SidecarKind};
-use bellwether_types::{Error, KeySpec, Result};
+use bellwether_types::{Error, KeySpec, Result, SketchSpec, Tokenizer, SKETCH_DEFAULT_PRECISION};
 
 /// Parses the short form or the JSON form.
 pub fn parse(s: &str) -> Result<KeySpec> {
@@ -29,9 +53,12 @@ pub fn parse(s: &str) -> Result<KeySpec> {
         serde_json::from_str::<KeySpec>(s).map_err(|e| {
             Error::KeySpec(format!(
                 "{s:?} is not a key spec ({e}); write it as exact:col, temporal:col@ts, \
-                 bloom:col@0.01, range:col, or its JSON form"
+                 bloom:col@0.01, range:col, text:col,tokenizer=words, expr:name=<expression>:exact, or
+                 its JSON form"
             ))
         })?
+    } else if let Some(rest) = s.strip_prefix("expr:") {
+        parse_expr(s, rest)?
     } else {
         parse_short(s)?
     };
@@ -58,8 +85,57 @@ pub fn check(spec: &KeySpec) -> Result<()> {
 fn bad(s: &str, why: &str) -> Error {
     Error::KeySpec(format!(
         "{s:?} is not a key spec ({why}); write it as exact:a,b, temporal:a@ts, bloom:a@0.01, \
-         or range:ts"
+         range:ts, text:body,tokenizer=words (or tokenizer=trigram), expr:name=<expression>:exact, or list:tags"
     ))
+}
+
+/// `expr:<name>=<expression>:<kind>`, the kind after the last `:` that is
+/// outside quotes (an expression's strings and quoted columns may hold
+/// `:`), `exact` or `bloom@<fpr>`.
+fn parse_expr(s: &str, rest: &str) -> Result<KeySpec> {
+    let bad_expr = |why: &str| {
+        Error::KeySpec(format!(
+            "{s:?} is not an expr key ({why}); write it as \
+             expr:<name>=<expression>:exact or expr:<name>=<expression>:bloom@0.01, for \
+             example expr:sym=json_get(payload,'$.symbol'):exact"
+        ))
+    };
+    let (name, tail) = rest
+        .split_once('=')
+        .ok_or_else(|| bad_expr("no '=' after the name"))?;
+    let mut quote: Option<char> = None;
+    let mut split = None;
+    for (i, c) in tail.char_indices() {
+        match (quote, c) {
+            (None, '\'' | '"') => quote = Some(c),
+            (Some(q), c) if c == q => quote = None,
+            (None, ':') => split = Some(i),
+            _ => {}
+        }
+    }
+    let i = split.ok_or_else(|| bad_expr("no ':<kind>' after the expression"))?;
+    let (text, kind) = (tail[..i].trim(), tail[i + 1..].trim());
+    let over = match kind.split_once('@') {
+        None if kind == "exact" => bellwether_core::expr::Over::Exact,
+        None if kind.replace(' ', "") == "exact,counts" => bellwether_core::expr::Over::Counts,
+        Some(("bloom", fpr)) => bellwether_core::expr::Over::Bloom(
+            fpr.trim()
+                .parse()
+                .map_err(|_| bad_expr("the false-positive rate after '@' is not a number"))?,
+        ),
+        None if kind == "bloom" => {
+            return Err(bad_expr(
+                "a bloom expr key needs a false-positive rate, :bloom@0.01",
+            ))
+        }
+        _ => {
+            return Err(bad_expr(&format!(
+                "the kind after the expression is exact, exact,counts, or bloom@<fpr>, not \
+                 {kind:?}"
+            )))
+        }
+    };
+    bellwether_core::expr::spec(name.trim(), text, over)
 }
 
 fn columns(s: &str, list: &str) -> Result<Vec<String>> {
@@ -68,6 +144,16 @@ fn columns(s: &str, list: &str) -> Result<Vec<String>> {
         return Err(bad(s, "a column name is empty"));
     }
     Ok(cols)
+}
+
+/// `list` without a trailing `,counts` element, and whether it had one.
+/// The element counts only after at least one other: `counts` alone is a
+/// column name.
+fn strip_counts(list: &str) -> (&str, bool) {
+    match list.trim_end().rsplit_once(',') {
+        Some((head, "counts")) if !head.trim().is_empty() => (head, true),
+        _ => (list, false),
+    }
 }
 
 fn parse_short(s: &str) -> Result<KeySpec> {
@@ -79,9 +165,14 @@ fn parse_short(s: &str) -> Result<KeySpec> {
         None => (rest, None),
     };
     match (kind.trim(), extra) {
-        ("exact", None) => Ok(KeySpec::Exact {
-            columns: columns(s, cols)?,
-        }),
+        ("exact", None) => {
+            let (cols, counts) = strip_counts(cols);
+            Ok(KeySpec::Exact {
+                columns: columns(s, cols)?,
+                counts,
+                bounds: None,
+            })
+        }
         ("bloom", Some(fpr)) => {
             let fpr: f64 = fpr
                 .parse()
@@ -89,6 +180,7 @@ fn parse_short(s: &str) -> Result<KeySpec> {
             Ok(KeySpec::Bloom {
                 columns: columns(s, cols)?,
                 fpr,
+                bounds: None,
             })
         }
         ("bloom", None) => Err(bad(
@@ -104,10 +196,21 @@ fn parse_short(s: &str) -> Result<KeySpec> {
                 _ => Err(bad(s, "a range spec has exactly one column")),
             }
         }
-        ("temporal", Some(ts)) if !ts.is_empty() => Ok(KeySpec::Temporal {
-            columns: columns(s, cols)?,
-            ts_column: ts.to_string(),
-        }),
+        ("temporal", Some(ts)) if !ts.is_empty() => {
+            let (ts, counts) = strip_counts(ts);
+            match columns(s, ts)?.as_slice() {
+                [one] => Ok(KeySpec::Temporal {
+                    columns: columns(s, cols)?,
+                    ts_column: one.clone(),
+                    counts,
+                }),
+                _ => Err(bad(
+                    s,
+                    "a temporal spec has one timestamp column, then optionally counts: \
+                     temporal:id@ts or temporal:id@ts,counts",
+                )),
+            }
+        }
         ("temporal", _) => Err(bad(
             s,
             "a temporal spec needs a timestamp column, temporal:id@ts",
@@ -118,21 +221,91 @@ fn parse_short(s: &str) -> Result<KeySpec> {
              accepts; a key spec itself has no '@'",
         )),
         ("range", Some(_)) => Err(bad(s, "a range spec takes no '@'")),
+        ("list", None) => match columns(s, cols)?.as_slice() {
+            [one] => Ok(KeySpec::List {
+                column: one.clone(),
+            }),
+            _ => Err(bad(
+                s,
+                "a list key indexes the elements of exactly one list column, list:tags",
+            )),
+        },
+        ("list", Some(_)) => Err(bad(s, "a list key takes no '@'; write list:<column>")),
+        ("sketch", _) => Err(bad(
+            s,
+            "a sketch is an approximate distinct-count sidecar, not a key spec; declare it with \
+             `index --key`",
+        )),
+        ("text", None) => parse_text(s, cols),
+        ("text", Some(_)) => Err(bad(s, "a text key takes no '@'")),
         (other, _) => Err(bad(s, &format!("unknown kind {other:?}"))),
     }
 }
 
-/// The short form of `spec`; [`parse`] reads it back to an equal spec.
-#[must_use]
-pub fn label(spec: &KeySpec) -> String {
-    match spec {
-        KeySpec::Exact { columns } => format!("exact:{}", columns.join(",")),
-        KeySpec::Bloom { columns, fpr } => format!("bloom:{}@{fpr}", columns.join(",")),
-        KeySpec::Range { column } => format!("range:{column}"),
-        KeySpec::Temporal { columns, ts_column } => {
-            format!("temporal:{}@{ts_column}", columns.join(","))
+/// `text:<column>,tokenizer=words|trigram[,bloom=<fpr>]`: the column, then
+/// each parameter once, in any order.
+fn parse_text(s: &str, rest: &str) -> Result<KeySpec> {
+    let mut parts = rest.split(',').map(str::trim);
+    let column = parts.next().unwrap_or_default();
+    if column.is_empty() || column.contains('=') {
+        return Err(bad(
+            s,
+            "a text key names its column first, text:body,tokenizer=words",
+        ));
+    }
+    let (mut tokenizer, mut bloom) = (None, None);
+    for p in parts {
+        match p.split_once('=') {
+            Some(("tokenizer", t)) if tokenizer.is_none() => {
+                tokenizer = Some(match t.trim() {
+                    "words" => Tokenizer::Words,
+                    "trigram" => Tokenizer::Trigram,
+                    other => {
+                        let why = format!("unknown tokenizer {other:?}; use words or trigram");
+                        return Err(bad(s, &why));
+                    }
+                });
+            }
+            Some(("bloom", f)) if bloom.is_none() => {
+                bloom = Some(f.trim().parse::<f64>().map_err(|_| {
+                    bad(
+                        s,
+                        "the bloom false-positive rate is not a number, bloom=0.01",
+                    )
+                })?);
+            }
+            Some(("tokenizer" | "bloom", _)) => {
+                return Err(bad(s, &format!("{p:?} is given twice")));
+            }
+            _ => {
+                return Err(bad(
+                    s,
+                    &format!(
+                        "{p:?} is not a text key parameter; a text key takes tokenizer= and bloom="
+                    ),
+                ))
+            }
         }
     }
+    let tokenizer = tokenizer.ok_or_else(|| {
+        bad(
+            s,
+            "a text key names its tokenizer, text:body,tokenizer=words (word tokens: has_token, \
+             has_prefix) or text:body,tokenizer=trigram (substrings: contains)",
+        )
+    })?;
+    Ok(KeySpec::Text {
+        column: column.to_string(),
+        tokenizer,
+        bloom,
+    })
+}
+
+/// The short form of `spec`: its identity ([`KeySpec::identity`],
+/// `docs/format.md`), which [`parse`] reads back to an equal spec.
+#[must_use]
+pub fn label(spec: &KeySpec) -> String {
+    spec.identity()
 }
 
 /// What one `index --key` argument declares: a key spec, a sidecar that
@@ -145,6 +318,9 @@ pub struct Declaration {
     pub key: Option<KeySpec>,
     /// The sidecar, if the argument declares one.
     pub sidecar: Option<SidecarDef>,
+    /// The sketch, if the argument declares one (`sketch:...`); never with a
+    /// key or a sidecar.
+    pub sketch: Option<SketchSpec>,
 }
 
 /// Parses one `index --key` argument (see [`Declaration`]): everything
@@ -175,12 +351,27 @@ pub fn parse_declaration(s: &str) -> Result<Declaration> {
         return Ok(Declaration {
             key: None,
             sidecar: Some(sidecar(SidecarKind::Bitemporal, cols, times)?),
+            sketch: None,
+        });
+    }
+    if t.starts_with("sketch:") {
+        return Ok(Declaration {
+            key: None,
+            sidecar: None,
+            sketch: Some(parse_sketch(t)?),
         });
     }
     let bounded = match t.split_once(':') {
-        Some(("exact", rest)) => rest
-            .split_once('@')
-            .map(|(cols, ts)| (format!("exact:{cols}"), cols.to_string(), ts.to_string())),
+        // exact:a@ts,counts: the counts option belongs to the key spec.
+        Some(("exact", rest)) => rest.split_once('@').map(|(cols, ts)| {
+            let (ts, counts) = strip_counts(ts);
+            let key = if counts {
+                format!("exact:{cols},counts")
+            } else {
+                format!("exact:{cols}")
+            };
+            (key, cols.to_string(), ts.to_string())
+        }),
         Some(("bloom", rest)) => {
             let parts: Vec<&str> = rest.split('@').collect();
             match parts.as_slice() {
@@ -201,11 +392,13 @@ pub fn parse_declaration(s: &str) -> Result<Declaration> {
             Ok(Declaration {
                 key: Some(key),
                 sidecar: Some(def),
+                sketch: None,
             })
         }
         None => Ok(Declaration {
             key: Some(parse(t)?),
             sidecar: None,
+            sketch: None,
         }),
     }
 }
@@ -215,6 +408,100 @@ pub fn parse_declaration(s: &str) -> Result<Declaration> {
 #[must_use]
 pub fn sidecar_label(def: &SidecarDef) -> String {
     def.name()
+}
+
+/// The `index --key` argument that declares `declared`;
+/// [`parse_declaration`] reads it back to an equal declaration.
+#[must_use]
+pub fn declaration_label(declared: &Declaration) -> String {
+    if let Some(sketch) = &declared.sketch {
+        return sketch.label();
+    }
+    match (&declared.key, &declared.sidecar) {
+        (Some(key), Some(def)) if def.kind == SidecarKind::Bounds => {
+            // exact:a@ts,counts: the counts option follows the time column.
+            let mut bare = key.clone();
+            if let KeySpec::Exact { counts, .. } = &mut bare {
+                *counts = false;
+            }
+            let counts = if key.counts() { ",counts" } else { "" };
+            format!("{}@{}{counts}", label(&bare), def.time_columns.join(","))
+        }
+        (_, Some(def)) => def.name(),
+        (Some(key), None) => label(key),
+        (None, None) => String::new(),
+    }
+}
+
+/// Parses `sketch:<item>[,<item>...][,p=<precision>][,minhash=<k>]`: each
+/// item is a column or a `+`-joined tuple of columns; `p` defaults to
+/// [`SKETCH_DEFAULT_PRECISION`]; without `minhash` no signature is kept.
+/// [`SketchSpec::label`] is its inverse.
+pub fn parse_sketch(s: &str) -> Result<SketchSpec> {
+    let t = s.trim();
+    let bad = |why: &str| {
+        Error::KeySpec(format!(
+            "{t:?} is not a sketch ({why}); write it as sketch:a,b,a+b with optional ,p=14 and \
+             ,minhash=64"
+        ))
+    };
+    let rest = t
+        .strip_prefix("sketch:")
+        .ok_or_else(|| bad("it does not start with sketch:"))?;
+    let mut items = Vec::new();
+    let mut precision = None;
+    let mut minhash = None;
+    for part in rest.split(',').map(str::trim) {
+        if let Some((k, v)) = part.split_once('=') {
+            let dup = match k.trim() {
+                "p" => precision
+                    .replace(
+                        v.trim()
+                            .parse::<u8>()
+                            .map_err(|_| bad("p is not an integer"))?,
+                    )
+                    .is_some(),
+                "minhash" => minhash
+                    .replace(
+                        v.trim()
+                            .parse::<u16>()
+                            .map_err(|_| bad("minhash is not an integer"))?,
+                    )
+                    .is_some(),
+                other => return Err(bad(&format!("unknown parameter {other:?}"))),
+            };
+            if dup {
+                return Err(bad("a parameter is given twice"));
+            }
+            continue;
+        }
+        if precision.is_some() || minhash.is_some() {
+            return Err(bad("parameters come after every item"));
+        }
+        if part.is_empty() {
+            return Err(bad("an item is empty"));
+        }
+        items.push(
+            part.split('+')
+                .map(|c| c.trim().to_string())
+                .collect::<Vec<_>>(),
+        );
+    }
+    let spec = SketchSpec {
+        items,
+        precision: precision.unwrap_or(SKETCH_DEFAULT_PRECISION),
+        minhash,
+    };
+    bellwether_core::sketch::validate(&spec)?;
+    Ok(spec)
+}
+
+/// `s` as one POSIX shell word, for a command a message names: unchanged
+/// when every character is one a shell never interprets, else in single
+/// quotes, each `'` written `'\''`.
+#[must_use]
+pub fn shell_quote(s: &str) -> String {
+    bellwether_core::expr::shell_quote(s)
 }
 
 fn message(e: &Error) -> String {
@@ -238,6 +525,15 @@ mod tests {
             "range:ts",
             "temporal:id@ts",
             "temporal:id,v@ts",
+            "exact:a,counts",
+            "exact:a,b,counts",
+            "exact:counts",
+            "exact:counts,counts",
+            "temporal:id@ts,counts",
+            "temporal:id@counts",
+            "text:body,tokenizer=words",
+            "text:body,tokenizer=trigram",
+            "text:body,tokenizer=trigram,bloom=0.01",
         ] {
             let spec = parse(s).unwrap();
             assert_eq!(label(&spec), s);
@@ -245,6 +541,27 @@ mod tests {
         }
         let json = r#"{"kind":"exact","columns":["order_id"]}"#;
         assert_eq!(label(&parse(json).unwrap()), "exact:order_id");
+        assert_eq!(
+            parse("exact:a,b,counts").unwrap(),
+            KeySpec::Exact {
+                columns: vec!["a".into(), "b".into()],
+                counts: true,
+                bounds: None,
+            }
+        );
+        assert_eq!(
+            parse("temporal:id@ts,counts").unwrap(),
+            KeySpec::Temporal {
+                columns: vec!["id".into()],
+                ts_column: "ts".into(),
+                counts: true,
+            }
+        );
+        assert!(parse("temporal:id@ts,known").is_err());
+        let d = parse_declaration("exact:a@ts,counts").unwrap();
+        assert_eq!(d.key.as_ref().map(KeySpec::counts), Some(true));
+        assert_eq!(declaration_label(&d), "exact:a@ts,counts");
+        assert_eq!(parse_declaration(&declaration_label(&d)).unwrap(), d);
     }
 
     #[test]
@@ -264,6 +581,14 @@ mod tests {
             "hash:a",
             "exact:a,a",
             "{\"kind\":\"zorder\"}",
+            "text:body",
+            "text:body,tokenizer=ngram",
+            "text:body,tokenizer=words,tokenizer=trigram",
+            "text:,tokenizer=words",
+            "text:a,b,tokenizer=words",
+            "text:body,tokenizer=words,bloom=2",
+            "text:body,tokenizer=words,bloom=x",
+            "text:body@ts,tokenizer=words",
         ] {
             assert!(parse(s).is_err(), "{s}");
         }
@@ -306,5 +631,71 @@ mod tests {
         }
         // A key spec alone never carries the bound.
         assert!(parse("exact:symbol@ts").is_err());
+    }
+
+    #[test]
+    fn declaration_labels_read_back_to_equal_declarations() {
+        for s in [
+            "exact:symbol@ts",
+            "bloom:a,b@0.01@ts",
+            "temporal2:id@valid,known",
+            "temporal:id@ts",
+            "exact:a,b",
+            "range:ts",
+            "sketch:id",
+            "sketch:batch,id,symbol+ts,p=12,minhash=64",
+            "sketch:a,minhash=8",
+        ] {
+            let d = parse_declaration(s).unwrap();
+            assert_eq!(declaration_label(&d), s);
+            assert_eq!(parse_declaration(&declaration_label(&d)).unwrap(), d);
+        }
+    }
+
+    #[test]
+    fn sketches_parse_and_malformed_ones_name_the_problem() {
+        let d = parse_declaration("sketch:batch, id ,symbol+ts,p=12,minhash=64").unwrap();
+        assert_eq!((d.key, d.sidecar), (None, None));
+        let s = d.sketch.unwrap();
+        assert_eq!(
+            s.items,
+            vec![
+                vec!["batch".to_string()],
+                vec!["id".to_string()],
+                vec!["symbol".to_string(), "ts".to_string()]
+            ]
+        );
+        assert_eq!((s.precision, s.minhash), (12, Some(64)));
+        assert_eq!(s.name(), "sketch:batch,id,symbol+ts");
+        let d = parse_declaration("sketch:id").unwrap().sketch.unwrap();
+        assert_eq!((d.precision, d.minhash), (14, None));
+        for (bad, why) in [
+            ("sketch:", "empty"),
+            ("sketch:a,,b", "empty"),
+            ("sketch:a,p=x", "integer"),
+            ("sketch:a,p=3", "precision"),
+            ("sketch:a,q=3", "unknown parameter"),
+            ("sketch:a,p=12,b", "after every item"),
+            ("sketch:a,p=12,p=13", "twice"),
+            ("sketch:a,a", "twice"),
+            ("sketch:a+a", "twice"),
+            ("sketch:a,minhash=0", "minhash"),
+        ] {
+            let e = parse_declaration(bad).unwrap_err().to_string();
+            assert!(e.contains(why), "{bad}: {e}");
+        }
+        // A sketch is not a key spec.
+        let e = parse("sketch:a").unwrap_err().to_string();
+        assert!(e.contains("index --key"), "{e}");
+    }
+
+    #[test]
+    fn shell_quote_makes_one_word() {
+        assert_eq!(shell_quote("/a/b-c_d.parquet"), "/a/b-c_d.parquet");
+        assert_eq!(shell_quote("temporal2:id@v,k"), "temporal2:id@v,k");
+        assert_eq!(shell_quote("/tmp/my lake"), "'/tmp/my lake'");
+        assert_eq!(shell_quote("{day:date}.parquet"), "'{day:date}.parquet'");
+        assert_eq!(shell_quote("it's"), r"'it'\''s'");
+        assert_eq!(shell_quote(""), "''");
     }
 }

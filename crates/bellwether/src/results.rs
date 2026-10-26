@@ -4,8 +4,8 @@
 //! every ledger record a command wrote or read is embedded whole, with its
 //! hash, exactly as the ledger stores it ([`Written`]).
 
-use bellwether_ledger::RecordKind;
-use bellwether_types::{Hash, KeySpec, Record};
+use bellwether_ledger::{RecordKind, SignatureStatus, Verdict};
+use bellwether_types::{Hash, KeySpec, Record, TextOp};
 use serde::{Deserialize, Serialize};
 
 /// A ledger record and its hash. `record` serializes to exactly the bytes
@@ -54,7 +54,8 @@ pub struct SpecState {
 /// while it is incomplete.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SidecarState {
-    /// The sidecar's name: `bounds:symbol@ts`, `temporal2:id@valid,known`.
+    /// The sidecar's name: `bounds:symbol@ts`, `temporal2:id@valid,known`,
+    /// or a sketch's `sketch:batch,id` (approximate; never planned with).
     pub sidecar: String,
     /// Completeness sequence.
     pub complete_at: Option<u64>,
@@ -83,6 +84,17 @@ pub struct IndexResult {
     /// Segment or sidecar kinds the manifest lists that this binary does
     /// not know: kept unchanged by builds, never used to plan.
     pub unknown_segment_kinds: Vec<String>,
+    /// Re-declared sketches whose segments were missing from the store or
+    /// damaged: their segments were dropped and every live row group was
+    /// sketched again. Omitted in JSON when none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sketches_rebuilt: Vec<String>,
+    /// Counted key specs (by identity) this build rebuilt because two of
+    /// their segments counted one row group: a corrupt index, which every
+    /// count and plan through the spec refused until then. Omitted in JSON
+    /// when none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub specs_repaired: Vec<String>,
     /// Files seen for the first time.
     pub files_new: u64,
     /// Tracked files whose fingerprint changed (ADR 013).
@@ -97,6 +109,42 @@ pub struct IndexResult {
     pub row_groups_assigned: u64,
     /// Row-group ids retired (never reused).
     pub row_groups_retired: u64,
+    /// Unchanged files whose storage version 2 statistics (rows, bytes,
+    /// column bytes per row group) this build recorded from their footers:
+    /// every tracked file on the first commit over a version 1 manifest.
+    /// Zero (omitted in JSON) otherwise.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub files_filled: u64,
+    /// The storage version this build's commit upgraded the index from
+    /// (ADR 028): a binary of that version can no longer open it. Absent
+    /// (omitted in JSON) when the index was already current or nothing was
+    /// committed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upgraded_from: Option<u32>,
+    /// Text keys this build rebuilt whole because their segments were built
+    /// under other Unicode tables (B5; after a deliberate upgrade of a
+    /// table crate). Absent (omitted in JSON) when none was.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub text_rebuilt: Vec<TextRebuilt>,
+}
+
+/// A text key `index` rebuilt because its segments recorded other Unicode
+/// tables ([`IndexResult::text_rebuilt`]).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TextRebuilt {
+    /// The key.
+    pub spec: String,
+    /// The case-folding tables its old segments recorded, and this
+    /// binary's (`crate version`).
+    pub case: [String; 2],
+    /// The word-boundary tables its old segments recorded, and this
+    /// binary's.
+    pub words: [String; 2],
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)] // serde passes a reference
+fn is_zero(n: &u64) -> bool {
+    *n == 0
 }
 
 /// Which lookup a plan answers.
@@ -168,6 +216,52 @@ pub enum LookupKind {
         /// The known-time column.
         known_column: String,
     },
+    /// Rows whose string column matches a text lookup (B5), both sides
+    /// case-folded.
+    Text {
+        /// `has_token`, `contains`, or `has_prefix`.
+        operator: TextOp,
+        /// The argument as given.
+        value: String,
+        /// The argument case-folded, as the index and the residual compare
+        /// it.
+        folded: String,
+        /// The string column.
+        column: String,
+        /// The text keys the plan intersected.
+        serving: Vec<KeySpec>,
+        /// `true`: every planned row group holds a matching row (a words
+        /// dictionary served); apply the residual for the rows. `false`:
+        /// the plan is a candidate set (trigrams or a bloom filter), a
+        /// planned row group may hold no match, and the residual is
+        /// mandatory.
+        exact_row_groups: bool,
+        /// Why nothing was pruned, when nothing was.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        unpruned: Option<String>,
+    },
+    /// A workload's text runs (B5), as `why` priced them: rows whose string
+    /// column matches one of each run's values, both sides case-folded.
+    TextRuns {
+        /// The string columns the runs look up, sorted.
+        columns: Vec<String>,
+        /// The matches the runs ask for (`contains`, `has_token`,
+        /// `has_prefix`), sorted.
+        operators: Vec<TextOp>,
+    },
+    // --- phase 5 kinds ---
+    /// Rows whose list column holds at least one of the values
+    /// (`contains_any`: `array_contains`, `has_any`, `exists(unnest)`).
+    ContainsAny {
+        /// The list column.
+        column: String,
+    },
+    /// Rows whose list column holds every one of the values
+    /// (`contains_all`).
+    ContainsAll {
+        /// The list column.
+        column: String,
+    },
 }
 
 /// A lookback window on a `latest` or `asof` lookup: every version of each
@@ -222,8 +316,52 @@ pub struct PlanResult {
     pub ordered_by: Option<String>,
     /// Why the order is unspecified, when it is.
     pub unordered_reason: Option<String>,
+    /// The rows holding the keys in the planned row groups, exact from the
+    /// per-key counts of a spec on exactly the lookup's columns that stores
+    /// them (`exact:…,counts`; storage version 2). Absent otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rows: Option<u64>,
+    /// With `--columns`: the compressed bytes of only those columns over the
+    /// planned row groups, from the manifest's per-column bytes (a text
+    /// source has none and counts its whole chunks). Absent otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub projected_bytes: Option<u64>,
+    /// With `--columns` on a storage version 1 manifest, which records no
+    /// per-column bytes: the Parquet footers they were read from instead,
+    /// one per planned file. Zero (omitted) otherwise.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub column_bytes_from_footers: u64,
     /// The `plan` Evidence.
     pub evidence: Written,
+}
+
+/// What [`crate::Engine::count`] answered: `count(*) where (columns) in
+/// keys`, exact, from the per-key counts of one spec. Writes nothing.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct CountResult {
+    /// Key columns, in tuple order.
+    pub columns: Vec<String>,
+    /// Distinct non-null key tuples counted.
+    pub keys: u64,
+    /// Input rows dropped because their tuple held a null (ADR 014).
+    pub null_tuples: u64,
+    /// BLAKE3 of the canonical key set (the one `locate` cites for the same
+    /// keys).
+    pub key_set: Hash,
+    /// The manifest sequence counted against.
+    pub sequence: u64,
+    /// The spec whose counts answered (its identity, `exact:…,counts`).
+    pub counted_by: String,
+    /// Rows whose key tuple is one of the keys.
+    pub rows: u64,
+    /// Live row groups holding at least one of the keys.
+    pub row_groups: u64,
+    /// Live row groups in the index.
+    pub row_groups_total: u64,
+    /// Files holding those row groups.
+    pub files: u64,
+    /// Live files in the index.
+    pub files_total: u64,
 }
 
 /// What [`crate::Engine::propose`] did: wrote the Proposal, or refused at
@@ -273,6 +411,33 @@ pub enum ProposeRefusal {
         /// The name given.
         name: String,
     },
+    /// The declaration builds a sidecar (`temporal2:id@valid,known`
+    /// bitemporal versions, or the per-key time bounds of
+    /// `exact:symbol@ts`), which a Proposal cannot carry: `ProposalBody::Key`
+    /// holds a key spec, and replay prices key specs only. It is built with
+    /// `bellwether index --key`, which gives it no receipt
+    /// (`docs/contract-v3.md`, entry 42).
+    SidecarNotProposable {
+        /// The declaration, as `index --key` reads it.
+        declaration: String,
+        /// The sidecar it declares, by its manifest name.
+        sidecar: String,
+        /// The key spec the sidecar rides beside, which can be proposed
+        /// alone; `None` for a sidecar declared alone (`temporal2`).
+        key: Option<String>,
+        /// The data root.
+        root: String,
+        /// The `bellwether index` command that builds it, every argument
+        /// shell-quoted, with the flags the engine was opened with that
+        /// shape a build or locate the index (`--index`, `--format`,
+        /// `--chunk-size`, `--schema`, `--fingerprint-policy`,
+        /// `--partitioning` or `--path-template`; `EngineOptions::source_flags`),
+        /// so following it builds the folder as it was read and where its
+        /// lookups look. `None` when a library caller opened the engine with
+        /// source options no flags spell (a CSV dialect other than comma
+        /// with a header, say).
+        command: Option<String>,
+    },
 }
 
 /// Whether a link of a receipt's chain resolved as expected.
@@ -308,6 +473,16 @@ pub struct ChainLink {
     pub status: LinkStatus,
     /// Key facts, as ordered `(name, value)` pairs.
     pub facts: Vec<(String, String)>,
+    /// For the receipt and its certificate, when they resolved: every
+    /// signature object beside the record, each verified on its own (ADR
+    /// 029). Absent for the other links and for flagged ones.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signatures: Option<Vec<SignatureStatus>>,
+    /// For the receipt and its certificate, when the engine was given
+    /// trusted keys: those signatures folded against them (`signed`,
+    /// `untrusted`, `unsigned`, or `invalid`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verdict: Option<Verdict>,
 }
 
 /// What [`crate::Engine::receipt`] found: the chain behind a receipt, with
@@ -324,6 +499,50 @@ pub struct ReceiptResult {
     pub chain: Vec<ChainLink>,
     /// Every link's record that resolved, in chain order.
     pub records: Vec<Written>,
+    /// The data roots the chain's resolved evidence is about: a profile's
+    /// root, and the folder of every file a plan names outside this
+    /// engine's root. Sorted, each once.
+    pub roots: Vec<String>,
+    /// With trusted keys: whether the chain is signed, which needs all of
+    /// every link intact, the receipt and its certificate each signed by a
+    /// trusted key within its window, and the evidence about this engine's
+    /// data root. `None` without trusted keys. A receipt alone does not
+    /// count: a certificate planted in the store and applied would otherwise
+    /// ride on a signed receipt. Signatures bind content, not location, so a
+    /// chain copied from another index is refused by its root.
+    pub signed: Option<bool>,
+    /// With trusted keys, when `signed` is false: the first reason.
+    pub not_signed: Option<NotSigned>,
+}
+
+/// Why a chain is not signed against trusted keys, in the order checked.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum NotSigned {
+    /// A link is missing, of the wrong kind, or unreadable, so the chain
+    /// does not stand whatever its signatures say.
+    LinksFlagged {
+        /// The first flagged link.
+        link: Hash,
+        /// The kind the chain expects there.
+        link_kind: RecordKind,
+        /// How it is flagged.
+        status: LinkStatus,
+    },
+    /// The receipt or the certificate is not signed by a trusted key in
+    /// its window; their links' `verdict`s say how.
+    Verdicts,
+    /// Both are signed by trusted keys, but the evidence is about another
+    /// data root: a signed chain copied from another index.
+    OtherRoot {
+        /// The roots the evidence names.
+        roots: Vec<String>,
+        /// This engine's data root.
+        expected: String,
+    },
+    /// Both are signed, but no resolved evidence names a data root, so the
+    /// chain cannot be tied to this one.
+    NoRoot,
 }
 
 /// Costs summed over runs.
@@ -353,4 +572,9 @@ pub struct ReportResult {
     pub realized: u64,
     /// Records this build could not read, listed and skipped.
     pub unreadable: Vec<Hash>,
+    /// With trusted keys: how many of `receipts` are signed, by the rule of
+    /// [`ReceiptResult::signed`] (intact links, receipt and certificate each
+    /// signed by a trusted key in its window, evidence about this data
+    /// root). `None` without trusted keys.
+    pub signed: Option<u64>,
 }

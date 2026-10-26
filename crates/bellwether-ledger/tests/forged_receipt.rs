@@ -308,6 +308,8 @@ fn passing_certificate_with_differences_is_rejected() {
         |c: &mut bellwether_types::Certificate| c.body.mismatched = 1,
         |c: &mut bellwether_types::Certificate| c.body.missing_left = 1,
         |c: &mut bellwether_types::Certificate| c.body.missing_right = 1,
+        // rule 9, record version 3: an uncomparable key is not a pass
+        |c: &mut bellwether_types::Certificate| c.body.uncomparable = 1,
         |c: &mut bellwether_types::Certificate| {
             c.body.totals_delta = vec![("g".into(), "1.00".into(), "2.00".into())];
         },
@@ -400,9 +402,14 @@ fn only_a_rewrite_may_leave_the_manifest_unchanged() {
     let mut p = proposal(vec![f.evidence], "agent");
     p.body = bellwether_types::ProposalBody::Rewrite {
         shape: bellwether_types::RewriteShape {
+            pairs: Vec::new(),
+            key: Vec::new(),
+            keys: None,
             before: "scan by batch_id".into(),
             after: "lookup by order_id".into(),
             invariant: "same rows".into(),
+            before_plan: None,
+            after_plan: None,
         },
     };
     let ph = ledger.put(&Record::Proposal(p)).unwrap();

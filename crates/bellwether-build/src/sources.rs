@@ -25,6 +25,15 @@ pub(crate) struct FileLayout {
     pub(crate) chunks: Option<Vec<Range<u64>>>,
 }
 
+/// Per-row-group statistics of one file, as a storage version 2 manifest
+/// records them ([`DataSource::rowgroup_stats`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct RowGroupStats {
+    pub(crate) rows: Vec<u64>,
+    pub(crate) bytes: Vec<u64>,
+    pub(crate) column_bytes: Option<Vec<u64>>,
+}
+
 /// The source of one index: Parquet, or text at one or more chunk sizes.
 #[derive(Debug)]
 pub(crate) enum DataSource {
@@ -179,6 +188,45 @@ impl DataSource {
                 })
             }
         }
+    }
+
+    /// The statistics a storage version 2 manifest records for `file`
+    /// (`rowgroup_rows`, `rowgroup_bytes`, `column_bytes`), from one
+    /// `Source::row_groups` call: a Parquet footer, or the scan of a text
+    /// file at `chunk_size` (which the workers' reads then reuse). Column
+    /// bytes are row-group-major over `columns`, the dataset schema's
+    /// columns; a column the file does not hold (a virtual partition column)
+    /// has 0. A text source has no per-column bytes, so `None`.
+    pub(crate) fn rowgroup_stats(
+        &self,
+        file: &FileFingerprint,
+        chunk_size: Option<u64>,
+        columns: &[String],
+    ) -> Result<RowGroupStats> {
+        let rgs = self.row_groups(file, chunk_size)?;
+        let column_bytes = match self {
+            Self::Parquet(_) => {
+                let mut out = Vec::with_capacity(rgs.len().saturating_mul(columns.len()));
+                for rg in &rgs {
+                    for c in columns {
+                        out.push(
+                            rg.stats
+                                .iter()
+                                .find(|s| &s.column == c)
+                                .and_then(|s| s.bytes)
+                                .unwrap_or(0),
+                        );
+                    }
+                }
+                Some(out)
+            }
+            Self::Text { .. } => None,
+        };
+        Ok(RowGroupStats {
+            rows: rgs.iter().map(|rg| rg.rows).collect(),
+            bytes: rgs.iter().map(|rg| rg.bytes).collect(),
+            column_bytes,
+        })
     }
 
     /// `Source::row_groups` of `file`, read at `chunk_size` for text.

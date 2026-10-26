@@ -1,0 +1,49 @@
+[package]
+name = "bellwether-source-sql"
+description = "SQL tables as Bellwether sources (ADR 027): partitions or key ranges as units with an identity, statistics from one aggregate query per unit, projected reads through ADBC, SQLite, or ODBC as Arrow batches, snapshot discipline, and measured costs."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[features]
+default = ["sqlite", "adbc"]
+# SQLite through rusqlite with the bundled SQLite (in process, no server).
+# The ADBC SQLite driver types each column from its first values, not from
+# the declared type, and is not distributed through crates.io (README).
+sqlite = ["dep:rusqlite"]
+# DuckDB, Postgres, and Flight SQL through the ADBC driver manager, which
+# loads the engine's ADBC driver library at run time (libduckdb itself for
+# DuckDB). No native code is linked at build time.
+adbc = ["dep:adbc_core", "dep:adbc_driver_manager"]
+# SQL Server through ODBC and arrow-odbc. Links the system ODBC driver
+# manager (unixODBC on Linux and macOS), so it is off by default.
+odbc = ["dep:arrow-odbc"]
+
+[dependencies]
+bellwether-types = { path = "../bellwether-types" }
+# The canonical encoder (ADR 016) for unit statistics, and the catalog
+# digest's schema spelling.
+bellwether-source = { path = "../bellwether-source" }
+arrow = { workspace = true }
+blake3 = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+url = { workspace = true }
+chrono = { workspace = true }
+rusqlite = { version = "0.41", features = ["bundled"], optional = true }
+adbc_core = { version = "0.24", optional = true }
+adbc_driver_manager = { version = "0.24", optional = true }
+arrow-odbc = { version = "26", optional = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+# Writes the SQLite test databases (the source opens them read-only).
+rusqlite = { version = "0.41", features = ["bundled"] }
+parquet = { workspace = true, features = ["arrow"] }
+
+[lints]
+workspace = true

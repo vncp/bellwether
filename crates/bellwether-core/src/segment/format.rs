@@ -18,10 +18,52 @@ pub const MAGIC: [u8; 8] = *b"BWSEGMNT";
 /// Fixed preamble: magic, `storage_version u32`, `encoding_version u32`,
 /// `header_len u32`.
 pub const PREAMBLE_LEN: usize = 8 + 4 + 4 + 4;
-/// Fixed footer: `index_offset u64`, `index_len u64`, magic.
+/// Fixed footer of a storage version 1 segment: `index_offset u64`,
+/// `index_len u64`, magic.
 pub const FOOTER_LEN: usize = 8 + 8 + 8;
-/// The only codec in storage version 1.
+/// Fixed footer of a storage version 2 segment: `index_offset u64`,
+/// `index_len u64`, `checksum u64` (XXH3-64 of the preamble, the header, and
+/// the index), magic.
+pub const FOOTER_LEN_V2: usize = 8 + 8 + 8 + 8;
+/// The only codec in storage versions 1 and 2.
 pub const CODEC_NONE: &str = "none";
+
+/// The footer length of a segment at `storage` version.
+#[must_use]
+pub fn footer_len(storage: u32) -> usize {
+    if storage >= 2 {
+        FOOTER_LEN_V2
+    } else {
+        FOOTER_LEN
+    }
+}
+
+/// XXH3-64 (seed 0) over the concatenation of `parts`: the integrity check
+/// a storage version 2 segment stores beside every region a reader reads
+/// (the index, each block's filter and directory, each value record), so a
+/// corrupt byte is refused, never decoded into a wrong answer.
+#[must_use]
+pub fn checksum(parts: &[&[u8]]) -> u64 {
+    let mut h = xxhash_rust::xxh3::Xxh3::new();
+    for p in parts {
+        h.update(p);
+    }
+    h.digest()
+}
+
+/// Appends `v` as unsigned LEB128 (seven bits per byte, least significant
+/// group first, high bit set on every byte but the last).
+pub(crate) fn put_leb128(out: &mut Vec<u8>, mut v: u64) {
+    loop {
+        let byte = (v & 0x7f) as u8;
+        v >>= 7;
+        if v == 0 {
+            out.push(byte);
+            return;
+        }
+        out.push(byte | 0x80);
+    }
+}
 
 /// How the body of a segment is organized; follows from the key spec kind.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -39,14 +81,23 @@ pub enum Layout {
 }
 
 impl Layout {
-    /// The layout a key spec is stored in.
+    /// The layout a key spec is stored in; `None` for a bitemporal spec,
+    /// whose versions this release still stores in a `temporal2` sidecar
+    /// segment ([`crate::sidecar`]), and for a spec with per-key time
+    /// bounds, which ride in a `bounds` sidecar beside the key's segments.
     #[must_use]
-    pub fn for_spec(spec: &KeySpec) -> Self {
+    pub fn for_spec(spec: &KeySpec) -> Option<Self> {
         match spec {
-            KeySpec::Exact { .. } => Self::Keyed,
-            KeySpec::Temporal { .. } => Self::KeyedTemporal,
-            KeySpec::Bloom { .. } => Self::BloomPerRowGroup,
-            KeySpec::Range { .. } => Self::MinMax,
+            KeySpec::Exact { bounds: None, .. }
+            | KeySpec::Text { bloom: None, .. }
+            | KeySpec::List { .. } => Some(Self::Keyed),
+            KeySpec::Temporal { .. } => Some(Self::KeyedTemporal),
+            KeySpec::Bloom { bounds: None, .. } | KeySpec::Text { bloom: Some(_), .. } => {
+                Some(Self::BloomPerRowGroup)
+            }
+            KeySpec::Range { .. } => Some(Self::MinMax),
+            KeySpec::Exact { .. } | KeySpec::Bloom { .. } | KeySpec::Bitemporal { .. } => None,
+            KeySpec::Expr { over, .. } => Self::for_spec(over),
         }
     }
 }
@@ -272,24 +323,42 @@ impl std::fmt::Display for ColumnType {
 
 /// The dataset types a key spec's columns take from a dataset schema: the
 /// key columns in prefix order, and the timestamp column for temporal specs.
-pub(crate) fn spec_types(
-    spec: &KeySpec,
-    schema: &Schema,
-) -> Result<(Vec<DataType>, Option<DataType>)> {
-    let lookup = |column: &str| -> Result<DataType> {
-        let dt = schema
+/// An `expr` key's one key column is its virtual column, at its
+/// expression's type. A list key's one "key type" is its column's element
+/// type (the list item type, or a map's key type), the type its elements
+/// are encoded at. Public so every crate that builds or prices segments
+/// takes key types from this one definition.
+pub fn spec_types(spec: &KeySpec, schema: &Schema) -> Result<(Vec<DataType>, Option<DataType>)> {
+    if let KeySpec::Expr { .. } = spec {
+        let t = crate::expr::typed_spec(spec, schema)?;
+        return Ok((vec![t.data_type().clone()], None));
+    }
+    let field = |column: &str| -> Result<DataType> {
+        Ok(schema
             .field_with_name(column)
             .map_err(|_| Error::KeySpec(format!("column {column} is not in the dataset schema")))?
             .data_type()
-            .clone();
+            .clone())
+    };
+    let lookup = |column: &str| -> Result<DataType> {
+        let dt = field(column)?;
         encoding::check_supported(&dt)?;
         Ok(dt)
     };
+    if let KeySpec::List { column } = spec {
+        return Ok((
+            vec![crate::list::check_list_column(column, &field(column)?)?],
+            None,
+        ));
+    }
     let keys = spec
         .columns()
         .iter()
         .map(|c| lookup(c))
         .collect::<Result<Vec<_>>>()?;
+    if let KeySpec::Text { column, .. } = spec {
+        crate::text::check_column_type(column, &keys[0])?;
+    }
     let ts = match spec {
         KeySpec::Temporal { ts_column, .. } => {
             let dt = lookup(ts_column)?;
@@ -334,6 +403,11 @@ pub struct SegmentHeader {
     /// together with `key_types` for temporal specs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ts_type: Option<ColumnType>,
+    /// For a text key (and only a text key): the Unicode tables its tokens
+    /// were folded and split under (`docs/format.md`, "Text keys"). A
+    /// reader built on other tables refuses the segment.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text_unicode: Option<crate::text::UnicodeTables>,
     /// Fields written by a newer minor writer, preserved verbatim.
     #[serde(flatten)]
     pub extra: serde_json::Map<String, serde_json::Value>,
@@ -341,9 +415,13 @@ pub struct SegmentHeader {
 
 impl SegmentHeader {
     /// A header for `spec` at the current versions, with canonical filters.
+    /// A spec with no segment layout of its own ([`Layout::for_spec`]) gets
+    /// the keyed layout here and is refused by [`SegmentHeader::validate`],
+    /// so no such segment is ever written.
     #[must_use]
     pub fn new(spec: KeySpec) -> Self {
-        let layout = Layout::for_spec(&spec);
+        let layout = Layout::for_spec(&spec).unwrap_or(Layout::Keyed);
+        let spec_is_text = matches!(spec, KeySpec::Text { .. });
         Self {
             storage_version: STORAGE_VERSION,
             encoding_version: ENCODING_VERSION,
@@ -353,13 +431,15 @@ impl SegmentHeader {
             codec: CODEC_NONE.to_string(),
             key_types: None,
             ts_type: None,
+            text_unicode: spec_is_text.then(crate::text::UnicodeTables::current),
             extra: serde_json::Map::new(),
         }
     }
 
-    /// Checks a parsed header against its preamble and the rules of storage
-    /// version 1. Versions are checked again here (they were checked in the
-    /// preamble before parsing) and must agree with the preamble's.
+    /// Checks a parsed header against its preamble and the rules of its
+    /// storage version. Versions are checked again here (they were checked
+    /// in the preamble before parsing) and must agree with the preamble's.
+    /// A spec that stores counts needs storage version 2.
     pub fn validate(&self, preamble_storage: u32, preamble_encoding: u32) -> Result<()> {
         check_versions(self.storage_version, self.encoding_version)?;
         if self.storage_version != preamble_storage || self.encoding_version != preamble_encoding {
@@ -368,14 +448,29 @@ impl SegmentHeader {
                 self.storage_version, self.encoding_version
             )));
         }
+        if self.storage_version == 0 {
+            return Err(corrupt("storage version 0"));
+        }
         if self.codec != CODEC_NONE {
             return Err(Error::Other(format!(
                 "segment codec {:?} is not supported",
                 self.codec
             )));
         }
-        if self.layout != Layout::for_spec(&self.key_spec) {
+        let Some(layout) = Layout::for_spec(&self.key_spec) else {
+            return Err(Error::KeySpec(format!(
+                "{} has no key segment of its own in this release: per-key time bounds and \
+                 bitemporal versions are stored as sidecar segments",
+                self.key_spec.identity()
+            )));
+        };
+        if self.layout != layout {
             return Err(corrupt("layout does not match key spec"));
+        }
+        if self.key_spec.counts() && self.storage_version < 2 {
+            return Err(corrupt(
+                "a storage version 1 segment cannot store counts (they arrived in version 2)",
+            ));
         }
         // Only bloom segments may hold reused Parquet filters.
         if self.bloom_hash == BloomHash::ParquetPlain && self.layout != Layout::BloomPerRowGroup {
@@ -386,7 +481,7 @@ impl SegmentHeader {
             )));
         }
         if let (KeySpec::Bloom { columns, .. }, BloomHash::ParquetPlain) =
-            (&self.key_spec, self.bloom_hash)
+            (self.key_spec.physical(), self.bloom_hash)
         {
             if columns.len() != 1 {
                 return Err(corrupt("parquet_plain filters cover exactly one column"));
@@ -407,8 +502,70 @@ impl SegmentHeader {
             }
             _ => {}
         }
-        Ok(())
+        match (&self.key_spec, &self.text_unicode) {
+            (KeySpec::Text { .. }, None) => {
+                return Err(corrupt("a text segment records its Unicode tables"));
+            }
+            (KeySpec::Text { .. }, Some(t)) => {
+                let now = crate::text::UnicodeTables::current();
+                if *t != now {
+                    return Err(Error::KeySpec(format!(
+                        "this {} segment was built with the Unicode tables of {} (case folding) \
+                         and {} (word boundaries), and this binary folds and splits text with {} \
+                         and {}, so the same value could give other tokens; {}",
+                        self.key_spec.name(),
+                        t.case,
+                        t.words,
+                        now.case,
+                        now.words,
+                        crate::text::REBUILD_STEP
+                    )));
+                }
+            }
+            (_, Some(_)) => {
+                return Err(corrupt("text_unicode on a segment that is not a text key"))
+            }
+            (_, None) => {}
+        }
+        // An expr key's header carries its expression and conformance
+        // vectors; a reader recomputes them before trusting the keys.
+        crate::expr::check_spec(&self.key_spec)
     }
+}
+
+/// Parses a segment's JSON header. A storage version 2 header in a shape
+/// the next storage version 2 release adds (the `bitemporal` layout, a key
+/// spec with per-key `bounds` or of the bitemporal kind, a header `bounds`
+/// field, each of which changes the value records) is refused with
+/// [`Error::UnsupportedShape`], before the typed parse could misread it or
+/// fail with a serde error (ADR 028).
+pub(crate) fn parse_header(bytes: &[u8], storage: u32) -> Result<SegmentHeader> {
+    if storage >= 2 {
+        if let Ok(v) = serde_json::from_slice::<serde_json::Value>(bytes) {
+            let spec = v.get("key_spec");
+            let found = || {
+                spec.and_then(|s| serde_json::from_value::<KeySpec>(s.clone()).ok())
+                    .map_or_else(|| "in a segment".to_string(), |s| s.identity())
+            };
+            let shape = if v.get("layout").and_then(|l| l.as_str()) == Some("bitemporal") {
+                Some(("segment layout", "bitemporal".to_string()))
+            } else if spec.and_then(|s| s.get("kind")).and_then(|k| k.as_str())
+                == Some("bitemporal")
+            {
+                Some(("bitemporal key spec", found()))
+            } else if spec.is_some_and(|s| s.get("bounds").is_some()) {
+                Some(("key spec with per-key bounds", found()))
+            } else if v.get("bounds").is_some() {
+                Some(("segment header field", "bounds".to_string()))
+            } else {
+                None
+            };
+            if let Some((what, found)) = shape {
+                return Err(Error::UnsupportedShape { what, found });
+            }
+        }
+    }
+    Ok(serde_json::from_slice(bytes)?)
 }
 
 /// Checks the preamble's versions before anything else is parsed.
@@ -584,5 +741,78 @@ impl<'a> Cursor<'a> {
 
     pub(crate) fn is_done(&self) -> bool {
         self.pos == self.buf.len()
+    }
+
+    /// An unsigned LEB128 value in its shortest form: an over-long encoding
+    /// (a last byte of zero after the first) or one past 64 bits is refused,
+    /// so every count has exactly one spelling.
+    pub(crate) fn leb128(&mut self) -> Result<u64> {
+        let mut v: u64 = 0;
+        for i in 0..10u32 {
+            let b = self.u8()?;
+            let bits = u64::from(b & 0x7f);
+            if i == 9 && b > 1 {
+                return Err(corrupt("count exceeds 64 bits"));
+            }
+            v |= bits << (7 * i);
+            if b & 0x80 == 0 {
+                if b == 0 && i > 0 {
+                    return Err(corrupt("count is not in its shortest LEB128 form"));
+                }
+                return Ok(v);
+            }
+        }
+        Err(corrupt("count exceeds 64 bits"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn leb(bytes: &[u8]) -> Result<u64> {
+        let mut c = Cursor::new(bytes);
+        let v = c.leb128()?;
+        assert!(c.is_done(), "{bytes:02x?} read past one value");
+        Ok(v)
+    }
+
+    /// Every count has exactly one spelling: the shortest LEB128 form reads
+    /// back, an over-long one (a zero last byte after the first) and one
+    /// past 64 bits are refused.
+    #[test]
+    fn leb128_reads_only_the_shortest_form() {
+        for v in [
+            0u64,
+            1,
+            127,
+            128,
+            300,
+            16_383,
+            16_384,
+            u64::from(u32::MAX),
+            u64::MAX,
+        ] {
+            let mut out = Vec::new();
+            put_leb128(&mut out, v);
+            assert_eq!(leb(&out).expect("the shortest form reads back"), v);
+        }
+        for over_long in [
+            &[0x80, 0x00][..],
+            &[0x81, 0x00],
+            &[0xac, 0x82, 0x00],
+            &[0xff, 0x80, 0x00],
+        ] {
+            let err = leb(over_long)
+                .expect_err("an over-long form is refused")
+                .to_string();
+            assert!(
+                err.contains("shortest LEB128 form"),
+                "{over_long:02x?}: {err}"
+            );
+        }
+        let too_wide = [0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x02];
+        assert!(leb(&too_wide).is_err());
+        assert!(leb(&[0xff; 11]).is_err());
     }
 }

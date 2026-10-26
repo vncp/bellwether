@@ -64,6 +64,10 @@ fn probe_receipt_and_report_over_a_real_receipt() {
             mismatched: 0,
             ignored_columns: vec![],
             totals_delta: vec![],
+            examples: Vec::new(),
+            uncomparable: 0,
+            totals: Vec::new(),
+            row_filter: None,
         },
         provenance: Provenance {
             inputs: vec![Hash::of(b"stand-in for verify")],
@@ -75,6 +79,8 @@ fn probe_receipt_and_report_over_a_real_receipt() {
     let c = ledger.put(&Record::Certificate(cert)).unwrap();
     e.index(&[spec::parse("exact:id").unwrap()]).unwrap();
     let receipt = Receipt {
+        attest_only: false,
+        prediction: None,
         record_version: format::RECORD_VERSION,
         evidence: vec![],
         proposal: cand.proposal.hash,

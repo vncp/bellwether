@@ -34,12 +34,12 @@ use serde::{Deserialize, Serialize};
 use xxhash_rust::xxh3::xxh3_128_with_seed;
 
 use crate::footer::{all_null, stats_of, FooterStats};
-use crate::hll::Hll;
 use crate::quantile::p50_p95_max;
 use crate::ranges::{is_time_type, ColumnRanges, TimeColumn};
 use crate::sampler::{
     dkw_epsilon, high_water_at_most, high_water_for_budget, peak_bytes_bound, DistinctSampler,
 };
+use bellwether_core::hll::Hll;
 
 /// Confidence level of the quantile band reported for a sampled fanout:
 /// `quantile_rank_error` holds with probability at least `1 - QUANTILE_ALPHA`.
@@ -172,7 +172,16 @@ fn auto_columns(
     let mut skipped = Vec::new();
     for (i, f) in schema.fields().iter().enumerate() {
         let dt = f.data_type();
-        let reason = if let Some(kind) = nested_kind(dt) {
+        let reason = if bellwether_core::list::check_list_column(f.name(), dt).is_ok() {
+            // A list (or map) of a flat type is indexed by its elements, for
+            // membership lookups, not profiled as a key (B4).
+            Some(format!(
+                "a list column, not a key candidate; its elements can be indexed for membership \
+                 lookups with list:{name} (price it with `bellwether why --from \
+                 <values.parquet> --mode contains-any`)",
+                name = f.name()
+            ))
+        } else if let Some(kind) = nested_kind(dt) {
             Some(format!(
                 "a nested {kind} column, not a key candidate; flatten a field into its own \
                  column to profile it"
@@ -786,6 +795,8 @@ impl CachedEntry {
                 row_groups_per_value: self.row_groups.map(f64::from),
                 files_total: self.files_total,
                 row_groups_total: self.row_groups_total,
+                sample_size: None,
+                quantile_error: None,
             },
             sample: SampleInfo {
                 retained: self.retained,

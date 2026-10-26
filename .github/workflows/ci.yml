@@ -13,18 +13,76 @@ jobs:
   check:
     name: fmt · clippy · test
     runs-on: ubuntu-latest
+    env:
+      # No debuginfo: the --all-features test binaries with DWARF no longer
+      # fit on the runner's root volume next to the dependency builds.
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+    services:
+      # The reference query-engine adapter (ADR 033) is tested end to end
+      # against this server (bellwether-source-engine/tests/clickhouse.rs;
+      # in CI those tests fail rather than skip without it). Pinned by
+      # digest: clickhouse/clickhouse-server:26.9.25.15. The user `default`
+      # gets network access with no password and access management (the
+      # export-denial test creates a user without the export grant).
+      clickhouse:
+        image: clickhouse/clickhouse-server:26.9.25.15@sha256:19bfacb135479a892551a8155cfbbc8211aedf2aa888cd91950b9ee7e76cc7e3
+        env:
+          CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: "1"
+        ports:
+          - 8123:8123
+        options: >-
+          --ulimit nofile=262144:262144
+          --health-cmd "clickhouse-client --query 'SELECT 1'"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
     steps:
       - uses: actions/checkout@v4
+      - uses: ./.github/actions/free-runner-disk
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
+      # Keyed on Cargo.lock, every Cargo.toml, rustc and the CARGO*/RUST*
+      # environment. Saves only the dependency builds (workspace crates and
+      # their test binaries are pruned before saving), and only from main:
+      # a pull request restores main's entry instead of writing its own.
       - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: install libduckdb (the DuckDB tests read DuckDB through its ADBC driver, libduckdb itself)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/libduckdb" && cd "$RUNNER_TEMP/libduckdb"
+          gh release download v2.0.0 --repo duckdb/duckdb --pattern 'duckdb-shared-libs-linux-amd64.tar.gz'
+          echo '993ad89e7dfca66cd6da994c2cad090c2fc160ddf9f550498a098ab4bb13cfb1  duckdb-shared-libs-linux-amd64.tar.gz' | sha256sum -c -
+          tar -xzf duckdb-shared-libs-linux-amd64.tar.gz libduckdb.so
+          echo "BELLWETHER_DUCKDB_DRIVER=$RUNNER_TEMP/libduckdb/libduckdb.so" >> "$GITHUB_ENV"
+      - name: install the ODBC driver manager (the `odbc` feature of bellwether-source-sql links it)
+        run: sudo apt-get update && sudo apt-get install -y unixodbc-dev
       - name: fmt
         run: cargo fmt --all -- --check
+      # clippy and test both pass --workspace --all-features, so cargo
+      # resolves one feature set and the build scripts and proc macros
+      # built for clippy are reused by the test build.
       - name: clippy
         run: cargo clippy --workspace --all-targets --all-features
       - name: test
+        env:
+          BELLWETHER_CLICKHOUSE_URL: clickhouse://127.0.0.1:8123/default
         run: cargo test --workspace --all-features
+      - name: the ClickHouse adapter ran against the service container (not skipped)
+        env:
+          BELLWETHER_CLICKHOUSE_URL: clickhouse://127.0.0.1:8123/default
+        run: |
+          # --workspace (not -p) keeps the feature set of the test step, so
+          # this reuses its build instead of recompiling four crates.
+          cargo test --workspace --all-features --test clickhouse -- --nocapture 2>&1 | tee clickhouse.log
+          ! grep -q 'SKIPPED:' clickhouse.log
+      - name: disk left after the build
+        if: always()
+        run: df -h / && du -sh target
 
   format-compat:
     name: persisted format v0.1 fixture
@@ -39,6 +97,9 @@ jobs:
         if: steps.fixture.outputs.present == 'true'
       - uses: Swatinem/rust-cache@v2
         if: steps.fixture.outputs.present == 'true'
+      - name: install the ODBC driver manager (`--all-features` links the `odbc` feature of bellwether-source-sql)
+        if: steps.fixture.outputs.present == 'true'
+        run: sudo apt-get update && sudo apt-get install -y unixodbc-dev
       - name: current binary must read the frozen v0.1 fixture
         if: steps.fixture.outputs.present == 'true'
         run: cargo test --workspace --test '*format_compat*' --all-features

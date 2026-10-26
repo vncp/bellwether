@@ -21,11 +21,12 @@ Replay reads very little. The current index costs no data reads at all. A hypoth
 | `workload` | `WorkloadRecorder`, `KeyInput`, `Workload`, `record_bench_workload` | Records each run's key set in the cache under its BLAKE3, plus a `workload.json` manifest. Reads `bellwether-bench`'s workload format directly. |
 | `keys` | `RunKeys`, `RunKeysBuilder` | One run's distinct, non-null key tuples, canonical at the **dataset** types, and their cache payload. |
 | `catalog` | `Catalog` | Every live row group of one manifest version, under the dataset schema. Sizes and statistics come from `Source::row_groups`. Its digest names the data. |
-| `plan` | `PlanSource`, `SegmentPlanner`, `servable` | The plan-building seam, and this crate's implementation of it over core segments. |
+| `plan` | `PlanSource`, `SegmentPlanner`, `servable`, `text_residual` | The plan-building seam, and this crate's implementation of it over core segments. A text run (B5; query kinds `contains`, `has_token`, `has_prefix`, its key set the words, substrings, or prefixes over one string column) plans through `PlanSource::plan_text` in both planners, so a priced text key plans what the built one does (`tests/text.rs`); `Replayer::text_stats` counts a text key's distinct tokens exactly. |
 | `build_plan` | `impl PlanSource for bellwether_build::Planner` | The build crate's planner, the one the index answers queries with, behind the same seam. |
-| `transient` | `TransientIndex`, `TransientCache`, `TransientLimits` | A hypothetical spec's segments, built over key reads, and their cache. |
-| `baseline` | `Baseline::{RawScan, ParquetStats}` | Costs without a Bellwether index. |
+| `transient` | `TransientIndex`, `TransientCache`, `TransientLimits` | A hypothetical spec's segments, built over key reads, and their cache. An `expr` key's index derives its virtual column per row group from the expression's input columns (bounded like any transient build); `BuildStats::null_rows` and `TransientIndex::distinct_keys` give `why`'s `expr` column. |
+| `baseline` | `Baseline::{RawScan, ParquetStats}` | Costs without a Bellwether index. A text run reads every row group under both: no statistic says which words a string holds. |
 | `layout` | `LayoutModel`, `replay_layout` | Layout proposals under a stated model, `exact: false`. |
+| `sketch` | `TransientSketch` | What a `sketch` sidecar would hold, computed now: reads only the sketch's item columns, one row group at a time in catalog order, through core's `FileSketcher` (the code a build writes segments with), so its registers equal a committed sketch's over the same files (the facade's `tests/sketch.rs` checks predicted equals built). It reports the files, row groups, and rows it read. **Approximate**, like every sketch, and never handed to a planner. Memory: one row group's item columns, one file's open sketch, and the running totals (`2^p` registers and `k` slots per item). |
 | `replay` | `Replayer`, `Scored`, `write_replay` | Pins one manifest, scores proposals, and writes `Replay` records through the ledger. |
 | `report` | `report`, `TemplateSummary` | Per-run rows. Per-template p50/p95/max of keys, files, row groups and bytes. |
 | `attribution` | `Replayer::replace_node`, `Replayer::interaction` | Counterfactual hooks for WP13 (ADR 024). |
@@ -88,6 +89,9 @@ The bench hashes are `u64`-specific. The replay hashes cover canonical encodings
 
 ## Plans
 
+A run keyed on an expression (its one key column named by an expression over dataset columns, recorded normalized) is served only by an `expr` key over that expression, and only as a point lookup; its residual is `ExprIn`. `tests/expr.rs` checks that the replay's prediction equals the build planner's plan per run (files, row groups, bytes) for exact and bloom `expr` keys.
+
+
 `PlanSource` is the surface replay plans through. The build crate's `Planner` implements it (`build_plan`), and so does this crate's `SegmentPlanner`; see "The two planners" below.
 
 ```rust
@@ -143,6 +147,10 @@ A run's cost has these parts:
 
 It keys the transient cache together with the full spec and its key and timestamp types. An unindexed folder has manifest version `"0"`, so its digest, not the version, names its data.
 
+### Membership runs (B4)
+
+A run recorded with `RunQuery::ContainsAny` or `ContainsAll` (`query_kind` `contains_any` / `contains_all`) looks up one list column; its values are encoded at the column's element type. Recording refuses a membership run on a flat column or on several columns, a list column in any other kind of run, and a `contains_all` run with a null value (no list holds a null, ADR 014). Both planners plan it by the build planner's `Lookup::ContainsAny` / `ContainsAll` rules through `list:<column>` alone (`serves_query`), with the same residual (`membership_residual`), so predicted equals planned (`tests/list.rs`: the build lookup, committed segments, transient segments through WP4, and `SegmentPlanner` agree run by run; the unindexed replayer prices every run the same). A transient list key measures each row group's distinct elements. Both baselines read every live row group for a membership run (`BaselinePlanner::plan_membership`), and so does an unserved membership run under `Replayer::with_unserved(Baseline::ParquetStats)` (its Replay is labelled as priced by min/max): Parquet keeps a list's statistics on its nested leaf, which the catalog reports as unknown, and a run's values are elements, never compared with a column's bounds.
+
 ## Configurations
 
 `Replayer` pins one manifest version. It is built three ways:
@@ -153,15 +161,18 @@ It keys the transient cache together with the full spec and its key and timestam
 
 Configurations:
 
-- **Current.** The manifest's declared specs that are complete at the pinned sequence. With none, every run reads every row group. A declared spec that is not complete is not current: the index cannot plan with it yet.
+- **Current.** The manifest's declared specs that are complete at the pinned sequence. With none, every run is unserved (below). A declared spec that is not complete is not current: the index cannot plan with it yet.
 - **Hypothetical** (`replay_specs`). Any specs. Those the index cannot plan with, including a declared spec that is not complete, are built as transient segments and planned through `PlanSource::with_transient`. A configuration holds every hypothetical index it needs at once, because one plan intersects them.
-- **Unserved runs.** A run that no spec of a configuration serves reads every live row group. The index cannot narrow it.
+- **Unserved runs.** A run that no spec of a configuration serves is priced under the replayer's unserved baseline (`Replayer::with_unserved`):
+  - `RawScan`, the default: every live row group the planner cannot exclude (a window run's partitions). The index cannot narrow it.
+  - `ParquetStats`: of those, the row groups the `ParquetStats` baseline (below) keeps for the run's keys and window: what any Parquet reader skips to without an index. Both keep every row group holding a key, so their intersection does (invariant 1). An `asof` or `latest` run that no temporal spec serves is planned on its keys alone: a recorded run names no time column, so two callers could not agree on an instant bound. The facade sets it on every Parquet replayer, indexed or not, so a predicted cost equals the realized one.
 - **Key proposal.** The current specs, plus the proposed spec, which replaces a current spec of the same `KeySpec::name`. A proposed spec that serves none of the workload's runs is refused, never reported as "no change".
 - **Layout proposal.** Costs come from the layout model: `exact: false`. The `Replay` names the model in `model`, the statement `LayoutModel::describe` gives (below).
 - **Rewrite proposal.** Refused. Its cost depends on the rewritten plan, and a `RewriteShape` states that plan in prose (contract v3 backlog #2).
 - **Baselines.**
   - `RawScan` reads every row group.
   - `ParquetStats` keeps a row group when some key tuple passes, for every key column, two tests: the footer min/max, and the row group's embedded split-block bloom filter (below). A NaN probe is never pruned by range or by a filter.
+  - A window run: `ParquetStats` also skips a row group whose footer range for the window's time column lies wholly outside the window; `RawScan` still reads every row group.
 
 **`ParquetStats` filter probing.** The filter is probed with the PLAIN value of the key converted to the file column's physical type (ADR 008 amendment):
 
@@ -179,7 +190,7 @@ Configurations:
 
 A value the file column cannot hold fails the probe. A run column whose filter has none of these shapes is refused with `ReplayError::UnprobeableFilter`: `BOOLEAN`, `INT96`, a decimal stored as `BYTE_ARRAY`, or a `Decimal256` dataset column. The baseline is never silently weaker than `docs/benchmark.md` defines it.
 
-The baseline reads its filters once, after verifying each file's fingerprint on the opened handle, and **holds every embedded filter of every run column of every file** for its lifetime.
+The baseline reads its filters once, after verifying each file's fingerprint on the opened handle, and **holds every embedded filter of every run column of every file** for its lifetime. A replayer pricing unserved runs under `ParquetStats` reads a row group's filters only when its footer min/max (and the window) keeps it, one file at a time, and drops them after the run (ADR 018; `Replayer::bloom_filters_read` counts them). A filter it cannot probe exactly is treated as absent there, which keeps the row group; only the bench baseline refuses it.
 
 ## The Replay record
 
@@ -194,6 +205,8 @@ The baseline reads its filters once, after verifying each file's fingerprint on 
 - **`model`** is present exactly when a proposed cost is inexact. That is a layout replay over a workload with runs, and the model is the layout model's statement. A key proposal's replay is exact throughout and names no model. Current costs are always exact.
 
 The ledger enforces these rules on `put`. `write_replay` checks them first, against the proposal it resolves itself.
+
+**`unserved`** is `"parquet_stats"` when some run, under the current configuration or the proposal, was unserved and priced under `ParquetStats` (above); absent otherwise, so a record that prices nothing that way keeps the bytes it had before the field existed. The replayer sets it; the ledger stores it as given.
 
 ## Errors
 
@@ -295,15 +308,20 @@ The build planner reads footers through its own source, which the test's countin
 
 ### Memory caps
 
-`max_segment_key_bytes` and `max_index_bytes` cap **accounted** key bytes (the measures above), not resident memory. Measured in debug builds:
+`max_segment_key_bytes` and `max_index_bytes` cap **accounted** key bytes (the measures above), not resident memory.
 
-- **Open writer.** An open transient segment writer costs about 290 bytes of resident memory per key.
+The per-key resident overhead (contract v3, entry 32) was measured in a release build by `tests/resident.rs` (`cargo test --release -p bellwether-replay --test resident -- --ignored`), over 1,048,576 keys, on 2026-10-26 ([the measured document](../../docs/measured/2026-10-26-performance.md)). These are the documented constants:
+
+- **Open writer: 320 bytes resident per key.** An open transient segment writer over `UInt64` keys accounts 9 bytes per key and holds 320, which is 35.5 times the accounted bytes. A key cap therefore bounds resident memory at about 36 times itself for narrow keys.
+- **Layout map: 84 bytes resident per key.** The cluster-key map over 9-byte keys accounts 73 bytes per key (`CLUSTER_KEY_OVERHEAD` included) and holds 84, which is 1.15 times the accounted bytes.
+
+Earlier debug-build figures, for scale:
+
 - **Index cap, u64 keys.** An 8 MiB `max_index_bytes` cap admitted about 900,000 keys, and resident memory peaked near 284 MB, 33 times the cap.
 - **Default caps, u64 keys.** 2 million unique keys peaked near 397 MB for a 90 MB index.
 - **Rows cap.** For narrow keys, `max_segment_rows` (2^20 rows, roughly 300 MB resident) is the bound that takes effect.
-- **Layout map.** `CLUSTER_KEY_OVERHEAD` undercounts the measured resident cost of the cluster-key map by about 15 to 25% for 9-byte keys: resident is about 1.2 times accounted.
 
-A calibrated per-key overhead, shared with the build crate, is a joint follow-up (`docs/contract-v3.md`, entry 32).
+Charging the writer's measured overhead to the caps, shared with the build crate, is a WP22b candidate.
 
 ## Tests
 
@@ -312,6 +330,7 @@ A calibrated per-key overhead, shared with the build crate, is a joint follow-up
 | `tests/determinism.rs` | Invariant 3: two processes in different modes over one corpus, byte-identical record, golden hash with the digest masked. |
 | `tests/inputs.rs` | `Replay.inputs`: the same data at two paths gives equal costs and two records; so does one folder before and after a file lands. |
 | `tests/wp4_planner.rs` | A committed index built by the build crate's `Builder`. Every run plans to the same whole `ScanPlan` under each configuration (exact, temporal, composite prefix, range, bloom, range ∩ exact), three ways: WP4 committed, WP4 with this crate's transient segments, and `SegmentPlanner` with them. `for_snapshot` replays equal `SegmentPlanner::from_snapshot`'s. |
+| `tests/sketch_planner.rs` | Two indexes over one corpus with the same key specs, one also declaring a `sketch`: `SegmentPlanner::from_snapshot` plans every run under each spec and all together to the same `ScanPlan` (some prune), and `Replayer::for_snapshot` replays current and hypothetical specs to the same costs. A sketch never reaches a replay plan. |
 | `tests/null_row_groups.rs` | All-null row groups: covered by every spec kind, recorded in the segments' own bytes, never selected, split-invariant. Two adjacent key-less segments have different bytes. A run of only null tuples plans nothing. Catalogs that differ by one all-null row group are kept apart. |
 | `tests/oracle.rs` | Invariant 1 through replay, on in-test corpora (also a property test over random layouts). The oracle reads the files directly. Exact paths must equal it: exact, temporal, composite prefix, range ∩ exact, and bloom ∩ prefix. Inexact paths must contain it. The per-key intersection of two single-column specs must equal the union over tuples of `oracle(a) ∩ oracle(b)`, and on some run be strictly smaller than the per-run intersection. Every cost must equal the footer sum of its cells, read with the `parquet` crate. `ParquetStats` must equal an independent implementation. |
 | `tests/typed_oracle.rs` | The same, two-sided, on the review's typed corpus: nulls, both zeros, NaN, decimals at two file scales, `u64 ≥ 2^63` and `u32 ≥ 2^31` under embedded filters, strings with NUL. |

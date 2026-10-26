@@ -55,6 +55,7 @@ The dataset schema is the one given in `BuildOptions::schema`, else the one the 
 Removal is explicit, in one of two ways:
 
 - `Builder::remove_spec(spec)` drops the declaration, the completeness entry and the segments in one commit, without reading a source file. It refuses a different spec declared under the same name.
+- `Builder::reset_sketch(spec)` drops a declared sketch's segments and completeness entry, keeping its declaration, in one commit that reads no source file, so the next build sketches every live row group again. The facade calls it when `index --key sketch:…` re-declares a sketch whose segments are missing from the store or damaged; nothing plans with a sketch, so nothing else depends on them.
 - `BuildOptions::remove_unlisted` makes a build remove every spec it is not given.
 
 Dropped segments are tombstoned by the commit, for GC. A build with nothing to do reads nothing and commits nothing.
@@ -83,6 +84,9 @@ A writer is finished and uploaded (`put_content_addressed`) as soon as the next 
 `tests/concurrency.rs` and `tests/restarts.rs` interleave a competing build, a winner that only retires ids, a schema change, a compaction, and a foreign segment drop at the CAS.
 
 ## Planning
+
+A lookup on an expression (a key column named by an expression over dataset columns) is served only by an `expr` key whose expression normalizes to the lookup's. Any other expression is refused with `Error::KeySpec` naming the `expr` keys that exist and the `index --key` spelling that would declare it; so is a lookup naming an `expr` key's virtual column, an expression beside other columns, and a latest, asof, lookback, window, or range lookup on an expression (an `expr` key answers point lookups only).
+
 
 **Serving rules.** A lookup over columns `C` is served by a spec over `P` when either:
 
@@ -118,7 +122,9 @@ Either probe silently misses. **Callers must encode probes with the typed encode
 
 **Plan contents.**
 
-- **Bytes.** Bytes are exact: the Parquet footer's `RowGroupMeta.bytes`, or a text file's recorded chunk lengths. The manifest records no per-row-group bytes.
+- **Bytes.** Bytes are exact: the manifest's `rowgroup_bytes` (storage version 2), or, for a file the manifest has no statistics for (a version 1 manifest before its first version 2 commit), the Parquet footer's `RowGroupMeta.bytes`; a text file's recorded chunk lengths. On a version 2 manifest a plan opens no footer (`tests/counts.rs` counts the calls).
+- **Rows and projections.** A plan through a spec that stores counts (`exact:a,counts`, `temporal:id@ts,counts`) carries `rows`, the exact rows holding the keys, summed from the segments' per-key counts (`Planner::count` returns them per key with no plan). With a projection (`locate --columns`), every entry carries `columns` and the plan `projected_bytes`, summed from the manifest's `column_bytes`.
+- **Statistics.** The build records `rowgroup_rows`, `rowgroup_bytes` and `column_bytes` for every file it adds, and the first commit over a version 1 manifest fills them for every tracked file from its footer (`docs/format.md`, "Manifest, storage version 2"). A build with nothing to do commits nothing, so a version 1 index stays at version 1 until a build has work.
 - **Drift.** Every planned file is checked against its fingerprint, so a plan over a drifted file is an error.
 - **Totals.** `row_groups_total` is the number of live row groups. `manifest_version` is the sequence (ADR 020).
 
@@ -127,11 +133,13 @@ Either probe silently misses. **Callers must encode probes with the typed encode
 | Lookup | Residual |
 |---|---|
 | `Keys` | `In` over the lookup columns |
+| `Keys` on an expression (`expr` key) | `ExprIn`: the expression recomputed per row |
 | `Latest` | `And[In, NotOlderThan, LatestPerKey]` |
 | `AsOf` | `And[In, Between(ts ≤ asof), NotOlderThan, LatestPerKey]` |
 | `Lookback` | `And[In, NotOlderThan(newest − lookback per key)]` |
 | `Between` | `Between` |
 | `Window` (also an `asof` lookback, the window `[asof − lookback, asof]`) | `And[In, Between(ts in window)]` |
+| `Text` (B5: `has_token`, `contains`, `has_prefix` on a string column through its text keys; a trigram or bloom plan is a candidate set) | `Text{column, operator, values}`, mandatory for candidates |
 | `Bitemporal` | `And[In, Between(valid), Between(known), NotOlderThan(valid), NotOlderThan(known), LatestPerKey(valid)]` |
 
 Details:
@@ -150,7 +158,22 @@ Details:
 - **`Lookup::Bitemporal`.** Through the one complete `temporal2` sidecar serving the key columns: per key, the greatest valid time at or before `valid` among versions known at or before `known` (either unbounded), then the greatest known time; the plan holds exactly the live row groups of each winner, ties kept (`tests/bitemporal.rs`). Retired row groups never win.
 - **Order.** `Planner::plan_ordered` plans the same row groups and orders entries by a timestamp range key's row-group minimum, returning `PlanOrder::Ordered` only when that order holds for every planned row group (`tests/ordered.rs`).
 
+**Sketches (B2): built here, never planned with.**
+
+- `BuildOptions::sketches` declares `bellwether_types::SketchSpec`s (`sketch:a,b,a+b[,p=14][,minhash=K]` on the command line): per item, per file, the HyperLogLog registers and optional MinHash signature of `bellwether_core::sketch`. Each is recorded in `schema.sidecars[]` with kind `sketch` (items in `columns`, no time column, `p` and `minhash` in `params`), its segments carry `segments[].kind = "sketch"`, and it is built, covered, and recorded complete by the sidecar rules (`sketch_completeness`; `declared_sketches` lists them). A malformed sketch declaration is kept unchanged like an unknown kind and never used.
+- **No planner path reads a sketch.** `declared_sidecars`, the only sidecars the planner sees, never yields one, and the planner modules never name the kind. `tests/sketch.rs` proves it: every lookup plans byte-identically with and without a sketch, and still does after every sketch segment is deleted from the store; a source tripwire fails if a planner file ever mentions the sketch kind.
+- Memory: a sketch writer grows by one entry per file stretch, each at most `sketch::max_entry_bytes` (`2^p` registers and `k` slots per item); that bound is charged against `max_segment_bytes` when an entry starts, so a segment closes before the cap is crossed.
+
+### List keys (B4)
+
+A `list:<column>` key is built like an exact key whose keys are the column's elements: one row group per worker, each row group's distinct elements (and their bytes) counted against `max_segment_keys` and `max_segment_bytes`, so a row group whose lists alone exceed a cap gets a segment of its own. `types_differ` compares element types, so a list key is not rebuilt on every build.
+
+`Lookup::ContainsAny { column, values }` and `Lookup::ContainsAll { column, values }` (values encoded at `Planner::element_type(column)`) plan through the list key on `column` only: any is the union of each value's row groups, all their intersection, a float zero probed in both encodings; a null value is dropped (any) or plans nothing (all); `contains_all` of no value is refused. Listed specs none of which is that list key are refused with the key to declare; no spec reads every live row group. A list key never serves `Lookup::Keys` or any other lookup. The residual is `ContainsAny` (every value's encodings) or `ContainsAll` (one sorted group per value), the residual replay writes for the same run.
+
 ## Memory (ADR 018)
+
+An `expr` key's build reads the expression's input columns and derives its virtual column one row group at a time, never more; JSON documents are scanned without building a tree.
+
 
 - **Build.**
   - Each worker holds one row group's key columns and one open segment per spec it builds.
@@ -163,6 +186,7 @@ Details:
   - one whole bloom or range segment at a time (they are scanned per probe);
   - the bitmaps and version hits for the keys asked.
 - **Compaction.** Holds a group's inputs and its output, so about twice `max_output_bytes`.
+- **Resident bytes per key (contract v3, entry 32).** The caps count accounted key bytes, not resident memory. A release build measured an open segment writer over `UInt64` keys at **320 resident bytes per key**, against 9 bytes accounted: 35.5 times. Over 9-byte keys, the layout map measured 84 resident bytes per key, against 73 accounted: 1.15 times. For narrow keys, then, the resident memory of `specs × cap` is about 36 times the cap. The figures come from `bellwether-replay`'s `tests/resident.rs` and are listed in [the measured document](../../docs/measured/2026-10-26-performance.md). Charging that overhead to the caps is a WP22b candidate.
 
 ## Tests
 
@@ -174,10 +198,12 @@ Ground truth never goes through the code under test:
 
 | File | Covers |
 |---|---|
+| `tests/expr.rs` | `expr` keys against files decoded with `parquet` and documents read with `serde_json`: invariant 1 for exact and bloom keys (an exact key plans exactly the holding row groups), the `ExprIn` residual keeps exactly the oracle's rows, equal spellings plan the same, and near misses, the virtual column's name, mixed columns, and latest lookups are refused naming the declared keys |
 | `tests/fixtures.rs` | Every source fixture: manifest contents, inference, exact/composite/prefix/bloom/range/raw plans with exact bytes, an all-null row group, NaN, UInt32 ≥ 2³¹, Decimal(38,4), latest/asof, CSV and JSON lines chunks persisted, and each file read at its recorded chunk size after the option changes |
 | `tests/invariants.rs` | Invariant 1 and 5 property test over random layouts, caps, item sizes and thread counts; the pruned-newest-version scenario, with the bound shown to be load-bearing; a retired version never bounding live rows |
 | `tests/ids.rs` | Never-reused ids across rewrite, removal and re-add; mtime drift |
-| `tests/completeness.rs` | A spec added later: every row group, recorded at its commit; incomplete spec queries are errors; gap filling; failed builds commit nothing; same-name redefinition; explicit removal by `remove_unlisted` and `remove_spec` |
+| `tests/completeness.rs` | A spec added later: every row group, recorded at its commit; incomplete spec queries are errors; gap filling; failed builds commit nothing; same-name redefinition; completeness keyed by identity (`bloom:grp@0.01` and `bloom:grp@0.05` never share an entry); explicit removal by `remove_unlisted` and `remove_spec` |
+| `tests/counts.rs` | Per-key counts against an oracle that decodes every file (trailing-null tuples, a rewrite that retires ids); the manifest arrays equal the footers before and after the rewrite; a version 2 plan opens no footer and carries exact rows; projected bytes equal the footers' column chunks |
 | `tests/concurrency.rs` | A competing build at the CAS forces a restart with fresh ids; a concurrent compaction is rebased onto |
 | `tests/memory.rs` | Peak batches alive per worker, key-only projection, segment caps, thread-count independence |
 | `tests/incremental.rs` | Source calls linear in new files (counted); no-op builds; root, kind, policy and chunk-size refusals |
@@ -191,6 +217,7 @@ Ground truth never goes through the code under test:
 | `tests/invariant1_by_value.rs` | Invariant 1 against an oracle comparing decoded values (SQL equality) over two decimal scales, two time units, nulls, signed zero, NaN, and CSV/JSONL chunks |
 | `tests/invariant5_retired.rs` | Latest and asof give the live answer when an old segment still holds a retired newest version, including ties, signed-zero variants, and asof with a pruned winner |
 | `tests/ledger.rs` | A ledger shaped like `bellwether-bench`'s; `real_bench_corpus` (ignored) runs the same checks over a corpus the bench crate wrote: `BELLWETHER_BENCH_CORPUS=<dir> cargo test -p bellwether-build --test ledger -- --ignored` |
+| `tests/sketch.rs` | Stored sketches equal sketches of the decoded files (the `parquet` crate's reader fed to core's sketcher), complete like a sidecar; new and changed files re-sketched, retired entries unused; a sketch on a missing column refused with nothing committed; no planner path reads a sketch (plans equal with, without, and after deleting every sketch segment; the planner sources never name the kind) |
 
 ## Benchmark
 
@@ -204,6 +231,6 @@ The bench crate cannot depend on this one (layering), so the benchmark lives her
 ## Known limits
 
 - Retired row-group ids stay inside segments written before the rewrite, because core's merge does not filter them. The planner drops them, and they cost space until the spec is rebuilt.
-- `KeySpec::name` omits `ts_column` and `fpr`, and the manifest keys segments and completeness by name. So two specs that differ only there cannot be declared together; the build refuses.
+- `KeySpec::name` omits `ts_column`, `fpr` and `counts`, and an index holds one spec per name: two specs that differ only there cannot be declared together (the build refuses), and declaring one over the other rebuilds it. Segments and completeness are keyed by `KeySpec::identity`, so the old definition's never serve the new one (`tests/completeness.rs`).
 - The manifest has no field for a CSV dialect. A non-default dialect is carried in `source.kind` as `csv;delimiter=<byte>;header=<bool>`, so a change is detected.
 - Sources read local files only (`LocalFs`), like `bellwether-source`. The index itself can live on any `bellwether-store` backend.

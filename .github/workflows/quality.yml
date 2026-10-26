@@ -19,6 +19,23 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - run: python3 dev/check-layering.py
 
+  charts:
+    name: charts and result tables match the committed results
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: python3 scripts/render_charts.py --check
+
+  readme-assets:
+    name: README figures and captures match their sources
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: python3 scripts/render_figures.py --check
+      # The captures' text is committed beside each SVG; no engine run here.
+      # scripts/readme-captures.sh regenerates the text from a real session.
+      - run: python3 scripts/render_terminal.py --check
+
   supply-chain:
     name: licenses · advisories · sources
     runs-on: ubuntu-latest
@@ -45,8 +62,14 @@ jobs:
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     timeout-minutes: 120
+    env:
+      # Two scratch copies build every --all-features test binary; without
+      # debuginfo they fit on the runner's root volume (see ci.yml `check`).
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
     steps:
       - uses: actions/checkout@v4
+      - uses: ./.github/actions/free-runner-disk
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo install cargo-mutants --locked

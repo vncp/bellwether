@@ -52,7 +52,11 @@
 //!   `LatestPerKey`: every version in the key's window is returned. The
 //!   plan holds every live row group with a version of a key in its window;
 //! - windows: `In` over `C`, then `Between` on the time column;
-//! - range lookups: `Between`, widened for signed zero.
+//! - range lookups: `Between`, widened for signed zero;
+//! - text lookups: `Text`, the match itself. A plan through a trigram or
+//!   bloom text key is a candidate set (a planned row group may hold no
+//!   match), so the residual is mandatory; a words dictionary plans only
+//!   row groups holding a match.
 //!
 //! # Order
 //!
@@ -72,6 +76,7 @@
 //! that does not hold.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use arrow::array::{ArrayRef, RecordBatch};
@@ -82,13 +87,15 @@ use bellwether_core::sidecar::{
     bitemporal_winner, BitemporalHit, RgBounds, SidecarDef, SidecarKind, SidecarReader, Triple,
 };
 use bellwether_core::temporal::{self, LookbackHit, VersionChain, VersionHit};
+use bellwether_core::text;
 use bellwether_core::SegmentReader;
 use bellwether_source::{
     fingerprint_with_policy, FingerprintPolicy, LocalFs, ParquetSource, Partitioning,
 };
 use bellwether_store::{Manifest, SegmentRef, Snapshot, StoreExt};
 use bellwether_types::{
-    Error, Hash, KeySpec, Predicate, Result, RowGroupId, ScanEntry, ScanPlan, Source,
+    ColumnBytes, Error, Hash, KeySpec, Predicate, Quantity, Result, RowGroupId, ScanEntry,
+    ScanPlan, Source, TextOp,
 };
 use bytes::Bytes;
 use roaring::RoaringBitmap;
@@ -200,6 +207,68 @@ pub enum Lookup {
         /// Upper bound on known time, in the known column's unit.
         known: Option<i64>,
     },
+    // --- phase 5 kinds ---
+    /// Rows whose string `column` matches one of `values` under `op`, both
+    /// sides case-folded (core's `text` module). Per value, the complete
+    /// text keys on `column` that answer `op` (core's `text::Shape`) are
+    /// intersected (every live row group when none prunes); the values'
+    /// sets are united. No value plans no row group. The residual is
+    /// [`Predicate::Text`].
+    Text {
+        /// The string column.
+        column: String,
+        /// The match.
+        op: TextOp,
+        /// The arguments as given.
+        values: Vec<String>,
+    },
+    /// Rows whose list column `column` (a `List`, `LargeList`, or a `Map`
+    /// by its keys) holds at least one of `values`: `array_contains`,
+    /// `has_any`, `exists(unnest)`. Each value is one canonical encoding at
+    /// the column's element type ([`Planner::element_type`]); a float zero
+    /// is probed in both encodings and a null value matches nothing (ADR
+    /// 014). Served only by a list key on `column` (B4), whose bitmaps are
+    /// unioned over the values; with no spec, every live row group. No
+    /// value plans no row group. Residual: `ContainsAny`.
+    ContainsAny {
+        /// The list column.
+        column: String,
+        /// Canonical element values.
+        values: Vec<Vec<u8>>,
+    },
+    /// Rows whose list column `column` holds every one of `values`
+    /// (`has_all`, `array_contains` of each). As
+    /// [`Lookup::ContainsAny`], except that the values' row groups are
+    /// intersected: a row group holding every value, possibly in different
+    /// rows, is planned, and the residual (`ContainsAll`) rechecks per row.
+    /// A null value matches nothing; no value at all is refused, because
+    /// every row, null and empty lists included, contains all of nothing.
+    ContainsAll {
+        /// The list column.
+        column: String,
+        /// Canonical element values.
+        values: Vec<Vec<u8>>,
+    },
+}
+
+/// The answer of [`Planner::count`]: exact, from per-key counts.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KeyCount {
+    /// The pinned manifest sequence.
+    pub manifest_version: String,
+    /// Distinct keys counted (a key containing a null matches nothing and
+    /// is not counted, ADR 014).
+    pub keys: u64,
+    /// Rows whose key tuple is one of the keys, in live row groups.
+    pub rows: u64,
+    /// Live row groups holding at least one of the keys.
+    pub row_groups: u64,
+    /// Live row groups in the index.
+    pub row_groups_total: u64,
+    /// Files holding those row groups.
+    pub files: u64,
+    /// The spec whose counts answered.
+    pub counted_by: KeySpec,
 }
 
 /// The order of a plan's entries ([`Planner::plan_ordered`]).
@@ -245,6 +314,10 @@ struct SpecSegments {
     sources: Vec<SegSource>,
 }
 
+/// A key lookup's row groups, the rows of its keys and the spec that
+/// counted them (when one does), and its non-null probe keys.
+type SelectedKeys = (RoaringBitmap, Option<(u64, KeySpec)>, Vec<Vec<u8>>);
+
 /// How a spec serves a lookup (see the module docs).
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Serve {
@@ -253,6 +326,18 @@ enum Serve {
 }
 
 fn serve(spec: &KeySpec, columns: &[String]) -> Option<Serve> {
+    // A text key serves text lookups only ([`Lookup::Text`]); its
+    // dictionary holds tokens, not values, so it never serves a key. An
+    // expr key serves only a lookup on its expression (`plan_expr`), never
+    // one that names its virtual column. A list key answers membership
+    // lookups only (`plan_contains`), never a lookup on the list column's
+    // value as a whole.
+    if matches!(
+        spec,
+        KeySpec::Text { .. } | KeySpec::Expr { .. } | KeySpec::List { .. }
+    ) {
+        return None;
+    }
     let p = spec.columns();
     let positions: Option<Vec<usize>> = p
         .iter()
@@ -274,6 +359,7 @@ pub struct Planner<S: StoreExt + ?Sized> {
     parquet: Option<ParquetSource<LocalFs>>,
     locator: Locator,
     verified: Mutex<BTreeSet<usize>>,
+    footers: AtomicU64,
 }
 
 impl<S: StoreExt + ?Sized> std::fmt::Debug for Planner<S> {
@@ -309,6 +395,7 @@ impl<S: StoreExt + ?Sized> Planner<S> {
             parquet,
             locator,
             verified: Mutex::new(BTreeSet::new()),
+            footers: AtomicU64::new(0),
         })
     }
 
@@ -341,6 +428,15 @@ impl<S: StoreExt + ?Sized> Planner<S> {
     #[must_use]
     pub fn completeness(&self, spec: &KeySpec) -> Option<u64> {
         completeness(self.manifest(), spec)
+    }
+
+    /// Parquet footers this planner opened to price a plan: zero on a
+    /// storage version 2 manifest, whose row-group bytes the plan reads from
+    /// the manifest; one per planned file of a version 1 manifest the next
+    /// build has not yet filled.
+    #[must_use]
+    pub fn footers_opened(&self) -> u64 {
+        self.footers.load(Ordering::Relaxed)
     }
 
     /// The sidecars the manifest declares that this binary knows (per-key
@@ -382,11 +478,31 @@ impl<S: StoreExt + ?Sized> Planner<S> {
             .collect()
     }
 
+    /// The element type of list column `column` (the item type of a `List`
+    /// or `LargeList`, the key type of a `Map`): the type a membership
+    /// lookup's values are encoded at. Refused, with the reason, for a
+    /// column that is not a list of a flat type.
+    pub fn element_type(&self, column: &str) -> Result<DataType> {
+        let (_, dt) = self.column_types(&[column.to_string()])?.remove(0);
+        bellwether_core::list::check_list_column(column, &dt)
+    }
+
     /// The dataset types of `columns`, which must be distinct schema
     /// columns.
     pub fn column_types(&self, columns: &[String]) -> Result<Vec<(String, DataType)>> {
         if columns.is_empty() {
             return Err(Error::KeySpec("a lookup needs at least one column".into()));
+        }
+        if columns.len() > 1
+            && columns
+                .iter()
+                .any(|c| bellwether_core::expr::is_expression(c, &self.schema))
+        {
+            return Err(Error::KeySpec(format!(
+                "a lookup on an expression names that expression alone, not with other columns \
+                 ({}); look it up by the expression only",
+                columns.join(", ")
+            )));
         }
         let mut seen = BTreeSet::new();
         columns
@@ -395,13 +511,32 @@ impl<S: StoreExt + ?Sized> Planner<S> {
                 if !seen.insert(c) {
                     return Err(Error::KeySpec(format!("lookup lists column {c:?} twice")));
                 }
-                let f = self
-                    .schema
-                    .field_with_name(c)
-                    .map_err(|_| Error::KeySpec(encoding::not_in_schema(&self.schema, c)))?;
-                Ok((c.clone(), f.data_type().clone()))
+                if let Ok(f) = self.schema.field_with_name(c) {
+                    return Ok((c.clone(), f.data_type().clone()));
+                }
+                if bellwether_core::expr::is_expression(c, &self.schema) {
+                    let t = bellwether_core::expr::Typed::parse(c, &self.schema)?;
+                    return Ok((t.expr().to_string(), t.data_type().clone()));
+                }
+                Err(Error::KeySpec(self.missing_column(c)))
             })
             .collect()
+    }
+
+    /// Why `c` is not a lookup column: not in the schema, or the virtual
+    /// column of an `expr` key, which a lookup names by its expression.
+    fn missing_column(&self, c: &str) -> String {
+        let named = self.declared_specs().iter().find_map(|s| match s {
+            KeySpec::Expr { name, expr, .. } if name == c => Some((s.name(), expr.clone())),
+            _ => None,
+        });
+        match named {
+            Some((spec, expr)) => format!(
+                "{c:?} is the virtual column of the expr key {spec}, which a lookup matches only \
+                 by its expression: name the key column {expr}"
+            ),
+            None => encoding::not_in_schema(&self.schema, c),
+        }
     }
 
     /// Canonical key tuples over `columns` for every row of `batch`, each
@@ -509,6 +644,7 @@ impl<S: StoreExt + ?Sized> Planner<S> {
                             KeySpec::Temporal {
                                 columns: c,
                                 ts_column,
+                                ..
                             } if c.iter().all(|x| columns.contains(x)) => Some(ts_column.clone()),
                             _ => None,
                         })
@@ -516,7 +652,10 @@ impl<S: StoreExt + ?Sized> Planner<S> {
                     Lookup::Lookback { columns, .. } => {
                         self.lookback_column(specs, columns).ok().flatten()
                     }
-                    Lookup::Keys { .. } => None,
+                    Lookup::Keys { .. }
+                    | Lookup::Text { .. }
+                    | Lookup::ContainsAny { .. }
+                    | Lookup::ContainsAll { .. } => None,
                 };
                 many.iter()
                     .find(|s| Some(&s.columns()[0]) == own.as_ref())
@@ -547,7 +686,7 @@ impl<S: StoreExt + ?Sized> Planner<S> {
         let column = spec.columns()[0].clone();
         // Every row group's minimum from the range key's own segments.
         let mut mins: BTreeMap<u32, Vec<u8>> = BTreeMap::new();
-        let name = spec.name();
+        let name = spec.identity();
         for s in self.manifest().key_spec_segments(&name) {
             let src = SegSource::Committed {
                 id: s.id,
@@ -639,6 +778,39 @@ impl<S: StoreExt + ?Sized> Planner<S> {
         extra: &[TransientSpec],
     ) -> Result<ScanPlan> {
         let segs = self.resolve(specs, extra)?;
+        let lookup_columns: &[String] = match lookup {
+            Lookup::Keys { columns, .. }
+            | Lookup::Latest { columns, .. }
+            | Lookup::AsOf { columns, .. }
+            | Lookup::Lookback { columns, .. }
+            | Lookup::Window { columns, .. }
+            | Lookup::Bitemporal { columns, .. } => columns,
+            Lookup::Between { column, .. }
+            | Lookup::Text { column, .. }
+            | Lookup::ContainsAny { column, .. }
+            | Lookup::ContainsAll { column, .. } => std::slice::from_ref(column),
+        };
+        if let Some(e) = lookup_columns
+            .iter()
+            .find(|c| bellwether_core::expr::is_expression(c, &self.schema))
+        {
+            return match lookup {
+                Lookup::Keys { keys, .. } if lookup_columns.len() == 1 => {
+                    self.plan_expr(&segs, e, keys)
+                }
+                Lookup::Keys { .. } => {
+                    self.column_types(lookup_columns)?;
+                    Err(Error::KeySpec(
+                        "an expression lookup takes one column".into(),
+                    ))
+                }
+                _ => Err(Error::KeySpec(format!(
+                    "{e} is an expression; an expression key answers point lookups (locate) \
+                     only, so a latest, asof, lookback, window, or range lookup needs dataset \
+                     columns"
+                ))),
+            };
+        }
         match lookup {
             Lookup::Keys { columns, keys } => self.plan_keys(&segs, columns, keys),
             Lookup::Latest { columns, keys } => {
@@ -672,7 +844,314 @@ impl<S: StoreExt + ?Sized> Planner<S> {
                 let sidecars = self.sidecars_for(lookup);
                 self.plan_bitemporal(&sidecars, columns, keys, *valid, *known)
             }
+            Lookup::Text { column, op, values } => self.plan_text(&segs, column, *op, values),
+            Lookup::ContainsAny { column, values } => {
+                self.plan_contains(&segs, column, values, false)
+            }
+            Lookup::ContainsAll { column, values } => {
+                self.plan_contains(&segs, column, values, true)
+            }
         }
+    }
+
+    /// Counts the rows whose `columns` tuple is one of `keys`
+    /// (`count(*) where (columns) in keys`) from the per-key counts of a
+    /// complete spec in `specs` that stores them and whose key is exactly
+    /// `columns` (`exact:…,counts`, `temporal:…,counts`). Every other spec
+    /// in `specs` that serves the lookup narrows the row groups, as in
+    /// [`Planner::plan`]. Reads the manifest and the value records of the
+    /// keys asked; no data file is opened, not even for a fingerprint.
+    /// `None` without such a spec: rows would need a scan. A count on an
+    /// expression (one key column named by it) is counted by an
+    /// `expr:<name>=<expr>:exact,counts` key over the same normalized
+    /// expression; a near miss is refused as [`Planner::plan`] refuses it.
+    pub fn count(
+        &self,
+        specs: &[KeySpec],
+        columns: &[String],
+        keys: &[Vec<u8>],
+    ) -> Result<Option<KeyCount>> {
+        // Only specs that serve the lookup take part; with none, nothing
+        // counts. A count on an expression: only the expr keys over it take part
+        // (a near miss is refused as a lookup is), counted by one that
+        // stores counts.
+        let (selected, rows, keys) = match columns {
+            [c] if bellwether_core::expr::is_expression(c, &self.schema) => {
+                let exprs: Vec<KeySpec> = specs
+                    .iter()
+                    .filter(|s| matches!(s, KeySpec::Expr { .. }))
+                    .cloned()
+                    .collect();
+                if exprs.is_empty() {
+                    return Ok(None);
+                }
+                let segs = self.resolve(&exprs, &[])?;
+                self.select_expr(&segs, c, keys)?.0
+            }
+            _ => {
+                let specs: Vec<KeySpec> = specs
+                    .iter()
+                    .filter(|s| serve(s, columns).is_some())
+                    .cloned()
+                    .collect();
+                if specs.is_empty() {
+                    return Ok(None);
+                }
+                let segs = self.resolve(&specs, &[])?;
+                self.select_keys(&segs, columns, keys)?
+            }
+        };
+        self.count_of(&selected, rows, &keys)
+    }
+
+    fn count_of(
+        &self,
+        selected: &RoaringBitmap,
+        rows: Option<(u64, KeySpec)>,
+        keys: &[Vec<u8>],
+    ) -> Result<Option<KeyCount>> {
+        let Some((rows, counted_by)) = rows else {
+            return Ok(None);
+        };
+        self.locator.check_known(selected)?;
+        let live = selected & self.locator.live();
+        let mut files = BTreeSet::new();
+        for id in &live {
+            let (fi, _) = self
+                .locator
+                .locate(RowGroupId(id))
+                .ok_or_else(|| Error::Other(format!("live row-group id {id} has no file")))?;
+            files.insert(fi);
+        }
+        Ok(Some(KeyCount {
+            manifest_version: self.sequence().to_string(),
+            keys: keys.len() as u64,
+            rows,
+            row_groups: live.len(),
+            row_groups_total: self.locator.live().len(),
+            files: files.len() as u64,
+            counted_by,
+        }))
+    }
+
+    /// Fills each entry's `columns` and the plan's `projected_bytes` for a
+    /// consumer that reads only `columns` (distinct dataset columns): the
+    /// compressed bytes of each column over the entry's row groups, from the
+    /// manifest's `column_bytes` (storage version 2). A storage version 1
+    /// manifest records none, so a Parquet file's are read from its footer;
+    /// the result is the number of footers read that way (0 on a version 2
+    /// manifest). A text source's chunks have no per-column bytes, so its
+    /// entries carry none and count their whole bytes. `plan` must come
+    /// from this planner.
+    pub fn project(&self, plan: &mut ScanPlan, columns: &[String]) -> Result<u64> {
+        if plan.manifest_version != self.sequence().to_string() {
+            return Err(Error::Other(format!(
+                "the plan is of manifest {} but the planner pins {}",
+                plan.manifest_version,
+                self.sequence()
+            )));
+        }
+        self.column_types(columns)?;
+        let m = self.manifest();
+        let width = m.schema.columns.len();
+        let positions: Vec<usize> = columns
+            .iter()
+            .map(|c| {
+                m.schema
+                    .columns
+                    .iter()
+                    .position(|d| &d.name == c)
+                    .ok_or_else(|| Error::KeySpec(encoding::not_in_schema(&self.schema, c)))
+            })
+            .collect::<Result<_>>()?;
+        let by_path: BTreeMap<&str, usize> = m
+            .rowgroup_space
+            .files
+            .iter()
+            .enumerate()
+            .map(|(i, f)| (f.fingerprint.path.as_str(), i))
+            .collect();
+        let mut projected = 0u64;
+        let mut from_footers = 0u64;
+        for e in &mut plan.entries {
+            let fi = *by_path.get(e.file.path.as_str()).ok_or_else(|| {
+                Error::Other(format!("{} is not tracked by the manifest", e.file.path))
+            })?;
+            let f = &m.rowgroup_space.files[fi];
+            if self.kind.text_format().is_some() {
+                e.columns = None;
+                projected += e.bytes;
+                continue;
+            }
+            let footer;
+            let column_bytes = if let Some(b) = &f.column_bytes {
+                b.as_slice()
+            } else {
+                footer = self.footer_column_bytes(fi)?;
+                from_footers += 1;
+                footer.as_slice()
+            };
+            let mut out = Vec::with_capacity(columns.len());
+            for (c, &j) in columns.iter().zip(&positions) {
+                let mut bytes = 0u64;
+                for idx in &e.row_groups {
+                    let i = usize::try_from(idx).unwrap_or(usize::MAX);
+                    bytes += i
+                        .checked_mul(width)
+                        .and_then(|at| column_bytes.get(at.checked_add(j)?))
+                        .ok_or_else(|| {
+                            Error::Other(format!("row group {idx} out of range in {}", e.file.path))
+                        })?;
+                }
+                projected += bytes;
+                out.push(ColumnBytes {
+                    column: c.clone(),
+                    bytes,
+                });
+            }
+            e.columns = Some(out);
+        }
+        plan.projected_bytes = Some(projected);
+        Ok(from_footers)
+    }
+
+    /// Compressed bytes of each column chunk of tracked Parquet file `fi`,
+    /// row-group-major over the dataset schema's columns (0 for a column
+    /// the file does not hold, a virtual partition column), read from its
+    /// footer: what a storage version 2 manifest records as
+    /// `column_bytes`, for a version 1 manifest that records none.
+    fn footer_column_bytes(&self, fi: usize) -> Result<Vec<u64>> {
+        let m = self.manifest();
+        let f = &m.rowgroup_space.files[fi];
+        let parquet = self.parquet.as_ref().ok_or_else(|| {
+            Error::Other(format!(
+                "{}: no Parquet reader for a Parquet index",
+                f.fingerprint.path
+            ))
+        })?;
+        self.footers.fetch_add(1, Ordering::Relaxed);
+        let metas = parquet.row_groups(&f.fingerprint)?;
+        if metas.len() != f.rowgroup_ids.len() {
+            return Err(Error::Source(format!(
+                "{}: the footer lists {} row groups, the manifest {}",
+                f.fingerprint.path,
+                metas.len(),
+                f.rowgroup_ids.len()
+            )));
+        }
+        let mut out = Vec::with_capacity(metas.len().saturating_mul(m.schema.columns.len()));
+        for rg in &metas {
+            for c in &m.schema.columns {
+                out.push(
+                    rg.stats
+                        .iter()
+                        .find(|s| s.column == c.name)
+                        .and_then(|s| s.bytes)
+                        .unwrap_or(0),
+                );
+            }
+        }
+        Ok(out)
+    }
+
+    /// A membership lookup on list column `column` (see
+    /// [`Lookup::ContainsAny`] and [`Lookup::ContainsAll`]).
+    fn plan_contains(
+        &self,
+        segs: &[SpecSegments],
+        column: &str,
+        values: &[Vec<u8>],
+        all: bool,
+    ) -> Result<ScanPlan> {
+        let element = self.element_type(column)?;
+        if all && values.is_empty() {
+            return Err(Error::KeySpec(format!(
+                "contains_all on {column} needs at least one value: with none, every row matches, \
+                 null and empty lists included, which a list key does not record; pass the \
+                 values, or read the folder without a lookup"
+            )));
+        }
+        let types = [(column.to_string(), element)];
+        let (kept, _) = non_null_probes(values, &types)?;
+        // ADR 014: a null value matches nothing. For `any` it is dropped;
+        // for `all` no row can contain it, so nothing matches.
+        let nothing = all && kept.len() < values.len();
+        // One sorted group per value (both encodings of a float zero), the
+        // groups sorted: the residual replay writes for the same run.
+        let mut groups: Vec<Vec<Vec<u8>>> = kept
+            .iter()
+            .map(|v| {
+                let mut g = zero_variants(v);
+                g.sort_unstable();
+                g
+            })
+            .collect();
+        groups.sort_unstable();
+        groups.dedup();
+        let serving: Vec<&SpecSegments> = segs
+            .iter()
+            .filter(|s| matches!(&s.spec, KeySpec::List { column: c } if c == column))
+            .collect();
+        if !segs.is_empty() && serving.is_empty() {
+            return Err(Error::KeySpec(format!(
+                "none of the key specs {:?} serves a membership lookup on {column}; only a list \
+                 key does: declare list:{column}, or plan with no key spec to read every row group",
+                segs.iter().map(|s| s.spec.name()).collect::<Vec<_>>()
+            )));
+        }
+        let selected = if groups.is_empty() || nothing {
+            // No value (or, for `all`, a null value): no row, never a scan.
+            RoaringBitmap::new()
+        } else if serving.is_empty() {
+            self.locator.live().clone()
+        } else {
+            let probes = sorted_probes(&groups);
+            let mut per: BTreeMap<Vec<u8>, RoaringBitmap> = BTreeMap::new();
+            for seg in &serving {
+                for src in &seg.sources {
+                    let r = self.open_segment(&seg.spec, src, false)?;
+                    for (k, v) in r.get(&probes)? {
+                        *per.entry(k).or_default() |= &v.bitmap;
+                    }
+                }
+            }
+            let of = |g: &Vec<Vec<u8>>| {
+                g.iter()
+                    .filter_map(|v| per.get(v))
+                    .fold(RoaringBitmap::new(), |u, b| u | b)
+            };
+            if all {
+                let mut acc: Option<RoaringBitmap> = None;
+                for g in &groups {
+                    let b = of(g);
+                    acc = Some(match acc {
+                        Some(a) => a & b,
+                        None => b,
+                    });
+                }
+                acc.unwrap_or_default()
+            } else {
+                groups.iter().fold(RoaringBitmap::new(), |u, g| u | of(g))
+            }
+        };
+        let residual = if all && !nothing {
+            Predicate::ContainsAll {
+                column: column.to_string(),
+                values: groups,
+            }
+        } else {
+            // `any`, or `all` with a null value, whose residual keeps no
+            // row: `ContainsAny` of nothing.
+            Predicate::ContainsAny {
+                column: column.to_string(),
+                values: if nothing {
+                    Vec::new()
+                } else {
+                    sorted_probes(&groups)
+                },
+            }
+        };
+        self.finish(&selected, residual)
     }
 
     // -- specs and segments ------------------------------------------------
@@ -701,10 +1180,11 @@ impl<S: StoreExt + ?Sized> Planner<S> {
                 if self.completeness(spec).is_none() {
                     return Err(self.not_servable(spec));
                 }
+                let identity = spec.identity();
                 let sources = m
                     .segments
                     .iter()
-                    .filter(|s| segment_of(s, &name))
+                    .filter(|s| segment_of(s, &identity))
                     .map(|s| SegSource::Committed {
                         id: s.id,
                         size: s.bytes,
@@ -724,7 +1204,9 @@ impl<S: StoreExt + ?Sized> Planner<S> {
         match self.declared_specs().iter().find(|s| s.name() == name) {
             None => Error::KeySpec(format!("key spec {name} is not declared in this index")),
             Some(d) if d != spec => Error::KeySpec(format!(
-                "the index declares {d:?} under the name {name}, not {spec:?}"
+                "the index declares {} under the name {name}, not {}",
+                d.identity(),
+                spec.identity()
             )),
             Some(_) => Error::KeySpec(format!(
                 "key spec {name} is not complete at manifest sequence {seq} (ADR 012); a query on an \
@@ -756,9 +1238,10 @@ impl<S: StoreExt + ?Sized> Planner<S> {
         let reader = SegmentReader::open_for_dataset(bytes, &self.schema)?;
         if reader.key_spec() != spec {
             return Err(Error::KeySpec(format!(
-                "a segment listed under {} indexes {:?}",
-                spec.name(),
-                reader.key_spec()
+                "a segment listed under {} indexes {}; the manifest lists it under another \
+                 spec, so restore the manifest from manifests/ or rebuild the spec",
+                spec.identity(),
+                reader.key_spec().identity()
             )));
         }
         Ok(reader)
@@ -781,13 +1264,17 @@ impl<S: StoreExt + ?Sized> Planner<S> {
         Ok(serving)
     }
 
-    /// For each key, the row groups `seg` may hold it in.
+    /// For each key, the row groups `seg` may hold it in. With `rows`, the
+    /// spec stores counts and its key is the whole lookup tuple: the rows of
+    /// every key in live row groups are added to it, read from the same
+    /// value records.
     fn per_key(
         &self,
         seg: &SpecSegments,
         how: &Serve,
         keys: &[Vec<u8>],
         spans: &[Vec<std::ops::Range<usize>>],
+        mut rows: Option<&mut u64>,
     ) -> Result<Vec<RoaringBitmap>> {
         let probes: Vec<Vec<Vec<u8>>> = keys
             .iter()
@@ -798,7 +1285,10 @@ impl<S: StoreExt + ?Sized> Planner<S> {
             })
             .collect();
         let mut out = vec![RoaringBitmap::new(); keys.len()];
-        let keyed = matches!(seg.spec, KeySpec::Exact { .. } | KeySpec::Temporal { .. });
+        let keyed = matches!(
+            seg.spec.physical(),
+            KeySpec::Exact { .. } | KeySpec::Temporal { .. }
+        );
         match (keyed, how) {
             (true, Serve::Project(_)) => {
                 let mut owners: BTreeMap<&[u8], Vec<usize>> = BTreeMap::new();
@@ -808,9 +1298,41 @@ impl<S: StoreExt + ?Sized> Planner<S> {
                     }
                 }
                 let all: Vec<&[u8]> = owners.keys().copied().collect();
+                let live = self.locator.live();
+                // The live row groups each probe was counted in so far: two
+                // segments counting one key in one live row group would
+                // count its rows twice (a retired one is never counted).
+                let mut counted_in: BTreeMap<&[u8], RoaringBitmap> = BTreeMap::new();
                 for src in &seg.sources {
                     let r = self.open_segment(&seg.spec, src, false)?;
                     for (probe, value) in r.get(&all)? {
+                        if let Some(total) = rows.as_deref_mut() {
+                            let key = owners
+                                .get_key_value(probe.as_slice())
+                                .map_or(&[][..], |(k, _)| *k);
+                            let seen = counted_in.entry(key).or_default();
+                            let counts_in = &value.bitmap & live;
+                            if !seen.is_disjoint(&counts_in) {
+                                return Err(overlapping_counts(&seg.spec));
+                            }
+                            *seen |= counts_in;
+                            // Probes are distinct (both zeros of a key are
+                            // two stored keys), so no row counts twice.
+                            let counted = value.counted().ok_or_else(|| {
+                                Error::Other(format!(
+                                    "corrupt segment: a segment of {} holds a key without its \
+                                     counts",
+                                    seg.spec.identity()
+                                ))
+                            })?;
+                            for (rg, n) in counted {
+                                if live.contains(rg.0) {
+                                    *total = total.checked_add(n).ok_or_else(|| {
+                                        Error::Other("row count overflows u64".into())
+                                    })?;
+                                }
+                            }
+                        }
                         for &i in owners.get(probe.as_slice()).map_or(&[][..], Vec::as_slice) {
                             out[i] |= &value.bitmap;
                         }
@@ -847,16 +1369,23 @@ impl<S: StoreExt + ?Sized> Planner<S> {
         Ok(out)
     }
 
-    /// Intersects per-key row groups across `serving` into `acc`.
+    /// Intersects per-key row groups across `serving` into `acc`. With
+    /// `rows`, the serving spec at `rows.0` counts the rows of the keys
+    /// into `rows.1` ([`Self::counting`]).
     fn intersect(
         &self,
         acc: &mut [Option<RoaringBitmap>],
         serving: &[(&SpecSegments, Serve)],
         keys: &[Vec<u8>],
         spans: &[Vec<std::ops::Range<usize>>],
+        mut rows: Option<(usize, &mut u64)>,
     ) -> Result<()> {
-        for (seg, how) in serving {
-            let bitmaps = self.per_key(seg, how, keys, spans)?;
+        for (si, (seg, how)) in serving.iter().enumerate() {
+            let count = match rows.as_mut() {
+                Some((at, total)) if *at == si => Some(&mut **total),
+                _ => None,
+            };
+            let bitmaps = self.per_key(seg, how, keys, spans, count)?;
             for (a, b) in acc.iter_mut().zip(bitmaps) {
                 *a = Some(match a.take() {
                     Some(x) => x & b,
@@ -869,15 +1398,124 @@ impl<S: StoreExt + ?Sized> Planner<S> {
 
     // -- lookups -------------------------------------------------------------
 
+    /// A point lookup on an expression (`text`, as the lookup spells it):
+    /// the `expr` keys among `segs` whose expression normalizes to the
+    /// lookup's serve it, intersected per key; none serving (with any key
+    /// given) is an error naming the expr keys that do exist, never a guess.
+    /// The residual recomputes the expression per row (`ExprIn`).
+    fn plan_expr(&self, segs: &[SpecSegments], text: &str, keys: &[Vec<u8>]) -> Result<ScanPlan> {
+        let ((selected, rows, keys), normalized) = self.select_expr(segs, text, keys)?;
+        let residual = Predicate::ExprIn {
+            expr: normalized,
+            values: expanded(keys.iter()),
+        };
+        let mut plan = self.finish(&selected, residual)?;
+        plan.rows = rows.map(|(n, _)| Quantity::exact(n));
+        Ok(plan)
+    }
+
+    /// The row groups of a lookup on an expression ([`Self::plan_expr`]),
+    /// the rows of its values when a serving `expr` key stores counts
+    /// (`expr:<name>=<expr>:exact,counts`, whose key is the whole lookup),
+    /// the non-null probe values, and the normalized expression.
+    fn select_expr(
+        &self,
+        segs: &[SpecSegments],
+        text: &str,
+        keys: &[Vec<u8>],
+    ) -> Result<(SelectedKeys, String)> {
+        let typed = bellwether_core::expr::Typed::parse(text, &self.schema)?;
+        let normalized = typed.expr().to_string();
+        let key_types = vec![(normalized.clone(), typed.data_type().clone())];
+        let (keys, spans) = non_null_probes(keys, &key_types)?;
+        let serving: Vec<(&SpecSegments, Serve)> = segs
+            .iter()
+            .filter(|s| matches!(&s.spec, KeySpec::Expr { expr, .. } if *expr == normalized))
+            .map(|s| (s, Serve::Project(vec![0])))
+            .collect();
+        // The manifest's spec, not only its segments' headers, must carry
+        // every vector this binary pins (a manifest edited to drop them is
+        // refused before any segment is read).
+        for (s, _) in &serving {
+            bellwether_core::expr::check_spec(&s.spec)?;
+        }
+        if !segs.is_empty() && serving.is_empty() {
+            let others: Vec<String> = segs
+                .iter()
+                .filter(|s| matches!(s.spec, KeySpec::Expr { .. }))
+                .map(|s| s.spec.name())
+                .collect();
+            let declare = format!(
+                "bellwether index {} --key {}",
+                bellwether_core::expr::shell_quote(&self.manifest().source.root),
+                bellwether_core::expr::shell_quote(&format!(
+                    "expr:{}={normalized}:exact",
+                    bellwether_core::expr::suggested_name(typed.expr(), &self.schema)
+                ))
+            );
+            return Err(Error::KeySpec(if others.is_empty() {
+                format!(
+                    "no expr key indexes {normalized}, and no other key spec can serve a lookup \
+                     on an expression; declare one with `{declare}`"
+                )
+            } else {
+                format!(
+                    "no expr key indexes {normalized}: the expr keys here are {}; a lookup \
+                     matches an expr key only when its expression normalizes to the key's \
+                     (an expression that differs at all is another value, so it is never \
+                     guessed); look up one of those expressions, or declare this one with \
+                     `{declare}`",
+                    others.join(", ")
+                )
+            }));
+        }
+        let counting = serving.iter().position(|(s, _)| s.spec.counts());
+        let mut rows = counting.map(|_| 0u64);
+        let selected = if keys.is_empty() {
+            RoaringBitmap::new()
+        } else if segs.is_empty() {
+            self.locator.live().clone()
+        } else {
+            let mut acc = vec![None; keys.len()];
+            let count = counting.zip(rows.as_mut());
+            self.intersect(&mut acc, &serving, &keys, &spans, count)?;
+            acc.into_iter()
+                .flatten()
+                .fold(RoaringBitmap::new(), |u, b| u | b)
+        };
+        let rows = rows.zip(counting.map(|i| serving[i].0.spec.clone()));
+        Ok(((selected, rows, keys), normalized))
+    }
+
     fn plan_keys(
         &self,
         segs: &[SpecSegments],
         columns: &[String],
         keys: &[Vec<u8>],
     ) -> Result<ScanPlan> {
+        let (selected, rows, keys) = self.select_keys(segs, columns, keys)?;
+        let residual = Predicate::In {
+            columns: columns.to_vec(),
+            values: expanded(keys.iter()),
+        };
+        let mut plan = self.finish(&selected, residual)?;
+        plan.rows = rows.map(|(n, _)| Quantity::exact(n));
+        Ok(plan)
+    }
+
+    /// The row groups of a key lookup, the rows of its keys when a serving
+    /// spec counts them ([`Self::counting`]), and the non-null probe keys.
+    fn select_keys(
+        &self,
+        segs: &[SpecSegments],
+        columns: &[String],
+        keys: &[Vec<u8>],
+    ) -> Result<SelectedKeys> {
         let types = self.column_types(columns)?;
         let (keys, spans) = non_null_probes(keys, &types)?;
         let serving = Self::serving(segs, columns)?;
+        let counting = Self::counting(&serving, columns);
+        let mut rows = counting.map(|_| 0u64);
         let selected = if keys.is_empty() {
             // No key, no row: never a full scan.
             RoaringBitmap::new()
@@ -885,16 +1523,24 @@ impl<S: StoreExt + ?Sized> Planner<S> {
             self.locator.live().clone()
         } else {
             let mut acc = vec![None; keys.len()];
-            self.intersect(&mut acc, &serving, &keys, &spans)?;
+            let count = counting.zip(rows.as_mut());
+            self.intersect(&mut acc, &serving, &keys, &spans, count)?;
             acc.into_iter()
                 .flatten()
                 .fold(RoaringBitmap::new(), |u, b| u | b)
         };
-        let residual = Predicate::In {
-            columns: columns.to_vec(),
-            values: expanded(keys.iter()),
-        };
-        self.finish(&selected, residual)
+        let rows = rows.zip(counting.map(|i| serving[i].0.spec.clone()));
+        Ok((selected, rows, keys))
+    }
+
+    /// The serving spec that counts a key lookup's rows: the first one that
+    /// stores counts (`exact:…,counts`, `temporal:…,counts`) and whose key is
+    /// the whole lookup tuple, so each probe is one stored key. A spec over
+    /// fewer columns would count rows of other tuples sharing its key.
+    fn counting(serving: &[(&SpecSegments, Serve)], columns: &[String]) -> Option<usize> {
+        serving.iter().position(|(s, how)| {
+            s.spec.counts() && matches!(how, Serve::Project(p) if p.len() == columns.len())
+        })
     }
 
     fn plan_temporal(
@@ -966,7 +1612,7 @@ impl<S: StoreExt + ?Sized> Planner<S> {
             .filter(|(s, _)| !std::ptr::eq(*s, t))
             .map(|(s, h)| (*s, h.clone()))
             .collect();
-        self.intersect(&mut acc, &others, keys, &spans)?;
+        self.intersect(&mut acc, &others, keys, &spans, None)?;
         let selected = acc
             .into_iter()
             .flatten()
@@ -1157,7 +1803,7 @@ impl<S: StoreExt + ?Sized> Planner<S> {
         for s in segs {
             let range = match &s.spec {
                 KeySpec::Range { column: c } if c == column => true,
-                KeySpec::Exact { columns } | KeySpec::Temporal { columns, .. }
+                KeySpec::Exact { columns, .. } | KeySpec::Temporal { columns, .. }
                     if columns.first().is_some_and(|c| c == column) =>
                 {
                     false
@@ -1276,7 +1922,7 @@ impl<S: StoreExt + ?Sized> Planner<S> {
             }
         };
         let mut acc: Vec<Option<RoaringBitmap>> = vec![None; keys.len()];
-        self.intersect(&mut acc, &serving, &keys, &spans)?;
+        self.intersect(&mut acc, &serving, &keys, &spans, None)?;
         if let Some(w) = &window {
             narrow(&mut acc, w);
         }
@@ -1443,6 +2089,7 @@ impl<S: StoreExt + ?Sized> Planner<S> {
             KeySpec::Temporal {
                 columns: c,
                 ts_column,
+                ..
             } if c.iter().all(|x| columns.contains(x)) => Some(ts_column),
             _ => None,
         });
@@ -1606,7 +2253,7 @@ impl<S: StoreExt + ?Sized> Planner<S> {
             .filter_map(|s| serve(&s.spec, columns).map(|v| (s, v)))
             .collect();
         let mut acc = lookback_rows(&hits);
-        self.intersect(&mut acc, &serving, &keys, &spans)?;
+        self.intersect(&mut acc, &serving, &keys, &spans, None)?;
         let selected = acc
             .into_iter()
             .flatten()
@@ -1737,6 +2384,54 @@ impl<S: StoreExt + ?Sized> Planner<S> {
         self.finish(&selected, residual)
     }
 
+    /// A text lookup (see [`Lookup::Text`]): per value, each serving text
+    /// key's segments, one at a time, through core's `text::select_one`,
+    /// the serving keys' sets intersected; the values' sets united.
+    fn plan_text(
+        &self,
+        segs: &[SpecSegments],
+        column: &str,
+        op: TextOp,
+        values: &[String],
+    ) -> Result<ScanPlan> {
+        let types = self.column_types(&[column.to_string()])?;
+        text::check_column_type(column, &types[0].1)?;
+        let specs: Vec<KeySpec> = segs.iter().map(|s| s.spec.clone()).collect();
+        let mut selected = RoaringBitmap::new();
+        for value in values {
+            let shape = text::Shape::of(&specs, column, op, value)?;
+            let mut acc: Option<RoaringBitmap> = None;
+            for (spec, probe) in &shape.serving {
+                if *probe == text::Probe::Unpruned {
+                    continue;
+                }
+                let Some(seg) = segs.iter().find(|s| &s.spec == spec) else {
+                    continue;
+                };
+                // Bloom segments are scanned whole, one at a time.
+                let whole = matches!(spec, KeySpec::Text { bloom: Some(_), .. });
+                let mut one = RoaringBitmap::new();
+                for src in &seg.sources {
+                    let r = self.open_segment(spec, src, whole)?;
+                    one |= text::select_one(&r, probe)?;
+                }
+                acc = Some(match acc {
+                    Some(a) => a & one,
+                    None => one,
+                });
+            }
+            selected |= acc.unwrap_or_else(|| self.locator.live().clone());
+        }
+        self.finish(
+            &selected,
+            Predicate::Text {
+                column: column.to_string(),
+                operator: op,
+                values: values.to_vec(),
+            },
+        )
+    }
+
     // -- the plan --------------------------------------------------------------
 
     fn finish(&self, selected: &RoaringBitmap, residual: Predicate) -> Result<ScanPlan> {
@@ -1766,6 +2461,7 @@ impl<S: StoreExt + ?Sized> Planner<S> {
                 file: files[fi].fingerprint.clone(),
                 row_groups,
                 bytes,
+                columns: None,
             });
         }
         entries.sort_by(|a, b| a.file.path.cmp(&b.file.path));
@@ -1776,16 +2472,28 @@ impl<S: StoreExt + ?Sized> Planner<S> {
             row_groups_total: self.locator.live().len(),
             entries,
             residual: Some(residual),
+            projected_bytes: None,
+            order: None,
+            rows: None,
         })
     }
 
     /// Compressed bytes of each row group of tracked file `fi`, by
-    /// `index_in_file`: the Parquet footer's row-group sizes, or the
-    /// recorded chunk lengths. Both paths verify the file's fingerprint.
-    fn row_group_bytes(&self, fi: usize) -> Result<Vec<u64>> {
+    /// `index_in_file`: the manifest's `rowgroup_bytes` (storage version
+    /// 2), else the Parquet footer's row-group sizes or the recorded chunk
+    /// lengths (a version 1 manifest the next build has not yet filled).
+    /// Every path verifies the file's fingerprint; only the version 1
+    /// Parquet path opens a footer.
+    fn row_group_bytes(&self, fi: usize) -> Result<std::borrow::Cow<'_, [u64]>> {
         let f = &self.manifest().rowgroup_space.files[fi];
         let path = &f.fingerprint.path;
+        // `Manifest::from_slice` refused misaligned arrays.
+        if let Some(bytes) = &f.rowgroup_bytes {
+            self.check_fingerprint(fi)?;
+            return Ok(std::borrow::Cow::Borrowed(bytes));
+        }
         if let Some(parquet) = &self.parquet {
+            self.footers.fetch_add(1, Ordering::Relaxed);
             let metas = parquet.row_groups(&f.fingerprint)?;
             if metas.len() != f.rowgroup_ids.len() {
                 return Err(Error::Source(format!(
@@ -1794,35 +2502,50 @@ impl<S: StoreExt + ?Sized> Planner<S> {
                     f.rowgroup_ids.len()
                 )));
             }
-            return Ok(metas.iter().map(|m| m.bytes).collect());
+            return Ok(std::borrow::Cow::Owned(
+                metas.iter().map(|m| m.bytes).collect(),
+            ));
         }
         let chunks = f
             .chunks
             .as_ref()
             .filter(|c| c.len() == f.rowgroup_ids.len())
             .ok_or_else(|| Error::Other(format!("{path}: a text file entry without its chunks")))?;
+        self.check_fingerprint(fi)?;
+        Ok(std::borrow::Cow::Owned(
+            chunks
+                .iter()
+                .map(|c| c.end.saturating_sub(c.start))
+                .collect(),
+        ))
+    }
+
+    /// Verifies tracked file `fi` against its recorded fingerprint, once
+    /// per planner, under the index's policy (metadata and a bounded hash;
+    /// no footer is parsed).
+    fn check_fingerprint(&self, fi: usize) -> Result<()> {
+        let f = &self.manifest().rowgroup_space.files[fi];
         let checked = self
             .verified
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .contains(&fi);
-        if !checked {
-            let now = fingerprint_with_policy(&LocalFs, path, self.policy)?;
-            if now != f.fingerprint {
-                return Err(Error::Source(format!(
-                    "{path}: fingerprint drift since manifest sequence {}; run a build",
-                    self.sequence()
-                )));
-            }
-            self.verified
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .insert(fi);
+        if checked {
+            return Ok(());
         }
-        Ok(chunks
-            .iter()
-            .map(|c| c.end.saturating_sub(c.start))
-            .collect())
+        let now = fingerprint_with_policy(&LocalFs, &f.fingerprint.path, self.policy)?;
+        if now != f.fingerprint {
+            return Err(Error::Source(format!(
+                "{}: fingerprint drift since manifest sequence {}; run a build",
+                f.fingerprint.path,
+                self.sequence()
+            )));
+        }
+        self.verified
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(fi);
+        Ok(())
     }
 }
 
@@ -1880,6 +2603,7 @@ pub fn default_window_column(
             KeySpec::Temporal {
                 columns: c,
                 ts_column,
+                ..
             } if c.iter().all(|x| columns.contains(x)) => Some(ts_column.clone()),
             _ => None,
         })
@@ -2012,6 +2736,22 @@ fn non_null_probes(keys: &[Vec<u8>], types: &[(String, DataType)]) -> Result<Pro
         }
     }
     Ok(kept)
+}
+
+/// The refusal for two segments of one counting spec that both count a
+/// key in one row group. No build commits that (each row group is indexed
+/// by one segment of a spec, and merge refuses overlapping counts), so the
+/// manifest was written by another tool or edited; summing would count the
+/// rows twice. `bellwether index` finds such a spec and rebuilds it.
+#[must_use]
+pub fn overlapping_counts(spec: &KeySpec) -> Error {
+    Error::Other(format!(
+        "corrupt index: two segments listed under {} count the same key in the same row group, \
+         which no build commits, so its rows would be counted twice; run `bellwether index` on \
+         the data folder, which finds the overlap and rebuilds the spec's counts from the data, \
+         or restore the last good manifest from manifests/",
+        spec.identity()
+    ))
 }
 
 /// Every zero variant of every key, sorted and deduplicated.
@@ -2229,13 +2969,18 @@ mod tests {
     fn serving_rules() {
         let exact_a = KeySpec::Exact {
             columns: cols(&["a"]),
+            counts: false,
+            bounds: None,
         };
         let exact_ab = KeySpec::Exact {
             columns: cols(&["a", "b"]),
+            counts: false,
+            bounds: None,
         };
         let bloom_ba = KeySpec::Bloom {
             columns: cols(&["b", "a"]),
             fpr: 0.01,
+            bounds: None,
         };
         let range_b = KeySpec::Range { column: "b".into() };
         // projection: the spec's columns are all in the lookup

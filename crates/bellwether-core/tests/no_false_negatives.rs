@@ -287,6 +287,8 @@ fn decimal_at_two_scales_and_two_widths_is_one_key() {
     ];
     let exact = KeySpec::Exact {
         columns: vec!["amt".into()],
+        counts: false,
+        bounds: None,
     };
     let r = amt_segment(&exact, &files);
     assert_eq!(
@@ -313,6 +315,8 @@ fn decimal_at_two_scales_and_two_widths_is_one_key() {
 fn unrepresentable_or_mismatched_columns_are_errors_not_misses() {
     let spec = KeySpec::Exact {
         columns: vec!["amt".into()],
+        counts: false,
+        bounds: None,
     };
     let mut w = SegmentWriter::for_dataset(
         spec.clone(),
@@ -352,9 +356,9 @@ proptest! {
             .filter(|(_, (_, cents))| cents.iter().any(|c| c.is_some_and(|c| q.contains(&c))))
             .map(|(i, _)| u32::try_from(i).unwrap())
             .collect();
-        let exact = amt_segment(&KeySpec::Exact { columns: vec!["amt".into()] }, &files);
+        let exact = amt_segment(&KeySpec::Exact { columns: vec!["amt".into()], counts: false, bounds: None, }, &files);
         prop_assert_eq!(&exact.lookup(&keys).unwrap(), &want);
-        let bloom = amt_segment(&KeySpec::Bloom { columns: vec!["amt".into()], fpr: 0.05 }, &files);
+        let bloom = amt_segment(&KeySpec::Bloom { columns: vec!["amt".into()], fpr: 0.05, bounds: None, }, &files);
         prop_assert!(want.is_subset(&bloom.lookup(&keys).unwrap()));
         let range = amt_segment(&KeySpec::Range { column: "amt".into() }, &files);
         prop_assert!(want.is_subset(&range.lookup(&keys).unwrap()));
@@ -368,6 +372,8 @@ fn timestamp_units_across_files_encode_in_the_dataset_unit() {
     let schema = Schema::new(vec![Field::new("t", us.clone(), true)]);
     let spec = KeySpec::Exact {
         columns: vec!["t".into()],
+        counts: false,
+        bounds: None,
     };
     let mut w = SegmentWriter::for_dataset(spec, &schema, WriterOptions::default()).unwrap();
     let files: Vec<ArrayRef> = vec![

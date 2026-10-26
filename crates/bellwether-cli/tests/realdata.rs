@@ -19,7 +19,7 @@ use bellwether::types::{KeySpec, Record};
 use bellwether::{
     FixOutcome, FixResult, LookupKind, PlanResult, ReconcileResult, Refusal, Score, WhyReport,
 };
-use common::{bw, check_records, corpus, index_dir, keys, path, run, typed};
+use common::{bw, check_records, corpus, index_dir, keys, path, run, scattered, typed};
 use parquet::arrow::ArrowWriter;
 
 /// One Parquet file at `file` holding `columns`, one row group.
@@ -148,6 +148,7 @@ fn defect_4_fix_refuses_a_proposal_that_saves_nothing() {
                 replay: cited,
                 current_bytes,
                 proposed_bytes,
+                ..
             },
     } = &r.outcome
     else {
@@ -188,9 +189,17 @@ fn defect_5_memory_budget_sets_the_passes_and_both_outputs_report_them() {
     assert_eq!(m.restarts, 0, "{m:?}");
     assert_eq!(m.rows_read, [200 * u64::from(m.passes); 2]);
     let human = run(&tight_args, 0);
+    // The count with thousands separators, as every human count prints.
+    let passes = m.passes.to_string();
+    let grouped: Vec<String> = passes
+        .as_bytes()
+        .rchunks(3)
+        .rev()
+        .map(|c| String::from_utf8(c.to_vec()).unwrap())
+        .collect();
     let line = format!(
-        "read {} pass(es) over each side under a 4,096-byte state budget",
-        m.passes
+        "read {} passes over each side under a 4,096-byte state budget",
+        grouped.join(",")
     );
     assert!(human.contains(&line), "{line} not in\n{human}");
     assert!(human.contains("rows read on the left"), "{human}");
@@ -410,6 +419,7 @@ fn defect_9_why_latest_by_prices_temporal_lookups_and_matches_latest_and_asof_pl
         KeySpec::Temporal {
             columns: vec!["pu".into()],
             ts_column: "pickup_ts".into(),
+            counts: false,
         }
     );
     assert_eq!(rec.lookup, LookupKind::Latest);
@@ -436,7 +446,7 @@ fn defect_9_why_latest_by_prices_temporal_lookups_and_matches_latest_and_asof_pl
         ],
         0,
     );
-    assert!(human.contains("funnel: 1 run(s) (latest)"), "{human}");
+    assert!(human.contains("funnel: 1 run (latest)"), "{human}");
     assert!(
         human.contains("floor (latest): only row groups holding the winning version"),
         "{human}"
@@ -630,7 +640,7 @@ fn defect_13_every_record_of_a_fix_shares_the_clock_and_its_format() {
     let stamps_of = |clock: Option<&str>| {
         let dir = tempfile::tempdir().unwrap();
         let data = dir.path().join("data");
-        corpus(&data, 2, 3, 20, 100);
+        scattered(&data, 2, 3, 20, 100);
         let kf = dir.path().join("k.parquet");
         keys(&kf, "id", &[4, 9, 60]);
         let fixed: Vec<String> = clock
@@ -1164,6 +1174,7 @@ fn request_3_why_mode_prices_latest_and_asof_lookback_windows() {
     let temporal = KeySpec::Temporal {
         columns: vec!["pu".into()],
         ts_column: "pickup_ts".into(),
+        counts: false,
     };
     let floor = |r: &WhyReport| {
         r.candidates
@@ -1280,7 +1291,7 @@ fn request_3_why_mode_prices_latest_and_asof_lookback_windows() {
         0,
     );
     assert!(
-        human.contains(&format!("funnel: 1 run(s) (asof {at}, lookback 20s)")),
+        human.contains(&format!("funnel: 1 run (asof {at}, lookback 20s)")),
         "{human}"
     );
     assert!(
@@ -1513,13 +1524,15 @@ fn request_5_memory_budget_takes_human_units() {
     assert!(err.contains("binary unit, K, M, G, or T"), "{err}");
 }
 
-/// Four one-row-group files of ten rows, ids 0..40 in order, with a struct,
-/// a list, and a map column beside the flat `id`.
+/// Four one-row-group files of ten rows, file `f` holding ids `f, f + 4,
+/// ..., f + 36` (so each file's min/max spans nearly every id and only a
+/// key prunes), with a struct, a list, and a map column beside the flat
+/// `id`.
 fn nested_lake(dir: &Path) {
     use arrow::array::{Int64Builder, ListArray, MapBuilder, StringBuilder};
     use arrow::datatypes::Int64Type;
     for f in 0..4i64 {
-        let ids: Vec<i64> = (f * 10..f * 10 + 10).collect();
+        let ids: Vec<i64> = (0..10).map(|i| f + 4 * i).collect();
         let repo = StructArray::from(vec![(
             Arc::new(Field::new("id", DataType::Int64, true)),
             Arc::new(Int64Array::from_iter_values(ids.iter().map(|k| k / 4))) as ArrayRef,

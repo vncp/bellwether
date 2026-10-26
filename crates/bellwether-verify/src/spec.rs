@@ -44,6 +44,19 @@ pub enum CoverageRequest {
         /// Identifier of the identity in the rule catalog.
         identity: String,
     },
+    /// The rows a recorded workload asks for, chosen by the row filter
+    /// ([`ReconcileSpec::rows_where`], required) rather than by key tuples:
+    /// a workload of list-membership lookups (B4), whose runs name element
+    /// values, not reconcile keys. Every key with a kept row on either side
+    /// is compared; the certificate's coverage is the workload with the
+    /// number of keys compared.
+    WorkloadRows {
+        /// Hash of the recorded workload; it names the coverage and is one
+        /// of the certificate's provenance inputs.
+        workload: Hash,
+        /// Age of the recorded workload when the reconcile starts.
+        age: Duration,
+    },
 }
 
 /// The key tuples of a recorded workload, as the replay crate records them.
@@ -167,6 +180,13 @@ pub struct ReconcileSpec {
     /// predicate keeps are read and skipped on both sides. `None` compares
     /// every row.
     pub row_filter: Option<Vec<Predicate>>,
+    /// With workload coverage: the workload's keys are values of this
+    /// expression (normalized, `bellwether_core::expr`) over the dataset's
+    /// columns, not key tuples. A row is covered when its expression's
+    /// value is one of them; [`ReconcileSpec::key_columns`] (normally the
+    /// expression's input columns) still identify the rows compared. `None`
+    /// keys the workload by the key columns.
+    pub keys_of: Option<String>,
 }
 
 impl ReconcileSpec {
@@ -186,7 +206,16 @@ impl ReconcileSpec {
             group_by: Vec::new(),
             coverage: CoverageRequest::Full,
             row_filter: None,
+            keys_of: None,
         }
+    }
+
+    /// Reads the workload coverage's keys as values of `expr`
+    /// ([`ReconcileSpec::keys_of`]).
+    #[must_use]
+    pub fn keys_of(mut self, expr: impl Into<String>) -> Self {
+        self.keys_of = Some(expr.into());
+        self
     }
 
     /// Compares the newest version per key by `column`.
@@ -302,6 +331,13 @@ impl ReconcileSpec {
                 "a row filter with no predicate would compare nothing".into(),
             ));
         }
+        if self.keys_of.is_some() && !matches!(self.coverage, CoverageRequest::Workload(_)) {
+            return Err(VerifyError::InvalidSpec(
+                "keys_of reads a workload's keys as an expression's values; it needs workload \
+                 coverage"
+                    .into(),
+            ));
+        }
         match &self.coverage {
             CoverageRequest::Full => {}
             CoverageRequest::StaticProof { identity } => {
@@ -320,6 +356,15 @@ impl ReconcileSpec {
                 if w.keys.is_empty() {
                     return Err(VerifyError::InvalidSpec(
                         "workload coverage with no keys would compare nothing".into(),
+                    ));
+                }
+            }
+            CoverageRequest::WorkloadRows { .. } => {
+                if self.row_filter.is_none() {
+                    return Err(VerifyError::InvalidSpec(
+                        "workload-rows coverage chooses rows by the row filter; give one \
+                         (rows_where) or the whole data would be compared under a workload's name"
+                            .into(),
                     ));
                 }
             }

@@ -10,8 +10,8 @@ use std::time::Instant;
 
 use bellwether::types::{Error, ProposalBody};
 use bellwether::{
-    Engine, EngineOptions, FixOutcome, FixRequest, FixResult, KeyFile, ProposeResult, WhyRequest,
-    DEFAULT_MAX_CANDIDATES,
+    Engine, EngineOptions, FixOutcome, FixRequest, FixResult, KeyFile, ProposeResult, TextQuery,
+    WhyRequest, DEFAULT_MAX_CANDIDATES,
 };
 use serde::Serialize;
 use serde_json::{json, Value};
@@ -21,8 +21,9 @@ use crate::envelope::{cites_of, Chain, Envelope, Status};
 use crate::jobs::{job_id, Job, JobInfo, JobState, Jobs};
 use crate::refusal::{self, Refusal, RefusalCode};
 use crate::tools::{
-    self, ApplyReceipt, JobRef, JobsStart, ObserveAsof, ObserveLocate, ObserveWhy, ProposeKey,
-    ProposeLayout, ProposeRewrite, ScoreVerify, ScoreWhy, Tier,
+    self, ApplyReceipt, JobRef, JobsStart, KeyArg, Membership, ObserveAsof, ObserveCardinality,
+    ObserveCount, ObserveLocate, ObserveOverlap, ObserveText, ObserveWhy, ProposeKey,
+    ProposeLayout, ProposeRewrite, ScoreRecord, ScoreVerify, ScoreWhy, Tier,
 };
 
 /// How the server is configured at startup. Nothing is read from the
@@ -175,11 +176,7 @@ impl Server {
             return self.refused(
                 tool,
                 def.tier,
-                Refusal::new(
-                    RefusalCode::InvalidInput,
-                    format!("the arguments do not match {tool}'s input schema"),
-                    json!({ "errors": errors }),
-                ),
+                schema_refusal(tool, &def.input, &args, &errors),
             );
         }
         match tool {
@@ -293,8 +290,26 @@ impl Server {
                 let a = parse!(ObserveWhy);
                 match e.why(&WhyRequest {
                     columns: a.columns,
+                    sketches_only: a.sketches_only,
                     ..WhyRequest::default()
                 }) {
+                    Ok(r) => done(&r, None),
+                    Err(err) => failed(&err),
+                }
+            }
+            "observe.cardinality" => {
+                let a = parse!(ObserveCardinality);
+                match e.cardinality(&bellwether::CardinalityRequest {
+                    items: a.items,
+                    transient: a.transient,
+                }) {
+                    Ok(r) => done(&r, None),
+                    Err(err) => failed(&err),
+                }
+            }
+            "observe.overlap" => {
+                let a = parse!(ObserveOverlap);
+                match e.overlap(&a.left, &a.right, None) {
                     Ok(r) => done(&r, None),
                     Err(err) => failed(&err),
                 }
@@ -309,10 +324,35 @@ impl Server {
                     Ok(p) => p,
                     Err(err) => return failed(&err),
                 };
+                let engine = pinned.as_ref().unwrap_or(e);
+                let keys = key_file(a.keys, a.key_columns);
+                let result = match (&a.columns, a.contains) {
+                    (Some(_), Some(_)) => Err(bellwether::types::Error::InvalidArgument {
+                        field: "columns",
+                        reason: "a membership lookup (contains) plans row groups without a \
+                                 projection; drop columns, or drop contains for a point lookup \
+                                 with column bytes"
+                            .into(),
+                    }),
+                    (None, Some(m)) => engine.locate_contains(&keys, m == Membership::All),
+                    (Some(columns), None) => engine.locate_columns(&keys, None, columns),
+                    (None, None) => engine.locate(&keys),
+                };
+                match result {
+                    Ok(r) => done(&r, None),
+                    Err(err) => failed(&err),
+                }
+            }
+            "observe.count" => {
+                let a = parse!(ObserveCount);
+                let pinned = match self.lookup_engine(a.at_manifest) {
+                    Ok(p) => p,
+                    Err(err) => return failed(&err),
+                };
                 match pinned
                     .as_ref()
                     .unwrap_or(e)
-                    .locate(&key_file(a.keys, a.key_columns))
+                    .count(&key_file(a.keys, a.key_columns))
                 {
                     Ok(r) => done(&r, None),
                     Err(err) => failed(&err),
@@ -333,12 +373,29 @@ impl Server {
                     Err(err) => failed(&err),
                 }
             }
+            "observe.text" => {
+                let a = parse!(ObserveText);
+                let pinned = match self.lookup_engine(a.at_manifest) {
+                    Ok(p) => p,
+                    Err(err) => return failed(&err),
+                };
+                let query = TextQuery {
+                    column: a.column,
+                    op: a.op,
+                    value: a.value,
+                };
+                match pinned.as_ref().unwrap_or(e).locate_text(&query) {
+                    Ok(r) => done(&r, None),
+                    Err(err) => failed(&err),
+                }
+            }
             "score.why" => {
                 let a = parse!(ScoreWhy);
-                if a.keys.is_none() && a.workload.is_none() {
+                if a.keys.is_none() && a.workload.is_none() && a.text.is_empty() {
                     return Done::Failed(Refusal::new(
                         RefusalCode::NoWorkload,
-                        "score.why replays a workload; without one, call observe.why",
+                        "score.why replays a workload (keys, workload, or text lookups); without \
+                         one, call observe.why",
                         json!({}),
                     ));
                 }
@@ -346,7 +403,10 @@ impl Server {
                     keys: a.keys.map(|k| key_file(k, a.key_columns)),
                     bench_workload: None,
                     workload: a.workload,
-                    mode: None,
+                    mode: a.contains.map(|m| match m {
+                        Membership::Any => bellwether::LookupMode::ContainsAny,
+                        Membership::All => bellwether::LookupMode::ContainsAll,
+                    }),
                     latest_by: None,
                     at: None,
                     lookback: None,
@@ -356,6 +416,9 @@ impl Server {
                     max_candidates: a
                         .max_candidates
                         .map_or(DEFAULT_MAX_CANDIDATES, |n| n as usize),
+                    gates: a.gates,
+                    sketches_only: false,
+                    text: a.text.into_iter().map(Into::into).collect(),
                 };
                 match e.why(&request) {
                     Ok(r) => done(&r, None),
@@ -364,6 +427,23 @@ impl Server {
             }
             "score.verify" => {
                 let a = parse!(ScoreVerify);
+                // A tool argument never names a database to connect to: a
+                // table is a data root the human gives at start (threat
+                // model).
+                if let Some(r) = &a.rewrite {
+                    if [&r.before, &r.after]
+                        .iter()
+                        .any(|p| bellwether::is_sql_root(p))
+                    {
+                        return failed(&bellwether::types::Error::InvalidArgument {
+                            field: "rewrite",
+                            reason: "a rewrite's outputs are folders of files here; a table \
+                                     (sql://) is read only as the data root the human starts \
+                                     the server with"
+                                .into(),
+                        });
+                    }
+                }
                 let request = FixRequest {
                     proposal: Some(a.proposal),
                     certificate: None,
@@ -379,18 +459,42 @@ impl Server {
                     }),
                     verify_only: true,
                     allow_no_gain: false,
+                    engine: a.engine.map(|c| bellwether::EngineCompare {
+                        latest_by: c.latest_by,
+                        ignore: c.ignore,
+                        totals: c.totals,
+                        group_by: c.group_by,
+                    }),
                 };
                 fix_done(e.fix(&request))
             }
+            "score.record" => {
+                let a = parse!(ScoreRecord);
+                match e.record_from_engine(&a.keys_query, a.key_columns.as_deref()) {
+                    Ok(r) => done(&r, None),
+                    Err(err) => failed(&err),
+                }
+            }
             "propose.key" => {
                 let a = parse!(ProposeKey);
-                propose(
-                    e,
-                    ProposalBody::Key { spec: a.spec },
-                    &a.evidence,
-                    &a.by,
-                    a.dry_run,
-                )
+                // The short form is read as `index --key` reads it, so a
+                // sidecar declaration reaches the facade's typed refusal.
+                let declared = match a.spec {
+                    KeyArg::Short(s) => match bellwether::spec::parse_declaration(&s) {
+                        Ok(d) => d,
+                        Err(err) => return failed(&err),
+                    },
+                    KeyArg::Spec(spec) => bellwether::spec::Declaration {
+                        key: Some(spec),
+                        sidecar: None,
+                        sketch: None,
+                    },
+                };
+                propose_done(if a.dry_run {
+                    e.propose_key_dry_run(&declared, &a.evidence, &a.by)
+                } else {
+                    e.propose_key(&declared, &a.evidence, &a.by)
+                })
             }
             "propose.layout" => {
                 let a = parse!(ProposeLayout);
@@ -454,11 +558,7 @@ impl Server {
             return self.refused(
                 shown,
                 def.tier,
-                Refusal::new(
-                    RefusalCode::InvalidInput,
-                    format!("the arguments do not match {tool}'s input schema"),
-                    json!({ "errors": errors }),
-                ),
+                schema_refusal(tool, &def.input, &args, &errors),
             );
         }
         let mut request = args.clone();
@@ -651,11 +751,81 @@ fn charged(tier: Tier, args: &Value) -> bool {
     matches!(tier, Tier::Score | Tier::Apply) && !dry_run
 }
 
+/// The refusal for arguments that do not match `tool`'s input schema. A
+/// score, a cost, a measurement, or a verdict the caller tried to hand
+/// over is refused by name (`caller_supplied_cost`): the README's
+/// guarantee, the same whether the tool is called directly or started as a
+/// job.
+fn schema_refusal(tool: &str, schema: &Value, args: &Value, errors: &[String]) -> Refusal {
+    if let Some(field) = supplied_cost(schema, args, errors) {
+        return Refusal::new(
+            RefusalCode::CallerSuppliedCost,
+            format!(
+                "{tool} was given `{field}`: a caller cannot supply a cost, a measurement, a \
+                 replay, a verdict, or a certificate; the engine measures and verifies itself"
+            ),
+            json!({ "field": field, "errors": errors }),
+        );
+    }
+    Refusal::new(
+        RefusalCode::InvalidInput,
+        format!("the arguments do not match {tool}'s input schema"),
+        json!({ "errors": errors }),
+    )
+}
+
+/// The cost-like field (`refusal::COST_FIELDS`) the caller supplied where
+/// the schema takes none: named by a validation error, or, inside a tagged
+/// union (whose error names no field), the first cost-like key below a
+/// declared argument whose removal, with every other such key, makes the
+/// arguments valid. `None` when the arguments are wrong for another reason.
+fn supplied_cost(schema: &Value, args: &Value, errors: &[String]) -> Option<String> {
+    if let Some(field) = refusal::caller_supplied(errors) {
+        return Some(field);
+    }
+    let declared = schema.get("properties").and_then(Value::as_object)?;
+    let mut stripped = args.clone();
+    let mut found = None;
+    if let Value::Object(top) = &mut stripped {
+        for (k, v) in top.iter_mut() {
+            if declared.contains_key(k) {
+                strip_cost_fields(v, &mut found);
+            }
+        }
+    }
+    found.filter(|_| tools::validate(schema, &stripped).is_ok())
+}
+
+/// Removes every cost-like key at any depth of `v`, keeping the first
+/// removed in `found`.
+fn strip_cost_fields(v: &mut Value, found: &mut Option<String>) {
+    match v {
+        Value::Object(m) => {
+            m.retain(|k, _| {
+                let cost = refusal::COST_FIELDS.contains(&k.as_str());
+                if cost && found.is_none() {
+                    *found = Some(k.clone());
+                }
+                !cost
+            });
+            for x in m.values_mut() {
+                strip_cost_fields(x, found);
+            }
+        }
+        Value::Array(a) => {
+            for x in a {
+                strip_cost_fields(x, found);
+            }
+        }
+        _ => {}
+    }
+}
+
 /// The static rule for which calls become jobs (`crate::jobs`).
 fn runs_as_job(tool: &str, args: &Value) -> bool {
     let flag = |k: &str| args.get(k).and_then(Value::as_bool).unwrap_or(false);
     match tool {
-        "score.why" | "score.verify" => !flag("wait"),
+        "score.why" | "score.verify" | "score.record" => !flag("wait"),
         "apply.receipt" => !flag("wait") && !flag("dry_run"),
         _ => false,
     }
@@ -684,11 +854,14 @@ fn propose(
     by: &str,
     dry_run: bool,
 ) -> Done {
-    let r = if dry_run {
+    propose_done(if dry_run {
         e.propose_dry_run(body, evidence, by)
     } else {
         e.propose(body, evidence, by)
-    };
+    })
+}
+
+fn propose_done(r: bellwether::types::Result<ProposeResult>) -> Done {
     match r {
         Ok(r) => {
             let refusal = match &r {
@@ -709,6 +882,7 @@ fn fix_done(r: bellwether::types::Result<FixResult>) -> Done {
                     Some(refusal::from_fix(refusal, r.verification.as_ref()))
                 }
                 FixOutcome::Applied { .. }
+                | FixOutcome::Attested { .. }
                 | FixOutcome::Verified
                 | FixOutcome::WouldApply { .. } => None,
             };

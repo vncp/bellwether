@@ -58,11 +58,16 @@ fn the_tools_are_the_tiers_and_nothing_else() {
         names,
         vec![
             ("observe.why", Tier::Observe),
+            ("observe.cardinality", Tier::Observe),
+            ("observe.overlap", Tier::Observe),
             ("observe.profile", Tier::Observe),
             ("observe.locate", Tier::Observe),
+            ("observe.count", Tier::Observe),
             ("observe.asof", Tier::Observe),
+            ("observe.text", Tier::Observe),
             ("score.why", Tier::Score),
             ("score.verify", Tier::Score),
+            ("score.record", Tier::Score),
             ("propose.key", Tier::Propose),
             ("propose.layout", Tier::Propose),
             ("propose.rewrite", Tier::Propose),
@@ -76,8 +81,11 @@ fn the_tools_are_the_tiers_and_nothing_else() {
 }
 
 /// Schemas come from the contract's derives, closed; no tool takes a path
-/// to write, a command, a query, or a score; apply takes a certificate hash
-/// only (and its delivery flags); observe.why takes no keys.
+/// to write, a command, a free-form query, or a score; apply takes a
+/// certificate hash only (and its delivery flags); observe.why takes no
+/// keys. The one query text a tool takes is `score.record`'s
+/// `keys_query` (and a rewrite's `shape.pairs`), submitted read-only to the
+/// engine the operator started the server with.
 #[test]
 fn schemas_are_closed_and_carry_no_dangerous_field() {
     for t in catalog() {
@@ -115,8 +123,10 @@ fn schemas_are_closed_and_carry_no_dangerous_field() {
             assert!(!props.contains("keys") && !props.contains("workload"));
         }
     }
-    // The key spec in propose.key is the contract's KeySpec: its tagged
-    // variants, each closed.
+    // The key spec in propose.key is the contract's KeySpec (its tagged
+    // variants, each closed) or the short form `index --key` reads, so a
+    // sidecar declaration such as temporal2 passes the schema and reaches
+    // the facade's typed refusal (`sidecar_not_proposable`).
     let key = catalog()
         .into_iter()
         .find(|t| t.name == "propose.key")
@@ -125,6 +135,25 @@ fn schemas_are_closed_and_carry_no_dangerous_field() {
     for kind in ["exact", "bloom", "range", "temporal"] {
         assert!(text.contains(&format!("\"const\":\"{kind}\"")), "{kind}");
     }
+    let ev = "0".repeat(64);
+    for spec in [
+        serde_json::json!("temporal2:symbol@ts,known_at"),
+        serde_json::json!("exact:symbol@ts"),
+        serde_json::json!({"kind": "exact", "columns": ["id"]}),
+    ] {
+        let args = serde_json::json!({"spec": spec, "evidence": [ev], "by": "a"});
+        assert!(
+            bellwether_mcp::tools::validate(&key.input, &args).is_ok(),
+            "{args}"
+        );
+    }
+    // A score nested in the JSON form is still refused by the schema.
+    let args = serde_json::json!({
+        "spec": {"kind": "exact", "columns": ["id"], "score": 1},
+        "evidence": [ev],
+        "by": "a",
+    });
+    assert!(bellwether_mcp::tools::validate(&key.input, &args).is_err());
     // A hash is the contract's Hash: 64 lowercase hex characters.
     assert!(text.contains("^[0-9a-f]{64}$"));
     assert_closed(&output_schema(), "output");

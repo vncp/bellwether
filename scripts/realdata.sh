@@ -54,39 +54,18 @@ fi
 BW=$BELLWETHER
 
 # ---- downloads (verified against Content-Length) ----------------------------
-size() { if [ -f "$1" ]; then wc -c <"$1" | tr -d ' '; else echo 0; fi; }
-fetch() { # fetch URL DEST
-  local want have
-  want=$(curl -sSfI "$1" | tr -d '\r' | awk 'tolower($1)=="content-length:" {print $2}' | tail -1)
-  have=$(size "$2")
-  [ -n "$want" ] && [ "$have" = "$want" ] && return 0
-  curl -sSfL --retry 3 -o "$2.part" "$1" || { echo "download failed: $1" >&2; exit 1; }
-  have=$(size "$2.part")
-  [ "$have" = "$want" ] || { echo "truncated: $1 ($have of $want bytes)" >&2; exit 1; }
-  mv "$2.part" "$2"
-}
-for m in $TAXI_MONTHS; do
-  fetch "https://d37ci6vzurychx.cloudfront.net/trip-data/yellow_tripdata_2024-$m.parquet" \
-    "$DL/taxi/yellow_tripdata_2024-$m.parquet"
-done
-for h in $GH_HOURS; do
-  fetch "https://data.gharchive.org/2024-01-01-$h.json.gz" "$DL/gh/2024-01-01-$h.json.gz"
-done
+# shellcheck source=datasets.sh
+. "$REPO/scripts/datasets.sh"
+bw_fetch_taxi "$DL" "$TAXI_MONTHS"
+bw_fetch_gh "$DL" "$GH_HOURS"
 
 # ---- datasets ----------------------------------------------------------------
 cd "$W" || exit 1
-rm -rf taxi taxi_duck taxi_duck_mut taxi_dec taxi_dec_duck gh ghfix1000 ghfix10 ghjson ghnested keys
+rm -rf taxi taxi_duck taxi_duck_mut taxi_dec taxi_dec_duck gh ghfix1000 ghfix10 ghjson ghnested keys idx-counts
 mkdir -p taxi taxi_duck taxi_duck_mut taxi_dec taxi_dec_duck gh ghjson ghnested keys
 cp "$DL"/taxi/*.parquet taxi/
 
-# GH Archive is nested JSON (repo.id, actor.id). Flattened by DuckDB to one
-# Parquet file per hour, DuckDB's default writer settings, timestamps in UTC.
-for h in $GH_HOURS; do
-  f=$(printf '%02d' "$h")
-  duckdb -no-agent -c "SET TimeZone='UTC'; COPY (SELECT repo.id AS repo_id, actor.id AS actor_id, type, created_at
-    FROM read_json('$DL/gh/2024-01-01-$h.json.gz', format='newline_delimited', maximum_object_size=100000000))
-    TO 'gh/2024-01-01-$f.parquet' (FORMAT PARQUET)" >/dev/null
-done
+bw_flatten_gh "$DL" gh "$GH_HOURS"
 cp -r gh ghfix1000
 cp -r gh ghfix10
 # Probes of the raw nested data: hour 0 as JSON lines (named .json, then
@@ -311,6 +290,37 @@ duckdb -no-agent -c "COPY (SELECT * REPLACE (fare_amount::DECIMAL(10,2) AS fare_
 say "WORKAROUND: decimal copies of January for --totals (fare_amount cast to DECIMAL(10,2) on both sides)"
 run 33-reconcile-dec-totals reconcile taxi_dec taxi_dec_duck --key $K --totals fare_amount --group-by VendorID
 say "DuckDB fare_amount total, January, by VendorID: $(duck "SELECT string_agg(VendorID || '=' || s, ' ' ORDER BY VendorID) FROM (SELECT VendorID, sum(fare_amount) s FROM 'taxi_dec/jan.parquet' GROUP BY 1)")"
+
+# ---- 3b. count ---------------------------------------------------------------
+# count(*) where key in (...) from per-key counts (exact:<key>,counts), one
+# index location per folder under idx-counts/, so the indexes above are
+# unchanged. Keys: an integer (PULocationID, repo_id), a timestamp
+# (created_at) and a decimal (fare_amount in the decimal January copy). The
+# oracle is DuckDB over the rows: count(*) of the rows whose key is in the
+# key file, and the row groups holding one (oracle_pairs).
+say ""
+say "## 3b. count from per-key counts, against DuckDB"
+sample 'gh/*.parquet' created_at 1000 keys/gh_created.parquet
+sample 'taxi_dec/*.parquet' fare_amount 1000 keys/taxi_fare.parquet
+count_check() { # count_check NAME DIR KEYCOL KEYS
+  check "$1: count rows = DuckDB count(*)" "$(j "$1" '.rows')" \
+    "$(duck "SELECT count(*) FROM read_parquet('$2/*.parquet') WHERE $3 IN (SELECT $3 FROM read_parquet('$4'))")"
+  check "$1: count row groups = DuckDB row groups holding a key" "$(j "$1" '.row_groups')" \
+    "$(oracle_pairs "$2" "$3" "$4" locate | wc -l | tr -d ' ')"
+}
+once 34-taxi-count-index index taxi --index idx-counts/taxi --key exact:PULocationID,counts
+run 35-taxi-count count taxi --index idx-counts/taxi --keys keys/taxi_pu.parquet
+count_check 35-taxi-count taxi PULocationID keys/taxi_pu.parquet
+once 36-gh-count-index index gh --index idx-counts/gh --key exact:repo_id,counts --key exact:created_at,counts
+run 37-gh-count count gh --index idx-counts/gh --keys keys/gh_repo.parquet
+count_check 37-gh-count gh repo_id keys/gh_repo.parquet
+run 38-gh-count10 count gh --index idx-counts/gh --keys keys/gh_repo10.parquet
+count_check 38-gh-count10 gh repo_id keys/gh_repo10.parquet
+run 39-gh-count-ts count gh --index idx-counts/gh --keys keys/gh_created.parquet
+count_check 39-gh-count-ts gh created_at keys/gh_created.parquet
+once 3a-dec-count-index index taxi_dec --index idx-counts/taxi_dec --key exact:fare_amount,counts
+run 3b-dec-count count taxi_dec --index idx-counts/taxi_dec --keys keys/taxi_fare.parquet
+count_check 3b-dec-count taxi_dec fare_amount keys/taxi_fare.parquet
 
 # ---- 4. fix ------------------------------------------------------------------
 say ""

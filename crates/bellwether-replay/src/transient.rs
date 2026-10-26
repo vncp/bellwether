@@ -15,7 +15,8 @@
 //! build crate accounts its segments: distinct key tuples and their
 //! canonical bytes (distinct `(key, ts)` pairs and 8 bytes more each for a
 //! temporal spec, 8 bytes per distinct key for a bloom spec, twice the
-//! longest key for a range spec). Summed over a segment's row groups these
+//! longest key for a range spec, distinct tokens and their bytes for a
+//! text spec). Summed over a segment's row groups these
 //! bound what its open writer holds from above. While building, the process
 //! holds:
 //!
@@ -108,6 +109,9 @@ pub struct BuildStats {
     pub largest_segment_key_bytes: u64,
     /// Total segment bytes.
     pub bytes: u64,
+    /// Rows whose key is not indexed because its leading column is null
+    /// (ADR 014); for an `expr` key, rows whose expression is null.
+    pub null_rows: u64,
 }
 
 /// A hypothetical spec's segments over every live row group of one catalog.
@@ -121,35 +125,15 @@ pub struct TransientIndex {
     stats: BuildStats,
 }
 
-/// The dataset types of a spec's key columns and, for a temporal spec, its
-/// timestamp column.
+/// The dataset types of a spec's key columns (a list key's element type)
+/// and, for a temporal spec, its timestamp column; for an `expr` key, its
+/// expression's value type: core's one definition, the types the segment
+/// writer records.
 pub(crate) fn spec_types(
     spec: &KeySpec,
     schema: &Schema,
 ) -> Result<(Vec<DataType>, Option<DataType>)> {
-    let lookup = |c: &str| -> Result<DataType> {
-        let dt = schema
-            .field_with_name(c)
-            .map_err(|_| Error::KeySpec(format!("column {c} is not in the dataset schema")))?
-            .data_type()
-            .clone();
-        encoding::check_supported(&dt)?;
-        Ok(dt)
-    };
-    let keys = spec
-        .columns()
-        .iter()
-        .map(|c| lookup(c))
-        .collect::<Result<Vec<_>>>()?;
-    let ts = match spec {
-        KeySpec::Temporal { ts_column, .. } => {
-            let dt = lookup(ts_column)?;
-            encoding::check_ts_type(&dt)?;
-            Some(dt)
-        }
-        _ => None,
-    };
-    Ok((keys, ts))
+    bellwether_core::segment::spec_types(spec, schema)
 }
 
 /// Measures one row group's keys for `spec` (module docs): `(keys, bytes)`.
@@ -165,6 +149,27 @@ pub(crate) fn measure(
             .cloned()
             .ok_or_else(|| Error::KeySpec(format!("column {name} not in batch")))
     };
+    if let KeySpec::List { column: c } = spec {
+        // A list key: the row group's distinct element keys and their bytes.
+        let elements = bellwether_core::list::ListElements::new(&column(c)?)?;
+        let mut seen: HashSet<Vec<u8>> = HashSet::new();
+        let mut bytes = 0u64;
+        elements.for_each_encoded(&keys[0], |_, k| {
+            if !seen.contains(k) {
+                bytes += k.len() as u64;
+                seen.insert(k.to_vec());
+            }
+        })?;
+        return Ok((seen.len() as u64, bytes));
+    }
+    if let KeySpec::Text {
+        column: c,
+        tokenizer,
+        bloom,
+    } = spec
+    {
+        return bellwether_core::text::measure(*tokenizer, bloom.is_some(), column(c)?.as_ref());
+    }
     let cols = spec
         .columns()
         .iter()
@@ -202,7 +207,7 @@ pub(crate) fn measure(
             }
         }
         if seen.insert(buf.clone()) {
-            bytes += match spec {
+            bytes += match spec.physical() {
                 KeySpec::Bloom { .. } => 8,
                 KeySpec::Temporal { .. } => key_len + 8,
                 _ => key_len,
@@ -230,7 +235,9 @@ impl TransientIndex {
         }
         let schema = catalog.schema();
         let (key_types, ts_type) = spec_types(spec, schema)?;
-        let mut columns: Vec<String> = spec.columns().to_vec();
+        // An expr key reads its expression's input columns and derives the
+        // virtual column one row group at a time (ADR 018).
+        let mut columns: Vec<String> = bellwether_core::expr::input_columns(spec)?;
         if let KeySpec::Temporal { ts_column, .. } = spec {
             if !columns.contains(ts_column) {
                 columns.push(ts_column.clone());
@@ -254,6 +261,7 @@ impl TransientIndex {
         let mut open: Option<(RowGroupId, RowGroupId)> = None;
         for rg in catalog.row_groups() {
             let batch = source.read_columns(&rg.meta, &columns)?;
+            let batch = bellwether_core::expr::with_derived(spec, schema, &batch)?;
             let rows = batch.num_rows() as u64;
             if rows != rg.meta.rows {
                 return Err(Error::Source(format!(
@@ -294,6 +302,11 @@ impl TransientIndex {
             open_bytes += bytes;
             build.stats.row_groups_read += 1;
             build.stats.rows_read += rows;
+            if let Some(lead) = spec.columns().first() {
+                build.stats.null_rows += batch
+                    .column_by_name(lead)
+                    .map_or(0, |c| c.logical_null_count() as u64);
+            }
         }
         // The open writer is finished whenever it processed a row group,
         // even one that gave it no keys.
@@ -362,6 +375,29 @@ impl TransientIndex {
     #[must_use]
     pub fn stats(&self) -> &BuildStats {
         &self.stats
+    }
+
+    /// For an exact spec (or an `expr` key over exact), the distinct keys
+    /// the index holds, as `(low, high)`: exact (`low == high`) when one
+    /// segment holds them all; otherwise each segment's key count is exact
+    /// but a key may sit in several, so the distinct count lies between the
+    /// largest segment's and their sum. `None` for any other spec.
+    #[must_use]
+    pub fn distinct_keys(&self) -> Option<(u64, u64)> {
+        if !matches!(self.spec().physical(), KeySpec::Exact { .. }) {
+            return None;
+        }
+        let readers = self.segments.readers();
+        let high = readers.iter().map(SegmentReader::entries).sum();
+        let low = match readers {
+            [_] | [] => high,
+            _ => readers
+                .iter()
+                .map(SegmentReader::entries)
+                .max()
+                .unwrap_or(0),
+        };
+        Some((low, high))
     }
 
     /// The segments, for planners.

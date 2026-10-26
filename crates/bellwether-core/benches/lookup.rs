@@ -15,6 +15,8 @@ fn key(i: i64) -> Vec<u8> {
 fn segment(n: u32) -> SegmentReader<Vec<u8>> {
     let spec = KeySpec::Exact {
         columns: vec!["id".into()],
+        counts: false,
+        bounds: None,
     };
     let mut w = SegmentWriter::new(spec, WriterOptions::default()).unwrap();
     for i in 0..n {

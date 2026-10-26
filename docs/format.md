@@ -1,6 +1,6 @@
-# On-disk format, storage version 1
+# On-disk format, storage version 2
 
-Versioned from the first commit. `bellwether-types::format::STORAGE_VERSION` is written into the manifest and every segment header. A binary that reads a newer version refuses with `Error::UnsupportedVersion` and never downgrades in place (ADR 017). A fixture written by v0.1 lives under `fixtures/format-v0.1/` once the format is frozen, and every later version must read it in CI.
+Versioned from the first commit. `bellwether-types::format::STORAGE_VERSION` (2) is written into the manifest and every segment header. A binary that reads a newer version refuses with `Error::UnsupportedVersion` and never downgrades in place (ADR 017). This binary writes storage version 2 and reads version 1 ("Reading storage version 1"). ADR 028 freezes the format in two steps: this release makes the record version 3 shapes final, and the next release freezes the bytes of storage version 2, at M5. Until then a storage version 2 shape that only the next release writes is refused by name with `Error::UnsupportedShape` ("Segments, storage version 2", "Not frozen yet"). `fixtures/format-v1/` (built by the last version 1 binary) and `fixtures/format-v0.1/` (built by this one, pre-M5) are read in CI by every later binary, and every plan and record hash they pin must replay identically (`crates/bellwether-cli/tests/format_compat.rs`).
 
 ```
 <index-root>/
@@ -14,11 +14,13 @@ Versioned from the first commit. `bellwether-types::format::STORAGE_VERSION` is 
                                             "Partition columns"; absent for none)
                                  schema{columns[{name, data_type, nullable}], key_specs[],
                                         sidecars?[{kind, columns[], time_columns[]}]}   (see "Sidecar kinds")
-                                 rowgroup_space{next_id, files[{fingerprint, rowgroup_ids[], chunk_size?, chunks?[{start,end}]}],
+                                 rowgroup_space{next_id, files[{fingerprint, rowgroup_ids[], rowgroup_rows[], rowgroup_bytes[],
+                                                column_bytes?[], chunk_size?, chunks?[{start,end}]}],
                                                 tombstones[{since, rowgroup_ids[]}]}   (retired row-group ids, ADR 013)
-                                 (chunk_size and chunks are present only for byte-range sources and are immutable per file)
-                                 key_spec_completeness{name -> sequence at which the spec became complete, that is, first covered every live row group (ADR 020)}
-                                 segments[{id=blake3, kind?, key_spec=KeySpec::name() or the sidecar's name,
+                                 (chunk_size and chunks are present only for byte-range sources and are immutable per file;
+                                  rowgroup_rows, rowgroup_bytes and column_bytes are storage version 2: see "Manifest, storage version 2")
+                                 key_spec_completeness{identity -> sequence at which the spec became complete, that is, first covered every live row group (ADR 020)}
+                                 segments[{id=blake3, kind?, key_spec=KeySpec::identity() or the sidecar's name,
                                            rowgroup_range{start, end} (half-open), bytes}]
                                            (rowgroup_range = the row groups the segment's writer processed, including
                                             any that held no keys; the spec's coverage, and recorded in the segment too;
@@ -41,10 +43,14 @@ Versioned from the first commit. `bellwether-types::format::STORAGE_VERSION` is 
                                  overwritten and never blocking a commit; see "Manifest history"
   segments/<blake3>.seg          header{storage_version, encoding_version, key_spec, codec, bloom_hash}
                                  bloom_hash ∈ {"canonical", "parquet_plain"}; readers refuse any other value
+                                 footer index_offset u64 | index_len u64 | checksum u64 | magic; every block,
+                                           filter and value record a read touches has its own checksum
+                                           (see "Segments, storage version 2")
                                  exact:    block index of sorted key blocks, one split-block bloom per block,
-                                           key → bitmap offset; bitmaps: roaring, over global RowGroupId,
-                                           always in the no-run serialized form (cookie 3a 30 00 00), never empty;
-                                           readers refuse any other cookie or an empty keyed bitmap
+                                           key → value record: bitmap_len u32 | bitmap | [counts]; bitmaps: roaring,
+                                           over global RowGroupId, always in the no-run serialized form
+                                           (cookie 3a 30 00 00), never empty; readers refuse any other cookie or an
+                                           empty keyed bitmap; counts (spec `counts`): one LEB128 row count per set bit
                                  header also records each key column's dataset type (and the temporal ts type
                                            and unit); segments with differing recorded types never merge
                                  index records the row-group range the writer processed (inclusive; a merge
@@ -55,12 +61,23 @@ Versioned from the first commit. `bellwether-types::format::STORAGE_VERSION` is 
                                  bloom:    one split-block bloom per row group (the shape Parquet embeds),
                                            header field bloom_hash names the hash input; newtypes keep the two apart
                                  range:    (min, max) canonical bytes per row group
-                                 temporal: exact layout plus key → [(ts, rowgroup_id)] chain + max_ts;
-                                           latest/asof return every row group at the winning ts (ties)
+                                 temporal: exact layout plus key → [(ts, rowgroup_id)] chain + max_ts after the
+                                           counts; latest/asof return every row group at the winning ts (ties)
                                  bounds, temporal2: sidecar segments, their own layout (magic "BWSIDECR"); see
                                            "Sidecar kinds"
+                                 sketch:   sidecar segment, its own layout (magic "BWSKETCH"); approximate, never
+                                           read by a planner; see "Sketch segments"
+                                 text:     the exact layout keyed by tokens, or with bloom=<fpr> the bloom layout
+                                           over tokens; header also records text_unicode; see "Text keys"
   ledger/<blake3>.rec            Record (Evidence | Proposal | Replay | Certificate | Receipt), canonical JSON
                                  Receipt.certificate must resolve and have pass == true
+  ledger/<blake3>.sig.<key id>.json
+                                 a detached ed25519 signature over the Receipt or Certificate named <blake3>
+                                 (ADR 029): canonical JSON {signature_version: 1, record, kind, alg: "ed25519",
+                                 key_id (blake3 of the public key), public_key, signed_at (RFC 3339 UTC ms), sig};
+                                 signs "bellwether-signature-v1\0" ‖ kind ‖ 0x00 ‖ record hash (32 bytes) ‖ signed_at.
+                                 Outside manifests and segments, not a record: record readers skip the name, so it
+                                 is not a storage-version or record-version matter
   cache/<input-hash>.bin         footer stats, fanout tables, recorded workload key sets
                                  rebuildable; carries age; never cited without its hash
   cache/<input-hash>.meta.json   sidecar {created_at (RFC 3339), payload_blake3}; written after the .bin; an entry whose
@@ -77,7 +94,24 @@ rowgroup id      = dense u32 assigned at first sighting of (fingerprint, index_i
 
 ## Key specs
 
-`Exact{columns}`, `Bloom{columns, fpr}`, `Range{column}`, `Temporal{columns, ts_column}`. Composite is not a kind; every kind takes a column list and encodes it memcomparably (ADR 002). CSV and JSON lines sources define row groups as fixed byte-range chunks recorded in the manifest, so the rest of the system never knows the difference.
+`Exact{columns, counts?}`, `Bloom{columns, fpr}`, `Range{column}`, `Temporal{columns, ts_column, counts?}`, and (phase 5) `Expr{name, expr, over, conformance}` ([Expression keys](#expression-keys-expr-phase-5)), and (phase 5) `Text{column, tokenizer, bloom?}` (see "Text keys"), and (phase 5) `List{column}` (B4; see "List keys"). Composite is not a kind; every kind takes a column list and encodes it memcomparably (ADR 002). CSV and JSON lines sources define row groups as fixed byte-range chunks recorded in the manifest, so the rest of the system never knows the difference. `counts` (storage version 2) is serialized only when true, so a spec without it has the same JSON as in version 1; a version 1 manifest that carries it is refused.
+
+**Key-spec identity (storage version 2).** `KeySpec::identity()` is the canonical string of every field of a spec, and the key under which the manifest lists its segments (`segments[].key_spec`) and its completeness (`key_spec_completeness`):
+
+| Spec | Identity |
+|---|---|
+| `Exact{columns: [a, b]}` | `exact:a,b` |
+| `Exact{columns: [a], counts: true}` | `exact:a,counts` |
+| `Bloom{columns: [a], fpr: 0.01}` | `bloom:a@0.01` (the shortest decimal that reads back as the same `f64`) |
+| `Range{column: ts}` | `range:ts` |
+| `Temporal{columns: [id], ts_column: ts}` | `temporal:id@ts` |
+| `Temporal{columns: [id], ts_column: ts, counts: true}` | `temporal:id@ts,counts` |
+| `Expr{name: sym, expr: json_get(payload,'$.symbol'), over: Exact{counts: true}}` | `expr:sym=json_get(payload,'$.symbol'):exact,counts` (bloom: `...:bloom@0.01`) |
+| `Text{column: body, tokenizer: words}` | `text:body,tokenizer=words` |
+| `Text{column: body, tokenizer: trigram, bloom: 0.01}` | `text:body,tokenizer=trigram,bloom=0.01` |
+| `List{column: tags}` | `list:tags` |
+
+So `bloom:a@0.01` and `bloom:a@0.05` never share a segment list or a completeness entry. Two specs declared by a version 2 binary never share an identity: `,` and `@` separate its parts, so a new declaration (a key spec given to `index` that the index does not already declare, or a proposal's) naming a key or time column that contains either is refused (`exact:a,counts` could otherwise be `Exact{[a], counts}` or `Exact{["a,counts"]}`). For the same reason, because `,counts` ends a counted spec's identity, a new composite exact spec whose last key column is named `counts` is refused (list that column first). A spec an index already declares is read and indexed as it is, whatever its column names: a storage version 1 index on a column named `a,b` reads, plans, and upgrades like any other. Only two declared specs that actually share an identity are refused, which version 1 allowed only for two temporal specs whose time column holds an `@` (`temporal:id` on `ts@x` and `temporal:id@ts` on `x`, both `temporal:id@ts@x`): see "Reading storage version 1". Errors name a spec by its identity. `KeySpec::name()` is the display name and the spec's slot (`exact:a`, `bloom:a`, `temporal:id`): an index holds one spec per name, and declaring another spec under a declared name (another rate, counts on or off, another time column) rebuilds it and drops the old segments in the same commit. A storage version 1 manifest keyed both maps by name (one spec per name, so the rewrite is one-to-one); a version 2 reader rewrites those keys to identities when it reads one, and a version 1 manifest that no commit could upgrade yet (see "Manifest, storage version 2") is written back in names.
 
 ## Canonical encoding (ADR 016), encoding version 1
 
@@ -128,6 +162,71 @@ The pinned digests in `bellwether_source::catalog`'s tests were refreshed with t
 
 **Downgrade is one-way.** Once a newer binary has committed to an index, a binary built on Arrow 53 refuses that index. The commit rewrites the manifest's type spellings (see "Manifest column types") into a form Arrow 53 does not parse. Strictly, this happens only when the dataset has a time or timestamp column; an index with neither is spelled the same by both. Nothing converts an index back. An index the newer binary has only read stays readable by both.
 
+## SQL sources: the `sql://` identity scheme (2026-10-25, ADR 027)
+
+A table is read through the same `Source` trait as a folder of files (`bellwether-source-sql`). Nothing in the index format (storage version 1 or 2) changes: a table never has an index (the engine builds none over a database), so these identities appear only in what a reconcile, `why`, or `fix` over a table records, through the catalog digest above and the source identity below.
+
+**Root.** `sql://<engine>/<schema>.<table>[,<schema>.<table>...]` with `engine` one of `sqlite`, `duckdb`, `postgres`, `flightsql`, `mssql`. The connection and the unit configuration follow `?` (`db=`, `driver=`, `range=`, `units=`, `version=`, `snapshot=`) and are never part of a recorded root: a record names `sql://<engine>/<tables>` only, so a password in a connection string never reaches the ledger. Every table of one root holds the same columns and declared types.
+
+**Units.** A unit plays a file of exactly one row group (`index_in_file` 0). Each table is cut, in order of preference, into its declared partitions (Postgres leaf partitions), else key ranges of `range=<column>` into at most `units=<n>` ranges plus one unit for its nulls, else one unit. Range boundaries are the column's values at ranks `k * count / n` in the engine's own order, so the ranges are `column < b1`, `b1 <= column < b2`, ..., `column >= bk`, and `column IS NULL`: every row in exactly one unit, which discovery checks (the units' row counts must sum to the table's `COUNT(*)`, else the cut is refused). Unit paths:
+
+```
+sql://<engine>/<schema>.<table>/all
+sql://<engine>/<schema>.<table>/partition=<schema>.<child>
+sql://<engine>/<schema>.<table>/<column>=null
+sql://<engine>/<schema>.<table>/<column>=[<lo>,<hi>)        lo = -inf for the first, hi = +inf for the last
+```
+
+**Fingerprint.** `path` is the unit path; `size` is the unit's row count (a count from the engine, not bytes); `etag` is the unit's identity string; `tail_blake3` is BLAKE3 of the identity string's UTF-8 bytes. The identity string is
+
+```
+v1;rows=<count>;version=<hex>      with version=<column>: BLAKE3 hex of the canonical encoding of MAX(<column>) over the unit, or "null"
+v1;rows=<count>;stats=<hex>        otherwise: Hash::of_record((rows, [ColumnStats, ...])), the unit's statistics as reported below
+```
+
+No engine this release reads exposes a per-table snapshot id, so ADR 027's second identity source is not used yet. The statistics checksum detects a change to the row count or to any column's minimum, maximum, null count, or byte count; an in-place update that keeps all of them is not detected by it, so a table updated in place should name a version column (one that increases on every write), or be read inside a snapshot.
+
+**Statistics.** One aggregate query per unit gives each column `COUNT(*) - COUNT(col)` (the null count, exact) and, where the engine can order in the canonical order, `MIN` and `MAX`, encoded as the dataset type (ADR 016): bounds attained by the data, never a sample. Strings are bounded in UTF-8 byte order (`COLLATE "C"` in Postgres, `COLLATE BINARY` in SQLite, `COLLATE "binary"` in DuckDB); SQL Server and Flight SQL report no string bounds (`None`), since their order is not byte order. Float bounds follow "Statistics semantics" above (a NaN bound is dropped). `distinct_count` is `None` and `has_bloom` false. `bytes` per column is the unit's logical bytes: for fixed-width types the non-null count times the type's width, for strings and binaries the engine's octet length summed; the unit's `RowGroupMeta.bytes` is their sum. They are measured, not storage bytes, which is why costs over a table are measured (ADR 027) and never stored as exact. Planner statistics (`pg_stats`, `sqlite_stat4`, BRIN summaries, DuckDB zone maps, columnstore segments) are not used as bounds: they are samples, or cover block ranges and row groups that are not the unit.
+
+**Source identity.** `SqlSource::identity` is `Hash::of_record((root, connection_identity, [(unit path, identity string), ...]))` in unit path order, where `connection_identity` is BLAKE3 of the connection with its credentials removed (a URI's `user:password@`, and query parameters or ODBC keys naming a password, token, secret, or key), so two databases holding a table of one name are two identities: the first implementation of contract v3 backlog #10. A certificate over a table cites it after the two catalog digests.
+
+**Snapshot.** A run over a table holds one read transaction where the engine has a snapshot (`BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY` in Postgres, `BEGIN TRANSACTION` in DuckDB, a deferred read transaction in SQLite, `SNAPSHOT` isolation in SQL Server when the database allows it) and rolls it back at the end. Otherwise (`snapshot=reread`, Flight SQL, or SQL Server without snapshot isolation) every unit's identity, and the list of partitions, is read again when the run ends, and any difference is refused (`Error::SourceChanged`) before anything is recorded. A unit read returning another row count than its identity says is refused either way.
+
+## Query engine sources: `clickhouse://` and `kusto://` (2026-10-26, ADR 033)
+
+A query engine that owns its storage is reached through a `MeasuredEngine` adapter (`bellwether-source-engine`) and is a `Source` too, so its tables have an identity like a folder or a SQL table. Nothing in storage version 1 changes: an engine never has an index (the engine builds nothing inside it), so these identities and statistics appear only in records, through the fields below. Every field is additive with `skip_serializing_if`: a record written before them keeps its bytes and its hash (`crates/bellwether-source-engine/tests/conformance.rs`).
+
+**Root.** `clickhouse://[user@]host[:port]/<database>[/<table>[,<table>...]]` and `kusto://<cluster>/<database>[/<table>...]`. Parameters follow `?`: `password=env:NAME` (ClickHouse; a secret is read from the environment only), `scratch=<storage folder URL>` (Kusto, where `.export` writes). A recorded root has neither the user nor any parameter: `clickhouse://host:port/db/table`.
+
+**Units.** A unit plays a file of one row group. ClickHouse: one per partition of each MergeTree table, from the active parts in `system.parts`; path `<root>/<table>/<partition_id>`; size the partition's rows; identity string `v1;rows=<n>;blocks=<lo>-<hi>;mutation=<v>` (the lowest and highest block numbers of its parts and the highest mutation version), which an insert, a delete, or a mutation changes and a background merge does not. Kusto: one per extent, from `.show table <t> extents`; path `<root>/<table>/<extent id>`; identity string `v1;rows=<n>;extent=<extent id>` (an extent is immutable; a merge replaces extents, so a merge is seen as a change). In both, `etag` is the identity string and `tail_blake3` its BLAKE3.
+
+**Engine identity.** `Hash::of_record((root, [(unit path, identity string), ...]))` with the units sorted by path, beside the unit count and the rows they hold (`EngineIdentity`). `why --twin-of` records it in the profile Evidence (`twin.identity`); `fix` reads it before scoring and again, on a fresh connection, after the exports, cites both in the Certificate's provenance, and refuses a change between them (`Error::SourceChanged`).
+
+**Tags.** Every query bellwether submits runs under `bw-<run>-<role>`: `<run>` is 16 lowercase hex digits drawn per run (BLAKE3 of the clock, the process id, and a counter; the apply tier draws its own run), `<role>` names the query (`keys` for `workload record`, `p<i>-before` and `p<i>-after` for pair `i`). ASCII letters, digits, and `-` only, at most 96 bytes, so a tag is safe inside any engine's string literal. The engine logs it with the query (ClickHouse `query_id` = the tag; Kusto `ClientRequestId` = `bellwether;<tag>`) and statistics are read back by it, so a number in a record is always one the engine logged for a query bellwether submitted.
+
+**Record fields.**
+
+| Field | Meaning |
+|---|---|
+| `EvidenceBody::Profile.twin` (`TwinOf`) | `engine` (recorded root), `identity`, `units`, `engine_rows`, the lake's `sequence` and `lake_rows`, the key sample's `workload`, `keys`, the twin's prediction (`predicted_rows`, `predicted_row_groups`, `predicted_files`: the lake's rows, row groups, and files holding a sampled key, exact), and the `gates` compared against |
+| `RewriteShape.pairs` / `.key` / `.keys` | the (before, after) query texts, the result columns each pair is reconciled by, the key sample's workload |
+| `RunCost.measured` (`QueryStats`) | `tag`, `read_rows`, `read_bytes`, `peak_memory_bytes`, `cpu_ns?`, `duration_ns`, `result_rows`, `units_read?`, `units_total?`, as the engine's own log records them; such a cost is never `exact`: from record version 3 its `exactness` is `measured` with the model (`clickhouse.query_log`, `kusto.query_log`), which its Replay names too, and its `rows` is absent (the log's `read_rows` are rows read, not rows holding the keys) |
+| `Replay.prediction`, `Receipt.prediction` (`Prediction`) | the twin Evidence, `predicted_rows`, `predicted_row_groups`, and `pairs`: one `PairPrediction` per pair in the proposal's order, each with the engine's `before_read_rows`, `after_read_rows`, `before_read_bytes`, `after_read_bytes` for that pair's queries and `before_ratio`, `after_ratio` = that pair's read rows / predicted rows as a decimal string with three places, rounded half to even, absent when nothing was predicted. Nothing is summed across pairs |
+| `Receipt.attest_only` | `true`: the engine scored and verified and applied nothing (`manifest_after == manifest_before`); written only for a rewrite whose current costs are measured |
+
+The ledger's rules (ADR 033 amendment of ADR 005): a Replay may carry inexact current costs only for a rewrite and only with its model named; a cost carrying `measured` is never `exact`; a receipt over a Replay with measured costs must be `attest_only`, leave the manifest where it was, and copy the Replay's `prediction` unchanged.
+
+**Conformance vectors** (`crates/bellwether-source-engine/tests/conformance.rs` checks each):
+
+| Vector | Value |
+|---|---|
+| tag, run `0123456789abcdef`, role `p0-before` | `bw-0123456789abcdef-p0-before` |
+| ratio 1600 / 2, 400 / 1600, 2 / 3, 1 / 2000, 3 / 2000, 7 / 2000, 9 / 0 | `800.000`, `0.250`, `0.667`, `0.000`, `0.002`, `0.004`, absent |
+| `tail_blake3` of `v1;rows=1000;blocks=1-3;mutation=0` | `97ddb63656c5d7e616b9f7d953d66097a154551af091837730c0ef76563f58c7` |
+| identity of `clickhouse://h:8123/db/orders` with units `0` (`v1;rows=500;blocks=1-1;mutation=0`) and `1` (`v1;rows=1000;blocks=2-4;mutation=0`), listed `1` first (units sort by path, not by identity string) | canonical bytes `["clickhouse://h:8123/db/orders",[["clickhouse://h:8123/db/orders/0","v1;rows=500;blocks=1-1;mutation=0"],["clickhouse://h:8123/db/orders/1","v1;rows=1000;blocks=2-4;mutation=0"]]]`, hash `2dfe8d56adbc1ecb0e1c9f5ebd4bcc91de6dedde8eeafe233aef35fc6c0aa8b1` |
+| a record version 3 `RunCost` with `measured` (run and tag `bw-0123456789abcdef-p0-after`, 2 keys, 1 file, 1 row group, 16,000 bytes, `exactness` measured by `clickhouse.query_log`; 400 rows read, 1,048,576 peak, 1.5 ms CPU, 2 ms, 2 result rows, 1 of 4 units) | hash `7487563e98460bee3490ac37be52a0849914e7503dc85e25372ad968f3688c01` |
+| a record version 3 attest-only Receipt (evidence, proposal, replay, certificate `e…`, `f…`, `a…`, `c…`; manifest `0` to `0`; prediction 2 rows in 1 row group; pair 0 read 1,600 then 400 rows, 64,000 then 16,000 bytes; pair 1 read 5 then 3 rows, 200 then 100 bytes) | hash `86c7ffc92a990bf9235e23ea6a8dc21b48a4357279d2d2e8214890e089c69c34` |
+
 ## Build-side memory (ADR 018 note)
 
 The lookup bound is one block index plus the bitmaps for the keys asked. The build bound is one segment: a writer holds a segment's distinct keys until the segment is finished, because the segment's name is the hash of its bytes. The build crate therefore caps segment size (keys and bytes) and emits many segments rather than one large one; merge compacts them later.
@@ -176,9 +275,280 @@ Both the core encoder and any source-side stats encoder must reproduce these byt
 
 Additional vectors (decimal rescale, Decimal256, floats including the canonical NaN) are appended by the conformance test as they are agreed, never by one side alone.
 
-## Planned for storage version 2 (ADR 026)
+## Segments, storage version 2
 
-Not part of version 1 and not read by version 1 readers: (1) exact segments may carry, per key and per set bit of its bitmap, a row count, enabled by `counts: true` on the key spec; (2) scan entries carry per-column bytes so a plan's projection cost is a sum of chunk sizes; (3) manifests record per-row-group bytes and per-column bytes at build time so plans need not open footers; (4) the version 1 sidecar kinds (`bounds`, `temporal2`, "Sidecar kinds" below) fold into the segment they ride beside: an exact or bloom segment's per-key value carries the per-row-group time bounds, and the bitemporal triples become a temporal layout, so one segment read answers what a key segment plus a sidecar answer in version 1. A version 2 reader still reads version 1 sidecars. The format freeze happens after these exist, so that version 2 is the frozen version.
+A segment is one file, `segments/<blake3 of its bytes>.seg`, readable from this section alone. Every integer is little-endian and every offset counts from the start of the file. `bytes` is a length-prefixed byte string, `len u32 | len bytes`. A checksum is XXH3-64, seed 0, stored as a `u64`. A key is the canonical encoding of its tuple ("Canonical encoding"), and keys compare as bytes.
+
+```
+segment             preamble | header | data | index | footer
+preamble            magic "BWSEGMNT" | storage_version u32 | encoding_version u32 | header_len u32
+header              header_len bytes of JSON: {storage_version, encoding_version, key_spec, codec, layout,
+                    bloom_hash, key_types?, ts_type?, ..unknown fields, preserved}
+data                the layout's blocks, at the offsets the index gives
+index               entries u64 | has_rg u8 | rg_min u32 | rg_max u32 | block_count u32 |
+                    block_count x index entry (of the layout)
+footer              index_offset u64 | index_len u64 | checksum u64 | magic "BWSEGMNT"
+                    (checksum over preamble ‖ header ‖ index)
+```
+
+- **Header.** `storage_version` and `encoding_version` equal the preamble's. `codec` is `"none"`. `layout` follows from the key spec's kind: `keyed` (exact), `keyed_temporal` (temporal), `bloom_per_row_group` (bloom), `min_max` (range); any other pairing is refused. `bloom_hash` is `canonical`, or `parquet_plain` for a bloom segment holding a reused single-column Parquet filter (ADR 008). `key_types` (one per key column) and, for a temporal spec, `ts_type` are each key column's dataset type in core's `ColumnType` spelling, present together when the segment was written from a dataset schema.
+- **Index header.** `entries` counts keys (keyed layouts), range entries (`min_max`) or the sum of the filters' distinct-value estimates (`bloom_per_row_group`). `rg_min..=rg_max` is the row-group range the writer processed, inclusive (see the tree above); `has_rg` is 0, with both bounds 0, only for a segment that recorded no range.
+
+The layouts:
+
+```
+keyed, keyed_temporal (exact, temporal specs)
+  block             value records | bloom | directory, in that order; at most 1024 keys or 64 KiB of
+                    key bytes per block; keys strictly ascending across the segment
+  index entry       first_key bytes | last_key bytes | bloom_off u64 | bloom_len u32 | bloom_checksum u64 |
+                    body_off u64 | body_len u32 | body_checksum u64 | n u32
+  bloom             a split-block bloom filter (Parquet's layout) over the block's keys, hashed canonically
+  directory (body)  n u32 | (n+1) key end offsets u32, the first 0 | key bytes |
+                    n x (value_offset u64 | value_len u32 | value_checksum u64)
+  value record      bitmap_len u32 | bitmap | [counts] | [chain]
+  bitmap            roaring over global RowGroupId, in the no-run serialized form (cookie 3a 30 00 00),
+                    never empty
+  counts            spec has counts: one unsigned LEB128 u64 per set bit, in ascending row-group order
+  chain             temporal only: count u32 | has_max u8 | max_ts i64 | count x (ts i64 | rg u32);
+                    the distinct (ts, row group) pairs of the key's non-null times, strictly ascending;
+                    has_max = 1 and max_ts = the last ts when count > 0, else 0 and 0
+
+bloom_per_row_group (bloom specs)
+  index entry       rg u32 | off u64 | len u32 | ndv u64 | checksum u64, rg non-decreasing (a lookup
+                    unions every entry of one row group)
+  data              that row group's split-block bloom filter, len bytes at off
+
+min_max (range specs)
+  block             n u32 | n x (rg u32 | min bytes | max bytes), ascending by (min, max, rg); at most
+                    256 entries per block
+  index entry       first_min bytes | max_of_max bytes | off u64 | len u32 | n u32 | checksum u64
+```
+
+- **Checksums.** A reader checks the footer's checksum when it opens a segment, and the checksum of every filter, directory and value record before it decodes one. A mismatch is refused as a corrupt segment (`corrupt segment: …`, the corrupt-index class), never decoded into an answer. A lookup still holds the index, one block and the values of the keys asked (ADR 018).
+- **Counts** are present exactly when the header's `key_spec` has `counts: true`. Each is the number of rows in that row group whose key tuple is this key: at least 1, in its shortest LEB128 form (an over-long form or one past 64 bits is refused), and nothing may follow the last one (or the chain). Rows whose leading key column is null are not indexed and not counted; a trailing null element of a composite key is the `0x00` marker and counts under that tuple (ADR 014). A temporal count is the key's rows in the row group over all versions, including rows with a null time, which never win. `SegmentReader::counts(keys)` returns `None` for a segment without counts, never zero.
+- **Merge** sums the counts of a (key, row group) only when the inputs' row groups are disjoint, as the build's contiguous groups are, and refuses inputs that both count one key in one row group. Its output is written at this build's storage version. A read that finds two listed segments of one counted spec both counting one (key, row group) refuses the index as corrupt rather than summing them.
+- A segment header at storage version 1 that declares `counts` is refused.
+- **Not frozen yet (ADR 028).** Storage version 2's bytes are frozen by the next release, at M5; this one makes the record version 3 shapes final. Per-key time bounds (`exact:symbol@ts`) and bitemporal versions (`temporal2:id@valid,known`) are still the version 1 sidecar segments of "Sidecar kinds", declared in `schema.sidecars`. The next release folds them into the exact value record (`[counts] | [bounds]`) and a `bitemporal` layout, writes a manifest column's `data_type` in core's `ColumnType` spelling and a text source's `source.dialect`. This binary refuses each of those shapes by name, never misreading them and never calling them a newer storage version (the version is the same): a segment header with the `bitemporal` layout, a bitemporal key spec, a key spec with `bounds` or a header `bounds` field, and a manifest whose `data_type` is a map, which has a `source.dialect`, or which declares a key spec with `bounds` or of the bitemporal kind. The refusal is `Error::UnsupportedShape`: "`<shape> <where>`: storage version 2 segment/manifest shape not supported by this binary; upgrade bellwether to read this index" (exit 4; MCP `unsupported_version`).
+
+### Roaring bitmaps
+
+The bitmap of a keyed value record (exact and temporal layouts) is a roaring bitmap of row-group ids in the portable serialization of the [Roaring format specification](https://github.com/RoaringBitmap/RoaringFormatSpec), in its form without run containers, as the `roaring` crate 0.10 (0.10.12 in `Cargo.lock`) writes it. Everything a reader needs is here; the specification is the reference. All integers are little-endian.
+
+```
+bitmap        cookie u32 = 12346 (3a 30 00 00) | n u32, the number of containers, at least 1 |
+              n x (key u16 | cardinality-1 u16) | n x offset u32 | the n containers, in that order
+key           the high 16 bits of the ids the container holds (id / 65,536); strictly ascending
+cardinality   how many ids the container holds, 1 to 65,536; stored minus one
+offset        where the container starts, in bytes from the cookie's first byte
+container     cardinality <= 4,096: an array container, cardinality x u16, the low 16 bits of
+              each id (id mod 65,536), strictly ascending: 2 x cardinality bytes
+              cardinality > 4,096: a bitmap container, 1,024 x u64 (8,192 bytes): the id
+              key x 65,536 + i is present exactly when bit (i mod 64) of word (i / 64) is set
+```
+
+So a key held in at most 4,096 row groups of one 65,536-wide range of ids has an array container for that range, and a key held in more has a bitmap container; a key held in row groups of several ranges has one container per range. The bitmap's length is its `bitmap_len`; in a counts record, the counts follow it in ascending id order, one per id, across all containers. Any other cookie (a run-container serialization, `3b 30`) is refused.
+
+**Roaring bitmap vectors** (`crates/bellwether-core/tests/counts_conformance.rs` writes a counted exact segment holding `"BIG"` in each of row groups 0 to 4,999 and in 65,536 and 70,000, one row each, finds this bitmap in it right after its `bitmap_len`, decodes it with the rules above alone, and checks that this table lists exactly these vectors):
+
+| Vector | Bytes |
+|---|---|
+| `"BIG"` bitmap: cookie, 2 containers, (key 0, 5,000 ids), (key 1, 2 ids), offsets 24 and 8,216 | `3a 30 00 00 02 00 00 00 00 00 87 13 01 00 01 00 18 00 00 00 18 20 00 00` |
+| `"BIG"` container 0 (bitmap, ids 0 to 4,999) | 625 bytes `ff`, then 7,567 bytes `00` |
+| `"BIG"` container 1 (array, ids 65,536 and 70,000) | `00 00 70 11` |
+
+### Worked segment
+
+The counted exact segment of "Counts conformance vectors", every byte of it. Offsets are hexadecimal, values decimal. `crates/bellwether-core/tests/counts_conformance.rs` checks that the bytes of these lines, in order, are the segment and that each offset is the count of bytes before it. The header is
+
+```
+{"storage_version":2,"encoding_version":1,"key_spec":{"kind":"exact","columns":["symbol"],"counts":true},"codec":"none","layout":"keyed","bloom_hash":"canonical"}
+```
+
+```text
+0000 | 42 57 53 45 47 4d 4e 54                         | preamble  magic "BWSEGMNT"
+0008 | 02 00 00 00                                     |           storage_version u32 = 2
+000c | 01 00 00 00                                     |           encoding_version u32 = 1
+0010 | a2 00 00 00                                     |           header_len u32 = 162
+0014 | 7b 22 73 74 6f 72 61 67 65 5f 76 65 72 73 69 6f | header    JSON (header_len bytes), shown below
+0024 | 6e 22 3a 32 2c 22 65 6e 63 6f 64 69 6e 67 5f 76 |
+0034 | 65 72 73 69 6f 6e 22 3a 31 2c 22 6b 65 79 5f 73 |
+0044 | 70 65 63 22 3a 7b 22 6b 69 6e 64 22 3a 22 65 78 |
+0054 | 61 63 74 22 2c 22 63 6f 6c 75 6d 6e 73 22 3a 5b |
+0064 | 22 73 79 6d 62 6f 6c 22 5d 2c 22 63 6f 75 6e 74 |
+0074 | 73 22 3a 74 72 75 65 7d 2c 22 63 6f 64 65 63 22 |
+0084 | 3a 22 6e 6f 6e 65 22 2c 22 6c 61 79 6f 75 74 22 |
+0094 | 3a 22 6b 65 79 65 64 22 2c 22 62 6c 6f 6f 6d 5f |
+00a4 | 68 61 73 68 22 3a 22 63 61 6e 6f 6e 69 63 61 6c |
+00b4 | 22 7d                                           |
+00b6 | 14 00 00 00                                     | value "AAPL": bitmap_len u32 = 20
+00ba | 3a 30 00 00                                     |   bitmap: no-run cookie 3a 30 00 00
+00be | 01 00 00 00                                     |   bitmap: containers u32 = 1
+00c2 | 00 00 01 00                                     |   bitmap: container key u16 = 0, cardinality-1 u16 = 1
+00c6 | 10 00 00 00                                     |   bitmap: container offset u32 = 16
+00ca | 00 00 02 00                                     |   bitmap: row groups u16 = 0, 2
+00ce | 03 01                                           |   counts: LEB128 = 3, 1
+00d0 | 12 00 00 00                                     | value "MSFT": bitmap_len u32 = 18
+00d4 | 3a 30 00 00                                     |   bitmap: no-run cookie 3a 30 00 00
+00d8 | 01 00 00 00                                     |   bitmap: containers u32 = 1
+00dc | 00 00 00 00                                     |   bitmap: container key u16 = 0, cardinality-1 u16 = 0
+00e0 | 10 00 00 00                                     |   bitmap: container offset u32 = 16
+00e4 | 01 00                                           |   bitmap: row groups u16 = 1
+00e6 | ac 02                                           |   counts: LEB128 = 300
+00e8 | 84 00 00 00 00 08 00 04 20 00 04 00 00 00 08 04 | block bloom: split-block filter over the block's keys (32 bytes)
+00f8 | 00 40 00 80 02 10 00 00 00 10 00 80 04 01 00 00 |
+0108 | 02 00 00 00                                     | directory n u32 = 2
+010c | 00 00 00 00                                     |   key end offset u32 = 0
+0110 | 07 00 00 00                                     |   key end offset u32 = 7
+0114 | 0e 00 00 00                                     |   key end offset u32 = 14
+0118 | 06 41 41 50 4c 00 00                            |   key "AAPL" (canonical encoding)
+011f | 06 4d 53 46 54 00 00                            |   key "MSFT"
+0126 | b6 00 00 00 00 00 00 00                         |   "AAPL" value_offset u64 = 182
+012e | 1a 00 00 00                                     |   "AAPL" value_len u32 = 26
+0132 | 5a 72 54 b2 31 02 a3 68                         |   "AAPL" value_checksum u64 = 0x68a30231b254725a
+013a | d0 00 00 00 00 00 00 00                         |   "MSFT" value_offset u64 = 208
+0142 | 18 00 00 00                                     |   "MSFT" value_len u32 = 24
+0146 | ad 3f e7 2f a9 b9 bd 34                         |   "MSFT" value_checksum u64 = 0x34bdb9a92fe73fad
+014e | 02 00 00 00 00 00 00 00                         | index     entries u64 = 2 (keys)
+0156 | 01                                              |           has_rg u8 = 1
+0157 | 00 00 00 00                                     |           rg_min u32 = 0
+015b | 03 00 00 00                                     |           rg_max u32 = 3 (processed range 0..4, inclusive)
+015f | 01 00 00 00                                     |           block_count u32 = 1
+0163 | 07 00 00 00                                     |   block 0 first_key_len u32 = 7
+0167 | 06 41 41 50 4c 00 00                            |   block 0 first_key "AAPL"
+016e | 07 00 00 00                                     |   block 0 last_key_len u32 = 7
+0172 | 06 4d 53 46 54 00 00                            |   block 0 last_key "MSFT"
+0179 | e8 00 00 00 00 00 00 00                         |   block 0 bloom_off u64 = 232
+0181 | 20 00 00 00                                     |   block 0 bloom_len u32 = 32
+0185 | b4 5e 6b a1 66 72 e2 c7                         |   block 0 bloom_checksum u64 = 0xc7e27266a16b5eb4
+018d | 08 01 00 00 00 00 00 00                         |   block 0 body_off u64 = 264 (the directory)
+0195 | 46 00 00 00                                     |   block 0 body_len u32 = 70
+0199 | 57 11 11 ff 08 67 f0 65                         |   block 0 body_checksum u64 = 0x65f06708ff111157
+01a1 | 02 00 00 00                                     |   block 0 n u32 = 2
+01a5 | 4e 01 00 00 00 00 00 00                         | footer    index_offset u64 = 334
+01ad | 57 00 00 00 00 00 00 00                         |           index_len u64 = 87
+01b5 | 73 28 5a 4f f8 8d fd e4                         |           checksum u64 = 0xe4fd8df84f5a2873 (preamble ‖ header ‖ index)
+01bd | 42 57 53 45 47 4d 4e 54                         |           magic "BWSEGMNT"
+```
+
+The footer's checksum is XXH3-64 over bytes `0000..00b6` (preamble and header) followed by `014e..01a5` (the index); each other checksum covers exactly the bytes its offset and length name.
+
+## Manifest, storage version 2
+
+Each `rowgroup_space.files[]` entry gains three arrays:
+
+- `rowgroup_rows`: rows of each row group, aligned with `rowgroup_ids`.
+- `rowgroup_bytes`: compressed bytes of each row group (a text chunk's length), aligned with `rowgroup_ids`.
+- `column_bytes`: compressed bytes of each column chunk, row-group-major: entry `i * columns + j` is row group `i`'s chunk of schema column `j`. It is 0 for a virtual partition column, and the whole array is absent for a text source, whose chunks have no per-column bytes.
+
+A file whose arrays are present but do not align with its row groups or the schema's columns is refused. The build fills them for every file it adds. The first build with work by a version 2 binary over a version 1 manifest fills them for every tracked file from its footer (one footer read per file; a footer whose row-group count disagrees with the manifest is drift, ADR 013) and stamps `storage_version: 2`. A commit that fills nothing (compaction, garbage collection, removing a spec) over a version 1 manifest keeps it at version 1, in version 1's keys, so the arrays are absent only in a version 1 manifest. No commit ever lowers the version. A plan over a manifest with the arrays opens no Parquet footer: bytes come from `rowgroup_bytes`, and `locate --columns` sums `column_bytes` into each entry's `columns` and the plan's `projected_bytes`. Over a version 1 manifest (`--at-manifest` included), `locate --columns` reads each planned file's footer instead and says so ("manifest sequence N is a storage version 1 manifest, which records no per-column bytes, so the projected bytes were read from N Parquet footers"; `column_bytes_from_footers` in JSON). Counts (`count`, and the rows a plan through a counted spec reports) come from the segments.
+
+**Size.** The arrays cost about 8 bytes of decimal text per (row group, column). An index over 10^5 row groups of 50 columns carries a manifest of about 40 MB; beyond that, externalized statistics are a storage version 3 question, not solved here.
+
+The minimal version 2 manifest, in the canonical form `Manifest::to_vec` writes (sorted keys, two-space indent). `crates/bellwether-store/tests/manifest_v2.rs` reads it, writes it back byte for byte, checks that this section shows it exactly, and sweeps every byte of it:
+
+```json
+{
+  "commit_nonce": 1,
+  "committed_at": "2026-10-25T00:00:00.000Z",
+  "created_at": "2026-10-25T00:00:00.000Z",
+  "deleting": [],
+  "key_spec_completeness": {
+    "exact:symbol,counts": 1
+  },
+  "rowgroup_space": {
+    "files": [
+      {
+        "column_bytes": [
+          50,
+          0,
+          30,
+          0
+        ],
+        "fingerprint": {
+          "etag": "2026-10-25T00:00:00.000000000Z",
+          "path": "/data/day=2026-01-01/part-0.parquet",
+          "size": 1000,
+          "tail_blake3": "0000000000000000000000000000000000000000000000000000000000000000"
+        },
+        "rowgroup_bytes": [
+          60,
+          40
+        ],
+        "rowgroup_ids": [
+          0,
+          1
+        ],
+        "rowgroup_rows": [
+          4,
+          2
+        ]
+      }
+    ],
+    "next_id": 2,
+    "tombstones": []
+  },
+  "schema": {
+    "columns": [
+      {
+        "data_type": "Utf8",
+        "name": "symbol",
+        "nullable": true
+      },
+      {
+        "data_type": "Date32",
+        "name": "day",
+        "nullable": true
+      }
+    ],
+    "key_specs": [
+      {
+        "columns": [
+          "symbol"
+        ],
+        "counts": true,
+        "kind": "exact"
+      }
+    ]
+  },
+  "segment_tombstones": [],
+  "segments": [
+    {
+      "bytes": 300,
+      "id": "1111111111111111111111111111111111111111111111111111111111111111",
+      "key_spec": "exact:symbol,counts",
+      "rowgroup_range": {
+        "end": 2,
+        "start": 0
+      }
+    }
+  ],
+  "sequence": 1,
+  "source": {
+    "fingerprint_policy": "tail64k",
+    "kind": "parquet",
+    "partitioning": "hive",
+    "root": "/data"
+  },
+  "storage_version": 2
+}
+```
+
+## Counts conformance vectors
+
+`crates/bellwether-core/tests/counts_conformance.rs` writes a counted exact segment on `symbol` (row groups 0..4, no recorded types) holding `"AAPL"` in row groups 0 (3 rows) and 2 (1 row) and `"MSFT"` in row group 1 (300 rows). It finds each value record below exactly once in the segment's bytes, followed in the directory by its offset, length and checksum, and checks that this table lists exactly these vectors.
+
+| Vector | Bytes |
+|---|---|
+| `"AAPL"` key | `06 41 41 50 4c 00 00` |
+| exact value `"AAPL"`, row groups {0, 2}, counts [3, 1] | `14 00 00 00 3a 30 00 00 01 00 00 00 00 00 01 00 10 00 00 00 00 00 02 00 03 01` |
+| exact value `"MSFT"`, row group {1}, counts [300] | `12 00 00 00 3a 30 00 00 01 00 00 00 00 00 00 00 10 00 00 00 01 00 ac 02` |
+
+The same test checks that every segment in `fixtures/format-v1/` and `fixtures/format-v0.1/` is named by the blake3 of its bytes.
+
+## Reading storage version 1
+
+- **Segments.** A version 1 segment has the 24-byte footer without a checksum and no other checksums; an exact value record is the bare bitmap and a temporal one the length-prefixed bitmap and the chain. It never stores counts: `SegmentReader::counts` returns `None`, and its value bytes are never read as counts. Sidecar segments (`BWSIDECR`, "Sidecar kinds") are unchanged in version 2.
+- **Manifests.** Keys are rewritten from names to identities on read ("Key-spec identity"). Without the arrays, a plan opens each planned file's footer, as version 1 did. `storage_version` stays 1 until a commit: `bellwether index` with nothing to do commits nothing and leaves the index at version 1, readable by a version 1 binary; the first build with work fills the arrays, commits at version 2 and says so (`manifest upgraded to storage version 2`). Every plan of the version 1 index pinned to its earlier sequences (`--at-manifest`) is unchanged by the upgrade. Its specs are read as they were declared, whatever their column names. Two of them that share an identity (two temporal specs whose time column holds an `@`) are read under `v1-shared-identity:<name>` keys, which no identity equals, so neither plans; every build refuses before reading or writing anything, naming both specs in their JSON form and the step that upgrades the index: re-declare the one whose key columns have no `,` or `@` under its name with another time column (`--key '{"kind":"temporal","columns":["id"],"ts_column":"ts"}'`; a spec declared under an existing name replaces it), or, when both key columns hold one, move the index folder aside and index again. A storage version 2 manifest with two such specs is refused as a corrupt index: no build commits one.
 
 ## Inference stability (2026-10-24)
 
@@ -242,3 +612,162 @@ A block holds at most 1024 keys or 64 KiB of key bytes. Readers refuse a newer s
 | `temporal2 record valid=1 known=86400000000 rg=2` | `01 00 00 00 00 00 00 00 00 60 d7 1d 14 00 00 00 02 00 00 00` |
 | `bounds:symbol@ts blake3` | `56b28b58922841137a0d3b51f47293790dd8099934f56292360b683405863b95` |
 | `temporal2:symbol@valid,known blake3` | `63dc33afbfe97a78dcd5003a3390061bca9c20fdf19e811a24c839170548d31c` |
+
+### Sidecar proposal vectors
+
+Record version 3 can already propose the specs the next storage version 2 release makes declarable (ADR 028): a key whose exact spec carries per-key `bounds`, a bitemporal key, and a key with specs applied beside it (`ProposalBody::Key.sidecars`). Their records are final now, whichever release builds them. `bellwether-types`' `sidecar_proposal_vectors_match_docs_format_md` writes these three proposals, checks that this block lists exactly their canonical JSON, one record per line, and reads each line back to the same record:
+
+```json
+{"record":"proposal","record_version":3,"evidence":["eda5d831cf40b9fa97713a4eb5eec65e322a1a05ab2c8dad5ce1f7907e10236c"],"proposed_by":"agent","created_at":"2026-10-25T00:00:00.000Z","body":{"kind":"key","spec":{"kind":"exact","columns":["symbol"],"bounds":"ts"}}}
+{"record":"proposal","record_version":3,"evidence":["eda5d831cf40b9fa97713a4eb5eec65e322a1a05ab2c8dad5ce1f7907e10236c"],"proposed_by":"agent","created_at":"2026-10-25T00:00:00.000Z","body":{"kind":"key","spec":{"kind":"bitemporal","columns":["id"],"valid_column":"valid","known_column":"known"}}}
+{"record":"proposal","record_version":3,"evidence":["eda5d831cf40b9fa97713a4eb5eec65e322a1a05ab2c8dad5ce1f7907e10236c"],"proposed_by":"agent","created_at":"2026-10-25T00:00:00.000Z","body":{"kind":"key","spec":{"kind":"exact","columns":["symbol"],"counts":true},"sidecars":[{"kind":"bloom","columns":["symbol"],"fpr":0.01,"bounds":"ts"}]}}
+```
+
+A binary of this release that finds one of these specs in a manifest or a segment header refuses it with `Error::UnsupportedShape` (see "Segments, storage version 2").
+
+## Sketch segments (storage version 1, additive sidecar kind, 2026-10-26)
+
+`schema.sidecars[]` holds structures the planner never reads, beside the key specs it plans with. `sketch` is the first that is approximate: per item, per file, HyperLogLog registers and an optional MinHash signature, answering `count(distinct item)` and the overlap of two items with an error bound. It is declared `{kind: "sketch", columns: [items], time_columns: [], params: {"p": "<precision>", "minhash": "<k>"}}`, where an item is one column or a `+`-joined tuple (`symbol+ts`), and named `sketch:<items joined by ,>` (no `@`: it has no time column). `params` omits `minhash` when no signature is kept; the default precision is 14. Its segments are listed with `kind: "sketch"` and that name as `key_spec`, are complete under that name exactly as a key spec is, and are built over the row groups they do not cover. **No planner path reads a sketch segment**: a plan built from an approximate number could miss a row group (invariant 1). A binary that does not know the kind keeps the declaration and the segments (see "Segment kinds").
+
+An item's value is its canonical bytes (ADR 016); a tuple is encoded like a composite key (ADR 014): a row whose leading column is null is not sketched and counts as a null, and a null trailing column is the `0x00` marker. Each value is hashed once with XXH3-128, seed `0x6265_6c6c_7765_7468` (the profiler's seed, so a column's merged registers equal the profiler's sketch of it). The low 64 bits feed the HyperLogLog: register index = the top `p` bits, rank = leading zeros of the remaining bits plus one, capped at `65 - p`. MinHash slot `i` is `mix64(h1 + i * (h2 | 1))`, wrapping, with `h1`/`h2` the low/high 64 bits and `mix64` SplitMix64's finalizer; the signature keeps each slot's minimum. Registers merge by maximum and slots by minimum, both lossless, so a file split across segments merges back to the sketch of the whole file.
+
+One entry per file stretch: the build starts an entry whenever the file changes or a row-group id does not follow the previous one, so an entry's row groups always belong to one file. Layout, all integers little-endian:
+
+```
+preamble  magic "BWSKETCH" | storage_version u32 | encoding_version u32 | header_len u32
+header    JSON {storage_version, encoding_version, kind:"sketch", items:[[col,..],..], item_types?:[[ColumnType,..],..],
+                precision, minhash:k|null, hash:"xxh3_128", seed, codec:"none", ..unknown preserved}
+body      entry*; entry = rg_start u32 | rg_end u32 | item* (header order)
+          item    = rows u64 | nulls u64 | hll | minhash?
+          hll     = 0x00 | n u32 | n x (index u32 | rank u8)    sparse, iff 4 + 5n < 2^p
+                  | 0x01 | 2^p x rank u8                        dense, otherwise
+          minhash = k x u64                                     present iff the header's minhash is k
+footer    entries u32 | range_start u32 | range_end u32 | BLAKE3 of every byte before the checksum (32) | magic "BWSKETCH"
+```
+
+Readers refuse: a newer storage or encoding version, any kind, codec, hash, or seed but the ones above, a checksum mismatch (so every damaged byte is refused, never read as another estimate), entries that are empty (`rg_start >= rg_end`), out of order, overlapping, or outside `[range_start, range_end)` (the row groups the writer processed, recorded so that two segments over different row groups never share bytes), sparse indices out of order or range, a rank of 0 in a sparse list or above `65 - p` anywhere, the encoding the size rule does not pick, and an item whose `rows` disagrees with its registers (`rows = 0` exactly when every register is 0 and every slot is `u64::MAX`). A reader also refuses a segment whose `item_types` differ from the dataset's types for those columns, because its hashes describe other bytes.
+
+Estimates. Distinct counts use Ertl's improved raw estimator (relative standard error about `1.04 / sqrt(2^p)`, 0.81 % at `p = 14`); the reported interval is three standard errors either side, clamped to `[1, rows]` when any row was sketched. Overlap is MinHash when both items keep signatures of one length (the share of agreeing slots, bounded by the Wilson score interval at three standard errors), else HyperLogLog inclusion-exclusion over the merged registers with bounds propagated from each estimate's interval. Items of different column types are refused (their values never compare equal), as are items at different precisions. Every number derived from a sketch is labelled `approximate` in every type and every output.
+
+Float items count canonical bytes, not SQL equality: `0.0` and `-0.0` are two values, and so is every distinct NaN payload, where SQL `count(distinct)` counts one zero (and engines differ on NaN). A float item's distinct count can therefore exceed the SQL answer by up to one for the zeros plus the number of NaN payloads beyond the first. Uniqueness is never asserted from a sketch: a file is reported as repeating a value only when its estimate times `1 + 3σ` (σ the relative standard error) is still below its row count, so a file of `r` rows must repeat more than `r · 3σ / (1 + 3σ)` of them to be flagged (24 of 1,000 rows at precision 14). `cardinality` reports that floor for a file of the average size as `duplicate_floor`, and the CLI prints it.
+
+## Sketch conformance vectors (storage version 1)
+
+`crates/bellwether-core/tests/sketch.rs` writes the reference segment (items `id` (Int64) and `id+tag` (Int64, Utf8), `p = 4`, `minhash = 2`; file 0 is one row group holding `(1, "a")` and `(2, null)`; file 1 is two row groups, `(1, "a")` then `(null, null)`; row groups 0..3) and checks every row of this table byte for byte.
+
+| Vector | Bytes |
+|---|---|
+| `value_hash(Int64 1)` | `d6ef277c610adb0706d0067c5aa355d5` |
+| `preamble` | `42 57 53 4b 45 54 43 48 01 00 00 00 01 00 00 00 f3 00 00 00` |
+| `first entry, item id` | `00 00 00 00 01 00 00 00 02 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 02 00 00 00 00 00 00 00 02 0f 00 00 00 03 08 a9 ce 44 2c 92 04 07 de 13 b3 66 ea df fb b4` |
+| `footer` | `02 00 00 00 00 00 00 00 03 00 00 00 ab 25 6d ba de e3 11 dd b0 80 2d e7 f2 40 53 1b a6 12 d6 4b 1e 04 dc d8 62 76 30 ad a5 67 a7 d0 42 57 53 4b 45 54 43 48` |
+| `segment blake3` | `e84c9be5a3d4bdad2674f98364b2d2440e40795bf7f91c35a5c923429ddfd4f3` |
+
+## Expression keys (`expr`, phase 5)
+
+An `expr` key indexes a value derived from dataset columns by a closed, deterministic expression: the operator it serves is a filter or join key that is a function of a column (`json_get(payload,'$.symbol') = 'S-R0007-1'`, `date_trunc(ts,day) = ...`). It is a key-spec kind of its own (not a sidecar): `schema.key_specs[]` holds
+
+```
+{"kind":"expr", "name":<virtual column>, "expr":<normalized expression>,
+ "over":{"kind":"exact","columns":[<name>],"counts"?:true} | {"kind":"bloom","columns":[<name>],"fpr":<f64>},
+ "conformance":[{"expr":<closed expression>, "value":<lowercase hex> | null}, ...]}
+```
+
+named `expr:<name>=<expr>:exact` or `expr:<name>=<expr>:bloom`, and identified (storage version 2, the key of its segments and completeness) as `expr:<name>=<expr>:exact`, `expr:<name>=<expr>:exact,counts`, or `expr:<name>=<expr>:bloom@<fpr>`. `name` is an identifier that is not a dataset column. The store's key-spec allow-list holds `expr`, and the spec an `expr` key wraps is checked against the same list, so a reader without the kind refuses the manifest with the typed shape error (ADR 017), never a serde error or a silent drop on rewrite. A reader built before this kind refuses such a manifest, and so does this binary for a storage version 1 manifest that names it: the kind ships with storage version 2.
+
+**Segments.** An `expr` key's segments are ordinary segments in the layout of `over` (the exact or bloom bytes above, nothing added), listed in `segments[]` with the `expr` spec's identity as `key_spec` and no `kind`. With `:exact,counts` the exact segment stores, per derived value and row group, its rows (the storage version 2 counts layout), so `bellwether count --keys` with a key file named by the expression answers `count(*) where <expr> in (...)` from the index, and a `locate` plan states its rows. The key column is the virtual column, encoded at the expression's value type with the canonical encoding. The segment header's key spec is the whole `expr` spec, so a segment carries its expression and conformance vectors. The build reads the expression's input columns one row group at a time and derives the virtual column for that row group only (ADR 018); a row whose value is null is not indexed (ADR 014).
+
+**Expression language.** Six functions, string and integer literals, column references; no user code (`bellwether_core::expr` documents each function's types and value). `json_get(s, path)` gives a JSON value at a path as text (a string's text, a number's literal token as written, `true`/`false`; null for a JSON null, an object, an array, a missing path, or a document that is not valid JSON; a repeated member takes its first occurrence). `lower(s)` is the Unicode lowercase mapping as Rust's `str::to_lowercase` computes it (per-character default lowercase, the multi-character `İ` mapping, the final-sigma rule). `substr(s, start, len)` counts Unicode scalar values from a 1-based start. `cast(x, int64|utf8|timestamp_s|ms|us|ns)` converts strictly (a string that is not an integer is null). `date_trunc(t, second|minute|hour|day|month|year)` floors in UTC. `hash(x, ...)` is xxhash64 (seed 0) over the arguments' concatenated canonical encodings, as `UInt64`.
+
+**Normalized form.** Function names and keywords lowercase, no whitespace, columns bare when an identifier (`[A-Za-z_][A-Za-z0-9_]*`) else double-quoted, strings single-quoted with `'` doubled, integers in decimal, JSON paths `$` then `.key` (identifier), `["key"]` (other, `"` and `\` escaped by `\`), or `[n]`; `date_trunc('day', ts)` normalizes to `date_trunc(ts,day)`. A lookup matches an `expr` key only when its expression normalizes to the key's expression; a lookup on any other expression, on the virtual column's name, or on an expression beside another column is refused, naming the `expr` keys that exist. An `expr` key answers point lookups (`locate`) only; `latest`, `asof`, window, and lookback lookups on an expression are refused. The residual is `ExprIn {expr, values}`: the expression recomputed per row, kept when its canonical value is one of `values`; a null value matches nothing.
+
+**Conformance vectors.** An `expr` spec carries every vector below for each function its expression calls, and a spec that does not record every vector this binary pins for a function its expression calls (none at all, or only another function's) is refused at `index`, at segment open, and at plan, naming the missing vector. The consequence: adding a vector to a function later makes every existing `expr` key over that function refuse until it is declared again and rebuilt, so after the format freeze adding a vector is a format change. Every reader (segment open, spec check, build, plan, price, verify) recomputes them and refuses the key, naming both values, when this binary computes another: an evaluator whose behaviour moved (for example a changed Unicode table under `lower`) refuses rather than misses rows (invariant 1). A character whose mapping a later Unicode version adds is outside what the vectors see. `crates/bellwether-core/tests/expr_conformance.rs` checks every row of this table against the code's table, and every value against the evaluator. Values are canonical encodings (ADR 016) in lowercase hex; spaces are for reading only.
+
+| Function | Closed expression | Value |
+|---|---|---|
+| `json_get` | `json_get('{"symbol":"SYM1","px":1.50}','$.symbol')` | `0653594d 310000` |
+| `json_get` | `json_get('{"px":1.50}','$.px')` | `06312e35 300000` |
+| `json_get` | `json_get('{"a":{"b c":[10,"x\u00e9"]}}','$.a["b c"][1]')` | `0678c3a9 0000` |
+| `json_get` | `json_get('{"a":1,"a":2}','$.a')` | `06310000` |
+| `json_get` | `json_get('{"a":"\ud83d\ude00"}','$.a')` | `06f09f98 800000` |
+| `json_get` | `json_get('{"a":true}','$.a')` | `06747275 650000` |
+| `json_get` | `json_get('{"a":null}','$.a')` | `null` |
+| `json_get` | `json_get('{"a":[1]}','$.a')` | `null` |
+| `json_get` | `json_get('{"a":1','$.a')` | `null` |
+| `lower` | `lower('AbC-Z')` | `06616263 2d7a0000` |
+| `lower` | `lower('ÀB')` | `06c3a062 0000` |
+| `lower` | `lower('İ')` | `0669cc87 0000` |
+| `lower` | `lower('ΣΑΣ')` | `06cf83ce b1cf8200 00` |
+| `substr` | `substr('héllo',2,3)` | `06c3a96c 6c0000` |
+| `substr` | `substr('abc',5,2)` | `060000` |
+| `cast` | `cast('007',int64)` | `02800000 00000000 07` |
+| `cast` | `cast('-12',int64)` | `027fffff ffffffff f4` |
+| `cast` | `cast('1.5',int64)` | `null` |
+| `cast` | `cast(42,utf8)` | `06343200 00` |
+| `cast` | `cast(86400000000,timestamp_us)` | `080403 80000014 1dd76000` |
+| `date_trunc` | `date_trunc(cast(90061000001,timestamp_us),day)` | `080403 80000014 1dd76000` |
+| `date_trunc` | `date_trunc(cast(90061000001,timestamp_us),hour)` | `080403 80000014 f46b0400` |
+| `date_trunc` | `date_trunc(cast(-1,timestamp_us),day)` | `080403 7fffffeb e228a000` |
+| `date_trunc` | `date_trunc(cast(6307200000000,timestamp_us),month)` | `080403 800004a2 e0a32000` |
+| `date_trunc` | `date_trunc(cast(6307200000000,timestamp_us),year)` | `080403 80000000 00000000` |
+| `hash` | `hash('SYM1')` | `03 29185bcc 2d6b9e2a` |
+| `hash` | `hash('SYM1','X1')` | `03 2be2127e 8956e278` |
+| `hash` | `hash(1,'a')` | `03 e51a8fcd c38e4db3` |
+## Text keys (storage version 2, B5)
+
+A text key indexes the tokens of one string column (`Utf8`, `LargeUtf8`, `Utf8View`, or a dictionary of one) and serves the text operators `contains` (`like '%x%'`), `has` (`has_token`), and prefix match (`has_prefix`), never a key lookup. It is a key spec of its own, `{"kind": "text", "column": c, "tokenizer": "words" | "trigram", "bloom"?: fpr}` in `schema.key_specs`, named `text:<column>,tokenizer=<tokenizer>` (`KeySpec::name()`, its slot: a words and a trigram key coexist on one column), with identity `KeySpec::identity()` = the name, plus `,bloom=<fpr>` for a bloom layout; its segments are ordinary key-spec segments (`segments[].kind` absent, `key_spec` = the identity) and complete under the identity. A reader that does not know the kind refuses the manifest with `Error::UnsupportedVersion` (ADR 017), so text keys ride on storage version 2; a tokenizer this build does not know is refused the same way.
+
+**Tokens.** A value is case-folded first: each code point is replaced by its Unicode full case folding (`CaseFolding.txt`, statuses C and F), one code point at a time, with no context, so folding a concatenation folds each part and a substring of a value folds to a substring of the folded value. `ß` folds to `ss`, `ς` and `Σ` to `σ`, the Kelvin sign to `k`, `İ` to `i` + U+0307. The residual folds the same way, so plan and residual always agree.
+
+Text is **not Unicode-normalized**: folding maps case, never composition, so a precomposed `é` (U+00E9, NFC) and `e` followed by a combining acute (U+0065 U+0301, NFD) are different text. `contains("école")` in NFC does not match the NFD spelling, and `has_prefix("e")` matches the NFD word `école` (it starts with `e`) but not the NFC one. Normalize the column and the arguments to one form before indexing if both forms occur.
+
+- `words`: the words of the folded value at Unicode word boundaries (UAX #29, `unicode_words`), each stored as the canonical `Utf8` encoding of the word (ADR 016).
+- `trigram`: every 3-byte window of the folded value's UTF-8 bytes, each stored as the canonical `Binary` encoding of the 3 bytes (a window may cut a multi-byte character). A folded value shorter than 3 bytes has no trigram.
+
+A null value has no token and matches nothing (ADR 014); the empty string is a value with no token.
+
+**Segment.** Without `bloom`, the exact layout with tokens as keys: per distinct token, the roaring bitmap of the row groups holding a row with that token. With `bloom`, the bloom layout: one split-block bloom filter per row group over that row group's tokens, at the given false-positive rate (ADR 008). The header carries one more field, `text_unicode: {case, words}`, naming the tables tokens were folded and split with: the pinned crate and version that carries each (`"unicase 2.10.0"`, `"unicode-segmentation 1.13.3"`), never the toolchain's tables. A text segment without it, or a non-text segment with it, is corrupt; a reader whose tables differ refuses the segment with a typed error whose next step is `bellwether index <root>`, and `index` rebuilds exactly the text keys whose segments record other tables (only their segments are dropped; the ledger and every other key are kept), so one key never holds tokens from two table versions. `index` reads one segment header per text key to tell (a key's segments always share one table version), and its result lists each key it rebuilt this way with the old and new tables (`text_rebuilt`). This happens only after a deliberate upgrade of either crate, which the workspace pins to one exact version.
+
+**Lookups.** For an argument `a`, folded to `f`:
+
+| Spec | `has_token(a)` (`f` one word) | `contains(a)` | `has_prefix(a)` (`f` non-empty) |
+|---|---|---|---|
+| words | row groups of word `f`: exact | not served | row groups of any word with prefix `f`: exact |
+| words, bloom | candidates: row groups whose filter may hold `f` | not served | not served |
+| trigram (bloom or not) | candidates: row groups holding every trigram of `f` | the same | the same |
+
+An argument shorter than 3 bytes once folded has no trigram, so a trigram key plans every row group for it, and says so. Several serving specs are intersected; a run's several values are united. Exact means every planned row group holds a matching row; candidates mean a planned row group may hold none, so the residual is mandatory. The residual is `Text{column, operator, values}`: keep a row whose folded value matches one of the folded values.
+
+## Text key conformance vectors (storage version 2)
+
+`crates/bellwether-core/tests/text_keys.rs` checks these byte for byte.
+
+| Vector | Bytes |
+|---|---|
+| `fold("ẞİΣ\u{212A}ς")` | `ssi` U+0307 `σkσ` |
+| words key `grösse` | `06 67 72 c3 b6 73 73 65 00 00` |
+| trigram key `61 c3 b6` (`aö`) | `07 61 c3 b6 00 00` |
+| word prefix probe `st` | `06 73 74` |
+| words of `hello, wörld! can't 3.5 日本` | `hello`, `wörld`, `can't`, `3.5`, `日`, `本` |
+| `text:body,tokenizer=words` over row groups `["Hello, World"]`, `[null, "Straße"]` (one segment, block of 3 keys), blake3 | `9ec49da81fbc14f0851824f2cf1c9e0d5b4073518f07e8e7fe7506bb7c73e7e1` |
+| `text:body,tokenizer=trigram`, the same rows, blake3 | `61059108b1be52592ddf632085b14b055dc4640b736ff3a2c3e5896d82872e57` |
+
+## List keys (B4, `list:<column>`, 2026-10-26)
+
+`KeySpec::List { column }` (JSON `{"kind": "list", "column": "<c>"}`, named `list:<c>`) is an inverted index over a list column: per distinct **element** value, the row groups holding a row whose list contains that value. It is a key spec of its own, not a sidecar: it is declared in `schema.key_specs`, its segments are ordinary key-spec segments (`segments[].kind` absent, `key_spec` = `list:<c>`), and it is complete under its name like any key spec (ADR 012). A reader that does not know the kind refuses the manifest with the typed unknown-kind error (`key-spec or fingerprint shape in storage`), never a serde error and never by dropping the declaration on a rewrite (ADR 017); the kind is admitted by storage version 2 (WP14), which every commit by a binary that knows it writes.
+
+- **Column.** An Arrow `List<T>` or `LargeList<T>` whose item type `T` has a canonical encoding (the table above), or a `Map<K, V>`, indexed by its keys `K`. A fixed-size list, a list view, a list of a nested type, or a flat column is refused with the reason.
+- **Bytes.** The exact layout (`layout: "keyed"`), unchanged: sorted blocks of element keys, one split-block bloom per block, element key to a no-run roaring bitmap over global `RowGroupId`. An element key is the canonical encoding of one element at the dataset's element type (a file `List<Int32>` under a dataset `List<Int64>` encodes at Int64; a value that does not convert fails the row group, all or nothing). The header's `key_spec` is the list spec and its `key_types` holds one entry, the element type; a segment whose recorded element type differs from the dataset's is refused on open.
+- **Nulls and empty lists (ADR 014).** A null list, an empty list, and a null element are not indexed. An empty list holds no element, so no membership probe can match it, and a null probe matches nothing (`array_contains(x, NULL)` is unknown, never true); the index is therefore exact without them. A row group whose lists are all null or empty is still covered: the writer records the range it processed. `contains_all` with no value is refused, because "contains all of nothing" holds for every row, null and empty lists included, which the index does not record. A null queried value is dropped and counted by `contains_any` and refused by `contains_all` (ADR 014, amendment 2026-10-26).
+- **Duplicates.** An element repeated within a list, or across rows of one row group, is one key with that row group once.
+- **Lookups.** `contains_any(values)` plans the union over the queried values of each value's row groups; `contains_all(values)` plans their intersection. A float zero is probed in both encodings. The residual is `Predicate::ContainsAny { column, values }` (the queried encodings, both zeros listed) or `Predicate::ContainsAll { column, values }` (one group per queried value, both zeros in one group), which the reader applies per row: `contains_all`'s plan keeps a row group holding every value in different rows. A list key serves only these two lookups, never a lookup on the column's value as a whole, and no other kind serves them; without a complete list key on the column a membership lookup reads every live row group.
+- **Memory (ADR 018).** As the exact layout: a lookup holds one segment's block index, one block at a time, and one bitmap per present queried value. The build counts a row group's distinct element keys and their bytes against the segment caps.
+
+Conformance vectors (`crates/bellwether-core/tests/list.rs`): a `list:tags` segment over `List<Utf8>` built from row group 0 `[AAPL, MSFT, AAPL]`, `[]`; row group 1 null, `[MSFT, null]`; row group 2 `[IBM]`; row group 3 `[]`, with processed range 0..4 and default writer options, written in the storage version 2 segment format (its footer checksum included). It holds three keys.
+
+| Vector | Bytes |
+|---|---|
+| element key `AAPL` | `06 41 41 50 4c 00 00` |
+| `AAPL` bitmap {0} | `3a 30 00 00 01 00 00 00 00 00 00 00 10 00 00 00 00 00` |
+| `MSFT` bitmap {0, 1} | `3a 30 00 00 01 00 00 00 00 00 01 00 10 00 00 00 00 00 01 00` |
+| `list:tags blake3` | `972f0deeeb42ea46c6402160dae27f6ac7dfd87102ad9480e83798db78ad232d` |

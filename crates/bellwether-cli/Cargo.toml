@@ -16,17 +16,24 @@ path = "src/main.rs"
 # text, and rustdoc output would collide with the facade library `bellwether`.
 doc = false
 
+[features]
+# SQL Server tables through ODBC (links the system ODBC driver manager).
+odbc = ["bellwether/odbc"]
+
 [dependencies]
 bellwether = { path = "../bellwether" }
 # The `bench` subcommand only (and the end-to-end tests' planted corpus).
 bellwether-bench = { path = "../bellwether-bench" }
 # The `mcp` subcommand only: `bellwether mcp` is `bellwether-mcp`.
 bellwether-mcp = { path = "../bellwether-mcp" }
-clap = { version = "4", features = ["derive"] }
+# `env`: BELLWETHER_SIGNING_KEY and BELLWETHER_TRUSTED_KEYS (paths only).
+clap = { version = "4", features = ["derive", "env"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 
 [dev-dependencies]
+# Writes the SQLite table the sql:// root tests read.
+rusqlite = { version = "0.41", features = ["bundled"] }
 assert_cmd = "2"
 tempfile = { workspace = true }
 arrow = { workspace = true }

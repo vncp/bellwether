@@ -29,5 +29,8 @@ Short, dated, and final until superseded by a later ADR. Each states what was ch
 - [ADR 025](025-rulebook-validation.md) — A rule is promoted only by held-out replay (amended 2026-10-25)
 - [ADR 026](026-the-cost-model-prices-the-relational-subset-exactly.md) — The cost model prices the relational subset exactly from statistics and counted indexes
 - [ADR 027](027-sql-tables-are-sources-with-measured-costs.md) — SQL tables are sources with measured costs and attest-only apply
+- [ADR 028](028-storage-version-2-and-record-version-3-are-the-frozen-format.md) — Storage version 2 and record version 3 are the frozen format
+- [ADR 029](029-signatures-are-detached-objects-beside-the-record.md) — Signatures are detached objects beside the record
 - [ADR 031](031-scoped-proposers-and-a-frozen-outer-loop.md) — Scoped proposers and a frozen outer loop
 - [ADR 032](032-staged-delivery-with-a-measured-trigger.md) — Staged delivery with a measured trigger
+- [ADR 033](033-query-engines-are-measured-sources.md) — Query engines are measured sources

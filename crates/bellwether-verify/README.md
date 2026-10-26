@@ -14,7 +14,7 @@ Dependencies, as `dev/check-layering.py` permits: `bellwether-types` (the contra
 | `record(&ledger, &certified) -> Hash` | Checks that the certificate's proposal resolves, then writes the plan Evidence and the certificate, each through `Ledger::put`; a refusal writes nothing. Never a Receipt: applying and attesting is the facade's. |
 | `Side::new(&source, root)`, `.indexed(&planner)` | One side: any `bellwether_types::Source` over a root, optionally with its index. |
 | `ReconcileSpec` | `key_columns`, `latest_by`, `ignored_columns`, `total_columns`, `group_by`, `coverage`, `row_filter`. Builder methods of the same names (`rows_where` for the row filter). |
-| `CoverageRequest` | `Full`, `Workload(WorkloadKeys { workload, age, keys })`, `Sampled { fraction, seed }`, and `StaticProof`, which is always refused with `VerifyError::StaticProofUnsupported` (the rewrite verifier's, WP13). |
+| `CoverageRequest` | `Full`, `Workload(WorkloadKeys { workload, age, keys })`, `WorkloadRows { workload, age }` (rows chosen by the row filter, for workloads whose runs name values that are not reconcile keys: list membership, text lookups), `Sampled { fraction, seed }`, and `StaticProof`, which is always refused with `VerifyError::StaticProofUnsupported` (the rewrite verifier's, WP13). |
 | `Options` | `memory_budget` (default `DEFAULT_MEMORY_BUDGET`, 256 MiB) and `max_examples` (default 100). |
 | `SidePlanner`, `ManifestIdentity` | The seam for an indexed side. |
 | `IndexPlanner::open(&store, index_root)` | `SidePlanner` over `bellwether_build::Planner`, pinned to the current manifest. |
@@ -67,6 +67,10 @@ Values in rows outside the coverage (other workload keys, unsampled keys) are no
 
 **Mismatches and the pass rule.** `Mismatch` is `MissingOnLeft`, `MissingOnRight`, `RowHashDiffers`, `NoComparableVersion`, or `TotalDiffers { group, column, left, right }`. Counts are always exact. The first `max_examples` per-key mismatches are kept as examples in canonical key order (so they do not depend on the pass count), followed by every differing total. `pass` is true only when every compared key matched, every requested total matched, and no key failed to compare.
 
+### Rows chosen by a filter (list keys, B4)
+
+`CoverageRequest::WorkloadRows { workload, age }` compares the rows the row filter keeps (`rows_where`, required) under a workload's name, rather than key tuples: `fix` uses it for a workload of list-membership runs, whose values are list elements, not reconcile keys, keying rows by every hashable column. The row filter may test membership (`Predicate::ContainsAny` / `ContainsAll`) on a list column that is otherwise never hashed, keyed, versioned, totalled, or grouped by; both sides' element types must share a class. A filter that keeps no row on either side is `NothingCompared`.
+
 ## The certificate
 
 | Field | Value |
@@ -112,6 +116,30 @@ The comparison runs in `P` passes over hash-partitioned key space. Pass `p` read
 
 `tests/memory_bound.rs` holds the bound at `P > 1` with the meter's peak and checks the results equal the `P = 1` results across five specs (plain, totals by group, `latest_by` with totals, sampled, workload), forces an underestimate that restarts, and checks the integer key range lowers `P`. `tests/real_memory.rs` measures the real heap with a counting allocator: on 600,000 keys under a 64 MiB budget, the heap grew 59.4 MB while the meter peaked at 58.9 MB, over five passes.
 
+### Measured budgets
+
+A release build was measured on 2026-10-26 with `scripts/perf.sh`: full coverage, with `latest_by` and totals by group, one run per budget. The full tables are in [the measured document](../../docs/measured/2026-10-26-performance.md#reconcile).
+
+- **The ledger small rung** has 8,000,000 rows and 401,325 keys a side. It reconciles in one pass from a 592 MiB budget, so **640 MiB** is recommended. The meter's peak there is 164.4 MiB. `P` is chosen from row counts, not keys (see Known limits).
+- **The six taxi months** have 20,332,093 rows and 20,314,139 keys. They reconcile in one pass from **16 GiB**, which is recommended, with a meter peak of 9.68 GiB.
+- **Below one pass, the cost is the extra passes.** On taxi:
+
+  | Budget | Passes | Rows per second per side |
+  |---|---:|---:|
+  | 8 GiB | 2 | 372,364 |
+  | 1 GiB | 14 | 214,183 |
+  | 64 MiB | 224 | 22,737 |
+
+- **Measured peak memory exceeds the bound stated above.** On the ledger rung, whose row groups are 100,000 rows wide, the bound is the budget, plus one decoded batch (37.8 MiB), plus the 256 MiB footer cache:
+
+  | Budget | Bound | Peak RSS | Peak footprint |
+  |---|---:|---:|---:|
+  | 64 MiB | 357.8 MiB | 1,625.3 MiB | 1,616.5 MiB |
+  | 256 MiB | 549.8 MiB | 1,303.9 MiB | 1,268.4 MiB |
+  | 1 GiB | 1,317.8 MiB | 456.3 MiB | 447.7 MiB |
+
+  The taxi pair stays within its bound at every budget. Peak memory follows row-group size: on a corpus with 10,000-row row groups it stays at 31 to 41 MiB. The cause is under investigation as a defect. Until it is fixed, size memory for wide row groups from these measurements, not from `--memory-budget`.
+
 ## Tests
 
 | File | Covers |
@@ -143,4 +171,4 @@ Deliberate breaks, each in a scratch copy built in its own target directory, eac
 
 - Without a value range (a string or composite key), `P` is chosen from row counts, which over-count keys with many versions; the run then makes more passes than it needs. A wrong guess the other way costs a restart, never the bound.
 - A planner's completeness is trusted (invariant 1 is the build crate's).
-- `CertBody` has no field for per-key examples (`docs/contract-v3.md` #25), and keys that failed to compare share the `mismatched` counter (#26); the typed result carries both.
+- Record version 3 gives `CertBody` the fields `examples`, `uncomparable`, `totals` and `row_filter` (`docs/contract-v3.md` #25, #26, #37, #44; ADR 028), but this crate still writes them empty: keys that failed to compare share the `mismatched` counter, and the typed result carries the examples and the filter. Filling them is the second pull request of the freeze. The ledger already refuses a passing certificate with `uncomparable > 0`.

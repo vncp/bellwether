@@ -13,6 +13,8 @@ ALLOWED = {
     "bellwether-types": set(),
     "bellwether-core": {"bellwether-types"},
     "bellwether-source": {"bellwether-types"},
+    "bellwether-source-sql": {"bellwether-types", "bellwether-source"},  # SQL tables as sources (ADR 027): the contract, the canonical encoder, and the catalog digest
+    "bellwether-source-engine": {"bellwether-types", "bellwether-source-sql"},  # query engines as measured sources (ADR 033): the contract and the MeasuredScorer trait of ADR 027
     "bellwether-store": {"bellwether-types"},
     "bellwether-ledger": {"bellwether-types"},
     "bellwether-bench": {"bellwether-types", "bellwether-source"},
@@ -21,7 +23,7 @@ ALLOWED = {
     "bellwether-replay": {"bellwether-types", "bellwether-core", "bellwether-source", "bellwether-store", "bellwether-ledger", "bellwether-build"},
     "bellwether-verify": {"bellwether-types", "bellwether-core", "bellwether-source", "bellwether-store", "bellwether-ledger", "bellwether-build"},
     "bellwether-evolve": {"bellwether-types", "bellwether-core", "bellwether-source", "bellwether-store", "bellwether-ledger", "bellwether-build", "bellwether-profile", "bellwether-replay", "bellwether-verify"},
-    "bellwether": {"bellwether-types", "bellwether-core", "bellwether-source", "bellwether-store", "bellwether-ledger", "bellwether-build", "bellwether-profile", "bellwether-replay", "bellwether-verify", "bellwether-evolve"},  # the facade: the one code path the CLI and MCP share (ADR 010)
+    "bellwether": {"bellwether-types", "bellwether-core", "bellwether-source", "bellwether-store", "bellwether-ledger", "bellwether-build", "bellwether-profile", "bellwether-replay", "bellwether-verify", "bellwether-evolve", "bellwether-source-sql", "bellwether-source-engine"},  # the facade: the one code path the CLI and MCP share (ADR 010)
     "bellwether-cli": {"bellwether", "bellwether-types", "bellwether-bench", "bellwether-mcp"},  # formatting and argument parsing only; `bench` and `mcp` subcommands delegate
     "bellwether-mcp": {"bellwether", "bellwether-types"},  # tool envelopes over the facade; no engine logic
 }

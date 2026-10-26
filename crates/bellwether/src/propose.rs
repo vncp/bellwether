@@ -1,13 +1,18 @@
 //! `propose`: write a Proposal citing evidence. There is no score field in
 //! a Proposal and the facade adds none, anywhere (ADR 009).
 
+use std::fmt::Write as _;
+
 use bellwether_ledger::RecordKind;
+use bellwether_source::Partitioning;
 use bellwether_types::{
-    format, Error, Hash, HashKind, KeySpec, Proposal, ProposalBody, Record, Result, RewriteShape,
+    format, Error, Evidence, EvidenceBody, Hash, HashKind, KeySpec, Proposal, ProposalBody,
+    QueryPair, Record, Result, RewriteShape,
 };
 
-use crate::engine::{guard, Engine};
+use crate::engine::{guard, Engine, SourceFormat};
 use crate::results::{ProposeRefusal, ProposeResult, Written};
+use crate::spec::Declaration;
 use crate::why::RESERVED_PROPOSERS;
 
 impl Engine {
@@ -43,13 +48,162 @@ impl Engine {
         guard(|| self.propose_inner(body, evidence, proposed_by, false))
     }
 
-    fn propose_inner(
+    /// [`Engine::propose`] of a key, given as the `index --key` argument
+    /// [`crate::spec::parse_declaration`] reads (`propose --key`, MCP
+    /// `propose.key`): a key spec is proposed as `ProposalBody::Key`. A
+    /// declaration that builds a sidecar (`temporal2:id@valid,known`, or
+    /// `exact:symbol@ts`, whose per-key time bounds ride beside the key) is
+    /// refused, typed ([`ProposeRefusal::SidecarNotProposable`]), and
+    /// nothing is written: a Proposal holds a key spec only, and replay
+    /// prices key specs only, so it has no path to a receipt. The refusal
+    /// comes after every check a proposal gets (proposer, evidence, and the
+    /// key and time columns against the dataset), so both next steps it
+    /// names work: the `index` command that builds the sidecar, and, beside
+    /// a key, proposing the key alone.
+    pub fn propose_key(
         &self,
-        body: ProposalBody,
+        declared: &Declaration,
+        evidence: &[Hash],
+        proposed_by: &str,
+    ) -> Result<ProposeResult> {
+        guard(|| self.propose_declared(declared, evidence, proposed_by, true))
+    }
+
+    /// [`Engine::propose_key`] as [`Engine::propose_dry_run`]: the same
+    /// refusal, or the Proposal it would write; writes nothing.
+    pub fn propose_key_dry_run(
+        &self,
+        declared: &Declaration,
+        evidence: &[Hash],
+        proposed_by: &str,
+    ) -> Result<ProposeResult> {
+        guard(|| self.propose_declared(declared, evidence, proposed_by, false))
+    }
+
+    fn propose_declared(
+        &self,
+        declared: &Declaration,
         evidence: &[Hash],
         proposed_by: &str,
         write: bool,
     ) -> Result<ProposeResult> {
+        if let Some(sketch) = &declared.sketch {
+            // A sketch is approximate and never planned with: no replay can
+            // price it, so it has no path to a receipt.
+            if let Some(refused) = self.check_proposer_and_evidence(evidence, proposed_by, false)? {
+                return Ok(refused);
+            }
+            let schema = self.check_columns(&sketch.items.iter().flatten().collect::<Vec<_>>())?;
+            bellwether_core::sketch::item_types(sketch, &schema)?;
+            let declaration = crate::spec::declaration_label(declared);
+            return Ok(ProposeResult::Refused {
+                refusal: ProposeRefusal::SidecarNotProposable {
+                    command: self.index_command(&declaration),
+                    declaration,
+                    sidecar: sketch.name(),
+                    key: None,
+                    root: self.root().to_string(),
+                },
+            });
+        }
+        let sidecar = match (&declared.key, &declared.sidecar) {
+            (Some(spec), None) => {
+                return self.propose_inner(
+                    ProposalBody::Key {
+                        spec: spec.clone(),
+                        sidecars: Vec::new(),
+                    },
+                    evidence,
+                    proposed_by,
+                    write,
+                )
+            }
+            (_, Some(sidecar)) => sidecar,
+            (None, None) => {
+                return Err(Error::KeySpec(
+                    "the declaration names no key spec; pass one such as exact:<column>".into(),
+                ))
+            }
+        };
+        // Every check a proposal gets, without creating the index location:
+        // the refusal writes nothing.
+        if let Some(refused) = self.check_proposer_and_evidence(evidence, proposed_by, false)? {
+            return Ok(refused);
+        }
+        if let Some(spec) = &declared.key {
+            self.check_body(&ProposalBody::Key {
+                spec: spec.clone(),
+                sidecars: Vec::new(),
+            })?;
+        }
+        let schema = self.check_columns(
+            &sidecar
+                .columns
+                .iter()
+                .chain(&sidecar.time_columns)
+                .collect::<Vec<_>>(),
+        )?;
+        // The checks the build applies to a sidecar's columns: encodable
+        // keys, and time columns of a type a sidecar orders by.
+        sidecar
+            .key_types(&schema)
+            .and_then(|_| sidecar.time_types(&schema))
+            .map_err(|e| match e {
+                Error::KeySpec(m) => Error::KeySpec(format!("{}: {m}", sidecar.name())),
+                other => other,
+            })?;
+        let declaration = crate::spec::declaration_label(declared);
+        Ok(ProposeResult::Refused {
+            refusal: ProposeRefusal::SidecarNotProposable {
+                command: self.index_command(&declaration),
+                declaration,
+                sidecar: crate::spec::sidecar_label(sidecar),
+                key: declared.key.as_ref().map(crate::spec::label),
+                root: self.root().to_string(),
+            },
+        })
+    }
+
+    /// `bellwether index <root> <source flags> --key <declaration>`, every
+    /// argument POSIX shell-quoted, the source flags those the engine was
+    /// opened with ([`crate::EngineOptions::source_flags`]), so following it
+    /// builds the folder as it was read here and where its lookups look.
+    /// `None` when a library caller opened the engine with source options
+    /// and no flags spell them. Reads nothing.
+    fn index_command(&self, declaration: &str) -> Option<String> {
+        let o = self.options();
+        let flags: &[String] = match &o.source_flags {
+            Some(flags) => flags,
+            None if o.index.is_none()
+                && o.format == SourceFormat::Parquet
+                && o.chunk_size.is_none()
+                && o.schema.is_none()
+                && o.fingerprint_policy.is_none()
+                && matches!(o.partitioning, None | Some(Partitioning::None)) =>
+            {
+                &[]
+            }
+            None => return None,
+        };
+        let mut cmd = format!("bellwether index {}", crate::spec::shell_quote(self.root()));
+        for f in flags {
+            let _ = write!(cmd, " {}", crate::spec::shell_quote(f));
+        }
+        let _ = write!(cmd, " --key {}", crate::spec::shell_quote(declaration));
+        Some(cmd)
+    }
+
+    /// The proposer and evidence checks every proposal gets: a typed
+    /// refusal for a reserved proposer name, or an error for an empty name,
+    /// no evidence, or a hash that is not Evidence in this ledger. `create`
+    /// lets the check create the index location (a real write); otherwise
+    /// a folder with no ledger resolves no evidence.
+    fn check_proposer_and_evidence(
+        &self,
+        evidence: &[Hash],
+        proposed_by: &str,
+        create: bool,
+    ) -> Result<Option<ProposeResult>> {
         if proposed_by.trim().is_empty() {
             return Err(Error::InvalidArgument {
                 field: "by",
@@ -62,11 +216,11 @@ impl Engine {
             .any(|r| name.eq_ignore_ascii_case(r))
         {
             // A trust-boundary refusal, typed: nothing is written.
-            return Ok(ProposeResult::Refused {
+            return Ok(Some(ProposeResult::Refused {
                 refusal: ProposeRefusal::ReservedProposer {
                     name: name.to_string(),
                 },
-            });
+            }));
         }
         if evidence.is_empty() {
             return Err(Error::InvalidArgument {
@@ -83,7 +237,7 @@ impl Engine {
         };
         // A dry run never creates the index location: with no ledger yet,
         // no evidence can resolve.
-        let ledger = if write {
+        let ledger = if create {
             self.ledger()?
         } else {
             match self.existing_store()? {
@@ -103,6 +257,35 @@ impl Engine {
                 }
                 Err(Error::NotFound(_)) => return Err(not_found(h)),
                 Err(e) => return Err(e),
+            }
+        }
+        Ok(None)
+    }
+
+    fn propose_inner(
+        &self,
+        body: ProposalBody,
+        evidence: &[Hash],
+        proposed_by: &str,
+        write: bool,
+    ) -> Result<ProposeResult> {
+        if let Some(refused) = self.check_proposer_and_evidence(evidence, proposed_by, write)? {
+            return Ok(refused);
+        }
+        let mut body = body;
+        if let ProposalBody::Rewrite { shape } = &mut body {
+            if !shape.pairs.is_empty() {
+                // The evidence resolved above, so the ledger is there; a dry
+                // run reads it without creating anything.
+                let store = self
+                    .existing_store()?
+                    .ok_or_else(|| Error::RecordNotFound {
+                        kind: HashKind::Evidence,
+                        hash: evidence[0],
+                        place: format!("the ledger at {}", self.index_location()),
+                    })?;
+                let ledger = bellwether_ledger::Ledger::new(std::sync::Arc::clone(store));
+                self.complete_engine_rewrite(&ledger, evidence, shape)?;
             }
         }
         self.check_body(&body)?;
@@ -131,8 +314,24 @@ impl Engine {
 
     fn check_body(&self, body: &ProposalBody) -> Result<()> {
         match body {
-            ProposalBody::Key { spec } => {
+            ProposalBody::Key { spec, .. } => {
                 crate::spec::check(spec)?;
+                if let KeySpec::Expr { .. } = spec {
+                    // The expression's input columns exist, it type-checks,
+                    // and its virtual column is not a dataset column.
+                    let inputs = bellwether_core::expr::input_columns(spec)?;
+                    let schema = self.check_columns(&inputs.iter().collect::<Vec<_>>())?;
+                    bellwether_core::expr::typed_spec(spec, &schema)?;
+                    return Ok(());
+                }
+                // A spec the index does not declare yet is a new
+                // declaration: it must name its columns uniquely.
+                if !self
+                    .manifest()?
+                    .is_some_and(|m| m.schema.key_specs.contains(spec))
+                {
+                    spec.check_names()?;
+                }
                 let mut cols: Vec<&String> = spec.columns().iter().collect();
                 if let KeySpec::Temporal { ts_column, .. } = spec {
                     cols.push(ts_column);
@@ -152,6 +351,9 @@ impl Engine {
                             bellwether_core::encoding::no_encoding(dt)
                         )));
                     }
+                    if matches!(spec, KeySpec::Text { .. }) {
+                        bellwether_core::text::check_column_type(c, dt)?;
+                    }
                 }
                 Ok(())
             }
@@ -167,6 +369,53 @@ impl Engine {
             }
             ProposalBody::Rewrite { shape } => check_shape(shape),
         }
+    }
+
+    /// A rewrite of engine queries (ADR 033) cites the twin diagnosis it
+    /// rests on, and that diagnosis must have run on a key sample; its key
+    /// columns default to the sample's, and its key sample to the twin's
+    /// recorded workload. A key sample given must be the twin's.
+    fn complete_engine_rewrite<S>(
+        &self,
+        ledger: &bellwether_ledger::Ledger<S>,
+        evidence: &[Hash],
+        shape: &mut RewriteShape,
+    ) -> Result<()>
+    where
+        S: std::ops::Deref,
+        S::Target: bellwether_types::Store,
+    {
+        let twin = evidence.iter().find_map(|h| match ledger.get(h) {
+            Ok(Record::Evidence(Evidence {
+                body: EvidenceBody::Profile { twin: Some(t), .. },
+                ..
+            })) => Some(t),
+            _ => None,
+        });
+        let Some(twin) = twin else {
+            return Err(Error::InvalidArgument {
+                field: "evidence",
+                reason: "a rewrite of engine queries cites the twin diagnosis it rests on: run \
+                         `why` with the engine named (--twin-of) and cite the evidence it prints"
+                    .into(),
+            });
+        };
+        if shape.keys.is_none() {
+            shape.keys = twin.workload;
+        }
+        crate::engine_fix::key_sample(shape, &twin)?;
+        if shape.key.is_empty() {
+            // Read from an existing index only: a dry run creates nothing.
+            if let (Some(w), Some(store)) = (twin.workload, self.existing_store()?) {
+                let cache = bellwether_store::Cache::new(std::sync::Arc::clone(store), "");
+                if let Ok(wl) = bellwether_replay::Workload::load(&cache, &w) {
+                    if let Some(r) = wl.runs().first() {
+                        shape.key.clone_from(&r.columns);
+                    }
+                }
+            }
+        }
+        crate::engine_fix::check_pairs(shape)
     }
 
     /// Every column in `cols` is in the dataset, or [`Error::UnknownColumn`]
@@ -212,4 +461,33 @@ fn check_shape(shape: &RewriteShape) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// A rewrite of engine queries as the CLI writes it (ADR 033): the pairs
+/// as given, the key columns (empty: the key sample's), and the invariant
+/// (default: each pair returns the same rows by its key columns). The
+/// descriptions say what the pairs are; the pairs are the proposal.
+#[must_use]
+pub fn engine_rewrite(
+    pairs: Vec<QueryPair>,
+    key: Vec<String>,
+    invariant: Option<String>,
+) -> RewriteShape {
+    let n = pairs.len();
+    RewriteShape {
+        before: format!(
+            "{n} quer{} as {} run in the engine today",
+            if n == 1 { "y" } else { "ies" },
+            if n == 1 { "it" } else { "they" }
+        ),
+        after: format!("the rewritten quer{}", if n == 1 { "y" } else { "ies" }),
+        invariant: invariant.unwrap_or_else(|| {
+            "each pair returns the same rows, compared by the proposal's key columns".to_string()
+        }),
+        pairs,
+        key,
+        keys: None,
+        before_plan: None,
+        after_plan: None,
+    }
 }

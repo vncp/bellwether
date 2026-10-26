@@ -20,8 +20,8 @@ use std::path::{Path, PathBuf};
 use bellwether_mcp::jobs::JobState;
 use bellwether_mcp::{Budget, Reply, Server, Status};
 use common::{
-    delta, finish, json, ledger_corpus, objects, ok, server, server_at, server_with, write_file,
-    write_keys, CLOCKS,
+    delta, finish, json, ledger_corpus, objects, ok, scattered_corpus, server, server_at,
+    server_with, write_file, write_keys, CLOCKS,
 };
 use serde_json::{json, Value};
 
@@ -34,7 +34,7 @@ struct F {
 fn folder() -> F {
     let dir = tempfile::tempdir().unwrap();
     let data = dir.path().join("data");
-    ledger_corpus(&data, 3, 4, 25, 400);
+    scattered_corpus(&data, 3, 4, 25, 400);
     let keys = dir.path().join("k.parquet");
     write_keys(&keys, "id", &[5, 77, 123]);
     F { dir, data, keys }
@@ -881,7 +881,9 @@ fn schemas_are_closed_everywhere() {
             "jobs.start",
             json!({"tool": "propose.key", "arguments": {"spec": {"kind": "exact", "columns": ["id"], "score": 9}, "evidence": [e], "by": "a"}}),
         );
-        refused_as("jobs.start nested score", &r, "invalid_input");
+        // A score inside a tagged union is named too (ADR 033).
+        refused_as("jobs.start nested score", &r, "caller_supplied_cost");
+        assert_eq!(refusal(&r).fields["field"], "score");
         for spec in [
             json!({"kind": "bloom", "columns": ["id"], "fpr": 0.01, "score": 1}),
             json!({"kind": "temporal", "columns": ["id"], "ts_column": "ts", "score": 1}),
@@ -891,8 +893,14 @@ fn schemas_are_closed_everywhere() {
                 "propose.key",
                 json!({"spec": spec, "evidence": [e], "by": "a"}),
             );
-            refused_as("variant score", &r, "invalid_input");
+            refused_as("variant score", &r, "caller_supplied_cost");
         }
+        // Any other unknown field there stays a schema error.
+        let r = srv.call(
+            "propose.key",
+            json!({"spec": {"kind": "exact", "columns": ["id"], "colour": 1}, "evidence": [e], "by": "a"}),
+        );
+        refused_as("variant colour", &r, "invalid_input");
         assert_eq!(objects(&index), before, "[clock={clock:?}]");
     }
 }

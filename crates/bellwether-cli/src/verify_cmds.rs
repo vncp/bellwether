@@ -5,21 +5,23 @@ use std::fmt::Write as _;
 use bellwether::spec::label;
 use bellwether::types::{Coverage, Predicate, ProposalBody, Record};
 use bellwether::{
-    FixOutcome, FixRequest, FixResult, KeyRepr, Mismatch, ReconcileProblem, ReconcileRequest,
-    ReconcileResult, Refusal, RewriteOutputs, Score, TotalColumn,
+    EngineCompare, EngineRun, FixOutcome, FixRequest, FixResult, KeyRepr, Mismatch,
+    ReconcileProblem, ReconcileRequest, ReconcileResult, Refusal, RewriteOutputs, Score,
+    TotalColumn,
 };
 use clap::{Args, Subcommand};
 
-use crate::human::{heading, num, short, size};
+use crate::human::{count, heading, num, short, size};
 use crate::{
-    done, engine, hash, Failure, Global, Out, Outcome, RootArg, EXIT_FAILED, EXIT_OK, EXIT_REFUSED,
+    done, engine, engine_keyed, hash, Failure, Global, Out, Outcome, RootArg, EXIT_FAILED, EXIT_OK,
+    EXIT_REFUSED,
 };
 
 /// Commands that write certificates.
 #[derive(Subcommand)]
 pub(crate) enum VerifyCommand {
-    /// Prove two folders agree, by key, latest version, and exact decimal
-    /// totals; writes a Certificate. The summary names the first 10
+    /// Prove two folders, or a table (sql://...) and a folder, agree, by
+    /// key, latest version, and exact decimal totals; writes a Certificate. The summary names the first 10
     /// mismatching keys (every one is in --json), prints the exact totals,
     /// and says how many passes the comparison made over each side.
     Reconcile(ReconcileArgs),
@@ -52,9 +54,10 @@ pub(crate) struct CompareArgs {
 
 #[derive(Args)]
 pub(crate) struct ReconcileArgs {
-    /// The left folder (its index and ledger are used).
+    /// The left folder (its index and ledger are used), or a table:
+    /// sql://<engine>/<schema>.<table>?db=<connection> (needs --index).
     left: String,
-    /// The right folder.
+    /// The right folder, or a table (sql://...).
     right: String,
     #[command(flatten)]
     compare: CompareArgs,
@@ -100,7 +103,7 @@ pub(crate) struct FixArgs {
     /// workload; without it fix refuses with `nothing_to_gain` (exit 3).
     #[arg(long)]
     allow_no_gain: bool,
-    /// A rewrite's output before the rewrite (a folder).
+    /// A rewrite's output before the rewrite (a folder or a sql:// table).
     #[arg(long, value_name = "DIR", requires = "after_output")]
     before_output: Option<String>,
     /// A rewrite's output after it.
@@ -108,6 +111,12 @@ pub(crate) struct FixArgs {
     after_output: Option<String>,
     #[command(flatten)]
     compare: CompareArgs,
+    /// Sign the receipt and the certificate this run writes (a verify-only
+    /// run: its passing certificate) with this key: the seed file
+    /// `bellwether keys generate` wrote, readable by its owner only. A
+    /// path, never key bytes.
+    #[arg(long, value_name = "FILE", env = "BELLWETHER_SIGNING_KEY")]
+    signing_key: Option<std::path::PathBuf>,
 }
 
 pub(crate) fn run(g: &Global, out: &Out, cmd: &VerifyCommand) -> Result<Outcome, Failure> {
@@ -159,13 +168,30 @@ pub(crate) fn run(g: &Global, out: &Out, cmd: &VerifyCommand) -> Result<Outcome,
                     .as_deref()
                     .map(|w| hash(w, "workload"))
                     .transpose()?,
+                engine: (a.before_output.is_none()
+                    && (a.compare.latest_by.is_some()
+                        || !a.compare.ignore.is_empty()
+                        || !a.compare.totals.is_empty()
+                        || !a.compare.group_by.is_empty()))
+                .then(|| EngineCompare {
+                    latest_by: a.compare.latest_by.clone(),
+                    ignore: a.compare.ignore.clone(),
+                    totals: a.compare.totals.clone(),
+                    group_by: a.compare.group_by.clone(),
+                }),
                 rewrite,
                 verify_only: a.verify_only,
                 allow_no_gain: a.allow_no_gain,
             };
-            let r = engine(g, &a.root.root)?.fix(&request)?;
+            // The key is read before anything is scored: a key that cannot
+            // be used is a usage error, not a receipt without a signature.
+            let key = crate::keys_cmds::signing_key(g, &a.root.root, a.signing_key.as_deref())?;
+            let e = engine_keyed(g, &a.root.root, key, None)?;
+            let table = e.is_table();
+            let r = e.fix(&request)?;
             let code = match &r.outcome {
                 FixOutcome::Applied { .. }
+                | FixOutcome::Attested { .. }
                 | FixOutcome::Verified
                 | FixOutcome::WouldApply { .. } => EXIT_OK,
                 FixOutcome::Refused {
@@ -173,7 +199,7 @@ pub(crate) fn run(g: &Global, out: &Out, cmd: &VerifyCommand) -> Result<Outcome,
                 } => EXIT_FAILED,
                 FixOutcome::Refused { .. } => EXIT_REFUSED,
             };
-            done(&r, fix_human(&r, out), code)
+            done(&r, fix_human(&r, out, table), code)
         }
     }
 }
@@ -264,9 +290,9 @@ fn key(k: &KeyRepr) -> String {
 fn coverage(c: &Coverage) -> String {
     match c {
         Coverage::Full => "full".into(),
-        Coverage::Workload { keys, .. } => format!("workload, {} keys", num(*keys)),
+        Coverage::Workload { keys, .. } => format!("workload, {}", count(*keys, "key", "keys")),
         Coverage::Sampled { keys, fraction } => {
-            format!("sampled, {} keys ({fraction})", num(*keys))
+            format!("sampled, {} ({fraction})", count(*keys, "key", "keys"))
         }
         Coverage::StaticProof { identity } => format!("static proof {identity}"),
     }
@@ -284,6 +310,32 @@ fn rows_asked(filter: &[Predicate]) -> String {
                 format!("the newest version by {ts_column}")
             }
             Predicate::In { .. } => "the workload's keys".to_string(),
+            Predicate::SemiJoin { columns, .. } => {
+                format!("rows whose {} is a semi-join key", columns.join(", "))
+            }
+            Predicate::Join { left, .. } => format!("rows joined on {}", left.join(", ")),
+            Predicate::WindowPartition { columns } => {
+                format!("whole partitions of {}", columns.join(", "))
+            }
+            Predicate::Text {
+                column,
+                operator,
+                values,
+            } => match values.as_slice() {
+                [one] => format!("{}({column}, {one:?}), case-folded", operator.as_str()),
+                many => format!(
+                    "{}({column}, any of {} values), case-folded",
+                    operator.as_str(),
+                    many.len()
+                ),
+            },
+            Predicate::ExprIn { expr, .. } => format!("the workload's keys of {expr}"),
+            Predicate::ContainsAny { column, .. } => {
+                format!("{column} holding any of the workload's values")
+            }
+            Predicate::ContainsAll { column, .. } => {
+                format!("{column} holding every one of the workload's values")
+            }
             Predicate::And { all } => {
                 for q in all {
                     walk(q, out);
@@ -353,8 +405,8 @@ fn totals_human(s: &mut String, o: &bellwether::Reconciliation) {
     if o.totals.len() > HUMAN_TOTALS {
         let _ = writeln!(
             s,
-            "    ... {} more groups in --json",
-            o.totals.len() - HUMAN_TOTALS
+            "    ... {} more in --json",
+            count((o.totals.len() - HUMAN_TOTALS) as u64, "group", "groups")
         );
     }
 }
@@ -402,8 +454,8 @@ fn reconcile_human(r: &ReconcileResult, out: &Out) -> String {
         let shown = per_key.len().min(HUMAN_MISMATCHES);
         let _ = writeln!(
             s,
-            "\n  first {shown} of {} mismatching keys ({}): every kept example is in --json",
-            num(per_key_total),
+            "\n  first {shown} of {} ({}): every kept example is in --json",
+            count(per_key_total, "mismatching key", "mismatching keys"),
             o.key_columns.join(", ")
         );
         for (what, k) in per_key.iter().take(HUMAN_MISMATCHES) {
@@ -414,11 +466,11 @@ fn reconcile_human(r: &ReconcileResult, out: &Out) -> String {
     let m = &o.memory;
     let _ = writeln!(
         s,
-        "\n  read {} pass(es) over each side under a {}-byte state budget ({} restarts): {} rows read on the left, {} on the right",
-        m.passes,
+        "\n  read {} over each side under a {}-byte state budget ({}): {} read on the left, {} on the right",
+        count(u64::from(m.passes), "pass", "passes"),
         num(m.budget_bytes),
-        m.restarts,
-        num(m.rows_read[0]),
+        count(u64::from(m.restarts), "restart", "restarts"),
+        count(m.rows_read[0], "row", "rows"),
         num(m.rows_read[1])
     );
     if m.passes > 1 {
@@ -427,18 +479,75 @@ fn reconcile_human(r: &ReconcileResult, out: &Out) -> String {
             "  each pass reads both sides again; a larger --memory-budget makes fewer passes"
         );
     }
+    tables_human(&mut s, &r.tables);
     let _ = writeln!(s, "\ncertificate {}", r.certificate.hash);
     s
 }
 
+/// One line per table a run read (ADR 027): its units and rows, and the
+/// snapshot it held or the identity re-read that stood in for one.
+pub(crate) fn tables_human(s: &mut String, tables: &[bellwether::TableRun]) {
+    for t in tables {
+        let held = match &t.snapshot {
+            Some(snap) => format!("read inside {snap}"),
+            None if t.rechecked && t.identity_by == "statistics checksum" => {
+                "no snapshot held: every unit's identity (a statistics checksum) re-read at the \
+                 end, unchanged; an in-place update that keeps every column's bounds, null \
+                 count, and bytes is not seen, so name a version column (version=<column>) or \
+                 read inside a snapshot"
+                    .into()
+            }
+            None if t.rechecked => format!(
+                "no snapshot held: every unit's identity ({}) re-read at the end, unchanged",
+                t.identity_by
+            ),
+            None => "no snapshot held".into(),
+        };
+        let _ = writeln!(
+            s,
+            "  table {}: {} in {} ({}), {held}",
+            t.root,
+            count(t.rows, "row", "rows"),
+            count(t.units, "unit", "units"),
+            t.units_by
+        );
+    }
+}
+
+/// What `fix` signed, or that `what` is unsigned.
+fn signed_line(s: &mut String, r: &FixResult, what: &str) {
+    let Some(first) = r.signatures.first() else {
+        let _ = writeln!(
+            s,
+            "            {what} unsigned (no --signing-key; `bellwether keys generate --out \
+             <path>` makes a key)"
+        );
+        return;
+    };
+    let kinds: Vec<&str> = r.signatures.iter().map(|x| x.kind.as_str()).collect();
+    let _ = writeln!(
+        s,
+        "            signed the {} with key {} at {}",
+        kinds.join(" and the "),
+        short(&first.key_id),
+        first.signed_at
+    );
+}
+
 // One linear screen, a line per stage.
 #[allow(clippy::too_many_lines)]
-fn fix_human(r: &FixResult, out: &Out) -> String {
+fn fix_human(r: &FixResult, out: &Out, table: bool) -> String {
     let mut s = String::new();
     let what = match &r.proposal.record {
         Record::Proposal(p) => match &p.body {
-            ProposalBody::Key { spec } => format!("key {}", label(spec)),
+            ProposalBody::Key { spec, .. } => format!("key {}", label(spec)),
             ProposalBody::Layout { cluster_by } => format!("layout by {}", cluster_by.join(", ")),
+            ProposalBody::Rewrite { shape } if !shape.pairs.is_empty() => format!(
+                "rewrite of {} engine quer{}, compared by ({})",
+                shape.pairs.len(),
+                if shape.pairs.len() == 1 { "y" } else { "ies" },
+                shape.key.join(", ")
+            ),
             ProposalBody::Rewrite { shape } => format!("rewrite to {}", shape.after),
         },
         _ => "?".into(),
@@ -448,26 +557,177 @@ fn fix_human(r: &FixResult, out: &Out) -> String {
         "{}",
         heading(
             out,
-            &format!(
-                "fix {}: {what}, against manifest sequence {}",
-                short(&r.proposal.hash),
-                r.manifest_before
-            )
+            &if table {
+                format!(
+                    "fix {}: {what}, over a table (no index, no manifest)",
+                    short(&r.proposal.hash)
+                )
+            } else {
+                format!(
+                    "fix {}: {what}, against manifest sequence {}",
+                    short(&r.proposal.hash),
+                    r.manifest_before
+                )
+            }
         )
     );
+    if let Some(run) = &r.engine {
+        engine_score_human(&mut s, r, run);
+    } else {
+        score_human(&mut s, r);
+    }
+    verify_and_outcome_human(&mut s, r);
+    s
+}
+
+/// Stage 1 over a query engine (ADR 033): each pair as the engine's log
+/// recorded the run that exported it, and the twin's prediction beside it.
+#[allow(clippy::too_many_lines)]
+fn engine_score_human(s: &mut String, r: &FixResult, run: &EngineRun) {
+    let replay = match &r.score {
+        Some(Score::Measured { replay, .. }) => short(&replay.hash),
+        _ => "none written".into(),
+    };
+    let _ = writeln!(
+        s,
+        "  1 score   in {}, measured, not exact ({}): replay {replay}",
+        run.engine, run.model
+    );
+    let _ = writeln!(
+        s,
+        "            {:<6} {:>14} {:>14} {:>14} {:>12} {:>10}",
+        "", "rows read", "bytes read", "peak memory", "cpu ms", "result"
+    );
+    for (i, p) in run.pairs.iter().enumerate() {
+        for (side, q) in [("before", &p.before), ("after", &p.after)] {
+            let _ = writeln!(
+                s,
+                "    p{i} {side:<6} {:>14} {:>14} {:>14} {:>12} {:>10}  {}",
+                num(q.read_rows),
+                size(q.read_bytes),
+                size(q.peak_memory_bytes),
+                q.cpu_ns
+                    .map_or_else(|| "-".to_string(), |c| num(c / 1_000_000)),
+                num(q.result_rows),
+                q.tag
+            );
+        }
+        if p.before.result_rows != p.after.result_rows {
+            let _ = writeln!(
+                s,
+                "    p{i} returns {} rows before and {} after: the rewrite does not return the \
+                 same rows",
+                num(p.before.result_rows),
+                num(p.after.result_rows)
+            );
+        }
+    }
+    if let Some(p) = &run.prediction {
+        let ratio = |r: &Option<String>| {
+            r.clone()
+                .unwrap_or_else(|| "undefined (the twin predicts 0 rows)".into())
+        };
+        let _ = writeln!(
+            s,
+            "            twin predicted {} rows in {} row groups for the key sample",
+            num(p.predicted_rows),
+            num(p.predicted_row_groups)
+        );
+        for (i, q) in p.pairs.iter().enumerate() {
+            let _ = writeln!(
+                s,
+                "    p{i} the engine read {} rows before (ratio {}) and {} after (ratio {})",
+                num(q.before_read_rows),
+                ratio(&q.before_ratio),
+                num(q.after_read_rows),
+                ratio(&q.after_ratio)
+            );
+        }
+    }
+    let twin = &run.identity_at_twin;
+    let _ = writeln!(
+        s,
+        "            engine identity {} ({} units, {} rows){}; {}",
+        short(&run.identity_before.hash),
+        num(run.identity_before.units),
+        num(run.identity_before.rows),
+        match &run.identity_after {
+            Some(a) if a.hash == run.identity_before.hash =>
+                ", unchanged through the runs".to_string(),
+            Some(a) => format!(", {} after the runs", short(&a.hash)),
+            None => String::new(),
+        },
+        if twin.hash == run.identity_before.hash {
+            "the same as when the twin diagnosis ran".to_string()
+        } else {
+            format!(
+                "the twin diagnosis ran against {} ({} units, {} rows), so its prediction \
+                 describes an earlier state of the tables",
+                short(&twin.hash),
+                num(twin.units),
+                num(twin.rows)
+            )
+        }
+    );
+    if let Some(dir) = &run.scratch {
+        let exported: u64 = run
+            .pairs
+            .iter()
+            .filter_map(|p| p.exported.as_ref())
+            .flat_map(|e| e.iter().map(|x| x.bytes))
+            .sum();
+        let _ = writeln!(
+            s,
+            "            exports: {} under {dir}, {}",
+            size(exported),
+            if run.kept {
+                "kept there (--keep)"
+            } else {
+                "deleted when the run ended"
+            }
+        );
+    }
+}
+
+fn score_human(s: &mut String, r: &FixResult) {
     match &r.score {
         Some(Score::Replayed {
             replay,
             current,
             proposed,
         }) => {
+            // Sizes carry their unit: no "bytes" after them.
             let _ = writeln!(
                 s,
-                "  1 score   {:>10} -> {:>10} bytes over the workload ({} -> {} row groups), replay {}",
+                "  1 score   {:>10} -> {:>10} over the workload ({} -> {}), replay {}",
                 size(current.bytes),
                 size(proposed.bytes),
                 num(current.row_groups),
-                num(proposed.row_groups),
+                count(proposed.row_groups, "row group", "row groups"),
+                short(&replay.hash)
+            );
+            if matches!(&replay.record, Record::Replay(rp) if rp.unserved.is_some()) {
+                let _ = writeln!(
+                    s,
+                    "            a lookup no key serves is priced as the files' own min/max \
+                     statistics read it, as a reader without an index does"
+                );
+            }
+        }
+        Some(Score::Measured {
+            replay,
+            current,
+            proposed,
+            model,
+        }) => {
+            let _ = writeln!(
+                s,
+                "  1 score   {:>10} -> {:>10} over the workload ({} -> {}), {model}: \
+                 not exact, so replay {} is not recorded",
+                size(current.bytes),
+                size(proposed.bytes),
+                num(current.row_groups),
+                count(proposed.row_groups, "unit", "units"),
                 short(&replay.hash)
             );
         }
@@ -476,6 +736,10 @@ fn fix_human(r: &FixResult, out: &Out) -> String {
         }
         None => {}
     }
+}
+
+#[allow(clippy::too_many_lines)]
+fn verify_and_outcome_human(s: &mut String, r: &FixResult) {
     if let Some(c) = &r.certificate {
         if let Record::Certificate(cert) = &c.record {
             let _ = writeln!(
@@ -498,7 +762,9 @@ fn fix_human(r: &FixResult, out: &Out) -> String {
             rows_asked(filter)
         );
     }
-    if let Some(inv) = &r.invariant {
+    // The invariant is checked by the certificate; without one (a refusal
+    // before the verify stage), nothing was.
+    if let (Some(inv), Some(_)) = (&r.invariant, &r.certificate) {
         let _ = writeln!(s, "            invariant checked: {inv}");
     }
     match &r.outcome {
@@ -515,13 +781,14 @@ fn fix_human(r: &FixResult, out: &Out) -> String {
                 );
             }
             let _ = writeln!(s, "  4 attest  receipt {}", receipt.hash);
+            signed_line(s, r, "receipt");
             if let Some(r) = realized {
                 if let Record::Replay(rp) = &r.record {
                     let bytes: u64 = rp.current.iter().map(|c| c.bytes).sum();
                     let _ = writeln!(
                         s,
-                        "  realized {} bytes at manifest {}, replay {}",
-                        num(bytes),
+                        "  realized {} at manifest {}, replay {}",
+                        count(bytes, "byte", "bytes"),
                         rp.manifest_version,
                         short(&r.hash)
                     );
@@ -531,8 +798,34 @@ fn fix_human(r: &FixResult, out: &Out) -> String {
                 let _ = writeln!(s, "  warning: {w}");
             }
         }
+        FixOutcome::Attested {
+            receipt,
+            target,
+            deploy,
+        } => {
+            let _ = writeln!(
+                s,
+                "  3 apply   attest-only: nothing applied in {target}; a human or a CI gate \
+                 deploys the rewritten {}",
+                if deploy.len() == 1 {
+                    "query"
+                } else {
+                    "queries"
+                }
+            );
+            let _ = writeln!(s, "  4 attest  receipt {} (attest-only)", receipt.hash);
+            signed_line(s, r, "receipt");
+            for (i, q) in deploy.iter().enumerate() {
+                let _ = writeln!(
+                    s,
+                    "  deploy p{i}: {}",
+                    q.lines().collect::<Vec<_>>().join(" ")
+                );
+            }
+        }
         FixOutcome::Verified => {
             let _ = writeln!(s, "  3 apply   not run (--verify-only)");
+            signed_line(s, r, "certificate");
         }
         // The CLI never asks for a dry run; the MCP server does.
         FixOutcome::WouldApply { sequence, expected } => {
@@ -563,9 +856,32 @@ fn fix_human(r: &FixResult, out: &Out) -> String {
                 } => format!(
                     "another commit landed during the apply (expected sequence {expected}, got {committed}). The key is built and serves lookups at sequence {committed}; no re-index is needed. It cannot be attested, and retrying will not attest it: a retry finds the key already complete (nothing_to_apply) and writes no receipt. `bellwether why` with the same keys reports the cost it now has"
                 ),
+                Refusal::DataChanged { .. } if engine_rewrite(r) => {
+                    "the engine's tables changed after the certificate was computed (their identity differs from the one it cites), so the certificate no longer describes them; run fix on the proposal again to re-verify".into()
+                }
                 Refusal::DataChanged { .. } => {
                     "the data changed after the certificate was computed (its catalog digest differs), so the certificate no longer describes it; run fix again to re-verify".into()
                 }
+                Refusal::MeasurementChanged {
+                    replay,
+                    pair,
+                    side,
+                    certified_read_rows,
+                    measured_read_rows,
+                    certified_read_bytes,
+                    measured_read_bytes,
+                    certified_result_rows,
+                    measured_result_rows,
+                    ..
+                } => format!(
+                    "measurement_changed: run again in the state certified, p{pair} {side} read {} rows and {} bytes and returned {} rows, where the certified replay {replay} says {} rows, {} bytes, and {} rows; the numbers a receipt would attest are not the numbers verified (a query that behaves differently between runs, or a background merge, does this), so nothing was written; run fix on the proposal again",
+                    num(*measured_read_rows),
+                    num(*measured_read_bytes),
+                    num(*measured_result_rows),
+                    num(*certified_read_rows),
+                    num(*certified_read_bytes),
+                    num(*certified_result_rows)
+                ),
                 Refusal::NothingToApply { sequence } => format!(
                     "the key is already complete at sequence {sequence}, so applying it changes nothing; no receipt"
                 ),
@@ -575,6 +891,47 @@ fn fix_human(r: &FixResult, out: &Out) -> String {
                 Refusal::NoReplay { .. } => {
                     "the rewrite verified, but a receipt cites a replay and rewrites have none yet (contract v3 backlog #2)".into()
                 }
+                Refusal::AttestOnly {
+                    target,
+                    run,
+                    proposed_rewrite,
+                    ..
+                } => {
+                    let mut why = format!(
+                        "attest-only: the certificate passed, and {target} is a table, so the \
+                         engine applies nothing and writes no receipt (ADR 027)."
+                    );
+                    if !run.is_empty() {
+                        why.push_str(" To apply it, a human runs:");
+                        for r in run {
+                            why.push_str("\n    ");
+                            why.push_str(r);
+                        }
+                    }
+                    if let Some(text) = proposed_rewrite {
+                        why.push_str(
+                            " The agent's proposed rewrite, verified on the outputs given; the \
+                             engine never ran it, so review it before deploying it:\n    ",
+                        );
+                        why.push_str(text);
+                    }
+                    why
+                }
+                Refusal::ExportDenied { message, .. } => format!(
+                    "export_denied: {message}. The export is the measured run, so nothing was \
+                     measured, and there is no certificate and no receipt"
+                ),
+                Refusal::NothingToGain {
+                    replay,
+                    current_bytes,
+                    proposed_bytes,
+                } if engine_rewrite(r) => format!(
+                    "nothing_to_gain: replay {replay} measured the rewrite reading no fewer bytes \
+                     in the engine ({} before, {} after), so nothing was verified or attested; \
+                     pass --allow-no-gain to go on anyway",
+                    num(*current_bytes),
+                    num(*proposed_bytes)
+                ),
                 Refusal::NothingToGain {
                     replay,
                     current_bytes,
@@ -588,5 +945,13 @@ fn fix_human(r: &FixResult, out: &Out) -> String {
             let _ = writeln!(s, "  refused: {why}");
         }
     }
-    s
+}
+
+/// Whether `r` is a fix of a rewrite of engine queries (ADR 033).
+fn engine_rewrite(r: &FixResult) -> bool {
+    r.engine.is_some()
+        || matches!(
+            &r.proposal.record,
+            Record::Proposal(p) if matches!(&p.body, ProposalBody::Rewrite { shape } if !shape.pairs.is_empty())
+        )
 }

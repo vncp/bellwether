@@ -140,6 +140,10 @@ pub struct SidecarDecl {
     /// Timestamp column(s) the sidecar indexes over.
     #[serde(default)]
     pub time_columns: Vec<String>,
+    /// The sidecar's parameters, by name (`sketch`: `p`, `minhash`). Absent
+    /// when it has none.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub params: BTreeMap<String, String>,
     /// Unknown fields (ADR 017).
     #[serde(flatten)]
     pub extra: Extra,
@@ -147,9 +151,13 @@ pub struct SidecarDecl {
 
 impl SidecarDecl {
     /// Canonical sidecar name, stored in [`SegmentRef::key_spec`] for segments
-    /// of this sidecar: `{kind}:{columns joined by ','}@{time_columns joined by ','}`.
+    /// of this sidecar: `{kind}:{columns joined by ','}@{time_columns joined by ','}`,
+    /// without the `@` part when it has no time column (`sketch:a,b`).
     #[must_use]
     pub fn name(&self) -> String {
+        if self.time_columns.is_empty() {
+            return format!("{}:{}", self.kind, self.columns.join(","));
+        }
         format!(
             "{}:{}@{}",
             self.kind,
@@ -161,7 +169,7 @@ impl SidecarDecl {
 
 /// Segment kinds this build understands in [`SegmentRef::kind`] and
 /// [`SidecarDecl::kind`].
-pub const KNOWN_SEGMENT_KINDS: [&str; 2] = ["bounds", "temporal2"];
+pub const KNOWN_SEGMENT_KINDS: [&str; 3] = ["bounds", "temporal2", "sketch"];
 
 /// Dataset schema, declared key specs, and declared sidecars.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -206,9 +214,85 @@ pub struct FileEntry {
     /// Chunk ranges for byte-range sources; immutable per file.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chunks: Option<Vec<ChunkRange>>,
+    /// Rows of each row group, aligned with `rowgroup_ids` (storage version
+    /// 2). Absent only in a version 1 manifest, which the first commit by a
+    /// version 2 binary fills from the footers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rowgroup_rows: Option<Vec<u64>>,
+    /// Compressed bytes of each row group (a text chunk's length), aligned
+    /// with `rowgroup_ids` (storage version 2), so a plan sums bytes from
+    /// the manifest and opens no footer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rowgroup_bytes: Option<Vec<u64>>,
+    /// Compressed bytes of each column chunk, row-group-major: entry
+    /// `i * columns + j` is row group `i`'s chunk of schema column `j`
+    /// (storage version 2); 0 for a virtual partition column. Absent for a
+    /// text source, whose chunks have no per-column bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub column_bytes: Option<Vec<u64>>,
     /// Unknown fields (ADR 017).
     #[serde(flatten)]
     pub extra: Extra,
+}
+
+impl FileEntry {
+    /// The row-group statistics a plan reads from the manifest: rows and
+    /// bytes of row group `i` in the file, when recorded (storage version 2).
+    #[must_use]
+    pub fn rowgroup_stats(&self, i: usize) -> Option<(u64, u64)> {
+        Some((
+            *self.rowgroup_rows.as_ref()?.get(i)?,
+            *self.rowgroup_bytes.as_ref()?.get(i)?,
+        ))
+    }
+
+    /// The compressed bytes of schema column `column` (of `columns`) in row
+    /// group `i` of the file, when recorded.
+    #[must_use]
+    pub fn column_bytes_of(&self, i: usize, column: usize, columns: usize) -> Option<u64> {
+        self.column_bytes
+            .as_ref()?
+            .get(i.checked_mul(columns)?.checked_add(column)?)
+            .copied()
+    }
+
+    /// Whether the version 2 arrays are recorded (`column_bytes` may stay
+    /// absent for a text source).
+    #[must_use]
+    pub fn has_rowgroup_stats(&self) -> bool {
+        self.rowgroup_rows.is_some() && self.rowgroup_bytes.is_some()
+    }
+
+    /// Checks that the version 2 arrays, where present, align with the
+    /// file's row groups and the schema's `columns`.
+    fn check_aligned(&self, columns: usize) -> Result<()> {
+        let n = self.rowgroup_ids.len();
+        let bad = |what: &str, found: usize, want: usize| {
+            Error::Other(format!(
+                "corrupt manifest: file {} has {found} {what} entries for {want}; the manifest \
+                 was edited or truncated outside a commit, so restore it from manifests/ or \
+                 re-index",
+                self.fingerprint.path
+            ))
+        };
+        if let Some(v) = &self.rowgroup_rows {
+            if v.len() != n {
+                return Err(bad("rowgroup_rows", v.len(), n));
+            }
+        }
+        if let Some(v) = &self.rowgroup_bytes {
+            if v.len() != n {
+                return Err(bad("rowgroup_bytes", v.len(), n));
+            }
+        }
+        if let Some(v) = &self.column_bytes {
+            let want = n.saturating_mul(columns);
+            if v.len() != want {
+                return Err(bad("column_bytes", v.len(), want));
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Row-group ids retired by fingerprint drift, and since when (ADR 013).
@@ -275,8 +359,9 @@ pub struct SegmentRef {
     /// `None` for an ordinary key-spec segment.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kind: Option<String>,
-    /// Name of the key spec ([`KeySpec::name`]) when `kind` is `None`, or the
-    /// sidecar's [`SidecarDecl::name`] when `kind` is `Some`.
+    /// The key spec's identity ([`KeySpec::identity`]; its name in a
+    /// storage version 1 file) when `kind` is `None`, or the sidecar's
+    /// [`SidecarDecl::name`] when `kind` is `Some`.
     pub key_spec: String,
     /// Row groups covered.
     pub rowgroup_range: RowGroupRange,
@@ -423,7 +508,20 @@ impl Manifest {
     /// [`UNSUPPORTED_STORAGE`]), and an unknown `KeySpec` kind or an unknown
     /// field in a `KeySpec` or `FileFingerprint` (`what` =
     /// [`UNSUPPORTED_SHAPE`]; those require a version bump, see the module
-    /// docs).
+    /// docs). Refuses a file whose per-row-group arrays do not align with
+    /// its row groups.
+    ///
+    /// A storage version 1 manifest keys segments and completeness by
+    /// [`KeySpec::name`]; it is read with those keys rewritten to
+    /// [`KeySpec::identity`], the version 2 keys, so every caller sees one
+    /// shape. Its `storage_version` stays 1 until a commit stamps 2
+    /// (docs/format.md, "Reading storage version 1"). Its specs are read as
+    /// they were declared, whatever their column names: two of them that
+    /// share an identity (which version 1 allowed) keep their segments
+    /// apart under [`V1_SHARED_IDENTITY`] keys, so neither plans until one
+    /// is re-declared, and the build refuses to upgrade the index until
+    /// then. A version 2 manifest with two such specs is refused as corrupt:
+    /// no build commits one.
     pub fn from_slice(bytes: &[u8]) -> Result<Self> {
         let value: Value = serde_json::from_slice(bytes)?;
         let found = value
@@ -438,20 +536,117 @@ impl Manifest {
         if found > u64::from(STORAGE_VERSION) {
             return Err(unsupported(UNSUPPORTED_STORAGE));
         }
-        if !types_owned_fields_known(&value) {
+        if found >= 2 {
+            refuse_later_v2_shapes(&value)?;
+        }
+        if !types_owned_fields_known(&value, found) {
             return Err(Error::UnknownKind {
                 what: UNSUPPORTED_SHAPE,
                 found: "unrecognized key-spec kind or fingerprint field".to_string(),
             });
         }
-        Ok(serde_json::from_value(value)?)
+        let mut m: Self = serde_json::from_value(value)?;
+        if m.storage_version >= 2 {
+            if let Some((a, b)) = KeySpec::shared_identity(&m.schema.key_specs) {
+                return Err(Error::Other(format!(
+                    "corrupt index: manifest sequence {} declares the key specs {} and {}, which \
+                     share the identity {}, and storage version 2 files segments by identity, so \
+                     no build commits that; restore the manifest from manifests/",
+                    m.sequence,
+                    spec_json(a),
+                    spec_json(b),
+                    a.identity()
+                )));
+            }
+        }
+        let columns = m.schema.columns.len();
+        for f in &m.rowgroup_space.files {
+            f.check_aligned(columns)?;
+        }
+        if m.storage_version < 2 {
+            m.rekey_by_identity();
+        }
+        Ok(m)
     }
 
-    /// Serializes to the canonical on-disk form (sorted keys, pretty).
+    /// Rewrites a storage version 1 manifest's keys (a key spec segment's
+    /// `key_spec` and `key_spec_completeness`) from each spec's name to its
+    /// identity. Version 1 allowed one spec per name, so the map is
+    /// one-to-one, except for specs that share an identity: those map to
+    /// [`V1_SHARED_IDENTITY`] and their name, which no identity equals.
+    /// Sidecar segments keep their sidecar names, and a name no declared
+    /// spec has is left as it is (it plans with nothing).
+    fn rekey_by_identity(&mut self) {
+        let by_name: BTreeMap<String, String> = self
+            .schema
+            .key_specs
+            .iter()
+            .map(|s| (s.name(), self.v2_key(s)))
+            .collect();
+        self.rekey(&by_name);
+    }
+
+    /// The key a version 1 spec's segments are read under: its identity,
+    /// or, when another declared spec shares that identity,
+    /// [`V1_SHARED_IDENTITY`] and its name.
+    fn v2_key(&self, spec: &KeySpec) -> String {
+        let identity = spec.identity();
+        let shared = self
+            .schema
+            .key_specs
+            .iter()
+            .filter(|s| s.identity() == identity)
+            .count()
+            > 1;
+        if shared {
+            format!("{V1_SHARED_IDENTITY}{}", spec.name())
+        } else {
+            identity
+        }
+    }
+
+    /// The inverse of [`Manifest::rekey_by_identity`], for writing a
+    /// storage version 1 manifest back in version 1's keys.
+    fn rekey_by_name(&mut self) {
+        let by_identity: BTreeMap<String, String> = self
+            .schema
+            .key_specs
+            .iter()
+            .map(|s| (self.v2_key(s), s.name()))
+            .collect();
+        self.rekey(&by_identity);
+    }
+
+    /// Renames key spec segments' `key_spec` and `key_spec_completeness`
+    /// keys found in `map`; sidecar segments and other keys stay.
+    fn rekey(&mut self, map: &BTreeMap<String, String>) {
+        for seg in &mut self.segments {
+            if seg.kind.is_none() {
+                if let Some(to) = map.get(&seg.key_spec) {
+                    seg.key_spec.clone_from(to);
+                }
+            }
+        }
+        self.key_spec_completeness = std::mem::take(&mut self.key_spec_completeness)
+            .into_iter()
+            .map(|(k, v)| (map.get(&k).cloned().unwrap_or(k), v))
+            .collect();
+    }
+
+    /// Serializes to the canonical on-disk form (sorted keys, pretty). A
+    /// storage version 1 manifest (one no commit could upgrade yet, see
+    /// `commit`) is written in version 1's keys, each spec's name, so a
+    /// version 1 binary still reads it.
     pub fn to_vec(&self) -> Result<Vec<u8>> {
         // Round trip through `Value` so flattened extras and known fields
         // come out in one sorted key order.
-        let v = serde_json::to_value(self)?;
+        let v = if self.storage_version < 2 {
+            let mut v1 = self.clone();
+            v1.rekey_by_name();
+            serde_json::to_value(&v1)?
+        } else {
+            serde_json::to_value(self)?
+        };
         Ok(serde_json::to_vec_pretty(&v)?)
     }
 
@@ -536,14 +731,40 @@ pub const UNSUPPORTED_STORAGE: &str = "storage";
 /// amendment: such a change requires a `storage_version` bump).
 pub const UNSUPPORTED_SHAPE: &str = "key-spec or fingerprint shape in storage";
 
-/// Serialized field names of each `KeySpec` kind this build understands.
-/// Kept in step with `bellwether-types` by a drift test.
-fn key_spec_fields(kind: &str) -> Option<&'static [&'static str]> {
+/// The prefix of the key a storage version 1 spec's segments and
+/// completeness are read under when another spec of the manifest shares its
+/// identity, followed by its name. No identity starts with it (an identity
+/// starts with its kind), so neither spec plans until one is re-declared
+/// (`Manifest::from_slice`).
+pub const V1_SHARED_IDENTITY: &str = "v1-shared-identity:";
+
+/// A key spec as its JSON form spells it (the form `--key` reads), for a
+/// message that names one exactly.
+#[must_use]
+pub fn spec_json(spec: &KeySpec) -> String {
+    serde_json::to_string(spec).unwrap_or_else(|_| spec.identity())
+}
+
+/// Serialized field names of each `KeySpec` kind this build understands in
+/// a manifest at `storage_version`. Kept in step with `bellwether-types` by
+/// a drift test. `counts` arrived in storage version 2, so a version 1
+/// manifest that carries it is refused rather than read.
+fn key_spec_fields(kind: &str, storage_version: u64) -> Option<&'static [&'static str]> {
+    let v2 = storage_version >= 2;
     match kind {
+        "exact" if v2 => Some(&["kind", "columns", "counts"]),
         "exact" => Some(&["kind", "columns"]),
         "bloom" => Some(&["kind", "columns", "fpr"]),
         "range" => Some(&["kind", "column"]),
+        // a list key (B4) is a storage version 2 kind: a version 1 build
+        // refuses a manifest declaring one
+        "list" if v2 => Some(&["kind", "column"]),
+        "temporal" if v2 => Some(&["kind", "columns", "ts_column", "counts"]),
         "temporal" => Some(&["kind", "columns", "ts_column"]),
+        // --- phase 5 kinds ---
+        // Storage version 2 on: a reader of version 1 refuses the kind.
+        "expr" if v2 => Some(&["kind", "name", "expr", "over", "conformance"]),
+        "text" if v2 => Some(&["kind", "column", "tokenizer", "bloom"]),
         _ => None,
     }
 }
@@ -552,9 +773,30 @@ fn key_spec_fields(kind: &str) -> Option<&'static [&'static str]> {
 /// Kept in step with `bellwether-types` by a drift test.
 const FINGERPRINT_FIELDS: &[&str] = &["path", "size", "etag", "tail_blake3"];
 
+/// Whether a serialized `KeySpec` has a kind and fields this build
+/// understands, including the inner spec an `expr` key wraps.
+fn key_spec_known(spec: &Value, storage_version: u64) -> bool {
+    fn keys_within(v: &Value, allowed: &[&str]) -> bool {
+        v.as_object()
+            .is_some_and(|o| o.keys().all(|k| allowed.contains(&k.as_str())))
+    }
+    let Some(allowed) = spec
+        .get("kind")
+        .and_then(Value::as_str)
+        .and_then(|k| key_spec_fields(k, storage_version))
+    else {
+        return false;
+    };
+    keys_within(spec, allowed)
+        && spec
+            .get("over")
+            .is_none_or(|o| key_spec_known(o, storage_version))
+}
+
 /// Whether every types-owned struct in the manifest has only kinds and
-/// fields this build understands (see the module docs).
-fn types_owned_fields_known(manifest: &Value) -> bool {
+/// fields this build understands at the manifest's storage version (see the
+/// module docs).
+fn types_owned_fields_known(manifest: &Value, storage_version: u64) -> bool {
     fn keys_within(v: &Value, allowed: &[&str]) -> bool {
         v.as_object()
             .is_some_and(|o| o.keys().all(|k| allowed.contains(&k.as_str())))
@@ -563,14 +805,17 @@ fn types_owned_fields_known(manifest: &Value) -> bool {
         .pointer("/schema/key_specs")
         .and_then(Value::as_array);
     for spec in key_specs.into_iter().flatten() {
-        let Some(allowed) = spec
-            .get("kind")
-            .and_then(Value::as_str)
-            .and_then(key_spec_fields)
-        else {
+        if !key_spec_known(spec, storage_version) {
             return false;
-        };
-        if !keys_within(spec, allowed) {
+        }
+        // A text key's tokenizer is a closed set too: a later one is a
+        // shape this build does not know, never a serde error.
+        if spec.get("kind").and_then(Value::as_str) == Some("text")
+            && !matches!(
+                spec.get("tokenizer").and_then(Value::as_str),
+                Some("words" | "trigram")
+            )
+        {
             return false;
         }
     }
@@ -585,6 +830,48 @@ fn types_owned_fields_known(manifest: &Value) -> bool {
         }
     }
     true
+}
+
+/// Refuses, with [`Error::UnsupportedShape`], a storage version 2 manifest
+/// in a shape the next storage version 2 release writes and this binary
+/// does not read (ADR 028): a column's `data_type` as a type map rather
+/// than a string, a `source.dialect` (a text source's delimiter, header and
+/// quote, which this binary reads from `source.kind`), a key spec with
+/// per-key `bounds`, or a bitemporal key spec. Reading any of them as this
+/// binary would is a serde error or, for the dialect, a misread source.
+fn refuse_later_v2_shapes(manifest: &Value) -> Result<()> {
+    let shape = |what, found: String| Err(Error::UnsupportedShape { what, found });
+    let columns = manifest
+        .pointer("/schema/columns")
+        .and_then(Value::as_array);
+    for c in columns.into_iter().flatten() {
+        if c.get("data_type").is_some_and(|t| !t.is_string()) {
+            let name = c.get("name").and_then(Value::as_str).unwrap_or("?");
+            return shape(
+                "manifest column data_type",
+                format!("of column \"{name}\" (a type map)"),
+            );
+        }
+    }
+    if manifest.pointer("/source/dialect").is_some() {
+        return shape("manifest source", "dialect".to_string());
+    }
+    let key_specs = manifest
+        .pointer("/schema/key_specs")
+        .and_then(Value::as_array);
+    for spec in key_specs.into_iter().flatten() {
+        let identity = || {
+            serde_json::from_value::<KeySpec>(spec.clone())
+                .map_or_else(|_| spec.to_string(), |s| s.identity())
+        };
+        if spec.get("kind").and_then(Value::as_str) == Some("bitemporal") {
+            return shape("bitemporal key spec", identity());
+        }
+        if spec.get("bounds").is_some() {
+            return shape("key spec with per-key bounds", identity());
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -687,52 +974,78 @@ mod tests {
 
     #[test]
     fn newer_storage_version_is_refused_with_typed_error() {
-        let v2 = r#"{"storage_version": 2, "created_at": "x", "segments": "a different shape"}"#;
-        match Manifest::from_slice(v2.as_bytes()) {
+        let v3 = r#"{"storage_version": 3, "created_at": "x", "segments": "a different shape"}"#;
+        match Manifest::from_slice(v3.as_bytes()) {
             Err(Error::UnsupportedVersion {
                 what: UNSUPPORTED_STORAGE,
-                found: 2,
-                supported: 1,
+                found: 3,
+                supported: 2,
             }) => {}
             other => panic!("expected UnsupportedVersion, got {other:?}"),
         }
     }
 
     /// The allow-lists the loader checks against must match what
-    /// `bellwether-types` actually serializes. Adding a `KeySpec` variant or
-    /// a `FileFingerprint` field breaks compilation here (exhaustive match,
-    /// full struct literal) or fails this test, so the allow-list and the
-    /// `storage_version` bump it implies (ADR 017) cannot be forgotten.
+    /// `bellwether-types` actually serializes, every optional field set.
+    /// Adding a `KeySpec` variant or a `FileFingerprint` field breaks
+    /// compilation here (exhaustive match, full struct literal) or fails
+    /// this test, so the allow-list and the `storage_version` bump it
+    /// implies (ADR 017) cannot be forgotten.
     #[test]
     fn allow_lists_match_types_serialization() {
         let specs = [
             KeySpec::Exact {
                 columns: vec!["a".into()],
+                counts: true,
+                bounds: None,
             },
             KeySpec::Bloom {
                 columns: vec!["a".into()],
                 fpr: 0.01,
+                bounds: None,
             },
             KeySpec::Range { column: "a".into() },
             KeySpec::Temporal {
                 columns: vec!["a".into()],
                 ts_column: "t".into(),
+                counts: true,
             },
+            KeySpec::Expr {
+                name: "k".into(),
+                expr: "lower(a)".into(),
+                over: Box::new(KeySpec::Exact {
+                    columns: vec!["k".into()],
+                    counts: true,
+                    bounds: None,
+                }),
+                conformance: Vec::new(),
+            },
+            KeySpec::Text {
+                column: "a".into(),
+                tokenizer: bellwether_types::Tokenizer::Trigram,
+                bloom: Some(0.01),
+            },
+            KeySpec::List { column: "a".into() },
         ];
         let mut kinds_seen = BTreeSet::new();
         for spec in &specs {
-            // Exhaustive on purpose: a new variant must be added to `specs`.
+            // Exhaustive on purpose: a new variant must be added to `specs`,
+            // or to the list of specs this release keeps out of manifests.
             match spec {
                 KeySpec::Exact { .. }
                 | KeySpec::Bloom { .. }
                 | KeySpec::Range { .. }
-                | KeySpec::Temporal { .. } => {}
+                | KeySpec::Temporal { .. }
+                | KeySpec::Bitemporal { .. }
+                | KeySpec::Expr { .. }
+                | KeySpec::Text { .. }
+                | KeySpec::List { .. } => {}
             }
             let v = serde_json::to_value(spec).unwrap();
             let kind = v["kind"].as_str().unwrap().to_string();
             let mut keys: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
             keys.sort_unstable();
-            let mut allowed = key_spec_fields(&kind)
+            let mut allowed = key_spec_fields(&kind, 2)
                 .unwrap_or_else(|| panic!("no allow-list for kind {kind}"))
                 .to_vec();
             allowed.sort_unstable();
@@ -740,6 +1053,16 @@ mod tests {
             kinds_seen.insert(kind);
         }
         assert_eq!(kinds_seen.len(), specs.len());
+        // Per-key time bounds and bitemporal specs are declared as sidecars
+        // in this release, so a manifest naming them as key specs is refused.
+        assert!(key_spec_fields("bitemporal", 2).is_none());
+        for kind in ["exact", "bloom"] {
+            assert!(!key_spec_fields(kind, 2).unwrap().contains(&"bounds"));
+        }
+        // counts arrived in storage version 2
+        for kind in ["exact", "temporal"] {
+            assert!(!key_spec_fields(kind, 1).unwrap().contains(&"counts"));
+        }
 
         let fp = FileFingerprint {
             path: "a".into(),
@@ -773,6 +1096,134 @@ mod tests {
                 "rowgroup_space": {"files": [{"rowgroup_ids": [], "fingerprint": {
                   "path": "a", "size": 1, "etag": null, "mtime_ns": 5,
                   "tail_blake3": "0000000000000000000000000000000000000000000000000000000000000000"}}]}}"#,
+        );
+    }
+
+    /// A text key (B5) lives in `schema.key_specs` of a storage version 2
+    /// manifest as an ordinary key spec, and this build reads it. Storage
+    /// version 1 has no text kind: a version 1 manifest that names one is
+    /// refused with the typed unknown-kind error, exactly as a version 1
+    /// reader refuses a version 2 manifest's text key (never a serde error,
+    /// never by dropping the spec; ADR 017). A field or a tokenizer this
+    /// build does not know is refused the same way.
+    #[test]
+    fn text_key_specs_are_read_at_version_2_and_refused_typed_otherwise() {
+        let m = Manifest::from_slice(
+            br#"{"storage_version": 2, "created_at": "x",
+                "schema": {"key_specs": [{"kind": "text", "column": "body", "tokenizer": "words"},
+                  {"kind": "text", "column": "body", "tokenizer": "trigram", "bloom": 0.01}]}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            m.schema.key_specs[0],
+            KeySpec::Text {
+                column: "body".into(),
+                tokenizer: bellwether_types::Tokenizer::Words,
+                bloom: None,
+            }
+        );
+        assert_eq!(m.schema.key_specs[1].name(), "text:body,tokenizer=trigram");
+        assert_eq!(
+            m.schema.key_specs[1].identity(),
+            "text:body,tokenizer=trigram,bloom=0.01"
+        );
+        let again = Manifest::from_slice(&m.to_vec().unwrap()).unwrap();
+        assert_eq!(again.schema.key_specs, m.schema.key_specs);
+        // Version 1 has no text kind.
+        expect_unsupported_shape(
+            r#"{"storage_version": 1, "created_at": "x",
+                "schema": {"key_specs": [{"kind": "text", "column": "body", "tokenizer": "words"}]}}"#,
+        );
+        // A field a text key does not have.
+        expect_unsupported_shape(
+            r#"{"storage_version": 2, "created_at": "x",
+                "schema": {"key_specs": [{"kind": "text", "column": "b", "tokenizer": "words",
+                  "stemmer": "en"}]}}"#,
+        );
+        // A tokenizer this build does not know.
+        expect_unsupported_shape(
+            r#"{"storage_version": 2, "created_at": "x",
+                "schema": {"key_specs": [{"kind": "text", "column": "b", "tokenizer": "ngram4"}]}}"#,
+        );
+    }
+
+    /// An `expr` key (phase 5) is a `KeySpec` kind. A reader whose
+    /// allow-list lacks a kind, as every reader built before the kind did,
+    /// refuses the manifest with the typed shape error, never a serde error
+    /// and never a silent drop on rewrite (ADR 017); this reader reads it,
+    /// and checks the spec an `expr` key wraps the same way.
+    #[test]
+    fn expr_keys_load_and_a_reader_without_the_kind_refuses_typed() {
+        let at = |version: u32, spec: &str| {
+            format!(
+                r#"{{"storage_version": {version}, "created_at": "x",
+                    "schema": {{"key_specs": [{spec}]}}}}"#
+            )
+        };
+        let with = |spec: &str| at(2, spec);
+        let expr = r#"{"kind": "expr", "name": "k", "expr": "lower(a)",
+                       "over": {"kind": "exact", "columns": ["k"], "counts": true},
+                       "conformance": []}"#;
+        let m = Manifest::from_slice(with(expr).as_bytes()).unwrap();
+        assert!(matches!(m.schema.key_specs[0], KeySpec::Expr { .. }));
+        // The kind ships with storage version 2: a version 1 manifest that
+        // names it is refused typed, as a version 1 reader refuses it.
+        expect_unsupported_shape(&at(1, expr));
+        // What a reader without the kind sees: the same manifest with a kind
+        // name its allow-list does not hold.
+        expect_unsupported_shape(&with(
+            &expr.replace("\"expr\", \"name\"", "\"expr9\", \"name\""),
+        ));
+        // A field this build does not know, on the expr key or on the spec it
+        // wraps.
+        expect_unsupported_shape(&with(
+            &expr.replace("\"name\"", "\"collation\": 1, \"name\""),
+        ));
+        expect_unsupported_shape(&with(&expr.replace(
+            "\"columns\": [\"k\"]",
+            "\"columns\": [\"k\"], \"collation\": 1",
+        )));
+        expect_unsupported_shape(&with(
+            &expr.replace("\"kind\": \"exact\"", "\"kind\": \"zorder\""),
+        ));
+    }
+
+    /// A list key (B4) is a storage version 2 kind: a version 2 manifest
+    /// declaring it reads back as written, and a version 1 manifest
+    /// declaring it (what a version 1 build would be handed) is refused with
+    /// the typed unknown-kind error, never a serde error and never by
+    /// dropping the declaration on a rewrite; so is a list key with a field
+    /// this build does not know. The version 1 binary's own allow-list is
+    /// `key_spec_fields(_, 1)`, the one the M5 fixture was written under.
+    #[test]
+    fn a_list_key_is_a_storage_version_2_kind() {
+        let json = |version: u32| {
+            format!(
+                r#"{{"storage_version": {version}, "created_at": "x",
+                "schema": {{"key_specs": [{{"kind": "list", "column": "tags"}}]}}}}"#
+            )
+        };
+        let m = Manifest::from_slice(json(2).as_bytes()).unwrap();
+        assert_eq!(
+            m.schema.key_specs[0],
+            KeySpec::List {
+                column: "tags".into()
+            }
+        );
+        assert_eq!(m.schema.key_specs[0].name(), "list:tags");
+        let back: Value = serde_json::from_slice(&m.to_vec().unwrap()).unwrap();
+        assert_eq!(back["schema"]["key_specs"][0]["kind"], "list");
+        assert!(key_spec_fields("list", 1).is_none());
+        match Manifest::from_slice(json(1).as_bytes()) {
+            Err(Error::UnknownKind {
+                what: UNSUPPORTED_SHAPE,
+                ..
+            }) => {}
+            other => panic!("expected UnknownKind (shape), got {other:?}"),
+        }
+        expect_unsupported_shape(
+            r#"{"storage_version": 2, "created_at": "x",
+                "schema": {"key_specs": [{"kind": "list", "column": "t", "keys_only": true}]}}"#,
         );
     }
 
@@ -819,6 +1270,7 @@ mod tests {
             kind: "bounds".into(),
             columns: vec!["symbol".into(), "venue".into()],
             time_columns: vec!["ts".into()],
+            params: BTreeMap::new(),
             extra: Extra::new(),
         };
         assert_eq!(decl_bounds.name(), "bounds:symbol,venue@ts");
@@ -827,9 +1279,23 @@ mod tests {
             kind: "temporal2".into(),
             columns: vec!["symbol".into()],
             time_columns: vec!["valid".into(), "known".into()],
+            params: BTreeMap::new(),
             extra: Extra::new(),
         };
         assert_eq!(decl_t2.name(), "temporal2:symbol@valid,known");
+        let decl_sketch = SidecarDecl {
+            kind: "sketch".into(),
+            columns: vec!["symbol".into(), "symbol+ts".into()],
+            params: BTreeMap::from([("p".to_string(), "12".to_string())]),
+            ..SidecarDecl::default()
+        };
+        assert_eq!(decl_sketch.name(), "sketch:symbol,symbol+ts");
+        let json = serde_json::to_value(&decl_sketch).unwrap();
+        assert_eq!(json["params"]["p"], "12");
+        assert!(serde_json::to_value(&decl_t2)
+            .unwrap()
+            .get("params")
+            .is_none());
 
         let raw = r#"{
           "storage_version": 1,

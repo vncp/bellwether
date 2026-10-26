@@ -60,7 +60,7 @@ fn a_concurrent_build_that_changes_the_row_group_space_restarts_with_fresh_ids()
         r.files_new, 0,
         "after the restart both new files are tracked by Y"
     );
-    assert_eq!(r.specs_rebuilt, vec!["bloom:grp".to_string()]);
+    assert_eq!(r.specs_rebuilt, vec!["bloom:grp@0.01".to_string()]);
 
     let m = builder(&inner).manifest().unwrap().unwrap();
     let (live, retired) = check_id_space(&m);
@@ -147,7 +147,7 @@ fn a_concurrent_compaction_is_rebased_onto_without_restart() {
         let mut ranges: Vec<(u32, u32)> = m
             .segments
             .iter()
-            .filter(|x| x.key_spec == spec.name())
+            .filter(|x| x.key_spec == spec.identity())
             .map(|x| (x.rowgroup_range.start.0, x.rowgroup_range.end.0))
             .collect();
         ranges.sort_unstable();

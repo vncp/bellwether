@@ -19,6 +19,7 @@ use arrow::array::{ArrayRef, RecordBatch};
 use arrow::datatypes::{DataType, Schema};
 use bellwether_core::encoding::{self, KeyColumns};
 use bellwether_core::sidecar::{self, SidecarWriter};
+use bellwether_core::sketch::{self as sketch_seg, SketchWriter};
 use bellwether_core::{SegmentWriter, WriterOptions};
 use bellwether_store::{segment_path, Extra, RowGroupRange, SegmentRef, StoreExt};
 use bellwether_types::{Error, FileFingerprint, KeySpec, Result, RowGroupId, RowGroupMeta};
@@ -308,7 +309,7 @@ fn process_item<S: StoreExt + ?Sized>(ctx: &Ctx<'_, S>, item: &Item) -> Result<I
             o.row_group_read(RowGroupId(task.id), &columns, &batch);
         }
         for w in &mut writers {
-            w.add(ctx, task.id, &batch)?;
+            w.add(ctx, task.file, task.id, &batch)?;
         }
     }
     for w in writers {
@@ -317,10 +318,11 @@ fn process_item<S: StoreExt + ?Sized>(ctx: &Ctx<'_, S>, item: &Item) -> Result<I
     Ok(out)
 }
 
-/// An open segment writer: a key spec's or a sidecar's.
+/// An open segment writer: a key spec's, a sidecar's, or a sketch's.
 enum AnyWriter {
     Key(SegmentWriter),
     Sidecar(SidecarWriter),
+    Sketch(SketchWriter),
 }
 
 /// One spec's open segment within an item.
@@ -350,10 +352,36 @@ impl<'a> SpecWriter<'a> {
     fn add<S: StoreExt + ?Sized>(
         &mut self,
         ctx: &Ctx<'_, S>,
+        file: usize,
         id: u32,
         batch: &RecordBatch,
     ) -> Result<()> {
-        let (keys, bytes) = measure(self.plan, batch)?;
+        // An expr key's virtual column, derived for this row group only
+        // (ADR 018) and dropped with it.
+        let derived;
+        let batch = match &self.plan.target {
+            Target::Key(spec @ KeySpec::Expr { .. }) => {
+                derived = bellwether_core::expr::with_derived(spec, ctx.schema, batch)?;
+                &derived
+            }
+            _ => batch,
+        };
+        let (keys, bytes) = match (&self.plan.target, &self.writer) {
+            // A sketch grows by one entry per file stretch, at most
+            // `max_entry_bytes` each: the bound is charged when one starts.
+            (Target::Sketch(spec), w) => {
+                let starts = match w {
+                    Some(AnyWriter::Sketch(w)) => w.starts_entry(file as u64, RowGroupId(id)),
+                    _ => true,
+                };
+                if starts {
+                    (1, sketch_seg::max_entry_bytes(spec))
+                } else {
+                    (0, 0)
+                }
+            }
+            _ => measure(self.plan, batch)?,
+        };
         if self.writer.is_some()
             && (self.keys.saturating_add(keys) > ctx.max_keys
                 || self.bytes.saturating_add(bytes) > ctx.max_bytes)
@@ -375,12 +403,16 @@ impl<'a> SpecWriter<'a> {
                     Target::Sidecar(def) => {
                         AnyWriter::Sidecar(SidecarWriter::for_dataset(def.clone(), ctx.schema)?)
                     }
+                    Target::Sketch(spec) => {
+                        AnyWriter::Sketch(SketchWriter::for_dataset(spec, ctx.schema)?)
+                    }
                 })
             }
         };
         match writer {
             AnyWriter::Key(w) => w.add_batch(RowGroupId(id), batch)?,
             AnyWriter::Sidecar(w) => w.add_batch(RowGroupId(id), batch)?,
+            AnyWriter::Sketch(w) => w.add_batch(file as u64, RowGroupId(id), batch)?,
         }
         self.end = id
             .checked_add(1)
@@ -407,6 +439,11 @@ impl<'a> SpecWriter<'a> {
                 (seg.id, seg.bytes)
             }
             AnyWriter::Sidecar(mut w) => {
+                w.set_rowgroup_range(range)?;
+                let seg = w.finish()?;
+                (seg.id, seg.bytes)
+            }
+            AnyWriter::Sketch(mut w) => {
                 w.set_rowgroup_range(range)?;
                 let seg = w.finish()?;
                 (seg.id, seg.bytes)
@@ -441,6 +478,8 @@ impl<'a> SpecWriter<'a> {
 /// - bloom: its distinct key tuples, and 8 bytes per tuple (the writer
 ///   holds one hash per key);
 /// - range: one entry if any key is present, and twice the longest key;
+/// - text: the batch's distinct tokens and their canonical bytes (8 per
+///   token with a bloom filter; core's `text::measure`);
 /// - a sidecar: core's `sidecar::measure` (distinct keys, and key bytes
 ///   plus 20 per stored record).
 pub(crate) fn measure(plan: &SpecPlan, batch: &RecordBatch) -> Result<(u64, u64)> {
@@ -449,13 +488,38 @@ pub(crate) fn measure(plan: &SpecPlan, batch: &RecordBatch) -> Result<(u64, u64)
         Target::Sidecar(def) => {
             return sidecar::measure(def, &plan.key_types, &plan.time_types, batch)
         }
+        Target::Sketch(spec) => return Ok((1, sketch_seg::max_entry_bytes(spec))),
     };
+    if let KeySpec::Text {
+        column,
+        tokenizer,
+        bloom,
+    } = spec
+    {
+        let arr = batch
+            .column_by_name(column)
+            .ok_or_else(|| Error::KeySpec(format!("column {column} not in batch")))?;
+        return bellwether_core::text::measure(*tokenizer, bloom.is_some(), arr.as_ref());
+    }
     let column = |name: &str| -> Result<ArrayRef> {
         batch
             .column_by_name(name)
             .cloned()
             .ok_or_else(|| Error::KeySpec(format!("column {name} not in batch")))
     };
+    if let KeySpec::List { column: c } = spec {
+        // Distinct element keys and their bytes: what the writer adds.
+        let elements = bellwether_core::list::ListElements::new(&column(c)?)?;
+        let mut seen: HashSet<Vec<u8>> = HashSet::new();
+        let mut bytes = 0u64;
+        elements.for_each_encoded(&plan.key_types[0], |_, k| {
+            if !seen.contains(k) {
+                bytes += k.len() as u64;
+                seen.insert(k.to_vec());
+            }
+        })?;
+        return Ok((seen.len() as u64, bytes));
+    }
     let cols = spec
         .columns()
         .iter()
@@ -494,7 +558,7 @@ pub(crate) fn measure(plan: &SpecPlan, batch: &RecordBatch) -> Result<(u64, u64)
         }
         if !seen.contains(buf.as_slice()) {
             seen.insert(buf.clone());
-            bytes += match spec {
+            bytes += match spec.physical() {
                 KeySpec::Bloom { .. } => 8,
                 KeySpec::Temporal { .. } => key_len + 8,
                 _ => key_len,
@@ -652,6 +716,8 @@ mod tests {
         let exact = plan_for(
             KeySpec::Exact {
                 columns: vec!["id".into()],
+                counts: false,
+                bounds: None,
             },
             &schema,
         );
@@ -660,6 +726,7 @@ mod tests {
             KeySpec::Temporal {
                 columns: vec!["id".into()],
                 ts_column: "ts".into(),
+                counts: false,
             },
             &schema,
         );
@@ -669,6 +736,7 @@ mod tests {
             KeySpec::Bloom {
                 columns: vec!["s".into()],
                 fpr: 0.01,
+                bounds: None,
             },
             &schema,
         );
@@ -679,6 +747,8 @@ mod tests {
         let composite = plan_for(
             KeySpec::Exact {
                 columns: vec!["id".into(), "s".into()],
+                counts: false,
+                bounds: None,
             },
             &schema,
         );

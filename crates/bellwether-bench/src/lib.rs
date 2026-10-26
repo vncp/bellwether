@@ -17,6 +17,19 @@
 //! - [`market`] writes a deterministic synthetic bitemporal market trade corpus
 //!   (`symbol`, `ts`, `known_at`, `price`, `size`), time-series workloads
 //!   (`window`, `asof`, `latest_known`), and exact ground truth (`truth.json`).
+//! - [`expr`] writes a corpus with a JSON attribute column on each shape
+//!   (ledger, market), key files for equality on a JSON path at three
+//!   selectivities, and exact ground truth, for `expr` keys.
+//! - [`perf`] reads a lookup's planned row groups (or every row group under a
+//!   folder) through the byte-counting reader, for the release measurements
+//!   of `scripts/perf.sh`.
+//! - [`text`] writes a text corpus (1–4 KB documents with planted terms at
+//!   1% and 0.01% of rows) in the ledger or market shape, with exact ground
+//!   truth, for text keys (B5; `scripts/text-funnels.py`).
+//! - [`lists`] writes a list column with skewed element cardinality in both
+//!   shapes (ledger attributes, market holdings), `contains_any` runs of 10,
+//!   10^3, and 10^5 terms and a `contains_all` run, and exact ground truth,
+//!   for list keys (B4).
 
 #![forbid(unsafe_code)]
 // Benchmark arithmetic converts freely between counts, sizes, and floating
@@ -40,14 +53,18 @@
 
 pub mod corpus;
 pub mod env;
+pub mod expr;
 pub mod generate;
 pub mod harness;
+pub mod lists;
 pub mod market;
 pub mod mem;
+pub mod perf;
 pub mod report;
 pub mod results;
 pub mod slo;
 pub mod stats;
+pub mod text;
 pub mod truth;
 pub mod workload;
 

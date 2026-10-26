@@ -114,6 +114,16 @@ enum Scope {
         workload: Hash,
         age: Duration,
         keys: Vec<Vec<u8>>,
+        /// When the keys are values of an expression
+        /// ([`crate::ReconcileSpec::keys_of`]), how a row's value is
+        /// computed, and which keys some row held.
+        expr: Option<ExprScope>,
+    },
+    /// The rows the row filter keeps, named after a workload
+    /// ([`CoverageRequest::WorkloadRows`]).
+    WorkloadRows {
+        workload: Hash,
+        age: Duration,
     },
     Sampled {
         requested: f64,
@@ -122,10 +132,58 @@ enum Scope {
     },
 }
 
+/// A workload scope whose keys are values of an expression.
+struct ExprScope {
+    typed: bellwether_core::expr::Typed,
+    /// The expression's input columns: name and projection index.
+    cols: Vec<(String, usize)>,
+    /// Indices into the scope's sorted keys that some row (on either side)
+    /// evaluated to; at most one entry per workload key.
+    found: std::sync::Mutex<std::collections::BTreeSet<usize>>,
+}
+
+impl ExprScope {
+    /// Whether row `row` of `cols` (projected) is in scope: its value is
+    /// one of `keys`. Records which key it was.
+    fn includes(
+        &self,
+        keys: &[Vec<u8>],
+        cols: &[&dyn Array],
+        row: usize,
+    ) -> bellwether_types::Result<bool> {
+        let named: Vec<(&str, &dyn Array)> = self
+            .cols
+            .iter()
+            .map(|(c, i)| (c.as_str(), cols[*i]))
+            .collect();
+        let Some(v) = self.typed.encode_row(&named, row)? else {
+            return Ok(false);
+        };
+        match keys.binary_search(&v) {
+            Ok(i) => {
+                self.found
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .insert(i);
+                Ok(true)
+            }
+            Err(_) => Ok(false),
+        }
+    }
+
+    /// How many workload keys some row evaluated to.
+    fn found(&self) -> u64 {
+        self.found
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len() as u64
+    }
+}
+
 impl Scope {
     fn includes(&self, key: &[u8]) -> bool {
         match self {
-            Self::Full => true,
+            Self::Full | Self::WorkloadRows { .. } => true,
             Self::Workload { keys, .. } => keys.binary_search_by(|k| k.as_slice().cmp(key)).is_ok(),
             Self::Sampled {
                 seed, threshold, ..
@@ -375,7 +433,7 @@ impl Reconciler {
             sides[1].source.schema(sides[1].root)?,
         ];
         let plan = Plan::resolve(&self.spec, &schemas[0], &schemas[1])?;
-        let scope = resolve_scope(&self.spec.coverage, &plan)?;
+        let scope = resolve_scope(&self.spec, &plan)?;
         let mut read: Vec<ReadSet> = Vec::with_capacity(2);
         let mut reports: Vec<SideReport> = Vec::with_capacity(2);
         let mut ranges: Vec<Option<(i128, i128)>> = Vec::with_capacity(2);
@@ -448,7 +506,10 @@ impl Reconciler {
         // most the workload's keys.
         let rows = prep.reports[0].rows.max(prep.reports[1].rows);
         let mut entries = prep.key_bound.map_or(rows, |b| rows.min(b));
-        if let Scope::Workload { keys, .. } = &prep.scope {
+        if let Scope::Workload {
+            keys, expr: None, ..
+        } = &prep.scope
+        {
             entries = entries.min(keys.len() as u64);
         }
         let key_len: u64 = prep.plan.key_types(0).iter().map(encoded_width).sum();
@@ -757,13 +818,23 @@ fn schema_identity(
 }
 
 /// Resolves the coverage request against the key types.
-fn resolve_scope(coverage: &CoverageRequest, plan: &Plan) -> Result<Scope> {
-    Ok(match coverage {
+fn resolve_scope(spec: &ReconcileSpec, plan: &Plan) -> Result<Scope> {
+    Ok(match &spec.coverage {
         CoverageRequest::Full => Scope::Full,
         CoverageRequest::Workload(w) => {
-            let types = plan.key_types(0);
-            for k in &w.keys {
-                check_probe(k, &types)?;
+            let expr = match &spec.keys_of {
+                Some(text) => Some(expr_scope(text, plan)?),
+                None => None,
+            };
+            if let Some(e) = &expr {
+                for k in &w.keys {
+                    check_probe(k, std::slice::from_ref(e.typed.data_type()))?;
+                }
+            } else {
+                let types = plan.key_types(0);
+                for k in &w.keys {
+                    check_probe(k, &types)?;
+                }
             }
             let mut keys = w.keys.clone();
             keys.sort_unstable();
@@ -772,6 +843,7 @@ fn resolve_scope(coverage: &CoverageRequest, plan: &Plan) -> Result<Scope> {
                 workload: w.workload,
                 age: w.age,
                 keys,
+                expr,
             }
         }
         CoverageRequest::Sampled { fraction, seed } => Scope::Sampled {
@@ -784,11 +856,48 @@ fn resolve_scope(coverage: &CoverageRequest, plan: &Plan) -> Result<Scope> {
                 t
             }),
         },
+        CoverageRequest::WorkloadRows { workload, age } => Scope::WorkloadRows {
+            workload: *workload,
+            age: *age,
+        },
         CoverageRequest::StaticProof { identity } => {
             return Err(VerifyError::StaticProofUnsupported {
                 identity: identity.clone(),
             })
         }
+    })
+}
+
+/// The expression a workload's keys are values of, checked against the
+/// projected columns at the left side's types.
+fn expr_scope(text: &str, plan: &Plan) -> Result<ExprScope> {
+    let parsed = bellwether_core::expr::Expr::parse(text)
+        .map_err(|e| VerifyError::InvalidSpec(e.to_string()))?;
+    let mut cols = Vec::new();
+    let mut fields = Vec::new();
+    for c in parsed.columns() {
+        let i = plan
+            .projection
+            .iter()
+            .position(|p| *p == c)
+            .ok_or_else(|| {
+                VerifyError::Schema(format!(
+                    "the workload expression {text} reads column {c:?}, which is not compared"
+                ))
+            })?;
+        fields.push(arrow::datatypes::Field::new(
+            &c,
+            plan.types[0][i].clone(),
+            true,
+        ));
+        cols.push((c, i));
+    }
+    let typed = bellwether_core::expr::Typed::new(parsed, &arrow::datatypes::Schema::new(fields))
+        .map_err(|e| VerifyError::InvalidSpec(e.to_string()))?;
+    Ok(ExprScope {
+        typed,
+        cols,
+        found: std::sync::Mutex::new(std::collections::BTreeSet::new()),
     })
 }
 
@@ -803,7 +912,13 @@ fn read_set(
     indexed: Option<&mut Indexed>,
     created_at: &str,
 ) -> Result<(ReadSet, SidePath)> {
-    let (Scope::Workload { keys, .. }, Some(ix), Some(planner)) = (scope, indexed, side.planner)
+    let (
+        Scope::Workload {
+            keys, expr: None, ..
+        },
+        Some(ix),
+        Some(planner),
+    ) = (scope, indexed, side.planner)
     else {
         return Ok((ReadSet::Scan(files.to_vec()), SidePath::Scan));
     };
@@ -965,6 +1080,7 @@ fn run_pass(
 
 /// Reads one row group's projected columns and folds the rows of partition
 /// `p` into the pass state.
+#[allow(clippy::too_many_lines)]
 fn read_row_group(
     prep: &Prepared<'_>,
     s: usize,
@@ -1010,7 +1126,23 @@ fn read_row_group(
         {
             continue;
         }
-        if !prep.scope.includes(key) {
+        let in_scope = match &prep.scope {
+            Scope::Workload {
+                keys,
+                expr: Some(e),
+                ..
+            } => e.includes(keys, &cols, row).map_err(|e| {
+                Abort::Error(VerifyError::Unrepresentable {
+                    side: SIDE_NAMES[s],
+                    file: rg.file.path.clone(),
+                    row_group: rg.index_in_file,
+                    column: "(workload expression)".into(),
+                    detail: e.to_string(),
+                })
+            })?,
+            scope => scope.includes(key),
+        };
+        if !in_scope {
             if matches!(prep.scope, Scope::Sampled { .. })
                 && !pass.unsampled.map.contains_key(key.as_slice())
             {
@@ -1285,6 +1417,12 @@ fn nothing_compared(scope: &Scope, seen: u64, unsampled: u64, filtered: bool) ->
              the dataset types (decimal scale is not visible in the bytes)",
             keys.len()
         ))),
+        Scope::WorkloadRows { .. } if seen == 0 => Err(VerifyError::NothingCompared(
+            "no row on either side holds what the workload's lookups ask for (the row filter \
+             keeps none), so there is nothing to verify; check the recorded values against the \
+             data"
+                .into(),
+        )),
         Scope::Sampled { requested, .. } if seen == 0 && unsampled > 0 => {
             Err(VerifyError::NothingCompared(format!(
                 "a sample at fraction {requested} selected none of the {unsampled} keys present; \
@@ -1303,13 +1441,28 @@ fn realized_coverage(scope: &Scope, counts: &mut Counts, seen: u64, unsampled: u
             counts.keys_compared = seen;
             Coverage::Full
         }
-        Scope::Workload { workload, keys, .. } => {
+        Scope::Workload {
+            workload,
+            keys,
+            expr,
+            ..
+        } => {
             let supplied = keys.len() as u64;
             counts.keys_compared = supplied;
-            counts.absent_both = supplied - seen;
+            // With an expression the rows' keys are not the workload's
+            // values; a value is absent when no row on either side had it.
+            let present = expr.as_ref().map_or(seen, ExprScope::found);
+            counts.absent_both = supplied.saturating_sub(present);
             Coverage::Workload {
                 workload: *workload,
                 keys: supplied,
+            }
+        }
+        Scope::WorkloadRows { workload, .. } => {
+            counts.keys_compared = seen;
+            Coverage::Workload {
+                workload: *workload,
+                keys: seen,
             }
         }
         Scope::Sampled { requested, .. } => {
@@ -1349,8 +1502,11 @@ fn provenance(prep: &Prepared<'_>, started: Instant) -> (Vec<Input>, Vec<u64>, V
             evidence.push(ev.clone());
         }
     }
-    if let Scope::Workload { workload, age, .. } = &prep.scope {
-        inputs.push((*workload, *age, started));
+    match &prep.scope {
+        Scope::Workload { workload, age, .. } | Scope::WorkloadRows { workload, age } => {
+            inputs.push((*workload, *age, started));
+        }
+        Scope::Full | Scope::Sampled { .. } => {}
     }
     (inputs, manifests, evidence)
 }

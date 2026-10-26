@@ -1,0 +1,31 @@
+#! title: bellwether fix, then reconcile
+#! caption: bellwether fix with the proposal and workload the why capture printed, then reconcile against a copy with one entity's amount raised by 0.01 (planted with DuckDB); the bench ledger corpus (bench generate --seed 42: 16 files, 64 row groups, 128,000 rows; bench workload: 12 recorded runs); release build of 3a0c26a, 2026-10-26.
+$ bellwether fix ledger/data --proposal f8923b75c3e8df7f17a54883997973a0dcd8b6917f31fe8132ec58e3d7b4506a --workload 3a1921721b730b1ea76a1933a0cb7cccae1f2d7f1cd90a2ebfd34228807cb842
+[1mfix f8923b75c3e8: key exact:entity_id, against manifest sequence 0[0m
+  1 score     134.0 MB ->   130.3 MB over the workload (444 -> 432 row groups), replay 8d75b102abba
+            a lookup no key serves is priced as the files' own min/max statistics read it, as a reader without an index does
+  2 verify  pass, coverage workload, 935 keys, 0 mismatched, 0 missing left, 0 missing right, certificate 17f55f748b7a
+  3 apply   manifest 0 -> 1
+  4 attest  receipt 9a8bee8992c815d6822805485a80cf7e8dc0049994fe9635bd2907067fb3d964
+            receipt unsigned (no --signing-key; `bellwether keys generate --out <path>` makes a key)
+  realized 130,336,047 bytes at manifest 1, replay 99787b551a48
+
+$ bellwether reconcile ledger/data changed/data --key entity_id --latest-by version_ts --totals amount
+[1mreconcile: FAIL, coverage full[0m
+  keys compared                   6,855
+  matched                         6,854
+  mismatched                          1
+  missing on the left                 0
+  missing on the right                0
+  totals that differ                  1
+
+  first 1 of 1 mismatching key (entity_id): every kept example is in --json
+    rows differ            (3)
+
+  exact totals, left and right
+    amount           all rows                                1546909874.77            1546909874.78  DIFFER
+
+  read 1 pass over each side under a 268,435,456-byte state budget (0 restarts): 128,000 rows read on the left, 128,000 on the right
+
+certificate 296091ee85d0dddd810fc6b201db56fec002d9ad24b3d834bf5853f80d85b2ce
+#! exit 1

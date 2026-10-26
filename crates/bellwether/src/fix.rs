@@ -14,7 +14,9 @@
 //!    current manifest sequence: build the key (WP4) in one commit
 //!    (`manifest_after`).
 //! 4. **Attest**: `Ledger::put_receipt` links evidence, proposal, replay,
-//!    and certificate, with `manifest_before < manifest_after`.
+//!    and certificate, with `manifest_before < manifest_after`; with a
+//!    signing key, the receipt and the certificate this call wrote are then
+//!    signed (ADR 029). A verify-only run signs its passing certificate.
 //!
 //! A failing certificate writes no Receipt and returns a typed refusal
 //! naming the mismatch counts.
@@ -26,8 +28,12 @@ use std::time::Duration;
 use arrow::array::RecordBatch;
 use arrow::datatypes::SchemaRef;
 use bellwether_build::encode_ts;
-use bellwether_build::{BuildOptions, Builder};
-use bellwether_replay::{proposed_specs, Catalog, Replayer, RunKeys, RunQuery, Workload};
+use bellwether_build::Builder;
+use bellwether_ledger::RecordKind;
+use bellwether_replay::{
+    proposed_specs, Baseline, Catalog, RecordedRun, Replayer, RunKeys, RunQuery, Workload,
+};
+use bellwether_source_sql::{is_sql_root, SqlUrl, MEASURED_AGGREGATES};
 use bellwether_store::{parse_rfc3339, Cache, ObjectStoreBackend};
 use bellwether_types::{
     format, Certificate, Coverage, Error, Evidence, EvidenceBody, FileFingerprint, Hash, HashKind,
@@ -42,6 +48,7 @@ use roaring::RoaringBitmap;
 use serde::{Deserialize, Serialize};
 
 use crate::engine::{folder_changes, guard, Engine, Pinned};
+use crate::engine_fix::{engine_shape, EngineCompare, EngineRun};
 use crate::index::stale_index;
 use crate::results::{total, Cost, Written};
 
@@ -87,6 +94,10 @@ pub struct FixRequest {
     /// proposal is refused right after the score ([`Refusal::NothingToGain`]).
     #[serde(default)]
     pub allow_no_gain: bool,
+    /// For a rewrite of engine queries (ADR 033): how its before and after
+    /// results are compared (default: by the proposal's key columns alone).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub engine: Option<EngineCompare>,
 }
 
 /// The score stage's outcome.
@@ -97,10 +108,31 @@ pub enum Score {
     Replayed {
         /// The Replay.
         replay: Box<Written>,
-        /// Summed over runs, under the current configuration.
+        /// Summed over runs, under the current configuration. A run no
+        /// current spec serves is priced, over Parquet files, as their
+        /// min/max statistics read it (the Replay's `unserved` says so).
         current: Cost,
         /// Summed over runs, under the proposal.
         proposed: Cost,
+    },
+    /// Every cost measured (`exact: false`, `model` named). Over a table
+    /// (ADR 027): a Replay computed now and not recorded, since the ledger
+    /// keeps exact current costs only for anything but a measured rewrite
+    /// (ADR 005); nothing is applied to a table, so no gain gate runs. In a
+    /// query engine (ADR 033): the Replay of a rewrite measured from the
+    /// engine's own query log, recorded before anything else, with the
+    /// twin's prediction.
+    Measured {
+        /// The Replay, recorded (engine) or as it would be stored (table),
+        /// with its hash.
+        replay: Box<Written>,
+        /// Summed over runs, under the current configuration (measured).
+        current: Cost,
+        /// Summed over runs, under the proposal (measured).
+        proposed: Cost,
+        /// The cost model: `measured: logical bytes from per-unit
+        /// aggregates` over a table, `<engine>.query_log` in an engine.
+        model: String,
     },
     /// The proposal kind has no defined replay.
     NotScorable {
@@ -177,13 +209,46 @@ pub enum Refusal {
         /// The passing certificate.
         certificate: Hash,
     },
-    /// The Key proposal's replay predicts no saving on the workload: summed
-    /// over its runs, the proposal reads at least as many bytes as the
-    /// current configuration (the measure `why` recommends by). Refused
-    /// right after the score, before the verify, so nothing but the Replay
-    /// is written; `allow_no_gain` goes on anyway. A verify-only run is
-    /// not gated (it applies nothing); applying its certificate is. CLI
+    /// The proposal verified, and its target is a table (ADR 027): the
+    /// engine creates no index inside a database and deploys no job, so
+    /// apply is attest-only. The passing certificate is written; no
+    /// Receipt is, because a Receipt attests an apply the engine made.
+    /// `run` is what a human (or a CI gate) runs to apply a key. CLI
     /// exit 3.
+    AttestOnly {
+        /// The passing certificate.
+        certificate: Hash,
+        /// The table root the proposal targets (the data root).
+        target: String,
+        /// For a key: one `CREATE INDEX` per table, written by the engine.
+        /// Empty for a rewrite.
+        run: Vec<String>,
+        /// For a rewrite: the proposal's `after` text as the agent wrote it,
+        /// verified on the outputs given and never run by the engine. Not a
+        /// statement the engine vouches for: a human reviews it before
+        /// deploying it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        proposed_rewrite: Option<String>,
+    },
+    /// A query engine refused to export a rewrite's results (ADR 033): the
+    /// export is the measured run, so nothing was measured, and there is no
+    /// certificate and no receipt. CLI exit 3.
+    ExportDenied {
+        /// The engine root.
+        engine: String,
+        /// The permission the export needs.
+        permission: String,
+        /// The whole message, naming what to grant.
+        message: String,
+    },
+    /// The proposal's replay predicts no saving on the workload: summed
+    /// over its runs, the proposal reads at least as many bytes as the
+    /// current configuration (the measure `why` recommends by; for a
+    /// rewrite of engine queries, the bytes the engine's log says each
+    /// query read). Refused right after the score, before the verify, so
+    /// nothing but the Replay is written; `allow_no_gain` goes on anyway. A
+    /// verify-only run is not gated (it applies nothing); applying its
+    /// certificate is, on the apply tier's own measurement. CLI exit 3.
     NothingToGain {
         /// The Replay that predicts it.
         replay: Hash,
@@ -192,11 +257,43 @@ pub enum Refusal {
         /// Bytes with the proposal, summed over runs.
         proposed_bytes: u64,
     },
+    /// The apply tier ran a rewrite of engine queries again, in the state
+    /// the certificate verified, and one query's measurement disagrees with
+    /// the certified Replay's on rows read, bytes read, or result rows: the
+    /// numbers a receipt would attest are not the numbers verified. Nothing
+    /// is written. CLI exit 3.
+    MeasurementChanged {
+        /// The certificate.
+        certificate: Hash,
+        /// The measured Replay it cites.
+        replay: Hash,
+        /// The pair, in the proposal's order.
+        pair: u64,
+        /// `before` or `after`.
+        side: String,
+        /// Rows read, as certified.
+        certified_read_rows: u64,
+        /// Rows read now.
+        measured_read_rows: u64,
+        /// Bytes read, as certified.
+        certified_read_bytes: u64,
+        /// Bytes read now.
+        measured_read_bytes: u64,
+        /// Result rows, as certified.
+        certified_result_rows: u64,
+        /// Result rows now.
+        measured_result_rows: u64,
+    },
 }
 
 /// The gain gate: a refusal when the proposal reads no fewer bytes than the
 /// current configuration and the caller did not allow it.
-fn no_gain(replay: &Hash, current: &Cost, proposed: &Cost, allow: bool) -> Option<Refusal> {
+pub(crate) fn no_gain(
+    replay: &Hash,
+    current: &Cost,
+    proposed: &Cost,
+    allow: bool,
+) -> Option<Refusal> {
     (!allow && proposed.bytes >= current.bytes).then_some(Refusal::NothingToGain {
         replay: *replay,
         current_bytes: current.bytes,
@@ -219,6 +316,19 @@ pub enum FixOutcome {
         /// Set when the realized replay could not be computed after the
         /// receipt was written; the receipt stands.
         warning: Option<String>,
+    },
+    /// A rewrite of engine queries verified and attested (ADR 033): an
+    /// attest-only Receipt (nothing applied; `manifest_after ==
+    /// manifest_before`). A human or a CI gate deploys `deploy` in
+    /// `target`; the engine changes nothing there.
+    Attested {
+        /// The attest-only Receipt.
+        receipt: Box<Written>,
+        /// The engine the queries run in.
+        target: String,
+        /// The `after` query of each pair, as the agent wrote them, in the
+        /// proposal's order: what a human deploys after review.
+        deploy: Vec<String>,
     },
     /// Verified; `verify_only` was set, nothing applied.
     Verified,
@@ -262,6 +372,34 @@ pub struct FixResult {
     pub verification: Option<Reconciliation>,
     /// Stages 3 and 4.
     pub outcome: FixOutcome,
+    /// The signatures this call wrote (ADR 029): with a signing key, the
+    /// Receipt and the Certificate this call wrote, signed right after the
+    /// Receipt was written, or the passing Certificate of a verify-only run.
+    /// Empty without a signing key, and whenever nothing was attested or
+    /// verified.
+    pub signatures: Vec<SignatureWritten>,
+    /// For a rewrite of engine queries (ADR 033): what each query measured
+    /// in the engine, the exports, and the engine's identity before and
+    /// after. Omitted otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub engine: Option<EngineRun>,
+}
+
+/// One signature `fix` wrote.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SignatureWritten {
+    /// The record signed.
+    pub record: Hash,
+    /// Its kind: a receipt or a certificate.
+    pub kind: RecordKind,
+    /// The signing key's id (BLAKE3 of its public key).
+    pub key_id: Hash,
+    /// When it was signed: the engine's clock, RFC 3339 UTC with
+    /// milliseconds.
+    pub signed_at: String,
+    /// The signature object's store path,
+    /// `ledger/<record>.sig.<key id>.json`.
+    pub path: String,
 }
 
 /// What scoring, verifying, and applying depend on now: the current
@@ -293,6 +431,7 @@ impl Engine {
                 )),
             }
         })
+        .map_err(|e| crate::engine::root_hint(self.root(), e))
     }
 
     /// The apply tier as a dry run: resolves `certificate` and its proposal
@@ -383,6 +522,7 @@ impl Engine {
         }
         let before = pinned.as_ref().map_or(0, Pinned::sequence);
         let mut result = FixResult {
+            engine: None,
             proposal: written,
             manifest_before: before.to_string(),
             score: None,
@@ -391,13 +531,14 @@ impl Engine {
             invariant: None,
             verification: None,
             outcome: FixOutcome::Verified,
+            signatures: Vec::new(),
         };
         match &proposal.body {
             ProposalBody::Layout { .. } => {
                 result.outcome = refused(Refusal::LayoutNotApplicable);
                 Ok(result)
             }
-            ProposalBody::Key { spec } => {
+            ProposalBody::Key { spec, .. } => {
                 // A key already complete has nothing to apply: refused
                 // before anything is scored, so the refusal writes nothing.
                 if !req.verify_only && complete(pinned.as_ref(), spec) {
@@ -416,24 +557,49 @@ impl Engine {
                 let cache = self.cache()?;
                 let workload = load_workload(self, &cache, &workload_hash)?;
                 // 1. Score.
-                let replay = self.score(&replayer, hash, &workload, &cache)?;
-                let replay_hash = replay.0.hash;
-                // A verify-only run applies nothing, so it is not gated; applying
-                // its certificate later re-scores and is.
-                let gate = no_gain(
-                    &replay_hash,
-                    &replay.1,
-                    &replay.2,
-                    req.allow_no_gain || req.verify_only,
-                );
-                result.score = Some(Score::Replayed {
-                    replay: Box::new(replay.0),
-                    current: replay.1,
-                    proposed: replay.2,
-                });
-                if let Some(r) = gate {
-                    result.outcome = refused(r);
-                    return Ok(result);
+                let mut replay_hash = None;
+                if self.is_table() {
+                    let (h, scored) = measured_score(self, &replayer, hash, &workload, &cache)?;
+                    // The same gain gate as over files, on measured costs.
+                    let gate = no_gain(
+                        &h,
+                        &total(&scored.replay.current),
+                        &total(&scored.replay.proposed),
+                        req.allow_no_gain || req.verify_only,
+                    );
+                    result.score = Some(Score::Measured {
+                        current: total(&scored.replay.current),
+                        proposed: total(&scored.replay.proposed),
+                        model: MEASURED_AGGREGATES.to_string(),
+                        replay: Box::new(Written {
+                            hash: h,
+                            record: Record::Replay(scored.replay),
+                        }),
+                    });
+                    if let Some(r) = gate {
+                        result.outcome = refused(r);
+                        return Ok(result);
+                    }
+                } else {
+                    let replay = self.score(&replayer, hash, &workload, &cache)?;
+                    replay_hash = Some(replay.0.hash);
+                    // A verify-only run applies nothing, so it is not gated;
+                    // applying its certificate later re-scores and is.
+                    let gate = no_gain(
+                        &replay.0.hash,
+                        &replay.1,
+                        &replay.2,
+                        req.allow_no_gain || req.verify_only,
+                    );
+                    result.score = Some(Score::Replayed {
+                        replay: Box::new(replay.0),
+                        current: replay.1,
+                        proposed: replay.2,
+                    });
+                    if let Some(r) = gate {
+                        result.outcome = refused(r);
+                        return Ok(result);
+                    }
                 }
                 // 2. Verify.
                 let (plan, cert, verification) = self.verify_key(
@@ -454,23 +620,45 @@ impl Engine {
                     return Ok(result);
                 }
                 if req.verify_only {
+                    // A verify-only run's attestation is its passing
+                    // certificate, written by this call.
+                    result.signatures =
+                        self.sign_written(&[(cert.hash, RecordKind::Certificate)], None)?;
                     return Ok(result);
                 }
-                // 3 and 4, behind the trust-boundary gate.
-                result.outcome = match self.gate(&cert.hash, &certificate, true)? {
-                    Err(r) => refused(r),
-                    Ok(before) => self.apply_and_attest(
-                        &proposal,
-                        hash,
-                        spec,
-                        &replay_hash,
-                        &cert.hash,
-                        before,
-                        &workload,
-                    )?,
+                let Some(replay_hash) = replay_hash else {
+                    // A table: attest-only (ADR 027).
+                    result.outcome = refused(self.attest_only(&cert.hash, &proposal.body)?);
+                    return Ok(result);
                 };
+                // 3 and 4, behind the trust-boundary gate.
+                match self.gate(&cert.hash, &certificate, true)? {
+                    Err(r) => result.outcome = refused(r),
+                    Ok(before) => {
+                        (result.outcome, result.signatures) = self.apply_and_attest(
+                            &proposal,
+                            hash,
+                            spec,
+                            &replay_hash,
+                            &cert.hash,
+                            true,
+                            before,
+                            &workload,
+                        )?;
+                    }
+                }
                 Ok(result)
             }
+            ProposalBody::Rewrite { shape } if engine_shape(&proposal.body).is_some() => self
+                .fix_engine_rewrite(
+                    result,
+                    hash,
+                    &proposal,
+                    shape,
+                    req,
+                    before,
+                    pinned.as_ref().map(anchor).as_ref(),
+                ),
             ProposalBody::Rewrite { shape } => {
                 result.score = Some(Score::NotScorable {
                     reason: "the replay crate defines no replay for rewrite proposals (contract \
@@ -487,9 +675,18 @@ impl Engine {
                 result.verification = Some(verification);
                 let certificate = cert_of(&cert)?.clone();
                 result.certificate = Some(cert.clone());
+                // Attest-only when the data root is a table; a rewrite over
+                // a folder has no replay to attest, whatever its outputs are,
+                // so `fix --certificate` (which sees no outputs) agrees.
+                let table = self.is_table();
                 result.outcome = match failed(&cert.hash, &certificate) {
                     Some(r) => refused(r),
-                    None if req.verify_only => FixOutcome::Verified,
+                    None if req.verify_only => {
+                        result.signatures =
+                            self.sign_written(&[(cert.hash, RecordKind::Certificate)], None)?;
+                        FixOutcome::Verified
+                    }
+                    None if table => refused(self.attest_only(&cert.hash, &proposal.body)?),
                     None => refused(Refusal::NoReplay {
                         certificate: cert.hash,
                     }),
@@ -501,6 +698,7 @@ impl Engine {
 
     /// Apply and attest a certificate written earlier: every check runs
     /// before anything is written, and the replay is recomputed now.
+    #[allow(clippy::too_many_lines)]
     fn apply_certificate(
         &self,
         cert_hash: &Hash,
@@ -529,6 +727,7 @@ impl Engine {
             .clone()
             .unwrap_or_default();
         let mut result = FixResult {
+            engine: None,
             proposal: written,
             manifest_before: certified.clone(),
             score: None,
@@ -537,6 +736,7 @@ impl Engine {
             invariant: None,
             verification: None,
             outcome: FixOutcome::Verified,
+            signatures: Vec::new(),
         };
         // The gate runs before anything is written; for a key proposal it
         // also checks that the data is still the data certified.
@@ -552,6 +752,60 @@ impl Engine {
             ProposalBody::Layout { .. } => {
                 result.outcome = refused(Refusal::LayoutNotApplicable);
             }
+            ProposalBody::Rewrite { shape } if engine_shape(&proposal.body).is_some() => {
+                return self.apply_engine_rewrite(
+                    result,
+                    cert_hash,
+                    &certificate,
+                    &proposal_hash,
+                    &proposal,
+                    shape,
+                    before,
+                    dry_run,
+                    allow_no_gain,
+                );
+            }
+            // A table: the gate passed, and the engine applies nothing to a
+            // table (ADR 027).
+            body if self.is_table() => {
+                if let ProposalBody::Rewrite { shape } = body {
+                    result.invariant = Some(shape.invariant.clone());
+                }
+                if let ProposalBody::Key { .. } = body {
+                    // Re-scored now, and gated like `fix --proposal`. The
+                    // dry run scores too (a measured score is never
+                    // recorded, so it writes nothing) and so agrees with
+                    // the real apply.
+                    let Coverage::Workload { workload, .. } = &certificate.coverage else {
+                        return Err(not_workload_covered(cert_hash));
+                    };
+                    let source = self.source(None)?;
+                    let replayer = replayer(self, &*source, None)?;
+                    let cache = self.cache()?;
+                    let workload = load_workload(self, &cache, workload)?;
+                    let (h, scored) =
+                        measured_score(self, &replayer, &proposal_hash, &workload, &cache)?;
+                    let (current, proposed) = (
+                        total(&scored.replay.current),
+                        total(&scored.replay.proposed),
+                    );
+                    let gate = no_gain(&h, &current, &proposed, allow_no_gain);
+                    result.score = Some(Score::Measured {
+                        current,
+                        proposed,
+                        model: MEASURED_AGGREGATES.to_string(),
+                        replay: Box::new(Written {
+                            hash: h,
+                            record: Record::Replay(scored.replay),
+                        }),
+                    });
+                    if let Some(r) = gate {
+                        result.outcome = refused(r);
+                        return Ok(result);
+                    }
+                }
+                result.outcome = refused(self.attest_only(cert_hash, body)?);
+            }
             ProposalBody::Rewrite { shape } => {
                 result.invariant = Some(shape.invariant.clone());
                 result.outcome = refused(Refusal::NoReplay {
@@ -561,7 +815,7 @@ impl Engine {
             // Already complete: the apply would commit nothing. Refused
             // here, before the replay is scored, so the dry run and the
             // real apply agree and the refusal writes nothing.
-            ProposalBody::Key { spec } if complete(self.pin()?.as_ref(), spec) => {
+            ProposalBody::Key { spec, .. } if complete(self.pin()?.as_ref(), spec) => {
                 result.outcome = refused(Refusal::NothingToApply {
                     sequence: before.to_string(),
                 });
@@ -575,7 +829,7 @@ impl Engine {
                     expected: before.saturating_add(1),
                 };
             }
-            ProposalBody::Key { spec } => {
+            ProposalBody::Key { spec, .. } => {
                 let Coverage::Workload { workload, .. } = &certificate.coverage else {
                     return Err(not_workload_covered(cert_hash));
                 };
@@ -597,18 +851,45 @@ impl Engine {
                     result.outcome = refused(r);
                     return Ok(result);
                 }
-                result.outcome = self.apply_and_attest(
+                // The certificate was written by an earlier call (which
+                // signed it then, if it had a key); this call signs only
+                // the receipt it writes.
+                (result.outcome, result.signatures) = self.apply_and_attest(
                     &proposal,
                     &proposal_hash,
                     spec,
                     &replay_hash,
                     cert_hash,
+                    false,
                     before,
                     &workload,
                 )?;
             }
         }
         Ok(result)
+    }
+
+    /// The attest-only refusal for a proposal over a table (ADR 027): what
+    /// a human runs to apply it.
+    fn attest_only(&self, certificate: &Hash, body: &ProposalBody) -> Result<Refusal> {
+        let target = self.root().to_string();
+        let (run, proposed_rewrite) = match body {
+            ProposalBody::Key { spec, .. } => match self.table_url() {
+                Some(url) => (
+                    SqlUrl::parse(url)?.create_index_statements(spec.columns()),
+                    None,
+                ),
+                None => (Vec::new(), None),
+            },
+            ProposalBody::Rewrite { shape } => (Vec::new(), Some(shape.after.clone())),
+            ProposalBody::Layout { .. } => (Vec::new(), None),
+        };
+        Ok(Refusal::AttestOnly {
+            certificate: *certificate,
+            target,
+            run,
+            proposed_rewrite,
+        })
     }
 
     /// Stage 1: the replay, computed now and written now.
@@ -635,7 +916,7 @@ impl Engine {
     }
 
     /// Stage 2 for a Key proposal.
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     fn verify_key(
         &self,
         proposal: &Hash,
@@ -658,6 +939,21 @@ impl Engine {
                          from the keys a slow lookup ran"
                             .into(),
                 })?;
+        let text = runs
+            .iter()
+            .map(|r| r.query().map(|q| q.text_op().is_some()))
+            .collect::<Result<Vec<bool>>>()?;
+        if text.iter().any(|t| *t) && !text.iter().all(|t| *t) {
+            return Err(Error::InvalidArgument {
+                field: "workload",
+                reason: "the workload mixes text lookups (contains, has_token, has_prefix) with \
+                         key lookups; verify compares one kind at a time, so record each as its \
+                         own workload"
+                    .into(),
+            });
+        }
+        let text = text.first().copied().unwrap_or(false);
+        let membership = membership_runs(runs)?;
         if runs.iter().any(|r| r.columns != columns) {
             return Err(Error::InvalidArgument {
                 field: "workload",
@@ -683,9 +979,14 @@ impl Engine {
                     .1 |= &e.row_groups;
             }
             // Both encodings of a float zero, as the planner probes them:
-            // SQL equality matches a row stored under either zero.
-            let all: Vec<usize> = (0..rk.columns().len()).collect();
-            keys.extend(rk.all_probes(&all));
+            // SQL equality matches a row stored under either zero. A text
+            // run's values are words, substrings, or prefixes, and a
+            // membership run's (B4) list elements, not reconcile keys: their
+            // rows are chosen by the row filter (`rows_asked`).
+            if !text && !membership {
+                let all: Vec<usize> = (0..rk.columns().len()).collect();
+                keys.extend(rk.all_probes(&all));
+            }
             let column = replayer.planned_time_column(&specs, rk.columns(), &query)?;
             asked.push(AskedRun {
                 keys: rk,
@@ -712,15 +1013,67 @@ impl Engine {
             None => cache.get_cached(&workload.hash())?,
         };
         let workload_age = cached.map_or(Duration::ZERO, |(_, age)| age);
-        let ignored = unhashable(replayer.schema(), &columns);
-        let rec_spec =
-            ReconcileSpec::new(columns)
-                .ignore(ignored)
-                .coverage(CoverageRequest::Workload(WorkloadKeys {
+        // A text workload (B5) names words and substrings, and a membership
+        // workload (B4) list elements, not keys: rows are compared keyed by
+        // every hashable column, and chosen by the runs' text matches or
+        // membership tests. A workload keyed on an expression (an expr
+        // key's runs) compares the rows whose expression value is one of its
+        // keys, each row identified by the expression's input columns.
+        let (key_columns, coverage, keys_of) = if text || membership {
+            let hashable: Vec<String> = replayer
+                .schema()
+                .fields()
+                .iter()
+                .filter(|f| bellwether_core::encoding::check_supported(f.data_type()).is_ok())
+                .map(|f| f.name().clone())
+                .collect();
+            if hashable.is_empty() {
+                return Err(Error::Other(format!(
+                    "every column of {} is nested (a list, map, or struct), so verify has no \
+                     column to compare rows by and cannot certify {}; build it without a \
+                     receipt with `bellwether index {} --key {}`",
+                    self.root(),
+                    crate::spec::label(spec),
+                    self.root(),
+                    crate::spec::label(spec)
+                )));
+            }
+            (
+                hashable,
+                CoverageRequest::WorkloadRows {
+                    workload: workload.hash(),
+                    age: workload_age,
+                },
+                None,
+            )
+        } else {
+            let keys_of = match columns.as_slice() {
+                [c] if bellwether_core::expr::is_expression(c, replayer.schema()) => {
+                    Some(c.clone())
+                }
+                _ => None,
+            };
+            let key_columns = match &keys_of {
+                Some(e) => bellwether_core::expr::Expr::parse(e)?.columns(),
+                None => columns,
+            };
+            (
+                key_columns,
+                CoverageRequest::Workload(WorkloadKeys {
                     workload: workload.hash(),
                     age: workload_age,
                     keys,
-                }));
+                }),
+                keys_of,
+            )
+        };
+        let ignored = unhashable(replayer.schema(), &key_columns);
+        let mut rec_spec = ReconcileSpec::new(key_columns)
+            .ignore(ignored)
+            .coverage(coverage);
+        if let Some(e) = keys_of {
+            rec_spec = rec_spec.keys_of(e);
+        }
         let rec_spec = rows_asked(source, replayer.catalog(), &asked, rec_spec)?;
         let ctx = CertificateContext {
             proposal: Some(*proposal),
@@ -768,8 +1121,16 @@ impl Engine {
         outputs: &RewriteOutputs,
         pinned: Option<&Pinned>,
     ) -> Result<(Written, Reconciliation)> {
-        let before = canonical_dir(&outputs.before)?;
-        let after = canonical_dir(&outputs.after)?;
+        let side = |p: &str| -> Result<(String, String)> {
+            if is_sql_root(p) {
+                Ok((p.to_string(), SqlUrl::parse(p)?.root()))
+            } else {
+                let c = canonical_dir(p)?;
+                Ok((c.clone(), c))
+            }
+        };
+        let (before, before_root) = side(&outputs.before)?;
+        let (after, after_root) = side(&outputs.after)?;
         let left_source = self.output_source(&before)?;
         let right_source = self.output_source(&after)?;
         let mut spec = ReconcileSpec::new(outputs.key.clone())
@@ -786,8 +1147,8 @@ impl Engine {
             clock: self.options().clock.clone(),
         };
         let certified = self.reconciler(spec, Options::default())?.certify(
-            &Side::new(&*left_source, &before),
-            &Side::new(&*right_source, &after),
+            &Side::new(&*left_source, &before_root),
+            &Side::new(&*right_source, &after_root),
             &ctx,
         )?;
         let cert = self.record_certified(&certified)?;
@@ -810,6 +1171,9 @@ impl Engine {
         &self,
         certified: &bellwether_verify::Certified,
     ) -> Result<Written> {
+        // A run over a table ends before its certificate is written: a
+        // table that changed without a snapshot is refused, never certified.
+        self.finish_tables()?;
         let hash = bellwether_verify::record(&self.ledger()?, certified)?;
         Ok(Written {
             hash,
@@ -874,7 +1238,9 @@ impl Engine {
     }
 
     /// Stages 3 and 4, after the gate: build the key in one commit, which
-    /// must be exactly `before + 1`, then write the receipt.
+    /// must be exactly `before + 1`, then write the receipt and, with a
+    /// signing key, sign it (and the certificate, when `certificate_written`
+    /// says this call wrote it) right after `put_receipt` returns.
     #[allow(clippy::too_many_arguments)]
     fn apply_and_attest(
         &self,
@@ -883,16 +1249,13 @@ impl Engine {
         spec: &KeySpec,
         replay: &Hash,
         cert_hash: &Hash,
+        certificate_written: bool,
         before: u64,
         workload: &Workload,
-    ) -> Result<FixOutcome> {
+    ) -> Result<(FixOutcome, Vec<SignatureWritten>)> {
         #[cfg(test)]
         test_seam::before_apply(self);
-        let mut options = BuildOptions::new(self.format().kind());
-        options.chunk_size = self.options().chunk_size;
-        options.schema.clone_from(&self.options().schema);
-        options.fingerprint_policy = self.options().fingerprint_policy;
-        options.exclude = self.excluded();
+        let options = self.build_options(Vec::new());
         let report = Builder::new(Arc::clone(self.store()?), "").build(
             self.root(),
             std::slice::from_ref(spec),
@@ -900,9 +1263,11 @@ impl Engine {
         )?;
         let after = match advance(before, report.sequence) {
             Ok(after) => after,
-            Err(refusal) => return Ok(refused(refusal)),
+            Err(refusal) => return Ok((refused(refusal), Vec::new())),
         };
         let receipt = Receipt {
+            attest_only: false,
+            prediction: None,
             record_version: format::RECORD_VERSION,
             evidence: proposal.evidence.clone(),
             proposal: *proposal_hash,
@@ -914,6 +1279,14 @@ impl Engine {
         };
         let now = self.manifest()?.map_or(0, |m| m.sequence);
         let hash = self.ledger()?.put_receipt(&receipt, &now.to_string())?;
+        // Attest: sign only what this call wrote, and only now that the
+        // ledger has accepted the receipt.
+        let mut signed = vec![(hash, RecordKind::Receipt)];
+        if certificate_written {
+            signed.push((*cert_hash, RecordKind::Certificate));
+        }
+        let applied = format!("manifest {before} -> {after}");
+        let signatures = self.sign_written(&signed, Some(&applied))?;
         // After the apply: the same proposal replayed at manifest_after, the
         // realized cost `report` sets beside the predicted one.
         let (realized, warning) = match self.realize(proposal_hash, workload) {
@@ -926,15 +1299,114 @@ impl Engine {
                 )),
             ),
         };
-        Ok(FixOutcome::Applied {
-            receipt: Box::new(Written {
-                hash,
-                record: Record::Receipt(receipt),
-            }),
-            realized,
-            warning,
-        })
+        Ok((
+            FixOutcome::Applied {
+                receipt: Box::new(Written {
+                    hash,
+                    record: Record::Receipt(receipt),
+                }),
+                realized,
+                warning,
+            },
+            signatures,
+        ))
     }
+
+    /// Signs records this call wrote with the configured key, at the
+    /// engine's clock; nothing without a key. The hashes come from this
+    /// call's own writes, never from a request.
+    ///
+    /// `applied` names the change already committed (`manifest 3 -> 4`),
+    /// so a signing failure after the apply says the change stands.
+    pub(crate) fn sign_written(
+        &self,
+        records: &[(Hash, RecordKind)],
+        applied: Option<&str>,
+    ) -> Result<Vec<SignatureWritten>> {
+        let Some(key) = &self.options().signing_key else {
+            return Ok(Vec::new());
+        };
+        let ledger = self.ledger()?;
+        let signed_at = self.now();
+        let mut out = Vec::with_capacity(records.len());
+        for (i, (record, kind)) in records.iter().enumerate() {
+            let at = ledger.sign(record, key, &signed_at).map_err(|e| {
+                let applied = applied
+                    .map_or_else(String::new, |a| format!("the change is applied ({a}) and "));
+                // Signing stops at the first failure: name what else this
+                // call wrote that is left unsigned with it.
+                let rest: Vec<String> = records[i + 1..]
+                    .iter()
+                    .map(|(h, k)| format!("the {} {h} this call wrote", k.as_str()))
+                    .collect();
+                let also = if rest.is_empty() {
+                    String::new()
+                } else {
+                    format!(" (and so is {})", rest.join(" and "))
+                };
+                Error::Other(format!(
+                    "{applied}{} {record} is written, but it could not be signed ({e}); it \
+                     stands unsigned{also}, since only the call that writes a record signs it. \
+                     Check that the index location is writable for `ledger/` (each signature \
+                     is a new file there), then sign the next change; `bellwether receipt \
+                     show` shows this one as unsigned",
+                    kind.as_str()
+                ))
+            })?;
+            out.push(SignatureWritten {
+                record: *record,
+                kind: *kind,
+                key_id: at.key_id,
+                signed_at: signed_at.clone(),
+                path: at.path(),
+            });
+        }
+        Ok(out)
+    }
+}
+
+/// Scores `proposal` on `workload` without recording the Replay: over a
+/// table (ADR 027) every cost, current and proposed, is measured, so each
+/// is marked inexact and the Replay names [`MEASURED_AGGREGATES`]. The ledger
+/// keeps only replays whose current costs are exact (ADR 005), so a
+/// measured one is returned, hashed as it would be stored, and never
+/// stored: nothing measured is ever recorded as exact.
+pub(crate) fn measured_score(
+    engine: &Engine,
+    replayer: &Replayer<'_>,
+    proposal: &Hash,
+    workload: &Workload,
+    cache: &Cache<ObjectStoreBackend>,
+) -> Result<(Hash, bellwether_replay::Scored)> {
+    let body = match engine.get(proposal)?.record {
+        Record::Proposal(p) => p.body,
+        _ => {
+            return Err(Error::WrongKind {
+                hash: *proposal,
+                expected: HashKind::Proposal,
+                found: "another record".into(),
+            })
+        }
+    };
+    let mut scored = replayer
+        .score(proposal, &body, workload, cache, &engine.now())
+        .map_err(Error::from)?;
+    mark_measured(&mut scored.replay);
+    let hash = Record::Replay(scored.replay.clone()).hash()?;
+    Ok((hash, scored))
+}
+
+/// Marks every cost of `replay` measured and names the model, on both
+/// `exact` and `exactness` (record version 3: they agree, ledger rule 7b).
+/// Runs no spec serves stay priced as a raw scan (`unserved` absent).
+pub(crate) fn mark_measured(replay: &mut bellwether_types::Replay) {
+    for c in replay.current.iter_mut().chain(replay.proposed.iter_mut()) {
+        c.exact = false;
+        c.exactness = bellwether_types::Exactness::Measured {
+            model: MEASURED_AGGREGATES.to_string(),
+        };
+    }
+    replay.model = Some(MEASURED_AGGREGATES.to_string());
 }
 
 /// The data root's catalog digest as the verifier computes a scanned side's
@@ -1022,6 +1494,8 @@ pub(crate) mod test_seam {
 /// The sequence a Key apply produced, or the refusal: nothing committed (the
 /// key was already complete), or another commit landed first. A Key
 /// proposal must advance the manifest by exactly the apply's own commit.
+// The refusal is returned as is; it is built once per apply.
+#[allow(clippy::result_large_err)]
 fn advance(before: u64, committed: Option<u64>) -> std::result::Result<u64, Refusal> {
     let after = committed.unwrap_or(before);
     if after <= before {
@@ -1087,15 +1561,30 @@ fn anchor(p: &Pinned) -> ManifestAnchor {
     }
 }
 
-fn replayer<'a>(
+/// The replayer every `why` and `fix` replay is computed by, pinned to
+/// `pinned` or over the unindexed folder: over Parquet files, a run no spec
+/// of a configuration serves is priced as the files' own min/max statistics
+/// read it (`Baseline::ParquetStats`), so `why`'s numbers, the score `fix`
+/// gates on, and the realized replay after the apply are one measure, the
+/// Replay a receipt cites. CSV and JSON lines have no footer statistics,
+/// and a table's costs are measured (ADR 027): such a run reads every row
+/// group.
+pub(crate) fn replayer<'a>(
     engine: &Engine,
     source: &'a dyn Source,
     pinned: Option<&Pinned>,
 ) -> Result<Replayer<'a>> {
-    match pinned {
-        Some(p) => Replayer::for_snapshot(source, &p.snapshot),
-        None => Replayer::unindexed(source, engine.root(), &engine.partitioning(None)?),
-    }
+    let replayer = match pinned {
+        Some(p) => Replayer::for_snapshot(source, &p.snapshot)?,
+        None => Replayer::unindexed(source, engine.root(), &engine.partitioning(None)?)?
+            .with_fingerprint_policy(engine.options().fingerprint_policy.unwrap_or_default()),
+    };
+    Ok(match engine.format() {
+        crate::SourceFormat::Parquet if !engine.is_table() => {
+            replayer.with_unserved(Baseline::ParquetStats)
+        }
+        _ => replayer,
+    })
 }
 
 /// The recorded workload `hash`: absent is [`Error::RecordNotFound`];
@@ -1115,6 +1604,25 @@ fn unhashable(schema: &arrow::datatypes::Schema, keys: &[String]) -> Vec<String>
         .collect()
 }
 
+/// Whether a workload's runs are list-membership runs (B4); a workload
+/// mixing them with key lookups is refused, since verify compares one kind
+/// at a time.
+fn membership_runs(runs: &[RecordedRun]) -> Result<bool> {
+    let membership = runs
+        .iter()
+        .map(|r| r.query().map(|q| q.is_membership()))
+        .collect::<Result<Vec<bool>>>()?;
+    if membership.iter().any(|m| *m) && !membership.iter().all(|m| *m) {
+        return Err(Error::InvalidArgument {
+            field: "workload",
+            reason: "the workload mixes list-membership runs with key lookups; verify compares \
+                     one kind at a time, so record each as its own workload"
+                .into(),
+        });
+    }
+    Ok(membership.first().copied().unwrap_or(false))
+}
+
 /// One run as verify compares it: its keys, its lookup, the time column the
 /// lookup is planned on (`Replayer::planned_time_column`; `None` when no
 /// index can plan it, so the run reads every row group), and its plan's
@@ -1132,7 +1640,10 @@ struct AskedRun {
 /// run's own, and a `latest` lookback's window `[newest − N, newest]` is
 /// built from each key's newest time in `source` (the left side, every
 /// live row group of `catalog`). A row is compared, on both sides, when
-/// some run keeps it: one of the run's keys, within its window. Locate and
+/// some run keeps it: one of the run's keys, within its window, or for a
+/// text run (B5) a row whose string matches one of the run's values, and for
+/// a membership run (B4) a row whose list holds any (or every one) of the
+/// run's values. Locate and
 /// plain `latest` runs keep every row of their keys, and `latest` and
 /// `asof` compare the newest kept version per key (`latest_by`). An index
 /// whose bounds disagree with the data plans other row groups than these
@@ -1154,11 +1665,42 @@ fn rows_asked(
     let mut narrowed = false;
     let mut filter = Vec::with_capacity(runs.len());
     for run in runs {
+        if run.query.is_membership() {
+            // The rows whose list holds the run's values, from the
+            // workload alone.
+            let [column] = run.keys.columns() else {
+                return Err(Error::KeySpec(format!(
+                    "a membership run looks up one list column, not {:?}",
+                    run.keys.columns()
+                )));
+            };
+            filter.push(bellwether_replay::membership_residual(
+                column,
+                &run.keys,
+                matches!(run.query, RunQuery::ContainsAll),
+            ));
+            narrowed = true;
+            continue;
+        }
+        if let Some(text) = bellwether_replay::text_residual(&run.keys, &run.query)? {
+            // The rows whose string matches the run's values, from the
+            // workload alone.
+            filter.push(text);
+            narrowed = true;
+            continue;
+        }
         let all: Vec<usize> = (0..run.keys.columns().len()).collect();
-        let mut tests = vec![Predicate::In {
-            columns: run.keys.columns().to_vec(),
-            values: run.keys.all_probes(&all),
-        }];
+        let keyed = match run.keys.columns() {
+            [c] if bellwether_core::expr::is_expression(c, schema) => Predicate::ExprIn {
+                expr: c.clone(),
+                values: run.keys.all_probes(&all),
+            },
+            columns => Predicate::In {
+                columns: columns.to_vec(),
+                values: run.keys.all_probes(&all),
+            },
+        };
+        let mut tests = vec![keyed];
         let between = |c: &str, lo: i64, hi: i64| -> Result<Predicate> {
             let t = ty(c)?;
             let floor = bellwether_core::encoding::ts_min(&t)?;
@@ -1376,6 +1918,7 @@ fn union_plan(
             file: fp.clone(),
             row_groups: rgs.clone(),
             bytes: b,
+            columns: None,
         });
     }
     let plan = ScanPlan {
@@ -1385,6 +1928,9 @@ fn union_plan(
         bytes,
         row_groups_total: catalog.len() as u64,
         row_groups_selected: count,
+        projected_bytes: None,
+        order: None,
+        rows: None,
     };
     catalog.verify_plan(&plan)?;
     Ok(plan)
@@ -1549,8 +2095,9 @@ mod tests {
     fn an_incomplete_plan_fails_verify_and_writes_no_receipt() {
         let dir = tempfile::tempdir().unwrap();
         let data = dir.path().join("data");
-        // ids 0..299 once each: 5 and 77 in part-000, 123 in part-001.
-        common::ledger_corpus(&data, 3, 4, 25, 400);
+        // id 37k mod 400 for row k in 0..299: 5 (k 65) and 123 (k 79) in
+        // part-000, 77 (k 121) in part-001; min/max prunes nothing.
+        common::scattered_corpus(&data, 3, 4, 25, 400);
         let kf = dir.path().join("k.parquet");
         common::write_keys(&kf, "id", &[5, 77, 123]);
         let (e, wl, p) = setup(&data, &kf);
@@ -1624,7 +2171,9 @@ mod tests {
     fn a_commit_between_the_gate_and_the_apply_withholds_the_receipt() {
         let dir = tempfile::tempdir().unwrap();
         let data = dir.path().join("data");
-        common::ledger_corpus(&data, 3, 4, 25, 400);
+        // Ids scattered over row groups (37k mod 400): the files' min/max
+        // statistics skip nothing, so the key has a gain to apply.
+        common::scattered_corpus(&data, 3, 4, 25, 400);
         let kf = dir.path().join("k.parquet");
         common::write_keys(&kf, "id", &[5, 77, 123]);
         Engine::open(data.to_str().unwrap(), EngineOptions::default())
@@ -1816,10 +2365,13 @@ mod tests {
             let mut w = ArrowWriter::try_new(file, Arc::clone(&schema), Some(props)).unwrap();
             for r in 0..3 {
                 let d = FIRST + f * 3 + r;
+                // A day without A still spans it in its footer min/max
+                // ("0" to "B"), so a reader's own statistics read it and a
+                // key on symbol is worth building.
                 let syms = if (d - FIRST) % 2 == 0 {
                     ["A", "B", "A", "B"]
                 } else {
-                    ["B", "B", "B", "B"]
+                    ["0", "B", "B", "B"]
                 };
                 let ts: Vec<i64> = (0..4)
                     .map(|i| i64::from(d) * 86_400_000_000 + i * 1_000_000 + 1)
@@ -2164,6 +2716,7 @@ mod tests {
                 .propose(
                     ProposalBody::Key {
                         spec: crate::spec::parse("bloom:symbol@0.01").unwrap(),
+                        sidecars: Vec::new(),
                     },
                     &[ev],
                     "test",
@@ -2267,7 +2820,10 @@ mod tests {
                 ..WhyRequest::default()
             })
             .unwrap();
+        // An unserved asof run is bounded by its keys only, never by an
+        // instant (A is in every file), so the temporal floor is recommended.
         let rec = why.recommended.as_ref().expect("a recommendation");
+        let floor = rec.proposal;
         let wl = why.workload.as_ref().unwrap().hash;
         test_seam::set(|sel| {
             assert!(
@@ -2276,7 +2832,7 @@ mod tests {
             );
             sel.retain(|p, _| !p.ends_with("a-start.parquet"));
         });
-        let bad = fix_key(&e, rec.proposal, wl, true);
+        let bad = fix_key(&e, floor, wl, true);
         test_seam::clear();
         assert!(
             matches!(
@@ -2289,7 +2845,7 @@ mod tests {
             bad.outcome,
             bad.verification
         );
-        let ok = fix_key(&e, rec.proposal, wl, true);
+        let ok = fix_key(&e, floor, wl, true);
         assert!(
             matches!(ok.outcome, FixOutcome::Verified),
             "{:?}",

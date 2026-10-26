@@ -108,6 +108,8 @@ fn replay_and_source_catalog_digests_agree_on_a_built_index() {
             &root,
             &[KeySpec::Exact {
                 columns: vec!["id".into()],
+                counts: false,
+                bounds: None,
             }],
             &BuildOptions::new(SourceKind::Parquet),
         )

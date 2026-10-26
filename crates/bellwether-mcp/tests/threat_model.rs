@@ -22,8 +22,8 @@ use std::path::{Path, PathBuf};
 
 use bellwether_mcp::{Budget, Status};
 use common::{
-    code, delta, finish, json, ledger_corpus, objects, ok, server, server_at, write_file,
-    write_keys, CLOCKS,
+    code, delta, finish, json, ledger_corpus, objects, ok, scattered_corpus, server, server_at,
+    write_file, write_keys, CLOCKS,
 };
 use serde_json::{json, Value};
 
@@ -37,7 +37,7 @@ struct Loop {
 fn folder() -> Loop {
     let dir = tempfile::tempdir().unwrap();
     let data = dir.path().join("data");
-    ledger_corpus(&data, 3, 4, 25, 400);
+    scattered_corpus(&data, 3, 4, 25, 400);
     let keys = dir.path().join("k.parquet");
     write_keys(&keys, "id", &[5, 77, 123]);
     Loop {
@@ -222,39 +222,49 @@ fn no_smuggled_score(clock: Option<&str>) {
     let before = objects(&f.index);
     let spec = json!({"kind": "exact", "columns": ["id"]});
     let shape = json!({"before": "b", "after": "a", "invariant": "i"});
+    // A score or a replay is a caller-supplied cost, refused by name (ADR
+    // 033); any other unknown field is a plain schema error.
+    let cost = "caller_supplied_cost";
     let cases = [
         (
             "propose.key",
             json!({"spec": spec, "evidence": [ev], "by": "a", "score": 1.0}),
+            cost,
         ),
         (
             "propose.key",
             json!({"spec": {"kind": "exact", "columns": ["id"], "score": 9}, "evidence": [ev], "by": "a"}),
+            cost,
         ),
         (
             "propose.key",
             json!({"spec": spec, "evidence": [ev], "by": "a", "dry_run": true, "confidence": 1}),
+            "invalid_input",
         ),
         (
             "propose.layout",
             json!({"cluster_by": ["id"], "evidence": [ev], "by": "a", "score": 1}),
+            cost,
         ),
         (
             "propose.rewrite",
             json!({"shape": shape, "evidence": [ev], "by": "a", "score": 1}),
+            cost,
         ),
         (
             "propose.rewrite",
             json!({"shape": {"before": "b", "after": "a", "invariant": "i", "score": 1}, "evidence": [ev], "by": "a"}),
+            cost,
         ),
         (
             "propose.key",
             json!({"spec": {"kind": "bloom", "columns": ["id"], "fpr": 0.01, "replay": {}}, "evidence": [ev], "by": "a"}),
+            cost,
         ),
     ];
-    for (tool, args) in cases {
+    for (tool, args, want) in cases {
         let r = srv.call(tool, args.clone());
-        assert_eq!(code(&r), "invalid_input", "{tool} {args}");
+        assert_eq!(code(&r), want, "{tool} {args}");
         let errors = &r.envelope.refusal.as_ref().unwrap().fields["errors"];
         assert!(!errors.as_array().unwrap().is_empty());
     }
@@ -420,6 +430,18 @@ fn refusals(clock: Option<&str>) {
         // The text is the facade's typed refusal, as the CLI prints it.
         assert_eq!(json(&r)["outcome"], "refused");
     }
+    // A sidecar declaration has no receipt path: refused, typed, dry run or
+    // not, before anything is read or written.
+    for spec in ["temporal2:id@ts,batch", "exact:id@ts"] {
+        for dry in [true, false] {
+            let r = srv.call(
+                "propose.key",
+                json!({"spec": spec, "evidence": [ev], "by": "a", "dry_run": dry}),
+            );
+            assert_eq!(code(&r), "sidecar_not_proposable", "{spec} [dry={dry}]");
+            assert_eq!(json(&r)["refusal"]["declaration"], spec);
+        }
+    }
     assert_eq!(objects(&f.index), before);
 
     let r = srv.call("score.why", json!({"wait": true}));
@@ -519,5 +541,5 @@ fn score_and_apply_run_as_jobs() {
         "jobs.start",
         json!({"tool": "propose.key", "arguments": {"score": 1}}),
     );
-    assert_eq!(code(&r), "invalid_input");
+    assert_eq!(code(&r), "caller_supplied_cost");
 }

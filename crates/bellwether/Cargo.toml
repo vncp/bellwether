@@ -27,15 +27,32 @@ bellwether-profile = { path = "../bellwether-profile" }
 bellwether-replay = { path = "../bellwether-replay" }
 # `reconcile`, and `fix`'s verify stage.
 bellwether-verify = { path = "../bellwether-verify" }
+# Tables as sources (`sql://` roots, ADR 027): reconcile, why, and fix
+# (verify, then an attest-only refusal) over a table.
+bellwether-source-sql = { path = "../bellwether-source-sql" }
+# Query engines as measured sources (ADR 033): the lake twin's engine, its
+# identity, and the measured score and exports of a rewrite proposal.
+bellwether-source-engine = { path = "../bellwether-source-engine" }
 arrow = { workspace = true }
 parquet = { workspace = true, features = ["arrow"] }
 roaring = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 bytes = { workspace = true }
+# Signing keys (ADR 029): a fresh seed from the operating system's RNG,
+# wiped from memory after use; the trust file is TOML.
+rand_core = { version = "0.6", features = ["getrandom"] }
+zeroize = "1"
+toml = "1"
+
+[features]
+# SQL Server tables through ODBC (links the system ODBC driver manager).
+odbc = ["bellwether-source-sql/odbc"]
 
 [dev-dependencies]
 tempfile = { workspace = true }
+# Writes the SQLite tables the table tests read.
+rusqlite = { version = "0.41", features = ["bundled"] }
 
 [lints]
 workspace = true

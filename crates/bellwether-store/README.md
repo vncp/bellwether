@@ -81,24 +81,30 @@ These `object_store` errors map to `Error::VersionConflict`:
 - `commit_nonce`
 - `source`
 - `schema{columns, key_specs, sidecars?[{kind, columns, time_columns}]}`
-- `rowgroup_space{next_id, files[{fingerprint, rowgroup_ids, chunk_size?, chunks?}], tombstones[{since, rowgroup_ids}]}`
-- `key_spec_completeness{name -> sequence}`
-- `segments[{id, kind?, key_spec, rowgroup_range{start, end}, bytes}]`
+- `rowgroup_space{next_id, files[{fingerprint, rowgroup_ids, rowgroup_rows?, rowgroup_bytes?, column_bytes?, chunk_size?, chunks?}], tombstones[{since, rowgroup_ids}]}`
+- `key_spec_completeness{identity -> sequence}`
+- `segments[{id, kind?, key_spec, rowgroup_range{start, end}, bytes}]` (`key_spec` is the spec's `KeySpec::identity()`, or a sidecar's name)
 - `segment_tombstones[{id, since}]`
 - `deleting[{id, claimed_at, token, lease_ms}]`
 
 `rowgroup_space.tombstones` holds only retired row-group ids (ADR 013). Unreferenced segments go in `segment_tombstones`.
 
+**Storage version 2 (ADR 028).** `FileEntry::{rowgroup_rows, rowgroup_bytes, column_bytes}` are the row-group statistics a plan reads instead of footers: `rowgroup_stats(i)` gives row group `i`'s rows and bytes, `column_bytes_of(i, column, columns)` one column chunk (row-group-major), and `has_rowgroup_stats()` whether they are recorded. `Manifest::from_slice` refuses a file whose arrays do not align with its row groups or the schema's columns. A version 1 manifest is read with its `segments[].key_spec` and `key_spec_completeness` keys rewritten from each spec's name to its identity, so every caller sees one shape; its `storage_version` stays 1 until a commit stamps 2. The loader's allow-lists are per version: `counts` on a key spec is refused in a version 1 manifest. `tests/manifest_v2.rs` pins the minimal version 2 manifest of `docs/format.md` byte for byte, the misalignment refusals, and an every-byte sweep.
+
 **Forward compatibility (ADR 017).** There are two rules, depending on who owns the type:
 
 - **Manifest-owned structs** have a `#[serde(flatten)] extra` map, so a newer binary's fields survive a rewrite. These are every struct in `manifest.rs`: `Manifest`, `SourceInfo`, `SchemaInfo`, `SidecarDecl`, `ColumnDef`, `RowGroupSpace`, `FileEntry`, `ChunkRange`, `RowGroupTombstone`, `SegmentRef`, `RowGroupRange`, `SegmentTombstone` and `DeleteClaim`. A fixture test checks the round trip with unknown keys at every one of these levels.
-- **Sidecar declarations and segment kinds.** Sidecars are declared in `schema.sidecars` (`SidecarDecl { kind, columns, time_columns }`, named `{kind}:{columns}@{time_columns}`) and their segments set `SegmentRef.kind` (`"bounds"`, `"temporal2"`, or a future kind; absent means an ordinary key-spec segment) and `SegmentRef.key_spec` to the sidecar's name. `Manifest::key_spec_segments(name)` yields only segments with `kind == None` and `key_spec == name`; `Manifest::sidecar_segments(kind, name)` yields sidecar segments of that kind and name. A manifest listing a segment or sidecar declaration whose `kind` is not in `KNOWN_SEGMENT_KINDS` still opens: `Manifest::unknown_segment_kinds()` returns the sorted distinct unknown kinds, `key_spec_segments` never yields them, and rewrites preserve both entries byte-for-byte.
+- **Sidecar declarations and segment kinds.** Sidecars are declared in `schema.sidecars` (`SidecarDecl { kind, columns, time_columns, params }`, named `{kind}:{columns}@{time_columns}`, or `{kind}:{columns}` with no `@` when there is no time column, as for `sketch:a,b`) and their segments set `SegmentRef.kind` (`"bounds"`, `"temporal2"`, `"sketch"`, or a future kind; absent means an ordinary key-spec segment) and `SegmentRef.key_spec` to the sidecar's name. `params` is an optional string map of the sidecar's parameters (`sketch`: `p` and `minhash`), omitted from the JSON when empty, so existing declarations serialize byte for byte as before; a reader that predates it keeps it as an unknown field (ADR 017). `schema.sidecars[]` also holds structures the planner never reads: `sketch` is approximate and only `cardinality`, `overlap`, and `why` read it. `Manifest::key_spec_segments(name)` yields only segments with `kind == None` and `key_spec == name`; `Manifest::sidecar_segments(kind, name)` yields sidecar segments of that kind and name. A manifest listing a segment or sidecar declaration whose `kind` is not in `KNOWN_SEGMENT_KINDS` (`bounds`, `temporal2`, `sketch`) still opens: `Manifest::unknown_segment_kinds()` returns the sorted distinct unknown kinds, `key_spec_segments` never yields them, and rewrites preserve both entries byte-for-byte.
 - **Types-owned structs** (`FileFingerprint`, `KeySpec`) live in `bellwether-types` and get no extra map, so the contract stays additive. Instead:
   - Adding a `KeySpec` kind, or a field to either type, requires a `storage_version` bump.
   - `Manifest::from_slice` pre-scans the raw JSON. If it finds an unknown kind, or an unknown field in either type, it refuses with `Error::UnsupportedVersion { what: "key-spec or fingerprint shape in storage" }` (`UNSUPPORTED_SHAPE`). That beats a serde error, and it never silently drops the field on rewrite.
   - A drift test serializes every `KeySpec` kind and a `FileFingerprint` and compares their keys with the loader's allow-lists. Adding a variant or a field breaks that test's compilation or fails it, so the allow-list and the version bump can't be forgotten.
 
 `Manifest::from_slice` also refuses a newer `storage_version` with `Error::UnsupportedVersion { what: "storage" }` (`UNSUPPORTED_STORAGE`) before typed deserialization.
+
+### List keys (B4)
+
+`list` is a key-spec kind (`key_spec_fields`: `kind`, `column`): declared in `schema.key_specs`, its segments ordinary key-spec segments named `list:<column>`. A build that predates the kind refuses such a manifest with the typed unknown-kind error, never a serde error and never by dropping the declaration on a rewrite (tested with storage version 1's allow-list). The kind is admitted by storage version 2 (WP14); this branch merges after it.
 
 ## Commit protocol
 

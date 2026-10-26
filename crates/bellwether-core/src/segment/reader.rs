@@ -5,6 +5,14 @@
 //! block's bloom bitset and, only if the bloom passes, the block's key
 //! directory and the value records of the keys found. At most one block is
 //! held at a time; keys are sorted first so consecutive keys reuse it.
+//!
+//! A storage version 2 segment carries an XXH3-64 checksum beside every
+//! region a reader reads (the preamble, header, and index in the footer;
+//! each block's filter and directory in its index entry; each value record
+//! in its directory entry). The reader checks each region as it reads it, so
+//! a corrupt byte is refused with an error, never decoded into a wrong
+//! answer. A storage version 1 segment has no checksums and is read as
+//! before.
 
 use std::borrow::Cow;
 use std::collections::BTreeMap;
@@ -14,8 +22,8 @@ use bellwether_types::{Error, KeySpec, Result, RowGroupId};
 use roaring::RoaringBitmap;
 
 use super::format::{
-    check_versions, corrupt, spec_types, ColumnType, Cursor, Layout, ReadAt, SegmentHeader,
-    FOOTER_LEN, MAGIC, PREAMBLE_LEN,
+    check_versions, checksum, corrupt, footer_len, parse_header, spec_types, ColumnType, Cursor,
+    Layout, ReadAt, SegmentHeader, MAGIC, PREAMBLE_LEN,
 };
 use super::types;
 use super::writer::KeyValue;
@@ -48,14 +56,24 @@ pub(crate) fn reserve_hint(block_count: u64, index_len: u64, min_entry: u64) -> 
     usize::try_from(block_count.min(fit)).unwrap_or(0)
 }
 
+/// Checks `bytes` against a stored checksum, when the segment stores one.
+fn verified<'b>(bytes: Cow<'b, [u8]>, sum: Option<u64>, what: &str) -> Result<Cow<'b, [u8]>> {
+    match sum {
+        Some(s) if checksum(&[&bytes]) != s => Err(corrupt(&format!("{what} checksum mismatch"))),
+        _ => Ok(bytes),
+    }
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct KeyedBlock {
     pub(crate) first: Vec<u8>,
     pub(crate) last: Vec<u8>,
     bloom_off: u64,
     bloom_len: u32,
+    bloom_sum: Option<u64>,
     body_off: u64,
     body_len: u32,
+    body_sum: Option<u64>,
     pub(crate) n: u32,
 }
 
@@ -65,6 +83,7 @@ pub(crate) struct BloomEntry {
     off: u64,
     len: u32,
     pub(crate) ndv: u64,
+    sum: Option<u64>,
 }
 
 #[derive(Clone, Debug)]
@@ -74,6 +93,7 @@ pub(crate) struct RangeBlock {
     off: u64,
     len: u32,
     n: u32,
+    sum: Option<u64>,
 }
 
 #[derive(Clone, Debug)]
@@ -113,10 +133,16 @@ pub(crate) struct BlockView<'a> {
     offsets: &'a [u8],
     keys: &'a [u8],
     refs: &'a [u8],
+    /// Bytes per value reference: 12 (`offset u64 | len u32`) in storage
+    /// version 1, 20 (`| checksum u64`) in version 2.
+    ref_len: usize,
 }
 
 impl<'a> BlockView<'a> {
-    pub(crate) fn parse(body: &'a [u8], expect_n: u32) -> Result<Self> {
+    /// Parses a block directory. `sums`: the segment stores a checksum per
+    /// value record (storage version 2).
+    pub(crate) fn parse(body: &'a [u8], expect_n: u32, sums: bool) -> Result<Self> {
+        let ref_len = if sums { 20 } else { 12 };
         let mut c = Cursor::new(body);
         let n = c.u32()?;
         if n != expect_n {
@@ -126,7 +152,7 @@ impl<'a> BlockView<'a> {
         let offsets = c.take((n + 1) * 4)?;
         let total = u32_at(offsets, n) as usize;
         let keys = c.take(total)?;
-        let refs = c.take(n * 12)?;
+        let refs = c.take(n * ref_len)?;
         if !c.is_done() {
             return Err(corrupt("block trailing bytes"));
         }
@@ -135,6 +161,7 @@ impl<'a> BlockView<'a> {
             offsets,
             keys,
             refs,
+            ref_len,
         })
     }
 
@@ -152,11 +179,16 @@ impl<'a> BlockView<'a> {
             .ok_or_else(|| corrupt("block key offsets"))
     }
 
-    fn value_ref(&self, i: usize) -> (u64, usize) {
-        let b = &self.refs[i * 12..i * 12 + 12];
-        let mut o = [0u8; 8];
-        o.copy_from_slice(&b[..8]);
-        (u64::from_le_bytes(o), u32_at(&b[8..], 0) as usize)
+    /// The value record's offset, length, and checksum (version 2).
+    fn value_ref(&self, i: usize) -> (u64, usize, Option<u64>) {
+        let b = &self.refs[i * self.ref_len..(i + 1) * self.ref_len];
+        let u64_at = |s: &[u8]| {
+            let mut o = [0u8; 8];
+            o.copy_from_slice(&s[..8]);
+            u64::from_le_bytes(o)
+        };
+        let sum = (self.ref_len == 20).then(|| u64_at(&b[12..]));
+        (u64_at(b), u32_at(&b[8..], 0) as usize, sum)
     }
 
     fn find(&self, key: &[u8]) -> Result<Option<usize>> {
@@ -206,10 +238,12 @@ pub struct SegmentReader<R> {
 impl<R: ReadAt> SegmentReader<R> {
     /// Opens a segment: checks the preamble versions before parsing anything
     /// else, validates the header against them (versions agree, codec,
-    /// layout, `bloom_hash`), and loads the index.
+    /// layout, `bloom_hash`), loads the index, and, for storage version 2,
+    /// checks the footer's checksum over the preamble, header, and index.
+    #[allow(clippy::too_many_lines)]
     pub fn open(src: R) -> Result<Self> {
         let size = src.size()?;
-        if size < (PREAMBLE_LEN + FOOTER_LEN) as u64 {
+        if size < (PREAMBLE_LEN + footer_len(1)) as u64 {
             return Err(corrupt("file too short"));
         }
         let pre = src.read_at(0, PREAMBLE_LEN)?;
@@ -220,18 +254,36 @@ impl<R: ReadAt> SegmentReader<R> {
         let storage = c.u32()?;
         let encoding = c.u32()?;
         check_versions(storage, encoding)?;
+        let v2 = storage >= 2;
+        let foot_len = footer_len(storage);
+        if size < (PREAMBLE_LEN + foot_len) as u64 {
+            return Err(corrupt("file too short"));
+        }
         let header_len = c.u32()? as usize;
         let header_bytes = src.read_at(PREAMBLE_LEN as u64, header_len)?;
-        let header: SegmentHeader = serde_json::from_slice(&header_bytes)?;
+        let header = parse_header(&header_bytes, storage)?;
         header.validate(storage, encoding)?;
-        let foot = src.read_at(size - FOOTER_LEN as u64, FOOTER_LEN)?;
+        let foot = src.read_at(size - foot_len as u64, foot_len)?;
         let mut c = Cursor::new(&foot);
         let index_off = c.u64()?;
         let index_len = usize::try_from(c.u64()?).map_err(|_| corrupt("index length"))?;
+        let index_sum = if v2 { Some(c.u64()?) } else { None };
         if c.take(8)? != MAGIC {
             return Err(corrupt("bad footer magic"));
         }
         let index_bytes = src.read_at(index_off, index_len)?;
+        if let Some(sum) = index_sum {
+            if checksum(&[&pre, &header_bytes, &index_bytes]) != sum {
+                return Err(corrupt("header or index checksum mismatch"));
+            }
+        }
+        let sum = |c: &mut Cursor<'_>| -> Result<Option<u64>> {
+            if v2 {
+                Ok(Some(c.u64()?))
+            } else {
+                Ok(None)
+            }
+        };
         let mut c = Cursor::new(&index_bytes);
         let entries = c.u64()?;
         let has_rg = c.u8()? == 1;
@@ -248,8 +300,10 @@ impl<R: ReadAt> SegmentReader<R> {
                         last: c.bytes()?.to_vec(),
                         bloom_off: c.u64()?,
                         bloom_len: c.u32()?,
+                        bloom_sum: sum(&mut c)?,
                         body_off: c.u64()?,
                         body_len: c.u32()?,
+                        body_sum: sum(&mut c)?,
                         n: c.u32()?,
                     });
                 }
@@ -263,6 +317,7 @@ impl<R: ReadAt> SegmentReader<R> {
                         off: c.u64()?,
                         len: c.u32()?,
                         ndv: c.u64()?,
+                        sum: sum(&mut c)?,
                     });
                 }
                 Index::Bloom(v)
@@ -276,6 +331,7 @@ impl<R: ReadAt> SegmentReader<R> {
                         off: c.u64()?,
                         len: c.u32()?,
                         n: c.u32()?,
+                        sum: sum(&mut c)?,
                     });
                 }
                 Index::Range(v)
@@ -389,18 +445,99 @@ impl<R: ReadAt> SegmentReader<R> {
         self.src.read_at(off, len as usize)
     }
 
+    /// Whether the segment stores checksums (storage version 2).
+    pub(crate) fn checked(&self) -> bool {
+        self.header.storage_version >= 2
+    }
+
     pub(crate) fn block_body(&self, b: &KeyedBlock) -> Result<Cow<'_, [u8]>> {
-        self.read(b.body_off, b.body_len)
+        verified(
+            self.read(b.body_off, b.body_len)?,
+            b.body_sum,
+            "block directory",
+        )
+    }
+
+    fn block_bloom(&self, b: &KeyedBlock) -> Result<Cow<'_, [u8]>> {
+        verified(
+            self.read(b.bloom_off, b.bloom_len)?,
+            b.bloom_sum,
+            "block filter",
+        )
     }
 
     pub(crate) fn value_at(&self, view: &BlockView<'_>, i: usize) -> Result<KeyValue> {
-        let (off, len) = view.value_ref(i);
-        let bytes = self.src.read_at(off, len)?;
-        KeyValue::decode(&bytes, matches!(self.header.layout, Layout::KeyedTemporal))
+        let (off, len, sum) = view.value_ref(i);
+        let bytes = verified(self.src.read_at(off, len)?, sum, "value record")?;
+        KeyValue::decode(
+            &bytes,
+            matches!(self.header.layout, Layout::KeyedTemporal),
+            self.header.key_spec.counts(),
+            self.header.storage_version,
+        )
     }
 
     pub(crate) fn bloom_bitset(&self, e: &BloomEntry) -> Result<Cow<'_, [u8]>> {
-        self.read(e.off, e.len)
+        verified(self.read(e.off, e.len)?, e.sum, "row-group filter")
+    }
+
+    fn range_block(&self, b: &RangeBlock) -> Result<Cow<'_, [u8]>> {
+        verified(self.read(b.off, b.len)?, b.sum, "range block")
+    }
+
+    /// Whether the segment stores per-key per-row-group counts (a spec with
+    /// `counts`, storage version 2).
+    #[must_use]
+    pub fn has_counts(&self) -> bool {
+        self.header.key_spec.counts()
+    }
+
+    /// For each key of `keys` present, `(row group, rows)` for every row
+    /// group holding it, ascending. `None` when the segment stores no counts
+    /// (never zero counts: a reader cannot tell an uncounted key from an
+    /// absent one). Holds the block index, one block, and the values of the
+    /// keys asked (ADR 018).
+    #[allow(clippy::type_complexity)]
+    pub fn counts<K: AsRef<[u8]>>(
+        &self,
+        keys: &[K],
+    ) -> Result<Option<BTreeMap<Vec<u8>, Vec<(RowGroupId, u64)>>>> {
+        if !self.has_counts() {
+            return Ok(None);
+        }
+        let mut out = BTreeMap::new();
+        let mut missing = false;
+        self.visit_keys(keys, |k, v| match v.counted() {
+            Some(c) => {
+                out.insert(k.to_vec(), c);
+            }
+            None => missing = true,
+        })?;
+        if missing {
+            return Err(corrupt("a counted segment holds a value without counts"));
+        }
+        Ok(Some(out))
+    }
+
+    /// The keys of block `i` of a keyed segment, ascending; `None` past the
+    /// last block. One block (at most a block's key cap) at a time, so a
+    /// caller walking every key holds one block per segment (ADR 018).
+    pub(crate) fn block_keys(&self, i: usize) -> Result<Option<Vec<Vec<u8>>>> {
+        let Index::Keyed(blocks) = &self.index else {
+            return Err(Error::KeySpec(format!(
+                "{} segments have no per-key values",
+                self.header.key_spec.name()
+            )));
+        };
+        let Some(b) = blocks.get(i) else {
+            return Ok(None);
+        };
+        let body = self.block_body(b)?;
+        let view = BlockView::parse(&body, b.n, self.checked())?;
+        (0..view.len())
+            .map(|k| view.key(k).map(<[u8]>::to_vec))
+            .collect::<Result<Vec<_>>>()
+            .map(Some)
     }
 
     /// Visits each distinct key of `keys` present in a keyed segment, in
@@ -433,7 +570,7 @@ impl<R: ReadAt> SegmentReader<R> {
                 continue;
             }
             if cur.as_ref().is_none_or(|c| c.0 != bi) {
-                cur = Some((bi, self.read(b.bloom_off, b.bloom_len)?, None));
+                cur = Some((bi, self.block_bloom(b)?, None));
             }
             let Some((_, bloom_bits, body)) = cur.as_mut() else {
                 continue;
@@ -447,7 +584,7 @@ impl<R: ReadAt> SegmentReader<R> {
             let Some(body) = body.as_deref() else {
                 continue;
             };
-            let view = BlockView::parse(body, b.n)?;
+            let view = BlockView::parse(body, b.n, self.checked())?;
             if let Some(idx) = view.find(key)? {
                 f(key, self.value_at(&view, idx)?);
             }
@@ -591,7 +728,7 @@ impl<R: ReadAt> SegmentReader<R> {
                         continue;
                     }
                     let body = self.block_body(b)?;
-                    let view = BlockView::parse(&body, b.n)?;
+                    let view = BlockView::parse(&body, b.n, self.checked())?;
                     for i in view.lower_bound(&r.lo)?..view.len() {
                         if !r.contains(view.key(i)?) {
                             break;
@@ -615,7 +752,7 @@ impl<R: ReadAt> SegmentReader<R> {
                             continue;
                         }
                     }
-                    let body = self.read(b.off, b.len)?;
+                    let body = self.range_block(b)?;
                     let mut c = Cursor::new(&body);
                     if c.u32()? != b.n {
                         return Err(corrupt("range block count"));
@@ -647,7 +784,7 @@ impl<R: ReadAt> SegmentReader<R> {
             return Err(Error::KeySpec("not a range segment".into()));
         };
         for b in blocks {
-            let body = self.read(b.off, b.len)?;
+            let body = self.range_block(b)?;
             let mut c = Cursor::new(&body);
             if c.u32()? != b.n {
                 return Err(corrupt("range block count"));
@@ -671,6 +808,30 @@ impl<R: ReadAt> SegmentReader<R> {
             out.push((RowGroupId(rg), min.to_vec(), max.to_vec()));
             Ok(())
         })?;
+        Ok(out)
+    }
+
+    /// Every stored key of a keyed (exact or temporal) segment with its
+    /// value, in key order; an error for any other layout. A whole-segment
+    /// read like [`Self::range_entries`], for verification and oracles: it
+    /// holds every key, where a lookup holds only the keys asked (ADR 018).
+    /// Unlike [`Self::counts`] it returns stored tuples that hold a trailing
+    /// null marker, which no probe matches (ADR 014).
+    pub fn keyed_entries(&self) -> Result<Vec<(Vec<u8>, KeyValue)>> {
+        let Index::Keyed(blocks) = &self.index else {
+            return Err(Error::KeySpec(format!(
+                "{} is not a keyed segment",
+                self.header.key_spec.identity()
+            )));
+        };
+        let mut out = Vec::new();
+        for b in blocks {
+            let body = self.block_body(b)?;
+            let view = BlockView::parse(&body, b.n, self.checked())?;
+            for i in 0..view.len() {
+                out.push((view.key(i)?.to_vec(), self.value_at(&view, i)?));
+            }
+        }
         Ok(out)
     }
 
@@ -780,6 +941,8 @@ mod tests {
         let exact = SegmentWriter::new(
             KeySpec::Exact {
                 columns: vec!["k".into()],
+                counts: false,
+                bounds: None,
             },
             WriterOptions::default(),
         )
