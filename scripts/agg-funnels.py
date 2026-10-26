@@ -27,9 +27,11 @@ statistics, never estimates):
                     over them (locate --columns), and the rows decoded
                     (every row of those row groups)
   with agg          row groups and bytes `aggregate` still reads (its
-                    residual), and data files opened: 0 by construction when
-                    the residual is empty (the aggregate reads the segments
-                    only; crates/bellwether/tests/agg.rs)
+                    residual), and data files opened, measured: the same
+                    `aggregate` runs again with every data file under the
+                    folder made unreadable (mode 000); an identical answer
+                    shows it opened none of them ("0 of N"), since opening
+                    one would fail
   oracle            keys whose rows, null values, count and sum `aggregate`
                     returned equal pyarrow's over the decoded files, of the
                     keys asked (the ledger's run totals are also checked
@@ -167,7 +169,9 @@ def per_key_rows(bin_, name, data, extra, key_cols, value, sets, work, scale, pa
             pq.write_table(pa.table({c: pa.array(list(v), type=t)
                                      for c, v, t in zip(key_cols, cols, types)}), kf)
         base = [data, "--keys", kf, *extra]
-        agg = js(bin_, ["aggregate", *base, "--value", value, "--fn", "sum,count,min,max"])
+        agg_args = ["aggregate", *base, "--value", value, "--fn", "sum,count,min,max"]
+        agg = js(bin_, agg_args)
+        opened = files_opened(bin_, agg_args, data, agg)
         loc = js(bin_, ["locate", *base])
         proj = js(bin_, ["locate", *base, "--columns", ",".join([*key_cols, value])])
         want, holding, decoded = oracle(data, partitioning, key_cols, value,
@@ -187,6 +191,7 @@ def per_key_rows(bin_, name, data, extra, key_cols, value, sets, work, scale, pa
             "res_rg": agg["residual_row_groups"],
             "res_bytes": agg["residual_bytes"],
             "complete": agg["complete"],
+            "opened": opened,
             "good": good,
             "asked": agg["keys"],
             "sum_total": sum((v[2] for v in want.values()), 0),
@@ -204,11 +209,31 @@ def per_key_table(title, rows):
           "with agg: data files opened | keys equal to the oracle |")
     print("|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|---:|")
     for r in rows:
-        opened = "0 by construction" if r["complete"] and r["res_rg"] == 0 else "residual files"
+        opened = r["opened"]
         print(f"| {r['keys']:,} | {r['present']:,} | {r['live']:,} | {r['rows']:,} / {r['oracle_rows']:,} | "
               f"{r['loc_rg']:,} | {r['loc_bytes']:,} | {r['proj_bytes']:,} | {r['decoded']:,} | "
               f"{r['res_rg']:,} | {r['res_bytes']:,} | {opened} | {r['good']:,} of {r['asked']:,} |")
     print()
+
+
+def files_opened(bin_, args, data, want):
+    """The data files `args` opens, measured: rerun with every data file
+    under `data` unreadable (the index under `.bellwether` stays readable).
+    The same answer means it opened none: an open would have failed."""
+    files = [os.path.join(d, f) for d, dirs, names in os.walk(data)
+             for f in names if not d[len(data):].lstrip(os.sep).startswith(".")
+             and f.endswith(".parquet")]
+    modes = {f: os.stat(f).st_mode for f in files}
+    try:
+        for f in files:
+            os.chmod(f, 0)
+        out = subprocess.run([bin_, *args, "--json"], capture_output=True, text=True)
+    finally:
+        for f, m in modes.items():
+            os.chmod(f, m)
+    if out.returncode == 0 and json.loads(out.stdout) == want:
+        return f"0 of {len(files):,}"
+    return f"at least 1 of {len(files):,} (with them unreadable it failed: {out.stderr.strip()[:80]})"
 
 
 def link_copy(src, dst):

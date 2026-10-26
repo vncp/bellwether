@@ -2996,9 +2996,10 @@ mod tests {
 
     /// An agg key (B7) is certified only when its cells are the rows' own
     /// aggregates: a planted wrong cell (a sum one unit off, a row or a
-    /// null too many, a wrong minimum, a missing cell, a cell where the key
-    /// has no row) fails `fix`'s certificate, which names the cell, and no
-    /// receipt is written; untouched, the same fix applies.
+    /// null too many, a wrong minimum, a wrong maximum alone, a null too
+    /// many alone, a missing cell, a cell where the key has no row) fails
+    /// `fix`'s certificate, which names the cell, and no receipt is
+    /// written; untouched, the same fix applies.
     #[test]
     #[allow(clippy::too_many_lines, clippy::many_single_char_names)]
     fn a_planted_wrong_agg_cell_fails_the_certificate() {
@@ -3062,6 +3063,22 @@ mod tests {
                 Box::new(|m| {
                     let c = m.values_mut().next().unwrap().values_mut().next().unwrap();
                     c.min.clone_from(&c.max);
+                }),
+            ),
+            (
+                "a wrong maximum alone",
+                Box::new(|m| {
+                    let c = m.values_mut().next().unwrap().values_mut().next().unwrap();
+                    assert_ne!(c.min, c.max, "{c:?}");
+                    c.max.clone_from(&c.min);
+                }),
+            ),
+            (
+                "a null too many alone",
+                Box::new(|m| {
+                    let c = m.values_mut().next().unwrap().values_mut().next().unwrap();
+                    assert!(c.nulls < c.rows, "{c:?}");
+                    c.nulls += 1;
                 }),
             ),
             (

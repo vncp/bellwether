@@ -251,8 +251,8 @@ pub(crate) struct Execution {
     pub outcome: Reconciliation,
     /// Provenance inputs, in citation order.
     pub inputs: Vec<Input>,
-    /// Sequences of the indexed sides' manifests.
-    pub manifests: Vec<u64>,
+    /// Each side's manifest sequence, when it is indexed.
+    pub manifests: [Option<u64>; 2],
     /// `plan` Evidence of the planned sides.
     pub evidence: Vec<Evidence>,
 }
@@ -1379,13 +1379,14 @@ fn agg_side<'s>(
         Err(e) => return Err(e.into()),
     }
     if rows != all {
+        let nulls = all.saturating_sub(rows);
         return Ok(not_used(
             vec![format!(
-                "{} of its {} rows have a null {} and are in no agg key (ADR 014), so the rows \
-                 are read to compare them",
-                all.saturating_sub(rows),
-                all,
-                spec.key_columns[0]
+                "{nulls} of its {all} rows {} a null {} and {} in no agg key (ADR 014), so the \
+                 rows are read to compare them",
+                if nulls == 1 { "has" } else { "have" },
+                spec.key_columns[0],
+                if nulls == 1 { "is" } else { "are" },
             )],
             None,
         ));
@@ -1850,19 +1851,23 @@ fn realized_coverage(scope: &Scope, counts: &mut Counts, seen: u64, unsampled: u
     }
 }
 
-/// The provenance inputs of a run, the indexed manifests' sequences, and
-/// the plan Evidence to write.
-fn provenance(prep: &Prepared<'_>, started: Instant) -> (Vec<Input>, Vec<u64>, Vec<Evidence>) {
+/// The provenance inputs of a run, each indexed side's manifest sequence,
+/// and the plan Evidence to write.
+fn provenance(
+    prep: &Prepared<'_>,
+    started: Instant,
+) -> (Vec<Input>, [Option<u64>; 2], Vec<Evidence>) {
     let mut inputs: Vec<Input> = prep
         .reports
         .iter()
         .map(|r| (r.catalog, Duration::ZERO, started))
         .collect();
-    let mut manifests = Vec::new();
+    let mut manifests = [None; 2];
     let mut evidence = Vec::new();
-    for ix in prep.indexed.iter().flatten() {
+    for (s, ix) in prep.indexed.iter().enumerate() {
+        let Some(ix) = ix else { continue };
         inputs.push((ix.manifest.hash, ix.manifest.age, ix.taken));
-        manifests.push(ix.manifest.sequence);
+        manifests[s] = Some(ix.manifest.sequence);
         if let Some((ev, h)) = &ix.plan {
             inputs.push((*h, ix.manifest.age, ix.taken));
             evidence.push(ev.clone());

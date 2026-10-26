@@ -902,8 +902,11 @@ fn plan_specs(
                 // type, and the agg key needs a counted key on exactly its
                 // columns beside it: those counts prove which aggregates
                 // answer a lookup.
-                bellwether_core::agg::value_type(spec, schema)
-                    .map_err(|e| Error::KeySpec(format!("{name}: {e}")))?;
+                // Named once: the refusal's own message carries no prefix.
+                bellwether_core::agg::value_type(spec, schema).map_err(|e| match e {
+                    Error::KeySpec(m) => Error::KeySpec(format!("{name}: {m}")),
+                    e => e,
+                })?;
                 columns.push(value.clone());
                 let beside = specs.iter().any(|s| {
                     matches!(s, KeySpec::Exact { .. } | KeySpec::Temporal { .. })

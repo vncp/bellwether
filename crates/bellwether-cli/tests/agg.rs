@@ -340,3 +340,240 @@ fn aggregate_fix_and_reconcile_human_output() {
     );
     assert!(rec.contains("R-agg-1"), "{rec}");
 }
+
+/// Writes a key file of `(account, entry)` pairs.
+fn pair_keys(path: &Path, pairs: &[(i64, i64)]) {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("account", DataType::Int64, false),
+        Field::new("entry", DataType::Int64, false),
+    ]));
+    let cols: Vec<ArrayRef> = vec![
+        Arc::new(Int64Array::from_iter_values(pairs.iter().map(|p| p.0))),
+        Arc::new(Int64Array::from_iter_values(pairs.iter().map(|p| p.1))),
+    ];
+    let mut w =
+        ArrowWriter::try_new(File::create(path).unwrap(), Arc::clone(&schema), None).unwrap();
+    w.write(&RecordBatch::try_new(schema, cols).unwrap())
+        .unwrap();
+    w.close().unwrap();
+}
+
+/// Every next step the agg surfaces print can be followed as printed: the
+/// counted key's `fix … --allow-no-gain` line from `why` on a fresh folder;
+/// the partial answer's `index --key 'agg:…{fns}'`; a sum of a column with
+/// none refused (exit 2) naming `--fn` and the functions it has; a spec the
+/// dataset refuses named once (exit 4, as for every kind); reconcile saying
+/// why each side was read and the `--ignore` list that lets the agg key
+/// answer; and `why` naming no culprit once the agg key answers.
+#[test]
+fn agg_next_steps_can_be_followed_as_printed() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    corpus(&data);
+    let kf = dir.path().join("k.parquet");
+    common::keys(&kf, "account", &[1, 3]);
+    let (d, k) = (path(&data), path(&kf));
+    let why_args = [
+        "why",
+        d,
+        "--from",
+        k,
+        "--value",
+        "amount",
+        "--fn",
+        "sum,count",
+    ];
+
+    // A fresh folder: why names the counted key's fix with --allow-no-gain.
+    let first = human(&why_args, 0);
+    let line = first
+        .lines()
+        .find(|l| l.contains("--allow-no-gain"))
+        .unwrap_or_else(|| panic!("{first}"));
+    assert!(
+        line.contains("first apply the counted key the agg key needs"),
+        "{line}"
+    );
+    let cmd = line.split("allow that: ").nth(1).unwrap();
+    let args: Vec<&str> = cmd.split_whitespace().collect();
+    assert_eq!(args[..2], ["bellwether", "fix"], "{cmd}");
+    human(&args[1..], 0);
+    assert!(
+        first.contains("then run why again: it proposes the agg key"),
+        "{first}"
+    );
+    // Following it: why proposes the agg key; applying it, the culprit is
+    // that nothing is read.
+    let why: Value = serde_json::from_str(&cli(&why_args, 0)).unwrap();
+    let c = why["candidates"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["spec"]["kind"] == "agg")
+        .unwrap_or_else(|| panic!("{why}"));
+    let p = c["proposal"]["hash"].as_str().unwrap().to_string();
+    let wl = why["workload"]["hash"].as_str().unwrap().to_string();
+    human(&["fix", d, "--proposal", &p, "--workload", &wl], 0);
+    let again = human(&why_args, 0);
+    assert!(
+        again.contains(
+            "none: the index answers the aggregates from agg:account@amount{sum,count} beside \
+             its counted key; nothing is read"
+        ),
+        "{again}"
+    );
+
+    // A sum of a column with none: refused as a usage error naming --fn.
+    let label = dir.path().join("label");
+    common::corpus(&label, 1, 2, 10, 4);
+    let lk = dir.path().join("lk.parquet");
+    common::keys(&lk, "id", &[1]);
+    run(&["index", path(&label), "--key", "exact:id,counts"], 0);
+    let out = common::bw()
+        .args([
+            "aggregate",
+            path(&label),
+            "--keys",
+            path(&lk),
+            "--value",
+            "payload",
+            "--fn",
+            "sum,count",
+        ])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert_eq!(out.status.code(), Some(2), "{stderr}");
+    assert!(
+        stderr.contains("payload is Utf8, which has no sum"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("agg:id@payload{count,min,max}"), "{stderr}");
+    assert!(stderr.contains("check --fn"), "{stderr}");
+    // The same refusal at index time: named once.
+    let out = common::bw()
+        .args([
+            "index",
+            path(&label),
+            "--key",
+            "exact:id,counts",
+            "--key",
+            "agg:id@payload{sum,count}",
+        ])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert_eq!(out.status.code(), Some(4), "{stderr}");
+    assert_eq!(stderr.matches("key spec error").count(), 1, "{stderr}");
+    assert!(
+        stderr.contains("agg:id@payload: payload is Utf8"),
+        "{stderr}"
+    );
+    // ... and the spec it names instead is accepted.
+    run(
+        &[
+            "index",
+            path(&label),
+            "--key",
+            "exact:id,counts",
+            "--key",
+            "agg:id@payload{count,min,max}",
+        ],
+        0,
+    );
+
+    // A partial answer (keys on (account, entry), the agg key on account):
+    // the index command it prints carries the functions and is accepted.
+    let pk = dir.path().join("pk.parquet");
+    pair_keys(&pk, &[(1, 1), (3, 7)]);
+    run(&["index", d, "--key", "exact:account,entry,counts"], 0);
+    let partial = human(
+        &[
+            "aggregate",
+            d,
+            "--keys",
+            path(&pk),
+            "--value",
+            "amount",
+            "--fn",
+            "sum,count",
+        ],
+        0,
+    );
+    let line = partial
+        .lines()
+        .find(|l| l.contains("bellwether index "))
+        .unwrap_or_else(|| panic!("{partial}"));
+    assert!(
+        line.ends_with("/data --key 'agg:account,entry@amount{sum,count}'"),
+        "{line}"
+    );
+    run(
+        &[
+            "index",
+            d,
+            "--key",
+            "exact:account,counts",
+            "--key",
+            "exact:account,entry,counts",
+            "--key",
+            "agg:account@amount{sum,count}",
+            "--key",
+            "agg:account,entry@amount{sum,count}",
+        ],
+        0,
+    );
+    let whole = human(
+        &[
+            "aggregate",
+            d,
+            "--keys",
+            path(&pk),
+            "--value",
+            "amount",
+            "--fn",
+            "sum,count",
+        ],
+        0,
+    );
+    assert!(whole.contains("no data file was read"), "{whole}");
+
+    // Reconcile comparing the total row by row: each side read, and why.
+    let right = dir.path().join("right");
+    corpus(&right);
+    run(
+        &[
+            "index",
+            path(&right),
+            "--key",
+            "exact:account,counts",
+            "--key",
+            "agg:account@amount{sum,count}",
+        ],
+        0,
+    );
+    let rec = human(
+        &[
+            "reconcile",
+            d,
+            path(&right),
+            "--key",
+            "account",
+            "--ignore",
+            "entry",
+            "--totals",
+            "amount",
+        ],
+        0,
+    );
+    for side in ["left", "right"] {
+        assert!(
+            rec.contains(&format!(
+                "the {side} side was read, not answered from its index's \
+                 agg:account@amount{{sum,count}}: amount is compared row by row"
+            )),
+            "{rec}"
+        );
+    }
+    assert!(rec.contains("--ignore amount,entry"), "{rec}");
+}
