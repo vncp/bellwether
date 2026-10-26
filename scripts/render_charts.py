@@ -505,7 +505,7 @@ def reconcile_chart(res, theme):
     bars.sub = lambda q: f"{commas(res.v(q, 'bellwether', 'rows_compared'))} rows, both sides"
     take = reconcile_takeaway(res)
     sub = (
-        "Rows read from both sides per second, one cold-cache-free run each, default 256 MiB memory budget. "
+        "Rows of both copies compared per second, one warm run each; Bellwether at its default 256 MiB memory budget. "
         + res.provenance_line(qids)
     )
     return hbar_chart(
