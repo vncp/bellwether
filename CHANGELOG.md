@@ -58,8 +58,10 @@ All notable changes are documented here. The format follows Keep a Changelog; ve
   field, `Replay.unserved = "parquet_stats"` (absent otherwise, so older
   records keep their bytes). `why`'s number is therefore the Replay a
   receipt cites: without an index the funnel prints it as
-  `unindexed (min/max pruning)` under the full scan (`WhyReport::full_scan`,
-  context only), and the recommendation and `fix`'s `nothing_to_gain` gate
+  `current: no index (min/max pruning)` under the full scan
+  (`WhyReport::full_scan`, context only), and with an index whose keys
+  leave some run unserved as `current (min/max where no key serves)`; the
+  recommendation and `fix`'s `nothing_to_gain` gate
   measure against it. In a workload mixing lookup columns, a key that
   serves some runs is no longer charged a full scan for the others.
   Pricing an unserved run reads a row group's bloom filters only when its
