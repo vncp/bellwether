@@ -62,6 +62,8 @@ All notable changes are documented here. The format follows Keep a Changelog; ve
 ### Fixed
 
 - `why --clock` over an indexed folder measured the manifest's age with the system clock, so the profile Evidence (and its hash) differed between two runs, and between the CLI's `--json` line and the MCP result (ADR 010). The age is now measured at the fixed clock (`ProfileOptions::now_millis`).
+- README "Results" rerun on one release build that prices the unindexed baseline with the files' min/max statistics (and bloom filters): `why` now recommends nothing for ClickBench by `CounterID` and `fix` refuses it (`nothing_to_gain`); every Parquet question's "Bellwether, unindexed" column reports min/max pruning, and the "When an index can't help" rows give the min/max cause.
+- `why`'s funnel header and fanout table no longer pad lines with trailing spaces when there is no sketch column; README captures regenerated.
 - README "Results": the market questions are measured with the corpus's `day=` directories as a partition column on every side, through `fix` (which now records `--partitioning`); `scripts/showcase.sh` always reads the market corpus that way, and its `--market-hive` flag is gone.
 - `why` and `fix` priced a lookup no key serves, over Parquet files, as a
   full scan, so on files sorted by the key `why` recommended a key that

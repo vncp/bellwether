@@ -736,11 +736,18 @@ def why_text(res, q):
     full_rg = res.v(q, "full-scan", "row_groups")
     fixed_rg = res.v(q, "bellwether-fixed", "row_groups")
     pred_rg = res.v(q, "bellwether-predicted", "row_groups")
+    unindexed_rg = res.v(q, "bellwether-unindexed", "row_groups")
     out = outcome(res, q)
     key = res.v(q, "bellwether", "key")
     if out.startswith("refused"):
+        if unindexed_rg < full_rg:
+            return (
+                f"the files' own min/max statistics already narrow it to {unindexed_rg} of {full_rg} row groups and "
+                f"`{key}` would plan {pred_rg}, no fewer bytes, so `why` recommended nothing and `fix` refused "
+                f"(`{out.split(': ', 1)[-1]}`)"
+            )
         return (
-            f"the keys sit in {pred_rg} of {full_rg} row groups, so `why` recommended no key and `fix` refused "
+            f"the keys sit in {pred_rg} of {full_rg} row groups, so `why` recommended nothing and `fix` refused "
             f"(`{out.split(': ', 1)[-1]}`)"
         )
     if out.startswith("not run"):
@@ -754,13 +761,13 @@ def why_text(res, q):
     saved = 1 - res.v(q, "bellwether-predicted", "bytes") / unindexed
     if res.v(q, "duckdb", "row_groups") <= res.v(q, "duckdb-on-plan", "row_groups"):
         return (
-            f"{pruning_cause(res, q)}, as many as `{key}` plans; the build measured here compared the key against a full scan "
-            f"({res.v(q, 'bellwether-unindexed', 'row_groups')} row groups), not that min/max pruning, so `why` recommended "
-            "the key and `fix` attested it; `why` now prices min/max pruning and recommends none here"
+            f"{pruning_cause(res, q)}, as many as `{key}` plans; `why` priced the files' min/max statistics at "
+            f"{unindexed_rg} row groups, so it recommended the key (saving {saved:.2%} of the bytes) and `fix` attested it"
         )
+    baseline = " against min/max pruning" if unindexed_rg < full_rg else ""
     return (
         f"the keys sit in {fixed_rg} of {full_rg} row groups; `why` still recommended `{key}`, which saves "
-        f"{saved:.2%} of the bytes, and `fix` attested it"
+        f"{saved:.2%} of the bytes{baseline}, and `fix` attested it"
     )
 
 
@@ -790,17 +797,19 @@ def reconcile_table(res):
 def no_gain_text(res, qids):
     refused = [q for q in qids if outcome(res, q).startswith("refused")]
     attested = [q for q in qids if outcome(res, q) == "applied"]
+    which = f"all {len(qids)} of these questions" if len(refused) == len(qids) else f"{len(refused)} of these {len(qids)} questions"
     text = (
-        f"On {len(refused)} of these {len(qids)} questions Bellwether said so before building anything: `why` priced "
-        "every candidate key by exact replay over the footers, recommended none, and `fix` refused to attest a key that "
-        "saves nothing (`nothing_to_gain`)."
+        f"On {which} Bellwether said so before building anything: `why` priced every candidate key by exact replay "
+        "over the footers against what the files' own min/max statistics already skip without an index, recommended "
+        "nothing, and `fix` refused to attest a key that saves nothing (`nothing_to_gain`)."
     )
     if attested:
+        other = "On the remaining one" if len(attested) == 1 else f"On the other {len(attested)}"
         text += (
-            f" On the other {len(attested)} it did not: `why` recommended a key and `fix` attested it, though DuckDB on the "
-            "plan read about as much as DuckDB alone. The last column gives each cause."
+            f" {other} it did not: `why` recommended a key and `fix` attested it, though DuckDB on the "
+            "plan read about as much as DuckDB alone."
         )
-    return text
+    return text + " The last column gives each cause."
 
 
 def readme_block(res):
@@ -874,8 +883,13 @@ def detail_block(res):
             f"{cell('bellwether-fixed')} | {cell('duckdb-on-plan')} | "
             f"{'yes, ' + returned(res, q) if same else 'no plan' if same is None else 'NO'} |"
         )
+    bare = [res.dataset_name(d) for d in dict.fromkeys(res.queries[q]["dataset"] for q in qids)
+            if res.dataset(d).get("column_chunks_with_minmax") == 0]
     rows += ["", "Bytes (row groups). Full scan and Bellwether columns are exact footer sums; DuckDB columns are its profiler's "
-             "`total_bytes_read` and `total_row_groups_scanned`, which include footer reads.", "",
+             "`total_bytes_read` and `total_row_groups_scanned`, which include footer reads. Bellwether, unindexed is what "
+             "`why` prices the question at with no index: the row groups the files' own min/max statistics (and bloom "
+             "filters, where written) do not rule out"
+             + (f"; on files without statistics ({', '.join(bare)}) that is the full scan." if bare else "."), "",
              "### `why` → `fix`: predicted against realized", "",
              "| Question | `why` recommended | Key | Predicted | Realized (fix's replay after apply) | Planned (lookup after fix) | `fix` | Receipt |",
              "|---|---|---|---:|---:|---:|---|---|"]
