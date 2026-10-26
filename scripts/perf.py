@@ -1122,6 +1122,22 @@ def demangle(sym):
 
 # bellwether's own functions (any workspace crate), by demangled name.
 OWN = re.compile(r"(^|[<&\s])bellwether(_[a-z]+)?::")
+# The hot paths the WP22 brief expects, each with the frames that make it.
+# Every profile reports each one's inclusive share, so a path that does not
+# show up is shown as such, not left out.
+EXPECTED = {
+    "bitmap intersection and union (Planner::intersect, per_key)": r"Planner<.*>>::(intersect|per_key)$",
+    "bloom probing (lookup_hashes, bloom::check_bitset)": r"lookup_hashes|bloom::check_bitset",
+    "key-directory block decoding (SegmentReader block index, BlockView)": r"BlockView>::find|SegmentReader<.*>>::(block_index|open_for_dataset|open)\b",
+    "footer parsing (ParquetSource footer, row_groups)": r"ParquetSource>::footer|ParquetSource as bellwether_types::Source>::row_groups|load_reader_metadata",
+    "blake3 over a finished segment (Framing::finish)": r"Framing>::finish",
+    "temporal chain compaction (bellwether_core::temporal)": r"bellwether_core::temporal::",
+    "reconcile pass hashing (verify rowhash, fold_row)": r"bellwether_verify::(rowhash::|reconcile::fold_row)",
+    "store reads per value (SegmentBytes::read_at, get_range)": r"ReadAt>::read_at|StoreExt>::get_range",
+}
+EXPECTED_RE = {k: re.compile(v) for k, v in EXPECTED.items()}
+
+
 # A segment value read through the store (one round trip each, hypothesis 1).
 READS = re.compile(r"ReadAt>::read_at|StoreExt>::get_range")
 GENERIC = re.compile(r"^(bellwether::main|bellwether::run|bellwether::\w+_cmds::run|<?rayon|<?core::|<?std::"
@@ -1147,6 +1163,7 @@ def top_frames(profile, syms, n=10):
     cpu_total, inclusive_no_reads = 0, {}
     waits, wait_callers = {}, {}
     thread_cpu = []
+    expected = {}
     for th in profile["threads"]:
         smp = th["samples"]
         weights = smp.get("threadCPUDelta") or [1] * len(smp["stack"])
@@ -1219,6 +1236,9 @@ def top_frames(profile, syms, n=10):
             total += w
             mine = own_frames(at)
             reads = any(READS.search(nm) for nm in mine)
+            for path, rx in EXPECTED_RE.items():
+                if any(rx.search(nm) for nm in mine):
+                    expected[path] = expected.get(path, 0) + w
             for nm in set(mine):
                 inclusive[nm] = inclusive.get(nm, 0) + w
                 if not reads:
@@ -1264,6 +1284,7 @@ def top_frames(profile, syms, n=10):
             "threads": len(thread_cpu),
             "busiest_threads_cpu_pct": [round(100 * x / max(1, cpu_total), 1)
                                         for x in sorted(thread_cpu, reverse=True)[:3]],
+            "expected_paths": {k: pct(expected.get(k, 0)) for k in EXPECTED},
             "main_thread_wall_samples": wall,
             "main_thread_wall": [{"frame": k, "wall_pct": round(100 * v / max(1, wall), 1)}
                                  for k, v in ranked(wall_inclusive)]}

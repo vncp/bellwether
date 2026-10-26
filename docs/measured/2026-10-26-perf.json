@@ -594,6 +594,16 @@
     35.7,
     26.8
    ],
+   "expected_paths": {
+    "bitmap intersection and union (Planner::intersect, per_key)": 29.2,
+    "bloom probing (lookup_hashes, bloom::check_bitset)": 0.4,
+    "key-directory block decoding (SegmentReader block index, BlockView)": 1.8,
+    "footer parsing (ParquetSource footer, row_groups)": 0.1,
+    "blake3 over a finished segment (Framing::finish)": 0.0,
+    "temporal chain compaction (bellwether_core::temporal)": 0.3,
+    "reconcile pass hashing (verify rowhash, fold_row)": 0.0,
+    "store reads per value (SegmentBytes::read_at, get_range)": 34.8
+   },
    "main_thread_wall_samples": 481893,
    "main_thread_wall": [
     {
@@ -873,6 +883,16 @@
     33.5,
     28.9
    ],
+   "expected_paths": {
+    "bitmap intersection and union (Planner::intersect, per_key)": 19.3,
+    "bloom probing (lookup_hashes, bloom::check_bitset)": 0.2,
+    "key-directory block decoding (SegmentReader block index, BlockView)": 1.8,
+    "footer parsing (ParquetSource footer, row_groups)": 0.5,
+    "blake3 over a finished segment (Framing::finish)": 0.0,
+    "temporal chain compaction (bellwether_core::temporal)": 1.2,
+    "reconcile pass hashing (verify rowhash, fold_row)": 0.0,
+    "store reads per value (SegmentBytes::read_at, get_range)": 33.7
+   },
    "main_thread_wall_samples": 51719,
    "main_thread_wall": [
     {
@@ -1165,6 +1185,16 @@
     8.4,
     8.3
    ],
+   "expected_paths": {
+    "bitmap intersection and union (Planner::intersect, per_key)": 0.0,
+    "bloom probing (lookup_hashes, bloom::check_bitset)": 0.0,
+    "key-directory block decoding (SegmentReader block index, BlockView)": 0.0,
+    "footer parsing (ParquetSource footer, row_groups)": 2.9,
+    "blake3 over a finished segment (Framing::finish)": 0.9,
+    "temporal chain compaction (bellwether_core::temporal)": 1.8,
+    "reconcile pass hashing (verify rowhash, fold_row)": 0.0,
+    "store reads per value (SegmentBytes::read_at, get_range)": 0.0
+   },
    "main_thread_wall_samples": 102,
    "main_thread_wall": [
     {
@@ -1200,11 +1230,11 @@
      "wall_pct": 16.7
     },
     {
-     "frame": "<bellwether_store::backend::ObjectStoreBackend as bellwether_store::backend::StoreExt>::exists",
+     "frame": "<tokio::runtime::runtime::Runtime>::block_on::<<bellwether_store::backend::ObjectStoreBackend as bellwether_store::backend::StoreExt>::exists::{closure#0}>",
      "wall_pct": 16.7
     },
     {
-     "frame": "<tokio::runtime::runtime::Runtime>::block_on::<<bellwether_store::backend::ObjectStoreBackend as bellwether_store::backend::StoreExt>::exists::{closure#0}>",
+     "frame": "<bellwether_store::backend::ObjectStoreBackend as bellwether_store::backend::StoreExt>::exists",
      "wall_pct": 16.7
     },
     {
@@ -1292,12 +1322,12 @@
      "without_store_reads_pct": 100.0
     },
     {
-     "frame": "<bellwether_verify::reconcile::Reconciler>::certify",
+     "frame": "<bellwether_verify::reconcile::Reconciler>::execute",
      "total_pct": 100.0,
      "without_store_reads_pct": 100.0
     },
     {
-     "frame": "<bellwether_verify::reconcile::Reconciler>::execute",
+     "frame": "<bellwether_verify::reconcile::Reconciler>::certify",
      "total_pct": 100.0,
      "without_store_reads_pct": 100.0
     },
@@ -1439,6 +1469,16 @@
     0.0,
     0.0
    ],
+   "expected_paths": {
+    "bitmap intersection and union (Planner::intersect, per_key)": 0.0,
+    "bloom probing (lookup_hashes, bloom::check_bitset)": 0.0,
+    "key-directory block decoding (SegmentReader block index, BlockView)": 0.0,
+    "footer parsing (ParquetSource footer, row_groups)": 0.0,
+    "blake3 over a finished segment (Framing::finish)": 0.0,
+    "temporal chain compaction (bellwether_core::temporal)": 0.0,
+    "reconcile pass hashing (verify rowhash, fold_row)": 22.0,
+    "store reads per value (SegmentBytes::read_at, get_range)": 0.0
+   },
    "main_thread_wall_samples": 66598,
    "main_thread_wall": [
     {
@@ -1446,11 +1486,11 @@
      "wall_pct": 100.0
     },
     {
-     "frame": "<bellwether_verify::reconcile::Reconciler>::certify",
+     "frame": "<bellwether_verify::reconcile::Reconciler>::execute",
      "wall_pct": 100.0
     },
     {
-     "frame": "<bellwether_verify::reconcile::Reconciler>::execute",
+     "frame": "<bellwether_verify::reconcile::Reconciler>::certify",
      "wall_pct": 100.0
     },
     {
@@ -1715,6 +1755,16 @@
     20.4,
     0.2
    ],
+   "expected_paths": {
+    "bitmap intersection and union (Planner::intersect, per_key)": 0.0,
+    "bloom probing (lookup_hashes, bloom::check_bitset)": 0.0,
+    "key-directory block decoding (SegmentReader block index, BlockView)": 0.0,
+    "footer parsing (ParquetSource footer, row_groups)": 0.0,
+    "blake3 over a finished segment (Framing::finish)": 1.5,
+    "temporal chain compaction (bellwether_core::temporal)": 2.7,
+    "reconcile pass hashing (verify rowhash, fold_row)": 0.0,
+    "store reads per value (SegmentBytes::read_at, get_range)": 0.0
+   },
    "main_thread_wall_samples": 39,
    "main_thread_wall": [
     {
@@ -1746,11 +1796,11 @@
      "wall_pct": 30.8
     },
     {
-     "frame": "bellwether_store::local::create_dirs_durably",
+     "frame": "bellwether_store::local::lock",
      "wall_pct": 15.4
     },
     {
-     "frame": "bellwether_store::local::lock",
+     "frame": "bellwether_store::local::create_dirs_durably",
      "wall_pct": 15.4
     },
     {
@@ -1990,6 +2040,16 @@
     0.4,
     0.1
    ],
+   "expected_paths": {
+    "bitmap intersection and union (Planner::intersect, per_key)": 0.0,
+    "bloom probing (lookup_hashes, bloom::check_bitset)": 3.0,
+    "key-directory block decoding (SegmentReader block index, BlockView)": 5.3,
+    "footer parsing (ParquetSource footer, row_groups)": 0.0,
+    "blake3 over a finished segment (Framing::finish)": 0.6,
+    "temporal chain compaction (bellwether_core::temporal)": 0.0,
+    "reconcile pass hashing (verify rowhash, fold_row)": 0.0,
+    "store reads per value (SegmentBytes::read_at, get_range)": 0.1
+   },
    "main_thread_wall_samples": 20537,
    "main_thread_wall": [
     {
