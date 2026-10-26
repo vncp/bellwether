@@ -4,12 +4,13 @@
 //! the current configuration and under each candidate key, one engine
 //! Proposal citing the Evidence and one Replay record per candidate.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use arrow::datatypes::Schema;
 use bellwether_core::encoding::check_ts_type;
+use bellwether_profile::lints::MembershipUse;
 use bellwether_profile::{ProfileOptions, ProfileReport};
 use bellwether_replay::{
     proposed_specs, record_bench_workload, servable, serves_query, Baseline, KeyInput, Lookup,
@@ -82,11 +83,17 @@ pub enum LookupMode {
     /// The rows whose string column holds a word starting with one of the
     /// values, case-folded (B5: prefix match; `bellwether locate --prefix`).
     HasPrefix,
+    /// The rows whose list column holds any of the values (`bellwether
+    /// locate --any`: `array_contains`, `has_any`, `exists(unnest)`).
+    ContainsAny,
+    /// The rows whose list column holds every one of the values
+    /// (`bellwether locate --all`).
+    ContainsAll,
 }
 
 impl LookupMode {
     /// The CLI spelling: `locate`, `latest`, `asof`, `contains`,
-    /// `has-token`, or `has-prefix`.
+    /// `has-token`, `has-prefix`, `contains-any`, or `contains-all`.
     #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
@@ -96,6 +103,8 @@ impl LookupMode {
             Self::Contains => "contains",
             Self::HasToken => "has-token",
             Self::HasPrefix => "has-prefix",
+            Self::ContainsAny => "contains-any",
+            Self::ContainsAll => "contains-all",
         }
     }
 
@@ -107,7 +116,34 @@ impl LookupMode {
             Self::Contains => Some(TextOp::Contains),
             Self::HasToken => Some(TextOp::HasToken),
             Self::HasPrefix => Some(TextOp::HasPrefix),
-            Self::Locate | Self::Latest | Self::Asof => None,
+            Self::Locate | Self::Latest | Self::Asof | Self::ContainsAny | Self::ContainsAll => {
+                None
+            }
+        }
+    }
+
+    /// Whether this prices list membership (`contains-any`,
+    /// `contains-all`).
+    #[must_use]
+    pub fn is_membership(self) -> bool {
+        matches!(self, Self::ContainsAny | Self::ContainsAll)
+    }
+
+    /// The run query a text or membership mode records (its values are
+    /// words, substrings, prefixes, or list elements), `None` for the
+    /// others.
+    fn value_query(self) -> Option<RunQuery> {
+        self.text_op()
+            .map(RunQuery::Text)
+            .or_else(|| self.membership_query())
+    }
+
+    /// The run query a membership mode records, `None` for the others.
+    fn membership_query(self) -> Option<RunQuery> {
+        match self {
+            Self::ContainsAny => Some(RunQuery::ContainsAny),
+            Self::ContainsAll => Some(RunQuery::ContainsAll),
+            _ => None,
         }
     }
 }
@@ -132,7 +168,10 @@ pub struct WhyRequest {
     /// `has_token`, and `has_prefix` (B5) price a key file of one string
     /// column's words, substrings, or prefixes as one text run, with the
     /// text keys on the column as the floor candidates, and take none of
-    /// them.
+    /// them;
+    /// `contains_any` and `contains_all` (B4) price a key file of one list
+    /// column's element values as membership lookups, with `list:<column>`
+    /// as the floor candidate, and take none of them.
     #[serde(default)]
     pub mode: Option<LookupMode>,
     /// Timestamp (or date, time, or integer version) column for temporal
@@ -263,13 +302,15 @@ impl WhyRequest {
         };
         match mode {
             LookupMode::Contains | LookupMode::HasToken | LookupMode::HasPrefix
+            | LookupMode::ContainsAny
+            | LookupMode::ContainsAll
                 if self.latest_by.is_some()
                     || self.at.is_some()
                     || self.lookback.is_some()
                     || self.window.is_some() =>
             {
                 Err(format!(
-                    "--mode {} prices text lookups and takes no --latest-by, --at, --lookback, or \
+                    "--mode {} prices text lookups or list membership and takes no --latest-by, --at, --lookback, or \
                      --window; drop them, or pass --mode latest or --mode asof to price versions",
                     mode.as_str()
                 ))
@@ -467,6 +508,21 @@ pub enum CulpritReason {
         /// per value (ties: lower p95), and its fanout; `None` when the
         /// profile measured no single column.
         lowest_fanout: Option<Fanout>,
+    },
+    /// As [`CulpritReason::Layout`], for a workload of list-membership runs
+    /// (B4): every priced configuration, the list key included, reads at
+    /// least [`LAYOUT_BOUND_FRACTION`] of the row groups the runs span, and
+    /// `values` says why: the row groups (and files) holding each queried
+    /// value present in the data, exact, from the list key.
+    ListLayout {
+        /// The fewest row groups any priced configuration reads, summed
+        /// over runs.
+        least_row_groups: u64,
+        /// The row groups the runs span.
+        row_groups: u64,
+        /// Per queried value present in the data (`distinct` of them, over
+        /// every run): files and row groups holding it, p50 / p95 / max.
+        values: Fanout,
     },
     /// A current key spec serves the workload; its columns bound what it
     /// prunes.
@@ -824,8 +880,14 @@ impl Engine {
             Some((w, _)) if !text_lints.is_empty() => Some(w.hash()),
             _ => None,
         };
+        // The list-membership detector (B4) likewise, citing the key set or
+        // workload it read.
+        let membership = self.membership_lints(req, &replayer, &current_specs)?;
         let mut extra_lints = sketch_lints;
         extra_lints.extend(text_lints);
+        extra_lints.extend(membership.lints);
+        let mut cites: Vec<Hash> = text_input.into_iter().collect();
+        cites.extend(membership.inputs);
         let (profile, evidence) = self.profile(
             req,
             Measure::Source(source),
@@ -834,7 +896,7 @@ impl Engine {
             twin_of.clone(),
             &twin_lints,
             extra_lints,
-            text_input,
+            cites,
         )?;
         let mut report = WhyReport {
             root: self.root().to_string(),
@@ -883,10 +945,12 @@ impl Engine {
                 req,
                 temporal.as_ref(),
             )?;
-            Some(workload)
+            let spread = queried_spread(&replayer, &workload, &cache)?;
+            Some((workload, spread))
         } else {
             None
         };
+        let (workload, spread) = workload.map_or((None, None), |(w, s)| (Some(w), s));
         let text_runs = match &workload {
             Some(w) => is_text_workload(w)?,
             None => false,
@@ -895,7 +959,7 @@ impl Engine {
             Some(w) if text_runs => text_culprit(&report.current_specs, w)?,
             _ => workload
                 .as_ref()
-                .and_then(|w| layout_culprit(&report, w, indexed_row_groups))
+                .and_then(|w| layout_culprit(&report, w, indexed_row_groups, spread))
                 .or_else(|| culprit(&report.current_specs, &report.profile, workload.as_ref())),
         };
         if self.is_table() {
@@ -1016,7 +1080,7 @@ impl Engine {
             None,
             &[],
             lints,
-            None,
+            Vec::new(),
         )?;
         let current_specs = p.specs().0;
         let culprit = culprit(&current_specs, &profile, None);
@@ -1237,6 +1301,92 @@ impl Engine {
         Ok(())
     }
 
+    /// The `R-list-1` lints (B4) for the request's membership runs: a key
+    /// file priced with `--mode contains-any|contains-all`, or a recorded
+    /// workload's membership runs, on a list column no complete list key in
+    /// `current` serves. The key set (stored in the cache) or the workload
+    /// is the lints' input.
+    fn membership_lints(
+        &self,
+        req: &WhyRequest,
+        replayer: &Replayer<'_>,
+        current: &[KeySpec],
+    ) -> Result<MembershipLints> {
+        let mut uses: BTreeMap<String, MembershipUse> = BTreeMap::new();
+        let mut inputs = Vec::new();
+        let mut add = |column: &str, all: bool, values: u64| {
+            let u = uses
+                .entry(column.to_string())
+                .or_insert_with(|| MembershipUse {
+                    column: column.to_string(),
+                    any_runs: 0,
+                    all_runs: 0,
+                    values_max: 0,
+                });
+            if all {
+                u.all_runs += 1;
+            } else {
+                u.any_runs += 1;
+            }
+            u.values_max = u.values_max.max(values);
+        };
+        match (
+            req.mode.filter(|m| m.is_membership()),
+            &req.keys,
+            &req.workload,
+        ) {
+            (Some(mode), Some(keys), _) => {
+                let (run_keys, _) = keys.run_keys(replayer.schema())?;
+                let is_list = |c: &String| {
+                    replayer
+                        .schema()
+                        .field_with_name(c)
+                        .is_ok_and(|f| bellwether_core::list::element_type(f.data_type()).is_some())
+                };
+                // Anything but one list column is refused when the run is
+                // recorded, with the reason; it raises no lint here.
+                if let [column] = run_keys
+                    .columns()
+                    .iter()
+                    .filter(|c| is_list(c))
+                    .collect::<Vec<_>>()[..]
+                {
+                    let payload = run_keys.to_payload()?;
+                    let hash = Hash::of(&payload);
+                    if let Some(cache) = self.writable_store().and_then(|_| self.cache().ok()) {
+                        cache.put_cached(&hash, bytes::Bytes::from(payload))?;
+                    }
+                    inputs.push(hash);
+                    add(
+                        column,
+                        mode == LookupMode::ContainsAll,
+                        run_keys.len() as u64,
+                    );
+                }
+            }
+            (_, None, Some(h)) => {
+                if let Some(w) = self.cache().ok().and_then(|c| Workload::load(&c, h).ok()) {
+                    for r in w.runs() {
+                        if let (Ok(q), [column]) = (r.query(), r.columns.as_slice()) {
+                            if q.is_membership() {
+                                add(column, q == RunQuery::ContainsAll, r.keys);
+                            }
+                        }
+                    }
+                    if !uses.is_empty() {
+                        inputs.push(*h);
+                    }
+                }
+            }
+            _ => {}
+        }
+        let uses: Vec<MembershipUse> = uses.into_values().collect();
+        Ok(MembershipLints {
+            lints: bellwether_profile::lints::list_membership(&uses, current),
+            inputs,
+        })
+    }
+
     /// Refuses a `why` request whose flags contradict each other, before any
     /// work. Returns whether it carries a workload.
     fn check_why_request(&self, req: &WhyRequest) -> Result<bool> {
@@ -1276,14 +1426,7 @@ impl Engine {
         }
         self.check_text_request(req)?;
         let mode = req.lookup_mode().map_err(Error::KeySpec)?;
-        if mode.text_op().is_some() && req.keys.is_none() && req.workload.is_none() {
-            return Err(Error::KeySpec(format!(
-                "--mode {} prices a key file of one string column's values (named after the \
-                 column) as a text lookup; pass --from <values.parquet> (or --workload <hash>), \
-                 or give the lookups themselves with --contains, --has, or --prefix COL=TEXT",
-                mode.as_str()
-            )));
-        }
+        check_values_given(req, mode)?;
         if req.window.is_some() && !(given[0] || given[1]) {
             return Err(Error::Other(
                 "a window (--window) applies to the runs why records: give a key file (--from) or \
@@ -1345,7 +1488,8 @@ impl Engine {
     /// Proposals must cite a recorded Evidence. Lints the profile does not
     /// compute (`extra_lints`: the sketch detector's, and `R-text-1`, which
     /// reads the workload's runs) join the same Evidence, which then also
-    /// cites `cites` (the workload `R-text-1` read). [`Measure::Manifest`]
+    /// cites `cites` (the workload `R-text-1` read, the key set or workload
+    /// `R-list-1` read). [`Measure::Manifest`]
     /// profiles from totals the caller already holds and reads no file.
     #[allow(clippy::too_many_arguments)]
     fn profile(
@@ -1357,7 +1501,7 @@ impl Engine {
         twin: Option<TwinOf>,
         twin_lints: &[Lint],
         extra_lints: Vec<bellwether_types::Lint>,
-        cites: Option<Hash>,
+        cites: Vec<Hash>,
     ) -> Result<(ProfileReport, ProfileEvidence)> {
         let writable = if has_workload {
             Some(Arc::clone(self.store()?))
@@ -1442,7 +1586,7 @@ impl Engine {
         // segments by content, and the text lints through the workload.
         profile.lints.extend(extra_lints);
         let mut evidence = bellwether_profile::evidence(&profile)?;
-        if let Some(h) = cites {
+        for h in cites {
             if !evidence.provenance.inputs.contains(&h) {
                 evidence.provenance.inputs.push(h);
             }
@@ -1512,18 +1656,8 @@ impl Engine {
                     }
                     Some(t)
                 }
-                None if req.mode.is_some_and(|m| m.text_op().is_some()) => {
-                    let want = req.mode.and_then(LookupMode::text_op).map(RunQuery::Text);
-                    if let Some(r) = w.runs().iter().find(|r| r.query().ok() != want) {
-                        let mode = req.mode.map_or("", LookupMode::as_str);
-                        return Err(Error::KeySpec(format!(
-                            "workload {h} records its runs as {} lookups, and --mode {mode} asks \
-                             for text lookups; drop --mode to price them as recorded, or record \
-                             the values again with `bellwether why --from <values.parquet> \
-                             --mode {mode}`",
-                            describe(&r.query()?),
-                        )));
-                    }
+                None if req.mode.and_then(LookupMode::value_query).is_some() => {
+                    check_value_runs(h, &w, req.mode)?;
                     None
                 }
                 None if req.mode == Some(LookupMode::Locate) => {
@@ -1566,8 +1700,8 @@ impl Engine {
                 .map(|f| f.name().clone())
                 .collect();
             let mut recorder = self.windowed(recorder, req, pinned, replayer, &columns)?;
-            let query = match req.mode.and_then(LookupMode::text_op) {
-                Some(op) => RunQuery::Text(op),
+            let query = match req.mode.and_then(LookupMode::value_query) {
+                Some(q) => q,
                 None => resolved
                     .as_ref()
                     .map_or(RunQuery::Locate, |t| t.query.clone()),
@@ -1691,9 +1825,9 @@ impl Engine {
                 workload.runs().iter().map(|r| r.columns.clone()).collect();
             set.into_iter().collect()
         };
-        // A workload of text runs (B5) is priced on text keys alone; one
-        // mixing them with key lookups would price each candidate on runs
-        // it cannot serve.
+        // A workload of text runs (B5) is priced on text keys alone, and one
+        // of membership runs (B4) on list keys alone; one mixing either with
+        // key lookups would price each candidate on runs it cannot serve.
         let queries: Vec<RunQuery> = workload
             .runs()
             .iter()
@@ -1711,6 +1845,18 @@ impl Engine {
             )));
         }
         let text = text_runs > 0;
+        let membership = queries.iter().filter(|q| q.is_membership()).count();
+        if membership > 0 && membership < queries.len() {
+            return Err(Error::KeySpec(format!(
+                "workload {} mixes {membership} list-membership runs with {} key lookups; a list \
+                 key serves only the former, so price them as two workloads (record each with \
+                 `bellwether why --from <keys.parquet>`, adding --mode contains-any or \
+                 contains-all for the list values)",
+                workload.hash(),
+                queries.len() - membership
+            )));
+        }
+        let membership = membership > 0;
         let mut windows: Vec<RunWindow> = Vec::new();
         for w in workload.runs().iter().filter_map(|r| r.window.as_ref()) {
             if !windows.contains(w) {
@@ -1738,16 +1884,31 @@ impl Engine {
                 operators: operators.into_iter().collect(),
             }
         });
+        let membership_kind = match (membership, queries.first(), run_columns.first()) {
+            (true, Some(q), Some(c)) => Some(match q {
+                RunQuery::ContainsAll => LookupKind::ContainsAll {
+                    column: c.join(","),
+                },
+                _ => LookupKind::ContainsAny {
+                    column: c.join(","),
+                },
+            }),
+            _ => None,
+        };
+        let run_kind = text_kind.or(membership_kind);
         let query_kind = if text {
             let kinds: BTreeSet<&str> = queries.iter().map(RunQuery::kind_str).collect();
             kinds.into_iter().collect::<Vec<_>>().join(",")
         } else {
-            temporal
-                .as_ref()
-                .map_or(QUERY_KIND_LOCATE, |t| t.query.kind_str())
-                .to_string()
+            match (&run_kind, queries.first()) {
+                (Some(_), Some(q)) => q.kind_str(),
+                _ => temporal
+                    .as_ref()
+                    .map_or(QUERY_KIND_LOCATE, |t| t.query.kind_str()),
+            }
+            .to_string()
         };
-        let lookup_kind = match &text_kind {
+        let lookup_kind = match &run_kind {
             Some(k) => k.clone(),
             None => temporal
                 .as_ref()
@@ -1758,7 +1919,9 @@ impl Engine {
             hash: workload.hash(),
             runs: workload.runs().len() as u64,
             query_kind,
-            lookup: text_kind.or_else(|| temporal.as_ref().map(|t| t.lookup.clone())),
+            lookup: run_kind
+                .clone()
+                .or_else(|| temporal.as_ref().map(|t| t.lookup.clone())),
             lookback: lookback.clone(),
             columns: run_columns.clone(),
             keys_p50_p95_max: workload.keys_p50_p95_max(),
@@ -1803,6 +1966,18 @@ impl Engine {
         // columns gets the exact key on them.
         let floor: Vec<KeySpec> = if text {
             crate::text::floor_keys(workload)?
+        } else if membership {
+            // A membership run's floor is the list key on its one column
+            // (B4); an exact key cannot look a list's elements up.
+            run_columns
+                .iter()
+                .filter_map(|c| match c.as_slice() {
+                    [column] => Some(KeySpec::List {
+                        column: column.clone(),
+                    }),
+                    _ => None,
+                })
+                .collect()
         } else {
             run_columns
                 .iter()
@@ -1903,7 +2078,7 @@ impl Engine {
                 counts: false,
                 bounds: None,
             };
-            if text || !serves(&exact_spec) {
+            if text || membership || !serves(&exact_spec) {
                 if !current_names.contains(&label(&exact_spec))
                     && !names.contains(&label(&exact_spec))
                 {
@@ -2004,7 +2179,8 @@ impl Engine {
             } else {
                 None
             };
-            // The kind column: a text key's (distinct tokens); an `expr`
+            // The kind column: a text key's (distinct tokens); a list key's
+            // (distinct elements); an `expr`
             // candidate's (null-expression rows and distinct derived values);
             // else the sketch's rows per value where a sketch holds the
             // candidate's columns; otherwise the `counts` column: for an exact
@@ -2017,6 +2193,8 @@ impl Engine {
                     &spec,
                     total(&scored.replay.proposed).bytes < total(&scored.replay.current).bytes,
                 )?),
+                // a list key's column: its distinct elements (B4)
+                KeySpec::List { .. } => Some(list_column(replayer, &spec)?),
                 _ => match expr_column(replayer, &spec)? {
                     Some(c) => Some(c),
                     None => match sketch_column(&report.sketch, spec.columns()) {
@@ -2212,6 +2390,135 @@ fn is_expression_run(schema: &arrow::datatypes::Schema, columns: &[String]) -> b
     matches!(columns, [c] if bellwether_core::expr::is_expression(c, schema))
 }
 
+/// How the values a workload of membership runs (B4) asks for are spread
+/// over the data: per distinct queried value present in it (both encodings
+/// of a float zero are one value), the row groups and files holding it,
+/// read from the list key on the runs' column (its transient segments, the
+/// ones the candidate was priced with). Exact. `None` for any other
+/// workload.
+fn queried_spread(
+    replayer: &Replayer<'_>,
+    workload: &Workload,
+    cache: &Cache<ObjectStoreBackend>,
+) -> Result<Option<Fanout>> {
+    let Some(first) = workload.runs().first() else {
+        return Ok(None);
+    };
+    let ([column], true) = (first.columns.as_slice(), first.query()?.is_membership()) else {
+        return Ok(None);
+    };
+    let mut groups: BTreeSet<Vec<Vec<u8>>> = BTreeSet::new();
+    for run in workload.runs() {
+        let rk = workload.run_keys(cache, run)?;
+        groups.extend((0..rk.len()).map(|i| rk.probes(i, &[0])));
+    }
+    let probes: Vec<&Vec<u8>> = groups.iter().flatten().collect();
+    let index = replayer.transient(&KeySpec::List {
+        column: column.clone(),
+    })?;
+    let per = bellwether_core::list::element_row_groups(index.segments().readers(), &probes)?;
+    let catalog = replayer.catalog();
+    let file_of: BTreeMap<u32, usize> = catalog
+        .row_groups()
+        .iter()
+        .map(|rg| (rg.id.0, rg.file))
+        .collect();
+    let (mut rgs, mut files): (Vec<u32>, Vec<u32>) = (Vec::new(), Vec::new());
+    for g in &groups {
+        let held = g
+            .iter()
+            .filter_map(|v| per.get(v))
+            .fold(roaring::RoaringBitmap::new(), |u, b| u | b);
+        if held.is_empty() {
+            continue;
+        }
+        let in_files: BTreeSet<usize> = held
+            .iter()
+            .filter_map(|id| file_of.get(&id).copied())
+            .collect();
+        rgs.push(u32::try_from(held.len()).unwrap_or(u32::MAX));
+        files.push(u32::try_from(in_files.len()).unwrap_or(u32::MAX));
+    }
+    rgs.sort_unstable();
+    files.sort_unstable();
+    Ok(Some(Fanout {
+        columns: vec![column.clone()],
+        distinct: rgs.len() as u64,
+        sampled: false,
+        files_per_value: bellwether_profile::quantile::p50_p95_max(&files),
+        row_groups_per_value: bellwether_profile::quantile::p50_p95_max(&rgs),
+        files_total: catalog.files().len() as u64,
+        row_groups_total: catalog.len() as u64,
+        sample_size: None,
+        quantile_error: None,
+    }))
+}
+
+/// Refuses a text (B5) or membership (B4) `mode` without the values it
+/// prices: a key file of one string or list column's values, or a recorded
+/// workload.
+fn check_values_given(req: &WhyRequest, mode: LookupMode) -> Result<()> {
+    if mode.value_query().is_none() || req.keys.is_some() || req.workload.is_some() {
+        return Ok(());
+    }
+    let (kind, also) = if mode.is_membership() {
+        ("list", "")
+    } else {
+        (
+            "string",
+            ", or give the lookups themselves with --contains, --has, or --prefix COL=TEXT",
+        )
+    };
+    Err(Error::KeySpec(format!(
+        "--mode {} prices a key file of one {kind} column's values (named after the column); \
+         pass --from <values.parquet> (or --workload <hash>){also}",
+        mode.as_str()
+    )))
+}
+
+/// Refuses a recorded workload `w` priced under a text (B5) or membership
+/// (B4) `mode` when a run records another lookup: its costs would be
+/// labelled as the mode's.
+fn check_value_runs(h: &Hash, w: &Workload, mode: Option<LookupMode>) -> Result<()> {
+    let want = mode.and_then(LookupMode::value_query);
+    let Some(r) = w.runs().iter().find(|r| r.query().ok() != want) else {
+        return Ok(());
+    };
+    let name = mode.map_or("", LookupMode::as_str);
+    let asks = if mode.is_some_and(LookupMode::is_membership) {
+        "list membership"
+    } else {
+        "text lookups"
+    };
+    Err(Error::KeySpec(format!(
+        "workload {h} records its runs as {} lookups, and --mode {name} asks for {asks}; drop \
+         --mode to price them as recorded, or record the values again with `bellwether why \
+         --from <values.parquet> --mode {name}`",
+        describe(&r.query()?),
+    )))
+}
+
+/// The list-membership detector's lints (B4) and the inputs they cite.
+#[derive(Default)]
+struct MembershipLints {
+    lints: Vec<bellwether_types::Lint>,
+    inputs: Vec<Hash>,
+}
+
+/// A list key's `why` column (B4): the distinct element values of its
+/// column, exact, counted over the transient index the candidate was priced
+/// with (an element in several segments counts once).
+fn list_column(replayer: &Replayer<'_>, spec: &KeySpec) -> Result<bellwether_types::KindColumn> {
+    let index = replayer.transient(spec)?;
+    let distinct = bellwether_core::list::distinct_elements(index.segments().readers())?;
+    Ok(bellwether_types::KindColumn {
+        kind: "list".into(),
+        label: "distinct elements".into(),
+        value: distinct.to_string(),
+        exactness: bellwether_types::Exactness::Exact,
+    })
+}
+
 /// A run's lookup in words, for refusals: `locate`, `latest`, `asof at 30`,
 /// either with `, lookback 3600` (in the timestamp column's unit), or
 /// `window 10..=20 of ts`.
@@ -2292,7 +2599,12 @@ fn text_culprit(current: &[KeySpec], w: &Workload) -> Result<Option<Culprit>> {
 /// current spec serving the first run) and every priced configuration reads
 /// at least [`LAYOUT_BOUND_FRACTION`] of the `runs × indexed_row_groups` row
 /// groups the runs span. A dataset of one row group never names the layout.
-fn layout_culprit(r: &WhyReport, w: &Workload, indexed_row_groups: u64) -> Option<Culprit> {
+fn layout_culprit(
+    r: &WhyReport,
+    w: &Workload,
+    indexed_row_groups: u64,
+    spread: Option<Fanout>,
+) -> Option<Culprit> {
     // A text lookup (B5) that reads nearly every row group under every
     // text key is a term in nearly every row group, which the text key's
     // `why` column says; no clustering of the files changes that.
@@ -2303,14 +2615,23 @@ fn layout_culprit(r: &WhyReport, w: &Workload, indexed_row_groups: u64) -> Optio
         return None;
     }
     let current = r.current?;
-    let columns = w.runs().first()?.columns.clone();
+    let first = w.runs().first()?;
+    let columns = first.columns.clone();
+    let query = first.query().ok()?;
+    // The floor is priced when it is a candidate or a current spec serves
+    // the runs: for membership runs (B4), the list key on their column.
+    let serves = |s: &KeySpec| {
+        if query.is_membership() {
+            serves_query(s, &columns, &query)
+        } else {
+            servable(s, &columns).is_some()
+        }
+    };
     let floor_priced = r
         .candidates
         .iter()
         .any(|c| c.origin == CandidateOrigin::Workload)
-        || r.current_specs
-            .iter()
-            .any(|s| servable(s, &columns).is_some());
+        || r.current_specs.iter().any(serves);
     let row_groups = indexed_row_groups * w.runs().len() as u64;
     // One row group has nothing to prune: no layout could do better.
     if !floor_priced || indexed_row_groups < 2 {
@@ -2325,6 +2646,19 @@ fn layout_culprit(r: &WhyReport, w: &Workload, indexed_row_groups: u64) -> Optio
     #[allow(clippy::cast_precision_loss)]
     if (least_row_groups as f64) < LAYOUT_BOUND_FRACTION * row_groups as f64 {
         return None;
+    }
+    // Membership runs: the cause is where the queried values sit, measured
+    // from the list key itself, not any column's fanout.
+    if let Some(values) = spread {
+        return Some(Culprit {
+            columns,
+            fanout: None,
+            reason: CulpritReason::ListLayout {
+                least_row_groups,
+                row_groups,
+                values,
+            },
+        });
     }
     // A run keyed on an expression looks up derived values, which no
     // profiled column holds: no column's fanout explains its layout.
@@ -2556,10 +2890,15 @@ fn infer_workload_temporal(
     // A window run reads every row of its keys in a fixed window, and a
     // count run counts every row of its keys: no version is chosen, so
     // there is no temporal lookup to infer. A text run (B5) chooses no
-    // version either.
+    // version either, nor does a membership run (B4).
     if matches!(
         query,
-        RunQuery::Locate | RunQuery::Window(_) | RunQuery::Count | RunQuery::Text(_)
+        RunQuery::Locate
+            | RunQuery::Window(_)
+            | RunQuery::Count
+            | RunQuery::Text(_)
+            | RunQuery::ContainsAny
+            | RunQuery::ContainsAll
     ) {
         return Ok(None);
     }

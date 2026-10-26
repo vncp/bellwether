@@ -92,12 +92,14 @@ pub enum Lookup {
 /// How `spec` serves a run keyed on `run_columns`, or `None` if it cannot
 /// (module docs, rule (a) then rule (b)). An `expr` key serves exactly the
 /// runs keyed on its (normalized) expression, never one naming its virtual
-/// column.
+/// column. A list key serves only membership runs ([`serves_query`]),
+/// never a lookup on the list column's value as a whole.
 #[must_use]
 pub fn servable(spec: &KeySpec, run_columns: &[String]) -> Option<Lookup> {
     // A text key serves text lookups only (`PlanSource::plan_text`), never
-    // a key: its dictionary holds tokens, not values.
-    if run_columns.is_empty() || matches!(spec, KeySpec::Text { .. }) {
+    // a key: its dictionary holds tokens, not values. A list key serves
+    // membership runs only (`serves_query`).
+    if run_columns.is_empty() || matches!(spec, KeySpec::Text { .. } | KeySpec::List { .. }) {
         return None;
     }
     if let KeySpec::Expr { expr, .. } = spec {
@@ -130,7 +132,8 @@ pub fn serves_window(spec: &KeySpec, ts_column: &str) -> bool {
         KeySpec::Bloom { .. }
         | KeySpec::Bitemporal { .. }
         | KeySpec::Expr { .. }
-        | KeySpec::Text { .. } => false,
+        | KeySpec::Text { .. }
+        | KeySpec::List { .. } => false,
     }
 }
 
@@ -141,7 +144,9 @@ pub fn serves_window(spec: &KeySpec, ts_column: &str) -> bool {
 /// ([`serves_window`]). `latest`, `asof`, and lookback runs need a temporal
 /// spec whose columns are all in `run_columns` (`Lookup::Point`); other
 /// specs that serve `run_columns` also participate by per-key intersection
-/// when paired with one temporal spec.
+/// when paired with one temporal spec. A membership run (`contains_any`,
+/// `contains_all`) is served by a list key on its one column, and by
+/// nothing else.
 #[must_use]
 pub fn serves_query(spec: &KeySpec, run_columns: &[String], query: &RunQuery) -> bool {
     match query {
@@ -159,6 +164,9 @@ pub fn serves_query(spec: &KeySpec, run_columns: &[String], query: &RunQuery) ->
             }
             _ => servable(spec, run_columns).is_some(),
         },
+        RunQuery::ContainsAny | RunQuery::ContainsAll => {
+            matches!(spec, KeySpec::List { column } if run_columns == std::slice::from_ref(column))
+        }
     }
 }
 
@@ -204,7 +212,12 @@ pub fn planned_time_column(
         check_lookback(lookback)?;
     }
     match query {
-        RunQuery::Locate | RunQuery::Window(_) | RunQuery::Count | RunQuery::Text(_) => Ok(None),
+        RunQuery::Locate
+        | RunQuery::Window(_)
+        | RunQuery::Count
+        | RunQuery::Text(_)
+        | RunQuery::ContainsAny
+        | RunQuery::ContainsAll => Ok(None),
         RunQuery::Latest | RunQuery::Asof { .. } => serving_temporal_column(specs, run_columns),
         RunQuery::Lookback { asof: None, .. } => planner.lookback_column(specs, run_columns),
         RunQuery::Lookback { asof: Some(_), .. } => {
@@ -1019,7 +1032,9 @@ impl SegmentPlanner {
             | RunQuery::Count
             | RunQuery::Window(_)
             | RunQuery::Text(_)
-            | RunQuery::Lookback { asof: Some(_), .. } => {
+            | RunQuery::Lookback { asof: Some(_), .. }
+            | RunQuery::ContainsAny
+            | RunQuery::ContainsAll => {
                 return Err(Error::Other(format!(
                     "a {} run is not planned through version chains alone",
                     query.kind_str()
@@ -1182,6 +1197,90 @@ impl SegmentPlanner {
         }
         Ok(out)
     }
+
+    /// A membership run (`contains_any`, `contains_all`) on its one list
+    /// column, by the build planner's `Lookup::ContainsAny` /
+    /// `ContainsAll` rules: the list key on the column unions (any) or
+    /// intersects (all) each value's row groups, both encodings of a float
+    /// zero counting as one value; with no spec, every live row group; a
+    /// listed spec of which none is that list key is an error. No value
+    /// plans nothing (`contains_any`); `contains_all` with none is refused.
+    fn plan_membership(
+        &self,
+        specs: &[KeySpec],
+        listed: &[&Arc<SpecSegments>],
+        keys: &RunKeys,
+        all: bool,
+    ) -> Result<ScanPlan> {
+        let [column] = keys.columns() else {
+            return Err(Error::KeySpec(format!(
+                "a membership run looks up one list column, not {:?}",
+                keys.columns()
+            )));
+        };
+        bellwether_core::list::check_list_column(column, &ts_type(self.catalog.schema(), column)?)?;
+        let mut groups: Vec<Vec<Vec<u8>>> = (0..keys.len()).map(|i| keys.probes(i, &[0])).collect();
+        groups.sort_unstable();
+        groups.dedup();
+        if all && groups.is_empty() {
+            return Err(Error::KeySpec(format!(
+                "contains_all on {column} needs at least one value: with none, every row \
+                 matches, null and empty lists included, which a list key does not record; \
+                 pass a key file holding the values, or read the folder without a lookup"
+            )));
+        }
+        let query = if all {
+            RunQuery::ContainsAll
+        } else {
+            RunQuery::ContainsAny
+        };
+        let serving: Vec<&Arc<SpecSegments>> = specs
+            .iter()
+            .zip(listed)
+            .filter(|(s, _)| serves_query(s, keys.columns(), &query))
+            .map(|(_, l)| *l)
+            .collect();
+        if !specs.is_empty() && serving.is_empty() {
+            return Err(Error::KeySpec(format!(
+                "none of {:?} serves a membership run on {column}; only a list key does",
+                specs.iter().map(KeySpec::name).collect::<Vec<_>>()
+            )));
+        }
+        let selected = if groups.is_empty() {
+            RoaringBitmap::new()
+        } else if serving.is_empty() {
+            self.catalog.all_ids()
+        } else {
+            let probes = keys.all_probes(&[0]);
+            let mut per: BTreeMap<Vec<u8>, RoaringBitmap> = BTreeMap::new();
+            for s in &serving {
+                for (k, b) in bellwether_core::list::element_row_groups(s.readers(), &probes)? {
+                    *per.entry(k).or_default() |= b;
+                }
+            }
+            let of = |g: &Vec<Vec<u8>>| {
+                g.iter()
+                    .filter_map(|v| per.get(v))
+                    .fold(RoaringBitmap::new(), |u, b| u | b)
+            };
+            if all {
+                let mut acc: Option<RoaringBitmap> = None;
+                for g in &groups {
+                    let b = of(g);
+                    acc = Some(match acc {
+                        Some(a) => a & b,
+                        None => b,
+                    });
+                }
+                acc.unwrap_or_default()
+            } else {
+                groups.iter().fold(RoaringBitmap::new(), |u, g| u | of(g))
+            }
+        };
+        let mut plan = self.catalog.plan_for(&selected)?;
+        plan.residual = Some(membership_residual(column, keys, all));
+        Ok(plan)
+    }
 }
 
 impl PlanSource for SegmentPlanner {
@@ -1211,6 +1310,10 @@ impl PlanSource for SegmentPlanner {
             listed.push(self.listed(spec)?);
         }
         let query = planned_query(self.catalog.schema(), specs, keys.columns(), query)?;
+        if query.is_membership() {
+            let all = matches!(*query, RunQuery::ContainsAll);
+            return self.plan_membership(specs, &listed, keys, all);
+        }
         if *query != RunQuery::Locate && is_expression_run(self.catalog.schema(), keys.columns()) {
             return Err(Error::KeySpec(format!(
                 "{} is an expression; an expression key answers point lookups (locate) only, \
@@ -1355,7 +1458,7 @@ impl PlanSource for SegmentPlanner {
 pub(crate) fn check_key_types(schema: &Schema, keys: &RunKeys) -> Result<()> {
     for (c, recorded) in keys.columns().iter().zip(keys.key_types()) {
         let declared = crate::keys::declared_type(schema, c)?;
-        if ColumnType::of(&declared)? != *recorded {
+        if ColumnType::of(bellwether_core::list::value_type(&declared))? != *recorded {
             return Err(Error::KeySpec(format!(
                 "keys on {c:?} were encoded as {recorded}, but the dataset declares {declared}; re-read the keys"
             )));
@@ -1401,6 +1504,28 @@ impl EncodedWindow {
             window: window.clone(),
             ty,
         })
+    }
+}
+
+/// The residual of a membership run on list column `column` (ADR 011), as
+/// the build planner writes it: `ContainsAny` over every value's encodings
+/// (both zeros), or `ContainsAll` with one sorted group per value. Also the
+/// rows a membership run asks for, which `fix` compares.
+#[must_use]
+pub fn membership_residual(column: &str, keys: &RunKeys, all: bool) -> Predicate {
+    if all {
+        let mut groups: Vec<Vec<Vec<u8>>> = (0..keys.len()).map(|i| keys.probes(i, &[0])).collect();
+        groups.sort_unstable();
+        groups.dedup();
+        Predicate::ContainsAll {
+            column: column.to_string(),
+            values: groups,
+        }
+    } else {
+        Predicate::ContainsAny {
+            column: column.to_string(),
+            values: keys.all_probes(&[0]),
+        }
     }
 }
 
@@ -1616,5 +1741,11 @@ mod tests {
         );
         assert_eq!(servable(&range, &cols(&["b"])), None);
         assert_eq!(servable(&range, &[]), None);
+        // A list key serves membership runs only (`serves_query`), never a
+        // lookup on the list column's value as a whole.
+        let list = KeySpec::List { column: "a".into() };
+        assert_eq!(servable(&list, &cols(&["a"])), None);
+        assert!(serves_query(&list, &cols(&["a"]), &RunQuery::ContainsAny));
+        assert!(!serves_query(&list, &cols(&["a"]), &RunQuery::Locate));
     }
 }

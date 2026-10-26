@@ -48,6 +48,8 @@ Each reply's text is the facade's typed result serialized exactly as the CLI's `
 
 **Budgets.** One server process is one session. Before any tool runs, a spent dimension refuses it with `budget_exceeded`; after it runs, the Replay records it wrote, the rows its verification read (both sides), and its wall time are charged (so `observe.*` is charged wall time too). A score or apply call that is not a dry run is admitted atomically: under the budget lock it is checked and reserves the replays and rows left; a concurrent one waits (its job's progress says so) until that call settles, its actual cost charged and the rest refunded, and is then checked. Concurrent jobs therefore behave as if run one at a time, and only the call that crosses a limit finishes over it. Bytes read are not a dimension: the facade reports what a plan would read, not what the engine read.
 
+List keys (B4): `observe.locate` takes `contains: "any" | "all"` (= `locate --any` / `--all`) and `score.why` takes `contains` (= `why --mode contains-any|contains-all`); each tool's text is the CLI's `--json` line (`crates/bellwether-cli/tests/list.rs`).
+
 ## Resources and the prompt
 
 `bellwether://findings` (the newest profile Evidence per root with its lints), `bellwether://receipts` (every receipt with its chain status), and `bellwether://scorecard` (per rule id: proposals, certificates passed and failed, receipts), each the facade's ledger view, byte for byte `bellwether ledger findings|receipts|scorecard --json`. One prompt, `diagnose_slow_query`, which is `AGENTS.md` (and the symptom the human described, when given).

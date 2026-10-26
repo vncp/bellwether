@@ -191,10 +191,13 @@ struct WhyArgs {
     workload: Option<String>,
     /// The lookup the keys are priced under: `locate` (rows holding a key),
     /// `latest` (each key's newest version), `asof` (the version current
-    /// at --at), or a text lookup over a key file of one string column's
+    /// at --at), a text lookup over a key file of one string column's
     /// values: `contains` (substrings), `has-token` (words), `has-prefix`
-    /// (word prefixes), case-folded [default: asof with --at, latest with
-    /// --latest-by, else locate].
+    /// (word prefixes), case-folded, or a list-membership lookup over a key
+    /// file of one list column's values (named after the column):
+    /// `contains-any` (rows whose list holds any of them) or `contains-all`
+    /// (every one), priced against list:<column> [default: asof with --at,
+    /// latest with --latest-by, else locate].
     #[arg(long, value_enum, value_name = "MODE")]
     mode: Option<ModeArg>,
     /// Timestamp (or date, time, or integer version) column that orders
@@ -298,6 +301,8 @@ enum ModeArg {
     Contains,
     HasToken,
     HasPrefix,
+    ContainsAny,
+    ContainsAll,
 }
 
 impl From<ModeArg> for bellwether::LookupMode {
@@ -309,6 +314,8 @@ impl From<ModeArg> for bellwether::LookupMode {
             ModeArg::Contains => Self::Contains,
             ModeArg::HasToken => Self::HasToken,
             ModeArg::HasPrefix => Self::HasPrefix,
+            ModeArg::ContainsAny => Self::ContainsAny,
+            ModeArg::ContainsAll => Self::ContainsAll,
         }
     }
 }
@@ -400,6 +407,16 @@ struct LocateArgs {
     /// read from the planned files' footers, and the output says so).
     #[arg(long, value_name = "COLS", value_delimiter = ',')]
     columns: Option<Vec<String>>,
+    /// List membership: the rows whose list (or map) column holds ANY of
+    /// the values in --keys (`array_contains`, `has_any`), through the list
+    /// key on that column (list:<column>). The key file has one column,
+    /// named after the list column, of its element type.
+    #[arg(long, conflicts_with_all = ["all", "from", "to", "window", "ts", "columns", "contains", "has", "prefix"])]
+    any: bool,
+    /// List membership: the rows whose list column holds EVERY one of the
+    /// values in --keys, as --any.
+    #[arg(long, conflicts_with_all = ["from", "to", "window", "ts", "columns", "contains", "has", "prefix"])]
+    all: bool,
 }
 
 #[derive(Args)]
@@ -1107,6 +1124,7 @@ fn locate(g: &Global, out: &Out, a: &LocateArgs) -> Result<Outcome, Failure> {
             engine.locate_columns(&keys, w.map(|(f, t)| (f, t, a.ts.as_deref())), columns)?
         }
         (Some((from, to)), None) => engine.locate_window(&keys, from, to, a.ts.as_deref())?,
+        (None, None) if a.any || a.all => engine.locate_contains(&keys, a.all)?,
         (None, None) => engine.locate(&keys)?,
     };
     done(&result, human::plan(&result, out), EXIT_OK)

@@ -21,9 +21,9 @@ use crate::envelope::{cites_of, Chain, Envelope, Status};
 use crate::jobs::{job_id, Job, JobInfo, JobState, Jobs};
 use crate::refusal::{self, Refusal, RefusalCode};
 use crate::tools::{
-    self, ApplyReceipt, JobRef, JobsStart, KeyArg, ObserveAsof, ObserveCardinality, ObserveCount,
-    ObserveLocate, ObserveOverlap, ObserveText, ObserveWhy, ProposeKey, ProposeLayout,
-    ProposeRewrite, ScoreRecord, ScoreVerify, ScoreWhy, Tier,
+    self, ApplyReceipt, JobRef, JobsStart, KeyArg, Membership, ObserveAsof, ObserveCardinality,
+    ObserveCount, ObserveLocate, ObserveOverlap, ObserveText, ObserveWhy, ProposeKey,
+    ProposeLayout, ProposeRewrite, ScoreRecord, ScoreVerify, ScoreWhy, Tier,
 };
 
 /// How the server is configured at startup. Nothing is read from the
@@ -326,9 +326,17 @@ impl Server {
                 };
                 let engine = pinned.as_ref().unwrap_or(e);
                 let keys = key_file(a.keys, a.key_columns);
-                let result = match &a.columns {
-                    Some(columns) => engine.locate_columns(&keys, None, columns),
-                    None => engine.locate(&keys),
+                let result = match (&a.columns, a.contains) {
+                    (Some(_), Some(_)) => Err(bellwether::types::Error::InvalidArgument {
+                        field: "columns",
+                        reason: "a membership lookup (contains) plans row groups without a \
+                                 projection; drop columns, or drop contains for a point lookup \
+                                 with column bytes"
+                            .into(),
+                    }),
+                    (None, Some(m)) => engine.locate_contains(&keys, m == Membership::All),
+                    (Some(columns), None) => engine.locate_columns(&keys, None, columns),
+                    (None, None) => engine.locate(&keys),
                 };
                 match result {
                     Ok(r) => done(&r, None),
@@ -395,7 +403,10 @@ impl Server {
                     keys: a.keys.map(|k| key_file(k, a.key_columns)),
                     bench_workload: None,
                     workload: a.workload,
-                    mode: None,
+                    mode: a.contains.map(|m| match m {
+                        Membership::Any => bellwether::LookupMode::ContainsAny,
+                        Membership::All => bellwether::LookupMode::ContainsAll,
+                    }),
                     latest_by: None,
                     at: None,
                     lookback: None,

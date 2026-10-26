@@ -266,6 +266,9 @@ pub struct Row {
     pub rg: u32,
     pub row: usize,
     pub cols: BTreeMap<String, Option<Vec<u8>>>,
+    /// List and map columns (B4): each non-null element's canonical bytes
+    /// at the element type (a map's keys), in order; `None` for a null list.
+    pub lists: BTreeMap<String, Option<Vec<Vec<u8>>>>,
 }
 
 impl Row {
@@ -292,11 +295,33 @@ fn rows_of(
 ) -> Vec<Row> {
     (0..batch.num_rows())
         .map(|r| {
+            let mut lists = BTreeMap::new();
             let cols = schema
                 .fields()
                 .iter()
                 .filter_map(|f| {
                     let array = batch.column_by_name(f.name())?;
+                    if let Some(element) = bellwether_core::list::element_type(f.data_type()) {
+                        let items = bellwether_core::list::row_elements(array.as_ref(), r)
+                            .unwrap()
+                            .map(|items| {
+                                (0..items.len())
+                                    .filter_map(|i| {
+                                        let mut out = Vec::new();
+                                        encoding::encode_array_value_as(
+                                            items.as_ref(),
+                                            i,
+                                            element,
+                                            &mut out,
+                                        )
+                                        .unwrap()
+                                        .then_some(out)
+                                    })
+                                    .collect()
+                            });
+                        lists.insert(f.name().clone(), items);
+                        return None;
+                    }
                     let mut out = Vec::new();
                     let present =
                         encoding::encode_array_value_as(array.as_ref(), r, f.data_type(), &mut out)
@@ -309,6 +334,7 @@ fn rows_of(
                 rg,
                 row: first_row + r,
                 cols,
+                lists,
             }
         })
         .collect()
@@ -486,6 +512,24 @@ pub fn apply_residual(pred: &Predicate, rows: Vec<Row>) -> Vec<Row> {
         // Rows here hold canonical bytes; an expression residual is checked
         // against decoded files in `tests/expr.rs`.
         Predicate::ExprIn { .. } => panic!("apply_residual does not evaluate expressions"),
+        Predicate::ContainsAny { column, values } => rows
+            .into_iter()
+            .filter(|r| {
+                r.lists
+                    .get(column)
+                    .and_then(Option::as_ref)
+                    .is_some_and(|items| items.iter().any(|e| values.contains(e)))
+            })
+            .collect(),
+        Predicate::ContainsAll { column, values } => rows
+            .into_iter()
+            .filter(|r| {
+                r.lists
+                    .get(column)
+                    .and_then(Option::as_ref)
+                    .is_some_and(|items| values.iter().all(|g| items.iter().any(|e| g.contains(e))))
+            })
+            .collect(),
     }
 }
 

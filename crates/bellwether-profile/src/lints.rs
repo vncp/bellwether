@@ -11,6 +11,7 @@
 //! | `R-counts-1` (count before scan, [`COUNT_BEFORE_SCAN`]) | a recorded workload has a `count` run that a later run over the same keys follows ([`WorkloadSummary::counts_before_scan`]), and no declared `exact` spec on exactly the workload's key columns stores counts |
 //! | `R-text-1` | the workload records text runs (`contains`, `has_token`, `has_prefix`) on a string column, and for some of those matches no complete text key on the column serves it ([`text_lookups`]; the caller reads the workload's runs, so it is not part of [`run`]) |
 //! | `R-expr-1` | lookups supply a function of a dataset column (`bellwether_core::expr`, for example `json_get(payload,'$.symbol')`) that type-checks, and no declared `expr` key is over that expression, normalized |
+//! | `R-list-1` | the workload records list-membership runs (`array_contains`, `has_any`, `exists(unnest)`) on a list column that no complete list key serves ([`list_membership`]; the caller reads the workload's runs, so it is not part of [`run`]) |
 //!
 //! The two decisions the benchmark also makes are not reimplemented here:
 //! `batch_stamp_key` is `bellwether_source::stats::batch_stamp` and
@@ -114,6 +115,9 @@ pub const LOW_SELECTIVITY_MIN_RATIO_OVER_COMPOSITE: f64 = 2.0;
 /// every measured single column, as a fraction of all row groups. At three quarters a
 /// point lookup on the best key still reads three row groups in four.
 pub const NO_DISCRIMINATING_MIN_FRACTION: f64 = 0.75;
+
+/// Rule id (B4): list-membership lookups on a column no list key serves.
+pub const LIST_MEMBERSHIP: &str = "R-list-1";
 
 /// Everything the detectors read.
 #[derive(Clone, Copy, Debug)]
@@ -822,6 +826,66 @@ pub fn text_lookups(uses: &[TextUse], complete: &[KeySpec]) -> Vec<Lint> {
         .collect()
 }
 
+/// One list column a recorded workload looks up by membership (B4).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MembershipUse {
+    /// The list (or map) column.
+    pub column: String,
+    /// Runs that look it up: rows holding any of their values.
+    pub any_runs: u64,
+    /// Runs that look it up: rows holding every one of their values.
+    pub all_runs: u64,
+    /// The most values one run asks for.
+    pub values_max: u64,
+}
+
+/// `R-list-1` (B4): a recorded workload looks rows up by list membership
+/// (`array_contains`, `has_any`, `exists(unnest)`) on a column that none of
+/// `complete` (the key specs complete at the current manifest) serves, so
+/// every such run reads every row group: Parquet statistics of a list are
+/// on its nested leaf, and no reader prunes row groups by membership from
+/// them. Fires once per such column, high confidence (nothing is sampled:
+/// the runs are recorded and the specs are the manifest's). Does not fire
+/// when a complete `list:<column>` exists, or without membership runs.
+#[must_use]
+pub fn list_membership(uses: &[MembershipUse], complete: &[KeySpec]) -> Vec<Lint> {
+    uses.iter()
+        .filter(|u| u.any_runs + u.all_runs > 0)
+        .filter(|u| {
+            !complete
+                .iter()
+                .any(|s| matches!(s, KeySpec::List { column } if *column == u.column))
+        })
+        .map(|u| {
+            let c = &u.column;
+            let mode = if u.any_runs > 0 {
+                "contains-any"
+            } else {
+                "contains-all"
+            };
+            Lint {
+                rule: LIST_MEMBERSHIP.into(),
+                columns: vec![c.clone()],
+                message: format!(
+                    "{} recorded run(s) look up the rows whose list {c} holds any ({}) or every \
+                     ({}) one of up to {} values (array_contains, has_any, exists(unnest)), and \
+                     no list key serves {c}, so each run reads every row group: Parquet keeps a \
+                     list's statistics on its nested elements, which no reader prunes row \
+                     groups by. A list key, list:{c}, stores each element's row groups; price \
+                     it with `bellwether why <root> --from <values.parquet> --mode {mode}`.",
+                    u.any_runs + u.all_runs,
+                    u.any_runs,
+                    u.all_runs,
+                    u.values_max
+                ),
+                confidence: HIGH,
+                site: None,
+                fix: None,
+            }
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -984,5 +1048,67 @@ mod tests {
         assert!(words.is_empty(), "{words:?}");
         assert_eq!(text_lookups(&[text_use("body", 0, 0, 0)], &[]), []);
         assert_eq!(text_lookups(&[], &[]), []);
+    }
+
+    fn uses(column: &str, any_runs: u64, all_runs: u64) -> MembershipUse {
+        MembershipUse {
+            column: column.into(),
+            any_runs,
+            all_runs,
+            values_max: 1000,
+        }
+    }
+
+    /// `R-list-1` fires on membership runs over a list column no complete
+    /// list key serves, naming the key and how to price it; an exact key on
+    /// the column, or a list key on another column, does not silence it.
+    #[test]
+    fn list_membership_fires_without_a_list_key_on_the_column() {
+        let lints = list_membership(
+            &[uses("tags", 3, 1)],
+            &[
+                KeySpec::Exact {
+                    columns: vec!["tags".into()],
+                    counts: false,
+                    bounds: None,
+                },
+                KeySpec::List {
+                    column: "other".into(),
+                },
+            ],
+        );
+        assert_eq!(lints.len(), 1);
+        let l = &lints[0];
+        assert_eq!(
+            (l.rule.as_str(), l.columns.as_slice()),
+            (LIST_MEMBERSHIP, ["tags".to_string()].as_slice())
+        );
+        assert!(l.message.contains("list:tags"), "{}", l.message);
+        assert!(l.message.contains("--mode contains-any"), "{}", l.message);
+        assert!(l.message.contains("4 recorded run(s)"), "{}", l.message);
+        assert!((l.confidence - HIGH).abs() < f64::EPSILON);
+        // contains_all only: the pricing command says so
+        let all = list_membership(&[uses("tags", 0, 2)], &[]);
+        assert!(
+            all[0].message.contains("--mode contains-all"),
+            "{}",
+            all[0].message
+        );
+    }
+
+    /// It does not fire when a complete list key serves the column, or when
+    /// no run looks the column up by membership.
+    #[test]
+    #[allow(clippy::assert_is_empty)]
+    fn list_membership_does_not_fire_with_the_list_key_or_without_runs() {
+        let served = list_membership(
+            &[uses("tags", 3, 1)],
+            &[KeySpec::List {
+                column: "tags".into(),
+            }],
+        );
+        assert!(served.is_empty(), "{served:?}");
+        assert!(list_membership(&[uses("tags", 0, 0)], &[]).is_empty());
+        assert!(list_membership(&[], &[]).is_empty());
     }
 }

@@ -139,6 +139,23 @@ pub struct ObserveLocate {
     /// (`projected_bytes`), from the index. Default: no projection.
     #[serde(default)]
     pub columns: Option<Vec<String>>,
+    /// List membership (B4; `locate --any` / `--all`): the key file holds
+    /// one column, named after a list (or map) column, of its element
+    /// type, and the plan is the rows whose list holds `any` of the values
+    /// or `all` of them, through the list key on that column. Default: a
+    /// point lookup of the key tuples.
+    #[serde(default)]
+    pub contains: Option<Membership>,
+}
+
+/// Which rows a list-membership lookup keeps.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum Membership {
+    /// Rows whose list holds at least one of the values.
+    Any,
+    /// Rows whose list holds every one of the values.
+    All,
 }
 
 /// `observe.count`: the rows holding the keys, exact, from the index's
@@ -248,6 +265,13 @@ pub struct ScoreWhy {
     /// 1000000}`.
     #[serde(default)]
     pub gates: Vec<Gate>,
+    /// Price `keys` as list membership (B4; `why --mode contains-any` /
+    /// `contains-all`): the key file holds one column, named after a list
+    /// (or map) column, of its element type, and the floor candidate is
+    /// the list key on it. With `workload`, its runs must already be
+    /// membership runs of that kind.
+    #[serde(default)]
+    pub contains: Option<Membership>,
     /// Run in this call instead of returning a job id.
     #[serde(default)]
     pub wait: bool,
@@ -460,9 +484,9 @@ pub fn catalog() -> Vec<ToolDef> {
             "observe.locate",
             Tier::Observe,
             true,
-            "Plan which files and row groups hold the keys in a Parquet key file, against the \
-             current manifest or a committed one (at_manifest). Writes the plan Evidence and \
-             the key set to the cache only.",
+            "Plan which files and row groups hold the keys in a Parquet key file (or, with \
+             contains, the rows whose list holds them), against the current or a committed \
+             manifest (at_manifest). Writes the plan Evidence and the key set to the cache only.",
         ),
         def::<ObserveCount>(
             "observe.count",

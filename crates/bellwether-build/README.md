@@ -164,6 +164,12 @@ Details:
 - **No planner path reads a sketch.** `declared_sidecars`, the only sidecars the planner sees, never yields one, and the planner modules never name the kind. `tests/sketch.rs` proves it: every lookup plans byte-identically with and without a sketch, and still does after every sketch segment is deleted from the store; a source tripwire fails if a planner file ever mentions the sketch kind.
 - Memory: a sketch writer grows by one entry per file stretch, each at most `sketch::max_entry_bytes` (`2^p` registers and `k` slots per item); that bound is charged against `max_segment_bytes` when an entry starts, so a segment closes before the cap is crossed.
 
+### List keys (B4)
+
+A `list:<column>` key is built like an exact key whose keys are the column's elements: one row group per worker, each row group's distinct elements (and their bytes) counted against `max_segment_keys` and `max_segment_bytes`, so a row group whose lists alone exceed a cap gets a segment of its own. `types_differ` compares element types, so a list key is not rebuilt on every build.
+
+`Lookup::ContainsAny { column, values }` and `Lookup::ContainsAll { column, values }` (values encoded at `Planner::element_type(column)`) plan through the list key on `column` only: any is the union of each value's row groups, all their intersection, a float zero probed in both encodings; a null value is dropped (any) or plans nothing (all); `contains_all` of no value is refused. Listed specs none of which is that list key are refused with the key to declare; no spec reads every live row group. A list key never serves `Lookup::Keys` or any other lookup. The residual is `ContainsAny` (every value's encodings) or `ContainsAll` (one sorted group per value), the residual replay writes for the same run.
+
 ## Memory (ADR 018)
 
 An `expr` key's build reads the expression's input columns and derives its virtual column one row group at a time, never more; JSON documents are scanned without building a tree.

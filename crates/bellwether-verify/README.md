@@ -67,6 +67,10 @@ Values in rows outside the coverage (other workload keys, unsampled keys) are no
 
 **Mismatches and the pass rule.** `Mismatch` is `MissingOnLeft`, `MissingOnRight`, `RowHashDiffers`, `NoComparableVersion`, or `TotalDiffers { group, column, left, right }`. Counts are always exact. The first `max_examples` per-key mismatches are kept as examples in canonical key order (so they do not depend on the pass count), followed by every differing total. `pass` is true only when every compared key matched, every requested total matched, and no key failed to compare.
 
+### Rows chosen by a filter (list keys, B4)
+
+`CoverageRequest::WorkloadRows { workload, age }` compares the rows the row filter keeps (`rows_where`, required) under a workload's name, rather than key tuples: `fix` uses it for a workload of list-membership runs, whose values are list elements, not reconcile keys, keying rows by every hashable column. The row filter may test membership (`Predicate::ContainsAny` / `ContainsAll`) on a list column that is otherwise never hashed, keyed, versioned, totalled, or grouped by; both sides' element types must share a class. A filter that keeps no row on either side is `NothingCompared`.
+
 ## The certificate
 
 | Field | Value |

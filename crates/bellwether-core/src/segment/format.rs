@@ -88,9 +88,9 @@ impl Layout {
     #[must_use]
     pub fn for_spec(spec: &KeySpec) -> Option<Self> {
         match spec {
-            KeySpec::Exact { bounds: None, .. } | KeySpec::Text { bloom: None, .. } => {
-                Some(Self::Keyed)
-            }
+            KeySpec::Exact { bounds: None, .. }
+            | KeySpec::Text { bloom: None, .. }
+            | KeySpec::List { .. } => Some(Self::Keyed),
             KeySpec::Temporal { .. } => Some(Self::KeyedTemporal),
             KeySpec::Bloom { bounds: None, .. } | KeySpec::Text { bloom: Some(_), .. } => {
                 Some(Self::BloomPerRowGroup)
@@ -324,24 +324,33 @@ impl std::fmt::Display for ColumnType {
 /// The dataset types a key spec's columns take from a dataset schema: the
 /// key columns in prefix order, and the timestamp column for temporal specs.
 /// An `expr` key's one key column is its virtual column, at its
-/// expression's type.
-pub(crate) fn spec_types(
-    spec: &KeySpec,
-    schema: &Schema,
-) -> Result<(Vec<DataType>, Option<DataType>)> {
+/// expression's type. A list key's one "key type" is its column's element
+/// type (the list item type, or a map's key type), the type its elements
+/// are encoded at. Public so every crate that builds or prices segments
+/// takes key types from this one definition.
+pub fn spec_types(spec: &KeySpec, schema: &Schema) -> Result<(Vec<DataType>, Option<DataType>)> {
     if let KeySpec::Expr { .. } = spec {
         let t = crate::expr::typed_spec(spec, schema)?;
         return Ok((vec![t.data_type().clone()], None));
     }
-    let lookup = |column: &str| -> Result<DataType> {
-        let dt = schema
+    let field = |column: &str| -> Result<DataType> {
+        Ok(schema
             .field_with_name(column)
             .map_err(|_| Error::KeySpec(format!("column {column} is not in the dataset schema")))?
             .data_type()
-            .clone();
+            .clone())
+    };
+    let lookup = |column: &str| -> Result<DataType> {
+        let dt = field(column)?;
         encoding::check_supported(&dt)?;
         Ok(dt)
     };
+    if let KeySpec::List { column } = spec {
+        return Ok((
+            vec![crate::list::check_list_column(column, &field(column)?)?],
+            None,
+        ));
+    }
     let keys = spec
         .columns()
         .iter()

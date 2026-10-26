@@ -125,42 +125,15 @@ pub struct TransientIndex {
     stats: BuildStats,
 }
 
-/// The dataset types of a spec's key columns and, for a temporal spec, its
-/// timestamp column; for an `expr` key, its expression's value type.
+/// The dataset types of a spec's key columns (a list key's element type)
+/// and, for a temporal spec, its timestamp column; for an `expr` key, its
+/// expression's value type: core's one definition, the types the segment
+/// writer records.
 pub(crate) fn spec_types(
     spec: &KeySpec,
     schema: &Schema,
 ) -> Result<(Vec<DataType>, Option<DataType>)> {
-    if let KeySpec::Expr { .. } = spec {
-        let t = bellwether_core::expr::typed_spec(spec, schema)?;
-        return Ok((vec![t.data_type().clone()], None));
-    }
-    let lookup = |c: &str| -> Result<DataType> {
-        let dt = schema
-            .field_with_name(c)
-            .map_err(|_| Error::KeySpec(format!("column {c} is not in the dataset schema")))?
-            .data_type()
-            .clone();
-        encoding::check_supported(&dt)?;
-        Ok(dt)
-    };
-    let keys = spec
-        .columns()
-        .iter()
-        .map(|c| lookup(c))
-        .collect::<Result<Vec<_>>>()?;
-    if let KeySpec::Text { column, .. } = spec {
-        bellwether_core::text::check_column_type(column, &keys[0])?;
-    }
-    let ts = match spec {
-        KeySpec::Temporal { ts_column, .. } => {
-            let dt = lookup(ts_column)?;
-            encoding::check_ts_type(&dt)?;
-            Some(dt)
-        }
-        _ => None,
-    };
-    Ok((keys, ts))
+    bellwether_core::segment::spec_types(spec, schema)
 }
 
 /// Measures one row group's keys for `spec` (module docs): `(keys, bytes)`.
@@ -176,6 +149,19 @@ pub(crate) fn measure(
             .cloned()
             .ok_or_else(|| Error::KeySpec(format!("column {name} not in batch")))
     };
+    if let KeySpec::List { column: c } = spec {
+        // A list key: the row group's distinct element keys and their bytes.
+        let elements = bellwether_core::list::ListElements::new(&column(c)?)?;
+        let mut seen: HashSet<Vec<u8>> = HashSet::new();
+        let mut bytes = 0u64;
+        elements.for_each_encoded(&keys[0], |_, k| {
+            if !seen.contains(k) {
+                bytes += k.len() as u64;
+                seen.insert(k.to_vec());
+            }
+        })?;
+        return Ok((seen.len() as u64, bytes));
+    }
     if let KeySpec::Text {
         column: c,
         tokenizer,

@@ -114,6 +114,10 @@ How the thresholds and choices were made:
 - **Confidence scale.** High, medium, and low map to 0.9, 0.6, and 0.3. Every message is one sentence and `site` is `None`.
 - **Out of scope.** `unprefiltered_window`, `lookback_unbounded`, and `wide_projection_before_filter` need a consumer's query plan, and no `EvidenceBody` carries one. This crate never emits them.
 
+### `R-list-1` (list keys, B4)
+
+`lints::list_membership(uses, complete)` fires once per list column that recorded runs look up by membership (`array_contains`, `has_any`, `exists(unnest)`) when no complete `list:<column>` serves it, high confidence, naming the key and the `why --mode` command that prices it. It reads the workload's runs, which the profile does not, so `why` calls it and adds its lints to the same `profile` Evidence, citing the key set or workload. It is not part of `lints::run`.
+
 ## Workload summary
 
 `workload_keys` holds the nearest-rank p50, p95, and max of distinct keys per recorded run. The only recorded-workload format that exists today is the benchmark's (`bellwether-bench-workload/1`), and nothing in its `workload.json` is trusted:

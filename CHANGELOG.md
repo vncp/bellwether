@@ -60,6 +60,7 @@ All notable changes are documented here. The format follows Keep a Changelog; ve
   header field, pinned encoding test vectors.
 - README rewritten: tagline, loop diagram, highlights, comparison table,
   what the project deliberately is not, milestone checklist.
+- List keys (B4), for the array-membership operator (`array_contains`, `has_any`, `has_all`, `exists(unnest)`): `KeySpec::List` (`list:<column>`) over `List<T>`, `LargeList<T>`, or a `Map`'s keys, an inverted index from each element to its row groups in the exact layout (`docs/format.md`, "List keys", with conformance vectors); null lists, empty lists, and null elements are not indexed (ADR 014 amendment). `Predicate::ContainsAny` / `ContainsAll` residuals; `locate --any` / `--all` (MCP `observe.locate` with `contains`); `why --mode contains-any|contains-all` (MCP `score.why` with `contains`) with `list:<column>` as the floor candidate and its distinct elements in the `list` column (`KindColumn`); `fix` verifies a membership workload on the rows it asks for (workload-rows coverage); the `R-list-1` lint; `bench lists` corpora in the ledger and market shapes with `scripts/list-funnels.py`. CONTRACT CHANGE (additive): `KeySpec::List`, the two predicates, `Exactness`, `KindColumn`. Needs storage version 2 (WP14): a build without the kind refuses the manifest with the typed unknown-kind error.
 
 ### Fixed
 

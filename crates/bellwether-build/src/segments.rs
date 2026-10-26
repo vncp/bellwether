@@ -507,6 +507,19 @@ pub(crate) fn measure(plan: &SpecPlan, batch: &RecordBatch) -> Result<(u64, u64)
             .cloned()
             .ok_or_else(|| Error::KeySpec(format!("column {name} not in batch")))
     };
+    if let KeySpec::List { column: c } = spec {
+        // Distinct element keys and their bytes: what the writer adds.
+        let elements = bellwether_core::list::ListElements::new(&column(c)?)?;
+        let mut seen: HashSet<Vec<u8>> = HashSet::new();
+        let mut bytes = 0u64;
+        elements.for_each_encoded(&plan.key_types[0], |_, k| {
+            if !seen.contains(k) {
+                bytes += k.len() as u64;
+                seen.insert(k.to_vec());
+            }
+        })?;
+        return Ok((seen.len() as u64, bytes));
+    }
     let cols = spec
         .columns()
         .iter()

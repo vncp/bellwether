@@ -172,7 +172,16 @@ fn auto_columns(
     let mut skipped = Vec::new();
     for (i, f) in schema.fields().iter().enumerate() {
         let dt = f.data_type();
-        let reason = if let Some(kind) = nested_kind(dt) {
+        let reason = if bellwether_core::list::check_list_column(f.name(), dt).is_ok() {
+            // A list (or map) of a flat type is indexed by its elements, for
+            // membership lookups, not profiled as a key (B4).
+            Some(format!(
+                "a list column, not a key candidate; its elements can be indexed for membership \
+                 lookups with list:{name} (price it with `bellwether why --from \
+                 <values.parquet> --mode contains-any`)",
+                name = f.name()
+            ))
+        } else if let Some(kind) = nested_kind(dt) {
             Some(format!(
                 "a nested {kind} column, not a key candidate; flatten a field into its own \
                  column to profile it"

@@ -238,6 +238,10 @@ pub(crate) fn index(r: &IndexResult, out: &Out) -> String {
 fn lookup_label(lookup: &LookupKind) -> String {
     match lookup {
         LookupKind::Locate => "locate".to_string(),
+        LookupKind::ContainsAny { column } => format!("locate rows whose {column} holds any value"),
+        LookupKind::ContainsAll { column } => {
+            format!("locate rows whose {column} holds every value")
+        }
         LookupKind::Latest => "latest".to_string(),
         LookupKind::Asof { at, ts, ts_column } => format!("asof {at} ({ts_column} = {ts})"),
         LookupKind::Window {
@@ -388,6 +392,67 @@ pub(crate) fn count_result(r: &CountResult, out: &Out) -> String {
     s
 }
 
+/// The layout culprit of a list-membership workload (B4), from where the
+/// queried values sit.
+fn list_layout(least: u64, spanned: u64, values: &bellwether::types::Fanout) -> String {
+    let column = values.columns.join(", ");
+    let per = quantiles(&values.row_groups_per_value);
+    #[allow(clippy::cast_precision_loss)]
+    let each_everywhere = values.row_groups_per_value[0]
+        >= bellwether::LAYOUT_BOUND_FRACTION * values.row_groups_total as f64;
+    let because = if each_everywhere {
+        format!(
+            "because each queried value found in the data ({}) is in nearly every row group: \
+             {per} of the {} row groups per value (p50 / p95 / max)",
+            num(values.distinct),
+            num(values.row_groups_total)
+        )
+    } else {
+        format!(
+            "because the queried values found in the data ({}) each sit in few row groups \
+             ({per} of {} per value, p50 / p95 / max) but together cover nearly every row group",
+            num(values.distinct),
+            num(values.row_groups_total)
+        )
+    };
+    format!(
+        "the layout, not a missing index: every candidate, the list key list:{column} included, \
+         reads at least {} of the {} row groups the runs span, {because}, so no index helps; \
+         only files rewritten so that rows holding the same values sit together would prune",
+        num(least),
+        num(spanned)
+    )
+}
+
+/// What a plan's key file holds: list values (B4) or keys.
+fn noun(lookup: &LookupKind) -> &'static str {
+    match lookup {
+        LookupKind::ContainsAny { .. } | LookupKind::ContainsAll { .. } => "values",
+        _ => "keys",
+    }
+}
+
+/// A membership plan's residual (B4), in words.
+fn membership_residual(s: &mut String, lookup: &LookupKind) {
+    match lookup {
+        LookupKind::ContainsAny { column } => {
+            let _ = writeln!(
+                *s,
+                "  residual: keep the rows whose {column} holds one of the values (every planned \
+                 row group holds such a row; other rows in it do not match)"
+            );
+        }
+        LookupKind::ContainsAll { column } => {
+            let _ = writeln!(
+                *s,
+                "  residual MANDATORY: keep the rows whose {column} holds every value; a planned \
+                 row group holds each value but possibly in different rows"
+            );
+        }
+        _ => {}
+    }
+}
+
 #[allow(clippy::too_many_lines)]
 pub(crate) fn plan(r: &PlanResult, out: &Out) -> String {
     let mut s = String::new();
@@ -397,7 +462,10 @@ pub(crate) fn plan(r: &PlanResult, out: &Out) -> String {
     } else {
         format!(
             "{what}: {} on ({}) at manifest sequence {}",
-            count(r.keys, "key", "keys"),
+            match noun(&r.lookup) {
+                "values" => count(r.keys, "value", "values"),
+                _ => count(r.keys, "key", "keys"),
+            },
             r.columns.join(", "),
             r.sequence
         )
@@ -460,8 +528,16 @@ pub(crate) fn plan(r: &PlanResult, out: &Out) -> String {
     if r.null_tuples > 0 {
         let _ = writeln!(
             s,
-            "  {} held a null and match nothing (ADR 014)",
-            count(r.null_tuples, "key row", "key rows")
+            "  {} held a null and {} nothing (ADR 014)",
+            match noun(&r.lookup) {
+                "values" => count(r.null_tuples, "value", "values"),
+                _ => count(r.null_tuples, "key row", "key rows"),
+            },
+            if r.null_tuples == 1 {
+                "matches"
+            } else {
+                "match"
+            }
         );
     }
     let specs: Vec<String> = r.specs.iter().map(label).collect();
@@ -470,6 +546,7 @@ pub(crate) fn plan(r: &PlanResult, out: &Out) -> String {
         let _ = writeln!(s, "  sidecars: {}", r.sidecars.join(", "));
     }
     text_plan(&mut s, &r.lookup);
+    membership_residual(&mut s, &r.lookup);
     if let Some(c) = &r.path_values {
         let _ = writeln!(
             s,
@@ -716,20 +793,37 @@ pub(crate) fn why(r: &bellwether::WhyReport, out: &Out, fix_command: &str) -> St
             None => kind,
         })
     });
+    // A list-membership workload (B4): its runs' values and the list column.
+    let membership = r.workload.as_ref().and_then(|w| match &w.lookup {
+        Some(LookupKind::ContainsAny { column }) => Some((column.clone(), "any")),
+        Some(LookupKind::ContainsAll { column }) => Some((column.clone(), "every")),
+        _ => None,
+    });
     if let (Some(w), Some(current)) = (&r.workload, r.current) {
         let text = matches!(w.lookup, Some(LookupKind::TextRuns { .. }));
         let contains_runs = matches!(
             &w.lookup,
             Some(LookupKind::TextRuns { operators, .. }) if operators.contains(&TextOp::Contains)
         );
-        let kind = kind_label
-            .as_ref()
-            .map_or_else(String::new, |k| format!(" ({k})"));
+        // What the runs look up: a list's values (B4), or keys (with the
+        // temporal lookup they are priced under), or text values.
+        let what = membership.as_ref().map_or_else(
+            || {
+                kind_label
+                    .as_ref()
+                    .map_or_else(String::new, |k| format!(" ({k})"))
+            },
+            |(column, which)| format!(" of rows whose {column} holds {which} value"),
+        );
         let _ = writeln!(
             s,
-            "funnel: {}{kind}, {} p50/p95/max {}/{}/{}; {basis}, summed over runs",
+            "funnel: {}{what}, {} p50/p95/max {}/{}/{}; {basis}, summed over runs",
             count(w.runs, "run", "runs"),
-            if text { "values per run" } else { "keys" },
+            match (text, &membership) {
+                (true, _) => "values per run",
+                (false, Some(_)) => "values",
+                (false, None) => "keys",
+            },
             num(w.keys_p50_p95_max[0]),
             num(w.keys_p50_p95_max[1]),
             num(w.keys_p50_p95_max[2])
@@ -851,6 +945,14 @@ pub(crate) fn why(r: &bellwether::WhyReport, out: &Out, fix_command: &str) -> St
                         )
                     } else {
                         format!("floor ({k}): only row groups holding the winning version")
+                    });
+                }
+                (CandidateOrigin::Workload, KeySpec::List { .. }, _) => {
+                    notes.push(match &membership {
+                        Some((_, "every")) => {
+                            "floor: only row groups holding every value (in some row)".to_string()
+                        }
+                        _ => "floor: only row groups holding a value".to_string(),
                     });
                 }
                 (CandidateOrigin::Workload, _, Some(_)) => {
@@ -1018,6 +1120,11 @@ pub(crate) fn why(r: &bellwether::WhyReport, out: &Out, fix_command: &str) -> St
                     count(*row_groups, "row group", "row groups")
                 )
             }
+            CulpritReason::ListLayout {
+                least_row_groups,
+                row_groups,
+                values,
+            } => list_layout(*least_row_groups, *row_groups, values),
             CulpritReason::ServingSpec { spec } => format!("the serving key {}", label(spec)),
             CulpritReason::Text { matches } => {
                 let parts: Vec<String> = matches

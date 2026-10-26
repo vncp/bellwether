@@ -519,6 +519,27 @@ impl<R: ReadAt> SegmentReader<R> {
         Ok(Some(out))
     }
 
+    /// The keys of block `i` of a keyed segment, ascending; `None` past the
+    /// last block. One block (at most a block's key cap) at a time, so a
+    /// caller walking every key holds one block per segment (ADR 018).
+    pub(crate) fn block_keys(&self, i: usize) -> Result<Option<Vec<Vec<u8>>>> {
+        let Index::Keyed(blocks) = &self.index else {
+            return Err(Error::KeySpec(format!(
+                "{} segments have no per-key values",
+                self.header.key_spec.name()
+            )));
+        };
+        let Some(b) = blocks.get(i) else {
+            return Ok(None);
+        };
+        let body = self.block_body(b)?;
+        let view = BlockView::parse(&body, b.n, self.checked())?;
+        (0..view.len())
+            .map(|k| view.key(k).map(<[u8]>::to_vec))
+            .collect::<Result<Vec<_>>>()
+            .map(Some)
+    }
+
     /// Visits each distinct key of `keys` present in a keyed segment, in
     /// ascending order. Per key: block-index binary search, bloom check,
     /// key binary search. O(k log n) for k keys over n. A probe tuple that

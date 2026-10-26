@@ -105,7 +105,7 @@ mod reader;
 mod writer;
 
 pub use format::{
-    checksum, footer_len, types, ColumnType, FileRange, Layout, ReadAt, RecordedUnit,
+    checksum, footer_len, spec_types, types, ColumnType, FileRange, Layout, ReadAt, RecordedUnit,
     SegmentHeader, CODEC_NONE, FOOTER_LEN, FOOTER_LEN_V2, MAGIC, PREAMBLE_LEN,
 };
 pub use reader::SegmentReader;

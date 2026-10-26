@@ -68,6 +68,16 @@ fn lookup(keys: &RunKeys, query: &RunQuery) -> Result<Lookup> {
             lo: w.lo,
             hi: w.hi,
         },
+        // A recorded membership run has exactly one column
+        // (`RecordedRun::query`); any other count names no schema column.
+        RunQuery::ContainsAny => Lookup::ContainsAny {
+            column: columns.join(","),
+            values: tuples,
+        },
+        RunQuery::ContainsAll => Lookup::ContainsAll {
+            column: columns.join(","),
+            values: tuples,
+        },
         RunQuery::Text(_) => {
             let (column, op, values) = text_run(keys, query)?
                 .ok_or_else(|| Error::Other("a text run without a text match".into()))?;

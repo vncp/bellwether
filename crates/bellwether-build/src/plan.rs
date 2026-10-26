@@ -207,6 +207,7 @@ pub enum Lookup {
         /// Upper bound on known time, in the known column's unit.
         known: Option<i64>,
     },
+    // --- phase 5 kinds ---
     /// Rows whose string `column` matches one of `values` under `op`, both
     /// sides case-folded (core's `text` module). Per value, the complete
     /// text keys on `column` that answer `op` (core's `text::Shape`) are
@@ -220,6 +221,33 @@ pub enum Lookup {
         op: TextOp,
         /// The arguments as given.
         values: Vec<String>,
+    },
+    /// Rows whose list column `column` (a `List`, `LargeList`, or a `Map`
+    /// by its keys) holds at least one of `values`: `array_contains`,
+    /// `has_any`, `exists(unnest)`. Each value is one canonical encoding at
+    /// the column's element type ([`Planner::element_type`]); a float zero
+    /// is probed in both encodings and a null value matches nothing (ADR
+    /// 014). Served only by a list key on `column` (B4), whose bitmaps are
+    /// unioned over the values; with no spec, every live row group. No
+    /// value plans no row group. Residual: `ContainsAny`.
+    ContainsAny {
+        /// The list column.
+        column: String,
+        /// Canonical element values.
+        values: Vec<Vec<u8>>,
+    },
+    /// Rows whose list column `column` holds every one of `values`
+    /// (`has_all`, `array_contains` of each). As
+    /// [`Lookup::ContainsAny`], except that the values' row groups are
+    /// intersected: a row group holding every value, possibly in different
+    /// rows, is planned, and the residual (`ContainsAll`) rechecks per row.
+    /// A null value matches nothing; no value at all is refused, because
+    /// every row, null and empty lists included, contains all of nothing.
+    ContainsAll {
+        /// The list column.
+        column: String,
+        /// Canonical element values.
+        values: Vec<Vec<u8>>,
     },
 }
 
@@ -301,8 +329,13 @@ fn serve(spec: &KeySpec, columns: &[String]) -> Option<Serve> {
     // A text key serves text lookups only ([`Lookup::Text`]); its
     // dictionary holds tokens, not values, so it never serves a key. An
     // expr key serves only a lookup on its expression (`plan_expr`), never
-    // one that names its virtual column.
-    if matches!(spec, KeySpec::Text { .. } | KeySpec::Expr { .. }) {
+    // one that names its virtual column. A list key answers membership
+    // lookups only (`plan_contains`), never a lookup on the list column's
+    // value as a whole.
+    if matches!(
+        spec,
+        KeySpec::Text { .. } | KeySpec::Expr { .. } | KeySpec::List { .. }
+    ) {
         return None;
     }
     let p = spec.columns();
@@ -443,6 +476,15 @@ impl<S: StoreExt + ?Sized> Planner<S> {
                     && self.sidecar_completeness(d).is_some()
             })
             .collect()
+    }
+
+    /// The element type of list column `column` (the item type of a `List`
+    /// or `LargeList`, the key type of a `Map`): the type a membership
+    /// lookup's values are encoded at. Refused, with the reason, for a
+    /// column that is not a list of a flat type.
+    pub fn element_type(&self, column: &str) -> Result<DataType> {
+        let (_, dt) = self.column_types(&[column.to_string()])?.remove(0);
+        bellwether_core::list::check_list_column(column, &dt)
     }
 
     /// The dataset types of `columns`, which must be distinct schema
@@ -610,7 +652,10 @@ impl<S: StoreExt + ?Sized> Planner<S> {
                     Lookup::Lookback { columns, .. } => {
                         self.lookback_column(specs, columns).ok().flatten()
                     }
-                    Lookup::Keys { .. } | Lookup::Text { .. } => None,
+                    Lookup::Keys { .. }
+                    | Lookup::Text { .. }
+                    | Lookup::ContainsAny { .. }
+                    | Lookup::ContainsAll { .. } => None,
                 };
                 many.iter()
                     .find(|s| Some(&s.columns()[0]) == own.as_ref())
@@ -740,9 +785,10 @@ impl<S: StoreExt + ?Sized> Planner<S> {
             | Lookup::Lookback { columns, .. }
             | Lookup::Window { columns, .. }
             | Lookup::Bitemporal { columns, .. } => columns,
-            Lookup::Between { column, .. } | Lookup::Text { column, .. } => {
-                std::slice::from_ref(column)
-            }
+            Lookup::Between { column, .. }
+            | Lookup::Text { column, .. }
+            | Lookup::ContainsAny { column, .. }
+            | Lookup::ContainsAll { column, .. } => std::slice::from_ref(column),
         };
         if let Some(e) = lookup_columns
             .iter()
@@ -799,6 +845,12 @@ impl<S: StoreExt + ?Sized> Planner<S> {
                 self.plan_bitemporal(&sidecars, columns, keys, *valid, *known)
             }
             Lookup::Text { column, op, values } => self.plan_text(&segs, column, *op, values),
+            Lookup::ContainsAny { column, values } => {
+                self.plan_contains(&segs, column, values, false)
+            }
+            Lookup::ContainsAll { column, values } => {
+                self.plan_contains(&segs, column, values, true)
+            }
         }
     }
 
@@ -1000,6 +1052,106 @@ impl<S: StoreExt + ?Sized> Planner<S> {
             }
         }
         Ok(out)
+    }
+
+    /// A membership lookup on list column `column` (see
+    /// [`Lookup::ContainsAny`] and [`Lookup::ContainsAll`]).
+    fn plan_contains(
+        &self,
+        segs: &[SpecSegments],
+        column: &str,
+        values: &[Vec<u8>],
+        all: bool,
+    ) -> Result<ScanPlan> {
+        let element = self.element_type(column)?;
+        if all && values.is_empty() {
+            return Err(Error::KeySpec(format!(
+                "contains_all on {column} needs at least one value: with none, every row matches, \
+                 null and empty lists included, which a list key does not record; pass the \
+                 values, or read the folder without a lookup"
+            )));
+        }
+        let types = [(column.to_string(), element)];
+        let (kept, _) = non_null_probes(values, &types)?;
+        // ADR 014: a null value matches nothing. For `any` it is dropped;
+        // for `all` no row can contain it, so nothing matches.
+        let nothing = all && kept.len() < values.len();
+        // One sorted group per value (both encodings of a float zero), the
+        // groups sorted: the residual replay writes for the same run.
+        let mut groups: Vec<Vec<Vec<u8>>> = kept
+            .iter()
+            .map(|v| {
+                let mut g = zero_variants(v);
+                g.sort_unstable();
+                g
+            })
+            .collect();
+        groups.sort_unstable();
+        groups.dedup();
+        let serving: Vec<&SpecSegments> = segs
+            .iter()
+            .filter(|s| matches!(&s.spec, KeySpec::List { column: c } if c == column))
+            .collect();
+        if !segs.is_empty() && serving.is_empty() {
+            return Err(Error::KeySpec(format!(
+                "none of the key specs {:?} serves a membership lookup on {column}; only a list \
+                 key does: declare list:{column}, or plan with no key spec to read every row group",
+                segs.iter().map(|s| s.spec.name()).collect::<Vec<_>>()
+            )));
+        }
+        let selected = if groups.is_empty() || nothing {
+            // No value (or, for `all`, a null value): no row, never a scan.
+            RoaringBitmap::new()
+        } else if serving.is_empty() {
+            self.locator.live().clone()
+        } else {
+            let probes = sorted_probes(&groups);
+            let mut per: BTreeMap<Vec<u8>, RoaringBitmap> = BTreeMap::new();
+            for seg in &serving {
+                for src in &seg.sources {
+                    let r = self.open_segment(&seg.spec, src, false)?;
+                    for (k, v) in r.get(&probes)? {
+                        *per.entry(k).or_default() |= &v.bitmap;
+                    }
+                }
+            }
+            let of = |g: &Vec<Vec<u8>>| {
+                g.iter()
+                    .filter_map(|v| per.get(v))
+                    .fold(RoaringBitmap::new(), |u, b| u | b)
+            };
+            if all {
+                let mut acc: Option<RoaringBitmap> = None;
+                for g in &groups {
+                    let b = of(g);
+                    acc = Some(match acc {
+                        Some(a) => a & b,
+                        None => b,
+                    });
+                }
+                acc.unwrap_or_default()
+            } else {
+                groups.iter().fold(RoaringBitmap::new(), |u, g| u | of(g))
+            }
+        };
+        let residual = if all && !nothing {
+            Predicate::ContainsAll {
+                column: column.to_string(),
+                values: groups,
+            }
+        } else {
+            // `any`, or `all` with a null value, whose residual keeps no
+            // row: `ContainsAny` of nothing.
+            Predicate::ContainsAny {
+                column: column.to_string(),
+                values: if nothing {
+                    Vec::new()
+                } else {
+                    sorted_probes(&groups)
+                },
+            }
+        };
+        self.finish(&selected, residual)
     }
 
     // -- specs and segments ------------------------------------------------

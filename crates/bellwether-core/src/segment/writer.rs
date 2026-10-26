@@ -1003,6 +1003,23 @@ impl SegmentWriter {
                 .cloned()
                 .ok_or_else(|| Error::KeySpec(format!("column {name} not in batch")))
         };
+        if let KeySpec::List { column: c } = &self.spec {
+            // One key per distinct element: a null list, an empty list, and
+            // a null element add nothing (ADR 014). Every element converts
+            // before any is recorded.
+            let elements = crate::list::ListElements::new(&column(c)?)?;
+            let mut staged: std::collections::BTreeSet<Vec<u8>> = std::collections::BTreeSet::new();
+            elements.for_each_encoded(&dataset.keys[0], |_, k| {
+                if !staged.contains(k) {
+                    staged.insert(k.to_vec());
+                }
+            })?;
+            self.check_insertable(rg)?;
+            for key in &staged {
+                self.insert(key, rg)?;
+            }
+            return Ok(());
+        }
         if let KeySpec::Text {
             column: c,
             tokenizer,
