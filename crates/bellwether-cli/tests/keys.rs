@@ -540,3 +540,52 @@ fn the_gate_refuses_store_side_tricks() {
     assert!(out.contains("refused: --require-signature"), "{out}");
     assert!(out.contains("replay") && out.contains("MISSING"), "{out}");
 }
+
+/// A receipt planted under its own BLAKE3 name with a newline and ESC in
+/// `created_at`: `receipt show` and `ledger receipts` print it escaped,
+/// with no forged line and no escape byte.
+#[test]
+fn planted_record_text_is_escaped_on_the_terminal() {
+    let dir = tempfile::tempdir().unwrap();
+    let (data, p, wl) = setup(dir.path());
+    let fix: FixResult = typed(&run(
+        &[
+            "--json",
+            "fix",
+            path(&data),
+            "--proposal",
+            &p,
+            "--workload",
+            &wl,
+        ],
+        0,
+    ));
+    let FixOutcome::Applied { receipt, .. } = &fix.outcome else {
+        panic!("{:?}", fix.outcome)
+    };
+    let bellwether::types::Record::Receipt(mut r) = receipt.record.clone() else {
+        panic!()
+    };
+    r.created_at = "x\n  receipt      signed by ci\u{1b}[2J\nok: signature verified".into();
+    let bytes = serde_json::to_vec(&bellwether::types::Record::Receipt(r)).unwrap();
+    let planted = bellwether::types::Hash::of(&bytes).to_hex();
+    std::fs::write(
+        index_dir(&data)
+            .join("ledger")
+            .join(format!("{planted}.rec")),
+        &bytes,
+    )
+    .unwrap();
+    for args in [
+        vec!["receipt", "show", path(&data), planted.as_str()],
+        vec!["ledger", "receipts", path(&data)],
+    ] {
+        let out = run(&args, 0);
+        assert!(!out.contains('\u{1b}'), "{args:?}: {out}");
+        assert!(
+            !out.lines().any(|l| l.starts_with("ok: ") || l.trim_start().starts_with("receipt      signed")),
+            "{args:?}: {out}"
+        );
+        assert!(out.contains("\\u{1b}[2J"), "{args:?}: {out}");
+    }
+}

@@ -197,7 +197,53 @@ pub fn worse<'a>(a: &'a str, b: &'a str) -> &'a str {
 
 #[cfg(test)]
 mod tests {
-    use super::worse;
+    use super::{chain_verdict, worse};
+    use bellwether::types::Hash;
+    use bellwether::{LinkStatus, NotSigned, ReceiptResult, RecordKind};
+
+    fn result(signed: Option<bool>, not_signed: Option<NotSigned>) -> ReceiptResult {
+        ReceiptResult {
+            receipt: Hash::of(b"r"),
+            intact: true,
+            chain: Vec::new(),
+            records: Vec::new(),
+            roots: Vec::new(),
+            signed,
+            not_signed,
+        }
+    }
+
+    #[test]
+    fn each_reason_has_its_verdict_word() {
+        let cases = [
+            (Some(true), None, Some("signed")),
+            (None, None, None),
+            (Some(false), Some(NotSigned::NoRoot), Some("no_root")),
+            (
+                Some(false),
+                Some(NotSigned::OtherRoot {
+                    roots: vec!["/a".into()],
+                    expected: "/b".into(),
+                }),
+                Some("other_root"),
+            ),
+            (
+                Some(false),
+                Some(NotSigned::LinksFlagged {
+                    link: Hash::of(b"x"),
+                    link_kind: RecordKind::Replay,
+                    status: LinkStatus::Missing,
+                }),
+                Some("links_flagged"),
+            ),
+            // No link carries a verdict: unsigned.
+            (Some(false), Some(NotSigned::Verdicts), Some("unsigned")),
+        ];
+        for (signed, why, want) in cases {
+            let got = chain_verdict(&result(signed, why.clone()));
+            assert_eq!(got.as_deref(), want, "{signed:?} {why:?}");
+        }
+    }
 
     #[test]
     fn invalid_outranks_untrusted_outranks_unsigned_outranks_signed() {

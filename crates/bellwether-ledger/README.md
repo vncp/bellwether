@@ -66,7 +66,7 @@ so a signature cannot be moved to another record, another kind, or another time,
 
 The public key an object carries proves only that the object is self-consistent; it never makes a record `Signed` on its own.
 
-**What a verdict does not say.** A signature binds kind, hash, and time, not location: the same record copied into another index carries the same valid signature, so a reader checks the chain's evidence root itself (the facade's `ReceiptResult::signed` does). The window `[valid_from, revoked_at)` retires an honest key only: `signed_at` is what the signer asserts, so a stolen key can sign with a time inside its window. Remove a compromised key from the trust file.
+**What a verdict does not say.** A signature binds kind, hash, and time, not location: the same record copied into another index carries the same valid signature, so a reader checks the chain's evidence root itself (the facade's `ReceiptResult::signed` does). That check compares the canonical data-root path, not the dataset: a chain signed over a different dataset at the same path is not told apart. The window `[valid_from, revoked_at)` retires an honest key only: `signed_at` is what the signer asserts, so a stolen key can sign with a time inside its window. Remove a compromised key from the trust file.
 
 **Store text.** An object's reasons use fixed phrases (never serde's message, which would echo field names from the store), and `printable` escapes every control character in the kind or algorithm an object names, and in every fact `explain` shows, so a planted object cannot forge output lines or terminal sequences. An object beside a record that is neither a receipt nor a certificate is `Invalid` (`unsignable`).
 

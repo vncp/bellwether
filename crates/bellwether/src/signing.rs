@@ -320,22 +320,11 @@ fn parse_trust_file(path: &Path) -> Result<(String, TrustFile)> {
             ),
         )
     };
-    let mut table: toml::Table =
+    // Through a `toml::Table`: the round trip into `TrustFile` reads a TOML
+    // datetime (`valid_from = 2026-01-01T00:00:00Z`) as the RFC 3339 text
+    // it spells, so quoted and unquoted times are both accepted.
+    let table: toml::Table =
         toml::from_str(&text).map_err(|e| shape(e.to_string().trim().to_string()))?;
-    // A TOML datetime (`valid_from = 2026-01-01T00:00:00Z`) is read as the
-    // RFC 3339 text it spells.
-    if let Some(toml::Value::Array(keys)) = table.get_mut("key") {
-        for k in keys {
-            if let toml::Value::Table(t) = k {
-                for field in ["valid_from", "revoked_at"] {
-                    if let Some(toml::Value::Datetime(d)) = t.get(field) {
-                        let spelled = d.to_string();
-                        t.insert(field.to_string(), toml::Value::String(spelled));
-                    }
-                }
-            }
-        }
-    }
     let file: TrustFile = toml::Value::Table(table)
         .try_into()
         .map_err(|e: toml::de::Error| shape(e.to_string().trim().to_string()))?;

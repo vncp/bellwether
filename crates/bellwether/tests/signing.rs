@@ -774,3 +774,55 @@ fn trust_file_errors_name_the_fix_and_toml_datetimes_are_read() {
         .to_string();
     assert!(msg.contains("with an offset"), "{msg}");
 }
+
+/// A signed chain whose only evidence is a plan that found nothing names
+/// no data root, so it cannot be tied to this one: `NoRoot`, never signed.
+#[test]
+fn a_signed_chain_whose_evidence_names_no_root_is_not_signed() {
+    let dir = tempfile::tempdir().unwrap();
+    let (data, _, wl) = corpus(dir.path());
+    let e = open(&data, Some(key()), None);
+    e.index(&[bellwether::spec::parse("exact:batch").unwrap()])
+        .unwrap();
+    let none = dir.path().join("none.parquet");
+    write_keys(&none, "batch", &[999_999]);
+    let plan = e.locate(&KeyFile::new(&none)).unwrap();
+    let bellwether::types::Record::Evidence(ev) = &plan.evidence.record else {
+        panic!()
+    };
+    let bellwether::types::EvidenceBody::Plan { plan: p } = &ev.body else {
+        panic!("{ev:?}")
+    };
+    assert!(p.entries.is_empty(), "{p:?}");
+    let proposal = e
+        .propose(
+            bellwether::types::ProposalBody::Key {
+                spec: bellwether::spec::parse("exact:id").unwrap(),
+            },
+            &[plan.evidence.hash],
+            "agent",
+        )
+        .unwrap()
+        .proposal()
+        .unwrap()
+        .hash;
+    let r = e
+        .fix(&FixRequest {
+            proposal: Some(proposal),
+            workload: Some(wl),
+            allow_no_gain: true,
+            ..FixRequest::default()
+        })
+        .unwrap();
+    let receipt = receipt_hash(&r);
+    assert_eq!(r.signatures.len(), 2);
+    let shown = open(&data, None, Some(trusting(&key())))
+        .receipt(&receipt)
+        .unwrap();
+    assert!(shown.intact);
+    assert_eq!(shown.roots, Vec::<String>::new());
+    assert_eq!(shown.signed, Some(false));
+    assert_eq!(shown.not_signed, Some(bellwether::NotSigned::NoRoot));
+    assert!(bellwether::signature_summary(&shown)
+        .contains("no evidence in the chain names a data root"));
+}

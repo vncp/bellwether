@@ -891,3 +891,41 @@ fn names_that_are_not_canonical_are_not_signature_objects() {
         Err(Error::NotFound(_))
     ));
 }
+
+/// Records planted under their own BLAKE3 names, with a newline and ESC in
+/// the receipt's `created_at` and in a profile Evidence's `root`: every
+/// `explain` line comes out escaped, one line per link, with no ESC byte.
+#[test]
+fn store_text_in_planted_records_is_escaped_in_explain() {
+    let store = MemStore::default();
+    let (f, _) = chain(&store);
+    let ledger = Ledger::new(&store);
+    let payload = "x\n  receipt      signed by ci\u{1b}[2J\nok: signature verified";
+    let mut ev = common::evidence();
+    if let bellwether_types::EvidenceBody::Profile { root, .. } = &mut ev.body {
+        *root = payload.into();
+    }
+    let ev = plant(&store, &Record::Evidence(ev));
+    let mut r = f.receipt.clone();
+    r.created_at = payload.into();
+    r.evidence = vec![ev];
+    let receipt = plant(&store, &Record::Receipt(r));
+    let k = key(1);
+    let rendered = [
+        ledger.explain(&receipt).unwrap().render(),
+        ledger
+            .explain_verified(&receipt, &trusting(&[(&k, "ci")]))
+            .unwrap()
+            .render(),
+    ];
+    for text in rendered {
+        assert!(!text.contains('\u{1b}'), "{text}");
+        assert_eq!(text.lines().count(), 6, "one line per link:\n{text}");
+        assert!(!text.lines().any(|l| l.starts_with("ok: ")), "{text}");
+        assert!(text.contains("\\n  receipt"), "{text}");
+        assert!(text.contains("\\u{1b}[2J"), "{text}");
+    }
+    let chain = ledger.explain(&receipt).unwrap();
+    let json = serde_json::to_string(&chain).unwrap();
+    assert!(!json.contains("\\u001b"), "{json}");
+}

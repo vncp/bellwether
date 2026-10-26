@@ -1009,30 +1009,40 @@ impl Engine {
         };
         let ledger = self.ledger()?;
         let signed_at = self.now();
-        records
-            .iter()
-            .map(|(record, kind)| {
-                let at = ledger.sign(record, key, &signed_at).map_err(|e| {
-                    let applied = applied
-                        .map_or_else(String::new, |a| format!("the change is applied ({a}) and "));
-                    Error::Other(format!(
-                        "{applied}{} {record} is written, but it could not be signed ({e}); it \
-                         stands unsigned, since only the call that writes a record signs it. \
-                         Check that the index location is writable for `ledger/` (the \
-                         signature is a new file there) and that the key loads, then sign \
-                         the next change; `bellwether receipt show` shows this one as unsigned",
-                        kind.as_str()
-                    ))
-                })?;
-                Ok(SignatureWritten {
-                    record: *record,
-                    kind: *kind,
-                    key_id: at.key_id,
-                    signed_at: signed_at.clone(),
-                    path: at.path(),
-                })
-            })
-            .collect()
+        let mut out = Vec::with_capacity(records.len());
+        for (i, (record, kind)) in records.iter().enumerate() {
+            let at = ledger.sign(record, key, &signed_at).map_err(|e| {
+                let applied = applied
+                    .map_or_else(String::new, |a| format!("the change is applied ({a}) and "));
+                // Signing stops at the first failure: name what else this
+                // call wrote that is left unsigned with it.
+                let rest: Vec<String> = records[i + 1..]
+                    .iter()
+                    .map(|(h, k)| format!("the {} {h} this call wrote", k.as_str()))
+                    .collect();
+                let also = if rest.is_empty() {
+                    String::new()
+                } else {
+                    format!(" (and so is {})", rest.join(" and "))
+                };
+                Error::Other(format!(
+                    "{applied}{} {record} is written, but it could not be signed ({e}); it \
+                     stands unsigned{also}, since only the call that writes a record signs it. \
+                     Check that the index location is writable for `ledger/` (each signature \
+                     is a new file there), then sign the next change; `bellwether receipt \
+                     show` shows this one as unsigned",
+                    kind.as_str()
+                ))
+            })?;
+            out.push(SignatureWritten {
+                record: *record,
+                kind: *kind,
+                key_id: at.key_id,
+                signed_at: signed_at.clone(),
+                path: at.path(),
+            });
+        }
+        Ok(out)
     }
 }
 
