@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 702" width="1000" height="702" role="img" aria-labelledby="title desc">
 <title id="title">bellwether asof --valid --known</title>
-<desc id="desc">bellwether index and asof on the bench market corpus (bench market --rung small: 50 symbols, 10 days, prints with restatements and late arrivals), one as-of query of the corpus's own workload (10 symbols); debug build of 79ab8ec, 2026-10-26.</desc>
+<desc id="desc">bellwether index and asof on the bench market corpus (bench market --rung small: 50 symbols, 10 days, prints with restatements and late arrivals), one as-of query of the corpus's own workload (10 symbols); debug build of 96b9369, 2026-10-26.</desc>
 <rect x="0.5" y="0.5" width="999" height="701" rx="10" fill="#f6f8fa" stroke="#d0d7de"/>
 <path d="M0.5 40V10.5a10 10 0 0 1 10-10H989.5a10 10 0 0 1 10 10V40Z" fill="#eaeef2"/>
 <line x1="0.5" y1="40" x2="999.5" y2="40" stroke="#d0d7de"/>
@@ -17,7 +17,7 @@
 <text x="39.6" y="185" textLength="429.0" lengthAdjust="spacing" xml:space="preserve" style="white-space:pre">range:ts                                              1</text>
 <text x="39.6" y="203" textLength="429.0" lengthAdjust="spacing" xml:space="preserve" style="white-space:pre">bounds:symbol@ts                                      1</text>
 <text x="39.6" y="221" textLength="429.0" lengthAdjust="spacing" xml:space="preserve" style="white-space:pre">temporal2:symbol@ts,known_at                          1</text>
-<text x="24.0" y="257" textLength="569.4" lengthAdjust="spacing" xml:space="preserve" style="white-space:pre">manifest 5a025f8bf5a28ef2653c28fa24fe88052e44866aa70e0e368c69dfdb9d832c72</text>
+<text x="24.0" y="257" textLength="569.4" lengthAdjust="spacing" xml:space="preserve" style="white-space:pre">manifest 2370cd81edf25d95b2f547ef14f13e4b35031a32ac8fadd771a62b465d92efce</text>
 <text x="24.0" y="293" textLength="897.0" lengthAdjust="spacing" xml:space="preserve" style="white-space:pre"><tspan fill="#1a7f37">$ </tspan><tspan fill="#0969da">bellwether asof market/data --keys market/workload/keys/q0019.parquet --valid 2026-01-01T14:33:36.594660Z --known</tspan></text>
 <text x="70.8" y="311" textLength="210.6" lengthAdjust="spacing" xml:space="preserve" style="white-space:pre"><tspan fill="#0969da">2026-01-02T15:29:06.427726Z</tspan></text>
 <text x="24.0" y="329" textLength="811.2" lengthAdjust="spacing" xml:space="preserve" style="white-space:pre"><tspan font-weight="700">bitemporal ts &lt;= 2026-01-01T14:33:36.594660Z (1767278016594660), known_at &lt;= 2026-01-02T15:29:06.427726Z</tspan></text>
@@ -34,9 +34,9 @@
 <text x="39.6" y="545" textLength="709.8" lengthAdjust="spacing" xml:space="preserve" style="white-space:pre">...ether-readme/market/data/day=2026-01-01/part-0001.parquet           4             48,946</text>
 <text x="39.6" y="563" textLength="709.8" lengthAdjust="spacing" xml:space="preserve" style="white-space:pre">...ether-readme/market/data/day=2026-01-01/part-0000.parquet           3             34,995</text>
 <text x="39.6" y="581" textLength="709.8" lengthAdjust="spacing" xml:space="preserve" style="white-space:pre">...ether-readme/market/data/day=2026-01-02/part-0000.parquet           1             13,910</text>
-<text x="24.0" y="617" textLength="569.4" lengthAdjust="spacing" xml:space="preserve" style="white-space:pre">evidence 9518e1627beed07d03d01f7ff055855180b8f94dff537fd304296d22d7dce43e</text>
+<text x="24.0" y="617" textLength="569.4" lengthAdjust="spacing" xml:space="preserve" style="white-space:pre">evidence af9bfd7efe9f4e3cfbf069ebf69ca323b966cc0a7a715a1801bce86d0dff52bf</text>
 </g>
 <line x1="24" y1="642" x2="976" y2="642" stroke="#d0d7de"/>
 <text x="24" y="664" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" font-style="italic" fill="#656d76">bellwether index and asof on the bench market corpus (bench market --rung small: 50 symbols, 10 days, prints with restatements and late arrivals), one</text>
-<text x="24" y="681" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" font-style="italic" fill="#656d76">as-of query of the corpus's own workload (10 symbols); debug build of 79ab8ec, 2026-10-26.</text>
+<text x="24" y="681" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" font-style="italic" fill="#656d76">as-of query of the corpus's own workload (10 symbols); debug build of 96b9369, 2026-10-26.</text>
 </svg>

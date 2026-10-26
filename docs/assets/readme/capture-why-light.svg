@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 1080" width="1000" height="1080" role="img" aria-labelledby="title desc">
 <title id="title">bellwether why</title>
-<desc id="desc">bellwether why on the bench ledger corpus (bench generate --seed 42: 16 files, 64 row groups, 128,000 rows; bench workload: 12 recorded runs), nothing indexed; debug build of 79ab8ec, 2026-10-26.</desc>
+<desc id="desc">bellwether why on the bench ledger corpus (bench generate --seed 42: 16 files, 64 row groups, 128,000 rows; bench workload: 12 recorded runs), nothing indexed; debug build of 96b9369, 2026-10-26.</desc>
 <rect x="0.5" y="0.5" width="999" height="1079" rx="10" fill="#f6f8fa" stroke="#d0d7de"/>
 <path d="M0.5 40V10.5a10 10 0 0 1 10-10H989.5a10 10 0 0 1 10 10V40Z" fill="#eaeef2"/>
 <line x1="0.5" y1="40" x2="999.5" y2="40" stroke="#d0d7de"/>
@@ -24,7 +24,7 @@
 <text x="55.2" y="311" textLength="834.6" lengthAdjust="spacing" xml:space="preserve" style="white-space:pre">768 row groups the runs span; one value touches 1 / 2 / 4 files and 4 / 8 / 16 row groups (p50 / p95 / max)</text>
 <text x="24.0" y="329" textLength="920.4" lengthAdjust="spacing" xml:space="preserve" style="white-space:pre">recommended: exact:entity_id reads 130,336,047 bytes (130.3 MB) instead of 133,956,413 (134.0 MB) with min/max pruning</text>
 <text x="39.6" y="347" textLength="608.4" lengthAdjust="spacing" xml:space="preserve" style="white-space:pre">apply it: bellwether fix /private/tmp/bellwether-readme/ledger/data --proposal</text>
-<text x="70.8" y="365" textLength="585.0" lengthAdjust="spacing" xml:space="preserve" style="white-space:pre">9f3f305b4851845769dbe8b83403906582854c39e76089dc70d20294c5249c18 --workload</text>
+<text x="70.8" y="365" textLength="585.0" lengthAdjust="spacing" xml:space="preserve" style="white-space:pre">3c29b24a06c5c9cbbb7721952d6c0e1c8e0641147a07e1d9f67a751de7bb053b --workload</text>
 <text x="70.8" y="383" textLength="499.2" lengthAdjust="spacing" xml:space="preserve" style="white-space:pre">3a1921721b730b1ea76a1933a0cb7cccae1f2d7f1cd90a2ebfd34228807cb842</text>
 <text x="24.0" y="419" textLength="491.4" lengthAdjust="spacing" xml:space="preserve" style="white-space:pre">fanout: files and row groups one value touches, p50 / p95 / max</text>
 <text x="39.6" y="437" textLength="803.4" lengthAdjust="spacing" xml:space="preserve" style="white-space:pre">key                                      distinct  files/value            row groups/value       sample</text>
@@ -54,11 +54,11 @@
 <text x="86.4" y="887" textLength="889.2" lengthAdjust="spacing" xml:space="preserve" style="white-space:pre">row groups in a file ascend without overlapping, so range pruning on version_ts reads far more than it needs; sort</text>
 <text x="86.4" y="905" textLength="413.4" lengthAdjust="spacing" xml:space="preserve" style="white-space:pre">or cluster each partition by version_ts when writing.</text>
 <text x="24.0" y="941" textLength="54.6" lengthAdjust="spacing" xml:space="preserve" style="white-space:pre">records</text>
-<text x="39.6" y="959" textLength="577.2" lengthAdjust="spacing" xml:space="preserve" style="white-space:pre">evidence  fe47da9f877b6bc9433ccb569b18074f0b17fa4a86f60007981c35e8075d1e04</text>
+<text x="39.6" y="959" textLength="577.2" lengthAdjust="spacing" xml:space="preserve" style="white-space:pre">evidence  b8edab52adc5f2e0785ca476e23d4b8c37a79f913a8fb13db6622b87008ffb57</text>
 <text x="39.6" y="977" textLength="577.2" lengthAdjust="spacing" xml:space="preserve" style="white-space:pre">workload  3a1921721b730b1ea76a1933a0cb7cccae1f2d7f1cd90a2ebfd34228807cb842</text>
-<text x="39.6" y="995" textLength="873.6" lengthAdjust="spacing" xml:space="preserve" style="white-space:pre">proposal  9f3f305b4851845769dbe8b83403906582854c39e76089dc70d20294c5249c18  replay 3caf79c959ac  exact:entity_id</text>
+<text x="39.6" y="995" textLength="873.6" lengthAdjust="spacing" xml:space="preserve" style="white-space:pre">proposal  3c29b24a06c5c9cbbb7721952d6c0e1c8e0641147a07e1d9f67a751de7bb053b  replay 1b115e20e4f6  exact:entity_id</text>
 </g>
 <line x1="24" y1="1020" x2="976" y2="1020" stroke="#d0d7de"/>
 <text x="24" y="1042" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" font-style="italic" fill="#656d76">bellwether why on the bench ledger corpus (bench generate --seed 42: 16 files, 64 row groups, 128,000 rows; bench workload: 12 recorded runs), nothing</text>
-<text x="24" y="1059" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" font-style="italic" fill="#656d76">indexed; debug build of 79ab8ec, 2026-10-26.</text>
+<text x="24" y="1059" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" font-style="italic" fill="#656d76">indexed; debug build of 96b9369, 2026-10-26.</text>
 </svg>

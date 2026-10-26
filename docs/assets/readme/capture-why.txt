@@ -1,5 +1,5 @@
 #! title: bellwether why
-#! caption: bellwether why on the bench ledger corpus (bench generate --seed 42: 16 files, 64 row groups, 128,000 rows; bench workload: 12 recorded runs), nothing indexed; debug build of 79ab8ec, 2026-10-26.
+#! caption: bellwether why on the bench ledger corpus (bench generate --seed 42: 16 files, 64 row groups, 128,000 rows; bench workload: 12 recorded runs), nothing indexed; debug build of 96b9369, 2026-10-26.
 $ bellwether why ledger/data --bench-workload ledger
 [1mwhy /private/tmp/bellwether-readme/ledger/data: not indexed[0m
 funnel: 12 runs, keys p50/p95/max 20/400/400; exact sums of row-group statistics, summed over runs
@@ -11,7 +11,7 @@ funnel: 12 runs, keys p50/p95/max 20/400/400; exact sums of row-group statistics
 
 culprit (entity_id): no key index serves this lookup; the files' own min/max statistics already narrow it to 444 of the 768 row groups the runs span; one value touches 1 / 2 / 4 files and 4 / 8 / 16 row groups (p50 / p95 / max)
 recommended: exact:entity_id reads 130,336,047 bytes (130.3 MB) instead of 133,956,413 (134.0 MB) with min/max pruning
-  apply it: bellwether fix /private/tmp/bellwether-readme/ledger/data --proposal 9f3f305b4851845769dbe8b83403906582854c39e76089dc70d20294c5249c18 --workload 3a1921721b730b1ea76a1933a0cb7cccae1f2d7f1cd90a2ebfd34228807cb842
+  apply it: bellwether fix /private/tmp/bellwether-readme/ledger/data --proposal 3c29b24a06c5c9cbbb7721952d6c0e1c8e0641147a07e1d9f67a751de7bb053b --workload 3a1921721b730b1ea76a1933a0cb7cccae1f2d7f1cd90a2ebfd34228807cb842
 
 fanout: files and row groups one value touches, p50 / p95 / max
   key                                      distinct  files/value            row groups/value       sample
@@ -38,6 +38,6 @@ lints
     version_ts is out of order: a point in time falls inside 27.8 row-group ranges on average, and only 25% of consecutive row groups in a file ascend without overlapping, so range pruning on version_ts reads far more than it needs; sort or cluster each partition by version_ts when writing.
 
 records
-  evidence  fe47da9f877b6bc9433ccb569b18074f0b17fa4a86f60007981c35e8075d1e04
+  evidence  b8edab52adc5f2e0785ca476e23d4b8c37a79f913a8fb13db6622b87008ffb57
   workload  3a1921721b730b1ea76a1933a0cb7cccae1f2d7f1cd90a2ebfd34228807cb842
-  proposal  9f3f305b4851845769dbe8b83403906582854c39e76089dc70d20294c5249c18  replay 3caf79c959ac  exact:entity_id
+  proposal  3c29b24a06c5c9cbbb7721952d6c0e1c8e0641147a07e1d9f67a751de7bb053b  replay 1b115e20e4f6  exact:entity_id
