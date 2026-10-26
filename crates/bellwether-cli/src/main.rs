@@ -203,9 +203,10 @@ struct WhyArgs {
     /// window (pass the same column to --latest-by).
     #[arg(long = "ts", value_name = "COLUMN")]
     ts: Option<String>,
-    /// Diagnose from the index's complete sketches alone (`index --key
-    /// sketch:...`): no data file is read; the sketch column and the
-    /// low-cardinality-key lint carry the diagnosis, approximate.
+    /// Diagnose from the index's manifest and complete sketches alone
+    /// (`index --key sketch:...`): no data file is opened, footers
+    /// included; the sketch column and the low-cardinality-key lint carry
+    /// the diagnosis, approximate.
     #[arg(long, conflicts_with_all = ["from", "bench_workload", "workload", "columns"])]
     sketches_only: bool,
 }

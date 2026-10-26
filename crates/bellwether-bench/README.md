@@ -359,11 +359,11 @@ bellwether bench read --all data/ --json        # every row group: the full scan
 
 ## Sketch funnel (B2): "is this column a key?" over 10⁴ small files
 
-`scripts/sketch-funnels.py --bin <bellwether>` measures, through the CLI only, how many data files a `why` diagnosis reads with and without a `sketch` sidecar, on both bench shapes, each over at least 10⁴ files:
+`scripts/sketch-funnels.py --bin <bellwether>` measures, through the CLI only, how many data files and footers a `why` diagnosis reads with and without a `sketch` sidecar, on both bench shapes, each over at least 10⁴ files:
 
 | Shape | Corpus | The question |
 |---|---|---|
 | ledger | `bench generate --files 10000 --days 1 --row-groups-per-file 1 --rows-per-row-group 1000 --entities 1000000 --churn 1 --payload-bytes 16`: 10⁷ rows, one 1,000-row row group per file, so the day's 72 twenty-minute `batch_id` windows each cover about 139,000 rows beside `entity_id` | is `batch_id` a key, or a batch timestamp shared by many rows (`R-sketch-1`, the low-cardinality key)? |
 | time series | `bench market --rung small --files-per-day 1000`: 10 days × 1,000 files | is `(symbol, ts)` unique per file (vendor onboarding)? |
 
-For each it records `reads.files` and `reads.row_groups` of `why` with no index, `why --sketches-only`, and `why` with the sketch present; the row groups the one sketch build read; and every item's approximate distinct count and interval from `sketch cardinality` beside an independent oracle (pyarrow over the decoded files: exact distinct values and the files that repeat a value). Read counts are exact; distinct counts from a sketch are approximate and printed with their interval. No timing is measured. The measured tables, labelled with machine and build, are in the B2 pull request.
+For each it records `reads.files`, `reads.row_groups`, and `reads.footers` of `why` with no index, `why --sketches-only` (run with every data file made unreadable, mode 000, so a single open would fail it; it must report zero of each), and `why` with the sketch present; the row groups the one sketch build read; and every item's approximate distinct count and interval from `sketch cardinality` beside an independent oracle (pyarrow over the decoded files: exact distinct values and the files that repeat a value), with the detection floor under which a file's repeats go unflagged (`duplicate_floor`). Read counts are exact; distinct counts from a sketch are approximate and printed with their interval. No timing is measured. The measured tables, labelled with machine and build, are in the B2 pull request.

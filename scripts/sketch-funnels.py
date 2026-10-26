@@ -14,17 +14,20 @@ answer it:
 For each shape it runs, through the `bellwether` binary only:
 
   1. `why` on the folder with no index: the profile reads every file's key
-     columns (`reads.files`) to measure fanout and fire the batch-stamp lint;
+     columns (`reads.files`) and every footer (`reads.footers`) to measure
+     fanout and fire the batch-stamp lint;
   2. `index --key sketch:...`: the one pass that writes the sketch segments
      (`row_groups_read`);
-  3. `why --sketches-only`: the same diagnosis from the sketch segments alone
-     (`reads.files` = 0), with the low-cardinality-key lint `R-sketch-1`;
-  4. `why` with the sketch present (the profile still reads; the `sketch`
-     column is added beside it);
+  3. `why --sketches-only`: the same diagnosis from the manifest and the
+     sketch segments alone, run with every data file made unreadable
+     (mode 000) to show it opens none, footers included (`reads` all zero),
+     with the low-cardinality-key lint `R-sketch-1`;
+  4. `why` with the sketch present (the profile and the catalog still read;
+     the `sketch` column is added beside it);
   5. `sketch cardinality`: every item's approximate distinct count and error
      bound, against an independent oracle (pyarrow over the decoded files),
-     and on `market` the files the sketch says repeat a `(symbol, ts)` value
-     against the files that do.
+     and the files the sketch says repeat a value against the files that do,
+     with the detection floor (a file repeating fewer rows is not flagged).
 
 Every count of reads, rows, and files is exact; every distinct count from a
 sketch is approximate and printed with its interval. No timing is measured.
@@ -104,13 +107,22 @@ def funnel(bin_, name, data, part, sketch, batch_col, items, work):
 
     plain = lookup(bin_, ["why", data, *part])
     built = lookup(bin_, ["index", data, *part, "--index", idx, "--key", sketch])
-    only = lookup(bin_, ["why", data, *part, "--index", idx, "--sketches-only"])
+    # The diagnosis from sketches alone opens no data file: make every one
+    # unreadable while it runs.
+    modes = {f: os.stat(f).st_mode for f in files}
+    for f in files:
+        os.chmod(f, 0)
+    try:
+        only = lookup(bin_, ["why", data, *part, "--index", idx, "--sketches-only"])
+    finally:
+        for f, mode in modes.items():
+            os.chmod(f, mode)
     both = lookup(bin_, ["why", data, *part, "--index", idx])
     card = lookup(bin_, ["sketch", "cardinality", data, *part, "--index", idx])
 
     for r in (plain, only, both):
         assert r["reads"]["files"] <= len(files), r["reads"]
-    assert only["reads"] == {"files": 0, "row_groups": 0}, only["reads"]
+    assert all(v == 0 for v in only["reads"].values()), only["reads"]
     assert only["from_sketches"] is True
 
     truth = {}
@@ -133,25 +145,26 @@ def report(name, m, label):
     f = m["files"]
     b = m["batch_col"]
     print(f"### {name}: {f} files ({label})\n")
-    print("| diagnosis | data files read | row groups read | lints on `" + b + "` | sketch column |")
-    print("|---|---:|---:|---|---|")
+    print("| diagnosis | data files read | row groups read | footers read | lints on `" + b
+          + "` | sketch column |")
+    print("|---|---:|---:|---:|---|---|")
     for title, r in [
         ("`why`, no index", m["plain"]),
-        ("`why --sketches-only`", m["only"]),
+        ("`why --sketches-only` (data files unreadable)", m["only"]),
         ("`why`, sketch present", m["both"]),
     ]:
         col = ", ".join(
             f"{c['cardinality']['item']} ≈{c['cardinality']['distinct']}" for c in r.get("sketch", [])
         ) or "—"
         print(f"| {title} | {r['reads']['files']} | {r['reads']['row_groups']} | "
-              f"{', '.join(rules(r, b)) or 'none'} | {col} |")
+              f"{r['reads']['footers']} | {', '.join(rules(r, b)) or 'none'} | {col} |")
     print()
     print(f"One-time cost of the sketch: `index --key sketch:...` read "
           f"{m['built']['row_groups_read']} row groups and wrote {m['built']['segments_written']} "
           f"segment(s); every later diagnosis reads none.\n")
     print("| item | rows | ≈distinct (sketch) | 99.7% interval | exact distinct (oracle) | inside | "
-          "rows per value | files repeating a value: sketch / oracle |")
-    print("|---|---:|---:|---|---:|---|---:|---|")
+          "rows per value | files repeating a value: sketch / oracle | detection floor (rows) |")
+    print("|---|---:|---:|---|---:|---|---:|---|---:|")
     for it in m["card"]["items"]:
         c = it["cardinality"]
         t = m["truth"].get(c["item"])
@@ -163,7 +176,7 @@ def report(name, m, label):
             dup = f"{c['files_with_duplicates']} / {t['files_with_duplicates']}"
         print(f"| `{c['item']}` | {c['rows']} | {c['distinct']} | "
               f"[{c['distinct_low']}, {c['distinct_high']}] (±{300 * c['relative_standard_error']:.1f}%) | "
-              f"{exact} | {inside} | ≈{c['rows_per_value']:.0f} | {dup} |")
+              f"{exact} | {inside} | ≈{c['rows_per_value']:.0f} | {dup} | {c['duplicate_floor']} |")
     print()
 
 

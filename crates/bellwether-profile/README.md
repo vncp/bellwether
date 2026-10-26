@@ -17,6 +17,7 @@ Dependencies: `bellwether-types`, `-core` (canonical encoding), `-source` (sourc
 | Item | What it does |
 |---|---|
 | `profile(source, root, store, &ProfileOptions) -> ProfileReport` | Measures everything below. `store` is rooted at the index root (`docs/format.md`): the cache is at `cache/`, the manifest, if any, at `manifest.json`. The folder need not be indexed. |
+| `manifest_profile(root, store, &ProfileOptions, DatasetTotals) -> ProfileReport` | A profile that reads no data file, footers included: the caller's totals (files, live row groups, rows; the facade takes them from the manifest and a sketch) stand in for the footer pass, nothing is measured, and the only provenance input is the manifest at the store root, which must exist. For `why --sketches-only`, whose lints come from sketches. |
 | `ProfileOptions::for_source(config)` | The defaults with the required `source_config` set. `ProfileOptions::default()` leaves it unset, and `profile` refuses that. |
 | `evidence(&report) -> Evidence` | Builds the `profile` Evidence. Refuses a report with no provenance inputs. |
 | `record(&ledger, &report)`, `profile_and_record(..)` | Write it through the ledger. |

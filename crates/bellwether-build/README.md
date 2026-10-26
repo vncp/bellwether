@@ -55,6 +55,7 @@ The dataset schema is the one given in `BuildOptions::schema`, else the one the 
 Removal is explicit, in one of two ways:
 
 - `Builder::remove_spec(spec)` drops the declaration, the completeness entry and the segments in one commit, without reading a source file. It refuses a different spec declared under the same name.
+- `Builder::reset_sketch(spec)` drops a declared sketch's segments and completeness entry, keeping its declaration, in one commit that reads no source file, so the next build sketches every live row group again. The facade calls it when `index --key sketch:…` re-declares a sketch whose segments are missing from the store or damaged; nothing plans with a sketch, so nothing else depends on them.
 - `BuildOptions::remove_unlisted` makes a build remove every spec it is not given.
 
 Dropped segments are tombstoned by the commit, for GC. A build with nothing to do reads nothing and commits nothing.

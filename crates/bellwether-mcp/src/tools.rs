@@ -42,10 +42,11 @@ pub struct ObserveWhy {
     /// Candidate key columns for the profile; default: every id-like column.
     #[serde(default)]
     pub columns: Option<Vec<String>>,
-    /// Diagnose from the index's complete sketches alone: no data file is
-    /// read, the profile's fanout table is empty, and the `sketch` column
-    /// and the `R-sketch-1` lint carry the (approximate) diagnosis. Refused
-    /// with `columns`, and without a complete sketch.
+    /// Diagnose from the index's manifest and complete sketches alone: no
+    /// data file is opened, footers included, the profile measures nothing,
+    /// and the `sketch` column and the `R-sketch-1` lint carry the
+    /// (approximate) diagnosis. Refused with `columns`, without a complete
+    /// sketch, and over files that changed since the index was built.
     #[serde(default)]
     pub sketches_only: bool,
 }
