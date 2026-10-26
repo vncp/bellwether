@@ -88,9 +88,9 @@ use serde::{Deserialize, Serialize};
 
 pub use explain::{Chain, Link, LinkStatus};
 pub use signature::{
-    is_utc_millis, signature_message, InvalidReason, InvalidSignature, OutsideWindow, PublicKey,
-    SignaturePath, SignatureStatus, SignedBy, SigningKey, TrustedKey, TrustedKeys, Verdict,
-    SIGNATURE_ALG, SIGNATURE_DOMAIN, SIGNATURE_VERSION,
+    is_utc_millis, printable, signature_message, InvalidReason, InvalidSignature, OutsideWindow,
+    PublicKey, SignaturePath, SignatureStatus, SignedBy, SigningKey, TrustError, TrustedKey,
+    TrustedKeys, Verdict, SIGNATURE_ALG, SIGNATURE_DOMAIN, SIGNATURE_VERSION,
 };
 
 /// Directory under the index root that holds ledger records.

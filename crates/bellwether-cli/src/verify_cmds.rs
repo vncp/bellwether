@@ -172,7 +172,7 @@ pub(crate) fn run(g: &Global, out: &Out, cmd: &VerifyCommand) -> Result<Outcome,
             };
             // The key is read before anything is scored: a key that cannot
             // be used is a usage error, not a receipt without a signature.
-            let key = crate::keys_cmds::signing_key(a.signing_key.as_deref())?;
+            let key = crate::keys_cmds::signing_key(g, &a.root.root, a.signing_key.as_deref())?;
             let r = engine_keyed(g, &a.root.root, key, None)?.fix(&request)?;
             let code = match &r.outcome {
                 FixOutcome::Applied { .. }

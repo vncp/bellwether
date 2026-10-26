@@ -248,6 +248,12 @@ fn verify_only_signs_the_certificate_and_the_apply_tier_signs_only_its_receipt()
         .receipt(&receipt)
         .unwrap();
     assert_eq!(shown.signed, Some(false));
+    assert_eq!(shown.not_signed, Some(bellwether::NotSigned::Verdicts));
+    // The report counts it as not signed either.
+    let r = open(&data, None, Some(trusting(&key())))
+        .report(&dir.path().join("r.html"))
+        .unwrap();
+    assert_eq!(r.signed, Some(0));
 
     // A verify-only run with a key signs its certificate alone.
     let dir2 = tempfile::tempdir().unwrap();
@@ -402,12 +408,19 @@ fn unusable_signing_key_files_are_refused_with_the_fix_named() {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt as _;
-        std::fs::set_permissions(&out, std::fs::Permissions::from_mode(0o644)).unwrap();
-        let e = bellwether::load_signing_key(&out).unwrap_err();
-        assert_eq!(field(&e), "signing_key");
-        let msg = e.to_string();
-        assert!(msg.contains("0644") && msg.contains("chmod 600"), "{msg}");
+        // Group- or other-readable, group-writable: each refused.
+        for mode in [0o644, 0o640, 0o604, 0o620] {
+            std::fs::set_permissions(&out, std::fs::Permissions::from_mode(mode)).unwrap();
+            let e = bellwether::load_signing_key(&out).unwrap_err();
+            assert_eq!(field(&e), "signing_key");
+            let msg = e.to_string();
+            assert!(
+                msg.contains(&format!("{mode:04o}")) && msg.contains("chmod 600"),
+                "{msg}"
+            );
+        }
         std::fs::set_permissions(&out, std::fs::Permissions::from_mode(0o600)).unwrap();
+        bellwether::load_signing_key(&out).unwrap();
     }
     let e = bellwether::load_signing_key(&dir.path().join("absent")).unwrap_err();
     assert_eq!(field(&e), "signing_key");
@@ -497,4 +510,267 @@ fn trust_files_round_trip_and_refuse_bad_entries() {
     );
     let e = bellwether::load_trusted_keys(&dir.path().join("absent.toml")).unwrap_err();
     assert!(e.to_string().contains("keys trust"), "{e}");
+}
+
+// -- review round 1 ----------------------------------------------------------
+
+/// Copies every ledger object of `from`'s index into `to`'s.
+fn copy_ledger(from: &Path, to: &Path) {
+    let src = from.join(".bellwether").join("ledger");
+    let dst = to.join(".bellwether").join("ledger");
+    std::fs::create_dir_all(&dst).unwrap();
+    for e in std::fs::read_dir(&src).unwrap() {
+        let p = e.unwrap().path();
+        let name = p.file_name().unwrap().to_string_lossy().into_owned();
+        // Records and signature objects, not the store's lock files.
+        if !name.contains(".lock#") {
+            std::fs::copy(&p, dst.join(name)).unwrap();
+        }
+    }
+}
+
+/// Signatures bind content, not location: a signed chain copied into
+/// another index is "signed, but for" the root it was made over, never
+/// signed here.
+#[test]
+fn a_signed_chain_copied_from_another_index_is_not_signed_here() {
+    let a = tempfile::tempdir().unwrap();
+    let b = tempfile::tempdir().unwrap();
+    let (data_a, p, wl) = corpus(a.path());
+    let receipt = receipt_hash(&fix(&open(&data_a, Some(key()), None), p, wl, false));
+    let shown = open(&data_a, None, Some(trusting(&key())))
+        .receipt(&receipt)
+        .unwrap();
+    assert_eq!(shown.signed, Some(true));
+    let root_a = shown.roots.clone();
+    assert_eq!(root_a.len(), 1);
+
+    let (data_b, _, _) = corpus(b.path());
+    copy_ledger(&data_a, &data_b);
+    let engine_b = open(&data_b, None, Some(trusting(&key())));
+    let shown = engine_b.receipt(&receipt).unwrap();
+    assert_eq!(shown.signed, Some(false));
+    assert_eq!(
+        shown.not_signed,
+        Some(bellwether::NotSigned::OtherRoot {
+            roots: root_a.clone(),
+            expected: engine_b.root().to_string(),
+        })
+    );
+    let said = bellwether::signature_summary(&shown);
+    assert!(
+        said.starts_with(&format!("signed, but for {}", root_a[0])),
+        "{said}"
+    );
+    let listed = engine_b.receipts().unwrap();
+    assert_eq!(listed.receipts[0].signed, Some(false));
+    let r = engine_b.report(&b.path().join("r.html")).unwrap();
+    assert_eq!(r.signed, Some(0));
+}
+
+/// A signed chain with a link deleted does not stand: not signed, the
+/// flagged link named.
+#[test]
+fn a_signed_chain_with_a_missing_link_is_not_signed() {
+    let dir = tempfile::tempdir().unwrap();
+    let (data, p, wl) = corpus(dir.path());
+    let r = fix(&open(&data, Some(key()), None), p, wl, false);
+    let receipt = receipt_hash(&r);
+    let Some(bellwether::Score::Replayed { replay, .. }) = &r.score else {
+        panic!("{:?}", r.score)
+    };
+    std::fs::remove_file(
+        data.join(".bellwether")
+            .join("ledger")
+            .join(format!("{}.rec", replay.hash)),
+    )
+    .unwrap();
+    let e = open(&data, None, Some(trusting(&key())));
+    let shown = e.receipt(&receipt).unwrap();
+    assert!(!shown.intact);
+    assert_eq!(shown.signed, Some(false));
+    assert!(matches!(
+        shown.not_signed,
+        Some(bellwether::NotSigned::LinksFlagged { link, link_kind: RecordKind::Replay, .. })
+            if link == replay.hash
+    ));
+    let said = bellwether::signature_summary(&shown);
+    assert!(
+        said.contains("replay") && said.contains("MISSING"),
+        "{said}"
+    );
+    assert_eq!(
+        e.report(&dir.path().join("r.html")).unwrap().signed,
+        Some(0)
+    );
+}
+
+/// A rewrite verified with `verify_only` signs the certificate it wrote.
+#[test]
+fn a_verify_only_rewrite_signs_its_certificate() {
+    let dir = tempfile::tempdir().unwrap();
+    let (data, _, _) = corpus(dir.path());
+    let after = dir.path().join("after");
+    std::fs::create_dir_all(&after).unwrap();
+    for e in std::fs::read_dir(&data).unwrap() {
+        let p = e.unwrap().path();
+        if p.extension().is_some_and(|x| x == "parquet") {
+            std::fs::copy(&p, after.join(p.file_name().unwrap())).unwrap();
+        }
+    }
+    let e = open(&data, Some(key()), None);
+    let kf = dir.path().join("k.parquet");
+    e.index(&[bellwether::spec::parse("exact:id").unwrap()])
+        .unwrap();
+    let ev = e.locate(&KeyFile::new(&kf)).unwrap().evidence.hash;
+    let rw = e
+        .propose(
+            bellwether::types::ProposalBody::Rewrite {
+                shape: bellwether::types::RewriteShape {
+                    before: "a".into(),
+                    after: "b".into(),
+                    invariant: "same rows by id".into(),
+                },
+            },
+            &[ev],
+            "agent",
+        )
+        .unwrap();
+    let rw = rw.proposal().unwrap().hash;
+    let r = e
+        .fix(&FixRequest {
+            proposal: Some(rw),
+            rewrite: Some(bellwether::RewriteOutputs {
+                before: data.to_str().unwrap().into(),
+                after: after.to_str().unwrap().into(),
+                key: vec!["id".into()],
+                ..bellwether::RewriteOutputs::default()
+            }),
+            verify_only: true,
+            ..FixRequest::default()
+        })
+        .unwrap();
+    assert!(matches!(r.outcome, FixOutcome::Verified), "{:?}", r.outcome);
+    let cert = r.certificate.as_ref().unwrap().hash;
+    assert_eq!(
+        r.signatures
+            .iter()
+            .map(|s| (s.record, s.kind))
+            .collect::<Vec<_>>(),
+        vec![(cert, RecordKind::Certificate)]
+    );
+}
+
+/// A key or trust file inside the index location is refused, saying where
+/// to put it; one outside is accepted.
+#[test]
+fn keys_and_trust_files_inside_the_index_are_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let (data, _, _) = corpus(dir.path());
+    let root = data.to_str().unwrap();
+    let index = data.join(".bellwether");
+    std::fs::create_dir_all(&index).unwrap();
+    let inside = index.join("signer");
+    bellwether::generate_key(&inside, None, None).unwrap();
+    let e = bellwether::refuse_inside_index(root, None, &inside, "signing_key").unwrap_err();
+    assert_eq!(field(&e), "signing_key");
+    assert!(e.to_string().contains("inside the index location"), "{e}");
+    assert!(e.to_string().contains("--signing-key"), "{e}");
+    let trust = index.join("trusted.toml");
+    bellwether::trust_key(&trust, &bellwether::public_path(&inside), None, None).unwrap();
+    let e = bellwether::refuse_inside_index(root, None, &trust, "trusted_keys").unwrap_err();
+    assert_eq!(field(&e), "trusted_keys");
+    assert!(e.to_string().contains("choose who is trusted"), "{e}");
+    // An explicit index location elsewhere, and a key beside the data.
+    let elsewhere = dir.path().join("idx");
+    std::fs::create_dir_all(&elsewhere).unwrap();
+    let in_elsewhere = elsewhere.join("signer");
+    bellwether::generate_key(&in_elsewhere, None, None).unwrap();
+    assert_eq!(
+        field(
+            &bellwether::refuse_inside_index(
+                root,
+                Some(elsewhere.to_str().unwrap()),
+                &in_elsewhere,
+                "signing_key"
+            )
+            .unwrap_err()
+        ),
+        "signing_key"
+    );
+    bellwether::refuse_inside_index(
+        root,
+        Some(elsewhere.to_str().unwrap()),
+        &inside,
+        "signing_key",
+    )
+    .unwrap();
+    let outside = dir.path().join("signer");
+    bellwether::generate_key(&outside, None, None).unwrap();
+    bellwether::refuse_inside_index(root, None, &outside, "signing_key").unwrap();
+}
+
+/// Trust-file errors say what to change, never "ledger rule"; TOML
+/// datetimes are read as the time they spell.
+#[test]
+fn trust_file_errors_name_the_fix_and_toml_datetimes_are_read() {
+    let dir = tempfile::tempdir().unwrap();
+    let k = dir.path().join("k");
+    let g = bellwether::generate_key(&k, Some("ci"), None).unwrap();
+    let file = dir.path().join("t.toml");
+    let e = bellwether::trust_key(
+        &file,
+        &bellwether::public_path(&k),
+        Some("2030-01-01T00:00:00Z"),
+        Some("2029-01-01T00:00:00Z"),
+    )
+    .unwrap_err();
+    let msg = e.to_string();
+    assert!(!msg.contains("ledger"), "{msg}");
+    assert!(
+        msg.contains("give --valid-from an earlier time than --revoked-at"),
+        "{msg}"
+    );
+    assert!(!file.exists());
+
+    std::fs::write(
+        &file,
+        format!(
+            "[[key]]\nkey_id = \"{}\"\npublic_key = \"{}\"\nname = \"ci\"\nvalid_from = \
+             2026-01-01T00:00:00Z\nrevoked_at = 2027-01-01T00:00:00+01:00\n",
+            g.public.key_id, g.public.public_key
+        ),
+    )
+    .unwrap();
+    let keys = bellwether::load_trusted_keys(&file).unwrap();
+    let t = keys.get(&g.public.key_id).unwrap();
+    assert_eq!(t.valid_from.as_deref(), Some("2026-01-01T00:00:00.000Z"));
+    assert_eq!(t.revoked_at.as_deref(), Some("2026-12-31T23:00:00.000Z"));
+
+    // Listed twice, and an empty window, in the file.
+    let text = std::fs::read_to_string(&file).unwrap();
+    std::fs::write(&file, format!("{text}\n{text}")).unwrap();
+    let msg = bellwether::load_trusted_keys(&file)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        msg.contains("remove one of its two [[key]] tables"),
+        "{msg}"
+    );
+    assert!(!msg.contains("ledger rule"), "{msg}");
+    std::fs::write(&file, text.replace("2026-01-01", "2028-01-01")).unwrap();
+    let msg = bellwether::load_trusted_keys(&file)
+        .unwrap_err()
+        .to_string();
+    assert!(msg.contains("so valid_from comes first"), "{msg}");
+    // A datetime without an offset is not an instant.
+    std::fs::write(
+        &file,
+        text.replace("2026-01-01T00:00:00Z", "2026-01-01T00:00:00"),
+    )
+    .unwrap();
+    let msg = bellwether::load_trusted_keys(&file)
+        .unwrap_err()
+        .to_string();
+    assert!(msg.contains("with an offset"), "{msg}");
 }

@@ -972,7 +972,7 @@ impl Engine {
 }
 
 /// The index location as a local directory, or `None` for an object store.
-fn local_path(index: &str) -> Result<Option<PathBuf>> {
+pub(crate) fn local_path(index: &str) -> Result<Option<PathBuf>> {
     let path = match index.split_once("://") {
         None => index,
         Some(("file", rest)) => rest,

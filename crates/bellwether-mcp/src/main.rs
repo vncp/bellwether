@@ -29,7 +29,7 @@ struct Args {
 fn main() -> ExitCode {
     let args = Args::parse();
     let engine = match args.engine.options().and_then(|mut o| {
-        args.keys.apply(&mut o)?;
+        args.keys.apply(&args.root, &mut o)?;
         Ok(o)
     }) {
         Ok(o) => o,

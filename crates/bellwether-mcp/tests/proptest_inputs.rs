@@ -77,9 +77,14 @@ fn signing_server(data: &std::path::Path, dir: &std::path::Path, signing: bool) 
             )
             .unwrap();
         }
-        engine.signing_key = Some(bellwether::load_signing_key(&path).unwrap());
-        engine.trusted_keys =
-            Some(bellwether::load_trusted_keys(&dir.join("trusted.toml")).unwrap());
+        // Through the server's own flags, as `--signing-key` and
+        // `--trusted-keys` load them.
+        bellwether_mcp::KeyArgs {
+            signing_key: Some(path),
+            trusted_keys: Some(dir.join("trusted.toml")),
+        }
+        .apply(data.to_str().unwrap(), &mut engine)
+        .unwrap();
     }
     Server::new(&bellwether_mcp::Config {
         root: data.to_str().unwrap().to_string(),
@@ -449,4 +454,35 @@ fn the_valid_arguments_reach_the_facade() {
             assert_ne!(r.code.as_str(), "invalid_input", "{tool}: {}", r.message);
         }
     }
+}
+
+/// The server's `--signing-key` and `--trusted-keys` are refused inside the
+/// index location, as the CLI's are.
+#[test]
+fn key_args_refuse_paths_inside_the_index() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    ledger_corpus(&data, 1, 1, 10, 10);
+    let index = data.join(".bellwether");
+    std::fs::create_dir_all(&index).unwrap();
+    let key = index.join("signer");
+    bellwether::generate_key(&key, None, None).unwrap();
+    let mut options = bellwether::EngineOptions::default();
+    let e = bellwether_mcp::KeyArgs {
+        signing_key: Some(key.clone()),
+        trusted_keys: None,
+    }
+    .apply(data.to_str().unwrap(), &mut options)
+    .unwrap_err();
+    assert!(matches!(e, bellwether_mcp::args::OptionsError::Usage(_)));
+    assert!(e.to_string().contains("inside the index location"), "{e}");
+    let trust = index.join("t.toml");
+    bellwether::trust_key(&trust, &bellwether::public_path(&key), None, None).unwrap();
+    let e = bellwether_mcp::KeyArgs {
+        signing_key: None,
+        trusted_keys: Some(trust),
+    }
+    .apply(data.to_str().unwrap(), &mut options)
+    .unwrap_err();
+    assert!(e.to_string().contains("choose who is trusted"), "{e}");
 }

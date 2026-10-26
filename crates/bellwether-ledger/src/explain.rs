@@ -10,7 +10,7 @@ use bellwether_types::{
 };
 use serde::Serialize;
 
-use crate::{Ledger, RecordKind, SignatureStatus, TrustedKeys, Verdict};
+use crate::{printable, Ledger, RecordKind, SignatureStatus, TrustedKeys, Verdict};
 
 /// Hex characters of the hash shown per line in the text rendering.
 const HASH_PREFIX: usize = 12;
@@ -68,9 +68,14 @@ impl Link {
         Self {
             hash,
             kind,
-            created_at: Some(created_at.to_owned()),
+            // Every value comes from a stored record, which a store writer
+            // controls: escaped before it can reach a terminal.
+            created_at: Some(printable(created_at)),
             status: LinkStatus::Ok,
-            facts: facts.into_iter().map(|(k, v)| (k.to_owned(), v)).collect(),
+            facts: facts
+                .into_iter()
+                .map(|(k, v)| (k.to_owned(), printable(&v)))
+                .collect(),
             signatures: None,
             verdict: None,
         }
@@ -185,7 +190,7 @@ where
             | Error::Serde(_)
             | Error::Other(_)),
         ) => Ok(Err(LinkStatus::Unreadable {
-            reason: e.to_string(),
+            reason: printable(&e.to_string()),
         })),
         Err(e) => Err(e),
     }

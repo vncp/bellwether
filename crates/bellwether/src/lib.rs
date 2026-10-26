@@ -46,8 +46,8 @@ pub mod spec;
 mod why;
 
 pub use bellwether_ledger::{
-    InvalidReason, InvalidSignature, OutsideWindow, PublicKey, RecordKind, SignatureStatus,
-    SignedBy, SigningKey, TrustedKey, TrustedKeys, Verdict,
+    printable, InvalidReason, InvalidSignature, OutsideWindow, PublicKey, RecordKind,
+    SignatureStatus, SignedBy, SigningKey, TrustError, TrustedKey, TrustedKeys, Verdict,
 };
 pub use bellwether_profile::ProfileReport;
 pub use bellwether_source::{FingerprintPolicy, Partitioning, PathTemplate};
@@ -67,14 +67,15 @@ pub use ledger_views::{
     Finding, FindingsResult, ReceiptEntry, ReceiptsResult, RuleScore, ScorecardResult, UNATTRIBUTED,
 };
 pub use lookback::{split_window, window_reversed, Lookback};
+pub use receipt::signature_summary;
 pub use reconcile::{ReconcileProblem, ReconcileRequest, ReconcileResult};
 pub use results::{
-    ChainLink, Cost, IndexResult, LinkStatus, LookbackWindow, LookupKind, PlanResult,
+    ChainLink, Cost, IndexResult, LinkStatus, LookbackWindow, LookupKind, NotSigned, PlanResult,
     ProposeRefusal, ProposeResult, ReceiptResult, ReportResult, SidecarState, SpecState, Written,
 };
 pub use signing::{
-    generate_key, load_signing_key, load_trusted_keys, public_path, read_public_key, trust_key,
-    GeneratedKey, PublicKeyFile, TrustEntry, TrustResult,
+    generate_key, load_signing_key, load_trusted_keys, public_path, read_public_key,
+    refuse_inside_index, trust_key, GeneratedKey, PublicKeyFile, TrustEntry, TrustResult,
 };
 pub use why::{
     Candidate, CandidateOrigin, Culprit, CulpritReason, Dataset, LookupMode, ProfileEvidence,

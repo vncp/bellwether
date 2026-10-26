@@ -57,9 +57,11 @@ pub struct ReceiptEntry {
     pub intact: bool,
     /// The chain: evidence, proposal, replay, certificate, receipt.
     pub chain: Vec<ChainLink>,
-    /// With trusted keys: whether the receipt and its certificate are both
-    /// signed by a trusted key within its window ([`crate::ReceiptResult`]).
+    /// With trusted keys: whether the chain is signed
+    /// ([`crate::ReceiptResult::signed`]).
     pub signed: Option<bool>,
+    /// With trusted keys, when not signed: why.
+    pub not_signed: Option<crate::NotSigned>,
 }
 
 /// What [`Engine::receipts`] found.
@@ -181,6 +183,7 @@ impl Engine {
                     intact: shown.intact,
                     chain: shown.chain,
                     signed: shown.signed,
+                    not_signed: shown.not_signed,
                 });
             }
             Ok(ReceiptsResult {

@@ -484,7 +484,7 @@ impl Engine {
                     // A verify-only run's attestation is its passing
                     // certificate, written by this call.
                     result.signatures =
-                        self.sign_written(&[(cert.hash, RecordKind::Certificate)])?;
+                        self.sign_written(&[(cert.hash, RecordKind::Certificate)], None)?;
                     return Ok(result);
                 }
                 // 3 and 4, behind the trust-boundary gate.
@@ -525,7 +525,7 @@ impl Engine {
                     Some(r) => refused(r),
                     None if req.verify_only => {
                         result.signatures =
-                            self.sign_written(&[(cert.hash, RecordKind::Certificate)])?;
+                            self.sign_written(&[(cert.hash, RecordKind::Certificate)], None)?;
                         FixOutcome::Verified
                     }
                     None => refused(Refusal::NoReplay {
@@ -966,7 +966,8 @@ impl Engine {
         if certificate_written {
             signed.push((*cert_hash, RecordKind::Certificate));
         }
-        let signatures = self.sign_written(&signed)?;
+        let applied = format!("manifest {before} -> {after}");
+        let signatures = self.sign_written(&signed, Some(&applied))?;
         // After the apply: the same proposal replayed at manifest_after, the
         // realized cost `report` sets beside the predicted one.
         let (realized, warning) = match self.realize(proposal_hash, workload) {
@@ -995,7 +996,14 @@ impl Engine {
     /// Signs records this call wrote with the configured key, at the
     /// engine's clock; nothing without a key. The hashes come from this
     /// call's own writes, never from a request.
-    fn sign_written(&self, records: &[(Hash, RecordKind)]) -> Result<Vec<SignatureWritten>> {
+    ///
+    /// `applied` names the change already committed (`manifest 3 -> 4`),
+    /// so a signing failure after the apply says the change stands.
+    fn sign_written(
+        &self,
+        records: &[(Hash, RecordKind)],
+        applied: Option<&str>,
+    ) -> Result<Vec<SignatureWritten>> {
         let Some(key) = &self.options().signing_key else {
             return Ok(Vec::new());
         };
@@ -1005,9 +1013,14 @@ impl Engine {
             .iter()
             .map(|(record, kind)| {
                 let at = ledger.sign(record, key, &signed_at).map_err(|e| {
+                    let applied = applied
+                        .map_or_else(String::new, |a| format!("the change is applied ({a}) and "));
                     Error::Other(format!(
-                        "{} {record} was written but could not be signed ({e}); it stands \
-                         unsigned, and only the call that writes a record signs it",
+                        "{applied}{} {record} is written, but it could not be signed ({e}); it \
+                         stands unsigned, since only the call that writes a record signs it. \
+                         Check that the index location is writable for `ledger/` (the \
+                         signature is a new file there) and that the key loads, then sign \
+                         the next change; `bellwether receipt show` shows this one as unsigned",
                         kind.as_str()
                     ))
                 })?;

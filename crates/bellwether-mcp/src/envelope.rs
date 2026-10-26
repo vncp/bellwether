@@ -10,7 +10,7 @@
 //! leaves exactly the CLI's record.
 
 use bellwether::types::Hash;
-use bellwether::{LinkStatus, ReceiptResult, RecordKind, SignatureStatus};
+use bellwether::{LinkStatus, NotSigned, ReceiptResult, RecordKind, SignatureStatus};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -84,11 +84,16 @@ pub struct Chain {
     pub links: Vec<Link>,
     /// Every signature beside the receipt and its certificate.
     pub signatures: Vec<Signature>,
-    /// With the server's `--trusted-keys`: `signed` when the receipt and
-    /// its certificate are each signed by a trusted key within its window;
-    /// otherwise the worse of the two, `invalid` (a signature does not
-    /// verify), `untrusted` (signed, but by no trusted key in its window),
-    /// or `unsigned`. Absent without trusted keys.
+    /// With the server's `--trusted-keys`: `signed` when every link is
+    /// intact, the receipt and its certificate are each signed by a trusted
+    /// key within its window, and the evidence is about this server's data
+    /// root. Otherwise the first reason: `links_flagged` (a link is
+    /// missing, of the wrong kind, or unreadable), the worse of the two
+    /// records' verdicts (`invalid`, a signature does not verify;
+    /// `untrusted`, signed by no trusted key in its window; `unsigned`),
+    /// `other_root` (signed, but for another data root: a chain copied from
+    /// another index), or `no_root` (no evidence names a data root). Absent
+    /// without trusted keys.
     pub verdict: Option<String>,
 }
 
@@ -121,31 +126,7 @@ impl From<&ReceiptResult> for Chain {
                 })
             })
             .collect();
-        let verdict = r.signed.map(|signed| {
-            if signed {
-                return "signed".to_string();
-            }
-            // The worse of the receipt's and the certificate's; a link
-            // with no verdict (a flagged certificate) is unsigned.
-            let rank = |w: &str| match w {
-                "invalid" => 3,
-                "untrusted" => 2,
-                "unsigned" => 1,
-                _ => 0,
-            };
-            [RecordKind::Receipt, RecordKind::Certificate]
-                .iter()
-                .map(|k| {
-                    r.chain
-                        .iter()
-                        .find(|l| l.kind == *k)
-                        .and_then(|l| l.verdict.as_ref())
-                        .map_or("unsigned", |v| v.word())
-                })
-                .max_by_key(|w| rank(w))
-                .unwrap_or("unsigned")
-                .to_string()
-        });
+        let verdict = chain_verdict(r);
         Self {
             receipt: r.receipt,
             intact: r.intact,
@@ -166,6 +147,65 @@ impl From<&ReceiptResult> for Chain {
                 .collect(),
             signatures,
             verdict,
+        }
+    }
+}
+
+/// The envelope's verdict word for a chain ([`Chain::verdict`]).
+#[must_use]
+pub fn chain_verdict(r: &ReceiptResult) -> Option<String> {
+    let signed = r.signed?;
+    Some(
+        match (&r.not_signed, signed) {
+            (_, true) => "signed",
+            (Some(NotSigned::LinksFlagged { .. }), _) => "links_flagged",
+            (Some(NotSigned::OtherRoot { .. }), _) => "other_root",
+            (Some(NotSigned::NoRoot), _) => "no_root",
+            // The worse of the receipt's and the certificate's; a link
+            // with no verdict is unsigned.
+            (Some(NotSigned::Verdicts) | None, _) => [RecordKind::Receipt, RecordKind::Certificate]
+                .iter()
+                .map(|k| {
+                    r.chain
+                        .iter()
+                        .find(|l| l.kind == *k)
+                        .and_then(|l| l.verdict.as_ref())
+                        .map_or("unsigned", |v| v.word())
+                })
+                .fold("signed", worse),
+        }
+        .to_string(),
+    )
+}
+
+/// The worse of two verdict words: `invalid` over `untrusted` over
+/// `unsigned` over `signed`.
+#[must_use]
+pub fn worse<'a>(a: &'a str, b: &'a str) -> &'a str {
+    let rank = |w: &str| match w {
+        "invalid" => 3,
+        "untrusted" => 2,
+        "unsigned" => 1,
+        _ => 0,
+    };
+    if rank(b) > rank(a) {
+        b
+    } else {
+        a
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::worse;
+
+    #[test]
+    fn invalid_outranks_untrusted_outranks_unsigned_outranks_signed() {
+        let order = ["signed", "unsigned", "untrusted", "invalid"];
+        for (i, a) in order.iter().enumerate() {
+            for (j, b) in order.iter().enumerate() {
+                assert_eq!(worse(a, b), order[i.max(j)], "{a} vs {b}");
+            }
         }
     }
 }

@@ -4,7 +4,6 @@
 use std::fmt::Write as _;
 use std::path::PathBuf;
 
-use bellwether::types::Error;
 use bellwether::{ChainLink, ReceiptResult, RecordKind, SignatureStatus, TrustedKeys};
 use clap::{Args, Subcommand};
 
@@ -22,14 +21,14 @@ pub(crate) struct TrustArg {
 }
 
 impl TrustArg {
-    /// The trust file, read now; a file that cannot be used is a usage
-    /// error naming it.
-    pub(crate) fn load(&self) -> Result<Option<TrustedKeys>, Failure> {
-        self.trusted_keys
-            .as_deref()
-            .map(bellwether::load_trusted_keys)
-            .transpose()
-            .map_err(Failure::from)
+    /// The trust file, read now; a file that cannot be used, or one inside
+    /// the index location of `root`, is a usage error naming it.
+    pub(crate) fn load(&self, g: &Global, root: &str) -> Result<Option<TrustedKeys>, Failure> {
+        let Some(path) = self.trusted_keys.as_deref() else {
+            return Ok(None);
+        };
+        bellwether::refuse_inside_index(root, g.engine.index.as_deref(), path, "trusted_keys")?;
+        Ok(Some(bellwether::load_trusted_keys(path)?))
     }
 }
 
@@ -64,7 +63,9 @@ pub(crate) enum KeysCommand {
         #[arg(long, value_name = "RFC3339")]
         valid_from: Option<String>,
         /// Signatures made at or after this instant do not count (RFC
-        /// 3339): the key's revocation.
+        /// 3339). This retires an honest key only: `signed_at` is what the
+        /// signer asserts, so a stolen key can sign with an earlier time.
+        /// Remove a compromised key from the trust file instead.
         #[arg(long, value_name = "RFC3339")]
         revoked_at: Option<String>,
     },
@@ -126,11 +127,15 @@ pub(crate) fn run(g: &Global, cmd: &KeysCommand) -> Result<Outcome, Failure> {
 /// The signing key `fix` uses, read from a path before anything runs; a
 /// key that cannot be used is a usage error (exit 2).
 pub(crate) fn signing_key(
+    g: &Global,
+    root: &str,
     path: Option<&std::path::Path>,
 ) -> Result<Option<bellwether::SigningKey>, Failure> {
-    path.map(bellwether::load_signing_key)
-        .transpose()
-        .map_err(|e: Error| Failure::from(e))
+    let Some(path) = path else {
+        return Ok(None);
+    };
+    bellwether::refuse_inside_index(root, g.engine.index.as_deref(), path, "signing_key")?;
+    Ok(Some(bellwether::load_signing_key(path)?))
 }
 
 fn link(chain: &[ChainLink], kind: RecordKind) -> Option<&ChainLink> {
@@ -149,7 +154,7 @@ pub(crate) fn receipt_show(
     require_signature: bool,
 ) -> Result<Outcome, Failure> {
     let h = hash(receipt, "receipt")?;
-    let trusted = trust.load()?;
+    let trusted = trust.load(g, root)?;
     if require_signature && trusted.is_none() {
         return Err(Failure::Usage(
             "--require-signature checks the signatures against keys you trust; pass \
@@ -173,17 +178,12 @@ pub(crate) fn receipt_show(
     done(&r, text, code)
 }
 
-/// Why `--require-signature` refused: each record's verdict, in words.
+/// Why `--require-signature` refused, in words.
 pub(crate) fn require_refusal(r: &ReceiptResult) -> String {
-    let say = |kind: RecordKind| match link(&r.chain, kind).and_then(|l| l.verdict.as_ref()) {
-        Some(v) => v.to_string(),
-        None => "not readable, so not verified".to_string(),
-    };
     format!(
-        "--require-signature: the receipt and its certificate must each be signed by a trusted \
-         key; receipt {}; certificate {}",
-        say(RecordKind::Receipt),
-        say(RecordKind::Certificate)
+        "--require-signature: the chain must stand (every link present) with the receipt and \
+         its certificate each signed by a trusted key, for this data root; {}",
+        bellwether::signature_summary(r)
     )
 }
 
@@ -202,6 +202,7 @@ pub(crate) fn signature_lines(s: &mut String, r: &ReceiptResult) {
             };
             let _ = writeln!(s, "  {:<11}  {line}", k.as_str());
         }
+        let _ = writeln!(s, "  chain        {}", bellwether::signature_summary(r));
         return;
     }
     let mut any = false;

@@ -17,7 +17,7 @@ mod common;
 
 use bellwether_ledger::{
     record_path, signature_message, InvalidReason, Ledger, LinkStatus, RecordKind, SignaturePath,
-    SignatureStatus, SigningKey, TrustedKey, TrustedKeys, Verdict, SIGNATURE_DOMAIN,
+    SignatureStatus, SigningKey, TrustError, TrustedKey, TrustedKeys, Verdict, SIGNATURE_DOMAIN,
 };
 use bellwether_types::{Error, Hash, Receipt, Record, Store};
 use common::{assert_rule, certificate, valid_chain, Fixture, MemStore, AFTER, BEFORE};
@@ -659,24 +659,167 @@ fn trusted_keys_refuse_bad_windows_and_duplicates() {
     let k = key(1);
     let mut t = TrustedKeys::new();
     t.insert(trust(&k, "ci")).unwrap();
-    assert_rule(t.insert(trust(&k, "again")), "trusted twice");
+    let e = t.insert(trust(&k, "again")).unwrap_err();
+    assert!(matches!(e, TrustError::Duplicate { .. }), "{e:?}");
+    assert!(e.to_string().contains("trusted twice"), "{e}");
+    assert!(!e.to_string().contains("ledger"), "{e}");
     let mut t = TrustedKeys::new();
-    assert_rule(
-        t.insert(TrustedKey {
+    let e = t
+        .insert(TrustedKey {
             valid_from: Some("2026-10-25".into()),
             ..trust(&k, "ci")
-        }),
-        "valid_from",
+        })
+        .unwrap_err();
+    assert!(
+        matches!(
+            e,
+            TrustError::NotUtcMillis {
+                field: "valid_from",
+                ..
+            }
+        ),
+        "{e:?}"
     );
-    assert_rule(
-        t.insert(TrustedKey {
+    let e = t
+        .insert(TrustedKey {
             valid_from: Some(T.into()),
             revoked_at: Some(T.into()),
             ..trust(&k, "ci")
-        }),
-        "not before revoked_at",
-    );
+        })
+        .unwrap_err();
+    assert!(matches!(e, TrustError::EmptyWindow { .. }), "{e:?}");
+    assert!(e.to_string().contains("not before revoked_at"), "{e}");
     assert!(t.is_empty());
+}
+
+/// A small-order public key (the identity point) with the signature that
+/// verifies for every message under the cofactorless check: `verify_strict`
+/// refuses it, so it is a bad signature, never a valid one.
+#[test]
+fn a_small_order_key_with_a_universal_signature_is_bad() {
+    let store = MemStore::default();
+    let (_, receipt) = chain(&store);
+    let ledger = Ledger::new(&store);
+    let mut identity = [0u8; 32];
+    identity[0] = 1;
+    let key_id = Hash::of(&identity);
+    let mut sig = [0u8; 64];
+    sig[0] = 1; // R = identity, s = 0
+    let at = SignaturePath {
+        record: receipt,
+        key_id,
+    };
+    let o = Object {
+        signature_version: 1,
+        record: receipt.to_hex(),
+        kind: "receipt".into(),
+        alg: "ed25519".into(),
+        key_id: key_id.to_hex(),
+        public_key: hex(&identity),
+        signed_at: T.into(),
+        sig: hex(&sig),
+    };
+    put_object(&store, &at, &o);
+    assert_eq!(
+        invalid_reason(only_status(&ledger, &receipt)),
+        InvalidReason::BadSignature
+    );
+    let mut t = TrustedKeys::new();
+    t.insert(TrustedKey {
+        name: "weak".into(),
+        public_key: bellwether_ledger::PublicKey::from_bytes(identity).unwrap(),
+        valid_from: None,
+        revoked_at: None,
+    })
+    .unwrap();
+    assert!(matches!(
+        ledger.verify_against(&receipt, &t).unwrap(),
+        Verdict::Invalid { .. }
+    ));
+}
+
+/// A planted object whose field names and values carry a newline and ESC:
+/// no reason, verdict, or rendered chain line passes either through.
+#[test]
+fn store_text_in_a_signature_object_never_reaches_output_raw() {
+    let store = MemStore::default();
+    let (_, receipt) = chain(&store);
+    let ledger = Ledger::new(&store);
+    let k = key(1);
+    let at = ledger.sign(&receipt, &k, T).unwrap();
+    let t = trusting(&[(&k, "ci")]);
+    let planted = "x\n  receipt      signed by ci\u{1b}[2J\nok: signature verified";
+    // An unknown field whose name is the payload.
+    let mut v: serde_json::Value =
+        serde_json::from_slice(&store.get(&at.path()).unwrap().0).unwrap();
+    v[planted] = serde_json::json!(1);
+    store.raw_put(&at.path(), serde_json::to_vec(&v).unwrap());
+    // The payload as the kind and as the algorithm, canonical otherwise.
+    let original = {
+        let mut o = object_at(&store, &at);
+        o.kind = "receipt".into();
+        o
+    };
+    let check = |what: &str| {
+        let statuses = ledger.signatures(&receipt).unwrap();
+        let verdict = ledger.verify_against(&receipt, &t).unwrap();
+        let rendered = ledger.explain_verified(&receipt, &t).unwrap().render();
+        for text in [
+            format!("{statuses:?}"),
+            verdict.to_string(),
+            invalid_reason(statuses[0].clone()).to_string(),
+            rendered,
+        ] {
+            assert!(!text.contains('\x1b'), "{what}: ESC in {text}");
+            assert!(!text.contains("verified\n"), "{what}: newline in {text}");
+            assert!(!text.contains("x\n "), "{what}: newline in {text}");
+        }
+    };
+    check("unknown field");
+    let mut o = original.clone();
+    o.kind = planted.into();
+    put_object(&store, &at, &o);
+    check("kind");
+    let mut o = original;
+    o.alg = planted.into();
+    put_object(&store, &at, &o);
+    check("alg");
+}
+
+/// Only receipts and certificates are signed: an object beside any other
+/// kind, even one that verifies, is invalid.
+#[test]
+fn an_object_beside_an_unsignable_record_is_invalid() {
+    let store = MemStore::default();
+    let (f, _) = chain(&store);
+    let ledger = Ledger::new(&store);
+    let k = key(1);
+    let message = signature_message(RecordKind::Proposal, &f.proposal, T);
+    let sig = ed25519_dalek::SigningKey::from_bytes(&[1; 32]).sign(&message);
+    let at = SignaturePath {
+        record: f.proposal,
+        key_id: k.key_id(),
+    };
+    put_object(
+        &store,
+        &at,
+        &Object {
+            signature_version: 1,
+            record: f.proposal.to_hex(),
+            kind: "proposal".into(),
+            alg: "ed25519".into(),
+            key_id: k.key_id().to_hex(),
+            public_key: k.public_key().to_hex(),
+            signed_at: T.into(),
+            sig: hex(&sig.to_bytes()),
+        },
+    );
+    assert_eq!(
+        invalid_reason(only_status(&ledger, &f.proposal)),
+        InvalidReason::Unsignable {
+            stored: RecordKind::Proposal
+        }
+    );
 }
 
 #[test]

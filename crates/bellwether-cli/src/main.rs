@@ -671,7 +671,8 @@ fn run(cli: &Cli, out: &Out) -> Result<Outcome, Failure> {
                 done(&r, human::findings(&r, out), EXIT_OK)
             }
             LedgerCommand::Receipts { root, trust } => {
-                let r = engine_keyed(g, &root.root, None, trust.load()?)?.receipts()?;
+                let r =
+                    engine_keyed(g, &root.root, None, trust.load(g, &root.root)?)?.receipts()?;
                 done(&r, human::receipts(&r, out), EXIT_OK)
             }
             LedgerCommand::Scorecard(root) => {
@@ -680,7 +681,8 @@ fn run(cli: &Cli, out: &Out) -> Result<Outcome, Failure> {
             }
         },
         Command::Report(a) => {
-            let r = engine_keyed(g, &a.root.root, None, a.trust.load()?)?.report(&a.html)?;
+            let r = engine_keyed(g, &a.root.root, None, a.trust.load(g, &a.root.root)?)?
+                .report(&a.html)?;
             done(&r, human::report(&r, out), EXIT_OK)
         }
         Command::Verify(c) => verify_cmds::run(g, out, c),
@@ -720,10 +722,12 @@ fn run(cli: &Cli, out: &Out) -> Result<Outcome, Failure> {
 /// flags, signing and trust included.
 fn mcp(g: &Global, a: &McpArgs) -> Result<Outcome, Failure> {
     let mut engine = engine_options(g)?;
-    a.keys.apply(&mut engine).map_err(|e| match e {
-        OptionsError::Usage(m) => Failure::Usage(m),
-        OptionsError::Engine(e) => Failure::Engine(e),
-    })?;
+    a.keys
+        .apply(&a.root.root, &mut engine)
+        .map_err(|e| match e {
+            OptionsError::Usage(m) => Failure::Usage(m),
+            OptionsError::Engine(e) => Failure::Engine(e),
+        })?;
     let config = bellwether_mcp::Config {
         root: a.root.root.clone(),
         engine,

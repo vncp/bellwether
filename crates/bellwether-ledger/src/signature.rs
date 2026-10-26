@@ -101,8 +101,21 @@ fn parse_lower_hex<const N: usize>(s: &str) -> Option<[u8; N]> {
     Some(out)
 }
 
-fn rule(msg: impl Into<String>) -> Error {
-    Error::LedgerRule(msg.into())
+/// Text read from the store, made safe to show on a terminal or hand to an
+/// agent: every control character (newline and ESC included) is escaped as
+/// `\n`, `\u{1b}`, and so on, so a planted object cannot forge output lines
+/// or terminal sequences.
+#[must_use]
+pub fn printable(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        if c.is_control() {
+            out.extend(c.escape_default());
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -359,6 +372,12 @@ pub enum InvalidReason {
         /// The algorithm named.
         alg: String,
     },
+    /// Filed beside a record of a kind that is never signed (only receipts
+    /// and certificates are).
+    Unsignable {
+        /// The stored record's kind.
+        stored: RecordKind,
+    },
     /// The signature does not verify over the message for this record,
     /// kind, and `signed_at` under the object's public key.
     BadSignature,
@@ -389,6 +408,11 @@ impl fmt::Display for InvalidReason {
             Self::UnknownAlgorithm { alg } => {
                 write!(f, "unknown algorithm {alg:?} (only ed25519 is read)")
             }
+            Self::Unsignable { stored } => write!(
+                f,
+                "filed beside {}, and only receipts and certificates are signed",
+                stored.with_article()
+            ),
             Self::BadSignature => f.write_str(
                 "bad signature: it does not verify over this record, kind, and signed_at",
             ),
@@ -461,10 +485,13 @@ fn check_inner(
     at: &SignaturePath,
     stored: RecordKind,
 ) -> std::result::Result<(PublicKey, String), InvalidReason> {
+    if !matches!(stored, RecordKind::Receipt | RecordKind::Certificate) {
+        return Err(InvalidReason::Unsignable { stored });
+    }
     // The version first, from an untyped parse, so a newer object is never
     // mistaken for a malformed one.
     let value: serde_json::Value =
-        serde_json::from_slice(bytes).map_err(|e| malformed(format!("not JSON ({e})")))?;
+        serde_json::from_slice(bytes).map_err(|_| malformed("not JSON"))?;
     let version = value
         .get("signature_version")
         .and_then(serde_json::Value::as_u64)
@@ -479,13 +506,20 @@ fn check_inner(
         return Err(malformed("signature_version 0"));
     }
     let object: SignatureObject =
-        serde_json::from_value(value).map_err(|e| malformed(e.to_string()))?;
-    let canonical = serde_json::to_vec(&object).map_err(|e| malformed(e.to_string()))?;
+        // A fixed phrase, never serde's message: that would echo field
+        // names and values from the store to a terminal.
+        serde_json::from_value(value).map_err(|_| {
+            malformed("a field is missing, unknown, or of the wrong type")
+        })?;
+    let canonical =
+        serde_json::to_vec(&object).map_err(|_| malformed("cannot be re-serialized"))?;
     if canonical != bytes {
         return Err(malformed("not in canonical form"));
     }
     if object.alg != SIGNATURE_ALG {
-        return Err(InvalidReason::UnknownAlgorithm { alg: object.alg });
+        return Err(InvalidReason::UnknownAlgorithm {
+            alg: printable(&object.alg),
+        });
     }
     if object.record != at.record {
         return Err(InvalidReason::RecordMismatch {
@@ -494,7 +528,7 @@ fn check_inner(
     }
     if RecordKind::from_tag(&object.kind) != Some(stored) {
         return Err(InvalidReason::KindMismatch {
-            signed: object.kind,
+            signed: printable(&object.kind),
             stored,
         });
     }
@@ -556,6 +590,70 @@ impl TrustedKey {
     }
 }
 
+/// Why a key cannot join a [`TrustedKeys`] set. Its own type: a trust set
+/// is the reader's, not a ledger rule. Callers add the next step in their
+/// own terms (a flag, a `[[key]]` table).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TrustError {
+    /// A window bound is not RFC 3339 UTC with milliseconds.
+    NotUtcMillis {
+        /// The key's name.
+        name: String,
+        /// `valid_from` or `revoked_at`.
+        field: &'static str,
+        /// The value given.
+        value: String,
+    },
+    /// `valid_from` is not before `revoked_at`: no signature could count.
+    EmptyWindow {
+        /// The key's name.
+        name: String,
+        /// The window's start.
+        valid_from: String,
+        /// The window's end.
+        revoked_at: String,
+    },
+    /// The key is already in the set.
+    Duplicate {
+        /// Its id.
+        key_id: Hash,
+        /// The name it is trusted under already.
+        first: String,
+        /// The name given now.
+        second: String,
+    },
+}
+
+impl fmt::Display for TrustError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NotUtcMillis { name, field, value } => write!(
+                f,
+                "trusted key {name:?}: {field} {value:?} is not RFC 3339 UTC with milliseconds"
+            ),
+            Self::EmptyWindow {
+                name,
+                valid_from,
+                revoked_at,
+            } => write!(
+                f,
+                "trusted key {name:?}: valid_from {valid_from} is not before revoked_at \
+                 {revoked_at}, so no signature could count"
+            ),
+            Self::Duplicate {
+                key_id,
+                first,
+                second,
+            } => write!(
+                f,
+                "key {key_id} is trusted twice (as {first:?} and {second:?})"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for TrustError {}
+
 /// The keys a reader trusts. Never stored in the ledger: an attacker with
 /// write access to the store would then also choose who is trusted.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -570,37 +668,40 @@ impl TrustedKeys {
         Self::default()
     }
 
-    /// Adds a key. Refused: a key already present, a window bound that is
-    /// not RFC 3339 UTC with milliseconds, or `valid_from` not before
-    /// `revoked_at`.
-    pub fn insert(&mut self, key: TrustedKey) -> Result<()> {
-        for (what, t) in [
+    /// Adds a key. Refused ([`TrustError`]): a key already present, a
+    /// window bound that is not RFC 3339 UTC with milliseconds, or
+    /// `valid_from` not before `revoked_at`.
+    pub fn insert(&mut self, key: TrustedKey) -> std::result::Result<(), TrustError> {
+        for (field, t) in [
             ("valid_from", &key.valid_from),
             ("revoked_at", &key.revoked_at),
         ] {
             if let Some(t) = t {
                 if !is_utc_millis(t) {
-                    return Err(rule(format!(
-                        "trusted key {:?}: {what} {t:?} is not RFC 3339 UTC with milliseconds",
-                        key.name
-                    )));
+                    return Err(TrustError::NotUtcMillis {
+                        name: key.name.clone(),
+                        field,
+                        value: t.clone(),
+                    });
                 }
             }
         }
         if let (Some(from), Some(rev)) = (&key.valid_from, &key.revoked_at) {
             if from >= rev {
-                return Err(rule(format!(
-                    "trusted key {:?}: valid_from {from} is not before revoked_at {rev}",
-                    key.name
-                )));
+                return Err(TrustError::EmptyWindow {
+                    name: key.name.clone(),
+                    valid_from: from.clone(),
+                    revoked_at: rev.clone(),
+                });
             }
         }
         let id = key.key_id();
         if let Some(old) = self.keys.get(&id) {
-            return Err(rule(format!(
-                "key {id} is trusted twice (as {:?} and {:?})",
-                old.name, key.name
-            )));
+            return Err(TrustError::Duplicate {
+                key_id: id,
+                first: old.name.clone(),
+                second: key.name.clone(),
+            });
         }
         self.keys.insert(id, key);
         Ok(())

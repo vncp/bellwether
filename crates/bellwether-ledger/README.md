@@ -53,7 +53,7 @@ so a signature cannot be moved to another record, another kind, or another time,
 
 **`SigningKey`** is built from a 32-byte seed and never gives it back: no call returns secret key material (two `compile_fail` doctests pin that), its `Debug` shows the key id only, and only the public half is written.
 
-**Verification.** A signature object is `Invalid` when it is malformed (not JSON, a missing, mistyped, or unknown field, or not in canonical form), has a newer `signature_version` (`newer`), names another record than the one it is filed beside (`record_mismatch`), names another kind than the stored record's (`kind_mismatch`), has a key id that is not its file name's or its public key's (`key_id_mismatch`), names an algorithm other than ed25519, or does not verify (`bad_signature`, checked with `verify_strict`). A record whose own bytes do not match its name is the ledger's tamper error before any signature is looked at.
+**Verification.** A signature object is `Invalid` when it is malformed (not JSON, a missing, mistyped, or unknown field, or not in canonical form), has a newer `signature_version` (`newer`), names another record than the one it is filed beside (`record_mismatch`), names another kind than the stored record's (`kind_mismatch`), has a key id that is not its file name's or its public key's (`key_id_mismatch`), names an algorithm other than ed25519, sits beside a record that is never signed (`unsignable`), or does not verify (`bad_signature`, checked with `verify_strict`). A record whose own bytes do not match its name is the ledger's tamper error before any signature is looked at.
 
 **Verdicts** (`verify_against`, `Verdict::of`), against a `TrustedKeys` set the reader supplies (never stored in the ledger):
 
@@ -65,6 +65,10 @@ so a signature cannot be moved to another record, another kind, or another time,
 | `Invalid { invalid, signed }` | at least one object does not verify; reported even when a trusted key also signed (`signed`), never hidden by it |
 
 The public key an object carries proves only that the object is self-consistent; it never makes a record `Signed` on its own.
+
+**What a verdict does not say.** A signature binds kind, hash, and time, not location: the same record copied into another index carries the same valid signature, so a reader checks the chain's evidence root itself (the facade's `ReceiptResult::signed` does). The window `[valid_from, revoked_at)` retires an honest key only: `signed_at` is what the signer asserts, so a stolen key can sign with a time inside its window. Remove a compromised key from the trust file.
+
+**Store text.** An object's reasons use fixed phrases (never serde's message, which would echo field names from the store), and `printable` escapes every control character in the kind or algorithm an object names, and in every fact `explain` shows, so a planted object cannot forge output lines or terminal sequences. An object beside a record that is neither a receipt nor a certificate is `Invalid` (`unsignable`).
 
 ## Write-time rules
 
@@ -177,7 +181,7 @@ The hashes below are illustrative.
   A valid chain is then accepted.
 - `tests/provenance_required.rs` (invariant 6): Evidence and Certificate provenance.
 - `tests/write_paths.rs`: a store that counts mutations proves that reads, verification, and refused writes never write, `sign` writes exactly one object, and nothing ever deletes.
-- `tests/signatures.rs` (ADR 029): a valid chain signed and `Signed`; altered record bytes (the tamper error wins, `UNREADABLE` in `explain`); a moved signature, verbatim (`record_mismatch`) and re-addressed (`bad_signature`); an edited kind, `signed_at`, or key; one flipped bit of `sig`; an untrusted key; a revoked or not-yet-valid key (`Untrusted`, with its window); an unsigned receipt; a `signature_version: 2` object; an invalid signature beside a trusted one; `sign` refusing a Proposal, Evidence, Replay, an absent hash, and a planted chain `put_receipt` would refuse; an every-byte corruption sweep (every single-byte flip and every truncation is `Invalid`, never a panic); an independent oracle for the message bytes and the signature.
+- `tests/signatures.rs` (ADR 029): a small-order key with a universal signature (`bad_signature`, `verify_strict`); store text with a newline and ESC never reaching a reason or a rendered line; an object beside a Proposal (`unsignable`); a valid chain signed and `Signed`; altered record bytes (the tamper error wins, `UNREADABLE` in `explain`); a moved signature, verbatim (`record_mismatch`) and re-addressed (`bad_signature`); an edited kind, `signed_at`, or key; one flipped bit of `sig`; an untrusted key; a revoked or not-yet-valid key (`Untrusted`, with its window); an unsigned receipt; a `signature_version: 2` object; an invalid signature beside a trusted one; `sign` refusing a Proposal, Evidence, Replay, an absent hash, and a planted chain `put_receipt` would refuse; an every-byte corruption sweep (every single-byte flip and every truncation is `Invalid`, never a panic); an independent oracle for the message bytes and the signature.
 - `tests/ledger.rs`:
   - content addressing and idempotence, and lowercase-only names
   - tamper detection

@@ -15,7 +15,9 @@
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
-use bellwether_ledger::{is_utc_millis, PublicKey, SigningKey, TrustedKey, TrustedKeys};
+use bellwether_ledger::{
+    is_utc_millis, PublicKey, SigningKey, TrustError, TrustedKey, TrustedKeys,
+};
 use bellwether_store::{now_rfc3339, rfc3339_millis};
 use bellwether_types::{Error, Hash, Result};
 use serde::{Deserialize, Serialize};
@@ -181,8 +183,11 @@ pub fn generate_key(
 /// (on Unix, no group or other permission bits). Every refusal names the
 /// file and what to do.
 pub fn load_signing_key(path: &Path) -> Result<SigningKey> {
+    use std::io::Read as _;
     let shown = path.display();
-    let meta = std::fs::metadata(path).map_err(|e| {
+    // Opened once: the mode and the bytes come from the same file, never
+    // from two lookups of the path that a swap could split.
+    let mut file = std::fs::File::open(path).map_err(|e| {
         bad(
             "signing_key",
             format!(
@@ -191,18 +196,29 @@ pub fn load_signing_key(path: &Path) -> Result<SigningKey> {
             ),
         )
     })?;
+    let meta = file.metadata().map_err(|e| {
+        bad(
+            "signing_key",
+            format!("cannot read the signing key {shown} ({e})"),
+        )
+    })?;
     if !meta.is_file() {
         return Err(bad(
             "signing_key",
             format!("the signing key {shown} is not a file; pass the seed file `bellwether keys generate` wrote"),
         ));
     }
-    let bytes = Zeroizing::new(std::fs::read(path).map_err(|e| {
-        bad(
-            "signing_key",
-            format!("cannot read the signing key {shown} ({e})"),
-        )
-    })?);
+    let mut bytes = Zeroizing::new(Vec::with_capacity(33));
+    // At most one byte past a seed is read: enough to tell its size apart.
+    (&mut file)
+        .take(4096)
+        .read_to_end(&mut bytes)
+        .map_err(|e| {
+            bad(
+                "signing_key",
+                format!("cannot read the signing key {shown} ({e})"),
+            )
+        })?;
     // The shape first: a public key file passed by mistake is named as
     // one, not as a permission problem.
     if bytes.len() != 32 {
@@ -215,7 +231,7 @@ pub fn load_signing_key(path: &Path) -> Result<SigningKey> {
             "signing_key",
             format!(
                 "the signing key {shown} is {} bytes, not a 32-byte ed25519 seed; {hint}",
-                bytes.len()
+                meta.len()
             ),
         ));
     }
@@ -294,16 +310,35 @@ fn parse_trust_file(path: &Path) -> Result<(String, TrustFile)> {
             ),
         )
     })?;
-    let file: TrustFile = toml::from_str(&text).map_err(|e| {
+    let shape = |detail: String| {
         bad(
             "trusted_keys",
             format!(
                 "the trust file {shown} is not a list of [[key]] tables with key_id, \
-                 public_key, name, and optionally valid_from and revoked_at: {}",
-                e.to_string().trim()
+                 public_key, name, and optionally valid_from and revoked_at (times, quoted or \
+                 not): {detail}"
             ),
         )
-    })?;
+    };
+    let mut table: toml::Table =
+        toml::from_str(&text).map_err(|e| shape(e.to_string().trim().to_string()))?;
+    // A TOML datetime (`valid_from = 2026-01-01T00:00:00Z`) is read as the
+    // RFC 3339 text it spells.
+    if let Some(toml::Value::Array(keys)) = table.get_mut("key") {
+        for k in keys {
+            if let toml::Value::Table(t) = k {
+                for field in ["valid_from", "revoked_at"] {
+                    if let Some(toml::Value::Datetime(d)) = t.get(field) {
+                        let spelled = d.to_string();
+                        t.insert(field.to_string(), toml::Value::String(spelled));
+                    }
+                }
+            }
+        }
+    }
+    let file: TrustFile = toml::Value::Table(table)
+        .try_into()
+        .map_err(|e: toml::de::Error| shape(e.to_string().trim().to_string()))?;
     Ok((text, file))
 }
 
@@ -329,7 +364,10 @@ fn trusted_from(path: &Path, file: &TrustFile) -> Result<TrustedKeys> {
                     rfc3339_millis(t).map_err(|_| {
                         bad(
                             "trusted_keys",
-                            format!("{at}: {field} {t:?} is not an RFC 3339 time"),
+                            format!(
+                                "{at}: {field} {t:?} is not an RFC 3339 time with an offset; \
+                                 write it as 2026-10-25T00:00:00Z"
+                            ),
                         )
                     })
                 })
@@ -341,9 +379,31 @@ fn trusted_from(path: &Path, file: &TrustFile) -> Result<TrustedKeys> {
             valid_from: bound("valid_from", &e.valid_from)?,
             revoked_at: bound("revoked_at", &e.revoked_at)?,
         })
-        .map_err(|err| bad("trusted_keys", format!("{at}: {err}")))?;
+        .map_err(|err| bad("trusted_keys", trust_error_in_file(&at, &err)))?;
     }
     Ok(keys)
+}
+
+/// A trust error in a trust file's entry, with the edit that fixes it.
+fn trust_error_in_file(at: &str, err: &TrustError) -> String {
+    match err {
+        TrustError::EmptyWindow {
+            valid_from,
+            revoked_at,
+            ..
+        } => format!(
+            "{at}: valid_from {valid_from} is not before revoked_at {revoked_at}, so none of \
+             its signatures could count; edit its [[key]] table so valid_from comes first"
+        ),
+        TrustError::Duplicate { key_id, first, .. } => format!(
+            "{at}: key {key_id} is already trusted as {first:?}; remove one of its two [[key]] \
+             tables"
+        ),
+        TrustError::NotUtcMillis { field, value, .. } => format!(
+            "{at}: {field} {value:?} is not an RFC 3339 time; write it as \
+             2026-10-25T00:00:00Z"
+        ),
+    }
 }
 
 /// Reads a trust file. A missing or malformed file, a key id that is not
@@ -375,6 +435,17 @@ pub fn trust_key(
             .map(|t| window_bound("revoked_at", "--revoked-at", t))
             .transpose()?,
     };
+    if let (Some(from), Some(rev)) = (&entry.valid_from, &entry.revoked_at) {
+        if from >= rev {
+            return Err(bad(
+                "valid_from",
+                format!(
+                    "--valid-from {from} is not before --revoked-at {rev}, so no signature by \
+                     the key could count; give --valid-from an earlier time than --revoked-at"
+                ),
+            ));
+        }
+    }
     let (text, existing) = if file.exists() {
         parse_trust_file(file)?
     } else {
@@ -402,7 +473,12 @@ pub fn trust_key(
         valid_from: entry.valid_from.clone(),
         revoked_at: entry.revoked_at.clone(),
     })
-    .map_err(|e| bad("trusted_keys", e.to_string()))?;
+    .map_err(|e| {
+        bad(
+            "trusted_keys",
+            trust_error_in_file(&file.display().to_string(), &e),
+        )
+    })?;
     let block = toml::to_string(&TrustFile {
         key: vec![entry.clone()],
     })
@@ -431,4 +507,58 @@ pub fn trust_key(
         key: entry,
         keys: keys.len() as u64,
     })
+}
+
+/// Refuses a signing key or trust file inside the index location of the
+/// data at `root` (`index` as given, default `<root>/.bellwether`): anyone
+/// who can write the store could read the key there, or choose who is
+/// trusted (ADR 029). `field` is `signing_key` or `trusted_keys`. A path
+/// that does not exist is left to the loader to refuse; an index on an
+/// object store holds no local file.
+pub fn refuse_inside_index(
+    root: &str,
+    index: Option<&str>,
+    path: &Path,
+    field: &'static str,
+) -> Result<()> {
+    let location = if let Some(i) = index {
+        match crate::engine::local_path(i)? {
+            Some(p) => p,
+            None => return Ok(()),
+        }
+    } else {
+        let local = root.strip_prefix("file://").unwrap_or(root);
+        Path::new(local).join(crate::DEFAULT_INDEX_DIR)
+    };
+    let (Ok(location), Ok(file)) = (
+        std::fs::canonicalize(&location),
+        std::fs::canonicalize(path),
+    ) else {
+        return Ok(());
+    };
+    if !file.starts_with(&location) {
+        return Ok(());
+    }
+    let (what, why, flag) = if field == "signing_key" {
+        (
+            "the signing key",
+            "anyone who can write the store could read or replace it there",
+            "--signing-key",
+        )
+    } else {
+        (
+            "the trust file",
+            "anyone who can write the store could then choose who is trusted",
+            "--trusted-keys",
+        )
+    };
+    Err(bad(
+        field,
+        format!(
+            "{what} {} is inside the index location {}, and {why}; move it outside the index \
+             (for example under ~/.config/bellwether/) and pass that path to {flag}",
+            path.display(),
+            location.display()
+        ),
+    ))
 }

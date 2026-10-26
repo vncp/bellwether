@@ -189,13 +189,20 @@ pub struct KeyArgs {
 }
 
 impl KeyArgs {
-    /// Loads the key and the trust file into `options`.
-    pub fn apply(&self, options: &mut EngineOptions) -> Result<(), OptionsError> {
+    /// Loads the key and the trust file for the data at `root` into
+    /// `options`. Either one inside the index location is refused: a store
+    /// writer could read the key there, or choose who is trusted.
+    pub fn apply(&self, root: &str, options: &mut EngineOptions) -> Result<(), OptionsError> {
         let usage = |e: bellwether::types::Error| OptionsError::Usage(e.to_string());
+        let index = options.index.clone();
         if let Some(p) = &self.signing_key {
+            bellwether::refuse_inside_index(root, index.as_deref(), p, "signing_key")
+                .map_err(usage)?;
             options.signing_key = Some(bellwether::load_signing_key(p).map_err(usage)?);
         }
         if let Some(p) = &self.trusted_keys {
+            bellwether::refuse_inside_index(root, index.as_deref(), p, "trusted_keys")
+                .map_err(usage)?;
             options.trusted_keys = Some(bellwether::load_trusted_keys(p).map_err(usage)?);
         }
         Ok(())

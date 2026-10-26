@@ -19,7 +19,7 @@
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
-use bellwether_ledger::{parse_record_path, Verdict, LEDGER_PREFIX};
+use bellwether_ledger::{parse_record_path, LEDGER_PREFIX};
 use bellwether_types::Store as _;
 use bellwether_types::{
     Certificate, Coverage, Error, Evidence, EvidenceBody, Hash, Proposal, ProposalBody, Receipt,
@@ -27,7 +27,7 @@ use bellwether_types::{
 };
 
 use crate::engine::{guard, Engine};
-use crate::results::{total, Cost, ReportResult};
+use crate::results::{total, Cost, ReceiptResult, ReportResult};
 use crate::spec::label;
 
 /// Profile Evidence rendered, newest first; older ones are counted.
@@ -40,14 +40,14 @@ struct ReceiptView {
     replay: Option<Replay>,
     certificate: Option<Certificate>,
     realized: Option<(Hash, Cost)>,
-    /// With trusted keys: the receipt's verdict, and the certificate's
-    /// (`None` when the certificate could not be read).
-    signature: Option<(Verdict, Option<Verdict>)>,
+    /// With trusted keys: the chain as `receipt` shows it, whose `signed`
+    /// is the one rule every surface applies.
+    signature: Option<ReceiptResult>,
 }
 
 impl ReceiptView {
     fn signed(&self) -> bool {
-        matches!(&self.signature, Some((r, Some(c))) if r.is_signed() && c.is_signed())
+        self.signature.as_ref().and_then(|r| r.signed) == Some(true)
     }
 }
 
@@ -109,7 +109,7 @@ impl Engine {
                     .max_by(|a, b| a.1.created_at.cmp(&b.1.created_at).then(a.0.cmp(&b.0)))
                     .map(|(h, r)| (*h, total(&r.current)))
             });
-            let signature = self.verdicts(&ledger, &h, &receipt, certificate.is_some())?;
+            let signature = self.verdicts(&h)?;
             receipts.push(ReceiptView {
                 hash: h,
                 receipt,
@@ -172,30 +172,12 @@ impl Engine {
             .map(|_| receipts.iter().filter(|r| r.signed()).count() as u64)
     }
 
-    /// With trusted keys: the receipt's verdict and, when its certificate
-    /// was read, the certificate's. A certificate that cannot be verified
-    /// (unreadable) has none; a store failure is an error.
-    fn verdicts(
-        &self,
-        ledger: &bellwether_ledger::Ledger<std::sync::Arc<bellwether_store::ObjectStoreBackend>>,
-        hash: &Hash,
-        receipt: &Receipt,
-        certificate_read: bool,
-    ) -> Result<Option<(Verdict, Option<Verdict>)>> {
-        let Some(t) = &self.options().trusted_keys else {
+    /// With trusted keys: the chain behind `hash` as `receipt` shows it.
+    fn verdicts(&self, hash: &Hash) -> Result<Option<ReceiptResult>> {
+        if self.options().trusted_keys.is_none() {
             return Ok(None);
-        };
-        let on_receipt = ledger.verify_against(hash, t)?;
-        let on_certificate = if certificate_read {
-            match ledger.verify_against(&receipt.certificate, t) {
-                Ok(v) => Some(v),
-                Err(Error::Store(m)) => return Err(Error::Store(m)),
-                Err(_) => None,
-            }
-        } else {
-            None
-        };
-        Ok(Some((on_receipt, on_certificate)))
+        }
+        self.receipt(hash).map(Some)
     }
 }
 
@@ -341,17 +323,12 @@ fn render_receipt(h: &mut String, r: &ReceiptView) {
             num(c.body.missing_right)
         );
     }
-    if let Some((on_receipt, on_certificate)) = &r.signature {
+    if let Some(shown) = &r.signature {
         let class = if r.signed() { "pass" } else { "fail" };
-        let cert = on_certificate.as_ref().map_or_else(
-            || "not readable, so not verified".to_string(),
-            ToString::to_string,
-        );
         let _ = write!(
             h,
-            "<p>Signatures: <span class=\"{class}\">receipt {}; certificate {}</span>.</p>",
-            esc(&on_receipt.to_string()),
-            esc(&cert)
+            "<p>Signatures: <span class=\"{class}\">{}</span>.</p>",
+            esc(&crate::receipt::signature_summary(shown))
         );
     }
     let Some(replay) = &r.replay else {
