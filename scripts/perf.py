@@ -269,7 +269,15 @@ class Perf:
             self.metrics = [m for m in doc["metrics"] if not m["id"].startswith(mine)]
             self.context = {k: v for k, v in doc["context"].items() if not k.startswith(mine)}
             self.sections = doc["environment"].get("sections", {})
-        self.samples = open(os.path.join(a.out, "samples.jsonl"), "a")
+        spath = os.path.join(a.out, "samples.jsonl")
+        if a.merge and os.path.exists(spath) and os.path.exists(old):
+            # Drop the samples of what this run replaces.
+            keep = [l for l in open(spath) if not json.loads(l)["id"].startswith(mine)]
+            with open(spath, "w") as f:
+                f.writelines(keep)
+        elif not a.merge and os.path.exists(spath):
+            os.remove(spath)
+        self.samples = open(spath, "a")
 
     def section(self, name, start):
         """Records when a section ran, at which commit, and the machine's
@@ -1117,6 +1125,7 @@ def top_frames(profile, syms, n=10):
     wall, wall_inclusive = 0, {}
     cpu_total, inclusive_no_reads = 0, {}
     waits, wait_callers = {}, {}
+    thread_cpu = []
     for th in profile["threads"]:
         smp = th["samples"]
         weights = smp.get("threadCPUDelta") or [1] * len(smp["stack"])
@@ -1151,6 +1160,7 @@ def top_frames(profile, syms, n=10):
             return out
 
         main = th.get("isMainThread")
+        thread_cpu.append(sum(w for w in weights if w))
         prev = None
         for s, w in zip(smp["stack"], weights):
             if s is None:
@@ -1228,6 +1238,11 @@ def top_frames(profile, syms, n=10):
                        "callers": [{"frame": c, "cpu_pct": round(100 * x / max(1, cpu_total), 1)} for c, x in
                                    sorted(wait_callers.get(k, {}).items(), key=lambda kv: -kv[1])[:2]]}
                       for k, v in sorted(waits.items(), key=lambda kv: -kv[1])[:4]],
+            # How the CPU spread over threads: one busy thread among many
+            # idle ones is a parallelism problem, not a per-row cost.
+            "threads": len(thread_cpu),
+            "busiest_threads_cpu_pct": [round(100 * x / max(1, cpu_total), 1)
+                                        for x in sorted(thread_cpu, reverse=True)[:3]],
             "main_thread_wall_samples": wall,
             "main_thread_wall": [{"frame": k, "wall_pct": round(100 * v / max(1, wall), 1)}
                                  for k, v in ranked(wall_inclusive)]}

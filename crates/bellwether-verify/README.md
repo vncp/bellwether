@@ -114,19 +114,27 @@ The comparison runs in `P` passes over hash-partitioned key space. Pass `p` read
 
 ### Measured budgets
 
-A release build was measured on 2026-10-26 with `scripts/perf.sh`: full coverage, with `latest_by` and totals by group. The full tables are in [the measured document](../../docs/measured/2026-10-26-performance.md#reconcile).
+A release build was measured on 2026-10-26 with `scripts/perf.sh`: full coverage, with `latest_by` and totals by group, one run per budget. The full tables are in [the measured document](../../docs/measured/2026-10-26-performance.md#reconcile).
 
-- **The ledger small rung**, 8,000,000 rows and 401,325 keys a side, reconciles in one pass from a 592 MiB budget. **Recommend 640 MiB.** The meter's peak there is 164 MiB: the `P` choice counts rows, not keys (see Known limits).
-- **The six taxi months**, 20,332,093 rows and 20,314,139 keys, reconcile in one pass from 16 GiB (meter peak 9.9 GiB). **Recommend 16 GiB.**
+- **The ledger small rung** has 8,000,000 rows and 401,325 keys a side. It reconciles in one pass from a 592 MiB budget, so **640 MiB** is recommended. The meter's peak there is 164.4 MiB. `P` is chosen from row counts, not keys (see Known limits).
+- **The six taxi months** have 20,332,093 rows and 20,314,139 keys. They reconcile in one pass from **16 GiB**, which is recommended, with a meter peak of 9.68 GiB.
 - **Below one pass, the cost is the extra passes.** On taxi:
 
   | Budget | Passes | Rows per second per side |
   |---|---:|---:|
-  | 8 GiB | 2 | 406,715 |
-  | 1 GiB | 14 | 207,977 |
+  | 8 GiB | 2 | 372,364 |
+  | 1 GiB | 14 | 214,183 |
   | 64 MiB | 224 | 22,737 |
 
-- **Measured peak RSS on the ledger rung exceeds the bound stated above at small budgets.** At 64 MiB it was 1.63 GB, against a meter peak of 18 MiB. At 256 MiB it was 1.13 GB. At 1 GiB it was 469 MB. The taxi pair stays at 460 MB even at 64 MiB. The cause is under investigation as a defect; until it is fixed, budget memory for this shape from the measured RSS, not from `--memory-budget`.
+- **Measured peak memory exceeds the bound stated above.** On the ledger rung, whose row groups are 100,000 rows wide, the bound is the budget, plus one decoded batch (37.8 MiB), plus the 256 MiB footer cache:
+
+  | Budget | Bound | Peak RSS | Peak footprint |
+  |---|---:|---:|---:|
+  | 64 MiB | 357.8 MiB | 1,625.3 MiB | 1,616.5 MiB |
+  | 256 MiB | 549.8 MiB | 1,303.9 MiB | 1,268.4 MiB |
+  | 1 GiB | 1,317.8 MiB | 456.3 MiB | 447.7 MiB |
+
+  The taxi pair stays within its bound at every budget. Peak memory follows row-group size: on a corpus with 10,000-row row groups it stays at 31 to 41 MiB. The cause is under investigation as a defect. Until it is fixed, size memory for wide row groups from these measurements, not from `--memory-budget`.
 
 ## Tests
 

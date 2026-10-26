@@ -52,7 +52,10 @@ Nothing above the file layer is format-specific: a text file's fixed byte-range 
 - 🤖 **Agent-first, with a trust boundary.** MCP tools in tiers: `observe.*` and `propose.*` for the agent; `score.*` and `apply.receipt` ask the engine, which alone scores, verifies, and applies. A confused or compromised agent can waste your time and nothing else.
 - 🗂️ **Parquet stays Parquet.** Immutable sidecar segments and a manifest committed by conditional PUT. No table format conversion, no locks, no new file format. Local disk, S3, Azure, GCS.
 - ⏱️ **Time travel without a table format.** `latest` and `asof` answer "the current state of these keys" and "their state on March 3rd" across a folder of history files, located to the row group.
-- 💻 **Runs on a laptop.** Memory is bounded per operation and stated in the docs. The "which files do I need" question no longer needs a cluster or a JVM. [Measured on one](docs/measured/2026-10-26-performance.md).
+- 💻 **Runs on a laptop.** Memory is bounded per operation and stated in the docs. The "which files do I need" question no longer needs a cluster or a JVM. [Measured on one](docs/measured/2026-10-26-performance.md), with two caveats from that page:
+  - `reconcile` exceeds its stated memory bound on wide row groups at small `--memory-budget` values: 1.6 GiB at 64 MiB on the ledger rung. This is [an open defect](docs/measured/2026-10-26-performance.md#findings).
+  - Plan plus read was slower than both a full scan and DuckDB in all 42 measured lookups. The plan makes one store round trip per indexed value ([the measured cause](docs/measured/2026-10-26-performance.md#hypotheses-for-wp22b-ranked-by-expected-gain)). The index saves bytes read, not yet wall time.
+  - The lookup timings overlapped another process's compile; [the load record](docs/measured/2026-10-26-performance.md#measured-under-load) shows by how much.
 
 ## How it compares
 
