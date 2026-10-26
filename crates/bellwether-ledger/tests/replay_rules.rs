@@ -340,15 +340,17 @@ fn exactness_agrees_with_exact_and_a_measured_cost_names_the_model() {
         ledger.put(&Record::Replay(r.clone())),
         "exact is true exactly when exactness is exact",
     );
-    // exactness measured with exact still true: disagree the other way
-    exact(&mut r.proposed[0]);
-    r.proposed[0].exactness = Exactness::Measured {
+    // exactness measured with exact still true: disagree the other way (on
+    // a current cost, which passes the "current is exact" rule by `exact`)
+    inexact(&mut r.proposed[0]);
+    r.current[0].exactness = Exactness::Measured {
         model: "layout.v1".into(),
     };
     assert_rule(
         ledger.put(&Record::Replay(r.clone())),
         "exact is true exactly when exactness is exact",
     );
+    exact(&mut r.current[0]);
     // a measured cost with an unnamed model
     inexact(&mut r.proposed[0]);
     r.proposed[0].exactness = Exactness::Measured { model: " ".into() };

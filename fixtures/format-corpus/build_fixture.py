@@ -22,7 +22,8 @@ storage version 2 binary only). The steps, every one under the fixed clock
    workload), `propose --key exact:symbol` citing it, `fix` (Replay, plan
    Evidence, Certificate, Receipt; sequence 3);
 5. `reconcile` against `right/` (one amount differs): a failing Certificate;
-6. every pinned lookup with `--json`, and `receipt` (the explain chain text).
+6. every pinned lookup with `--json`, and `receipt` (the explain chain text);
+   with `--counts`, also `count` and `locate --columns`.
 
 `expected.json` holds the root the fixture was built at, the clock, every
 lookup's argument list and its output lines, the receipt text, and the hash
@@ -85,14 +86,12 @@ def main():
 
     suffix = ",counts" if a.counts else ""
     keys = [
-        "exact:id@ts" if not a.counts else "exact:id@ts",
+        "exact:id@ts",
         "bloom:id@0.01",
         "range:ts",
         f"temporal:id@ts{suffix}",
         "temporal2:id@valid,known",
     ]
-    if a.counts:
-        keys.append("exact:symbol,id,counts")
     args = ["index", data, "--partitioning", "hive"]
     for k in keys:
         args += ["--key", k]
@@ -137,6 +136,14 @@ def main():
         ["asof", data, "--keys", ids, "--at", "2026-01-02T00:00:00Z"],
         ["asof", data, "--keys", ids, "--valid", "2026-01-01T00:00:00Z", "--known", "2026-01-02T12:00:00Z"],
     ]
+    if a.counts:
+        # Storage version 2 only: a count from per-key counts, and a plan
+        # with per-column bytes.
+        lookups += [
+            ["count", data, "--keys", ids],
+            ["count", data, "--keys", symbols],
+            ["locate", data, "--keys", ids, "--columns", "id,amount"],
+        ]
     pinned = []
     for args in lookups:
         out = run("--json", *args).stdout.splitlines()

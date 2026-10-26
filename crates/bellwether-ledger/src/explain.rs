@@ -5,8 +5,8 @@ use std::fmt;
 use std::ops::Deref;
 
 use bellwether_types::{
-    Certificate, Coverage, Error, Evidence, EvidenceBody, Hash, Proposal, ProposalBody, Receipt,
-    Record, Replay, Result, RunCost, Store,
+    Certificate, Coverage, Error, Evidence, EvidenceBody, Hash, KeySpec, Proposal, ProposalBody,
+    Receipt, Record, Replay, Result, RunCost, Store,
 };
 use serde::Serialize;
 
@@ -302,7 +302,16 @@ fn evidence_link(hash: Hash, e: &Evidence) -> Link {
 
 fn proposal_link(hash: Hash, p: &Proposal) -> Link {
     let body = match &p.body {
-        ProposalBody::Key { spec, .. } => ("key", spec.name()),
+        // The full identity: `exact:symbol,counts` is a different spec
+        // from `exact:symbol`, and the receipt applied that one.
+        ProposalBody::Key { spec, sidecars } => (
+            "key",
+            std::iter::once(spec)
+                .chain(sidecars)
+                .map(KeySpec::identity)
+                .collect::<Vec<_>>()
+                .join("+"),
+        ),
         ProposalBody::Layout { cluster_by, .. } => ("layout", cluster_by.join(",")),
         ProposalBody::Rewrite { shape } => ("rewrite", format!("{:?}", shape.after)),
     };

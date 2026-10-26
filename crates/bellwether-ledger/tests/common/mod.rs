@@ -180,6 +180,7 @@ pub fn replay(proposal: Hash) -> Replay {
         created_at: "2026-10-24T00:02:00Z".into(),
         configuration: Vec::new(),
         operators: Vec::new(),
+        unserved: None,
     }
 }
 

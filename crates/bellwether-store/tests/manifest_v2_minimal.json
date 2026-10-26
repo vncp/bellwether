@@ -1,0 +1,84 @@
+{
+  "commit_nonce": 1,
+  "committed_at": "2026-10-25T00:00:00.000Z",
+  "created_at": "2026-10-25T00:00:00.000Z",
+  "deleting": [],
+  "key_spec_completeness": {
+    "exact:symbol,counts": 1
+  },
+  "rowgroup_space": {
+    "files": [
+      {
+        "column_bytes": [
+          50,
+          0,
+          30,
+          0
+        ],
+        "fingerprint": {
+          "etag": "2026-10-25T00:00:00.000000000Z",
+          "path": "/data/day=2026-01-01/part-0.parquet",
+          "size": 1000,
+          "tail_blake3": "0000000000000000000000000000000000000000000000000000000000000000"
+        },
+        "rowgroup_bytes": [
+          60,
+          40
+        ],
+        "rowgroup_ids": [
+          0,
+          1
+        ],
+        "rowgroup_rows": [
+          4,
+          2
+        ]
+      }
+    ],
+    "next_id": 2,
+    "tombstones": []
+  },
+  "schema": {
+    "columns": [
+      {
+        "data_type": "Utf8",
+        "name": "symbol",
+        "nullable": true
+      },
+      {
+        "data_type": "Date32",
+        "name": "day",
+        "nullable": true
+      }
+    ],
+    "key_specs": [
+      {
+        "columns": [
+          "symbol"
+        ],
+        "counts": true,
+        "kind": "exact"
+      }
+    ]
+  },
+  "segment_tombstones": [],
+  "segments": [
+    {
+      "bytes": 300,
+      "id": "1111111111111111111111111111111111111111111111111111111111111111",
+      "key_spec": "exact:symbol,counts",
+      "rowgroup_range": {
+        "end": 2,
+        "start": 0
+      }
+    }
+  ],
+  "sequence": 1,
+  "source": {
+    "fingerprint_policy": "tail64k",
+    "kind": "parquet",
+    "partitioning": "hive",
+    "root": "/data"
+  },
+  "storage_version": 2
+}

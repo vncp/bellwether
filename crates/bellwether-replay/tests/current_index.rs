@@ -621,7 +621,9 @@ fn a_layout_proposal_is_costed_and_written_under_its_named_model() {
         row_groups: rgs,
         bytes,
         exact: false,
-        exactness: bellwether_types::Exactness::Exact,
+        exactness: bellwether_types::Exactness::Measured {
+            model: "layout.v1".into(),
+        },
         rows: None,
     };
     assert_eq!(

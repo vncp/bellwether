@@ -97,6 +97,23 @@ pub struct IndexResult {
     pub row_groups_assigned: u64,
     /// Row-group ids retired (never reused).
     pub row_groups_retired: u64,
+    /// Unchanged files whose storage version 2 statistics (rows, bytes,
+    /// column bytes per row group) this build recorded from their footers:
+    /// every tracked file on the first commit over a version 1 manifest.
+    /// Zero (omitted in JSON) otherwise.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub files_filled: u64,
+    /// The storage version this build's commit upgraded the index from
+    /// (ADR 028): a binary of that version can no longer open it. Absent
+    /// (omitted in JSON) when the index was already current or nothing was
+    /// committed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upgraded_from: Option<u32>,
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)] // serde passes a reference
+fn is_zero(n: &u64) -> bool {
+    *n == 0
 }
 
 /// Which lookup a plan answers.

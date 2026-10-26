@@ -130,6 +130,16 @@ pub(crate) fn index(r: &IndexResult, out: &Out) -> String {
         num(r.segments_written),
         num(r.segments)
     );
+    if let Some(from) = r.upgraded_from {
+        let _ = writeln!(
+            s,
+            "  manifest upgraded to storage version {} (this index can no longer be opened by a \
+             version {from} binary); {} unchanged files' row-group statistics read from their \
+             footers, once",
+            bellwether::types::format::STORAGE_VERSION,
+            num(r.files_filled)
+        );
+    }
     let labels: Vec<String> = r.specs.iter().map(|x| label(&x.spec)).collect();
     let w = label_width(
         labels
@@ -242,7 +252,7 @@ pub(crate) fn count(r: &CountResult, out: &Out) -> String {
             )
         )
     );
-    let _ = writeln!(s, "  rows        {:>14}", num(r.rows));
+    let _ = writeln!(s, "  rows        {:>14}  holding the keys", num(r.rows));
     let _ = writeln!(
         s,
         "  row groups  {:>14} of {}",
@@ -322,7 +332,7 @@ pub(crate) fn plan(r: &PlanResult, out: &Out) -> String {
     if let Some(rows) = r.rows {
         let _ = writeln!(
             s,
-            "  rows: {} hold the keys (exact, from the index's per-key counts)",
+            "  rows holding the keys: {} (exact, from the index's per-key counts)",
             num(rows)
         );
     }

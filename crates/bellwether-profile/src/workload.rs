@@ -13,6 +13,11 @@
 //! counted, and hashed, and the run hashes and the workload hash must match
 //! what the file claims. A mismatch is an error, not a best guess.
 //!
+//! A run may say which lookup it was (`query`: `locate`, the default, or
+//! `count`, the row count of its keys). The summary counts the count runs
+//! that precede a later run over the same keys (same run hash), the input of
+//! the `R-counts-1` detector (`crate::lints::count_before_scan`).
+//!
 //! Memory: one run's key set at a time (ADR 018, "Replay holds one run's
 //! key set").
 
@@ -30,7 +35,11 @@ pub const BENCH_WORKLOAD_FORMAT: &str = "bellwether-bench-workload/1";
 /// The manifest file name inside a workload directory.
 pub const WORKLOAD_FILE: &str = "workload.json";
 /// Format tag of the cached summary. Part of the cache key.
-pub const WORKLOAD_CACHE_FORMAT: &str = "bellwether-profile/workload-summary/1";
+pub const WORKLOAD_CACHE_FORMAT: &str = "bellwether-profile/workload-summary/2";
+/// A run's `query` when it looks up every row of its keys (the default).
+pub const QUERY_LOCATE: &str = "locate";
+/// A run's `query` when it counts the rows of its keys.
+pub const QUERY_COUNT: &str = "count";
 
 /// What a recorded workload looks like, for the profile.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -44,6 +53,16 @@ pub struct WorkloadSummary {
     pub key_columns: Vec<String>,
     /// Distinct keys per run at nearest-rank p50, p95, and max.
     pub sizes: [u64; 3],
+    /// Runs with `query: "count"` that a later run over the same keys (the
+    /// same run hash) follows: a count pass ahead of the query it gates.
+    /// Zero (omitted in JSON) when no count run precedes one.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub counts_before_scan: u64,
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)] // serde passes a reference
+fn is_zero(n: &u64) -> bool {
+    *n == 0
 }
 
 #[derive(Deserialize)]
@@ -59,6 +78,8 @@ struct BenchRun {
     file: String,
     keys: u64,
     hash: Hash,
+    #[serde(default)]
+    query: Option<String>,
 }
 
 /// The directory and manifest path of a workload given as either.
@@ -158,7 +179,21 @@ pub fn summarize(path: &Path) -> Result<WorkloadSummary> {
     let mut sizes = Vec::with_capacity(parsed.runs.len());
     let mut key_columns: Vec<String> = Vec::new();
     let mut workload_hasher = blake3::Hasher::new();
+    // Per run, in listed order: whether it counts, and its verified hash.
+    let mut runs: Vec<(bool, Hash)> = Vec::with_capacity(parsed.runs.len());
     for run in &parsed.runs {
+        let counts = match run.query.as_deref() {
+            None | Some(QUERY_LOCATE) => false,
+            Some(QUERY_COUNT) => true,
+            Some(other) => {
+                return Err(Error::Other(format!(
+                    "{}: run {} has query {other:?}; a bench run is a {QUERY_LOCATE:?} or a \
+                     {QUERY_COUNT:?}",
+                    manifest.display(),
+                    run.run_id
+                )))
+            }
+        };
         let file = run_path(&dir, &run.file)?;
         let fp = fingerprint(path_str(&file)?)?;
         let mut keys: Vec<u64> = Vec::new();
@@ -216,6 +251,7 @@ pub fn summarize(path: &Path) -> Result<WorkloadSummary> {
         }
         workload_hasher.update(&run_hash.0);
         sizes.push(keys.len() as u64);
+        runs.push((counts, run_hash));
     }
     let hash = Hash(*workload_hasher.finalize().as_bytes());
     if hash != parsed.hash {
@@ -226,11 +262,23 @@ pub fn summarize(path: &Path) -> Result<WorkloadSummary> {
         )));
     }
     sizes.sort_unstable();
+    // Walk backwards, remembering the hashes of the non-count runs seen so
+    // far: a count run whose hash is among them precedes a run over its keys.
+    let mut later_scans: std::collections::HashSet<Hash> = std::collections::HashSet::new();
+    let mut counts_before_scan = 0u64;
+    for (counts, h) in runs.iter().rev() {
+        if !counts {
+            later_scans.insert(*h);
+        } else if later_scans.contains(h) {
+            counts_before_scan += 1;
+        }
+    }
     Ok(WorkloadSummary {
         hash,
         runs: sizes.len() as u64,
         key_columns,
         sizes: p50_p95_max_u64(&sizes),
+        counts_before_scan,
     })
 }
 

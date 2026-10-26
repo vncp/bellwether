@@ -7,6 +7,7 @@
 //! | `scattered_time_column` | a date or timestamp column's overlap depth is at least `SCATTER_MIN_DEPTH` and its sortedness below `SCATTER_MAX_SORTEDNESS` (`bellwether_source::stats`) |
 //! | `declared_but_unused_key` | a manifest declares a key spec and a recorded workload exists whose runs never supply the spec's leading column |
 //! | `no_discriminating_column` | the dataset has at least 2 row groups and every measured single column (composites are not searched) has a median value touching at least [`NO_DISCRIMINATING_MIN_FRACTION`] of all row groups: the layout, not a missing index, sets the cost of a lookup |
+//! | `R-counts-1` (count before scan, [`COUNT_BEFORE_SCAN`]) | a recorded workload has a `count` run that a later run over the same keys follows ([`WorkloadSummary::counts_before_scan`]), and no declared `exact` spec on exactly the workload's key columns stores counts |
 //!
 //! The two decisions the benchmark also makes are not reimplemented here:
 //! `batch_stamp_key` is `bellwether_source::stats::batch_stamp` and
@@ -48,7 +49,7 @@
 use bellwether_source::stats::{
     batch_stamp as batch_stamp_decision, partner_order, BatchStamp, PartnerCandidate,
 };
-use bellwether_types::{Lint, Result, RowGroupMeta};
+use bellwether_types::{KeySpec, Lint, Result, RowGroupMeta};
 
 use crate::fanout::{is_id_like, DistinctSource, FanoutEntry, KeyPlan};
 use crate::manifest::ManifestInfo;
@@ -66,6 +67,10 @@ pub const DECLARED_BUT_UNUSED_KEY: &str = "declared_but_unused_key";
 /// Rule id: no measured key prunes, because every value is spread over
 /// nearly every row group.
 pub const NO_DISCRIMINATING_COLUMN: &str = "no_discriminating_column";
+/// Rule id of the `counts` detector (`docs/rule-catalog.md`): a count pass
+/// over keys that a later query looks up again, with no counting spec to
+/// answer it from the index.
+pub const COUNT_BEFORE_SCAN: &str = "R-counts-1";
 
 /// Confidence of a high finding.
 pub const HIGH: f64 = 0.9;
@@ -118,6 +123,7 @@ pub fn run(inputs: &LintInputs<'_>) -> Result<Vec<Lint>> {
     lints.extend(low_selectivity(inputs, &stamps));
     lints.extend(scattered_time(inputs));
     lints.extend(declared_but_unused(inputs));
+    lints.extend(count_before_scan(inputs));
     lints.extend(no_discriminating(inputs.entries));
     Ok(lints)
 }
@@ -416,6 +422,46 @@ fn declared_but_unused(inputs: &LintInputs<'_>) -> Vec<Lint> {
         });
     }
     out
+}
+
+/// `R-counts-1`: the recorded workload counts a key set and then looks the
+/// same keys up again (a count pass gating the query), and no declared
+/// `exact` spec on exactly its key columns stores counts, so every count
+/// costs what the query costs. Advice: `exact:<columns>,counts`, which
+/// answers the count from the index with no data file read, exactly. High
+/// confidence: both facts are exact (run hashes, declared specs).
+fn count_before_scan(inputs: &LintInputs<'_>) -> Vec<Lint> {
+    let Some(workload) = inputs.workload else {
+        return Vec::new();
+    };
+    if workload.counts_before_scan == 0 || workload.key_columns.is_empty() {
+        return Vec::new();
+    }
+    let columns = &workload.key_columns;
+    let counted = inputs.manifest.is_some_and(|m| {
+        m.key_specs
+            .iter()
+            .any(|s| matches!(s, KeySpec::Exact { columns: c, counts: true, .. } if c == columns))
+    });
+    if counted {
+        return Vec::new();
+    }
+    let cols = columns.join(",");
+    let n = workload.counts_before_scan;
+    let runs = if n == 1 { "run" } else { "runs" };
+    vec![Lint {
+        rule: COUNT_BEFORE_SCAN.into(),
+        columns: columns.clone(),
+        message: format!(
+            "{n} recorded count {runs} each precede a later run over the same keys on ({cols}), \
+             and no key spec stores counts on ({cols}), so each count reads what the query \
+             reads; declaring exact:{cols},counts answers `bellwether count` from the index with \
+             no data file read and gives plans exact row counts."
+        ),
+        confidence: HIGH,
+        site: None,
+        fix: None,
+    }]
 }
 
 /// `no_discriminating_column`: the measured single column with the lowest

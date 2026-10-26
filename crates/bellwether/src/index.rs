@@ -98,6 +98,8 @@ impl Engine {
             row_groups_read: report.row_groups_read,
             row_groups_assigned: report.row_groups_assigned,
             row_groups_retired: report.row_groups_retired,
+            files_filled: report.files_filled,
+            upgraded_from: report.upgraded_from,
         })
     }
 

@@ -11,7 +11,7 @@ use bellwether_profile::{lints, profile, ProfileOptions, ProfileReport};
 use bellwether_source::ParquetSource;
 use bellwether_store::{commit, StagedSegments};
 use bellwether_types::{KeySpec, Lint};
-use common::{path_str, temp_store, write_bench_workload, Layout};
+use common::{path_str, temp_store, write_bench_workload, write_bench_workload_queries, Layout};
 
 fn rules<'a>(report: &'a ProfileReport, rule: &str) -> Vec<&'a bellwether_types::Lint> {
     report.lints.iter().filter(|l| l.rule == rule).collect()
@@ -172,4 +172,133 @@ fn every_lint_message_is_one_sentence() {
         );
         assert!((0.0..=1.0).contains(&l.confidence));
     }
+}
+
+fn counted_specs() -> Vec<KeySpec> {
+    vec![KeySpec::Exact {
+        columns: vec!["entity_id".into()],
+        counts: true,
+        bounds: None,
+    }]
+}
+
+/// `R-counts-1` fires on a count run that a later run over the same keys
+/// follows, with no counting spec on the workload's key columns, and names
+/// the spec that answers it.
+#[test]
+fn count_before_scan_fires_on_a_count_pass_ahead_of_its_query() {
+    let tmp = tempfile::tempdir().unwrap();
+    let data = Layout::flat().write(&tmp.path().join("data"));
+    let wl = tmp.path().join("wl");
+    write_bench_workload_queries(
+        &wl,
+        &[
+            (Some("count"), vec![1, 2, 3]),
+            (Some("locate"), vec![1, 2, 3]),
+            (Some("count"), vec![10, 20]),
+            (None, vec![20, 10]),
+        ],
+    );
+    // Unindexed, and indexed with a non-counting exact spec on the column:
+    // both fire, once, naming the two count passes.
+    let (_a, bare) = temp_store();
+    let (_b, store) = temp_store();
+    index(&store, &path_str(&data), &specs());
+    for s in [&bare, &store] {
+        let report = run(&data, s, Some(&wl));
+        assert_eq!(report.workload.as_ref().unwrap().counts_before_scan, 2);
+        let found = rules(&report, lints::COUNT_BEFORE_SCAN);
+        assert_eq!(found.len(), 1, "{:?}", report.lints);
+        let l = found[0];
+        assert_eq!(l.columns, ["entity_id"]);
+        assert!((l.confidence - lints::HIGH).abs() < 1e-9);
+        assert!(
+            l.message.starts_with("2 recorded count runs each precede"),
+            "{}",
+            l.message
+        );
+        assert!(
+            l.message.contains("exact:entity_id,counts"),
+            "{}",
+            l.message
+        );
+        assert!(l.message.ends_with('.') && !l.message.contains(". "));
+    }
+}
+
+/// `R-counts-1` stays quiet when a counting spec answers the counts, when no
+/// run counts, when a count is never followed by its query (or only
+/// preceded by it), and without a workload.
+#[test]
+fn count_before_scan_does_not_fire_without_a_gated_count_or_with_counts() {
+    let tmp = tempfile::tempdir().unwrap();
+    let data = Layout::flat().write(&tmp.path().join("data"));
+    let gated = tmp.path().join("gated");
+    write_bench_workload_queries(
+        &gated,
+        &[(Some("count"), vec![1, 2]), (Some("locate"), vec![1, 2])],
+    );
+    let (_c, counted) = temp_store();
+    index(&counted, &path_str(&data), &counted_specs());
+    assert!(rules(
+        &run(&data, &counted, Some(&gated)),
+        lints::COUNT_BEFORE_SCAN
+    )
+    .is_empty());
+
+    let (_s, store) = temp_store();
+    let none = |name: &str, runs: &[(Option<&str>, Vec<u64>)]| {
+        let wl = tmp.path().join(name);
+        write_bench_workload_queries(&wl, runs);
+        let report = run(&data, &store, Some(&wl));
+        assert_eq!(
+            report.workload.as_ref().unwrap().counts_before_scan,
+            0,
+            "{name}"
+        );
+        assert!(
+            rules(&report, lints::COUNT_BEFORE_SCAN).is_empty(),
+            "{name}"
+        );
+    };
+    none("locate-only", &[(None, vec![1, 2]), (None, vec![1, 2])]);
+    none(
+        "other-keys",
+        &[(Some("count"), vec![1, 2]), (Some("locate"), vec![1, 3])],
+    );
+    none(
+        "count-after",
+        &[(Some("locate"), vec![1, 2]), (Some("count"), vec![1, 2])],
+    );
+    none(
+        "count-twice",
+        &[(Some("count"), vec![1, 2]), (Some("count"), vec![1, 2])],
+    );
+    assert!(rules(&run(&data, &store, None), lints::COUNT_BEFORE_SCAN).is_empty());
+}
+
+/// A run whose `query` is neither `locate` nor `count` is refused, naming
+/// both.
+#[test]
+fn an_unknown_run_query_is_refused() {
+    let tmp = tempfile::tempdir().unwrap();
+    let data = Layout::flat().write(&tmp.path().join("data"));
+    let wl = tmp.path().join("wl");
+    write_bench_workload_queries(&wl, &[(Some("latest"), vec![1])]);
+    let (_s, store) = temp_store();
+    let err = profile(
+        &ParquetSource::new(),
+        &path_str(&data),
+        &store,
+        &ProfileOptions {
+            workload: Some(wl),
+            ..ProfileOptions::for_source("parquet")
+        },
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(
+        err.contains("\"latest\"") && err.contains("\"count\""),
+        "{err}"
+    );
 }

@@ -609,3 +609,74 @@ fn bellwether_mcp_serves_over_stdio() {
     drop(stdin);
     assert!(child.wait().unwrap().success());
 }
+
+/// `observe.count` = `count` and `observe.locate` with `columns` = `locate
+/// --columns`, byte for byte, and a count with no counting spec is refused
+/// by both naming the same `index --key`.
+#[test]
+fn count_and_a_projected_locate_return_the_cli_json_line() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    // 180 rows, ids 0..20, nine rows each; keys 7 and 8 hold 18, 150 none.
+    corpus(&data, 2, 3, 30, 20);
+    let kf = dir.path().join("k.parquet");
+    keys(&kf, "id", &[7, 8, 150]);
+    let (d, k) = (path(&data), path(&kf));
+    let srv = server(&data);
+    cli(&["index", d, "--key", "exact:id"], 0);
+
+    // No counting spec: the server refuses with not_indexed and the CLI
+    // exits 4, both naming `exact:id,counts` (the CLI as the `index --key`
+    // to run).
+    let r = srv.call("observe.count", json!({"keys": k}));
+    let refusal = r.envelope.refusal.as_ref().unwrap();
+    assert_eq!(refusal.code.as_str(), "not_indexed", "{refusal:?}");
+    assert_eq!(refusal.fields["needs"], "exact:id,counts", "{refusal:?}");
+    assert!(refusal.next.contains("exact:id,counts"), "{refusal:?}");
+    let out = common::bw()
+        .args(["--clock", CLOCK, "count", d, "--keys", k])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(4));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("--key exact:id,counts"), "{stderr}");
+
+    cli(&["index", d, "--key", "exact:id,counts"], 0);
+    let counted = both(
+        &srv,
+        "observe.count",
+        json!({"keys": k}),
+        &["count", d, "--keys", k],
+        0,
+    );
+    assert_eq!(counted["rows"], 18, "{counted}");
+    assert_eq!(counted["keys"], 3);
+    assert_eq!(counted["counted_by"], "exact:id,counts");
+    assert_eq!(counted["row_groups_total"], 6);
+
+    // The plan carries the same exact rows, and a projection's bytes.
+    let located = both(
+        &srv,
+        "observe.locate",
+        json!({"keys": k, "columns": ["id", "ts"]}),
+        &["locate", d, "--keys", k, "--columns", "id,ts"],
+        0,
+    );
+    assert_eq!(located["rows"], 18, "{located}");
+    let projected = located["projected_bytes"].as_u64().unwrap();
+    let planned = located["planned"]["bytes"].as_u64().unwrap();
+    assert!(
+        projected > 0 && projected < planned,
+        "{projected} {planned}"
+    );
+    // Without a projection: no projected bytes, no per-column bytes.
+    let plain = both(
+        &srv,
+        "observe.locate",
+        json!({"keys": k}),
+        &["locate", d, "--keys", k],
+        0,
+    );
+    assert!(plain.get("projected_bytes").is_none(), "{plain}");
+    assert_eq!(plain["planned"], located["planned"]);
+}

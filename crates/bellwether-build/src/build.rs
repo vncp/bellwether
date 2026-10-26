@@ -85,8 +85,8 @@ pub struct BuildReport {
     /// Unchanged files whose per-row-group statistics (storage version 2:
     /// rows, bytes, column bytes) this build recorded, each from one
     /// `Source::row_groups` call: every file of a version 1 manifest on the
-    /// first build by this binary, and every file when the schema's columns
-    /// changed.
+    /// first build by this binary that commits, and every file when the
+    /// schema's columns changed. Zero when nothing was committed.
     pub files_filled: u64,
     /// The storage version of the manifest this build committed over, when
     /// older than this binary's: the commit upgraded the index to
@@ -290,6 +290,9 @@ impl<S: StoreExt + ?Sized> Builder<S> {
         let work = plan_work(base.as_ref(), &specs, &cfg, &live);
         let mut report = files.report(&work);
         if is_noop(base.as_ref(), &files, &work, &cfg, &specs)? {
+            // Nothing committed: a version 1 index stays at version 1 and
+            // keeps planning as before (ADR 028); no statistics were recorded.
+            report.files_filled = 0;
             return Ok(Attempt::Done(report));
         }
         let items = segments::items(&files.rows, &work.needed, opts.max_segment_row_groups)?;
@@ -1001,7 +1004,10 @@ fn plan_work(
     work
 }
 
-/// Whether committing would change nothing.
+/// Whether committing would change nothing. Filling the storage version 2
+/// statistics of a version 1 manifest is not a change on its own: a build
+/// with nothing else to do commits nothing and leaves the index at version
+/// 1; the next commit that changes anything upgrades it.
 fn is_noop(
     base: Option<&Manifest>,
     files: &FilePlan,
@@ -1016,8 +1022,6 @@ fn is_noop(
     let unchanged = files.counts.new == 0
         && files.counts.changed == 0
         && files.counts.removed == 0
-        && files.counts.filled == 0
-        && m.storage_version == STORAGE_VERSION
         && work.needed.iter().all(RoaringBitmap::is_empty)
         && work.replaced.is_empty()
         && work.removed.is_empty()

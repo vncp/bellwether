@@ -3,7 +3,7 @@
 An index, its manifest history, and its ledger as written by the last binary
 before storage version 2: main at `495682a` (storage version 1, record
 version 2, encoding version 1; per-key time bounds and bitemporal versions as
-sidecar segments). Every later binary must read it; `crates/bellwether/tests/format_compat.rs`
+sidecar segments). Every later binary must read it; `crates/bellwether-cli/tests/format_compat.rs`
 plans every pinned lookup over it and compares the output with
 `expected.json` byte for byte, walks the ledger chain, and commits a copy plus
 one new file at the current storage version with every old plan unchanged.

@@ -789,6 +789,30 @@ impl<R: ReadAt> SegmentReader<R> {
         Ok(out)
     }
 
+    /// Every stored key of a keyed (exact or temporal) segment with its
+    /// value, in key order; an error for any other layout. A whole-segment
+    /// read like [`Self::range_entries`], for verification and oracles: it
+    /// holds every key, where a lookup holds only the keys asked (ADR 018).
+    /// Unlike [`Self::counts`] it returns stored tuples that hold a trailing
+    /// null marker, which no probe matches (ADR 014).
+    pub fn keyed_entries(&self) -> Result<Vec<(Vec<u8>, KeyValue)>> {
+        let Index::Keyed(blocks) = &self.index else {
+            return Err(Error::KeySpec(format!(
+                "{} is not a keyed segment",
+                self.header.key_spec.identity()
+            )));
+        };
+        let mut out = Vec::new();
+        for b in blocks {
+            let body = self.block_body(b)?;
+            let view = BlockView::parse(&body, b.n, self.checked())?;
+            for i in 0..view.len() {
+                out.push((view.key(i)?.to_vec(), self.value_at(&view, i)?));
+            }
+        }
+        Ok(out)
+    }
+
     pub(crate) fn require_temporal(&self) -> Result<()> {
         if self.header.layout == Layout::KeyedTemporal {
             Ok(())

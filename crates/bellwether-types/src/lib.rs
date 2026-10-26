@@ -1377,6 +1377,12 @@ pub struct Replay {
     /// in version-1 records.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// How the replay priced runs that no spec of the configuration serves:
+    /// absent means every live row group (a raw scan); `"parquet_stats"`
+    /// means the row groups the files' min/max statistics keep. Absent in
+    /// records written before it existed, which keep their bytes and hashes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unserved: Option<String>,
     /// RFC 3339.
     pub created_at: String,
 }
@@ -1970,6 +1976,7 @@ mod schema_feature {
                 created_at: "2026-10-24T00:00:00.000Z".into(),
                 configuration: Vec::new(),
                 operators: Vec::new(),
+                unserved: None,
             }),
             Record::Certificate(Certificate {
                 record_version: format::RECORD_VERSION,
@@ -2017,7 +2024,7 @@ mod schema_feature {
         assert_eq!(Hash::of(&all).to_hex(), GOLDEN);
     }
 
-    const GOLDEN: &str = "d00a59c94e95f3829c8a9019e964ffe276757709eb22ce4ff770079998c5fa49";
+    const GOLDEN: &str = "b59003f39b3c09092346c665bbe85b3b3ac44b1a376f0d4eb6c907d249a84449";
 
     /// With the feature on, the schemas describe what serde writes: a hash
     /// is a 64-hex string, the bitmap a list of integers, the age an

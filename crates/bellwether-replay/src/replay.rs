@@ -549,6 +549,7 @@ impl<'a> Replayer<'a> {
                 model,
                 configuration: Vec::new(),
                 operators: Vec::new(),
+                unserved: None,
             },
             body: Hash::of_record(body)?,
             layout,
