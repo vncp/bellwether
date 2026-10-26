@@ -9,6 +9,7 @@
 //! | `Exact { columns: [a, b], counts: true }` | `exact:a,b,counts` |
 //! | `Temporal { columns: [id], ts_column: ts, counts: true }` | `temporal:id@ts,counts` |
 //! | `Expr { name: sym, expr: json_get(payload,'$.symbol'), over: Exact }` | `expr:sym=json_get(payload,'$.symbol'):exact` |
+//! | `Expr { .., over: Exact { counts: true } }` | `expr:sym=json_get(payload,'$.symbol'):exact,counts` |
 //! | `Expr { .., over: Bloom { fpr: 0.01 } }` | `expr:sym=json_get(payload,'$.symbol'):bloom@0.01` |
 //!
 //! A trailing `,counts` asks the spec to store, per key and per row group,
@@ -20,7 +21,7 @@
 //! An `expr` key's expression is in the closed language of
 //! `bellwether_core::expr`; it is stored normalized, so `label` gives the
 //! normalized spelling, and the kind after the last `:` outside quotes is
-//! `exact` or `bloom@<fpr>`.
+//! `exact`, `exact,counts`, or `bloom@<fpr>`.
 //!
 //! A spec may also be given as its JSON form (`{"kind":"exact",...}`).
 //! [`label`] and [`parse`] are inverses. Specs are validated by core's
@@ -112,6 +113,7 @@ fn parse_expr(s: &str, rest: &str) -> Result<KeySpec> {
     let (text, kind) = (tail[..i].trim(), tail[i + 1..].trim());
     let over = match kind.split_once('@') {
         None if kind == "exact" => bellwether_core::expr::Over::Exact,
+        None if kind.replace(' ', "") == "exact,counts" => bellwether_core::expr::Over::Counts,
         Some(("bloom", fpr)) => bellwether_core::expr::Over::Bloom(
             fpr.trim()
                 .parse()
@@ -124,7 +126,8 @@ fn parse_expr(s: &str, rest: &str) -> Result<KeySpec> {
         }
         _ => {
             return Err(bad_expr(&format!(
-                "the kind after the expression is exact or bloom@<fpr>, not {kind:?}"
+                "the kind after the expression is exact, exact,counts, or bloom@<fpr>, not \
+                 {kind:?}"
             )))
         }
     };

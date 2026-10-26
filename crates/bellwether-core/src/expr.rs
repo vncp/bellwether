@@ -1900,6 +1900,10 @@ pub fn verify_vectors(spec_name: &str, vectors: &[ExprVector]) -> Result<()> {
 pub enum Over {
     /// An exact segment.
     Exact,
+    /// An exact segment that also stores, per derived value and row group,
+    /// its rows (storage version 2 counts), so `count` on the expression is
+    /// answered from the index.
+    Counts,
     /// A bloom segment at a false-positive rate.
     Bloom(f64),
 }
@@ -1914,8 +1918,16 @@ pub fn spec(name: &str, text: &str, over: Over) -> Result<KeySpec> {
         name: name.to_string(),
         expr: e.to_string(),
         over: Box::new(match over {
-            Over::Exact => KeySpec::Exact { columns },
-            Over::Bloom(fpr) => KeySpec::Bloom { columns, fpr },
+            Over::Exact | Over::Counts => KeySpec::Exact {
+                columns,
+                counts: over == Over::Counts,
+                bounds: None,
+            },
+            Over::Bloom(fpr) => KeySpec::Bloom {
+                columns,
+                fpr,
+                bounds: None,
+            },
         }),
         conformance: vectors_for(&e),
     };
@@ -1964,12 +1976,20 @@ pub fn check_spec(spec: &KeySpec) -> Result<()> {
         )));
     }
     match over.as_ref() {
-        KeySpec::Exact { columns } | KeySpec::Bloom { columns, .. }
-            if columns.as_slice() == std::slice::from_ref(name) => {}
+        KeySpec::Exact {
+            columns,
+            bounds: None,
+            ..
+        }
+        | KeySpec::Bloom {
+            columns,
+            bounds: None,
+            ..
+        } if columns.as_slice() == std::slice::from_ref(name) => {}
         other => {
             return Err(Error::KeySpec(format!(
-                "expr key {name}: its segment is exact or bloom over the virtual column {name}, \
-                 not {}",
+                "expr key {name}: its segment is exact (optionally with counts) or bloom over \
+                 the virtual column {name}, with no time bounds, not {}",
                 other.name()
             )))
         }
@@ -1986,13 +2006,7 @@ pub fn check_spec(spec: &KeySpec) -> Result<()> {
              for a function its expression calls, so its derived values cannot be trusted; \
              declare it again with this binary: bellwether index <data root> --key {}",
             missing.expr,
-            shell_quote(&format!(
-                "expr:{name}={expr}:{}",
-                match over.as_ref() {
-                    KeySpec::Bloom { fpr, .. } => format!("bloom@{fpr}"),
-                    _ => "exact".to_string(),
-                }
-            ))
+            shell_quote(&spec.identity())
         )));
     }
     verify_vectors(&spec.name(), conformance)

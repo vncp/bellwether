@@ -202,7 +202,7 @@ Reproduce everything above, downloads included, with [`scripts/showcase.sh`](scr
 | `temporal` | latest and as-of: the newest version of each key, or the version current at an instant | `index --key temporal:col@ts`; on two clocks, `temporal2:col@valid,known` | `latest`, `asof --at`; `asof --valid --known` for what was known at one time about another |
 | `counts` (on `exact` and `temporal`) | `count(*) where key in (...)`: the count that precedes a gated query | `index --key exact:col,counts` or `temporal:col@ts,counts` | `count --keys`: exact rows and row groups from the index, no data file read; plans through the spec carry exact row counts |
 | `sketch` | `count(distinct col)`; "is this column a key" | `index --key sketch:col[,col][,a+b][,p=14][,minhash=K]` | never (approximate; read by `why`, `sketch cardinality`, `sketch overlap`) |
-| `expr` | a filter or join key that is a function of a column: a member of a JSON column, `lower`, `substr`, `cast`, `date_trunc`, `hash` | `index --key "expr:<name>=<expression>:exact"` (or `:bloom@<fpr>`) | point lookups (`locate`) by the same expression after normalization; any other expression is refused, never guessed |
+| `expr` | a filter or join key that is a function of a column: a member of a JSON column, `lower`, `substr`, `cast`, `date_trunc`, `hash` | `index --key "expr:<name>=<expression>:exact"` (or `:exact,counts`, `:bloom@<fpr>`) | point lookups (`locate`) and, with counts, `count` by the same expression after normalization; any other expression is refused, never guessed |
 
 ## How `fix` proves a change
 

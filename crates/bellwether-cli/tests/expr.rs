@@ -281,6 +281,38 @@ fn why_fix_receipt_locate_round_trip_with_cli_mcp_byte_identity() {
         refusal.message
     );
 
+    // count on the expression: refused (exit 3 or 4) while no expr key
+    // stores counts, naming the key that would; after `index --key
+    // expr:...:exact,counts`, the rows holding the values, from the index,
+    // byte-identical from the CLI and the server, equal to the truth.
+    let o = bw().args(["count", d, "--keys", k]).output().unwrap();
+    let err = String::from_utf8_lossy(&o.stderr);
+    assert_ne!(o.status.code(), Some(0));
+    assert!(
+        err.contains("expr:json_get_payload_symbol=json_get(payload,'$.symbol'):exact,counts"),
+        "{err}"
+    );
+    cli(
+        &[
+            "index",
+            d,
+            "--key",
+            "expr:sym_counts=json_get(payload,'$.symbol'):exact,counts",
+        ],
+        0,
+    );
+    let counted = both(
+        &srv,
+        "observe.count",
+        json!({"keys": k}),
+        &["count", d, "--keys", k],
+    );
+    assert_eq!(counted["rows"], rare.rows, "{counted}");
+    assert_eq!(
+        counted["counted_by"],
+        "expr:sym_counts=json_get(payload,'$.symbol'):exact,counts"
+    );
+
     // `index --key` reads the spec spelling, and its JSON names the key.
     let spelled = cli(
         &[

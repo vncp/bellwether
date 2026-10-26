@@ -29,8 +29,8 @@
 
 pub mod bloom;
 pub mod encoding;
-pub mod hll;
 pub mod expr;
+pub mod hll;
 pub mod merge;
 pub mod segment;
 pub mod sidecar;

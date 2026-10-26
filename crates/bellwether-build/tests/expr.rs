@@ -166,10 +166,12 @@ fn values(b: &RecordBatch, lower: bool) -> Vec<Option<String>> {
 
 fn specs() -> Vec<KeySpec> {
     vec![
-        expr::spec("sym", SYM, Over::Exact).unwrap(),
+        expr::spec("sym", SYM, Over::Counts).unwrap(),
         expr::spec("sym_lower", LOW, Over::Bloom(0.01)).unwrap(),
         KeySpec::Exact {
             columns: vec!["id".into()],
+            counts: false,
+            bounds: None,
         },
     ]
 }
@@ -417,4 +419,79 @@ fn a_spec_without_its_conformance_vectors_is_refused_at_index_and_plan() {
         matches!(&e, Error::KeySpec(m) if m.contains("does not record the conformance vector")),
         "{e:?}"
     );
+}
+
+/// `expr:sym=...:exact,counts` answers `count(*) where json_get(...) in
+/// (...)` from the index: the rows equal the decoded files' rows holding a
+/// value, a lookup's plan carries the same exact count, and the count needs
+/// a key over that very expression (a near miss is refused; without any expr
+/// key there is nothing to count with).
+#[test]
+fn counts_on_an_expr_key_equal_the_decoded_rows() {
+    let (_s, paths, planner) = indexed();
+    let rows = decoded(&paths);
+    for keys in [
+        vec!["ab3"],
+        vec!["AB3", "Ab7", "ab0"],
+        vec!["4", "ZZ9"],
+        vec!["ZZ9"],
+    ] {
+        let want: BTreeSet<&str> = keys.iter().copied().collect();
+        let (mut n, mut rgs) = (0u64, BTreeSet::new());
+        for (p, rg, b) in &rows {
+            let hits = values(b, false)
+                .iter()
+                .filter(|v| v.as_deref().is_some_and(|s| want.contains(s)))
+                .count() as u64;
+            if hits > 0 {
+                n += hits;
+                rgs.insert((p.clone(), *rg));
+            }
+        }
+        let enc: Vec<Vec<u8>> = keys.iter().map(|k| enc_str(k)).collect();
+        let c = planner
+            .count(&specs(), &[SYM.to_string()], &enc)
+            .unwrap()
+            .expect("the counting expr key counts");
+        assert_eq!(c.rows, n, "{keys:?}");
+        assert_eq!(c.row_groups, rgs.len() as u64, "{keys:?}");
+        assert_eq!(c.counted_by, specs()[0]);
+        let plan = planner.plan(&specs(), &lookup(SYM, &keys)).unwrap();
+        assert_eq!(plan.rows.map(|q| q.value), Some(n), "{keys:?}");
+    }
+    // Spelled another way, the same count.
+    let enc = vec![enc_str("ab3")];
+    let a = planner
+        .count(&specs(), &[SYM.to_string()], &enc)
+        .unwrap()
+        .unwrap();
+    let b = planner
+        .count(
+            &specs(),
+            &["JSON_GET( payload, '$[\"symbol\"]' )".to_string()],
+            &enc,
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(a.rows, b.rows);
+    // A bloom expr key counts nothing; a near miss is refused.
+    assert!(planner
+        .count(&specs(), &[LOW.to_string()], &enc)
+        .unwrap()
+        .is_none());
+    let e = planner
+        .count(
+            &specs(),
+            &["json_get(payload,'$.Symbol')".to_string()],
+            &enc,
+        )
+        .unwrap_err();
+    assert!(
+        matches!(&e, Error::KeySpec(m) if m.contains("no expr key indexes")),
+        "{e:?}"
+    );
+    assert!(planner
+        .count(&specs()[2..], &[SYM.to_string()], &enc)
+        .unwrap()
+        .is_none());
 }

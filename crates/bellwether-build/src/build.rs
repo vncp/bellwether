@@ -670,7 +670,9 @@ fn shared_identity(root: &str, base: Option<&Manifest>, a: &KeySpec, b: &KeySpec
                     fix(valid_column);
                     fix(known_column);
                 }
-                KeySpec::Range { .. } => {}
+                // An expr key's column is an identifier; it names no time
+                // column.
+                KeySpec::Range { .. } | KeySpec::Expr { .. } => {}
             }
             format!(
                 "re-declare {} under its name with a time column whose name has no ',' or '@', \
@@ -790,6 +792,8 @@ fn declared_sketch_specs(
 /// Validates the declared key specs, sidecars, and sketches against the
 /// dataset schema: key specs first, in declaration order, then sidecars,
 /// then sketches.
+// One arm per kind of target (key spec, expr key, sidecar, sketch).
+#[allow(clippy::too_many_lines)]
 fn plan_specs(
     specs: &[KeySpec],
     sidecars: &[SidecarDef],
@@ -832,7 +836,7 @@ fn plan_specs(
                     .map_err(|e| Error::KeySpec(format!("{name}: {e}")))?;
                 return Ok(SpecPlan {
                     target: Target::Key(spec.clone()),
-                    name,
+                    name: spec.identity(),
                     key_types: vec![typed.data_type().clone()],
                     ts_type: None,
                     time_types: Vec::new(),

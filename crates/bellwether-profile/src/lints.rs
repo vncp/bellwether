@@ -245,6 +245,7 @@ fn expression_lookups(inputs: &LintInputs<'_>) -> Vec<Lint> {
             ),
             confidence: HIGH,
             site: None,
+            fix: None,
         });
     }
     out

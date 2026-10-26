@@ -785,7 +785,10 @@ impl<S: StoreExt + ?Sized> Planner<S> {
     /// in `specs` that serves the lookup narrows the row groups, as in
     /// [`Planner::plan`]. Reads the manifest and the value records of the
     /// keys asked; no data file is opened, not even for a fingerprint.
-    /// `None` without such a spec: rows would need a scan.
+    /// `None` without such a spec: rows would need a scan. A count on an
+    /// expression (one key column named by it) is counted by an
+    /// `expr:<name>=<expr>:exact,counts` key over the same normalized
+    /// expression; a near miss is refused as [`Planner::plan`] refuses it.
     pub fn count(
         &self,
         specs: &[KeySpec],
@@ -793,22 +796,49 @@ impl<S: StoreExt + ?Sized> Planner<S> {
         keys: &[Vec<u8>],
     ) -> Result<Option<KeyCount>> {
         // Only specs that serve the lookup take part; with none, nothing
-        // counts.
-        let specs: Vec<KeySpec> = specs
-            .iter()
-            .filter(|s| serve(s, columns).is_some())
-            .cloned()
-            .collect();
-        if specs.is_empty() {
-            return Ok(None);
-        }
-        let segs = self.resolve(&specs, &[])?;
-        let (selected, rows, keys) = self.select_keys(&segs, columns, keys)?;
+        // counts. A count on an expression: only the expr keys over it take part
+        // (a near miss is refused as a lookup is), counted by one that
+        // stores counts.
+        let (selected, rows, keys) = match columns {
+            [c] if bellwether_core::expr::is_expression(c, &self.schema) => {
+                let exprs: Vec<KeySpec> = specs
+                    .iter()
+                    .filter(|s| matches!(s, KeySpec::Expr { .. }))
+                    .cloned()
+                    .collect();
+                if exprs.is_empty() {
+                    return Ok(None);
+                }
+                let segs = self.resolve(&exprs, &[])?;
+                self.select_expr(&segs, c, keys)?.0
+            }
+            _ => {
+                let specs: Vec<KeySpec> = specs
+                    .iter()
+                    .filter(|s| serve(s, columns).is_some())
+                    .cloned()
+                    .collect();
+                if specs.is_empty() {
+                    return Ok(None);
+                }
+                let segs = self.resolve(&specs, &[])?;
+                self.select_keys(&segs, columns, keys)?
+            }
+        };
+        self.count_of(&selected, rows, &keys)
+    }
+
+    fn count_of(
+        &self,
+        selected: &RoaringBitmap,
+        rows: Option<(u64, KeySpec)>,
+        keys: &[Vec<u8>],
+    ) -> Result<Option<KeyCount>> {
         let Some((rows, counted_by)) = rows else {
             return Ok(None);
         };
-        self.locator.check_known(&selected)?;
-        let live = &selected & self.locator.live();
+        self.locator.check_known(selected)?;
+        let live = selected & self.locator.live();
         let mut files = BTreeSet::new();
         for id in &live {
             let (fi, _) = self
@@ -1198,6 +1228,26 @@ impl<S: StoreExt + ?Sized> Planner<S> {
     /// given) is an error naming the expr keys that do exist, never a guess.
     /// The residual recomputes the expression per row (`ExprIn`).
     fn plan_expr(&self, segs: &[SpecSegments], text: &str, keys: &[Vec<u8>]) -> Result<ScanPlan> {
+        let ((selected, rows, keys), normalized) = self.select_expr(segs, text, keys)?;
+        let residual = Predicate::ExprIn {
+            expr: normalized,
+            values: expanded(keys.iter()),
+        };
+        let mut plan = self.finish(&selected, residual)?;
+        plan.rows = rows.map(|(n, _)| Quantity::exact(n));
+        Ok(plan)
+    }
+
+    /// The row groups of a lookup on an expression ([`Self::plan_expr`]),
+    /// the rows of its values when a serving `expr` key stores counts
+    /// (`expr:<name>=<expr>:exact,counts`, whose key is the whole lookup),
+    /// the non-null probe values, and the normalized expression.
+    fn select_expr(
+        &self,
+        segs: &[SpecSegments],
+        text: &str,
+        keys: &[Vec<u8>],
+    ) -> Result<(SelectedKeys, String)> {
         let typed = bellwether_core::expr::Typed::parse(text, &self.schema)?;
         let normalized = typed.expr().to_string();
         let key_types = vec![(normalized.clone(), typed.data_type().clone())];
@@ -1243,22 +1293,22 @@ impl<S: StoreExt + ?Sized> Planner<S> {
                 )
             }));
         }
+        let counting = serving.iter().position(|(s, _)| s.spec.counts());
+        let mut rows = counting.map(|_| 0u64);
         let selected = if keys.is_empty() {
             RoaringBitmap::new()
         } else if segs.is_empty() {
             self.locator.live().clone()
         } else {
             let mut acc = vec![None; keys.len()];
-            self.intersect(&mut acc, &serving, &keys, &spans)?;
+            let count = counting.zip(rows.as_mut());
+            self.intersect(&mut acc, &serving, &keys, &spans, count)?;
             acc.into_iter()
                 .flatten()
                 .fold(RoaringBitmap::new(), |u, b| u | b)
         };
-        let residual = Predicate::ExprIn {
-            expr: normalized,
-            values: expanded(keys.iter()),
-        };
-        self.finish(&selected, residual)
+        let rows = rows.zip(counting.map(|i| serving[i].0.spec.clone()));
+        Ok(((selected, rows, keys), normalized))
     }
 
     fn plan_keys(

@@ -1776,41 +1776,41 @@ impl Engine {
             let kind_column = match expr_column(replayer, &spec)? {
                 Some(c) => Some(c),
                 None => match sketch_column(&report.sketch, spec.columns()) {
-                Some(c) => Some(c),
-                None => match &spec {
-                    KeySpec::Exact {
-                        columns,
-                        bounds: None,
-                        ..
-                    } if temporal.is_none()
-                        && workload.runs().iter().all(|r| {
-                            &r.columns == columns && matches!(r.query(), Ok(RunQuery::Locate))
-                        }) =>
-                    {
-                        let counted = KeySpec::Exact {
-                            columns: columns.clone(),
-                            counts: true,
+                    Some(c) => Some(c),
+                    None => match &spec {
+                        KeySpec::Exact {
+                            columns,
                             bounds: None,
-                        };
-                        let specs = proposed_specs(replayer.current_specs(), &counted);
-                        let costs = replayer.replay_specs(&specs, workload, cache)?;
-                        costs
-                            .iter()
-                            .map(|c| c.rows.as_ref().map(|q| q.value))
-                            .sum::<Option<u64>>()
-                            .map(|rows| bellwether_types::KindColumn {
-                                kind: "counts".into(),
-                                label: format!(
-                                    "rows holding the keys over every run, as {} counts them",
-                                    counted.identity()
-                                ),
-                                value: rows.to_string(),
-                                exactness: bellwether_types::Exactness::Exact,
-                            })
-                    }
-                    _ => None,
+                            ..
+                        } if temporal.is_none()
+                            && workload.runs().iter().all(|r| {
+                                &r.columns == columns && matches!(r.query(), Ok(RunQuery::Locate))
+                            }) =>
+                        {
+                            let counted = KeySpec::Exact {
+                                columns: columns.clone(),
+                                counts: true,
+                                bounds: None,
+                            };
+                            let specs = proposed_specs(replayer.current_specs(), &counted);
+                            let costs = replayer.replay_specs(&specs, workload, cache)?;
+                            costs
+                                .iter()
+                                .map(|c| c.rows.as_ref().map(|q| q.value))
+                                .sum::<Option<u64>>()
+                                .map(|rows| bellwether_types::KindColumn {
+                                    kind: "counts".into(),
+                                    label: format!(
+                                        "rows holding the keys over every run, as {} counts them",
+                                        counted.identity()
+                                    ),
+                                    value: rows.to_string(),
+                                    exactness: bellwether_types::Exactness::Exact,
+                                })
+                        }
+                        _ => None,
+                    },
                 },
-            },
             };
             report.candidates.push(Candidate {
                 spec,
@@ -1873,6 +1873,14 @@ impl Engine {
                     .iter()
                     .any(|s| serves_query(s, &r.columns, &query))
             })
+            .collect();
+        // A run on an expression looks up derived values no file statistics
+        // hold: the unserved baseline reads every row group for it (correct,
+        // and nothing to say about statistics), so only runs on dataset
+        // columns decide the note.
+        let unserved_runs: Vec<_> = unserved_runs
+            .into_iter()
+            .filter(|r| !is_expression_run(replayer.schema(), &r.columns))
             .collect();
         if replayer.unserved() == Baseline::ParquetStats && !unserved_runs.is_empty() {
             let columns: BTreeSet<&str> = unserved_runs
@@ -1950,6 +1958,12 @@ fn expr_column(
         value: format!("{} null / {distinct} distinct", thousands(nulls)),
         exactness,
     }))
+}
+
+/// Whether a run is keyed on one expression over dataset columns (an `expr`
+/// key's lookup) rather than on dataset columns.
+fn is_expression_run(schema: &arrow::datatypes::Schema, columns: &[String]) -> bool {
+    matches!(columns, [c] if bellwether_core::expr::is_expression(c, schema))
 }
 
 /// A run's lookup in words, for refusals: `locate`, `latest`, `asof at 30`,

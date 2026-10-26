@@ -1001,6 +1001,8 @@ mod tests {
                 expr: "lower(a)".into(),
                 over: Box::new(KeySpec::Exact {
                     columns: vec!["k".into()],
+                    counts: true,
+                    bounds: None,
                 }),
                 conformance: Vec::new(),
             },
@@ -1082,16 +1084,21 @@ mod tests {
     /// and checks the spec an `expr` key wraps the same way.
     #[test]
     fn expr_keys_load_and_a_reader_without_the_kind_refuses_typed() {
-        let with = |spec: &str| {
+        let at = |version: u32, spec: &str| {
             format!(
-                r#"{{"storage_version": 1, "created_at": "x",
+                r#"{{"storage_version": {version}, "created_at": "x",
                     "schema": {{"key_specs": [{spec}]}}}}"#
             )
         };
+        let with = |spec: &str| at(2, spec);
         let expr = r#"{"kind": "expr", "name": "k", "expr": "lower(a)",
-                       "over": {"kind": "exact", "columns": ["k"]}, "conformance": []}"#;
+                       "over": {"kind": "exact", "columns": ["k"], "counts": true},
+                       "conformance": []}"#;
         let m = Manifest::from_slice(with(expr).as_bytes()).unwrap();
         assert!(matches!(m.schema.key_specs[0], KeySpec::Expr { .. }));
+        // The kind ships with storage version 2: a version 1 manifest that
+        // names it is refused typed, as a version 1 reader refuses it.
+        expect_unsupported_shape(&at(1, expr));
         // What a reader without the kind sees: the same manifest with a kind
         // name its allow-list does not hold.
         expect_unsupported_shape(&with(

@@ -187,7 +187,9 @@ fn spec_rules() {
     assert_eq!(
         **over,
         KeySpec::Exact {
-            columns: vec!["sym".into()]
+            columns: vec!["sym".into()],
+            counts: false,
+            bounds: None,
         }
     );
     assert_eq!(conformance.len(), 9, "json_get's vectors only");
@@ -238,6 +240,8 @@ fn spec_rules() {
         expr: "json_get(payload,'$.symbol')".into(),
         over: Box::new(KeySpec::Exact {
             columns: vec!["other".into()],
+            counts: false,
+            bounds: None,
         }),
         conformance: conformance.clone(),
     };

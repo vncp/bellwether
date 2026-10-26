@@ -29,7 +29,6 @@ use arrow::datatypes::{
 use bellwether_build::{Builder, Lookup, Planner};
 use bellwether_core::encoding::Value;
 use bellwether_core::expr::{self, Over};
-use bellwether_types::KeySpec;
 use common::{enc, enc_i64, enc_str, memory_store, parquet_opts, plan_rgs, write_parquet, Scratch};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
@@ -256,5 +255,4 @@ fn probe_invariant1_date_trunc_cast_substr_mixed_units() {
         by_n.len(),
         by_s.len()
     );
-    let _ = KeySpec::Exact { columns: vec![] };
 }

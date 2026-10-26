@@ -93,7 +93,7 @@ fn small() -> Vec<Vec<Option<String>>> {
 
 #[test]
 fn round_trip_exact_and_bloom() {
-    for over in [Over::Exact, Over::Bloom(0.01)] {
+    for over in [Over::Exact, Over::Counts, Over::Bloom(0.01)] {
         let spec = sym_spec(over);
         let bytes = build(&spec, &small(), WriterOptions::default());
         let r = SegmentReader::open_for_dataset(bytes.clone(), &schema()).unwrap();
@@ -104,13 +104,23 @@ fn round_trip_exact_and_bloom() {
         let sym2 = r.lookup(&[key("SYM2")]).unwrap();
         let nul = r.lookup(&[key("a\0b")]).unwrap();
         match over {
-            Over::Exact => {
+            Over::Exact | Over::Counts => {
                 assert_eq!(sym1, RoaringBitmap::from_iter([0, 1]));
                 assert_eq!(sym2, RoaringBitmap::from_iter([0]));
                 assert_eq!(nul, RoaringBitmap::from_iter([3]));
                 // two distinct values plus "a\0b"; no null, no invalid JSON
                 assert_eq!(r.entries(), 3);
                 assert!(r.lookup(&[key("nope")]).unwrap().is_empty());
+                // With counts: the rows of each derived value per row group,
+                // a value the expression never yields counts nothing.
+                let got = r.get(&[key("SYM1"), key("SYM2")]).unwrap();
+                let counts: Vec<Option<Vec<u64>>> =
+                    got.values().map(|v| v.counts.clone()).collect();
+                if over == Over::Counts {
+                    assert_eq!(counts, vec![Some(vec![1, 1]), Some(vec![1])]);
+                } else {
+                    assert_eq!(counts, vec![None, None]);
+                }
             }
             Over::Bloom(_) => {
                 assert!(sym1.contains(0) && sym1.contains(1));
@@ -118,7 +128,9 @@ fn round_trip_exact_and_bloom() {
                 assert!(nul.contains(3));
             }
         }
-        // merging two segments of the key keeps the spec
+        // merging two segments of the key keeps the spec (two counted
+        // segments over one row group are refused: a spec's segments cover
+        // disjoint row groups, so counts never add twice)
         let other = build(&spec, &small()[..1], WriterOptions::default());
         let m = merge(
             &[
@@ -126,9 +138,15 @@ fn round_trip_exact_and_bloom() {
                 SegmentReader::open(other).unwrap(),
             ],
             &WriterOptions::default(),
-        )
-        .unwrap();
-        assert_eq!(m.key_spec, spec);
+        );
+        if over == Over::Counts {
+            assert!(m
+                .unwrap_err()
+                .to_string()
+                .contains("cannot merge counted segments"));
+        } else {
+            assert_eq!(m.unwrap().key_spec, spec);
+        }
     }
 }
 
