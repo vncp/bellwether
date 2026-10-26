@@ -259,11 +259,11 @@ fn reconcile_with_and_without_agg_keys_catches_one_unit_and_says_which_side() {
         .reconcile(right.to_str().unwrap(), &reconcile_req())
         .unwrap();
     assert!(r.outcome.pass);
-    assert!(r.outcome.agg.is_empty());
+    assert_eq!(r.outcome.agg.len(), 0);
     let Record::Certificate(c) = &r.certificate.record else {
         panic!()
     };
-    assert!(c.body.agg.is_empty());
+    assert_eq!(c.body.agg.len(), 0);
     assert_eq!(r.outcome.totals.len(), 1);
     assert_eq!(r.outcome.totals[0].left.render(), dec6(total));
     assert!(r.lints.iter().any(|l| l.rule == "R-agg-1"), "{:?}", r.lints);

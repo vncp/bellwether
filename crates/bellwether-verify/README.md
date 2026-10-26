@@ -71,6 +71,12 @@ Values in rows outside the coverage (other workload keys, unsampled keys) are no
 
 `CoverageRequest::WorkloadRows { workload, age }` compares the rows the row filter keeps (`rows_where`, required) under a workload's name, rather than key tuples: `fix` uses it for a workload of list-membership runs, whose values are list elements, not reconcile keys, keying rows by every hashable column. The row filter may test membership (`Predicate::ContainsAny` / `ContainsAll`) on a list column that is otherwise never hashed, keyed, versioned, totalled, or grouped by; both sides' element types must share a class. A filter that keeps no row on either side is `NothingCompared`.
 
+### Agg keys (B7)
+
+**Reconcile from an agg key.** A side whose `IndexPlanner` holds a complete agg key on exactly the reconcile key, storing the sum of its one `Decimal128` total at the side's dataset type (`SidePlanner::agg_totals`), is folded from the cells (`SidePath::Agg`): per key, its rows, the row hash of its key columns, and the exact sum, with no row read. It is used only when no version rule, row filter, or expression scope selects among a key's rows, every compared column is a key column, totals are grouped by nothing or by the key, and the agg key's rows equal every row of the side (a row whose leading key is null is in no cell, so such a side is read). `Reconciliation.agg` and the certificate's `agg` (`AggServed { side, specs, rows }`) name each side so served.
+
+**Checking a proposed agg key.** `check_agg_cells(source, schema, row_groups, spec, keys, stored)` reads every live row group one at a time and compares, for each workload key, the cell the rows make with the stored one: rows, nulls, sum, minimum, and maximum, a missing cell and a cell where the key has no row both counted as differences (`AggCellCheck { keys, cells, row_groups_read, differ, examples }`, each example an `AggCellDiff` naming the key, row group, and stored cell and the cell the rows make). `fix` passes it the cells replay's transient segments hold (written by the build's writer) as `CertificateContext.agg`; `certify` records it as `AggServed { side: "proposed", checked }` and passes only when no cell differs.
+
 ## The certificate
 
 | Field | Value |

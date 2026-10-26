@@ -4,6 +4,7 @@
 use std::path::{Path, PathBuf};
 
 use bellwether::types::{Error, Hash};
+use bellwether_bench::agg::{generate_agg, AggParams, AggSummary};
 use bellwether_bench::corpus::{GenParams, Rung};
 use bellwether_bench::expr::{generate_expr, ExprParams, ExprShape, ExprSummary};
 use bellwether_bench::harness::{run_all, DuckDbMode, RunOptions, ScanFault};
@@ -69,6 +70,39 @@ pub(crate) enum BenchCommand {
     /// with skewed element cardinality, membership runs of 10, 10^3, and
     /// 10^5 terms, and ground truth, for list keys.
     Lists(ListsArgs),
+    /// Write the ledger corpus for agg keys: decimal amounts at scale 6 over
+    /// skewed accounts with null amounts (10^7 rows by default), per-key sum
+    /// runs of 10, 10^3, and 10^5 accounts, and exact per-run sums.
+    Agg(AggArgs),
+}
+
+#[derive(Args)]
+pub(crate) struct AggArgs {
+    /// Output directory (`data/` and `workload/`); must not hold a corpus.
+    #[arg(long)]
+    out: PathBuf,
+    /// RNG seed [default: 7].
+    #[arg(long)]
+    seed: Option<u64>,
+    /// Files [default: 100].
+    #[arg(long)]
+    files: Option<u32>,
+    /// Row groups per file [default: 10].
+    #[arg(long)]
+    row_groups_per_file: Option<u32>,
+    /// Rows per row group [default: 10000].
+    #[arg(long)]
+    rows_per_row_group: Option<u32>,
+    /// Distinct accounts the rows draw from [default: 1000000].
+    #[arg(long)]
+    accounts: Option<u32>,
+    /// Fraction of null amounts [default: 0.02].
+    #[arg(long)]
+    null_fraction: Option<f64>,
+    /// Accounts per per-key sum run, comma-separated [default:
+    /// 10,1000,100000].
+    #[arg(long, value_delimiter = ',')]
+    keys: Option<Vec<u32>>,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -347,6 +381,9 @@ pub(crate) struct Wrote {
     /// List corpus summary (`lists` only).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lists: Option<ListSummary>,
+    /// Agg corpus summary (`agg` only).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agg: Option<AggSummary>,
 }
 
 fn bench_err(e: &bellwether_bench::BenchError) -> Error {
@@ -444,6 +481,7 @@ pub(crate) fn run(cmd: &BenchCommand) -> Result<Wrote, Error> {
         BenchCommand::Read(a) => return read(a),
         BenchCommand::Expr(a) => return expr(a),
         BenchCommand::Lists(a) => return lists(a),
+        BenchCommand::Agg(a) => return agg(a),
     };
     Ok(Wrote {
         what,
@@ -455,6 +493,59 @@ pub(crate) fn run(cmd: &BenchCommand) -> Result<Wrote, Error> {
         text: None,
         expr: None,
         lists: None,
+        agg: None,
+    })
+}
+
+/// `bench agg`: the preset, each flag given overriding one.
+fn agg(a: &AggArgs) -> Result<Wrote, Error> {
+    let mut params = AggParams::preset();
+    if let Some(v) = a.seed {
+        params.seed = v;
+    }
+    if let Some(v) = a.files {
+        params.files = v;
+    }
+    if let Some(v) = a.row_groups_per_file {
+        params.row_groups_per_file = v;
+    }
+    if let Some(v) = a.rows_per_row_group {
+        params.rows_per_row_group = v;
+    }
+    if let Some(v) = a.accounts {
+        params.accounts = v;
+    }
+    if let Some(v) = a.null_fraction {
+        params.null_fraction = v;
+    }
+    if let Some(v) = &a.keys {
+        params.keys.clone_from(v);
+    }
+    let truth = generate_agg(&a.out, &params).map_err(|e| bench_err(&e))?;
+    let s = &truth.summary;
+    let where_summary = format!(
+        "{} ({} files, {} row groups, {} rows, {} null amounts, {} rows on the busiest account, \
+         {} bytes)",
+        a.out.display(),
+        s.files,
+        s.row_groups,
+        s.rows,
+        s.null_amounts,
+        s.head_rows,
+        s.bytes,
+    );
+    let truth_path = a.out.join("workload").join("truth.json");
+    Ok(Wrote {
+        what: "agg corpus",
+        path: where_summary,
+        blake3: file_hash(&truth_path)?,
+        failed: Vec::new(),
+        market: None,
+        read: None,
+        expr: None,
+        text: None,
+        lists: None,
+        agg: Some(truth.summary),
     })
 }
 
@@ -507,6 +598,7 @@ fn lists(a: &ListsArgs) -> Result<Wrote, Error> {
         expr: None,
         text: None,
         lists: Some(truth.summary),
+        agg: None,
     })
 }
 
@@ -550,6 +642,7 @@ fn text(a: &TextArgs) -> Result<Wrote, Error> {
         expr: None,
         text: Some(summary),
         lists: None,
+        agg: None,
     })
 }
 
@@ -608,6 +701,7 @@ fn market(a: &MarketArgs) -> Result<Wrote, Error> {
         expr: None,
         text: None,
         lists: None,
+        agg: None,
     })
 }
 
@@ -656,6 +750,7 @@ fn expr(a: &ExprArgs) -> Result<Wrote, Error> {
         expr: Some(summary),
         text: None,
         lists: None,
+        agg: None,
     })
 }
 
@@ -700,5 +795,6 @@ fn read(a: &ReadArgs) -> Result<Wrote, Error> {
         text: None,
         expr: None,
         lists: None,
+        agg: None,
     })
 }

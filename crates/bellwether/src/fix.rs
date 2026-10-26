@@ -3000,6 +3000,7 @@ mod tests {
     /// has no row) fails `fix`'s certificate, which names the cell, and no
     /// receipt is written; untouched, the same fix applies.
     #[test]
+    #[allow(clippy::too_many_lines, clippy::many_single_char_names)]
     fn a_planted_wrong_agg_cell_fails_the_certificate() {
         use bellwether_core::agg::AggSum;
         use bellwether_types::AggregateFn;

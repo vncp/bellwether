@@ -2656,17 +2656,17 @@ fn queried_spread(
 /// another aggregate: its costs would be labelled as the asked ones.
 fn check_aggregate_runs(h: &Hash, w: &Workload, asked: Option<&AggregateQuery>) -> Result<()> {
     let want = asked.map(AggregateQuery::run_query);
-    let Some(r) = w.runs().iter().find(|r| r.query().ok() != want) else {
+    let Some(run) = w.runs().iter().find(|r| r.query().ok() != want) else {
         return Ok(());
     };
-    let q = r.query()?;
-    let recorded = match q.aggregate() {
-        Some(a) => format!(
+    let query = run.query()?;
+    let recorded = match query.aggregate() {
+        Some(agg) => format!(
             "aggregate lookups of {}{{{}}}",
-            a.value,
-            fn_list(&a.functions)
+            agg.value,
+            fn_list(&agg.functions)
         ),
-        None => format!("{} lookups", describe(&q)),
+        None => format!("{} lookups", describe(&query)),
     };
     Err(Error::KeySpec(format!(
         "workload {h} records its runs as {recorded}, and --value and --fn ask for another \

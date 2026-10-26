@@ -50,7 +50,7 @@ pub use keys::encode_ts;
 pub use plan::{
     aggregate_answer, counting_spec, default_window_column, overlapping_counts, partition_columns,
     serving_agg, AggAnswer, AggLookup, Aggregated, KeyAggregate, KeyCount, Lookup, PlanOrder,
-    Planner, TransientSpec,
+    Planner, TotalsVisitor, TransientSpec,
 };
 pub use target::declared_sketches;
 pub use verify::Drift;

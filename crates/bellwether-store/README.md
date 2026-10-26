@@ -106,6 +106,10 @@ These `object_store` errors map to `Error::VersionConflict`:
 
 `list` is a key-spec kind (`key_spec_fields`: `kind`, `column`): declared in `schema.key_specs`, its segments ordinary key-spec segments named `list:<column>`. A build that predates the kind refuses such a manifest with the typed unknown-kind error, never a serde error and never by dropping the declaration on a rewrite (tested with storage version 1's allow-list). The kind is admitted by storage version 2 (WP14); this branch merges after it.
 
+### Agg keys (B7)
+
+`agg` is a key-spec kind (`key_spec_fields`: `kind`, `columns`, `value`, `functions`), admitted by storage version 2: declared in `schema.key_specs`, its segments ordinary key-spec segments named by the identity `agg:<columns>@<value>{<functions>}`. A build that predates the kind refuses such a manifest with the typed unknown-kind error, never by dropping the declaration on a rewrite.
+
 ## Commit protocol
 
 ```rust

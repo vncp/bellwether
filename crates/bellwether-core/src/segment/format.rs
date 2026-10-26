@@ -451,6 +451,7 @@ impl SegmentHeader {
     /// storage version. Versions are checked again here (they were checked
     /// in the preamble before parsing) and must agree with the preamble's.
     /// A spec that stores counts needs storage version 2.
+    #[allow(clippy::too_many_lines)] // one check per header rule, in order
     pub fn validate(&self, preamble_storage: u32, preamble_encoding: u32) -> Result<()> {
         check_versions(self.storage_version, self.encoding_version)?;
         if self.storage_version != preamble_storage || self.encoding_version != preamble_encoding {

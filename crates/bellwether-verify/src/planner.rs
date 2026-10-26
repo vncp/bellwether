@@ -13,6 +13,7 @@
 use std::time::Duration;
 
 use arrow::datatypes::SchemaRef;
+use bellwether_build::TotalsVisitor;
 use bellwether_types::{FileFingerprint, Hash, ScanPlan};
 
 /// The manifest an indexed side is planned against.
@@ -95,8 +96,5 @@ pub trait AggTotals {
     /// Visits every key with a live row, in ascending canonical order,
     /// with its rows and the exact sum of its non-null values at the
     /// dataset scale. Bounded memory: one block per segment at a time.
-    fn visit(
-        &self,
-        f: &mut dyn FnMut(&[u8], u64, i128) -> bellwether_types::Result<()>,
-    ) -> bellwether_types::Result<()>;
+    fn visit(&self, f: &mut TotalsVisitor<'_>) -> bellwether_types::Result<()>;
 }

@@ -120,7 +120,7 @@ fn refused(
         .output()
         .unwrap();
     assert_eq!(out.status.code(), Some(code));
-    assert!(out.stdout.is_empty());
+    assert_eq!(out.stdout, b"");
     let stderr = String::from_utf8(out.stderr).unwrap();
     assert!(
         stderr.contains(&refusal.message),

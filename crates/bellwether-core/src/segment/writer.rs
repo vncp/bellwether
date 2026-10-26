@@ -1115,6 +1115,7 @@ impl SegmentWriter {
     /// For an `expr` key the batch holds the expression's input columns; the
     /// virtual column is derived from them here, for this batch only (or
     /// taken from the batch when it already holds a column of that name).
+    #[allow(clippy::too_many_lines)] // one arm per layout, all or nothing
     pub fn add_batch(&mut self, rg: RowGroupId, batch: &RecordBatch) -> Result<()> {
         let Some(dataset) = self.dataset.clone() else {
             return Err(Error::KeySpec(

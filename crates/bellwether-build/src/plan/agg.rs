@@ -147,11 +147,7 @@ impl<S: StoreExt + ?Sized> Planner<S> {
     /// the index instead of the rows (B7). Holds one block per segment at a
     /// time (ADR 018). Refused for a spec that stores no sum or whose sums
     /// are floats, which are never exact.
-    pub fn agg_totals(
-        &self,
-        spec: &KeySpec,
-        f: &mut dyn FnMut(&[u8], u64, i128) -> Result<()>,
-    ) -> Result<()> {
+    pub fn agg_totals(&self, spec: &KeySpec, f: &mut TotalsVisitor<'_>) -> Result<()> {
         if !core_agg::functions(spec).contains(&AggregateFn::Sum) {
             return Err(Error::KeySpec(format!(
                 "{} stores no sum, so it has no totals to read",
@@ -180,20 +176,21 @@ impl<S: StoreExt + ?Sized> Planner<S> {
             if !any {
                 return Ok(());
             }
-            let sum = match total.sum {
-                Some(core_agg::AggSum::Int(v)) => v,
-                _ => {
-                    return Err(Error::KeySpec(format!(
-                        "{} sums floats, which are never exact, so its totals cannot stand in \
-                         for a reconcile's exact totals",
-                        spec.identity()
-                    )))
-                }
+            let Some(core_agg::AggSum::Int(sum)) = total.sum else {
+                return Err(Error::KeySpec(format!(
+                    "{} sums floats, which are never exact, so its totals cannot stand in for a \
+                     reconcile's exact totals",
+                    spec.identity()
+                )));
             };
             f(key, total.rows, sum)
         })
     }
 }
+
+/// What [`Planner::agg_totals`] calls per key: the key, its rows, and its
+/// exact sum over live row groups.
+pub type TotalsVisitor<'f> = dyn FnMut(&[u8], u64, i128) -> Result<()> + 'f;
 
 /// What [`answer`] computes from one agg key and the counted key beside it.
 #[derive(Clone, Debug, PartialEq)]
@@ -228,6 +225,7 @@ impl AggAnswer {
 /// the index ([`Planner::aggregate`]) and replay's planner over transient
 /// segments use, so a predicted aggregate plan is the planned one. Reads
 /// the value records of the keys asked only.
+#[allow(clippy::too_many_lines)] // the two steps of `cover`, then the plan
 pub fn answer<R: ReadAt>(
     (agg, agg_readers): (&KeySpec, &[SegmentReader<R>]),
     (counting, count_readers): (&KeySpec, &[SegmentReader<R>]),
@@ -357,6 +355,7 @@ pub fn answer<R: ReadAt>(
 /// The agg key among `specs` that serves `lookup`: on its value, storing
 /// every function asked, its key columns all lookup columns; the one with
 /// the most key columns, the first of those on a tie.
+#[must_use]
 pub fn serving_agg<'a>(specs: &'a [KeySpec], lookup: &AggLookup) -> Option<&'a KeySpec> {
     specs
         .iter()
@@ -380,6 +379,7 @@ pub fn serving_agg<'a>(specs: &'a [KeySpec], lookup: &AggLookup) -> Option<&'a K
 
 /// The spec among `specs` that stores counts on exactly the lookup's
 /// columns (in any order), so each probe is one stored key.
+#[must_use]
 pub fn counting_spec<'a>(specs: &'a [KeySpec], columns: &[String]) -> Option<&'a KeySpec> {
     specs.iter().find(|s| {
         matches!(s, KeySpec::Exact { .. } | KeySpec::Temporal { .. })

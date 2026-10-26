@@ -863,12 +863,12 @@ impl KeySpec {
             Self::Exact { columns, .. }
             | Self::Bloom { columns, .. }
             | Self::Temporal { columns, .. }
-            | Self::Bitemporal { columns, .. } => columns,
+            | Self::Bitemporal { columns, .. }
+            | Self::Agg { columns, .. } => columns,
             Self::Range { column } | Self::Text { column, .. } | Self::List { column } => {
                 std::slice::from_ref(column)
             }
             Self::Expr { over, .. } => over.columns(),
-            Self::Agg { columns, .. } => columns,
         }
     }
 

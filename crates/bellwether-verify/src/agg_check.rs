@@ -15,6 +15,7 @@
 //! decimal rescale) is computed from the rows alone.
 
 use std::collections::BTreeMap;
+use std::fmt::Write as _;
 
 use arrow::datatypes::{DataType, Schema};
 use bellwether_core::agg::{functions, value_at, AggCell, AggSum};
@@ -39,6 +40,7 @@ use crate::rowhash::hex;
 /// # Errors
 /// A column missing from the schema or a row group, a value that does not
 /// convert to the dataset type, or a source read failure.
+#[allow(clippy::too_many_lines)] // the fold, then one comparison per cell
 pub fn check_agg_cells<'a>(
     source: &dyn Source,
     schema: &Schema,
@@ -121,7 +123,7 @@ pub fn check_agg_cells<'a>(
         };
         let mut s = format!("rows {}, nulls {}", c.rows, c.nulls);
         if let Some(sum) = &c.sum {
-            s.push_str(&format!(", sum {}", sum.render(scale)));
+            let _ = write!(s, ", sum {}", sum.render(scale));
             if let AggSum::Float { .. } = sum {
                 s.push_str(" (inexact)");
             }
@@ -131,7 +133,7 @@ pub fn check_agg_cells<'a>(
                 let shown = render_tuple(b, std::slice::from_ref(&value_type))
                     .and_then(|mut v| v.pop().flatten())
                     .unwrap_or_else(|| hex(b));
-                s.push_str(&format!(", {name} {shown}"));
+                let _ = write!(s, ", {name} {shown}");
             }
         }
         s

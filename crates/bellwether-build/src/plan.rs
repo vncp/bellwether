@@ -110,7 +110,7 @@ use crate::target::declared_sidecars;
 mod agg;
 pub use agg::{
     answer as aggregate_answer, counting_spec, serving_agg, AggAnswer, AggLookup, Aggregated,
-    KeyAggregate,
+    KeyAggregate, TotalsVisitor,
 };
 
 /// What to look up.

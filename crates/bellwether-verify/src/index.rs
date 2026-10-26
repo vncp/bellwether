@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use arrow::datatypes::SchemaRef;
-use bellwether_build::{Lookup, Planner};
+use bellwether_build::{Lookup, Planner, TotalsVisitor};
 use bellwether_store::{manifest_path, parse_rfc3339, Manifest, Snapshot, StoreExt};
 use bellwether_types::{AggregateFn, Error, FileFingerprint, Hash, KeySpec, ScanPlan};
 
@@ -194,10 +194,7 @@ impl<S: StoreExt + ?Sized> AggTotals for IndexAggTotals<'_, S> {
         self.spec.identity()
     }
 
-    fn visit(
-        &self,
-        f: &mut dyn FnMut(&[u8], u64, i128) -> bellwether_types::Result<()>,
-    ) -> bellwether_types::Result<()> {
+    fn visit(&self, f: &mut TotalsVisitor<'_>) -> bellwether_types::Result<()> {
         self.planner.agg_totals(&self.spec, f)
     }
 }

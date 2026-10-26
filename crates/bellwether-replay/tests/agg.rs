@@ -7,7 +7,13 @@
 //! without its counted key, and a run recorded over a value that cannot be
 //! aggregated, are refused by name.
 
-#![allow(clippy::unwrap_used, missing_docs, clippy::too_many_lines)]
+#![allow(
+    clippy::unwrap_used,
+    missing_docs,
+    clippy::too_many_lines,
+    clippy::cast_possible_truncation,
+    clippy::type_complexity
+)]
 
 mod common;
 

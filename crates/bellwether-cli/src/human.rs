@@ -68,6 +68,7 @@ const AGGREGATE_ROWS_SHOWN: usize = 20;
 /// then where they came from, whether any float sum is measured rather
 /// than exact, and the row groups still to read when the index answered
 /// only part.
+#[allow(clippy::too_many_lines)] // header, one row per key, then the residual
 pub(crate) fn aggregate_result(r: &AggregateResult, out: &Out) -> String {
     let mut s = String::new();
     let _ = writeln!(

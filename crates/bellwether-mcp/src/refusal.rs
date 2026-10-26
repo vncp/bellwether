@@ -722,9 +722,9 @@ pub fn from_fix(r: &FixRefusal, verification: Option<&Reconciliation>) -> Refusa
                     .take(MISMATCH_SAMPLE)
                     .map(|d| serde_json::to_value(d).unwrap_or(Value::Null))
                     .collect();
-                message.push_str(&format!(
-                    ", {agg_cells_differ} agg cells differ from the rows they aggregate"
-                ));
+                message.push_str(", ");
+                message.push_str(&agg_cells_differ.to_string());
+                message.push_str(" agg cells differ from the rows they aggregate");
                 detail["agg_cells_differ"] = json!(agg_cells_differ);
                 detail["agg_cells_sample"] = Value::Array(cells);
             }

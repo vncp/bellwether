@@ -19,6 +19,7 @@
     clippy::unwrap_used,
     missing_docs,
     clippy::too_many_lines,
+    clippy::many_single_char_names,
     clippy::cast_possible_truncation,
     clippy::cast_possible_wrap,
     clippy::cast_sign_loss
@@ -300,7 +301,7 @@ fn check(planner: &Planner<ObjectStoreBackend>, specs: &[KeySpec], root: &Path) 
     assert_eq!(a.counted_by, counted(&["account"]));
     // The agg key's columns are the lookup's: nothing to read.
     assert_eq!(a.residual.row_groups_selected, 0);
-    assert!(a.residual.entries.is_empty());
+    assert_eq!(a.residual.entries.len(), 0);
     for k in &a.keys {
         let name = accounts()
             .into_iter()
@@ -421,7 +422,7 @@ fn aggregates_equal_decoded_files_at_every_segment_cap_and_after_changes() {
         b.build(&s.root_str(), &specs, &opts(max_keys, max_rgs))
             .unwrap();
         let planner = Planner::open(Arc::clone(&store), "idx").unwrap();
-        assert!(!planner.manifest().rowgroup_space.tombstones.is_empty());
+        assert_ne!(planner.manifest().rowgroup_space.tombstones.len(), 0);
         check(&planner, &specs, s.root());
     }
 }

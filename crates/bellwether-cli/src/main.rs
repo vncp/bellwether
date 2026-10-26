@@ -1266,6 +1266,7 @@ fn check_lookback(lookback: Option<&str>) -> Result<(), Failure> {
     }
 }
 
+#[allow(clippy::too_many_lines)] // one branch per lookup mode
 fn why(g: &Global, out: &Out, a: &WhyArgs) -> Result<Outcome, Failure> {
     check_lookback(a.lookback.as_deref())?;
     let window = a

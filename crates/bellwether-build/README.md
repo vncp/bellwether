@@ -170,6 +170,12 @@ A `list:<column>` key is built like an exact key whose keys are the column's ele
 
 `Lookup::ContainsAny { column, values }` and `Lookup::ContainsAll { column, values }` (values encoded at `Planner::element_type(column)`) plan through the list key on `column` only: any is the union of each value's row groups, all their intersection, a float zero probed in both encodings; a null value is dropped (any) or plans nothing (all); `contains_all` of no value is refused. Listed specs none of which is that list key are refused with the key to declare; no spec reads every live row group. A list key never serves `Lookup::Keys` or any other lookup. The residual is `ContainsAny` (every value's encodings) or `ContainsAll` (one sorted group per value), the residual replay writes for the same run.
 
+### Agg keys (B7)
+
+An `agg:<key>@<value>{...}` key is built like an exact key whose values carry cells: one row group per worker, the cells counted against `max_segment_bytes`. It is refused at declaration unless `exact:<key>,counts` is declared beside it (`counting_spec`), and it never serves `Lookup::Keys` or any other key lookup.
+
+`Planner::aggregate(AggLookup)` (and `aggregate_with_transient` for replay) answers per key from one complete agg key on the value whose columns are among the lookup's and which stores every function asked (`serving_agg`), beside the complete counted key on exactly the lookup's columns: the exact rows from the counts, the aggregate over the row groups the counts prove answered (`bellwether_core::agg::unanswered`), and a residual `ScanPlan` with an `In` predicate over the keys holding rows there (empty when the agg key's columns are the lookup's). Two listed segments aggregating one key in one row group are refused as corrupt. `Planner::agg_totals(spec, f)` streams each key's rows and exact sum over live row groups for `reconcile`, refusing a float sum. Tests (`tests/agg.rs`): exact decimal sums, null counts, minimum and maximum against the decoded files at three segment caps and after an append and a rewrite; invariant 1 for a finer lookup over a coarser agg key; refusals.
+
 ## Memory (ADR 018)
 
 An `expr` key's build reads the expression's input columns and derives its virtual column one row group at a time, never more; JSON documents are scanned without building a tree.

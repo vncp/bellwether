@@ -156,6 +156,19 @@ footer     index_offset u64 | index_len u64 | checksum u64 | "BWSEGMNT"
 
 Tests (`tests/list.rs`): round trip, the pinned conformance vectors, nulls and empty lists, float zero and NaN, type conversion and refusals, an every-byte corruption sweep, and a property test of both lookups and `distinct_elements` against a brute-force oracle over random multi-segment layouts with duplicates.
 
+## Agg keys (B7, `agg:<key>@<value>{...}`; `docs/format.md`, "Agg keys")
+
+`agg` holds per key, per row group, one `AggCell` of a value column: `rows`, `nulls` (ADR 014: counted, never summed or compared), and, as the spec declares, the sum, minimum, and maximum of the non-null values. The cells ride after the bitmap in the `keyed_agg` value record, one per set bit; the header records the value column's dataset type (`value_type`), checked on open.
+
+- `agg::sum_kind(column, type)`: integers and `Decimal128` sum exactly as `i128` (a decimal at the dataset scale), floats as a Neumaier-compensated pair (never exact, `AGG_FLOAT_SUM_MODEL`); anything else is refused for `sum` with the spec to declare instead.
+- `agg::check_spec` / `agg::value_type`: functions once each in canonical order with `count`, a value column that is not a key column and has a canonical encoding.
+- `SegmentWriter::add_batch` folds a batch's rows into the cells all or nothing (`insert_values`): a value that does not convert at the dataset type, or a sum past 128 bits, fails the row group and records nothing.
+- `SegmentReader::agg_cells(keys)`: each key's `(row group, cell)` pairs. `merge` and `merge::visit_merged_values` interleave cells only across disjoint row groups and refuse two inputs that both aggregate one (key, row group).
+- `agg::unanswered(counts, cells, same, spec)` and `agg::cover(counts, cells, residual)`: which matching row groups a cell answers (its rows equal the counted key's rows for the lookup key), which are residual (more rows: a finer lookup over a coarser agg key), and the refusal as a corrupt index when a cell holds fewer rows or is missing.
+- `AggCell::combine` adds rows, nulls, and sums and keeps the least minimum and greatest maximum, in ascending row-group order (a float sum depends on the order).
+
+Tests (`tests/agg.rs`): round trip, the pinned conformance segment (`docs/format.md`), decimal rescale and its refusal, both float zeros and the compensated sum, integer overflow, refusals, merge over disjoint row groups only, an every-byte corruption sweep, and a property test of the stored cells, the combined aggregates, and `unanswered`/`cover` against a brute-force oracle over the rows written.
+
 ## Lookup cost and memory bound (ADR 018)
 
 `SegmentReader::open` holds the header and the block index, which is two keys and five integers per block of up to 1024 keys. A keyed lookup of `k` keys:

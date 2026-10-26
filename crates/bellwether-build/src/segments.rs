@@ -482,6 +482,7 @@ impl<'a> SpecWriter<'a> {
 ///   token with a bloom filter; core's `text::measure`);
 /// - a sidecar: core's `sidecar::measure` (distinct keys, and key bytes
 ///   plus 20 per stored record).
+#[allow(clippy::too_many_lines)] // one arm per kind
 pub(crate) fn measure(plan: &SpecPlan, batch: &RecordBatch) -> Result<(u64, u64)> {
     let spec = match &plan.target {
         Target::Key(spec) => spec,

@@ -94,7 +94,7 @@ rowgroup id      = dense u32 assigned at first sighting of (fingerprint, index_i
 
 ## Key specs
 
-`Exact{columns, counts?}`, `Bloom{columns, fpr}`, `Range{column}`, `Temporal{columns, ts_column, counts?}`, and (phase 5) `Expr{name, expr, over, conformance}` ([Expression keys](#expression-keys-expr-phase-5)), and (phase 5) `Text{column, tokenizer, bloom?}` (see "Text keys"), and (phase 5) `List{column}` (B4; see "List keys"). Composite is not a kind; every kind takes a column list and encodes it memcomparably (ADR 002). CSV and JSON lines sources define row groups as fixed byte-range chunks recorded in the manifest, so the rest of the system never knows the difference. `counts` (storage version 2) is serialized only when true, so a spec without it has the same JSON as in version 1; a version 1 manifest that carries it is refused.
+`Exact{columns, counts?}`, `Bloom{columns, fpr}`, `Range{column}`, `Temporal{columns, ts_column, counts?}`, and (phase 5) `Expr{name, expr, over, conformance}` ([Expression keys](#expression-keys-expr-phase-5)), and (phase 5) `Text{column, tokenizer, bloom?}` (see "Text keys"), and (phase 5) `List{column}` (B4; see "List keys"), and (phase 5) `Agg{columns, value, functions}` (B7; see "Agg keys"). Composite is not a kind; every kind takes a column list and encodes it memcomparably (ADR 002). CSV and JSON lines sources define row groups as fixed byte-range chunks recorded in the manifest, so the rest of the system never knows the difference. `counts` (storage version 2) is serialized only when true, so a spec without it has the same JSON as in version 1; a version 1 manifest that carries it is refused.
 
 **Key-spec identity (storage version 2).** `KeySpec::identity()` is the canonical string of every field of a spec, and the key under which the manifest lists its segments (`segments[].key_spec`) and its completeness (`key_spec_completeness`):
 
@@ -110,6 +110,7 @@ rowgroup id      = dense u32 assigned at first sighting of (fingerprint, index_i
 | `Text{column: body, tokenizer: words}` | `text:body,tokenizer=words` |
 | `Text{column: body, tokenizer: trigram, bloom: 0.01}` | `text:body,tokenizer=trigram,bloom=0.01` |
 | `List{column: tags}` | `list:tags` |
+| `Agg{columns: [account], value: amount, functions: [sum, count]}` | `agg:account@amount{sum,count}` (functions in the order sum, count, min, max) |
 
 So `bloom:a@0.01` and `bloom:a@0.05` never share a segment list or a completeness entry. Two specs declared by a version 2 binary never share an identity: `,` and `@` separate its parts, so a new declaration (a key spec given to `index` that the index does not already declare, or a proposal's) naming a key or time column that contains either is refused (`exact:a,counts` could otherwise be `Exact{[a], counts}` or `Exact{["a,counts"]}`). For the same reason, because `,counts` ends a counted spec's identity, a new composite exact spec whose last key column is named `counts` is refused (list that column first). A spec an index already declares is read and indexed as it is, whatever its column names: a storage version 1 index on a column named `a,b` reads, plans, and upgrades like any other. Only two declared specs that actually share an identity are refused, which version 1 allowed only for two temporal specs whose time column holds an `@` (`temporal:id` on `ts@x` and `temporal:id@ts` on `x`, both `temporal:id@ts@x`): see "Reading storage version 1". Errors name a spec by its identity. `KeySpec::name()` is the display name and the spec's slot (`exact:a`, `bloom:a`, `temporal:id`): an index holds one spec per name, and declaring another spec under a declared name (another rate, counts on or off, another time column) rebuilds it and drops the old segments in the same commit. A storage version 1 manifest keyed both maps by name (one spec per name, so the rewrite is one-to-one); a version 2 reader rewrites those keys to identities when it reads one, and a version 1 manifest that no commit could upgrade yet (see "Manifest, storage version 2") is written back in names.
 
@@ -283,7 +284,7 @@ A segment is one file, `segments/<blake3 of its bytes>.seg`, readable from this 
 segment             preamble | header | data | index | footer
 preamble            magic "BWSEGMNT" | storage_version u32 | encoding_version u32 | header_len u32
 header              header_len bytes of JSON: {storage_version, encoding_version, key_spec, codec, layout,
-                    bloom_hash, key_types?, ts_type?, ..unknown fields, preserved}
+                    bloom_hash, key_types?, ts_type?, value_type?, ..unknown fields, preserved}
 data                the layout's blocks, at the offsets the index gives
 index               entries u64 | has_rg u8 | rg_min u32 | rg_max u32 | block_count u32 |
                     block_count x index entry (of the layout)
@@ -291,13 +292,13 @@ footer              index_offset u64 | index_len u64 | checksum u64 | magic "BWS
                     (checksum over preamble ‖ header ‖ index)
 ```
 
-- **Header.** `storage_version` and `encoding_version` equal the preamble's. `codec` is `"none"`. `layout` follows from the key spec's kind: `keyed` (exact), `keyed_temporal` (temporal), `bloom_per_row_group` (bloom), `min_max` (range); any other pairing is refused. `bloom_hash` is `canonical`, or `parquet_plain` for a bloom segment holding a reused single-column Parquet filter (ADR 008). `key_types` (one per key column) and, for a temporal spec, `ts_type` are each key column's dataset type in core's `ColumnType` spelling, present together when the segment was written from a dataset schema.
+- **Header.** `storage_version` and `encoding_version` equal the preamble's. `codec` is `"none"`. `layout` follows from the key spec's kind: `keyed` (exact), `keyed_temporal` (temporal), `keyed_agg` (agg), `bloom_per_row_group` (bloom), `min_max` (range); any other pairing is refused. `bloom_hash` is `canonical`, or `parquet_plain` for a bloom segment holding a reused single-column Parquet filter (ADR 008). `key_types` (one per key column) and, for a temporal spec, `ts_type` are each key column's dataset type in core's `ColumnType` spelling, present together when the segment was written from a dataset schema. `value_type` is present exactly on an agg segment written from a dataset schema, beside `key_types`: the value column's dataset type, which the cells were encoded and summed at (a decimal's scale is not visible in the bytes); a reader whose dataset type differs refuses the segment on open.
 - **Index header.** `entries` counts keys (keyed layouts), range entries (`min_max`) or the sum of the filters' distinct-value estimates (`bloom_per_row_group`). `rg_min..=rg_max` is the row-group range the writer processed, inclusive (see the tree above); `has_rg` is 0, with both bounds 0, only for a segment that recorded no range.
 
 The layouts:
 
 ```
-keyed, keyed_temporal (exact, temporal specs)
+keyed, keyed_temporal, keyed_agg (exact, temporal, agg specs)
   block             value records | bloom | directory, in that order; at most 1024 keys or 64 KiB of
                     key bytes per block; keys strictly ascending across the segment
   index entry       first_key bytes | last_key bytes | bloom_off u64 | bloom_len u32 | bloom_checksum u64 |
@@ -305,13 +306,14 @@ keyed, keyed_temporal (exact, temporal specs)
   bloom             a split-block bloom filter (Parquet's layout) over the block's keys, hashed canonically
   directory (body)  n u32 | (n+1) key end offsets u32, the first 0 | key bytes |
                     n x (value_offset u64 | value_len u32 | value_checksum u64)
-  value record      bitmap_len u32 | bitmap | [counts] | [chain]
+  value record      bitmap_len u32 | bitmap | [counts] | [chain] | [cells]
   bitmap            roaring over global RowGroupId, in the no-run serialized form (cookie 3a 30 00 00),
                     never empty
   counts            spec has counts: one unsigned LEB128 u64 per set bit, in ascending row-group order
   chain             temporal only: count u32 | has_max u8 | max_ts i64 | count x (ts i64 | rg u32);
                     the distinct (ts, row group) pairs of the key's non-null times, strictly ascending;
                     has_max = 1 and max_ts = the last ts when count > 0, else 0 and 0
+  cells             keyed_agg only: one cell per set bit, in ascending row-group order (see "Agg keys")
 
 bloom_per_row_group (bloom specs)
   index entry       rg u32 | off u64 | len u32 | ndv u64 | checksum u64, rg non-decreasing (a lookup
@@ -771,3 +773,49 @@ Conformance vectors (`crates/bellwether-core/tests/list.rs`): a `list:tags` segm
 | `AAPL` bitmap {0} | `3a 30 00 00 01 00 00 00 00 00 00 00 10 00 00 00 00 00` |
 | `MSFT` bitmap {0, 1} | `3a 30 00 00 01 00 00 00 00 00 01 00 10 00 00 00 00 00 01 00` |
 | `list:tags blake3` | `972f0deeeb42ea46c6402160dae27f6ac7dfd87102ad9480e83798db78ad232d` |
+
+## Agg keys (B7, `agg:<key>@<value>{...}`, 2026-10-26)
+
+`KeySpec::Agg { columns, value, functions }` (JSON `{"kind": "agg", "columns": [...], "value": "<v>", "functions": [...]}`, named `agg:<columns>@<v>`, identity `agg:<columns>@<v>{<functions>}`) stores, per key value per row group, the aggregates of one value column: the operator `sum/count/min/max(value) group by key where key in (...)`. `functions` lists each of `sum`, `count`, `min`, `max` at most once, in that order, with `count` always among them (the rows and the nulls are always stored); the CLI accepts any order and writes the canonical one. It is a key spec of its own, not a sidecar: declared in `schema.key_specs` (`key_spec_fields`: `kind`, `columns`, `value`, `functions`), its segments ordinary key-spec segments (`segments[].kind` absent, `key_spec` = the identity), complete under its identity (ADR 012). A reader that does not know the kind refuses the manifest with the typed unknown-kind error, never by dropping the declaration on a rewrite (ADR 017); the kind is admitted by storage version 2. The name has no functions, so declaring another function set redefines the key: it is rebuilt and the old segments dropped in the same commit.
+
+- **Beside a counted exact key.** An agg key is declared, planned, proposed, and scored only beside `exact:<columns>,counts` on the same columns: the counts are what prove which row groups an aggregate answers. Without it the declaration, the proposal, and the score are refused, naming the spec to declare first.
+- **Value column.** Any column with a canonical encoding that is not a key column. `sum` needs an integer, `Decimal128`, or float column; a `Decimal256`, string, or other column is refused for `sum` with the spec to declare instead (`{count,min,max}`).
+- **Bytes.** The keyed layout's blocks, bloom, and directory, unchanged, with `layout: "keyed_agg"`; the header carries `key_types` and `value_type` (the value column's dataset type). The value record is `bitmap_len u32 | bitmap | cells`: one cell per set bit, in ascending row-group order, and nothing after the last.
+
+```
+cell             rows LEB128 | nulls LEB128 | [sum] | [min] | [max]
+rows             rows of the key in the row group, at least 1, shortest LEB128 form
+nulls            among them, rows whose value is null, at most rows
+sum              present exactly when functions has sum:
+                   01 | i128 LE            an integer, or a Decimal128 unscaled at the dataset scale; exact
+                   02 | f64 LE | f64 LE    a float: the Neumaier-compensated running sum and its
+                                           compensation; never exact (model agg.kahan_f64)
+                 a cell whose values are all null stores 01 and an i128 zero, whatever the type
+min, max         each present exactly when functions has it and nulls < rows: bytes (len u32 | len
+                 bytes), the canonical encoding of the least (greatest) non-null value at the
+                 dataset type; min <= max as bytes
+```
+
+- **Nulls (ADR 014, amendment 2026-10-26).** A row whose leading key column is null is not indexed and in no cell, as in every keyed kind. A null value is counted in `rows` and `nulls`, never summed or compared: `count(value)` is `rows - nulls`, and `sum` of a key whose values are all null is reported as null, not zero.
+- **Values at the dataset type.** Each value is converted to the value column's dataset type before it is summed or compared (ADR 016): a decimal is rescaled to the dataset scale exactly, or the row group fails, all or nothing (never rounded); integers sum exactly as `i128`, and a sum past 128 bits fails the row group. Minimum and maximum compare canonical bytes, which order as the typed values do: `-0.0 < +0.0`, NaN the greatest float.
+- **Merge.** Cells of a key are interleaved by row group only when the inputs' row groups are disjoint, as the build's contiguous groups are; two inputs that both aggregate one (key, row group) are refused, never combined. A read that finds two listed segments of one agg key both holding a cell for one (key, row group) refuses the index as corrupt.
+- **Lookups.** An aggregate by columns `C` of value `v` reads one complete agg key on `v` whose columns `P` are among `C` and which stores every function asked, beside `exact:C,counts`. Per matching row group, the lookup key's count there is compared with the cell of its projection onto `P`: equal, the cell answers it (every row the cell aggregates is a row of the lookup key); larger (a finer lookup over a coarser agg key, `P ⊂ C`), the row group is residual and read; smaller, or no cell, is a corrupt index, refused. When `P = C` every matching row group is answered and no data file is opened. Rows are always exact, from the counts.
+- **Reconcile.** A side whose fresh index holds a complete agg key on exactly the reconcile key, storing the sum of its one `Decimal128` total at the side's dataset type, is folded from the cells instead of its rows, when no version rule, row filter, or expression scope selects among a key's rows, every compared column is a key column, totals are grouped by nothing or by the key, and the agg key's rows are every row of the side (a side with null leading keys is read instead). The certificate's `agg` lists each side so served (`AggServed`).
+- **Memory (ADR 018).** As the exact layout: a lookup holds one segment's block index, one block at a time, and the cells of the keys asked; the build holds one row group's cells per key and counts their bytes against the segment caps.
+
+## Agg key conformance vectors (storage version 2)
+
+`crates/bellwether-core/tests/agg.rs` writes `agg:account@amount{sum,count,min,max}` over `account: Utf8`, `amount: Decimal128(18, 6)`, with default writer options and processed range 0..3, from row group 0 (`a` 1.500000, `a` null, `b` -2.000000), row group 1 (`a` 0.250000, a null account with 9.000000, which is not indexed), and row group 2 (`b` null). It holds two keys and is pinned byte for byte (`PINNED_HEX`); its header is
+
+```
+{"storage_version":2,"encoding_version":1,"key_spec":{"kind":"agg","columns":["account"],"value":"amount","functions":["sum","count","min","max"]},"codec":"none","layout":"keyed_agg","bloom_hash":"canonical","key_types":[{"type":"utf8"}],"value_type":{"type":"decimal128","precision":18,"scale":6}}
+```
+
+| Vector | Bytes |
+|---|---|
+| `a` bitmap {0, 1} | `14 00 00 00` then `3a 30 00 00 01 00 00 00 00 00 01 00 10 00 00 00 00 00 01 00` |
+| `a` cell, row group 0: 2 rows, 1 null, sum 1.500000, min = max 1.500000 | `02 01 01 60 e3 16 00 00 00 00 00 00 00 00 00 00 00 00 00 12 00 00 00 05 10 80 00 00 00 00 00 00 00 00 00 00 00 00 16 e3 60 12 00 00 00 05 10 80 00 00 00 00 00 00 00 00 00 00 00 00 16 e3 60` |
+| `a` cell, row group 1: 1 row, sum 0.250000 | `01 00 01 90 d0 03 00 00 00 00 00 00 00 00 00 00 00 00 00 12 00 00 00 05 10 80 00 00 00 00 00 00 00 00 00 00 00 00 03 d0 90 12 00 00 00 05 10 80 00 00 00 00 00 00 00 00 00 00 00 00 03 d0 90` |
+| `b` cell, row group 0: sum -2.000000 | `01 00 01 80 7b e1 ff ff ff ff ff ff ff ff ff ff ff ff ff 12 00 00 00 05 10 7f ff ff ff ff ff ff ff ff ff ff ff ff e1 7b 80 12 00 00 00 05 10 7f ff ff ff ff ff ff ff ff ff ff ff ff e1 7b 80` |
+| `b` cell, row group 2: 1 row, 1 null (integer zero sum, no min or max) | `01 01 01 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00` |
+| `agg:account@amount{sum,count,min,max}` blake3 | `9fb9f7147c731d0d55220d5f3b0c4f4182267b4a33aac26ff956bb6effb6d609` |

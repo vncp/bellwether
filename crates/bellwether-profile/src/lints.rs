@@ -1458,6 +1458,6 @@ mod tests {
             agg(&["account"], "amount", &[AggregateFn::Sum]),
         ])]);
         assert!(quiet.is_empty(), "{quiet:?}");
-        assert!(reconcile_rescans(&[]).is_empty());
+        assert_eq!(reconcile_rescans(&[]), Vec::new());
     }
 }

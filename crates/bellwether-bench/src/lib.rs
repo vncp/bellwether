@@ -30,6 +30,9 @@
 //!   shapes (ledger attributes, market holdings), `contains_any` runs of 10,
 //!   10^3, and 10^5 terms and a `contains_all` run, and exact ground truth,
 //!   for list keys (B4).
+//! - [`agg`] writes the ledger corpus for agg keys (B7): decimal amounts at
+//!   scale 6 over skewed accounts with null amounts, per-key sum runs of 10,
+//!   10^3, and 10^5 accounts, and exact per-run sums (`scripts/agg-funnels.py`).
 
 #![forbid(unsafe_code)]
 // Benchmark arithmetic converts freely between counts, sizes, and floating
@@ -51,6 +54,7 @@
 )]
 #![cfg_attr(test, allow(clippy::unwrap_used))]
 
+pub mod agg;
 pub mod corpus;
 pub mod env;
 pub mod expr;
