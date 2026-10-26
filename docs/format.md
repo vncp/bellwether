@@ -21,7 +21,8 @@ Versioned from the first commit. `bellwether-types::format::STORAGE_VERSION` (2)
                                   rowgroup_rows, rowgroup_bytes and column_bytes are storage version 2: see "Manifest, storage version 2")
                                  key_spec_completeness{identity -> sequence at which the spec became complete, that is, first covered every live row group (ADR 020)}
                                  segments[{id=blake3, kind?, key_spec=KeySpec::identity() or the sidecar's name,
-                                           rowgroup_range{start, end} (half-open), bytes}]
+                                           rowgroup_range{start, end} (half-open), bytes,
+                                           right_sequence? (a join key's segment only: the right manifest it pins; see "Join keys")}]
                                            (rowgroup_range = the row groups the segment's writer processed, including
                                             any that held no keys; the spec's coverage, and recorded in the segment too;
                                             kind is absent for a key spec's segment, "bounds" or "temporal2" for a
@@ -94,7 +95,7 @@ rowgroup id      = dense u32 assigned at first sighting of (fingerprint, index_i
 
 ## Key specs
 
-`Exact{columns, counts?}`, `Bloom{columns, fpr}`, `Range{column}`, `Temporal{columns, ts_column, counts?}`, and (phase 5) `Expr{name, expr, over, conformance}` ([Expression keys](#expression-keys-expr-phase-5)), and (phase 5) `Text{column, tokenizer, bloom?}` (see "Text keys"), and (phase 5) `List{column}` (B4; see "List keys"). Composite is not a kind; every kind takes a column list and encodes it memcomparably (ADR 002). CSV and JSON lines sources define row groups as fixed byte-range chunks recorded in the manifest, so the rest of the system never knows the difference. `counts` (storage version 2) is serialized only when true, so a spec without it has the same JSON as in version 1; a version 1 manifest that carries it is refused.
+`Exact{columns, counts?}`, `Bloom{columns, fpr}`, `Range{column}`, `Temporal{columns, ts_column, counts?}`, and (phase 5) `Expr{name, expr, over, conformance}` ([Expression keys](#expression-keys-expr-phase-5)), and (phase 5) `Text{column, tokenizer, bloom?}` (see "Text keys"), and (phase 5) `List{column}` (B4; see "List keys"), and (phase 5) `Join{dataset, columns, right, right_columns, counts?}` (B3; see "Join keys"). Composite is not a kind; every kind takes a column list and encodes it memcomparably (ADR 002). CSV and JSON lines sources define row groups as fixed byte-range chunks recorded in the manifest, so the rest of the system never knows the difference. `counts` (storage version 2) is serialized only when true, so a spec without it has the same JSON as in version 1; a version 1 manifest that carries it is refused.
 
 **Key-spec identity (storage version 2).** `KeySpec::identity()` is the canonical string of every field of a spec, and the key under which the manifest lists its segments (`segments[].key_spec`) and its completeness (`key_spec_completeness`):
 
@@ -110,6 +111,7 @@ rowgroup id      = dense u32 assigned at first sighting of (fingerprint, index_i
 | `Text{column: body, tokenizer: words}` | `text:body,tokenizer=words` |
 | `Text{column: body, tokenizer: trigram, bloom: 0.01}` | `text:body,tokenizer=trigram,bloom=0.01` |
 | `List{column: tags}` | `list:tags` |
+| `Join{dataset: orders, columns: [id], right: payables, right_columns: [order_id]}` | `join:orders.id=payables.order_id` (with `counts: true`: `...,counts`) |
 
 So `bloom:a@0.01` and `bloom:a@0.05` never share a segment list or a completeness entry. Two specs declared by a version 2 binary never share an identity: `,` and `@` separate its parts, so a new declaration (a key spec given to `index` that the index does not already declare, or a proposal's) naming a key or time column that contains either is refused (`exact:a,counts` could otherwise be `Exact{[a], counts}` or `Exact{["a,counts"]}`). For the same reason, because `,counts` ends a counted spec's identity, a new composite exact spec whose last key column is named `counts` is refused (list that column first). A spec an index already declares is read and indexed as it is, whatever its column names: a storage version 1 index on a column named `a,b` reads, plans, and upgrades like any other. Only two declared specs that actually share an identity are refused, which version 1 allowed only for two temporal specs whose time column holds an `@` (`temporal:id` on `ts@x` and `temporal:id@ts` on `x`, both `temporal:id@ts@x`): see "Reading storage version 1". Errors name a spec by its identity. `KeySpec::name()` is the display name and the spec's slot (`exact:a`, `bloom:a`, `temporal:id`): an index holds one spec per name, and declaring another spec under a declared name (another rate, counts on or off, another time column) rebuilds it and drops the old segments in the same commit. A storage version 1 manifest keyed both maps by name (one spec per name, so the rewrite is one-to-one); a version 2 reader rewrites those keys to identities when it reads one, and a version 1 manifest that no commit could upgrade yet (see "Manifest, storage version 2") is written back in names.
 

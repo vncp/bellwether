@@ -205,3 +205,12 @@ A `sketch` segment (`segments/<blake3>.seg`, magic `"BWSKETCH"`) holds, per sket
 A footer checksum (BLAKE3 over every byte before it) makes every damaged byte a typed refusal rather than a silently different estimate. Merging is exact: registers by maximum, slots by minimum, so the union of a file's stretches equals sketching the file whole. Intervals are three standard errors (`SKETCH_CONFIDENCE`) either side, clamped to `[1, rows]`.
 
 Sketch memory bound (ADR 018): a writer holds one open entry (`2^p` registers and `k` slots per item) and the finished entries encoded; `max_entry_bytes` bounds one entry so the build caps a segment's entries and bytes. A reader holds the segment bytes and decodes one entry at a time; `SketchTotals` holds `2^p` registers and `k` slots per item, whatever the file count.
+
+## Join keys (B3, `join:<left>.<cols>=<right>.<cols>`; `docs/format.md`, "Join keys")
+
+`join` holds a dataset pair's key overlap in one segment in the `keyed_join` layout: per key both sides hold, the left value record (`bitmap_len | bitmap | [counts]`, left row-group ids) then the right one (right ids), and after the index the number of keys each side holds alone. The header pins `left_sequence` and `right_sequence` and records `right_key_types`; a generic key read, a merge, or a row-by-row write of a join segment is refused.
+
+- `join::build_pair(spec, left, right, range, pins, options)`: a merge join over both sides' exact segments (each a k-way merge holding one block per segment, ADR 018), dropping retired row groups; a tuple holding a null is one-sided (ADR 014). The same function builds the index segment and the transient pair `why` prices with.
+- `join::check_comparable`, `check_column_type`: join columns pair only when their canonical encodings compare (integers of one signedness, strings, binaries, one decimal width and scale, one time unit); a float is refused.
+- `join::semijoin(readers, keys)`, `overlap_stats(readers)` (`|L∩R|`, `|L∖R|`, `|R∖L|`, max and sum of row groups per shared key on each side, rows and the join's size when counted), `decode_pair`, `pinned_sequence`, `pair_entries`, `one_sided`.
+- `tests/join.rs`: round trip, the pinned conformance vectors of `docs/format.md`, nulls, retired row groups, refusals, an every-byte corruption sweep, and a property test against a brute-force oracle.

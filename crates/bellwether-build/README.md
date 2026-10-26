@@ -234,3 +234,12 @@ The bench crate cannot depend on this one (layering), so the benchmark lives her
 - `KeySpec::name` omits `ts_column`, `fpr` and `counts`, and an index holds one spec per name: two specs that differ only there cannot be declared together (the build refuses), and declaring one over the other rebuilds it. Segments and completeness are keyed by `KeySpec::identity`, so the old definition's never serve the new one (`tests/completeness.rs`).
 - The manifest has no field for a CSV dialect. A non-default dialect is carried in `source.kind` as `csv;delimiter=<byte>;header=<bool>`, so a change is detected.
 - Sources read local files only (`LocalFs`), like `bellwether-source`. The index itself can live on any `bellwether-store` backend.
+
+## Join keys (B3)
+
+A join key is declared on the left index but not built row group by row group: an ordinary build keeps its pair segment and keeps it complete only while the pair still covers every live left row group (a commit that adds a key or compacts keeps it; one that changes the left's files does not).
+
+- `Builder::refresh_join(spec, right_store, right_root)` builds the pair from the complete exact keys on the join columns in this index and in the right one (with counts when the key counts), and commits it in one commit that declares it if needed, replaces the pair segment, pins the right manifest's sequence (segment header and `segments[].right_sequence`), and records it complete; a fresh key commits nothing. A missing exact key on either side is `Error::NotIndexed` naming it; a float column, or a left dataset name other than the root's folder, is refused before anything is read. It starts over when a concurrent commit changes the left's row groups or declarations.
+- `transient_pair(left, right, spec)` builds the same bytes without committing (what `why` prices with).
+- `Planner::join_state(spec, right_sequence)`: `Fresh`, `NotBuilt`, `LeftChanged`, or `RightAdvanced`. `plan_semijoin(spec, keys, right_planner)` gives the two-step `SemiJoinPlan` (each side's row groups holding a key both hold, `In` residual over those keys, exact rows with counts); `join_overlap` the overlap statistics. Both refuse a stale key. Compaction skips join keys.
+- `tests/join.rs`: invariant 1 per side against both datasets' decoded files (fixed and random key sets, with and without counts), overlap against the decoded key sets, stale and fresh on each side, refresh is a no-op when fresh, left compaction keeps it fresh, missing exact keys and floats refused.

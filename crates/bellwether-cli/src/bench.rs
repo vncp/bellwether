@@ -7,6 +7,7 @@ use bellwether::types::{Error, Hash};
 use bellwether_bench::corpus::{GenParams, Rung};
 use bellwether_bench::expr::{generate_expr, ExprParams, ExprShape, ExprSummary};
 use bellwether_bench::harness::{run_all, DuckDbMode, RunOptions, ScanFault};
+use bellwether_bench::joins::{generate_joins, JoinParams, JoinShape, JoinSummary};
 use bellwether_bench::lists::{generate_lists, ListParams, ListShape, ListSummary};
 use bellwether_bench::market::{
     generate_market, parse_ymd, MarketParams, MarketRung, MarketSummary,
@@ -69,6 +70,10 @@ pub(crate) enum BenchCommand {
     /// with skewed element cardinality, membership runs of 10, 10^3, and
     /// 10^5 terms, and ground truth, for list keys.
     Lists(ListsArgs),
+    /// Write two datasets beside each other (ledger orders and payables, or
+    /// market trades and quotes) with 1:N skew, semi-join key sets of 10,
+    /// 10^3, and 10^5 keys, and per-side ground truth, for join keys.
+    Joins(JoinsArgs),
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -148,6 +153,37 @@ pub(crate) struct TextArgs {
     /// Rows per row group [default: 500].
     #[arg(long)]
     rows_per_row_group: Option<u32>,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+pub(crate) enum JoinShapeArg {
+    /// `orders` and `payables` on `order_id`.
+    Ledger,
+    /// `trades` and `quotes` on `(symbol, minute)`.
+    Market,
+}
+
+#[derive(Args)]
+pub(crate) struct JoinsArgs {
+    /// Output directory (the two dataset folders and `workload/`); must not
+    /// hold a corpus.
+    #[arg(long)]
+    out: PathBuf,
+    /// The shape.
+    #[arg(long, value_enum)]
+    shape: JoinShapeArg,
+    /// Orders (ledger) or minutes (market) [default: 400000 or 2000].
+    #[arg(long)]
+    size: Option<u64>,
+    /// Symbols (market) [default: 400].
+    #[arg(long)]
+    symbols: Option<u32>,
+    /// Rows per row group, both datasets [default: 5000].
+    #[arg(long)]
+    rows_per_row_group: Option<u32>,
+    /// Keys per semi-join run, comma-separated [default: 10,1000,100000].
+    #[arg(long, value_delimiter = ',')]
+    keysets: Option<Vec<u32>>,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -347,6 +383,9 @@ pub(crate) struct Wrote {
     /// List corpus summary (`lists` only).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lists: Option<ListSummary>,
+    /// Join corpus summary (`joins` only).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub joins: Option<JoinSummary>,
 }
 
 fn bench_err(e: &bellwether_bench::BenchError) -> Error {
@@ -444,6 +483,7 @@ pub(crate) fn run(cmd: &BenchCommand) -> Result<Wrote, Error> {
         BenchCommand::Read(a) => return read(a),
         BenchCommand::Expr(a) => return expr(a),
         BenchCommand::Lists(a) => return lists(a),
+        BenchCommand::Joins(a) => return joins(a),
     };
     Ok(Wrote {
         what,
@@ -455,6 +495,61 @@ pub(crate) fn run(cmd: &BenchCommand) -> Result<Wrote, Error> {
         text: None,
         expr: None,
         lists: None,
+        joins: None,
+    })
+}
+
+/// `bench joins`: the preset for the shape, each flag given overriding one.
+fn joins(a: &JoinsArgs) -> Result<Wrote, Error> {
+    let shape = match a.shape {
+        JoinShapeArg::Ledger => JoinShape::Ledger,
+        JoinShapeArg::Market => JoinShape::Market,
+    };
+    let mut params = JoinParams::preset(shape);
+    if let Some(v) = a.size {
+        params.size = v;
+    }
+    if let Some(v) = a.symbols {
+        params.symbols = v;
+    }
+    if let Some(v) = a.rows_per_row_group {
+        params.rows_per_row_group = v;
+    }
+    if let Some(v) = &a.keysets {
+        params.keysets.clone_from(v);
+    }
+    let truth = generate_joins(&a.out, &params).map_err(|e| bench_err(&e))?;
+    let s = &truth.summary;
+    let (left, right) = shape.datasets();
+    let where_summary = format!(
+        "{} ({left}: {} files, {} row groups, {} rows, {} keys; {right}: {} files, {} row groups, \
+         {} rows, {} keys; {} keys on both, right rows per shared key p50/p95/max {}/{}/{})",
+        a.out.display(),
+        s.left.files,
+        s.left.row_groups,
+        s.left.rows,
+        s.left.keys,
+        s.right.files,
+        s.right.row_groups,
+        s.right.rows,
+        s.right.keys,
+        s.both,
+        s.right_rows_per_key[0],
+        s.right_rows_per_key[1],
+        s.right_rows_per_key[2],
+    );
+    let truth_path = a.out.join("workload").join("truth.json");
+    Ok(Wrote {
+        what: "join corpus",
+        path: where_summary,
+        blake3: file_hash(&truth_path)?,
+        failed: Vec::new(),
+        market: None,
+        read: None,
+        expr: None,
+        text: None,
+        lists: None,
+        joins: Some(truth.summary),
     })
 }
 
@@ -507,6 +602,7 @@ fn lists(a: &ListsArgs) -> Result<Wrote, Error> {
         expr: None,
         text: None,
         lists: Some(truth.summary),
+        joins: None,
     })
 }
 
@@ -550,6 +646,7 @@ fn text(a: &TextArgs) -> Result<Wrote, Error> {
         expr: None,
         text: Some(summary),
         lists: None,
+        joins: None,
     })
 }
 
@@ -608,6 +705,7 @@ fn market(a: &MarketArgs) -> Result<Wrote, Error> {
         expr: None,
         text: None,
         lists: None,
+        joins: None,
     })
 }
 
@@ -656,6 +754,7 @@ fn expr(a: &ExprArgs) -> Result<Wrote, Error> {
         expr: Some(summary),
         text: None,
         lists: None,
+        joins: None,
     })
 }
 
@@ -700,5 +799,6 @@ fn read(a: &ReadArgs) -> Result<Wrote, Error> {
         text: None,
         expr: None,
         lists: None,
+        joins: None,
     })
 }

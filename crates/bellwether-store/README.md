@@ -240,3 +240,5 @@ The same file also covers:
 ## Memory (ADR 018)
 
 `StoreExt::list_pages(prefix, page_size, f)` polls the `object_store` list stream and holds at most one page. GC uses it and caps the orphans it holds per run. `Store::list` returns a `Vec` because the contract requires it, so it materializes the whole listing; callers that need bounded memory use `list_pages`. Apart from the capped orphan set, GC holds only sets bounded by the manifest's own lists, which are already in memory.
+
+**Join keys (B3).** `SegmentRef.right_sequence` is present only on a join key's segment: the right dataset's manifest sequence the pair index was built from, which the segment header repeats; the allow-list admits the `join` kind at storage version 2 only.
