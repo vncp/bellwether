@@ -121,13 +121,22 @@ class Doc:
             if skipped:
                 out.append("\n" + "; ".join(skipped) + ".")
             one = self.c.get(f"reconcile/{ds}/smallest-one-pass")
-            if isinstance(one, dict):
+            if isinstance(one, dict) and one.get("above"):
+                out.append("\nNo listed budget gave one pass, so the search doubled past 8 GiB: "
+                           + "; ".join(f"{a['budget_mib']:,} MiB: {a['passes']} pass(es), meter peak "
+                                       f"{mib(a['meter_peak'])} MiB, peak RSS {mib(a['peak_rss'])} MiB, "
+                                       f"{a['wall_ms'] / 1000:,.1f} s" for a in one["above"]) + ".")
+            if isinstance(one, dict) and "none" in one:
+                out.append(f"\nSmallest budget with one pass: none found ({one['none']}).")
+            elif isinstance(one, dict):
                 mem = one["memory_at_budget"]
-                out.append(f"\nSmallest budget with one pass (bisection to 10%): **{one['budget_mib']} MiB**; the "
-                           f"meter's peak at that budget was {mib(mem['peak_state_bytes'])} MiB, so the pass "
-                           f"count needs {one['budget_mib'] / (mem['peak_state_bytes'] / 2**20):.2f}x the state it "
+                out.append(f"\nSmallest budget with one pass (bisection to 10%): **{one['budget_mib']:,} MiB**; the "
+                           f"meter's peak at that budget was {mib(mem['peak_state_bytes'])} MiB, so one pass "
+                           f"needs {one['budget_mib'] / (mem['peak_state_bytes'] / 2**20):.2f}x the state it "
                            f"then holds. Probes (MiB, passes, meter peak MiB): "
-                           + ", ".join(f"{m} {p} {mib(s)}" for m, p, s in one["probes"]) + ".")
+                           + (", ".join(f"{m:,} {p} {mib(s)}" for m, p, s in one["probes"]) or "none needed") + ".")
+            elif one:
+                out.append(f"\nSmallest budget with one pass: {one}.")
             out.append("")
         return "\n".join(out)
 
@@ -159,6 +168,26 @@ class Doc:
             for i, t in enumerate(v["top"], 1):
                 frame = t["frame"].replace("|", "\\|")
                 out.append(f"| {i} | {t['self_pct']} | `{frame}` |")
+            callers = v.get("callers") or {}
+            if any(callers.values()):
+                out.append("\nNearest bellwether caller of the top self frames, when the frame is not "
+                           "bellwether's own (% of on-CPU time):\n")
+                for frame, cs in callers.items():
+                    if cs:
+                        out.append(f"- `{frame}`: " + "; ".join(f"`{c['frame']}` {c['pct']}" for c in cs))
+            if v.get("inclusive"):
+                out.append("\nbellwether functions by inclusive on-CPU time (every thread):\n")
+                out.append("| # | total % (on CPU) | function |")
+                out.append("|---:|---:|---|")
+                for i, t in enumerate(v["inclusive"], 1):
+                    out.append(f"| {i} | {t['total_pct']} | `{t['frame']}` |")
+            if v.get("main_thread_wall"):
+                out.append(f"\nMain thread wall time ({v['main_thread_wall_samples']:,} samples, on CPU or "
+                           "waiting), by bellwether function on the stack:\n")
+                out.append("| # | wall % (main thread) | function |")
+                out.append("|---:|---:|---|")
+                for i, t in enumerate(v["main_thread_wall"], 1):
+                    out.append(f"| {i} | {t['wall_pct']} | `{t['frame']}` |")
             out.append("")
         return "\n".join(out)
 

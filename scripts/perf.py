@@ -212,8 +212,15 @@ class Perf:
             doc = json.load(open(old))
             mine = tuple(p for s in a.run_sections if s != "reconcile" for p in SECTION_PREFIXES[s])
             if "reconcile" in a.run_sections:
-                # Only the pairs this run reconciles are replaced.
-                mine += tuple(f"reconcile/{RECONCILE_NAMES[d]}/" for d in a.reconcile_datasets)
+                # Only the pairs (and, with --reconcile-budgets, the budgets)
+                # this run reconciles are replaced; the one-pass search always
+                # reruns.
+                for d in a.reconcile_datasets:
+                    base = f"reconcile/{RECONCILE_NAMES[d]}/"
+                    if set(a.reconcile_budgets) == {l for l, _ in BUDGETS}:
+                        mine += (base,)
+                    else:
+                        mine += tuple(f"{base}{l}" for l in a.reconcile_budgets) + (f"{base}smallest-one-pass",)
             self.metrics = [m for m in doc["metrics"] if not m["id"].startswith(mine)]
             self.context = {k: v for k, v in doc["context"].items() if not k.startswith(mine)}
             self.sections = doc["environment"].get("sections", {})
@@ -803,7 +810,7 @@ def section_reconcile(p, ledger):
         # Largest budget first: its single pass predicts what the smaller
         # budgets cost, and one whose predicted wall time is past the cap is
         # recorded as not run rather than run for hours.
-        for label, b in reversed(BUDGETS):
+        for label, b in reversed([x for x in BUDGETS if x[0] in p.a.reconcile_budgets]):
             if one_pass_ms and name in results.get("_need", {}):
                 need = results["_need"][name]
                 predicted = math.ceil(need / b)
@@ -840,17 +847,37 @@ def section_reconcile(p, ledger):
                 f"{mem['peak_state_bytes'] / 2**20:8.1f} MiB  RSS {peak / 2**20:7.0f} MiB  "
                 f"{rows[0] / (ms / 1000):10.0f} rows/s/side")
         results.pop("_need", None)
+        ones = [b for passes, b in results.values() if passes == 1]
+        floor_mem = None
+        above = []
+        if ones:
+            floor_mem = p.context[f"reconcile/{name}/{[l for l, b in BUDGETS if b == min(ones)][0]}"]["memory"]
+        else:
+            # No budget run gave one pass: double past the largest, up to half
+            # the machine's memory, so the one-pass budget is still found.
+            b = max(b for _, b in results.values()) * 2
+            limit = p.env["memory_bytes"] // 2
+            while b <= limit:
+                ms, _, mem, peak, _ = reconcile_once(p, name, left, right, args, f"{b >> 20}M")
+                above.append({"budget_mib": b >> 20, "passes": mem["passes"], "meter_peak": mem["peak_state_bytes"],
+                              "wall_ms": round(ms), "peak_rss": peak})
+                say(f"  {b >> 20:>5}M: {ms:9.0f} ms  passes {mem['passes']:4d}  meter peak "
+                    f"{mem['peak_state_bytes'] / 2**20:8.1f} MiB  RSS {peak / 2**20:7.0f} MiB")
+                results[f"{b >> 20}M"] = (mem["passes"], b)
+                if mem["passes"] == 1:
+                    ones, floor_mem = [b], mem
+                    break
+                b *= 2
+            if not ones:
+                p.context[f"reconcile/{name}/smallest-one-pass"] = {
+                    "none": f"more than one pass at every budget run, up to {limit >> 20} MiB", "above": above}
+                continue
         # The smallest budget with one pass, by bisection on MiB, between the
         # one-pass run's state (a budget below what one pass holds cannot be
-        # one pass) and the smallest listed budget that gave one pass.
-        ones = [b for passes, b in results.values() if passes == 1]
-        if not ones:
-            p.context[f"reconcile/{name}/smallest-one-pass"] = "more than one pass at every budget run"
-            continue
+        # one pass) and the smallest budget that gave one pass.
         hi = min(ones) >> 20
         more = [b for passes, b in results.values() if passes > 1 and b < min(ones)]
-        floor = p.context[f"reconcile/{name}/{[l for l, b in BUDGETS if b == min(ones)][0]}"]["memory"]["peak_state_bytes"]
-        lo = max([b >> 20 for b in more] + [max(1, floor >> 20) - 1])
+        lo = max([b >> 20 for b in more] + [max(1, floor_mem["peak_state_bytes"] >> 20) - 1])
         probes = []
         while hi - lo > max(1, hi // 10):
             mid = (lo + hi) // 2
@@ -864,8 +891,8 @@ def section_reconcile(p, ledger):
         p.metric(f"reconcile/{name}/smallest-one-pass-budget", hi << 20, "bytes", "none",
                  dataset=name, metric="smallest budget with passes == 1 (within 10%)")
         p.context[f"reconcile/{name}/smallest-one-pass"] = {
-            "budget_mib": hi, "probes": probes, "bounds_mib": [lo, hi],
-            "memory_at_budget": mem or p.context[f"reconcile/{name}/{[l for l, b in BUDGETS if b == min(ones)][0]}"]["memory"]}
+            "budget_mib": hi, "probes": probes, "bounds_mib": [lo, hi], "above": above,
+            "memory_at_budget": mem or floor_mem}
         say(f"  smallest one-pass budget: {hi} MiB (bisection to 10%, probes {probes})")
 
 
@@ -980,24 +1007,35 @@ def demangle(sym):
     return out
 
 
+# bellwether's own functions (any workspace crate), by demangled name.
+OWN = re.compile(r"(^|[<&\s])bellwether(_[a-z]+)?::")
+
+
 def top_frames(profile, syms, n=10):
     """Self time per symbol over every thread, weighted by each sample's CPU
-    delta; idle waits are counted separately, not ranked."""
+    delta; idle waits are counted separately, not ranked. Also the inclusive
+    time of bellwether's own functions, and for the top three self frames the
+    nearest bellwether function that called them, so a system frame (an
+    `open`, a `malloc`) is tied to the code that caused it."""
     tabs = {}
     for d in syms["data"]:
         st = sorted(d["symbol_table"], key=lambda e: e["rva"])
         tabs[d["code_id"].upper()] = ([e["rva"] for e in st], st)
     names = syms["string_table"]
     libs = profile["libs"]
+    idle_names = {x.lstrip("_") for x in IDLE}
     agg, total, idle = {}, 0, 0
+    inclusive, leaf_callers = {}, {}
+    wall, wall_inclusive = 0, {}
     for th in profile["threads"]:
         smp = th["samples"]
         weights = smp.get("threadCPUDelta") or [1] * len(smp["stack"])
         ft, stk, fu, rs = th["frameTable"], th["stackTable"], th["funcTable"], th["resourceTable"]
-        for s, w in zip(smp["stack"], weights):
-            if s is None or not w:
-                continue
-            f = stk["frame"][s]
+        cache = {}
+
+        def frame_name(f):
+            if f in cache:
+                return cache[f]
             addr, func = ft["address"][f], ft["func"][f]
             res = fu["resource"][func]
             lib = libs[rs["lib"][res]] if res is not None and res >= 0 and rs["lib"][res] is not None else None
@@ -1008,15 +1046,57 @@ def top_frames(profile, syms, n=10):
                     i = bisect.bisect_right(tab[0], addr) - 1
                     if i >= 0 and addr < tab[1][i]["rva"] + max(tab[1][i]["size"], 1):
                         name = demangle(names[tab[1][i]["symbol"]])
-            if name.lstrip("_") in {x.lstrip("_") for x in IDLE}:
+            cache[f] = (name, libname)
+            return cache[f]
+
+        def own_frames(s):
+            """bellwether's own functions on the stack ending at s, leaf
+            first."""
+            out = []
+            while s is not None:
+                nm = frame_name(stk["frame"][s])[0]
+                if OWN.search(nm):
+                    out.append(nm)
+                s = stk["prefix"][s]
+            return out
+
+        main = th.get("isMainThread")
+        for s, w in zip(smp["stack"], weights):
+            if s is None:
+                continue
+            if main:
+                # Wall time on the main thread: every sample counts, on CPU
+                # or waiting, so a wait shows up under the code that waits.
+                wall += 1
+                for nm in set(own_frames(s)):
+                    wall_inclusive[nm] = wall_inclusive.get(nm, 0) + 1
+            if not w:
+                continue
+            name, libname = frame_name(stk["frame"][s])
+            if name.lstrip("_") in idle_names:
                 idle += w
                 continue
             key = f"{name} [{libname}]"
             agg[key] = agg.get(key, 0) + w
             total += w
+            mine = own_frames(s)
+            for nm in set(mine):
+                inclusive[nm] = inclusive.get(nm, 0) + w
+            if mine and not OWN.search(name):
+                c = leaf_callers.setdefault(key, {})
+                c[mine[0]] = c.get(mine[0], 0) + w
     top = sorted(agg.items(), key=lambda kv: -kv[1])[:n]
+    pct = lambda v: round(100 * v / max(1, total), 1)
     return {"on_cpu_weight": total, "idle_weight": idle,
-            "top": [{"frame": k, "self_pct": round(100 * v / total, 1)} for k, v in top]}
+            "top": [{"frame": k, "self_pct": pct(v)} for k, v in top],
+            "inclusive": [{"frame": k, "total_pct": pct(v)}
+                          for k, v in sorted(inclusive.items(), key=lambda kv: -kv[1])[:n]],
+            "callers": {k: [{"frame": c, "pct": pct(v)} for c, v in
+                            sorted(leaf_callers.get(k, {}).items(), key=lambda kv: -kv[1])[:3]]
+                        for k, _ in top[:3]},
+            "main_thread_wall_samples": wall,
+            "main_thread_wall": [{"frame": k, "wall_pct": round(100 * v / max(1, wall), 1)}
+                                 for k, v in sorted(wall_inclusive.items(), key=lambda kv: -kv[1])[:n]]}
 
 
 def section_profiles(p, mkt10, ledger):
@@ -1080,13 +1160,32 @@ def section_profiles(p, mkt10, ledger):
             p.context[f"profile/{name}"]["passes"] = v["outcome"]["memory"]["passes"]
 
 
+def reanalyze_profiles(out):
+    path = os.path.join(out, "perf.json")
+    doc = json.load(open(path))
+    for key, old in list(doc["context"].items()):
+        if not key.startswith("profile/") or not isinstance(old, dict) or "top" not in old:
+            continue
+        prof = os.path.join(out, "profiles", key.split("/", 1)[1] + ".json.gz")
+        with gzip.open(prof) as f:
+            profile = json.load(f)
+        with open(prof.replace(".json.gz", ".json.syms.json")) as f:
+            syms = json.load(f)
+        keep = {k: v for k, v in old.items() if k in ("command", "iterations", "rate_hz", "passes")}
+        doc["context"][key] = {**top_frames(profile, syms), **keep}
+        say(f"reanalyzed {key}")
+    with open(path, "w") as f:
+        json.dump(doc, f, indent=1)
+        f.write("\n")
+
+
 # ------------------------------------------------------------------- main
 
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--bin", required=True, help="the release bellwether binary")
-    ap.add_argument("--work", required=True, help="scratch directory for corpora and indexes")
+    ap.add_argument("--bin", help="the release bellwether binary (required unless --reanalyze-profiles)")
+    ap.add_argument("--work", help="scratch directory for corpora and indexes (required unless --reanalyze-profiles)")
     ap.add_argument("--out", default=os.path.join(REPO, "benches", "out"))
     ap.add_argument("--realdata", default=os.environ.get("REALDATA_WORK", ""),
                     help="directory holding gh/, taxi/, and taxi_duck/ from scripts/realdata.sh")
@@ -1100,6 +1199,8 @@ def main():
                     help="warn when processes outside this run use more cores than this during a section")
     ap.add_argument("--reconcile-datasets", default="ledger,replay,taxi",
                     help="which reconcile pairs to run: ledger, replay, taxi")
+    ap.add_argument("--reconcile-budgets", default=",".join(l for l, _ in BUDGETS),
+                    help="which of the listed budgets to run (the one-pass search always runs)")
     ap.add_argument("--reconcile-cap-s", type=int, default=900,
                     help="skip a budget whose predicted wall time is past this many seconds")
     ap.add_argument("--warm", type=int, default=20)
@@ -1109,9 +1210,20 @@ def main():
     ap.add_argument("--key-sets", default="10,300,3000")
     ap.add_argument("--profile-rate", type=int, default=4000)
     ap.add_argument("--build-label", default="release (thin LTO, codegen-units 1, line-table debug info)")
+    ap.add_argument("--reanalyze-profiles", action="store_true",
+                    help="recompute the frame tables of the profiles already saved under <out>/profiles "
+                         "into <out>/perf.json, without running anything")
     a = ap.parse_args()
+    if a.reanalyze_profiles:
+        reanalyze_profiles(a.out)
+        return
+    if not a.bin or not a.work:
+        ap.error("--bin and --work are required")
     a.key_sets = [int(x) for x in a.key_sets.split(",")]
     a.reconcile_datasets = a.reconcile_datasets.split(",")
+    a.reconcile_budgets = a.reconcile_budgets.split(",")
+    if set(a.reconcile_budgets) - {l for l, _ in BUDGETS}:
+        ap.error(f"--reconcile-budgets: choose from {', '.join(l for l, _ in BUDGETS)}")
     a.bin = os.path.realpath(a.bin)
     a.work = os.path.realpath(a.work)
     os.makedirs(a.work, exist_ok=True)
@@ -1146,7 +1258,11 @@ def main():
         if name in sections:
             # Reconcile pairs may be measured in separate slots (--merge), so
             # each pair set keeps its own section record.
-            key = f"reconcile {','.join(a.reconcile_datasets)}" if name == "reconcile" else name
+            key = name
+            if name == "reconcile":
+                key = f"reconcile {','.join(a.reconcile_datasets)}"
+                if len(a.reconcile_budgets) < len(BUDGETS):
+                    key += f" at {','.join(a.reconcile_budgets)}"
             p.section(key, start=True)
             run()
             p.section(key, start=False)
