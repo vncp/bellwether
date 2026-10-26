@@ -73,9 +73,23 @@ pub(crate) fn label_width<'a>(labels: impl IntoIterator<Item = &'a str>, min: us
 
 /// One funnel row: label, files, row groups, bytes (exact and rounded).
 pub(crate) fn funnel_row(s: &mut String, w: usize, name: &str, c: &Cost, note: &str) {
+    funnel_row_kind(s, w, name, c, None, note);
+}
+
+/// A funnel row with the index kind's column (`KindColumn`) before the
+/// note: `Some((width, value))` when the table has one.
+pub(crate) fn funnel_row_kind(
+    s: &mut String,
+    w: usize,
+    name: &str,
+    c: &Cost,
+    kind: Option<(usize, &str)>,
+    note: &str,
+) {
+    let kind = kind.map_or_else(String::new, |(kw, v)| format!(" {v:>kw$}"));
     let _ = writeln!(
         s,
-        "  {name:<w$} {:>9} {:>12} {:>18} {:>10}  {note}",
+        "  {name:<w$} {:>9} {:>12} {:>18} {:>10}{kind}  {note}",
         num(c.files),
         num(c.row_groups),
         num(c.bytes),
@@ -84,9 +98,16 @@ pub(crate) fn funnel_row(s: &mut String, w: usize, name: &str, c: &Cost, note: &
 }
 
 pub(crate) fn funnel_header(s: &mut String, w: usize) {
+    funnel_header_kind(s, w, None);
+}
+
+/// The funnel header, with the index kind's column header when the table
+/// has one: `Some((width, kind))`.
+pub(crate) fn funnel_header_kind(s: &mut String, w: usize, kind: Option<(usize, &str)>) {
+    let kind = kind.map_or_else(String::new, |(kw, k)| format!(" {k:>kw$}"));
     let _ = writeln!(
         s,
-        "  {:<w$} {:>9} {:>12} {:>18} {:>10}",
+        "  {:<w$} {:>9} {:>12} {:>18} {:>10}{kind}",
         "", "files", "row groups", "bytes", ""
     );
 }
@@ -134,6 +155,25 @@ pub(crate) fn index(r: &IndexResult, out: &Out) -> String {
             .complete_at
             .map_or_else(|| "incomplete".to_string(), |n| n.to_string());
         let _ = writeln!(s, "  {:<w$} {at:>14}", sc.sidecar);
+    }
+    if r.sidecars
+        .iter()
+        .any(|sc| sc.sidecar.starts_with("sketch:"))
+    {
+        let _ = writeln!(
+            s,
+            "\n  sketches are approximate distinct counts and are never used to plan; read them \
+             with `bellwether sketch cardinality {}`",
+            r.root
+        );
+    }
+    if !r.sketches_rebuilt.is_empty() {
+        let _ = writeln!(
+            s,
+            "\n  rebuilt {} from every row group: its segments were missing from the store or \
+             damaged",
+            r.sketches_rebuilt.join(", ")
+        );
     }
     if !r.unknown_segment_kinds.is_empty() {
         let _ = writeln!(
@@ -355,11 +395,18 @@ pub(crate) fn propose(r: &ProposeResult, _out: &Out) -> String {
                 },
                 |c| format!("build it with `{c}`"),
             );
-            format!(
-                "refused: {declaration} declares the sidecar {sidecar}, and a proposal can carry \
-                 only a key spec, so it has no replay, certificate, or receipt yet; {build} (no \
-                 receipt){alone}\n"
-            )
+            let why = if sidecar.starts_with("sketch:") {
+                format!(
+                    "{declaration} declares the sketch {sidecar}, which is approximate and never \
+                     planned with, so no replay can price it"
+                )
+            } else {
+                format!(
+                    "{declaration} declares the sidecar {sidecar}, and a proposal can carry only \
+                     a key spec, so it has no replay, certificate, or receipt yet"
+                )
+            };
+            format!("refused: {why}; {build} (no receipt){alone}\n")
         }
     }
 }
@@ -507,8 +554,25 @@ pub(crate) fn why(r: &bellwether::WhyReport, out: &Out, fix_command: &str) -> St
         }
         let labels: Vec<String> = r.candidates.iter().map(|c| label(&c.spec)).collect();
         let w_col = label_width(labels.iter().map(String::as_str), MIN_FUNNEL_LABEL);
-        funnel_header(&mut s, w_col);
-        funnel_row(&mut s, w_col, "dataset", &dataset, &rows);
+        // One trailing column for the index kind that contributes one
+        // (`KindColumn`), headed by the kind's name, before the notes.
+        let kind_head = r
+            .candidates
+            .iter()
+            .find_map(|c| c.kind_column.as_ref().map(|k| k.kind.clone()));
+        let kind_width = kind_head.as_ref().map(|h| {
+            r.candidates
+                .iter()
+                .filter_map(|c| c.kind_column.as_ref().map(|k| k.value.chars().count()))
+                .chain(std::iter::once(h.chars().count()))
+                .max()
+                .unwrap_or(0)
+        });
+        let kind_cell = |v: &str| kind_width.map(|kw| (kw, v.to_string()));
+        funnel_header_kind(&mut s, w_col, kind_width.zip(kind_head.as_deref()));
+        let blank = kind_cell("");
+        let blank = blank.as_ref().map(|(w, v)| (*w, v.as_str()));
+        funnel_row_kind(&mut s, w_col, "dataset", &dataset, blank, &rows);
         let current_name = if r.current_specs.is_empty() {
             "current (no index)"
         } else {
@@ -523,7 +587,7 @@ pub(crate) fn why(r: &bellwether::WhyReport, out: &Out, fix_command: &str) -> St
             ),
             _ => String::new(),
         };
-        funnel_row(&mut s, w_col, current_name, &current, &current_note);
+        funnel_row_kind(&mut s, w_col, current_name, &current, blank, &current_note);
         for c in &r.candidates {
             let mut notes = Vec::new();
             match (&c.origin, &c.spec, &kind_label) {
@@ -565,21 +629,48 @@ pub(crate) fn why(r: &bellwether::WhyReport, out: &Out, fix_command: &str) -> St
             if r.recommended.as_ref().is_some_and(|x| x.spec == c.spec) {
                 notes.push("recommended".to_string());
             }
-            funnel_row(
+            let cell = kind_cell(c.kind_column.as_ref().map_or("", |k| k.value.as_str()));
+            if let Some(k) = &c.kind_column {
+                notes.push(format!(
+                    "{}: {}{}",
+                    k.kind,
+                    k.label,
+                    if k.exactness.is_exact() {
+                        ""
+                    } else {
+                        " (not exact)"
+                    }
+                ));
+            }
+            funnel_row_kind(
                 &mut s,
                 w_col,
                 &label(&c.spec),
                 &c.proposed,
+                cell.as_ref().map(|(w, v)| (*w, v.as_str())),
                 &notes.join(", "),
             );
         }
     } else {
         let _ = writeln!(
             s,
-            "funnel: no workload; pass --from <keys.parquet> to replay a run under each candidate key"
+            "funnel: no workload; {}pass --from <keys.parquet> to replay a run under each \
+             candidate key",
+            if r.from_sketches {
+                "drop --sketches-only and "
+            } else {
+                ""
+            }
         );
         funnel_header(&mut s, MIN_FUNNEL_LABEL);
         funnel_row(&mut s, MIN_FUNNEL_LABEL, "dataset", &dataset, &rows);
+        if r.from_sketches {
+            let _ = writeln!(
+                s,
+                "  dataset from the index's manifest and sketches: rows are the sketch's exact \
+                 counts, bytes the file sizes the manifest recorded (no footer read)"
+            );
+        }
     }
     if let Some(c) = &r.culprit {
         let fan = c.fanout.as_ref().map_or_else(String::new, |f| {
@@ -699,21 +790,69 @@ pub(crate) fn why(r: &bellwether::WhyReport, out: &Out, fix_command: &str) -> St
         s,
         "\nfanout: files and row groups one value touches, p50 / p95 / max"
     );
+    if r.from_sketches {
+        let _ = writeln!(
+            s,
+            "  not measured: --sketches-only opens no data file, footers included; the sketch \
+             column is the diagnosis, approximate"
+        );
+    }
+    if let Some(why_not) = &r.sketch_unavailable {
+        let _ = writeln!(s, "  {why_not}");
+    }
+    let sketch_cell = |columns: &[String]| {
+        r.sketch
+            .iter()
+            .find(|i| i.cardinality.columns == columns)
+            .map_or_else(String::new, sketch_fanout)
+    };
     let _ = writeln!(
         s,
-        "  {:<36} {:>12}  {:<22} {:<22} sample",
-        "key", "distinct", "files/value", "row groups/value"
+        "  {:<36} {:>12}  {:<22} {:<22} {:<8} {}",
+        "key",
+        "distinct",
+        "files/value",
+        "row groups/value",
+        "sample",
+        if r.sketch.is_empty() { "" } else { "sketch" }
     );
     for e in &r.profile.fanout {
         let f = &e.fanout;
         let _ = writeln!(
             s,
-            "  {:<36} {:>12}  {:<22} {:<22} {}",
+            "  {:<36} {:>12}  {:<22} {:<22} {:<8} {}",
             tail(&f.columns.join(", "), 36),
             num(f.distinct),
             quantiles(&f.files_per_value),
             quantiles(&f.row_groups_per_value),
-            if f.sampled { "sampled" } else { "exact" }
+            if f.sampled { "sampled" } else { "exact" },
+            sketch_cell(&f.columns)
+        );
+    }
+    for i in r.sketch.iter().filter(|i| {
+        !r.profile
+            .fanout
+            .iter()
+            .any(|e| e.fanout.columns == i.cardinality.columns)
+    }) {
+        let _ = writeln!(
+            s,
+            "  {:<36} {:>12}  {:<22} {:<22} {:<8} {}",
+            tail(&i.cardinality.columns.join(", "), 36),
+            "-",
+            "-",
+            "-",
+            "-",
+            sketch_fanout(i)
+        );
+    }
+    if !r.sketch.is_empty() {
+        let _ = writeln!(
+            s,
+            "  sketch: rows per value over ≈distinct values (HyperLogLog, 99.7% interval), files \
+             per value, files repeating a value (≥≈N: a file repeating fewer rows is not \
+             detected, so 0 never proves uniqueness); approximate unless marked exact; never \
+             used to plan"
         );
     }
     if !r.profile.skipped.is_empty() {
@@ -735,6 +874,21 @@ pub(crate) fn why(r: &bellwether::WhyReport, out: &Out, fix_command: &str) -> St
             );
         }
     }
+    let exact_scan = if r.reads.exact_index_segments > 0 {
+        format!(
+            "; {} exact-index segment(s) scanned for exact distinct counts",
+            num(r.reads.exact_index_segments)
+        )
+    } else {
+        String::new()
+    };
+    let _ = writeln!(
+        s,
+        "\ndata read: {} files, {} row groups; footers of {} files{exact_scan}",
+        num(r.reads.files),
+        num(r.reads.row_groups),
+        num(r.reads.footers)
+    );
     let _ = writeln!(s, "\nrecords");
     match (&r.evidence.hash, &r.evidence.note) {
         (Some(h), _) => {
@@ -914,5 +1068,163 @@ pub(crate) fn scorecard(r: &bellwether::ScorecardResult, out: &Out) -> String {
         );
     }
     unreadable_line(&mut s, &r.unreadable);
+    s
+}
+
+/// One sketched item's `why` cell: `≈138,889 rows/value of ≈72 (±2.4%),
+/// ≈139 files/value, 9,998 of 10,000 files repeat ≥≈24 rows`, or exact
+/// with an exact distinct count. The last figure is the detection floor:
+/// fewer repeats in a file go unseen.
+fn sketch_fanout(i: &bellwether::ItemCardinality) -> String {
+    let c = &i.cardinality;
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let rpv = num(c.rows_per_value.round() as u64);
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let fpv = num(c.files_per_value.round() as u64);
+    let distinct = match c.exact_distinct {
+        Some(d) => format!("{rpv} rows/value of {} (exact)", num(d)),
+        None => format!(
+            "≈{rpv} rows/value of ≈{} (±{:.1}%)",
+            num(c.distinct),
+            300.0 * c.relative_standard_error
+        ),
+    };
+    format!(
+        "{distinct}, ≈{fpv} files/value, {} of {} files repeat ≥≈{} rows",
+        num(c.files_with_duplicates),
+        num(c.files),
+        num(c.duplicate_floor.max(1))
+    )
+}
+
+/// `sketch cardinality`: one block per item.
+pub(crate) fn cardinality(r: &bellwether::CardinalityResult, out: &Out) -> String {
+    use bellwether::SketchSource;
+    let mut s = String::new();
+    let state = if r.sequence == 0 {
+        "not indexed".to_string()
+    } else {
+        format!("manifest sequence {}", r.sequence)
+    };
+    let read = if r.files_read == 0 {
+        "from sketches; no data file read".to_string()
+    } else {
+        format!(
+            "{} files ({} row groups) read now for the items no sketch holds",
+            num(r.files_read),
+            num(r.row_groups_read)
+        )
+    };
+    let _ = writeln!(
+        s,
+        "{}",
+        heading(
+            out,
+            &format!(
+                "sketch cardinality {} ({state}): approximate, {read}",
+                r.root
+            )
+        )
+    );
+    for i in &r.items {
+        let c = &i.cardinality;
+        let distinct = match c.exact_distinct {
+            Some(d) => format!(
+                "{} distinct values (exact, from the exact key on {}; the sketch says ≈{})",
+                num(d),
+                c.columns.join(", "),
+                num(c.distinct)
+            ),
+            None => format!(
+                "≈{} distinct values (99.7%: {}..{}, ±{:.1}%)",
+                num(c.distinct),
+                num(c.distinct_low),
+                num(c.distinct_high),
+                300.0 * c.relative_standard_error
+            ),
+        };
+        let _ = writeln!(
+            s,
+            "  {}: {distinct}; {} rows, {} with a null {}",
+            c.item,
+            num(c.rows),
+            num(c.nulls),
+            if c.columns.len() > 1 {
+                "leading column (not counted)"
+            } else {
+                "(not counted)"
+            }
+        );
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let (rpv, fpv) = (
+            c.rows_per_value.round() as u64,
+            num(c.files_per_value.round() as u64),
+        );
+        let _ = writeln!(
+            s,
+            "    {}{} {} per value; each value in ≈{fpv} files; {} of {} files repeat a value \
+             (a file of average size repeating fewer than about {} rows is not detected; a \
+             sketch cannot prove uniqueness)",
+            if c.rows_per_value_exact { "" } else { "≈" },
+            num(rpv),
+            if rpv == 1 { "row" } else { "rows" },
+            num(c.files_with_duplicates),
+            num(c.files),
+            num(c.duplicate_floor.max(1)),
+        );
+        let from = match (&i.source, &i.sketch) {
+            (SketchSource::Index, Some(label)) => format!("read from {label}"),
+            _ => format!(
+                "computed now; `bellwether index {} --key sketch:{}` answers it without reading",
+                r.root, c.item
+            ),
+        };
+        let _ = writeln!(s, "    {from}");
+    }
+    if r.exact_index_segments_read > 0 {
+        let _ = writeln!(
+            s,
+            "  exact distinct counts scanned {} exact-index segment(s) (index, not data)",
+            num(r.exact_index_segments_read)
+        );
+    }
+    s
+}
+
+/// `sketch overlap`: the estimate, its interval, and the sizes.
+pub(crate) fn overlap(r: &bellwether::OverlapResult, out: &Out) -> String {
+    use bellwether::types::OverlapMethod;
+    let o = &r.overlap;
+    let mut s = String::new();
+    let how = match (o.method, o.signatures) {
+        (OverlapMethod::Minhash, Some(k)) => format!("MinHash, {k} signatures"),
+        _ => "HyperLogLog inclusion-exclusion; declare both sketches with minhash= for a \
+              tighter bound on small overlaps"
+            .to_string(),
+    };
+    let _ = writeln!(
+        s,
+        "{}",
+        heading(
+            out,
+            &format!(
+                "sketch overlap {} ~ {}: approximate ({how})",
+                o.left, o.right
+            )
+        )
+    );
+    let _ = writeln!(
+        s,
+        "  Jaccard ≈{:.4} (99.7%: {:.4}..{:.4}); ≈{} values in both, ≈{} in either (left ≈{}, right ≈{})",
+        o.jaccard,
+        o.jaccard_low,
+        o.jaccard_high,
+        num(o.intersection),
+        num(o.union_distinct),
+        num(o.left_distinct),
+        num(o.right_distinct)
+    );
+    let _ = writeln!(s, "  left  {} in {}", r.left_sketch, r.left_root);
+    let _ = writeln!(s, "  right {} in {}", r.right_sketch, r.right_root);
     s
 }

@@ -34,12 +34,12 @@ use serde::{Deserialize, Serialize};
 use xxhash_rust::xxh3::xxh3_128_with_seed;
 
 use crate::footer::{all_null, stats_of, FooterStats};
-use crate::hll::Hll;
 use crate::quantile::p50_p95_max;
 use crate::ranges::{is_time_type, ColumnRanges, TimeColumn};
 use crate::sampler::{
     dkw_epsilon, high_water_at_most, high_water_for_budget, peak_bytes_bound, DistinctSampler,
 };
+use bellwether_core::hll::Hll;
 
 /// Confidence level of the quantile band reported for a sampled fanout:
 /// `quantile_rank_error` holds with probability at least `1 - QUANTILE_ALPHA`.

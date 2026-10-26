@@ -140,6 +140,10 @@ pub struct SidecarDecl {
     /// Timestamp column(s) the sidecar indexes over.
     #[serde(default)]
     pub time_columns: Vec<String>,
+    /// The sidecar's parameters, by name (`sketch`: `p`, `minhash`). Absent
+    /// when it has none.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub params: BTreeMap<String, String>,
     /// Unknown fields (ADR 017).
     #[serde(flatten)]
     pub extra: Extra,
@@ -147,9 +151,13 @@ pub struct SidecarDecl {
 
 impl SidecarDecl {
     /// Canonical sidecar name, stored in [`SegmentRef::key_spec`] for segments
-    /// of this sidecar: `{kind}:{columns joined by ','}@{time_columns joined by ','}`.
+    /// of this sidecar: `{kind}:{columns joined by ','}@{time_columns joined by ','}`,
+    /// without the `@` part when it has no time column (`sketch:a,b`).
     #[must_use]
     pub fn name(&self) -> String {
+        if self.time_columns.is_empty() {
+            return format!("{}:{}", self.kind, self.columns.join(","));
+        }
         format!(
             "{}:{}@{}",
             self.kind,
@@ -161,7 +169,7 @@ impl SidecarDecl {
 
 /// Segment kinds this build understands in [`SegmentRef::kind`] and
 /// [`SidecarDecl::kind`].
-pub const KNOWN_SEGMENT_KINDS: [&str; 2] = ["bounds", "temporal2"];
+pub const KNOWN_SEGMENT_KINDS: [&str; 3] = ["bounds", "temporal2", "sketch"];
 
 /// Dataset schema, declared key specs, and declared sidecars.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -819,6 +827,7 @@ mod tests {
             kind: "bounds".into(),
             columns: vec!["symbol".into(), "venue".into()],
             time_columns: vec!["ts".into()],
+            params: BTreeMap::new(),
             extra: Extra::new(),
         };
         assert_eq!(decl_bounds.name(), "bounds:symbol,venue@ts");
@@ -827,9 +836,23 @@ mod tests {
             kind: "temporal2".into(),
             columns: vec!["symbol".into()],
             time_columns: vec!["valid".into(), "known".into()],
+            params: BTreeMap::new(),
             extra: Extra::new(),
         };
         assert_eq!(decl_t2.name(), "temporal2:symbol@valid,known");
+        let decl_sketch = SidecarDecl {
+            kind: "sketch".into(),
+            columns: vec!["symbol".into(), "symbol+ts".into()],
+            params: BTreeMap::from([("p".to_string(), "12".to_string())]),
+            ..SidecarDecl::default()
+        };
+        assert_eq!(decl_sketch.name(), "sketch:symbol,symbol+ts");
+        let json = serde_json::to_value(&decl_sketch).unwrap();
+        assert_eq!(json["params"]["p"], "12");
+        assert!(serde_json::to_value(&decl_t2)
+            .unwrap()
+            .get("params")
+            .is_none());
 
         let raw = r#"{
           "storage_version": 1,

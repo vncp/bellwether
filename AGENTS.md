@@ -16,7 +16,12 @@ fail if the two differ.
    funnel, the culprit, the recommended key, and `workload.hash`.
 2. **Read the evidence.** Quote the lint (`rule`, columns, message) and the
    fanout that explain the read. Every number is an exact sum of footer
-   statistics; none is an estimate.
+   statistics; none is an estimate, except those labelled `approximate`:
+   the `sketch` column, the `R-sketch-1` lint, `observe.cardinality`, and
+   `observe.overlap` read `sketch` sidecars (distinct counts with an error
+   bound) and never decide a plan. To ask whether a column is a key without
+   reading the data, call `observe.cardinality`, or `observe.why` with
+   `sketches_only: true`.
 3. **Propose.** Call `propose.key` (a key spec, as JSON or in the short form
    such as `"exact:id"`) or `propose.rewrite` (before, after, invariant: a
    description, never code), citing the evidence hash in
@@ -50,7 +55,7 @@ already holds.
 
 | Tier | Tool | Writes |
 |---|---|---|
-| observe | `observe.why` (no keys), `observe.profile`, `observe.locate`, `observe.asof` | Evidence and cache entries only |
+| observe | `observe.why` (no keys), `observe.cardinality`, `observe.overlap`, `observe.profile`, `observe.locate`, `observe.asof` | Evidence and cache entries only |
 | score (engine-scored) | `score.why` (with keys or a workload), `score.verify` | engine Proposals, Replays, plan Evidence, Certificates |
 | propose | `propose.key`, `propose.layout`, `propose.rewrite` | one Proposal, or nothing with `dry_run` |
 | apply | `apply.receipt` | Replay, the index commit, Receipt; nothing with `dry_run` or on a refusal, unless another commit lands during the apply (`concurrent_commit`: the key is built, the receipt withheld) |

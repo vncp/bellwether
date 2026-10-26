@@ -10,6 +10,8 @@ Work package WP1. This crate holds canonical key encoding, split-block bloom fil
 | `temporal` | `latest` and `asof` across every segment of a key spec, plus `VersionChain`, `VersionHit`, and `is_stale` |
 | `merge` | `merge(&[SegmentReader], &WriterOptions)` |
 | `sidecar` | `bounds` and `temporal2` sidecar segment writer (`SidecarWriter`), reader (`SidecarReader<R: ReadAt>`), `bitemporal_winner`, and `measure` |
+| `sketch` | `sketch` sidecar segments (approximate, never planned with): `FileSketcher` (one file's per-item HyperLogLog and optional MinHash), `SketchWriter`/`SketchReader` (one entry per file stretch, BLAKE3-sealed), `SketchTotals` (folds entries; `cardinality(i, exact)` with its interval, `copresent`), `overlap` (MinHash or HyperLogLog Jaccard with bounds), `value_hash`, `validate`, `item_types` |
+| `hll` | The one HyperLogLog (Ertl's improved raw estimator, `p` in 4..=18), shared by the profiler's fanout pass and the `sketch` sidecar; `merge` is the register-wise maximum (lossless union) |
 
 Tests:
 
@@ -24,6 +26,7 @@ Tests:
 | `tests/conformance.rs` | The pinned test vectors of `docs/format.md`, through both the scalar and the Arrow encoder paths; the test also requires the document's table to list exactly these vectors |
 | `tests/sidecar_conformance.rs` | Pinned byte and record conformance for `bounds` and `temporal2` sidecar segments, `measure`, `add_batch` atomicity, and corruption sweeps |
 | `tests/sidecar_oracle.rs` | Oracle property tests for `bounds`, `temporal2`, and `bitemporal_winner` across row groups, nulls, composite keys, and sentinel timestamps |
+| `tests/sketch.rs` | `sketch` segments: round trip against a brute-force oracle (rows, nulls, distinct counts inside the interval; property test); split files merge losslessly; the HyperLogLog error bound over 312 trials at precisions 10, 12, and 14 (1 to 300,000 distinct values) against exact counts; MinHash and HyperLogLog overlap intervals against the exact Jaccard; nulls per ADR 014; determinism; layout rules behind the checksum; every-byte corruption refused; the `docs/format.md` conformance table byte for byte |
 
 Benchmark: `cargo bench -p bellwether-core --bench lookup` measures single-key lookup latency against segment size.
 
@@ -172,3 +175,11 @@ footer    index_offset u64 | index_len u64 | magic "BWSIDECR"
 ```
 
 Sidecar memory bound (ADR 018): a lookup holds the block index, one block at a time, and the results for the keys asked; `SidecarWriter` holds every distinct `(key, rg)` (for `bounds`) or `(key, valid, known, rg)` (for `temporal2`) until `finish`, and the build crate caps segment size with `sidecar::measure`.
+
+## Sketch segment format (`docs/format.md`, "Sketch segments")
+
+A `sketch` segment (`segments/<blake3>.seg`, magic `"BWSKETCH"`) holds, per sketched item (a column or a `+`-joined tuple, encoded like a composite key, ADR 014) and per file, the row count, the null count, the HyperLogLog registers (sparse or dense), and optionally a MinHash signature of `k` slots. It is a sidecar declared in `schema.sidecars[]` with kind `sketch`; **no planner path reads it**: every number it yields is approximate (`ApproxCardinality`, `ApproxOverlap`, `approximate: true`), and an approximate number in a plan would break invariant 1. The build crate's planner never opens these segments (its `tests/sketch.rs` proves plans are equal with and without them).
+
+A footer checksum (BLAKE3 over every byte before it) makes every damaged byte a typed refusal rather than a silently different estimate. Merging is exact: registers by maximum, slots by minimum, so the union of a file's stretches equals sketching the file whole. Intervals are three standard errors (`SKETCH_CONFIDENCE`) either side, clamped to `[1, rows]`.
+
+Sketch memory bound (ADR 018): a writer holds one open entry (`2^p` registers and `k` slots per item) and the finished entries encoded; `max_entry_bytes` bounds one entry so the build caps a segment's entries and bytes. A reader holds the segment bytes and decodes one entry at a time; `SketchTotals` holds `2^p` registers and `k` slots per item, whatever the file count.

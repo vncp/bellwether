@@ -317,3 +317,33 @@ of 22 row groups, and no rule said so (defect 8 of
 Note: `RowGroupMeta.bytes` is a single total per row group. The estimator
 for this rule needs per-column chunk sizes, which `ColumnStats` does not
 carry today.
+
+### R-sketch-1
+
+- **id**: `R-sketch-1` (the low-cardinality-key lint, read from sketches;
+  `bellwether_profile::lints::low_cardinality_key`).
+- **Detector**: from a complete `sketch` sidecar, no data file read: a
+  sketched column `B` whose values each cover at least 100,000 rows on
+  average (sketched rows over approximate distinct values), beside an
+  id-like sketched column `K` of the same sketch (integer, string, or
+  binary) with at least ten times `B`'s distinct values, present in at least
+  90 % of the files `B` is present in. `B` behaves like a batch timestamp
+  shared by many rows; `K` is the real id. When several columns qualify as
+  `K`, the one with the most distinct values is named. Runs in every `why`
+  over an index with a complete sketch, and is the diagnosis of `why
+  --sketches-only`.
+- **Estimator**: approximate: rows per value of `B` (rows over its
+  HyperLogLog estimate, or over the exact count where a complete
+  `exact:B` key spec holds it) and `K`'s distinct count. No byte figure: a
+  sketch prices nothing; bytes come from replaying a recorded workload under
+  the composite (`why --from`).
+- **Guidance template**: file `<consumer>`, step `<lookup or join on B>`.
+  Before: `key on <B>`. After: `key on (<K>, <B>)`. Invariant: `the rows
+  selected per (<K>, <B>) are the rows selected per <B> restricted to the
+  keys the run supplies`.
+- **Verification method**: reconcile over touched keys (after `why --from`
+  prices the composite and `fix` builds it).
+- **Confidence rubric**: medium (the counts are approximate); high when
+  both distinct counts are exact. It never reaches a plan; it recommends a
+  key that the planner then prices exactly.
+

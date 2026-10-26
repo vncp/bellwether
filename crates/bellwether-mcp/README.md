@@ -24,6 +24,7 @@ Flags: `--index <PATH|URL>` (default `<ROOT>/.bellwether`), `--format parquet|cs
 |---|---|---|---|
 |observe|`observe.why` (no keys)|`why` without a workload|the profile Evidence, cache entries|
 |observe|`observe.profile`|`findings`|nothing|
+|observe|`observe.cardinality` (`items`, `transient`), `observe.overlap` (`left`, `right`)|`cardinality`, `overlap`: approximate distinct counts and Jaccard similarity from `sketch` sidecars (never used to plan); `transient` reads the files for items no sketch holds|nothing|
 |observe|`observe.locate`, `observe.asof`|`locate`, `asof`; with `at_manifest`, on an engine opened at that committed manifest (`EngineOptions::at_manifest`, the CLI's `--at-manifest`)|the `plan` Evidence, cache entries|
 |score|`score.why` (keys or a workload hash)|`why` with a workload|engine Proposals and Replays|
 |score|`score.verify`|`fix` with `verify_only`|Replay, plan Evidence, Certificate|
