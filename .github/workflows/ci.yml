@@ -25,6 +25,7 @@ jobs:
         run: |
           mkdir -p "$RUNNER_TEMP/libduckdb" && cd "$RUNNER_TEMP/libduckdb"
           gh release download v2.0.0 --repo duckdb/duckdb --pattern 'duckdb-shared-libs-linux-amd64.tar.gz'
+          echo '993ad89e7dfca66cd6da994c2cad090c2fc160ddf9f550498a098ab4bb13cfb1  duckdb-shared-libs-linux-amd64.tar.gz' | sha256sum -c -
           tar -xzf duckdb-shared-libs-linux-amd64.tar.gz libduckdb.so
           echo "BELLWETHER_DUCKDB_DRIVER=$RUNNER_TEMP/libduckdb/libduckdb.so" >> "$GITHUB_ENV"
       - name: install the ODBC driver manager (the `odbc` feature of bellwether-source-sql links it)

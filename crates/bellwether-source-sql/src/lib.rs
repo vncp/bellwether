@@ -40,8 +40,10 @@ pub mod url;
 
 pub use driver::Driver;
 pub use measured::{
-    ExplainScorer, MeasuredScore, MeasuredScorer, Measurement, TimingScorer, MEASURED_PLAN,
-    MEASURED_WALL,
+    ExplainScorer, MeasuredScore, MeasuredScorer, Measurement, TimingScorer, MEASURED_AGGREGATES,
+    MEASURED_PLAN, MEASURED_WALL,
 };
-pub use source::{open_driver, SqlOptions, SqlSource, TableRun, DEFAULT_MAX_UNIT_ROWS};
+pub use source::{
+    open_driver, SqlOptions, SqlSource, TableRun, DEFAULT_MAX_UNIT_BYTES, DEFAULT_MAX_UNIT_ROWS,
+};
 pub use url::{is_sql_root, EngineKind, SnapshotPolicy, SqlUrl, TableName};

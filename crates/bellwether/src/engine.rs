@@ -373,7 +373,8 @@ impl Engine {
             return Err(Error::InvalidArgument {
                 field: "index",
                 reason: format!(
-                    "{} is a table, so there is no folder to hold the ledger; give the index                      location where certificates and evidence are written",
+                    "{} is a table, so there is no folder to hold the ledger: give the index \
+                     location, where certificates and evidence are written",
                     url.root()
                 ),
             });

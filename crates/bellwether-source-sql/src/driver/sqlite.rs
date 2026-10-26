@@ -52,9 +52,10 @@ impl SqliteDriver {
     /// error; nothing is created.
     pub(crate) fn open(path: &str) -> Result<Self> {
         if !path.starts_with("file:") && !std::path::Path::new(path).is_file() {
-            return Err(Error::Source(format!(
-                "sqlite: no database file at {path:?}; pass db=<path to the .sqlite file>"
-            )));
+            return Err(Error::Source(
+                "sqlite: no database file at the db= path; pass db=<path to the .sqlite file>"
+                    .into(),
+            ));
         }
         let conn = Connection::open_with_flags(
             path,
@@ -62,7 +63,12 @@ impl SqliteDriver {
                 | OpenFlags::SQLITE_OPEN_URI
                 | OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )
-        .map_err(|e| Error::Source(format!("sqlite: cannot open {path:?}: {e}")))?;
+        .map_err(|e| {
+            Error::Source(format!(
+                "sqlite: cannot open the db= database: {}",
+                super::scrub(&e.to_string(), path)
+            ))
+        })?;
         conn.busy_timeout(Duration::from_secs(30)).map_err(err)?;
         Ok(Self { conn })
     }

@@ -174,7 +174,9 @@ pub(crate) fn run(g: &Global, out: &Out, cmd: &VerifyCommand) -> Result<Outcome,
             // The key is read before anything is scored: a key that cannot
             // be used is a usage error, not a receipt without a signature.
             let key = crate::keys_cmds::signing_key(g, &a.root.root, a.signing_key.as_deref())?;
-            let r = engine_keyed(g, &a.root.root, key, None)?.fix(&request)?;
+            let e = engine_keyed(g, &a.root.root, key, None)?;
+            let table = e.is_table();
+            let r = e.fix(&request)?;
             let code = match &r.outcome {
                 FixOutcome::Applied { .. }
                 | FixOutcome::Verified
@@ -184,7 +186,7 @@ pub(crate) fn run(g: &Global, out: &Out, cmd: &VerifyCommand) -> Result<Outcome,
                 } => EXIT_FAILED,
                 FixOutcome::Refused { .. } => EXIT_REFUSED,
             };
-            done(&r, fix_human(&r, out), code)
+            done(&r, fix_human(&r, out, table), code)
         }
     }
 }
@@ -449,9 +451,17 @@ pub(crate) fn tables_human(s: &mut String, tables: &[bellwether::TableRun]) {
     for t in tables {
         let held = match &t.snapshot {
             Some(snap) => format!("read inside {snap}"),
-            None if t.rechecked => {
-                "no snapshot held: every unit's identity re-read at the end, unchanged".into()
+            None if t.rechecked && t.identity_by == "statistics checksum" => {
+                "no snapshot held: every unit's identity (a statistics checksum) re-read at the \
+                 end, unchanged; an in-place update that keeps every column's bounds, null \
+                 count, and bytes is not seen, so name a version column (version=<column>) or \
+                 read inside a snapshot"
+                    .into()
             }
+            None if t.rechecked => format!(
+                "no snapshot held: every unit's identity ({}) re-read at the end, unchanged",
+                t.identity_by
+            ),
             None => "no snapshot held".into(),
         };
         let _ = writeln!(
@@ -487,7 +497,7 @@ fn signed_line(s: &mut String, r: &FixResult, what: &str) {
 
 // One linear screen, a line per stage.
 #[allow(clippy::too_many_lines)]
-fn fix_human(r: &FixResult, out: &Out) -> String {
+fn fix_human(r: &FixResult, out: &Out, table: bool) -> String {
     let mut s = String::new();
     let what = match &r.proposal.record {
         Record::Proposal(p) => match &p.body {
@@ -502,11 +512,18 @@ fn fix_human(r: &FixResult, out: &Out) -> String {
         "{}",
         heading(
             out,
-            &format!(
-                "fix {}: {what}, against manifest sequence {}",
-                short(&r.proposal.hash),
-                r.manifest_before
-            )
+            &if table {
+                format!(
+                    "fix {}: {what}, over a table (no index, no manifest)",
+                    short(&r.proposal.hash)
+                )
+            } else {
+                format!(
+                    "fix {}: {what}, against manifest sequence {}",
+                    short(&r.proposal.hash),
+                    r.manifest_before
+                )
+            }
         )
     );
     match &r.score {
@@ -648,15 +665,29 @@ fn fix_human(r: &FixResult, out: &Out) -> String {
                 Refusal::NoReplay { .. } => {
                     "the rewrite verified, but a receipt cites a replay and rewrites have none yet (contract v3 backlog #2)".into()
                 }
-                Refusal::AttestOnly { target, run, .. } => {
+                Refusal::AttestOnly {
+                    target,
+                    run,
+                    proposed_rewrite,
+                    ..
+                } => {
                     let mut why = format!(
                         "attest-only: the certificate passed, and {target} is a table, so the \
-                         engine applies nothing and writes no receipt (ADR 027). To apply it, a \
-                         human runs:"
+                         engine applies nothing and writes no receipt (ADR 027)."
                     );
-                    for r in run {
-                        why.push_str("\n    ");
-                        why.push_str(r);
+                    if !run.is_empty() {
+                        why.push_str(" To apply it, a human runs:");
+                        for r in run {
+                            why.push_str("\n    ");
+                            why.push_str(r);
+                        }
+                    }
+                    if let Some(text) = proposed_rewrite {
+                        why.push_str(
+                            " The agent's proposed rewrite, verified on the outputs given; the \
+                             engine never ran it, so review it before deploying it:\n    ",
+                        );
+                        why.push_str(text);
                     }
                     why
                 }

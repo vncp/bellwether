@@ -56,6 +56,16 @@ pub trait Driver: Send {
     }
 }
 
+/// `message` with every occurrence of the connection replaced: a driver
+/// may echo it, and it may hold a credential.
+pub(crate) fn scrub(message: &str, secret: &str) -> String {
+    if secret.is_empty() {
+        message.to_string()
+    } else {
+        message.replace(secret, "<connection>")
+    }
+}
+
 /// Opens the driver for `url`'s engine. With `create`, a DuckDB database
 /// file that does not exist is created; a source passes `false`.
 pub(crate) fn open(url: &SqlUrl, create: bool) -> Result<Box<dyn Driver>> {

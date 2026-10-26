@@ -21,7 +21,7 @@ use bellwether_types::{
 };
 use serde::{Deserialize, Serialize};
 
-use bellwether_source_sql::{TableRun, MEASURED_PLAN};
+use bellwether_source_sql::{TableRun, MEASURED_AGGREGATES};
 
 use crate::engine::{folder_changes, guard, schema_hint, Engine, Pinned, SnapshotFiles};
 use crate::index::{instant_in_unit, no_time_column};
@@ -612,7 +612,7 @@ impl Engine {
             .or_else(|| culprit(&report.current_specs, &report.profile, workload.as_ref()));
         if self.is_table() {
             report.exact = false;
-            report.model = Some(MEASURED_PLAN.to_string());
+            report.model = Some(MEASURED_AGGREGATES.to_string());
             report.tables = self.finish_tables()?;
         }
         Ok(report)

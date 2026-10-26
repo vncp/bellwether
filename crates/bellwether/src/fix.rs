@@ -31,7 +31,7 @@ use bellwether_build::encode_ts;
 use bellwether_build::{BuildOptions, Builder};
 use bellwether_ledger::RecordKind;
 use bellwether_replay::{proposed_specs, Catalog, Replayer, RunKeys, RunQuery, Workload};
-use bellwether_source_sql::{is_sql_root, SqlUrl, MEASURED_PLAN};
+use bellwether_source_sql::{is_sql_root, SqlUrl, MEASURED_AGGREGATES};
 use bellwether_store::{parse_rfc3339, Cache, ObjectStoreBackend};
 use bellwether_types::{
     format, Certificate, Coverage, Error, Evidence, EvidenceBody, FileFingerprint, Hash, HashKind,
@@ -199,15 +199,22 @@ pub enum Refusal {
     /// engine creates no index inside a database and deploys no job, so
     /// apply is attest-only. The passing certificate is written; no
     /// Receipt is, because a Receipt attests an apply the engine made.
-    /// `run` is what a human (or a CI gate) runs to apply it. CLI exit 3.
+    /// `run` is what a human (or a CI gate) runs to apply a key. CLI
+    /// exit 3.
     AttestOnly {
         /// The passing certificate.
         certificate: Hash,
-        /// The table root the proposal targets.
+        /// The table root the proposal targets (the data root).
         target: String,
-        /// The statements to run (a key: one `CREATE INDEX` per table) or
-        /// the query to deploy (a rewrite: its `after` text).
+        /// For a key: one `CREATE INDEX` per table, written by the engine.
+        /// Empty for a rewrite.
         run: Vec<String>,
+        /// For a rewrite: the proposal's `after` text as the agent wrote it,
+        /// verified on the outputs given and never run by the engine. Not a
+        /// statement the engine vouches for: a human reviews it before
+        /// deploying it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        proposed_rewrite: Option<String>,
     },
     /// The Key proposal's replay predicts no saving on the workload: summed
     /// over its runs, the proposal reads at least as many bytes as the
@@ -475,15 +482,26 @@ impl Engine {
                 let mut replay_hash = None;
                 if self.is_table() {
                     let (h, scored) = measured_score(self, &replayer, hash, &workload, &cache)?;
+                    // The same gain gate as over files, on measured costs.
+                    let gate = no_gain(
+                        &h,
+                        &total(&scored.replay.current),
+                        &total(&scored.replay.proposed),
+                        req.allow_no_gain || req.verify_only,
+                    );
                     result.score = Some(Score::Measured {
                         current: total(&scored.replay.current),
                         proposed: total(&scored.replay.proposed),
-                        model: MEASURED_PLAN.to_string(),
+                        model: MEASURED_AGGREGATES.to_string(),
                         replay: Box::new(Written {
                             hash: h,
                             record: Record::Replay(scored.replay),
                         }),
                     });
+                    if let Some(r) = gate {
+                        result.outcome = refused(r);
+                        return Ok(result);
+                    }
                 } else {
                     let replay = self.score(&replayer, hash, &workload, &cache)?;
                     replay_hash = Some(replay.0.hash);
@@ -569,8 +587,10 @@ impl Engine {
                 result.verification = Some(verification);
                 let certificate = cert_of(&cert)?.clone();
                 result.certificate = Some(cert.clone());
-                let table =
-                    self.is_table() || is_sql_root(&outputs.before) || is_sql_root(&outputs.after);
+                // Attest-only when the data root is a table; a rewrite over
+                // a folder has no replay to attest, whatever its outputs are,
+                // so `fix --certificate` (which sees no outputs) agrees.
+                let table = self.is_table();
                 result.outcome = match failed(&cert.hash, &certificate) {
                     Some(r) => refused(r),
                     None if req.verify_only => {
@@ -649,6 +669,36 @@ impl Engine {
                 if let ProposalBody::Rewrite { shape } = body {
                     result.invariant = Some(shape.invariant.clone());
                 }
+                if let (ProposalBody::Key { .. }, false) = (body, dry_run) {
+                    // Re-scored now, and gated like `fix --proposal`.
+                    let Coverage::Workload { workload, .. } = &certificate.coverage else {
+                        return Err(not_workload_covered(cert_hash));
+                    };
+                    let source = self.source(None)?;
+                    let replayer = replayer(self, &*source, None)?;
+                    let cache = self.cache()?;
+                    let workload = load_workload(self, &cache, workload)?;
+                    let (h, scored) =
+                        measured_score(self, &replayer, &proposal_hash, &workload, &cache)?;
+                    let (current, proposed) = (
+                        total(&scored.replay.current),
+                        total(&scored.replay.proposed),
+                    );
+                    let gate = no_gain(&h, &current, &proposed, allow_no_gain);
+                    result.score = Some(Score::Measured {
+                        current,
+                        proposed,
+                        model: MEASURED_AGGREGATES.to_string(),
+                        replay: Box::new(Written {
+                            hash: h,
+                            record: Record::Replay(scored.replay),
+                        }),
+                    });
+                    if let Some(r) = gate {
+                        result.outcome = refused(r);
+                        return Ok(result);
+                    }
+                }
                 result.outcome = refused(self.attest_only(cert_hash, body)?);
             }
             ProposalBody::Rewrite { shape } => {
@@ -718,20 +768,22 @@ impl Engine {
     /// a human runs to apply it.
     fn attest_only(&self, certificate: &Hash, body: &ProposalBody) -> Result<Refusal> {
         let target = self.root().to_string();
-        let run = match body {
+        let (run, proposed_rewrite) = match body {
             ProposalBody::Key { spec } => match self.table_url() {
-                Some(url) => SqlUrl::parse(url)?.create_index_statements(spec.columns()),
-                None => Vec::new(),
+                Some(url) => (
+                    SqlUrl::parse(url)?.create_index_statements(spec.columns()),
+                    None,
+                ),
+                None => (Vec::new(), None),
             },
-            ProposalBody::Rewrite { shape } => vec![shape.after.clone()],
-            ProposalBody::Layout { cluster_by } => {
-                vec![format!("recluster the table by {}", cluster_by.join(", "))]
-            }
+            ProposalBody::Rewrite { shape } => (Vec::new(), Some(shape.after.clone())),
+            ProposalBody::Layout { .. } => (Vec::new(), None),
         };
         Ok(Refusal::AttestOnly {
             certificate: *certificate,
             target,
             run,
+            proposed_rewrite,
         })
     }
 
@@ -1140,7 +1192,7 @@ impl Engine {
 
 /// Scores `proposal` on `workload` without recording the Replay: over a
 /// table (ADR 027) every cost, current and proposed, is measured, so each
-/// is marked inexact and the Replay names [`MEASURED_PLAN`]. The ledger
+/// is marked inexact and the Replay names [`MEASURED_AGGREGATES`]. The ledger
 /// keeps only replays whose current costs are exact (ADR 005), so a
 /// measured one is returned, hashed as it would be stored, and never
 /// stored: nothing measured is ever recorded as exact.
@@ -1174,7 +1226,7 @@ pub(crate) fn mark_measured(replay: &mut bellwether_types::Replay) {
     for c in replay.current.iter_mut().chain(replay.proposed.iter_mut()) {
         c.exact = false;
     }
-    replay.model = Some(MEASURED_PLAN.to_string());
+    replay.model = Some(MEASURED_AGGREGATES.to_string());
 }
 
 /// The data root's catalog digest as the verifier computes a scanned side's

@@ -611,7 +611,20 @@ pub(crate) fn why(r: &bellwether::WhyReport, out: &Out, fix_command: &str) -> St
             }
             CulpritReason::ServingSpec { spec } => format!("the serving key {}", label(spec)),
         };
-        let _ = writeln!(s, "\nculprit ({}): {why}{fan}", c.columns.join(", "));
+        // A table read as one unit: every lookup reads all of it whatever
+        // the index, which is the cause to state.
+        let one_unit = !r.tables.is_empty() && r.tables.iter().all(|t| t.units <= 1);
+        if one_unit {
+            let _ = writeln!(
+                s,
+                "\nculprit: the table is read as one unit, so any lookup reads all of it; cut it \
+                 into key ranges (range=<column>&units=<n> in the root) to see what an index on \
+                 {} would save",
+                c.columns.join(", ")
+            );
+        } else {
+            let _ = writeln!(s, "\nculprit ({}): {why}{fan}", c.columns.join(", "));
+        }
     }
     if let Some(w) = &r.workload {
         let for_kind = kind_label

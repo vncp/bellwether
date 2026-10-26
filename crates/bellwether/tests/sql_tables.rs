@@ -23,10 +23,10 @@ use arrow::array::{
     ArrayRef, Decimal128Array, Int64Array, RecordBatch, StringArray, TimestampMicrosecondArray,
 };
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
-use bellwether::types::{Error, Record};
+use bellwether::types::{Error, ProposalBody, Record, RewriteShape};
 use bellwether::{
-    Engine, EngineOptions, FixOutcome, FixRequest, KeyFile, ReconcileRequest, Refusal, Score,
-    WhyRequest, MEASURED_PLAN,
+    Engine, EngineOptions, FixOutcome, FixRequest, KeyFile, ProposeResult, ReconcileRequest,
+    Refusal, RewriteOutputs, Score, WhyRequest, MEASURED_AGGREGATES,
 };
 use bellwether_source_sql::{open_driver, EngineKind, SnapshotPolicy, SqlUrl, TableName};
 use parquet::arrow::ArrowWriter;
@@ -356,7 +356,7 @@ fn why_over_a_table_never_reports_or_stores_a_measured_cost_as_exact() {
             })
             .unwrap();
         assert!(!r.exact, "{engine}");
-        assert_eq!(r.model.as_deref(), Some(MEASURED_PLAN));
+        assert_eq!(r.model.as_deref(), Some(MEASURED_AGGREGATES));
         assert_eq!(r.tables.len(), 1);
         assert_ne!(r.candidates.len(), 0, "a candidate is priced");
         for c in &r.candidates {
@@ -367,7 +367,7 @@ fn why_over_a_table_never_reports_or_stores_a_measured_cost_as_exact() {
                 rp.current.iter().chain(&rp.proposed).all(|c| !c.exact),
                 "{engine}"
             );
-            assert_eq!(rp.model.as_deref(), Some(MEASURED_PLAN));
+            assert_eq!(rp.model.as_deref(), Some(MEASURED_AGGREGATES));
             assert_eq!(c.replay.record.hash().unwrap(), c.replay.hash);
         }
         let json = serde_json::to_value(&r).unwrap();
@@ -426,6 +426,7 @@ fn fix_over_a_table_is_attest_only_and_writes_no_receipt() {
                     certificate,
                     target,
                     run,
+                    ..
                 },
         } = &r.outcome
         else {
@@ -504,4 +505,191 @@ fn folder_only_operations_refuse_a_table() {
     )
     .unwrap_err();
     assert!(matches!(e, Error::NotAFolder { .. }), "{e}");
+}
+
+fn key_file(dir: &Path, ids: &[i64]) -> PathBuf {
+    let keys = dir.join("keys.parquet");
+    let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+    let batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![Arc::new(Int64Array::from(ids.to_vec())) as ArrayRef],
+    )
+    .unwrap();
+    let mut w = ArrowWriter::try_new(File::create(&keys).unwrap(), schema, None).unwrap();
+    w.write(&batch).unwrap();
+    w.close().unwrap();
+    keys
+}
+
+/// M1: a table that changes during a run without a snapshot is refused
+/// before the certificate is written.
+#[test]
+fn a_table_changing_during_a_reconcile_writes_no_certificate() {
+    let d = tempfile::tempdir().unwrap();
+    let folder = files(d.path());
+    let root = sqlite(d.path()) + "&snapshot=reread";
+    let db = d.path().join("t.sqlite");
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flag = Arc::clone(&stop);
+    let writer = std::thread::spawn(move || {
+        let c = rusqlite::Connection::open(db).unwrap();
+        c.busy_timeout(std::time::Duration::from_secs(5)).unwrap();
+        let mut n = 0;
+        while !flag.load(std::sync::atomic::Ordering::Relaxed) {
+            n += 1;
+            let _ = c.execute("UPDATE trips SET amount = 1000 + ?1 WHERE id = 1", [n]);
+        }
+    });
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    let index = d.path().join("m1");
+    let r = open(&root, &index).reconcile(
+        folder.to_str().unwrap(),
+        &ReconcileRequest {
+            key: vec!["id".into()],
+            ..ReconcileRequest::default()
+        },
+    );
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    writer.join().unwrap();
+    assert!(
+        matches!(r, Err(Error::SourceChanged { .. })),
+        "{:?}",
+        r.map(|_| ())
+    );
+    assert!(!ledger_kinds(&index).contains(&"certificate".to_string()));
+}
+
+/// Items 5, M20: a rewrite over a table is attest-only, names the table,
+/// and carries the agent's text as a proposed rewrite, never as statements
+/// to run; `fix --certificate` agrees.
+#[test]
+fn a_rewrite_over_a_table_is_attest_only_and_names_the_agent_s_text() {
+    let d = tempfile::tempdir().unwrap();
+    let folder = files(d.path());
+    let root = sqlite(d.path());
+    let e = open(&root, &d.path().join("rw"));
+    let ev = e
+        .why(&WhyRequest::default())
+        .unwrap()
+        .evidence
+        .hash
+        .unwrap();
+    let ProposeResult::Written { proposal } = e
+        .propose(
+            ProposalBody::Rewrite {
+                shape: RewriteShape {
+                    before: "SELECT * FROM trips".into(),
+                    after: "DROP TABLE trips".into(),
+                    invariant: "same rows".into(),
+                },
+            },
+            &[ev],
+            "agent",
+        )
+        .unwrap()
+    else {
+        panic!()
+    };
+    let r = e
+        .fix(&FixRequest {
+            proposal: Some(proposal.hash),
+            rewrite: Some(RewriteOutputs {
+                before: folder.to_string_lossy().into_owned(),
+                after: folder.to_string_lossy().into_owned(),
+                key: vec!["id".into()],
+                ..RewriteOutputs::default()
+            }),
+            ..FixRequest::default()
+        })
+        .unwrap();
+    let cert = r.certificate.as_ref().unwrap().hash;
+    for out in [
+        r.outcome,
+        e.fix(&FixRequest {
+            certificate: Some(cert),
+            ..FixRequest::default()
+        })
+        .unwrap()
+        .outcome,
+    ] {
+        let FixOutcome::Refused {
+            refusal:
+                Refusal::AttestOnly {
+                    target,
+                    run,
+                    proposed_rewrite,
+                    ..
+                },
+        } = out
+        else {
+            panic!("{out:?}")
+        };
+        assert_eq!(target, "sql://sqlite/main.trips");
+        assert_eq!(run, Vec::<String>::new());
+        assert_eq!(proposed_rewrite.as_deref(), Some("DROP TABLE trips"));
+    }
+}
+
+/// Item 6: attest-only keeps the gain gate: a key that saves nothing on a
+/// table read as one unit is refused unless `allow_no_gain`.
+#[test]
+fn attest_only_keeps_the_gain_gate() {
+    let d = tempfile::tempdir().unwrap();
+    let keys = key_file(d.path(), &[3, 4]);
+    let root = sqlite(d.path()).replace("&range=id&units=3", "");
+    let e = open(&root, &d.path().join("g"));
+    let why = e
+        .why(&WhyRequest {
+            keys: Some(KeyFile::new(&keys)),
+            ..WhyRequest::default()
+        })
+        .unwrap();
+    assert!(why.recommended.is_none());
+    let req = FixRequest {
+        proposal: Some(why.candidates[0].proposal.hash),
+        workload: Some(why.workload.as_ref().unwrap().hash),
+        ..FixRequest::default()
+    };
+    let r = e.fix(&req).unwrap();
+    assert!(
+        matches!(
+            r.outcome,
+            FixOutcome::Refused {
+                refusal: Refusal::NothingToGain { .. }
+            }
+        ),
+        "{:?}",
+        r.outcome
+    );
+    let r = e
+        .fix(&FixRequest {
+            allow_no_gain: true,
+            ..req
+        })
+        .unwrap();
+    assert!(
+        matches!(
+            r.outcome,
+            FixOutcome::Refused {
+                refusal: Refusal::AttestOnly { .. }
+            }
+        ),
+        "{:?}",
+        r.outcome
+    );
+}
+
+/// Item 4: no facade error over a table names its connection.
+#[test]
+fn no_facade_error_names_the_connection() {
+    let d = tempfile::tempdir().unwrap();
+    let root = format!(
+        "sql://sqlite/main.t?db={}/TOKEN-77f1.sqlite",
+        d.path().display()
+    );
+    let e = open(&root, &d.path().join("i"))
+        .why(&WhyRequest::default())
+        .unwrap_err()
+        .to_string();
+    assert!(!e.contains("TOKEN-77f1"), "{e}");
 }

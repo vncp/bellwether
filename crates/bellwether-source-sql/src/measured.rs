@@ -28,6 +28,9 @@ use crate::url::{EngineKind, SqlUrl};
 
 /// The model of costs read from statistics the engine reports.
 pub const MEASURED_PLAN: &str = "measured: engine plan statistics";
+/// The model of `why` and `fix` costs over a table: the logical bytes the
+/// per-unit aggregates report (no planner statistic is read).
+pub const MEASURED_AGGREGATES: &str = "measured: logical bytes from per-unit aggregates";
 /// The model of costs timed on the wall clock.
 pub const MEASURED_WALL: &str = "measured: wall time";
 

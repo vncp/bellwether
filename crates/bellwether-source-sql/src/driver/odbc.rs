@@ -27,8 +27,9 @@ impl OdbcDriver {
             .connect_with_connection_string(connection_string, ConnectionOptions::default())
             .map_err(|e| {
                 Error::Source(format!(
-                    "mssql (ODBC): cannot connect ({e}); check the ODBC driver is installed and \
-                     the connection string in db= (or the variable db=env:NAME names)"
+                    "mssql (ODBC): cannot connect ({}); check the ODBC driver is installed and \
+                     the connection string in db= (or the variable db=env:NAME names)",
+                    super::scrub(&e.to_string(), connection_string)
                 ))
             })?;
         Ok(Self { conn })

@@ -21,6 +21,15 @@ use crate::url::{EngineKind, TableName};
 /// says which unit it counts.
 pub(crate) const INTEGER_UNIT: &str = "bellwether.sqlite.integer_unit";
 
+/// Field metadata on a Postgres `character(n)` column: compared ignoring
+/// trailing blanks but read padded, so `MIN`/`MAX` are not bounds of the
+/// values read, and none are reported.
+pub(crate) const PG_BPCHAR: &str = "bellwether.postgres.bpchar";
+
+/// `[0-9]` repeated as a SQLite GLOB.
+const D4: &str = "[0-9][0-9][0-9][0-9]";
+const D2: &str = "[0-9][0-9]";
+
 /// The engine-specific SQL.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Dialect(pub EngineKind);
@@ -122,7 +131,14 @@ impl Dialect {
                 return Err("Flight SQL columns are typed by the driver".into())
             }
         };
-        Ok(Field::new(&c.name, dt, c.nullable))
+        let field = Field::new(&c.name, dt, c.nullable);
+        Ok(
+            if self.0 == EngineKind::Postgres && spelled == "CHARACTER" {
+                field.with_metadata([(PG_BPCHAR.to_string(), "true".to_string())].into())
+            } else {
+                field
+            },
+        )
     }
 
     /// The snapshot a run holds, or `None` where the engine has none this
@@ -170,8 +186,19 @@ impl Dialect {
 
     /// `MIN` and `MAX` of a column as bounds in the canonical order, or
     /// `None` where the engine cannot give that order: strings compare by
-    /// UTF-8 bytes (binary collation), booleans as 0 and 1.
-    pub fn min_max(self, column: &str, dt: &DataType) -> Option<(String, String)> {
+    /// UTF-8 bytes (binary collation), booleans as 0 and 1. Postgres
+    /// `bytea` has no `MIN`, and `character(n)` compares ignoring trailing
+    /// blanks while it is read padded: no bounds for either.
+    pub fn min_max(self, field: &Field) -> Option<(String, String)> {
+        let (column, dt) = (field.name(), field.data_type());
+        if self.0 == EngineKind::Postgres
+            && (matches!(
+                dt,
+                DataType::Binary | DataType::LargeBinary | DataType::BinaryView
+            ) || field.metadata().contains_key(PG_BPCHAR))
+        {
+            return None;
+        }
         let c = self.ident(column);
         let text = matches!(
             dt,
@@ -205,13 +232,49 @@ impl Dialect {
         }
     }
 
+    /// SQLite only: an expression counting the non-null values of `field`
+    /// whose storage class or text shape `MIN`/`MAX` would not order as the
+    /// values are read (a text timestamp with a zone or another separator,
+    /// a date with spaces, a number stored as text, integers beside text).
+    /// When it is not zero the unit reports no bounds for the column.
+    pub fn irregular(self, field: &Field) -> Option<String> {
+        if self.0 != EngineKind::Sqlite {
+            return None;
+        }
+        let c = self.ident(field.name());
+        let regular = match field.data_type() {
+            DataType::Timestamp(..) => format!(
+                "CASE WHEN SUM(typeof({c}) = 'integer') = COUNT({c}) THEN COUNT({c}) ELSE \
+                 SUM(typeof({c}) = 'text' AND ({c} GLOB '{D4}-{D2}-{D2} {D2}:{D2}:{D2}' OR \
+                 ({c} GLOB '{D4}-{D2}-{D2} {D2}:{D2}:{D2}.[0-9]*' AND substr({c}, 21) NOT GLOB \
+                 '*[^0-9]*'))) END"
+            ),
+            DataType::Date32 => {
+                format!("SUM(typeof({c}) = 'text' AND {c} GLOB '{D4}-{D2}-{D2}')")
+            }
+            DataType::Decimal128(..) | DataType::Float32 | DataType::Float64 => {
+                format!("SUM(typeof({c}) IN ('integer', 'real'))")
+            }
+            _ => return None,
+        };
+        Some(format!("COUNT({c}) - COALESCE({regular}, 0)"))
+    }
+
     /// The bytes of one value of a variable-width column.
-    pub fn octets(self, column: &str) -> String {
-        let c = self.ident(column);
+    pub fn octets(self, field: &Field) -> String {
+        let c = self.ident(field.name());
+        let text = matches!(
+            field.data_type(),
+            DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View
+        );
         match self.0 {
             EngineKind::Sqlite => format!("length(CAST({c} AS BLOB))"),
-            EngineKind::Duckdb => format!("octet_length(CAST({c} AS BLOB))"),
-            EngineKind::Postgres | EngineKind::FlightSql => format!("octet_length({c})"),
+            // `strlen` is the UTF-8 byte length; a cast of text to BLOB
+            // fails on any non-ASCII character.
+            EngineKind::Duckdb if text => format!("strlen({c})"),
+            EngineKind::Duckdb | EngineKind::Postgres | EngineKind::FlightSql => {
+                format!("octet_length({c})")
+            }
             EngineKind::Mssql => format!("DATALENGTH({c})"),
         }
     }
@@ -256,7 +319,9 @@ impl Dialect {
     /// The row of `array` as a literal of the column's own type, for a
     /// range unit's boundary. The value came from the engine's own answer,
     /// so the literal compares in the engine's own order.
-    pub fn literal(self, array: &ArrayRef, row: usize) -> Result<String> {
+    /// `integer_time`: the column is a SQLite time column holding integer
+    /// counts of its unit, compared as integers.
+    pub fn literal(self, array: &ArrayRef, row: usize, integer_time: bool) -> Result<String> {
         if array.is_null(row) {
             return Err(Error::Source("a range boundary is null".into()));
         }
@@ -301,7 +366,11 @@ impl Dialect {
             }
             DataType::Timestamp(unit, tz) => {
                 let v = crate::cast::timestamp_column(array, *unit, row);
-                self.timestamp_literal(v, *unit, tz.is_some())?
+                if integer_time && self.0 == EngineKind::Sqlite {
+                    v.to_string()
+                } else {
+                    self.timestamp_literal(v, *unit, tz.is_some())?
+                }
             }
             _ => return Err(unsupported()),
         })

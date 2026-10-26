@@ -44,8 +44,12 @@ Each table is cut into units, each a "file" of one row group: its declared parti
 | `ColumnStats.bytes`, `RowGroupMeta.bytes` | **measured**: logical bytes, the non-null count times the type's width, or the engine's octet length summed for strings and binaries; not storage bytes |
 | `ColumnStats.distinct_count`, `has_bloom` | `None`, `false` |
 | unit counts, units read, rows read in `why`, `fix`, and reconcile | counts |
-| bytes in `why` and `fix` over a table, the dataset's bytes | **measured** (`exact: false`, model `measured: engine plan statistics`) |
+| bytes in `why` and `fix` over a table, the dataset's bytes | **measured** (`exact: false`, model `measured: logical bytes from per-unit aggregates`) |
 | `MeasuredScore` | **measured**: wall-clock nanoseconds (`measured: wall time`), or Postgres buffers / DuckDB rows scanned from `EXPLAIN ANALYZE` (`measured: engine plan statistics`), with the noise as a bound |
+
+Bounds are reported only where the engine's `MIN`/`MAX` order is the order of the values read: SQLite times, dates, and decimals only when every value has one storage class and (for text) the one canonical shape (`YYYY-MM-DD HH:MM:SS[.f]`, `YYYY-MM-DD`); none for Postgres `bytea` (no `MIN`) or `character(n)` (compared without trailing blanks, read padded); strings in byte order under any column collation.
+
+SQLite itself stores a `DECIMAL(p,s)` value with more than 15 significant digits as an 8-byte float or integer and loses its last digits on insert (`'12345678901234567.89'` becomes `12345678901234568`); the reader reads what SQLite stored, so declare such columns `TEXT` and give the decimal type in the dataset schema.
 
 Planner statistics (`pg_stats`, `sqlite_stat4`, BRIN summaries, DuckDB zone maps, columnstore segment metadata) are never used as bounds: they are samples, or cover block ranges and row groups that are not the unit, and a bound that excludes a row would break invariant 1.
 
@@ -55,11 +59,13 @@ The identity's limit: the statistics checksum sees a change to the row count or 
 
 A run (a reconcile, a `why`, a `fix`) holds one read transaction where the engine has a snapshot: Postgres `REPEATABLE READ READ ONLY`, DuckDB's transaction (snapshot isolation), a SQLite read transaction, SQL Server `SNAPSHOT` isolation when the database allows it. The transaction is rolled back when the run ends. Where there is none (`snapshot=reread`, Flight SQL, SQL Server without snapshot isolation), every unit's identity and the partition list are read again before anything is recorded, and a change is refused (`Error::SourceChanged`, MCP `source_changed`): never a partial answer. A unit read that returns another row count than its identity says is refused either way. In SQLite's rollback-journal mode a read transaction makes writers wait for the run; `snapshot=reread` avoids that. The human output names which discipline each table got.
 
+A DuckDB source opens its database read-only, so other processes may read it too (a process that already holds the file read-write in this process is shared instead). Errors never print the connection: a driver's message has it replaced by `<connection>`, and the CLI prints a root as `db=<connection>` unless it names an environment variable. The source identity covers a hash of the connection with its credentials removed, so two databases holding a table of one name are two identities. A unit holds at most `max_unit_rows` rows and `max_unit_bytes` logical bytes (16 Mi rows, 1 GiB); `read_columns` may hold a second copy while it joins the engine's batches, so twice that at most.
+
 Every value is read at the dataset type and converted exactly or refused, never rounded: a decimal at another scale is rescaled exactly, a timestamp in another unit converted exactly, an integer narrowed only if it fits. When a table is reconciled against a folder, the table is read at the folder's types where the two differ only in scale, unit, or width (`--schema` for the data root wins).
 
 ## Measured costs and attest-only apply
 
-Over a table every cost is measured, never exact (ADR 027). `why` and `fix` compute the same replay as over files, mark every cost `exact: false` with the model `measured: engine plan statistics`, and report it; the ledger keeps a Replay only when its current costs are exact (ADR 005), so these are never recorded, and nothing measured is ever stored as exact. The `MeasuredScorer` trait (`TimingScorer`, `ExplainScorer`) has the shape of evolve's `Scorer` (`docs/evolve.md` §10) and is for evolve once it lands; nothing in the engine calls it, since it runs SQL text and a Proposal's text is an agent's.
+Over a table every cost is measured, never exact (ADR 027). `why` and `fix` compute the same replay as over files, mark every cost `exact: false` with the model `measured: logical bytes from per-unit aggregates`, and report it; the ledger keeps a Replay only when its current costs are exact (ADR 005), so these are never recorded, and nothing measured is ever stored as exact. The `MeasuredScorer` trait (`TimingScorer`, `ExplainScorer`) has the shape of evolve's `Scorer` (`docs/evolve.md` §10) and is for evolve once it lands; nothing in the engine calls it, since it runs SQL text and a Proposal's text is an agent's.
 
 Apply is attest-only. The engine creates no index inside a database and deploys no job, so `fix` over a table scores, verifies, writes the Certificate, and refuses with `attest_only`, naming what a human runs (`CREATE INDEX "bw_<table>_<cols>" ON ...` per table for a key; the rewrite's `after` text for a rewrite). No Receipt is written: a Receipt attests an apply the engine made against `manifest_before`, and here the engine made none.
 

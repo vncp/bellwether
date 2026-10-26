@@ -69,7 +69,22 @@ fn postgres_units_statistics_and_snapshot() {
              00:00:00+00' + i * interval '1 millisecond', i % 2 = 0 FROM generate_series(1, 99) i"
         ),
         &format!("CREATE TABLE {s}.plain AS SELECT * FROM {s}.t"),
+        // Review items 2, 3, M11: bytea and character(n) get no bounds; an
+        // ICU-collated column is still bounded in byte order.
+        &format!("CREATE TABLE {s}.odd (b bytea, c character(4), u text COLLATE \"und-x-icu\")"),
+        &format!("INSERT INTO {s}.odd VALUES ('\\x01', 'ab', 'a'), ('\\x02', E'ab\\t', 'B')"),
     ]);
+    let odd = SqlSource::connect(&pg_root(&s, "odd", ""), SqlOptions::default()).unwrap();
+    let rg = odd
+        .row_groups(&odd.discover(odd.root()).unwrap()[0])
+        .unwrap()
+        .remove(0);
+    assert_eq!((&rg.stats[0].min, &rg.stats[1].min), (&None, &None));
+    assert_eq!(
+        rg.stats[2].min,
+        Some(bellwether_source::canonical::encode_utf8("B"))
+    );
+    drop(odd);
     let src = SqlSource::connect(&pg_root(&s, "t", ""), SqlOptions::default()).unwrap();
     let schema = src.schema(src.root()).unwrap();
     let cols: Vec<String> = schema.fields().iter().map(|f| f.name().clone()).collect();

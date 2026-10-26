@@ -335,6 +335,15 @@ impl SqlUrl {
             .collect()
     }
 
+    /// BLAKE3 of the connection with its credentials removed: a URI's
+    /// `user:password@`, query parameters and ODBC keys naming a password,
+    /// token, secret, or key. Two databases holding tables of one name are
+    /// then two identities, and no credential is hashed into a record.
+    #[must_use]
+    pub fn connection_identity(&self) -> bellwether_types::Hash {
+        bellwether_types::Hash::of(strip_credentials(&self.db).as_bytes())
+    }
+
     /// What, besides the tables, decides the units and their identities:
     /// part of the source configuration a cache is keyed by.
     #[must_use]
@@ -348,6 +357,74 @@ impl SqlUrl {
         }
         s
     }
+}
+
+fn secret_key(k: &str) -> bool {
+    let k = k.trim().to_ascii_lowercase();
+    [
+        "pass",
+        "pwd",
+        "token",
+        "secret",
+        "key",
+        "auth",
+        "credential",
+    ]
+    .iter()
+    .any(|w| k.contains(w))
+}
+
+/// `db` without credentials (see [`SqlUrl::connection_identity`]).
+#[must_use]
+pub fn strip_credentials(db: &str) -> String {
+    let (base, query) = db.split_once('?').unwrap_or((db, ""));
+    let base = match base.split_once("://") {
+        Some((scheme, rest)) => match rest.split_once('@') {
+            Some((_, host))
+                if !rest[..rest.find('/').unwrap_or(rest.len())].is_empty()
+                    && rest.find('@') < rest.find('/').or(Some(usize::MAX)) =>
+            {
+                format!("{scheme}://{host}")
+            }
+            _ => base.to_string(),
+        },
+        None => base.to_string(),
+    };
+    // ODBC: key=value pairs separated by `;`.
+    let base = if base.contains(';') && base.contains('=') {
+        base.split(';')
+            .filter(|kv| !kv.split_once('=').is_some_and(|(k, _)| secret_key(k)))
+            .collect::<Vec<_>>()
+            .join(";")
+    } else {
+        base
+    };
+    let query: Vec<&str> = query
+        .split('&')
+        .filter(|kv| !kv.is_empty() && !secret_key(kv.split_once('=').map_or(*kv, |(k, _)| k)))
+        .collect();
+    if query.is_empty() {
+        base
+    } else {
+        format!("{base}?{}", query.join("&"))
+    }
+}
+
+/// A root as given, its `db=` value replaced by `<connection>` unless it
+/// names an environment variable (`db=env:NAME`): what may be printed.
+#[must_use]
+pub fn redact_db(given: &str) -> String {
+    let Some((root, query)) = given.split_once('?') else {
+        return given.to_string();
+    };
+    let kept: Vec<String> = query
+        .split('&')
+        .map(|kv| match kv.split_once('=') {
+            Some(("db", v)) if !v.starts_with("env:") => "db=<connection>".to_string(),
+            _ => kv.to_string(),
+        })
+        .collect();
+    format!("{root}?{}", kept.join("&"))
 }
 
 /// Percent-decodes one path segment (`%2E` is a literal dot inside a

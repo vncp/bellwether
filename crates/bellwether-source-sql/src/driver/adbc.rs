@@ -35,19 +35,28 @@ struct Shared {
     _driver: ManagedDriver,
 }
 
-type Instances = Mutex<HashMap<(EngineKind, String), Weak<Shared>>>;
+type Instances = Mutex<HashMap<(EngineKind, String, bool), Weak<Shared>>>;
 
 static INSTANCES: LazyLock<Instances> = LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// A connection through an ADBC driver.
 pub(crate) struct AdbcDriver {
     engine: EngineKind,
+    /// The connection, scrubbed from every error message.
+    secret: String,
     conn: ManagedConnection,
     _shared: Arc<Shared>,
 }
 
-fn adbc(engine: EngineKind) -> impl Fn(adbc_core::error::Error) -> Error {
-    move |e| Error::Source(format!("{engine} (ADBC): {}", e.message.trim()))
+/// An ADBC error as a source error, with every occurrence of the
+/// connection (`secret`) replaced: a driver may echo it.
+fn adbc_err(engine: EngineKind, secret: &str) -> impl Fn(adbc_core::error::Error) -> Error + '_ {
+    move |e| {
+        Error::Source(format!(
+            "{engine} (ADBC): {}",
+            super::scrub(e.message.trim(), secret)
+        ))
+    }
 }
 
 /// The driver library's environment variable, default name, and init
@@ -134,8 +143,9 @@ fn shared(url: &SqlUrl, create: bool) -> Result<Arc<Shared>> {
             let path = Path::new(&url.db);
             let missing = |e: std::io::Error| {
                 Error::Source(format!(
-                    "duckdb: no database file at {:?} ({e}); pass db=<path to the .duckdb file>",
-                    url.db
+                    "duckdb: no database file at the db= path ({}); pass db=<path to the .duckdb \
+                     file>",
+                    e.kind()
                 ))
             };
             let canonical = if create && !path.exists() {
@@ -157,7 +167,14 @@ fn shared(url: &SqlUrl, create: bool) -> Result<Arc<Shared>> {
         .lock()
         .map_err(|_| Error::Other("the ADBC instance map is poisoned".into()))?;
     if !key.is_empty() {
-        if let Some(s) = map.get(&(engine, key.clone())).and_then(Weak::upgrade) {
+        // A source reuses a read-write instance this process already has
+        // open (two instances of one file would not see each other's
+        // writes), else opens its own read-only one.
+        let modes: &[bool] = if create { &[true] } else { &[true, false] };
+        if let Some(s) = modes
+            .iter()
+            .find_map(|m| map.get(&(engine, key.clone(), *m)).and_then(Weak::upgrade))
+        {
             return Ok(s);
         }
     }
@@ -171,16 +188,24 @@ fn shared(url: &SqlUrl, create: bool) -> Result<Arc<Shared>> {
     } else {
         key.clone()
     };
+    let mut opts = vec![(option, OptionValue::String(target))];
+    if engine == EngineKind::Duckdb && !create && !key.is_empty() {
+        // A source only reads: other processes may hold the file too.
+        opts.push((
+            OptionDatabase::Other("access_mode".into()),
+            OptionValue::String("READ_ONLY".into()),
+        ));
+    }
     let database = driver
-        .new_database_with_opts([(option, OptionValue::String(target))])
-        .map_err(adbc(engine))?;
+        .new_database_with_opts(opts)
+        .map_err(adbc_err(engine, &url.db))?;
     let s = Arc::new(Shared {
         database,
         _driver: driver,
     });
     if !key.is_empty() {
         map.retain(|_, w| w.strong_count() > 0);
-        map.insert((engine, key), Arc::downgrade(&s));
+        map.insert((engine, key, create), Arc::downgrade(&s));
     }
     Ok(s)
 }
@@ -190,9 +215,13 @@ impl AdbcDriver {
     /// created (a source never creates one).
     pub(crate) fn open(url: &SqlUrl, create: bool) -> Result<Self> {
         let shared = shared(url, create)?;
-        let conn = shared.database.new_connection().map_err(adbc(url.engine))?;
+        let conn = shared
+            .database
+            .new_connection()
+            .map_err(adbc_err(url.engine, &url.db))?;
         Ok(Self {
             engine: url.engine,
+            secret: url.db.clone(),
             conn,
             _shared: shared,
         })
@@ -206,13 +235,17 @@ impl Driver for AdbcDriver {
         _native: &SchemaRef,
         each: &mut dyn FnMut(RecordBatch) -> Result<()>,
     ) -> Result<()> {
-        let e = adbc(self.engine);
+        let e = adbc_err(self.engine, &self.secret);
         let mut st = self.conn.new_statement().map_err(&e)?;
         st.set_sql_query(sql).map_err(&e)?;
         let reader = st.execute().map_err(&e)?;
         for batch in reader {
             let batch = batch.map_err(|err| {
-                Error::Source(format!("{} (ADBC): reading a result: {err}", self.engine))
+                Error::Source(format!(
+                    "{} (ADBC): reading a result: {}",
+                    self.engine,
+                    super::scrub(&err.to_string(), &self.secret)
+                ))
             })?;
             each(batch)?;
         }
@@ -220,7 +253,7 @@ impl Driver for AdbcDriver {
     }
 
     fn execute(&mut self, sql: &str) -> Result<()> {
-        let e = adbc(self.engine);
+        let e = adbc_err(self.engine, &self.secret);
         let mut st = self.conn.new_statement().map_err(&e)?;
         st.set_sql_query(sql).map_err(&e)?;
         st.execute_update().map_err(&e)?;
@@ -230,6 +263,6 @@ impl Driver for AdbcDriver {
     fn table_schema(&mut self, table: &TableName) -> Result<Schema> {
         self.conn
             .get_table_schema(None, Some(&table.schema), &table.table)
-            .map_err(adbc(self.engine))
+            .map_err(adbc_err(self.engine, &self.secret))
     }
 }

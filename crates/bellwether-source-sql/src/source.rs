@@ -21,6 +21,12 @@ use crate::url::{redact, EngineKind, SnapshotPolicy, SqlUrl, TableName};
 /// into key ranges (`range=<column>&units=<n>`).
 pub const DEFAULT_MAX_UNIT_ROWS: u64 = 16 * 1024 * 1024;
 
+/// The largest unit read by default, in logical bytes (the unit's
+/// `RowGroupMeta::bytes`). `read_columns` holds a unit's projected columns
+/// and, while it joins the engine's batches into one, a second copy: at
+/// most twice this.
+pub const DEFAULT_MAX_UNIT_BYTES: u64 = 1024 * 1024 * 1024;
+
 /// How a [`SqlSource`] reads.
 #[derive(Clone, Debug)]
 pub struct SqlOptions {
@@ -30,6 +36,8 @@ pub struct SqlOptions {
     pub schema: Option<SchemaRef>,
     /// The largest unit, in rows ([`DEFAULT_MAX_UNIT_ROWS`]).
     pub max_unit_rows: u64,
+    /// The largest unit, in logical bytes ([`DEFAULT_MAX_UNIT_BYTES`]).
+    pub max_unit_bytes: u64,
 }
 
 impl Default for SqlOptions {
@@ -37,6 +45,7 @@ impl Default for SqlOptions {
         Self {
             schema: None,
             max_unit_rows: DEFAULT_MAX_UNIT_ROWS,
+            max_unit_bytes: DEFAULT_MAX_UNIT_BYTES,
         }
     }
 }
@@ -62,6 +71,10 @@ pub struct TableRun {
     /// Whether every unit's identity was re-read when the run ended (and
     /// found unchanged; a change is an error, never a result).
     pub rechecked: bool,
+    /// What a unit's identity is: `version column <name>`, or `statistics
+    /// checksum`, which does not see an in-place update that keeps every
+    /// column's bounds, null count, and bytes.
+    pub identity_by: String,
     /// The source identity: BLAKE3 over the root and every unit's path and
     /// identity, in path order (contract v3 backlog #10).
     pub identity: Hash,
@@ -118,7 +131,9 @@ impl std::fmt::Debug for SqlSource {
 /// The driver for `url`'s engine, as [`SqlSource::connect`] opens it,
 /// except that a DuckDB database file that does not exist is created (for
 /// loading a table; a source never creates one). The driver runs whatever
-/// SQL it is given: only for SQL the caller trusts.
+/// SQL it is given: only for SQL the caller trusts. A DuckDB source
+/// opened while this driver is alive shares its instance; one opened
+/// before it holds a read-only instance that does not see its writes.
 pub fn open_driver(url: &SqlUrl) -> Result<Box<dyn Driver>> {
     driver::open(url, true)
 }
@@ -145,13 +160,22 @@ fn fixed_width(dt: &DataType) -> Option<u64> {
 }
 
 /// A boundary literal as a path segment: the value without its type
-/// keyword and quotes, a space as `T`.
+/// keyword and quotes, every byte outside `[A-Za-z0-9._:-]` percent-escaped,
+/// so two boundaries never share a path.
 fn shown(literal: &str) -> String {
     let inner = match (literal.find('\''), literal.rfind('\'')) {
         (Some(a), Some(b)) if b > a => &literal[a + 1..b],
         _ => literal,
     };
-    inner.replace(' ', "T").replace('/', "%2F")
+    let mut out = String::with_capacity(inner.len());
+    for b in inner.bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b':' | b'-') {
+            out.push(char::from(b));
+        } else {
+            let _ = write!(out, "%{b:02X}");
+        }
+    }
+    out
 }
 
 impl SqlSource {
@@ -227,6 +251,13 @@ impl SqlSource {
     /// The snapshot this run holds, if any.
     pub fn snapshot(&self) -> Result<Option<&'static str>> {
         Ok(self.lock()?.snapshot)
+    }
+
+    fn identity_by(&self) -> String {
+        match &self.url.version {
+            Some(v) => format!("version column {v}"),
+            None => "statistics checksum".into(),
+        }
     }
 
     /// The source configuration a cache is keyed by.
@@ -473,6 +504,7 @@ impl SqlSource {
             ))
         })?;
         let q = self.dialect.ident(col);
+        let integer_time = field.metadata().contains_key(crate::dialect::INTEGER_UNIT);
         let count_shape = Arc::new(Schema::new(vec![Field::new("n", DataType::Int64, true)]));
         let rows = collect(
             &mut *inner.driver,
@@ -509,7 +541,7 @@ impl SqlSource {
                 let len = b.num_rows() as u64;
                 while next < wanted.len() && wanted[next] < seen + len {
                     let row = usize::try_from(wanted[next] - seen).unwrap_or(usize::MAX);
-                    let lit = dialect.literal(col_values, row)?;
+                    let lit = dialect.literal(col_values, row, integer_time)?;
                     if literals.last() != Some(&lit) {
                         literals.push(lit);
                     }
@@ -587,7 +619,7 @@ impl SqlSource {
         // Per column: [min, max,] nulls, [octets].
         let mut layout = Vec::with_capacity(native.fields().len());
         for (n, f) in native.fields().iter().zip(dataset.fields()) {
-            let mm = d.min_max(n.name(), n.data_type());
+            let mm = d.min_max(n);
             if let Some((min, max)) = &mm {
                 exprs.push(min.clone());
                 exprs.push(max.clone());
@@ -604,11 +636,17 @@ impl SqlSource {
             ds.push(Field::new("nulls", DataType::Int64, true));
             let width = fixed_width(f.data_type());
             if width.is_none() {
-                exprs.push(Dialect::bigint(&format!("SUM({})", d.octets(n.name()))));
+                exprs.push(Dialect::bigint(&format!("SUM({})", d.octets(n))));
                 nat.push(Field::new("octets", DataType::Int64, true));
                 ds.push(Field::new("octets", DataType::Int64, true));
             }
-            layout.push((mm.is_some(), width));
+            let irregular = mm.as_ref().and_then(|_| d.irregular(n));
+            if let Some(expr) = &irregular {
+                exprs.push(Dialect::bigint(expr));
+                nat.push(Field::new("irregular", DataType::Int64, true));
+                ds.push(Field::new("irregular", DataType::Int64, true));
+            }
+            layout.push((mm.is_some(), width, irregular.is_some()));
         }
         let mut sql = format!("SELECT {} FROM {}", exprs.join(", "), unit.from);
         if let Some(w) = &unit.filter {
@@ -653,7 +691,7 @@ impl SqlSource {
             None
         };
         let mut stats = Vec::with_capacity(layout.len());
-        for (f, (has_mm, width)) in dataset.fields().iter().zip(&layout) {
+        for (f, (has_mm, width, checked)) in dataset.fields().iter().zip(&layout) {
             let (mut min, mut max) = (None, None);
             if *has_mm {
                 min = encode_as(b.column(i).as_ref(), 0, f.data_type())?;
@@ -703,6 +741,19 @@ impl SqlSource {
                     (Some(s), _) => Some(s),
                 }
             };
+            // Bounds that the engine's order does not make bounds of the
+            // values read are dropped (invariant 1).
+            let (min, max) = if *checked {
+                let n = int(i, "an irregular count")?.unwrap_or(0);
+                i += 1;
+                if n > 0 {
+                    (None, None)
+                } else {
+                    (min, max)
+                }
+            } else {
+                (min, max)
+            };
             stats.push(ColumnStats {
                 column: f.name().clone(),
                 min,
@@ -744,7 +795,15 @@ impl SqlSource {
                     )));
                 }
                 sum += rows;
-                let bytes = stats.iter().filter_map(|s| s.bytes).sum();
+                let bytes: u64 = stats.iter().filter_map(|s| s.bytes).sum();
+                if bytes > self.options.max_unit_bytes {
+                    return Err(Error::Source(format!(
+                        "{}: unit {} holds {bytes} logical bytes, more than the {} one read may \
+                         hold (ADR 018); cut the table into more key ranges \
+                         (range=<column>&units=<n>, a larger n) so each holds fewer",
+                        self.root, unit.path, self.options.max_unit_bytes
+                    )));
+                }
                 let fp = FileFingerprint {
                     path: unit.path.clone(),
                     size: rows,
@@ -781,7 +840,11 @@ impl SqlSource {
                 if total != i64::try_from(sum).ok() {
                     return Err(Error::Source(format!(
                         "{}: the units of {t} hold {sum} rows but the table holds {}; the units \
-                         do not partition the table, so nothing read from them is complete",
+                         do not partition the table, so nothing read from them is complete. The \
+                         engine's order of the range column does not agree with its values (for \
+                         example SQLite text times in mixed zones or formats), or the table \
+                         changed while it was cut: cut by another column (range=), read it as one \
+                         unit (no range=), or run it again when the table is quiet",
                         self.root,
                         total.map_or_else(|| "null".into(), |t| t.to_string())
                     )));
@@ -809,9 +872,9 @@ impl SqlSource {
             .ok_or_else(|| Error::Source(format!("{}: no unit {}", self.root, file.path)))?;
         if found.1.file != *file {
             return Err(Error::Source(format!(
-                "{}: the identity given ({:?}) is not the one this run discovered ({:?}); \
-                 discover again",
-                file.path, file.etag, found.1.file.etag
+                "{}: the unit's identity given is not the one this run discovered; the table \
+                 changed since it was listed, so list it again",
+                file.path
             )));
         }
         Ok(found)
@@ -823,7 +886,7 @@ impl SqlSource {
     pub fn identity(&self) -> Result<Hash> {
         let mut inner = self.lock()?;
         let d = self.discover_locked(&mut inner)?;
-        identity_of(&self.root, &d)
+        identity_of(&self.root, &self.url.connection_identity(), &d)
     }
 
     /// Ends the run: with a snapshot held, nothing to check (every read saw
@@ -842,6 +905,7 @@ impl SqlSource {
                 rows: 0,
                 snapshot: inner.snapshot.map(str::to_string),
                 rechecked: false,
+                identity_by: self.identity_by(),
                 identity: Hash::of(self.root.as_bytes()),
             });
         };
@@ -858,7 +922,8 @@ impl SqlSource {
             rows: d.units.iter().map(|(_, m)| m.rows).sum(),
             snapshot: inner.snapshot.map(str::to_string),
             rechecked: inner.rechecked,
-            identity: identity_of(&self.root, &d)?,
+            identity_by: self.identity_by(),
+            identity: identity_of(&self.root, &self.url.connection_identity(), &d)?,
         })
     }
 
@@ -924,13 +989,13 @@ impl SqlSource {
     }
 }
 
-fn identity_of(root: &str, d: &Discovered) -> Result<Hash> {
+fn identity_of(root: &str, connection: &Hash, d: &Discovered) -> Result<Hash> {
     let units: Vec<(&str, Option<&str>)> = d
         .units
         .iter()
         .map(|(u, m)| (u.path.as_str(), m.file.etag.as_deref()))
         .collect();
-    Hash::of_record(&(root, units))
+    Hash::of_record(&(root, connection, units))
 }
 
 fn unsupported_column(t: &TableName, column: &str, why: &str) -> Error {
@@ -1065,6 +1130,12 @@ impl Source for SqlSource {
                 .map(|f| Field::new(f.name(), f.data_type().clone(), true))
                 .collect::<Vec<_>>(),
         ));
+        if parts.len() == 1 {
+            let only = parts.remove(0);
+            return only
+                .with_schema(schema)
+                .map_err(|e| Error::Source(format!("{what}: {e}")));
+        }
         concat_batches(&schema, &parts).map_err(|e| Error::Source(format!("{what}: {e}")))
     }
 

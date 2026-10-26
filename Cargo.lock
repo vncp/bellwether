@@ -594,6 +594,7 @@ dependencies = [
  "bellwether-mcp",
  "clap",
  "parquet",
+ "rusqlite",
  "serde",
  "serde_json",
  "tempfile",

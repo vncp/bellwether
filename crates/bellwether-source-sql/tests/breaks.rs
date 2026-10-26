@@ -57,6 +57,9 @@ fn engines(dir: &Path) -> Vec<(&'static str, Box<dyn Fn(&str) -> String>, Box<dy
     ));
     if let Some(d) = duck_db(dir) {
         let d2 = d.clone();
+        // Held for the test: sources share this read-write instance, so a
+        // write through it lands in the file they read.
+        std::mem::forget(open_driver(&duck_url(&d)).unwrap());
         out.push((
             "duckdb",
             Box::new(move |extra| duck_root(&d, "t", extra)),

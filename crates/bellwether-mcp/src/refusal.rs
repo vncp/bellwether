@@ -196,8 +196,9 @@ impl RefusalCode {
                 "rewrites cannot be attested yet; report the passing certificate to the human"
             }
             Self::AttestOnly => {
-                "report the passing certificate and the statements in `fields.run` to the human; \
-                 the engine applies nothing to a table, so a human or a CI gate runs them"
+                "report the passing certificate to the human with `fields.run` (statements the engine \
+                 wrote) or `fields.proposed_rewrite` (your own text, for the human to review); \
+                 the engine applies nothing to a table"
             }
             Self::ReservedProposer => "pass your own agent name in `by`",
             Self::NoWorkload => {
@@ -578,13 +579,19 @@ pub fn from_fix(r: &FixRefusal, verification: Option<&Reconciliation>) -> Refusa
             certificate,
             target,
             run,
+            proposed_rewrite,
         } => Refusal::new(
             RefusalCode::AttestOnly,
             format!(
                 "certificate {certificate} passed; {target} is a table, so the engine applies \
                  nothing and writes no receipt (ADR 027)"
             ),
-            json!({ "certificate": certificate, "target": target, "run": run }),
+            json!({
+                "certificate": certificate,
+                "target": target,
+                "run": run,
+                "proposed_rewrite": proposed_rewrite,
+            }),
         ),
         FixRefusal::NoReplay { certificate } => Refusal::new(
             RefusalCode::NoReplay,
