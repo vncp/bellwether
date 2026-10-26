@@ -31,7 +31,7 @@ import sys
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 RESULTS = os.path.join(REPO, "docs", "measured", "results")
 ASSETS = os.path.join(REPO, "docs", "assets")
-MEASURED_PAGE = "docs/measured/2026-10-25-showcase.md"
+MEASURED_PAGE = "docs/measured/2026-10-26-showcase.md"
 
 THEMES = {
     "light": {
@@ -215,7 +215,7 @@ class Scale:
             self.lo = 0
             top = max(vals) if vals else 1
             mag = 10 ** math.floor(math.log10(top))
-            self.hi = math.ceil(top / mag) * mag
+            self.hi = next(m * mag for m in (1, 1.2, 1.6, 2, 2.4, 3, 4, 5, 6, 8, 10) if m * mag >= top)
 
     def x(self, v):
         if v is None or v <= 0:
@@ -640,6 +640,9 @@ def why_text(res, q):
     fixed_rg = res.v(q, "bellwether-fixed", "row_groups")
     outcome = res.v(q, "bellwether", "fix") or ""
     key = res.v(q, "bellwether", "key")
+    if outcome.startswith("not run"):
+        return (f"`{key}` plans {fixed_rg} of {full_rg} row groups; built with `index`, no receipt "
+                "(bitemporal keys can be proposed and receipted with storage version 2)")
     if outcome.startswith("refused"):
         return f"no key can help: the keys sit in every row group (`fix` refused, {outcome.split(': ', 1)[-1]})"
     if fixed_rg == full_rg:
@@ -666,6 +669,9 @@ def reconcile_table(res):
             f"{', pass' if res.v(q, 'bellwether', 'pass') else ', fail'} | `{res.v(q, 'bellwether', 'certificate')[:12]}` | "
             f"{human_ms(res.v(q, 'duckdb', 'wall_ms'))} | {r} differing row{'s' if r != 1 else ''} |"
         )
+    out += ["", "A changed row is one differing key to `reconcile` and two rows to `EXCEPT ALL` (the old version from one side, "
+            "the new from the other). DuckDB's time is one query; Bellwether's includes writing a certificate that names the "
+            "differing key."]
     return "\n".join(out)
 
 
@@ -682,7 +688,7 @@ def no_gain_text(res, qids):
             " Where the data is already sorted by the key, DuckDB's own min/max statistics prune as well as any index, "
             "and the table says so."
         )
-    return text + " The cause is the layout (the keys sit in nearly every row group), not a missing index."
+    return text + " Otherwise the cause is the layout (the keys sit in nearly every row group), not a missing index."
 
 
 def readme_block(res):
@@ -700,7 +706,8 @@ def readme_block(res):
         f"{len(qids)} questions people ask of {len(datasets)} datasets ({len(datasets) - synthetic} public, {synthetic} synthetic), "
         "each answered on the same files by DuckDB alone (with its own min/max pruning) and by DuckDB reading only the row "
         "groups Bellwether planned after `bellwether why` recommended a key and `bellwether fix` verified, applied, and "
-        "attested it. Both answers are fingerprinted and must match"
+        "attested it (one bitemporal key, built with `index`, is the exception the table names). "
+        "Both answers are fingerprinted and must match"
         + ("; they did on every question." if same else "; see the measured page for the questions where they did not.")
         + f" Here are the {len(top)} where the plan read less, biggest reduction first (`rg` is row groups):",
         "",
@@ -792,7 +799,7 @@ def detail_block(res):
             f"{human_ms(res.v(q, 'duckdb', 'wall_ms'))}, {human_rate(res.v(q, 'duckdb', 'rows_per_s'))} | "
             f"{res.v(q, 'duckdb', 'differing_rows')} |"
         )
-    rows += ["", "### The questions as SQL", ""]
+    rows += ["", "### The questions as SQL", "", "`<work>` is the script's scratch directory (`$SHOWCASE_DIR/work`).", ""]
     for q in res.ids():
         m = res.queries[q]
         rows.append(f"- `{q}` ({m.get('keys', '')}): `{m['sql']}`")

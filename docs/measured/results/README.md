@@ -10,7 +10,7 @@ committed results render.
 
 | File | Written by | Rendered as |
 |---|---|---|
-| `showcase.json` | [`scripts/showcase.sh`](../../../scripts/showcase.sh) | README "Results"; `results-bytes`, `results-replay`, `results-latency`, `results-reconcile`; the tables of [2026-10-25-showcase.md](../2026-10-25-showcase.md) |
+| `showcase.json` | [`scripts/showcase.sh`](../../../scripts/showcase.sh) | README "Results"; `results-bytes`, `results-replay`, `results-latency`, `results-reconcile`; the tables of [2026-10-26-showcase.md](../2026-10-26-showcase.md) |
 | any other `<source>.json` | its own script | the charts it declares (below), `results-<source>-<name>-{light,dark}.svg`, and a table of every row for the block `results:<source>` wherever that marker appears |
 
 ## Schema
