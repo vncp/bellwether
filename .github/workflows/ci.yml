@@ -13,6 +13,11 @@ jobs:
   check:
     name: fmt · clippy · test
     runs-on: ubuntu-latest
+    env:
+      # No debuginfo: the --all-features test binaries with DWARF no longer
+      # fit on the runner's root volume next to the dependency builds.
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
     services:
       # The reference query-engine adapter (ADR 033) is tested end to end
       # against this server (bellwether-source-engine/tests/clickhouse.rs;
@@ -34,10 +39,17 @@ jobs:
           --health-retries 20
     steps:
       - uses: actions/checkout@v4
+      - uses: ./.github/actions/free-runner-disk
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
+      # Keyed on Cargo.lock, every Cargo.toml, rustc and the CARGO*/RUST*
+      # environment. Saves only the dependency builds (workspace crates and
+      # their test binaries are pruned before saving), and only from main:
+      # a pull request restores main's entry instead of writing its own.
       - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: install libduckdb (the DuckDB tests read DuckDB through its ADBC driver, libduckdb itself)
         env:
           GH_TOKEN: ${{ github.token }}
@@ -51,6 +63,9 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y unixodbc-dev
       - name: fmt
         run: cargo fmt --all -- --check
+      # clippy and test both pass --workspace --all-features, so cargo
+      # resolves one feature set and the build scripts and proc macros
+      # built for clippy are reused by the test build.
       - name: clippy
         run: cargo clippy --workspace --all-targets --all-features
       - name: test
@@ -61,7 +76,9 @@ jobs:
         env:
           BELLWETHER_CLICKHOUSE_URL: clickhouse://127.0.0.1:8123/default
         run: |
-          cargo test -p bellwether-source-engine --all-features --test clickhouse -- --nocapture 2>&1 | tee clickhouse.log
+          # --workspace (not -p) keeps the feature set of the test step, so
+          # this reuses its build instead of recompiling four crates.
+          cargo test --workspace --all-features --test clickhouse -- --nocapture 2>&1 | tee clickhouse.log
           ! grep -q 'SKIPPED:' clickhouse.log
 
   format-compat:
