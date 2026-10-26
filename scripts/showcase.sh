@@ -9,14 +9,9 @@
 #     scripts/showcase.sh                                # skip the build
 #   SHOWCASE_DIR=/some/scratch scripts/showcase.sh       # where data and indexes go
 #   scripts/showcase.sh --only gh-repos10,rec-gh-planted # re-measure some ids
-#   scripts/showcase.sh --market-hive                    # market with hive partitioning
 #   scripts/showcase.sh --accept-new-inputs              # after a DuckDB upgrade or a
 #                                                        # republished download (measures
 #                                                        # everything; refused with --only)
-#
-# --market-hive needs an engine whose `fix` records --partitioning in the
-# index it builds. Without it the market folder is read as plain files (the
-# questions never filter on `day`, so no byte changes).
 #
 # Needs: curl, duckdb (2.x, run as `duckdb -no-agent`), python3, cargo.
 # Downloads about 2.6 GB (6 taxi months, 12 GH Archive hours, 10 ClickBench
