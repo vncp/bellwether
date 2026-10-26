@@ -86,7 +86,7 @@ Keep evolve. It is the one place in this field where the optimizer has an exact 
 
 **Kill criterion for stages 2 and 3.** If stage 1 captures the frontier on the real workloads you have (frontier within 5% of stage 2's on bytes read at p50 and p95), stop. An exact what-if advisor with receipts is already a product; the language-model search is the part that must prove it adds rewrites enumeration cannot reach.
 
-**The stage-2 budget.** Cost per accepted mutation is replays plus model calls charged to one budget (§11, item 2). Its bound is written into this section before WP13b's first search, as ADR 019 requires of every threshold an evaluation is judged by, and is recorded as a ledger row with the search; WP13b's done-when cannot be met until it is.
+**The stage-2 budget.** Cost per accepted mutation is replays plus model calls charged to one budget (§11, item 2). Its bound is the owner's decision and is deliberately unset here; it must be written into this section and recorded as a ledger row before WP13b's first search, as ADR 019 requires of every threshold an evaluation is judged by. WP13b's done-when cannot be met until it is.
 
 Each trigger is evaluated from ledger records and recorded as a ledger row, so the decision to open the next stage is itself replayable. In stage 1, `propose` runs only the deterministic proposers (§4.3, §4.4) plus layout and materialization search; the composer and admission rule above apply in every stage.
 

@@ -48,7 +48,7 @@ Nothing above the file layer is format-specific: a text file's fixed byte-range 
 - 🔎 **Tells you which column to index, with evidence.** Fanout per column (files and row groups touched per value), then an exact replay of your recorded query keys against each candidate key. The cost is a sum of row-group statistics, never an estimate.
 - 🎯 **Prunes to the row group, not the file.** Composite keys with prefix lookup, latest-version and as-of lookups over plain append-only files. Single-key seek in the core index: ~0.2 µs at 10k keys, ~0.5 µs at 1M keys.
 - 🧾 **Shows its receipts.** Every applied change hash-links the evidence it was based on, the proposal, the exact before-and-after replay, and a reconciliation certificate proving the same rows came back. If it cannot prove something, it says so.
-- 🧬 **Learns your workload's rulebook.** `evolve` runs a reflective, population-based search over query plans, physical designs, and whole pipelines in the style of GEPA and SkillOpt, with two substitutions those methods never had: an exact loss (replay) and a hard constraint (reconciliation). The backward pass is counterfactual attribution, numeric knobs get real finite-difference descent, selection is Pareto across your recorded runs, and the output is a rulebook promoted only by held-out replay.
+- 🧬 **Learns your workload's rulebook, in stages.** `advise` comes first and calls no language model: rule-driven enumeration, exact finite-difference descent on knobs, and layout and materialization search over query plans, physical designs, and whole pipelines, each candidate scored by exact replay, gated by reconciliation, and selected by Pareto across your recorded runs with held-out anchors. `evolve` adds scoped LLM proposers behind `--llm`, fed by counterfactual attribution, only if `advise` leaves anti-patterns that need a structural rewrite. Rulebook promotion comes last, each rule promoted only by temporally held-out replay. Unlike GEPA and SkillOpt, the loop has an exact loss (replay) and a hard constraint (reconciliation).
 - 🤖 **Agent-first, with a trust boundary.** MCP tools in tiers: `observe.*` and `propose.*` for the agent; `score.*` and `apply.receipt` ask the engine, which alone scores, verifies, and applies. A confused or compromised agent can waste your time and nothing else.
 - 🗂️ **Parquet stays Parquet.** Immutable sidecar segments and a manifest committed by conditional PUT. No table format conversion, no locks, no new file format. Local disk, S3, Azure, GCS.
 - ⏱️ **Time travel without a table format.** `latest` and `asof` answer "the current state of these keys" and "their state on March 3rd" across a folder of history files, located to the row group.
@@ -72,28 +72,32 @@ The honest summary: the index kinds are not new. What is new is the diagnosis, t
 
 ## Evolve: optimization that learns from exact replay
 
-Most LLM query optimizers score their own suggestions with an estimate and verify them by hope. Bellwether has the two things text-space optimizers like [GEPA](https://arxiv.org/abs/2507.19457) and [SkillOpt](https://github.com/microsoft/SkillOpt) need and most data systems lack: a loss you cannot game and a gate you cannot skip. `evolve` is that loop applied to data pipelines.
+Most LLM query optimizers score their own suggestions with an estimate and verify them by hope. Bellwether has the two things text-space optimizers like [GEPA](https://arxiv.org/abs/2507.19457) and [SkillOpt](https://github.com/microsoft/SkillOpt) need and most data systems lack: a loss you cannot game and a gate you cannot skip. `advise` and `evolve` are that loop applied to data pipelines.
 
 ```
 population ← { baseline }
 repeat until budget:
     parent ← Pareto-select(population)                 best on at least one recorded run
     trace  ← replay(parent, workload)                  exact bytes per run, per operator
-    attr   ← attribute(parent, trace)                  Δ per node by counterfactual replay
-    child  ← propose(parent, trace, attr, rulebook)    LLM for structure · descent for knobs · rules
-    if not reconcile(child): discard                   never ranked, never applied
-    population ← pareto-update(population, child)
-rulebook ← distill(archive), promoted only if held-out replay reproduces the gain
+    attr   ← attribute(parent, trace)                  Δ per node and per step edge, by counterfactual replay
+    cands  ← propose(parent, trace, attr, rulebook)    advise: rules · descent for knobs · layouts; evolve --llm adds structure
+    for child in compose(cands, attr):                 bundle the changes that do not compose additively
+        if not reconcile(child): discard               never ranked, never applied
+        if not admit(child, anchors, δ): discard       net gain > 0, regressions ≤ δ, held-out anchors included
+        population ← pareto-update(population, child)
+rulebook ← distill(archive), promoted only if temporally held-out replay reproduces the gain
 ```
+
+It ships in three stages, each useful alone and each opened by a measured trigger: `advise` first (deterministic, no model, receipts for every admitted change); `evolve --llm` only if `advise` leaves planted or real anti-patterns that need a structural rewrite, within a stated cost per accepted mutation; rulebook promotion last, once a rule reproduces its gain on a held-out template. If `advise` already captures the frontier, stages two and three do not ship.
 
 What makes it different from a per-query rewriter:
 
 - **It optimizes sets and pipelines, not calls.** Plans are mutated as DAGs and scored whole, so the semi-join that only pays off once the prefilter moves is found as a bundle. Physical design is a set of keys scored against every run with maintenance cost as its own objective. Pipelines are DAGs of steps with lineage, and equivalence is certified at the pipeline output, which admits non-local rewrites (push a filter three steps upstream, share a materialized intermediate) that no SQL prover can express.
-- **The gradient is real where it can be and honest where it cannot.** Knobs (bloom rate, key-count gates, lookbacks, chunk sizes) get exact finite differences, because replay is deterministic. Structure gets a textual gradient grounded in exact per-node attribution. A learned surrogate may propose, never score.
+- **The gradient is real where it can be and honest where it cannot.** Knobs (bloom rate, key-count gates, lookbacks, chunk sizes) get exact finite differences, because replay is deterministic. Structure, in `evolve`, gets a textual gradient grounded in exact per-node attribution. A learned surrogate may propose, never score.
 - **Tail protection by construction.** Selection is Pareto over runs × objectives, so a rewrite that wins at the median batch and loses at the p95 batch cannot kill the candidate that protects the tail.
 - **Replayable.** Every prompt, completion, score, certificate, and frontier snapshot is a content-addressed ledger record, and a search replays from its ledger byte for byte.
 
-Design: [`docs/evolve.md`](docs/evolve.md), ADRs [021](docs/adr/021-reflective-workload-optimization.md) through [025](docs/adr/025-rulebook-validation.md).
+Design: [`docs/evolve.md`](docs/evolve.md), ADRs [021](docs/adr/021-reflective-workload-optimization.md) through [025](docs/adr/025-rulebook-validation.md), [031](docs/adr/031-scoped-proposers-and-a-frozen-outer-loop.md), and [032](docs/adr/032-staged-delivery-with-a-measured-trigger.md).
 
 ## What you will run
 
@@ -282,14 +286,14 @@ All twelve bitemporal lookups in the same workload planned exactly the row group
 
 Pre-alpha. The architecture and on-disk format are fixed and documented; the crates are being built against them, each landing by reviewed pull request.
 
-- [x] Contract crate, architecture, invariants, threat model, format, 27 decision records
+- [x] Contract crate, architecture, invariants, threat model, format, 29 decision records
 - [x] Engine foundations: canonical encoding, segments and blooms, Parquet and text sources, object-store manifest commits, the ledger; each crate reviewed against its invariants, with the reviewer's probes kept as regression tests
 - [x] **M1** `why` works with no index built: footers, the profile's fanout and lints as a recorded Evidence, and replay
 - [x] **M2** the index: `index`, `locate`, `latest`, `asof`
 - [x] **M3** receipts: `fix` writes one
 - [x] **M4** agent-first: the loop runs end to end from an MCP client
 - [ ] **M5** format v0.1 frozen with a compatibility fixture
-- [ ] **M6** `evolve` and `report`: reflective optimization of plans, keys, layouts, and whole pipelines against your recorded workload, with charts rendered from the ledger
+- [ ] **M6** staged optimization against your recorded workload: `advise` first (no language model; enumeration, knob descent, layout and materialization search, with receipts), then `evolve --llm` only if `advise` leaves structural anti-patterns, then rulebook promotion; charts rendered from the ledger by `report`
 - [ ] **M7** a SQL table reconciles against a folder of files with a certificate; plans execute inside DataFusion and DuckDB without a sidecar step; receipts gate pull requests
 - [ ] **M8** the loss covers joins, windows, projections, and layouts exactly; rules transfer across datasets; receipts are signed
 
