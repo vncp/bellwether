@@ -1,0 +1,19 @@
+name: free runner disk
+description: >-
+  Removes the large toolchains ubuntu-latest preinstalls that this repository
+  never uses (.NET, the Android SDK, GHC, Boost, the CodeQL bundle) so a full
+  `--all-features` test build fits on the root volume. Prints `df -h /`
+  before and after.
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      run: |
+        echo "before:"
+        df -h /
+        for dir in /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/share/boost "$AGENT_TOOLSDIRECTORY/CodeQL"; do
+          sudo rm -rf "$dir" &
+        done
+        wait
+        echo "after:"
+        df -h /
