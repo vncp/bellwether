@@ -87,6 +87,25 @@ impl Engine {
         proposed_by: &str,
         write: bool,
     ) -> Result<ProposeResult> {
+        if let Some(sketch) = &declared.sketch {
+            // A sketch is approximate and never planned with: no replay can
+            // price it, so it has no path to a receipt.
+            if let Some(refused) = self.check_proposer_and_evidence(evidence, proposed_by, false)? {
+                return Ok(refused);
+            }
+            let schema = self.check_columns(&sketch.items.iter().flatten().collect::<Vec<_>>())?;
+            bellwether_core::sketch::item_types(sketch, &schema)?;
+            let declaration = crate::spec::declaration_label(declared);
+            return Ok(ProposeResult::Refused {
+                refusal: ProposeRefusal::SidecarNotProposable {
+                    command: self.index_command(&declaration),
+                    declaration,
+                    sidecar: sketch.name(),
+                    key: None,
+                    root: self.root().to_string(),
+                },
+            });
+        }
         let sidecar = match (&declared.key, &declared.sidecar) {
             (Some(spec), None) => {
                 return self.propose_inner(

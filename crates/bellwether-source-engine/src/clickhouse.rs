@@ -62,6 +62,10 @@ const ACCESS_DENIED: i64 = 497;
 /// read-only mode.
 const READONLY: i64 = 164;
 
+/// How a request refused in read-only mode is reported, before `run` says
+/// whether it was the agent's text.
+const READONLY_TEXT: &str = "ClickHouse refused the request in read-only mode";
+
 /// One partition of one table: a unit.
 #[derive(Clone, Debug)]
 struct Unit {
@@ -300,7 +304,25 @@ impl ClickHouse {
             ("default_format", format),
         ];
         params.extend_from_slice(&self.caches_off);
-        self.post(q, &params, self.query_timeout)
+        self.post(q, &params, self.query_timeout).map_err(|e| {
+            // A read-only refusal of the agent's text (a write, or a
+            // setting the text changes); a refused `readonly` itself is the
+            // user's profile and keeps its own message.
+            let prefix = format!("{}: {READONLY_TEXT} (", self.root);
+            match e {
+                Error::Source(m) if m.starts_with(&prefix) => {
+                    Error::Source(format!(
+                    "{}: ClickHouse refused query {tag} in read-only mode ({}); bellwether runs \
+                     every query with readonly=1, so the query text may neither write nor change \
+                     a setting (a SETTINGS clause included, which could turn a cache or the \
+                     query log off); propose the rewrite again without it",
+                    self.root,
+                    m[prefix.len()..].strip_suffix(')').unwrap_or(&m[prefix.len()..])
+                ))
+                }
+                other => other,
+            }
+        })
     }
 
     /// With another cap on the rows of a unit `read_columns` reads.
@@ -353,14 +375,15 @@ impl ClickHouse {
                  its password as password=env:NAME",
                 self.root
             )),
-            // Only the agent's text runs under readonly=1.
-            Some(READONLY) => Error::Source(format!(
-                "{}: ClickHouse refused the query in read-only mode ({line}); bellwether runs \
-                 every query with readonly=1, so the query text may neither write nor change a \
-                 setting (a SETTINGS clause included, which could turn a cache or the query \
-                 log off); propose the rewrite again without it",
-                self.root
+            // `readonly` itself refused: the user's profile already sets
+            // read-only mode, so no request may set its own.
+            Some(READONLY) if line.contains("'readonly'") => Error::Source(format!(
+                "{}: ClickHouse refused bellwether's own read-only setting ({line}): the profile \
+                 of user {} sets readonly, so no request may choose its read-only mode; connect \
+                 as a user with SELECT grants and no readonly in its profile",
+                self.root, self.user
             )),
+            Some(READONLY) => Error::Source(format!("{}: {READONLY_TEXT} ({line})", self.root)),
             _ => Error::Source(format!(
                 "{}: ClickHouse refused the request (HTTP {status}): {line}",
                 self.root

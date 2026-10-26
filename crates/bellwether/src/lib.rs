@@ -43,6 +43,7 @@ mod reconcile;
 mod report;
 mod results;
 mod signing;
+mod sketch;
 pub mod spec;
 mod twin;
 mod why;
@@ -86,12 +87,15 @@ pub use signing::{
     generate_key, load_signing_key, load_trusted_keys, public_path, read_public_key,
     refuse_inside_index, trust_key, GeneratedKey, PublicKeyFile, TrustEntry, TrustResult,
 };
+pub use sketch::{
+    CardinalityRequest, CardinalityResult, ItemCardinality, OverlapResult, SketchSource,
+};
 pub use twin::{
     EngineWorkload, GateFit, TwinCandidate, TwinColumns, TwinReport, CARDINALITY_RATIO,
     LOW_CARDINALITY_ROWS, MEMBERSHIP_GATE, NARROW_PERCENT, SELECTIVE_FILES_PERCENT,
 };
 pub use why::{
-    Candidate, CandidateOrigin, Culprit, CulpritReason, Dataset, LookupMode, ProfileEvidence,
-    Recommendation, TimeWindow, WhyReport, WhyRequest, WorkloadInfo, DEFAULT_MAX_CANDIDATES,
-    ENGINE_PROPOSER, LAYOUT_BOUND_FRACTION, RESERVED_PROPOSERS,
+    Candidate, CandidateOrigin, Culprit, CulpritReason, Dataset, DiagnosisReads, LookupMode,
+    ProfileEvidence, Recommendation, TimeWindow, WhyReport, WhyRequest, WorkloadInfo,
+    DEFAULT_MAX_CANDIDATES, ENGINE_PROPOSER, LAYOUT_BOUND_FRACTION, RESERVED_PROPOSERS,
 };

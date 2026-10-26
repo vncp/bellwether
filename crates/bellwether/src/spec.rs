@@ -17,10 +17,15 @@
 //! (`bounds:a@ts`); `temporal2:id@valid,known` declares a bitemporal
 //! sidecar alone. A key spec itself never carries the bound, so `parse`
 //! refuses `exact:a@ts` and names `index --key`.
+//!
+//! `index --key` also takes `sketch:a,b,a+b[,p=12][,minhash=64]`
+//! ([`parse_sketch`]): an approximate per-file distinct-count sketch
+//! (`bellwether_types::SketchSpec`) that no planner reads. It is not a key
+//! spec, so `parse` refuses it and names `index --key`.
 
 use bellwether_core::segment::validate_spec;
 use bellwether_core::sidecar::{SidecarDef, SidecarKind};
-use bellwether_types::{Error, KeySpec, Result};
+use bellwether_types::{Error, KeySpec, Result, SketchSpec, SKETCH_DEFAULT_PRECISION};
 
 /// Parses the short form or the JSON form.
 pub fn parse(s: &str) -> Result<KeySpec> {
@@ -118,6 +123,11 @@ fn parse_short(s: &str) -> Result<KeySpec> {
              accepts; a key spec itself has no '@'",
         )),
         ("range", Some(_)) => Err(bad(s, "a range spec takes no '@'")),
+        ("sketch", _) => Err(bad(
+            s,
+            "a sketch is an approximate distinct-count sidecar, not a key spec; declare it with \
+             `index --key`",
+        )),
         (other, _) => Err(bad(s, &format!("unknown kind {other:?}"))),
     }
 }
@@ -145,6 +155,9 @@ pub struct Declaration {
     pub key: Option<KeySpec>,
     /// The sidecar, if the argument declares one.
     pub sidecar: Option<SidecarDef>,
+    /// The sketch, if the argument declares one (`sketch:...`); never with a
+    /// key or a sidecar.
+    pub sketch: Option<SketchSpec>,
 }
 
 /// Parses one `index --key` argument (see [`Declaration`]): everything
@@ -175,6 +188,14 @@ pub fn parse_declaration(s: &str) -> Result<Declaration> {
         return Ok(Declaration {
             key: None,
             sidecar: Some(sidecar(SidecarKind::Bitemporal, cols, times)?),
+            sketch: None,
+        });
+    }
+    if t.starts_with("sketch:") {
+        return Ok(Declaration {
+            key: None,
+            sidecar: None,
+            sketch: Some(parse_sketch(t)?),
         });
     }
     let bounded = match t.split_once(':') {
@@ -201,11 +222,13 @@ pub fn parse_declaration(s: &str) -> Result<Declaration> {
             Ok(Declaration {
                 key: Some(key),
                 sidecar: Some(def),
+                sketch: None,
             })
         }
         None => Ok(Declaration {
             key: Some(parse(t)?),
             sidecar: None,
+            sketch: None,
         }),
     }
 }
@@ -221,6 +244,9 @@ pub fn sidecar_label(def: &SidecarDef) -> String {
 /// [`parse_declaration`] reads it back to an equal declaration.
 #[must_use]
 pub fn declaration_label(declared: &Declaration) -> String {
+    if let Some(sketch) = &declared.sketch {
+        return sketch.label();
+    }
     match (&declared.key, &declared.sidecar) {
         (Some(key), Some(def)) if def.kind == SidecarKind::Bounds => {
             format!("{}@{}", label(key), def.time_columns.join(","))
@@ -229,6 +255,69 @@ pub fn declaration_label(declared: &Declaration) -> String {
         (Some(key), None) => label(key),
         (None, None) => String::new(),
     }
+}
+
+/// Parses `sketch:<item>[,<item>...][,p=<precision>][,minhash=<k>]`: each
+/// item is a column or a `+`-joined tuple of columns; `p` defaults to
+/// [`SKETCH_DEFAULT_PRECISION`]; without `minhash` no signature is kept.
+/// [`SketchSpec::label`] is its inverse.
+pub fn parse_sketch(s: &str) -> Result<SketchSpec> {
+    let t = s.trim();
+    let bad = |why: &str| {
+        Error::KeySpec(format!(
+            "{t:?} is not a sketch ({why}); write it as sketch:a,b,a+b with optional ,p=14 and \
+             ,minhash=64"
+        ))
+    };
+    let rest = t
+        .strip_prefix("sketch:")
+        .ok_or_else(|| bad("it does not start with sketch:"))?;
+    let mut items = Vec::new();
+    let mut precision = None;
+    let mut minhash = None;
+    for part in rest.split(',').map(str::trim) {
+        if let Some((k, v)) = part.split_once('=') {
+            let dup = match k.trim() {
+                "p" => precision
+                    .replace(
+                        v.trim()
+                            .parse::<u8>()
+                            .map_err(|_| bad("p is not an integer"))?,
+                    )
+                    .is_some(),
+                "minhash" => minhash
+                    .replace(
+                        v.trim()
+                            .parse::<u16>()
+                            .map_err(|_| bad("minhash is not an integer"))?,
+                    )
+                    .is_some(),
+                other => return Err(bad(&format!("unknown parameter {other:?}"))),
+            };
+            if dup {
+                return Err(bad("a parameter is given twice"));
+            }
+            continue;
+        }
+        if precision.is_some() || minhash.is_some() {
+            return Err(bad("parameters come after every item"));
+        }
+        if part.is_empty() {
+            return Err(bad("an item is empty"));
+        }
+        items.push(
+            part.split('+')
+                .map(|c| c.trim().to_string())
+                .collect::<Vec<_>>(),
+        );
+    }
+    let spec = SketchSpec {
+        items,
+        precision: precision.unwrap_or(SKETCH_DEFAULT_PRECISION),
+        minhash,
+    };
+    bellwether_core::sketch::validate(&spec)?;
+    Ok(spec)
 }
 
 /// `s` as one POSIX shell word, for a command a message names: unchanged
@@ -346,11 +435,51 @@ mod tests {
             "temporal:id@ts",
             "exact:a,b",
             "range:ts",
+            "sketch:id",
+            "sketch:batch,id,symbol+ts,p=12,minhash=64",
+            "sketch:a,minhash=8",
         ] {
             let d = parse_declaration(s).unwrap();
             assert_eq!(declaration_label(&d), s);
             assert_eq!(parse_declaration(&declaration_label(&d)).unwrap(), d);
         }
+    }
+
+    #[test]
+    fn sketches_parse_and_malformed_ones_name_the_problem() {
+        let d = parse_declaration("sketch:batch, id ,symbol+ts,p=12,minhash=64").unwrap();
+        assert_eq!((d.key, d.sidecar), (None, None));
+        let s = d.sketch.unwrap();
+        assert_eq!(
+            s.items,
+            vec![
+                vec!["batch".to_string()],
+                vec!["id".to_string()],
+                vec!["symbol".to_string(), "ts".to_string()]
+            ]
+        );
+        assert_eq!((s.precision, s.minhash), (12, Some(64)));
+        assert_eq!(s.name(), "sketch:batch,id,symbol+ts");
+        let d = parse_declaration("sketch:id").unwrap().sketch.unwrap();
+        assert_eq!((d.precision, d.minhash), (14, None));
+        for (bad, why) in [
+            ("sketch:", "empty"),
+            ("sketch:a,,b", "empty"),
+            ("sketch:a,p=x", "integer"),
+            ("sketch:a,p=3", "precision"),
+            ("sketch:a,q=3", "unknown parameter"),
+            ("sketch:a,p=12,b", "after every item"),
+            ("sketch:a,p=12,p=13", "twice"),
+            ("sketch:a,a", "twice"),
+            ("sketch:a+a", "twice"),
+            ("sketch:a,minhash=0", "minhash"),
+        ] {
+            let e = parse_declaration(bad).unwrap_err().to_string();
+            assert!(e.contains(why), "{bad}: {e}");
+        }
+        // A sketch is not a key spec.
+        let e = parse("sketch:a").unwrap_err().to_string();
+        assert!(e.contains("index --key"), "{e}");
     }
 
     #[test]

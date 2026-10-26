@@ -186,6 +186,60 @@ fn merge_keyed<R: ReadAt>(
     out.finish()
 }
 
+/// Distinct keys across keyed segments of one key spec whose row groups
+/// include at least one id in `live`: the exact distinct count of the
+/// spec's columns over the live row groups. A k-way merge over the sorted
+/// keys, each input holding one block at a time (ADR 018). Bloom and range
+/// segments hold no per-key values and are refused.
+pub fn count_live_keys<R: ReadAt>(
+    inputs: &[SegmentReader<R>],
+    live: &roaring::RoaringBitmap,
+) -> Result<u64> {
+    if inputs.iter().any(|s| !matches!(s.index, Index::Keyed(_))) {
+        return Err(Error::KeySpec(
+            "only exact and temporal segments hold their distinct keys".into(),
+        ));
+    }
+    let mut cursors: Vec<KeyedCursor<'_, R>> = inputs
+        .iter()
+        .map(|seg| KeyedCursor {
+            seg,
+            block: 0,
+            pos: 0,
+            body: None,
+        })
+        .collect();
+    let mut heads: Vec<Option<KeyValue>> = Vec::with_capacity(cursors.len());
+    let mut heap = BinaryHeap::new();
+    for (i, c) in cursors.iter_mut().enumerate() {
+        match c.next()? {
+            Some((k, v)) => {
+                heap.push(Reverse((k, i)));
+                heads.push(Some(v));
+            }
+            None => heads.push(None),
+        }
+    }
+    let mut count = 0u64;
+    while let Some(Reverse((key, i))) = heap.pop() {
+        let mut held = heads[i].take().is_some_and(|v| !v.bitmap.is_disjoint(live));
+        advance(&mut cursors, &mut heads, &mut heap, i)?;
+        while heap.peek().is_some_and(|Reverse((k, _))| *k == key) {
+            let Some(Reverse((_, j))) = heap.pop() else {
+                break;
+            };
+            if let Some(v) = heads[j].take() {
+                held |= !v.bitmap.is_disjoint(live);
+            }
+            advance(&mut cursors, &mut heads, &mut heap, j)?;
+        }
+        if held {
+            count += 1;
+        }
+    }
+    Ok(count)
+}
+
 fn advance<R: ReadAt>(
     cursors: &mut [KeyedCursor<'_, R>],
     heads: &mut [Option<KeyValue>],

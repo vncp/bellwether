@@ -54,7 +54,8 @@ pub struct SpecState {
 /// while it is incomplete.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SidecarState {
-    /// The sidecar's name: `bounds:symbol@ts`, `temporal2:id@valid,known`.
+    /// The sidecar's name: `bounds:symbol@ts`, `temporal2:id@valid,known`,
+    /// or a sketch's `sketch:batch,id` (approximate; never planned with).
     pub sidecar: String,
     /// Completeness sequence.
     pub complete_at: Option<u64>,
@@ -83,6 +84,11 @@ pub struct IndexResult {
     /// Segment or sidecar kinds the manifest lists that this binary does
     /// not know: kept unchanged by builds, never used to plan.
     pub unknown_segment_kinds: Vec<String>,
+    /// Re-declared sketches whose segments were missing from the store or
+    /// damaged: their segments were dropped and every live row group was
+    /// sketched again. Omitted in JSON when none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sketches_rebuilt: Vec<String>,
     /// Files seen for the first time.
     pub files_new: u64,
     /// Tracked files whose fingerprint changed (ADR 013).

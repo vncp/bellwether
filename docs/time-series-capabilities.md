@@ -40,6 +40,7 @@ Files (Parquet, CSV, or JSON lines) partitioned by date, each file holding rows 
 | Multi-machine build | N workers writing segments, one committer, for lakes a single machine cannot index in time | planned (WP22) |
 | SQL table as a side | Reconcile a warehouse table against files, with measured costs | planned (WP20) |
 | Agent interface | The same engine as MCP tools with job handles, typed refusals, dry runs, budgets | building (WP12) |
+| Is this column a key (sketches) | How many distinct symbols, timestamps, or `(symbol, ts)` pairs a vendor file set has, rows per value, and which files repeat a `(symbol, ts)`, approximately and without reading the files; never used to plan | `bellwether index ./data --key sketch:symbol,ts,symbol+ts`, then `bellwether sketch cardinality ./data` (or `--transient` before building); `why --sketches-only` | building (B2) |
 
 ## Query patterns that become viable
 

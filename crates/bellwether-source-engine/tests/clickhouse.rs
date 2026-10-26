@@ -329,6 +329,35 @@ fn a_query_text_that_changes_a_setting_or_an_entry_not_fully_logged_is_refused()
     }
 }
 
+/// A user whose profile sets readonly (a common read-only setup): no
+/// request may set its own read-only mode, so the adapter refuses at
+/// connect, naming the user's profile, never a rewrite.
+#[test]
+fn a_user_whose_profile_sets_readonly_is_named_at_connect() {
+    let Some(s) = Server::new() else { return };
+    orders(&s);
+    let user = format!("{}_ro", s.db);
+    s.sql(&format!(
+        "CREATE USER {user} IDENTIFIED WITH no_password SETTINGS readonly = 1"
+    ));
+    s.sql(&format!("GRANT SELECT ON {}.* TO {user}", s.db));
+    s.sql(&format!("GRANT SELECT ON system.* TO {user}"));
+    let err = connect(
+        &format!(
+            "clickhouse://{user}@{}",
+            s.root.trim_start_matches("clickhouse://")
+        ),
+        None,
+    )
+    .map(|_| ())
+    .unwrap_err()
+    .to_string();
+    s.sql(&format!("DROP USER {user}"));
+    assert!(err.contains("profile"), "{err}");
+    assert!(err.contains("no readonly in its profile"), "{err}");
+    assert!(!err.contains("rewrite"), "{err}");
+}
+
 /// A server or user that does not log profile events: every entry is
 /// refused as not fully logged, never read as "no cache, nothing read".
 #[test]

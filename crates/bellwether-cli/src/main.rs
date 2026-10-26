@@ -11,6 +11,7 @@
 mod bench;
 mod human;
 mod keys_cmds;
+mod sketch_cmds;
 mod verify_cmds;
 
 use std::io::{IsTerminal, Write};
@@ -101,6 +102,12 @@ enum Command {
     Bench {
         #[command(subcommand)]
         command: bench::BenchCommand,
+    },
+    /// Approximate distinct counts and overlaps from `sketch` sidecars
+    /// (never used to plan): cardinality per column, overlap of two.
+    Sketch {
+        #[command(subcommand)]
+        command: sketch_cmds::SketchCommand,
     },
     /// Signing keys: generate one, show a public key's id, or add a public
     /// key to a trust file (ADR 029).
@@ -231,6 +238,12 @@ struct WhyArgs {
     /// list the engine accepts) or join:200000 (a join's broadcast size).
     #[arg(long = "gate", value_name = "NAME:N", value_parser = parse_gate)]
     gates: Vec<bellwether::types::Gate>,
+    /// Diagnose from the index's manifest and complete sketches alone
+    /// (`index --key sketch:...`): no data file is opened, footers
+    /// included; the sketch column and the low-cardinality-key lint carry
+    /// the diagnosis, approximate.
+    #[arg(long, conflicts_with_all = ["from", "bench_workload", "workload", "columns"])]
+    sketches_only: bool,
 }
 
 /// `--gate NAME:N`.
@@ -543,7 +556,7 @@ impl From<Error> for Failure {
             Error::InvalidArgument {
                 field:
                     "lookback" | "latest_by" | "signing_key" | "trusted_keys" | "public_key" | "out"
-                    | "name" | "valid_from" | "revoked_at" | "index" | "root" | "scratch",
+                    | "name" | "valid_from" | "revoked_at" | "index" | "root" | "scratch" | "items",
                 ..
             } => Self::Usage(match hint(&e) {
                 Some(h) => format!("{e}; {h}"),
@@ -588,6 +601,18 @@ fn hint(e: &Error) -> Option<String> {
             }
             .to_string(),
         ),
+        Error::NotIndexed {
+            root,
+            needs: Some(sketch),
+            operation,
+        } if sketch.starts_with("sketch:") => Some(format!(
+            "run `bellwether index {root} --key {sketch}` first{}",
+            if *operation == "cardinality" {
+                ", or pass --transient to read the files now"
+            } else {
+                ""
+            }
+        )),
         Error::NotIndexed { root, needs, .. } => Some(format!(
             "run `bellwether index {root} --key {}` first",
             needs.as_deref().unwrap_or("<spec>")
@@ -611,6 +636,7 @@ fn hint(e: &Error) -> Option<String> {
                 "workload" => "--from, --bench-workload, or --workload",
                 "rewrite" => "--before-output and --after-output",
                 "index" => "--index <dir>",
+                "items" => "--column",
                 _ => return None,
             };
             Some(format!("check {flag}"))
@@ -815,6 +841,7 @@ fn run(cli: &Cli, out: &Out) -> Result<Outcome, Failure> {
             };
             done(&w, human, code)
         }
+        Command::Sketch { command } => sketch_cmds::run(g, out, command),
         Command::Keys { command } => keys_cmds::run(g, command),
         Command::Mcp(a) => mcp(g, a),
         Command::Workload {
@@ -1059,6 +1086,7 @@ fn why(g: &Global, out: &Out, a: &WhyArgs) -> Result<Outcome, Failure> {
         columns: a.columns.clone(),
         max_candidates: a.max_candidates,
         gates: a.gates.clone(),
+        sketches_only: a.sketches_only,
     };
     let mode = request.lookup_mode().map_err(Failure::Usage)?;
     if mode != bellwether::LookupMode::Locate && a.from.is_none() && a.workload.is_none() {

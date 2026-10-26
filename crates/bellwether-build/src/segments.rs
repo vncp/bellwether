@@ -19,6 +19,7 @@ use arrow::array::{ArrayRef, RecordBatch};
 use arrow::datatypes::{DataType, Schema};
 use bellwether_core::encoding::{self, KeyColumns};
 use bellwether_core::sidecar::{self, SidecarWriter};
+use bellwether_core::sketch::{self as sketch_seg, SketchWriter};
 use bellwether_core::{SegmentWriter, WriterOptions};
 use bellwether_store::{segment_path, Extra, RowGroupRange, SegmentRef, StoreExt};
 use bellwether_types::{Error, FileFingerprint, KeySpec, Result, RowGroupId, RowGroupMeta};
@@ -308,7 +309,7 @@ fn process_item<S: StoreExt + ?Sized>(ctx: &Ctx<'_, S>, item: &Item) -> Result<I
             o.row_group_read(RowGroupId(task.id), &columns, &batch);
         }
         for w in &mut writers {
-            w.add(ctx, task.id, &batch)?;
+            w.add(ctx, task.file, task.id, &batch)?;
         }
     }
     for w in writers {
@@ -317,10 +318,11 @@ fn process_item<S: StoreExt + ?Sized>(ctx: &Ctx<'_, S>, item: &Item) -> Result<I
     Ok(out)
 }
 
-/// An open segment writer: a key spec's or a sidecar's.
+/// An open segment writer: a key spec's, a sidecar's, or a sketch's.
 enum AnyWriter {
     Key(SegmentWriter),
     Sidecar(SidecarWriter),
+    Sketch(SketchWriter),
 }
 
 /// One spec's open segment within an item.
@@ -350,10 +352,26 @@ impl<'a> SpecWriter<'a> {
     fn add<S: StoreExt + ?Sized>(
         &mut self,
         ctx: &Ctx<'_, S>,
+        file: usize,
         id: u32,
         batch: &RecordBatch,
     ) -> Result<()> {
-        let (keys, bytes) = measure(self.plan, batch)?;
+        let (keys, bytes) = match (&self.plan.target, &self.writer) {
+            // A sketch grows by one entry per file stretch, at most
+            // `max_entry_bytes` each: the bound is charged when one starts.
+            (Target::Sketch(spec), w) => {
+                let starts = match w {
+                    Some(AnyWriter::Sketch(w)) => w.starts_entry(file as u64, RowGroupId(id)),
+                    _ => true,
+                };
+                if starts {
+                    (1, sketch_seg::max_entry_bytes(spec))
+                } else {
+                    (0, 0)
+                }
+            }
+            _ => measure(self.plan, batch)?,
+        };
         if self.writer.is_some()
             && (self.keys.saturating_add(keys) > ctx.max_keys
                 || self.bytes.saturating_add(bytes) > ctx.max_bytes)
@@ -375,12 +393,16 @@ impl<'a> SpecWriter<'a> {
                     Target::Sidecar(def) => {
                         AnyWriter::Sidecar(SidecarWriter::for_dataset(def.clone(), ctx.schema)?)
                     }
+                    Target::Sketch(spec) => {
+                        AnyWriter::Sketch(SketchWriter::for_dataset(spec, ctx.schema)?)
+                    }
                 })
             }
         };
         match writer {
             AnyWriter::Key(w) => w.add_batch(RowGroupId(id), batch)?,
             AnyWriter::Sidecar(w) => w.add_batch(RowGroupId(id), batch)?,
+            AnyWriter::Sketch(w) => w.add_batch(file as u64, RowGroupId(id), batch)?,
         }
         self.end = id
             .checked_add(1)
@@ -407,6 +429,11 @@ impl<'a> SpecWriter<'a> {
                 (seg.id, seg.bytes)
             }
             AnyWriter::Sidecar(mut w) => {
+                w.set_rowgroup_range(range)?;
+                let seg = w.finish()?;
+                (seg.id, seg.bytes)
+            }
+            AnyWriter::Sketch(mut w) => {
                 w.set_rowgroup_range(range)?;
                 let seg = w.finish()?;
                 (seg.id, seg.bytes)
@@ -449,6 +476,7 @@ pub(crate) fn measure(plan: &SpecPlan, batch: &RecordBatch) -> Result<(u64, u64)
         Target::Sidecar(def) => {
             return sidecar::measure(def, &plan.key_types, &plan.time_types, batch)
         }
+        Target::Sketch(spec) => return Ok((1, sketch_seg::max_entry_bytes(spec))),
     };
     let column = |name: &str| -> Result<ArrayRef> {
         batch

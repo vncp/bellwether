@@ -191,6 +191,12 @@ Reproduce everything above, downloads included, with [`scripts/showcase.sh`](scr
   - Plan plus read was slower than both a full scan and DuckDB in all 42 measured lookups. The plan makes one store round trip per indexed value ([the measured cause](docs/measured/2026-10-26-performance.md#hypotheses-for-wp22b-ranked-by-expected-gain)). The index saves bytes read, not yet wall time.
   - The lookup timings overlapped another process's compile; [the load record](docs/measured/2026-10-26-performance.md#measured-under-load) shows by how much.
 
+## Index kinds
+
+| Kind | Operator it serves | Declare | Planner |
+|---|---|---|---|
+| `sketch` | `count(distinct col)`; "is this column a key" | `index --key sketch:col[,col][,a+b][,p=14][,minhash=K]` | never (approximate; read by `why`, `sketch cardinality`, `sketch overlap`) |
+
 ## How `fix` proves a change
 
 In order, every time: **score** the proposal by exact replay, **verify** that the old and new way return the same rows over every key the workload touched, **apply** by building the index and committing the manifest, then **attest** with a receipt. The order never changes. The engine recomputes the replay and the data's fingerprint itself immediately before using them, so a caller cannot supply a cost, a verdict, or a stale certificate.
@@ -285,7 +291,7 @@ The trust boundary at the wire: a proposal has no score field, so the input sche
 |---|---|---|---|---|---|
 | Runs | one process | inside the query engine | inside the Hudi writer and engine | inside ClickHouse | inside the database |
 | Granularity | row group | file (min/max) | file group or record | granule | row |
-| Key kinds | exact, bloom, range, temporal | min/max statistics | bloom, record-level, column stats | minmax, set, bloom variants | B-tree |
+| Key kinds | exact, bloom, range, temporal, sketch (approximate, never plans) | min/max statistics | bloom, record-level, column stats | minmax, set, bloom variants | B-tree |
 | Composite keys | native, prefix seek | Z-order or clustering columns | record key | multi-column expressions | yes |
 | Latest / as-of | native over plain files | table time travel | incremental and point-in-time queries | no | via `ROW_NUMBER` scan |
 | Tells you which key to index | measured fanout + exact replay | no | no | no | estimated (what-if API) |

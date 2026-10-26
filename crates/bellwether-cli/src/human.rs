@@ -156,6 +156,25 @@ pub(crate) fn index(r: &IndexResult, out: &Out) -> String {
             .map_or_else(|| "incomplete".to_string(), |n| n.to_string());
         let _ = writeln!(s, "  {:<w$} {at:>14}", sc.sidecar);
     }
+    if r.sidecars
+        .iter()
+        .any(|sc| sc.sidecar.starts_with("sketch:"))
+    {
+        let _ = writeln!(
+            s,
+            "\n  sketches are approximate distinct counts and are never used to plan; read them \
+             with `bellwether sketch cardinality {}`",
+            r.root
+        );
+    }
+    if !r.sketches_rebuilt.is_empty() {
+        let _ = writeln!(
+            s,
+            "\n  rebuilt {} from every row group: its segments were missing from the store or \
+             damaged",
+            r.sketches_rebuilt.join(", ")
+        );
+    }
     if !r.unknown_segment_kinds.is_empty() {
         let _ = writeln!(
             s,
@@ -376,11 +395,18 @@ pub(crate) fn propose(r: &ProposeResult, _out: &Out) -> String {
                 },
                 |c| format!("build it with `{c}`"),
             );
-            format!(
-                "refused: {declaration} declares the sidecar {sidecar}, and a proposal can carry \
-                 only a key spec, so it has no replay, certificate, or receipt yet; {build} (no \
-                 receipt){alone}\n"
-            )
+            let why = if sidecar.starts_with("sketch:") {
+                format!(
+                    "{declaration} declares the sketch {sidecar}, which is approximate and never \
+                     planned with, so no replay can price it"
+                )
+            } else {
+                format!(
+                    "{declaration} declares the sidecar {sidecar}, and a proposal can carry only \
+                     a key spec, so it has no replay, certificate, or receipt yet"
+                )
+            };
+            format!("refused: {why}; {build} (no receipt){alone}\n")
         }
     }
 }
@@ -631,10 +657,23 @@ pub(crate) fn why(r: &bellwether::WhyReport, out: &Out, fix_command: &str) -> St
     } else {
         let _ = writeln!(
             s,
-            "funnel: no workload; pass --from <keys.parquet> to replay a run under each candidate key"
+            "funnel: no workload; {}pass --from <keys.parquet> to replay a run under each \
+             candidate key",
+            if r.from_sketches {
+                "drop --sketches-only and "
+            } else {
+                ""
+            }
         );
         funnel_header(&mut s, MIN_FUNNEL_LABEL);
         funnel_row(&mut s, MIN_FUNNEL_LABEL, "dataset", &dataset, &rows);
+        if r.from_sketches {
+            let _ = writeln!(
+                s,
+                "  dataset from the index's manifest and sketches: rows are the sketch's exact \
+                 counts, bytes the file sizes the manifest recorded (no footer read)"
+            );
+        }
     }
     if let Some(c) = &r.culprit {
         let fan = c.fanout.as_ref().map_or_else(String::new, |f| {
@@ -757,21 +796,69 @@ pub(crate) fn why(r: &bellwether::WhyReport, out: &Out, fix_command: &str) -> St
         s,
         "\nfanout: files and row groups one value touches, p50 / p95 / max"
     );
+    if r.from_sketches {
+        let _ = writeln!(
+            s,
+            "  not measured: --sketches-only opens no data file, footers included; the sketch \
+             column is the diagnosis, approximate"
+        );
+    }
+    if let Some(why_not) = &r.sketch_unavailable {
+        let _ = writeln!(s, "  {why_not}");
+    }
+    let sketch_cell = |columns: &[String]| {
+        r.sketch
+            .iter()
+            .find(|i| i.cardinality.columns == columns)
+            .map_or_else(String::new, sketch_fanout)
+    };
     let _ = writeln!(
         s,
-        "  {:<36} {:>12}  {:<22} {:<22} sample",
-        "key", "distinct", "files/value", "row groups/value"
+        "  {:<36} {:>12}  {:<22} {:<22} {:<8} {}",
+        "key",
+        "distinct",
+        "files/value",
+        "row groups/value",
+        "sample",
+        if r.sketch.is_empty() { "" } else { "sketch" }
     );
     for e in &r.profile.fanout {
         let f = &e.fanout;
         let _ = writeln!(
             s,
-            "  {:<36} {:>12}  {:<22} {:<22} {}",
+            "  {:<36} {:>12}  {:<22} {:<22} {:<8} {}",
             tail(&f.columns.join(", "), 36),
             num(f.distinct),
             quantiles(&f.files_per_value),
             quantiles(&f.row_groups_per_value),
-            if f.sampled { "sampled" } else { "exact" }
+            if f.sampled { "sampled" } else { "exact" },
+            sketch_cell(&f.columns)
+        );
+    }
+    for i in r.sketch.iter().filter(|i| {
+        !r.profile
+            .fanout
+            .iter()
+            .any(|e| e.fanout.columns == i.cardinality.columns)
+    }) {
+        let _ = writeln!(
+            s,
+            "  {:<36} {:>12}  {:<22} {:<22} {:<8} {}",
+            tail(&i.cardinality.columns.join(", "), 36),
+            "-",
+            "-",
+            "-",
+            "-",
+            sketch_fanout(i)
+        );
+    }
+    if !r.sketch.is_empty() {
+        let _ = writeln!(
+            s,
+            "  sketch: rows per value over ≈distinct values (HyperLogLog, 99.7% interval), files \
+             per value, files repeating a value (≥≈N: a file repeating fewer rows is not \
+             detected, so 0 never proves uniqueness); approximate unless marked exact; never \
+             used to plan"
         );
     }
     if !r.profile.skipped.is_empty() {
@@ -793,6 +880,21 @@ pub(crate) fn why(r: &bellwether::WhyReport, out: &Out, fix_command: &str) -> St
             );
         }
     }
+    let exact_scan = if r.reads.exact_index_segments > 0 {
+        format!(
+            "; {} exact-index segment(s) scanned for exact distinct counts",
+            num(r.reads.exact_index_segments)
+        )
+    } else {
+        String::new()
+    };
+    let _ = writeln!(
+        s,
+        "\ndata read: {} files, {} row groups; footers of {} files{exact_scan}",
+        num(r.reads.files),
+        num(r.reads.row_groups),
+        num(r.reads.footers)
+    );
     let _ = writeln!(s, "\nrecords");
     match (&r.evidence.hash, &r.evidence.note) {
         (Some(h), _) => {
@@ -1141,4 +1243,162 @@ fn twin_table(s: &mut String, t: &bellwether::TwinReport) {
             );
         }
     }
+}
+
+/// One sketched item's `why` cell: `≈138,889 rows/value of ≈72 (±2.4%),
+/// ≈139 files/value, 9,998 of 10,000 files repeat ≥≈24 rows`, or exact
+/// with an exact distinct count. The last figure is the detection floor:
+/// fewer repeats in a file go unseen.
+fn sketch_fanout(i: &bellwether::ItemCardinality) -> String {
+    let c = &i.cardinality;
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let rpv = num(c.rows_per_value.round() as u64);
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let fpv = num(c.files_per_value.round() as u64);
+    let distinct = match c.exact_distinct {
+        Some(d) => format!("{rpv} rows/value of {} (exact)", num(d)),
+        None => format!(
+            "≈{rpv} rows/value of ≈{} (±{:.1}%)",
+            num(c.distinct),
+            300.0 * c.relative_standard_error
+        ),
+    };
+    format!(
+        "{distinct}, ≈{fpv} files/value, {} of {} files repeat ≥≈{} rows",
+        num(c.files_with_duplicates),
+        num(c.files),
+        num(c.duplicate_floor.max(1))
+    )
+}
+
+/// `sketch cardinality`: one block per item.
+pub(crate) fn cardinality(r: &bellwether::CardinalityResult, out: &Out) -> String {
+    use bellwether::SketchSource;
+    let mut s = String::new();
+    let state = if r.sequence == 0 {
+        "not indexed".to_string()
+    } else {
+        format!("manifest sequence {}", r.sequence)
+    };
+    let read = if r.files_read == 0 {
+        "from sketches; no data file read".to_string()
+    } else {
+        format!(
+            "{} files ({} row groups) read now for the items no sketch holds",
+            num(r.files_read),
+            num(r.row_groups_read)
+        )
+    };
+    let _ = writeln!(
+        s,
+        "{}",
+        heading(
+            out,
+            &format!(
+                "sketch cardinality {} ({state}): approximate, {read}",
+                r.root
+            )
+        )
+    );
+    for i in &r.items {
+        let c = &i.cardinality;
+        let distinct = match c.exact_distinct {
+            Some(d) => format!(
+                "{} distinct values (exact, from the exact key on {}; the sketch says ≈{})",
+                num(d),
+                c.columns.join(", "),
+                num(c.distinct)
+            ),
+            None => format!(
+                "≈{} distinct values (99.7%: {}..{}, ±{:.1}%)",
+                num(c.distinct),
+                num(c.distinct_low),
+                num(c.distinct_high),
+                300.0 * c.relative_standard_error
+            ),
+        };
+        let _ = writeln!(
+            s,
+            "  {}: {distinct}; {} rows, {} with a null {}",
+            c.item,
+            num(c.rows),
+            num(c.nulls),
+            if c.columns.len() > 1 {
+                "leading column (not counted)"
+            } else {
+                "(not counted)"
+            }
+        );
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let (rpv, fpv) = (
+            c.rows_per_value.round() as u64,
+            num(c.files_per_value.round() as u64),
+        );
+        let _ = writeln!(
+            s,
+            "    {}{} {} per value; each value in ≈{fpv} files; {} of {} files repeat a value \
+             (a file of average size repeating fewer than about {} rows is not detected; a \
+             sketch cannot prove uniqueness)",
+            if c.rows_per_value_exact { "" } else { "≈" },
+            num(rpv),
+            if rpv == 1 { "row" } else { "rows" },
+            num(c.files_with_duplicates),
+            num(c.files),
+            num(c.duplicate_floor.max(1)),
+        );
+        let from = match (&i.source, &i.sketch) {
+            (SketchSource::Index, Some(label)) => format!("read from {label}"),
+            _ => format!(
+                "computed now; `bellwether index {} --key sketch:{}` answers it without reading",
+                r.root, c.item
+            ),
+        };
+        let _ = writeln!(s, "    {from}");
+    }
+    if r.exact_index_segments_read > 0 {
+        let _ = writeln!(
+            s,
+            "  exact distinct counts scanned {} exact-index segment(s) (index, not data)",
+            num(r.exact_index_segments_read)
+        );
+    }
+    s
+}
+
+/// `sketch overlap`: the estimate, its interval, and the sizes.
+pub(crate) fn overlap(r: &bellwether::OverlapResult, out: &Out) -> String {
+    use bellwether::types::OverlapMethod;
+    let o = &r.overlap;
+    let mut s = String::new();
+    let how = match (o.method, o.signatures) {
+        (OverlapMethod::Minhash, Some(k)) => format!("MinHash, {k} signatures"),
+        _ => "HyperLogLog inclusion-exclusion; declare both sketches with minhash= for a \
+              tighter bound on small overlaps"
+            .to_string(),
+    };
+    let _ = writeln!(
+        s,
+        "{}",
+        heading(
+            out,
+            &format!(
+                "sketch overlap {} ~ {}: approximate ({how})",
+                o.left, o.right
+            )
+        )
+    );
+    let _ = writeln!(
+        s,
+        "  Jaccard ≈{:.4} (99.7%: {:.4}..{:.4}); ≈{} values in both, ≈{} in either (left ≈{}, right ≈{})",
+        o.jaccard,
+        o.jaccard_low,
+        o.jaccard_high,
+        num(o.intersection),
+        num(o.union_distinct),
+        num(o.left_distinct),
+        num(o.right_distinct)
+    );
+    let _ = writeln!(s, "  left  {} in {}", r.left_sketch, r.left_root);
+    let _ = writeln!(s, "  right {} in {}", r.right_sketch, r.right_root);
+    s
 }

@@ -20,6 +20,9 @@
 //!   through it.
 //! - [`transient`]: a hypothetical spec's segments, built over key reads,
 //!   and their cache.
+//! - [`sketch`](mod@sketch): a transient `sketch` (approximate distinct
+//!   counts) over item-column reads, equal to what a built sketch holds. No
+//!   plan reads it.
 //! - [`baseline`]: raw scan and Parquet-native statistics plus embedded
 //!   bloom filters.
 //! - [`layout`]: layout proposals under a stated model (`exact: false`).
@@ -50,6 +53,7 @@ pub mod layout;
 pub mod plan;
 pub mod replay;
 pub mod report;
+pub mod sketch;
 pub mod slo;
 pub mod transient;
 pub mod workload;
@@ -69,6 +73,7 @@ pub use replay::{proposed_specs, write_replay, Replayer, Scored, DEFAULT_CACHE_B
 pub use report::{
     nearest_rank, p50_p95_max, report, CostQuantiles, Report, RunRow, TemplateSummary,
 };
+pub use sketch::TransientSketch;
 pub use slo::REPLAY_RUN_P50_BUDGET;
 pub use transient::{
     BuildStats, CacheStats, TransientCache, TransientIndex, TransientLimits, CLUSTER_KEY_OVERHEAD,

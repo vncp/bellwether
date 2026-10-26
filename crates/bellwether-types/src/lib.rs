@@ -343,6 +343,11 @@ impl fmt::Display for HashKind {
 fn not_indexed(root: &str, operation: &str, needs: Option<&str>) -> String {
     match needs {
         None => format!("{root} is not indexed, so {operation} has no index to plan with"),
+        // A sketch is read, never planned with, and is not a key spec.
+        Some(spec) if spec.starts_with("sketch:") => format!(
+            "{root} has no complete sketch holding {}, so {operation} has no sketch to read",
+            spec.trim_start_matches("sketch:")
+        ),
         Some(spec) => format!(
             "{root} has no complete {spec} key spec, so {operation} has no index to plan with"
         ),
@@ -1309,6 +1314,188 @@ impl Record {
             Self::Receipt(r) => r.record_version,
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// --- phase 5: sketch (approximate; never read by a planner) ---
+// ---------------------------------------------------------------------------
+
+/// `HyperLogLog` precision of a [`SketchSpec`] that names none: `2^14`
+/// registers, a relative standard error of about 0.81 %.
+pub const SKETCH_DEFAULT_PRECISION: u8 = 14;
+
+/// Confidence of every approximate interval a sketch reports: three standard
+/// errors of a normal approximation.
+pub const SKETCH_CONFIDENCE: f64 = 0.997;
+
+/// A `sketch` sidecar: per item, per file, `HyperLogLog` registers and an
+/// optional `MinHash` signature (`docs/format.md`, "Sketch segments").
+///
+/// **Approximate, and never planned with.** A sketch answers
+/// `count(distinct item)` and "how much do two columns overlap" with an
+/// error bound; it is not a [`KeySpec`], it cannot prune a row group, and no
+/// planner path reads it (an approximate number in a plan would break
+/// invariant 1). The manifest declares it in `schema.sidecars` with kind
+/// `sketch`, beside, never among, the key specs.
+///
+/// Short form `sketch:a,b,a+b[,p=12][,minhash=64]`: each comma-separated item
+/// is one column or a `+`-joined tuple of columns (a tuple is encoded like a
+/// composite key, ADR 014: a row whose leading column is null is not
+/// sketched, a null trailing column is the null marker).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct SketchSpec {
+    /// Sketched items in declaration order: one column, or a tuple of columns.
+    pub items: Vec<Vec<String>>,
+    /// `HyperLogLog` precision `p` (`2^p` registers), 4..=18.
+    pub precision: u8,
+    /// `MinHash` signature length `k`, when the sketch keeps signatures.
+    pub minhash: Option<u16>,
+}
+
+impl SketchSpec {
+    /// The short label of one item: `a`, or `a+b` for a tuple.
+    #[must_use]
+    pub fn item_label(item: &[String]) -> String {
+        item.join("+")
+    }
+
+    /// The name its segments and completeness are recorded under:
+    /// `sketch:a,b,a+b`. Parameters are not part of the name; a spec with
+    /// other parameters under the same name replaces the old one.
+    #[must_use]
+    pub fn name(&self) -> String {
+        let items: Vec<String> = self.items.iter().map(|i| Self::item_label(i)).collect();
+        format!("sketch:{}", items.join(","))
+    }
+
+    /// The short form with its parameters: the name, then `,p=<p>` when the
+    /// precision is not [`SKETCH_DEFAULT_PRECISION`], then `,minhash=<k>`.
+    #[must_use]
+    pub fn label(&self) -> String {
+        let mut s = self.name();
+        if self.precision != SKETCH_DEFAULT_PRECISION {
+            s = format!("{s},p={}", self.precision);
+        }
+        if let Some(k) = self.minhash {
+            s = format!("{s},minhash={k}");
+        }
+        s
+    }
+}
+
+/// Where an exact distinct count beside a sketch came from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum ExactDistinctSource {
+    /// The distinct keys of a complete `exact` key spec on exactly the item's
+    /// columns, counted over live row groups.
+    ExactSegment,
+}
+
+/// `cardinality(item)`: an **approximate** distinct count from a sketch,
+/// with its error bound, beside the exact row counts the sketch stores.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct ApproxCardinality {
+    /// Always `true`: `distinct` and every number derived from it is a
+    /// `HyperLogLog` estimate, never an exact count, unless `exact_distinct`
+    /// says otherwise.
+    pub approximate: bool,
+    /// The item, `a` or `a+b`.
+    pub item: String,
+    /// The item's columns.
+    pub columns: Vec<String>,
+    /// Estimated distinct values over every live file, rounded.
+    pub distinct: u64,
+    /// Lower end of the interval holding the true count with probability
+    /// `confidence`.
+    pub distinct_low: u64,
+    /// Upper end of that interval (never above `rows`).
+    pub distinct_high: u64,
+    /// Relative standard error of `distinct` at the sketch's precision.
+    pub relative_standard_error: f64,
+    /// Confidence of `[distinct_low, distinct_high]`: [`SKETCH_CONFIDENCE`].
+    pub confidence: f64,
+    /// The exact distinct count, when a complete exact key spec on the
+    /// same columns holds it.
+    pub exact_distinct: Option<u64>,
+    /// Where `exact_distinct` came from.
+    pub exact_source: Option<ExactDistinctSource>,
+    /// Rows whose item value was sketched (leading column non-null). Exact.
+    pub rows: u64,
+    /// Rows not sketched because the leading column is null. Exact.
+    pub nulls: u64,
+    /// Fanout: `rows / distinct` (or `rows / exact_distinct` when it is
+    /// known), the rows one value covers on average.
+    pub rows_per_value: f64,
+    /// Whether `rows_per_value` used the exact distinct count.
+    pub rows_per_value_exact: bool,
+    /// Live files the sketch covers.
+    pub files: u64,
+    /// Estimated files one value appears in, on average: the sum of the
+    /// per-file estimates over `distinct`. Approximate.
+    pub files_per_value: f64,
+    /// Files whose own estimate is below their row count by more than its
+    /// error bound: files that almost certainly repeat a value of the item
+    /// (for a tuple such as `symbol+ts`, files where it is not unique).
+    /// Files repeating fewer rows than `duplicate_floor` are not counted, so
+    /// zero never proves the item unique within every file.
+    pub files_with_duplicates: u64,
+    /// The detection floor of `files_with_duplicates`: the repeated rows a
+    /// file of the average sketched size (`rows / files`) must hold before
+    /// its estimate falls outside its bound, `ceil(r · 3σ / (1 + 3σ))` with
+    /// `r` that size and `σ` the relative standard error. Approximate.
+    #[serde(default)]
+    pub duplicate_floor: u64,
+}
+
+/// How an overlap was estimated.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum OverlapMethod {
+    /// `MinHash` signatures of equal length on both sides: the share of
+    /// signature slots whose minimums agree.
+    Minhash,
+    /// `HyperLogLog` inclusion-exclusion: `|A| + |B| - |A ∪ B|` over the
+    /// union of both sketches. Wider bounds than `MinHash` for small overlaps.
+    Hll,
+}
+
+/// `overlap(a.item, b.item)`: the **approximate** Jaccard similarity of two
+/// sketched items' value sets, with its error bound.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct ApproxOverlap {
+    /// Always `true`: every number here is an estimate.
+    pub approximate: bool,
+    /// The left item.
+    pub left: String,
+    /// The right item.
+    pub right: String,
+    /// How it was estimated.
+    pub method: OverlapMethod,
+    /// `MinHash` signature length, when `method` is `minhash`.
+    pub signatures: Option<u16>,
+    /// Estimated Jaccard similarity `|A ∩ B| / |A ∪ B|`, in `[0, 1]`.
+    pub jaccard: f64,
+    /// Lower end of the interval holding the true similarity with
+    /// probability `confidence`.
+    pub jaccard_low: f64,
+    /// Upper end of that interval.
+    pub jaccard_high: f64,
+    /// Confidence of the interval: [`SKETCH_CONFIDENCE`].
+    pub confidence: f64,
+    /// Estimated distinct values on the left.
+    pub left_distinct: u64,
+    /// Estimated distinct values on the right.
+    pub right_distinct: u64,
+    /// Estimated distinct values in the union.
+    pub union_distinct: u64,
+    /// Estimated distinct values in both: `jaccard × union_distinct`.
+    pub intersection: u64,
 }
 
 // --- phase 5: one `why` column per index kind ---

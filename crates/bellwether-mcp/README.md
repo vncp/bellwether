@@ -26,6 +26,7 @@ A folder that is the lake twin of a query engine (ADR 033) is served with `--twi
 |---|---|---|---|
 |observe|`observe.why` (no keys)|`why` without a workload|the profile Evidence, cache entries|
 |observe|`observe.profile`|`findings`|nothing|
+|observe|`observe.cardinality` (`items`, `transient`), `observe.overlap` (`left`, `right`)|`cardinality`, `overlap`: approximate distinct counts and Jaccard similarity from `sketch` sidecars (never used to plan); `transient` reads the files for items no sketch holds|nothing|
 |observe|`observe.locate`, `observe.asof`|`locate`, `asof`; with `at_manifest`, on an engine opened at that committed manifest (`EngineOptions::at_manifest`, the CLI's `--at-manifest`)|the `plan` Evidence, cache entries|
 |score|`score.why` (keys or a workload hash; `gates` with a twin)|`why` with a workload|engine Proposals and Replays; with a twin, the profile Evidence records it|
 |score|`score.verify` (`engine` sets latest-by, ignored columns, and totals for a rewrite of engine queries)|`fix` with `verify_only`|Replay, plan Evidence, Certificate; for an engine rewrite the measured Replay, then the Certificate|
