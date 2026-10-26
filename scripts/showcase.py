@@ -587,7 +587,7 @@ class Showcase:
             "noun": q["noun"],
             "kind": k,
             "keys": f"{len(values)} {col} values",
-            "sql": self.portable(all_sql if len(all_sql) < 600 else all_sql[:280] + " ... " + all_sql[-200:]),
+            "sql": shown_sql(self.portable(all_sql)),
         }
         log(
             self.logf,
@@ -665,6 +665,13 @@ class Showcase:
             f"  bellwether {secs:.1f} s, {found} differing keys, pass={o['pass']}, passes {o['memory']['passes']};"
             f" duckdb {m['seconds']:.1f} s, {m['rows']} differing rows",
         )
+
+
+def shown_sql(sql):
+    """The SQL as the results file shows it: whole when short, else its
+    head and tail. Cut after the scratch path is written as <work>, so the
+    cut does not move with the scratch directory's length."""
+    return sql if len(sql) < 600 else sql[:280] + " ... " + sql[-200:]
 
 
 def spec_text(spec):

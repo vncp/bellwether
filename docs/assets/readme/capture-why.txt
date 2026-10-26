@@ -1,9 +1,9 @@
 #! title: bellwether why
-#! caption: bellwether why on the bench ledger corpus (bench generate --seed 42: 16 files, 64 row groups, 128,000 rows; bench workload: 12 recorded runs), nothing indexed; debug build of 7ea1ea7, 2026-10-26.
+#! caption: bellwether why on the bench ledger corpus (bench generate --seed 42: 16 files, 64 row groups, 128,000 rows; bench workload: 12 recorded runs), nothing indexed; release build of 3a0c26a, 2026-10-26.
 $ bellwether why ledger/data --bench-workload ledger
 [1mwhy /private/tmp/bellwether-readme/ledger/data: not indexed[0m
 funnel: 12 runs, keys p50/p95/max 20/400/400; exact sums of row-group statistics, summed over runs
-                                            files   row groups              bytes           
+                                            files   row groups              bytes
   dataset                                      16           64         19,308,862    19.3 MB  128,000 rows
   full scan                                   192          768        231,706,344   231.7 MB  context: what a reader that skips nothing reads
   current: no index (min/max pruning)         111          444        133,956,413   134.0 MB  what the files' own footer statistics skip to without an index; a key must read less
@@ -11,20 +11,20 @@ funnel: 12 runs, keys p50/p95/max 20/400/400; exact sums of row-group statistics
 
 culprit (entity_id): no key index serves this lookup; the files' own min/max statistics already narrow it to 444 of the 768 row groups the runs span; one value touches 1 / 2 / 4 files and 4 / 8 / 16 row groups (p50 / p95 / max)
 recommended: exact:entity_id reads 130,336,047 bytes (130.3 MB) instead of 133,956,413 (134.0 MB) with min/max pruning
-  apply it: bellwether fix /private/tmp/bellwether-readme/ledger/data --proposal 4e4e944f168051be6c2639d4ca474db34a83d24d0a97c13f512984c7a835d566 --workload 3a1921721b730b1ea76a1933a0cb7cccae1f2d7f1cd90a2ebfd34228807cb842
+  apply it: bellwether fix /private/tmp/bellwether-readme/ledger/data --proposal f8923b75c3e8df7f17a54883997973a0dcd8b6917f31fe8132ec58e3d7b4506a --workload 3a1921721b730b1ea76a1933a0cb7cccae1f2d7f1cd90a2ebfd34228807cb842
 
 fanout: files and row groups one value touches, p50 / p95 / max
-  key                                      distinct  files/value            row groups/value       sample   
-  entity_id                                   6,855  1 / 2 / 4              4 / 8 / 16             exact    
-  batch_id                                      288  4 / 4 / 4              4 / 4 / 4              exact    
-  status                                          5  16 / 16 / 16           64 / 64 / 64           exact    
-  payload                                   128,000  1 / 1 / 1              1 / 1 / 1              exact    
-  entity_id, batch_id                       128,000  1 / 1 / 1              1 / 1 / 1              exact    
-  entity_id, payload                        128,000  1 / 1 / 1              1 / 1 / 1              exact    
-  batch_id, payload                         128,000  1 / 1 / 1              1 / 1 / 1              exact    
-  status, payload                           128,000  1 / 1 / 1              1 / 1 / 1              exact    
-  entity_id, status                          24,057  1 / 2 / 4              3 / 7 / 16             exact    
-  batch_id, status                            1,438  4 / 4 / 4              4 / 4 / 4              exact    
+  key                                      distinct  files/value            row groups/value       sample
+  entity_id                                   6,855  1 / 2 / 4              4 / 8 / 16             exact
+  batch_id                                      288  4 / 4 / 4              4 / 4 / 4              exact
+  status                                          5  16 / 16 / 16           64 / 64 / 64           exact
+  payload                                   128,000  1 / 1 / 1              1 / 1 / 1              exact
+  entity_id, batch_id                       128,000  1 / 1 / 1              1 / 1 / 1              exact
+  entity_id, payload                        128,000  1 / 1 / 1              1 / 1 / 1              exact
+  batch_id, payload                         128,000  1 / 1 / 1              1 / 1 / 1              exact
+  status, payload                           128,000  1 / 1 / 1              1 / 1 / 1              exact
+  entity_id, status                          24,057  1 / 2 / 4              3 / 7 / 16             exact
+  batch_id, status                            1,438  4 / 4 / 4              4 / 4 / 4              exact
   not candidates:
     version_ts: Timestamp(µs, "UTC"): a time column, analyzed for range overlap
     amount: Decimal128(18, 2): not an identifier type
@@ -40,6 +40,6 @@ lints
 data read: 16 files, 128 row groups; footers of 16 files
 
 records
-  evidence  927fb29c6751f0624efb96d624e2561ef3c0bddea2ffcbb4367fac3e63f7fa92
+  evidence  c8daa5732ac1c87ae61505d35c29823afb60e243d75274c17eb9d3148f34e453
   workload  3a1921721b730b1ea76a1933a0cb7cccae1f2d7f1cd90a2ebfd34228807cb842
-  proposal  4e4e944f168051be6c2639d4ca474db34a83d24d0a97c13f512984c7a835d566  replay 599ce435f093  exact:entity_id
+  proposal  f8923b75c3e8df7f17a54883997973a0dcd8b6917f31fe8132ec58e3d7b4506a  replay cf6d7eb3188d  exact:entity_id

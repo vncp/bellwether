@@ -269,6 +269,49 @@ fn over_an_index_that_serves_every_run_the_current_row_is_plain() {
     assert!(!head.contains("min/max"), "{head}");
 }
 
+/// The funnel and the fanout table end at their last cell: with no sketch
+/// column, no line of `why` pads past `exact` or `bytes`, and a funnel row
+/// with no note (the plain `current` row over an index that serves every
+/// run) ends at its size.
+#[test]
+fn why_tables_carry_no_trailing_padding() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    corpus(&data, 1, 8, 50, 1_000_000);
+    let kf = dir.path().join("k.parquet");
+    keys(&kf, "id", &[5, 7, 120]);
+    let no_padding = |human: &str| {
+        for line in human.lines() {
+            assert_eq!(line, line.trim_end(), "trailing padding in: {line:?}");
+        }
+    };
+
+    let human = run(&["why", path(&data), "--from", path(&kf)], 0);
+    assert!(human.contains("\nfanout:"), "{human}");
+    let header = human
+        .lines()
+        .find(|l| l.trim_start().starts_with("key ") && l.contains("files/value"))
+        .unwrap_or_else(|| panic!("{human}"));
+    assert!(
+        header.ends_with("sample"),
+        "no sketch column here: {header:?}"
+    );
+    no_padding(&human);
+
+    run(&["index", path(&data), "--key", "exact:id"], 0);
+    let human = run(&["why", path(&data), "--from", path(&kf)], 0);
+    let current = human
+        .lines()
+        .find(|l| l.trim_start().starts_with("current "))
+        .unwrap_or_else(|| panic!("{human}"));
+    let unit = current.split_whitespace().last().unwrap();
+    assert!(
+        ["B", "kB", "MB", "GB", "TB"].contains(&unit),
+        "the current row has no note here, so it ends at its size: {current:?}"
+    );
+    no_padding(&human);
+}
+
 /// Item 4, the other side: where min/max pruning keeps row groups the key
 /// does not hold, `why` still recommends the key, priced against them, and
 /// `fix` applies it. Row group `r` holds ids `r` and `1000 - r`, so its
