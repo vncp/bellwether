@@ -190,18 +190,18 @@ class Doc:
                        f"previous sample (the CPU was used in between); {idle:.0f}% of it is still charged to a "
                        "wait primitive, which is the kernel time spent sleeping and waking threads. The self "
                        "and inclusive tables below rank the rest.\n")
-            out.append("| # | self % (on CPU) | frame |")
+            out.append("| # | self % (CPU not charged to waits) | frame |")
             out.append("|---:|---:|---|")
             for i, t in enumerate(v["top"], 1):
                 frame = t["frame"].replace("|", "\\|")
                 out.append(f"| {i} | {t['self_pct']} | `{frame}` |")
             u = v.get("unprofiled")
             if u:
-                out.append(f"Run once more without the profiler under `/usr/bin/time -p`: {u['wall_s']:.2f} s wall, "
+                out.append(f"\nRun once more without the profiler under `/usr/bin/time -p`: {u['wall_s']:.2f} s wall, "
                            f"{u['user_s']:.2f} s user, {u['sys_s']:.2f} s system, so {u['cores_busy']:.2f} cores "
                            "busy on average.\n")
             if v.get("waits") and idle >= 5:
-                out.append("CPU charged to wait primitives (% of all sampled CPU), and the code that waited:\n")
+                out.append("\nCPU charged to wait primitives (% of all sampled CPU), and the code that waited:\n")
                 for wt in v["waits"]:
                     out.append(f"- `{wt['frame']}` {wt['cpu_pct']}: " + ("; ".join(
                         f"`{c['frame']}` {c['cpu_pct']}" for c in wt["callers"]) or "no caller named"))
@@ -210,18 +210,28 @@ class Doc:
             if any(callers.values()):
                 out.append("\nWho called the top self frames that are not bellwether's own: the nearest "
                            "bellwether function, or on a thread with none (a blocking-I/O pool) the nearest "
-                           "named library function (% of on-CPU time):\n")
+                           "named library function (% of the CPU not charged to waits):\n")
                 for frame, cs in callers.items():
                     if cs:
                         out.append(f"- `{frame}`: " + "; ".join(f"`{c['frame']}` {c['pct']}" for c in cs))
             if v.get("inclusive"):
-                out.append("\nbellwether functions by inclusive on-CPU time (every thread):\n")
-                out.append("| # | total % (on CPU) | without store reads % | function |")
+                out.append("\nbellwether functions by inclusive CPU, not charged to waits (every thread):\n")
+                out.append("| # | total % (CPU not charged to waits) | without store reads % | function |")
                 out.append("|---:|---:|---:|---|")
                 for i, t in enumerate(v["inclusive"], 1):
                     nr = t.get("without_store_reads_pct", "-")
                     out.append(f"| {i} | {t['total_pct']} | {nr} | `{t['frame']}` |")
-            if v.get("main_thread_wall"):
+            if v.get("busiest_threads_cpu_pct"):
+                out.append(f"\nCPU by thread: the busiest three of {v['threads']} threads hold "
+                           + ", ".join(f"{x}%" for x in v["busiest_threads_cpu_pct"]) + " of the sampled CPU.")
+            cover = None
+            if u and u.get("wall_s"):
+                cover = v["main_thread_wall_samples"] / (v["rate_hz"] * u["wall_s"] * v["iterations"])
+            if v.get("main_thread_wall") and cover is not None and cover < 0.5:
+                out.append(f"\nThe main thread has {v['main_thread_wall_samples']:,} samples, {cover:.0%} of its wall "
+                           "time at this rate: samply records a sleeping thread only when it runs, so no "
+                           "main-thread wall table is given.")
+            elif v.get("main_thread_wall"):
                 out.append(f"\nMain thread wall time ({v['main_thread_wall_samples']:,} samples, on CPU or "
                            "waiting), by bellwether function on the stack:\n")
                 out.append("| # | wall % (main thread) | function |")
