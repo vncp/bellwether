@@ -1141,9 +1141,12 @@ def main():
     ]
     for name, run in runs:
         if name in sections:
-            p.section(name, start=True)
+            # Reconcile pairs may be measured in separate slots (--merge), so
+            # each pair set keeps its own section record.
+            key = f"reconcile {','.join(a.reconcile_datasets)}" if name == "reconcile" else name
+            p.section(key, start=True)
             run()
-            p.section(name, start=False)
+            p.section(key, start=False)
             p.write()
 
 
