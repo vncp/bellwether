@@ -137,6 +137,9 @@ fn changed_files_are_resketched_and_a_stale_folder_is_refused() {
     ledger_corpus(dir.path(), 3, 2, 300, 10_000);
     let e = engine(dir.path());
     declare(&e, "sketch:id,batch");
+    // An exact key on batch: its distinct count is exact, over live row
+    // groups only (the rewrite below retires part-000's batches 0..11).
+    declare(&e, "exact:batch");
     // Rewrite one file with new values, add another: refused until indexed.
     let rows: Vec<Row> = (0..500)
         .map(|k| (1_000_000 + k, 9_000, Some(k), format!("q{k}")))
@@ -157,12 +160,17 @@ fn changed_files_are_resketched_and_a_stale_folder_is_refused() {
         })
         .unwrap();
     assert_eq!(c.items[0].source, SketchSource::Index);
-    let (ids, _, rows) = truth(dir.path());
+    let (ids, batches, rows) = truth(dir.path());
     assert_eq!(c.items[0].cardinality.rows, rows);
     assert_eq!(c.items[0].cardinality.files, 4);
     let card = &c.items[0].cardinality;
     let exact = ids.len() as u64;
     assert!(card.distinct_low <= exact && exact <= card.distinct_high);
+    assert_eq!(batches.len(), 25);
+    assert_eq!(
+        c.items[1].cardinality.exact_distinct,
+        Some(batches.len() as u64)
+    );
     // A second engine computing transiently over the same files agrees.
     let fresh = tempfile::tempdir().unwrap();
     for f in std::fs::read_dir(dir.path()).unwrap() {
@@ -387,4 +395,28 @@ fn a_sketch_is_refused_as_a_proposal() {
         }
         other => panic!("{other:?}"),
     }
+}
+
+/// When several complete sketches hold one item, `cardinality` and the
+/// `why` column read the one with the highest precision (the ruling in the
+/// facade's docs), whatever the declaration order.
+#[test]
+fn the_finest_sketch_holding_an_item_is_read() {
+    let dir = tempfile::tempdir().unwrap();
+    ledger_corpus(dir.path(), 3, 2, 200, 300);
+    let e = engine(dir.path());
+    declare(&e, "sketch:batch,p=10");
+    declare(&e, "sketch:id,batch,p=12");
+    let c = e.cardinality(&req(&["batch"], false)).unwrap();
+    assert_eq!(c.items[0].sketch.as_deref(), Some("sketch:id,batch,p=12"));
+    let rse12 = 1.04 / 64.0;
+    assert!((c.items[0].cardinality.relative_standard_error - rse12).abs() < 1e-12);
+    let w = e.why(&WhyRequest::default()).unwrap();
+    let batch = w
+        .sketch
+        .iter()
+        .find(|i| i.cardinality.item == "batch")
+        .unwrap();
+    assert_eq!(batch.sketch.as_deref(), Some("sketch:id,batch,p=12"));
+    assert_eq!(batch.cardinality, c.items[0].cardinality);
 }

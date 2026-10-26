@@ -61,24 +61,29 @@ def rules(report, column):
 
 
 def oracle_distinct(files, columns):
-    """Exact distinct values of a column tuple, and per-file duplicate files,
+    """Exact distinct values of a column tuple (rows whose leading column is
+    null left out, as the sketch does), and the files that repeat a value,
     from the decoded files (pyarrow), or None when pyarrow is missing."""
     try:
+        import pyarrow as pa
+        import pyarrow.compute as pc
         import pyarrow.parquet as pq
     except ImportError:
         return None
-    seen = set()
+    tables = []
     dup_files = 0
-    rows = 0
     for f in files:
-        t = pq.read_table(f, columns=columns)
-        cols = [t.column(c).to_pylist() for c in columns]
-        vals = [v for v in zip(*cols) if v[0] is not None]
-        rows += len(vals)
-        if len(set(vals)) < len(vals):
+        t = pq.read_table(f, columns=columns, partitioning=None)
+        t = t.filter(pc.is_valid(t.column(columns[0])))
+        if t.group_by(columns).aggregate([]).num_rows < t.num_rows:
             dup_files += 1
-        seen.update(vals)
-    return {"distinct": len(seen), "rows": rows, "files_with_duplicates": dup_files}
+        tables.append(t)
+    whole = pa.concat_tables(tables)
+    return {
+        "distinct": whole.group_by(columns).aggregate([]).num_rows,
+        "rows": whole.num_rows,
+        "files_with_duplicates": dup_files,
+    }
 
 
 def data_files(root):
