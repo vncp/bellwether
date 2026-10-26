@@ -4,7 +4,9 @@ use std::ops::Deref;
 use std::time::{Duration, Instant};
 
 use bellwether_ledger::{Ledger, RecordKind};
-use bellwether_types::{format, CertBody, Certificate, Evidence, Hash, Provenance, Record, Store};
+use bellwether_types::{
+    format, AggServed, CertBody, Certificate, Evidence, Hash, Provenance, Record, Store,
+};
 
 use crate::error::{Result, VerifyError};
 use crate::outcome::{Mismatch, Reconciliation};
@@ -49,6 +51,11 @@ pub struct CertificateContext {
     /// run is added to an input's age. Two runs over the same inputs then
     /// make byte-identical certificates. `None` uses the system clock.
     pub clock: Option<String>,
+    /// Agg cells (B7) the caller checked against the decoded rows
+    /// ([`crate::check_agg_cells`]), each with [`AggServed::checked`] set:
+    /// appended to the reconciliation's and the certificate's `agg`; both
+    /// pass only when no checked cell differs.
+    pub agg: Vec<AggServed>,
 }
 
 /// A reconciliation with its certificate, ready to record.
@@ -144,7 +151,13 @@ pub(crate) fn build(
     for i in &ctx.inputs {
         cite(i.hash, i.age, handed);
     }
-    let o = &exec.outcome;
+    let mut outcome = exec.outcome;
+    outcome.pass &= ctx
+        .agg
+        .iter()
+        .all(|a| a.checked.as_ref().is_none_or(|c| c.differ == 0));
+    outcome.agg.extend(ctx.agg.iter().cloned());
+    let o = &outcome;
     let totals_delta = o
         .mismatches
         .iter()
@@ -183,7 +196,7 @@ pub(crate) fn build(
         },
     };
     Ok(Certified {
-        outcome: exec.outcome,
+        outcome,
         certificate,
         evidence: exec.evidence,
     })

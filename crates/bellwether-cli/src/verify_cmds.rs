@@ -479,7 +479,7 @@ fn reconcile_human(r: &ReconcileResult, out: &Out) -> String {
             "  each pass reads both sides again; a larger --memory-budget makes fewer passes"
         );
     }
-    for a in &o.agg {
+    for a in o.agg.iter().filter(|a| a.checked.is_none()) {
         let _ = writeln!(
             s,
             "  the {} side's per-key rows and totals came from its index's {}: {} aggregated, \
@@ -784,6 +784,39 @@ fn verify_and_outcome_human(s: &mut String, r: &FixResult) {
             rows_asked(filter)
         );
     }
+    // A proposed agg key's cells (B7), checked against the rows.
+    if let Some(Record::Certificate(cert)) = r.certificate.as_ref().map(|c| &c.record) {
+        for a in &cert.body.agg {
+            let Some(c) = &a.checked else { continue };
+            let _ = writeln!(
+                s,
+                "            agg cells checked against the rows: {}: {} of {} ({}; {} read), \
+                 {} differ",
+                a.specs.join(", "),
+                count(c.cells, "cell", "cells"),
+                count(c.keys, "key", "keys"),
+                count(a.rows, "row", "rows"),
+                count(c.row_groups_read, "row group", "row groups"),
+                num(c.differ)
+            );
+            for d in c.examples.iter().take(5) {
+                let key: Vec<&str> = d
+                    .values
+                    .iter()
+                    .map(|v| v.as_deref().unwrap_or("null"))
+                    .collect();
+                let _ = writeln!(
+                    s,
+                    "              key ({}) row group {}: the index would store {}; the rows \
+                     make {}",
+                    key.join(", "),
+                    d.row_group,
+                    d.stored,
+                    d.rows
+                );
+            }
+        }
+    }
     // The invariant is checked by the certificate; without one (a refusal
     // before the verify stage), nothing was.
     if let (Some(inv), Some(_)) = (&r.invariant, &r.certificate) {
@@ -858,6 +891,16 @@ fn verify_and_outcome_human(s: &mut String, r: &FixResult) {
         }
         FixOutcome::Refused { refusal } => {
             let why = match refusal {
+                Refusal::CertificateFailed {
+                    mismatched,
+                    missing_left,
+                    missing_right,
+                    totals_differ,
+                    agg_cells_differ,
+                    ..
+                } if *agg_cells_differ > 0 => format!(
+                    "the certificate failed: {agg_cells_differ} agg cells of the proposed key differ from the rows they aggregate (above), so building it would store wrong aggregates ({mismatched} mismatched, {missing_left} missing left, {missing_right} missing right, {totals_differ} totals differ); no receipt"
+                ),
                 Refusal::CertificateFailed {
                     mismatched,
                     missing_left,

@@ -653,6 +653,7 @@ impl Reconciler {
                     side: SIDE_NAMES[s].to_string(),
                     specs: vec![a.spec.clone()],
                     rows: a.rows,
+                    checked: None,
                 })
             })
             .collect();

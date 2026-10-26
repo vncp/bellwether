@@ -905,9 +905,10 @@ fn check_counted_beside(spec: &KeySpec, specs: &[KeySpec], workload: &Workload) 
         let cols = cols.join(",");
         Error::KeySpec(format!(
             "{} {what} only beside a key counting rows on exactly ({cols}), which proves which \
-             of its aggregates cover each key, and the index declares none complete; declare it \
-             first with `bellwether index <root> --key 'exact:{cols},counts'`, then propose the \
-             agg key",
+             of its aggregates cover each key, and the index has none complete; propose it \
+             first with `bellwether propose <root> --evidence <hash> --key 'exact:{cols},counts'` \
+             and apply it with `bellwether fix` (with --allow-no-gain when it saves no bytes on \
+             its own), then propose the agg key",
             spec.identity()
         ))
     };

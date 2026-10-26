@@ -131,10 +131,13 @@ impl Engine {
             return Ok(refused);
         }
         if let Some(spec) = &declared.key {
-            self.check_body(&ProposalBody::Key {
-                spec: spec.clone(),
-                sidecars: Vec::new(),
-            })?;
+            self.check_body(
+                &ProposalBody::Key {
+                    spec: spec.clone(),
+                    sidecars: Vec::new(),
+                },
+                evidence,
+            )?;
         }
         let schema = self.check_columns(
             &sidecar
@@ -288,7 +291,7 @@ impl Engine {
                 self.complete_engine_rewrite(&ledger, evidence, shape)?;
             }
         }
-        self.check_body(&body)?;
+        self.check_body(&body, evidence)?;
         let proposal = Proposal {
             record_version: format::RECORD_VERSION,
             evidence: evidence.to_vec(),
@@ -312,7 +315,7 @@ impl Engine {
         })
     }
 
-    fn check_body(&self, body: &ProposalBody) -> Result<()> {
+    fn check_body(&self, body: &ProposalBody, evidence: &[Hash]) -> Result<()> {
         match body {
             ProposalBody::Key { spec, .. } => {
                 crate::spec::check(spec)?;
@@ -327,23 +330,16 @@ impl Engine {
                 if let KeySpec::Agg { value, .. } = spec {
                     // The value column exists and can be aggregated as
                     // declared, and the key counting rows on exactly the
-                    // agg key's columns is declared: without it the agg key
+                    // agg key's columns is complete: without it the agg key
                     // is never built (refused by name, not at `fix`).
                     let schema = self.check_columns(&[value])?;
                     bellwether_core::agg::value_type(spec, &schema)?;
-                    let declared = self
-                        .manifest()?
-                        .map(|m| m.schema.key_specs.clone())
-                        .unwrap_or_default();
-                    if bellwether_build::counting_spec(&declared, spec.columns()).is_none() {
-                        let cols = spec.columns().join(",");
-                        return Err(Error::KeySpec(format!(
-                            "{} needs a key counting rows on exactly ({cols}) beside it, whose \
-                             counts prove which aggregates answer a lookup, and the index \
-                             declares none; declare it first with `bellwether index {} --key \
-                             'exact:{cols},counts'`, then propose the agg key",
-                            spec.identity(),
-                            self.root()
+                    let complete = self.pin()?.map(|p| p.specs().0).unwrap_or_default();
+                    if bellwether_build::counting_spec(&complete, spec.columns()).is_none() {
+                        return Err(Error::KeySpec(counted_key_first(
+                            spec,
+                            self.root(),
+                            evidence,
                         )));
                     }
                 }
@@ -513,4 +509,19 @@ pub fn engine_rewrite(
         before_plan: None,
         after_plan: None,
     }
+}
+
+/// The refusal for an agg key (B7) proposed before the key counting rows on
+/// exactly its columns is complete: the propose step that comes first.
+fn counted_key_first(spec: &KeySpec, root: &str, evidence: &[Hash]) -> String {
+    let cols = spec.columns().join(",");
+    let cites: String = evidence.iter().map(|h| format!(" --evidence {h}")).collect();
+    format!(
+        "{} needs the key counting rows on exactly ({cols}) complete beside it, whose counts \
+         prove which of its aggregates answer a lookup, and the index has none; propose it \
+         first with `bellwether propose {root}{cites} --key 'exact:{cols},counts'` and apply \
+         it with `bellwether fix` (with --allow-no-gain when it saves no bytes on its own: its \
+         counts are what let the agg key answer), then propose the agg key",
+        spec.identity()
+    )
 }

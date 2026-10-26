@@ -37,6 +37,7 @@
 #![forbid(unsafe_code)]
 #![cfg_attr(test, allow(clippy::unwrap_used))]
 
+mod agg_check;
 mod certificate;
 mod error;
 mod index;
@@ -50,6 +51,7 @@ mod spec;
 mod state;
 mod totals;
 
+pub use agg_check::check_agg_cells;
 pub use certificate::{record, AgedInput, CertificateContext, Certified, ManifestAnchor};
 pub use error::{Result, VerifyError};
 pub use index::IndexPlanner;

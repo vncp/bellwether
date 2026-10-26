@@ -35,10 +35,11 @@ use bellwether_replay::{
 };
 use bellwether_source_sql::{is_sql_root, SqlUrl, MEASURED_AGGREGATES};
 use bellwether_store::{parse_rfc3339, Cache, ObjectStoreBackend};
+use bellwether_core::agg::AggCell;
 use bellwether_types::{
-    format, Certificate, Coverage, Error, Evidence, EvidenceBody, FileFingerprint, Hash, HashKind,
-    KeySpec, Predicate, Proposal, ProposalBody, Provenance, Receipt, Record, Result, RowGroupMeta,
-    ScanEntry, ScanPlan, Source,
+    format, AggServed, Certificate, Coverage, Error, Evidence, EvidenceBody, FileFingerprint, Hash,
+    HashKind, KeySpec, Predicate, Proposal, ProposalBody, Provenance, Receipt, Record, Result,
+    RowGroupMeta, ScanEntry, ScanPlan, Source,
 };
 use bellwether_verify::{
     AgedInput, CertificateContext, CoverageRequest, ManifestAnchor, Options, ReconcileSpec,
@@ -159,6 +160,10 @@ pub enum Refusal {
         missing_right: u64,
         /// Group totals that differ.
         totals_differ: u64,
+        /// Cells of a proposed agg key (B7) that differ from the rows they
+        /// aggregate. Omitted when zero.
+        #[serde(default, skip_serializing_if = "crate::results::is_zero")]
+        agg_cells_differ: u64,
     },
     /// The certificate was computed against another manifest than the
     /// current one; nothing was applied (ADR 020).
@@ -1004,6 +1009,15 @@ impl Engine {
         }
         keys.sort_unstable();
         keys.dedup();
+        // An agg key (B7) is certified only when its cells for the
+        // workload's keys are the rows' own aggregates: a receipted agg key
+        // with a wrong cell would answer `aggregate` wrongly behind it.
+        let agg = match spec {
+            KeySpec::Agg { .. } => vec![agg_cells_checked(
+                replayer, source, spec, &columns, &keys,
+            )?],
+            _ => Vec::new(),
+        };
         #[cfg(test)]
         test_seam::apply(&mut selected);
         let union = union_plan(replayer, &selected)?;
@@ -1090,6 +1104,7 @@ impl Engine {
                 age: Duration::ZERO,
             }],
             clock: self.options().clock.clone(),
+            agg,
         };
         let root = self.root();
         let left = Side::new(source, root);
@@ -1152,6 +1167,7 @@ impl Engine {
             manifest: pinned.map(anchor),
             inputs: Vec::new(),
             clock: self.options().clock.clone(),
+            agg: Vec::new(),
         };
         let certified = self.reconciler(spec, Options::default())?.certify(
             &Side::new(&*left_source, &before_root),
@@ -1496,6 +1512,32 @@ pub(crate) mod test_seam {
             }
         });
     }
+
+    type Cells = BTreeMap<Vec<u8>, BTreeMap<u32, bellwether_core::agg::AggCell>>;
+    type CellsHook = Box<dyn Fn(&mut Cells)>;
+
+    thread_local! {
+        static CELLS: RefCell<Option<CellsHook>> = RefCell::new(None);
+    }
+
+    /// Installs `hook`, run on a proposed agg key's cells before `fix`
+    /// checks them against the rows, for this thread until `clear_cells`:
+    /// a planted wrong cell must fail the certificate.
+    pub(crate) fn set_cells(hook: impl Fn(&mut Cells) + 'static) {
+        CELLS.with(|h| *h.borrow_mut() = Some(Box::new(hook)));
+    }
+
+    pub(crate) fn clear_cells() {
+        CELLS.with(|h| *h.borrow_mut() = None);
+    }
+
+    pub(crate) fn apply_cells(cells: &mut Cells) {
+        CELLS.with(|h| {
+            if let Some(f) = h.borrow().as_ref() {
+                f(cells);
+            }
+        });
+    }
 }
 
 /// The sequence a Key apply produced, or the refusal: nothing committed (the
@@ -1553,6 +1595,96 @@ fn failed(hash: &Hash, c: &Certificate) -> Option<Refusal> {
         missing_left: c.body.missing_left,
         missing_right: c.body.missing_right,
         totals_differ: c.body.totals_delta.len() as u64,
+        agg_cells_differ: agg_cells_differ(c),
+    })
+}
+
+/// The cells of a proposed agg key (B7) a certificate found differing from
+/// the rows.
+pub(crate) fn agg_cells_differ(c: &Certificate) -> u64 {
+    c.body
+        .agg
+        .iter()
+        .filter_map(|a| a.checked.as_ref())
+        .map(|k| k.differ)
+        .sum()
+}
+
+/// Checks the agg key `spec`'s cells (B7), as the build would write them
+/// (replay's transient segments, the same writer), for the workload's
+/// `keys` (canonical probes on `run_columns`, every float-zero variant)
+/// against the decoded rows of every row group: the entry `fix`'s
+/// certificate records in `agg`.
+fn agg_cells_checked(
+    replayer: &Replayer<'_>,
+    source: &dyn Source,
+    spec: &KeySpec,
+    run_columns: &[String],
+    keys: &[Vec<u8>],
+) -> Result<AggServed> {
+    let positions = spec
+        .columns()
+        .iter()
+        .map(|c| run_columns.iter().position(|r| r == c))
+        .collect::<Option<Vec<usize>>>()
+        .ok_or_else(|| Error::InvalidArgument {
+            field: "workload",
+            reason: format!(
+                "{} groups by {}, which the workload's runs (by {}) do not all look up, so \
+                 verify has no keys of it to check; record the aggregate runs by its columns",
+                spec.identity(),
+                spec.columns().join(", "),
+                run_columns.join(", ")
+            ),
+        })?;
+    let mut projected: Vec<Vec<u8>> = keys
+        .iter()
+        .filter_map(|k| {
+            let spans = bellwether_core::encoding::tuple_elements(k)?;
+            let mut out = Vec::with_capacity(k.len());
+            for &p in &positions {
+                out.extend_from_slice(&k[spans.get(p)?.clone()]);
+            }
+            Some(out)
+        })
+        .collect();
+    projected.sort_unstable();
+    projected.dedup();
+    let index = replayer.transient(spec)?;
+    let mut stored: BTreeMap<Vec<u8>, BTreeMap<u32, AggCell>> = BTreeMap::new();
+    for r in index.segments().readers() {
+        for (k, per_rg) in r.agg_cells(&projected)? {
+            let m = stored.entry(k).or_default();
+            for (rg, cell) in per_rg {
+                // Two segments holding one key's row group would both be
+                // read: their cells add, and the check sees the sum.
+                match m.entry(rg.0) {
+                    std::collections::btree_map::Entry::Vacant(v) => {
+                        v.insert(cell);
+                    }
+                    std::collections::btree_map::Entry::Occupied(mut o) => {
+                        o.get_mut().combine(&cell)?;
+                    }
+                }
+            }
+        }
+    }
+    #[cfg(test)]
+    test_seam::apply_cells(&mut stored);
+    let catalog = replayer.catalog();
+    let (check, rows) = bellwether_verify::check_agg_cells(
+        source,
+        replayer.schema(),
+        catalog.row_groups().iter().map(|rg| (rg.id, &rg.meta)),
+        spec,
+        &projected,
+        &stored,
+    )?;
+    Ok(AggServed {
+        side: "proposed".into(),
+        specs: vec![spec.identity()],
+        rows,
+        checked: Some(check),
     })
 }
 
@@ -2858,5 +2990,139 @@ mod tests {
             "{:?}",
             ok.outcome
         );
+    }
+
+    type CellsPlant = Box<dyn Fn(&mut BTreeMap<Vec<u8>, BTreeMap<u32, AggCell>>)>;
+
+    /// An agg key (B7) is certified only when its cells are the rows' own
+    /// aggregates: a planted wrong cell (a sum one unit off, a row or a
+    /// null too many, a wrong minimum, a missing cell, a cell where the key
+    /// has no row) fails `fix`'s certificate, which names the cell, and no
+    /// receipt is written; untouched, the same fix applies.
+    #[test]
+    fn a_planted_wrong_agg_cell_fails_the_certificate() {
+        use bellwether_core::agg::AggSum;
+        use bellwether_types::AggregateFn;
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("data");
+        common::agg_corpus(&data, 2, 3, 40, 30);
+        let kf = dir.path().join("k.parquet");
+        common::write_keys(&kf, "account", &[0, 4, 7]);
+        let e = Engine::open(data.to_str().unwrap(), EngineOptions::default()).unwrap();
+        e.index(&[crate::spec::parse("exact:account,counts").unwrap()])
+            .unwrap();
+        let w = e
+            .why(&WhyRequest {
+                keys: Some(KeyFile::new(&kf)),
+                aggregate: Some(crate::AggregateQuery {
+                    value: "amount".into(),
+                    functions: vec![
+                        AggregateFn::Sum,
+                        AggregateFn::Count,
+                        AggregateFn::Min,
+                        AggregateFn::Max,
+                    ],
+                }),
+                ..WhyRequest::default()
+            })
+            .unwrap();
+        let wl = w.workload.as_ref().unwrap().hash;
+        let p = w
+            .candidates
+            .iter()
+            .find(|c| matches!(c.spec, KeySpec::Agg { .. }))
+            .unwrap()
+            .proposal
+            .hash;
+        let first = |m: &mut BTreeMap<Vec<u8>, BTreeMap<u32, AggCell>>| -> AggCell {
+            m.values().next().unwrap().values().next().unwrap().clone()
+        };
+        let plants: Vec<(&str, CellsPlant)> = vec![
+            (
+                "a sum one unit off",
+                Box::new(|m| {
+                    let c = m.values_mut().next().unwrap().values_mut().next().unwrap();
+                    let Some(AggSum::Int(v)) = c.sum else {
+                        panic!("{c:?}")
+                    };
+                    c.sum = Some(AggSum::Int(v + 1));
+                }),
+            ),
+            (
+                "a row too many",
+                Box::new(|m| {
+                    let c = m.values_mut().next().unwrap().values_mut().next().unwrap();
+                    c.rows += 1;
+                    c.nulls += 1;
+                }),
+            ),
+            (
+                "a wrong minimum",
+                Box::new(|m| {
+                    let c = m.values_mut().next().unwrap().values_mut().next().unwrap();
+                    c.min.clone_from(&c.max);
+                }),
+            ),
+            (
+                "a missing cell",
+                Box::new(|m| {
+                    let cells = m.values_mut().next().unwrap();
+                    let rg = *cells.keys().next().unwrap();
+                    cells.remove(&rg);
+                }),
+            ),
+            (
+                "a cell where the key has no row",
+                Box::new(move |m| {
+                    let c = first(m);
+                    m.values_mut().next().unwrap().insert(999, c);
+                }),
+            ),
+        ];
+        for (name, plant) in plants {
+            test_seam::set_cells(plant);
+            let r = fix_key(&e, p, wl, false);
+            test_seam::clear_cells();
+            assert!(
+                matches!(
+                    r.outcome,
+                    FixOutcome::Refused {
+                        refusal: Refusal::CertificateFailed {
+                            agg_cells_differ: 1,
+                            mismatched: 0,
+                            missing_left: 0,
+                            missing_right: 0,
+                            totals_differ: 0,
+                            ..
+                        }
+                    }
+                ),
+                "{name}: {:?}",
+                r.outcome
+            );
+            let Record::Certificate(cert) = &r.certificate.as_ref().unwrap().record else {
+                panic!("{name}")
+            };
+            assert!(!cert.pass, "{name}");
+            let check = cert.body.agg[0].checked.as_ref().unwrap();
+            assert_eq!(check.differ, 1, "{name}");
+            assert_ne!(check.examples[0].stored, check.examples[0].rows, "{name}");
+            assert_eq!(check.examples[0].values, vec![Some("0".to_string())], "{name}");
+            assert!(!r.verification.as_ref().unwrap().pass, "{name}");
+            assert_eq!(receipts(&data.join(".bellwether")), 0, "{name}");
+        }
+        let ok = fix_key(&e, p, wl, false);
+        assert!(
+            matches!(ok.outcome, FixOutcome::Applied { .. }),
+            "{:?}",
+            ok.outcome
+        );
+        let Record::Certificate(cert) = &ok.certificate.as_ref().unwrap().record else {
+            panic!()
+        };
+        let check = cert.body.agg[0].checked.as_ref().unwrap();
+        assert_eq!((check.keys, check.differ), (3, 0));
+        assert_eq!(check.row_groups_read, 6);
+        assert_eq!(receipts(&data.join(".bellwether")), 1);
     }
 }

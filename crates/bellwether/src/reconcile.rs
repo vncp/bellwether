@@ -230,6 +230,7 @@ impl Engine {
                 })
                 .collect(),
             clock: self.options().clock.clone(),
+            agg: Vec::new(),
         };
         let mut options = Options::default();
         if let Some(budget) = req.memory_budget {

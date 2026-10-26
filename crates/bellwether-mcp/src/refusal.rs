@@ -675,6 +675,7 @@ pub fn from_fix(r: &FixRefusal, verification: Option<&Reconciliation>) -> Refusa
             missing_left,
             missing_right,
             totals_differ,
+            agg_cells_differ,
         } => {
             let sample: Vec<Value> = verification
                 .map(|v| {
@@ -685,22 +686,36 @@ pub fn from_fix(r: &FixRefusal, verification: Option<&Reconciliation>) -> Refusa
                         .collect()
                 })
                 .unwrap_or_default();
-            Refusal::new(
-                RefusalCode::CertificateFailed,
-                format!(
-                    "certificate {certificate} failed: {mismatched} mismatched, {missing_left} \
-                     missing on the left, {missing_right} missing on the right, {totals_differ} \
-                     group totals differ"
-                ),
-                json!({
-                    "certificate": certificate,
-                    "mismatched": mismatched,
-                    "missing_left": missing_left,
-                    "missing_right": missing_right,
-                    "totals_differ": totals_differ,
-                    "mismatches_sample": sample,
-                }),
-            )
+            let mut detail = json!({
+                "certificate": certificate,
+                "mismatched": mismatched,
+                "missing_left": missing_left,
+                "missing_right": missing_right,
+                "totals_differ": totals_differ,
+                "mismatches_sample": sample,
+            });
+            let mut message = format!(
+                "certificate {certificate} failed: {mismatched} mismatched, {missing_left} \
+                 missing on the left, {missing_right} missing on the right, {totals_differ} \
+                 group totals differ"
+            );
+            // A proposed agg key (B7) whose cells differ from the rows.
+            if *agg_cells_differ > 0 {
+                let cells: Vec<Value> = verification
+                    .into_iter()
+                    .flat_map(|v| &v.agg)
+                    .filter_map(|a| a.checked.as_ref())
+                    .flat_map(|c| &c.examples)
+                    .take(MISMATCH_SAMPLE)
+                    .map(|d| serde_json::to_value(d).unwrap_or(Value::Null))
+                    .collect();
+                message.push_str(&format!(
+                    ", {agg_cells_differ} agg cells differ from the rows they aggregate"
+                ));
+                detail["agg_cells_differ"] = json!(agg_cells_differ);
+                detail["agg_cells_sample"] = Value::Array(cells);
+            }
+            Refusal::new(RefusalCode::CertificateFailed, message, detail)
         }
         FixRefusal::StaleManifest {
             certificate,
@@ -1052,6 +1067,7 @@ mod tests {
                     missing_left: 2,
                     missing_right: 3,
                     totals_differ: 4,
+                    agg_cells_differ: 5,
                 },
                 RefusalCode::CertificateFailed,
             ),

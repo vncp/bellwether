@@ -2067,27 +2067,78 @@ pub struct CertBody {
     /// was compared.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub row_filter: Option<Vec<Predicate>>,
-    /// The `agg` keys (B7) whose per-key rows and sums stood in for a scan
-    /// of a side, one entry per side served so: the certificate says when
-    /// its per-key totals came from an index rather than from reading the
-    /// rows. Omitted when every side was read.
+    /// The `agg` keys (B7) a certificate relied on, one entry per side: in
+    /// a reconcile, the sides whose per-key rows and sums an index's agg
+    /// keys answered instead of a scan; in `fix`'s certificate for an agg
+    /// key, the proposed key's cells for the workload's keys, checked
+    /// against the decoded rows ([`AggServed::checked`]). Omitted when no
+    /// agg key was read.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub agg: Vec<AggServed>,
 }
 
-/// One side of a reconcile whose per-key rows and totals an index's `agg`
-/// keys answered (B7), instead of a scan.
+/// One side of a certificate that an `agg` key answered (B7): in a
+/// reconcile, instead of a scan; in `fix`'s certificate for an agg key, the
+/// proposed key whose cells were checked against the rows.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct AggServed {
-    /// `left` or `right`.
+    /// `left` or `right` in a reconcile; `proposed` for the cells `fix`
+    /// checked.
     pub side: String,
     /// The identities ([`KeySpec::identity`]) of the agg keys read, one per
     /// total column.
     pub specs: Vec<String>,
-    /// The rows those keys aggregate, every live row of the side: the count
-    /// a scan would have read.
+    /// The rows those keys aggregate: every live row of the side in a
+    /// reconcile (the count a scan would have read); the rows of the
+    /// checked cells in `fix`.
     pub rows: u64,
+    /// For `fix`'s certificate: the check of the proposed key's cells
+    /// against the decoded rows. A certificate passes only when no cell
+    /// differs. Absent in a reconcile.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checked: Option<AggCellCheck>,
+}
+
+/// The check of an agg key's cells (B7) against the decoded rows: for every
+/// key of a workload (projected onto the agg key's columns) and every live
+/// row group, the stored cell (rows, nulls, sum, minimum, maximum) equals
+/// the one the rows make, and a row group holding none of the key's rows
+/// has no cell.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct AggCellCheck {
+    /// Keys checked.
+    pub keys: u64,
+    /// Cells compared: (key, row group) pairs holding a row or a cell.
+    pub cells: u64,
+    /// Row groups read to compare them.
+    pub row_groups_read: u64,
+    /// Cells that differ from the rows.
+    pub differ: u64,
+    /// The first differing cells, in key then row-group order, at most
+    /// [`MAX_MISMATCH_EXAMPLES`]. Omitted when none differ.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub examples: Vec<AggCellDiff>,
+}
+
+/// One agg cell that differs from the rows it aggregates (B7).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct AggCellDiff {
+    /// Lowercase hex of the canonical key tuple (ADR 016).
+    pub key: String,
+    /// Each key element as Arrow displays it at the dataset type; `None`
+    /// for a null element.
+    pub values: Vec<Option<String>>,
+    /// The global row-group id (ADR 001).
+    pub row_group: u32,
+    /// The stored cell, rendered (`rows 3, nulls 1, sum 10.50, min 1.00,
+    /// max 5.00`), or `none` when the index has no cell there.
+    pub stored: String,
+    /// The cell the decoded rows make, rendered likewise, or `none` when
+    /// the row group holds no row of the key.
+    pub rows: String,
 }
 
 #[allow(clippy::trivially_copy_pass_by_ref)] // serde's skip_serializing_if signature

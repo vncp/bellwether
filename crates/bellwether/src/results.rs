@@ -143,7 +143,7 @@ pub struct TextRebuilt {
 }
 
 #[allow(clippy::trivially_copy_pass_by_ref)] // serde passes a reference
-fn is_zero(n: &u64) -> bool {
+pub(crate) fn is_zero(n: &u64) -> bool {
     *n == 0
 }
 

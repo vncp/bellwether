@@ -113,6 +113,7 @@ fn a_passing_certificate_fills_every_field_and_reaches_the_ledger() {
             age: Duration::from_millis(1),
         }],
         clock: None,
+        agg: Vec::new(),
     };
     let certified = Reconciler::new(spec, Options::default())
         .unwrap()
@@ -284,6 +285,7 @@ fn the_ledger_refuses_a_certificate_for_an_unknown_proposal() {
         manifest: Some(anchor(1, Duration::ZERO)),
         inputs: vec![],
         clock: None,
+        agg: Vec::new(),
     };
     let certified = Reconciler::new(ReconcileSpec::new(["id"]), Options::default())
         .unwrap()
