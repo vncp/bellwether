@@ -65,18 +65,18 @@ Jobs over a data lake routinely read a thousand times more than they return, bec
   </picture>
 </p>
 
-**Reconcile.** Bellwether compared up to 40,664,186 rows (both sides) at 233 k rows/s and reported exactly the planted key in 2 of 2 planted runs; DuckDB's EXCEPT ALL was 4.2× to 25.0× faster on the same files, and writes no certificate (timed at a 1-minute load average of 4.8 to 12.1 on 12 cores).
+**Reconcile.** Bellwether compared up to 40,664,186 rows (both sides) at 233 k rows/s and reported exactly the planted key in 2 of 2 planted runs; DuckDB's EXCEPT ALL was 5.9× to 21.8× faster on the same files, and writes no certificate (timed at a 1-minute load average of 4.1 to 5.8 on 12 cores).
 
 | Run | Rows, both sides | `bellwether reconcile` | Reported | DuckDB `EXCEPT ALL`, both ways | Reported |
 |---|---:|---:|---|---:|---|
-| taxi trips against DuckDB's rewrite of the same files | 40,664,186 | 174.39 s | 0 differing keys | 7.07 s | 0 differing rows |
-| taxi trips against the rewrite with one tip changed | 40,664,186 | 220.27 s | 1 differing key: `2, 2024-03-01T00:14:03Z, 142, 7.9`, the planted one | 8.83 s | 2 differing rows |
-| GH events against a copy | 3,537,030 | 2.03 s | 0 differing keys | 479 ms | 0 differing rows |
-| GH events against a copy with one event type changed | 3,537,030 | 1.96 s | 1 differing key: `629347145, 796623, 2024-01-01T05:00:25Z`, the planted one | 316 ms | 2 differing rows |
+| taxi trips against DuckDB's rewrite of the same files | 40,664,186 | 174.60 s | 0 differing keys | 8.79 s | 0 differing rows |
+| taxi trips against the rewrite with one tip changed | 40,664,186 | 173.40 s | 1 differing key: `2, 2024-03-01T00:14:03Z, 142, 7.9`, the planted one | 7.95 s | 2 differing rows |
+| GH events against a copy | 3,537,030 | 1.89 s | 0 differing keys | 300 ms | 0 differing rows |
+| GH events against a copy with one event type changed | 3,537,030 | 1.77 s | 1 differing key: `629347145, 796623, 2024-01-01T05:00:25Z`, the planted one | 298 ms | 2 differing rows |
 
 A changed row is one differing key to `reconcile` and two rows to `EXCEPT ALL` (the old version from one side, the new from the other). `reconcile` writes a certificate holding the counts; the differing keys are in its `--json` output, and the script fails unless the reported key is the planted one. DuckDB's time is one query; Bellwether's includes writing the certificate.
 
-<sub>Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1, local SSD. DuckDB v2.0.0 (d54cbbe3df); bellwether release build of eca48d1 (rustc 1.99.1). Measured 2026-10-26. 1-minute load average while timing: 4.8 to 12.1 on 12 cores.</sub>
+<sub>Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1, local SSD. DuckDB v2.0.0 (d54cbbe3df); bellwether release build of eca48d1 (rustc 1.99.1). Measured 2026-10-26. 1-minute load average while timing: 4.1 to 5.8 on 12 cores.</sub>
 
 **Time.** Bellwether's plan plus DuckDB on the plan was faster than DuckDB alone on 2 of the 12 questions with a plan (the latest trip from every pickup zone: 544 ms against 1.09 s). On 10, DuckDB on the plan took no more than 5% longer than DuckDB alone, and often less, but the plan step (one `bellwether` process, 24 ms to 183 ms) cost more than that saved. Per-question times, the throughput chart, receipts, and the SQL: [the measured page](docs/measured/showcase.md).
 

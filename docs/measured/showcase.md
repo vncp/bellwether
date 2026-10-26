@@ -53,7 +53,7 @@ Keys are distinct values chosen by a seeded hash (`ORDER BY hash(col, 42)`), so 
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="../assets/results-reconcile-dark.svg">
-    <img alt="Bellwether compared up to 40,664,186 rows (both sides) at 233 k rows/s and reported exactly the planted key in 2 of 2 planted runs; DuckDB's EXCEPT ALL was 4.2× to 25.0× faster on the same files, and writes no certificate (timed at a 1-minute load average of 4.8 to 12.1 on 12 cores)." src="../assets/results-reconcile-light.svg" width="1000">
+    <img alt="Bellwether compared up to 40,664,186 rows (both sides) at 233 k rows/s and reported exactly the planted key in 2 of 2 planted runs; DuckDB's EXCEPT ALL was 5.9× to 21.8× faster on the same files, and writes no certificate (timed at a 1-minute load average of 4.1 to 5.8 on 12 cores)." src="../assets/results-reconcile-light.svg" width="1000">
   </picture>
 </p>
 <!-- results:showcase-charts:end -->
@@ -128,10 +128,10 @@ Median of 3 warm runs for DuckDB and the lookup; `why` and `fix` once each (they
 
 | Run | Rows (both sides) | Bellwether | Differing keys | Reported key | Passes | Pass | Certificate | DuckDB EXCEPT ALL | Differing rows |
 |---|---:|---:|---:|---|---:|---|---|---:|---:|
-| `rec-taxi-same`: taxi trips against DuckDB's rewrite of the same files | 40,664,186 | 174.39 s, 233 k rows/s | 0 | – | 37 | yes | `0fbb97136f1a70efcc732377ee6122c779db4d6e743f3900d620597feee356e0` | 7.07 s, 5.7 M rows/s | 0 |
-| `rec-taxi-planted`: taxi trips against the rewrite with one tip changed | 40,664,186 | 220.27 s, 185 k rows/s | 1 | `2, 2024-03-01T00:14:03Z, 142, 7.9` | 37 | no | `c41166b950adf406cf011da5eb9472d6d6099b022aa92e8c0844cf20d06d141f` | 8.83 s, 4.6 M rows/s | 2 |
-| `rec-gh-same`: GH events against a copy | 3,537,030 | 2.03 s, 1.7 M rows/s | 0 | – | 4 | yes | `1de7cbb84647df84a1a8cb2dab7eefd4d726cd1f8e3e54a51117fd9530a5854b` | 479 ms, 7.4 M rows/s | 0 |
-| `rec-gh-planted`: GH events against a copy with one event type changed | 3,537,030 | 1.96 s, 1.8 M rows/s | 1 | `629347145, 796623, 2024-01-01T05:00:25Z` | 4 | no | `5e79bb7bc3015b9884c5bdeac8e408c32eaeb45b38cd0ee49672a858bd37071d` | 316 ms, 11.2 M rows/s | 2 |
+| `rec-taxi-same`: taxi trips against DuckDB's rewrite of the same files | 40,664,186 | 174.60 s, 233 k rows/s | 0 | – | 37 | yes | `befdc5bf7597300616ab8e6094305fa8fd2796b46e46932302fe8f1e257f58f9` | 8.79 s, 4.6 M rows/s | 0 |
+| `rec-taxi-planted`: taxi trips against the rewrite with one tip changed | 40,664,186 | 173.40 s, 235 k rows/s | 1 | `2, 2024-03-01T00:14:03Z, 142, 7.9` | 37 | no | `83800768015cebfcf7e142b063b582ebfa362c9fd7157e62a92f5ab864981c80` | 7.95 s, 5.1 M rows/s | 2 |
+| `rec-gh-same`: GH events against a copy | 3,537,030 | 1.89 s, 1.9 M rows/s | 0 | – | 4 | yes | `a99dde3db2013552fe3f123b89e7416c3165eba77c53ba25a4fd019c72a23b73` | 300 ms, 11.8 M rows/s | 0 |
+| `rec-gh-planted`: GH events against a copy with one event type changed | 3,537,030 | 1.77 s, 2.0 M rows/s | 1 | `629347145, 796623, 2024-01-01T05:00:25Z` | 4 | no | `92902ba4b6e246801e2bd2ae9438bf2ac84f5f9626f4304963a29218e4e3ee89` | 298 ms, 11.9 M rows/s | 2 |
 
 ### Datasets
 
