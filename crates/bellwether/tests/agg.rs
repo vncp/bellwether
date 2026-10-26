@@ -3,7 +3,11 @@
 //! round trip, exact decimal sums with nulls (ADR 014), and reconcile with
 //! and without agg keys, including a planted one-unit difference.
 
-#![allow(clippy::unwrap_used, clippy::expect_used)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::many_single_char_names
+)]
 
 mod common;
 

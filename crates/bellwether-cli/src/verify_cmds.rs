@@ -418,7 +418,7 @@ fn totals_human(s: &mut String, o: &bellwether::Reconciliation) {
     }
 }
 
-#[allow(clippy::many_single_char_names)]
+#[allow(clippy::many_single_char_names, clippy::too_many_lines)] // one section per outcome part
 fn reconcile_human(r: &ReconcileResult, out: &Out) -> String {
     let mut s = String::new();
     let o = &r.outcome;

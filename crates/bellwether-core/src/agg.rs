@@ -182,7 +182,8 @@ impl PartialEq for AggSum {
 /// key; callers that do replace it with [`sum_overflow`].
 const SUM_OVERFLOW: &str = "an agg sum overflows a 128-bit integer";
 
-/// Whether `e` is the bare overflow of an integer sum ([`SUM_OVERFLOW`]).
+/// Whether `e` is the bare overflow of an integer sum, before a caller
+/// names the agg key and key ([`sum_overflow`]).
 #[must_use]
 pub fn is_sum_overflow(e: &Error) -> bool {
     matches!(e, Error::Other(m) if m == SUM_OVERFLOW)
