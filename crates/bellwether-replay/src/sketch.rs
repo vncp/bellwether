@@ -4,7 +4,7 @@
 //!
 //! [`TransientSketch::build`] reads only the sketch's item columns, one row
 //! group at a time in catalog order, through core's
-//! [`FileSketcher`](bellwether_core::sketch::FileSketcher) — the code a build
+//! [`FileSketcher`] — the code a build
 //! writes segments with — so a transient sketch's registers equal a
 //! committed sketch's for the same files (tested: predicted equals built).
 //! Its numbers are **approximate**, like every sketch's, and nothing here

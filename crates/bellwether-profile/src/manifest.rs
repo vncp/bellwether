@@ -46,14 +46,13 @@ pub fn read<S: StoreExt + ?Sized>(
         &manifest.committed_at
     };
     let millis = parse_rfc3339(committed)?.timestamp_millis();
-    let now_millis = match now_millis {
-        Some(n) => n,
-        None => {
-            let now = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map_err(|e| Error::Other(format!("system clock before 1970: {e}")))?;
-            i64::try_from(now.as_millis()).unwrap_or(i64::MAX)
-        }
+    let now_millis = if let Some(n) = now_millis {
+        n
+    } else {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|e| Error::Other(format!("system clock before 1970: {e}")))?;
+        i64::try_from(now.as_millis()).unwrap_or(i64::MAX)
     };
     let age = Duration::from_millis(u64::try_from(now_millis.saturating_sub(millis)).unwrap_or(0));
     let mut segment_bytes: Vec<(String, u64)> = Vec::new();
