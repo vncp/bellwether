@@ -176,8 +176,8 @@ fn sketch_tools_return_the_cli_json_line_and_label_every_number_approximate() {
         ),
         (
             "observe.overlap",
-            json!({"left": "batch", "right": "nope"}),
-            vec!["sketch", "overlap", d, "batch", "nope"],
+            json!({"left": "batch", "right": "payload"}),
+            vec!["sketch", "overlap", d, "batch", "payload"],
         ),
     ] {
         let r = srv.call(tool, args);
@@ -208,10 +208,21 @@ fn sketch_tools_return_the_cli_json_line_and_label_every_number_approximate() {
     assert!(h.contains("approximate (MinHash, 64 signatures)"), "{h}");
     let h = run(&["why", d, "--sketches-only"], 0);
     assert!(
-        h.contains("not measured: --sketches-only reads no data file"),
+        h.contains("not measured: --sketches-only opens no data file, footers included"),
         "{h}"
     );
-    assert!(h.contains("data read: 0 files, 0 row groups"), "{h}");
+    assert!(
+        h.contains("data read: 0 files, 0 row groups; footers of 0 files"),
+        "{h}"
+    );
+    assert!(
+        h.contains("dataset from the index's manifest and sketches"),
+        "{h}"
+    );
+    assert!(h.contains("drop --sketches-only and pass --from"), "{h}");
+    assert!(h.contains("repeat ≥≈"), "{h}");
+    let h = run(&["why", d], 0);
+    assert!(h.contains("footers of 4 files"), "{h}");
     assert!(h.contains("rows/value of ≈15"), "{h}");
     let h = run(&["index", d], 0);
     assert!(h.contains("never used to plan"), "{h}");
@@ -259,4 +270,75 @@ fn sketches_only_refuses_without_a_sketch_and_with_a_workload() {
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
+}
+
+/// Refusals name real columns and a next step that works: `sketch
+/// cardinality` with no sketch names a declaration over the dataset's
+/// id-like columns (on the CLI and, with the root, over MCP); a column the
+/// dataset does not have lists the columns it has (never suggesting to
+/// sketch it); and `--transient` with nothing to count is a usage error
+/// naming `--column`.
+#[test]
+fn sketch_refusals_name_real_columns() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    corpus(&data, 2, 1, 20, 50);
+    let d = path(&data);
+    run(&["index", d, "--key", "exact:id"], 0);
+
+    let out = common::bw()
+        .args(["sketch", "cardinality", d])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(4));
+    let e = String::from_utf8_lossy(&out.stderr);
+    assert!(e.contains("--key sketch:id,batch,payload"), "{e}");
+    assert!(!e.contains('<'), "{e}");
+    let srv = server(&data);
+    let r = srv.call("observe.cardinality", json!({}));
+    let env = serde_json::to_string(&r.envelope).unwrap();
+    // The next step names the (canonical) root.
+    let canonical = std::fs::canonicalize(&data).unwrap();
+    assert!(
+        env.contains(&format!(
+            "bellwether index {} --key sketch:id,batch,payload",
+            canonical.display()
+        )),
+        "{env}"
+    );
+    // The suggested next step works.
+    run(&["index", d, "--key", "sketch:id,batch,payload"], 0);
+    run(&["sketch", "cardinality", d], 0);
+
+    let out = common::bw()
+        .args(["sketch", "cardinality", d, "--column", "nope"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(4));
+    let e = String::from_utf8_lossy(&out.stderr);
+    assert!(e.contains("\"nope\" is not in the dataset"), "{e}");
+    assert!(e.contains("id, batch, ts, payload"), "{e}");
+    assert!(!e.contains("--key sketch:nope"), "{e}");
+    let out = common::bw()
+        .args(["index", d, "--key", "sketch:nope"])
+        .output()
+        .unwrap();
+    let e = String::from_utf8_lossy(&out.stderr);
+    assert!(!e.contains("sketch sketch:"), "{e}");
+    assert!(e.contains("sketch:nope: column \"nope\""), "{e}");
+    assert!(e.contains("id, batch, ts, payload"), "{e}");
+
+    let fresh = tempfile::tempdir().unwrap();
+    let data = fresh.path().join("data");
+    corpus(&data, 2, 1, 20, 50);
+    let d = path(&data);
+    run(&["index", d, "--key", "exact:id"], 0);
+    let out = common::bw()
+        .args(["sketch", "cardinality", d, "--transient"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    let e = String::from_utf8_lossy(&out.stderr);
+    assert!(e.contains("--column"), "{e}");
+    assert!(e.contains("id, batch, payload"), "{e}");
 }

@@ -1208,7 +1208,15 @@ pub struct ApproxCardinality {
     /// Files whose own estimate is below their row count by more than its
     /// error bound: files that almost certainly repeat a value of the item
     /// (for a tuple such as `symbol+ts`, files where it is not unique).
+    /// Files repeating fewer rows than `duplicate_floor` are not counted, so
+    /// zero never proves the item unique within every file.
     pub files_with_duplicates: u64,
+    /// The detection floor of `files_with_duplicates`: the repeated rows a
+    /// file of the average sketched size (`rows / files`) must hold before
+    /// its estimate falls outside its bound, `ceil(r · 3σ / (1 + 3σ))` with
+    /// `r` that size and `σ` the relative standard error. Approximate.
+    #[serde(default)]
+    pub duplicate_floor: u64,
 }
 
 /// How an overlap was estimated.

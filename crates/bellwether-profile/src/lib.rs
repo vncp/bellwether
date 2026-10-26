@@ -371,6 +371,59 @@ where
     })
 }
 
+/// Dataset totals a caller already holds without reading a footer (from an
+/// index's manifest and its sketches).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DatasetTotals {
+    /// Files.
+    pub files: u64,
+    /// Live row groups.
+    pub row_groups: u64,
+    /// Rows.
+    pub rows: u64,
+}
+
+/// A profile that reads no data file, footers included: `totals` stand in
+/// for the footer pass, so nothing is measured (no key columns, fanout,
+/// ranges, time scatter, or lints; the caller adds lints of its own). Its
+/// one provenance input is the manifest at the store root, which must
+/// exist (an Evidence cites at least one input, invariant 6) and index
+/// `root`. For a diagnosis from an index's sketches alone.
+pub fn manifest_profile<S>(
+    root: &str,
+    store: &Arc<S>,
+    options: &ProfileOptions,
+    totals: DatasetTotals,
+) -> Result<ProfileReport>
+where
+    S: StoreExt + ?Sized,
+{
+    let mut inputs = Vec::new();
+    let Some(manifest) = load_manifest(store, root, options.now_millis, &mut inputs)? else {
+        return Err(Error::Other(format!(
+            "{root}: a profile without reading the data needs the index's manifest, and there \
+             is none; index the folder first"
+        )));
+    };
+    Ok(ProfileReport {
+        root: root.to_string(),
+        files_total: totals.files,
+        row_groups_total: totals.row_groups,
+        rows_total: totals.rows,
+        key_columns: Vec::new(),
+        skipped: Vec::new(),
+        time_columns: Vec::new(),
+        fanout: Vec::new(),
+        ranges: Vec::new(),
+        time_scatter: Vec::new(),
+        lints: Vec::new(),
+        workload: None,
+        manifest: Some(manifest),
+        inputs,
+        memory: MemoryReport::default(),
+    })
+}
+
 /// Footer statistics of every discovered file, from the cache when their
 /// fingerprints, the schema, and the source configuration are unchanged.
 fn load_footers<S>(

@@ -61,8 +61,9 @@ impl Engine {
         let mut options =
             self.build_options(declared.iter().filter_map(|d| d.sidecar.clone()).collect());
         options.sketches = declared.iter().filter_map(|d| d.sketch.clone()).collect();
-        let report =
-            Builder::new(Arc::clone(self.store()?), "").build(self.root(), &specs, &options)?;
+        let builder = Builder::new(Arc::clone(self.store()?), "");
+        let sketches_rebuilt = self.reset_unreadable_sketches(&builder, &options.sketches)?;
+        let report = builder.build(self.root(), &specs, &options)?;
         let pinned = self.pin_required("index")?;
         let m = pinned.manifest();
         Ok(IndexResult {
@@ -99,6 +100,7 @@ impl Engine {
                 )
                 .collect(),
             unknown_segment_kinds: m.unknown_segment_kinds(),
+            sketches_rebuilt,
             files_new: report.files_new,
             files_changed: report.files_changed,
             files_removed: report.files_removed,

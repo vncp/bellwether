@@ -29,7 +29,7 @@ use crate::segments::{self, Ctx, FileRow, SpecPlan};
 use crate::sources::{infer_schema, DataSource};
 use crate::target::{
     decl_of, declared_sidecars, declared_sketches, declared_targets, known_decl, sketch_columns,
-    sketch_decl, unknown_kind, Target,
+    sketch_decl, unknown_kind, Target, SKETCH_KIND,
 };
 
 /// Most key specs one index may declare.
@@ -164,6 +164,40 @@ impl<S: StoreExt + ?Sized> Builder<S> {
                 let mut next = m.clone();
                 next.schema.key_specs.retain(|s| s.name() != name);
                 next.segments.retain(|s| s.key_spec != name);
+                next.key_spec_completeness.remove(&name);
+                Ok(next)
+            },
+        );
+        match committed {
+            Ok(c) => Ok(Some(c.sequence)),
+            Err(_) if absent.get() => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Drops the segments and the completeness entry of the declared
+    /// sketch `spec`, keeping its declaration, in one manifest commit that
+    /// reads no source file: the next build then sketches every live row
+    /// group again. For a sketch whose segments are missing from the store
+    /// or damaged (a sketch is never planned with, so nothing else depends
+    /// on them). Returns the committed sequence, or `None` if the index does
+    /// not declare `spec`.
+    pub fn reset_sketch(&self, spec: &SketchSpec) -> Result<Option<u64>> {
+        let name = spec.name();
+        let absent = Cell::new(false);
+        let committed = commit_with(
+            &*self.store,
+            &self.index_root,
+            &StagedSegments::new(),
+            CommitOptions::default(),
+            |m| {
+                if !declared_sketches(m).contains(spec) {
+                    absent.set(true);
+                    return Err(Error::KeySpec(format!("sketch {name} is not declared")));
+                }
+                let mut next = m.clone();
+                next.segments
+                    .retain(|s| !(s.kind.as_deref() == Some(SKETCH_KIND) && s.key_spec == name));
                 next.key_spec_completeness.remove(&name);
                 Ok(next)
             },

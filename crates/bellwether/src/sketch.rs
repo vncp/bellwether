@@ -13,11 +13,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
 use arrow::datatypes::SchemaRef;
-use bellwether_build::{declared_sketches, sketch_completeness};
+use bellwether_build::{declared_sketches, sketch_completeness, Builder};
 use bellwether_core::segment::{ColumnType, SegmentReader};
 use bellwether_core::sketch::{item_types, ItemSketch, SketchReader, SketchTotals};
 use bellwether_replay::{Replayer, TransientSketch};
-use bellwether_store::SegmentRef;
+use bellwether_store::{SegmentRef, StoreExt};
 use bellwether_types::{
     ApproxCardinality, ApproxOverlap, Error, FileFingerprint, KeySpec, Result, RowGroupMeta,
     SketchSpec, Source, SKETCH_DEFAULT_PRECISION,
@@ -80,6 +80,12 @@ pub struct CardinalityResult {
     pub files_read: u64,
     /// Row groups read to answer.
     pub row_groups_read: u64,
+    /// Segments of complete `exact` key specs read to count distinct keys
+    /// exactly (`exact_distinct`): each such count scans every key of the
+    /// spec's index. Index segments, not data; 0 when no exact spec matches
+    /// an item.
+    #[serde(default)]
+    pub exact_index_segments_read: u64,
     /// One entry per item, in the order asked (or declaration order).
     pub items: Vec<ItemCardinality>,
 }
@@ -132,6 +138,7 @@ impl Engine {
         if let Some(p) = &pinned {
             self.refuse_stale(p, "cardinality")?;
         }
+        self.check_items(&req.items, pinned.as_ref())?;
         let folded = match &pinned {
             Some(p) => fold_complete_sketches(p)?,
             None => Vec::new(),
@@ -139,13 +146,17 @@ impl Engine {
         let wanted = self.requested_items(req, pinned.as_ref(), &folded)?;
         let mut out: Vec<Option<ItemCardinality>> = vec![None; wanted.len()];
         let mut missing: Vec<(usize, Vec<String>)> = Vec::new();
+        let mut exact_segments = 0;
+        let mut exact_of = |columns: &[String]| -> Result<Option<u64>> {
+            let Some(p) = &pinned else { return Ok(None) };
+            let (exact, segments) = exact_distinct(p, columns)?;
+            exact_segments += segments;
+            Ok(exact)
+        };
         for (slot, label) in wanted.iter().enumerate() {
             match best_sketch(&folded, label) {
                 Some((f, i)) => {
-                    let exact = match &pinned {
-                        Some(p) => exact_distinct(p, &f.spec.items[i])?,
-                        None => None,
-                    };
+                    let exact = exact_of(&f.spec.items[i])?;
                     out[slot] = Some(ItemCardinality {
                         source: SketchSource::Index,
                         sketch: Some(f.spec.label()),
@@ -181,10 +192,7 @@ impl Engine {
             files_read = t.files_read;
             row_groups_read = t.row_groups_read;
             for (i, (slot, item)) in missing.iter().enumerate() {
-                let exact = match &pinned {
-                    Some(p) => exact_distinct(p, item)?,
-                    None => None,
-                };
+                let exact = exact_of(item)?;
                 out[*slot] = Some(ItemCardinality {
                     source: SketchSource::Transient,
                     sketch: None,
@@ -198,8 +206,42 @@ impl Engine {
             sequence: pinned.as_ref().map_or(0, Pinned::sequence),
             files_read,
             row_groups_read,
+            exact_index_segments_read: exact_segments,
             items: out.into_iter().flatten().collect(),
         })
+    }
+
+    /// Refuses an item naming a column the dataset does not have, listing
+    /// the columns it has (`unknown_column`), before any refusal that would
+    /// suggest sketching it. The schema is the index's when there is one
+    /// (no data file is opened); else the source's.
+    fn check_items(&self, items: &[String], pinned: Option<&Pinned>) -> Result<()> {
+        if items.is_empty() {
+            return Ok(());
+        }
+        let columns: Vec<String> = items
+            .iter()
+            .flat_map(|i| i.split('+').map(str::to_string))
+            .collect();
+        let Some(p) = pinned else {
+            self.check_columns(&columns.iter().collect::<Vec<_>>())?;
+            return Ok(());
+        };
+        let schema = p.planner.schema();
+        for c in columns {
+            if schema.field_with_name(&c).is_err() {
+                let why = bellwether_core::encoding::not_in_schema(schema, &c);
+                if why.contains("nested") {
+                    return Err(Error::KeySpec(why));
+                }
+                return Err(Error::UnknownColumn {
+                    column: c,
+                    root: self.root().to_string(),
+                    columns: schema.fields().iter().map(|f| f.name().clone()).collect(),
+                });
+            }
+        }
+        Ok(())
     }
 
     /// The items a request names, or with none named, every item of every
@@ -225,24 +267,52 @@ impl Engine {
         if !all.is_empty() {
             return Ok(all);
         }
-        Err(match (pinned, req.transient) {
-            (_, true) => Error::InvalidArgument {
+        let declaration = self.sketch_declaration(pinned)?;
+        Err(if req.transient {
+            Error::InvalidArgument {
                 field: "items",
-                reason: "no complete sketch says which columns to count; name the columns (or \
-                         column+column tuples) to compute"
-                    .into(),
-            },
-            (Some(_), false) => Error::NotIndexed {
+                reason: format!(
+                    "no complete sketch says which columns to count; name the columns (or \
+                     column+column tuples) to compute, for example {}",
+                    declaration.trim_start_matches("sketch:").replace(',', ", ")
+                ),
+            }
+        } else {
+            Error::NotIndexed {
                 root: self.root().to_string(),
                 operation: "cardinality",
-                needs: Some("sketch:<column>".into()),
-            },
-            (None, false) => Error::NotIndexed {
-                root: self.root().to_string(),
-                operation: "cardinality",
-                needs: None,
-            },
+                needs: Some(declaration),
+            }
         })
+    }
+
+    /// `sketch:<columns>` over the dataset's id-like columns (integers,
+    /// strings, binary; every column with a canonical encoding when none
+    /// is): the declaration a refusal names when no complete sketch says
+    /// which columns to count. The schema is the index's when there is one
+    /// (no data file is opened), else the source's.
+    pub(crate) fn sketch_declaration(&self, pinned: Option<&Pinned>) -> Result<String> {
+        let schema = match pinned {
+            Some(p) => SchemaRef::clone(p.planner.schema()),
+            None => self.source(None)?.schema(self.root())?,
+        };
+        let encodable: Vec<&arrow::datatypes::Field> = schema
+            .fields()
+            .iter()
+            .filter(|f| ColumnType::of(f.data_type()).is_ok())
+            .map(AsRef::as_ref)
+            .collect();
+        let id_like: Vec<&str> = encodable
+            .iter()
+            .filter(|f| bellwether_profile::fanout::is_id_like(f.data_type()))
+            .map(|f| f.name().as_str())
+            .collect();
+        let columns = if id_like.is_empty() {
+            encodable.iter().map(|f| f.name().as_str()).collect()
+        } else {
+            id_like
+        };
+        Ok(format!("sketch:{}", columns.join(",")))
     }
 
     /// `overlap(left, right)`: the approximate Jaccard similarity of two
@@ -269,6 +339,7 @@ impl Engine {
         let side = |e: &Engine, label: &str| -> Result<(Folded, usize)> {
             let pinned = e.pin_required("overlap")?;
             e.refuse_stale(&pinned, "overlap")?;
+            e.check_items(&[label.to_string()], Some(&pinned))?;
             let mut folded = fold_complete_sketches(&pinned)?;
             let Some(pos) = best_index(&folded, label) else {
                 return Err(Error::NotIndexed {
@@ -310,6 +381,42 @@ impl Engine {
             overlap,
         })
     }
+
+    /// Drops the segments of each sketch in `sketches` the index declares
+    /// but cannot read (a segment missing from the store, damaged, or not a
+    /// sketch of the declared spec), so the build that follows sketches
+    /// every live row group again. Returns their labels. Reads each
+    /// re-declared sketch's segments; never a data file.
+    pub(crate) fn reset_unreadable_sketches<S: StoreExt + ?Sized>(
+        &self,
+        builder: &Builder<S>,
+        sketches: &[SketchSpec],
+    ) -> Result<Vec<String>> {
+        let mut out = Vec::new();
+        if sketches.is_empty() {
+            return Ok(out);
+        }
+        let Some(p) = self.pin()? else {
+            return Ok(out);
+        };
+        let schema = p.planner.schema();
+        for s in sketches {
+            let name = s.name();
+            let unreadable = p
+                .manifest()
+                .sidecar_segments(SKETCH_KIND, &name)
+                .any(|seg| {
+                    let check = p.snapshot.read_segment(&seg.id).and_then(|bytes| {
+                        SketchReader::open_for_dataset(&bytes, schema).map(|r| r.spec() == *s)
+                    });
+                    !matches!(check, Ok(true))
+                });
+            if unreadable && builder.reset_sketch(s)?.is_some() {
+                out.push(s.label());
+            }
+        }
+        Ok(out)
+    }
 }
 
 /// Every complete sketch the pinned manifest declares, folded over every
@@ -338,14 +445,15 @@ pub(crate) fn fold_complete_sketches(pinned: &Pinned) -> Result<Vec<Folded>> {
 
 /// The exact distinct count of `columns` over live row groups, when a
 /// complete `exact` key spec (with or without per-key counts) on exactly
-/// those columns holds it; `None` otherwise.
-pub(crate) fn exact_distinct(pinned: &Pinned, columns: &[String]) -> Result<Option<u64>> {
+/// those columns holds it (`None` otherwise), and the number of that spec's
+/// segments read for it: the count scans every key of the whole index.
+pub(crate) fn exact_distinct(pinned: &Pinned, columns: &[String]) -> Result<(Option<u64>, u64)> {
     let (complete, _) = pinned.specs();
     let Some(spec) = complete
         .iter()
         .find(|s| matches!(s, KeySpec::Exact { columns: c, .. } if c.as_slice() == columns))
     else {
-        return Ok(None);
+        return Ok((None, 0));
     };
     let m = pinned.manifest();
     let schema = pinned.planner.schema();
@@ -360,7 +468,8 @@ pub(crate) fn exact_distinct(pinned: &Pinned, columns: &[String]) -> Result<Opti
         .iter()
         .flat_map(|f| f.rowgroup_ids.iter().map(|id| id.0))
         .collect();
-    Ok(Some(bellwether_core::count_live_keys(&readers, &live)?))
+    let distinct = bellwether_core::count_live_keys(&readers, &live)?;
+    Ok((Some(distinct), readers.len() as u64))
 }
 
 /// The complete sketch holding `label` with the highest precision (then the
@@ -477,14 +586,26 @@ fn fold_sketch(pinned: &Pinned, schema: &SchemaRef, spec: &SketchSpec) -> Result
     Ok(totals)
 }
 
-/// A source that counts the data it reads: row groups through
-/// `read_columns`, and the distinct files they belong to. Footer reads
-/// (`row_groups`) are metadata and not counted. `why` reports these as the
-/// data reads its diagnosis needed.
+/// A source that counts what it reads: row groups through `read_columns`
+/// and the distinct files they belong to (data pages), and the distinct
+/// files whose footer was asked for through `row_groups` (each opened at
+/// most once: the source keeps parsed footers). `why` reports these as the
+/// reads its diagnosis needed.
 pub(crate) struct CountingSource<'a> {
     inner: &'a dyn Source,
     row_groups: AtomicU64,
     files: Mutex<std::collections::BTreeSet<String>>,
+    footers: Mutex<std::collections::BTreeSet<String>>,
+}
+
+/// What a [`CountingSource`] read.
+pub(crate) struct Counted {
+    /// Files whose data pages were read.
+    pub files: u64,
+    /// Row groups read.
+    pub row_groups: u64,
+    /// Files whose footer was asked for.
+    pub footers: u64,
 }
 
 impl<'a> CountingSource<'a> {
@@ -493,13 +614,17 @@ impl<'a> CountingSource<'a> {
             inner,
             row_groups: AtomicU64::new(0),
             files: Mutex::new(std::collections::BTreeSet::new()),
+            footers: Mutex::new(std::collections::BTreeSet::new()),
         }
     }
 
-    /// `(files, row groups)` read so far.
-    pub(crate) fn reads(&self) -> (u64, u64) {
-        let files = self.files.lock().map_or(0, |f| f.len() as u64);
-        (files, self.row_groups.load(Ordering::SeqCst))
+    /// What was read so far.
+    pub(crate) fn reads(&self) -> Counted {
+        Counted {
+            files: self.files.lock().map_or(0, |f| f.len() as u64),
+            row_groups: self.row_groups.load(Ordering::SeqCst),
+            footers: self.footers.lock().map_or(0, |f| f.len() as u64),
+        }
     }
 }
 
@@ -509,7 +634,11 @@ impl Source for CountingSource<'_> {
     }
 
     fn row_groups(&self, file: &FileFingerprint) -> Result<Vec<RowGroupMeta>> {
-        self.inner.row_groups(file)
+        let rgs = self.inner.row_groups(file)?;
+        if let Ok(mut f) = self.footers.lock() {
+            f.insert(file.path.clone());
+        }
+        Ok(rgs)
     }
 
     fn read_columns(

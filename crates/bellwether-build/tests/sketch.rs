@@ -405,6 +405,7 @@ fn planner_sources_never_name_the_sketch_kind() {
                         "declared_sketches",
                         "sketch_completeness",
                         "sketch: none",
+                        "sketches_rebuilt",
                     ]
                     .iter()
                     .any(|ok| l.contains(ok)))

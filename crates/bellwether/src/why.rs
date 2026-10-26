@@ -142,11 +142,12 @@ pub struct WhyRequest {
     /// Most profile candidates replayed beyond the workload's own key
     /// columns.
     pub max_candidates: usize,
-    /// Diagnose from the index's complete `sketch` sidecars alone: the
-    /// profile's key-read pass is skipped, so no data file is read, and the
+    /// Diagnose from the index's manifest and its complete `sketch`
+    /// sidecars alone: no data file is opened, footers included, and the
     /// report's `sketch` column and the `R-sketch-1` lint carry the
-    /// diagnosis (approximate). Needs a complete sketch; refuses a workload
-    /// (its keys are priced by reading key columns) and `columns`.
+    /// diagnosis (approximate). Needs a complete sketch and a folder whose
+    /// files the index still describes; refuses a workload (its keys are
+    /// priced by reading key columns) and `columns`.
     #[serde(default)]
     pub sketches_only: bool,
 }
@@ -292,6 +293,9 @@ pub struct WorkloadInfo {
 
 /// The whole dataset, from footer statistics: the replay crate's catalog
 /// plus, in an indexed folder, any file the index does not track yet.
+/// Under [`WhyReport::from_sketches`] no footer is read: files and live row
+/// groups are the manifest's, rows the sketch's exact row counts, and
+/// `bytes` the file sizes the manifest recorded.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Dataset {
     /// Files.
@@ -300,7 +304,8 @@ pub struct Dataset {
     pub row_groups: u64,
     /// Rows.
     pub rows: u64,
-    /// Compressed bytes of every live row group.
+    /// Compressed bytes of every live row group (file sizes under
+    /// `from_sketches`).
     pub bytes: u64,
 }
 
@@ -492,12 +497,14 @@ pub struct WhyReport {
     /// exact count. Empty without a complete sketch. No plan reads it.
     #[serde(default)]
     pub sketch: Vec<ItemCardinality>,
-    /// The data this report read for its diagnosis.
+    /// What this report read for its diagnosis: data pages, footers, and
+    /// exact-index segments.
     #[serde(default)]
     pub reads: DiagnosisReads,
-    /// Whether the diagnosis came from sketches alone
-    /// ([`WhyRequest::sketches_only`]): the profile read no data, and its
-    /// fanout table is empty.
+    /// Whether the diagnosis came from the manifest and sketches alone
+    /// ([`WhyRequest::sketches_only`]): no data file was opened, footers
+    /// included, so the profile measured nothing (its fanout table, ranges,
+    /// and footer lints are empty) and `dataset` is the manifest's.
     #[serde(default)]
     pub from_sketches: bool,
     /// Why the `sketch` column is empty although the index declares a
@@ -516,16 +523,49 @@ fn is_exact(e: &bool) -> bool {
     *e
 }
 
-/// Data a `why` read: row groups read through the source (the profile's
-/// key-read pass, a key file's replay), and the distinct files they belong
-/// to. Footer statistics are metadata, read (and cached) for every file,
-/// and not counted.
+/// What a `why` read: row groups read through the source (the profile's
+/// key-read pass, a key file's replay) and the distinct files they belong
+/// to; the files whose footer statistics were read from the source; and
+/// the exact-index segments scanned for exact distinct counts.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DiagnosisReads {
     /// Files whose data pages were read.
     pub files: u64,
     /// Row groups read.
     pub row_groups: u64,
+    /// Files whose footer (row-group statistics) was read from the source,
+    /// each at most once: the replay catalog's pass over the dataset and
+    /// any footer the profile's cache did not hold. 0 under
+    /// [`WhyReport::from_sketches`].
+    #[serde(default)]
+    pub footers: u64,
+    /// Segments of complete `exact` key specs read to give the `sketch`
+    /// column exact distinct counts: each such count scans every key of the
+    /// spec's index. Index segments, not data.
+    #[serde(default)]
+    pub exact_index_segments: u64,
+}
+
+/// What `why` takes from the index's sketches.
+#[derive(Default)]
+struct SketchInputs {
+    /// The `sketch` column.
+    column: Vec<ItemCardinality>,
+    /// The `R-sketch-1` lints.
+    lints: Vec<bellwether_types::Lint>,
+    /// Why a declared sketch could not be read, with how to rebuild it.
+    unavailable: Option<String>,
+    /// Exact-index segments read for exact distinct counts.
+    exact_index_segments: u64,
+}
+
+/// What `why`'s profile measures from.
+#[derive(Clone, Copy)]
+enum Measure<'a> {
+    /// The source: footers, then the key-read pass.
+    Source(&'a dyn bellwether_types::Source),
+    /// Nothing: totals the manifest and the sketches already hold.
+    Manifest(bellwether_profile::DatasetTotals),
 }
 
 impl Engine {
@@ -578,8 +618,15 @@ impl Engine {
     fn why_inner(&self, req: &WhyRequest) -> Result<WhyReport> {
         let has_workload = self.check_why_request(req)?;
         let pinned = self.pin()?;
-        let (sketch, sketch_lints, sketch_unavailable) =
-            self.sketch_inputs(req, pinned.as_ref())?;
+        if req.sketches_only {
+            return self.why_from_sketches(req, pinned.as_ref());
+        }
+        let SketchInputs {
+            column: sketch,
+            lints: sketch_lints,
+            unavailable: sketch_unavailable,
+            exact_index_segments,
+        } = self.sketch_inputs(false, pinned.as_ref())?;
         let folder = self.source(pinned.as_ref())?;
         // Pinned to an earlier manifest: the dataset is exactly the files
         // that manifest recorded, for the profile as for the replay.
@@ -599,29 +646,14 @@ impl Engine {
         let resolved_temporal = resolve_temporal(req, replayer.schema())?;
         let catalog = replayer.catalog();
         let indexed_row_groups = catalog.len() as u64;
-        let mut dataset = Dataset {
-            files: catalog.files().len() as u64,
-            row_groups: catalog.len() as u64,
-            rows: catalog.rows_total(),
-            bytes: catalog.bytes_total(),
-        };
-        let mut untracked = Vec::new();
-        if let Some(p) = pinned
-            .as_ref()
-            .filter(|_| self.options().at_manifest.is_none())
-        {
-            for fp in folder_changes(self.root(), p, self.format(), &self.excluded())?.untracked {
-                for rg in source.row_groups(&fp)? {
-                    dataset.row_groups += 1;
-                    dataset.rows += rg.rows;
-                    dataset.bytes += rg.bytes;
-                }
-                dataset.files += 1;
-                untracked.push(fp.path);
-            }
-        }
-        let (profile, evidence) =
-            self.profile(req, source, pinned.as_ref(), has_workload, sketch_lints)?;
+        let (dataset, untracked) = self.dataset(catalog, pinned.as_ref(), source)?;
+        let (profile, evidence) = self.profile(
+            req,
+            Measure::Source(source),
+            pinned.as_ref(),
+            has_workload,
+            sketch_lints,
+        )?;
         let mut report = WhyReport {
             root: self.root().to_string(),
             sequence,
@@ -642,7 +674,7 @@ impl Engine {
             tables: Vec::new(),
             sketch,
             reads: DiagnosisReads::default(),
-            from_sketches: req.sketches_only,
+            from_sketches: false,
             sketch_unavailable,
         };
         let workload = if has_workload {
@@ -670,76 +702,166 @@ impl Engine {
             report.model = Some(MEASURED_AGGREGATES.to_string());
             report.tables = self.finish_tables()?;
         }
-        let (files, row_groups) = counting.reads();
-        report.reads = DiagnosisReads { files, row_groups };
+        let read = counting.reads();
+        report.reads = DiagnosisReads {
+            files: read.files,
+            row_groups: read.row_groups,
+            footers: read.footers,
+            exact_index_segments,
+        };
         Ok(report)
+    }
+
+    /// The whole dataset from the replay catalog's footer statistics, plus,
+    /// in an indexed folder not pinned to an earlier manifest, every file
+    /// the index does not track yet (read through `source`, so counted),
+    /// with those files' paths.
+    fn dataset(
+        &self,
+        catalog: &bellwether_replay::Catalog,
+        pinned: Option<&Pinned>,
+        source: &dyn bellwether_types::Source,
+    ) -> Result<(Dataset, Vec<String>)> {
+        let mut dataset = Dataset {
+            files: catalog.files().len() as u64,
+            row_groups: catalog.len() as u64,
+            rows: catalog.rows_total(),
+            bytes: catalog.bytes_total(),
+        };
+        let mut untracked = Vec::new();
+        if let Some(p) = pinned.filter(|_| self.options().at_manifest.is_none()) {
+            for fp in folder_changes(self.root(), p, self.format(), &self.excluded())?.untracked {
+                for rg in source.row_groups(&fp)? {
+                    dataset.row_groups += 1;
+                    dataset.rows += rg.rows;
+                    dataset.bytes += rg.bytes;
+                }
+                dataset.files += 1;
+                untracked.push(fp.path);
+            }
+        }
+        Ok((dataset, untracked))
+    }
+
+    /// `why --sketches-only`: the diagnosis from the index's manifest and
+    /// its sketch segments alone. No data file is opened, footers
+    /// included: the dataset's files and live row groups are the
+    /// manifest's, its rows the sketch's exact row counts, its bytes the
+    /// file sizes the manifest recorded; the profile measures nothing (no
+    /// fanout, ranges, or footer lints) and its lints are the sketch
+    /// detector's. Refused on a table, without an index or a readable
+    /// complete sketch (naming a declaration over the dataset's id-like
+    /// columns), and over files that changed since the index was built (the
+    /// sketch would describe other files).
+    fn why_from_sketches(&self, req: &WhyRequest, pinned: Option<&Pinned>) -> Result<WhyReport> {
+        const VERB: &str = "why --sketches-only";
+        self.require_folder(VERB)?;
+        let Some(p) = pinned else {
+            return Err(Error::NotIndexed {
+                root: self.root().to_string(),
+                operation: VERB,
+                needs: Some(self.sketch_declaration(None)?),
+            });
+        };
+        self.refuse_stale(p, VERB)?;
+        let SketchInputs {
+            column,
+            lints,
+            exact_index_segments,
+            ..
+        } = self.sketch_inputs(true, Some(p))?;
+        let files = &p.manifest().rowgroup_space.files;
+        let totals = bellwether_profile::DatasetTotals {
+            files: files.len() as u64,
+            row_groups: files.iter().map(|f| f.rowgroup_ids.len() as u64).sum(),
+            // Every item of a complete sketch saw every row: sketched rows
+            // plus those whose leading column is null.
+            rows: column
+                .first()
+                .map_or(0, |i| i.cardinality.rows + i.cardinality.nulls),
+        };
+        let dataset = Dataset {
+            files: totals.files,
+            row_groups: totals.row_groups,
+            rows: totals.rows,
+            bytes: files.iter().map(|f| f.fingerprint.size).sum(),
+        };
+        let (profile, evidence) =
+            self.profile(req, Measure::Manifest(totals), Some(p), false, lints)?;
+        let current_specs = p.specs().0;
+        let culprit = culprit(&current_specs, &profile, None);
+        Ok(WhyReport {
+            root: self.root().to_string(),
+            sequence: p.sequence(),
+            current_specs,
+            workload: None,
+            evidence,
+            profile,
+            dataset,
+            untracked: Vec::new(),
+            current: None,
+            current_locate: None,
+            candidates: Vec::new(),
+            not_serving: Vec::new(),
+            recommended: None,
+            culprit,
+            exact: true,
+            model: None,
+            tables: Vec::new(),
+            sketch: column,
+            reads: DiagnosisReads {
+                exact_index_segments,
+                ..DiagnosisReads::default()
+            },
+            from_sketches: true,
+            sketch_unavailable: None,
+        })
     }
 
     /// The `sketch` column and the `R-sketch-1` lints from the index's
     /// complete sketches (empty without an index), and, when a declared
     /// sketch cannot be read (a missing or damaged segment), why not: the
     /// planner never needs a sketch, so `why` goes on without the column
-    /// and says how to rebuild it. `sketches_only` without a readable
-    /// complete sketch is refused, naming a declaration over the dataset's
-    /// id-like columns.
-    #[allow(clippy::type_complexity)]
-    fn sketch_inputs(
-        &self,
-        req: &WhyRequest,
-        pinned: Option<&Pinned>,
-    ) -> Result<(
-        Vec<ItemCardinality>,
-        Vec<bellwether_types::Lint>,
-        Option<String>,
-    )> {
+    /// and says how to rebuild it. With `required` (`--sketches-only`) an
+    /// unreadable sketch is an error, and no complete sketch is refused,
+    /// naming a declaration over the dataset's id-like columns.
+    fn sketch_inputs(&self, required: bool, pinned: Option<&Pinned>) -> Result<SketchInputs> {
         let Some(p) = pinned else {
-            if req.sketches_only {
-                return Err(Error::NotIndexed {
-                    root: self.root().to_string(),
-                    operation: "why --sketches-only",
-                    needs: Some("sketch:<columns>".into()),
-                });
-            }
-            return Ok((Vec::new(), Vec::new(), None));
+            return Ok(SketchInputs::default());
         };
         let read = crate::sketch::fold_complete_sketches(p).and_then(|sketches| {
-            if req.sketches_only && sketches.is_empty() {
-                let cols: Vec<&str> = p
-                    .planner
-                    .schema()
-                    .fields()
-                    .iter()
-                    .filter(|f| bellwether_profile::fanout::is_id_like(f.data_type()))
-                    .map(|f| f.name().as_str())
-                    .collect();
+            if required && sketches.is_empty() {
                 return Err(Error::NotIndexed {
                     root: self.root().to_string(),
                     operation: "why --sketches-only",
-                    needs: Some(format!("sketch:{}", cols.join(","))),
+                    needs: Some(self.sketch_declaration(Some(p))?),
                 });
             }
             sketch_view(p, &sketches)
         });
         match read {
-            Ok((column, lints)) => Ok((column, lints, None)),
-            Err(e) if req.sketches_only => Err(e),
-            Err(e @ Error::NotIndexed { .. }) => Err(e),
+            Ok(inputs) => Ok(inputs),
+            Err(e @ Error::NotIndexed { .. }) if required => Err(e),
             Err(e) => {
                 let labels: Vec<String> = bellwether_build::declared_sketches(p.manifest())
                     .iter()
                     .map(bellwether_types::SketchSpec::label)
                     .collect();
-                Ok((
-                    Vec::new(),
-                    Vec::new(),
-                    Some(format!(
-                        "the sketch column is unavailable: {e}; rebuild it with `bellwether \
-                         index {} --key {}` (plans never read a sketch, so nothing else is \
-                         affected)",
-                        self.root(),
-                        labels.join(" --key ")
-                    )),
-                ))
+                let why_not = format!(
+                    "the sketch column is unavailable: {e}; rebuild it with `bellwether index {} \
+                     --key {}` (re-declaring a sketch whose segments are missing or damaged \
+                     sketches every file again; plans never read a sketch, so nothing else is \
+                     affected)",
+                    self.root(),
+                    labels.join(" --key ")
+                );
+                if required {
+                    return Err(Error::Other(why_not));
+                }
+                Ok(SketchInputs {
+                    unavailable: Some(why_not),
+                    ..SketchInputs::default()
+                })
             }
         }
     }
@@ -786,21 +908,29 @@ fn sketch_column(
 /// The `sketch` column and the `R-sketch-1` lints from the folded complete
 /// sketches: one entry per distinct item (the finest sketch holding it),
 /// and the low-cardinality-key detector over each sketch's single-column
-/// items. Reads sketch and exact-key segments, no data.
-#[allow(clippy::type_complexity)]
-fn sketch_view(
-    pinned: &Pinned,
-    folded: &[crate::sketch::Folded],
-) -> Result<(Vec<ItemCardinality>, Vec<bellwether_types::Lint>)> {
+/// items. Reads sketch and exact-key segments, no data: an item's exact
+/// distinct count, where a complete exact spec holds it, scans that spec's
+/// segments once, and the segments read are counted.
+fn sketch_view(pinned: &Pinned, folded: &[crate::sketch::Folded]) -> Result<SketchInputs> {
     let schema = pinned.planner.schema();
     let mut column = Vec::new();
     let mut seen: BTreeSet<String> = BTreeSet::new();
     let mut lints: Vec<bellwether_types::Lint> = Vec::new();
+    let mut exact_of: std::collections::BTreeMap<&[String], Option<u64>> =
+        std::collections::BTreeMap::new();
+    let mut exact_index_segments = 0;
     for f in folded {
         let mut singles = Vec::new();
         for (i, item) in f.spec.items.iter().enumerate() {
             let label = bellwether_types::SketchSpec::item_label(item);
-            let exact = crate::sketch::exact_distinct(pinned, item)?;
+            let exact = if let Some(e) = exact_of.get(item.as_slice()) {
+                *e
+            } else {
+                let (e, segments) = crate::sketch::exact_distinct(pinned, item)?;
+                exact_index_segments += segments;
+                exact_of.insert(item.as_slice(), e);
+                e
+            };
             let card = f.totals.cardinality(i, exact)?;
             if item.len() == 1 {
                 singles.push((i, card.clone()));
@@ -848,7 +978,12 @@ fn sketch_view(
             }
         }
     }
-    Ok((column, lints))
+    Ok(SketchInputs {
+        column,
+        lints,
+        unavailable: None,
+        exact_index_segments,
+    })
 }
 
 impl Engine {
@@ -944,11 +1079,12 @@ impl Engine {
     /// Profiles the data root and builds its Evidence, recording it when the
     /// index location is writable. With a workload, an unwritable location
     /// is refused (the store's one-line error naming `--index`), since the
-    /// Proposals must cite a recorded Evidence.
+    /// Proposals must cite a recorded Evidence. [`Measure::Manifest`]
+    /// profiles from totals the caller already holds and reads no file.
     fn profile(
         &self,
         req: &WhyRequest,
-        source: &dyn bellwether_types::Source,
+        measure: Measure<'_>,
         pinned: Option<&Pinned>,
         has_workload: bool,
         sketch_lints: Vec<bellwether_types::Lint>,
@@ -984,10 +1120,6 @@ impl Engine {
         };
         let mut options = ProfileOptions::for_source(&self.source_config(pinned)?);
         options.columns.clone_from(&req.columns);
-        if req.sketches_only {
-            // No candidate: the key-read pass reads nothing.
-            options.columns = Some(Vec::new());
-        }
         // A fixed clock asks for reproducible output: recompute the cached
         // artifacts rather than reuse them, so no input carries a wall-clock
         // age or a cache hit, and measure the manifest's age at that clock.
@@ -1020,7 +1152,14 @@ impl Engine {
                 }
             }
         }
-        let mut profile = bellwether_profile::profile(source, self.root(), &store, &options)?;
+        let mut profile = match measure {
+            Measure::Source(source) => {
+                bellwether_profile::profile(source, self.root(), &store, &options)?
+            }
+            Measure::Manifest(totals) => {
+                bellwether_profile::manifest_profile(self.root(), &store, &options, totals)?
+            }
+        };
         // The sketch detector's lints join the profile's before the
         // Evidence is built, so the Evidence records them; its provenance
         // cites the manifest, which names the sketch segments by content.

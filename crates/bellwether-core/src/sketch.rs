@@ -174,14 +174,17 @@ pub fn item_types(spec: &SketchSpec, schema: &Schema) -> Result<Vec<Vec<DataType
                         .field_with_name(c)
                         .map(|f| f.data_type().clone())
                         .map_err(|_| {
+                            let names: Vec<&str> =
+                                schema.fields().iter().map(|f| f.name().as_str()).collect();
                             Error::KeySpec(format!(
-                                "sketch {}: {}",
+                                "{}: {}; the dataset's columns are {}",
                                 spec.name(),
-                                encoding::not_in_schema(schema, c)
+                                encoding::not_in_schema(schema, c),
+                                names.join(", ")
                             ))
                         })?;
                     ColumnType::of(&dt).map_err(|e| {
-                        Error::KeySpec(format!("sketch {}: column {c:?}: {e}", spec.name()))
+                        Error::KeySpec(format!("{}: column {c:?}: {e}", spec.name()))
                     })?;
                     Ok(dt)
                 })
@@ -1144,6 +1147,14 @@ impl SketchTotals {
         } else {
             t.sum_file_estimates / u64_f64(distinct)
         };
+        // `add_file` flags a file when `est · (1 + 3σ) < rows`; with
+        // `est ≈ rows - d` that needs `d > rows · 3σ / (1 + 3σ)` repeats.
+        let per_file = if t.files == 0 {
+            0.0
+        } else {
+            u64_f64(rows) / u64_f64(t.files)
+        };
+        let duplicate_floor = f64_u64((per_file * SIGMAS * rse / (1.0 + SIGMAS * rse)).ceil());
         Ok(ApproxCardinality {
             approximate: true,
             item: SketchSpec::item_label(item),
@@ -1162,6 +1173,7 @@ impl SketchTotals {
             files: t.files,
             files_per_value,
             files_with_duplicates: t.files_with_duplicates,
+            duplicate_floor,
         })
     }
 }

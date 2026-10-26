@@ -423,7 +423,9 @@ fn the_finest_sketch_holding_an_item_is_read() {
 
 /// A missing or damaged sketch segment never takes `why` down: plans never
 /// read a sketch, so `why` reports the column unavailable with the reason
-/// and the command that rebuilds it; `--sketches-only` refuses.
+/// and the command that rebuilds it; `--sketches-only` refuses with the
+/// same command; and that command (re-declaring the sketch) sketches every
+/// file again, after which both work.
 #[test]
 fn a_missing_or_damaged_sketch_segment_leaves_why_working() {
     let dir = tempfile::tempdir().unwrap();
@@ -454,12 +456,232 @@ fn a_missing_or_damaged_sketch_segment_leaves_why_working() {
     let why_not = w.sketch_unavailable.unwrap();
     assert!(why_not.contains("unavailable"), "{why_not}");
     assert!(why_not.contains("--key sketch:id,batch"), "{why_not}");
-    assert!(e
-        .why(&WhyRequest {
-            sketches_only: true,
-            ..WhyRequest::default()
+    let only = WhyRequest {
+        sketches_only: true,
+        ..WhyRequest::default()
+    };
+    let refused = e.why(&only).unwrap_err().to_string();
+    assert!(refused.contains("--key sketch:id,batch"), "{refused}");
+    // The next step works: re-declaring the sketch rebuilds it.
+    let r = e
+        .index_declared(&[bellwether::spec::parse_declaration("sketch:id,batch").unwrap()])
+        .unwrap();
+    assert_eq!(r.sketches_rebuilt, vec!["sketch:id,batch".to_string()]);
+    assert_eq!(r.row_groups_read, 4, "every row group sketched again");
+    let w = e.why(&WhyRequest::default()).unwrap();
+    assert!(w.sketch_unavailable.is_none());
+    assert_eq!(w.sketch.len(), 2);
+    assert!(e.why(&only).unwrap().from_sketches);
+    // A readable sketch re-declared is left alone.
+    let r = e
+        .index_declared(&[bellwether::spec::parse_declaration("sketch:id,batch").unwrap()])
+        .unwrap();
+    assert!(r.sketches_rebuilt.is_empty());
+    assert_eq!(r.row_groups_read, 0);
+}
+
+/// `why --sketches-only` opens no data file, footers included: with every
+/// Parquet file unreadable it still answers from the manifest and the
+/// sketch segments, reports zero reads, and gives the dataset's files, row
+/// groups, and rows as a full `why` does; `sketch cardinality` answers too,
+/// and a full `why` (the control) cannot.
+#[cfg(unix)]
+#[test]
+fn sketches_only_opens_no_data_file() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    ledger_corpus(dir.path(), 4, 2, 200, 300);
+    let e = engine(dir.path());
+    declare(&e, "sketch:id,batch");
+    let full = e.why(&WhyRequest::default()).unwrap();
+    assert_eq!(full.reads.footers, 4, "a full why reads every footer");
+    let files: Vec<std::path::PathBuf> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .map(|f| f.unwrap().path())
+        .filter(|p| p.extension().is_some_and(|x| x == "parquet"))
+        .collect();
+    assert_eq!(files.len(), 4);
+    let set = |mode: u32| {
+        for f in &files {
+            std::fs::set_permissions(f, std::fs::Permissions::from_mode(mode)).unwrap();
+        }
+    };
+    set(0o000);
+    if std::fs::File::open(&files[0]).is_ok() {
+        // Permission bits do not bind this user (root): nothing to show.
+        set(0o644);
+        return;
+    }
+    // A fresh engine: no footer held in memory.
+    let e = engine(dir.path());
+    let w = e.why(&WhyRequest {
+        sketches_only: true,
+        ..WhyRequest::default()
+    });
+    let c = e.cardinality(&req(&[], false));
+    let control = e.why(&WhyRequest::default());
+    set(0o644);
+    let w = w.unwrap();
+    assert!(w.from_sketches);
+    assert_eq!(w.reads, bellwether::DiagnosisReads::default());
+    assert_eq!(
+        (w.dataset.files, w.dataset.row_groups, w.dataset.rows),
+        (
+            full.dataset.files,
+            full.dataset.row_groups,
+            full.dataset.rows
+        )
+    );
+    assert_eq!(w.sketch.len(), 2);
+    assert!(
+        !w.profile.inputs.is_empty(),
+        "the Evidence cites the manifest"
+    );
+    assert!(w.evidence.hash.is_some(), "and is recorded");
+    let c = c.unwrap();
+    assert_eq!((c.files_read, c.row_groups_read), (0, 0));
+    assert!(control.is_err(), "a full why must open the files");
+}
+
+/// Through the facade, a sketch never reaches a plan: twin folders with the
+/// same files and key specs, one also declaring a sketch, give byte-equal
+/// `locate`, `latest`, `asof`, and window plans (JSON, apart from the
+/// evidence each records, which cites its own manifest) and the same `why
+/// --from` costs, candidates, and recommendation; and again after the
+/// sketch's segments are deleted from the store.
+#[test]
+fn twin_folders_plan_identically_with_and_without_a_sketch() {
+    let plain = tempfile::tempdir().unwrap();
+    let sketched = tempfile::tempdir().unwrap();
+    ledger_corpus(plain.path(), 4, 3, 200, 1_000);
+    ledger_corpus(sketched.path(), 4, 3, 200, 1_000);
+    let kd = tempfile::tempdir().unwrap();
+    let kf = kd.path().join("k.parquet");
+    write_keys(&kf, "id", &[3, 77, 140]);
+    let keys = KeyFile::new(kf.to_str().unwrap());
+    let open = |dir: &Path, extra: &[&str]| {
+        let e = engine(dir);
+        let declared: Vec<_> = ["exact:id", "temporal:id@ts", "range:ts"]
+            .iter()
+            .chain(extra)
+            .map(|s| bellwether::spec::parse_declaration(s).unwrap())
+            .collect();
+        e.index_declared(&declared).unwrap();
+        e
+    };
+    let a = open(plain.path(), &[]);
+    let b = open(sketched.path(), &["sketch:id,batch,id+batch"]);
+    let plans = |e: &Engine, dir: &Path| -> Vec<String> {
+        let canonical = std::fs::canonicalize(dir).unwrap();
+        [
+            e.locate(&keys).unwrap(),
+            e.latest(&keys).unwrap(),
+            e.asof(&keys, "1970-01-01T00:05:00Z").unwrap(),
+            e.locate_window(&keys, "1970-01-01T00:01:00Z", "1970-01-01T00:08:00Z", None)
+                .unwrap(),
+        ]
+        .iter()
+        .map(|p| {
+            let mut v = serde_json::to_value(p).unwrap();
+            v.as_object_mut().unwrap().remove("evidence");
+            v.to_string()
+                .replace(canonical.to_str().unwrap(), "<root>")
+                .replace(dir.to_str().unwrap(), "<root>")
         })
-        .is_err());
+        .collect()
+    };
+    let why = |e: &Engine| -> String {
+        let w = e
+            .why(&WhyRequest {
+                keys: Some(keys.clone()),
+                ..WhyRequest::default()
+            })
+            .unwrap();
+        let candidates: Vec<_> = w
+            .candidates
+            .iter()
+            .map(|c| (&c.spec, c.origin, c.proposed, c.locate))
+            .collect();
+        let recommended = w
+            .recommended
+            .as_ref()
+            .map(|r| (&r.spec, &r.lookup, r.current, r.proposed));
+        serde_json::to_string(&(
+            &w.current_specs,
+            w.current,
+            w.current_locate,
+            w.dataset,
+            candidates,
+            recommended,
+            // Data reads depend on the profile's cache; footers do not.
+            w.reads.footers,
+        ))
+        .unwrap()
+    };
+    let (pa, wa) = (plans(&a, plain.path()), why(&a));
+    // Non-vacuous: the locate plan prunes, and why priced candidates.
+    let locate: serde_json::Value = serde_json::from_str(&pa[0]).unwrap();
+    assert!(
+        locate["planned"]["row_groups"].as_u64().unwrap()
+            < locate["row_groups_total"].as_u64().unwrap(),
+        "{locate}"
+    );
+    assert!(wa.contains("proposed") || wa.contains("row_groups"), "{wa}");
+    assert_eq!(pa, plans(&b, sketched.path()), "with a sketch");
+    assert_eq!(wa, why(&b), "with a sketch");
+    // Delete every sketch segment from the sketched folder's store.
+    let idx = sketched.path().join(".bellwether");
+    let m: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(idx.join("manifest.json")).unwrap()).unwrap();
+    let mut deleted = 0;
+    for s in m["segments"].as_array().unwrap() {
+        if s["kind"] == "sketch" {
+            let id = s["id"].as_str().unwrap();
+            std::fs::remove_file(idx.join("segments").join(format!("{id}.seg"))).unwrap();
+            deleted += 1;
+        }
+    }
+    assert!(deleted > 0);
+    assert_eq!(pa, plans(&b, sketched.path()), "sketch segments deleted");
+    assert_eq!(wa, why(&b), "sketch segments deleted");
+}
+
+/// A file repeating fewer rows than the detection floor is not flagged,
+/// and the floor says so: ten files of 1,000 rows, five of them with 5
+/// repeated ids (under the floor of 24 at precision 14), are reported as
+/// 0 files with duplicates; with 100 repeated ids each, all five are.
+#[test]
+fn files_repeating_fewer_rows_than_the_floor_go_undetected() {
+    let corpus = |dups: i64| {
+        let dir = tempfile::tempdir().unwrap();
+        for f in 0..10_i64 {
+            let rows: Vec<Row> = (0..1_000_i64)
+                .map(|r| {
+                    // Files 0..5 repeat `dups` of their ids once each.
+                    let id = if f < 5 && r >= 1_000 - dups {
+                        f * 1_000 + (r - (1_000 - dups))
+                    } else {
+                        f * 1_000 + r
+                    };
+                    (id, f, Some(r), String::new())
+                })
+                .collect();
+            write_file(&dir.path().join(format!("part-{f:03}.parquet")), &[rows]);
+        }
+        let e = engine(dir.path());
+        declare(&e, "sketch:id");
+        let c = e.cardinality(&req(&["id"], false)).unwrap();
+        (dir, c.items[0].cardinality.clone())
+    };
+    let (_d, under) = corpus(5);
+    assert_eq!(under.duplicate_floor, 24);
+    assert_eq!(
+        under.files_with_duplicates, 0,
+        "5 repeats per file go unseen"
+    );
+    let (_d, over) = corpus(100);
+    assert_eq!(over.duplicate_floor, 24);
+    assert_eq!(over.files_with_duplicates, 5);
 }
 
 /// `--sketches-only` with no sketch names a declaration over the dataset's

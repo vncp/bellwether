@@ -167,6 +167,14 @@ pub(crate) fn index(r: &IndexResult, out: &Out) -> String {
             r.root
         );
     }
+    if !r.sketches_rebuilt.is_empty() {
+        let _ = writeln!(
+            s,
+            "\n  rebuilt {} from every row group: its segments were missing from the store or \
+             damaged",
+            r.sketches_rebuilt.join(", ")
+        );
+    }
     if !r.unknown_segment_kinds.is_empty() {
         let _ = writeln!(
             s,
@@ -646,10 +654,23 @@ pub(crate) fn why(r: &bellwether::WhyReport, out: &Out, fix_command: &str) -> St
     } else {
         let _ = writeln!(
             s,
-            "funnel: no workload; pass --from <keys.parquet> to replay a run under each candidate key"
+            "funnel: no workload; {}pass --from <keys.parquet> to replay a run under each \
+             candidate key",
+            if r.from_sketches {
+                "drop --sketches-only and "
+            } else {
+                ""
+            }
         );
         funnel_header(&mut s, MIN_FUNNEL_LABEL);
         funnel_row(&mut s, MIN_FUNNEL_LABEL, "dataset", &dataset, &rows);
+        if r.from_sketches {
+            let _ = writeln!(
+                s,
+                "  dataset from the index's manifest and sketches: rows are the sketch's exact \
+                 counts, bytes the file sizes the manifest recorded (no footer read)"
+            );
+        }
     }
     if let Some(c) = &r.culprit {
         let fan = c.fanout.as_ref().map_or_else(String::new, |f| {
@@ -772,8 +793,8 @@ pub(crate) fn why(r: &bellwether::WhyReport, out: &Out, fix_command: &str) -> St
     if r.from_sketches {
         let _ = writeln!(
             s,
-            "  not measured: --sketches-only reads no data file; the sketch column is the \
-             diagnosis, approximate"
+            "  not measured: --sketches-only opens no data file, footers included; the sketch \
+             column is the diagnosis, approximate"
         );
     }
     if let Some(why_not) = &r.sketch_unavailable {
@@ -829,8 +850,9 @@ pub(crate) fn why(r: &bellwether::WhyReport, out: &Out, fix_command: &str) -> St
         let _ = writeln!(
             s,
             "  sketch: rows per value over ≈distinct values (HyperLogLog, 99.7% interval), files \
-             per value, files repeating a value; approximate unless marked exact; never used to \
-             plan"
+             per value, files repeating a value (≥≈N: a file repeating fewer rows is not \
+             detected, so 0 never proves uniqueness); approximate unless marked exact; never \
+             used to plan"
         );
     }
     if !r.profile.skipped.is_empty() {
@@ -852,11 +874,20 @@ pub(crate) fn why(r: &bellwether::WhyReport, out: &Out, fix_command: &str) -> St
             );
         }
     }
+    let exact_scan = if r.reads.exact_index_segments > 0 {
+        format!(
+            "; {} exact-index segment(s) scanned for exact distinct counts",
+            num(r.reads.exact_index_segments)
+        )
+    } else {
+        String::new()
+    };
     let _ = writeln!(
         s,
-        "\ndata read: {} files, {} row groups (footer statistics are metadata and not counted)",
+        "\ndata read: {} files, {} row groups; footers of {} files{exact_scan}",
         num(r.reads.files),
-        num(r.reads.row_groups)
+        num(r.reads.row_groups),
+        num(r.reads.footers)
     );
     let _ = writeln!(s, "\nrecords");
     match (&r.evidence.hash, &r.evidence.note) {
@@ -1041,8 +1072,9 @@ pub(crate) fn scorecard(r: &bellwether::ScorecardResult, out: &Out) -> String {
 }
 
 /// One sketched item's `why` cell: `≈138,889 rows/value of ≈72 (±2.4%),
-/// ≈139 files/value, 9,998 files repeat`, or exact with an exact distinct
-/// count.
+/// ≈139 files/value, 9,998 of 10,000 files repeat ≥≈24 rows`, or exact
+/// with an exact distinct count. The last figure is the detection floor:
+/// fewer repeats in a file go unseen.
 fn sketch_fanout(i: &bellwether::ItemCardinality) -> String {
     let c = &i.cardinality;
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
@@ -1058,9 +1090,10 @@ fn sketch_fanout(i: &bellwether::ItemCardinality) -> String {
         ),
     };
     format!(
-        "{distinct}, ≈{fpv} files/value, {} of {} files repeat",
+        "{distinct}, ≈{fpv} files/value, {} of {} files repeat ≥≈{} rows",
         num(c.files_with_duplicates),
-        num(c.files)
+        num(c.files),
+        num(c.duplicate_floor.max(1))
     )
 }
 
@@ -1127,27 +1160,17 @@ pub(crate) fn cardinality(r: &bellwether::CardinalityResult, out: &Out) -> Strin
             c.rows_per_value.round() as u64,
             num(c.files_per_value.round() as u64),
         );
-        // A file is flagged only when its distinct estimate falls more than
-        // three standard errors below its rows: fewer repeated rows than
-        // that are invisible to a sketch, so uniqueness is never asserted.
-        #[allow(
-            clippy::cast_possible_truncation,
-            clippy::cast_sign_loss,
-            clippy::cast_precision_loss
-        )]
-        let floor = (3.0 * c.relative_standard_error * c.rows as f64 / c.files.max(1) as f64)
-            .ceil() as u64;
         let _ = writeln!(
             s,
             "    {}{} {} per value; each value in ≈{fpv} files; {} of {} files repeat a value \
-             (a file repeating fewer than about {} of its rows is not detected; a sketch \
-             cannot prove uniqueness)",
+             (a file of average size repeating fewer than about {} rows is not detected; a \
+             sketch cannot prove uniqueness)",
             if c.rows_per_value_exact { "" } else { "≈" },
             num(rpv),
             if rpv == 1 { "row" } else { "rows" },
             num(c.files_with_duplicates),
             num(c.files),
-            num(floor.max(1)),
+            num(c.duplicate_floor.max(1)),
         );
         let from = match (&i.source, &i.sketch) {
             (SketchSource::Index, Some(label)) => format!("read from {label}"),
@@ -1157,6 +1180,13 @@ pub(crate) fn cardinality(r: &bellwether::CardinalityResult, out: &Out) -> Strin
             ),
         };
         let _ = writeln!(s, "    {from}");
+    }
+    if r.exact_index_segments_read > 0 {
+        let _ = writeln!(
+            s,
+            "  exact distinct counts scanned {} exact-index segment(s) (index, not data)",
+            num(r.exact_index_segments_read)
+        );
     }
     s
 }

@@ -338,12 +338,12 @@ fn typed_next(e: &Error) -> Option<String> {
             _ => None,
         },
         Error::NotIndexed {
+            root,
             needs: Some(sketch),
             operation,
-            ..
         } if sketch.starts_with("sketch:") => Some(format!(
-            "ask the human to build the sketch with `bellwether index --key {sketch}` (a sketch is \
-             approximate and never planned with){}",
+            "ask the human to build the sketch with `bellwether index {root} --key {sketch}` (a \
+             sketch is approximate and never planned with){}",
             if *operation == "cardinality" {
                 ", or call the tool again with `transient: true` to read the files now"
             } else {

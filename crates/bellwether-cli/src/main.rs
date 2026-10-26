@@ -485,7 +485,7 @@ impl From<Error> for Failure {
             Error::InvalidArgument {
                 field:
                     "lookback" | "latest_by" | "signing_key" | "trusted_keys" | "public_key" | "out"
-                    | "name" | "valid_from" | "revoked_at" | "index" | "root",
+                    | "name" | "valid_from" | "revoked_at" | "index" | "root" | "items",
                 ..
             } => Self::Usage(match hint(&e) {
                 Some(h) => format!("{e}; {h}"),
@@ -561,6 +561,7 @@ fn hint(e: &Error) -> Option<String> {
                 "workload" => "--from, --bench-workload, or --workload",
                 "rewrite" => "--before-output and --after-output",
                 "index" => "--index <dir>",
+                "items" => "--column",
                 _ => return None,
             };
             Some(format!("check {flag}"))
