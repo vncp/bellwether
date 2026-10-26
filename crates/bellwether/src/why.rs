@@ -2891,6 +2891,15 @@ fn layout_culprit(
     ) {
         return None;
     }
+    // An aggregate run (B7) an agg key answers reads no row at all, so
+    // however its keys sit in the files the layout is not the cause; the
+    // culprit is the agg key no index has (`R-agg-1`, [`culprit`]).
+    if matches!(
+        r.workload.as_ref().and_then(|i| i.lookup.as_ref()),
+        Some(LookupKind::Aggregate { .. })
+    ) {
+        return None;
+    }
     let current = r.current?;
     let first = w.runs().first()?;
     let columns = first.columns.clone();
@@ -2991,6 +3000,27 @@ fn culprit(
                 .then_some((rank, l))
         })
         .min_by(|(ra, a), (rb, b)| b.confidence.total_cmp(&a.confidence).then(ra.cmp(rb)));
+    // A workload of aggregate runs no agg key answers (B7): the missing agg
+    // key is the cause, whatever else the profile found.
+    let aggregates = workload
+        .and_then(|w| w.runs().first())
+        .and_then(|r| r.query().ok())
+        .is_some_and(|q| q.aggregate().is_some());
+    let agg_lint = profile
+        .lints
+        .iter()
+        .find(|l| aggregates && l.rule == "R-agg-1");
+    if let Some(l) = agg_lint {
+        return Some(Culprit {
+            columns: l.columns.clone(),
+            fanout: fanout_of(profile, &l.columns),
+            reason: CulpritReason::Lint {
+                rule: l.rule.clone(),
+                confidence: l.confidence,
+                message: l.message.clone(),
+            },
+        });
+    }
     if let Some((_, l)) = lint {
         return Some(Culprit {
             columns: l.columns.clone(),

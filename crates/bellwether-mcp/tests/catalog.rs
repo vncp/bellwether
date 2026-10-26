@@ -63,6 +63,7 @@ fn the_tools_are_the_tiers_and_nothing_else() {
             ("observe.profile", Tier::Observe),
             ("observe.locate", Tier::Observe),
             ("observe.count", Tier::Observe),
+            ("observe.aggregate", Tier::Observe),
             ("observe.asof", Tier::Observe),
             ("observe.text", Tier::Observe),
             ("score.why", Tier::Score),

@@ -29,13 +29,13 @@ use arrow::array::RecordBatch;
 use arrow::datatypes::SchemaRef;
 use bellwether_build::encode_ts;
 use bellwether_build::Builder;
+use bellwether_core::agg::AggCell;
 use bellwether_ledger::RecordKind;
 use bellwether_replay::{
     proposed_specs, Baseline, Catalog, RecordedRun, Replayer, RunKeys, RunQuery, Workload,
 };
 use bellwether_source_sql::{is_sql_root, SqlUrl, MEASURED_AGGREGATES};
 use bellwether_store::{parse_rfc3339, Cache, ObjectStoreBackend};
-use bellwether_core::agg::AggCell;
 use bellwether_types::{
     format, AggServed, Certificate, Coverage, Error, Evidence, EvidenceBody, FileFingerprint, Hash,
     HashKind, KeySpec, Predicate, Proposal, ProposalBody, Provenance, Receipt, Record, Result,
@@ -1013,9 +1013,9 @@ impl Engine {
         // workload's keys are the rows' own aggregates: a receipted agg key
         // with a wrong cell would answer `aggregate` wrongly behind it.
         let agg = match spec {
-            KeySpec::Agg { .. } => vec![agg_cells_checked(
-                replayer, source, spec, &columns, &keys,
-            )?],
+            KeySpec::Agg { .. } => {
+                vec![agg_cells_checked(replayer, source, spec, &columns, &keys)?]
+            }
             _ => Vec::new(),
         };
         #[cfg(test)]
@@ -3107,7 +3107,11 @@ mod tests {
             let check = cert.body.agg[0].checked.as_ref().unwrap();
             assert_eq!(check.differ, 1, "{name}");
             assert_ne!(check.examples[0].stored, check.examples[0].rows, "{name}");
-            assert_eq!(check.examples[0].values, vec![Some("0".to_string())], "{name}");
+            assert_eq!(
+                check.examples[0].values,
+                vec![Some("0".to_string())],
+                "{name}"
+            );
             assert!(!r.verification.as_ref().unwrap().pass, "{name}");
             assert_eq!(receipts(&data.join(".bellwether")), 0, "{name}");
         }

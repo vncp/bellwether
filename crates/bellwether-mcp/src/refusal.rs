@@ -399,6 +399,19 @@ fn typed_next(e: &Error) -> Option<String> {
                 ", then call the tool again"
             }
         )),
+        Error::NotIndexed {
+            root,
+            needs: Some(agg),
+            ..
+        } if agg.starts_with("agg:") => Some(format!(
+            "ask the human to index the data folder with `bellwether index {root} --key \
+             'exact:{},counts' --key '{agg}'` (an agg key is declared beside the counted key on \
+             its columns), then call the tool again",
+            agg.trim_start_matches("agg:")
+                .split('@')
+                .next()
+                .unwrap_or_default()
+        )),
         Error::NotIndexed { needs, .. } => {
             let spec = needs
                 .as_deref()

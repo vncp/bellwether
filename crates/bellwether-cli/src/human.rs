@@ -1046,6 +1046,16 @@ pub(crate) fn why(r: &bellwether::WhyReport, out: &Out, fix_command: &str) -> St
         for c in &r.candidates {
             let mut notes = Vec::new();
             match (&c.origin, &c.spec, &kind_label) {
+                // Beside aggregate runs (B7), the key an agg key needs.
+                (CandidateOrigin::Workload, KeySpec::Exact { counts: true, .. }, _)
+                    if matches!(w.lookup, Some(LookupKind::Aggregate { .. })) =>
+                {
+                    notes.push(
+                        "the counted key an agg key needs beside it; on its own it reads what \
+                         the locate of the keys reads"
+                            .to_string(),
+                    );
+                }
                 // Priced for count runs, which it answers with no data file
                 // read: not the floor the plain exact key is.
                 (CandidateOrigin::Workload, KeySpec::Exact { counts: true, .. }, _) => {
@@ -1091,6 +1101,13 @@ pub(crate) fn why(r: &bellwether::WhyReport, out: &Out, fix_command: &str) -> St
                         }
                         _ => "floor: only row groups holding a value".to_string(),
                     });
+                }
+                (CandidateOrigin::Workload, KeySpec::Agg { .. }, _) => {
+                    notes.push(
+                        "answers the aggregates from the index: reads only the row groups its \
+                         counts do not prove answered"
+                            .to_string(),
+                    );
                 }
                 (CandidateOrigin::Workload, _, Some(_)) => {
                     notes.push("floor (locate): only row groups holding a key".to_string());

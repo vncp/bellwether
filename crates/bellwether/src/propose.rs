@@ -515,7 +515,10 @@ pub fn engine_rewrite(
 /// exactly its columns is complete: the propose step that comes first.
 fn counted_key_first(spec: &KeySpec, root: &str, evidence: &[Hash]) -> String {
     let cols = spec.columns().join(",");
-    let cites: String = evidence.iter().map(|h| format!(" --evidence {h}")).collect();
+    let cites: String = evidence
+        .iter()
+        .map(|h| format!(" --evidence {h}"))
+        .collect();
     format!(
         "{} needs the key counting rows on exactly ({cols}) complete beside it, whose counts \
          prove which of its aggregates answer a lookup, and the index has none; propose it \

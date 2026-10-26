@@ -216,7 +216,11 @@ fn predicted_equals_planned_on_every_planner_path() {
         }
         let (files, row_groups, b) = common::cost_of_cells(&want, &bytes);
         let c = &predicted[i];
-        assert_eq!((c.files, c.row_groups, c.bytes), (files, row_groups, b), "{c:?}");
+        assert_eq!(
+            (c.files, c.row_groups, c.bytes),
+            (files, row_groups, b),
+            "{c:?}"
+        );
     }
     // Predicted with the built agg key, the same.
     let current = replayer.replay_specs(&all, &w, &keys).unwrap();

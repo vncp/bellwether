@@ -210,17 +210,21 @@ pub fn write_agg_file(path: &Path, row_groups: &[Vec<AggRow>]) {
     let props = WriterProperties::builder()
         .set_max_row_group_row_count(Some(usize::MAX))
         .build();
-    let mut w = ArrowWriter::try_new(File::create(path).unwrap(), agg_schema(), Some(props)).unwrap();
+    let mut w =
+        ArrowWriter::try_new(File::create(path).unwrap(), agg_schema(), Some(props)).unwrap();
     for rows in row_groups {
         let batch = RecordBatch::try_new(
             agg_schema(),
             vec![
-                Arc::new(Int64Array::from(rows.iter().map(|r| r.0).collect::<Vec<_>>()))
-                    as ArrayRef,
+                Arc::new(Int64Array::from(
+                    rows.iter().map(|r| r.0).collect::<Vec<_>>(),
+                )) as ArrayRef,
                 Arc::new(
-                    arrow::array::Decimal128Array::from(rows.iter().map(|r| r.1).collect::<Vec<_>>())
-                        .with_precision_and_scale(18, 6)
-                        .unwrap(),
+                    arrow::array::Decimal128Array::from(
+                        rows.iter().map(|r| r.1).collect::<Vec<_>>(),
+                    )
+                    .with_precision_and_scale(18, 6)
+                    .unwrap(),
                 ),
                 Arc::new(Int64Array::from_iter_values(rows.iter().map(|r| r.2))),
             ],

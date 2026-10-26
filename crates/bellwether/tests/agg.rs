@@ -61,7 +61,10 @@ fn why_then_fix(
             panic!(
                 "no candidate {}: {:?}",
                 want.name(),
-                w.candidates.iter().map(|c| c.spec.name()).collect::<Vec<_>>()
+                w.candidates
+                    .iter()
+                    .map(|c| c.spec.name())
+                    .collect::<Vec<_>>()
             )
         });
     let r = e
@@ -252,7 +255,9 @@ fn reconcile_with_and_without_agg_keys_catches_one_unit_and_says_which_side() {
 
     // Without agg keys: both sides read, the lint names the agg key.
     let l = open(&left);
-    let r = l.reconcile(right.to_str().unwrap(), &reconcile_req()).unwrap();
+    let r = l
+        .reconcile(right.to_str().unwrap(), &reconcile_req())
+        .unwrap();
     assert!(r.outcome.pass);
     assert!(r.outcome.agg.is_empty());
     let Record::Certificate(c) = &r.certificate.record else {
@@ -262,7 +267,9 @@ fn reconcile_with_and_without_agg_keys_catches_one_unit_and_says_which_side() {
     assert_eq!(r.outcome.totals.len(), 1);
     assert_eq!(r.outcome.totals[0].left.render(), dec6(total));
     assert!(r.lints.iter().any(|l| l.rule == "R-agg-1"), "{:?}", r.lints);
-    let r = l.reconcile(bad.to_str().unwrap(), &reconcile_req()).unwrap();
+    let r = l
+        .reconcile(bad.to_str().unwrap(), &reconcile_req())
+        .unwrap();
     assert!(!r.outcome.pass);
     assert_eq!(r.outcome.totals[0].right.render(), dec6(total + 1));
 
@@ -271,7 +278,9 @@ fn reconcile_with_and_without_agg_keys_catches_one_unit_and_says_which_side() {
     index_agg(&right);
     index_agg(&bad);
     let l = open(&left);
-    let r = l.reconcile(right.to_str().unwrap(), &reconcile_req()).unwrap();
+    let r = l
+        .reconcile(right.to_str().unwrap(), &reconcile_req())
+        .unwrap();
     assert!(r.outcome.pass, "{:?}", r.outcome.mismatches);
     let sides: Vec<&str> = r.outcome.agg.iter().map(|a| a.side.as_str()).collect();
     assert_eq!(sides, ["left", "right"]);
@@ -283,7 +292,9 @@ fn reconcile_with_and_without_agg_keys_catches_one_unit_and_says_which_side() {
     assert_eq!(c.body.agg, r.outcome.agg);
     assert_eq!(r.outcome.totals[0].left.render(), dec6(total));
     assert!(r.lints.iter().all(|l| l.rule != "R-agg-1"), "{:?}", r.lints);
-    let r = l.reconcile(bad.to_str().unwrap(), &reconcile_req()).unwrap();
+    let r = l
+        .reconcile(bad.to_str().unwrap(), &reconcile_req())
+        .unwrap();
     assert!(!r.outcome.pass);
     assert_eq!(r.outcome.agg.len(), 2);
     assert_eq!(r.outcome.totals[0].right.render(), dec6(total + 1));
@@ -296,7 +307,9 @@ fn reconcile_with_and_without_agg_keys_catches_one_unit_and_says_which_side() {
     // One side indexed, the other not: only that side is named.
     let plain = dir.path().join("plain");
     corpus_with(&plain, 2, 3, 40, |_| {});
-    let r = l.reconcile(plain.to_str().unwrap(), &reconcile_req()).unwrap();
+    let r = l
+        .reconcile(plain.to_str().unwrap(), &reconcile_req())
+        .unwrap();
     assert!(r.outcome.pass);
     let sides: Vec<&str> = r.outcome.agg.iter().map(|a| a.side.as_str()).collect();
     assert_eq!(sides, ["left"]);

@@ -980,21 +980,32 @@ pub fn grouped_aggregates(uses: &[AggregateUse], complete: &[KeySpec]) -> Vec<Li
                 .map(|f| f.as_str())
                 .collect::<Vec<_>>()
                 .join(",");
+            let next = if counted {
+                format!(
+                    "`bellwether why` prices it beside the complete counted key and proposes \
+                     it, or declare it with `bellwether index <root> {}`",
+                    agg_declarations(&u.columns, &u.value, &u.functions, true)
+                )
+            } else {
+                format!(
+                    "it needs exact:{},counts complete beside it first, which `bellwether why` \
+                     proposes (its fix needs --allow-no-gain: on its own it reads no less), and \
+                     `why` then prices and proposes the agg key; or declare both with \
+                     `bellwether index <root> {}`",
+                    u.columns.join(","),
+                    agg_declarations(&u.columns, &u.value, &u.functions, false)
+                )
+            };
             Some(Lint {
                 rule: GROUPED_AGGREGATES.into(),
                 columns: u.columns.iter().chain([&u.value]).cloned().collect(),
                 message: format!(
                     "{} recorded run(s) compute {fns} of {} per key over up to {} keys of \
                      ({cols}), and no agg key answers them, so each run reads every row of its \
-                     keys. An agg key stores, per key and row group, the rows, the sum, the \
-                     minimum and the maximum, so the index answers the aggregate without a \
-                     read; declare {} and price it with `bellwether why <root> --from \
-                     <keys.parquet> --mode aggregate --value {} --fn {fns}`.",
-                    u.runs,
-                    u.value,
-                    u.keys_max,
-                    agg_declarations(&u.columns, &u.value, &u.functions, counted),
-                    u.value
+                     keys. An agg key stores, per key and row group, the rows, the nulls and \
+                     the aggregates it declares, so the index answers the aggregate without a \
+                     read; {next}.",
+                    u.runs, u.value, u.keys_max,
                 ),
                 confidence: HIGH,
                 site: None,
@@ -1344,9 +1355,11 @@ mod tests {
             "{}",
             l.message
         );
-        assert!(l
-            .message
-            .contains("--mode aggregate --value amount --fn sum,count"));
+        assert!(
+            l.message.contains("its fix needs --allow-no-gain"),
+            "{}",
+            l.message
+        );
         assert!(l.message.contains("3 recorded run(s)"), "{}", l.message);
         assert!((l.confidence - HIGH).abs() < f64::EPSILON);
         let only_counts = grouped_aggregates(&[agg_use(3)], &[counted(&["account"])]);

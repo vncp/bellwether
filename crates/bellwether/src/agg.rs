@@ -127,7 +127,17 @@ impl Engine {
         value: &str,
         functions: &[AggregateFn],
     ) -> Result<AggregateResult> {
-        let pinned = self.pin_required("aggregate")?;
+        let functions = AggregateFn::canonical(functions);
+        let Some(pinned) = self.pin()? else {
+            // No index: name the keys that answer this aggregate.
+            let schema = self.source(None)?.schema(self.root())?;
+            let (run_keys, _) = keys.run_keys(&schema)?;
+            return Err(Error::NotIndexed {
+                root: self.root().to_string(),
+                operation: "aggregate",
+                needs: missing_spec(&[], run_keys.columns(), value, &functions),
+            });
+        };
         self.refuse_stale(&pinned, "aggregate")?;
         let (specs, _) = pinned.specs();
         let schema = pinned.planner.schema();
@@ -140,7 +150,6 @@ impl Engine {
         }
         let (run_keys, null_tuples) = keys.run_keys(schema)?;
         let columns = run_keys.columns().to_vec();
-        let functions = AggregateFn::canonical(functions);
         if let Some(needs) = missing_spec(&specs, &columns, value, &functions) {
             return Err(Error::NotIndexed {
                 root: self.root().to_string(),
