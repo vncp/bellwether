@@ -126,8 +126,9 @@ def environment(a):
     commit = first(["git", "-C", REPO, "rev-parse", "--short=12", "HEAD"])
     # The chart rows this script writes itself (--showcase) do not make the
     # measured tree dirty.
+    # Neither do documents edited while a run goes on: only code counts.
     dirty = bool(subprocess.run(["git", "-C", REPO, "status", "--porcelain", "--untracked-files=no", "--",
-                                 ".", ":(exclude)docs/measured/results/perf.json"],
+                                 ".", ":(exclude)docs", ":(exclude)*.md"],
                                 capture_output=True, text=True).stdout.strip())
     # The binary's identity: cargo rebuilds whenever a Rust source or
     # manifest changes, so the binary matches the newest commit touching
@@ -284,10 +285,13 @@ class Perf:
                 f"({', '.join(self.ext_top[:3])})")
             self.load_stop = threading.Event()
 
+            self.ext_series = []
+
             def watch():
                 while not self.load_stop.wait(5):
                     self.load_max = max(self.load_max, os.getloadavg()[0])
                     cores, top = external_cpu()
+                    self.ext_series.append(cores)
                     if cores > self.ext_max:
                         self.ext_max, self.ext_top = cores, top
             self.load_thread = threading.Thread(target=watch, daemon=True)
@@ -300,6 +304,11 @@ class Perf:
             self.sections[name]["load_avg_1m_max"] = round(max(self.load_max, load), 2)
             self.sections[name]["external_cpu_cores_max"] = round(self.ext_max, 2)
             self.sections[name]["external_top_at_max"] = self.ext_top
+            xs = self.ext_series or [self.ext_max]
+            # How long the outside load lasted, not only its peak.
+            self.sections[name]["external_cpu_samples"] = len(xs)
+            self.sections[name]["external_cpu_cores_p50"] = round(nearest_rank(xs, 0.5), 2)
+            self.sections[name]["external_cpu_share_over_2_cores"] = round(sum(x > 2 for x in xs) / len(xs), 3)
             if self.ext_max > self.a.max_load:
                 say(f"WARNING: {name}: processes outside this run used up to {self.ext_max:.1f} cores "
                     f"(limit {self.a.max_load}; at the peak: {', '.join(self.ext_top)}); rerun this section on a quiet machine before publishing it")

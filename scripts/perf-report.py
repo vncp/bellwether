@@ -33,14 +33,17 @@ class Doc:
     def runs(self):
         """When each section ran, at which commit, and how busy the machine
         was outside the run (the load average also counts the run itself)."""
-        out = ["| section | started (UTC) | finished | commit | 1-min load: start / max | cores used outside the run, max | busiest outside process at that peak |",
-               "|---|---|---|---|---:|---:|---|"]
+        out = ["| section | started (UTC) | finished | commit | 1-min load: start / max | cores used outside the run: max / median | samples over 2 cores | busiest outside process at the peak |",
+               "|---|---|---|---|---:|---:|---:|---|"]
         for name, s in self.d["environment"].get("sections", {}).items():
             top = (s.get("external_top_at_max") or ["-"])[0]
             top = top.rsplit("/", 1)[-1]
             out.append(f"| {name} | {s['started_at']} | {s.get('finished_at', '-')} | `{s['commit']}`"
                        f"{' (dirty)' if s.get('commit_dirty') else ''} | {s['load_avg_1m_start']} / "
-                       f"{s.get('load_avg_1m_max', '-')} | {s.get('external_cpu_cores_max', '-')} | {top} |")
+                       f"{s.get('load_avg_1m_max', '-')} | {s.get('external_cpu_cores_max', '-')} / "
+                       f"{s.get('external_cpu_cores_p50', '-')} | "
+                       + (f"{s['external_cpu_share_over_2_cores'] * 100:.0f}% of {s['external_cpu_samples']}"
+                          if "external_cpu_samples" in s else "not recorded") + f" | {top} |")
         return "\n".join(out)
 
     def lookups(self):
