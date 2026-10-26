@@ -1,0 +1,37 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1100 313" width="1100" height="313" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif">
+<rect width="1100" height="313" fill="#0d1117" rx="12"/>
+<text x="24.0" y="34.0" fill="#e6edf3" font-size="18" font-weight="600">Observe tier (why, no workload) on replay-small, p50</text>
+<text x="24.0" y="58.0" fill="#e6edf3" font-size="15">Every way of asking why with no workload answered within 24 ms at the median, against the 100 ms observe budget (the CLI figure includes</text>
+<text x="24.0" y="80.0" fill="#e6edf3" font-size="15">process start).</text>
+<text x="24.0" y="98.0" fill="#8b949e" font-size="12">observe_p50_ms (ms). Apple M3 Pro, 12 cores, 36 GiB, macOS 26.4.1, local SSD. bellwether release build of sources at f809e5403d08 (rustc 1.99.1; sha256 3f05ece30dc0). Measured</text>
+<text x="24.0" y="114.0" fill="#8b949e" font-size="12">2026-10-26.</text>
+<rect x="24.0" y="132.0" width="12.0" height="12.0" rx="2" fill="#3fb950"/>
+<text x="42.0" y="142.0" fill="#e6edf3" font-size="13">bellwether-facade</text>
+<rect x="192.4" y="132.0" width="12.0" height="12.0" rx="2" fill="#a371f7"/>
+<text x="210.4" y="142.0" fill="#e6edf3" font-size="13">bellwether-mcp-in-process</text>
+<rect x="418.4" y="132.0" width="12.0" height="12.0" rx="2" fill="#f0883e"/>
+<text x="436.4" y="142.0" fill="#e6edf3" font-size="13">bellwether-mcp-stdio</text>
+<rect x="608.4" y="132.0" width="12.0" height="12.0" rx="2" fill="#58a6ff"/>
+<text x="626.4" y="142.0" fill="#e6edf3" font-size="13">bellwether-cli</text>
+<text x="24.0" y="186.0" fill="#e6edf3" font-size="14" font-weight="600">replay-small</text>
+<text x="224.0" y="206.0" fill="#e6edf3" font-size="13" text-anchor="end">why-no-workload</text>
+<rect x="236.0" y="194.0" width="428.4" height="11.0" rx="2" fill="#3fb950"/>
+<text x="670.4" y="204.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">16 ms</tspan><tspan fill="#8b949e" font-size="10"></tspan></text>
+<rect x="236.0" y="208.0" width="422.3" height="11.0" rx="2" fill="#a371f7"/>
+<text x="664.3" y="218.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">16 ms</tspan><tspan fill="#8b949e" font-size="10"></tspan></text>
+<rect x="236.0" y="222.0" width="450.7" height="11.0" rx="2" fill="#f0883e"/>
+<text x="692.7" y="232.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">17 ms</tspan><tspan fill="#8b949e" font-size="10"></tspan></text>
+<rect x="236.0" y="236.0" width="624.8" height="11.0" rx="2" fill="#58a6ff"/>
+<text x="866.8" y="246.0" fill="#e6edf3" font-size="11"><tspan font-weight="600">24 ms</tspan><tspan fill="#8b949e" font-size="10"></tspan></text>
+<line x1="236.0" y1="162.0" x2="236.0" y2="263.0" stroke="#8b949e" stroke-opacity="0.25" stroke-dasharray="3 4"/>
+<text x="236.0" y="281.0" fill="#8b949e" font-size="11" text-anchor="middle">0</text>
+<line x1="394.5" y1="162.0" x2="394.5" y2="263.0" stroke="#8b949e" stroke-opacity="0.25" stroke-dasharray="3 4"/>
+<text x="394.5" y="281.0" fill="#8b949e" font-size="11" text-anchor="middle">6.0 ms</text>
+<line x1="553.0" y1="162.0" x2="553.0" y2="263.0" stroke="#8b949e" stroke-opacity="0.25" stroke-dasharray="3 4"/>
+<text x="553.0" y="281.0" fill="#8b949e" font-size="11" text-anchor="middle">12 ms</text>
+<line x1="711.5" y1="162.0" x2="711.5" y2="263.0" stroke="#8b949e" stroke-opacity="0.25" stroke-dasharray="3 4"/>
+<text x="711.5" y="281.0" fill="#8b949e" font-size="11" text-anchor="middle">18 ms</text>
+<line x1="870.0" y1="162.0" x2="870.0" y2="263.0" stroke="#8b949e" stroke-opacity="0.25" stroke-dasharray="3 4"/>
+<text x="870.0" y="281.0" fill="#8b949e" font-size="11" text-anchor="middle">24 ms</text>
+<text x="236.0" y="299.0" fill="#8b949e" font-size="11">linear scale</text>
+</svg>
