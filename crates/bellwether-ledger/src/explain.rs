@@ -360,16 +360,25 @@ fn replay_link(hash: Hash, r: &Replay) -> Link {
     Link::new(hash, RecordKind::Replay, &r.created_at, facts)
 }
 
-/// The prediction error, as facts: the twin's rows beside the engine's.
+/// The prediction error, as facts: the twin's rows beside the engine's,
+/// each pair's value in the proposal's order.
 fn prediction_facts(facts: &mut Vec<(&'static str, String)>, p: &bellwether_types::Prediction) {
+    let each = |f: &dyn Fn(&bellwether_types::PairPrediction) -> String| {
+        p.pairs.iter().map(f).collect::<Vec<_>>().join(", ")
+    };
     facts.push(("predicted_rows", p.predicted_rows.to_string()));
-    facts.push(("read_rows_before", p.before_read_rows.to_string()));
-    facts.push(("read_rows_after", p.after_read_rows.to_string()));
+    facts.push((
+        "read_rows_before",
+        each(&|q| q.before_read_rows.to_string()),
+    ));
+    facts.push(("read_rows_after", each(&|q| q.after_read_rows.to_string())));
     facts.push((
         "ratio_after",
-        p.after_ratio
-            .clone()
-            .unwrap_or_else(|| "undefined".to_owned()),
+        each(&|q| {
+            q.after_ratio
+                .clone()
+                .unwrap_or_else(|| "undefined".to_owned())
+        }),
     ));
 }
 

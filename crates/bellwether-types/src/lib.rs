@@ -239,6 +239,27 @@ pub enum Error {
         /// The whole message, naming what to grant.
         message: String,
     },
+    /// A query engine's log entry for a run bellwether submitted cannot
+    /// stand as that run's measurement (ADR 033), so nothing is recorded.
+    /// `reason` is one of [`MEASUREMENT_REFUSALS`]: the run was served
+    /// from a cache (`cache_served`), the log lacks a statistic
+    /// (`statistics_missing`), the entry under the tag is not the query
+    /// submitted (`not_the_query_submitted`), more than one finished
+    /// entry holds the tag (`ambiguous_log_entry`), the statistics name
+    /// another tag (`tag_mismatch`), or the rows the run returned are not
+    /// the rows it exported (`result_rows_differ`). `message` is the whole
+    /// sentence, naming what to do.
+    #[error("{message}")]
+    MeasurementRefused {
+        /// The engine root (`clickhouse://host/db`, credentials removed).
+        engine: String,
+        /// The tag the run was submitted under.
+        tag: String,
+        /// One of [`MEASUREMENT_REFUSALS`].
+        reason: &'static str,
+        /// The whole message, naming what to do.
+        message: String,
+    },
     /// Serialization failure.
     #[error("serde error: {0}")]
     Serde(#[from] serde_json::Error),
@@ -246,6 +267,17 @@ pub enum Error {
     #[error("{0}")]
     Other(String),
 }
+
+/// The reasons an [`Error::MeasurementRefused`] carries, each a stable
+/// name.
+pub const MEASUREMENT_REFUSALS: [&str; 6] = [
+    "cache_served",
+    "statistics_missing",
+    "not_the_query_submitted",
+    "ambiguous_log_entry",
+    "tag_mismatch",
+    "result_rows_differ",
+];
 
 fn not_a_folder(root: &str, operation: &str) -> String {
     format!(
@@ -1063,9 +1095,11 @@ pub struct QueryStats {
 
 /// How well the lake twin predicted a query engine (ADR 033): the rows
 /// and row groups the twin says a query over the key sample must read,
-/// beside what the engine's log says each side of the rewrite read, and
-/// their ratio. Recorded on the Replay (so a failing certificate keeps it)
-/// and copied onto the Receipt.
+/// beside what the engine's log says each query of each pair read, and
+/// their ratio, pair by pair. Each pair is one query over the key sample,
+/// so each is compared with the prediction on its own; nothing is summed
+/// across pairs, which may read different tables. Recorded on the Replay
+/// (so a failing certificate keeps it) and copied onto the Receipt.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct Prediction {
@@ -1075,13 +1109,23 @@ pub struct Prediction {
     pub predicted_rows: u64,
     /// Row groups of the twin holding a sampled key.
     pub predicted_row_groups: u64,
-    /// Rows the engine read for the queries before the rewrite, summed.
+    /// Each pair's realized reads and ratios, in the proposal's order.
+    pub pairs: Vec<PairPrediction>,
+}
+
+/// One pair's side of a [`Prediction`]: what the engine's log says its
+/// before and after queries read, and each one's ratio to the twin's
+/// predicted rows.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct PairPrediction {
+    /// Rows the engine read for the pair's query before the rewrite.
     pub before_read_rows: u64,
-    /// Rows the engine read for the queries after the rewrite, summed.
+    /// Rows the engine read for the pair's query after the rewrite.
     pub after_read_rows: u64,
-    /// Bytes the engine read before the rewrite, summed.
+    /// Bytes the engine read before the rewrite.
     pub before_read_bytes: u64,
-    /// Bytes the engine read after the rewrite, summed.
+    /// Bytes the engine read after the rewrite.
     pub after_read_bytes: u64,
     /// `before_read_rows / predicted_rows` as a decimal string with three
     /// places, rounded half to even; absent when `predicted_rows` is 0.

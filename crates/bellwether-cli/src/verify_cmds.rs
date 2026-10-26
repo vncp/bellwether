@@ -555,11 +555,12 @@ fn fix_human(r: &FixResult, out: &Out, table: bool) -> String {
 }
 
 /// Stage 1 over a query engine (ADR 033): each pair as the engine's log
-/// recorded it, and the twin's prediction beside it.
+/// recorded the run that exported it, and the twin's prediction beside it.
+#[allow(clippy::too_many_lines)]
 fn engine_score_human(s: &mut String, r: &FixResult, run: &EngineRun) {
     let replay = match &r.score {
         Some(Score::Measured { replay, .. }) => short(&replay.hash),
-        _ => "-".into(),
+        _ => "none written".into(),
     };
     let _ = writeln!(
         s,
@@ -585,34 +586,61 @@ fn engine_score_human(s: &mut String, r: &FixResult, run: &EngineRun) {
                 q.tag
             );
         }
+        if p.before.result_rows != p.after.result_rows {
+            let _ = writeln!(
+                s,
+                "    p{i} returns {} rows before and {} after: the rewrite does not return the \
+                 same rows",
+                num(p.before.result_rows),
+                num(p.after.result_rows)
+            );
+        }
     }
-    let p = &run.prediction;
-    let ratio = |r: &Option<String>| {
-        r.clone()
-            .unwrap_or_else(|| "undefined (the twin predicts 0 rows)".into())
-    };
+    if let Some(p) = &run.prediction {
+        let ratio = |r: &Option<String>| {
+            r.clone()
+                .unwrap_or_else(|| "undefined (the twin predicts 0 rows)".into())
+        };
+        let _ = writeln!(
+            s,
+            "            twin predicted {} rows in {} row groups for the key sample",
+            num(p.predicted_rows),
+            num(p.predicted_row_groups)
+        );
+        for (i, q) in p.pairs.iter().enumerate() {
+            let _ = writeln!(
+                s,
+                "    p{i} the engine read {} rows before (ratio {}) and {} after (ratio {})",
+                num(q.before_read_rows),
+                ratio(&q.before_ratio),
+                num(q.after_read_rows),
+                ratio(&q.after_ratio)
+            );
+        }
+    }
+    let twin = &run.identity_at_twin;
     let _ = writeln!(
         s,
-        "            twin predicted {} rows in {} row groups; the engine read {} rows before \
-         (ratio {}) and {} after (ratio {})",
-        num(p.predicted_rows),
-        num(p.predicted_row_groups),
-        num(p.before_read_rows),
-        ratio(&p.before_ratio),
-        num(p.after_read_rows),
-        ratio(&p.after_ratio)
-    );
-    let _ = writeln!(
-        s,
-        "            engine identity {} ({} units, {} rows){}",
+        "            engine identity {} ({} units, {} rows){}; {}",
         short(&run.identity_before.hash),
         num(run.identity_before.units),
         num(run.identity_before.rows),
         match &run.identity_after {
             Some(a) if a.hash == run.identity_before.hash =>
-                ", unchanged through the exports".to_string(),
-            Some(a) => format!(", {} after the exports", short(&a.hash)),
+                ", unchanged through the runs".to_string(),
+            Some(a) => format!(", {} after the runs", short(&a.hash)),
             None => String::new(),
+        },
+        if twin.hash == run.identity_before.hash {
+            "the same as when the twin diagnosis ran".to_string()
+        } else {
+            format!(
+                "the twin diagnosis ran against {} ({} units, {} rows), so its prediction \
+                 describes an earlier state of the tables",
+                short(&twin.hash),
+                num(twin.units),
+                num(twin.rows)
+            )
         }
     );
     if let Some(dir) = &run.scratch {
@@ -627,9 +655,9 @@ fn engine_score_human(s: &mut String, r: &FixResult, run: &EngineRun) {
             "            exports: {} under {dir}, {}",
             size(exported),
             if run.kept {
-                "kept (--keep)"
+                "kept there (--keep)"
             } else {
-                "deleted after the certificate"
+                "deleted when the run ended"
             }
         );
     }
@@ -700,7 +728,9 @@ fn verify_and_outcome_human(s: &mut String, r: &FixResult) {
             rows_asked(filter)
         );
     }
-    if let Some(inv) = &r.invariant {
+    // The invariant is checked by the certificate; without one (a refusal
+    // before the verify stage), nothing was.
+    if let (Some(inv), Some(_)) = (&r.invariant, &r.certificate) {
         let _ = writeln!(s, "            invariant checked: {inv}");
     }
     match &r.outcome {
@@ -792,9 +822,32 @@ fn verify_and_outcome_human(s: &mut String, r: &FixResult) {
                 } => format!(
                     "another commit landed during the apply (expected sequence {expected}, got {committed}). The key is built and serves lookups at sequence {committed}; no re-index is needed. It cannot be attested, and retrying will not attest it: a retry finds the key already complete (nothing_to_apply) and writes no receipt. `bellwether why` with the same keys reports the cost it now has"
                 ),
+                Refusal::DataChanged { .. } if engine_rewrite(r) => {
+                    "the engine's tables changed after the certificate was computed (their identity differs from the one it cites), so the certificate no longer describes them; run fix on the proposal again to re-verify".into()
+                }
                 Refusal::DataChanged { .. } => {
                     "the data changed after the certificate was computed (its catalog digest differs), so the certificate no longer describes it; run fix again to re-verify".into()
                 }
+                Refusal::MeasurementChanged {
+                    replay,
+                    pair,
+                    side,
+                    certified_read_rows,
+                    measured_read_rows,
+                    certified_read_bytes,
+                    measured_read_bytes,
+                    certified_result_rows,
+                    measured_result_rows,
+                    ..
+                } => format!(
+                    "measurement_changed: run again in the state certified, p{pair} {side} read {} rows and {} bytes and returned {} rows, where the certified replay {replay} says {} rows, {} bytes, and {} rows; the numbers a receipt would attest are not the numbers verified (a query that behaves differently between runs, or a background merge, does this), so nothing was written; run fix on the proposal again",
+                    num(*measured_read_rows),
+                    num(*measured_read_bytes),
+                    num(*measured_result_rows),
+                    num(*certified_read_rows),
+                    num(*certified_read_bytes),
+                    num(*certified_result_rows)
+                ),
                 Refusal::NothingToApply { sequence } => format!(
                     "the key is already complete at sequence {sequence}, so applying it changes nothing; no receipt"
                 ),
@@ -831,16 +884,16 @@ fn verify_and_outcome_human(s: &mut String, r: &FixResult) {
                     why
                 }
                 Refusal::ExportDenied { message, .. } => format!(
-                    "export_denied: {message}. No export, so no certificate and no receipt; the \
-                     measured replay stands"
+                    "export_denied: {message}. The export is the measured run, so nothing was \
+                     measured, and there is no certificate and no receipt"
                 ),
                 Refusal::NothingToGain {
                     replay,
                     current_bytes,
                     proposed_bytes,
-                } if r.engine.is_some() => format!(
+                } if engine_rewrite(r) => format!(
                     "nothing_to_gain: replay {replay} measured the rewrite reading no fewer bytes \
-                     in the engine ({} before, {} after), so nothing was exported or verified; \
+                     in the engine ({} before, {} after), so nothing was verified or attested; \
                      pass --allow-no-gain to go on anyway",
                     num(*current_bytes),
                     num(*proposed_bytes)
@@ -858,4 +911,13 @@ fn verify_and_outcome_human(s: &mut String, r: &FixResult) {
             let _ = writeln!(s, "  refused: {why}");
         }
     }
+}
+
+/// Whether `r` is a fix of a rewrite of engine queries (ADR 033).
+fn engine_rewrite(r: &FixResult) -> bool {
+    r.engine.is_some()
+        || matches!(
+            &r.proposal.record,
+            Record::Proposal(p) if matches!(&p.body, ProposalBody::Rewrite { shape } if !shape.pairs.is_empty())
+        )
 }

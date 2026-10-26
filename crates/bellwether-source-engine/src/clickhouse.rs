@@ -2,13 +2,21 @@
 //!
 //! - **submit**: the query text as the request body, `query_id` = the tag,
 //!   `readonly=2` (no write, no DDL), `default_format=Null` (the engine
-//!   produces and discards the rows), `use_query_cache=0`.
+//!   produces and discards the rows), and the caches that change what a
+//!   run reads turned off: `use_query_cache=0`, and
+//!   `use_query_condition_cache=0` where the server has it.
+//! - **export**: the same request with `default_format=Parquet`, streamed
+//!   into `<dir>/part-0.parquet` and checked to be whole Parquet: one run,
+//!   logged under its own tag.
 //! - **stats**: `system.query_log` by `query_id` (`read_rows`,
 //!   `read_bytes`, `memory_usage`, `query_duration_ms`, `result_rows`, CPU
 //!   from `ProfileEvents`), after `SYSTEM FLUSH LOGS` where the user may,
-//!   else by waiting for the log's flush (bounded).
-//! - **export**: the query again, `readonly=2`, `default_format=Parquet`,
-//!   streamed into `<dir>/part-0.parquet` and checked to be whole Parquet.
+//!   else by waiting for the log's flush (bounded). The finished entry
+//!   must be the only one under the tag, logged for this user with the
+//!   exact text submitted, and not served from a cache: a `SETTINGS`
+//!   clause in the agent's text overrides the request's settings, so a
+//!   run that hit the query cache or the query condition cache, or that
+//!   turned the query cache on, is refused (`cache_served`).
 //! - **units**: one per partition of each MergeTree table, from
 //!   `system.parts` (active parts). Identity: rows, the lowest and highest
 //!   block numbers, and the highest mutation version, which an insert, a
@@ -33,7 +41,8 @@ use serde_json::{Map, Value};
 use crate::http::{self, METADATA};
 use crate::uri::EngineUri;
 use crate::{
-    check_query, denied_scratch, export_dir, listed, Exported, MeasuredEngine, ResultHandle, Tag,
+    check_query, denied_scratch, export_dir, listed, refused, Exported, MeasuredEngine,
+    ResultHandle, Tag,
 };
 
 /// The model of every ClickHouse cost.
@@ -66,6 +75,9 @@ pub struct ClickHouse {
     password: Option<String>,
     query_timeout: Option<Duration>,
     max_unit_rows: u64,
+    /// The cache settings every run of the agent's text turns off, beyond
+    /// the query cache (off on every request): those this server has.
+    caches_off: Vec<(&'static str, &'static str)>,
     client: reqwest::blocking::Client,
     units: Mutex<Option<Arc<Vec<Unit>>>>,
 }
@@ -243,7 +255,7 @@ impl ClickHouse {
         } else {
             format!("{}:{}", uri.host, if secure { 8443 } else { 8123 })
         };
-        let ch = Self {
+        let mut ch = Self {
             root: uri.root(),
             db_root: format!("clickhouse://{}/{}", uri.host, uri.database),
             base: format!("{}://{host}/", if secure { "https" } else { "http" }),
@@ -253,11 +265,34 @@ impl ClickHouse {
             password: uri.param("password")?,
             query_timeout: uri.timeout_secs()?.map(Duration::from_secs),
             max_unit_rows: crate::DEFAULT_MAX_UNIT_ROWS,
+            caches_off: Vec::new(),
             client: http::client()?,
             units: Mutex::new(None),
         };
-        ch.meta("SELECT 1 AS ok", &[])?;
+        // The query condition cache, where this server has it (it arrived
+        // in 25.3); the query cache is off on every request, metadata
+        // included (a user's profile may turn it on, and then the server
+        // refuses to cache a read of its system tables).
+        let known = ch.meta(
+            "SELECT name FROM system.settings WHERE name = 'use_query_condition_cache'",
+            &[],
+        )?;
+        if !known.is_empty() {
+            ch.caches_off.push(("use_query_condition_cache", "0"));
+        }
         Ok(ch)
+    }
+
+    /// Runs the agent's query once under `tag` in `format`, read-only, with
+    /// the caches off; the response streams the rows.
+    fn run(&self, q: &str, tag: &Tag, format: &str) -> Result<reqwest::blocking::Response> {
+        let mut params: Vec<(&str, &str)> = vec![
+            ("query_id", tag.as_str()),
+            ("readonly", "2"),
+            ("default_format", format),
+        ];
+        params.extend_from_slice(&self.caches_off);
+        self.post(q, &params, self.query_timeout)
     }
 
     /// With another cap on the rows of a unit `read_columns` reads.
@@ -276,7 +311,12 @@ impl ClickHouse {
         let mut req = self
             .client
             .post(&self.base)
-            .query(&[("database", self.database.as_str())])
+            .query(&[
+                ("database", self.database.as_str()),
+                // The query cache serves what an earlier run returned, so
+                // no request of bellwether's ever reads or fills it.
+                ("use_query_cache", "0"),
+            ])
             .query(params)
             .header("X-ClickHouse-User", &self.user)
             .body(sql.to_string());
@@ -495,16 +535,7 @@ impl MeasuredEngine for ClickHouse {
 
     fn submit(&self, query: &str, tag: &Tag) -> Result<ResultHandle> {
         let q = check_query(query)?;
-        let mut resp = self.post(
-            q,
-            &[
-                ("query_id", tag.as_str()),
-                ("readonly", "2"),
-                ("default_format", "Null"),
-                ("use_query_cache", "0"),
-            ],
-            self.query_timeout,
-        )?;
+        let mut resp = self.run(q, tag, "Null")?;
         // A query that names its own output format still returns rows:
         // they are read and dropped, never kept.
         std::io::copy(&mut resp, &mut std::io::sink()).map_err(|e| {
@@ -516,48 +547,106 @@ impl MeasuredEngine for ClickHouse {
         Ok(ResultHandle {
             tag: tag.clone(),
             query: q.to_string(),
+            logged: q.to_string(),
+            exported: None,
         })
     }
 
-    fn stats(&self, tag: &Tag) -> Result<QueryStats> {
+    fn export(&self, query: &str, tag: &Tag, dir: &Path) -> Result<ResultHandle> {
+        let q = check_query(query)?;
+        export_dir(&self.root, dir)?;
+        let file = dir.join("part-0.parquet");
+        let written = (|| -> Result<Exported> {
+            let mut resp = match self.run(q, tag, "Parquet") {
+                Ok(r) => r,
+                Err(Error::Source(m)) if m.contains(&format!("Code: {ACCESS_DENIED}.")) => {
+                    let permission = "SELECT on every table the query reads, for the user \
+                                      bellwether connects as"
+                        .to_string();
+                    return Err(Error::ExportDenied {
+                        message: format!(
+                            "{} refused to export the result of query {tag} ({m}); grant \
+                             {permission}",
+                            self.root
+                        ),
+                        engine: self.root.clone(),
+                        permission,
+                    });
+                }
+                Err(e) => return Err(e),
+            };
+            let mut out = std::fs::File::create(&file)
+                .map_err(|e| denied_scratch(&self.root, dir, &e.to_string()))?;
+            std::io::copy(&mut resp, &mut out).map_err(|e| {
+                Error::Source(format!(
+                    "{}: the export of query {tag} was cut off ({e})",
+                    self.root
+                ))
+            })?;
+            drop(out);
+            // A server error after the first bytes arrives inside the body:
+            // a file that is not whole Parquet is refused, never read.
+            let f = std::fs::File::open(&file)
+                .map_err(|e| Error::Source(format!("cannot reopen {} ({e})", file.display())))?;
+            parquet::file::reader::SerializedFileReader::new(f).map_err(|e| {
+                Error::Source(format!(
+                    "{}: the export of query {tag} is not whole Parquet ({e}); the query failed \
+                     while it streamed",
+                    self.root
+                ))
+            })?;
+            listed(dir)
+        })();
+        match written {
+            Ok(exported) => Ok(ResultHandle {
+                tag: tag.clone(),
+                query: q.to_string(),
+                logged: q.to_string(),
+                exported: Some(exported),
+            }),
+            Err(e) => {
+                let _ = std::fs::remove_dir_all(dir);
+                Err(e)
+            }
+        }
+    }
+
+    fn stats(&self, run: &ResultHandle) -> Result<QueryStats> {
+        let tag = &run.tag;
         let deadline = std::time::Instant::now() + LOG_WAIT;
         loop {
             // Flushing the log needs the SYSTEM FLUSH LOGS privilege; without
             // it, the log's own flush interval is waited for.
             let _ = self.post("SYSTEM FLUSH LOGS", &[], Some(METADATA));
             let rows = self.meta(
-                "SELECT type, read_rows, read_bytes, memory_usage, query_duration_ms, \
-                 result_rows, ProfileEvents['UserTimeMicroseconds'] + \
+                "SELECT type, user, query, read_rows, read_bytes, memory_usage, \
+                 query_duration_ms, result_rows, ProfileEvents['UserTimeMicroseconds'] + \
                  ProfileEvents['SystemTimeMicroseconds'] AS cpu_us, \
                  ProfileEvents['SelectedParts'] AS parts, \
-                 ProfileEvents['SelectedPartsTotal'] AS parts_total, exception \
+                 ProfileEvents['SelectedPartsTotal'] AS parts_total, \
+                 ProfileEvents['QueryCacheHits'] AS cache_hits, \
+                 ProfileEvents['QueryConditionCacheHits'] AS condition_cache_hits, \
+                 Settings['use_query_cache'] AS use_query_cache, exception \
                  FROM system.query_log WHERE query_id = {tag:String} AND type IN \
                  ('QueryFinish', 'ExceptionBeforeStart', 'ExceptionWhileProcessing') \
-                 ORDER BY event_time_microseconds DESC LIMIT 1",
+                 ORDER BY event_time_microseconds LIMIT 16",
                 &[("param_tag", tag.as_str())],
             )?;
+            if rows.len() > 1 {
+                return Err(refused(
+                    &self.root,
+                    tag,
+                    "ambiguous_log_entry",
+                    &format!(
+                        "system.query_log holds {} finished entries under the tag, so another \
+                         client ran a query under it and the entry of this run cannot be told \
+                         apart; run again",
+                        rows.len()
+                    ),
+                ));
+            }
             if let Some(r) = rows.first() {
-                let kind = str_of(r, "type")?;
-                if kind != "QueryFinish" {
-                    return Err(Error::Source(format!(
-                        "{}: query {tag} failed in the engine, so it has no cost to read: {}",
-                        self.root,
-                        first_line(str_of(r, "exception").unwrap_or(""))
-                    )));
-                }
-                let opt =
-                    |k: &str| -> Result<Option<u64>> { Ok(Some(u64_of(r, k)?).filter(|v| *v > 0)) };
-                return Ok(QueryStats {
-                    tag: tag.to_string(),
-                    read_rows: u64_of(r, "read_rows")?,
-                    read_bytes: u64_of(r, "read_bytes")?,
-                    peak_memory_bytes: u64_of(r, "memory_usage")?,
-                    cpu_ns: Some(u64_of(r, "cpu_us")?.saturating_mul(1_000)),
-                    duration_ns: u64_of(r, "query_duration_ms")?.saturating_mul(1_000_000),
-                    result_rows: u64_of(r, "result_rows")?,
-                    units_read: Some(u64_of(r, "parts")?),
-                    units_total: opt("parts_total")?,
-                });
+                return self.stats_of(run, r);
             }
             if std::time::Instant::now() >= deadline {
                 return Err(Error::Source(format!(
@@ -571,64 +660,61 @@ impl MeasuredEngine for ClickHouse {
             std::thread::sleep(Duration::from_millis(500));
         }
     }
+}
 
-    fn export(&self, handle: &ResultHandle, dir: &Path) -> Result<Exported> {
-        export_dir(&self.root, dir)?;
-        let tag = Tag(format!("{}-x", handle.tag.as_str()));
-        let file = dir.join("part-0.parquet");
-        let written = (|| -> Result<Exported> {
-            let mut resp = match self.post(
-                &handle.query,
-                &[
-                    ("query_id", tag.as_str()),
-                    ("readonly", "2"),
-                    ("default_format", "Parquet"),
-                    ("use_query_cache", "0"),
-                ],
-                self.query_timeout,
-            ) {
-                Ok(r) => r,
-                Err(Error::Source(m)) if m.contains(&format!("Code: {ACCESS_DENIED}.")) => {
-                    let permission = "SELECT on every table the query reads, for the user \
-                                      bellwether connects as"
-                        .to_string();
-                    return Err(Error::ExportDenied {
-                        message: format!(
-                            "{} refused to export the result of query {} ({m}); grant {permission}",
-                            self.root, handle.tag
-                        ),
-                        engine: self.root.clone(),
-                        permission,
-                    });
-                }
-                Err(e) => return Err(e),
-            };
-            let mut out = std::fs::File::create(&file)
-                .map_err(|e| denied_scratch(&self.root, dir, &e.to_string()))?;
-            std::io::copy(&mut resp, &mut out).map_err(|e| {
-                Error::Source(format!(
-                    "{}: the export of query {} was cut off ({e})",
-                    self.root, handle.tag
-                ))
-            })?;
-            drop(out);
-            // A server error after the first bytes arrives inside the body:
-            // a file that is not whole Parquet is refused, never read.
-            let f = std::fs::File::open(&file)
-                .map_err(|e| Error::Source(format!("cannot reopen {} ({e})", file.display())))?;
-            parquet::file::reader::SerializedFileReader::new(f).map_err(|e| {
-                Error::Source(format!(
-                    "{}: the export of query {} is not whole Parquet ({e}); the query failed \
-                     while it streamed",
-                    self.root, handle.tag
-                ))
-            })?;
-            listed(dir)
-        })();
-        if written.is_err() {
-            let _ = std::fs::remove_dir_all(dir);
+impl ClickHouse {
+    /// One finished `system.query_log` entry as `run`'s statistics, or the
+    /// refusal of it (module docs).
+    fn stats_of(&self, run: &ResultHandle, r: &Map<String, Value>) -> Result<QueryStats> {
+        let tag = &run.tag;
+        if str_of(r, "user")? != self.user || str_of(r, "query")? != run.logged {
+            return Err(refused(
+                &self.root,
+                tag,
+                "not_the_query_submitted",
+                &format!(
+                    "the entry under the tag was logged for another user or with another text \
+                     than the query submitted as user {}, so another client ran under the tag; \
+                     run again",
+                    self.user
+                ),
+            ));
         }
-        written
+        if str_of(r, "type")? != "QueryFinish" {
+            return Err(Error::Source(format!(
+                "{}: query {tag} failed in the engine, so it has no cost to read: {}",
+                self.root,
+                first_line(str_of(r, "exception").unwrap_or(""))
+            )));
+        }
+        let cache_on = str_of(r, "use_query_cache")?;
+        let (hits, condition_hits) = (u64_of(r, "cache_hits")?, u64_of(r, "condition_cache_hits")?);
+        if hits > 0 || condition_hits > 0 || matches!(cache_on, "1" | "true" | "True") {
+            return Err(refused(
+                &self.root,
+                tag,
+                "cache_served",
+                &format!(
+                    "the query turned a cache on (use_query_cache={}, {hits} query cache hits, \
+                     {condition_hits} query condition cache hits), so the log records what the \
+                     cache served, not what the query reads; propose the rewrite again without \
+                     the SETTINGS that turn a cache on",
+                    if cache_on.is_empty() { "0" } else { cache_on }
+                ),
+            ));
+        }
+        let opt = |k: &str| -> Result<Option<u64>> { Ok(Some(u64_of(r, k)?).filter(|v| *v > 0)) };
+        Ok(QueryStats {
+            tag: tag.to_string(),
+            read_rows: u64_of(r, "read_rows")?,
+            read_bytes: u64_of(r, "read_bytes")?,
+            peak_memory_bytes: u64_of(r, "memory_usage")?,
+            cpu_ns: Some(u64_of(r, "cpu_us")?.saturating_mul(1_000)),
+            duration_ns: u64_of(r, "query_duration_ms")?.saturating_mul(1_000_000),
+            result_rows: u64_of(r, "result_rows")?,
+            units_read: Some(u64_of(r, "parts")?),
+            units_total: opt("parts_total")?,
+        })
     }
 }
 

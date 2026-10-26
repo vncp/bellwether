@@ -38,13 +38,14 @@ trap 'sql "DROP DATABASE IF EXISTS $DB" >/dev/null 2>&1 || true' EXIT
 # extra flags for the lake (partitioning).
 run() {
   local shape=$1 lake=$2 table=$3 keys=$4 before=$5 after=$6; shift 6
-  local dir="$OUT/$shape" engine="$ENGINE_DB/$table"
-  mkdir -p "$dir/scratch"
+  # The scratch folder: hidden, under the lake root (scratch governance).
+  local dir="$OUT/$shape" engine="$ENGINE_DB/$table" scratch="$lake/_scratch"
+  mkdir -p "$dir"
   printf '%s\n' "$keys" >"$dir/keys.sql"
   printf '%s\n' "$before" >"$dir/before.sql"
   printf '%s\n' "$after" >"$dir/after.sql"
   "$BW" "$@" --json workload record "$lake" --from-engine "$engine" --keys-query "$dir/keys.sql" \
-    --scratch "$dir/scratch" >"$dir/workload.json"
+    --scratch "$scratch" >"$dir/workload.json"
   local wl; wl=$(jq -r .workload "$dir/workload.json")
   "$BW" "$@" why "$lake" --workload "$wl" --twin-of "$engine" --gate in:10 --gate join:100000 \
     >"$dir/why.txt"
@@ -54,7 +55,7 @@ run() {
   "$BW" "$@" --json propose "$lake" --rewrite "$dir/before.sql=$dir/after.sql" --evidence "$ev" \
     --by engine-funnel >"$dir/propose.json"
   local p; p=$(jq -r .proposal.hash "$dir/propose.json")
-  "$BW" "$@" fix "$lake" --twin-of "$engine" --proposal "$p" --scratch "$dir/scratch" \
+  "$BW" "$@" fix "$lake" --twin-of "$engine" --proposal "$p" --scratch "$scratch" \
     | tee "$dir/fix.txt"
   local r; r=$(grep -Eo 'receipt [0-9a-f]{64}' "$dir/fix.txt" | head -1 | cut -d' ' -f2)
   "$BW" "$@" receipt show "$lake" "$r" >"$dir/receipt.txt"

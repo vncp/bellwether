@@ -144,8 +144,10 @@ line. No refusal is prose only.
 | `unknown_kind` | The index uses a kind this build does not know. |
 | `segment_claimed` | A segment is being garbage-collected. Retry later. |
 | `engine_error` | Any other engine error; `message` says what to do. |
-| `export_denied` | The query engine refused to export a rewrite's results, or the scratch folder cannot be written; `fields.engine` and `fields.permission` name what to grant. No certificate and no receipt; the measured Replay (with the prediction) stands. Tell the human which permission. |
+| `export_denied` | The query engine refused to export a rewrite's results, or the scratch folder cannot be written; `fields.engine` and `fields.permission` name what to grant. The export is the measured run, so nothing was measured: no Replay, no certificate, no receipt. Tell the human which permission. |
 | `caller_supplied_cost` | The arguments carried a score, cost, measurement, replay, prediction, verdict, or certificate field (`fields.field`). The engine measures, verifies, and attests on its own; remove the field and call again. |
+| `measurement_refused` | A query engine's log entry for one run cannot stand as its measurement; `fields.reason` says why: `cache_served` (the query text turned a cache on), `statistics_missing`, `not_the_query_submitted` or `ambiguous_log_entry` (another client ran under the run's tag), `tag_mismatch`, or `result_rows_differ` (the rows the run returned are not the rows it exported). Nothing was recorded. For `cache_served`, propose the rewrite again without those settings. |
+| `measurement_changed` | `apply.receipt` measured a rewrite of engine queries again, in the state certified, and a query's rows read, bytes read, or result rows disagree with the certified replay's (`fields.pair`, `fields.side`, `fields.certified`, `fields.measured`). Nothing was written. Do not apply; verify the proposal again. |
 
 ## What you may never do
 

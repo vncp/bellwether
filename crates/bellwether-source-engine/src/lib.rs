@@ -6,11 +6,15 @@
 //!
 //! - [`MeasuredEngine::submit`] runs one query under a tag bellwether chose
 //!   ([`Tag`]), read-only, and discards its rows;
-//! - [`MeasuredEngine::stats`] reads that tag's statistics from the
+//! - [`MeasuredEngine::export`] runs one query under a tag, read-only, and
+//!   writes that same run's rows as Parquet into a scratch folder: the
+//!   rows verified are the rows of the run measured, never of a second
+//!   run;
+//! - [`MeasuredEngine::stats`] reads one run's statistics from the
 //!   engine's **own** query log ([`QueryStats`]): rows and bytes read, peak
-//!   memory, CPU, duration, result rows;
-//! - [`MeasuredEngine::export`] writes a submitted query's result as
-//!   Parquet into a scratch folder.
+//!   memory, CPU, duration, result rows. The entry must be the run's: its
+//!   tag, its exact text, and its user, one finished entry only, and not
+//!   served from a cache; otherwise [`Error::MeasurementRefused`].
 //!
 //! Nothing else crosses: no cost is computed here, none is accepted from a
 //! caller, and every number in a [`QueryStats`] is one the engine logged
@@ -99,14 +103,19 @@ impl std::fmt::Display for Tag {
     }
 }
 
-/// What [`MeasuredEngine::submit`] returns: the query as submitted and its
-/// tag, so [`MeasuredEngine::export`] exports exactly that query.
+/// One run: what [`MeasuredEngine::submit`] and [`MeasuredEngine::export`]
+/// return, and what [`MeasuredEngine::stats`] reads the log entry of.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ResultHandle {
     /// The tag the query ran under.
     pub tag: Tag,
-    /// The query text, exactly as given.
+    /// The query text, exactly as given (surrounding whitespace trimmed).
     pub query: String,
+    /// The text the engine received for this run and logs under the tag:
+    /// the query itself, or the engine's export statement around it.
+    pub logged: String,
+    /// What the run exported, for [`MeasuredEngine::export`].
+    pub exported: Option<Exported>,
 }
 
 /// What [`MeasuredEngine::export`] wrote.
@@ -122,6 +131,10 @@ pub struct Exported {
 /// Implementations are read-only towards the engine: they submit the text
 /// they are given under a read-only setting where the engine has one, run
 /// their own fixed metadata statements, and create nothing inside it.
+///
+/// The text is the agent's, so it can still tell its runs apart (by its
+/// own query id or the `bw-` prefix of the tag): a run's statistics and
+/// its rows therefore always come from the same run, never from two.
 pub trait MeasuredEngine: Send + Sync {
     /// The engine root, credentials and parameters removed: what records
     /// name (`clickhouse://host:8123/db/table`).
@@ -131,20 +144,26 @@ pub trait MeasuredEngine: Send + Sync {
     /// `<engine>.query_log`.
     fn model(&self) -> &'static str;
 
-    /// Runs one query under `tag`, read-only, discarding its rows; fails
-    /// with the engine's message if the engine refuses or fails it.
+    /// Runs one query under `tag`, read-only, with every cache the engine
+    /// lets a request turn off turned off, discarding its rows; fails with
+    /// the engine's message if the engine refuses or fails it.
     fn submit(&self, query: &str, tag: &Tag) -> Result<ResultHandle>;
 
-    /// The statistics the engine's own query log holds for `tag`, waiting
-    /// (bounded) for the log to record it. Fails when the log has no
-    /// finished entry for the tag, or when the query failed.
-    fn stats(&self, tag: &Tag) -> Result<QueryStats>;
+    /// Runs one query under `tag` as [`MeasuredEngine::submit`] does and
+    /// writes that run's rows as Parquet into the folder `dir`, which must
+    /// not exist yet or be empty: one run, whose log entry
+    /// [`MeasuredEngine::stats`] reads. Refuses with
+    /// [`Error::ExportDenied`] when the engine or the folder does not allow
+    /// it, naming the permission needed.
+    fn export(&self, query: &str, tag: &Tag, dir: &Path) -> Result<ResultHandle>;
 
-    /// Writes the result of `handle`'s query as Parquet into the folder
-    /// `dir`, which must not exist yet or be empty. Refuses with
-    /// [`Error::ExportDenied`] when the engine or the folder does not
-    /// allow it, naming the permission needed.
-    fn export(&self, handle: &ResultHandle, dir: &Path) -> Result<Exported>;
+    /// The statistics the engine's own query log holds for `run`, waiting
+    /// (bounded) for the log to record it. Fails when the log has no
+    /// finished entry for the tag or the query failed; refuses
+    /// ([`Error::MeasurementRefused`]) an entry that is not the run's
+    /// (another text or user), more than one finished entry under the tag,
+    /// a run served from a cache, and a missing statistic.
+    fn stats(&self, run: &ResultHandle) -> Result<QueryStats>;
 }
 
 /// An engine adapter: a [`Source`] over its storage units and a
@@ -262,9 +281,9 @@ impl MeasuredScorer for EngineScorer<'_> {
             Tag::new(&self.run, "before")?,
             Tag::new(&self.run, "after")?,
         );
-        self.engine.submit(check_query(before)?, &tb)?;
-        self.engine.submit(check_query(after)?, &ta)?;
-        let (b, a) = (self.engine.stats(&tb)?, self.engine.stats(&ta)?);
+        let hb = self.engine.submit(check_query(before)?, &tb)?;
+        let ha = self.engine.submit(check_query(after)?, &ta)?;
+        let (b, a) = (self.engine.stats(&hb)?, self.engine.stats(&ha)?);
         let m = |v: u64| Measurement {
             unit: "bytes of peak memory".into(),
             samples: vec![v],
@@ -279,6 +298,22 @@ impl MeasuredScorer for EngineScorer<'_> {
             noise: 0,
             improves: a.peak_memory_bytes < b.peak_memory_bytes,
         })
+    }
+}
+
+/// The refusal of a log entry as a run's measurement
+/// ([`Error::MeasurementRefused`]); `reason` is one of
+/// [`bellwether_types::MEASUREMENT_REFUSALS`].
+#[must_use]
+pub fn refused(engine: &str, tag: &Tag, reason: &'static str, what: &str) -> Error {
+    Error::MeasurementRefused {
+        engine: engine.to_string(),
+        tag: tag.to_string(),
+        reason,
+        message: format!(
+            "{engine}: the log entry of query {tag} cannot stand as its measurement \
+             ({reason}): {what}; nothing was recorded"
+        ),
     }
 }
 

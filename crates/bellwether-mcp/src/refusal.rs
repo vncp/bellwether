@@ -97,11 +97,20 @@ pub enum RefusalCode {
     /// The arguments carried a score, cost, measurement, replay, verdict, or
     /// certificate: a caller never supplies one.
     CallerSuppliedCost,
+    /// A query engine's log entry for a run cannot stand as its
+    /// measurement (`fields.reason`: served from a cache, a statistic
+    /// missing, not the query submitted, several entries, or rows that
+    /// are not the rows exported); nothing was recorded.
+    MeasurementRefused,
+    /// The apply tier measured a rewrite of engine queries again and a
+    /// query's numbers disagree with the certified replay's; nothing was
+    /// written.
+    MeasurementChanged,
 }
 
 impl RefusalCode {
     /// Every code, in `AGENTS.md` order.
-    pub const ALL: [Self; 36] = [
+    pub const ALL: [Self; 38] = [
         Self::CertificateFailed,
         Self::StaleManifest,
         Self::DataChanged,
@@ -138,6 +147,8 @@ impl RefusalCode {
         Self::EngineError,
         Self::ExportDenied,
         Self::CallerSuppliedCost,
+        Self::MeasurementRefused,
+        Self::MeasurementChanged,
     ];
 
     /// The code as it is serialized.
@@ -180,11 +191,14 @@ impl RefusalCode {
             Self::EngineError => "engine_error",
             Self::ExportDenied => "export_denied",
             Self::CallerSuppliedCost => "caller_supplied_cost",
+            Self::MeasurementRefused => "measurement_refused",
+            Self::MeasurementChanged => "measurement_changed",
         }
     }
 
     /// The one-line instruction an agent acts on.
     #[must_use]
+    #[allow(clippy::too_many_lines)]
     pub fn next(self) -> &'static str {
         match self {
             Self::CertificateFailed => {
@@ -270,12 +284,24 @@ impl RefusalCode {
             Self::SegmentClaimed => "retry later, with `wait: true`",
             Self::EngineError => "read the message; it says what to do",
             Self::ExportDenied => {
-                "tell the human which permission `fields.permission` names; without the export \
-                 there is no certificate and no receipt, and the measured replay stands"
+                "tell the human which permission `fields.permission` names; the export is the \
+                 measured run, so without it nothing is measured and there is no certificate \
+                 and no receipt"
             }
             Self::CallerSuppliedCost => {
                 "remove the field `fields.field` names and call again; the engine measures, \
                  verifies, and attests on its own"
+            }
+            Self::MeasurementRefused => {
+                "for `cache_served`, propose the rewrite again without the settings that turn a \
+                 cache on in its query text (propose.rewrite) and call the tool on the new \
+                 proposal; for any other `fields.reason`, call again, and tell the human if it \
+                 repeats"
+            }
+            Self::MeasurementChanged => {
+                "do not apply; call score.verify on the proposal again and apply.receipt with \
+                 the new certificate, or tell the human the query does not measure the same \
+                 twice"
             }
         }
     }
@@ -491,6 +517,15 @@ pub fn from_error(e: &Error) -> Refusal {
         } => (
             RefusalCode::ExportDenied,
             json!({ "engine": engine, "permission": permission }),
+        ),
+        Error::MeasurementRefused {
+            engine,
+            tag,
+            reason,
+            ..
+        } => (
+            RefusalCode::MeasurementRefused,
+            json!({ "engine": engine, "tag": tag, "reason": reason }),
         ),
         // No wildcard arm: a new `Error` variant must fail to compile here.
         Error::Serde(_) | Error::Other(_) => (RefusalCode::EngineError, json!({})),
@@ -730,6 +765,34 @@ pub fn from_fix(r: &FixRefusal, verification: Option<&Reconciliation>) -> Refusa
             format!("certificate {certificate} passed, but a rewrite has no replay to attest"),
             json!({ "certificate": certificate }),
         ),
+        FixRefusal::MeasurementChanged {
+            certificate,
+            replay,
+            pair,
+            side,
+            certified_read_rows,
+            measured_read_rows,
+            certified_read_bytes,
+            measured_read_bytes,
+            certified_result_rows,
+            measured_result_rows,
+        } => Refusal::new(
+            RefusalCode::MeasurementChanged,
+            format!(
+                "measured again in the state certificate {certificate} verified, p{pair} \
+                 {side} read {measured_read_rows} rows and {measured_read_bytes} bytes and \
+                 returned {measured_result_rows} rows; the certified replay {replay} says \
+                 {certified_read_rows}, {certified_read_bytes}, and {certified_result_rows}"
+            ),
+            json!({
+                "certificate": certificate,
+                "replay": replay,
+                "pair": pair,
+                "side": side,
+                "certified": {"read_rows": certified_read_rows, "read_bytes": certified_read_bytes, "result_rows": certified_result_rows},
+                "measured": {"read_rows": measured_read_rows, "read_bytes": measured_read_bytes, "result_rows": measured_result_rows},
+            }),
+        ),
     }
 }
 
@@ -857,6 +920,15 @@ mod tests {
                     retained: vec![3, 4, 5],
                 },
                 RefusalCode::NotRetained,
+            ),
+            (
+                Error::MeasurementRefused {
+                    engine: "clickhouse://h/db".into(),
+                    tag: "bw-1-p0-after".into(),
+                    reason: "cache_served",
+                    message: "m".into(),
+                },
+                RefusalCode::MeasurementRefused,
             ),
         ];
         for (e, code) in &cases {
@@ -991,6 +1063,21 @@ mod tests {
             (
                 FixRefusal::NoReplay { certificate: h },
                 RefusalCode::NoReplay,
+            ),
+            (
+                FixRefusal::MeasurementChanged {
+                    certificate: h,
+                    replay: h,
+                    pair: 0,
+                    side: "after".into(),
+                    certified_read_rows: 1,
+                    measured_read_rows: 1,
+                    certified_read_bytes: 2,
+                    measured_read_bytes: 3,
+                    certified_result_rows: 4,
+                    measured_result_rows: 4,
+                },
+                RefusalCode::MeasurementChanged,
             ),
         ];
         for (r, code) in &cases {

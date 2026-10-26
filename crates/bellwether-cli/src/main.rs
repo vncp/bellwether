@@ -543,7 +543,7 @@ impl From<Error> for Failure {
             Error::InvalidArgument {
                 field:
                     "lookback" | "latest_by" | "signing_key" | "trusted_keys" | "public_key" | "out"
-                    | "name" | "valid_from" | "revoked_at" | "index" | "root",
+                    | "name" | "valid_from" | "revoked_at" | "index" | "root" | "scratch",
                 ..
             } => Self::Usage(match hint(&e) {
                 Some(h) => format!("{e}; {h}"),
@@ -600,7 +600,11 @@ fn hint(e: &Error) -> Option<String> {
                 "window" => "--window (or --from and --to)",
                 "valid" => "--valid",
                 "known" => "--known",
-                "keys" => "--from or --keys",
+                "keys" => {
+                    "--from or --keys (for a rewrite of engine queries: the key sample the cited \
+                     twin diagnosis recorded)"
+                }
+                "scratch" => "--scratch",
                 "key_columns" => "--key",
                 "cluster_by" => "--layout",
                 "shape" => "--before, --after, and --invariant",

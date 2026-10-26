@@ -6,14 +6,20 @@
 //!   `results_progressive_enabled: false`. The response is read and
 //!   dropped; only its last 1 MiB is kept, to read the completion frame
 //!   that says whether the query failed.
-//! - **stats**: `.show queries`, filtered to `ClientActivityId ==
-//!   'bellwether;<tag>'`: `ScannedExtentsStatistics` (rows and extents read),
-//!   `CacheStatistics` (shard bytes read), `MemoryPeak`, `TotalCpu`,
-//!   `Duration`, `ResultSetStatistics`.
 //! - **export**: `.export to parquet (h@"<scratch>/<dir>;impersonate") <|
-//!   <query>`, written by the cluster into the storage folder the root's
-//!   `scratch=` names, which the local scratch folder must mount. Without
-//!   the permission the refusal is [`Error::ExportDenied`].
+//!   <query>` under the run's own request id, written by the cluster into
+//!   the storage folder the root's `scratch=` names, which the local
+//!   scratch folder must mount: one run, whose log entry `stats` reads.
+//!   Without the permission the refusal is [`Error::ExportDenied`].
+//! - **stats**: `.show commands-and-queries`, filtered to
+//!   `ClientActivityId == 'bellwether;<tag>'`: `ScannedExtentsStatistics`
+//!   (rows and extents read), `CacheStatistics` (shard bytes read),
+//!   `MemoryPeak`, `TotalCpu`, `Duration`, `ResultSetStatistics`. The
+//!   entry must be the only one under the request id and carry the exact
+//!   text submitted (`Text`, which Kusto truncates at 64 KB, so a longer
+//!   query is refused), and every scan and cache statistic must be there:
+//!   a missing one (as for a result served from the query results cache)
+//!   is refused (`statistics_missing`), never read as 0.
 //! - **units**: one per extent, from `.show table extents` (or
 //!   `.show database extents`). Identity: the extent id and its rows, so
 //!   ingestion, deletion, and a background merge each change it (a run
@@ -44,13 +50,13 @@ use serde_json::{json, Map, Value};
 
 use crate::http::{self, METADATA};
 use crate::uri::EngineUri;
-use crate::{check_query, denied_scratch, listed, Exported, MeasuredEngine, ResultHandle, Tag};
+use crate::{check_query, denied_scratch, listed, refused, MeasuredEngine, ResultHandle, Tag};
 
 /// The model of every Kusto cost.
 pub const MODEL: &str = "kusto.query_log";
 
-/// How long [`MeasuredEngine::stats`] waits for `.show queries` to list a
-/// finished query.
+/// How long [`MeasuredEngine::stats`] waits for `.show commands-and-queries`
+/// to list a finished run.
 const LOG_WAIT: Duration = Duration::from_secs(60);
 
 /// Bytes of a discarded result kept to read its completion frame.
@@ -483,24 +489,55 @@ fn num(v: &Value) -> Option<u64> {
         .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
 }
 
-/// The statistics of one `.show queries` row.
+/// The statistics of one `.show commands-and-queries` row, or the refusal
+/// of a row missing one (module docs).
 pub fn stats_of(root: &str, tag: &Tag, row: &Map<String, Value>) -> Result<QueryStats> {
-    let scanned = dynamic(&row["ScannedExtentsStatistics"]);
-    let cache = dynamic(&row["CacheStatistics"]);
-    let result = dynamic(&row["ResultSetStatistics"]);
-    let shard = |tier: &str, k: &str| num(&cache["Shards"][tier][k]).unwrap_or(0);
-    let read_bytes = shard("Hot", "HitBytes")
-        + shard("Hot", "MissBytes")
-        + shard("Cold", "HitBytes")
-        + shard("Cold", "MissBytes")
-        + num(&cache["Shards"]["BypassBytes"]).unwrap_or(0);
-    let result_rows = result["TablesStatistics"]
+    let scanned = dynamic(row.get("ScannedExtentsStatistics").unwrap_or(&Value::Null));
+    let cache = dynamic(row.get("CacheStatistics").unwrap_or(&Value::Null));
+    let result = dynamic(row.get("ResultSetStatistics").unwrap_or(&Value::Null));
+    let missing = |what: &str| {
+        refused(
+            root,
+            tag,
+            "statistics_missing",
+            &format!(
+                "the log entry has no {what}, so what the run read is unknown (a result served \
+                 from the query results cache has none) and is never taken as 0; propose the \
+                 rewrite again without any `set query_results_cache_max_age`, then run again"
+            ),
+        )
+    };
+    let need = |v: &Value, what: &str| num(v).ok_or_else(|| missing(what));
+    let mut read_bytes = 0u64;
+    for tier in ["Hot", "Cold"] {
+        for k in ["HitBytes", "MissBytes"] {
+            read_bytes = read_bytes.saturating_add(need(
+                &cache["Shards"][tier][k],
+                &format!("CacheStatistics.Shards.{tier}.{k}"),
+            )?);
+        }
+    }
+    read_bytes = read_bytes.saturating_add(need(
+        &cache["Shards"]["BypassBytes"],
+        "CacheStatistics.Shards.BypassBytes",
+    )?);
+    let tables = result["TablesStatistics"]
         .as_array()
-        .map_or(0, |t| t.iter().filter_map(|x| num(&x["RowCount"])).sum());
+        .ok_or_else(|| missing("ResultSetStatistics.TablesStatistics"))?;
+    let mut result_rows = 0u64;
+    for t in tables {
+        result_rows = result_rows.saturating_add(need(
+            &t["RowCount"],
+            "ResultSetStatistics.TablesStatistics.RowCount",
+        )?);
+    }
     let span = |k: &str| row.get(k).and_then(Value::as_str).and_then(timespan_ns);
     Ok(QueryStats {
         tag: tag.to_string(),
-        read_rows: num(&scanned["ScannedRowsCount"]).unwrap_or(0),
+        read_rows: need(
+            &scanned["ScannedRowsCount"],
+            "ScannedExtentsStatistics.ScannedRowsCount",
+        )?,
         read_bytes,
         peak_memory_bytes: row
             .get("MemoryPeak")
@@ -509,8 +546,14 @@ pub fn stats_of(root: &str, tag: &Tag, row: &Map<String, Value>) -> Result<Query
         cpu_ns: span("TotalCpu"),
         duration_ns: span("Duration").ok_or_else(|| bad(root, "a query without a Duration"))?,
         result_rows,
-        units_read: num(&scanned["ScannedExtentsCount"]),
-        units_total: num(&scanned["TotalExtentsCount"]),
+        units_read: Some(need(
+            &scanned["ScannedExtentsCount"],
+            "ScannedExtentsStatistics.ScannedExtentsCount",
+        )?),
+        units_total: Some(need(
+            &scanned["TotalExtentsCount"],
+            "ScannedExtentsStatistics.TotalExtentsCount",
+        )?),
     })
 }
 
@@ -904,15 +947,7 @@ impl MeasuredEngine for Kusto {
     }
 
     fn submit(&self, query: &str, tag: &Tag) -> Result<ResultHandle> {
-        let q = check_query(query)?;
-        if q.starts_with('.') {
-            return Err(Error::InvalidArgument {
-                field: "rewrite",
-                reason: "a query that starts with '.' is a management command; each side of a \
-                         rewrite pair is a query"
-                    .into(),
-            });
-        }
+        let q = Self::check(query)?;
         let (status, tail) = self.transport.post(
             "/v2/rest/query",
             &json!({"db": self.database, "csl": q,
@@ -933,48 +968,13 @@ impl MeasuredEngine for Kusto {
         Ok(ResultHandle {
             tag: tag.clone(),
             query: q.to_string(),
+            logged: q.to_string(),
+            exported: None,
         })
     }
 
-    fn stats(&self, tag: &Tag) -> Result<QueryStats> {
-        let deadline = std::time::Instant::now() + LOG_WAIT;
-        loop {
-            let rows = self.mgmt(
-                &format!(
-                    ".show queries | where ClientActivityId == '{}' | project State, \
-                     Duration, TotalCpu, MemoryPeak, ScannedExtentsStatistics, \
-                     CacheStatistics, ResultSetStatistics, FailureReason",
-                    Self::request_id(tag.as_str())
-                ),
-                &format!("{}-log", tag.as_str()),
-            )?;
-            if let Some(r) = rows.first() {
-                match r["State"].as_str() {
-                    Some("Completed") => return stats_of(&self.root, tag, r),
-                    Some("InProgress") | None => {}
-                    Some(state) => {
-                        return Err(Error::Source(format!(
-                            "{}: query {tag} ended {state} in the engine, so it has no cost to \
-                             read: {}",
-                            self.root,
-                            r["FailureReason"].as_str().unwrap_or("no reason given")
-                        )))
-                    }
-                }
-            }
-            if std::time::Instant::now() >= deadline {
-                return Err(Error::Source(format!(
-                    "{}: .show queries lists no completed query {tag} after {}s; the principal \
-                     must be allowed to see its own queries",
-                    self.root,
-                    LOG_WAIT.as_secs()
-                )));
-            }
-            std::thread::sleep(Duration::from_secs(1));
-        }
-    }
-
-    fn export(&self, handle: &ResultHandle, dir: &Path) -> Result<Exported> {
+    fn export(&self, query: &str, tag: &Tag, dir: &Path) -> Result<ResultHandle> {
+        let q = Self::check(query)?;
         let Some((remote, local)) = &self.scratch else {
             return Err(Error::InvalidArgument {
                 field: "scratch",
@@ -1012,14 +1012,13 @@ impl MeasuredEngine for Kusto {
         let target = format!("{}/{rel}", remote.trim_end_matches('/'));
         let csl = format!(
             ".export to parquet (h@\"{target};impersonate\") with (namePrefix=\"part\", \
-             distributed=false) <| {}",
-            handle.query
+             distributed=false) <| {q}"
         );
         let (status, body) = self.transport.post(
             "/v1/rest/mgmt",
             &json!({"db": self.database, "csl": csl,
                     "properties": {"Options": {"request_readonly": false}}}),
-            &Self::request_id(&format!("{}-x", handle.tag)),
+            &Self::request_id(tag.as_str()),
             Keep::All,
         )?;
         if status >= 300 {
@@ -1040,8 +1039,8 @@ impl MeasuredEngine for Kusto {
                 return Err(self.denied(&m));
             }
             return Err(Error::Source(format!(
-                "{}: the export of query {} failed (HTTP {status}): {m}",
-                self.root, handle.tag
+                "{}: the export of query {tag} failed (HTTP {status}): {m}",
+                self.root
             )));
         }
         let rows = v1_rows(&self.root, &body)?;
@@ -1059,7 +1058,87 @@ impl MeasuredEngine for Kusto {
                 )));
             }
         }
-        listed(dir)
+        Ok(ResultHandle {
+            tag: tag.clone(),
+            query: q.to_string(),
+            logged: csl,
+            exported: Some(listed(dir)?),
+        })
+    }
+
+    fn stats(&self, run: &ResultHandle) -> Result<QueryStats> {
+        let tag = &run.tag;
+        let deadline = std::time::Instant::now() + LOG_WAIT;
+        loop {
+            let rows = self.mgmt(
+                &format!(
+                    ".show commands-and-queries | where ClientActivityId == '{}' | project \
+                     State, Text, Duration, TotalCpu, MemoryPeak, ScannedExtentsStatistics, \
+                     CacheStatistics, ResultSetStatistics, FailureReason",
+                    Self::request_id(tag.as_str())
+                ),
+                &format!("{}-log", tag.as_str()),
+            )?;
+            if rows.len() > 1 {
+                return Err(refused(
+                    &self.root,
+                    tag,
+                    "ambiguous_log_entry",
+                    &format!(
+                        ".show commands-and-queries lists {} entries under the request id, so \
+                         another client ran under it and the entry of this run cannot be told \
+                         apart; run again",
+                        rows.len()
+                    ),
+                ));
+            }
+            if let Some(r) = rows.first() {
+                if r["Text"].as_str() != Some(run.logged.as_str()) {
+                    return Err(refused(
+                        &self.root,
+                        tag,
+                        "not_the_query_submitted",
+                        "the entry under the request id holds another text than the one \
+                         submitted (another client ran under it, or the text is over the 64 KB \
+                         the log keeps); run again, with a shorter query if it is that long",
+                    ));
+                }
+                return match r["State"].as_str() {
+                    Some("Completed") => stats_of(&self.root, tag, r),
+                    state => Err(Error::Source(format!(
+                        "{}: query {tag} ended {} in the engine, so it has no cost to read: {}",
+                        self.root,
+                        state.unwrap_or("in an unnamed state"),
+                        r["FailureReason"].as_str().unwrap_or("no reason given")
+                    ))),
+                };
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(Error::Source(format!(
+                    "{}: .show commands-and-queries lists no finished run {tag} after {}s; the \
+                     principal must be allowed to see its own commands and queries",
+                    self.root,
+                    LOG_WAIT.as_secs()
+                )));
+            }
+            std::thread::sleep(Duration::from_secs(1));
+        }
+    }
+}
+
+impl Kusto {
+    /// The query text, trimmed; a management command is refused.
+    fn check(query: &str) -> Result<&str> {
+        let q = check_query(query)?;
+        if q.starts_with('.') {
+            return Err(Error::InvalidArgument {
+                field: "rewrite",
+                reason: "a query that starts with '.' is a management command; each side of a \
+                         rewrite pair is a query"
+                    .into(),
+            });
+        }
+        Ok(q)
     }
 }
 
@@ -1290,5 +1369,113 @@ mod tests {
         let x = json!("x");
         let wrong: Vec<&Value> = vec![&x];
         assert!(column("k", "id", &DataType::Int64, &wrong).is_err());
+    }
+
+    #[test]
+    fn a_missing_scan_or_cache_statistic_is_refused_never_read_as_zero() {
+        let full = json!({
+            "State": "Completed",
+            "Duration": "00:00:01",
+            "MemoryPeak": 1,
+            "ScannedExtentsStatistics": {"ScannedExtentsCount": 1, "TotalExtentsCount": 2, "ScannedRowsCount": 3},
+            "CacheStatistics": {"Shards": {"Hot": {"HitBytes": 1, "MissBytes": 1}, "Cold": {"HitBytes": 1, "MissBytes": 1}, "BypassBytes": 1}},
+            "ResultSetStatistics": {"TablesStatistics": [{"RowCount": 7}]}
+        });
+        let tag = Tag::new("r", "p0-before").unwrap();
+        let row = |v: &Value| -> Map<String, Value> { serde_json::from_value(v.clone()).unwrap() };
+        assert_eq!(stats_of("k", &tag, &row(&full)).unwrap().read_bytes, 5);
+        for drop in [
+            "/CacheStatistics",
+            "/CacheStatistics/Shards/Cold",
+            "/CacheStatistics/Shards/BypassBytes",
+            "/ScannedExtentsStatistics",
+            "/ScannedExtentsStatistics/ScannedRowsCount",
+            "/ResultSetStatistics",
+        ] {
+            let mut v = full.clone();
+            let (parent, key) = drop.rsplit_once('/').unwrap();
+            v.pointer_mut(parent)
+                .unwrap()
+                .as_object_mut()
+                .unwrap()
+                .remove(key);
+            match stats_of("k", &tag, &row(&v)) {
+                Err(Error::MeasurementRefused { reason, .. }) => {
+                    assert_eq!(reason, "statistics_missing", "{drop}");
+                }
+                other => panic!("{drop}: {other:?}"),
+            }
+        }
+    }
+
+    /// A cluster answering each request with the next canned body.
+    struct Canned(Mutex<Vec<Vec<u8>>>);
+
+    impl Transport for Canned {
+        fn post(&self, _p: &str, _b: &Value, _id: &str, _k: Keep) -> Result<(u16, Vec<u8>)> {
+            Ok((200, self.0.lock().unwrap().remove(0)))
+        }
+    }
+
+    fn log_rows(rows: &[(&str, &str)]) -> Vec<u8> {
+        let stats =
+            json!({"ScannedExtentsCount": 1, "TotalExtentsCount": 1, "ScannedRowsCount": 1});
+        let cache = json!({"Shards": {"Hot": {"HitBytes": 1, "MissBytes": 0},
+                                      "Cold": {"HitBytes": 0, "MissBytes": 0}, "BypassBytes": 0}});
+        let result = json!({"TablesStatistics": [{"RowCount": 1}]});
+        let cols = [
+            "State",
+            "Text",
+            "Duration",
+            "TotalCpu",
+            "MemoryPeak",
+            "ScannedExtentsStatistics",
+            "CacheStatistics",
+            "ResultSetStatistics",
+            "FailureReason",
+        ];
+        let rows: Vec<Value> = rows
+            .iter()
+            .map(|(state, text)| {
+                json!([state, text, "00:00:01", "00:00:01", 1, stats, cache, result, ""])
+            })
+            .collect();
+        let columns: Vec<Value> = cols.iter().map(|c| json!({"ColumnName": c})).collect();
+        serde_json::to_vec(&json!({"Tables": [{"Columns": columns, "Rows": rows}]})).unwrap()
+    }
+
+    #[test]
+    fn stats_read_the_one_entry_holding_the_text_submitted() {
+        let uri = EngineUri::parse("kusto://c.example/db").unwrap();
+        let tag = Tag::new("r", "p0-before").unwrap();
+        let run = ResultHandle {
+            tag: tag.clone(),
+            query: "T | count".into(),
+            logged: "T | count".into(),
+            exported: None,
+        };
+        let stats = |body: Vec<u8>| {
+            let k = Kusto::with_transport(&uri, None, Box::new(Canned(Mutex::new(vec![body]))))
+                .unwrap();
+            match k.stats(&run) {
+                Ok(s) => Ok(s),
+                Err(Error::MeasurementRefused { reason, .. }) => Err(reason),
+                Err(e) => panic!("{e}"),
+            }
+        };
+        let ok = stats(log_rows(&[("Completed", "T | count")])).unwrap();
+        assert_eq!((ok.tag.as_str(), ok.read_rows), (tag.as_str(), 1));
+        assert_eq!(
+            stats(log_rows(&[("Completed", "T | take 1")])).unwrap_err(),
+            "not_the_query_submitted"
+        );
+        assert_eq!(
+            stats(log_rows(&[
+                ("Completed", "T | count"),
+                ("Completed", "T | count")
+            ]))
+            .unwrap_err(),
+            "ambiguous_log_entry"
+        );
     }
 }

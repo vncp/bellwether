@@ -708,7 +708,7 @@ impl Engine {
                         spec: c.spec.clone(),
                         twin: twin_pass
                             .as_ref()
-                            .and_then(|p| p.sets.get(c.spec.columns()).cloned()),
+                            .and_then(|p| twin::measured(p, c.spec.columns())),
                         kind_column: c.kind_column.clone(),
                     })
                     .collect(),

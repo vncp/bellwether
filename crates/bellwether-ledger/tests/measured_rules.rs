@@ -11,8 +11,8 @@ mod common;
 
 use bellwether_ledger::Ledger;
 use bellwether_types::{
-    format, Hash, Prediction, ProposalBody, QueryPair, QueryStats, Receipt, Record, Replay,
-    RewriteShape,
+    format, Hash, PairPrediction, Prediction, ProposalBody, QueryPair, QueryStats, Receipt, Record,
+    Replay, RewriteShape,
 };
 use common::{assert_rule, certificate, evidence, proposal, replay, MemStore, BEFORE};
 
@@ -49,12 +49,14 @@ fn prediction(evidence: Hash) -> Prediction {
         evidence,
         predicted_rows: 10,
         predicted_row_groups: 1,
-        before_read_rows: 100,
-        after_read_rows: 20,
-        before_read_bytes: 1_000,
-        after_read_bytes: 200,
-        before_ratio: Some("10.000".into()),
-        after_ratio: Some("2.000".into()),
+        pairs: vec![PairPrediction {
+            before_read_rows: 100,
+            after_read_rows: 20,
+            before_read_bytes: 1_000,
+            after_read_bytes: 200,
+            before_ratio: Some("10.000".into()),
+            after_ratio: Some("2.000".into()),
+        }],
     }
 }
 
@@ -189,7 +191,7 @@ fn a_measured_replay_never_backs_an_apply_receipt() {
     // A prediction other than the replay's: refused.
     let mut rc = receipt(p, r, c, e, true);
     let mut other = prediction(e);
-    other.after_read_rows = 1;
+    other.pairs[0].after_read_rows = 1;
     rc.prediction = Some(other);
     assert_rule(ledger.put_receipt(&rc, BEFORE), "prediction");
     // No prediction at all where the replay has one: refused.

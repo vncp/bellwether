@@ -53,11 +53,28 @@ const CLOCK: &str = "2026-10-26T00:00:00.000Z";
 #[derive(Default)]
 struct State {
     queries: HashMap<String, (RecordBatch, QueryStats)>,
-    submitted: Vec<(String, String)>,
+    /// Runs: tag and query.
+    runs: Vec<(String, String)>,
     deny: bool,
 }
 
 struct Fake(Arc<Mutex<State>>);
+
+impl Fake {
+    fn run(&self, query: &str, tag: &Tag) -> Result<ResultHandle> {
+        let mut s = self.0.lock().unwrap();
+        if !s.queries.contains_key(query.trim()) {
+            return Err(Error::Source(format!("fake: unknown query {query}")));
+        }
+        s.runs.push((tag.to_string(), query.trim().to_string()));
+        Ok(ResultHandle {
+            tag: tag.clone(),
+            query: query.trim().to_string(),
+            logged: query.trim().to_string(),
+            exported: None,
+        })
+    }
+}
 
 impl MeasuredEngine for Fake {
     fn root(&self) -> &str {
@@ -67,39 +84,18 @@ impl MeasuredEngine for Fake {
         "clickhouse.query_log"
     }
     fn submit(&self, query: &str, tag: &Tag) -> Result<ResultHandle> {
-        let mut s = self.0.lock().unwrap();
-        if !s.queries.contains_key(query.trim()) {
-            return Err(Error::Source(format!("fake: unknown query {query}")));
-        }
-        s.submitted
-            .push((tag.to_string(), query.trim().to_string()));
-        Ok(ResultHandle {
-            tag: tag.clone(),
-            query: query.trim().to_string(),
-        })
+        self.run(query, tag)
     }
-    fn stats(&self, tag: &Tag) -> Result<QueryStats> {
-        let s = self.0.lock().unwrap();
-        let q = s
-            .submitted
-            .iter()
-            .find(|(t, _)| t == tag.as_str())
-            .map(|(_, q)| q.clone())
-            .ok_or_else(|| Error::Source(format!("fake: no log entry for {tag}")))?;
-        let mut st = s.queries[&q].1.clone();
-        st.tag = tag.to_string();
-        Ok(st)
-    }
-    fn export(&self, handle: &ResultHandle, dir: &Path) -> Result<Exported> {
-        let s = self.0.lock().unwrap();
-        if s.deny {
+    fn export(&self, query: &str, tag: &Tag, dir: &Path) -> Result<ResultHandle> {
+        if self.0.lock().unwrap().deny {
             return Err(Error::ExportDenied {
                 engine: ROOT.into(),
                 permission: "the fake export grant".into(),
                 message: format!("{ROOT} refused the export; grant the fake export grant"),
             });
         }
-        let batch = s.queries[handle.query.trim()].0.clone();
+        let mut handle = self.run(query, tag)?;
+        let batch = self.0.lock().unwrap().queries[query.trim()].0.clone();
         std::fs::create_dir_all(dir).unwrap();
         let path = dir.join("part-0.parquet");
         let mut w =
@@ -107,10 +103,25 @@ impl MeasuredEngine for Fake {
         w.write(&batch).unwrap();
         w.close().unwrap();
         let bytes = std::fs::metadata(&path).unwrap().len();
-        Ok(Exported {
+        handle.exported = Some(Exported {
             files: vec![path],
             bytes,
-        })
+        });
+        Ok(handle)
+    }
+    fn stats(&self, run: &ResultHandle) -> Result<QueryStats> {
+        let s = self.0.lock().unwrap();
+        let q = s
+            .runs
+            .iter()
+            .find(|(t, _)| t == run.tag.as_str())
+            .map(|(_, q)| q.clone())
+            .ok_or_else(|| Error::Source(format!("fake: no log entry for {}", run.tag)))?;
+        let (batch, template) = &s.queries[&q];
+        let mut st = template.clone();
+        st.tag = run.tag.to_string();
+        st.result_rows = batch.num_rows() as u64;
+        Ok(st)
     }
 }
 
@@ -239,7 +250,7 @@ impl World {
         let st = Arc::clone(&self.state);
         EngineOptions {
             twin_of: Some(ROOT.to_string()),
-            scratch: Some(self.dir.path().join("scratch").display().to_string()),
+            scratch: Some(self.root.join("_scratch").display().to_string()),
             clock: Some(CLOCK.into()),
             engine_adapter: Some(EngineConnector(Arc::new(
                 move |_uri: &str, _s: Option<&Path>| -> Result<Box<dyn EngineAdapter>> {
@@ -586,7 +597,7 @@ fn a_caller_supplied_cost_is_refused_by_name_and_writes_nothing() {
     other["colour"] = json!("red");
     assert_eq!(code(&srv.call("observe.why", other)), "invalid_input");
     // Nothing reached the engine.
-    assert!(w.state.lock().unwrap().submitted.is_empty());
+    assert!(w.state.lock().unwrap().runs.is_empty());
 }
 
 #[test]
@@ -628,11 +639,68 @@ fn an_export_the_engine_refuses_is_export_denied_with_no_certificate() {
     assert!(refusal.next.contains("permission"), "{}", refusal.next);
     let v = json(&r);
     assert!(v["certificate"].is_null(), "{v}");
-    // The measured replay stands, with its prediction.
+    // The export is the measured run: nothing was measured or recorded.
+    assert!(v["score"].is_null(), "{v}");
     assert!(
-        !v["score"]["replay"]["record"]["prediction"].is_null(),
-        "{v}"
+        refusal.next.contains("nothing is measured"),
+        "{}",
+        refusal.next
     );
+}
+
+/// The proposal, verified over MCP (`score.verify`): its certificate.
+fn verified_over_mcp(srv: &bellwether_mcp::Server) -> String {
+    let wl = h(
+        &json(&ok(
+            srv,
+            "score.record",
+            json!({"keys_query": "SELECT keys", "wait": true}),
+        )),
+        "/workload",
+    );
+    let ev = h(
+        &json(&ok(srv, "score.why", json!({"workload": wl, "wait": true}))),
+        "/evidence/hash",
+    );
+    let p = h(
+        &json(&ok(
+            srv,
+            "propose.rewrite",
+            json!({"shape": {"before": "b", "after": "a", "invariant": "i",
+                             "pairs": [{"before": "SELECT before", "after": "SELECT after"}]},
+                   "evidence": [ev], "by": "agent"}),
+        )),
+        "/proposal/hash",
+    );
+    let v = json(&ok(
+        srv,
+        "score.verify",
+        json!({"proposal": p, "wait": true}),
+    ));
+    assert_eq!(v["outcome"]["kind"], "verified", "{v}");
+    h(&v, "/certificate/hash")
+}
+
+/// `score.verify` applies nothing and is not gated; `apply.receipt` on its
+/// certificate gates its own measurement, so a rewrite that reads no fewer
+/// bytes never gets a receipt over MCP.
+#[test]
+fn score_verify_then_apply_receipt_with_no_gain_is_refused() {
+    let w = World::new();
+    w.state
+        .lock()
+        .unwrap()
+        .queries
+        .get_mut("SELECT after")
+        .unwrap()
+        .1 = stats(1600, 64_000);
+    let srv = w.server();
+    let cert = verified_over_mcp(&srv);
+    let before = objects(&w.index());
+    let r = srv.call("apply.receipt", json!({"certificate": cert, "wait": true}));
+    assert_eq!(code(&r), "nothing_to_gain", "{}", r.text);
+    let (kinds, _) = delta(&before, &objects(&w.index()));
+    assert!(!kinds.iter().any(|k| k.contains("receipt")), "{kinds:?}");
 }
 
 #[test]

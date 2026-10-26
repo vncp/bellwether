@@ -1,6 +1,11 @@
 //! The reference adapter against a ClickHouse server: submit runs read-only
-//! and the query log yields its statistics by the tag; export writes whole
-//! Parquet and is refused (`ExportDenied`) without the permission; the
+//! and the query log yields its statistics for that run; export is itself
+//! the measured run (one log entry, its result rows the rows exported),
+//! writes whole Parquet, and is refused (`ExportDenied`) without the
+//! permission; a run served from a cache, or turning one on, is refused
+//! (`cache_served`), while the user's own cache settings never reach a
+//! bellwether run; a log entry another client wrote under the tag is
+//! refused (`ambiguous_log_entry`, `not_the_query_submitted`); the
 //! identity follows inserts and mutations and ignores merges; units read
 //! back exactly at their declared types.
 //!
@@ -20,7 +25,7 @@ use std::sync::Arc;
 use arrow::array::{Array, Decimal128Array, StringArray, TimestampMillisecondArray, UInt64Array};
 use arrow::datatypes::{DataType, TimeUnit};
 use bellwether_source_engine::{connect, identity, EngineUri, ResultHandle, Tag};
-use bellwether_types::Error;
+use bellwether_types::{Error, QueryStats};
 
 struct Server {
     http: String,
@@ -93,6 +98,36 @@ fn orders(s: &Server) {
     ));
 }
 
+/// The reason of a measurement refusal, or the statistics.
+fn reason(r: bellwether_types::Result<QueryStats>) -> std::result::Result<QueryStats, String> {
+    match r {
+        Ok(s) => Ok(s),
+        Err(Error::MeasurementRefused { reason, .. }) => Err(reason.to_string()),
+        Err(e) => panic!("{e}"),
+    }
+}
+
+/// A handle for a run of `query` under `tag` that bellwether did not make.
+fn handle(tag: &Tag, query: &str) -> ResultHandle {
+    ResultHandle {
+        tag: tag.clone(),
+        query: query.into(),
+        logged: query.into(),
+        exported: None,
+    }
+}
+
+fn parquet_rows(path: &std::path::Path) -> usize {
+    parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(
+        std::fs::File::open(path).unwrap(),
+    )
+    .unwrap()
+    .build()
+    .unwrap()
+    .map(|b| b.unwrap().num_rows())
+    .sum()
+}
+
 #[test]
 fn submit_is_read_only_and_the_log_holds_its_statistics_by_tag() {
     let Some(s) = Server::new() else { return };
@@ -103,8 +138,11 @@ fn submit_is_read_only_and_the_log_holds_its_statistics_by_tag() {
     let t = Tag::new(&run, "p0-before").unwrap();
     let q = format!("SELECT id, amount FROM {}.orders WHERE id < 1500", s.db);
     let h = e.submit(&q, &t).unwrap();
-    assert_eq!(h.query, q);
-    let st = e.stats(&t).unwrap();
+    assert_eq!(
+        (h.query.as_str(), h.logged.as_str()),
+        (q.as_str(), q.as_str())
+    );
+    let st = e.stats(&h).unwrap();
     assert_eq!(st.tag, t.as_str());
     assert_eq!(st.result_rows, 1500);
     assert!(st.read_rows >= 1500 && st.read_rows <= 3000, "{st:?}");
@@ -129,12 +167,11 @@ fn submit_is_read_only_and_the_log_holds_its_statistics_by_tag() {
             .trim(),
         "3000"
     );
-    // A tag never submitted has no log entry; a failed query is refused.
+    // A failed query is refused, and so is reading its cost.
     let bad = Tag::new(&run, "p2-before").unwrap();
-    assert!(e
-        .submit("SELECT no_such_column FROM system.one", &bad)
-        .is_err());
-    let missing = e.stats(&bad).unwrap_err().to_string();
+    let failing = "SELECT no_such_column FROM system.one";
+    assert!(e.submit(failing, &bad).is_err());
+    let missing = e.stats(&handle(&bad, failing)).unwrap_err().to_string();
     assert!(
         missing.contains("failed") || missing.contains("no finished entry"),
         "{missing}"
@@ -142,7 +179,7 @@ fn submit_is_read_only_and_the_log_holds_its_statistics_by_tag() {
 }
 
 #[test]
-fn export_writes_whole_parquet_and_is_refused_without_the_permission() {
+fn export_is_the_measured_run_and_is_refused_without_the_permission() {
     let Some(s) = Server::new() else { return };
     orders(&s);
     let e = connect(&s.table("orders"), None).unwrap();
@@ -152,20 +189,25 @@ fn export_writes_whole_parquet_and_is_refused_without_the_permission() {
         "SELECT id, amount FROM {}.orders WHERE id % 10 = 3 ORDER BY id",
         s.db
     );
-    let h = e.submit(&q, &Tag::new(&run, "p0-after").unwrap()).unwrap();
+    let tag = Tag::new(&run, "p0-after").unwrap();
     let out = dir.path().join("p0").join("after");
-    let x = e.export(&h, &out).unwrap();
+    let h = e.export(&q, &tag, &out).unwrap();
+    let x = h.exported.clone().unwrap();
     assert_eq!(x.files.len(), 1);
-    let reader = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(
-        std::fs::File::open(&x.files[0]).unwrap(),
-    )
-    .unwrap()
-    .build()
-    .unwrap();
-    let rows: usize = reader.map(|b| b.unwrap().num_rows()).sum();
-    assert_eq!(rows, 300);
+    assert_eq!(parquet_rows(&x.files[0]), 300);
+    // The export is the run measured: one entry under its tag, whose
+    // result rows are the rows exported.
+    let st = e.stats(&h).unwrap();
+    assert_eq!((st.tag.as_str(), st.result_rows), (tag.as_str(), 300));
+    s.sql("SYSTEM FLUSH LOGS");
+    let logged = s.sql(&format!(
+        "SELECT count() FROM system.query_log WHERE type = 'QueryFinish' AND \
+         startsWith(query_id, '{}')",
+        tag.as_str()
+    ));
+    assert_eq!(logged.trim(), "1", "one run, under the tag itself");
     // A fresh folder only.
-    let err = e.export(&h, &out).unwrap_err().to_string();
+    let err = e.export(&q, &tag, &out).unwrap_err().to_string();
     assert!(err.contains("not empty"), "{err}");
     // A scratch folder that cannot be written: export_denied naming it.
     #[cfg(unix)]
@@ -174,7 +216,9 @@ fn export_writes_whole_parquet_and_is_refused_without_the_permission() {
         let ro = dir.path().join("ro");
         std::fs::create_dir(&ro).unwrap();
         std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o500)).unwrap();
-        let err = e.export(&h, &ro.join("x")).unwrap_err();
+        let err = e
+            .export(&q, &Tag::new(&run, "p1-after").unwrap(), &ro.join("x"))
+            .unwrap_err();
         std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o700)).unwrap();
         match err {
             Error::ExportDenied { permission, .. } => {
@@ -196,12 +240,12 @@ fn export_writes_whole_parquet_and_is_refused_without_the_permission() {
         None,
     )
     .unwrap();
-    let handle = ResultHandle {
-        tag: Tag::new(&run, "p1-after").unwrap(),
-        query: q.clone(),
-    };
     let err = denied
-        .export(&handle, &dir.path().join("denied"))
+        .export(
+            &q,
+            &Tag::new(&run, "p2-after").unwrap(),
+            &dir.path().join("denied"),
+        )
         .unwrap_err();
     s.sql(&format!("DROP USER {user}"));
     match err {
@@ -219,6 +263,124 @@ fn export_writes_whole_parquet_and_is_refused_without_the_permission() {
         !dir.path().join("denied").exists(),
         "a refused export leaves nothing"
     );
+}
+
+/// The reviewer's probe: `SETTINGS use_query_cache=1` in the agent's text
+/// overrides the request's `use_query_cache=0`, so the second run reads
+/// what the cache serves. Both runs are refused: the first turned the
+/// cache on, the second was served from it.
+#[test]
+fn a_run_that_turns_a_cache_on_or_is_served_from_one_is_refused() {
+    let Some(s) = Server::new() else { return };
+    orders(&s);
+    let e = connect(&s.table("orders"), None).unwrap();
+    let run = Tag::run();
+    let q = format!(
+        "SELECT count(), sum(amount) FROM {}.orders WHERE id % 11 = 3 SETTINGS \
+         use_query_cache = 1, query_cache_min_query_runs = 0, query_cache_ttl = 600",
+        s.db
+    );
+    for i in 0..2 {
+        let t = Tag::new(&run, &format!("c{i}")).unwrap();
+        let h = e.submit(&q, &t).unwrap();
+        assert_eq!(reason(e.stats(&h)).unwrap_err(), "cache_served", "run {i}");
+    }
+    s.sql("SYSTEM FLUSH LOGS");
+    let hits = s.sql(&format!(
+        "SELECT sum(ProfileEvents['QueryCacheHits']) FROM system.query_log WHERE \
+         type = 'QueryFinish' AND startsWith(query_id, 'bw-{run}-c')"
+    ));
+    assert_ne!(hits.trim(), "0", "the second run was served from the cache");
+}
+
+/// The user's own settings turn the query cache on (and the query
+/// condition cache is on by default): every bellwether run turns both off,
+/// so the same query measures the same bytes twice and is never refused.
+#[test]
+fn a_user_profile_s_caches_never_reach_a_measured_run() {
+    let Some(s) = Server::new() else { return };
+    orders(&s);
+    let user = format!("{}_cached", s.db);
+    s.sql(&format!(
+        "CREATE USER {user} IDENTIFIED WITH no_password SETTINGS use_query_cache = 1, \
+         query_cache_min_query_runs = 0, query_cache_ttl = 600"
+    ));
+    s.sql(&format!("GRANT SELECT ON {}.* TO {user}", s.db));
+    s.sql(&format!("GRANT SELECT ON system.* TO {user}"));
+    s.sql(&format!("GRANT SYSTEM FLUSH LOGS ON *.* TO {user}"));
+    let e = connect(
+        &format!(
+            "clickhouse://{user}@{}",
+            s.root.trim_start_matches("clickhouse://")
+        ),
+        None,
+    )
+    .unwrap();
+    let run = Tag::run();
+    let q = format!(
+        "SELECT id, amount FROM {}.orders WHERE amount > 100 AND id % 3 = 1",
+        s.db
+    );
+    let measured: Vec<QueryStats> = (0..2)
+        .map(|i| {
+            let h = e
+                .submit(&q, &Tag::new(&run, &format!("u{i}")).unwrap())
+                .unwrap();
+            reason(e.stats(&h)).unwrap()
+        })
+        .collect();
+    s.sql(&format!("DROP USER {user}"));
+    assert_eq!(measured[0].read_bytes, measured[1].read_bytes);
+    assert_eq!(measured[0].read_rows, measured[1].read_rows);
+    assert!(measured[0].read_rows >= 3000, "{:?}", measured[0]);
+}
+
+/// The reviewer's probe: another client reuses bellwether's query id
+/// after its run. Two finished entries under the tag: refused. An entry
+/// with another text or user than the run's: refused.
+#[test]
+fn a_log_entry_another_client_wrote_under_the_tag_is_refused() {
+    let Some(s) = Server::new() else { return };
+    orders(&s);
+    let e = connect(&s.table("orders"), None).unwrap();
+    let run = Tag::run();
+    let t = Tag::new(&run, "p0-before").unwrap();
+    let q = format!("SELECT count(), sum(amount) FROM {}.orders", s.db);
+    let h = e.submit(&q, &t).unwrap();
+    let other = |tag: &Tag, text: &str| {
+        reqwest::blocking::Client::new()
+            .post(format!("{}?query_id={}&default_format=Null", s.http, tag))
+            .body(text.to_string())
+            .send()
+            .unwrap()
+            .text()
+            .unwrap()
+    };
+    other(&t, "SELECT 1");
+    assert_eq!(reason(e.stats(&h)).unwrap_err(), "ambiguous_log_entry");
+    // One entry, not the run's text.
+    let u = Tag::new(&run, "p1-before").unwrap();
+    other(&u, "SELECT 1");
+    assert_eq!(
+        reason(e.stats(&handle(&u, &q))).unwrap_err(),
+        "not_the_query_submitted"
+    );
+    // One entry with the run's text, logged for another user.
+    let user = format!("{}_other", s.db);
+    s.sql(&format!("CREATE USER {user} IDENTIFIED WITH no_password"));
+    s.sql(&format!("GRANT SELECT ON {}.* TO {user}", s.db));
+    let v = Tag::new(&run, "p2-before").unwrap();
+    reqwest::blocking::Client::new()
+        .post(format!("{}?query_id={}&default_format=Null", s.http, v))
+        .header("X-ClickHouse-User", &user)
+        .body(q.clone())
+        .send()
+        .unwrap()
+        .text()
+        .unwrap();
+    let refused = reason(e.stats(&handle(&v, &q)));
+    s.sql(&format!("DROP USER {user}"));
+    assert_eq!(refused.unwrap_err(), "not_the_query_submitted");
 }
 
 #[test]

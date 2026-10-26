@@ -80,8 +80,10 @@ pub struct GateFit {
 pub struct TwinCandidate {
     /// The candidate.
     pub spec: KeySpec,
-    /// Its columns' measurements; `None` when its columns are not among the
-    /// sample's (a temporal key's time column).
+    /// Its columns' measurements, in any order of the sample's; `None` when
+    /// the pass measured no set of exactly its columns: a column the
+    /// sample lacks, or, for a sample of more than four columns, a subset
+    /// that is neither a prefix nor a single column.
     pub twin: Option<TwinColumns>,
     /// The candidate's index-kind column, as the funnel shows it (the
     /// shared `KindColumn`), so an index kind's one number reads beside
@@ -375,6 +377,28 @@ pub(crate) fn pass(
     })
 }
 
+/// The pass's measurements of `columns`, whatever their order in the
+/// sample (no count depends on it); `None` when the pass measured no set
+/// of exactly these columns.
+pub(crate) fn measured(p: &TwinPass, columns: &[String]) -> Option<TwinColumns> {
+    if let Some(c) = p.sets.get(columns) {
+        return Some(c.clone());
+    }
+    let mut want = columns.to_vec();
+    want.sort();
+    p.sets
+        .iter()
+        .find(|(k, _)| {
+            let mut k = (*k).clone();
+            k.sort();
+            k == want
+        })
+        .map(|(_, c)| TwinColumns {
+            columns: columns.to_vec(),
+            ..c.clone()
+        })
+}
+
 fn lint(rule: &str, columns: Vec<String>, message: String, fresh: bool) -> Lint {
     Lint {
         rule: rule.to_string(),
@@ -501,11 +525,9 @@ pub(crate) fn note(of: &TwinOf) -> String {
 }
 
 impl Engine {
-    /// The engine adapter for `twin_of`, with `scratch` as the local folder
-    /// exports land in.
-    pub(crate) fn twin_adapter(&self, scratch: Option<&Path>) -> Result<Box<dyn EngineAdapter>> {
-        let uri = self
-            .options()
+    /// The engine root `twin_of` names, as given (credentials included).
+    fn twin_root(&self) -> Result<&str> {
+        self.options()
             .twin_of
             .as_deref()
             .ok_or_else(|| Error::InvalidArgument {
@@ -513,7 +535,13 @@ impl Engine {
                 reason: "this needs the query engine the folder copies; name it with --twin-of \
                      <clickhouse://... | kusto://...>"
                     .into(),
-            })?;
+            })
+    }
+
+    /// The engine adapter for `twin_of`, with `scratch` as the local folder
+    /// exports land in.
+    pub(crate) fn twin_adapter(&self, scratch: Option<&Path>) -> Result<Box<dyn EngineAdapter>> {
+        let uri = self.twin_root()?;
         match &self.options().engine_adapter {
             Some(c) => (c.0)(uri, scratch),
             None => bellwether_source_engine::connect(uri, scratch),
@@ -581,33 +609,43 @@ pub struct EngineWorkload {
 }
 
 impl Engine {
-    /// Runs `keys_query` in the engine `twin_of` names, read-only, exports
-    /// its result as Parquet into a fresh folder of the scratch folder (the
-    /// system's temporary folder when none is configured, for an engine
-    /// that exports through its client), and records the result's `columns` (all of them when
-    /// `None`) as a one-run workload over the data root's types. The export
-    /// is deleted afterwards. A diagnosis then starts from the keys the
-    /// engine itself produced, never a hand-built file.
+    /// Runs `keys_query` in the engine `twin_of` names, read-only, once,
+    /// that run exporting its result as Parquet into a fresh folder of the
+    /// scratch folder (governed as `fix`'s; the system's temporary folder
+    /// when none is configured, for an engine that exports through its
+    /// client), each created with the lake root's permissions, and records
+    /// the result's `columns` (all of them when `None`) as a one-run
+    /// workload over the data root's types. The export is deleted
+    /// afterwards. A diagnosis then starts from the keys the engine itself
+    /// produced, never a hand-built file; the tag reported is the one the
+    /// engine logged the run under.
     pub fn record_from_engine(
         &self,
         keys_query: &str,
         columns: Option<&[String]>,
     ) -> Result<EngineWorkload> {
         crate::engine::guard(|| {
-            let base = match &self.options().scratch {
-                Some(s) => std::path::PathBuf::from(s),
-                None => std::env::temp_dir(),
-            };
-            let engine = self.twin_adapter(Some(&base))?;
+            let named = bellwether_source_engine::redact(self.twin_root()?);
             let run = bellwether_source_engine::Tag::run();
-            let tag = bellwether_source_engine::Tag::new(&run, "keys")?;
-            let handle = bellwether_source_engine::ResultHandle {
-                tag: tag.clone(),
-                query: bellwether_source_engine::check_query(keys_query)?.to_string(),
+            let name = format!("bellwether-keys-{run}");
+            let dir = if let Some(s) = &self.options().scratch {
+                self.run_folder(&named, s, &name)?
+            } else {
+                let dir = std::env::temp_dir().join(name);
+                self.private_dir(&named, &dir)?;
+                dir
             };
-            let dir = base.join(format!("bellwether-keys-{run}"));
             let recorded = (|| {
-                let exported = engine.export(&handle, &dir)?;
+                let base = dir.parent().map(Path::to_path_buf).unwrap_or_default();
+                let engine = self.twin_adapter(Some(&base))?;
+                let tag = bellwether_source_engine::Tag::new(&run, "keys")?;
+                let exported = engine
+                    .export(keys_query, &tag, &dir)?
+                    .exported
+                    .unwrap_or_else(|| bellwether_source_engine::Exported {
+                        files: Vec::new(),
+                        bytes: 0,
+                    });
                 let mut batches = Vec::new();
                 for f in &exported.files {
                     let kf = crate::keys::KeyFile {
@@ -662,7 +700,7 @@ impl Engine {
                     None,
                 )?;
                 let w = recorder.finish()?;
-                let run = w.runs().first().cloned();
+                let first = w.runs().first().cloned();
                 Ok(EngineWorkload {
                     engine: engine.root().to_string(),
                     tag: tag.to_string(),
@@ -670,7 +708,7 @@ impl Engine {
                     columns: cols,
                     rows,
                     keys: w.keys_p50_p95_max()[2],
-                    null_tuples: run.map_or(0, |r| r.null_tuples),
+                    null_tuples: first.map_or(0, |r| r.null_tuples),
                 })
             })();
             let _ = std::fs::remove_dir_all(&dir);
@@ -680,6 +718,7 @@ impl Engine {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::assert_is_empty)]
 mod tests {
     use super::*;
 
@@ -699,5 +738,97 @@ mod tests {
         let wide = column_sets(6);
         assert!(wide.contains(&vec![0, 1]) && wide.contains(&vec![5]));
         assert!(!wide.contains(&vec![1, 3]));
+    }
+
+    /// A measured column set: `p50` rows per key, `keyset` keys covering
+    /// `rows` rows in `files` files.
+    fn set(columns: &[&str], p50: u64, keyset: u64, rows: u64, files: u64) -> TwinColumns {
+        TwinColumns {
+            columns: columns.iter().map(|c| (*c).to_string()).collect(),
+            keyset,
+            rows_per_key: [p50, p50, p50],
+            files_per_key: [1, 1, 1],
+            row_groups_per_key: [1, 1, 1],
+            rows,
+            row_groups: files,
+            files,
+            gates: Vec::new(),
+        }
+    }
+
+    /// A pass over a sample keyed (batch, id): batch covers `batch_p50`
+    /// rows per value and id `id_p50`; the whole key `keyset` keys in
+    /// `files` of 1,000 files.
+    fn pass_of(batch_p50: u64, id_p50: u64, keyset: u64, files: u64) -> TwinPass {
+        let key = vec!["batch".to_string(), "id".to_string()];
+        let mut sets = BTreeMap::new();
+        for s in [
+            set(&["batch"], batch_p50, 1, batch_p50, 500),
+            set(&["id"], id_p50, keyset, id_p50, 500),
+            set(&["batch", "id"], 1, keyset, keyset, files),
+        ] {
+            sets.insert(s.columns.clone(), s);
+        }
+        TwinPass {
+            sets,
+            key,
+            row_groups_read: 0,
+            rows_read: 0,
+            keys_bytes: None,
+            files_total: 1_000,
+            rows_total: 100_000_000,
+        }
+    }
+
+    fn fired(p: &TwinPass, gates: &[Gate], latest: bool) -> Vec<String> {
+        lints(p, gates, latest, true)
+            .into_iter()
+            .map(|l| l.rule)
+            .collect()
+    }
+
+    #[test]
+    fn the_low_cardinality_lint_fires_above_its_rows_and_needs_a_partner_100_times_finer() {
+        let low = |batch, id| fired(&pass_of(batch, id, 1, 500), &[], false);
+        // At the threshold: not low-cardinality.
+        assert!(low(LOW_CARDINALITY_ROWS, 1).is_empty());
+        assert_eq!(low(LOW_CARDINALITY_ROWS + 1, 1), ["low_cardinality_key"]);
+        // The partner must cover CARDINALITY_RATIO times fewer rows.
+        let high = 200_000;
+        assert_eq!(low(high, high / CARDINALITY_RATIO), ["low_cardinality_key"]);
+        assert!(low(high, high / CARDINALITY_RATIO + 1).is_empty());
+    }
+
+    #[test]
+    fn the_membership_lint_fires_above_the_gate_only() {
+        let gate = [Gate {
+            name: MEMBERSHIP_GATE.into(),
+            limit: 10,
+        }];
+        assert!(fired(&pass_of(1, 1, 10, 500), &gate, false).is_empty());
+        assert_eq!(
+            fired(&pass_of(1, 1, 11, 500), &gate, false),
+            ["unbounded_membership"]
+        );
+    }
+
+    #[test]
+    fn the_dedup_lint_fires_under_its_share_of_files_and_for_a_latest_lookup_only() {
+        // 1% of 1,000 files is 10: at the share, not selective.
+        assert!(fired(&pass_of(1, 1, 1, 10), &[], true).is_empty());
+        assert_eq!(
+            fired(&pass_of(1, 1, 1, 9), &[], true),
+            ["dedup_before_filter"]
+        );
+        assert!(fired(&pass_of(1, 1, 1, 9), &[], false).is_empty());
+    }
+
+    #[test]
+    fn a_candidate_s_columns_are_measured_in_any_order_of_the_sample() {
+        let p = pass_of(1, 1, 3, 9);
+        let swapped = measured(&p, &["id".to_string(), "batch".to_string()]).unwrap();
+        assert_eq!(swapped.columns, ["id", "batch"]);
+        assert_eq!(swapped.keyset, 3);
+        assert!(measured(&p, &["id".to_string(), "day".to_string()]).is_none());
     }
 }

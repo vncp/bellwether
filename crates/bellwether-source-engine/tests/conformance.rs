@@ -12,10 +12,10 @@
 
 use arrow::array::RecordBatch;
 use arrow::datatypes::{Schema, SchemaRef};
-use bellwether_source_engine::{identity, ratio, Exported, MeasuredEngine, ResultHandle, Tag};
+use bellwether_source_engine::{identity, ratio, MeasuredEngine, ResultHandle, Tag};
 use bellwether_types::{
-    FileFingerprint, Hash, Prediction, QueryStats, Receipt, Record, Result, RowGroupMeta, RunCost,
-    Source,
+    FileFingerprint, Hash, PairPrediction, Prediction, QueryStats, Receipt, Record, Result,
+    RowGroupMeta, RunCost, Source,
 };
 
 #[test]
@@ -64,10 +64,10 @@ impl MeasuredEngine for Listing {
     fn submit(&self, _q: &str, _t: &Tag) -> Result<ResultHandle> {
         unreachable!()
     }
-    fn stats(&self, _t: &Tag) -> Result<QueryStats> {
+    fn export(&self, _q: &str, _t: &Tag, _d: &std::path::Path) -> Result<ResultHandle> {
         unreachable!()
     }
-    fn export(&self, _h: &ResultHandle, _d: &std::path::Path) -> Result<Exported> {
+    fn stats(&self, _r: &ResultHandle) -> Result<QueryStats> {
         unreachable!()
     }
 }
@@ -121,17 +121,31 @@ fn h(c: char) -> Hash {
     serde_json::from_value(serde_json::json!(c.to_string().repeat(64))).unwrap()
 }
 
+/// Two pairs over one key sample: each pair's reads against the twin's
+/// prediction on their own, never summed.
 fn prediction() -> Prediction {
     Prediction {
         evidence: h('e'),
         predicted_rows: 2,
         predicted_row_groups: 1,
-        before_read_rows: 1600,
-        after_read_rows: 400,
-        before_read_bytes: 64_000,
-        after_read_bytes: 16_000,
-        before_ratio: ratio(1600, 2),
-        after_ratio: ratio(400, 2),
+        pairs: vec![
+            PairPrediction {
+                before_read_rows: 1600,
+                after_read_rows: 400,
+                before_read_bytes: 64_000,
+                after_read_bytes: 16_000,
+                before_ratio: ratio(1600, 2),
+                after_ratio: ratio(400, 2),
+            },
+            PairPrediction {
+                before_read_rows: 5,
+                after_read_rows: 3,
+                before_read_bytes: 200,
+                after_read_bytes: 100,
+                before_ratio: ratio(5, 2),
+                after_ratio: ratio(3, 2),
+            },
+        ],
     }
 }
 
@@ -154,7 +168,7 @@ fn the_adr_033_fields_have_pinned_bytes_and_hashes() {
     let a = "a".repeat(64);
     let c = "c".repeat(64);
     let want = format!(
-        r#"{{"record":"receipt","record_version":2,"evidence":["{e}"],"proposal":"{f}","replay":"{a}","certificate":"{c}","manifest_before":"0","manifest_after":"0","created_at":"2026-10-26T00:00:00.000Z","attest_only":true,"prediction":{{"evidence":"{e}","predicted_rows":2,"predicted_row_groups":1,"before_read_rows":1600,"after_read_rows":400,"before_read_bytes":64000,"after_read_bytes":16000,"before_ratio":"800.000","after_ratio":"200.000"}}}}"#
+        r#"{{"record":"receipt","record_version":2,"evidence":["{e}"],"proposal":"{f}","replay":"{a}","certificate":"{c}","manifest_before":"0","manifest_after":"0","created_at":"2026-10-26T00:00:00.000Z","attest_only":true,"prediction":{{"evidence":"{e}","predicted_rows":2,"predicted_row_groups":1,"pairs":[{{"before_read_rows":1600,"after_read_rows":400,"before_read_bytes":64000,"after_read_bytes":16000,"before_ratio":"800.000","after_ratio":"200.000"}},{{"before_read_rows":5,"after_read_rows":3,"before_read_bytes":200,"after_read_bytes":100,"before_ratio":"2.500","after_ratio":"1.500"}}]}}}}"#
     );
     assert_eq!(serde_json::to_string(&receipt).unwrap(), want);
     assert_eq!(receipt.hash().unwrap().to_hex(), RECEIPT);
@@ -183,7 +197,7 @@ fn the_adr_033_fields_have_pinned_bytes_and_hashes() {
     assert_eq!(Hash::of_record(&cost).unwrap().to_hex(), RUN_COST);
 }
 
-const RECEIPT: &str = "18e1637e08dfc32883f4adb40e11a6f9fecba699a945705102255df0073922ad";
+const RECEIPT: &str = "a75c47726b81d82a0e968c4aba143fc7feed9b5a32bfbc690e2dcd3379d81ac1";
 const RUN_COST: &str = "39c0305370655bd56bc6602de676ecfb4bb4e9868858774e37a31944db9d0537";
 
 /// Records of every kind whose type gained a field, as written before ADR

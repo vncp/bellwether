@@ -226,9 +226,9 @@ pub enum Refusal {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         proposed_rewrite: Option<String>,
     },
-    /// A query engine refused to export a rewrite's results (ADR 033): no
-    /// export, no certificate, no receipt. The measured Replay stands.
-    /// CLI exit 3.
+    /// A query engine refused to export a rewrite's results (ADR 033): the
+    /// export is the measured run, so nothing was measured, and there is no
+    /// certificate and no receipt. CLI exit 3.
     ExportDenied {
         /// The engine root.
         engine: String,
@@ -237,13 +237,14 @@ pub enum Refusal {
         /// The whole message, naming what to grant.
         message: String,
     },
-    /// The Key proposal's replay predicts no saving on the workload: summed
+    /// The proposal's replay predicts no saving on the workload: summed
     /// over its runs, the proposal reads at least as many bytes as the
-    /// current configuration (the measure `why` recommends by). Refused
-    /// right after the score, before the verify, so nothing but the Replay
-    /// is written; `allow_no_gain` goes on anyway. A verify-only run is
-    /// not gated (it applies nothing); applying its certificate is. CLI
-    /// exit 3.
+    /// current configuration (the measure `why` recommends by; for a
+    /// rewrite of engine queries, the bytes the engine's log says each
+    /// query read). Refused right after the score, before the verify, so
+    /// nothing but the Replay is written; `allow_no_gain` goes on anyway. A
+    /// verify-only run is not gated (it applies nothing); applying its
+    /// certificate is, on the apply tier's own measurement. CLI exit 3.
     NothingToGain {
         /// The Replay that predicts it.
         replay: Hash,
@@ -252,11 +253,43 @@ pub enum Refusal {
         /// Bytes with the proposal, summed over runs.
         proposed_bytes: u64,
     },
+    /// The apply tier ran a rewrite of engine queries again, in the state
+    /// the certificate verified, and one query's measurement disagrees with
+    /// the certified Replay's on rows read, bytes read, or result rows: the
+    /// numbers a receipt would attest are not the numbers verified. Nothing
+    /// is written. CLI exit 3.
+    MeasurementChanged {
+        /// The certificate.
+        certificate: Hash,
+        /// The measured Replay it cites.
+        replay: Hash,
+        /// The pair, in the proposal's order.
+        pair: u64,
+        /// `before` or `after`.
+        side: String,
+        /// Rows read, as certified.
+        certified_read_rows: u64,
+        /// Rows read now.
+        measured_read_rows: u64,
+        /// Bytes read, as certified.
+        certified_read_bytes: u64,
+        /// Bytes read now.
+        measured_read_bytes: u64,
+        /// Result rows, as certified.
+        certified_result_rows: u64,
+        /// Result rows now.
+        measured_result_rows: u64,
+    },
 }
 
 /// The gain gate: a refusal when the proposal reads no fewer bytes than the
 /// current configuration and the caller did not allow it.
-fn no_gain(replay: &Hash, current: &Cost, proposed: &Cost, allow: bool) -> Option<Refusal> {
+pub(crate) fn no_gain(
+    replay: &Hash,
+    current: &Cost,
+    proposed: &Cost,
+    allow: bool,
+) -> Option<Refusal> {
     (!allow && proposed.bytes >= current.bytes).then_some(Refusal::NothingToGain {
         replay: *replay,
         current_bytes: current.bytes,
@@ -724,6 +757,7 @@ impl Engine {
                     shape,
                     before,
                     dry_run,
+                    allow_no_gain,
                 );
             }
             // A table: the gate passed, and the engine applies nothing to a
@@ -1378,6 +1412,8 @@ pub(crate) mod test_seam {
 /// The sequence a Key apply produced, or the refusal: nothing committed (the
 /// key was already complete), or another commit landed first. A Key
 /// proposal must advance the manifest by exactly the apply's own commit.
+// The refusal is returned as is; it is built once per apply.
+#[allow(clippy::result_large_err)]
 fn advance(before: u64, committed: Option<u64>) -> std::result::Result<u64, Refusal> {
     let after = committed.unwrap_or(before);
     if after <= before {

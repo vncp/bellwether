@@ -417,7 +417,7 @@ Measured 2026-10-26 (UTC) on an Apple M3 Pro (12 cores, 36 GB, macOS 26.4.1), re
 
 ## Query engines as sources
 
-A query engine that keeps its own storage is a measured source (ADR 033, `bellwether-source-engine`): ClickHouse is the reference adapter, Kusto the second, and another engine is one file implementing three operations (`submit` a query under a tag, read that tag's `stats` from the engine's own query log, `export` a result as Parquet). The diagnosis runs on the lake twin, exactly; the measurement runs in the engine, and no caller can hand bellwether a number.
+A query engine that keeps its own storage is a measured source (ADR 033, `bellwether-source-engine`): ClickHouse is the reference adapter, Kusto the second, and another engine is one file implementing three operations (`submit` a query under a tag, `export` one run's rows as Parquet, read one run's `stats` from the engine's own query log). The diagnosis runs on the lake twin, exactly; the measurement runs in the engine, and no caller can hand bellwether a number.
 
 ```bash
 ENGINE='clickhouse://reader@ch.internal:8123/sales/orders?password=env:CH_PASSWORD'
@@ -427,7 +427,7 @@ bellwether propose ./orders/ --rewrite before.sql=after.sql --evidence <twin evi
 bellwether fix ./orders/ --twin-of "$ENGINE" --proposal <proposal> --scratch ./orders/_scratch
 ```
 
-`fix` submits every query of the rewrite under its own tags, reads their statistics from the engine's log (`measured`, never `exact`, the model named `clickhouse.query_log`), exports each pair's results into the scratch folder and reconciles them by the proposal's key columns, and writes an attest-only receipt with the twin's prediction beside the engine's realized reads. Bellwether neither edits jobs nor creates anything inside the engine; a human or a CI gate deploys the rewrite. The worked example: [agent loop](docs/agent-loop.md#second-worked-example-a-query-engine-that-owns-its-storage); the adapter sketches for BigQuery, Snowflake, and Postgres: [the crate README](crates/bellwether-source-engine/README.md).
+`fix` runs every query of the rewrite once, under its own tag, and that run exports its rows into the scratch folder (a hidden folder under the lake root); it reads that run's statistics from the engine's log (`measured`, never `exact`, the model named `clickhouse.query_log`; a run served from a cache, or whose logged rows are not the rows it exported, is refused), reconciles each pair by the proposal's key columns, and writes an attest-only receipt with the twin's prediction beside the engine's realized reads, pair by pair. Bellwether neither edits jobs nor creates anything inside the engine; a human or a CI gate deploys the rewrite. The agent's query text runs with every read privilege of the user bellwether connects as, network table functions included, so connect as a least-privilege user: `SELECT` on the twin's tables and the query log, nothing else. The worked example: [agent loop](docs/agent-loop.md#second-worked-example-a-query-engine-that-owns-its-storage); the adapter sketches for BigQuery, Snowflake, and Postgres: [the crate README](crates/bellwether-source-engine/README.md).
 
 ## Status
 

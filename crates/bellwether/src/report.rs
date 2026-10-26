@@ -400,17 +400,23 @@ fn render_receipt(h: &mut String, r: &ReceiptView) {
         let _ = write!(
             h,
             "<div class=\"scroll\"><table><tr><th>prediction error</th><th>rows</th><th>bytes read</th><th>ratio to the twin's rows</th></tr>\
-             <tr><td>twin predicted (exact, lake)</td><td>{}</td><td>-</td><td>1.000</td></tr>\
-             <tr><td>engine before (measured)</td><td>{}</td><td>{}</td><td>{}</td></tr>\
-             <tr><td>engine after (measured)</td><td>{}</td><td>{}</td><td>{}</td></tr></table></div>",
-            num(p.predicted_rows),
-            num(p.before_read_rows),
-            num(p.before_read_bytes),
-            esc(&ratio(&p.before_ratio)),
-            num(p.after_read_rows),
-            num(p.after_read_bytes),
-            esc(&ratio(&p.after_ratio))
+             <tr><td>twin predicted (exact, lake)</td><td>{}</td><td>-</td><td>1.000</td></tr>",
+            num(p.predicted_rows)
         );
+        for (i, q) in p.pairs.iter().enumerate() {
+            let _ = write!(
+                h,
+                "<tr><td>p{i} engine before (measured)</td><td>{}</td><td>{}</td><td>{}</td></tr>\
+                 <tr><td>p{i} engine after (measured)</td><td>{}</td><td>{}</td><td>{}</td></tr>",
+                num(q.before_read_rows),
+                num(q.before_read_bytes),
+                esc(&ratio(&q.before_ratio)),
+                num(q.after_read_rows),
+                num(q.after_read_bytes),
+                esc(&ratio(&q.after_ratio))
+            );
+        }
+        h.push_str("</table></div>");
     }
 }
 
@@ -531,23 +537,25 @@ fn render_predictions(h: &mut String, receipts: &[ReceiptView]) {
     }
     h.push_str(
         "<h2>Twin prediction against the engine (measured, not exact)</h2><div class=\"scroll\"><table>\
-         <tr><th>receipt</th><th>engine model</th><th>twin predicted rows</th><th>row groups</th>\
+         <tr><th>receipt</th><th>pair</th><th>engine model</th><th>twin predicted rows</th><th>row groups</th>\
          <th>engine read before</th><th>ratio</th><th>engine read after</th><th>ratio</th></tr>",
     );
     for (r, p) in with {
         let ratio = |x: &Option<String>| x.clone().unwrap_or_else(|| "undefined".into());
-        let _ = write!(
-            h,
-            "<tr><td><code>{}</code></td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
-            short(&r.hash),
-            esc(r.replay.as_ref().and_then(|x| x.model.as_deref()).unwrap_or("-")),
-            num(p.predicted_rows),
-            num(p.predicted_row_groups),
-            num(p.before_read_rows),
-            esc(&ratio(&p.before_ratio)),
-            num(p.after_read_rows),
-            esc(&ratio(&p.after_ratio))
-        );
+        for (i, q) in p.pairs.iter().enumerate() {
+            let _ = write!(
+                h,
+                "<tr><td><code>{}</code></td><td>p{i}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
+                short(&r.hash),
+                esc(r.replay.as_ref().and_then(|x| x.model.as_deref()).unwrap_or("-")),
+                num(p.predicted_rows),
+                num(p.predicted_row_groups),
+                num(q.before_read_rows),
+                esc(&ratio(&q.before_ratio)),
+                num(q.after_read_rows),
+                esc(&ratio(&q.after_ratio))
+            );
+        }
     }
     h.push_str("</table></div>");
 }

@@ -42,10 +42,15 @@ pub fn is_engine_uri(s: &str) -> bool {
 }
 
 /// `s` with user and parameters removed when it is an engine root, as
-/// records and messages print it; otherwise `s` unchanged.
+/// records and messages print it; otherwise `s` unchanged. A root that
+/// does not parse (a literal password among them) keeps its scheme, host,
+/// and path only, so a secret written in it is never echoed.
 #[must_use]
 pub fn redact(s: &str) -> String {
-    EngineUri::parse(s).map_or_else(|_| s.to_string(), |u| u.root())
+    if !is_engine_uri(s) {
+        return s.to_string();
+    }
+    EngineUri::parse(s).map_or_else(|_| redact_raw(s), |u| u.root())
 }
 
 /// A parsed engine root.
@@ -282,5 +287,17 @@ mod tests {
             let e = EngineUri::parse(bad).unwrap_err().to_string();
             assert!(!e.contains("secret"), "{e}");
         }
+    }
+
+    #[test]
+    fn a_root_that_does_not_parse_is_redacted_to_scheme_host_and_path() {
+        for (bad, want) in [
+            ("clickhouse://u:hunter2@h/db", "clickhouse://h/db"),
+            ("clickhouse://h/db?password=hunter2", "clickhouse://h/db"),
+            ("kusto://u:hunter2@c/db/t?auth=x", "kusto://c/db/t"),
+        ] {
+            assert_eq!(redact(bad), want);
+        }
+        assert_eq!(redact("/data/lake"), "/data/lake");
     }
 }

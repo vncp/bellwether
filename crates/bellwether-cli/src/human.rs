@@ -1029,6 +1029,11 @@ fn twin_header(s: &mut String, t: &bellwether::TwinReport) {
 
 /// The twin's columns per candidate: fanout, files per key, and the keyset
 /// against each gate, then the twin lints.
+#[allow(
+    clippy::too_many_lines,
+    clippy::type_complexity,
+    clippy::single_match_else
+)]
 fn twin_table(s: &mut String, t: &bellwether::TwinReport) {
     let Some(key) = &t.key else {
         let _ = writeln!(
@@ -1073,16 +1078,21 @@ fn twin_table(s: &mut String, t: &bellwether::TwinReport) {
         },
         kind.as_ref().map_or_else(String::new, |k| format!("  {k}"))
     );
-    let mut rows: Vec<(String, Option<&bellwether::TwinColumns>, Option<&str>)> =
-        vec![("the sample's key".to_string(), Some(key), None)];
+    let mut rows: Vec<(
+        String,
+        Option<&bellwether::TwinColumns>,
+        Option<&str>,
+        Vec<String>,
+    )> = vec![("the sample's key".to_string(), Some(key), None, Vec::new())];
     for c in &t.candidates {
         rows.push((
             label(&c.spec),
             c.twin.as_ref(),
             c.kind_column.as_ref().map(|k| k.value.as_str()),
+            c.spec.columns().to_vec(),
         ));
     }
-    for (name, cols, kind_value) in rows {
+    for (name, cols, kind_value, spec_columns) in rows {
         match cols {
             Some(c) => {
                 let fit: Vec<String> = c
@@ -1103,12 +1113,19 @@ fn twin_table(s: &mut String, t: &bellwether::TwinReport) {
                 );
             }
             None => {
-                let _ = writeln!(
-                    s,
-                    "  {:<34} {:>10}  its columns are not the sample's",
-                    tail(&name, 34),
-                    "-"
-                );
+                let lacks: Vec<&str> = spec_columns
+                    .iter()
+                    .filter(|c| !key.columns.contains(c))
+                    .map(String::as_str)
+                    .collect();
+                let why = if lacks.is_empty() {
+                    "not measured: of a sample over more than four columns, the twin measures \
+                     the prefixes and the single columns"
+                        .to_string()
+                } else {
+                    format!("the key sample has no {}", lacks.join(", "))
+                };
+                let _ = writeln!(s, "  {:<34} {:>10}  {why}", tail(&name, 34), "-");
             }
         }
     }

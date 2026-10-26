@@ -1,19 +1,18 @@
 //! Query engines as measured sources through the facade (ADR 033), with an
 //! in-process adapter (`EngineOptions::engine_adapter`): the twin's
 //! diagnosis against a brute-force oracle over the decoded files, the four
-//! twin lints firing and not firing, the rewrite loop ending in an
-//! attest-only receipt, export denial writing no certificate and no
-//! receipt, a failing certificate keeping the prediction error, a
-//! fabricated Replay never reaching a receipt, a changed engine refused, and
-//! the apply tier re-measuring.
+//! twin lints firing and not firing at their thresholds, the rewrite loop
+//! ending in an attest-only receipt with one run per query, export denial
+//! writing nothing, a failing certificate keeping the prediction error,
+//! the prediction error pair by pair against an oracle, a fabricated Replay
+//! never reaching a receipt, a measurement that is not its run's refused,
+//! a changed engine refused, the gain gate on bytes at both tiers, the
+//! apply tier's identity re-read and its agreement with the certified
+//! Replay, the key sample required, scratch governance, and secrets never
+//! echoed.
 //!
-//! Deliberate breaks (each made once in a scratch copy; the named test
-//! failed): drop the `attest_only` check on a measured replay's receipt in
-//! the ledger (`a_measured_replay_never_backs_an_apply_receipt`); write the
-//! Replay after the verify stage (`a_failing_certificate_keeps_the_prediction_error`);
-//! certify on export denial (`export_denial_writes_no_certificate_and_no_receipt`);
-//! skip the identity re-read after the exports
-//! (`an_engine_that_changes_during_the_run_is_refused`).
+//! Deliberate breaks (each made once; the named test failed): see the PR
+//! body's mutant table (`G2`, `F4`, `F6`, `A1`–`A4`, `S1`–`S3`, `M1`–`M3`).
 #![allow(
     clippy::unwrap_used,
     clippy::too_many_lines,
@@ -48,18 +47,41 @@ const MODEL: &str = "clickhouse.query_log";
 struct State {
     /// Query text to (result, stats template).
     queries: HashMap<String, (RecordBatch, QueryStats)>,
-    /// Tags submitted, with the query each ran.
-    submitted: Vec<(String, String)>,
+    /// For a run whose rows are discarded: the statistics it logs instead
+    /// (a query that behaves differently when its rows are not kept).
+    discarded: HashMap<String, QueryStats>,
+    /// Runs: tag, query, and whether the run exported.
+    runs: Vec<(String, String, bool)>,
     /// Exports refused.
     deny: bool,
+    /// Exports refused from this run on (1-based; 0: never).
+    deny_from: usize,
     /// Unit identities the listing reports.
     units: Vec<(String, u64)>,
-    /// Bump the units after this many exports (0: never).
-    change_after_exports: usize,
-    exports: usize,
+    /// Bump the units after this many runs (0: never).
+    change_after_runs: usize,
+    /// A query whose exporting run logs a read of almost nothing and no
+    /// result rows while it exports its rows (it branches on its run).
+    branch: Option<String>,
+    /// The adapter answers with another query's statistics.
+    foreign: bool,
 }
 
 struct Fake(Arc<Mutex<State>>);
+
+impl Fake {
+    fn run(s: &mut State, query: &str, tag: &Tag, exported: bool) -> Result<()> {
+        if !s.queries.contains_key(query.trim()) {
+            return Err(Error::Source(format!("fake: unknown query {query}")));
+        }
+        s.runs
+            .push((tag.to_string(), query.trim().to_string(), exported));
+        if s.change_after_runs > 0 && s.runs.len() == s.change_after_runs {
+            s.units.push(("p9".into(), 1));
+        }
+        Ok(())
+    }
+}
 
 impl MeasuredEngine for Fake {
     fn root(&self) -> &str {
@@ -69,43 +91,25 @@ impl MeasuredEngine for Fake {
         MODEL
     }
     fn submit(&self, query: &str, tag: &Tag) -> Result<ResultHandle> {
-        let mut s = self.0.lock().unwrap();
-        if !s.queries.contains_key(query.trim()) {
-            return Err(Error::Source(format!("fake: unknown query {query}")));
-        }
-        s.submitted
-            .push((tag.to_string(), query.trim().to_string()));
+        Self::run(&mut self.0.lock().unwrap(), query, tag, false)?;
         Ok(ResultHandle {
             tag: tag.clone(),
             query: query.trim().to_string(),
+            logged: query.trim().to_string(),
+            exported: None,
         })
     }
-    fn stats(&self, tag: &Tag) -> Result<QueryStats> {
-        let s = self.0.lock().unwrap();
-        let q = s
-            .submitted
-            .iter()
-            .find(|(t, _)| t == tag.as_str())
-            .map(|(_, q)| q.clone())
-            .ok_or_else(|| Error::Source(format!("fake: no log entry for {tag}")))?;
-        let mut st = s.queries[&q].1.clone();
-        st.tag = tag.to_string();
-        Ok(st)
-    }
-    fn export(&self, handle: &ResultHandle, dir: &Path) -> Result<Exported> {
+    fn export(&self, query: &str, tag: &Tag, dir: &Path) -> Result<ResultHandle> {
         let mut s = self.0.lock().unwrap();
-        if s.deny {
+        if s.deny || (s.deny_from > 0 && s.runs.len() + 1 >= s.deny_from) {
             return Err(Error::ExportDenied {
                 engine: ROOT.into(),
                 permission: "the fake export grant".into(),
                 message: format!("{ROOT} refused the export; grant the fake export grant"),
             });
         }
-        s.exports += 1;
-        if s.change_after_exports > 0 && s.exports == s.change_after_exports {
-            s.units.push(("p9".into(), 1));
-        }
-        let batch = s.queries[&handle.query].0.clone();
+        Self::run(&mut s, query, tag, true)?;
+        let batch = s.queries[query.trim()].0.clone();
         std::fs::create_dir_all(dir).unwrap();
         let path = dir.join("part-0.parquet");
         let mut w =
@@ -113,10 +117,40 @@ impl MeasuredEngine for Fake {
         w.write(&batch).unwrap();
         w.close().unwrap();
         let bytes = std::fs::metadata(&path).unwrap().len();
-        Ok(Exported {
-            files: vec![path],
-            bytes,
+        Ok(ResultHandle {
+            tag: tag.clone(),
+            query: query.trim().to_string(),
+            logged: query.trim().to_string(),
+            exported: Some(Exported {
+                files: vec![path],
+                bytes,
+            }),
         })
+    }
+    fn stats(&self, run: &ResultHandle) -> Result<QueryStats> {
+        let s = self.0.lock().unwrap();
+        let (_, q, exported) = s
+            .runs
+            .iter()
+            .find(|(t, _, _)| t == run.tag.as_str())
+            .cloned()
+            .ok_or_else(|| Error::Source(format!("fake: no log entry for {}", run.tag)))?;
+        let (batch, template) = &s.queries[&q];
+        let mut st = match s.discarded.get(&q) {
+            Some(d) if !exported => d.clone(),
+            _ => template.clone(),
+        };
+        st.result_rows = batch.num_rows() as u64;
+        if exported && s.branch.as_deref() == Some(q.as_str()) {
+            st = stats(1, 1, 1);
+            st.result_rows = 0;
+        }
+        st.tag = if s.foreign {
+            "someone-elses-query".into()
+        } else {
+            run.tag.to_string()
+        };
+        Ok(st)
     }
 }
 
@@ -271,7 +305,8 @@ impl World {
     fn new() -> Self {
         let dir = tempfile::tempdir().unwrap();
         let root = lake(dir.path(), 4, 400, 100, 200, 400);
-        let scratch = dir.path().join("scratch");
+        // A hidden folder under the lake root (scratch governance).
+        let scratch = root.join("_scratch");
         let state = Arc::new(Mutex::new(State {
             units: vec![("p0".into(), 800), ("p1".into(), 800)],
             ..State::default()
@@ -673,27 +708,42 @@ fn the_rewrite_loop_ends_in_an_attest_only_receipt_binding_the_prediction() {
     assert_eq!(rc.replay, replay.hash);
     assert_eq!(rc.prediction, rp.prediction);
     let pred = rp.prediction.as_ref().unwrap();
-    assert_eq!((pred.before_read_rows, pred.after_read_rows), (1600, 400));
+    assert_eq!(pred.pairs.len(), 1);
+    assert_eq!(
+        (
+            pred.pairs[0].before_read_rows,
+            pred.pairs[0].after_read_rows
+        ),
+        (1600, 400)
+    );
     assert_eq!(pred.evidence, ev);
     assert!(rp.current.iter().all(|c| !c.exact && c.measured.is_some()));
+    // The replay's workload is the key sample the twin diagnosis ran on.
+    let Record::Evidence(evidence) = ledger(&w.root).get(&ev).unwrap() else {
+        panic!()
+    };
+    let EvidenceBody::Profile { twin: Some(t), .. } = evidence.body else {
+        panic!()
+    };
+    assert_eq!(Some(rp.workload), t.workload);
     // The query texts are hashed into the replay's inputs.
     assert!(rp.inputs.contains(&Hash::of(b"SELECT before")));
     assert!(rp.inputs.contains(&Hash::of(b"SELECT after")));
-    // The tags the engine logged are the ones the replay cites.
-    let tags: Vec<String> = w
-        .state
-        .lock()
-        .unwrap()
-        .submitted
-        .iter()
-        .map(|t| t.0.clone())
-        .collect();
-    assert_eq!(rp.current[0].run_id, tags[0]);
-    assert_eq!(rp.proposed[0].run_id, tags[1]);
+    // One run per query, and it is the run that exported: the tags the
+    // engine logged are the ones the replay cites.
+    let runs = w.state.lock().unwrap().runs.clone();
+    assert_eq!(
+        runs.iter().map(|r| (r.1.as_str(), r.2)).collect::<Vec<_>>(),
+        vec![("SELECT before", true), ("SELECT after", true)]
+    );
+    assert_eq!(rp.current[0].run_id, runs[0].0);
+    assert_eq!(rp.proposed[0].run_id, runs[1].0);
+    // The twin was made against the engine as it is now.
+    let run = r.engine.as_ref().unwrap();
+    assert_eq!(run.identity_at_twin, run.identity_before);
     // Exports deleted after the certificate.
     let left: Vec<_> = std::fs::read_dir(&w.scratch).unwrap().collect();
     assert!(left.is_empty(), "{left:?}");
-    let run = r.engine.as_ref().unwrap();
     assert!(!run.kept);
     assert_eq!(run.identity_after.unwrap().hash, run.identity_before.hash);
     // The certificate cites both identities.
@@ -747,14 +797,9 @@ fn export_denial_writes_no_certificate_and_no_receipt() {
     assert!(r.certificate.is_none());
     assert_eq!(count(&w.root, |r| matches!(r, Record::Certificate(_))), 0);
     assert_eq!(count(&w.root, |r| matches!(r, Record::Receipt(_))), 0);
-    // The measured replay stands, with its prediction.
-    assert_eq!(
-        count(
-            &w.root,
-            |r| matches!(r, Record::Replay(x) if x.prediction.is_some())
-        ),
-        1
-    );
+    // The export is the measured run: nothing was measured, so not even a
+    // replay is written.
+    assert_eq!(count(&w.root, measured_replay), 0);
 }
 
 #[test]
@@ -793,7 +838,10 @@ fn a_failing_certificate_keeps_the_prediction_error() {
     let Record::Replay(rp) = &replays[0] else {
         panic!()
     };
-    assert_eq!(rp.prediction.as_ref().unwrap().after_read_rows, 400);
+    assert_eq!(
+        rp.prediction.as_ref().unwrap().pairs[0].after_read_rows,
+        400
+    );
 }
 
 #[test]
@@ -850,7 +898,10 @@ fn a_fabricated_replay_never_reaches_a_receipt() {
         panic!()
     };
     assert_ne!(rc.replay, planted_hash);
-    assert_eq!(rc.prediction.as_ref().unwrap().after_read_rows, 400);
+    assert_eq!(
+        rc.prediction.as_ref().unwrap().pairs[0].after_read_rows,
+        400
+    );
 }
 
 fn cost(s: &QueryStats) -> bellwether::types::RunCost {
@@ -871,7 +922,7 @@ fn an_engine_that_changes_during_the_run_is_refused() {
     let rows = [(3, 0, 3)];
     w.query("SELECT before", &rows, stats(10, 100, 10));
     w.query("SELECT after", &rows, stats(5, 50, 5));
-    w.state.lock().unwrap().change_after_exports = 2;
+    w.state.lock().unwrap().change_after_runs = 2;
     let e = w.engine();
     let (ev, _) = w.why(&e);
     let p = propose(&e, ev);
@@ -911,7 +962,7 @@ fn the_apply_tier_re_measures_and_refuses_a_changed_engine() {
         "{:?}",
         dry.outcome
     );
-    let submitted = w.state.lock().unwrap().submitted.len();
+    let runs = w.state.lock().unwrap().runs.len();
     let a = e
         .fix(&FixRequest {
             certificate: Some(cert),
@@ -923,8 +974,11 @@ fn the_apply_tier_re_measures_and_refuses_a_changed_engine() {
         "{:?}",
         a.outcome
     );
-    // Scored again now: two more submissions.
-    assert_eq!(w.state.lock().unwrap().submitted.len(), submitted + 2);
+    // Measured again now: two more runs, whose rows are discarded.
+    let state = w.state.lock().unwrap();
+    assert_eq!(state.runs.len(), runs + 2);
+    assert!(state.runs[runs..].iter().all(|r| !r.2));
+    drop(state);
     // The engine moves on: the certificate no longer describes it.
     w.state.lock().unwrap().units.push(("p2".into(), 1));
     let b = e
@@ -1046,7 +1100,7 @@ fn a_rewrite_of_engine_queries_needs_the_twin_and_the_scratch() {
         ),
         "{err}"
     );
-    assert_eq!(w.state.lock().unwrap().submitted.len(), 0);
+    assert_eq!(w.state.lock().unwrap().runs.len(), 0);
     // An engine root as the data root is refused, naming the twin flow.
     let err = Engine::open(ROOT, EngineOptions::default()).unwrap_err();
     assert!(err.to_string().contains("--twin-of"), "{err}");
@@ -1075,4 +1129,570 @@ fn records_without_the_new_fields_keep_their_bytes() {
     );
     let back: bellwether::types::Receipt = serde_json::from_str(&s).unwrap();
     assert_eq!(back, r);
+}
+
+/// Whether `r` is a Replay measured in an engine (`why` writes replays of
+/// its own over the lake).
+fn measured_replay(r: &Record) -> bool {
+    matches!(r, Record::Replay(x) if x.model.as_deref() == Some(MODEL))
+}
+
+/// The reason of a measurement refusal.
+fn reason(e: &Error) -> &'static str {
+    match e {
+        Error::MeasurementRefused { reason, .. } => reason,
+        other => panic!("{other}"),
+    }
+}
+
+/// No replay, certificate, or receipt in the ledger.
+fn nothing_recorded(root: &Path) {
+    assert_eq!(
+        count(root, |r| measured_replay(r)
+            || matches!(r, Record::Certificate(_) | Record::Receipt(_))),
+        0
+    );
+}
+
+/// The reviewer's first probe, as a fake: the after query tells its runs
+/// apart, and the run that exports logs a read of almost nothing and no
+/// rows while it exports the real rows. One run per query means the log
+/// entry read is the exporting run's, and its rows disagree with the rows
+/// it exported: refused, nothing recorded.
+#[test]
+fn a_run_whose_logged_rows_are_not_the_rows_it_exported_is_refused() {
+    let w = World::new();
+    let rows = [(3, 0, 3), (7, 0, 7)];
+    w.query("SELECT before", &rows, stats(1600, 64_000, 9));
+    w.query("SELECT after", &rows, stats(400, 16_000, 1));
+    w.state.lock().unwrap().branch = Some("SELECT after".into());
+    let e = w.engine();
+    let (ev, _) = w.why(&e);
+    let p = propose(&e, ev);
+    let err = e
+        .fix(&FixRequest {
+            proposal: Some(p),
+            ..FixRequest::default()
+        })
+        .unwrap_err();
+    assert_eq!(reason(&err), "result_rows_differ", "{err}");
+    nothing_recorded(&w.root);
+    assert_eq!(std::fs::read_dir(&w.scratch).unwrap().count(), 0);
+}
+
+#[test]
+fn statistics_naming_another_query_are_refused() {
+    let w = World::new();
+    let rows = [(3, 0, 3)];
+    w.query("SELECT before", &rows, stats(10, 100, 1));
+    w.query("SELECT after", &rows, stats(5, 50, 1));
+    w.state.lock().unwrap().foreign = true;
+    let e = w.engine();
+    let (ev, _) = w.why(&e);
+    let p = propose(&e, ev);
+    let err = e
+        .fix(&FixRequest {
+            proposal: Some(p),
+            ..FixRequest::default()
+        })
+        .unwrap_err();
+    assert_eq!(reason(&err), "tag_mismatch", "{err}");
+    nothing_recorded(&w.root);
+}
+
+#[test]
+fn the_gain_gate_counts_bytes_read_not_rows_read() {
+    let gate = |before: QueryStats, after: QueryStats| {
+        let w = World::new();
+        let rows = [(3, 0, 3)];
+        w.query("SELECT before", &rows, before);
+        w.query("SELECT after", &rows, after);
+        let e = w.engine();
+        let (ev, _) = w.why(&e);
+        fix(&e, propose(&e, ev)).outcome
+    };
+    // Fewer rows, the same bytes: nothing to gain.
+    let o = gate(stats(10, 100, 1), stats(5, 100, 1));
+    assert!(
+        matches!(
+            o,
+            FixOutcome::Refused {
+                refusal: Refusal::NothingToGain {
+                    current_bytes: 100,
+                    proposed_bytes: 100,
+                    ..
+                }
+            }
+        ),
+        "{o:?}"
+    );
+    // More rows, fewer bytes: a gain.
+    let o = gate(stats(5, 100, 1), stats(10, 50, 1));
+    assert!(matches!(o, FixOutcome::Attested { .. }), "{o:?}");
+}
+
+/// `score.verify` then `apply.receipt` (verify only, then the
+/// certificate) used to skip the gain gate: the apply tier now gates its
+/// own measurement.
+#[test]
+fn applying_a_verified_rewrite_with_no_gain_is_refused() {
+    let w = World::new();
+    let rows = [(3, 0, 3)];
+    w.query("SELECT before", &rows, stats(100, 100, 10));
+    w.query("SELECT after", &rows, stats(100, 100, 1));
+    let e = w.engine();
+    let (ev, _) = w.why(&e);
+    let p = propose(&e, ev);
+    let v = e
+        .fix(&FixRequest {
+            proposal: Some(p),
+            verify_only: true,
+            ..FixRequest::default()
+        })
+        .unwrap();
+    assert!(matches!(v.outcome, FixOutcome::Verified), "{:?}", v.outcome);
+    let cert = v.certificate.unwrap().hash;
+    let a = e
+        .fix(&FixRequest {
+            certificate: Some(cert),
+            ..FixRequest::default()
+        })
+        .unwrap();
+    assert!(
+        matches!(
+            a.outcome,
+            FixOutcome::Refused {
+                refusal: Refusal::NothingToGain { .. }
+            }
+        ),
+        "{:?}",
+        a.outcome
+    );
+    assert_eq!(count(&w.root, |r| matches!(r, Record::Receipt(_))), 0);
+    // The human may go on anyway.
+    let a = e
+        .fix(&FixRequest {
+            certificate: Some(cert),
+            allow_no_gain: true,
+            ..FixRequest::default()
+        })
+        .unwrap();
+    assert!(
+        matches!(a.outcome, FixOutcome::Attested { .. }),
+        "{:?}",
+        a.outcome
+    );
+}
+
+/// A verified proposal, its certificate, and the run count after it.
+fn verified(w: &World, e: &Engine) -> (Hash, usize) {
+    let (ev, _) = w.why(e);
+    let p = propose(e, ev);
+    let v = e
+        .fix(&FixRequest {
+            proposal: Some(p),
+            verify_only: true,
+            ..FixRequest::default()
+        })
+        .unwrap();
+    assert!(matches!(v.outcome, FixOutcome::Verified), "{:?}", v.outcome);
+    (
+        v.certificate.unwrap().hash,
+        w.state.lock().unwrap().runs.len(),
+    )
+}
+
+/// The reviewer's probe: the certified run read 15,999,999 bytes and the
+/// apply tier's run 16; the receipt used to record 16.
+#[test]
+fn the_apply_tier_refuses_a_measurement_that_is_not_the_certified_one() {
+    let w = World::new();
+    let rows = [(3, 0, 3)];
+    w.query("SELECT before", &rows, stats(1600, 32_000_000, 9));
+    w.query("SELECT after", &rows, stats(1600, 15_999_999, 1));
+    let e = w.engine();
+    let (cert, _) = verified(&w, &e);
+    w.state
+        .lock()
+        .unwrap()
+        .discarded
+        .insert("SELECT after".into(), stats(1, 16, 1));
+    let a = e
+        .fix(&FixRequest {
+            certificate: Some(cert),
+            ..FixRequest::default()
+        })
+        .unwrap();
+    let FixOutcome::Refused {
+        refusal:
+            Refusal::MeasurementChanged {
+                pair,
+                side,
+                certified_read_bytes,
+                measured_read_bytes,
+                ..
+            },
+    } = &a.outcome
+    else {
+        panic!("{:?}", a.outcome)
+    };
+    assert_eq!(
+        (
+            *pair,
+            side.as_str(),
+            *certified_read_bytes,
+            *measured_read_bytes
+        ),
+        (0, "after", 15_999_999, 16)
+    );
+    assert_eq!(count(&w.root, |r| matches!(r, Record::Receipt(_))), 0);
+    // Only the verify run's replay: a refused measurement is not recorded.
+    assert_eq!(count(&w.root, measured_replay), 1);
+}
+
+/// The reviewer's probe: the engine changed while the apply tier measured,
+/// and the receipt was written anyway.
+#[test]
+fn the_apply_tier_refuses_an_engine_that_changes_while_it_measures() {
+    let w = World::new();
+    let rows = [(3, 0, 3)];
+    w.query("SELECT before", &rows, stats(10, 100, 1));
+    w.query("SELECT after", &rows, stats(5, 50, 1));
+    let e = w.engine();
+    let (cert, runs) = verified(&w, &e);
+    w.state.lock().unwrap().change_after_runs = runs + 1;
+    let a = e
+        .fix(&FixRequest {
+            certificate: Some(cert),
+            ..FixRequest::default()
+        })
+        .unwrap();
+    assert!(
+        matches!(
+            a.outcome,
+            FixOutcome::Refused {
+                refusal: Refusal::DataChanged { .. }
+            }
+        ),
+        "{:?}",
+        a.outcome
+    );
+    assert_eq!(w.state.lock().unwrap().runs.len(), runs + 2);
+    assert_eq!(count(&w.root, |r| matches!(r, Record::Receipt(_))), 0);
+}
+
+#[test]
+fn a_rewrite_of_engine_queries_rests_on_the_twin_s_key_sample() {
+    let w = World::new();
+    let rows = [(3, 0, 3)];
+    w.query("SELECT before", &rows, stats(10, 100, 1));
+    w.query("SELECT after", &rows, stats(5, 50, 1));
+    let e = w.engine();
+    let pair = || {
+        vec![QueryPair {
+            before: "SELECT before".into(),
+            after: "SELECT after".into(),
+        }]
+    };
+    let keys_refusal = |err: Error| match err {
+        Error::InvalidArgument {
+            field: "keys",
+            reason,
+        } => reason,
+        other => panic!("{other}"),
+    };
+    // A twin diagnosis without a key sample backs no rewrite: refused at
+    // propose, naming the step that records one.
+    let bare = e.why(&WhyRequest::default()).unwrap();
+    let err = e
+        .propose(
+            ProposalBody::Rewrite {
+                shape: engine_rewrite(pair(), vec!["id".into()], None),
+            },
+            &[bare.evidence.hash.unwrap()],
+            "agent",
+        )
+        .unwrap_err();
+    let why = keys_refusal(err);
+    assert!(why.contains("why --workload <hash> --twin-of"), "{why}");
+    // A sample other than the twin's: refused at propose.
+    let (ev, _) = w.why(&e);
+    let mut other = engine_rewrite(pair(), Vec::new(), None);
+    other.keys = Some(Hash::of(b"another sample"));
+    let err = e
+        .propose(
+            ProposalBody::Rewrite {
+                shape: other.clone(),
+            },
+            &[ev],
+            "agent",
+        )
+        .unwrap_err();
+    keys_refusal(err);
+    // Planted in the ledger past propose, with another sample or none:
+    // fix refuses before anything runs.
+    let mut none = engine_rewrite(pair(), vec!["id".into(), "batch".into()], None);
+    none.keys = None;
+    other.key = vec!["id".into(), "batch".into()];
+    for shape in [other, none] {
+        let planted = ledger(&w.root)
+            .put(&Record::Proposal(bellwether::types::Proposal {
+                record_version: bellwether::types::format::RECORD_VERSION,
+                evidence: vec![ev],
+                proposed_by: "agent".into(),
+                created_at: "2026-10-26T00:00:00.000Z".into(),
+                body: ProposalBody::Rewrite { shape },
+            }))
+            .unwrap();
+        let err = e
+            .fix(&FixRequest {
+                proposal: Some(planted),
+                ..FixRequest::default()
+            })
+            .unwrap_err();
+        keys_refusal(err);
+    }
+    assert_eq!(w.state.lock().unwrap().runs.len(), 0);
+}
+
+/// An independent oracle for the ratio: long division to four places,
+/// then half to even on the third.
+fn oracle(num: u64, den: u64) -> String {
+    let (whole, mut rem) = (num / den, num % den);
+    let mut digits = Vec::new();
+    for _ in 0..4 {
+        rem *= 10;
+        digits.push(rem / den);
+        rem %= den;
+    }
+    let mut thousandths = whole * 1000 + digits[0] * 100 + digits[1] * 10 + digits[2];
+    let up = digits[3] > 5 || (digits[3] == 5 && (rem > 0 || thousandths % 2 == 1));
+    if up {
+        thousandths += 1;
+    }
+    format!("{}.{:03}", thousandths / 1000, thousandths % 1000)
+}
+
+#[test]
+fn the_prediction_error_is_kept_pair_by_pair_against_an_oracle() {
+    let w = World::new();
+    let rows = [(3, 0, 3), (7, 0, 7)];
+    w.query("SELECT before", &rows, stats(1600, 64_000, 9));
+    w.query("SELECT after", &rows, stats(401, 16_000, 1));
+    w.query("SELECT b2", &rows, stats(999, 500, 1));
+    w.query("SELECT a2", &rows, stats(7, 20, 1));
+    let e = w.engine();
+    let (ev, why) = w.why(&e);
+    let predicted = why.twin.as_ref().unwrap().key.as_ref().unwrap().rows;
+    let pair = |b: &str, a: &str| QueryPair {
+        before: b.into(),
+        after: a.into(),
+    };
+    let shape = engine_rewrite(
+        vec![
+            pair("SELECT before", "SELECT after"),
+            pair("SELECT b2", "SELECT a2"),
+            pair("SELECT before", "SELECT after"),
+        ],
+        Vec::new(),
+        None,
+    );
+    let ProposeResult::Written { proposal } = e
+        .propose(ProposalBody::Rewrite { shape }, &[ev], "agent")
+        .unwrap()
+    else {
+        panic!()
+    };
+    let r = fix(&e, proposal.hash);
+    let FixOutcome::Attested { receipt, .. } = &r.outcome else {
+        panic!("{:?}", r.outcome)
+    };
+    let Record::Receipt(rc) = &receipt.record else {
+        panic!()
+    };
+    let p = rc.prediction.as_ref().unwrap();
+    assert_eq!(p.predicted_rows, predicted);
+    let read = [(1600, 401), (999, 7), (1600, 401)];
+    assert_eq!(p.pairs.len(), read.len());
+    for (q, (b, a)) in p.pairs.iter().zip(read) {
+        assert_eq!((q.before_read_rows, q.after_read_rows), (b, a));
+        assert_eq!(
+            q.before_ratio.as_deref(),
+            Some(oracle(b, predicted).as_str())
+        );
+        assert_eq!(
+            q.after_ratio.as_deref(),
+            Some(oracle(a, predicted).as_str())
+        );
+    }
+    // The same pair twice keeps its own ratio: nothing is summed.
+    assert_eq!(p.pairs[0], p.pairs[2]);
+    assert_eq!(oracle(5, 2000), "0.002");
+    assert_eq!(oracle(7, 2000), "0.004");
+    assert_eq!(oracle(2, 3), "0.667");
+}
+
+#[test]
+fn the_scratch_folder_is_a_hidden_folder_under_the_lake_with_its_permissions() {
+    let w = World::new();
+    let rows = [(3, 0, 3)];
+    w.query("SELECT before", &rows, stats(10, 100, 1));
+    w.query("SELECT after", &rows, stats(5, 50, 1));
+    let e = w.engine();
+    let (ev, _) = w.why(&e);
+    let p = propose(&e, ev);
+    let fix_in = |scratch: &Path, keep: bool| {
+        let mut o = w.options(keep);
+        o.scratch = Some(scratch.display().to_string());
+        Engine::open(w.root.to_str().unwrap(), o)
+            .unwrap()
+            .fix(&FixRequest {
+                proposal: Some(p),
+                ..FixRequest::default()
+            })
+    };
+    let outside = w.dir.path().join("outside");
+    std::fs::create_dir(&outside).unwrap();
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&outside, w.root.join("_link")).unwrap();
+    for bad in [
+        outside.join("scratch"),
+        w.root.join("exports"),
+        w.root.join(".bellwether").join("x"),
+        w.root.clone(),
+        w.root.join("_link").join("x"),
+    ] {
+        if !cfg!(unix) && bad.starts_with(w.root.join("_link")) {
+            continue;
+        }
+        let err = fix_in(&bad, true).unwrap_err();
+        let Error::InvalidArgument {
+            field: "scratch",
+            reason,
+        } = &err
+        else {
+            panic!("{}: {err}", bad.display())
+        };
+        assert!(reason.contains("_bellwether-scratch"), "{reason}");
+    }
+    assert_eq!(w.state.lock().unwrap().runs.len(), 0);
+    assert!(!w.root.join("exports").exists() && !outside.join("scratch").exists());
+    // A hidden folder under the lake, missing: created, with the run's
+    // folder, at the lake root's permissions; the kept exports never reach
+    // the twin's reads.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&w.root, std::fs::Permissions::from_mode(0o750)).unwrap();
+        let r = fix_in(&w.root.join("_new").join("deeper"), true).unwrap();
+        assert!(
+            matches!(r.outcome, FixOutcome::Attested { .. }),
+            "{:?}",
+            r.outcome
+        );
+        let run = PathBuf::from(r.engine.unwrap().scratch.unwrap());
+        for d in [w.root.join("_new"), w.root.join("_new").join("deeper"), run] {
+            let mode = std::fs::metadata(&d).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o750, "{}", d.display());
+        }
+        let (_, again) = w.why(&e);
+        assert_eq!(again.twin.unwrap().rows_read, 1600);
+    }
+}
+
+#[test]
+fn keep_says_where_the_exports_are_left_when_a_run_stops_partway() {
+    let w = World::new();
+    let rows = [(3, 0, 3)];
+    w.query("SELECT before", &rows, stats(10, 100, 1));
+    w.query("SELECT after", &rows, stats(5, 50, 1));
+    w.state.lock().unwrap().deny_from = 2;
+    let e = Engine::open(w.root.to_str().unwrap(), w.options(true)).unwrap();
+    let (ev, _) = w.why(&e);
+    let p = propose(&e, ev);
+    let r = fix(&e, p);
+    assert!(
+        matches!(
+            r.outcome,
+            FixOutcome::Refused {
+                refusal: Refusal::ExportDenied { .. }
+            }
+        ),
+        "{:?}",
+        r.outcome
+    );
+    let run = r.engine.unwrap();
+    assert!(run.kept);
+    let dir = PathBuf::from(run.scratch.unwrap());
+    assert!(dir
+        .join("p0")
+        .join("before")
+        .join("part-0.parquet")
+        .is_file());
+    // A table change under --keep: the refusal says where the files are.
+    let w = World::new();
+    w.query("SELECT before", &rows, stats(10, 100, 1));
+    w.query("SELECT after", &rows, stats(5, 50, 1));
+    w.state.lock().unwrap().change_after_runs = 2;
+    let e = Engine::open(w.root.to_str().unwrap(), w.options(true)).unwrap();
+    let (ev, _) = w.why(&e);
+    let p = propose(&e, ev);
+    let err = e
+        .fix(&FixRequest {
+            proposal: Some(p),
+            ..FixRequest::default()
+        })
+        .unwrap_err();
+    assert!(matches!(err, Error::SourceChanged { .. }), "{err}");
+    assert!(err.to_string().contains("left in"), "{err}");
+}
+
+#[test]
+fn fix_shows_whether_the_twin_was_made_against_the_engine_as_it_is() {
+    let w = World::new();
+    let rows = [(3, 0, 3)];
+    w.query("SELECT before", &rows, stats(10, 100, 1));
+    w.query("SELECT after", &rows, stats(5, 50, 1));
+    let e = w.engine();
+    let (ev, _) = w.why(&e);
+    let p = propose(&e, ev);
+    // The engine takes an insert after the diagnosis.
+    w.state.lock().unwrap().units.push(("p5".into(), 3));
+    let r = fix(&e, p);
+    assert!(
+        matches!(r.outcome, FixOutcome::Attested { .. }),
+        "{:?}",
+        r.outcome
+    );
+    let run = r.engine.unwrap();
+    assert_ne!(run.identity_at_twin.hash, run.identity_before.hash);
+    assert_eq!(
+        (run.identity_at_twin.rows, run.identity_before.rows),
+        (1600, 1603)
+    );
+}
+
+#[test]
+fn a_literal_secret_in_an_engine_root_is_never_echoed() {
+    let w = World::new();
+    for root in [
+        "clickhouse://u:hunter2@h/db",
+        "clickhouse://h/db?password=hunter2",
+    ] {
+        let err = Engine::open(root, EngineOptions::default())
+            .unwrap_err()
+            .to_string();
+        assert!(!err.contains("hunter2"), "{err}");
+        assert!(err.contains("clickhouse://h/db"), "{err}");
+        let err = Engine::open(
+            w.root.to_str().unwrap(),
+            EngineOptions {
+                twin_of: Some(root.into()),
+                ..EngineOptions::default()
+            },
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(!err.contains("hunter2"), "{err}");
+    }
 }

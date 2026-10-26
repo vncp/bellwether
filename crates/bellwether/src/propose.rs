@@ -328,9 +328,9 @@ impl Engine {
     }
 
     /// A rewrite of engine queries (ADR 033) cites the twin diagnosis it
-    /// rests on; its key columns default to the key sample's, and its key
-    /// sample to the twin's recorded workload. A key sample given must be
-    /// the twin's.
+    /// rests on, and that diagnosis must have run on a key sample; its key
+    /// columns default to the sample's, and its key sample to the twin's
+    /// recorded workload. A key sample given must be the twin's.
     fn complete_engine_rewrite<S>(
         &self,
         ledger: &bellwether_ledger::Ledger<S>,
@@ -356,19 +356,10 @@ impl Engine {
                     .into(),
             });
         };
-        match (shape.keys, twin.workload) {
-            (Some(k), Some(w)) if k != w => {
-                return Err(Error::InvalidArgument {
-                    field: "keys",
-                    reason: format!(
-                        "the key sample {k} is not the one the cited twin diagnosis ran on ({w}); \
-                         cite the evidence of a diagnosis on this sample"
-                    ),
-                })
-            }
-            (None, w) => shape.keys = w,
-            _ => {}
+        if shape.keys.is_none() {
+            shape.keys = twin.workload;
         }
+        crate::engine_fix::key_sample(shape, &twin)?;
         if shape.key.is_empty() {
             // Read from an existing index only: a dry run creates nothing.
             if let (Some(w), Some(store)) = (twin.workload, self.existing_store()?) {
