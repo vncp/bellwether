@@ -555,6 +555,27 @@ fn a_bitemporal_key_goes_from_why_to_receipt_to_asof_on_both_sides() {
     );
     let ev = h(&why, "/evidence/hash");
     let workload = h(&why, "/workload/hash");
+    // The human output words the bitemporal candidate as the bitemporal
+    // as-of floor, not a locate's (fix's verify wording is checked below).
+    let human = |args: &[&str]| run(&[&["--clock", CLOCK][..], args].concat(), 0);
+    let why = human(&[
+        "why",
+        d,
+        "--from",
+        k,
+        "--valid-by",
+        "valid",
+        "--known-by",
+        "known",
+        "--valid",
+        valid,
+        "--known",
+        known,
+    ]);
+    assert!(
+        why.contains("floor (bitemporal as-of)") && !why.contains("floor (locate)"),
+        "{why}"
+    );
 
     let proposed = both(
         &srv,
@@ -672,6 +693,53 @@ fn a_bitemporal_key_goes_from_why_to_receipt_to_asof_on_both_sides() {
         verified["score"]["proposed"]["bytes"], asof["planned"]["bytes"],
         "{verified}"
     );
+    // fix's verify compares each key's as-of version, not a lookback.
+    let human = |args: &[&str]| run(&[&["--clock", CLOCK][..], args].concat(), 0);
+    let fix = human(&[
+        "fix",
+        d,
+        "--proposal",
+        &proposal,
+        "--workload",
+        &workload,
+        "--verify-only",
+    ]);
+    assert!(
+        fix.contains("each key's as-of version") && !fix.contains("lookback"),
+        "{fix}"
+    );
+}
+
+/// A bitemporal run on a folder with no index is priced over an index of
+/// its bitemporal key: `why` refuses naming the command and the exact key
+/// to declare, with no placeholder left unfilled.
+#[test]
+fn a_bitemporal_why_without_an_index_names_the_key_to_declare() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    bitemporal_lake(&data);
+    let kf = dir.path().join("k.parquet");
+    keys(&kf, "id", &[3]);
+    let out = common::bw()
+        .args([
+            "why",
+            path(&data),
+            "--from",
+            path(&kf),
+            "--valid-by",
+            "valid",
+            "--known-by",
+            "known",
+        ])
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_ne!(out.status.code(), Some(0), "{err}");
+    assert!(
+        err.contains("bellwether index") && err.contains("--key temporal2:id@valid,known"),
+        "{err}"
+    );
+    assert!(!err.contains('<') && !err.contains('>'), "{err}");
 }
 
 /// `cols` Int64 columns `c0..` over `rows` rows in two row groups (value

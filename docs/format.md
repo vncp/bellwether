@@ -719,6 +719,8 @@ A block holds at most 1024 keys or 64 KiB of key bytes. Readers refuse a newer s
 
 ### Sidecar proposal vectors
 
+**Recorded lookback runs (a limit of record version 3).** A workload run's `lookback` is a length in the unit of the column it was measured on, and the run does not record that column: replay takes it to be the column the current configuration plans the run on (`Replayer::planned_time_column`), and converts the window outward (the lower bound rounded down, the upper bound up) to a candidate's column when the candidate plans on another, in replay and in `fix`'s verify alike. A run whose current configuration plans it on no time column is measured on the candidate's column. Recording the column is a new field, so it waits for record version 4.
+
 Record version 3 proposes the specs storage version 2 declares since M5 (ADR 028): a key whose exact spec carries per-key `bounds`, a bitemporal key, and a key with specs applied beside it (`ProposalBody::Key.sidecars`). Their records were final from the first storage version 2 release, before M5 made them declarable. `bellwether-types`' `sidecar_proposal_vectors_match_docs_format_md` writes these three proposals, checks that this block lists exactly their canonical JSON, one record per line, and reads each line back to the same record:
 
 ```json
