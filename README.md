@@ -125,8 +125,9 @@ bellwether report ./orders/ --html out/
 # Serve the same engine to a coding agent over MCP (stdio), bound to one folder
 bellwether mcp ./orders/
 
-# Arriving later: evolve (M6)
-bellwether evolve ./pipeline/ --workload runs/ --budget 50g
+# Arriving later (M6, staged): advise first, with no language model; evolve only if advise leaves rewrites it cannot reach
+bellwether advise ./pipeline/ --workload runs/
+bellwether evolve ./pipeline/ --workload runs/ --llm --budget 50g
 ```
 
 Every command takes `--json` and then prints its typed result as one JSON line, with each ledger record it wrote embedded with its hash: the same value the MCP server returns (ADR 010). Exit codes: 0 success, 1 a certificate failed or mismatches were found, 2 usage, 3 refused at the trust boundary, 4 engine error.

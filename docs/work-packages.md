@@ -18,7 +18,8 @@ One crate, one owner, one interface contract each. WP0 ships first and alone. Af
 | Dependency upgrade | merged: arrow/parquet 59, object_store 0.14, DataFusion 55 (bench feature); `deny.toml` has no advisory ignores |
 | WP12 mcp | merged: observe, score, propose, apply, and jobs tools; resources; the prompt generated from `AGENTS.md`; typed refusals, dry runs, per-session budgets; ADR 010 against the CLI |
 | WP20 sql | next |
-| WP13 evolve | after M3 |
+| WP13a advise | after M3; no language model (ADR 032) |
+| WP13b evolve, WP13c rulebook v2 | each opens only when its measured trigger in `docs/evolve.md` §3 is met |
 | WP14 counted segments and column bytes, WP15 relational replay, WP16 engine adapters, WP17 CI receipts, WP18 transfer evaluation, WP19 signed receipts | planned 2026-10-24 (ADR 026) |
 | WP20 SQL sources | planned 2026-10-24 (ADR 027); runs right after WP12 |
 | WP21 time-series keys | merged: partition values from Hive-style paths, ordered plans, `--at-manifest` pinned lookups over a manifest history, per-key time bounds (`bounds` sidecar), bitemporal as-of (`temporal2` sidecar), the `market` bench corpus with measured funnels |
@@ -57,9 +58,17 @@ One crate, one owner, one interface contract each. WP0 ships first and alone. Af
 
 ## Row 4 · after M3
 
-| WP | Crate | Deliverables | Owns |
-|---|---|---|---|
-| WP13 | `bellwether-evolve` | Per `docs/evolve.md`: `Scorer` and `Verifier` traits (replay and reconcile first); plan DAG model with named rewrite identities; counterfactual attribution and interaction matrix (ADR 024); three proposers: LLM textual-gradient behind a trait with every prompt and completion as ledger records, exact finite-difference descent for knobs, rule-driven enumeration (ADR 022); set-valued physical design with subsumption and maintenance cost; pipeline DAG with lineage and output-level certificates (ADR 023); Pareto selection over runs × objectives with crowding distance; budgets and seed pinning so a search replays from its ledger; rulebook distillation validated on held-out runs (ADR 025); `bellwether evolve` and `bellwether report` (HTML charts plus `--paper` CSV export matching `paper/data/README.md`) with funnel, latency, realized-vs-predicted, convergence, frontier evolution, loss-landscape surface and contour with descent path, attribution and interaction heatmaps, and transfer charts; SLOs from `docs/evolve.md` §12 asserted in bench | ADR 021–025; threat model |
+WP13 is three packages in `bellwether-evolve`, owning ADR 021–025, 031, 032 and the threat model extension in `docs/evolve.md` §9. Each has a done-when the ledger can prove and a trigger that opens the next (ADR 032; the triggers, the kill criterion, and the stage-2 budget are in `docs/evolve.md` §3).
+
+| WP | Scope | Done when | Opens the next WP when |
+| --- | --- | --- | --- |
+| 13a · `advise` | `Layout` and `Cadence` artifacts in the contract; rule-driven enumeration; exact knob descent; materialization-set search; Pareto over runs × objectives with anchors and δ; lineage-edge attribution; bisect-on-failed-certificate; `bellwether advise` CLI and MCP tier `score.advise`; receipts for every admitted change | On the synthetic ledger, every planted anti-pattern reachable by enumeration or descent is recovered blind; on one real workload, `advise` produces a frontier with receipts and the realized-vs-predicted figure lies on the diagonal | Planted or real anti-patterns remain that need a structural rewrite (operator reorder, cross-step push, fusion) |
+| 13b · `evolve` | ADR 031 proposers behind `--llm`; generalization lint; deterministic composer from the interaction matrix; cheap-proposer default with strong composer on non-additive bundles; `Experience` records and reflection; proposer prompts, completions and model ids in the ledger; replay-from-ledger byte-for-byte | Stage 2 recovers the anti-patterns 13a could not, and cost per accepted mutation (replays + model calls) is under the budget written in §3 | A winning mutation recurs across two or more templates |
+| 13c · rulebook v2 | Templates with predicates and re-fit parameters; temporal holdout; `helpful`/`harmful` counters; bucket caps with merge; staleness re-earn; `bellwether rules {ls, audit, retire}` | One rule learned on the search templates reproduces a gain on a temporally held-out template under replay, and the transfer figure is rendered from ledger records | — |
+
+**Order inside 13a.** Contract additions first (`Layout`, `Cadence`, `Attribution` over edges, `Anchor`), then enumeration and descent, then Pareto with anchors, then receipts and the CLI. Attribution over edges comes before any proposer so the proposers in 13b start with the right evidence.
+
+**Carried into 13a from the single WP13**, because every stage stands on them: the `Scorer` and `Verifier` traits (replay and reconcile first; `docs/evolve.md` §15); the plan DAG model with named rewrite identities; the pipeline DAG with lineage and output-level certificates (ADR 023); counterfactual attribution and the interaction matrix over plan nodes (ADR 024), which edge attribution extends; set-valued physical design with subsumption and maintenance cost; the crowding-distance tie-break; budgets and seed pinning so a search replays from its ledger; the SLOs from `docs/evolve.md` §12 asserted in bench. `bellwether report` renders each figure in `docs/evolve.md` §11 (HTML charts, and the `--paper` CSV export matching `paper/data/README.md`) when its records exist; no figure is a delivery gate.
 
 ## Row 5 · after M4, before the format freeze
 
@@ -82,7 +91,7 @@ One crate, one owner, one interface contract each. WP0 ships first and alone. Af
 3. **M3** receipts exist: WP6, WP7, WP8. `fix` produces a Receipt.
 4. **M4** agent-first: WP12. The loop runs end to end from a coding agent.
 5. **M5** format frozen after WP14, so the frozen version carries counts and per-column bytes; fixture committed.
-6. **M6** `evolve`: reflective workload optimization over the synthetic ledger, with the rulebook as output and a replayable run in the ledger; WP15 makes the loss cover the operator table.
+6. **M6** staged (ADR 032): `advise` (WP13a) produces a frontier with receipts on the synthetic ledger and one real workload, with no language model; `evolve` (WP13b) ships only if `advise` leaves anti-patterns that need a structural rewrite, and recovers them under the budget in `docs/evolve.md` §3; rulebook v2 (WP13c) ships once a rule reproduces its gain on a temporally held-out template. Each stage is a replayable run in the ledger; WP15 makes the loss cover the operator table.
 7. **M7** a SQL table reconciles against a folder of files with a certificate (WP20); plans execute inside an engine (WP16); receipts gate pull requests (WP17).
 8. **M8** rules transfer across datasets and the exact-versus-estimated ablation is measured (WP18); receipts are signed (WP19).
 
