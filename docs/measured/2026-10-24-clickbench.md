@@ -1,17 +1,17 @@
 # Measured: a ClickBench slice, end to end with no index
 
-Measured by WP9 on 2026-10-24. Machine: Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1, local SSD; **debug build** (rustc 1.99.1). Data: ClickBench `hits_compatible/athena_partitioned/hits_0.parquet` through `hits_9.parquet` (10 files, 28 row groups, 10,000,000 rows), unindexed to start, in a scratch directory (deleted afterwards). Keys: 1,000 distinct `UserID` values sampled with DuckDB (`SELECT UserID FROM (SELECT DISTINCT UserID FROM read_parquet('hits_*.parquet')) USING SAMPLE reservoir(1000 ROWS) REPEATABLE (42)`). The transcript below is verbatim, from a script that ran each command in turn and printed its exit code and wall time.
+Measured by WP9 on 2026-10-24. Machine: Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1, local SSD; **debug build** (rustc 1.99.1). Data: ClickBench `hits_compatible/athena_partitioned/hits_0.parquet` through `hits_9.parquet` (10 files, 28 row groups, 10,000,000 rows), unindexed to start, in a scratch directory (deleted afterwards). Keys: 1,000 distinct `UserID` values sampled with DuckDB (`SELECT UserID FROM (SELECT DISTINCT UserID FROM read_parquet('hits_*.parquet')) USING SAMPLE reservoir(1000 ROWS) REPEATABLE (42)`). The transcript below is verbatim, from a script that ran each command in turn and printed its exit code and wall time, except that the scratch directory it ran in is shown as `<scratch>`.
 
 ```text
 $ bellwether why hits
-why /private/tmp/claude-501/-Users-vncp-repos/336d6fc2-80a6-4514-9809-e589ebb67329/scratchpad/clickbench/hits: not indexed
+why <scratch>/clickbench/hits: not indexed
 funnel: no workload; pass --from <keys.parquet> to replay a run under each candidate key
                                          files   row groups              bytes           
   dataset                                   10           28      1,486,306,919     1.5 GB  10,000,000 rows
 exit 0  (.159047000 s)
 
 $ bellwether why hits --from userid_keys.parquet
-why /private/tmp/claude-501/-Users-vncp-repos/336d6fc2-80a6-4514-9809-e589ebb67329/scratchpad/clickbench/hits: not indexed
+why <scratch>/clickbench/hits: not indexed
 funnel: 1 run(s), keys p50/p95/max 1,000/1,000/1,000; exact sums of row-group statistics, summed over runs
                                          files   row groups              bytes           
   dataset                                   10           28      1,486,306,919     1.5 GB  10,000,000 rows
@@ -27,7 +27,7 @@ records
 exit 0  (16.923555000 s)
 
 $ bellwether index hits --key exact:UserID
-index /private/tmp/claude-501/-Users-vncp-repos/336d6fc2-80a6-4514-9809-e589ebb67329/scratchpad/clickbench/hits: committed manifest sequence 1
+index <scratch>/clickbench/hits: committed manifest sequence 1
   files: 10 new, 0 changed, 0 removed, 0 unchanged; 28 row groups read; 2 segments written, 2 live
 
   key spec                                    complete at
@@ -44,22 +44,22 @@ locate: 1,000 keys on (UserID) at manifest sequence 1
   specs: exact:UserID
 
   file                                                          row groups              bytes
-  ...09-e589ebb67329/scratchpad/clickbench/hits/hits_0.parquet           2        122,401,403
-  ...09-e589ebb67329/scratchpad/clickbench/hits/hits_1.parquet           3        174,899,190
-  ...09-e589ebb67329/scratchpad/clickbench/hits/hits_2.parquet           4        229,279,215
-  ...09-e589ebb67329/scratchpad/clickbench/hits/hits_3.parquet           3        192,438,843
-  ...09-e589ebb67329/scratchpad/clickbench/hits/hits_4.parquet           3        140,863,574
-  ...09-e589ebb67329/scratchpad/clickbench/hits/hits_5.parquet           2        122,241,642
-  ...09-e589ebb67329/scratchpad/clickbench/hits/hits_6.parquet           3        122,862,108
-  ...09-e589ebb67329/scratchpad/clickbench/hits/hits_7.parquet           2        123,858,220
-  ...09-e589ebb67329/scratchpad/clickbench/hits/hits_8.parquet           3        122,669,790
-  ...09-e589ebb67329/scratchpad/clickbench/hits/hits_9.parquet           2        133,584,831
+  <scratch>/clickbench/hits/hits_0.parquet                               2        122,401,403
+  <scratch>/clickbench/hits/hits_1.parquet                               3        174,899,190
+  <scratch>/clickbench/hits/hits_2.parquet                               4        229,279,215
+  <scratch>/clickbench/hits/hits_3.parquet                               3        192,438,843
+  <scratch>/clickbench/hits/hits_4.parquet                               3        140,863,574
+  <scratch>/clickbench/hits/hits_5.parquet                               2        122,241,642
+  <scratch>/clickbench/hits/hits_6.parquet                               3        122,862,108
+  <scratch>/clickbench/hits/hits_7.parquet                               2        123,858,220
+  <scratch>/clickbench/hits/hits_8.parquet                               3        122,669,790
+  <scratch>/clickbench/hits/hits_9.parquet                               2        133,584,831
 
 evidence efbaa46c169c40b46e8765045c33d0ae87da96380ebe67e12c2a84e4f6852b24
 exit 0  (.685103000 s)
 
 $ bellwether why hits --from userid_keys.parquet
-why /private/tmp/claude-501/-Users-vncp-repos/336d6fc2-80a6-4514-9809-e589ebb67329/scratchpad/clickbench/hits: manifest sequence 1, current keys: exact:UserID
+why <scratch>/clickbench/hits: manifest sequence 1, current keys: exact:UserID
 funnel: 1 run(s), keys p50/p95/max 1,000/1,000/1,000; exact sums of row-group statistics, summed over runs
                                          files   row groups              bytes           
   dataset                                   10           28      1,486,306,919     1.5 GB  10,000,000 rows

@@ -69,12 +69,13 @@ class Duck:
         """Run `sql` REPEATS times under the JSON profiler.
 
         Returns bytes read, row groups scanned (and to scan), seconds (median),
-        and the answer's fingerprint: row count and an order-independent hash.
+        and the answer's fingerprint: row count and an order-independent hash
+        (a sum, so two identical rows do not cancel as they would in an xor).
         """
         runs = []
         with tempfile.TemporaryDirectory() as tmp:
             prof = os.path.join(tmp, "profile.json")
-            q = f"SELECT count(*), bit_xor(hash(q)) FROM ({sql}) q"
+            q = f"SELECT count(*), sum(hash(q)::HUGEINT) FROM ({sql}) q"
             for _ in range(repeats):
                 setup = (
                     f"{TZ} SET enable_profiling='json'; SET profiling_output='{prof}';"
@@ -88,7 +89,7 @@ class Duck:
                 if p.returncode != 0:
                     sys.exit(f"duckdb failed ({p.returncode}): {p.stderr.strip()}\n{q}")
                 n, h = p.stdout.strip().splitlines()[-1].split(",")
-                d = json.load(open(prof))
+                d = json.load(open(prof, encoding="utf-8"))
                 runs.append(
                     {
                         "bytes": d["io"]["total_bytes_read"],
@@ -321,6 +322,8 @@ class Showcase:
         self.queries = {}
         self.meta_cache = {}
         self.dataset_cost = {}
+        planted = os.path.join(self.work, "planted.json")
+        self.planted = json.load(open(planted, encoding="utf-8")) if os.path.exists(planted) else {}
 
     # -- results rows ----------------------------------------------------------
     def row(self, dataset, query, side, metric, value, unit, exactness):
@@ -480,7 +483,12 @@ class Showcase:
             mode = ["--latest-by", d["ts"], "--at", q["valid"]]
         why, why_s, _ = self.bw.run(["why", root, *common, "--from", keys, *mode])
         dataset, current = why["dataset"], why["current"]
-        self.dataset_cost[ds] = dataset
+        if ds not in self.dataset_cost:
+            target, _ = self.src(ds)
+            chunks, minmax = self.duck.rows(
+                f"SELECT count(*), count(stats_min_value) FROM parquet_metadata({target})"
+            )[0]
+            self.dataset_cost[ds] = {**dataset, "column_chunks": int(chunks), "column_chunks_with_minmax": int(minmax)}
         self.row(ds, qid, "full-scan", "bytes", dataset["bytes"], "bytes", "exact")
         self.row(ds, qid, "full-scan", "row_groups", dataset["row_groups"], "row groups", "exact")
         self.row(ds, qid, "bellwether-unindexed", "bytes", current["bytes"], "bytes", "exact")
@@ -518,7 +526,7 @@ class Showcase:
             applied = code == 0 and outcome.get("kind") == "applied"
             if applied:
                 self.row(ds, qid, "bellwether", "fix", "applied", "outcome", "exact")
-                self.row(ds, qid, "bellwether", "receipt", outcome["receipt"]["hash"], "blake3", "exact")
+                self.row(ds, qid, "bellwether", "receipt", outcome["receipt"]["hash"], "blake3", "identity")
                 realized = outcome["realized"]["record"]["current"][0]
                 self.row(ds, qid, "bellwether-realized", "bytes", realized["bytes"], "bytes", "exact")
                 self.row(ds, qid, "bellwether-realized", "row_groups", realized["row_groups"], "row groups", "exact")
@@ -547,36 +555,34 @@ class Showcase:
             self.row(ds, qid, "bellwether-plan", "wall_ms", round(look_s * 1000, 1), "ms", "measured")
             plan_sql = self.sql_plan(q, plan, where, qualify)
         all_sql = self.sql_all(q, where, qualify)
-        if not applied:
-            # Refused: no index, so the plan is every row group (DuckDB's own
-            # pruning still applies to the SQL, as it does to any plan).
-            self.row(ds, qid, "bellwether-fixed", "bytes", current["bytes"], "bytes", "exact")
-            self.row(ds, qid, "bellwether-fixed", "row_groups", current["row_groups"], "row groups", "exact")
-            self.row(ds, qid, "bellwether-plan", "wall_ms", 0.0, "ms", "measured")
-            look_s = 0.0
-            plan_sql = all_sql
 
-        # DuckDB alone, then DuckDB on the plan; the answers must agree.
+        # DuckDB alone, then (when `fix` left an index) DuckDB on the plan;
+        # the two answers must agree. A refused fix leaves no index and no
+        # plan, so there is nothing to run on a plan and no row for one.
         alone = self.duck.profile(all_sql, f"{qid} duckdb")
-        if plan_sql is None:  # the plan holds no row group
-            on_plan = {"bytes": 0, "row_groups": 0, "seconds": 0.0, "rows": 0, "hash": alone["hash"] if alone["rows"] == 0 else "none"}
-        else:
-            on_plan = self.duck.profile(plan_sql, f"{qid} plan")
-        if (alone["rows"], alone["hash"]) != (on_plan["rows"], on_plan["hash"]):
-            sys.exit(
-                f"{qid}: DuckDB on Bellwether's plan returned a different answer "
-                f"({on_plan['rows']} rows) than DuckDB on every file ({alone['rows']} rows)"
-            )
-        for side, m in (("duckdb", alone), ("duckdb-on-plan", on_plan)):
+        sides = [("duckdb", alone)]
+        if applied:
+            if plan_sql is None:  # the plan holds no row group
+                on_plan = {"bytes": 0, "row_groups": 0, "seconds": 0.0, "rows": 0, "hash": alone["hash"] if alone["rows"] == 0 else "none"}
+            else:
+                on_plan = self.duck.profile(plan_sql, f"{qid} plan")
+            if (alone["rows"], alone["hash"]) != (on_plan["rows"], on_plan["hash"]):
+                sys.exit(
+                    f"{qid}: DuckDB on Bellwether's plan returned a different answer "
+                    f"({on_plan['rows']} rows) than DuckDB on every file ({alone['rows']} rows)"
+                )
+            sides.append(("duckdb-on-plan", on_plan))
+        for side, m in sides:
             self.row(ds, qid, side, "bytes", m["bytes"], "bytes", "measured")
             self.row(ds, qid, side, "row_groups", m["row_groups"], "row groups", "measured")
             self.row(ds, qid, side, "wall_ms", round(m["seconds"] * 1000, 1), "ms", "measured")
         self.row(ds, qid, "duckdb", "rows_returned", alone["rows"], "rows", "exact")
-        self.row(ds, qid, "duckdb-on-plan", "same_answer", True, "bool", "exact")
-        self.row(
-            ds, qid, "bellwether+duckdb", "wall_ms",
-            round((look_s + on_plan["seconds"]) * 1000, 1), "ms", "measured",
-        )
+        if applied:
+            self.row(ds, qid, "duckdb-on-plan", "same_answer", True, "bool", "exact")
+            self.row(
+                ds, qid, "bellwether+duckdb", "wall_ms",
+                round((look_s + on_plan["seconds"]) * 1000, 1), "ms", "measured",
+            )
         self.queries[qid] = {
             "dataset": ds,
             "text": q["text"],
@@ -589,7 +595,7 @@ class Showcase:
             self.logf,
             f"  rows {alone['rows']}; full {dataset['bytes']}; duckdb {alone['bytes']} ({alone['row_groups']} rg); "
             f"bellwether unindexed {current['bytes']}, fixed {self.last('bytes', qid, 'bellwether-fixed')}, "
-            f"on plan {on_plan['bytes']} ({on_plan['row_groups']} rg)",
+            f"on plan {self.last('bytes', qid, 'duckdb-on-plan')} ({self.last('row_groups', qid, 'duckdb-on-plan')} rg)",
         )
 
     def portable(self, sql):
@@ -619,8 +625,17 @@ class Showcase:
         self.row(ds, rid, "bellwether", "rows_compared", rows, "rows", "exact")
         self.row(ds, rid, "bellwether", "differing_keys", found, "keys", "exact")
         self.row(ds, rid, "bellwether", "passes", o["memory"]["passes"], "passes", "exact")
-        self.row(ds, rid, "bellwether", "certificate", v["certificate"]["hash"], "blake3", "exact")
+        self.row(ds, rid, "bellwether", "certificate", v["certificate"]["hash"], "blake3", "identity")
         self.row(ds, rid, "bellwether", "pass", bool(o["pass"]), "bool", "exact")
+        if planted:
+            # The key the --json output names (the certificate holds counts
+            # only); it must be the one the script planted.
+            want = self.planted[rid]
+            got = [m["key"]["values"] for m in o["mismatches"]]
+            if got != [want]:
+                sys.exit(f"{rid}: reconcile reported differing keys {got}, but the planted key is {want}")
+            self.row(ds, rid, "bellwether", "differing_key", ", ".join(got[0]), "key", "exact")
+            self.row(ds, rid, "bellwether", "found_planted", True, "bool", "exact")
         a = f"read_parquet('{L}/*.parquet')"
         b = f"read_parquet('{R}/*.parquet')"
         diff = (
@@ -680,6 +695,11 @@ def main():
     ap.add_argument("--disk", default="local SSD")
     ap.add_argument("--only", help="comma-separated question or reconcile ids (debugging)")
     ap.add_argument(
+        "--accept-new-inputs",
+        action="store_true",
+        help="measure even though DuckDB's version or a downloaded file differs from what the results file records",
+    )
+    ap.add_argument(
         "--market-hive",
         action="store_true",
         help="read the market corpus with hive partitioning (`day=` directories) on every side; needs an "
@@ -692,8 +712,10 @@ def main():
     dv = subprocess.run([a.duckdb, "-no-agent", "--version"], capture_output=True, text=True).stdout.split()
     a.duckdb_build = f"DuckDB {dv[0]} ({dv[-1]})" if dv else "DuckDB"
     only = set(a.only.split(",")) if a.only else None
+    a.downloads = read_downloads(os.path.join(a.work, "downloads.sha256"))
+    pin(a)
     os.makedirs(os.path.join(a.work, "out"), exist_ok=True)
-    with open(os.path.join(a.work, "out", "showcase.log"), "w") as logf:
+    with open(os.path.join(a.work, "out", "showcase.log"), "w", encoding="utf-8") as logf:
         s = Showcase(a, logf)
         log(logf, f"machine: {a.machine}\nbellwether: {a.build}\nduckdb: {a.duckdb_build}\ndate: {a.date}")
         for q in QUESTIONS:
@@ -718,18 +740,51 @@ RECONCILES = [
 ]
 
 
+def read_downloads(path):
+    """{file: sha256} from the `sha256sum` listing showcase.sh writes."""
+    if not os.path.exists(path):
+        return {}
+    out = {}
+    for line in open(path, encoding="utf-8"):
+        digest, name = line.split(maxsplit=1)
+        out[name.strip().lstrip("*")] = digest
+    return out
+
+
+def pin(a):
+    """Refuse to mix inputs: the DuckDB version decides the GH Parquet layout,
+    the sampled keys, and the taxi rewrite, and the downloads are the data.
+    Both must match what the results file already records."""
+    if a.accept_new_inputs or not os.path.exists(a.out):
+        return
+    old = json.load(open(a.out, encoding="utf-8"))
+    builds = {r["build"] for r in old["rows"] if r["side"].startswith("duckdb")}
+    if builds and builds != {a.duckdb_build}:
+        sys.exit(
+            f"{a.out} was measured with {', '.join(sorted(builds))}, this DuckDB is {a.duckdb_build}: "
+            "install that version, or pass --accept-new-inputs and re-measure everything (no --only)"
+        )
+    recorded = old.get("downloads") or {}
+    changed = sorted(f for f in recorded.keys() & a.downloads.keys() if recorded[f] != a.downloads[f])
+    if changed:
+        sys.exit(
+            f"downloaded files differ from the ones {a.out} was measured on: {', '.join(changed)}; "
+            "pass --accept-new-inputs and re-measure everything (no --only)"
+        )
+
+
 def save(path, s):
     """Write the results file after every question: the ids measured in this
     run replace their old rows; the others are kept, in the canonical order,
     and ids no longer asked are dropped."""
     order = [q["id"] for q in QUESTIONS] + [r[0] for r in RECONCILES]
-    old = json.load(open(path)) if os.path.exists(path) else {"datasets": {}, "queries": {}, "rows": []}
+    old = json.load(open(path, encoding="utf-8")) if os.path.exists(path) else {"datasets": {}, "queries": {}, "rows": []}
     ids = set(s.queries)
     datasets = {}
     for k, v in DATASETS.items():
         prev = old.get("datasets", {}).get(k)
         cost = s.dataset_cost.get(k) or (
-            {f: prev[f] for f in ("files", "row_groups", "rows", "bytes") if f in prev} if isinstance(prev, dict) else {}
+            {f: v for f, v in prev.items() if f not in ("name", "label")} if isinstance(prev, dict) else {}
         )
         datasets[k] = {"name": v["name"], "label": v["label"], **cost}
     merged = {**{k: v for k, v in old["queries"].items() if k not in ids}, **s.queries}
@@ -738,10 +793,11 @@ def save(path, s):
         "source": "showcase",
         "generated_by": "scripts/showcase.sh",
         "datasets": datasets,
+        "downloads": s.a.downloads or old.get("downloads", {}),
         "queries": {k: merged[k] for k in order if k in merged},
         "rows": sorted((r for r in rows if r["query"] in order), key=lambda r: order.index(r["query"])),
     }
-    with open(path, "w") as f:
+    with open(path, "w", encoding="utf-8") as f:
         json.dump(doc, f, indent=1)
         f.write("\n")
     print(f"wrote {path}: {len(doc['rows'])} rows")

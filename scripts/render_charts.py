@@ -9,13 +9,15 @@ and writes, deterministically:
                                                   docs/**/*.md, replaced in place
 
 The `showcase` source (scripts/showcase.sh) gets the bytes, replay, latency,
-and reconcile charts and the README headline. Any other source gets one chart
-per numeric metric (results-<source>-<metric>-*.svg) and a table for the block
+and reconcile charts, the README headline, and the measured page's tables. Any
+other source gets the charts it declares in its `charts` list
+(results-<source>-<name>-*.svg) and a table of every row for the block
 `results:<source>`, wherever that marker appears.
 
   scripts/render_charts.py           write everything
   scripts/render_charts.py --check   exit 1 if any output differs from what the
-                                     committed results would render (CI)
+                                     committed results would render, or a marker
+                                     names a source with no results file (CI)
 
 Standard library only.
 """
@@ -31,7 +33,7 @@ import sys
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 RESULTS = os.path.join(REPO, "docs", "measured", "results")
 ASSETS = os.path.join(REPO, "docs", "assets")
-MEASURED_PAGE = "docs/measured/2026-10-26-showcase.md"
+MEASURED_PAGE = "docs/measured/showcase.md"
 
 THEMES = {
     "light": {
@@ -42,7 +44,6 @@ THEMES = {
         "full": "#8c959f",
         "duckdb": "#0969da",
         "bw": "#1a7f37",
-        "bw2": "#4ac26b",
         "pred": "#8250df",
         "extra": "#bc4c00",
     },
@@ -54,7 +55,6 @@ THEMES = {
         "full": "#6e7681",
         "duckdb": "#58a6ff",
         "bw": "#3fb950",
-        "bw2": "#2ea043",
         "pred": "#a371f7",
         "extra": "#f0883e",
     },
@@ -125,42 +125,54 @@ def ratio(a, b):
 
 # ---- results ------------------------------------------------------------------
 class Results:
-    def __init__(self, doc):
+    def __init__(self, doc, name="results"):
         self.doc = doc
         self.rows = doc.get("rows", [])
         self.queries = doc.get("queries", {})
         self.index = {}
         for r in self.rows:
-            self.index[(r["query"], r["side"], r["metric"])] = r
+            key = (r["dataset"], r["query"], r["side"], r["metric"])
+            if key in self.index:
+                sys.exit(f"{name}: two rows for dataset {key[0]!r}, query {key[1]!r}, side {key[2]!r}, metric {key[3]!r}")
+            self.index[key] = r
 
-    def v(self, q, side, metric):
-        r = self.index.get((q, side, metric))
+    def v(self, q, side, metric, ds=None):
+        ds = ds or self.queries[q]["dataset"]
+        r = self.index.get((ds, q, side, metric))
         return None if r is None else r["value"]
 
     def ids(self, kinds=None):
-        out = []
-        for q, meta in self.queries.items():
-            if kinds is None or meta.get("kind") in kinds:
-                out.append(q)
-        return out
+        return [q for q, meta in self.queries.items() if kinds is None or meta.get("kind") in kinds]
 
-    def provenance(self, qids=None):
-        """The distinct machine, builds, and dates behind the given queries."""
+    def provenance_line(self, qids=None, load=False):
+        """The machine, builds, and dates behind the given queries (and, for
+        timings, the range of load averages recorded while measuring)."""
         rows = [r for r in self.rows if qids is None or r["query"] in qids]
         machines = sorted({r["machine"] for r in rows})
         builds = sorted({r["build"] for r in rows if r["build"] != "footer statistics (no engine)"})
         dates = sorted({r["date"] for r in rows})
-        return machines, builds, dates
+        line = f"{'; '.join(machines)}. {'; '.join(builds)}. Measured {', '.join(dates)}."
+        if load:
+            loads = []
+            for r in rows:
+                m = re.match(r"1-minute load average ([0-9.]+) on (\d+) cores", r.get("notes") or "")
+                if m:
+                    loads.append((float(m.group(1)), m.group(2)))
+            if loads:
+                lo, hi = min(x for x, _ in loads), max(x for x, _ in loads)
+                line += f" 1-minute load average while timing: {lo:.1f} to {hi:.1f} on {loads[0][1]} cores."
+        return line
 
-    def provenance_line(self, qids=None):
-        m, b, d = self.provenance(qids)
-        return f"{'; '.join(m)}. {'; '.join(b)}. Measured {', '.join(d)}."
+    def dataset(self, ds):
+        meta = self.doc.get("datasets", {}).get(ds)
+        return meta if isinstance(meta, dict) else {}
 
     def dataset_name(self, ds):
-        meta = self.doc.get("datasets", {}).get(ds)
-        if isinstance(meta, dict) and meta.get("name"):
-            return meta["name"]
-        return DATASET_NAMES.get(ds, ds)
+        return self.dataset(ds).get("name") or DATASET_NAMES.get(ds, ds)
+
+
+def rg_text(n):
+    return f"{commas(n)} row group{'' if n == 1 else 's'}"
 
 
 # ---- SVG ----------------------------------------------------------------------
@@ -235,17 +247,24 @@ class Scale:
         return [step * i for i in range(5)]
 
 
-def hbar_chart(theme, title, takeaway, subtitle, groups, series, fmt, log=True, tick_fmt=None, width=1100):
+def hbar_chart(theme, title, takeaway, subtitle, groups, series, fmt, log=True, tick_fmt=None):
     """Horizontal grouped bars.
 
     groups: [{"header": str|None, "label": str, "sub": str, "bars": [(value, note)] per series}]
-    series: [(name, color)]
+    series: [(name, color)]. A bar whose value is None prints its note (or
+    "not measured") instead. Groups with no value at all are dropped. The label
+    column is as wide as the longest label.
     """
     t = THEMES[theme]
-    label_right, x0, x1 = 430, 442, width - 220
+    groups = [g for g in groups if any(v is not None for v, _ in g["bars"])]
+    longest = max([len(g["label"]) * 7.0 for g in groups] + [len(g.get("sub") or "") * 6.0 for g in groups] + [200])
+    label_right = 24 + longest
+    x0 = label_right + 12
+    width = int(max(1100, x0 + 520 + 230))
+    x1 = width - 230
     bar_h, gap, group_gap, header_h = 11, 3, 16, 26
-    take = wrap(takeaway, 138)
-    subs = wrap(subtitle, 176)
+    take = wrap(takeaway, int((width - 48) / 7.6))
+    subs = wrap(subtitle, int((width - 48) / 6.0))
     y = 34
     legend_y = 34 + 24 + 22 * len(take) + 16 * len(subs) + 8
     head_h = legend_y + 26
@@ -284,7 +303,7 @@ def hbar_chart(theme, title, takeaway, subtitle, groups, series, fmt, log=True, 
                 s.rect(x0, by, xe - x0, bar_h, color, rx=2)
                 s.rich(xe + 6, by + bar_h - 1, fmt(value), f"  {note}" if note else "", size=11)
             else:
-                s.text(x0 + 6, by + bar_h - 1, "not measured", size=11, color="muted")
+                s.text(x0 + 6, by + bar_h - 1, note or "not measured", size=11, color="muted")
             by += bar_h + gap
         y += group_h
     bottom = y
@@ -296,31 +315,19 @@ def hbar_chart(theme, title, takeaway, subtitle, groups, series, fmt, log=True, 
     return s.render()
 
 
-# ---- the showcase charts ----------------------------------------------------------------
-def showcase_groups(res, qids, bars_fn, by_dataset=True):
-    """One group per question: under dataset headings in the given order, or
-    (by_dataset=False) with the dataset named on the question's second line."""
-    groups, last_ds = [], None
-    for q in qids:
-        meta = res.queries[q]
-        ds = meta["dataset"]
-        sub = bars_fn.sub(q) if hasattr(bars_fn, "sub") else ""
-        if not by_dataset:
-            sub = f"{res.dataset_name(ds)} · {sub}" if sub else res.dataset_name(ds)
-        groups.append(
-            {
-                "header": res.dataset_name(ds) if by_dataset and ds != last_ds else None,
-                "label": meta["text"],
-                "sub": sub,
-                "bars": bars_fn(q),
-            }
-        )
-        last_ds = ds
-    return groups
-
-
+# ---- the showcase: which questions are which ------------------------------------
 def lookups(res):
     return [q for q in res.ids() if res.queries[q].get("kind") != "reconcile"]
+
+
+def outcome(res, q):
+    return res.v(q, "bellwether", "fix") or ""
+
+
+def planned(res, q):
+    """`fix` (or, for the bitemporal key, `index`) left an index, so there is a
+    plan and DuckDB ran on it."""
+    return res.v(q, "duckdb-on-plan", "bytes") is not None
 
 
 def reduction(res, q):
@@ -329,9 +336,9 @@ def reduction(res, q):
 
 
 def wins(res):
-    """Questions where the plan read at least 5% fewer bytes than DuckDB alone,
-    biggest reduction first."""
-    return sorted((q for q in lookups(res) if reduction(res, q) >= 1.05), key=lambda q: -reduction(res, q))
+    """Questions with a plan that read at least 5% fewer bytes than DuckDB
+    alone, biggest reduction first."""
+    return sorted((q for q in lookups(res) if planned(res, q) and reduction(res, q) >= 1.05), key=lambda q: -reduction(res, q))
 
 
 def no_gain(res):
@@ -344,39 +351,10 @@ def by_impact(res):
     return wins(res) + no_gain(res)
 
 
-def bytes_chart(res, theme):
-    qids = wins(res)
-
-    def bars(q):
-        rg = lambda side: res.v(q, side, "row_groups")
-        return [
-            (res.v(q, "full-scan", "bytes"), f"{rg('full-scan')} row groups"),
-            (res.v(q, "duckdb", "bytes"), f"{rg('duckdb')} row groups"),
-            (res.v(q, "duckdb-on-plan", "bytes"), f"{rg('duckdb-on-plan')} row groups · {ratio(res.v(q, 'duckdb', 'bytes'), res.v(q, 'duckdb-on-plan', 'bytes'))} fewer"),
-        ]
-
-    bars.sub = lambda q: f"{returned(res, q)} returned"
-    best = qids[0]
-    m = res.queries[best]
-    take = (
-        f"For {m['text']} ({res.dataset_name(m['dataset'])}, {returned(res, best)}), DuckDB read "
-        f"{human_bytes(res.v(best, 'duckdb-on-plan', 'bytes'))} following Bellwether's plan instead of "
-        f"{human_bytes(res.v(best, 'duckdb', 'bytes'))} on its own; the plan read less on {len(qids)} of "
-        f"{len(lookups(res))} questions, shown here biggest reduction first."
-    )
-    sub = (
-        "Bytes and row groups read per question. Full scan: footer sums. DuckDB alone and on the plan: DuckDB's profiler, "
-        "the same SQL, the plan's row groups selected by row number. " + res.provenance_line(qids)
-    )
-    return hbar_chart(
-        theme,
-        "Bytes read to answer each question",
-        take,
-        sub,
-        showcase_groups(res, qids, bars, by_dataset=False),
-        [("full scan", "full"), ("DuckDB alone", "duckdb"), ("DuckDB on Bellwether's plan", "bw")],
-        human_bytes,
-    )
+def receipted(res):
+    """Questions whose key `fix` verified, applied, and attested, biggest
+    reduction first."""
+    return [q for q in by_impact(res) if outcome(res, q) == "applied"]
 
 
 def returned(res, q):
@@ -387,87 +365,152 @@ def returned(res, q):
     return f"{commas(n)} {noun}"
 
 
-def same_count(res, qids):
-    n = 0
+def faster(res, q):
+    return res.v(q, "bellwether+duckdb", "wall_ms") < 0.95 * res.v(q, "duckdb", "wall_ms")
+
+
+def groups_for(res, qids, bars):
+    """One group per question, the dataset named on its second line."""
+    out = []
     for q in qids:
-        a, b = res.v(q, "duckdb", "bytes"), res.v(q, "duckdb-on-plan", "bytes")
-        if a and b and a / b < 1.05:
-            n += 1
-    return n
+        meta = res.queries[q]
+        sub = bars.sub(q) if hasattr(bars, "sub") else ""
+        name = res.dataset_name(meta["dataset"])
+        out.append({"header": None, "label": meta["text"], "sub": f"{name} · {sub}" if sub else name, "bars": bars(q)})
+    return out
 
 
-def replay_ids(res):
-    """Questions whose key `fix` applied (a prediction and a realized plan),
-    biggest reduction first."""
-    return [q for q in by_impact(res) if res.v(q, "bellwether", "fix") == "applied"]
+# ---- the showcase charts and their takeaways -------------------------------------
+def bytes_takeaway(res):
+    qids = wins(res)
+    best = qids[0]
+    m = res.queries[best]
+    return (
+        f"For {m['text']} ({res.dataset_name(m['dataset'])}, {returned(res, best)}), DuckDB read "
+        f"{human_bytes(res.v(best, 'duckdb-on-plan', 'bytes'))} following Bellwether's plan instead of "
+        f"{human_bytes(res.v(best, 'duckdb', 'bytes'))} on its own. The plan read at least 5% less on {len(qids)} of "
+        f"{len(lookups(res))} questions; these are those {len(qids)}, biggest reduction first."
+    )
+
+
+def bytes_chart(res, theme):
+    qids = wins(res)
+
+    def bars(q):
+        rg = lambda side: rg_text(res.v(q, side, "row_groups"))
+        return [
+            (res.v(q, "full-scan", "bytes"), rg("full-scan")),
+            (res.v(q, "duckdb", "bytes"), rg("duckdb")),
+            (res.v(q, "duckdb-on-plan", "bytes"), f"{rg('duckdb-on-plan')} · {ratio(res.v(q, 'duckdb', 'bytes'), res.v(q, 'duckdb-on-plan', 'bytes'))} fewer"),
+        ]
+
+    bars.sub = lambda q: f"{returned(res, q)} returned"
+    sub = (
+        "Bytes and row groups read. Full scan: footer sums. DuckDB alone and on the plan: DuckDB's profiler, which also "
+        "counts the footers it reads; the plan's row groups are selected by row number in the same SQL. "
+        + res.provenance_line(qids)
+    )
+    return hbar_chart(
+        theme,
+        f"Bytes read on the {len(qids)} questions where the plan read less",
+        bytes_takeaway(res),
+        sub,
+        groups_for(res, qids, bars),
+        [("full scan", "full"), ("DuckDB alone", "duckdb"), ("DuckDB on Bellwether's plan", "bw")],
+        human_bytes,
+    )
+
+
+def replay_takeaway(res):
+    qids = receipted(res)
+    equal = sum(1 for q in qids if res.v(q, "bellwether-predicted", "bytes") == res.v(q, "bellwether-fixed", "bytes"))
+    return (
+        "Before any index existed, `why` predicted by replay the bytes each key would plan; after `fix` applied it, "
+        f"the plan read exactly the predicted bytes on {equal} of the {len(qids)} questions with a receipt"
+        + (", to the byte." if equal == len(qids) else ".")
+    )
 
 
 def replay_chart(res, theme):
-    qids = replay_ids(res)
+    qids = receipted(res)
 
     def bars(q):
         p, r = res.v(q, "bellwether-predicted", "bytes"), res.v(q, "bellwether-fixed", "bytes")
-        outcome = res.v(q, "bellwether", "fix") or ""
-        receipt = res.v(q, "bellwether", "receipt")
-        note = f"receipt {receipt[:12]}" if receipt else outcome
         return [
-            (p, f"{res.v(q, 'bellwether-predicted', 'row_groups')} row groups"),
-            (r, ("= predicted · " if p == r else "≠ predicted · ") + note),
+            (p, rg_text(res.v(q, "bellwether-predicted", "row_groups"))),
+            (r, ("= predicted · " if p == r else "≠ predicted · ") + f"receipt {res.v(q, 'bellwether', 'receipt')[:12]}"),
         ]
 
     bars.sub = lambda q: f"key {res.v(q, 'bellwether', 'key')}"
-    equal = sum(1 for q in qids if res.v(q, "bellwether-predicted", "bytes") == res.v(q, "bellwether-fixed", "bytes"))
-    take = (
-        f"Before any index existed, replay predicted the bytes each fix would plan; after `fix` applied the key, "
-        f"the plan read exactly the predicted bytes on {equal} of {len(qids)} questions"
-        + (", to the byte." if equal == len(qids) else ".")
+    sub = (
+        "Predicted: `why` (exact replay over footer statistics). Planned: the lookup verb on the index `fix` built "
+        "(exact footer sums). " + res.provenance_line(qids)
     )
-    sub = "Predicted: `why` (exact replay over footer statistics). Planned: the lookup verb on the index `fix` built. " + res.provenance_line(qids)
     return hbar_chart(
         theme,
         "Predicted by replay vs planned after fix",
-        take,
+        replay_takeaway(res),
         sub,
-        showcase_groups(res, qids, bars, by_dataset=False),
+        groups_for(res, qids, bars),
         [("predicted before the index", "pred"), ("planned after fix", "bw")],
         human_bytes,
     )
 
 
 def latency_takeaway(res):
-    qids = lookups(res)
-    faster = [q for q in qids if res.v(q, "bellwether+duckdb", "wall_ms") < res.v(q, "duckdb", "wall_ms")]
-    best = max(qids, key=lambda q: res.v(q, "duckdb", "wall_ms") / res.v(q, "bellwether+duckdb", "wall_ms"))
-    return (
-        f"Planning first and then reading only the planned row groups was faster than DuckDB alone on {len(faster)} of "
-        f"{len(qids)} questions (best: {res.queries[best]['text']}, {human_ms(res.v(best, 'bellwether+duckdb', 'wall_ms'))} "
-        f"instead of {human_ms(res.v(best, 'duckdb', 'wall_ms'))}); on small or already-pruned questions the planning step costs more than it saves."
-    )
+    qids = [q for q in lookups(res) if planned(res, q)]
+    fast = [q for q in qids if faster(res, q)]
+    slow = [q for q in qids if res.v(q, "bellwether+duckdb", "wall_ms") > 1.05 * res.v(q, "duckdb", "wall_ms")]
+    slow_read = [q for q in slow if res.v(q, "duckdb-on-plan", "wall_ms") > 1.05 * res.v(q, "duckdb", "wall_ms")]
+    slow_plan = [q for q in slow if q not in slow_read]
+    parts = [f"Bellwether's plan plus DuckDB on the plan was faster than DuckDB alone on {len(fast)} of the {len(qids)} questions with a plan"]
+    if fast:
+        best = max(fast, key=lambda q: res.v(q, "duckdb", "wall_ms") / res.v(q, "bellwether+duckdb", "wall_ms"))
+        parts[0] += (
+            f" ({res.queries[best]['text']}: {human_ms(res.v(best, 'bellwether+duckdb', 'wall_ms'))} against "
+            f"{human_ms(res.v(best, 'duckdb', 'wall_ms'))})"
+        )
+    parts[0] += "."
+    if slow_plan:
+        plan_ms = [res.v(q, "bellwether-plan", "wall_ms") for q in slow_plan]
+        parts.append(
+            f"On {len(slow_plan)}, DuckDB on the plan took no more than 5% longer than DuckDB alone, and often less, but "
+            f"the plan step (one `bellwether` process, {human_ms(min(plan_ms))} to {human_ms(max(plan_ms))}) cost "
+            "more than that saved."
+        )
+    if slow_read:
+        ex = max(slow_read, key=lambda q: res.v(q, "duckdb-on-plan", "wall_ms") / res.v(q, "duckdb", "wall_ms"))
+        parts.append(
+            f"On {len(slow_read)}, DuckDB read the plan's row-number ranges more slowly than it scans on its own "
+            f"({res.queries[ex]['text']}: {rg_text(res.v(ex, 'duckdb-on-plan', 'row_groups'))} in "
+            f"{human_ms(res.v(ex, 'duckdb-on-plan', 'wall_ms'))} on the plan against "
+            f"{rg_text(res.v(ex, 'duckdb', 'row_groups'))} in {human_ms(res.v(ex, 'duckdb', 'wall_ms'))} alone)."
+        )
+    return " ".join(parts)
 
 
 def latency_chart(res, theme):
     qids = by_impact(res)
 
     def bars(q):
+        if not planned(res, q):
+            return [(res.v(q, "duckdb", "wall_ms"), ""), (None, "no plan: fix refused, so there is nothing to time")]
         plan, onp = res.v(q, "bellwether-plan", "wall_ms"), res.v(q, "duckdb-on-plan", "wall_ms")
         return [
             (res.v(q, "duckdb", "wall_ms"), ""),
-            (res.v(q, "bellwether+duckdb", "wall_ms"),
-             f"plan {human_ms(plan)} + query {human_ms(onp)}" if res.v(q, "bellwether", "fix") != "refused: nothing_to_gain"
-             else "no plan: fix refused, every row group read"),
+            (res.v(q, "bellwether+duckdb", "wall_ms"), f"plan {human_ms(plan)} + query {human_ms(onp)}"),
         ]
 
-    take = latency_takeaway(res)
     sub = (
-        "Median of 3 warm runs. DuckDB: the profiler's query time. Bellwether: the lookup verb's wall time (whole process) "
-        "plus DuckDB's query time on the plan. " + res.provenance_line(qids)
+        "Median of 3 warm runs. DuckDB: the profiler's query time. Bellwether: the lookup verb's wall time (a whole "
+        "process) plus DuckDB's query time on the plan. " + res.provenance_line(qids, load=True)
     )
     return hbar_chart(
         theme,
         "Time to answer each question",
-        take,
+        latency_takeaway(res),
         sub,
-        showcase_groups(res, qids, bars, by_dataset=False),
+        groups_for(res, qids, bars),
         [("DuckDB alone", "duckdb"), ("Bellwether plan + DuckDB on the plan", "bw")],
         human_ms,
     )
@@ -476,17 +519,19 @@ def latency_chart(res, theme):
 def reconcile_takeaway(res):
     qids = res.ids({"reconcile"})
     planted = [q for q in qids if res.queries[q].get("planted")]
-    found = [q for q in planted if res.v(q, "bellwether", "differing_keys") == 1]
+    found = [q for q in planted if res.v(q, "bellwether", "found_planted") is True]
     big = max(qids, key=lambda q: res.v(q, "bellwether", "rows_compared"))
-    bwr, dkr = res.v(big, "bellwether", "rows_per_s"), res.v(big, "duckdb", "rows_per_s")
-    cmp = (
-        f"DuckDB's EXCEPT ALL is {dkr / bwr:.1f}× faster on the same files and writes no certificate"
-        if dkr > bwr
-        else f"{bwr / dkr:.1f}× DuckDB's EXCEPT ALL on the same files"
-    )
+    times = [res.v(q, "duckdb", "rows_per_s") / res.v(q, "bellwether", "rows_per_s") for q in qids]
+    if min(times) > 1:
+        cmp = f"DuckDB's EXCEPT ALL was {min(times):.1f}× to {max(times):.1f}× faster on the same files, and writes no certificate"
+    elif max(times) < 1:
+        cmp = f"it was {1 / max(times):.1f}× to {1 / min(times):.1f}× faster than DuckDB's EXCEPT ALL on the same files"
+    else:
+        cmp = f"DuckDB's EXCEPT ALL took {min(times):.2f}× to {max(times):.2f}× its time on the same files"
     return (
-        f"Bellwether compared {commas(res.v(big, 'bellwether', 'rows_compared'))} rows at {human_rate(bwr)} "
-        f"and named the planted change in {len(found)} of {len(planted)} planted runs; {cmp}."
+        f"Bellwether compared up to {commas(res.v(big, 'bellwether', 'rows_compared'))} rows (both sides) at "
+        f"{human_rate(res.v(big, 'bellwether', 'rows_per_s'))} and reported exactly the planted key in {len(found)} of "
+        f"{len(planted)} planted runs; {cmp}."
     )
 
 
@@ -494,49 +539,66 @@ def reconcile_chart(res, theme):
     qids = res.ids({"reconcile"})
 
     def bars(q):
-        bw_found = res.v(q, "bellwether", "differing_keys")
-        dk_found = res.v(q, "duckdb", "differing_rows")
-        cert = res.v(q, "bellwether", "certificate") or ""
+        k, r = res.v(q, "bellwether", "differing_keys"), res.v(q, "duckdb", "differing_rows")
         return [
             (res.v(q, "bellwether", "rows_per_s"),
-             f"{human_ms(res.v(q, 'bellwether', 'wall_ms'))} · {bw_found} differing key{'s' if bw_found != 1 else ''} · certificate {cert[:12]}"),
+             f"{human_ms(res.v(q, 'bellwether', 'wall_ms'))} · {k} differing key{'s' if k != 1 else ''}"),
             (res.v(q, "duckdb", "rows_per_s"),
-             f"{human_ms(res.v(q, 'duckdb', 'wall_ms'))} · {dk_found} differing row{'s' if dk_found != 1 else ''}"),
+             f"{human_ms(res.v(q, 'duckdb', 'wall_ms'))} · {r} differing row{'s' if r != 1 else ''}"),
         ]
 
     bars.sub = lambda q: f"{commas(res.v(q, 'bellwether', 'rows_compared'))} rows, both sides"
-    take = reconcile_takeaway(res)
     sub = (
-        "Rows of both copies compared per second, one warm run each; Bellwether at its default 256 MiB memory budget. "
-        + res.provenance_line(qids)
+        "Rows of both copies compared per second, one warm run each; Bellwether at its default 256 MiB memory budget, "
+        "including writing its certificate. " + res.provenance_line(qids, load=True)
     )
     return hbar_chart(
         theme,
         "Reconcile: rows checked per second",
-        take,
+        reconcile_takeaway(res),
         sub,
-        showcase_groups(res, qids, bars),
+        groups_for(res, qids, bars),
         [("bellwether reconcile", "bw"), ("DuckDB EXCEPT ALL, both ways", "duckdb")],
         human_rate,
         log=False,
     )
 
 
-CHART_IDS = {
-    "results-bytes": wins,
-    "results-replay": replay_ids,
-    "results-latency": lookups,
-    "results-reconcile": lambda res: res.ids({"reconcile"}),
-}
 SHOWCASE_CHARTS = {
-    "results-bytes": bytes_chart,
-    "results-replay": replay_chart,
-    "results-latency": latency_chart,
-    "results-reconcile": reconcile_chart,
+    # name: (which questions it draws, the chart, its takeaway for alt text)
+    "results-bytes": (wins, bytes_chart, bytes_takeaway),
+    "results-replay": (receipted, replay_chart, replay_takeaway),
+    "results-latency": (by_impact, latency_chart, latency_takeaway),
+    "results-reconcile": (lambda res: res.ids({"reconcile"}), reconcile_chart, reconcile_takeaway),
 }
 
 
 # ---- generic charts and tables for other sources ------------------------------
+# A side keeps its colour in every chart; sides not named here take the
+# remaining colours in order of first appearance.
+SIDE_COLORS = {
+    "full-scan": "full",
+    "duckdb": "duckdb",
+    "duckdb-on-plan": "bw",
+    "bellwether-end-to-end": "bw",
+    "bellwether-plan": "pred",
+}
+PALETTE = ["bw", "pred", "extra", "duckdb", "full"]
+
+
+def side_colors(sides):
+    used = {SIDE_COLORS[sd] for sd in sides if sd in SIDE_COLORS}
+    free = [c for c in PALETTE if c not in used] or PALETTE
+    out, i = [], 0
+    for sd in sides:
+        if sd in SIDE_COLORS:
+            out.append((sd, SIDE_COLORS[sd]))
+        else:
+            out.append((sd, free[i % len(free)]))
+            i += 1
+    return out
+
+
 def generic_outputs(source, res):
     """The charts a source declares in its top-level `charts` list.
 
@@ -570,28 +632,29 @@ def generic_outputs(source, res):
         idx = {(r["dataset"], r["query"], r["side"]): r["value"] for r in rows}
         groups, last = [], None
         for ds, q in keys:
-            text = res.queries.get(q, {}).get("text", q) if isinstance(res.queries.get(q), dict) else q
+            bars = [(idx.get((ds, q, sd)), "") for sd in sides]
+            if all(v is None for v, _ in bars):
+                continue
+            meta = res.queries.get(q)
             groups.append(
                 {
                     "header": res.dataset_name(ds) if ds != last else None,
-                    "label": text,
+                    "label": meta.get("text", q) if isinstance(meta, dict) else q,
                     "sub": "",
-                    "bars": [(idx.get((ds, q, sd)), "") for sd in sides],
+                    "bars": bars,
                 }
             )
             last = ds
-        vals = [v for v in idx.values() if v and v > 0]
+        vals = [b[0] for g in groups for b in g["bars"] if b[0] and b[0] > 0]
         log = spec.get("log", bool(vals) and max(vals) / min(vals) > 30)
         fmt = human_bytes if unit == "bytes" else human_ms if unit == "ms" else human_rate if unit == "rows/s" else (
             lambda v, u=unit: f"{v:,.0f} {u}" if v >= 1000 else f"{v:,.3g} {u}"
         )
-        palette = ["duckdb", "bw", "full", "pred", "extra"]
-        series = [(sd, palette[i % len(palette)]) for i, sd in enumerate(sides)]
-        prov = Results({"rows": rows}).provenance_line()
+        prov = Results({"rows": rows}, source).provenance_line(load=True)
         name = f"results-{source}-{re.sub('[^a-z0-9]+', '-', spec['name'].lower()).strip('-')}"
         for theme in THEMES:
             charts[f"{name}-{theme}.svg"] = hbar_chart(
-                theme, spec["title"], spec["takeaway"], f"{metric} ({unit}). {prov}", groups, series, fmt, log=log
+                theme, spec["title"], spec["takeaway"], f"{metric} ({unit}). {prov}", groups, side_colors(sides), fmt, log=log
             )
     return charts
 
@@ -603,94 +666,124 @@ def generic_table(res):
         v = f"{v:,}" if isinstance(v, int) and not isinstance(v, bool) else str(v)
         lines.append(f"| {r['dataset']} | {r['query']} | {r['side']} | {r['metric']} | {v} | {r['unit']} | {r['exactness']} |")
     lines.append("")
-    lines.append(f"<sub>{Results({'rows': res.rows}).provenance_line()}</sub>")
+    lines.append(f"<sub>{res.provenance_line(load=True)}</sub>")
     return "\n".join(lines)
 
 
 # ---- markdown blocks ------------------------------------------------------------
-def picture(name, alt, width=1000, prefix=""):
+def picture(name, alt, width=1000, base="docs/assets"):
     return (
         '<p align="center">\n  <picture>\n'
-        f'    <source media="(prefers-color-scheme: dark)" srcset="{prefix}docs/assets/{name}-dark.svg">\n'
-        f'    <img alt="{esc(alt)}" src="{prefix}docs/assets/{name}-light.svg" width="{width}">\n'
+        f'    <source media="(prefers-color-scheme: dark)" srcset="{base}/{name}-dark.svg">\n'
+        f'    <img alt="{esc(alt.replace("`", ""))}" src="{base}/{name}-light.svg" width="{width}">\n'
         "  </picture>\n</p>"
     )
 
 
-def headline(res, qids, how="How", bold=True):
+def bytes_cell(res, q, side):
+    return f"{human_bytes(res.v(q, side, 'bytes'))} ({res.v(q, side, 'row_groups')} rg)"
+
+
+def headline(res, qids, how):
     out = [
         f"| Dataset | Question | Rows | DuckDB alone | DuckDB on Bellwether's plan | Fewer bytes | Full scan | {how} |",
         "|---|---|---:|---:|---:|---:|---:|---|",
     ]
     for q in qids:
         m = res.queries[q]
-        full, duck, plan = res.v(q, "full-scan", "bytes"), res.v(q, "duckdb", "bytes"), res.v(q, "duckdb-on-plan", "bytes")
-        frg, drg, prg = res.v(q, "full-scan", "row_groups"), res.v(q, "duckdb", "row_groups"), res.v(q, "duckdb-on-plan", "row_groups")
+        if planned(res, q):
+            plan = bytes_cell(res, q, "duckdb-on-plan")
+            plan = f"**{plan}**" if q in wins(res) else plan
+            fewer = ratio(res.v(q, "duckdb", "bytes"), res.v(q, "duckdb-on-plan", "bytes"))
+        else:
+            plan, fewer = "no plan (`fix` refused)", "–"
         out.append(
             f"| {res.dataset_name(m['dataset'])} | {m['text']} | {commas(res.v(q, 'duckdb', 'rows_returned'))} | "
-            f"{human_bytes(duck)} ({drg} rg) | {'**' if bold else ''}{human_bytes(plan)} ({prg} rg){'**' if bold else ''} | "
-            f"{ratio(duck, plan)} | "
-            f"{human_bytes(full)} ({frg} rg) | {why_text(res, q)} |"
+            f"{bytes_cell(res, q, 'duckdb')} | {plan} | {fewer} | {bytes_cell(res, q, 'full-scan')} | {why_text(res, q)} |"
         )
     return "\n".join(out)
+
+
+def pruning_cause(res, q):
+    """Why DuckDB alone read what it read, from the footers' facts."""
+    full_rg, duck_rg = res.v(q, "full-scan", "row_groups"), res.v(q, "duckdb", "row_groups")
+    meta = res.dataset(res.queries[q]["dataset"])
+    if duck_rg >= full_rg:
+        if meta.get("column_chunks_with_minmax") == 0:
+            return "the files carry no min/max statistics on any column, so DuckDB reads every row group"
+        return "DuckDB's min/max statistics skip no row group for these keys"
+    return f"DuckDB's min/max statistics skip to {duck_rg} row groups"
 
 
 def why_text(res, q):
     full_rg = res.v(q, "full-scan", "row_groups")
-    duck_rg = res.v(q, "duckdb", "row_groups")
-    plan_rg = res.v(q, "duckdb-on-plan", "row_groups")
     fixed_rg = res.v(q, "bellwether-fixed", "row_groups")
-    outcome = res.v(q, "bellwether", "fix") or ""
+    pred_rg = res.v(q, "bellwether-predicted", "row_groups")
+    out = outcome(res, q)
     key = res.v(q, "bellwether", "key")
-    if outcome.startswith("not run"):
-        return (f"`{key}` plans {fixed_rg} of {full_rg} row groups; built with `index`, no receipt "
-                "(bitemporal keys can be proposed and receipted with storage version 2)")
-    if outcome.startswith("refused"):
-        return f"no key can help: the keys sit in every row group (`fix` refused, {outcome.split(': ', 1)[-1]})"
-    if fixed_rg == full_rg:
-        return "no key can help: the keys sit in every row group"
-    if fixed_rg >= 0.9 * full_rg:
-        return f"no key can help much: the keys sit in {fixed_rg} of {full_rg} row groups"
-    if plan_rg >= duck_rg:
-        return f"DuckDB's min/max statistics already prune as well as `{key}`"
-    if duck_rg == full_rg:
-        return f"DuckDB's statistics prune nothing here; `{key}` plans {fixed_rg} of {full_rg} row groups"
-    return f"DuckDB prunes to {duck_rg}; `{key}` plans {fixed_rg} of {full_rg} row groups"
+    if out.startswith("refused"):
+        return (
+            f"the keys sit in {pred_rg} of {full_rg} row groups, so `why` recommended no key and `fix` refused "
+            f"(`{out.split(': ', 1)[-1]}`)"
+        )
+    if out.startswith("not run"):
+        return (
+            f"{pruning_cause(res, q)}; `{key}` plans {fixed_rg} of {full_rg}. Bitemporal keys cannot be proposed or "
+            "receipted until storage version 2, so this key was built with `index` and has no receipt"
+        )
+    if q in wins(res):
+        return f"{pruning_cause(res, q)}; `{key}` plans {fixed_rg} of {full_rg}"
+    unindexed = res.v(q, "bellwether-unindexed", "bytes")
+    saved = 1 - res.v(q, "bellwether-predicted", "bytes") / unindexed
+    if res.v(q, "duckdb", "row_groups") <= res.v(q, "duckdb-on-plan", "row_groups"):
+        return (
+            f"{pruning_cause(res, q)}, as many as `{key}` plans; `why` compared the key against a full scan "
+            f"({res.v(q, 'bellwether-unindexed', 'row_groups')} row groups), not that min/max baseline, so it recommended "
+            "the key and `fix` attested it"
+        )
+    return (
+        f"the keys sit in {fixed_rg} of {full_rg} row groups; `why` still recommended `{key}`, which saves "
+        f"{saved:.2%} of the bytes, and `fix` attested it"
+    )
 
 
 def reconcile_table(res):
     out = [
-        "| Run | Rows, both sides | `bellwether reconcile` | Found | Certificate | DuckDB `EXCEPT ALL`, both ways | Found |",
-        "|---|---:|---:|---|---|---:|---|",
+        "| Run | Rows, both sides | `bellwether reconcile` | Reported | DuckDB `EXCEPT ALL`, both ways | Reported |",
+        "|---|---:|---:|---|---:|---|",
     ]
     for q in res.ids({"reconcile"}):
         k, r = res.v(q, "bellwether", "differing_keys"), res.v(q, "duckdb", "differing_rows")
+        key = res.v(q, "bellwether", "differing_key")
+        found = f"{k} differing key{'s' if k != 1 else ''}"
+        if key:
+            found += f": `{key}`" + (", the planted one" if res.v(q, "bellwether", "found_planted") else "")
         out.append(
             f"| {res.queries[q]['text']} | {commas(res.v(q, 'bellwether', 'rows_compared'))} | "
-            f"{human_ms(res.v(q, 'bellwether', 'wall_ms'))} | {k} differing key{'s' if k != 1 else ''}"
-            f"{', pass' if res.v(q, 'bellwether', 'pass') else ', fail'} | `{res.v(q, 'bellwether', 'certificate')[:12]}` | "
+            f"{human_ms(res.v(q, 'bellwether', 'wall_ms'))} | {found} | "
             f"{human_ms(res.v(q, 'duckdb', 'wall_ms'))} | {r} differing row{'s' if r != 1 else ''} |"
         )
     out += ["", "A changed row is one differing key to `reconcile` and two rows to `EXCEPT ALL` (the old version from one side, "
-            "the new from the other). DuckDB's time is one query; Bellwether's includes writing a certificate that names the "
-            "differing key."]
+            "the new from the other). `reconcile` writes a certificate holding the counts; the differing keys are in its "
+            "`--json` output, and the script fails unless the reported key is the planted one. DuckDB's time is one query; "
+            "Bellwether's includes writing the certificate."]
     return "\n".join(out)
 
 
 def no_gain_text(res, qids):
-    refused = [q for q in qids if (res.v(q, "bellwether", "fix") or "").startswith("refused")]
-    pruned = [q for q in qids if q not in refused and res.v(q, "duckdb", "row_groups") < res.v(q, "full-scan", "row_groups")]
+    refused = [q for q in qids if outcome(res, q).startswith("refused")]
+    attested = [q for q in qids if outcome(res, q) == "applied"]
     text = (
-        "Bellwether measures this before anything is built: `why` prices every candidate key by exact replay over the "
-        "footers and recommends none when none reads less, and `fix` refuses to attest a key whose replay saves nothing "
-        f"(`nothing_to_gain`), as it did on {len(refused)} of these {len(qids)} questions."
+        f"On {len(refused)} of these {len(qids)} questions Bellwether said so before building anything: `why` priced "
+        "every candidate key by exact replay over the footers, recommended none, and `fix` refused to attest a key that "
+        "saves nothing (`nothing_to_gain`)."
     )
-    if pruned:
+    if attested:
         text += (
-            " Where the data is already sorted by the key, DuckDB's own min/max statistics prune as well as any index, "
-            "and the table says so."
+            f" On the other {len(attested)} it did not: `why` recommended a key and `fix` attested it, though DuckDB on the "
+            "plan read about as much as DuckDB alone. The last column gives each cause."
         )
-    return text + " Otherwise the cause is the layout (the keys sit in nearly every row group), not a missing index."
+    return text
 
 
 def readme_block(res):
@@ -701,49 +794,45 @@ def readme_block(res):
         if res.queries[q]["dataset"] not in datasets:
             datasets.append(res.queries[q]["dataset"])
     synthetic = sum(1 for d in datasets if "synthetic" in res.dataset_name(d).lower())
-    same = all(res.v(q, "duckdb-on-plan", "same_answer") is True for q in qids)
+    same = all(res.v(q, "duckdb-on-plan", "same_answer") is True for q in qids if planned(res, q))
+    exceptions = [q for q in qids if outcome(res, q) != "applied"]
     parts = [
         "<!-- Generated by scripts/render_charts.py from docs/measured/results/showcase.json; do not edit by hand. -->",
         "",
-        f"{len(qids)} questions people ask of {len(datasets)} datasets ({len(datasets) - synthetic} public, {synthetic} synthetic), "
-        "each answered on the same files by DuckDB alone (with its own min/max pruning) and by DuckDB reading only the row "
-        "groups Bellwether planned after `bellwether why` recommended a key and `bellwether fix` verified, applied, and "
-        "attested it (one bitemporal key, built with `index`, is the exception the table names). "
-        "Both answers are fingerprinted and must match"
-        + ("; they did on every question." if same else "; see the measured page for the questions where they did not.")
-        + f" Here are the {len(top)} where the plan read less, biggest reduction first (`rg` is row groups):",
+        f"{len(qids)} questions people ask of {len(datasets)} datasets ({len(datasets) - synthetic} public, {synthetic} synthetic). "
+        "Each is answered on the same files by DuckDB alone (with its own min/max pruning) and by DuckDB reading only "
+        "the row groups Bellwether planned after `bellwether why` recommended a key and `bellwether fix` verified, "
+        f"applied, and attested it; {len(exceptions)} questions are exceptions, each marked in its row. Both DuckDB answers "
+        "are fingerprinted and must match"
+        + ("; they did on every question with a plan." if same else "; see the measured page for those that did not.")
+        + f" These are the {len(top)} where the plan read at least 5% less, biggest reduction first (`rg` is row groups):",
         "",
-        headline(res, top),
+        headline(res, top, "How"),
         "",
-        f"<sub>{res.provenance_line(qids)} Full-scan and plan bytes are exact footer sums; DuckDB bytes are its profiler's "
-        "`total_bytes_read`. Every number is a row of "
+        f"<sub>{res.provenance_line(qids)} Full scan: exact footer sums. Both DuckDB columns, the plan column included, are "
+        "DuckDB's profiler (`total_bytes_read`), which counts the footers it reads too, so DuckDB alone can exceed the "
+        f"full scan. The plan's exact footer sums are on [the measured page]({MEASURED_PAGE}). Every number is a row of "
         "[`docs/measured/results/showcase.json`](docs/measured/results/showcase.json).</sub>",
         "",
-        picture("results-bytes", "Bytes read per question: full scan, DuckDB alone, DuckDB on Bellwether's plan (log scale)", 1000),
+        picture("results-bytes", bytes_takeaway(res)),
         "",
-        picture("results-replay", "Bytes predicted by replay before the index existed, against bytes planned after fix", 1000),
+        picture("results-replay", replay_takeaway(res)),
         "",
     ]
-    recs = res.ids({"reconcile"})
-    if recs:
-        parts += [
-            f"**Reconcile.** {reconcile_takeaway(res)}",
-            "",
-            reconcile_table(res),
-            "",
-        ]
+    if res.ids({"reconcile"}):
+        parts += [f"**Reconcile.** {reconcile_takeaway(res)}", "", reconcile_table(res), ""]
     parts += [
-        f"**Time.** {latency_takeaway(res)} Per-question times, the reconcile throughput chart, receipts, and the SQL: "
+        f"**Time.** {latency_takeaway(res)} Per-question times, the throughput chart, receipts, and the SQL: "
         f"[the measured page]({MEASURED_PAGE}).",
     ]
     if rest:
         parts += [
             "",
-            "### When an index can't help, and how Bellwether tells you",
+            "### When an index can't help",
             "",
             no_gain_text(res, rest),
             "",
-            headline(res, rest, how="Why not", bold=False),
+            headline(res, rest, "Why not"),
         ]
     return "\n".join(parts)
 
@@ -754,59 +843,75 @@ def detail_block(res):
             "| Question | Full scan | DuckDB alone | Bellwether, unindexed | Bellwether, after fix | DuckDB on the plan | Same answer |",
             "|---|---:|---:|---:|---:|---:|---|"]
     for q in qids:
-        cell = lambda side: f"{commas(res.v(q, side, 'bytes'))} ({res.v(q, side, 'row_groups')})"
+        cell = lambda side: (
+            f"{commas(res.v(q, side, 'bytes'))} ({res.v(q, side, 'row_groups')})" if res.v(q, side, "bytes") is not None
+            else "– (no index)" if side == "bellwether-fixed" else "– (no plan)"
+        )
+        same = res.v(q, "duckdb-on-plan", "same_answer")
         rows.append(
             f"| `{q}`: {res.queries[q]['text']} | {cell('full-scan')} | {cell('duckdb')} | {cell('bellwether-unindexed')} | "
             f"{cell('bellwether-fixed')} | {cell('duckdb-on-plan')} | "
-            f"{'yes, ' + returned(res, q) if res.v(q, 'duckdb-on-plan', 'same_answer') else 'NO'} |"
+            f"{'yes, ' + returned(res, q) if same else 'no plan' if same is None else 'NO'} |"
         )
     rows += ["", "Bytes (row groups). Full scan and Bellwether columns are exact footer sums; DuckDB columns are its profiler's "
              "`total_bytes_read` and `total_row_groups_scanned`, which include footer reads.", "",
              "### `why` → `fix`: predicted against realized", "",
-             "| Question | `why` recommended | Key put to `fix` | Predicted | Realized (fix's replay after apply) | Planned (lookup after fix) | `fix` | Receipt |",
+             "| Question | `why` recommended | Key | Predicted | Realized (fix's replay after apply) | Planned (lookup after fix) | `fix` | Receipt |",
              "|---|---|---|---:|---:|---:|---|---|"]
     for q in qids:
         pred = res.v(q, "bellwether-predicted", "bytes")
         real = res.v(q, "bellwether-realized", "bytes")
+        fixed = res.v(q, "bellwether-fixed", "bytes")
         rec = res.v(q, "bellwether", "receipt")
         rows.append(
             f"| `{q}` | `{res.v(q, 'bellwether', 'recommended')}` | `{res.v(q, 'bellwether', 'key')}` | "
             f"{commas(pred) if pred is not None else 'not priced'} | {commas(real) if real is not None else '–'} | "
-            f"{commas(res.v(q, 'bellwether-fixed', 'bytes'))} | {res.v(q, 'bellwether', 'fix')} | "
+            f"{commas(fixed) if fixed is not None else '– (no index)'} | {outcome(res, q)} | "
             f"{'`' + rec + '`' if rec else '–'} |"
         )
-    rows += ["", "### Time", "",
+    rows += ["", "Receipt hashes identify the records this run wrote; a rerun writes new ones (each record carries its "
+             "creation time), so they are marked `identity`, not `exact`.", "",
+             "### Time", "",
              "| Question | DuckDB alone | `why` | `fix` | Lookup plan | DuckDB on the plan | Plan + DuckDB on the plan |",
              "|---|---:|---:|---:|---:|---:|---:|"]
     for q in qids:
-        refused = (res.v(q, "bellwether", "fix") or "").startswith("refused")
-        ms = lambda side: (
-            "– (no index)" if side == "bellwether-plan" and refused
-            else human_ms(res.v(q, side, "wall_ms")) if res.v(q, side, "wall_ms") is not None else "–"
-        )
+        ms = lambda side: human_ms(res.v(q, side, "wall_ms")) if res.v(q, side, "wall_ms") is not None else "–"
         rows.append(
             f"| `{q}` | {ms('duckdb')} | {ms('bellwether-why')} | {ms('bellwether-fix')} | {ms('bellwether-plan')} | "
             f"{ms('duckdb-on-plan')} | {ms('bellwether+duckdb')} |"
         )
-    rows += ["", "Median of 3 warm runs for DuckDB and the lookup; `why` and `fix` once each (they write records).", "",
+    rows += ["", "Median of 3 warm runs for DuckDB and the lookup; `why` and `fix` once each (they write records). "
+             "`–`: not run (no index, or no `fix`). " + res.provenance_line(qids, load=True), "",
              "### Reconcile", "",
-             "| Run | Rows (both sides) | Bellwether | Differing keys | Passes | Pass | Certificate | DuckDB EXCEPT ALL | Differing rows |",
-             "|---|---:|---:|---:|---:|---|---|---:|---:|"]
+             "| Run | Rows (both sides) | Bellwether | Differing keys | Reported key | Passes | Pass | Certificate | DuckDB EXCEPT ALL | Differing rows |",
+             "|---|---:|---:|---:|---|---:|---|---|---:|---:|"]
     for q in res.ids({"reconcile"}):
+        key = res.v(q, "bellwether", "differing_key")
         rows.append(
             f"| `{q}`: {res.queries[q]['text']} | {commas(res.v(q, 'bellwether', 'rows_compared'))} | "
             f"{human_ms(res.v(q, 'bellwether', 'wall_ms'))}, {human_rate(res.v(q, 'bellwether', 'rows_per_s'))} | "
-            f"{res.v(q, 'bellwether', 'differing_keys')} | {res.v(q, 'bellwether', 'passes')} | "
+            f"{res.v(q, 'bellwether', 'differing_keys')} | {'`' + key + '`' if key else '–'} | {res.v(q, 'bellwether', 'passes')} | "
             f"{'yes' if res.v(q, 'bellwether', 'pass') else 'no'} | `{res.v(q, 'bellwether', 'certificate')}` | "
             f"{human_ms(res.v(q, 'duckdb', 'wall_ms'))}, {human_rate(res.v(q, 'duckdb', 'rows_per_s'))} | "
             f"{res.v(q, 'duckdb', 'differing_rows')} |"
         )
+    rows += ["", "### Datasets", "", "| Dataset | Files | Row groups | Rows | Bytes | Column chunks with min/max statistics |",
+             "|---|---:|---:|---:|---:|---:|"]
+    for ds, meta in res.doc.get("datasets", {}).items():
+        if "bytes" in meta:
+            rows.append(
+                f"| {meta['label']} | {commas(meta['files'])} | {commas(meta['row_groups'])} | {commas(meta['rows'])} | "
+                f"{commas(meta['bytes'])} | {commas(meta.get('column_chunks_with_minmax', 0))} of {commas(meta.get('column_chunks', 0))} |"
+            )
     rows += ["", "### The questions as SQL", "", "`<work>` is the script's scratch directory (`$SHOWCASE_DIR/work`).", ""]
     for q in res.ids():
         m = res.queries[q]
         rows.append(f"- `{q}` ({m.get('keys', '')}): `{m['sql']}`")
     rows += ["", f"<sub>{res.provenance_line()}</sub>"]
     return "\n".join(rows)
+
+
+MARKER = re.compile(r"<!-- results:([a-z0-9-]+):begin -->.*?<!-- results:\1:end -->", re.S)
 
 
 def replace_blocks(text, blocks):
@@ -816,61 +921,75 @@ def replace_blocks(text, blocks):
             return m.group(0)
         return f"<!-- results:{name}:begin -->\n{blocks[name]}\n<!-- results:{name}:end -->"
 
-    return re.sub(r"<!-- results:([a-z0-9-]+):begin -->.*?<!-- results:\1:end -->", sub, text, flags=re.S)
+    return MARKER.sub(sub, text)
 
 
 # ---- main -----------------------------------------------------------------------
+def read(path):
+    with open(path, encoding="utf-8") as f:
+        return f.read()
+
+
 def outputs():
+    """Every file the results render, and every marker that names no source."""
     files, blocks = {}, {}
     for path in sorted(glob.glob(os.path.join(RESULTS, "*.json"))):
-        doc = json.load(open(path))
+        doc = json.loads(read(path))
         source = doc.get("source") or os.path.splitext(os.path.basename(path))[0]
-        res = Results(doc)
+        res = Results(doc, os.path.relpath(path, REPO))
         if source == "showcase":
-            for name, fn in SHOWCASE_CHARTS.items():
-                if not CHART_IDS[name](res):
+            for name, (ids, chart, _) in SHOWCASE_CHARTS.items():
+                if not ids(res):
                     continue
                 for theme in THEMES:
-                    files[os.path.join(ASSETS, f"{name}-{theme}.svg")] = fn(res, theme)
+                    files[os.path.join(ASSETS, f"{name}-{theme}.svg")] = chart(res, theme)
             blocks["showcase-headline"] = readme_block(res)
             blocks["showcase-detail"] = detail_block(res)
+            blocks["showcase-charts"] = "\n\n".join(
+                picture(name, take(res), base="../assets") for name, (ids, _, take) in SHOWCASE_CHARTS.items() if ids(res)
+            )
         else:
             for name, svg in generic_outputs(source, res).items():
                 files[os.path.join(ASSETS, name)] = svg
             blocks[source] = generic_table(res)
     docs = [os.path.join(REPO, "README.md")] + sorted(glob.glob(os.path.join(REPO, "docs", "**", "*.md"), recursive=True))
+    unknown = []
     for path in docs:
-        text = open(path).read()
+        text = read(path)
+        unknown += [f"{os.path.relpath(path, REPO)}: results:{m.group(1)}" for m in MARKER.finditer(text) if m.group(1) not in blocks]
         new = replace_blocks(text, blocks)
         if new != text:
             files[path] = new
-    return files
+    return files, unknown
 
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--check", action="store_true", help="exit 1 if any output is stale")
     a = ap.parse_args()
-    files = outputs()
-    stale = [p for p, c in files.items() if not os.path.exists(p) or open(p).read() != c]
-    produced = set(files)
-    orphans = [p for p in glob.glob(os.path.join(ASSETS, "results-*.svg")) if p not in produced]
+    files, unknown = outputs()
+    stale = [p for p, c in files.items() if not os.path.exists(p) or read(p) != c]
+    orphans = [p for p in glob.glob(os.path.join(ASSETS, "results-*.svg")) if p not in files]
+    for u in unknown:
+        print(f"marker with no results file: {u} (add docs/measured/results/<source>.json or remove the marker)")
     if a.check:
         for p in stale:
             print(f"stale: {os.path.relpath(p, REPO)} (run scripts/render_charts.py)")
         for p in orphans:
             print(f"orphan: {os.path.relpath(p, REPO)} (no results file renders it; delete it)")
-        if stale or orphans:
+        if stale or orphans or unknown:
             sys.exit(1)
         print(f"{len(files)} outputs match the committed results")
         return
     for p in stale:
-        with open(p, "w") as f:
+        with open(p, "w", encoding="utf-8") as f:
             f.write(files[p])
         print(f"wrote {os.path.relpath(p, REPO)}")
     for p in orphans:
         os.remove(p)
         print(f"removed {os.path.relpath(p, REPO)}")
+    if unknown:
+        sys.exit(1)
 
 
 if __name__ == "__main__":

@@ -8,7 +8,9 @@
    "files": 6,
    "row_groups": 22,
    "rows": 20332093,
-   "bytes": 341861576
+   "bytes": 341861576,
+   "column_chunks": 418,
+   "column_chunks_with_minmax": 0
   },
   "gh": {
    "name": "GH Archive",
@@ -16,7 +18,9 @@
    "files": 12,
    "row_groups": 24,
    "rows": 1768515,
-   "bytes": 12817897
+   "bytes": 12817897,
+   "column_chunks": 96,
+   "column_chunks_with_minmax": 96
   },
   "clickbench": {
    "name": "ClickBench",
@@ -24,7 +28,9 @@
    "files": 10,
    "row_groups": 28,
    "rows": 10000000,
-   "bytes": 1486306919
+   "bytes": 1486306919,
+   "column_chunks": 2940,
+   "column_chunks_with_minmax": 2940
   },
   "market": {
    "name": "Market (synthetic)",
@@ -32,8 +38,40 @@
    "files": 120,
    "row_groups": 960,
    "rows": 1873726,
-   "bytes": 52309684
+   "bytes": 52309684,
+   "column_chunks": 4800,
+   "column_chunks_with_minmax": 4800
   }
+ },
+ "downloads": {
+  "taxi/yellow_tripdata_2024-01.parquet": "c4d59da7bbc8abaeeeb1727947ee93d9891a71acb42854bd80db1571b2030510",
+  "taxi/yellow_tripdata_2024-02.parquet": "c76c43c18c6c6664080dd920baab4928988d5786a6b65980792ca7cd796f9f20",
+  "taxi/yellow_tripdata_2024-03.parquet": "2d4cdc8fb96726cdd3803b13b02d2e61e71d45720aff0ebc693a8bdd1f249823",
+  "taxi/yellow_tripdata_2024-04.parquet": "ce37f736c7cf9e92164c850ef2b502a8f7bb590fc1804b6edbcb80293da01b89",
+  "taxi/yellow_tripdata_2024-05.parquet": "1974230be2b5a3ea92e47b5eb77f32dbf1de896d81ad8df4ab6faba52749ad23",
+  "taxi/yellow_tripdata_2024-06.parquet": "677cf14c8347f745b583f012fbdba072334c6c4efa17bfd6a64369f2ba30329c",
+  "gh/2024-01-01-0.json.gz": "d68c3e2d4443c01a02e25e23fc7b809e34027b26257bb743adadc4aaac1b9308",
+  "gh/2024-01-01-1.json.gz": "5dfd1b390483a77110820ef623d2a9aff6d09d14604cd0a5e0fd1546b6fcf78c",
+  "gh/2024-01-01-10.json.gz": "cb4473bedee1197002a3b5486ba7227a57d5bf6e4c6ca2ea5bd40e3d590b028d",
+  "gh/2024-01-01-11.json.gz": "7e1118950d0ffd5071f79c71d57149cdca7e5b7978bd64d84577140bf5adc7ca",
+  "gh/2024-01-01-2.json.gz": "aeeb854774c5dd4f6d5a2d885a40ee864881cffe167bc330d6a145fcaec2809f",
+  "gh/2024-01-01-3.json.gz": "3971bea55bed72f1b9103990e06888a264a113c190c47914374883f67f75922d",
+  "gh/2024-01-01-4.json.gz": "5cca17fe02ca3d41ee607b988b02215af243198fe52ced6bf0e12a90715bcc8e",
+  "gh/2024-01-01-5.json.gz": "35fea2b4bb850b1b2a0d5aec429c4ab06bc9fb5c4db64d2afa3fff3781bc9b90",
+  "gh/2024-01-01-6.json.gz": "eed475cba68157d183b8b465299085e16f5a3c9efe2804b96a3d039efa01be7c",
+  "gh/2024-01-01-7.json.gz": "97c8be10de7ce2c19f5c48d7af9be89ed37c3dcce93d2e2be75f4b2cbb24f5a8",
+  "gh/2024-01-01-8.json.gz": "0cf3a7d2e512da62e30e2b10187ddcc1137f5979389e1be2db1c17546a1be0d8",
+  "gh/2024-01-01-9.json.gz": "64fffb90967bf177a03064ad774ca6fd73a9e8039cfec2458e5664dc65254001",
+  "clickbench/hits_0.parquet": "fa134fe101e68324e0de851146fda69624f5cbb707d387141d1c2a88a219a16d",
+  "clickbench/hits_1.parquet": "04f5af123af25d9a6e65584b8fd166fb9b651da11c777ed51379a79bcd52bee3",
+  "clickbench/hits_2.parquet": "089abaab27e608d1c201cdad0ef7b9e1cb8e84e662745d3e3a4372a7780d0ae0",
+  "clickbench/hits_3.parquet": "c28da906c92ee840400c52e29da1d50a9fd622911c8515b9ae30823bc72f2200",
+  "clickbench/hits_4.parquet": "42d8d0190a98a7b63a89461d13eec0d7cded44c34969d65c73bdb3fc3a5fc7ac",
+  "clickbench/hits_5.parquet": "0e00d3cdf0a0f6ccb5cbc78a2b241bf226725eb9a971bf82cda20d1d6e676e2f",
+  "clickbench/hits_6.parquet": "c96da6182478ec20035f14d67f51f4891fb6a3eb6913d5d465053aa2bf266226",
+  "clickbench/hits_7.parquet": "174d3dc0374ec5b369b7346a0096b6dc6a41502d6704212463962af8e9458b46",
+  "clickbench/hits_8.parquet": "0132c8c1be5a7d982fda1a165ab279cec7634ef1bb23131cf727da8278f0ec98",
+  "clickbench/hits_9.parquet": "a22bc7656b744537f259fe018f25bc52c4b06ecebd3ac96268fa2cb63f745f3f"
  },
  "queries": {
   "taxi-zones-week": {
@@ -239,13 +277,13 @@
    "query": "taxi-zones-week",
    "side": "bellwether-why",
    "metric": "wall_ms",
-   "value": 17908.3,
+   "value": 17244.9,
    "unit": "ms",
    "exactness": "measured",
    "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1, local SSD",
    "build": "bellwether release build of eca48d1 (rustc 1.99.1)",
    "date": "2026-10-26",
-   "notes": "1-minute load average 4.1 on 12 cores"
+   "notes": "1-minute load average 8.8 on 12 cores"
   },
   {
    "dataset": "taxi",
@@ -304,13 +342,13 @@
    "query": "taxi-zones-week",
    "side": "bellwether-fix",
    "metric": "wall_ms",
-   "value": 15188.1,
+   "value": 13761.9,
    "unit": "ms",
    "exactness": "measured",
    "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1, local SSD",
    "build": "bellwether release build of eca48d1 (rustc 1.99.1)",
    "date": "2026-10-26",
-   "notes": "1-minute load average 3.6 on 12 cores"
+   "notes": "1-minute load average 8.2 on 12 cores"
   },
   {
    "dataset": "taxi",
@@ -330,9 +368,9 @@
    "query": "taxi-zones-week",
    "side": "bellwether",
    "metric": "receipt",
-   "value": "821ba8ff985d1c52aaf493fa1afb8a3c789ec89afda64725ad7e1f138dd4d52d",
+   "value": "067d0237cad8401d4ca7b519dca148fc499f49dd7d89931407fa5b7b1ec757dc",
    "unit": "blake3",
-   "exactness": "exact",
+   "exactness": "identity",
    "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1, local SSD",
    "build": "bellwether release build of eca48d1 (rustc 1.99.1)",
    "date": "2026-10-26",
@@ -395,13 +433,13 @@
    "query": "taxi-zones-week",
    "side": "bellwether-plan",
    "metric": "wall_ms",
-   "value": 40.9,
+   "value": 40.3,
    "unit": "ms",
    "exactness": "measured",
    "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1, local SSD",
    "build": "bellwether release build of eca48d1 (rustc 1.99.1)",
    "date": "2026-10-26",
-   "notes": "1-minute load average 3.6 on 12 cores"
+   "notes": "1-minute load average 8.2 on 12 cores"
   },
   {
    "dataset": "taxi",
@@ -414,7 +452,7 @@
    "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1, local SSD",
    "build": "DuckDB v2.0.0 (d54cbbe3df)",
    "date": "2026-10-26",
-   "notes": "1-minute load average 3.6 on 12 cores"
+   "notes": "1-minute load average 7.8 on 12 cores"
   },
   {
    "dataset": "taxi",
@@ -427,20 +465,20 @@
    "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1, local SSD",
    "build": "DuckDB v2.0.0 (d54cbbe3df)",
    "date": "2026-10-26",
-   "notes": "1-minute load average 3.6 on 12 cores"
+   "notes": "1-minute load average 7.8 on 12 cores"
   },
   {
    "dataset": "taxi",
    "query": "taxi-zones-week",
    "side": "duckdb",
    "metric": "wall_ms",
-   "value": 93.1,
+   "value": 80.5,
    "unit": "ms",
    "exactness": "measured",
    "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1, local SSD",
    "build": "DuckDB v2.0.0 (d54cbbe3df)",
    "date": "2026-10-26",
-   "notes": "1-minute load average 3.6 on 12 cores"
+   "notes": "1-minute load average 7.8 on 12 cores"
   },
   {
    "dataset": "taxi",
@@ -453,7 +491,7 @@
    "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1, local SSD",
    "build": "DuckDB v2.0.0 (d54cbbe3df)",
    "date": "2026-10-26",
-   "notes": "1-minute load average 3.6 on 12 cores"
+   "notes": "1-minute load average 7.8 on 12 cores"
   },
   {
    "dataset": "taxi",
@@ -466,20 +504,20 @@
    "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1, local SSD",
    "build": "DuckDB v2.0.0 (d54cbbe3df)",
    "date": "2026-10-26",
-   "notes": "1-minute load average 3.6 on 12 cores"
+   "notes": "1-minute load average 7.8 on 12 cores"
   },
   {
    "dataset": "taxi",
    "query": "taxi-zones-week",
    "side": "duckdb-on-plan",
    "metric": "wall_ms",
-   "value": 75.0,
+   "value": 64.3,
    "unit": "ms",
    "exactness": "measured",
    "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1, local SSD",
    "build": "DuckDB v2.0.0 (d54cbbe3df)",
    "date": "2026-10-26",
-   "notes": "1-minute load average 3.6 on 12 cores"
+   "notes": "1-minute load average 7.8 on 12 cores"
   },
   {
    "dataset": "taxi",
@@ -512,13 +550,13 @@
    "query": "taxi-zones-week",
    "side": "bellwether+duckdb",
    "metric": "wall_ms",
-   "value": 115.9,
+   "value": 104.6,
    "unit": "ms",
    "exactness": "measured",
    "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1, local SSD",
    "build": "bellwether release build of eca48d1 (rustc 1.99.1)",
    "date": "2026-10-26",
-   "notes": "1-minute load average 3.6 on 12 cores"
+   "notes": "1-minute load average 7.8 on 12 cores"
   },
   {
    "dataset": "taxi",
@@ -577,13 +615,13 @@
    "query": "taxi-latest-zone",
    "side": "bellwether-why",
    "metric": "wall_ms",
-   "value": 17848.7,
+   "value": 17407.0,
    "unit": "ms",
    "exactness": "measured",
    "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1, local SSD",
    "build": "bellwether release build of eca48d1 (rustc 1.99.1)",
    "date": "2026-10-26",
-   "notes": "1-minute load average 3.3 on 12 cores"
+   "notes": "1-minute load average 7.2 on 12 cores"
   },
   {
    "dataset": "taxi",
@@ -642,13 +680,13 @@
    "query": "taxi-latest-zone",
    "side": "bellwether-fix",
    "metric": "wall_ms",
-   "value": 28402.4,
+   "value": 25757.1,
    "unit": "ms",
    "exactness": "measured",
    "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1, local SSD",
    "build": "bellwether release build of eca48d1 (rustc 1.99.1)",
    "date": "2026-10-26",
-   "notes": "1-minute load average 3.6 on 12 cores"
+   "notes": "1-minute load average 6.1 on 12 cores"
   },
   {
    "dataset": "taxi",
@@ -668,9 +706,9 @@
    "query": "taxi-latest-zone",
    "side": "bellwether",
    "metric": "receipt",
-   "value": "49321d96ad6e046846bfad9123cbe616214a6f464b8a717de1f2aea8b4f3c40f",
+   "value": "d0d83cca613d023c9d61cf4cd40de6f525c4f4e74048bd84beecf5ed01bb061c",
    "unit": "blake3",
-   "exactness": "exact",
+   "exactness": "identity",
    "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1, local SSD",
    "build": "bellwether release build of eca48d1 (rustc 1.99.1)",
    "date": "2026-10-26",
@@ -733,13 +771,13 @@
    "query": "taxi-latest-zone",
    "side": "bellwether-plan",
    "metric": "wall_ms",
-   "value": 186.0,
+   "value": 189.6,
    "unit": "ms",
    "exactness": "measured",
    "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1, local SSD",
    "build": "bellwether release build of eca48d1 (rustc 1.99.1)",
    "date": "2026-10-26",
-   "notes": "1-minute load average 3.6 on 12 cores"
+   "notes": "1-minute load average 6.1 on 12 cores"
   },
   {
    "dataset": "taxi",
@@ -752,7 +790,7 @@
    "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1, local SSD",
    "build": "DuckDB v2.0.0 (d54cbbe3df)",
    "date": "2026-10-26",
-   "notes": "1-minute load average 4.1 on 12 cores"
+   "notes": "1-minute load average 6.9 on 12 cores"
   },
   {
    "dataset": "taxi",
@@ -765,20 +803,20 @@
    "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1, local SSD",
    "build": "DuckDB v2.0.0 (d54cbbe3df)",
    "date": "2026-10-26",
-   "notes": "1-minute load average 4.1 on 12 cores"
+   "notes": "1-minute load average 6.9 on 12 cores"
   },
   {
    "dataset": "taxi",
    "query": "taxi-latest-zone",
    "side": "duckdb",
    "metric": "wall_ms",
-   "value": 1093.8,
+   "value": 1093.1,
    "unit": "ms",
    "exactness": "measured",
    "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1, local SSD",
    "build": "DuckDB v2.0.0 (d54cbbe3df)",
    "date": "2026-10-26",
-   "notes": "1-minute load average 4.1 on 12 cores"
+   "notes": "1-minute load average 6.9 on 12 cores"
   },
   {
    "dataset": "taxi",
@@ -791,7 +829,7 @@
    "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1, local SSD",
    "build": "DuckDB v2.0.0 (d54cbbe3df)",
    "date": "2026-10-26",
-   "notes": "1-minute load average 4.1 on 12 cores"
+   "notes": "1-minute load average 6.9 on 12 cores"
   },
   {
    "dataset": "taxi",
@@ -804,20 +842,20 @@
    "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1, local SSD",
    "build": "DuckDB v2.0.0 (d54cbbe3df)",
    "date": "2026-10-26",
-   "notes": "1-minute load average 4.1 on 12 cores"
+   "notes": "1-minute load average 6.9 on 12 cores"
   },
   {
    "dataset": "taxi",
    "query": "taxi-latest-zone",
    "side": "duckdb-on-plan",
    "metric": "wall_ms",
-   "value": 356.3,
+   "value": 353.9,
    "unit": "ms",
    "exactness": "measured",
    "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1, local SSD",
    "build": "DuckDB v2.0.0 (d54cbbe3df)",
    "date": "2026-10-26",
-   "notes": "1-minute load average 4.1 on 12 cores"
+   "notes": "1-minute load average 6.9 on 12 cores"
   },
   {
    "dataset": "taxi",
@@ -850,13 +888,13 @@
    "query": "taxi-latest-zone",
    "side": "bellwether+duckdb",
    "metric": "wall_ms",
-   "value": 542.4,
+   "value": 543.6,
    "unit": "ms",
    "exactness": "measured",
    "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1, local SSD",
    "build": "bellwether release build of eca48d1 (rustc 1.99.1)",
    "date": "2026-10-26",
-   "notes": "1-minute load average 4.1 on 12 cores"
+   "notes": "1-minute load average 6.9 on 12 cores"
   },
   {
    "dataset": "taxi",
@@ -915,13 +953,13 @@
    "query": "taxi-asof-zone",
    "side": "bellwether-why",
    "metric": "wall_ms",
-   "value": 17929.3,
+   "value": 17455.7,
    "unit": "ms",
    "exactness": "measured",
    "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1, local SSD",
    "build": "bellwether release build of eca48d1 (rustc 1.99.1)",
    "date": "2026-10-26",
-   "notes": "1-minute load average 3.7 on 12 cores"
+   "notes": "1-minute load average 5.8 on 12 cores"
   },
   {
    "dataset": "taxi",
@@ -980,13 +1018,13 @@
    "query": "taxi-asof-zone",
    "side": "bellwether-fix",
    "metric": "wall_ms",
-   "value": 22520.0,
+   "value": 21678.0,
    "unit": "ms",
    "exactness": "measured",
    "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1, local SSD",
    "build": "bellwether release build of eca48d1 (rustc 1.99.1)",
    "date": "2026-10-26",
-   "notes": "1-minute load average 3.8 on 12 cores"
+   "notes": "1-minute load average 4.8 on 12 cores"
   },
   {
    "dataset": "taxi",
@@ -1006,9 +1044,9 @@
    "query": "taxi-asof-zone",
    "side": "bellwether",
    "metric": "receipt",
-   "value": "34c0f4f3e44f73542679a44002f349f42b577d8c3439ef97d05bce1c81c35eb5",
+   "value": "2d787162521b78c7d74d850595432caf12faab952b0d5ebca90f7a3857987695",
    "unit": "blake3",
-   "exactness": "exact",
+   "exactness": "identity",
    "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1, local SSD",
    "build": "bellwether release build of eca48d1 (rustc 1.99.1)",
    "date": "2026-10-26",
@@ -1071,13 +1109,13 @@
    "query": "taxi-asof-zone",
    "side": "bellwether-plan",
    "metric": "wall_ms",
-   "value": 184.0,
+   "value": 183.0,
    "unit": "ms",
    "exactness": "measured",
    "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1, local SSD",
    "build": "bellwether release build of eca48d1 (rustc 1.99.1)",
    "date": "2026-10-26",
-   "notes": "1-minute load average 3.8 on 12 cores"
+   "notes": "1-minute load average 4.8 on 12 cores"
   },
   {
    "dataset": "taxi",
@@ -1090,7 +1128,7 @@
    "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1, local SSD",
    "build": "DuckDB v2.0.0 (d54cbbe3df)",
    "date": "2026-10-26",
-   "notes": "1-minute load average 3.8 on 12 cores"
+   "notes": "1-minute load average 5.9 on 12 cores"
   },
   {
    "dataset": "taxi",
@@ -1103,20 +1141,20 @@
    "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1, local SSD",
    "build": "DuckDB v2.0.0 (d54cbbe3df)",
    "date": "2026-10-26",
-   "notes": "1-minute load average 3.8 on 12 cores"
+   "notes": "1-minute load average 5.9 on 12 cores"
   },
   {
    "dataset": "taxi",
    "query": "taxi-asof-zone",
    "side": "duckdb",
    "metric": "wall_ms",
-   "value": 368.5,
+   "value": 346.1,
    "unit": "ms",
    "exactness": "measured",
    "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1, local SSD",
    "build": "DuckDB v2.0.0 (d54cbbe3df)",
    "date": "2026-10-26",
-   "notes": "1-minute load average 3.8 on 12 cores"
+   "notes": "1-minute load average 5.9 on 12 cores"
   },
   {
    "dataset": "taxi",
@@ -1129,7 +1167,7 @@
    "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1, local SSD",
    "build": "DuckDB v2.0.0 (d54cbbe3df)",
    "date": "2026-10-26",
-   "notes": "1-minute load average 3.8 on 12 cores"
+   "notes": "1-minute load average 5.9 on 12 cores"
   },
   {
    "dataset": "taxi",
@@ -1142,20 +1180,20 @@
    "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1, local SSD",
    "build": "DuckDB v2.0.0 (d54cbbe3df)",
    "date": "2026-10-26",
-   "notes": "1-minute load average 3.8 on 12 cores"
+   "notes": "1-minute load average 5.9 on 12 cores"
   },
   {
    "dataset": "taxi",
    "query": "taxi-asof-zone",
    "side": "duckdb-on-plan",
    "metric": "wall_ms",
-   "value": 338.0,
+   "value": 333.8,
    "unit": "ms",
    "exactness": "measured",
    "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1, local SSD",
    "build": "DuckDB v2.0.0 (d54cbbe3df)",
    "date": "2026-10-26",
-   "notes": "1-minute load average 3.8 on 12 cores"
+   "notes": "1-minute load average 5.9 on 12 cores"
   },
   {
    "dataset": "taxi",
@@ -1188,13 +1226,13 @@
    "query": "taxi-asof-zone",
    "side": "bellwether+duckdb",
    "metric": "wall_ms",
-   "value": 522.0,
+   "value": 516.8,
    "unit": "ms",
    "exactness": "measured",
    "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1, local SSD",
    "build": "bellwether release build of eca48d1 (rustc 1.99.1)",
    "date": "2026-10-26",
-   "notes": "1-minute load average 3.8 on 12 cores"
+   "notes": "1-minute load average 5.9 on 12 cores"
   },
   {
    "dataset": "taxi",
@@ -1253,13 +1291,13 @@
    "query": "taxi-zones-all",
    "side": "bellwether-why",
    "metric": "wall_ms",
-   "value": 11086.4,
+   "value": 11177.6,
    "unit": "ms",
    "exactness": "measured",
    "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1, local SSD",
    "build": "bellwether release build of eca48d1 (rustc 1.99.1)",
    "date": "2026-10-26",
-   "notes": "1-minute load average 4.0 on 12 cores"
+   "notes": "1-minute load average 5.6 on 12 cores"
   },
   {
    "dataset": "taxi",
@@ -1318,13 +1356,13 @@
    "query": "taxi-zones-all",
    "side": "bellwether-fix",
    "metric": "wall_ms",
-   "value": 2231.8,
+   "value": 2234.7,
    "unit": "ms",
    "exactness": "measured",
    "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1, local SSD",
    "build": "bellwether release build of eca48d1 (rustc 1.99.1)",
    "date": "2026-10-26",
-   "notes": "1-minute load average 4.0 on 12 cores"
+   "notes": "1-minute load average 5.6 on 12 cores"
   },
   {
    "dataset": "taxi",
@@ -1342,45 +1380,6 @@
   {
    "dataset": "taxi",
    "query": "taxi-zones-all",
-   "side": "bellwether-fixed",
-   "metric": "bytes",
-   "value": 341861576,
-   "unit": "bytes",
-   "exactness": "exact",
-   "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1, local SSD",
-   "build": "bellwether release build of eca48d1 (rustc 1.99.1)",
-   "date": "2026-10-26",
-   "notes": ""
-  },
-  {
-   "dataset": "taxi",
-   "query": "taxi-zones-all",
-   "side": "bellwether-fixed",
-   "metric": "row_groups",
-   "value": 22,
-   "unit": "row groups",
-   "exactness": "exact",
-   "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1, local SSD",
-   "build": "bellwether release build of eca48d1 (rustc 1.99.1)",
-   "date": "2026-10-26",
-   "notes": ""
-  },
-  {
-   "dataset": "taxi",
-   "query": "taxi-zones-all",
-   "side": "bellwether-plan",
-   "metric": "wall_ms",
-   "value": 0.0,
-   "unit": "ms",
-   "exactness": "measured",
-   "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1, local SSD",
-   "build": "bellwether release build of eca48d1 (rustc 1.99.1)",
-   "date": "2026-10-26",
-   "notes": "1-minute load average 4.0 on 12 cores"
-  },
-  {
-   "dataset": "taxi",
-   "query": "taxi-zones-all",
    "side": "duckdb",
    "metric": "bytes",
    "value": 342282093,
@@ -1389,7 +1388,7 @@
    "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1, local SSD",
    "build": "DuckDB v2.0.0 (d54cbbe3df)",
    "date": "2026-10-26",
-   "notes": "1-minute load average 4.0 on 12 cores"
+   "notes": "1-minute load average 7.2 on 12 cores"
   },
   {
    "dataset": "taxi",
@@ -1402,59 +1401,20 @@
    "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1, local SSD",
    "build": "DuckDB v2.0.0 (d54cbbe3df)",
    "date": "2026-10-26",
-   "notes": "1-minute load average 4.0 on 12 cores"
+   "notes": "1-minute load average 7.2 on 12 cores"
   },
   {
    "dataset": "taxi",
    "query": "taxi-zones-all",
    "side": "duckdb",
    "metric": "wall_ms",
-   "value": 191.0,
+   "value": 186.1,
    "unit": "ms",
    "exactness": "measured",
    "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1, local SSD",
    "build": "DuckDB v2.0.0 (d54cbbe3df)",
    "date": "2026-10-26",
-   "notes": "1-minute load average 4.0 on 12 cores"
-  },
-  {
-   "dataset": "taxi",
-   "query": "taxi-zones-all",
-   "side": "duckdb-on-plan",
-   "metric": "bytes",
-   "value": 342282169,
-   "unit": "bytes",
-   "exactness": "measured",
-   "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1, local SSD",
-   "build": "DuckDB v2.0.0 (d54cbbe3df)",
-   "date": "2026-10-26",
-   "notes": "1-minute load average 4.0 on 12 cores"
-  },
-  {
-   "dataset": "taxi",
-   "query": "taxi-zones-all",
-   "side": "duckdb-on-plan",
-   "metric": "row_groups",
-   "value": 22,
-   "unit": "row groups",
-   "exactness": "measured",
-   "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1, local SSD",
-   "build": "DuckDB v2.0.0 (d54cbbe3df)",
-   "date": "2026-10-26",
-   "notes": "1-minute load average 4.0 on 12 cores"
-  },
-  {
-   "dataset": "taxi",
-   "query": "taxi-zones-all",
-   "side": "duckdb-on-plan",
-   "metric": "wall_ms",
-   "value": 190.9,
-   "unit": "ms",
-   "exactness": "measured",
-   "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1, local SSD",
-   "build": "DuckDB v2.0.0 (d54cbbe3df)",
-   "date": "2026-10-26",
-   "notes": "1-minute load average 4.0 on 12 cores"
+   "notes": "1-minute load average 7.2 on 12 cores"
   },
   {
    "dataset": "taxi",
@@ -1468,32 +1428,6 @@
    "build": "DuckDB v2.0.0 (d54cbbe3df)",
    "date": "2026-10-26",
    "notes": ""
-  },
-  {
-   "dataset": "taxi",
-   "query": "taxi-zones-all",
-   "side": "duckdb-on-plan",
-   "metric": "same_answer",
-   "value": true,
-   "unit": "bool",
-   "exactness": "exact",
-   "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1, local SSD",
-   "build": "DuckDB v2.0.0 (d54cbbe3df)",
-   "date": "2026-10-26",
-   "notes": ""
-  },
-  {
-   "dataset": "taxi",
-   "query": "taxi-zones-all",
-   "side": "bellwether+duckdb",
-   "metric": "wall_ms",
-   "value": 190.9,
-   "unit": "ms",
-   "exactness": "measured",
-   "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1, local SSD",
-   "build": "bellwether release build of eca48d1 (rustc 1.99.1)",
-   "date": "2026-10-26",
-   "notes": "1-minute load average 4.0 on 12 cores"
   },
   {
    "dataset": "gh",
@@ -1552,13 +1486,13 @@
    "query": "gh-repos10",
    "side": "bellwether-why",
    "metric": "wall_ms",
-   "value": 1082.8,
+   "value": 1050.5,
    "unit": "ms",
    "exactness": "measured",
    "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1, local SSD",
    "build": "bellwether release build of eca48d1 (rustc 1.99.1)",
    "date": "2026-10-26",
-   "notes": "1-minute load average 4.0 on 12 cores"
+   "notes": "1-minute load average 7.2 on 12 cores"
   },
   {
    "dataset": "gh",
@@ -1617,13 +1551,13 @@
    "query": "gh-repos10",
    "side": "bellwether-fix",
    "metric": "wall_ms",
-   "value": 1409.3,
+   "value": 1351.4,
    "unit": "ms",
    "exactness": "measured",
    "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1, local SSD",
    "build": "bellwether release build of eca48d1 (rustc 1.99.1)",
    "date": "2026-10-26",
-   "notes": "1-minute load average 3.8 on 12 cores"
+   "notes": "1-minute load average 7.2 on 12 cores"
   },
   {
    "dataset": "gh",
@@ -1643,9 +1577,9 @@
    "query": "gh-repos10",
    "side": "bellwether",
    "metric": "receipt",
-   "value": "94989f1e1d71a9d01ed4d004905c66ede5a22a72ff321686048143b8beed3ec7",
+   "value": "a4c3e61d97e231e1aa9a657e1b7c5927c718167b0661aad9d87b2d4674f11573",
    "unit": "blake3",
-   "exactness": "exact",
+   "exactness": "identity",
    "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1, local SSD",
    "build": "bellwether release build of eca48d1 (rustc 1.99.1)",
    "date": "2026-10-26",
@@ -1708,13 +1642,13 @@
    "query": "gh-repos10",
    "side": "bellwether-plan",
    "metric": "wall_ms",
-   "value": 25.8,
+   "value": 25.9,
    "unit": "ms",
    "exactness": "measured",
    "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1, local SSD",
    "build": "bellwether release build of eca48d1 (rustc 1.99.1)",
    "date": "2026-10-26",
-   "notes": "1-minute load average 3.8 on 12 cores"
+   "notes": "1-minute load average 7.2 on 12 cores"
   },
   {
    "dataset": "gh",
@@ -1727,7 +1661,7 @@
    "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1, local SSD",
    "build": "DuckDB v2.0.0 (d54cbbe3df)",
    "date": "2026-10-26",
-   "notes": "1-minute load average 3.8 on 12 cores"
+   "notes": "1-minute load average 7.2 on 12 cores"
   },
   {
    "dataset": "gh",
@@ -1740,20 +1674,20 @@
    "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1, local SSD",
    "build": "DuckDB v2.0.0 (d54cbbe3df)",
    "date": "2026-10-26",
-   "notes": "1-minute load average 3.8 on 12 cores"
+   "notes": "1-minute load average 7.2 on 12 cores"
   },
   {
    "dataset": "gh",
    "query": "gh-repos10",
    "side": "duckdb",
    "metric": "wall_ms",
-   "value": 7.6,
+   "value": 7.1,
    "unit": "ms",
    "exactness": "measured",
    "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1, local SSD",
    "build": "DuckDB v2.0.0 (d54cbbe3df)",
    "date": "2026-10-26",
-   "notes": "1-minute load average 3.8 on 12 cores"
+   "notes": "1-minute load average 7.2 on 12 cores"
   },
   {
    "dataset": "gh",
@@ -1766,7 +1700,7 @@
    "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1, local SSD",
    "build": "DuckDB v2.0.0 (d54cbbe3df)",
    "date": "2026-10-26",
-   "notes": "1-minute load average 3.8 on 12 cores"
+   "notes": "1-minute load average 7.2 on 12 cores"
   },
   {
    "dataset": "gh",
@@ -1779,20 +1713,20 @@
    "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1, local SSD",
    "build": "DuckDB v2.0.0 (d54cbbe3df)",
    "date": "2026-10-26",
-   "notes": "1-minute load average 3.8 on 12 cores"
+   "notes": "1-minute load average 7.2 on 12 cores"
   },
   {
    "dataset": "gh",
    "query": "gh-repos10",
    "side": "duckdb-on-plan",
    "metric": "wall_ms",
-   "value": 15.0,
+   "value": 6.5,
    "unit": "ms",
    "exactness": "measured",
    "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1, local SSD",
    "build": "DuckDB v2.0.0 (d54cbbe3df)",
    "date": "2026-10-26",
-   "notes": "1-minute load average 3.8 on 12 cores"
+   "notes": "1-minute load average 7.2 on 12 cores"
   },
   {
    "dataset": "gh",
@@ -1825,13 +1759,13 @@
    "query": "gh-repos10",
    "side": "bellwether+duckdb",
    "metric": "wall_ms",
-   "value": 40.7,
+   "value": 32.4,
    "unit": "ms",
    "exactness": "measured",
    "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1, local SSD",
    "build": "bellwether release build of eca48d1 (rustc 1.99.1)",
    "date": "2026-10-26",
-   "notes": "1-minute load average 3.8 on 12 cores"
+   "notes": "1-minute load average 7.2 on 12 cores"
   },
   {
    "dataset": "gh",
@@ -1890,13 +1824,13 @@
    "query": "gh-repos10-window",
    "side": "bellwether-why",
    "metric": "wall_ms",
-   "value": 1849.8,
+   "value": 1783.9,
    "unit": "ms",
    "exactness": "measured",
    "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1, local SSD",
    "build": "bellwether release build of eca48d1 (rustc 1.99.1)",
    "date": "2026-10-26",
-   "notes": "1-minute load average 3.8 on 12 cores"
+   "notes": "1-minute load average 7.2 on 12 cores"
   },
   {
    "dataset": "gh",
@@ -1955,13 +1889,13 @@
    "query": "gh-repos10-window",
    "side": "bellwether-fix",
    "metric": "wall_ms",
-   "value": 1705.2,
+   "value": 1651.8,
    "unit": "ms",
    "exactness": "measured",
    "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1, local SSD",
    "build": "bellwether release build of eca48d1 (rustc 1.99.1)",
    "date": "2026-10-26",
-   "notes": "1-minute load average 3.9 on 12 cores"
+   "notes": "1-minute load average 6.9 on 12 cores"
   },
   {
    "dataset": "gh",
@@ -1981,9 +1915,9 @@
    "query": "gh-repos10-window",
    "side": "bellwether",
    "metric": "receipt",
-   "value": "cdbbcf6206f2dcf4398cb2224b316216f9042b392ae5875b25f32af15dbc692e",
+   "value": "fc6131e70ac98dddacc2094f8249fe2d9fbf3178068c51b724687cc78a00b1fb",
    "unit": "blake3",
-   "exactness": "exact",
+   "exactness": "identity",
    "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1, local SSD",
    "build": "bellwether release build of eca48d1 (rustc 1.99.1)",
    "date": "2026-10-26",
@@ -2046,13 +1980,13 @@
    "query": "gh-repos10-window",
    "side": "bellwether-plan",
    "metric": "wall_ms",
-   "value": 26.7,
+   "value": 26.9,
    "unit": "ms",
    "exactness": "measured",
    "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1, local SSD",
    "build": "bellwether release build of eca48d1 (rustc 1.99.1)",
    "date": "2026-10-26",
-   "notes": "1-minute load average 3.9 on 12 cores"
+   "notes": "1-minute load average 6.9 on 12 cores"
   },
   {
    "dataset": "gh",
@@ -2065,7 +1999,7 @@
    "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1, local SSD",
    "build": "DuckDB v2.0.0 (d54cbbe3df)",
    "date": "2026-10-26",
-   "notes": "1-minute load average 3.9 on 12 cores"
+   "notes": "1-minute load average 6.9 on 12 cores"
   },
   {
    "dataset": "gh",
@@ -2078,20 +2012,20 @@
    "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1, local SSD",
    "build": "DuckDB v2.0.0 (d54cbbe3df)",
    "date": "2026-10-26",
-   "notes": "1-minute load average 3.9 on 12 cores"
+   "notes": "1-minute load average 6.9 on 12 cores"
   },
   {
    "dataset": "gh",
    "query": "gh-repos10-window",
    "side": "duckdb",
    "metric": "wall_ms",
-   "value": 5.8,
+   "value": 5.7,
    "unit": "ms",
    "exactness": "measured",
    "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1, local SSD",
    "build": "DuckDB v2.0.0 (d54cbbe3df)",
    "date": "2026-10-26",
-   "notes": "1-minute load average 3.9 on 12 cores"
+   "notes": "1-minute load average 6.9 on 12 cores"
   },
   {
    "dataset": "gh",
@@ -2104,7 +2038,7 @@
    "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1, local SSD",
    "build": "DuckDB v2.0.0 (d54cbbe3df)",
    "date": "2026-10-26",
-   "notes": "1-minute load average 3.9 on 12 cores"
+   "notes": "1-minute load average 6.9 on 12 cores"
   },
   {
    "dataset": "gh",
@@ -2117,20 +2051,20 @@
    "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1, local SSD",
    "build": "DuckDB v2.0.0 (d54cbbe3df)",
    "date": "2026-10-26",
-   "notes": "1-minute load average 3.9 on 12 cores"
+   "notes": "1-minute load average 6.9 on 12 cores"
   },
   {
    "dataset": "gh",
    "query": "gh-repos10-window",
    "side": "duckdb-on-plan",
    "metric": "wall_ms",
-   "value": 4.7,
+   "value": 4.8,
    "unit": "ms",
    "exactness": "measured",
    "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1, local SSD",
    "build": "DuckDB v2.0.0 (d54cbbe3df)",
    "date": "2026-10-26",
-   "notes": "1-minute load average 3.9 on 12 cores"
+   "notes": "1-minute load average 6.9 on 12 cores"
   },
   {
    "dataset": "gh",
@@ -2163,13 +2097,13 @@
    "query": "gh-repos10-window",
    "side": "bellwether+duckdb",
    "metric": "wall_ms",
-   "value": 31.4,
+   "value": 31.7,
    "unit": "ms",
    "exactness": "measured",
    "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1, local SSD",
    "build": "bellwether release build of eca48d1 (rustc 1.99.1)",
    "date": "2026-10-26",
-   "notes": "1-minute load average 3.9 on 12 cores"
+   "notes": "1-minute load average 6.9 on 12 cores"
   },
   {
    "dataset": "gh",
@@ -2228,13 +2162,13 @@
    "query": "gh-latest10",
    "side": "bellwether-why",
    "metric": "wall_ms",
-   "value": 1836.1,
+   "value": 1794.8,
    "unit": "ms",
    "exactness": "measured",
    "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1, local SSD",
    "build": "bellwether release build of eca48d1 (rustc 1.99.1)",
    "date": "2026-10-26",
-   "notes": "1-minute load average 3.9 on 12 cores"
+   "notes": "1-minute load average 6.9 on 12 cores"
   },
   {
    "dataset": "gh",
@@ -2293,13 +2227,13 @@
    "query": "gh-latest10",
    "side": "bellwether-fix",
    "metric": "wall_ms",
-   "value": 1730.1,
+   "value": 1681.5,
    "unit": "ms",
    "exactness": "measured",
    "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1, local SSD",
    "build": "bellwether release build of eca48d1 (rustc 1.99.1)",
    "date": "2026-10-26",
-   "notes": "1-minute load average 3.9 on 12 cores"
+   "notes": "1-minute load average 6.6 on 12 cores"
   },
   {
    "dataset": "gh",
@@ -2319,9 +2253,9 @@
    "query": "gh-latest10",
    "side": "bellwether",
    "metric": "receipt",
-   "value": "5eac2a5d92dfc135d94b98da05a7a32fc4747164d082702cb8e1037898265266",
+   "value": "9c767a6c2148aeaff3c2585697488776e0552768ac1511e316a8c9ca5ca6eae9",
    "unit": "blake3",
-   "exactness": "exact",
+   "exactness": "identity",
    "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1, local SSD",
    "build": "bellwether release build of eca48d1 (rustc 1.99.1)",
    "date": "2026-10-26",
@@ -2384,13 +2318,13 @@
    "query": "gh-latest10",
    "side": "bellwether-plan",
    "metric": "wall_ms",
-   "value": 23.6,
+   "value": 26.3,
    "unit": "ms",
    "exactness": "measured",
    "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1, local SSD",
    "build": "bellwether release build of eca48d1 (rustc 1.99.1)",
    "date": "2026-10-26",
-   "notes": "1-minute load average 3.9 on 12 cores"
+   "notes": "1-minute load average 6.6 on 12 cores"
   },
   {
    "dataset": "gh",
@@ -2403,7 +2337,7 @@
    "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1, local SSD",
    "build": "DuckDB v2.0.0 (d54cbbe3df)",
    "date": "2026-10-26",
-   "notes": "1-minute load average 3.9 on 12 cores"
+   "notes": "1-minute load average 6.6 on 12 cores"
   },
   {
    "dataset": "gh",
@@ -2416,20 +2350,20 @@
    "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1, local SSD",
    "build": "DuckDB v2.0.0 (d54cbbe3df)",
    "date": "2026-10-26",
-   "notes": "1-minute load average 3.9 on 12 cores"
+   "notes": "1-minute load average 6.6 on 12 cores"
   },
   {
    "dataset": "gh",
    "query": "gh-latest10",
    "side": "duckdb",
    "metric": "wall_ms",
-   "value": 8.5,
+   "value": 8.1,
    "unit": "ms",
    "exactness": "measured",
    "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1, local SSD",
    "build": "DuckDB v2.0.0 (d54cbbe3df)",
    "date": "2026-10-26",
-   "notes": "1-minute load average 3.9 on 12 cores"
+   "notes": "1-minute load average 6.6 on 12 cores"
   },
   {
    "dataset": "gh",
@@ -2442,7 +2376,7 @@
    "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1, local SSD",
    "build": "DuckDB v2.0.0 (d54cbbe3df)",
    "date": "2026-10-26",
-   "notes": "1-minute load average 3.9 on 12 cores"
+   "notes": "1-minute load average 6.6 on 12 cores"
   },
   {
    "dataset": "gh",
@@ -2455,20 +2389,20 @@
    "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1, local SSD",
    "build": "DuckDB v2.0.0 (d54cbbe3df)",
    "date": "2026-10-26",
-   "notes": "1-minute load average 3.9 on 12 cores"
+   "notes": "1-minute load average 6.6 on 12 cores"
   },
   {
    "dataset": "gh",
    "query": "gh-latest10",
    "side": "duckdb-on-plan",
    "metric": "wall_ms",
-   "value": 7.2,
+   "value": 7.4,
    "unit": "ms",
    "exactness": "measured",
    "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1, local SSD",
    "build": "DuckDB v2.0.0 (d54cbbe3df)",
    "date": "2026-10-26",
-   "notes": "1-minute load average 3.9 on 12 cores"
+   "notes": "1-minute load average 6.6 on 12 cores"
   },
   {
    "dataset": "gh",
@@ -2501,13 +2435,13 @@
    "query": "gh-latest10",
    "side": "bellwether+duckdb",
    "metric": "wall_ms",
-   "value": 30.9,
+   "value": 33.7,
    "unit": "ms",
    "exactness": "measured",
    "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1, local SSD",
    "build": "bellwether release build of eca48d1 (rustc 1.99.1)",
    "date": "2026-10-26",
-   "notes": "1-minute load average 3.9 on 12 cores"
+   "notes": "1-minute load average 6.6 on 12 cores"
   },
   {
    "dataset": "gh",
@@ -2566,13 +2500,13 @@
    "query": "gh-repos1000",
    "side": "bellwether-why",
    "metric": "wall_ms",
-   "value": 1071.6,
+   "value": 1032.1,
    "unit": "ms",
    "exactness": "measured",
    "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1, local SSD",
    "build": "bellwether release build of eca48d1 (rustc 1.99.1)",
    "date": "2026-10-26",
-   "notes": "1-minute load average 3.9 on 12 cores"
+   "notes": "1-minute load average 6.6 on 12 cores"
   },
   {
    "dataset": "gh",
@@ -2631,13 +2565,13 @@
    "query": "gh-repos1000",
    "side": "bellwether-fix",
    "metric": "wall_ms",
-   "value": 628.5,
+   "value": 608.0,
    "unit": "ms",
    "exactness": "measured",
    "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1, local SSD",
    "build": "bellwether release build of eca48d1 (rustc 1.99.1)",
    "date": "2026-10-26",
-   "notes": "1-minute load average 3.9 on 12 cores"
+   "notes": "1-minute load average 6.6 on 12 cores"
   },
   {
    "dataset": "gh",
@@ -2655,45 +2589,6 @@
   {
    "dataset": "gh",
    "query": "gh-repos1000",
-   "side": "bellwether-fixed",
-   "metric": "bytes",
-   "value": 12817897,
-   "unit": "bytes",
-   "exactness": "exact",
-   "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1, local SSD",
-   "build": "bellwether release build of eca48d1 (rustc 1.99.1)",
-   "date": "2026-10-26",
-   "notes": ""
-  },
-  {
-   "dataset": "gh",
-   "query": "gh-repos1000",
-   "side": "bellwether-fixed",
-   "metric": "row_groups",
-   "value": 24,
-   "unit": "row groups",
-   "exactness": "exact",
-   "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1, local SSD",
-   "build": "bellwether release build of eca48d1 (rustc 1.99.1)",
-   "date": "2026-10-26",
-   "notes": ""
-  },
-  {
-   "dataset": "gh",
-   "query": "gh-repos1000",
-   "side": "bellwether-plan",
-   "metric": "wall_ms",
-   "value": 0.0,
-   "unit": "ms",
-   "exactness": "measured",
-   "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1, local SSD",
-   "build": "bellwether release build of eca48d1 (rustc 1.99.1)",
-   "date": "2026-10-26",
-   "notes": "1-minute load average 3.9 on 12 cores"
-  },
-  {
-   "dataset": "gh",
-   "query": "gh-repos1000",
    "side": "duckdb",
    "metric": "bytes",
    "value": 13014505,
@@ -2702,7 +2597,7 @@
    "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1, local SSD",
    "build": "DuckDB v2.0.0 (d54cbbe3df)",
    "date": "2026-10-26",
-   "notes": "1-minute load average 3.9 on 12 cores"
+   "notes": "1-minute load average 6.6 on 12 cores"
   },
   {
    "dataset": "gh",
@@ -2715,59 +2610,20 @@
    "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1, local SSD",
    "build": "DuckDB v2.0.0 (d54cbbe3df)",
    "date": "2026-10-26",
-   "notes": "1-minute load average 3.9 on 12 cores"
+   "notes": "1-minute load average 6.6 on 12 cores"
   },
   {
    "dataset": "gh",
    "query": "gh-repos1000",
    "side": "duckdb",
    "metric": "wall_ms",
-   "value": 14.6,
+   "value": 15.9,
    "unit": "ms",
    "exactness": "measured",
    "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1, local SSD",
    "build": "DuckDB v2.0.0 (d54cbbe3df)",
    "date": "2026-10-26",
-   "notes": "1-minute load average 3.9 on 12 cores"
-  },
-  {
-   "dataset": "gh",
-   "query": "gh-repos1000",
-   "side": "duckdb-on-plan",
-   "metric": "bytes",
-   "value": 13014505,
-   "unit": "bytes",
-   "exactness": "measured",
-   "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1, local SSD",
-   "build": "DuckDB v2.0.0 (d54cbbe3df)",
-   "date": "2026-10-26",
-   "notes": "1-minute load average 3.9 on 12 cores"
-  },
-  {
-   "dataset": "gh",
-   "query": "gh-repos1000",
-   "side": "duckdb-on-plan",
-   "metric": "row_groups",
-   "value": 24,
-   "unit": "row groups",
-   "exactness": "measured",
-   "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1, local SSD",
-   "build": "DuckDB v2.0.0 (d54cbbe3df)",
-   "date": "2026-10-26",
-   "notes": "1-minute load average 3.9 on 12 cores"
-  },
-  {
-   "dataset": "gh",
-   "query": "gh-repos1000",
-   "side": "duckdb-on-plan",
-   "metric": "wall_ms",
-   "value": 16.6,
-   "unit": "ms",
-   "exactness": "measured",
-   "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1, local SSD",
-   "build": "DuckDB v2.0.0 (d54cbbe3df)",
-   "date": "2026-10-26",
-   "notes": "1-minute load average 3.9 on 12 cores"
+   "notes": "1-minute load average 6.6 on 12 cores"
   },
   {
    "dataset": "gh",
@@ -2781,32 +2637,6 @@
    "build": "DuckDB v2.0.0 (d54cbbe3df)",
    "date": "2026-10-26",
    "notes": ""
-  },
-  {
-   "dataset": "gh",
-   "query": "gh-repos1000",
-   "side": "duckdb-on-plan",
-   "metric": "same_answer",
-   "value": true,
-   "unit": "bool",
-   "exactness": "exact",
-   "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1, local SSD",
-   "build": "DuckDB v2.0.0 (d54cbbe3df)",
-   "date": "2026-10-26",
-   "notes": ""
-  },
-  {
-   "dataset": "gh",
-   "query": "gh-repos1000",
-   "side": "bellwether+duckdb",
-   "metric": "wall_ms",
-   "value": 16.6,
-   "unit": "ms",
-   "exactness": "measured",
-   "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1, local SSD",
-   "build": "bellwether release build of eca48d1 (rustc 1.99.1)",
-   "date": "2026-10-26",
-   "notes": "1-minute load average 3.9 on 12 cores"
   },
   {
    "dataset": "clickbench",
@@ -2865,13 +2695,13 @@
    "query": "cb-users10",
    "side": "bellwether-why",
    "metric": "wall_ms",
-   "value": 45891.7,
+   "value": 45014.4,
    "unit": "ms",
    "exactness": "measured",
    "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1, local SSD",
    "build": "bellwether release build of eca48d1 (rustc 1.99.1)",
    "date": "2026-10-26",
-   "notes": "1-minute load average 3.8 on 12 cores"
+   "notes": "1-minute load average 4.5 on 12 cores"
   },
   {
    "dataset": "clickbench",
@@ -2930,13 +2760,13 @@
    "query": "cb-users10",
    "side": "bellwether-fix",
    "metric": "wall_ms",
-   "value": 8956.8,
+   "value": 8827.8,
    "unit": "ms",
    "exactness": "measured",
    "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1, local SSD",
    "build": "bellwether release build of eca48d1 (rustc 1.99.1)",
    "date": "2026-10-26",
-   "notes": "1-minute load average 4.4 on 12 cores"
+   "notes": "1-minute load average 4.6 on 12 cores"
   },
   {
    "dataset": "clickbench",
@@ -2956,9 +2786,9 @@
    "query": "cb-users10",
    "side": "bellwether",
    "metric": "receipt",
-   "value": "2221fbc4366cc682e33911723a24bf71991e03fc4894d77f3be960490a990a0a",
+   "value": "4803b83224ed3b878b2250821c502346bb4f032749f6cf9f38f4007a57251937",
    "unit": "blake3",
-   "exactness": "exact",
+   "exactness": "identity",
    "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1, local SSD",
    "build": "bellwether release build of eca48d1 (rustc 1.99.1)",
    "date": "2026-10-26",
@@ -3021,26 +2851,26 @@
    "query": "cb-users10",
    "side": "bellwether-plan",
    "metric": "wall_ms",
-   "value": 26.1,
+   "value": 30.5,
    "unit": "ms",
    "exactness": "measured",
    "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1, local SSD",
    "build": "bellwether release build of eca48d1 (rustc 1.99.1)",
    "date": "2026-10-26",
-   "notes": "1-minute load average 4.4 on 12 cores"
+   "notes": "1-minute load average 4.6 on 12 cores"
   },
   {
    "dataset": "clickbench",
    "query": "cb-users10",
    "side": "duckdb",
    "metric": "bytes",
-   "value": 1436174087,
+   "value": 1436174181,
    "unit": "bytes",
    "exactness": "measured",
    "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1, local SSD",
    "build": "DuckDB v2.0.0 (d54cbbe3df)",
    "date": "2026-10-26",
-   "notes": "1-minute load average 4.4 on 12 cores"
+   "notes": "1-minute load average 4.6 on 12 cores"
   },
   {
    "dataset": "clickbench",
@@ -3053,20 +2883,20 @@
    "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1, local SSD",
    "build": "DuckDB v2.0.0 (d54cbbe3df)",
    "date": "2026-10-26",
-   "notes": "1-minute load average 4.4 on 12 cores"
+   "notes": "1-minute load average 4.6 on 12 cores"
   },
   {
    "dataset": "clickbench",
    "query": "cb-users10",
    "side": "duckdb",
    "metric": "wall_ms",
-   "value": 481.6,
+   "value": 454.2,
    "unit": "ms",
    "exactness": "measured",
    "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1, local SSD",
    "build": "DuckDB v2.0.0 (d54cbbe3df)",
    "date": "2026-10-26",
-   "notes": "1-minute load average 4.4 on 12 cores"
+   "notes": "1-minute load average 4.6 on 12 cores"
   },
   {
    "dataset": "clickbench",
@@ -3079,7 +2909,7 @@
    "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1, local SSD",
    "build": "DuckDB v2.0.0 (d54cbbe3df)",
    "date": "2026-10-26",
-   "notes": "1-minute load average 4.4 on 12 cores"
+   "notes": "1-minute load average 4.6 on 12 cores"
   },
   {
    "dataset": "clickbench",
@@ -3092,20 +2922,20 @@
    "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1, local SSD",
    "build": "DuckDB v2.0.0 (d54cbbe3df)",
    "date": "2026-10-26",
-   "notes": "1-minute load average 4.4 on 12 cores"
+   "notes": "1-minute load average 4.6 on 12 cores"
   },
   {
    "dataset": "clickbench",
    "query": "cb-users10",
    "side": "duckdb-on-plan",
    "metric": "wall_ms",
-   "value": 827.9,
+   "value": 235.5,
    "unit": "ms",
    "exactness": "measured",
    "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1, local SSD",
    "build": "DuckDB v2.0.0 (d54cbbe3df)",
    "date": "2026-10-26",
-   "notes": "1-minute load average 4.4 on 12 cores"
+   "notes": "1-minute load average 4.6 on 12 cores"
   },
   {
    "dataset": "clickbench",
@@ -3138,13 +2968,13 @@
    "query": "cb-users10",
    "side": "bellwether+duckdb",
    "metric": "wall_ms",
-   "value": 854.0,
+   "value": 266.1,
    "unit": "ms",
    "exactness": "measured",
    "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1, local SSD",
    "build": "bellwether release build of eca48d1 (rustc 1.99.1)",
    "date": "2026-10-26",
-   "notes": "1-minute load average 4.4 on 12 cores"
+   "notes": "1-minute load average 4.6 on 12 cores"
   },
   {
    "dataset": "clickbench",
@@ -3203,7 +3033,7 @@
    "query": "cb-users1000",
    "side": "bellwether-why",
    "metric": "wall_ms",
-   "value": 45509.2,
+   "value": 44761.8,
    "unit": "ms",
    "exactness": "measured",
    "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1, local SSD",
@@ -3268,13 +3098,13 @@
    "query": "cb-users1000",
    "side": "bellwether-fix",
    "metric": "wall_ms",
-   "value": 11984.8,
+   "value": 11567.0,
    "unit": "ms",
    "exactness": "measured",
    "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1, local SSD",
    "build": "bellwether release build of eca48d1 (rustc 1.99.1)",
    "date": "2026-10-26",
-   "notes": "1-minute load average 3.9 on 12 cores"
+   "notes": "1-minute load average 3.7 on 12 cores"
   },
   {
    "dataset": "clickbench",
@@ -3294,9 +3124,9 @@
    "query": "cb-users1000",
    "side": "bellwether",
    "metric": "receipt",
-   "value": "220b4edc23e61ebe34ed6a694995b42224ff62bff978b70bfc75285360cae10a",
+   "value": "2a06719c5c99e7bf38f62269950663b4ebc0e4467ffd4bccfaafa8e0339312a7",
    "unit": "blake3",
-   "exactness": "exact",
+   "exactness": "identity",
    "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1, local SSD",
    "build": "bellwether release build of eca48d1 (rustc 1.99.1)",
    "date": "2026-10-26",
@@ -3359,26 +3189,26 @@
    "query": "cb-users1000",
    "side": "bellwether-plan",
    "metric": "wall_ms",
-   "value": 93.0,
+   "value": 90.0,
    "unit": "ms",
    "exactness": "measured",
    "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1, local SSD",
    "build": "bellwether release build of eca48d1 (rustc 1.99.1)",
    "date": "2026-10-26",
-   "notes": "1-minute load average 3.9 on 12 cores"
+   "notes": "1-minute load average 3.7 on 12 cores"
   },
   {
    "dataset": "clickbench",
    "query": "cb-users1000",
    "side": "duckdb",
    "metric": "bytes",
-   "value": 1488571980,
+   "value": 1488572074,
    "unit": "bytes",
    "exactness": "measured",
    "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1, local SSD",
    "build": "DuckDB v2.0.0 (d54cbbe3df)",
    "date": "2026-10-26",
-   "notes": "1-minute load average 5.5 on 12 cores"
+   "notes": "1-minute load average 3.7 on 12 cores"
   },
   {
    "dataset": "clickbench",
@@ -3391,20 +3221,20 @@
    "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1, local SSD",
    "build": "DuckDB v2.0.0 (d54cbbe3df)",
    "date": "2026-10-26",
-   "notes": "1-minute load average 5.5 on 12 cores"
+   "notes": "1-minute load average 3.7 on 12 cores"
   },
   {
    "dataset": "clickbench",
    "query": "cb-users1000",
    "side": "duckdb",
    "metric": "wall_ms",
-   "value": 542.5,
+   "value": 465.6,
    "unit": "ms",
    "exactness": "measured",
    "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1, local SSD",
    "build": "DuckDB v2.0.0 (d54cbbe3df)",
    "date": "2026-10-26",
-   "notes": "1-minute load average 5.5 on 12 cores"
+   "notes": "1-minute load average 3.7 on 12 cores"
   },
   {
    "dataset": "clickbench",
@@ -3417,7 +3247,7 @@
    "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1, local SSD",
    "build": "DuckDB v2.0.0 (d54cbbe3df)",
    "date": "2026-10-26",
-   "notes": "1-minute load average 5.5 on 12 cores"
+   "notes": "1-minute load average 3.7 on 12 cores"
   },
   {
    "dataset": "clickbench",
@@ -3430,20 +3260,20 @@
    "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1, local SSD",
    "build": "DuckDB v2.0.0 (d54cbbe3df)",
    "date": "2026-10-26",
-   "notes": "1-minute load average 5.5 on 12 cores"
+   "notes": "1-minute load average 3.7 on 12 cores"
   },
   {
    "dataset": "clickbench",
    "query": "cb-users1000",
    "side": "duckdb-on-plan",
    "metric": "wall_ms",
-   "value": 1553.8,
+   "value": 486.3,
    "unit": "ms",
    "exactness": "measured",
    "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1, local SSD",
    "build": "DuckDB v2.0.0 (d54cbbe3df)",
    "date": "2026-10-26",
-   "notes": "1-minute load average 5.5 on 12 cores"
+   "notes": "1-minute load average 3.7 on 12 cores"
   },
   {
    "dataset": "clickbench",
@@ -3476,13 +3306,13 @@
    "query": "cb-users1000",
    "side": "bellwether+duckdb",
    "metric": "wall_ms",
-   "value": 1646.8,
+   "value": 576.3,
    "unit": "ms",
    "exactness": "measured",
    "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1, local SSD",
    "build": "bellwether release build of eca48d1 (rustc 1.99.1)",
    "date": "2026-10-26",
-   "notes": "1-minute load average 5.5 on 12 cores"
+   "notes": "1-minute load average 3.7 on 12 cores"
   },
   {
    "dataset": "clickbench",
@@ -3541,13 +3371,13 @@
    "query": "cb-counters3",
    "side": "bellwether-why",
    "metric": "wall_ms",
-   "value": 44533.5,
+   "value": 44279.5,
    "unit": "ms",
    "exactness": "measured",
    "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1, local SSD",
    "build": "bellwether release build of eca48d1 (rustc 1.99.1)",
    "date": "2026-10-26",
-   "notes": "1-minute load average 4.9 on 12 cores"
+   "notes": "1-minute load average 4.7 on 12 cores"
   },
   {
    "dataset": "clickbench",
@@ -3606,13 +3436,13 @@
    "query": "cb-counters3",
    "side": "bellwether-fix",
    "metric": "wall_ms",
-   "value": 10522.6,
+   "value": 10596.4,
    "unit": "ms",
    "exactness": "measured",
    "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1, local SSD",
    "build": "bellwether release build of eca48d1 (rustc 1.99.1)",
    "date": "2026-10-26",
-   "notes": "1-minute load average 5.2 on 12 cores"
+   "notes": "1-minute load average 5.1 on 12 cores"
   },
   {
    "dataset": "clickbench",
@@ -3632,9 +3462,9 @@
    "query": "cb-counters3",
    "side": "bellwether",
    "metric": "receipt",
-   "value": "1720eb4e771dceaa7ee8bab7e84a77ef630381cbf7091169ec2bd4da637077ca",
+   "value": "2c5b5edd08051f51e22adb10efcfd8ebe4d13b3c0d2626f8bab262181882b104",
    "unit": "blake3",
-   "exactness": "exact",
+   "exactness": "identity",
    "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1, local SSD",
    "build": "bellwether release build of eca48d1 (rustc 1.99.1)",
    "date": "2026-10-26",
@@ -3697,13 +3527,13 @@
    "query": "cb-counters3",
    "side": "bellwether-plan",
    "metric": "wall_ms",
-   "value": 24.4,
+   "value": 24.2,
    "unit": "ms",
    "exactness": "measured",
    "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1, local SSD",
    "build": "bellwether release build of eca48d1 (rustc 1.99.1)",
    "date": "2026-10-26",
-   "notes": "1-minute load average 5.2 on 12 cores"
+   "notes": "1-minute load average 5.1 on 12 cores"
   },
   {
    "dataset": "clickbench",
@@ -3716,7 +3546,7 @@
    "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1, local SSD",
    "build": "DuckDB v2.0.0 (d54cbbe3df)",
    "date": "2026-10-26",
-   "notes": "1-minute load average 5.2 on 12 cores"
+   "notes": "1-minute load average 5.1 on 12 cores"
   },
   {
    "dataset": "clickbench",
@@ -3729,20 +3559,20 @@
    "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1, local SSD",
    "build": "DuckDB v2.0.0 (d54cbbe3df)",
    "date": "2026-10-26",
-   "notes": "1-minute load average 5.2 on 12 cores"
+   "notes": "1-minute load average 5.1 on 12 cores"
   },
   {
    "dataset": "clickbench",
    "query": "cb-counters3",
    "side": "duckdb",
    "metric": "wall_ms",
-   "value": 185.7,
+   "value": 177.5,
    "unit": "ms",
    "exactness": "measured",
    "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1, local SSD",
    "build": "DuckDB v2.0.0 (d54cbbe3df)",
    "date": "2026-10-26",
-   "notes": "1-minute load average 5.2 on 12 cores"
+   "notes": "1-minute load average 5.1 on 12 cores"
   },
   {
    "dataset": "clickbench",
@@ -3755,7 +3585,7 @@
    "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1, local SSD",
    "build": "DuckDB v2.0.0 (d54cbbe3df)",
    "date": "2026-10-26",
-   "notes": "1-minute load average 5.2 on 12 cores"
+   "notes": "1-minute load average 5.1 on 12 cores"
   },
   {
    "dataset": "clickbench",
@@ -3768,20 +3598,20 @@
    "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1, local SSD",
    "build": "DuckDB v2.0.0 (d54cbbe3df)",
    "date": "2026-10-26",
-   "notes": "1-minute load average 5.2 on 12 cores"
+   "notes": "1-minute load average 5.1 on 12 cores"
   },
   {
    "dataset": "clickbench",
    "query": "cb-counters3",
    "side": "duckdb-on-plan",
    "metric": "wall_ms",
-   "value": 425.9,
+   "value": 181.7,
    "unit": "ms",
    "exactness": "measured",
    "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1, local SSD",
    "build": "DuckDB v2.0.0 (d54cbbe3df)",
    "date": "2026-10-26",
-   "notes": "1-minute load average 5.2 on 12 cores"
+   "notes": "1-minute load average 5.1 on 12 cores"
   },
   {
    "dataset": "clickbench",
@@ -3814,13 +3644,13 @@
    "query": "cb-counters3",
    "side": "bellwether+duckdb",
    "metric": "wall_ms",
-   "value": 450.3,
+   "value": 205.8,
    "unit": "ms",
    "exactness": "measured",
    "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1, local SSD",
    "build": "bellwether release build of eca48d1 (rustc 1.99.1)",
    "date": "2026-10-26",
-   "notes": "1-minute load average 5.2 on 12 cores"
+   "notes": "1-minute load average 5.1 on 12 cores"
   },
   {
    "dataset": "market",
@@ -3879,13 +3709,13 @@
    "query": "mkt-window",
    "side": "bellwether-why",
    "metric": "wall_ms",
-   "value": 1108.7,
+   "value": 1227.4,
    "unit": "ms",
    "exactness": "measured",
    "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1, local SSD",
    "build": "bellwether release build of eca48d1 (rustc 1.99.1)",
    "date": "2026-10-26",
-   "notes": "1-minute load average 5.2 on 12 cores"
+   "notes": "1-minute load average 5.1 on 12 cores"
   },
   {
    "dataset": "market",
@@ -3944,13 +3774,13 @@
    "query": "mkt-window",
    "side": "bellwether-fix",
    "metric": "wall_ms",
-   "value": 879.3,
+   "value": 927.8,
    "unit": "ms",
    "exactness": "measured",
    "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1, local SSD",
    "build": "bellwether release build of eca48d1 (rustc 1.99.1)",
    "date": "2026-10-26",
-   "notes": "1-minute load average 5.2 on 12 cores"
+   "notes": "1-minute load average 5.1 on 12 cores"
   },
   {
    "dataset": "market",
@@ -3970,9 +3800,9 @@
    "query": "mkt-window",
    "side": "bellwether",
    "metric": "receipt",
-   "value": "a62e9c564921a8171656f627028046f212301b0e473232e2778b007522e52140",
+   "value": "9bc2b39a99aa4e8709f55df3c4129e45fadaa7f90e2e98582926155e68e59551",
    "unit": "blake3",
-   "exactness": "exact",
+   "exactness": "identity",
    "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1, local SSD",
    "build": "bellwether release build of eca48d1 (rustc 1.99.1)",
    "date": "2026-10-26",
@@ -4035,13 +3865,13 @@
    "query": "mkt-window",
    "side": "bellwether-plan",
    "metric": "wall_ms",
-   "value": 35.1,
+   "value": 33.0,
    "unit": "ms",
    "exactness": "measured",
    "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1, local SSD",
    "build": "bellwether release build of eca48d1 (rustc 1.99.1)",
    "date": "2026-10-26",
-   "notes": "1-minute load average 5.2 on 12 cores"
+   "notes": "1-minute load average 5.1 on 12 cores"
   },
   {
    "dataset": "market",
@@ -4054,7 +3884,7 @@
    "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1, local SSD",
    "build": "DuckDB v2.0.0 (d54cbbe3df)",
    "date": "2026-10-26",
-   "notes": "1-minute load average 5.5 on 12 cores"
+   "notes": "1-minute load average 5.1 on 12 cores"
   },
   {
    "dataset": "market",
@@ -4067,20 +3897,20 @@
    "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1, local SSD",
    "build": "DuckDB v2.0.0 (d54cbbe3df)",
    "date": "2026-10-26",
-   "notes": "1-minute load average 5.5 on 12 cores"
+   "notes": "1-minute load average 5.1 on 12 cores"
   },
   {
    "dataset": "market",
    "query": "mkt-window",
    "side": "duckdb",
    "metric": "wall_ms",
-   "value": 11.8,
+   "value": 11.5,
    "unit": "ms",
    "exactness": "measured",
    "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1, local SSD",
    "build": "DuckDB v2.0.0 (d54cbbe3df)",
    "date": "2026-10-26",
-   "notes": "1-minute load average 5.5 on 12 cores"
+   "notes": "1-minute load average 5.1 on 12 cores"
   },
   {
    "dataset": "market",
@@ -4093,7 +3923,7 @@
    "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1, local SSD",
    "build": "DuckDB v2.0.0 (d54cbbe3df)",
    "date": "2026-10-26",
-   "notes": "1-minute load average 5.5 on 12 cores"
+   "notes": "1-minute load average 5.1 on 12 cores"
   },
   {
    "dataset": "market",
@@ -4106,20 +3936,20 @@
    "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1, local SSD",
    "build": "DuckDB v2.0.0 (d54cbbe3df)",
    "date": "2026-10-26",
-   "notes": "1-minute load average 5.5 on 12 cores"
+   "notes": "1-minute load average 5.1 on 12 cores"
   },
   {
    "dataset": "market",
    "query": "mkt-window",
    "side": "duckdb-on-plan",
    "metric": "wall_ms",
-   "value": 10.5,
+   "value": 8.3,
    "unit": "ms",
    "exactness": "measured",
    "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1, local SSD",
    "build": "DuckDB v2.0.0 (d54cbbe3df)",
    "date": "2026-10-26",
-   "notes": "1-minute load average 5.5 on 12 cores"
+   "notes": "1-minute load average 5.1 on 12 cores"
   },
   {
    "dataset": "market",
@@ -4152,13 +3982,13 @@
    "query": "mkt-window",
    "side": "bellwether+duckdb",
    "metric": "wall_ms",
-   "value": 45.6,
+   "value": 41.3,
    "unit": "ms",
    "exactness": "measured",
    "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1, local SSD",
    "build": "bellwether release build of eca48d1 (rustc 1.99.1)",
    "date": "2026-10-26",
-   "notes": "1-minute load average 5.5 on 12 cores"
+   "notes": "1-minute load average 5.1 on 12 cores"
   },
   {
    "dataset": "market",
@@ -4217,13 +4047,13 @@
    "query": "mkt-latest",
    "side": "bellwether-why",
    "metric": "wall_ms",
-   "value": 1112.7,
+   "value": 1111.7,
    "unit": "ms",
    "exactness": "measured",
    "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1, local SSD",
    "build": "bellwether release build of eca48d1 (rustc 1.99.1)",
    "date": "2026-10-26",
-   "notes": "1-minute load average 5.5 on 12 cores"
+   "notes": "1-minute load average 5.1 on 12 cores"
   },
   {
    "dataset": "market",
@@ -4282,13 +4112,13 @@
    "query": "mkt-latest",
    "side": "bellwether-fix",
    "metric": "wall_ms",
-   "value": 877.9,
+   "value": 870.3,
    "unit": "ms",
    "exactness": "measured",
    "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1, local SSD",
    "build": "bellwether release build of eca48d1 (rustc 1.99.1)",
    "date": "2026-10-26",
-   "notes": "1-minute load average 5.5 on 12 cores"
+   "notes": "1-minute load average 5.1 on 12 cores"
   },
   {
    "dataset": "market",
@@ -4308,9 +4138,9 @@
    "query": "mkt-latest",
    "side": "bellwether",
    "metric": "receipt",
-   "value": "efac4b379ad3b7f36b0fc4b01ae0acb045263458d3ffeba4e35c25d1b913d538",
+   "value": "7e35c6aaa6c82fd732fcdd1a7efeef8538129cadc23fd7e7834cbac73c62dcc1",
    "unit": "blake3",
-   "exactness": "exact",
+   "exactness": "identity",
    "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1, local SSD",
    "build": "bellwether release build of eca48d1 (rustc 1.99.1)",
    "date": "2026-10-26",
@@ -4373,13 +4203,13 @@
    "query": "mkt-latest",
    "side": "bellwether-plan",
    "metric": "wall_ms",
-   "value": 29.8,
+   "value": 30.9,
    "unit": "ms",
    "exactness": "measured",
    "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1, local SSD",
    "build": "bellwether release build of eca48d1 (rustc 1.99.1)",
    "date": "2026-10-26",
-   "notes": "1-minute load average 5.5 on 12 cores"
+   "notes": "1-minute load average 5.1 on 12 cores"
   },
   {
    "dataset": "market",
@@ -4392,7 +4222,7 @@
    "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1, local SSD",
    "build": "DuckDB v2.0.0 (d54cbbe3df)",
    "date": "2026-10-26",
-   "notes": "1-minute load average 5.5 on 12 cores"
+   "notes": "1-minute load average 5.4 on 12 cores"
   },
   {
    "dataset": "market",
@@ -4405,20 +4235,20 @@
    "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1, local SSD",
    "build": "DuckDB v2.0.0 (d54cbbe3df)",
    "date": "2026-10-26",
-   "notes": "1-minute load average 5.5 on 12 cores"
+   "notes": "1-minute load average 5.4 on 12 cores"
   },
   {
    "dataset": "market",
    "query": "mkt-latest",
    "side": "duckdb",
    "metric": "wall_ms",
-   "value": 14.6,
+   "value": 15.1,
    "unit": "ms",
    "exactness": "measured",
    "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1, local SSD",
    "build": "DuckDB v2.0.0 (d54cbbe3df)",
    "date": "2026-10-26",
-   "notes": "1-minute load average 5.5 on 12 cores"
+   "notes": "1-minute load average 5.4 on 12 cores"
   },
   {
    "dataset": "market",
@@ -4431,7 +4261,7 @@
    "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1, local SSD",
    "build": "DuckDB v2.0.0 (d54cbbe3df)",
    "date": "2026-10-26",
-   "notes": "1-minute load average 5.5 on 12 cores"
+   "notes": "1-minute load average 5.4 on 12 cores"
   },
   {
    "dataset": "market",
@@ -4444,20 +4274,20 @@
    "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1, local SSD",
    "build": "DuckDB v2.0.0 (d54cbbe3df)",
    "date": "2026-10-26",
-   "notes": "1-minute load average 5.5 on 12 cores"
+   "notes": "1-minute load average 5.4 on 12 cores"
   },
   {
    "dataset": "market",
    "query": "mkt-latest",
    "side": "duckdb-on-plan",
    "metric": "wall_ms",
-   "value": 4.0,
+   "value": 4.3,
    "unit": "ms",
    "exactness": "measured",
    "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1, local SSD",
    "build": "DuckDB v2.0.0 (d54cbbe3df)",
    "date": "2026-10-26",
-   "notes": "1-minute load average 5.5 on 12 cores"
+   "notes": "1-minute load average 5.4 on 12 cores"
   },
   {
    "dataset": "market",
@@ -4490,13 +4320,13 @@
    "query": "mkt-latest",
    "side": "bellwether+duckdb",
    "metric": "wall_ms",
-   "value": 33.8,
+   "value": 35.2,
    "unit": "ms",
    "exactness": "measured",
    "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1, local SSD",
    "build": "bellwether release build of eca48d1 (rustc 1.99.1)",
    "date": "2026-10-26",
-   "notes": "1-minute load average 5.5 on 12 cores"
+   "notes": "1-minute load average 5.4 on 12 cores"
   },
   {
    "dataset": "market",
@@ -4555,13 +4385,13 @@
    "query": "mkt-asof-known",
    "side": "bellwether-why",
    "metric": "wall_ms",
-   "value": 1106.3,
+   "value": 1101.6,
    "unit": "ms",
    "exactness": "measured",
    "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1, local SSD",
    "build": "bellwether release build of eca48d1 (rustc 1.99.1)",
    "date": "2026-10-26",
-   "notes": "1-minute load average 5.5 on 12 cores"
+   "notes": "1-minute load average 5.4 on 12 cores"
   },
   {
    "dataset": "market",
@@ -4633,13 +4463,13 @@
    "query": "mkt-asof-known",
    "side": "bellwether-plan",
    "metric": "wall_ms",
-   "value": 42.3,
+   "value": 38.8,
    "unit": "ms",
    "exactness": "measured",
    "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1, local SSD",
    "build": "bellwether release build of eca48d1 (rustc 1.99.1)",
    "date": "2026-10-26",
-   "notes": "1-minute load average 5.5 on 12 cores"
+   "notes": "1-minute load average 5.4 on 12 cores"
   },
   {
    "dataset": "market",
@@ -4652,7 +4482,7 @@
    "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1, local SSD",
    "build": "DuckDB v2.0.0 (d54cbbe3df)",
    "date": "2026-10-26",
-   "notes": "1-minute load average 5.5 on 12 cores"
+   "notes": "1-minute load average 5.4 on 12 cores"
   },
   {
    "dataset": "market",
@@ -4665,20 +4495,20 @@
    "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1, local SSD",
    "build": "DuckDB v2.0.0 (d54cbbe3df)",
    "date": "2026-10-26",
-   "notes": "1-minute load average 5.5 on 12 cores"
+   "notes": "1-minute load average 5.4 on 12 cores"
   },
   {
    "dataset": "market",
    "query": "mkt-asof-known",
    "side": "duckdb",
    "metric": "wall_ms",
-   "value": 13.6,
+   "value": 12.9,
    "unit": "ms",
    "exactness": "measured",
    "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1, local SSD",
    "build": "DuckDB v2.0.0 (d54cbbe3df)",
    "date": "2026-10-26",
-   "notes": "1-minute load average 5.5 on 12 cores"
+   "notes": "1-minute load average 5.4 on 12 cores"
   },
   {
    "dataset": "market",
@@ -4691,7 +4521,7 @@
    "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1, local SSD",
    "build": "DuckDB v2.0.0 (d54cbbe3df)",
    "date": "2026-10-26",
-   "notes": "1-minute load average 5.5 on 12 cores"
+   "notes": "1-minute load average 5.4 on 12 cores"
   },
   {
    "dataset": "market",
@@ -4704,20 +4534,20 @@
    "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1, local SSD",
    "build": "DuckDB v2.0.0 (d54cbbe3df)",
    "date": "2026-10-26",
-   "notes": "1-minute load average 5.5 on 12 cores"
+   "notes": "1-minute load average 5.4 on 12 cores"
   },
   {
    "dataset": "market",
    "query": "mkt-asof-known",
    "side": "duckdb-on-plan",
    "metric": "wall_ms",
-   "value": 4.8,
+   "value": 4.5,
    "unit": "ms",
    "exactness": "measured",
    "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1, local SSD",
    "build": "DuckDB v2.0.0 (d54cbbe3df)",
    "date": "2026-10-26",
-   "notes": "1-minute load average 5.5 on 12 cores"
+   "notes": "1-minute load average 5.4 on 12 cores"
   },
   {
    "dataset": "market",
@@ -4750,39 +4580,39 @@
    "query": "mkt-asof-known",
    "side": "bellwether+duckdb",
    "metric": "wall_ms",
-   "value": 47.1,
+   "value": 43.3,
    "unit": "ms",
    "exactness": "measured",
    "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1, local SSD",
    "build": "bellwether release build of eca48d1 (rustc 1.99.1)",
    "date": "2026-10-26",
-   "notes": "1-minute load average 5.5 on 12 cores"
+   "notes": "1-minute load average 5.4 on 12 cores"
   },
   {
    "dataset": "taxi",
    "query": "rec-taxi-same",
    "side": "bellwether",
    "metric": "rows_per_s",
-   "value": 232322,
+   "value": 233177,
    "unit": "rows/s",
    "exactness": "measured",
    "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1, local SSD",
    "build": "bellwether release build of eca48d1 (rustc 1.99.1)",
    "date": "2026-10-26",
-   "notes": "1-minute load average 4.2 on 12 cores"
+   "notes": "1-minute load average 4.8 on 12 cores"
   },
   {
    "dataset": "taxi",
    "query": "rec-taxi-same",
    "side": "bellwether",
    "metric": "wall_ms",
-   "value": 175033.4,
+   "value": 174392.2,
    "unit": "ms",
    "exactness": "measured",
    "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1, local SSD",
    "build": "bellwether release build of eca48d1 (rustc 1.99.1)",
    "date": "2026-10-26",
-   "notes": "1-minute load average 4.2 on 12 cores"
+   "notes": "1-minute load average 4.8 on 12 cores"
   },
   {
    "dataset": "taxi",
@@ -4828,9 +4658,9 @@
    "query": "rec-taxi-same",
    "side": "bellwether",
    "metric": "certificate",
-   "value": "da1a23ec35a9bdde34a36f1ceca22cda92246f7a03f98573a2fdb60d3776dea0",
+   "value": "0fbb97136f1a70efcc732377ee6122c779db4d6e743f3900d620597feee356e0",
    "unit": "blake3",
-   "exactness": "exact",
+   "exactness": "identity",
    "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1, local SSD",
    "build": "bellwether release build of eca48d1 (rustc 1.99.1)",
    "date": "2026-10-26",
@@ -4854,26 +4684,26 @@
    "query": "rec-taxi-same",
    "side": "duckdb",
    "metric": "rows_per_s",
-   "value": 4539153,
+   "value": 5749487,
    "unit": "rows/s",
    "exactness": "measured",
    "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1, local SSD",
    "build": "DuckDB v2.0.0 (d54cbbe3df)",
    "date": "2026-10-26",
-   "notes": "1-minute load average 8.1 on 12 cores"
+   "notes": "1-minute load average 5.6 on 12 cores"
   },
   {
    "dataset": "taxi",
    "query": "rec-taxi-same",
    "side": "duckdb",
    "metric": "wall_ms",
-   "value": 8958.5,
+   "value": 7072.7,
    "unit": "ms",
    "exactness": "measured",
    "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1, local SSD",
    "build": "DuckDB v2.0.0 (d54cbbe3df)",
    "date": "2026-10-26",
-   "notes": "1-minute load average 8.1 on 12 cores"
+   "notes": "1-minute load average 5.6 on 12 cores"
   },
   {
    "dataset": "taxi",
@@ -4906,26 +4736,26 @@
    "query": "rec-taxi-planted",
    "side": "bellwether",
    "metric": "rows_per_s",
-   "value": 229435,
+   "value": 184611,
    "unit": "rows/s",
    "exactness": "measured",
    "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1, local SSD",
    "build": "bellwether release build of eca48d1 (rustc 1.99.1)",
    "date": "2026-10-26",
-   "notes": "1-minute load average 4.0 on 12 cores"
+   "notes": "1-minute load average 9.5 on 12 cores"
   },
   {
    "dataset": "taxi",
    "query": "rec-taxi-planted",
    "side": "bellwether",
    "metric": "wall_ms",
-   "value": 177235.9,
+   "value": 220270.0,
    "unit": "ms",
    "exactness": "measured",
    "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1, local SSD",
    "build": "bellwether release build of eca48d1 (rustc 1.99.1)",
    "date": "2026-10-26",
-   "notes": "1-minute load average 4.0 on 12 cores"
+   "notes": "1-minute load average 9.5 on 12 cores"
   },
   {
    "dataset": "taxi",
@@ -4971,9 +4801,9 @@
    "query": "rec-taxi-planted",
    "side": "bellwether",
    "metric": "certificate",
-   "value": "018511c55afae470cc2402aae3bc76c3ffac86cc272af46b01280364e9f062f1",
+   "value": "c41166b950adf406cf011da5eb9472d6d6099b022aa92e8c0844cf20d06d141f",
    "unit": "blake3",
-   "exactness": "exact",
+   "exactness": "identity",
    "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1, local SSD",
    "build": "bellwether release build of eca48d1 (rustc 1.99.1)",
    "date": "2026-10-26",
@@ -4995,28 +4825,54 @@
   {
    "dataset": "taxi",
    "query": "rec-taxi-planted",
+   "side": "bellwether",
+   "metric": "differing_key",
+   "value": "2, 2024-03-01T00:14:03Z, 142, 7.9",
+   "unit": "key",
+   "exactness": "exact",
+   "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1, local SSD",
+   "build": "bellwether release build of eca48d1 (rustc 1.99.1)",
+   "date": "2026-10-26",
+   "notes": ""
+  },
+  {
+   "dataset": "taxi",
+   "query": "rec-taxi-planted",
+   "side": "bellwether",
+   "metric": "found_planted",
+   "value": true,
+   "unit": "bool",
+   "exactness": "exact",
+   "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1, local SSD",
+   "build": "bellwether release build of eca48d1 (rustc 1.99.1)",
+   "date": "2026-10-26",
+   "notes": ""
+  },
+  {
+   "dataset": "taxi",
+   "query": "rec-taxi-planted",
    "side": "duckdb",
    "metric": "rows_per_s",
-   "value": 4421238,
+   "value": 4607044,
    "unit": "rows/s",
    "exactness": "measured",
    "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1, local SSD",
    "build": "DuckDB v2.0.0 (d54cbbe3df)",
    "date": "2026-10-26",
-   "notes": "1-minute load average 6.0 on 12 cores"
+   "notes": "1-minute load average 12.1 on 12 cores"
   },
   {
    "dataset": "taxi",
    "query": "rec-taxi-planted",
    "side": "duckdb",
    "metric": "wall_ms",
-   "value": 9197.5,
+   "value": 8826.5,
    "unit": "ms",
    "exactness": "measured",
    "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1, local SSD",
    "build": "DuckDB v2.0.0 (d54cbbe3df)",
    "date": "2026-10-26",
-   "notes": "1-minute load average 6.0 on 12 cores"
+   "notes": "1-minute load average 12.1 on 12 cores"
   },
   {
    "dataset": "taxi",
@@ -5049,26 +4905,26 @@
    "query": "rec-gh-same",
    "side": "bellwether",
    "metric": "rows_per_s",
-   "value": 1851112,
+   "value": 1741246,
    "unit": "rows/s",
    "exactness": "measured",
    "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1, local SSD",
    "build": "bellwether release build of eca48d1 (rustc 1.99.1)",
    "date": "2026-10-26",
-   "notes": "1-minute load average 6.2 on 12 cores"
+   "notes": "1-minute load average 12.1 on 12 cores"
   },
   {
    "dataset": "gh",
    "query": "rec-gh-same",
    "side": "bellwether",
    "metric": "wall_ms",
-   "value": 1910.8,
+   "value": 2031.3,
    "unit": "ms",
    "exactness": "measured",
    "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1, local SSD",
    "build": "bellwether release build of eca48d1 (rustc 1.99.1)",
    "date": "2026-10-26",
-   "notes": "1-minute load average 6.2 on 12 cores"
+   "notes": "1-minute load average 12.1 on 12 cores"
   },
   {
    "dataset": "gh",
@@ -5114,9 +4970,9 @@
    "query": "rec-gh-same",
    "side": "bellwether",
    "metric": "certificate",
-   "value": "02fc890187a854eaa77d037a1a6018594e9bfb9cd7527be2c355ab3387aea948",
+   "value": "1de7cbb84647df84a1a8cb2dab7eefd4d726cd1f8e3e54a51117fd9530a5854b",
    "unit": "blake3",
-   "exactness": "exact",
+   "exactness": "identity",
    "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1, local SSD",
    "build": "bellwether release build of eca48d1 (rustc 1.99.1)",
    "date": "2026-10-26",
@@ -5140,26 +4996,26 @@
    "query": "rec-gh-same",
    "side": "duckdb",
    "metric": "rows_per_s",
-   "value": 10288126,
+   "value": 7382665,
    "unit": "rows/s",
    "exactness": "measured",
    "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1, local SSD",
    "build": "DuckDB v2.0.0 (d54cbbe3df)",
    "date": "2026-10-26",
-   "notes": "1-minute load average 6.2 on 12 cores"
+   "notes": "1-minute load average 12.1 on 12 cores"
   },
   {
    "dataset": "gh",
    "query": "rec-gh-same",
    "side": "duckdb",
    "metric": "wall_ms",
-   "value": 343.8,
+   "value": 479.1,
    "unit": "ms",
    "exactness": "measured",
    "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1, local SSD",
    "build": "DuckDB v2.0.0 (d54cbbe3df)",
    "date": "2026-10-26",
-   "notes": "1-minute load average 6.2 on 12 cores"
+   "notes": "1-minute load average 12.1 on 12 cores"
   },
   {
    "dataset": "gh",
@@ -5192,26 +5048,26 @@
    "query": "rec-gh-planted",
    "side": "bellwether",
    "metric": "rows_per_s",
-   "value": 1874484,
+   "value": 1804478,
    "unit": "rows/s",
    "exactness": "measured",
    "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1, local SSD",
    "build": "bellwether release build of eca48d1 (rustc 1.99.1)",
    "date": "2026-10-26",
-   "notes": "1-minute load average 6.2 on 12 cores"
+   "notes": "1-minute load average 11.4 on 12 cores"
   },
   {
    "dataset": "gh",
    "query": "rec-gh-planted",
    "side": "bellwether",
    "metric": "wall_ms",
-   "value": 1886.9,
+   "value": 1960.1,
    "unit": "ms",
    "exactness": "measured",
    "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1, local SSD",
    "build": "bellwether release build of eca48d1 (rustc 1.99.1)",
    "date": "2026-10-26",
-   "notes": "1-minute load average 6.2 on 12 cores"
+   "notes": "1-minute load average 11.4 on 12 cores"
   },
   {
    "dataset": "gh",
@@ -5257,9 +5113,9 @@
    "query": "rec-gh-planted",
    "side": "bellwether",
    "metric": "certificate",
-   "value": "b933599b7ddfb51d139cb6349b1d5cd944c7cbcd42fbaa6ec7212234fde085e9",
+   "value": "5e79bb7bc3015b9884c5bdeac8e408c32eaeb45b38cd0ee49672a858bd37071d",
    "unit": "blake3",
-   "exactness": "exact",
+   "exactness": "identity",
    "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1, local SSD",
    "build": "bellwether release build of eca48d1 (rustc 1.99.1)",
    "date": "2026-10-26",
@@ -5281,28 +5137,54 @@
   {
    "dataset": "gh",
    "query": "rec-gh-planted",
+   "side": "bellwether",
+   "metric": "differing_key",
+   "value": "629347145, 796623, 2024-01-01T05:00:25Z",
+   "unit": "key",
+   "exactness": "exact",
+   "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1, local SSD",
+   "build": "bellwether release build of eca48d1 (rustc 1.99.1)",
+   "date": "2026-10-26",
+   "notes": ""
+  },
+  {
+   "dataset": "gh",
+   "query": "rec-gh-planted",
+   "side": "bellwether",
+   "metric": "found_planted",
+   "value": true,
+   "unit": "bool",
+   "exactness": "exact",
+   "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1, local SSD",
+   "build": "bellwether release build of eca48d1 (rustc 1.99.1)",
+   "date": "2026-10-26",
+   "notes": ""
+  },
+  {
+   "dataset": "gh",
+   "query": "rec-gh-planted",
    "side": "duckdb",
    "metric": "rows_per_s",
-   "value": 8346054,
+   "value": 11200015,
    "unit": "rows/s",
    "exactness": "measured",
    "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1, local SSD",
    "build": "DuckDB v2.0.0 (d54cbbe3df)",
    "date": "2026-10-26",
-   "notes": "1-minute load average 6.2 on 12 cores"
+   "notes": "1-minute load average 11.4 on 12 cores"
   },
   {
    "dataset": "gh",
    "query": "rec-gh-planted",
    "side": "duckdb",
    "metric": "wall_ms",
-   "value": 423.8,
+   "value": 315.8,
    "unit": "ms",
    "exactness": "measured",
    "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1, local SSD",
    "build": "DuckDB v2.0.0 (d54cbbe3df)",
    "date": "2026-10-26",
-   "notes": "1-minute load average 6.2 on 12 cores"
+   "notes": "1-minute load average 11.4 on 12 cores"
   },
   {
    "dataset": "gh",
