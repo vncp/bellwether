@@ -76,12 +76,15 @@ fn temporal() -> KeySpec {
     KeySpec::Temporal {
         columns: vec!["id".into()],
         ts_column: "ts".into(),
+        counts: false,
     }
 }
 
 fn exact(c: &[&str]) -> KeySpec {
     KeySpec::Exact {
         columns: c.iter().map(|s| (*s).to_string()).collect(),
+        counts: false,
+        bounds: None,
     }
 }
 
@@ -301,6 +304,7 @@ fn a_retired_zero_variant_does_not_bound_the_other_zero() {
     let t = KeySpec::Temporal {
         columns: vec!["k".into()],
         ts_column: "ts".into(),
+        counts: false,
     };
     let o = BuildOptions {
         schema: Some(Arc::clone(&fschema)),

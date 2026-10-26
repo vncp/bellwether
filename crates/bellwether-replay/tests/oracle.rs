@@ -41,7 +41,11 @@ fn cols(c: &[&str]) -> Vec<String> {
 }
 
 fn exact(c: &[&str]) -> KeySpec {
-    KeySpec::Exact { columns: cols(c) }
+    KeySpec::Exact {
+        columns: cols(c),
+        counts: false,
+        bounds: None,
+    }
 }
 
 /// Checks every spec family against the oracle for entity-id runs; returns
@@ -60,6 +64,7 @@ fn check_entity_runs(spec: &CorpusSpec, runs: usize, seed: u64) -> usize {
     let bloom = KeySpec::Bloom {
         columns: cols(&["entity_id"]),
         fpr: 0.05,
+        bounds: None,
     };
     let range = KeySpec::Range {
         column: "entity_id".into(),
@@ -68,6 +73,7 @@ fn check_entity_runs(spec: &CorpusSpec, runs: usize, seed: u64) -> usize {
     let temporal = KeySpec::Temporal {
         columns: cols(&["entity_id"]),
         ts_column: "version_ts".into(),
+        counts: false,
     };
     let footer = common::footer_bytes(&corpus.files());
     let mut nonempty = 0;

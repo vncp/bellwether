@@ -310,6 +310,13 @@ fn rows_asked(filter: &[Predicate]) -> String {
                 format!("the newest version by {ts_column}")
             }
             Predicate::In { .. } => "the workload's keys".to_string(),
+            Predicate::SemiJoin { columns, .. } => {
+                format!("rows whose {} is a semi-join key", columns.join(", "))
+            }
+            Predicate::Join { left, .. } => format!("rows joined on {}", left.join(", ")),
+            Predicate::WindowPartition { columns } => {
+                format!("whole partitions of {}", columns.join(", "))
+            }
             Predicate::And { all } => {
                 for q in all {
                     walk(q, out);
@@ -514,7 +521,7 @@ fn fix_human(r: &FixResult, out: &Out, table: bool) -> String {
     let mut s = String::new();
     let what = match &r.proposal.record {
         Record::Proposal(p) => match &p.body {
-            ProposalBody::Key { spec } => format!("key {}", label(spec)),
+            ProposalBody::Key { spec, .. } => format!("key {}", label(spec)),
             ProposalBody::Layout { cluster_by } => format!("layout by {}", cluster_by.join(", ")),
             ProposalBody::Rewrite { shape } if !shape.pairs.is_empty() => format!(
                 "rewrite of {} engine quer{}, compared by ({})",

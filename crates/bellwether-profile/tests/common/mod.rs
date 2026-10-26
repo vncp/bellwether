@@ -594,10 +594,16 @@ pub fn u64_batch(name: &str, values: Vec<u64>) -> RecordBatch {
 /// Writes a bench-format workload (`workload.json` plus run files) over the
 /// `entity_id` key sets given.
 pub fn write_bench_workload(dir: &Path, runs: &[Vec<u64>]) -> Hash {
+    let runs: Vec<(Option<&str>, Vec<u64>)> = runs.iter().map(|k| (None, k.clone())).collect();
+    write_bench_workload_queries(dir, &runs)
+}
+
+/// [`write_bench_workload`] with each run's `query` (`None` omits it).
+pub fn write_bench_workload_queries(dir: &Path, runs: &[(Option<&str>, Vec<u64>)]) -> Hash {
     std::fs::create_dir_all(dir.join("workload")).unwrap();
     let mut entries = Vec::new();
     let mut workload = blake3::Hasher::new();
-    for (i, keys) in runs.iter().enumerate() {
+    for (i, (query, keys)) in runs.iter().enumerate() {
         let mut keys = keys.clone();
         keys.sort_unstable();
         keys.dedup();
@@ -614,12 +620,16 @@ pub fn write_bench_workload(dir: &Path, runs: &[Vec<u64>]) -> Hash {
         }
         let run_hash = Hash(*h.finalize().as_bytes());
         workload.update(&run_hash.0);
-        entries.push(serde_json::json!({
+        let mut entry = serde_json::json!({
             "run_id": format!("run-{i:04}"),
             "file": file,
             "keys": keys.len(),
             "hash": run_hash,
-        }));
+        });
+        if let Some(q) = query {
+            entry["query"] = serde_json::json!(q);
+        }
+        entries.push(entry);
     }
     let hash = Hash(*workload.finalize().as_bytes());
     let manifest = serde_json::json!({

@@ -535,7 +535,7 @@ impl Engine {
                 result.outcome = refused(Refusal::LayoutNotApplicable);
                 Ok(result)
             }
-            ProposalBody::Key { spec } => {
+            ProposalBody::Key { spec, .. } => {
                 // A key already complete has nothing to apply: refused
                 // before anything is scored, so the refusal writes nothing.
                 if !req.verify_only && complete(pinned.as_ref(), spec) {
@@ -812,7 +812,7 @@ impl Engine {
             // Already complete: the apply would commit nothing. Refused
             // here, before the replay is scored, so the dry run and the
             // real apply agree and the refusal writes nothing.
-            ProposalBody::Key { spec } if complete(self.pin()?.as_ref(), spec) => {
+            ProposalBody::Key { spec, .. } if complete(self.pin()?.as_ref(), spec) => {
                 result.outcome = refused(Refusal::NothingToApply {
                     sequence: before.to_string(),
                 });
@@ -826,7 +826,7 @@ impl Engine {
                     expected: before.saturating_add(1),
                 };
             }
-            ProposalBody::Key { spec } => {
+            ProposalBody::Key { spec, .. } => {
                 let Coverage::Workload { workload, .. } = &certificate.coverage else {
                     return Err(not_workload_covered(cert_hash));
                 };
@@ -871,7 +871,7 @@ impl Engine {
     fn attest_only(&self, certificate: &Hash, body: &ProposalBody) -> Result<Refusal> {
         let target = self.root().to_string();
         let (run, proposed_rewrite) = match body {
-            ProposalBody::Key { spec } => match self.table_url() {
+            ProposalBody::Key { spec, .. } => match self.table_url() {
                 Some(url) => (
                     SqlUrl::parse(url)?.create_index_statements(spec.columns()),
                     None,
@@ -1321,10 +1321,15 @@ pub(crate) fn measured_score(
     Ok((hash, scored))
 }
 
-/// Marks every cost of `replay` measured and names the model.
+/// Marks every cost of `replay` measured and names the model, on both
+/// `exact` and `exactness` (record version 3: they agree, ledger rule 7b).
+/// Runs no spec serves stay priced as a raw scan (`unserved` absent).
 pub(crate) fn mark_measured(replay: &mut bellwether_types::Replay) {
     for c in replay.current.iter_mut().chain(replay.proposed.iter_mut()) {
         c.exact = false;
+        c.exactness = bellwether_types::Exactness::Measured {
+            model: MEASURED_AGGREGATES.to_string(),
+        };
     }
     replay.model = Some(MEASURED_AGGREGATES.to_string());
 }
@@ -1785,6 +1790,7 @@ fn union_plan(
             file: fp.clone(),
             row_groups: rgs.clone(),
             bytes: b,
+            columns: None,
         });
     }
     let plan = ScanPlan {
@@ -1794,6 +1800,9 @@ fn union_plan(
         bytes,
         row_groups_total: catalog.len() as u64,
         row_groups_selected: count,
+        projected_bytes: None,
+        order: None,
+        rows: None,
     };
     catalog.verify_plan(&plan)?;
     Ok(plan)
@@ -2579,6 +2588,7 @@ mod tests {
                 .propose(
                     ProposalBody::Key {
                         spec: crate::spec::parse("bloom:symbol@0.01").unwrap(),
+                        sidecars: Vec::new(),
                     },
                     &[ev],
                     "test",

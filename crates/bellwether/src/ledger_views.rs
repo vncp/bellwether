@@ -272,7 +272,7 @@ impl Engine {
 /// The rule ids a proposal is counted under ([`ScorecardResult::rules`]).
 fn attribute(p: &Proposal, evidence: &BTreeMap<Hash, &Evidence>) -> BTreeSet<String> {
     let columns: Option<BTreeSet<&String>> = match &p.body {
-        ProposalBody::Key { spec } => {
+        ProposalBody::Key { spec, .. } => {
             let mut c: BTreeSet<&String> = spec.columns().iter().collect();
             if let KeySpec::Temporal { ts_column, .. } = spec {
                 c.insert(ts_column);

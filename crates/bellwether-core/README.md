@@ -27,6 +27,7 @@ Tests:
 | `tests/sidecar_conformance.rs` | Pinned byte and record conformance for `bounds` and `temporal2` sidecar segments, `measure`, `add_batch` atomicity, and corruption sweeps |
 | `tests/sidecar_oracle.rs` | Oracle property tests for `bounds`, `temporal2`, and `bitemporal_winner` across row groups, nulls, composite keys, and sentinel timestamps |
 | `tests/sketch.rs` | `sketch` segments: round trip against a brute-force oracle (rows, nulls, distinct counts inside the interval; property test); split files merge losslessly; the HyperLogLog error bound over 312 trials at precisions 10, 12, and 14 (1 to 300,000 distinct values) against exact counts; MinHash and HyperLogLog overlap intervals against the exact Jaccard; nulls per ADR 014; determinism; layout rules behind the checksum; every-byte corruption refused; the `docs/format.md` conformance table byte for byte |
+| `tests/counts_conformance.rs` | Storage version 2 counts: the pinned value records and their directory checksums (the table in `docs/format.md`, "Counts conformance vectors"); every fixture segment named by its hash, read by the reader of its magic, and counted only when it stores counts; merge sums disjoint counts and refuses overlapping ones; every byte value at every body position of a counted exact and temporal segment never panics or reads a wrong count |
 
 Benchmark: `cargo bench -p bellwether-core --bench lookup` measures single-key lookup latency against segment size.
 
@@ -92,7 +93,7 @@ A missing or unknown value is refused on open.
 
 A bloom segment with `parquet_plain` filters (from `SegmentWriter::insert_filter`) covers one column. It answers only `lookup_hashes::<PlainHash>`, and `lookup` with canonical keys is an error, never a silent miss.
 
-## Segment format (`docs/format.md`, storage version 1)
+## Segment format (`docs/format.md`, storage version 2)
 
 All integers are little-endian.
 
@@ -102,11 +103,12 @@ header     JSON {storage_version, encoding_version, key_spec, codec, layout, blo
                  key_types?, ts_type?, ..unknown}
 body       blocks (layout-specific)
 index      entries u64 | has_rg u8 | rg_min u32 | rg_max u32 | block_count u32 | entries
-footer     index_offset u64 | index_len u64 | "BWSEGMNT"
+footer     index_offset u64 | index_len u64 | checksum u64 | "BWSEGMNT"
 ```
 
 - **Versions before JSON.** The versions sit in a fixed binary preamble, so a newer file is refused with `Error::UnsupportedVersion` before the header is parsed (ADR 017). The JSON header repeats them and must agree with the preamble. Unknown header fields are kept in `SegmentHeader::extra`, and merge carries them through when every input agrees, refusing otherwise.
-- **Codec.** The codec is `"none"` in storage version 1, and any other codec is refused.
+- **Checksums (storage version 2).** Every region a read touches carries an XXH3-64 checksum (`segment::checksum`): the footer covers the preamble, header and index; each index entry covers its filter, block or row-group region; each directory entry covers its value record. The reader verifies each before decoding it, so a corrupt byte is `Error::Corrupt`, never a wrong answer. A storage version 1 segment (24-byte footer, no checksums) is still read; this build writes only version 2.
+- **Codec.** The codec is `"none"` in storage versions 1 and 2, and any other codec is refused.
 - **Recorded types.** A segment built with `for_dataset` records each key column's dataset type (`key_types`) and, for temporal specs, the timestamp column's type and unit (`ts_type`). The spelling is Bellwether's own `ColumnType`, for example `{"type":"decimal128","precision":10,"scale":2}` or `{"type":"timestamp","unit":"millisecond","tz":"UTC"}`, so the frozen format does not depend on Arrow's serde. A dictionary column is recorded as its value type. Keys encoded under different types would split silently, so:
   - segments whose recorded types differ never merge, and the temporal fold refuses them
   - `SegmentReader::open_for_dataset` (or `check_dataset`) refuses a segment whose recorded types differ from the dataset schema's, or which records none
@@ -121,10 +123,12 @@ footer     index_offset u64 | index_len u64 | "BWSEGMNT"
   - **Exact.** Sorted key blocks of at most 1024 keys or 64 KiB of key bytes. Each block is written as:
     1. its value records
     2. an SBBF over its canonical keys at 1% FPP
-    3. a key directory: `n`, `n+1` end offsets, the key bytes, then `n` × `(value_offset u64, value_len u32)`
+    3. a key directory: `n`, `n+1` end offsets, the key bytes, then `n` × `(value_offset u64, value_len u32, value_checksum u64)`
 
-    A value is a roaring bitmap over global `RowGroupId`, always in the no-run serialized form (cookie `3a 30 00 00`) and never empty. A reader refuses any other cookie, an empty bitmap, or a bitmap that does not fill its record, so corruption is an error rather than a wrong or empty answer.
-  - **Temporal.** The exact layout, except that each value is a length-prefixed bitmap followed by a version chain: `count u32 | has_max u8 | max_ts i64 | count × (ts i64, rg u32)`, ascending and deduplicated. The bitmap includes row groups whose rows have a null timestamp, because membership is still true. The chain leaves them out, because they never win.
+    A value is `bitmap_len u32 | bitmap`, a roaring bitmap over global `RowGroupId`, always in the no-run serialized form (cookie `3a 30 00 00`) and never empty. A reader refuses any other cookie, an empty bitmap, or a bitmap that does not fill its length, so corruption is an error rather than a wrong or empty answer. (A version 1 exact value is the bare bitmap.)
+
+    **Counts.** For a spec with `counts` (`exact:a,counts`), the bitmap is followed by one shortest-form LEB128 row count per row group in it, ascending, each at least 1: the rows of that row group whose key tuple is this key (`SegmentWriter::insert_rows`). `SegmentReader::counts(keys)` returns them, or `None` for a segment that stores none, never zeros. Merge sums the counts of one (key, row group) only across inputs over disjoint row groups and refuses otherwise.
+  - **Temporal.** The exact layout, except that each value is the length-prefixed bitmap, then the counts when the spec stores them (rows over all versions, null times included), then a version chain: `count u32 | has_max u8 | max_ts i64 | count × (ts i64, rg u32)`, ascending and deduplicated. The bitmap includes row groups whose rows have a null timestamp, because membership is still true. The chain leaves them out, because they never win.
   - **Bloom.** One SBBF per row group over that row group's distinct keys, sized from the spec's `fpr` with Parquet's formula. Merge ORs the filters of one row group when they are the same size and keeps them as separate entries otherwise, and a lookup unions over them.
   - **Range.** One `(min, max)` per row group, sorted by `(min, max, rg)`, in blocks of 256 entries. Bounds may come from statistics, which exclude NaN, so a probe that includes the canonical NaN matches every row group. Signed zero follows the Parquet statistics reading rule: a stored minimum of +0.0 is widened to -0.0 and a maximum of -0.0 to +0.0, on write and on merge, so a probe for either zero never prunes a row group holding the other.
 - **Lookups.**

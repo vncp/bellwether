@@ -103,7 +103,7 @@ impl<S: StoreExt + ?Sized> Builder<S> {
         let schema = columns_to_schema(&m.schema.columns)?;
         let mut groups = Vec::new();
         for spec in &m.schema.key_specs {
-            let name = spec.name();
+            let name = spec.identity();
             let mut segs: Vec<&SegmentRef> =
                 m.segments.iter().filter(|s| segment_of(s, &name)).collect();
             segs.sort_by_key(|s| (s.rowgroup_range.start, s.rowgroup_range.end, s.id));
@@ -150,7 +150,7 @@ impl<S: StoreExt + ?Sized> Builder<S> {
                 inputs: g.inputs.iter().map(|s| s.id).collect(),
                 output: SegmentRef {
                     id: out.id,
-                    key_spec: g.spec.name(),
+                    key_spec: g.spec.identity(),
                     rowgroup_range: RowGroupRange::new(start, end),
                     bytes,
                     kind: None,
@@ -265,6 +265,8 @@ mod tests {
     fn groups_never_bridge_a_coverage_gap() {
         let spec = KeySpec::Exact {
             columns: vec!["id".into()],
+            counts: false,
+            bounds: None,
         };
         let segs = [
             seg(0, 10, 1),
@@ -285,6 +287,8 @@ mod tests {
     fn groups_respect_size_and_fan_in_and_accept_overlap() {
         let spec = KeySpec::Exact {
             columns: vec!["id".into()],
+            counts: false,
+            bounds: None,
         };
         let segs = [
             seg(0, 10, 40),

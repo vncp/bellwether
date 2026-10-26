@@ -45,9 +45,9 @@ use bellwether_source_engine::{
     check_query, ratio, refused, EngineAdapter, EngineIdentity, Exported, Tag,
 };
 use bellwether_types::{
-    format, CertBody, Certificate, Coverage, Error, Evidence, EvidenceBody, Hash, PairPrediction,
-    Prediction, Proposal, ProposalBody, Provenance, QueryStats, Receipt, Record, Replay, Result,
-    RewriteShape, RunCost, TwinOf,
+    format, CertBody, Certificate, Coverage, Error, Evidence, EvidenceBody, Exactness, Hash,
+    PairPrediction, Prediction, Proposal, ProposalBody, Provenance, QueryStats, Receipt, Record,
+    Replay, Result, RewriteShape, RunCost, TwinOf, MAX_MISMATCH_EXAMPLES,
 };
 use bellwether_verify::{CertificateContext, Options, ReconcileSpec, Reconciliation, Side};
 use serde::{Deserialize, Serialize};
@@ -197,7 +197,7 @@ pub(crate) fn check_pairs(shape: &RewriteShape) -> Result<()> {
     Ok(())
 }
 
-fn stats_cost(s: &QueryStats, keys: u64) -> RunCost {
+fn stats_cost(s: &QueryStats, keys: u64, model: &str) -> RunCost {
     let units = s.units_read.unwrap_or(0);
     RunCost {
         run_id: s.tag.clone(),
@@ -205,7 +205,16 @@ fn stats_cost(s: &QueryStats, keys: u64) -> RunCost {
         files: units,
         row_groups: units,
         bytes: s.read_bytes,
+        // Measured by the engine's own log, never exact; `exact` and
+        // `exactness` agree (record version 3, ledger rule 7b).
         exact: false,
+        exactness: Exactness::Measured {
+            model: model.to_string(),
+        },
+        // `rows` counts the rows holding the run's keys; the log records
+        // the rows the engine read (`measured.read_rows`), a different
+        // number, so it is absent.
+        rows: None,
         measured: Some(s.clone()),
     }
 }
@@ -417,12 +426,14 @@ impl Engine {
             inputs,
             current: pairs
                 .iter()
-                .map(|p| stats_cost(&p.before, twin.keys))
+                .map(|p| stats_cost(&p.before, twin.keys, engine.model()))
                 .collect(),
             proposed: pairs
                 .iter()
-                .map(|p| stats_cost(&p.after, twin.keys))
+                .map(|p| stats_cost(&p.after, twin.keys, engine.model()))
                 .collect(),
+            configuration: Vec::new(),
+            operators: Vec::new(),
             model: Some(engine.model().to_string()),
             unserved: None,
             prediction: Some(prediction.clone()),
@@ -804,6 +815,12 @@ impl Engine {
             mismatched: 0,
             ignored_columns: Vec::new(),
             totals_delta: Vec::new(),
+            examples: Vec::new(),
+            uncomparable: 0,
+            totals: Vec::new(),
+            // Each pair's exports are reconciled whole: every row of every
+            // key is compared.
+            row_filter: None,
         };
         let mut inputs = vec![before.hash, after.hash, replay];
         let mut age = Duration::ZERO;
@@ -812,6 +829,14 @@ impl Engine {
             body.missing_right += b.missing_right;
             body.missing_left += b.missing_left;
             body.mismatched += b.mismatched;
+            body.uncomparable += b.uncomparable;
+            let room = MAX_MISMATCH_EXAMPLES - body.examples.len();
+            body.examples.extend(b.examples.iter().take(room).cloned());
+            for t in &b.totals {
+                if !body.totals.contains(t) {
+                    body.totals.push(t.clone());
+                }
+            }
             for col in &b.ignored_columns {
                 if !body.ignored_columns.contains(col) {
                     body.ignored_columns.push(col.clone());

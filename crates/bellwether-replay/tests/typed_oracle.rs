@@ -192,7 +192,11 @@ fn cols(c: &[&str]) -> Vec<String> {
 }
 
 fn exact(c: &[&str]) -> KeySpec {
-    KeySpec::Exact { columns: cols(c) }
+    KeySpec::Exact {
+        columns: cols(c),
+        counts: false,
+        bounds: None,
+    }
 }
 
 enum Want {
@@ -224,6 +228,7 @@ fn configs(run: &Run, corpus: &Corpus) -> Vec<(Vec<KeySpec>, Want)> {
                 vec![KeySpec::Temporal {
                     columns: cols(&["k_i64", "k_str"]),
                     ts_column: "ts".into(),
+                    counts: false,
                 }],
                 Want::Equal,
             ),
@@ -236,6 +241,7 @@ fn configs(run: &Run, corpus: &Corpus) -> Vec<(Vec<KeySpec>, Want)> {
                     KeySpec::Bloom {
                         columns: cols(&["k_i64"]),
                         fpr: 0.05,
+                        bounds: None,
                     },
                     exact(&["k_str"]),
                 ],
@@ -254,6 +260,7 @@ fn configs(run: &Run, corpus: &Corpus) -> Vec<(Vec<KeySpec>, Want)> {
     let bloom = KeySpec::Bloom {
         columns: cols(&[c]),
         fpr: 0.05,
+        bounds: None,
     };
     let range = KeySpec::Range { column: c.into() };
     let prefix = exact(&[c, other]);
@@ -263,6 +270,7 @@ fn configs(run: &Run, corpus: &Corpus) -> Vec<(Vec<KeySpec>, Want)> {
             vec![KeySpec::Temporal {
                 columns: cols(&[c]),
                 ts_column: "ts".into(),
+                counts: false,
             }],
             Want::Equal,
         ),

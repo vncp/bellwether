@@ -409,6 +409,7 @@ fn lint(rule: &str, columns: Vec<String>, message: String, fresh: bool) -> Lint 
         // (0.6) when it does not.
         confidence: if fresh { 0.9 } else { 0.6 },
         site: None,
+        fix: None,
     }
 }
 

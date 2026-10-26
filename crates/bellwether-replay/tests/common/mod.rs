@@ -491,6 +491,9 @@ pub fn build_index(
             chunk_size: None,
             chunks: None,
             extra: Extra::new(),
+            rowgroup_rows: None,
+            rowgroup_bytes: None,
+            column_bytes: None,
         });
     }
     let n = rgs.len() as u32;
@@ -523,7 +526,7 @@ pub fn build_index(
             let id = staged.stage(Bytes::from(seg.bytes));
             refs.push(SegmentRef {
                 id,
-                key_spec: spec.name(),
+                key_spec: spec.identity(),
                 rowgroup_range: RowGroupRange::new(lo, hi),
                 bytes,
                 kind: None,
@@ -567,7 +570,7 @@ pub fn build_index(
         m.key_spec_completeness = BTreeMap::new();
         for (si, s) in specs.iter().enumerate() {
             if opts.complete || si + 1 < specs.len() {
-                m.key_spec_completeness.insert(s.name(), m.sequence + 1);
+                m.key_spec_completeness.insert(s.identity(), m.sequence + 1);
             }
         }
         Ok(m)

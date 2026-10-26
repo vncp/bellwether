@@ -80,8 +80,9 @@ pub use propose::engine_rewrite;
 pub use receipt::signature_summary;
 pub use reconcile::{ReconcileProblem, ReconcileRequest, ReconcileResult};
 pub use results::{
-    ChainLink, Cost, IndexResult, LinkStatus, LookbackWindow, LookupKind, NotSigned, PlanResult,
-    ProposeRefusal, ProposeResult, ReceiptResult, ReportResult, SidecarState, SpecState, Written,
+    ChainLink, Cost, CountResult, IndexResult, LinkStatus, LookbackWindow, LookupKind, NotSigned,
+    PlanResult, ProposeRefusal, ProposeResult, ReceiptResult, ReportResult, SidecarState,
+    SpecState, Written,
 };
 pub use signing::{
     generate_key, load_signing_key, load_trusted_keys, public_path, read_public_key,

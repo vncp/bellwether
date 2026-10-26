@@ -105,7 +105,7 @@ fn multi_rg_exact_range_bloom_composite_and_prefix() {
         let segs: Vec<_> = m
             .segments
             .iter()
-            .filter(|x| x.key_spec == spec.name())
+            .filter(|x| x.key_spec == spec.identity())
             .collect();
         assert_eq!(segs.len(), 1);
         assert_eq!(

@@ -109,7 +109,10 @@ impl Engine {
         let sidecar = match (&declared.key, &declared.sidecar) {
             (Some(spec), None) => {
                 return self.propose_inner(
-                    ProposalBody::Key { spec: spec.clone() },
+                    ProposalBody::Key {
+                        spec: spec.clone(),
+                        sidecars: Vec::new(),
+                    },
                     evidence,
                     proposed_by,
                     write,
@@ -128,7 +131,10 @@ impl Engine {
             return Ok(refused);
         }
         if let Some(spec) = &declared.key {
-            self.check_body(&ProposalBody::Key { spec: spec.clone() })?;
+            self.check_body(&ProposalBody::Key {
+                spec: spec.clone(),
+                sidecars: Vec::new(),
+            })?;
         }
         let schema = self.check_columns(
             &sidecar
@@ -308,8 +314,16 @@ impl Engine {
 
     fn check_body(&self, body: &ProposalBody) -> Result<()> {
         match body {
-            ProposalBody::Key { spec } => {
+            ProposalBody::Key { spec, .. } => {
                 crate::spec::check(spec)?;
+                // A spec the index does not declare yet is a new
+                // declaration: it must name its columns uniquely.
+                if !self
+                    .manifest()?
+                    .is_some_and(|m| m.schema.key_specs.contains(spec))
+                {
+                    spec.check_names()?;
+                }
                 let mut cols: Vec<&String> = spec.columns().iter().collect();
                 if let KeySpec::Temporal { ts_column, .. } = spec {
                     cols.push(ts_column);
@@ -462,5 +476,7 @@ pub fn engine_rewrite(
         pairs,
         key,
         keys: None,
+        before_plan: None,
+        after_plan: None,
     }
 }

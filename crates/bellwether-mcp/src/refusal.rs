@@ -510,6 +510,12 @@ pub fn from_error(e: &Error) -> Refusal {
             RefusalCode::UnsupportedVersion,
             json!({ "what": what, "found": found, "supported": supported }),
         ),
+        // A storage version 2 shape a later release adds: the same next
+        // step as a newer version (upgrade), with the shape named.
+        Error::UnsupportedShape { what, found } => (
+            RefusalCode::UnsupportedVersion,
+            json!({ "what": what, "found": found }),
+        ),
         Error::SegmentClaimed(h) => (RefusalCode::SegmentClaimed, json!({ "segment": h })),
         Error::VersionConflict { expected, found } => (
             RefusalCode::VersionConflict,
@@ -951,6 +957,13 @@ mod tests {
                 },
                 RefusalCode::MeasurementRefused,
             ),
+            (
+                Error::UnsupportedShape {
+                    what: "bitemporal key spec",
+                    found: "temporal2:id@valid,known".into(),
+                },
+                RefusalCode::UnsupportedVersion,
+            ),
         ];
         for (e, code) in &cases {
             let r = from_error(e);
@@ -978,6 +991,8 @@ mod tests {
         assert_eq!(f(18)["requested"], 1);
         assert_eq!(f(18)["oldest"], 3);
         assert_eq!(f(18)["current"], 5);
+        assert_eq!(f(20)["what"], "bitemporal key spec");
+        assert_eq!(f(20)["found"], "temporal2:id@valid,known");
         // Next lines name the MCP field to fix.
         assert!(from_error(&cases[10].0).next.contains("`certificate`"));
         assert!(from_error(&cases[11].0).next.contains("`workload`"));

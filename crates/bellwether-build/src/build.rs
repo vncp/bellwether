@@ -13,10 +13,11 @@ use bellwether_core::segment::{validate_spec, ColumnType};
 use bellwether_core::sidecar::SidecarDef;
 use bellwether_source::{FingerprintPolicy, Partitioning, DEFAULT_CHUNK_SIZE};
 use bellwether_store::{
-    commit_with, now_rfc3339, read_manifest, ChunkRange, ColumnDef, CommitOptions, Extra,
-    FileEntry, Manifest, RowGroupSpace, RowGroupTombstone, SchemaInfo, SegmentRef, SourceInfo,
-    StagedSegments, StoreExt,
+    commit_with, now_rfc3339, read_manifest, spec_json, ChunkRange, ColumnDef, CommitOptions,
+    Extra, FileEntry, Manifest, RowGroupSpace, RowGroupTombstone, SchemaInfo, SegmentRef,
+    SourceInfo, StagedSegments, StoreExt,
 };
+use bellwether_types::format::STORAGE_VERSION;
 use bellwether_types::{Error, FileFingerprint, KeySpec, Result, RowGroupId, SketchSpec};
 use roaring::RoaringBitmap;
 
@@ -24,7 +25,7 @@ use crate::config::{
     columns_to_schema, parse_policy, persistable, policy_name, schema_to_columns, BuildObserver,
     BuildOptions, SourceKind,
 };
-use crate::coverage::{completeness, completeness_map, covered, live_ids, Locator};
+use crate::coverage::{completeness, completeness_map, covered, live_ids, segment_of, Locator};
 use crate::segments::{self, Ctx, FileRow, SpecPlan};
 use crate::sources::{infer_schema, DataSource};
 use crate::target::{
@@ -79,11 +80,27 @@ pub struct BuildReport {
     pub segments: Vec<SegmentRef>,
     /// Key specs whose segments were rebuilt over every live row group: new
     /// specs, specs whose definition changed under the same name, and specs
-    /// whose key or timestamp column changed type.
+    /// whose key or timestamp column changed type, and the specs in
+    /// `specs_repaired`.
     pub specs_rebuilt: Vec<String>,
+    /// Counted key specs (by identity) rebuilt because two of their
+    /// segments covered one live row group, so their rows would have been
+    /// counted twice: a manifest no build writes (another tool's, or an
+    /// edited one), which every planner refuses as a corrupt index.
+    pub specs_repaired: Vec<String>,
     /// Key specs removed because [`BuildOptions::remove_unlisted`] was set
     /// and they were not listed; their segments were dropped.
     pub specs_removed: Vec<String>,
+    /// Unchanged files whose per-row-group statistics (storage version 2:
+    /// rows, bytes, column bytes) this build recorded, each from one
+    /// `Source::row_groups` call: every file of a version 1 manifest on the
+    /// first build by this binary that commits, and every file when the
+    /// schema's columns changed. Zero when nothing was committed.
+    pub files_filled: u64,
+    /// The storage version of the manifest this build committed over, when
+    /// older than this binary's: the commit upgraded the index to
+    /// [`bellwether_types::format::STORAGE_VERSION`] (ADR 028).
+    pub upgraded_from: Option<u32>,
     /// Restarts after a conflicting concurrent commit.
     pub restarts: u32,
     /// Most row groups held by workers at once (at most the thread count).
@@ -95,7 +112,7 @@ pub struct BuildReport {
 }
 
 enum Attempt {
-    Done(BuildReport),
+    Done(Box<BuildReport>),
     Restart { claimed: bool },
 }
 
@@ -156,15 +173,20 @@ impl<S: StoreExt + ?Sized> Builder<S> {
                     }
                     Some(d) if d != spec => {
                         return Err(Error::KeySpec(format!(
-                            "the index declares {d:?} under the name {name}, not {spec:?}"
+                            "the index declares {} under the name {name}, not {}",
+                            d.identity(),
+                            spec.identity()
                         )))
                     }
                     Some(_) => {}
                 }
+                // Segments and completeness are keyed by the declared
+                // spec's identity (storage version 2).
+                let identity = spec.identity();
                 let mut next = m.clone();
                 next.schema.key_specs.retain(|s| s.name() != name);
-                next.segments.retain(|s| s.key_spec != name);
-                next.key_spec_completeness.remove(&name);
+                next.segments.retain(|s| s.key_spec != identity);
+                next.key_spec_completeness.remove(&identity);
                 Ok(next)
             },
         );
@@ -255,7 +277,7 @@ impl<S: StoreExt + ?Sized> Builder<S> {
                 Attempt::Done(mut report) => {
                     report.restarts = restarts;
                     report.elapsed = started.elapsed();
-                    return Ok(report);
+                    return Ok(*report);
                 }
                 Attempt::Restart { claimed } => {
                     restarts += 1;
@@ -284,6 +306,9 @@ impl<S: StoreExt + ?Sized> Builder<S> {
         }
         let cfg = Config::resolve(base.as_ref(), root, opts)?;
         let declared = declared_specs(base.as_ref(), key_specs, opts.remove_unlisted)?;
+        if let Some((a, b)) = KeySpec::shared_identity(&declared) {
+            return Err(shared_identity(root, base.as_ref(), a, b));
+        }
         let sidecars = declared_sidecar_defs(base.as_ref(), &opts.sidecars, opts.remove_unlisted)?;
         let sketches = declared_sketch_specs(base.as_ref(), &opts.sketches, opts.remove_unlisted)?;
         let specs = plan_specs(&declared, &sidecars, &sketches, &cfg.schema)?;
@@ -314,7 +339,10 @@ impl<S: StoreExt + ?Sized> Builder<S> {
         let work = plan_work(base.as_ref(), &specs, &cfg, &live);
         let mut report = files.report(&work);
         if is_noop(base.as_ref(), &files, &work, &cfg, &specs)? {
-            return Ok(Attempt::Done(report));
+            // Nothing committed: a version 1 index stays at version 1 and
+            // keeps planning as before (ADR 028); no statistics were recorded.
+            report.files_filled = 0;
+            return Ok(Attempt::Done(Box::new(report)));
         }
         let items = segments::items(&files.rows, &work.needed, opts.max_segment_row_groups)?;
         let ctx = Ctx {
@@ -362,8 +390,12 @@ impl<S: StoreExt + ?Sized> Builder<S> {
         match committed {
             Ok(c) => {
                 report.sequence = Some(c.sequence);
+                report.upgraded_from = base
+                    .as_ref()
+                    .map(|m| m.storage_version)
+                    .filter(|&v| v < STORAGE_VERSION);
                 report.segments = written.segments;
-                Ok(Attempt::Done(report))
+                Ok(Attempt::Done(Box::new(report)))
             }
             Err(_) if restart.get() => Ok(Attempt::Restart { claimed: false }),
             Err(Error::SegmentClaimed(_)) => Ok(Attempt::Restart { claimed: true }),
@@ -545,12 +577,16 @@ fn recorded_chunk_size(base: Option<&Manifest>) -> NewChunkSize {
 /// The specs a build declares: `key_specs`, plus, unless `remove_unlisted`,
 /// every spec the base declares under a name `key_specs` does not use. The
 /// base's specs keep their order, a given spec under an existing name
-/// replaces that definition in place, and new specs follow.
+/// replaces that definition in place, and new specs follow. A given spec
+/// the base does not already declare is a new declaration and must meet
+/// [`KeySpec::check_names`]; one it declares (a storage version 1 spec on a
+/// column named `a,b`) is indexed as it is.
 fn declared_specs(
     base: Option<&Manifest>,
     key_specs: &[KeySpec],
     remove_unlisted: bool,
 ) -> Result<Vec<KeySpec>> {
+    let base_specs = base.map_or(&[][..], |m| m.schema.key_specs.as_slice());
     let mut given: BTreeMap<String, &KeySpec> = BTreeMap::new();
     for spec in key_specs {
         if given.insert(spec.name(), spec).is_some() {
@@ -560,12 +596,15 @@ fn declared_specs(
                 spec.name()
             )));
         }
+        if !base_specs.contains(spec) {
+            spec.check_names()?;
+        }
     }
     if remove_unlisted {
         return Ok(key_specs.to_vec());
     }
     let mut out: Vec<KeySpec> = Vec::with_capacity(key_specs.len());
-    for spec in base.map_or(&[][..], |m| m.schema.key_specs.as_slice()) {
+    for spec in base_specs {
         out.push(
             given
                 .get(&spec.name())
@@ -578,6 +617,80 @@ fn declared_specs(
         }
     }
     Ok(out)
+}
+
+/// The refusal for two declared specs that share an identity, before
+/// anything is read or written: storage version 2 files segments by
+/// identity, so their segments could not be told apart. Either both come
+/// from a storage version 1 index (which allowed it), and the index cannot
+/// be upgraded until one is re-declared under its name (a spec declared
+/// under an existing name replaces it), or one is a new declaration
+/// colliding with a spec the index already declares.
+fn shared_identity(root: &str, base: Option<&Manifest>, a: &KeySpec, b: &KeySpec) -> Error {
+    let declared = |s: &KeySpec| base.is_some_and(|m| m.schema.key_specs.contains(s));
+    let both = format!(
+        "the key specs {} and {} share the identity {}, and storage version 2 files segments by \
+         identity, so their segments could not be told apart; nothing was read or written",
+        spec_json(a),
+        spec_json(b),
+        a.identity()
+    );
+    if !(declared(a) && declared(b)) {
+        let (new, old) = if declared(a) { (b, a) } else { (a, b) };
+        return Error::KeySpec(format!(
+            "{both}. {} is a new declaration and {} is already declared, so declare a spec \
+             over other columns instead",
+            spec_json(new),
+            spec_json(old)
+        ));
+    }
+    // A spec re-declared under its name replaces it; the replacement is a
+    // new declaration, so its key columns (its name) must be free of the
+    // separators. Its other columns (a time column) are the ones to change.
+    let clean = |s: &KeySpec| !s.columns().iter().any(|c| c.contains([',', '@']));
+    let step = match [a, b].into_iter().find(|s| clean(s)) {
+        Some(s) => {
+            let placeholder = "<a time column whose name has no ',' or '@'>";
+            let fix = |c: &mut String| {
+                if c.contains([',', '@']) {
+                    *c = placeholder.to_string();
+                }
+            };
+            let mut example = s.clone();
+            match &mut example {
+                KeySpec::Exact { bounds, .. } | KeySpec::Bloom { bounds, .. } => {
+                    bounds.iter_mut().for_each(fix);
+                }
+                KeySpec::Temporal { ts_column, .. } => fix(ts_column),
+                KeySpec::Bitemporal {
+                    valid_column,
+                    known_column,
+                    ..
+                } => {
+                    fix(valid_column);
+                    fix(known_column);
+                }
+                KeySpec::Range { .. } => {}
+            }
+            format!(
+                "re-declare {} under its name with a time column whose name has no ',' or '@', \
+                 for example `bellwether index {root} --key '{}'`: a spec declared under an \
+                 existing name replaces it, and that build upgrades the index",
+                s.name(),
+                spec_json(&example)
+            )
+        }
+        None => format!(
+            "both specs' key columns hold ',' or '@', so neither can be re-declared under its \
+             name; move the index folder of {root} aside and index again with key specs whose \
+             columns have neither"
+        ),
+    };
+    Error::KeySpec(format!(
+        "cannot upgrade this storage version 1 index to storage version {STORAGE_VERSION}: {both}. \
+         To upgrade it, {step}. Until then the index stays at storage version 1, and every other \
+         spec still plans"
+    ))
 }
 
 /// The schema this build commits: the dataset columns, the declared key
@@ -735,7 +848,7 @@ fn plan_specs(
             };
             Ok(SpecPlan {
                 target: Target::Key(spec.clone()),
-                name,
+                name: spec.identity(),
                 key_types,
                 ts_type,
                 time_types: Vec::new(),
@@ -815,6 +928,8 @@ struct FileCounts {
     unchanged: u64,
     assigned: u64,
     retired: u64,
+    /// Unchanged files whose storage version 2 statistics were filled.
+    filled: u64,
 }
 
 /// The tracked files and row-group space after this build.
@@ -833,7 +948,9 @@ impl FilePlan {
             files_unchanged: self.counts.unchanged,
             row_groups_assigned: self.counts.assigned,
             row_groups_retired: self.counts.retired,
+            files_filled: self.counts.filled,
             specs_rebuilt: work.replaced.iter().cloned().collect(),
+            specs_repaired: work.repaired.clone(),
             specs_removed: work.removed.clone(),
             ..BuildReport::default()
         }
@@ -843,6 +960,7 @@ impl FilePlan {
 /// Pairs discovered files with tracked ones by path, retires the ids of
 /// changed and vanished files, and assigns fresh ids, in path order, to
 /// every file seen for the first time or changed.
+#[allow(clippy::too_many_lines)]
 fn plan_files(
     base: Option<&Manifest>,
     discovered: &[FileFingerprint],
@@ -871,14 +989,41 @@ fn plan_files(
             counts.removed += 1;
         }
     }
+    let columns: Vec<String> = cfg.columns.iter().map(|c| c.name.clone()).collect();
+    // Column bytes are aligned with the schema's columns, so a schema whose
+    // columns changed refills them for every file.
+    let columns_changed =
+        base.is_some_and(|m| !m.schema.columns.iter().map(|c| &c.name).eq(columns.iter()));
     let mut next = base_space.next_id;
     let mut entries = Vec::with_capacity(discovered.len());
     for fp in discovered {
         if let Some(old) = by_path.get(fp.path.as_str()) {
             if old.fingerprint == *fp {
-                entries.push((*old).clone());
-                counts.unchanged += 1;
-                continue;
+                let current = old.has_rowgroup_stats()
+                    && (old.column_bytes.is_none() == cfg.kind.text_format().is_some())
+                    && !columns_changed;
+                if current {
+                    entries.push((*old).clone());
+                    counts.unchanged += 1;
+                    continue;
+                }
+                // A version 1 entry, or one whose column bytes no longer
+                // align: fill the statistics from one `row_groups` call. A
+                // footer that disagrees with the recorded row-group count
+                // is drift under an unchanged fingerprint (ADR 013): the
+                // file's ids are retired and reassigned like a changed
+                // file's.
+                let stats = sources.rowgroup_stats(fp, old.chunk_size, &columns)?;
+                if stats.rows.len() == old.rowgroup_ids.len() {
+                    let mut e = (*old).clone();
+                    e.rowgroup_rows = Some(stats.rows);
+                    e.rowgroup_bytes = Some(stats.bytes);
+                    e.column_bytes = stats.column_bytes;
+                    entries.push(e);
+                    counts.unchanged += 1;
+                    counts.filled += 1;
+                    continue;
+                }
             }
             retired.extend(&old.rowgroup_ids);
             counts.changed += 1;
@@ -889,6 +1034,16 @@ fn plan_files(
         let layout = sources.layout(fp, chunk_size)?;
         if let Some(o) = observer {
             o.file_laid_out(fp);
+        }
+        let stats = sources.rowgroup_stats(fp, chunk_size, &columns)?;
+        if stats.rows.len() != layout.row_groups {
+            return Err(Error::Source(format!(
+                "{}: the file lists {} row groups, then {}; it changed while the build read it, \
+                 so run the build again",
+                fp.path,
+                layout.row_groups,
+                stats.rows.len()
+            )));
         }
         let n = u32::try_from(layout.row_groups)
             .map_err(|_| Error::Other(format!("{}: too many row groups", fp.path)))?;
@@ -910,6 +1065,9 @@ fn plan_files(
                     .collect()
             }),
             extra: Extra::new(),
+            rowgroup_rows: Some(stats.rows),
+            rowgroup_bytes: Some(stats.bytes),
+            column_bytes: stats.column_bytes,
         });
         next = end;
     }
@@ -988,6 +1146,32 @@ struct WorkPlan {
     keep: BTreeSet<String>,
     /// Base specs no longer declared.
     removed: Vec<String>,
+    /// Counted specs rebuilt because two of their base segments cover one
+    /// live row group (also in `replaced`).
+    repaired: Vec<String>,
+}
+
+/// Whether two segments listed under `name` both cover one live row group.
+/// No build commits that (a build indexes each live row group in one
+/// segment per spec, and compaction merges only contiguous ranges), so the
+/// manifest was written by another tool or edited. A counted spec's rows
+/// would then be counted twice, which every planner refuses
+/// ([`crate::overlapping_counts`]); the build rebuilds the spec instead.
+fn double_covered(m: &Manifest, name: &str, live: &RoaringBitmap) -> bool {
+    let mut seen = RoaringBitmap::new();
+    for s in m.segments.iter().filter(|s| segment_of(s, name)) {
+        let (start, end) = (s.rowgroup_range.start.0, s.rowgroup_range.end.0);
+        let mut covers = RoaringBitmap::new();
+        if start < end {
+            covers.insert_range(start..end);
+        }
+        covers &= live;
+        if !seen.is_disjoint(&covers) {
+            return true;
+        }
+        seen |= covers;
+    }
+    false
 }
 
 /// Whether any column of `target` whose type its segments record (key
@@ -1018,15 +1202,23 @@ fn plan_work(
         replaced: BTreeSet::new(),
         keep: BTreeSet::new(),
         removed: Vec::new(),
+        repaired: Vec::new(),
     };
     let base_targets = base.map(declared_targets).unwrap_or_default();
     for p in specs {
-        let old = base_targets.iter().find(|t| t.name() == p.name);
+        let old = base_targets.iter().find(|t| t.slot() == p.target.slot());
         let types_changed = match &cfg.base_schema {
             Some(bs) => types_differ(bs, &cfg.schema, &p.target),
             None => old.is_some(),
         };
-        let replaced = old != Some(&p.target) || types_changed;
+        let double = match (base, &p.target) {
+            (Some(m), Target::Key(spec)) if spec.counts() => double_covered(m, &p.name, live),
+            _ => false,
+        };
+        let replaced = old != Some(&p.target) || types_changed || double;
+        if double && old == Some(&p.target) && !types_changed {
+            work.repaired.push(p.name.clone());
+        }
         let needed = match base {
             Some(m) if !replaced => live - &covered(m, &p.name),
             _ => live.clone(),
@@ -1038,16 +1230,20 @@ fn plan_work(
             work.keep.insert(p.name.clone());
         }
     }
-    let declared: BTreeSet<&str> = specs.iter().map(|p| p.name.as_str()).collect();
+    // A spec redefined under its slot is rebuilt, not removed.
+    let declared: BTreeSet<String> = specs.iter().map(|p| p.target.slot()).collect();
     work.removed = base_targets
         .iter()
+        .filter(|t| !declared.contains(&t.slot()))
         .map(Target::name)
-        .filter(|n| !declared.contains(n.as_str()))
         .collect();
     work
 }
 
-/// Whether committing would change nothing.
+/// Whether committing would change nothing. Filling the storage version 2
+/// statistics of a version 1 manifest is not a change on its own: a build
+/// with nothing else to do commits nothing and leaves the index at version
+/// 1; the next commit that changes anything upgrades it.
 fn is_noop(
     base: Option<&Manifest>,
     files: &FilePlan,

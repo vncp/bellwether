@@ -293,10 +293,13 @@ fn write_corpus(s: &Scratch) -> Vec<std::path::PathBuf> {
 fn specs() -> Vec<KeySpec> {
     let e = |c: &[&str]| KeySpec::Exact {
         columns: c.iter().map(|s| (*s).to_string()).collect(),
+        counts: false,
+        bounds: None,
     };
     let b = |c: &str| KeySpec::Bloom {
         columns: vec![c.into()],
         fpr: 0.01,
+        bounds: None,
     };
     let r = |c: &str| KeySpec::Range { column: c.into() };
     vec![
@@ -318,6 +321,7 @@ fn specs() -> Vec<KeySpec> {
         KeySpec::Temporal {
             columns: vec!["id".into()],
             ts_column: "ts".into(),
+            counts: false,
         },
     ]
 }
@@ -786,9 +790,13 @@ fn text_case(kind: SourceKind, file: &str, chunk: u64) {
     let specs = vec![
         KeySpec::Exact {
             columns: vec!["id".into()],
+            counts: false,
+            bounds: None,
         },
         KeySpec::Exact {
             columns: vec!["val".into()],
+            counts: false,
+            bounds: None,
         },
         KeySpec::Range {
             column: "val".into(),
@@ -796,9 +804,12 @@ fn text_case(kind: SourceKind, file: &str, chunk: u64) {
         KeySpec::Bloom {
             columns: vec!["name".into()],
             fpr: 0.01,
+            bounds: None,
         },
         KeySpec::Exact {
             columns: vec!["id".into(), "name".into()],
+            counts: false,
+            bounds: None,
         },
     ];
     let opts = BuildOptions {

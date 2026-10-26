@@ -58,6 +58,10 @@ use crate::workload::{KeySetSource, Workload};
 /// Version of the layout model this module implements.
 pub const LAYOUT_MODEL_VERSION: u32 = 1;
 
+/// The model's short name, recorded in each run cost's
+/// `Exactness::Measured` (the replay's `model` states it in full).
+pub const LAYOUT_MODEL_NAME: &str = "layout.v1";
+
 /// The layout a proposal is costed under (module docs).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LayoutModel {
@@ -115,7 +119,8 @@ pub struct LayoutReplay {
     pub model: LayoutModel,
     /// [`LayoutModel::describe`] for this dataset.
     pub description: String,
-    /// One cost per workload run, in workload order, each `exact: false`.
+    /// One cost per workload run, in workload order, each `exact: false` and
+    /// measured by [`LAYOUT_MODEL_NAME`].
     pub costs: Vec<RunCost>,
 }
 
@@ -411,6 +416,10 @@ fn modeled_costs(
             row_groups: selected.len(),
             bytes,
             exact: false,
+            exactness: bellwether_types::Exactness::Measured {
+                model: LAYOUT_MODEL_NAME.to_string(),
+            },
+            rows: None,
         });
     }
     Ok(costs)
@@ -420,6 +429,8 @@ fn exact_writer(columns: &[String]) -> ReplayResult<SegmentWriter> {
     Ok(SegmentWriter::new(
         KeySpec::Exact {
             columns: columns.to_vec(),
+            counts: false,
+            bounds: None,
         },
         WriterOptions::default(),
     )?)

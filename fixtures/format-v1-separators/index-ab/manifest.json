@@ -1,0 +1,89 @@
+{
+  "commit_nonce": 3216991978719044236,
+  "committed_at": "2026-10-26T12:22:38.461Z",
+  "created_at": "2026-10-26T12:22:38.461Z",
+  "deleting": [],
+  "key_spec_completeness": {
+    "exact:a,b": 1
+  },
+  "rowgroup_space": {
+    "files": [
+      {
+        "fingerprint": {
+          "etag": "2026-10-25T00:00:00.000000000Z",
+          "path": "/private/tmp/b1r2/fx/data/part-0.parquet",
+          "size": 4583,
+          "tail_blake3": "37710581aed39562ff8d263fac4535ec4299395fcc693ef3a650c05130334133"
+        },
+        "rowgroup_ids": [
+          0,
+          1,
+          2
+        ]
+      }
+    ],
+    "next_id": 3,
+    "tombstones": []
+  },
+  "schema": {
+    "columns": [
+      {
+        "data_type": "Int64",
+        "name": "a,b",
+        "nullable": true
+      },
+      {
+        "data_type": "Int64",
+        "name": "id",
+        "nullable": true
+      },
+      {
+        "data_type": "Timestamp(ms)",
+        "name": "ts",
+        "nullable": true
+      },
+      {
+        "data_type": "Timestamp(ms)",
+        "name": "ts@x",
+        "nullable": true
+      },
+      {
+        "data_type": "Int64",
+        "name": "id@ts",
+        "nullable": true
+      },
+      {
+        "data_type": "Timestamp(ms)",
+        "name": "x",
+        "nullable": true
+      }
+    ],
+    "key_specs": [
+      {
+        "columns": [
+          "a,b"
+        ],
+        "kind": "exact"
+      }
+    ]
+  },
+  "segment_tombstones": [],
+  "segments": [
+    {
+      "bytes": 464,
+      "id": "fc0fb70653dace25e74e498859be7c7bde5a83a34d83b95343fa3907fb742b5a",
+      "key_spec": "exact:a,b",
+      "rowgroup_range": {
+        "end": 3,
+        "start": 0
+      }
+    }
+  ],
+  "sequence": 1,
+  "source": {
+    "fingerprint_policy": "tail64k",
+    "kind": "parquet",
+    "root": "/private/tmp/b1r2/fx/data"
+  },
+  "storage_version": 1
+}

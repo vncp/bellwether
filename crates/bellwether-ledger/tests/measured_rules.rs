@@ -11,8 +11,8 @@ mod common;
 
 use bellwether_ledger::Ledger;
 use bellwether_types::{
-    format, Hash, PairPrediction, Prediction, ProposalBody, QueryPair, QueryStats, Receipt, Record,
-    Replay, RewriteShape,
+    format, Exactness, Hash, PairPrediction, Prediction, ProposalBody, QueryPair, QueryStats,
+    Receipt, Record, Replay, RewriteShape,
 };
 use common::{assert_rule, certificate, evidence, proposal, replay, MemStore, BEFORE};
 
@@ -41,6 +41,8 @@ fn engine_shape() -> RewriteShape {
         }],
         key: vec!["id".into()],
         keys: None,
+        before_plan: None,
+        after_plan: None,
     }
 }
 
@@ -60,7 +62,8 @@ fn prediction(evidence: Hash) -> Prediction {
     }
 }
 
-/// A measured replay of `p`: every cost inexact with engine statistics.
+/// A measured replay of `p`: every cost inexact with engine statistics,
+/// `exact` and `exactness` agreeing (record version 3, rule 7b).
 fn measured(p: Hash, evidence: Hash) -> Replay {
     let mut r = replay(p);
     for (i, c) in r
@@ -70,6 +73,9 @@ fn measured(p: Hash, evidence: Hash) -> Replay {
         .enumerate()
     {
         c.exact = false;
+        c.exactness = Exactness::Measured {
+            model: "clickhouse.query_log".into(),
+        };
         c.measured = Some(stats(&format!("bw-x-{i}")));
     }
     r.model = Some("clickhouse.query_log".into());

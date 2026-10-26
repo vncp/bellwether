@@ -287,6 +287,7 @@ fn nothing_but_fix_signs() {
         .propose(
             bellwether::types::ProposalBody::Key {
                 spec: bellwether::spec::parse("exact:batch").unwrap(),
+                sidecars: Vec::new(),
             },
             &[evidence],
             "agent",
@@ -633,6 +634,8 @@ fn a_verify_only_rewrite_signs_its_certificate() {
                     before: "a".into(),
                     after: "b".into(),
                     invariant: "same rows by id".into(),
+                    before_plan: None,
+                    after_plan: None,
                 },
             },
             &[ev],
@@ -801,6 +804,7 @@ fn a_signed_chain_whose_evidence_names_no_root_is_not_signed() {
         .propose(
             bellwether::types::ProposalBody::Key {
                 spec: bellwether::spec::parse("exact:id").unwrap(),
+                sidecars: Vec::new(),
             },
             &[plan.evidence.hash],
             "agent",

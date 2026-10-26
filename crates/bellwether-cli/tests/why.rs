@@ -121,3 +121,38 @@ fn why_on_a_read_only_folder_exits_0_with_the_evidence_unrecorded() {
     assert!(human.contains("--index"), "{human}");
     assert!(!index_dir(&data).exists());
 }
+
+/// Count runs ahead of their locates, over an index on the key without
+/// counts: the counts candidate's funnel row says what it is priced for
+/// (count runs read nothing), not the floor note of a plain exact key,
+/// which it no longer is.
+#[test]
+fn the_counts_candidate_names_what_it_is_priced_for() {
+    let dir = tempfile::tempdir().unwrap();
+    let corpus_dir = dir.path().join("corpus");
+    let data = planted(&corpus_dir, 6);
+    run(&["index", path(&data), "--key", "exact:entity_id"], 0);
+    // Every other run counts its keys (`query` is the bench workload's
+    // optional run field; the workload hash covers only the key sets).
+    let wl = corpus_dir.join("workload.json");
+    let mut v: serde_json::Value = serde_json::from_slice(&std::fs::read(&wl).unwrap()).unwrap();
+    for (i, r) in v["runs"].as_array_mut().unwrap().iter_mut().enumerate() {
+        if i % 2 == 0 {
+            r["query"] = "count".into();
+        }
+    }
+    std::fs::write(&wl, serde_json::to_vec(&v).unwrap()).unwrap();
+    let human = run(
+        &["why", path(&data), "--bench-workload", path(&corpus_dir)],
+        0,
+    );
+    let row = human
+        .lines()
+        .find(|l| l.trim_start().starts_with("exact:entity_id,counts "))
+        .unwrap_or_else(|| panic!("no counts candidate row:\n{human}"));
+    assert!(
+        row.contains("count runs answered from per-key counts, no data read"),
+        "{row}"
+    );
+    assert!(!row.contains("floor"), "{row}");
+}

@@ -135,11 +135,11 @@ fn compaction_merges_contiguous_segments_and_keeps_every_plan() {
     assert_eq!(r.merges, specs().len() as u64);
     let after = b.manifest().unwrap().unwrap();
     for spec in specs() {
-        assert_eq!(per_spec(&after, &spec.name()), 1, "{}", spec.name());
+        assert_eq!(per_spec(&after, &spec.identity()), 1, "{}", spec.name());
         let seg = after
             .segments
             .iter()
-            .find(|x| x.key_spec == spec.name())
+            .find(|x| x.key_spec == spec.identity())
             .unwrap();
         assert_eq!(
             (seg.rowgroup_range.start.0, seg.rowgroup_range.end.0),

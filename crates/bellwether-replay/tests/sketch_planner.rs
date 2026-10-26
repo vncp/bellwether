@@ -26,10 +26,13 @@ fn a_sketch_changes_no_replay_plan() {
     let specs = vec![
         KeySpec::Exact {
             columns: cols(&["entity_id"]),
+            counts: false,
+            bounds: None,
         },
         KeySpec::Temporal {
             columns: cols(&["entity_id"]),
             ts_column: "version_ts".into(),
+            counts: false,
         },
         KeySpec::Range {
             column: "entity_id".into(),
@@ -108,6 +111,8 @@ fn a_sketch_changes_no_replay_plan() {
     );
     let hypothetical = vec![KeySpec::Exact {
         columns: cols(&["entity_id", "batch_id"]),
+        counts: false,
+        bounds: None,
     }];
     assert_eq!(
         ra.replay_specs(&hypothetical, &workload, &keys).unwrap(),

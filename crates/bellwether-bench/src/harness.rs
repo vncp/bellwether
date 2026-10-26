@@ -107,6 +107,7 @@ fn plan_from(corpus: &Corpus, mut keep: impl FnMut(usize, usize) -> bool) -> Sca
                 file: file.fingerprint.clone(),
                 row_groups: bitmap,
                 bytes: file_bytes,
+                columns: None,
             });
         }
     }
@@ -117,6 +118,9 @@ fn plan_from(corpus: &Corpus, mut keep: impl FnMut(usize, usize) -> bool) -> Sca
         bytes,
         row_groups_total: corpus.row_groups_total(),
         row_groups_selected: selected,
+        projected_bytes: None,
+        order: None,
+        rows: None,
     }
 }
 
@@ -291,6 +295,8 @@ pub fn verify_plan(
         bytes,
         // Every number is a sum of footer statistics.
         exact: true,
+        exactness: bellwether_types::Exactness::Exact,
+        rows: None,
     };
     let reported = ReportedCost {
         bytes: plan.bytes,

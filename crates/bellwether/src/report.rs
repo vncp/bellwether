@@ -297,7 +297,7 @@ fn render(
 
 fn proposal_label(p: Option<&Proposal>) -> String {
     match p.map(|p| &p.body) {
-        Some(ProposalBody::Key { spec }) => format!("key {}", label(spec)),
+        Some(ProposalBody::Key { spec, .. }) => format!("key {}", label(spec)),
         Some(ProposalBody::Layout { cluster_by }) => format!("layout by {}", cluster_by.join(", ")),
         Some(ProposalBody::Rewrite { shape }) if !shape.pairs.is_empty() => format!(
             "rewrite of {} engine query pair(s), compared by ({})",

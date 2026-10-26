@@ -31,7 +31,10 @@ fn the_engines_proposer_names_are_refused() {
     let body = ProposalBody::Key {
         spec: KeySpec::Exact {
             columns: vec!["batch".into()],
+            counts: false,
+            bounds: None,
         },
+        sidecars: Vec::new(),
     };
     let ledger = data.join(".bellwether").join("ledger");
     let before = std::fs::read_dir(&ledger).unwrap().count();
