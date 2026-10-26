@@ -169,6 +169,10 @@ pub(crate) fn build(
             mismatched: o.counts.mismatched,
             ignored_columns: o.ignored_columns.clone(),
             totals_delta,
+            examples: Vec::new(),
+            uncomparable: 0,
+            totals: Vec::new(),
+            row_filter: None,
         },
         provenance: Provenance {
             inputs,

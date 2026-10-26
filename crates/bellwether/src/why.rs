@@ -1038,6 +1038,7 @@ impl Engine {
                 let spec = KeySpec::Temporal {
                     columns: c.clone(),
                     ts_column: t.ts_column.clone(),
+                    counts: false,
                 };
                 if !current_names.contains(&label(&spec)) && names.insert(label(&spec)) {
                     chosen.push((spec, CandidateOrigin::Workload));
@@ -1045,7 +1046,11 @@ impl Engine {
             }
         }
         for c in &run_columns {
-            let spec = KeySpec::Exact { columns: c.clone() };
+            let spec = KeySpec::Exact {
+                columns: c.clone(),
+                counts: false,
+                bounds: None,
+            };
             if !current_names.contains(&label(&spec)) && names.insert(label(&spec)) {
                 chosen.push((spec, CandidateOrigin::Workload));
             }
@@ -1069,7 +1074,11 @@ impl Engine {
             if !orderable || columns.contains(&ts_column) {
                 continue;
             }
-            let spec = KeySpec::Temporal { columns, ts_column };
+            let spec = KeySpec::Temporal {
+                columns,
+                ts_column,
+                counts: false,
+            };
             if !current_names.contains(&label(&spec)) && names.insert(label(&spec)) {
                 chosen.push((spec, CandidateOrigin::Window));
             }
@@ -1079,6 +1088,8 @@ impl Engine {
             let cols = &entry.fanout.columns;
             let exact_spec = KeySpec::Exact {
                 columns: cols.clone(),
+                counts: false,
+                bounds: None,
             };
             if !serves(&exact_spec) {
                 if !current_names.contains(&label(&exact_spec))
@@ -1096,6 +1107,7 @@ impl Engine {
                     let tspec = KeySpec::Temporal {
                         columns: cols.clone(),
                         ts_column: t.ts_column.clone(),
+                        counts: false,
                     };
                     if !current_names.contains(&label(&tspec))
                         && !names.contains(&label(&tspec))
@@ -1123,7 +1135,10 @@ impl Engine {
                 evidence: vec![evidence],
                 proposed_by: ENGINE_PROPOSER.to_string(),
                 created_at: self.now(),
-                body: ProposalBody::Key { spec: spec.clone() },
+                body: ProposalBody::Key {
+                    spec: spec.clone(),
+                    sidecars: Vec::new(),
+                },
             }))?;
             let (replay_hash, scored) = if self.is_table() {
                 // Over a table every cost is measured: scored, marked so,
@@ -1581,6 +1596,7 @@ mod tests {
             message: format!("{rule} on {column}"),
             confidence,
             site: None,
+            fix: None,
         }
     }
 
@@ -1607,6 +1623,8 @@ mod tests {
     fn exact(c: &str) -> KeySpec {
         KeySpec::Exact {
             columns: vec![c.into()],
+            counts: false,
+            bounds: None,
         }
     }
 

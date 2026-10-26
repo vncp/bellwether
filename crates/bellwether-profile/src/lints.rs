@@ -278,6 +278,7 @@ fn batch_stamp(inputs: &LintInputs<'_>) -> Result<Vec<Lint>> {
             ),
             confidence,
             site: None,
+            fix: None,
         });
     }
     Ok(out)
@@ -350,6 +351,7 @@ fn low_selectivity(inputs: &LintInputs<'_>, stamps: &[String]) -> Vec<Lint> {
             ),
             confidence,
             site: None,
+            fix: None,
         });
     }
     out
@@ -375,6 +377,7 @@ fn scattered_time(inputs: &LintInputs<'_>) -> Vec<Lint> {
                 ),
                 confidence: MEDIUM,
                 site: None,
+                fix: None,
             }
         })
         .collect()
@@ -408,6 +411,7 @@ fn declared_but_unused(inputs: &LintInputs<'_>) -> Vec<Lint> {
             ),
             confidence: MEDIUM,
             site: None,
+            fix: None,
         });
     }
     out
@@ -459,7 +463,7 @@ fn no_discriminating(entries: &[FanoutEntry]) -> Option<Lint> {
             fraction * 100.0,
         ),
         confidence: if sampled { LOW } else { HIGH },
-        site: None,
+        site: None, fix: None,
     })
 }
 
@@ -479,6 +483,8 @@ mod tests {
                 row_groups_per_value: [p50, p50, p50],
                 files_total: 1,
                 row_groups_total: 22,
+                sample_size: None,
+                quantile_error: None,
             },
             sample: SampleInfo {
                 retained: 100,

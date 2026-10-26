@@ -89,7 +89,10 @@ impl Engine {
         let sidecar = match (&declared.key, &declared.sidecar) {
             (Some(spec), None) => {
                 return self.propose_inner(
-                    ProposalBody::Key { spec: spec.clone() },
+                    ProposalBody::Key {
+                        spec: spec.clone(),
+                        sidecars: Vec::new(),
+                    },
                     evidence,
                     proposed_by,
                     write,
@@ -108,7 +111,10 @@ impl Engine {
             return Ok(refused);
         }
         if let Some(spec) = &declared.key {
-            self.check_body(&ProposalBody::Key { spec: spec.clone() })?;
+            self.check_body(&ProposalBody::Key {
+                spec: spec.clone(),
+                sidecars: Vec::new(),
+            })?;
         }
         let schema = self.check_columns(
             &sidecar
@@ -272,7 +278,7 @@ impl Engine {
 
     fn check_body(&self, body: &ProposalBody) -> Result<()> {
         match body {
-            ProposalBody::Key { spec } => {
+            ProposalBody::Key { spec, .. } => {
                 crate::spec::check(spec)?;
                 let mut cols: Vec<&String> = spec.columns().iter().collect();
                 if let KeySpec::Temporal { ts_column, .. } = spec {

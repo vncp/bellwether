@@ -109,6 +109,8 @@ fn baselines_and_exact_specs_equal_the_bench_oracle_run_by_run() {
         .unwrap();
     let exact = KeySpec::Exact {
         columns: cols(&["entity_id"]),
+        counts: false,
+        bounds: None,
     };
     let range = KeySpec::Range {
         column: "entity_id".into(),
@@ -149,11 +151,14 @@ fn hypothetical_specs_never_report_fewer_row_groups_than_the_oracle() {
     let (replayer, keys, workload) = setup(&source, &corpus);
     let exact = KeySpec::Exact {
         columns: cols(&["entity_id"]),
+        counts: false,
+        bounds: None,
     };
     let candidates = [
         KeySpec::Bloom {
             columns: cols(&["entity_id"]),
             fpr: 0.05,
+            bounds: None,
         },
         KeySpec::Range {
             column: "entity_id".into(),
@@ -161,10 +166,13 @@ fn hypothetical_specs_never_report_fewer_row_groups_than_the_oracle() {
         // The run column is a prefix of the composite: prefix lookups.
         KeySpec::Exact {
             columns: cols(&["entity_id", "batch_id"]),
+            counts: false,
+            bounds: None,
         },
         KeySpec::Temporal {
             columns: cols(&["entity_id"]),
             ts_column: "version_ts".into(),
+            counts: false,
         },
     ];
     for run in workload.runs() {
@@ -238,6 +246,8 @@ fn transient_segments_reproduce_the_planted_fanout() {
                 .collect();
             let spec = KeySpec::Exact {
                 columns: cols(&columns),
+                counts: false,
+                bounds: None,
             };
             let index = replayer.transient(&spec).unwrap();
             let tuples = distinct(&replayer, &source, &schema, &columns);

@@ -217,6 +217,7 @@ fn a_definition_change_under_the_same_name_rebuilds_the_spec() {
     let by_grp = KeySpec::Temporal {
         columns: cols(&["id"]),
         ts_column: "id".into(),
+        counts: false,
     };
     assert_eq!(by_ts.name(), by_grp.name());
     build_ok(&b, &s.root_str(), std::slice::from_ref(&by_ts), &opts);
@@ -290,6 +291,7 @@ fn remove_spec_removes_exactly_the_declared_spec() {
     let other = KeySpec::Temporal {
         columns: cols(&["id"]),
         ts_column: "grp".into(),
+        counts: false,
     };
     assert!(b.remove_spec(&other).is_err());
     assert_eq!(

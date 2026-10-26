@@ -203,6 +203,8 @@ pub fn check_id_space(m: &bellwether_store::Manifest) -> (BTreeSet<u32>, BTreeSe
 pub fn exact(cols: &[&str]) -> KeySpec {
     KeySpec::Exact {
         columns: cols.iter().map(|c| (*c).to_string()).collect(),
+        counts: false,
+        bounds: None,
     }
 }
 
@@ -210,6 +212,7 @@ pub fn bloom(cols: &[&str]) -> KeySpec {
     KeySpec::Bloom {
         columns: cols.iter().map(|c| (*c).to_string()).collect(),
         fpr: 0.01,
+        bounds: None,
     }
 }
 
@@ -221,6 +224,7 @@ pub fn temporal(cols: &[&str], ts: &str) -> KeySpec {
     KeySpec::Temporal {
         columns: cols.iter().map(|c| (*c).to_string()).collect(),
         ts_column: ts.into(),
+        counts: false,
     }
 }
 
@@ -462,6 +466,9 @@ pub fn apply_residual(pred: &Predicate, rows: Vec<Row>) -> Vec<Row> {
                 .collect()
         }
         Predicate::And { all } => all.iter().fold(rows, |rows, p| apply_residual(p, rows)),
+        Predicate::SemiJoin { .. } | Predicate::Join { .. } | Predicate::WindowPartition { .. } => {
+            panic!("a lookup's residual is never relational: {pred:?}")
+        }
     }
 }
 

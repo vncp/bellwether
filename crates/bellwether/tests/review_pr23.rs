@@ -168,6 +168,8 @@ fn probe_reconcile_anchor_and_rewrite_layout() {
                     before: "a".into(),
                     after: "b".into(),
                     invariant: "same rows by id".into(),
+                    before_plan: None,
+                    after_plan: None,
                 },
             },
             &[ev],

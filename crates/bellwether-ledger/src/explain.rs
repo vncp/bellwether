@@ -302,8 +302,8 @@ fn evidence_link(hash: Hash, e: &Evidence) -> Link {
 
 fn proposal_link(hash: Hash, p: &Proposal) -> Link {
     let body = match &p.body {
-        ProposalBody::Key { spec } => ("key", spec.name()),
-        ProposalBody::Layout { cluster_by } => ("layout", cluster_by.join(",")),
+        ProposalBody::Key { spec, .. } => ("key", spec.name()),
+        ProposalBody::Layout { cluster_by, .. } => ("layout", cluster_by.join(",")),
         ProposalBody::Rewrite { shape } => ("rewrite", format!("{:?}", shape.after)),
     };
     Link::new(

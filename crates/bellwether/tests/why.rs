@@ -120,7 +120,9 @@ fn why_with_keys_replays_each_candidate_and_the_floor_is_the_oracle() {
     assert_eq!(
         floor.spec,
         KeySpec::Exact {
-            columns: vec!["id".into()]
+            columns: vec!["id".into()],
+            counts: false,
+            bounds: None,
         }
     );
     assert_eq!(floor.proposed.row_groups, oracle(&data, &keys).len() as u64);
@@ -136,7 +138,7 @@ fn why_with_keys_replays_each_candidate_and_the_floor_is_the_oracle() {
             vec![r.evidence.hash.unwrap()],
             "cites the profile"
         );
-        assert!(matches!(&p.body, ProposalBody::Key { spec } if *spec == c.spec));
+        assert!(matches!(&p.body, ProposalBody::Key { spec, .. } if *spec == c.spec));
         let Record::Replay(rp) = &c.replay.record else {
             panic!()
         };
@@ -497,6 +499,7 @@ fn why_with_latest_by_prices_temporal_and_locate_and_equals_latest_and_asof_plan
         KeySpec::Temporal {
             columns: vec!["pu".into()],
             ts_column: "pickup_ts".into(),
+            counts: false,
         }
     );
     assert_eq!(rec.lookup, LookupKind::Latest);

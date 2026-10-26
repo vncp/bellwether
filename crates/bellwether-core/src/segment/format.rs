@@ -18,10 +18,52 @@ pub const MAGIC: [u8; 8] = *b"BWSEGMNT";
 /// Fixed preamble: magic, `storage_version u32`, `encoding_version u32`,
 /// `header_len u32`.
 pub const PREAMBLE_LEN: usize = 8 + 4 + 4 + 4;
-/// Fixed footer: `index_offset u64`, `index_len u64`, magic.
+/// Fixed footer of a storage version 1 segment: `index_offset u64`,
+/// `index_len u64`, magic.
 pub const FOOTER_LEN: usize = 8 + 8 + 8;
-/// The only codec in storage version 1.
+/// Fixed footer of a storage version 2 segment: `index_offset u64`,
+/// `index_len u64`, `checksum u64` (XXH3-64 of the preamble, the header, and
+/// the index), magic.
+pub const FOOTER_LEN_V2: usize = 8 + 8 + 8 + 8;
+/// The only codec in storage versions 1 and 2.
 pub const CODEC_NONE: &str = "none";
+
+/// The footer length of a segment at `storage` version.
+#[must_use]
+pub fn footer_len(storage: u32) -> usize {
+    if storage >= 2 {
+        FOOTER_LEN_V2
+    } else {
+        FOOTER_LEN
+    }
+}
+
+/// XXH3-64 (seed 0) over the concatenation of `parts`: the integrity check
+/// a storage version 2 segment stores beside every region a reader reads
+/// (the index, each block's filter and directory, each value record), so a
+/// corrupt byte is refused, never decoded into a wrong answer.
+#[must_use]
+pub fn checksum(parts: &[&[u8]]) -> u64 {
+    let mut h = xxhash_rust::xxh3::Xxh3::new();
+    for p in parts {
+        h.update(p);
+    }
+    h.digest()
+}
+
+/// Appends `v` as unsigned LEB128 (seven bits per byte, least significant
+/// group first, high bit set on every byte but the last).
+pub(crate) fn put_leb128(out: &mut Vec<u8>, mut v: u64) {
+    loop {
+        let byte = (v & 0x7f) as u8;
+        v >>= 7;
+        if v == 0 {
+            out.push(byte);
+            return;
+        }
+        out.push(byte | 0x80);
+    }
+}
 
 /// How the body of a segment is organized; follows from the key spec kind.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -39,14 +81,18 @@ pub enum Layout {
 }
 
 impl Layout {
-    /// The layout a key spec is stored in.
+    /// The layout a key spec is stored in; `None` for a bitemporal spec,
+    /// whose versions this release still stores in a `temporal2` sidecar
+    /// segment ([`crate::sidecar`]), and for a spec with per-key time
+    /// bounds, which ride in a `bounds` sidecar beside the key's segments.
     #[must_use]
-    pub fn for_spec(spec: &KeySpec) -> Self {
+    pub fn for_spec(spec: &KeySpec) -> Option<Self> {
         match spec {
-            KeySpec::Exact { .. } => Self::Keyed,
-            KeySpec::Temporal { .. } => Self::KeyedTemporal,
-            KeySpec::Bloom { .. } => Self::BloomPerRowGroup,
-            KeySpec::Range { .. } => Self::MinMax,
+            KeySpec::Exact { bounds: None, .. } => Some(Self::Keyed),
+            KeySpec::Temporal { .. } => Some(Self::KeyedTemporal),
+            KeySpec::Bloom { bounds: None, .. } => Some(Self::BloomPerRowGroup),
+            KeySpec::Range { .. } => Some(Self::MinMax),
+            KeySpec::Exact { .. } | KeySpec::Bloom { .. } | KeySpec::Bitemporal { .. } => None,
         }
     }
 }
@@ -341,9 +387,12 @@ pub struct SegmentHeader {
 
 impl SegmentHeader {
     /// A header for `spec` at the current versions, with canonical filters.
+    /// A spec with no segment layout of its own ([`Layout::for_spec`]) gets
+    /// the keyed layout here and is refused by [`SegmentHeader::validate`],
+    /// so no such segment is ever written.
     #[must_use]
     pub fn new(spec: KeySpec) -> Self {
-        let layout = Layout::for_spec(&spec);
+        let layout = Layout::for_spec(&spec).unwrap_or(Layout::Keyed);
         Self {
             storage_version: STORAGE_VERSION,
             encoding_version: ENCODING_VERSION,
@@ -357,9 +406,10 @@ impl SegmentHeader {
         }
     }
 
-    /// Checks a parsed header against its preamble and the rules of storage
-    /// version 1. Versions are checked again here (they were checked in the
-    /// preamble before parsing) and must agree with the preamble's.
+    /// Checks a parsed header against its preamble and the rules of its
+    /// storage version. Versions are checked again here (they were checked
+    /// in the preamble before parsing) and must agree with the preamble's.
+    /// A spec that stores counts needs storage version 2.
     pub fn validate(&self, preamble_storage: u32, preamble_encoding: u32) -> Result<()> {
         check_versions(self.storage_version, self.encoding_version)?;
         if self.storage_version != preamble_storage || self.encoding_version != preamble_encoding {
@@ -368,14 +418,29 @@ impl SegmentHeader {
                 self.storage_version, self.encoding_version
             )));
         }
+        if self.storage_version == 0 {
+            return Err(corrupt("storage version 0"));
+        }
         if self.codec != CODEC_NONE {
             return Err(Error::Other(format!(
                 "segment codec {:?} is not supported",
                 self.codec
             )));
         }
-        if self.layout != Layout::for_spec(&self.key_spec) {
+        let Some(layout) = Layout::for_spec(&self.key_spec) else {
+            return Err(Error::KeySpec(format!(
+                "{} has no key segment of its own in this release: per-key time bounds and \
+                 bitemporal versions are stored as sidecar segments",
+                self.key_spec.identity()
+            )));
+        };
+        if self.layout != layout {
             return Err(corrupt("layout does not match key spec"));
+        }
+        if self.key_spec.counts() && self.storage_version < 2 {
+            return Err(corrupt(
+                "a storage version 1 segment cannot store counts (they arrived in version 2)",
+            ));
         }
         // Only bloom segments may hold reused Parquet filters.
         if self.bloom_hash == BloomHash::ParquetPlain && self.layout != Layout::BloomPerRowGroup {
@@ -584,5 +649,27 @@ impl<'a> Cursor<'a> {
 
     pub(crate) fn is_done(&self) -> bool {
         self.pos == self.buf.len()
+    }
+
+    /// An unsigned LEB128 value in its shortest form: an over-long encoding
+    /// (a last byte of zero after the first) or one past 64 bits is refused,
+    /// so every count has exactly one spelling.
+    pub(crate) fn leb128(&mut self) -> Result<u64> {
+        let mut v: u64 = 0;
+        for i in 0..10u32 {
+            let b = self.u8()?;
+            let bits = u64::from(b & 0x7f);
+            if i == 9 && b > 1 {
+                return Err(corrupt("count exceeds 64 bits"));
+            }
+            v |= bits << (7 * i);
+            if b & 0x80 == 0 {
+                if b == 0 && i > 0 {
+                    return Err(corrupt("count is not in its shortest LEB128 form"));
+                }
+                return Ok(v);
+            }
+        }
+        Err(corrupt("count exceeds 64 bits"))
     }
 }

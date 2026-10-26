@@ -77,6 +77,8 @@ fn replay_bytes(mode: &str, corpus: &common::Corpus) -> Vec<u8> {
         },
         KeySpec::Exact {
             columns: cols(&["batch_id"]),
+            counts: false,
+            bounds: None,
         },
     ];
     let sequence = common::build_index(
@@ -116,7 +118,10 @@ fn replay_bytes(mode: &str, corpus: &common::Corpus) -> Vec<u8> {
             body: ProposalBody::Key {
                 spec: KeySpec::Exact {
                     columns: cols(&["entity_id", "batch_id"]),
+                    counts: false,
+                    bounds: None,
                 },
+                sidecars: Vec::new(),
             },
         }))
         .unwrap();
@@ -133,6 +138,8 @@ fn replay_bytes(mode: &str, corpus: &common::Corpus) -> Vec<u8> {
             replayer
                 .transient(&KeySpec::Exact {
                     columns: cols(&["payload"]),
+                    counts: false,
+                    bounds: None,
                 })
                 .unwrap();
         }

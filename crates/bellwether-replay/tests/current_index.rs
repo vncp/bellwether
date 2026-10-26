@@ -34,10 +34,13 @@ fn specs() -> Vec<KeySpec> {
     vec![
         KeySpec::Exact {
             columns: cols(&["entity_id"]),
+            counts: false,
+            bounds: None,
         },
         KeySpec::Bloom {
             columns: cols(&["batch_id"]),
             fpr: 0.05,
+            bounds: None,
         },
         KeySpec::Range {
             column: "version_ts".into(),
@@ -45,6 +48,7 @@ fn specs() -> Vec<KeySpec> {
         KeySpec::Temporal {
             columns: cols(&["status", "entity_id"]),
             ts_column: "version_ts".into(),
+            counts: false,
         },
     ]
 }
@@ -214,6 +218,7 @@ fn replaying_the_current_index_reads_no_columns_and_a_candidate_reads_only_its_k
     let candidate = KeySpec::Temporal {
         columns: cols(&["entity_id"]),
         ts_column: "version_ts".into(),
+        counts: false,
     };
     replayer
         .replay_specs(std::slice::from_ref(&candidate), &workload, &keys)
@@ -264,11 +269,13 @@ fn a_key_proposal_is_scored_and_written_through_the_ledger() {
     let bloom = KeySpec::Bloom {
         columns: cols(&["entity_id"]),
         fpr: 0.3,
+        bounds: None,
     };
     let p = proposal(
         &ledger,
         ProposalBody::Key {
             spec: bloom.clone(),
+            sidecars: Vec::new(),
         },
     );
     let (hash, scored) = replayer.record(&ledger, &p, &workload, &keys, AT).unwrap();
@@ -308,6 +315,7 @@ fn a_key_proposal_is_scored_and_written_through_the_ledger() {
     let tighter = KeySpec::Bloom {
         columns: cols(&["batch_id"]),
         fpr: 0.001,
+        bounds: None,
     };
     let replaced = bellwether_replay::proposed_specs(&specs(), &tighter);
     assert_eq!(replaced.len(), specs().len());
@@ -328,7 +336,8 @@ fn a_key_proposal_is_scored_and_written_through_the_ledger() {
         .score(
             &p,
             &ProposalBody::Key {
-                spec: specs()[0].clone()
+                spec: specs()[0].clone(),
+                sidecars: Vec::new(),
             },
             &workload,
             &keys,
@@ -356,7 +365,10 @@ fn irrelevant_specs_and_rewrites_are_refused() {
             &ProposalBody::Key {
                 spec: KeySpec::Exact {
                     columns: cols(&["status", "entity_id"]),
+                    counts: false,
+                    bounds: None,
                 },
+                sidecars: Vec::new(),
             },
             &workload,
             &keys,
@@ -376,6 +388,8 @@ fn irrelevant_specs_and_rewrites_are_refused() {
                     before: "a".into(),
                     after: "b".into(),
                     invariant: "c".into(),
+                    before_plan: None,
+                    after_plan: None,
                 },
             },
             &workload,
@@ -422,6 +436,8 @@ fn refusals_are_typed_and_write_nothing() {
                 before: "a".into(),
                 after: "b".into(),
                 invariant: "c".into(),
+                before_plan: None,
+                after_plan: None,
             },
         },
     );
@@ -436,7 +452,10 @@ fn refusals_are_typed_and_write_nothing() {
         ProposalBody::Key {
             spec: KeySpec::Exact {
                 columns: cols(&["payload"]),
+                counts: false,
+                bounds: None,
             },
+            sidecars: Vec::new(),
         },
     );
     let e = replayer
@@ -475,12 +494,16 @@ fn refusals_are_typed_and_write_nothing() {
     };
     let range_body = ProposalBody::Key {
         spec: range_spec.clone(),
+        sidecars: Vec::new(),
     };
     let a = proposal(&ledger, range_body.clone());
     let body_b = ProposalBody::Key {
         spec: KeySpec::Exact {
             columns: cols(&["entity_id"]),
+            counts: false,
+            bounds: None,
         },
+        sidecars: Vec::new(),
     };
     let scored = replayer.score(&a, &body_b, &workload, &keys, AT).unwrap();
     assert!(mismatch(&scored).contains("another proposal body"));
@@ -598,6 +621,8 @@ fn a_layout_proposal_is_costed_and_written_under_its_named_model() {
         row_groups: rgs,
         bytes,
         exact: false,
+        exactness: bellwether_types::Exactness::Exact,
+        rows: None,
     };
     assert_eq!(
         scored.replay.proposed,
@@ -659,7 +684,10 @@ fn reports_group_runs_by_template_with_nearest_rank_quantiles() {
             &ProposalBody::Key {
                 spec: KeySpec::Exact {
                     columns: cols(&["entity_id"]),
+                    counts: false,
+                    bounds: None,
                 },
+                sidecars: Vec::new(),
             },
             &workload,
             &keys,
@@ -706,6 +734,8 @@ fn attribution_hooks_return_exact_counterfactual_deltas() {
     };
     let exact = KeySpec::Exact {
         columns: cols(&["entity_id"]),
+        counts: false,
+        bounds: None,
     };
     let nodes = vec![range.clone(), exact.clone()];
     let c_both = replayer.replay_specs(&nodes, &workload, &keys).unwrap();
@@ -732,6 +762,7 @@ fn attribution_hooks_return_exact_counterfactual_deltas() {
     let bloom = KeySpec::Bloom {
         columns: cols(&["entity_id"]),
         fpr: 0.1,
+        bounds: None,
     };
     let d = replayer
         .replace_node(

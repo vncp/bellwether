@@ -460,7 +460,7 @@ impl Engine {
                 result.outcome = refused(Refusal::LayoutNotApplicable);
                 Ok(result)
             }
-            ProposalBody::Key { spec } => {
+            ProposalBody::Key { spec, .. } => {
                 // A key already complete has nothing to apply: refused
                 // before anything is scored, so the refusal writes nothing.
                 if !req.verify_only && complete(pinned.as_ref(), spec) {
@@ -713,7 +713,7 @@ impl Engine {
             // Already complete: the apply would commit nothing. Refused
             // here, before the replay is scored, so the dry run and the
             // real apply agree and the refusal writes nothing.
-            ProposalBody::Key { spec } if complete(self.pin()?.as_ref(), spec) => {
+            ProposalBody::Key { spec, .. } if complete(self.pin()?.as_ref(), spec) => {
                 result.outcome = refused(Refusal::NothingToApply {
                     sequence: before.to_string(),
                 });
@@ -727,7 +727,7 @@ impl Engine {
                     expected: before.saturating_add(1),
                 };
             }
-            ProposalBody::Key { spec } => {
+            ProposalBody::Key { spec, .. } => {
                 let Coverage::Workload { workload, .. } = &certificate.coverage else {
                     return Err(not_workload_covered(cert_hash));
                 };
@@ -1667,6 +1667,7 @@ fn union_plan(
             file: fp.clone(),
             row_groups: rgs.clone(),
             bytes: b,
+            columns: None,
         });
     }
     let plan = ScanPlan {
@@ -1676,6 +1677,9 @@ fn union_plan(
         bytes,
         row_groups_total: catalog.len() as u64,
         row_groups_selected: count,
+        projected_bytes: None,
+        order: None,
+        rows: None,
     };
     catalog.verify_plan(&plan)?;
     Ok(plan)
@@ -2455,6 +2459,7 @@ mod tests {
                 .propose(
                     ProposalBody::Key {
                         spec: crate::spec::parse("bloom:symbol@0.01").unwrap(),
+                        sidecars: Vec::new(),
                     },
                     &[ev],
                     "test",

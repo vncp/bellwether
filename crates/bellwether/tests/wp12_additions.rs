@@ -220,7 +220,10 @@ fn propose_dry_run_writes_nothing_and_predicts_the_hash() {
     let body = ProposalBody::Key {
         spec: KeySpec::Exact {
             columns: vec!["id".into()],
+            counts: false,
+            bounds: None,
         },
+        sidecars: Vec::new(),
     };
     let err = e
         .propose_dry_run(body.clone(), &[Hash::of(b"x")], "agent")

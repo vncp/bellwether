@@ -113,10 +113,10 @@ pub fn servable(spec: &KeySpec, run_columns: &[String]) -> Option<Lookup> {
 pub fn serves_window(spec: &KeySpec, ts_column: &str) -> bool {
     match spec {
         KeySpec::Range { column } => column == ts_column,
-        KeySpec::Exact { columns } | KeySpec::Temporal { columns, .. } => {
+        KeySpec::Exact { columns, .. } | KeySpec::Temporal { columns, .. } => {
             columns.first().is_some_and(|c| c == ts_column)
         }
-        KeySpec::Bloom { .. } => false,
+        KeySpec::Bloom { .. } | KeySpec::Bitemporal { .. } => false,
     }
 }
 
@@ -339,6 +339,8 @@ pub fn run_cost(run_id: &str, keys: u64, plan: &ScanPlan, exact: bool) -> RunCos
         row_groups: plan.row_groups_selected,
         bytes: plan.bytes,
         exact,
+        exactness: bellwether_types::Exactness::Exact,
+        rows: None,
     }
 }
 
@@ -1356,7 +1358,11 @@ mod tests {
 
     #[test]
     fn serving_follows_the_planner_rules() {
-        let exact = |c: &[&str]| KeySpec::Exact { columns: cols(c) };
+        let exact = |c: &[&str]| KeySpec::Exact {
+            columns: cols(c),
+            counts: false,
+            bounds: None,
+        };
         // (a) every spec column in the run's columns: projection, spec order.
         assert_eq!(
             servable(&exact(&["b", "a"]), &cols(&["a", "b"])),
@@ -1376,6 +1382,7 @@ mod tests {
         let temporal = KeySpec::Temporal {
             columns: cols(&["a", "b"]),
             ts_column: "t".into(),
+            counts: false,
         };
         assert_eq!(servable(&temporal, &cols(&["a"])), Some(Lookup::Prefix));
         // Neither: a leading column missing, or a bloom spec asked a prefix.
@@ -1384,6 +1391,7 @@ mod tests {
         let bloom = KeySpec::Bloom {
             columns: cols(&["a", "b"]),
             fpr: 0.01,
+            bounds: None,
         };
         assert_eq!(servable(&bloom, &cols(&["a"])), None);
         let range = KeySpec::Range { column: "a".into() };

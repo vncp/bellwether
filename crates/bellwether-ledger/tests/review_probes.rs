@@ -378,7 +378,9 @@ fn non_finite_floats_are_refused_in_every_float_field() {
             spec: KeySpec::Bloom {
                 columns: vec!["order_id".into()],
                 fpr,
+                bounds: None,
             },
+            sidecars: Vec::new(),
         };
         assert_rule(ledger.put(&Record::Proposal(p)), "round-trip");
     }
@@ -396,6 +398,8 @@ fn non_finite_floats_are_refused_in_every_float_field() {
         row_groups_per_value: [f64::NAN; 3],
         files_total: 0,
         row_groups_total: 0,
+        sample_size: None,
+        quantile_error: None,
     });
     assert_rule(ledger.put(&Record::Evidence(e)), "round-trip");
 

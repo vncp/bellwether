@@ -154,6 +154,8 @@ fn replay_of_the_p50_run_under_one_candidate_meets_the_budget() {
     let (keys, workload) = common::record(&["entity_id"], &runs);
     let spec = KeySpec::Exact {
         columns: vec!["entity_id".into()],
+        counts: false,
+        bounds: None,
     };
     let (median, n) = time_p50_run(&replayer, &spec, &workload, &keys, 25);
     judge("in-test corpus, one cached candidate", median, n);
@@ -200,10 +202,13 @@ fn replay_on_a_bench_corpus_meets_the_budget() {
     for spec in [
         KeySpec::Exact {
             columns: vec!["entity_id".into()],
+            counts: false,
+            bounds: None,
         },
         KeySpec::Bloom {
             columns: vec!["entity_id".into()],
             fpr: 0.01,
+            bounds: None,
         },
     ] {
         let t = Instant::now();

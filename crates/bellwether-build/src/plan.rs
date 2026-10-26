@@ -509,6 +509,7 @@ impl<S: StoreExt + ?Sized> Planner<S> {
                             KeySpec::Temporal {
                                 columns: c,
                                 ts_column,
+                                ..
                             } if c.iter().all(|x| columns.contains(x)) => Some(ts_column.clone()),
                             _ => None,
                         })
@@ -1157,7 +1158,7 @@ impl<S: StoreExt + ?Sized> Planner<S> {
         for s in segs {
             let range = match &s.spec {
                 KeySpec::Range { column: c } if c == column => true,
-                KeySpec::Exact { columns } | KeySpec::Temporal { columns, .. }
+                KeySpec::Exact { columns, .. } | KeySpec::Temporal { columns, .. }
                     if columns.first().is_some_and(|c| c == column) =>
                 {
                     false
@@ -1443,6 +1444,7 @@ impl<S: StoreExt + ?Sized> Planner<S> {
             KeySpec::Temporal {
                 columns: c,
                 ts_column,
+                ..
             } if c.iter().all(|x| columns.contains(x)) => Some(ts_column),
             _ => None,
         });
@@ -1766,6 +1768,7 @@ impl<S: StoreExt + ?Sized> Planner<S> {
                 file: files[fi].fingerprint.clone(),
                 row_groups,
                 bytes,
+                columns: None,
             });
         }
         entries.sort_by(|a, b| a.file.path.cmp(&b.file.path));
@@ -1776,6 +1779,9 @@ impl<S: StoreExt + ?Sized> Planner<S> {
             row_groups_total: self.locator.live().len(),
             entries,
             residual: Some(residual),
+            projected_bytes: None,
+            order: None,
+            rows: None,
         })
     }
 
@@ -1880,6 +1886,7 @@ pub fn default_window_column(
             KeySpec::Temporal {
                 columns: c,
                 ts_column,
+                ..
             } if c.iter().all(|x| columns.contains(x)) => Some(ts_column.clone()),
             _ => None,
         })
@@ -2229,13 +2236,18 @@ mod tests {
     fn serving_rules() {
         let exact_a = KeySpec::Exact {
             columns: cols(&["a"]),
+            counts: false,
+            bounds: None,
         };
         let exact_ab = KeySpec::Exact {
             columns: cols(&["a", "b"]),
+            counts: false,
+            bounds: None,
         };
         let bloom_ba = KeySpec::Bloom {
             columns: cols(&["b", "a"]),
             fpr: 0.01,
+            bounds: None,
         };
         let range_b = KeySpec::Range { column: "b".into() };
         // projection: the spec's columns are all in the lookup

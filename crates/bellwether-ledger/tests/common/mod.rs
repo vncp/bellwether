@@ -146,7 +146,10 @@ pub fn proposal(evidence: Vec<Hash>, by: &str) -> Proposal {
         body: ProposalBody::Key {
             spec: KeySpec::Exact {
                 columns: vec!["order_id".into()],
+                counts: false,
+                bounds: None,
             },
+            sidecars: Vec::new(),
         },
     }
 }
@@ -159,6 +162,8 @@ pub fn run(id: &str, bytes: u64) -> RunCost {
         row_groups: 9,
         bytes,
         exact: true,
+        exactness: bellwether_types::Exactness::Exact,
+        rows: None,
     }
 }
 
@@ -173,6 +178,8 @@ pub fn replay(proposal: Hash) -> Replay {
         proposed: vec![run("p50", 4_000), run("p95", 1_000)],
         model: None,
         created_at: "2026-10-24T00:02:00Z".into(),
+        configuration: Vec::new(),
+        operators: Vec::new(),
     }
 }
 
@@ -193,6 +200,10 @@ pub fn certificate(proposal: Option<Hash>, pass: bool) -> Certificate {
             mismatched: u64::from(!pass),
             ignored_columns: vec!["updated_at".into()],
             totals_delta: vec![],
+            examples: Vec::new(),
+            uncomparable: 0,
+            totals: Vec::new(),
+            row_filter: None,
         },
         provenance,
     }

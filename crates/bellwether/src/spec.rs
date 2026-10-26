@@ -81,6 +81,8 @@ fn parse_short(s: &str) -> Result<KeySpec> {
     match (kind.trim(), extra) {
         ("exact", None) => Ok(KeySpec::Exact {
             columns: columns(s, cols)?,
+            counts: false,
+            bounds: None,
         }),
         ("bloom", Some(fpr)) => {
             let fpr: f64 = fpr
@@ -89,6 +91,7 @@ fn parse_short(s: &str) -> Result<KeySpec> {
             Ok(KeySpec::Bloom {
                 columns: columns(s, cols)?,
                 fpr,
+                bounds: None,
             })
         }
         ("bloom", None) => Err(bad(
@@ -107,6 +110,7 @@ fn parse_short(s: &str) -> Result<KeySpec> {
         ("temporal", Some(ts)) if !ts.is_empty() => Ok(KeySpec::Temporal {
             columns: columns(s, cols)?,
             ts_column: ts.to_string(),
+            counts: false,
         }),
         ("temporal", _) => Err(bad(
             s,
@@ -122,17 +126,11 @@ fn parse_short(s: &str) -> Result<KeySpec> {
     }
 }
 
-/// The short form of `spec`; [`parse`] reads it back to an equal spec.
+/// The short form of `spec`: its identity ([`KeySpec::identity`],
+/// `docs/format.md`), which [`parse`] reads back to an equal spec.
 #[must_use]
 pub fn label(spec: &KeySpec) -> String {
-    match spec {
-        KeySpec::Exact { columns } => format!("exact:{}", columns.join(",")),
-        KeySpec::Bloom { columns, fpr } => format!("bloom:{}@{fpr}", columns.join(",")),
-        KeySpec::Range { column } => format!("range:{column}"),
-        KeySpec::Temporal { columns, ts_column } => {
-            format!("temporal:{}@{ts_column}", columns.join(","))
-        }
-    }
+    spec.identity()
 }
 
 /// What one `index --key` argument declares: a key spec, a sidecar that

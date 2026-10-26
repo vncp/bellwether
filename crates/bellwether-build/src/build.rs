@@ -802,6 +802,9 @@ fn plan_files(
                     .collect()
             }),
             extra: Extra::new(),
+            rowgroup_rows: None,
+            rowgroup_bytes: None,
+            column_bytes: None,
         });
         next = end;
     }

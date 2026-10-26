@@ -114,10 +114,13 @@ fn decimals_at_mixed_scales_and_widths_are_one_key_through_both_encoder_paths() 
         for spec in [
             KeySpec::Exact {
                 columns: vec!["amt".into()],
+                counts: false,
+                bounds: None,
             },
             KeySpec::Bloom {
                 columns: vec!["amt".into()],
                 fpr: 0.01,
+                bounds: None,
             },
             KeySpec::Range {
                 column: "amt".into(),
@@ -305,6 +308,7 @@ fn add_batch_into_a_row_group_with_a_ready_filter_records_nothing() {
     let spec = KeySpec::Bloom {
         columns: vec!["id".into()],
         fpr: 0.1,
+        bounds: None,
     };
     let mut w = SegmentWriter::for_dataset(spec, &schema, WriterOptions::default()).unwrap();
     let mut f = Sbbf::<CanonicalHash>::with_ndv_fpp(1, 0.1).unwrap();

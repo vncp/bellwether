@@ -410,6 +410,7 @@ fn defect_9_why_latest_by_prices_temporal_lookups_and_matches_latest_and_asof_pl
         KeySpec::Temporal {
             columns: vec!["pu".into()],
             ts_column: "pickup_ts".into(),
+            counts: false,
         }
     );
     assert_eq!(rec.lookup, LookupKind::Latest);
@@ -1164,6 +1165,7 @@ fn request_3_why_mode_prices_latest_and_asof_lookback_windows() {
     let temporal = KeySpec::Temporal {
         columns: vec!["pu".into()],
         ts_column: "pickup_ts".into(),
+        counts: false,
     };
     let floor = |r: &WhyReport| {
         r.candidates

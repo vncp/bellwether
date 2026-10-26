@@ -92,6 +92,8 @@ fn wide_keys_cut_segments_by_key_bytes_and_the_open_writer_counts_toward_the_cap
     let source = ParquetSource::new().with_schema(wide_schema());
     let spec = KeySpec::Exact {
         columns: cols(&["k_wide"]),
+        counts: false,
+        bounds: None,
     };
     // Rows never reach their cap; key bytes cut after every row group.
     let by_bytes = Replayer::unindexed(&source, &data, &bellwether_source::Partitioning::None)
@@ -195,6 +197,8 @@ fn segment_caps_bound_the_open_writer_and_never_change_a_cost() {
     let source = common::Counting::new(corpus.source());
     let spec = KeySpec::Exact {
         columns: cols(&["entity_id", "batch_id"]),
+        counts: false,
+        bounds: None,
     };
     let runs = common::entity_runs(&corpus, 10, 2);
     let (keys, workload) = common::record(&["entity_id"], &runs);
@@ -259,6 +263,8 @@ fn exceeding_the_index_byte_cap_is_an_error_not_a_partial_index() {
     let err = replayer
         .transient(&KeySpec::Exact {
             columns: cols(&["entity_id"]),
+            counts: false,
+            bounds: None,
         })
         .unwrap_err();
     assert!(err.to_string().contains("byte cap"), "{err}");
@@ -271,10 +277,12 @@ fn the_cache_is_bounded_by_bytes_and_keyed_by_the_full_spec() {
     let a = KeySpec::Bloom {
         columns: cols(&["entity_id"]),
         fpr: 0.1,
+        bounds: None,
     };
     let b = KeySpec::Bloom {
         columns: cols(&["entity_id"]),
         fpr: 0.01,
+        bounds: None,
     };
     assert_eq!(a.name(), b.name());
     let sizer = Replayer::unindexed(

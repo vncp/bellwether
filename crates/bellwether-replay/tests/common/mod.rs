@@ -491,6 +491,9 @@ pub fn build_index(
             chunk_size: None,
             chunks: None,
             extra: Extra::new(),
+            rowgroup_rows: None,
+            rowgroup_bytes: None,
+            column_bytes: None,
         });
     }
     let n = rgs.len() as u32;

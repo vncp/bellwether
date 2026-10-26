@@ -25,11 +25,18 @@ pub mod format {
     //! Format version constants. Every persisted record and every on-disk
     //! structure carries one. See ADR 017 for the forward-compatibility rule.
 
-    /// Version of the manifest and segment layout.
-    pub const STORAGE_VERSION: u32 = 1;
+    /// Version of the manifest and segment layout. History: 1 (the first
+    /// format); 2 (2026-10-26, ADR 028: exact and temporal segments may
+    /// carry per-key per-row-group counts, every keyed value record is
+    /// length-prefixed, manifests record per-row-group rows and bytes and
+    /// per-column bytes, and key segments and completeness by
+    /// [`KeySpec::identity`](crate::KeySpec::identity)).
+    pub const STORAGE_VERSION: u32 = 2;
     /// Version of the ledger record schemas. History: 1 (contract v2);
-    /// 2 (contract v2.1, 2026-10-24: `Replay` gains `inputs` and `model`).
-    pub const RECORD_VERSION: u32 = 2;
+    /// 2 (contract v2.1, 2026-10-24: `Replay` gains `inputs` and `model`);
+    /// 3 (contract v3, 2026-10-26, ADR 028: the record shapes are frozen;
+    /// `docs/contract-v3.md` lists every field it added).
+    pub const RECORD_VERSION: u32 = 3;
     /// Version of the canonical byte encoding (ADR 016).
     pub const ENCODING_VERSION: u32 = 1;
 }
@@ -572,6 +579,12 @@ pub trait Store: Send + Sync {
 /// What an index key looks like. Every variant takes a column list; a
 /// composite key is not a separate kind, it is a list of length greater than
 /// one, encoded memcomparably (ADR 002).
+///
+/// The options added in storage version 2 (`counts`, `bounds`, and the
+/// `Bitemporal` kind; ADR 028) are omitted from the JSON when off, so a spec
+/// without them serializes as it did in storage version 1. Each is part of
+/// the spec's [`KeySpec::identity`]: two specs differing in one are two
+/// specs, and redeclaring a spec with another option rebuilds it.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -580,6 +593,17 @@ pub enum KeySpec {
     Exact {
         /// Key columns in prefix order.
         columns: Vec<String>,
+        /// Store, per key and per row group holding it, the number of rows
+        /// whose key tuple is that key (storage version 2), so a count of
+        /// keys is answered from the index with no file read.
+        #[serde(default, skip_serializing_if = "is_false")]
+        counts: bool,
+        /// A time column whose per-key, per-row-group `[min, max]` the
+        /// segment carries beside each key (`exact:symbol@ts`), so a window
+        /// lookup prunes by each key's own times. Storage version 1 kept
+        /// these bounds in a `bounds` sidecar segment.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        bounds: Option<String>,
     },
     /// Split-block bloom filter per block (ADR 008).
     Bloom {
@@ -587,6 +611,12 @@ pub enum KeySpec {
         columns: Vec<String>,
         /// Target false-positive rate, strictly between 0 and 1.
         fpr: f64,
+        /// A time column whose per-key, per-row-group bounds are kept
+        /// beside the filters (`bloom:symbol@0.01@ts`). A bloom has no
+        /// per-key record to carry them, so they stay a `bounds` segment
+        /// listed under this spec.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        bounds: Option<String>,
     },
     /// Per-row-group min/max only.
     Range {
@@ -599,7 +629,28 @@ pub enum KeySpec {
         columns: Vec<String>,
         /// Timestamp column that orders versions. Nulls rank last (ADR 014).
         ts_column: String,
+        /// Store, per key and per row group holding it, the number of rows
+        /// of that key there, over all versions (storage version 2).
+        #[serde(default, skip_serializing_if = "is_false")]
+        counts: bool,
     },
+    /// Bitemporal versions per key (`temporal2:id@valid,known`): every
+    /// distinct `(valid, known, row group)` triple over rows where neither
+    /// time is null, for as-of lookups on two clocks. Storage version 1 kept
+    /// these in a `temporal2` sidecar segment.
+    Bitemporal {
+        /// Key columns in prefix order.
+        columns: Vec<String>,
+        /// The time at which a version is true in the world.
+        valid_column: String,
+        /// The time at which a version became known.
+        known_column: String,
+    },
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)] // serde's skip_serializing_if signature
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 impl KeySpec {
@@ -607,14 +658,29 @@ impl KeySpec {
     #[must_use]
     pub fn columns(&self) -> &[String] {
         match self {
-            Self::Exact { columns }
+            Self::Exact { columns, .. }
             | Self::Bloom { columns, .. }
-            | Self::Temporal { columns, .. } => columns,
+            | Self::Temporal { columns, .. }
+            | Self::Bitemporal { columns, .. } => columns,
             Self::Range { column } => std::slice::from_ref(column),
         }
     }
 
-    /// A stable name for this spec, used as the segment key-spec id.
+    /// Whether the spec stores per-key per-row-group counts.
+    #[must_use]
+    pub fn counts(&self) -> bool {
+        matches!(
+            self,
+            Self::Exact { counts: true, .. } | Self::Temporal { counts: true, .. }
+        )
+    }
+
+    /// The display name and the spec's slot: the kind and the key columns
+    /// (`exact:symbol`, `bloom:symbol`, `temporal:id`, `temporal2:id`). An
+    /// index holds at most one spec per name, so declaring another spec of
+    /// the same name (another false-positive rate, counts on or off) is a
+    /// redefinition that rebuilds it. The manifest keys segments and
+    /// completeness by [`KeySpec::identity`], which carries every field.
     #[must_use]
     pub fn name(&self) -> String {
         let kind = match self {
@@ -622,8 +688,60 @@ impl KeySpec {
             Self::Bloom { .. } => "bloom",
             Self::Range { .. } => "range",
             Self::Temporal { .. } => "temporal",
+            Self::Bitemporal { .. } => "temporal2",
         };
         format!("{kind}:{}", self.columns().join(","))
+    }
+
+    /// The canonical full-spec string (`docs/format.md`, "Key-spec
+    /// identity"): every field of the spec, in the short form the command
+    /// line reads. Storage version 2 manifests key segments and completeness
+    /// by it, so two specs that differ in any field never share a name.
+    ///
+    /// | Spec | Identity |
+    /// |---|---|
+    /// | exact, columns `a, b` | `exact:a,b` |
+    /// | exact with counts | `exact:a,b,counts` |
+    /// | exact with bounds on `ts` | `exact:a@ts` (with counts `exact:a@ts,counts`) |
+    /// | bloom at `0.01` | `bloom:a@0.01` (with bounds `bloom:a@0.01@ts`) |
+    /// | range | `range:ts` |
+    /// | temporal | `temporal:id@ts` (with counts `temporal:id@ts,counts`) |
+    /// | bitemporal | `temporal2:id@valid,known` |
+    ///
+    /// The false-positive rate is Rust's shortest round-trip spelling of the
+    /// `f64`. The trailing `counts` is unambiguous because a spec whose last
+    /// key column of several is named `counts` is refused when declared.
+    #[must_use]
+    pub fn identity(&self) -> String {
+        let counts = if self.counts() { ",counts" } else { "" };
+        match self {
+            Self::Exact {
+                columns, bounds, ..
+            } => match bounds {
+                Some(ts) => format!("exact:{}@{ts}{counts}", columns.join(",")),
+                None => format!("exact:{}{counts}", columns.join(",")),
+            },
+            Self::Bloom {
+                columns,
+                fpr,
+                bounds,
+            } => match bounds {
+                Some(ts) => format!("bloom:{}@{fpr}@{ts}", columns.join(",")),
+                None => format!("bloom:{}@{fpr}", columns.join(",")),
+            },
+            Self::Range { column } => format!("range:{column}"),
+            Self::Temporal {
+                columns, ts_column, ..
+            } => format!("temporal:{}@{ts_column}{counts}", columns.join(",")),
+            Self::Bitemporal {
+                columns,
+                valid_column,
+                known_column,
+            } => format!(
+                "temporal2:{}@{valid_column},{known_column}",
+                columns.join(",")
+            ),
+        }
     }
 }
 
@@ -673,6 +791,73 @@ pub enum Predicate {
         /// Conjuncts.
         all: Vec<Predicate>,
     },
+    /// Keep rows whose column tuple is among the keys `keys_from` names
+    /// (contract v3; priced by relational replay, WP15).
+    SemiJoin {
+        /// Columns, in the order the keys are encoded.
+        columns: Vec<String>,
+        /// Where the keys come from.
+        keys_from: KeysFrom,
+    },
+    /// Join two inputs on equal column tuples (contract v3; priced by
+    /// relational replay, WP15).
+    Join {
+        /// Left join columns.
+        left: Vec<String>,
+        /// Right join columns, pairwise with `left`.
+        right: Vec<String>,
+        /// Inner or left.
+        kind: JoinKind,
+    },
+    /// The rows of whole partitions of `columns` (a window's input,
+    /// contract v3; priced by relational replay, WP15).
+    WindowPartition {
+        /// Partition columns.
+        columns: Vec<String>,
+    },
+}
+
+/// Where a semi-join's keys come from (contract v3).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(tag = "from", rename_all = "snake_case")]
+pub enum KeysFrom {
+    /// The recorded run's key set.
+    Run,
+    /// These canonical-encoded key tuples.
+    Values {
+        /// Canonical-encoded key tuples.
+        values: Vec<Vec<u8>>,
+    },
+    /// The output of another node of the same [`ConsumerPlan`].
+    Node {
+        /// The node's index in [`ConsumerPlan::nodes`].
+        node: u32,
+        /// The node's output columns that hold the keys.
+        columns: Vec<String>,
+    },
+}
+
+/// A join's kind (contract v3).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum JoinKind {
+    /// Rows with a match on both sides.
+    Inner,
+    /// Every left row, with its matches or none.
+    Left,
+}
+
+/// The compressed bytes of one column over a scan entry's row groups.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct ColumnBytes {
+    /// The column.
+    pub column: String,
+    /// Its compressed bytes, summed over the entry's row groups from the
+    /// manifest's per-column bytes. Exact.
+    pub bytes: u64,
 }
 
 /// One file's share of a scan plan.
@@ -689,6 +874,12 @@ pub struct ScanEntry {
     /// Compressed bytes those row groups occupy, summed from stats. Exact,
     /// not estimated.
     pub bytes: u64,
+    /// With a projection: the bytes of each projected column over these row
+    /// groups, in the projection's order (contract v3). A text source's
+    /// chunks have no per-column bytes and carry none. Absent without a
+    /// projection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub columns: Option<Vec<ColumnBytes>>,
 }
 
 /// What the index guarantees (ADR 011): every row group holding a queried key
@@ -709,6 +900,23 @@ pub struct ScanPlan {
     pub row_groups_total: u64,
     /// Row groups in the plan.
     pub row_groups_selected: u64,
+    /// With a projection: the projected columns' bytes over every entry
+    /// (the sum of the entries' `columns`; for a text source, `bytes`).
+    /// Absent without a projection (contract v3).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub projected_bytes: Option<u64>,
+    /// A read order that interleaves files: `(entry, row group)` pairs, in
+    /// non-decreasing time minimum, when a complete range key on the
+    /// lookup's time column gives one (contract v3). Absent otherwise;
+    /// verify ignores it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub order: Option<Vec<(u32, u32)>>,
+    /// The rows holding the queried keys in the planned row groups: Exact
+    /// when the serving spec stores counts (storage version 2, `counts`), so
+    /// a gate on a key set's size reads the plan, not the files. Absent when
+    /// the serving spec has no counts or the lookup is not by keys alone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rows: Option<Quantity>,
 }
 
 impl Eq for KeySpec {}
@@ -788,6 +996,17 @@ pub struct Fanout {
     pub files_total: u64,
     /// Total row groups in the dataset.
     pub row_groups_total: u64,
+    /// Distinct values the quantiles were computed over, when they come
+    /// from a sample (`sampled`); absent when every value was measured
+    /// (contract v3).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sample_size: Option<u64>,
+    /// The rank error of the sampled quantiles, as a fraction of the values
+    /// (a p95 from a sample is the true quantile at a rank within this
+    /// fraction of 0.95); absent when every value was measured (contract
+    /// v3).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quantile_error: Option<f64>,
 }
 
 /// A lint the profiler raised.
@@ -806,6 +1025,10 @@ pub struct Lint {
     /// Where the lint applies when it is about a consumer artifact rather
     /// than the dataset itself: a file path and step, or `None`.
     pub site: Option<String>,
+    /// The rewrite the rule catalog maps this rule to, when it has one
+    /// (contract v3).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fix: Option<RewriteShape>,
 }
 
 /// What an observation found.
@@ -853,6 +1076,144 @@ pub struct RewriteShape {
     pub after: String,
     /// The algebraic or data invariant the rewrite must preserve.
     pub invariant: String,
+    /// The current shape as a typed plan, when the proposer has one
+    /// (contract v3; relational replay prices it, WP15).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub before_plan: Option<ConsumerPlan>,
+    /// The target shape as a typed plan (contract v3).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after_plan: Option<ConsumerPlan>,
+}
+
+/// A consumer's query as a typed plan DAG, never SQL (contract v3; priced by
+/// relational replay, WP15). Nodes refer to their inputs by index.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct ConsumerPlan {
+    /// Plan format version; 1.
+    pub version: u32,
+    /// The nodes.
+    pub nodes: Vec<PlanNode>,
+    /// The index of the node whose output is the query's result.
+    pub root: u32,
+}
+
+/// One operator of a [`ConsumerPlan`]. Inputs are node indices.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(tag = "op", rename_all = "snake_case")]
+pub enum PlanNode {
+    /// Read columns of a named dataset.
+    Scan {
+        /// The dataset's name in the plan's dataset map.
+        dataset: String,
+        /// Columns read.
+        columns: Vec<String>,
+    },
+    /// Keep the rows a predicate holds for.
+    Filter {
+        /// Input node.
+        input: u32,
+        /// The predicate.
+        predicate: Predicate,
+    },
+    /// The newest version per key.
+    Latest {
+        /// Input node.
+        input: u32,
+        /// Key columns.
+        columns: Vec<String>,
+        /// The column ordering versions.
+        ts: String,
+    },
+    /// The version per key current at the run's instant.
+    AsOf {
+        /// Input node.
+        input: u32,
+        /// Key columns.
+        columns: Vec<String>,
+        /// The column ordering versions.
+        ts: String,
+    },
+    /// Keep rows whose key is among `keys`.
+    SemiJoin {
+        /// Input node.
+        input: u32,
+        /// Key columns.
+        columns: Vec<String>,
+        /// Where the keys come from.
+        keys: KeysFrom,
+    },
+    /// Join two inputs on column pairs.
+    Join {
+        /// Left input node.
+        left: u32,
+        /// Right input node.
+        right: u32,
+        /// `(left column, right column)` pairs.
+        on: Vec<(String, String)>,
+        /// Inner or left.
+        kind: JoinKind,
+    },
+    /// A window over partitions, optionally only those of some keys.
+    Window {
+        /// Input node.
+        input: u32,
+        /// Partition columns.
+        partition_by: Vec<String>,
+        /// The partitions of interest, if not all.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        keys: Option<KeysFrom>,
+    },
+    /// Group and aggregate.
+    Aggregate {
+        /// Input node.
+        input: u32,
+        /// Grouping columns.
+        group_by: Vec<String>,
+        /// The aggregates computed.
+        measures: Vec<Measure>,
+    },
+    /// Repartition rows across workers by columns (a shuffle).
+    Exchange {
+        /// Input node.
+        input: u32,
+        /// Partitioning columns.
+        by: Vec<String>,
+    },
+    /// Keep only these columns.
+    Project {
+        /// Input node.
+        input: u32,
+        /// Columns kept.
+        columns: Vec<String>,
+    },
+}
+
+/// One aggregate of a [`PlanNode::Aggregate`].
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct Measure {
+    /// The function.
+    pub function: AggregateFn,
+    /// The column it reads; `None` for `count(*)`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub column: Option<String>,
+}
+
+/// An aggregate function.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum AggregateFn {
+    /// Row count.
+    Count,
+    /// Sum.
+    Sum,
+    /// Minimum.
+    Min,
+    /// Maximum.
+    Max,
 }
 
 /// What an agent may propose. There is no score field in any variant; scoring
@@ -863,8 +1224,15 @@ pub struct RewriteShape {
 pub enum ProposalBody {
     /// Add or change an index key.
     Key {
-        /// The proposed spec.
+        /// The proposed spec. Any [`KeySpec`], including one with per-key
+        /// time bounds (`exact:symbol@ts`) or a bitemporal spec (contract
+        /// v3), which storage version 1 could only declare as sidecars.
         spec: KeySpec,
+        /// Specs proposed together with `spec` and applied in the same
+        /// commit, for example a bloom with bounds beside an exact key
+        /// (contract v3). Empty for a single spec, and then omitted.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        sidecars: Vec<KeySpec>,
     },
     /// Cluster or sort files by these columns.
     Layout {
@@ -894,6 +1262,61 @@ pub struct Proposal {
     pub body: ProposalBody,
 }
 
+/// How a number was obtained (contract v3, ADR 026): computed exactly from
+/// the index and recorded statistics, bounded by an interval the statistics
+/// prove, or measured by a named model. Never estimated (ADR 005).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum Exactness {
+    /// A sum of recorded statistics and index contents.
+    #[default]
+    Exact,
+    /// The true value lies in `[low, high]`, both proven.
+    Bounded {
+        /// Proven lower bound.
+        low: u64,
+        /// Proven upper bound.
+        high: u64,
+    },
+    /// Measured or predicted by the named model (ADR 027).
+    Measured {
+        /// The model, for example `layout.v1` or a database's measured cost.
+        model: String,
+    },
+}
+
+impl Exactness {
+    /// Whether this is [`Exactness::Exact`].
+    #[must_use]
+    pub fn is_exact(&self) -> bool {
+        matches!(self, Self::Exact)
+    }
+}
+
+/// A number with how it was obtained (contract v3).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct Quantity {
+    /// The value when `Exact`; the upper end of the interval when
+    /// `Bounded` (the interval itself is in `exactness`); the model's figure
+    /// when `Measured`.
+    pub value: u64,
+    /// How `value` was obtained.
+    pub exactness: Exactness,
+}
+
+impl Quantity {
+    /// An exact value.
+    #[must_use]
+    pub fn exact(value: u64) -> Self {
+        Self {
+            value,
+            exactness: Exactness::Exact,
+        }
+    }
+}
+
 /// Cost of one recorded run under one configuration. Exact, from statistics,
 /// never estimated (ADR 005).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -915,8 +1338,34 @@ pub struct RunCost {
     /// or a `ProposalBody::Rewrite` whose cost is measured rather than
     /// replayed, such as a step inside a database (ADR 027). The Replay must
     /// then name the model. A key proposal is always exact. Never silently
-    /// estimated (ADR 005); contract v3 replaces this flag with a tri-state.
+    /// estimated (ADR 005). From record version 3, `exact` is true exactly
+    /// when `exactness` is `Exact` (a ledger rule), so a reader may use
+    /// either.
     pub exact: bool,
+    /// How the numbers above were obtained (contract v3). Omitted when
+    /// `Exact`, so an exact cost serializes as in record version 2.
+    #[serde(default, skip_serializing_if = "Exactness::is_exact")]
+    pub exactness: Exactness,
+    /// Rows holding the run's keys in the row groups it reads (contract
+    /// v3): Exact when the serving spec stores counts, Bounded otherwise.
+    /// Absent when not computed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rows: Option<Quantity>,
+}
+
+/// The cost of one operator of a [`ConsumerPlan`] in one run (contract v3;
+/// filled by relational replay, WP15).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct OperatorCost {
+    /// The node's index in the plan.
+    pub node: u32,
+    /// The operator, as [`PlanNode`] tags it (`scan`, `semi_join`, ...).
+    pub op: String,
+    /// Compressed bytes the operator reads or moves.
+    pub bytes: Quantity,
+    /// Rows it outputs.
+    pub rows_out: Quantity,
 }
 
 /// A record of replaying a recorded workload against a proposal.
@@ -939,10 +1388,19 @@ pub struct Replay {
     /// records.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub inputs: Vec<Hash>,
+    /// The full identities ([`KeySpec::identity`]) of the specs that formed
+    /// the current configuration: the complete specs a plan may use
+    /// (contract v3). Empty when none, and then omitted.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub configuration: Vec<String>,
     /// Cost per run under the current configuration.
     pub current: Vec<RunCost>,
     /// Cost per run under the proposal.
     pub proposed: Vec<RunCost>,
+    /// Per-operator costs of a run priced through a [`ConsumerPlan`]
+    /// (contract v3; WP15 fills it). Empty otherwise, and then omitted.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub operators: Vec<OperatorCost>,
     /// Name of the cost model behind any cost with `exact == false`.
     /// Present exactly when such a cost exists (a layout proposal), absent
     /// otherwise; enforced by the ledger against the proposal's kind. Absent
@@ -991,7 +1449,9 @@ pub struct CertBody {
     pub missing_right: u64,
     /// Keys present on the right only.
     pub missing_left: u64,
-    /// Keys present on both with differing latest-version row hash.
+    /// Keys present on both with differing latest-version row hash. From
+    /// record version 3, keys that could not be compared are counted in
+    /// `uncomparable` instead.
     pub mismatched: u64,
     /// Columns excluded from the row hash, listed so the certificate is
     /// auditable.
@@ -999,6 +1459,76 @@ pub struct CertBody {
     /// Per-group decimal totals that differed, as `(group, left, right)` with
     /// decimals rendered as strings at declared scale.
     pub totals_delta: Vec<(String, String, String)>,
+    /// The first per-key differences, in canonical key order, at most
+    /// [`MAX_MISMATCH_EXAMPLES`] (contract v3). Omitted when empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub examples: Vec<MismatchExample>,
+    /// Keys that could not be compared: with a version column, every row of
+    /// the key on some side has a null version, and a null never wins
+    /// (ADR 014). A certificate passes only when this is zero (contract
+    /// v3). Omitted when zero.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub uncomparable: u64,
+    /// Every total column the comparison summed and how it was quantized,
+    /// passing or not (contract v3). Omitted when none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub totals: Vec<TotalSpec>,
+    /// The rows compared, when only some rows of the covered keys were
+    /// (an `asof`, lookback, or window workload): the predicates, applied
+    /// in order (contract v3). Absent when every row of the covered keys
+    /// was compared.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub row_filter: Option<Vec<Predicate>>,
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)] // serde's skip_serializing_if signature
+fn is_zero(n: &u64) -> bool {
+    *n == 0
+}
+
+/// The most per-key examples a certificate carries (the verifier's
+/// `max_examples`).
+pub const MAX_MISMATCH_EXAMPLES: usize = 100;
+
+/// One key that differed, as a certificate records it (contract v3).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct MismatchExample {
+    /// How the key differed.
+    pub kind: MismatchKind,
+    /// Lowercase hex of the canonical key tuple (ADR 016): the identity.
+    pub key: String,
+    /// Each key element as Arrow displays it at the dataset type; `None`
+    /// for a null element.
+    pub values: Vec<Option<String>>,
+}
+
+/// How one key differed (contract v3).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum MismatchKind {
+    /// Rows on the right only.
+    MissingLeft,
+    /// Rows on the left only.
+    MissingRight,
+    /// On both sides, with differing compared versions.
+    Mismatched,
+    /// No comparable version on some side.
+    Uncomparable,
+}
+
+/// A total column of a certificate and its quantization (contract v3).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct TotalSpec {
+    /// The column.
+    pub column: String,
+    /// For a float column, the decimal scale each value was rounded to
+    /// (half to even) before an exact sum; `None` for a decimal or integer
+    /// column, summed as stored.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quantize: Option<u8>,
 }
 
 /// A record that a reconciliation ran and what it found (ADR 004).
@@ -1141,7 +1671,10 @@ mod tests {
             body: ProposalBody::Key {
                 spec: KeySpec::Exact {
                     columns: vec!["id".into()],
+                    counts: false,
+                    bounds: None,
                 },
+                sidecars: Vec::new(),
             },
         });
         let b = a.clone();
@@ -1169,6 +1702,8 @@ mod tests {
                         row_groups_per_value: [40.0, 500.0, 400.0],
                         files_total: 1_000,
                         row_groups_total: 8_000,
+                        sample_size: None,
+                        quantile_error: None,
                     }],
                     lints: vec![Lint {
                         rule: "batch_stamp_key".into(),
@@ -1176,6 +1711,7 @@ mod tests {
                         message: "looks like an id, is a timestamp".into(),
                         confidence: 0.9,
                         site: None,
+                        fix: None,
                     }],
                     workload_keys: Some([10, 1_000, 10_000]),
                 },
@@ -1194,6 +1730,10 @@ mod tests {
                     mismatched: 0,
                     ignored_columns: vec!["updated_at".into()],
                     totals_delta: vec![],
+                    examples: Vec::new(),
+                    uncomparable: 0,
+                    totals: Vec::new(),
+                    row_filter: None,
                 },
                 provenance: provenance(),
             }),
@@ -1232,6 +1772,7 @@ mod tests {
                 },
                 row_groups: rgs,
                 bytes: 10,
+                columns: None,
             }],
             residual: Some(Predicate::And {
                 all: vec![
@@ -1248,6 +1789,9 @@ mod tests {
             bytes: 10,
             row_groups_total: 8,
             row_groups_selected: 2,
+            projected_bytes: None,
+            order: None,
+            rows: None,
         };
         let json = serde_json::to_string(&plan).unwrap();
         assert!(json.contains("\"row_groups\":[0,7]"), "{json}");
@@ -1289,6 +1833,8 @@ mod tests {
             row_groups: 3,
             bytes: 4096,
             exact: true,
+            exactness: Exactness::Exact,
+            rows: None,
         };
         let back: RunCost = serde_json::from_str(&serde_json::to_string(&rc).unwrap()).unwrap();
         assert_eq!(back, rc);
@@ -1304,6 +1850,7 @@ mod tests {
         let k = KeySpec::Temporal {
             columns: vec!["id".into(), "version".into()],
             ts_column: "ts".into(),
+            counts: false,
         };
         assert_eq!(k.name(), "temporal:id,version");
         assert_eq!(
@@ -1351,6 +1898,7 @@ mod schema_feature {
                             },
                             row_groups: rgs,
                             bytes: 99,
+                            columns: None,
                         }],
                         residual: Some(Predicate::In {
                             columns: vec!["id".into()],
@@ -1359,6 +1907,9 @@ mod schema_feature {
                         bytes: 99,
                         row_groups_total: 4,
                         row_groups_selected: 2,
+                        projected_bytes: None,
+                        order: None,
+                        rows: None,
                     },
                 },
             }),
@@ -1372,6 +1923,8 @@ mod schema_feature {
                         before: "b".into(),
                         after: "a".into(),
                         invariant: "i".into(),
+                        before_plan: None,
+                        after_plan: None,
                     },
                 },
             }),
@@ -1388,10 +1941,14 @@ mod schema_feature {
                     row_groups: 4,
                     bytes: 5,
                     exact: true,
+                    exactness: Exactness::Exact,
+                    rows: None,
                 }],
                 proposed: vec![],
                 model: None,
                 created_at: "2026-10-24T00:00:00.000Z".into(),
+                configuration: Vec::new(),
+                operators: Vec::new(),
             }),
             Record::Certificate(Certificate {
                 record_version: format::RECORD_VERSION,
@@ -1407,6 +1964,10 @@ mod schema_feature {
                     mismatched: 2,
                     ignored_columns: vec![],
                     totals_delta: vec![("g".into(), "1.00".into(), "2.00".into())],
+                    examples: Vec::new(),
+                    uncomparable: 0,
+                    totals: Vec::new(),
+                    row_filter: None,
                 },
                 provenance,
             }),

@@ -485,7 +485,7 @@ impl<'a> Replayer<'a> {
             .into());
         }
         let (proposed, layout) = match body {
-            ProposalBody::Key { spec } => {
+            ProposalBody::Key { spec, .. } => {
                 validate_spec(spec)?;
                 if !workload
                     .runs()
@@ -541,6 +541,8 @@ impl<'a> Replayer<'a> {
                 created_at: created_at.to_string(),
                 inputs: vec![self.catalog.digest()],
                 model,
+                configuration: Vec::new(),
+                operators: Vec::new(),
             },
             body: Hash::of_record(body)?,
             layout,

@@ -91,6 +91,8 @@ pub fn batch(rows: &[Row]) -> RecordBatch {
 pub fn exact() -> KeySpec {
     KeySpec::Exact {
         columns: vec!["id".into(), "tag".into()],
+        counts: false,
+        bounds: None,
     }
 }
 
@@ -98,6 +100,8 @@ pub fn exact() -> KeySpec {
 pub fn exact_tag_first() -> KeySpec {
     KeySpec::Exact {
         columns: vec!["tag".into(), "id".into()],
+        counts: false,
+        bounds: None,
     }
 }
 
@@ -105,6 +109,7 @@ pub fn bloom(fpr: f64) -> KeySpec {
     KeySpec::Bloom {
         columns: vec!["id".into(), "tag".into()],
         fpr,
+        bounds: None,
     }
 }
 
@@ -118,6 +123,7 @@ pub fn temporal() -> KeySpec {
     KeySpec::Temporal {
         columns: vec!["id".into(), "tag".into()],
         ts_column: "ts".into(),
+        counts: false,
     }
 }
 

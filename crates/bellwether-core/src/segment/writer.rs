@@ -6,11 +6,13 @@ use std::collections::{BTreeMap, HashSet};
 
 use arrow::array::{ArrayRef, RecordBatch};
 use arrow::datatypes::{DataType, Schema};
+use bellwether_types::format::STORAGE_VERSION;
 use bellwether_types::{Error, Hash, KeySpec, Result, RowGroupId};
 use roaring::RoaringBitmap;
 
 use super::format::{
-    len_u32, spec_types, ColumnType, Layout, Put, SegmentHeader, FOOTER_LEN, MAGIC,
+    checksum, len_u32, put_leb128, spec_types, ColumnType, Layout, Put, SegmentHeader,
+    FOOTER_LEN_V2, MAGIC,
 };
 use crate::bloom::{BloomHash, CanonicalHash, FilterHash, Sbbf};
 use crate::encoding::{self, KeyColumns, NEG_ZERO_KEY, POS_ZERO_KEY};
@@ -96,6 +98,9 @@ pub fn segment_path(id: &Hash) -> String {
 
 pub(crate) struct Framing {
     pub(crate) out: Vec<u8>,
+    /// End of the preamble and header in `out`; the footer checksum covers
+    /// `out[..header_end]` and the index.
+    header_end: usize,
     spec: KeySpec,
     entries: u64,
     rg: Option<(u32, u32)>,
@@ -104,7 +109,16 @@ pub(crate) struct Framing {
 }
 
 impl Framing {
+    /// Starts a segment. This build writes only the current storage
+    /// version's layout (`docs/format.md`); a header asking for another is
+    /// refused.
     fn start(header: &SegmentHeader) -> Result<Self> {
+        if header.storage_version != STORAGE_VERSION {
+            return Err(Error::Other(format!(
+                "this build writes storage version {STORAGE_VERSION} segments, not version {}",
+                header.storage_version
+            )));
+        }
         header.validate(header.storage_version, header.encoding_version)?;
         let json = serde_json::to_vec(header)?;
         let mut out = Vec::with_capacity(4096);
@@ -114,6 +128,7 @@ impl Framing {
         out.put_u32(len_u32(json.len())?);
         out.extend_from_slice(&json);
         Ok(Self {
+            header_end: out.len(),
             out,
             spec: header.key_spec.clone(),
             entries: 0,
@@ -166,9 +181,12 @@ impl Framing {
         self.out.extend_from_slice(&prelude);
         self.out.extend_from_slice(&self.index);
         let index_len = self.pos() - index_offset;
-        self.out.reserve(FOOTER_LEN);
+        let start = usize::try_from(index_offset).unwrap_or(usize::MAX);
+        let sum = checksum(&[&self.out[..self.header_end], &self.out[start..]]);
+        self.out.reserve(FOOTER_LEN_V2);
         self.out.put_u64(index_offset);
         self.out.put_u64(index_len);
+        self.out.put_u64(sum);
         self.out.extend_from_slice(&MAGIC);
         EncodedSegment {
             id: Hash::of(&self.out),
@@ -195,29 +213,62 @@ pub struct KeyValue {
     pub bitmap: RoaringBitmap,
     /// Version chain; always empty for exact segments.
     pub chain: VersionChain,
+    /// For a spec that stores counts (storage version 2), the number of
+    /// rows of this key in each row group of `bitmap`, in ascending row
+    /// group order, each at least 1. `None` for a segment without counts.
+    pub counts: Option<Vec<u64>>,
 }
 
 impl KeyValue {
+    /// `(row group, rows)` for every row group holding the key, ascending;
+    /// `None` when the segment stores no counts.
+    #[must_use]
+    pub fn counted(&self) -> Option<Vec<(RowGroupId, u64)>> {
+        let counts = self.counts.as_ref()?;
+        Some(
+            self.bitmap
+                .iter()
+                .zip(counts.iter().copied())
+                .map(|(rg, n)| (RowGroupId(rg), n))
+                .collect(),
+        )
+    }
+
+    /// The storage version 2 value record: `bitmap_len u32 | bitmap |
+    /// [counts] | [chain]` (`docs/format.md`).
     pub(crate) fn encode(&self, temporal: bool, out: &mut Vec<u8>) -> Result<()> {
         let mut bm = Vec::with_capacity(self.bitmap.serialized_size());
         self.bitmap
             .serialize_into(&mut bm)
             .map_err(|e| Error::Other(e.to_string()))?;
+        out.put_bytes(&bm)?;
+        if let Some(counts) = &self.counts {
+            if counts.len() as u64 != self.bitmap.len() || counts.contains(&0) {
+                return Err(Error::Other(
+                    "a key's counts must be one positive count per row group holding it".into(),
+                ));
+            }
+            for &n in counts {
+                put_leb128(out, n);
+            }
+        }
         if temporal {
-            out.put_bytes(&bm)?;
             self.chain.write_to(out)?;
-        } else {
-            out.extend_from_slice(&bm);
         }
         Ok(())
     }
 
-    /// Parses a value record. The bitmap must be in roaring's no-run
-    /// serialized form (cookie `3a 30 00 00`, the only form the writer
-    /// emits), fill its bytes exactly, and be non-empty: every stored key is
-    /// held by at least one row group (`docs/format.md`). Anything else is
-    /// corruption and is refused, never decoded into a wrong answer.
-    pub(crate) fn decode(bytes: &[u8], temporal: bool) -> Result<Self> {
+    /// Parses a value record of a segment at `storage` version. The bitmap
+    /// must be in roaring's no-run serialized form (cookie `3a 30 00 00`,
+    /// the only form the writer emits), fill its bytes exactly, and be
+    /// non-empty: every stored key is held by at least one row group
+    /// (`docs/format.md`). Version 1: an exact record is the bare bitmap, a
+    /// temporal one the length-prefixed bitmap and the chain. Version 2:
+    /// always the length-prefixed bitmap, then, with `counts`, one shortest
+    /// LEB128 count of at least 1 per row group, then the chain for temporal
+    /// specs; nothing may follow. Anything else is corruption and is
+    /// refused, never decoded into a wrong answer.
+    pub(crate) fn decode(bytes: &[u8], temporal: bool, counts: bool, storage: u32) -> Result<Self> {
         let read_bm = |b: &[u8]| -> Result<RoaringBitmap> {
             if b.get(..4) != Some(&NO_RUN_COOKIE[..]) {
                 return Err(Error::Other(
@@ -233,25 +284,65 @@ impl KeyValue {
             }
             Ok(bm)
         };
-        if temporal {
-            let mut c = super::format::Cursor::new(bytes);
-            let bitmap = read_bm(c.bytes()?)?;
-            Ok(Self {
-                bitmap,
-                chain: VersionChain::read_from(c.rest())?,
-            })
-        } else {
-            Ok(Self {
-                bitmap: read_bm(bytes)?,
-                chain: VersionChain::new(),
-            })
+        if storage < 2 {
+            return if temporal {
+                let mut c = super::format::Cursor::new(bytes);
+                let bitmap = read_bm(c.bytes()?)?;
+                Ok(Self {
+                    bitmap,
+                    chain: VersionChain::read_from(c.rest())?,
+                    counts: None,
+                })
+            } else {
+                Ok(Self {
+                    bitmap: read_bm(bytes)?,
+                    chain: VersionChain::new(),
+                    counts: None,
+                })
+            };
         }
+        let mut c = super::format::Cursor::new(bytes);
+        let bitmap = read_bm(c.bytes()?)?;
+        let counts = if counts {
+            let mut v =
+                Vec::with_capacity(usize::try_from(bitmap.len()).unwrap_or(0).min(bytes.len()));
+            for _ in 0..bitmap.len() {
+                let n = c.leb128()?;
+                if n == 0 {
+                    return Err(Error::Other(
+                        "corrupt segment: a count of zero rows for a row group holding the key"
+                            .into(),
+                    ));
+                }
+                v.push(n);
+            }
+            Some(v)
+        } else {
+            None
+        };
+        let chain = if temporal {
+            VersionChain::read_from(c.rest())?
+        } else {
+            if !c.is_done() {
+                return Err(Error::Other(
+                    "corrupt segment: trailing bytes after a value record".into(),
+                ));
+            }
+            VersionChain::new()
+        };
+        Ok(Self {
+            bitmap,
+            chain,
+            counts,
+        })
     }
 }
 
 pub(crate) struct KeyedEmitter {
     f: Framing,
     temporal: bool,
+    /// Whether every value carries counts (the spec stores them).
+    counts: bool,
     opts: WriterOptions,
     keys: Vec<Vec<u8>>,
     key_bytes: usize,
@@ -264,6 +355,7 @@ impl KeyedEmitter {
         Ok(Self {
             f: Framing::start(header)?,
             temporal: header.layout == Layout::KeyedTemporal,
+            counts: header.key_spec.counts(),
             opts: opts.clone(),
             keys: Vec::new(),
             key_bytes: 0,
@@ -296,6 +388,17 @@ impl KeyedEmitter {
                 "keyed emitter: a key must be held by at least one row group".into(),
             ));
         };
+        if value.counts.is_some() != self.counts {
+            return Err(Error::Other(format!(
+                "keyed emitter: the spec {} counts, but a value {} counts",
+                if self.counts { "stores" } else { "stores no" },
+                if value.counts.is_some() {
+                    "carries"
+                } else {
+                    "carries no"
+                },
+            )));
+        }
         self.f.note_rg(lo, hi);
         let before = self.values.len();
         value.encode(self.temporal, &mut self.values)?;
@@ -328,6 +431,7 @@ impl KeyedEmitter {
         let bloom_off = f.pos();
         sbbf.write_to(&mut f.out);
         let bloom_len = len_u32(sbbf.num_bytes())?;
+        let bloom_sum = checksum(&[&f.out[f.out.len() - bloom_len as usize..]]);
         // body
         let body_off = f.pos();
         let n = len_u32(self.keys.len())?;
@@ -344,19 +448,26 @@ impl KeyedEmitter {
             f.out.extend_from_slice(k);
         }
         let mut off = values_off;
+        let mut at = 0usize;
         for &len in &self.value_lens {
+            let end = at + len as usize;
             f.out.put_u64(off);
             f.out.put_u32(len);
+            f.out.put_u64(checksum(&[&self.values[at..end]]));
             off += u64::from(len);
+            at = end;
         }
         let body_len = len_u32(usize::try_from(f.pos() - body_off).unwrap_or(usize::MAX))?;
+        let body_sum = checksum(&[&f.out[f.out.len() - body_len as usize..]]);
         // index entry
         f.index.put_bytes(first)?;
         f.index.put_bytes(last)?;
         f.index.put_u64(bloom_off);
         f.index.put_u32(bloom_len);
+        f.index.put_u64(bloom_sum);
         f.index.put_u64(body_off);
         f.index.put_u32(body_len);
+        f.index.put_u64(body_sum);
         f.index.put_u32(n);
         f.blocks += 1;
         self.keys.clear();
@@ -416,6 +527,7 @@ impl BloomEmitter {
         self.f.index.put_u64(off);
         self.f.index.put_u32(len_u32(bitset.len())?);
         self.f.index.put_u64(ndv);
+        self.f.index.put_u64(checksum(&[bitset]));
         self.f.entries = self.f.entries.saturating_add(ndv);
         self.f.blocks += 1;
         self.f.note_rg(rg, rg);
@@ -498,12 +610,15 @@ impl RangeEmitter {
             self.f.out.put_bytes(max)?;
         }
         let len = len_u32(usize::try_from(self.f.pos() - off).unwrap_or(usize::MAX))?;
+        let start = usize::try_from(off).unwrap_or(usize::MAX);
+        let sum = checksum(&[&self.f.out[start..]]);
         let first_min = first.0.clone();
         self.f.index.put_bytes(&first_min)?;
         self.f.index.put_bytes(&max_max)?;
         self.f.index.put_u64(off);
         self.f.index.put_u32(len);
         self.f.index.put_u32(n);
+        self.f.index.put_u64(sum);
         self.f.blocks += 1;
         self.pending.clear();
         Ok(())
@@ -523,6 +638,19 @@ impl RangeEmitter {
 struct KeyAcc {
     bitmap: RoaringBitmap,
     versions: VersionBuffer,
+    /// Rows per row group holding the key, kept only when the spec stores
+    /// counts.
+    rows: BTreeMap<u32, u64>,
+}
+
+/// The accumulator of `key`, created on first sight. The key is copied only
+/// then, never per row.
+fn key_acc<'m>(m: &'m mut BTreeMap<Vec<u8>, KeyAcc>, key: &[u8]) -> Result<&'m mut KeyAcc> {
+    if !m.contains_key(key) {
+        m.insert(key.to_vec(), KeyAcc::default());
+    }
+    m.get_mut(key)
+        .ok_or_else(|| Error::Other("key accumulator vanished".into()))
 }
 
 enum BloomAcc {
@@ -584,6 +712,24 @@ pub fn validate_spec(spec: &KeySpec) -> Result<()> {
             )));
         }
     }
+    // `exact:a,counts` is the spec on `a` that stores counts, so a spec
+    // whose last key column of several is named `counts` would share its
+    // identity (docs/format.md, "Key-spec identity").
+    if let KeySpec::Exact {
+        columns,
+        bounds: None,
+        ..
+    } = spec
+    {
+        if columns.len() > 1 && columns.last().is_some_and(|c| c == "counts") {
+            let rest = columns[..columns.len() - 1].join(",");
+            return Err(Error::KeySpec(format!(
+                "a key column named \"counts\" cannot come last in a composite exact spec, \
+                 because exact:{rest},counts already means the spec on {rest} that stores \
+                 counts; list it first instead, as exact:counts,{rest}"
+            )));
+        }
+    }
     Ok(())
 }
 
@@ -594,9 +740,16 @@ impl SegmentWriter {
     pub fn new(spec: KeySpec, opts: WriterOptions) -> Result<Self> {
         validate_spec(&spec)?;
         let acc = match Layout::for_spec(&spec) {
-            Layout::Keyed | Layout::KeyedTemporal => Acc::Keyed(BTreeMap::new()),
-            Layout::BloomPerRowGroup => Acc::Bloom(BTreeMap::new()),
-            Layout::MinMax => Acc::Range(BTreeMap::new()),
+            Some(Layout::Keyed | Layout::KeyedTemporal) => Acc::Keyed(BTreeMap::new()),
+            Some(Layout::BloomPerRowGroup) => Acc::Bloom(BTreeMap::new()),
+            Some(Layout::MinMax) => Acc::Range(BTreeMap::new()),
+            None => {
+                return Err(Error::KeySpec(format!(
+                    "{} has no key segment of its own in this release: per-key time bounds and \
+                     bitemporal versions are written as sidecar segments",
+                    spec.identity()
+                )))
+            }
         };
         Ok(Self {
             spec,
@@ -674,24 +827,37 @@ impl SegmentWriter {
         Ok(())
     }
 
-    /// Records that row group `rg` holds `key`. For temporal specs use
-    /// [`SegmentWriter::insert_version`]; calling this on one is an error.
-    /// On error nothing is recorded.
+    /// Records that row group `rg` holds one row of `key`. For temporal
+    /// specs use [`SegmentWriter::insert_version`]; calling this on one is
+    /// an error. On error nothing is recorded.
     pub fn insert(&mut self, key: &[u8], rg: RowGroupId) -> Result<()> {
+        self.insert_rows(key, rg, 1)
+    }
+
+    /// Records that row group `rg` holds `rows` rows of `key` (at least
+    /// one). Each call adds to the key's count there when the spec stores
+    /// counts; other specs record membership only. For temporal specs use
+    /// [`SegmentWriter::insert_version`]. On error nothing is recorded.
+    pub fn insert_rows(&mut self, key: &[u8], rg: RowGroupId, rows: u64) -> Result<()> {
         if matches!(self.spec, KeySpec::Temporal { .. }) {
             return Err(Error::KeySpec(
                 "temporal segments need a timestamp; use insert_version".into(),
             ));
         }
+        if rows == 0 {
+            return Err(Error::Other(
+                "a row group holding a key holds at least one row of it".into(),
+            ));
+        }
         self.check_insertable(rg)?;
+        let counts = self.spec.counts();
         match &mut self.acc {
             Acc::Keyed(m) => {
-                if let Some(v) = m.get_mut(key) {
-                    v.bitmap.insert(rg.0);
-                } else {
-                    let mut v = KeyAcc::default();
-                    v.bitmap.insert(rg.0);
-                    m.insert(key.to_vec(), v);
+                let v = key_acc(m, key)?;
+                v.bitmap.insert(rg.0);
+                if counts {
+                    let n = v.rows.entry(rg.0).or_insert(0);
+                    *n = n.saturating_add(rows);
                 }
             }
             Acc::Bloom(m) => {
@@ -718,10 +884,12 @@ impl SegmentWriter {
         Ok(())
     }
 
-    /// Records a version of `key` at `ts` in row group `rg` (temporal only).
-    /// `ts` is in the dataset column's unit. A `None` timestamp records
-    /// membership but never wins (ADR 014).
+    /// Records a version of `key` at `ts` in row group `rg` (temporal only):
+    /// one row. `ts` is in the dataset column's unit. A `None` timestamp
+    /// records membership (and, with counts, the row) but never wins
+    /// (ADR 014).
     pub fn insert_version(&mut self, key: &[u8], ts: Option<i64>, rg: RowGroupId) -> Result<()> {
+        let counts = self.spec.counts();
         let Acc::Keyed(m) = &mut self.acc else {
             return Err(Error::KeySpec(
                 "insert_version on a non-temporal spec".into(),
@@ -732,14 +900,12 @@ impl SegmentWriter {
                 "insert_version on a non-temporal spec".into(),
             ));
         }
-        if let Some(v) = m.get_mut(key) {
-            v.bitmap.insert(rg.0);
-            v.versions.push(ts, rg);
-        } else {
-            let mut v = KeyAcc::default();
-            v.bitmap.insert(rg.0);
-            v.versions.push(ts, rg);
-            m.insert(key.to_vec(), v);
+        let v = key_acc(m, key)?;
+        v.bitmap.insert(rg.0);
+        v.versions.push(ts, rg);
+        if counts {
+            let n = v.rows.entry(rg.0).or_insert(0);
+            *n = n.saturating_add(1);
         }
         Ok(())
     }
@@ -881,6 +1047,7 @@ impl SegmentWriter {
             header.key_types = Some(d.recorded_keys.clone());
             header.ts_type.clone_from(&d.recorded_ts);
         }
+        let counts = self.spec.counts();
         match self.acc {
             Acc::Keyed(m) => {
                 let mut e = KeyedEmitter::new(&header, &self.opts)?;
@@ -888,6 +1055,7 @@ impl SegmentWriter {
                     let v = KeyValue {
                         bitmap: acc.bitmap,
                         chain: acc.versions.finish(),
+                        counts: counts.then(|| acc.rows.values().copied().collect()),
                     };
                     e.push(&k, &v)?;
                 }
@@ -956,33 +1124,101 @@ mod tests {
         v
     }
 
+    /// Storage version 1 value records: an exact record is the bare bitmap.
     #[test]
     fn decode_accepts_only_non_empty_no_run_bitmaps_that_fill_their_record() {
         let bm: RoaringBitmap = [1u32, 7].into_iter().collect();
         let good = serialized(&bm);
         assert_eq!(good[..4], NO_RUN_COOKIE);
-        assert_eq!(KeyValue::decode(&good, false).unwrap().bitmap, bm);
+        assert_eq!(KeyValue::decode(&good, false, false, 1).unwrap().bitmap, bm);
         let mut run = good.clone();
         run[0] = 0x3b;
-        assert!(KeyValue::decode(&run, false).is_err(), "run cookie");
+        assert!(
+            KeyValue::decode(&run, false, false, 1).is_err(),
+            "run cookie"
+        );
         let empty = serialized(&RoaringBitmap::new());
-        assert!(KeyValue::decode(&empty, false).is_err(), "empty bitmap");
+        assert!(
+            KeyValue::decode(&empty, false, false, 1).is_err(),
+            "empty bitmap"
+        );
         let mut trailing = good.clone();
         trailing.push(0);
         assert!(
-            KeyValue::decode(&trailing, false).is_err(),
+            KeyValue::decode(&trailing, false, false, 1).is_err(),
             "trailing bytes"
         );
+        // version 1 bytes are not a version 2 record (no length prefix)
+        assert!(KeyValue::decode(&good, false, false, 2).is_err());
         // temporal records: a length-prefixed bitmap, then the chain
         let v = KeyValue {
             bitmap: bm,
             chain: VersionChain::from_versions(vec![(3, RowGroupId(1))]),
+            counts: None,
         };
         let mut rec = Vec::new();
         v.encode(true, &mut rec).unwrap();
-        assert_eq!(KeyValue::decode(&rec, true).unwrap(), v);
+        assert_eq!(KeyValue::decode(&rec, true, false, 2).unwrap(), v);
+        assert_eq!(KeyValue::decode(&rec, true, false, 1).unwrap(), v);
         rec[4] = 0x3b; // the bitmap's cookie, after its u32 length
-        assert!(KeyValue::decode(&rec, true).is_err());
+        assert!(KeyValue::decode(&rec, true, false, 2).is_err());
+    }
+
+    /// Storage version 2 value records with counts: one shortest LEB128
+    /// count of at least one per row group, nothing after (exact) or the
+    /// chain after (temporal).
+    #[test]
+    fn counted_records_round_trip_and_refuse_every_malformed_count() {
+        let bm: RoaringBitmap = [0u32, 2].into_iter().collect();
+        let v = KeyValue {
+            bitmap: bm.clone(),
+            chain: VersionChain::new(),
+            counts: Some(vec![3, 300]),
+        };
+        let mut rec = Vec::new();
+        v.encode(false, &mut rec).unwrap();
+        let bm_len = serialized(&bm).len();
+        // 300 = 0b10_0101100 -> ac 02
+        assert_eq!(rec[4 + bm_len..], [0x03, 0xac, 0x02]);
+        assert_eq!(KeyValue::decode(&rec, false, true, 2).unwrap(), v);
+        assert_eq!(
+            v.counted().unwrap(),
+            vec![(RowGroupId(0), 3), (RowGroupId(2), 300)]
+        );
+        // read without counts: the counts are trailing bytes
+        assert!(KeyValue::decode(&rec, false, false, 2).is_err());
+        // a missing count, a zero count, an over-long count, trailing bytes
+        let base = rec[..4 + bm_len].to_vec();
+        for tail in [
+            vec![0x03],
+            vec![0x00, 0x01],
+            vec![0x03, 0x80, 0x00],
+            vec![0x03, 0xac, 0x02, 0x00],
+            vec![
+                0x03, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x7f,
+            ],
+        ] {
+            let mut bad = base.clone();
+            bad.extend_from_slice(&tail);
+            assert!(KeyValue::decode(&bad, false, true, 2).is_err(), "{tail:?}");
+        }
+        // the writer refuses counts that do not match the bitmap
+        for counts in [vec![1], vec![1, 0], vec![1, 2, 3]] {
+            let bad = KeyValue {
+                counts: Some(counts),
+                ..v.clone()
+            };
+            assert!(bad.encode(false, &mut Vec::new()).is_err());
+        }
+        // temporal: counts, then the chain
+        let t = KeyValue {
+            bitmap: bm,
+            chain: VersionChain::from_versions(vec![(5, RowGroupId(0)), (9, RowGroupId(2))]),
+            counts: Some(vec![1, 2]),
+        };
+        let mut rec = Vec::new();
+        t.encode(true, &mut rec).unwrap();
+        assert_eq!(KeyValue::decode(&rec, true, true, 2).unwrap(), t);
     }
 
     /// A genuine run-format serialization (cookie `3b 30`): nine containers,
@@ -1014,13 +1250,15 @@ mod tests {
         let bm = RoaringBitmap::deserialize_from(&rec[..]).unwrap();
         assert_eq!(bm.len(), 10);
         assert_eq!(bm.serialized_size(), rec.len());
-        assert!(KeyValue::decode(&rec, false).is_err());
+        assert!(KeyValue::decode(&rec, false, false, 1).is_err());
     }
 
     #[test]
     fn the_emitter_refuses_a_key_held_by_no_row_group() {
         let header = SegmentHeader::new(KeySpec::Exact {
             columns: vec!["id".into()],
+            counts: false,
+            bounds: None,
         });
         let mut e = KeyedEmitter::new(&header, &WriterOptions::default()).unwrap();
         assert!(e.push(b"k", &KeyValue::default()).is_err());
@@ -1054,15 +1292,19 @@ mod tests {
         vec![
             KeySpec::Exact {
                 columns: vec!["k".into()],
+                counts: false,
+                bounds: None,
             },
             KeySpec::Bloom {
                 columns: vec!["k".into()],
                 fpr: 0.01,
+                bounds: None,
             },
             KeySpec::Range { column: "k".into() },
             KeySpec::Temporal {
                 columns: vec!["k".into()],
                 ts_column: "t".into(),
+                counts: false,
             },
         ]
     }
@@ -1100,6 +1342,8 @@ mod tests {
     fn a_processed_range_must_hold_every_referenced_row_group() {
         let spec = KeySpec::Exact {
             columns: vec!["k".into()],
+            counts: false,
+            bounds: None,
         };
         let mut w = SegmentWriter::new(spec.clone(), WriterOptions::default()).unwrap();
         w.insert(b"k", RowGroupId(5)).unwrap();
@@ -1118,6 +1362,8 @@ mod tests {
             let mut w = SegmentWriter::new(
                 KeySpec::Exact {
                     columns: vec!["k".into()],
+                    counts: false,
+                    bounds: None,
                 },
                 WriterOptions::default(),
             )

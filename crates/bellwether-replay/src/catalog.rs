@@ -387,6 +387,7 @@ impl Catalog {
                 file: self.files[fi].clone(),
                 row_groups,
                 bytes: file_bytes,
+                columns: None,
             });
         }
         Ok(ScanPlan {
@@ -396,6 +397,9 @@ impl Catalog {
             bytes,
             row_groups_total: self.row_groups.len() as u64,
             row_groups_selected: count,
+            projected_bytes: None,
+            order: None,
+            rows: None,
         })
     }
 

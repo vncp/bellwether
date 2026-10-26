@@ -51,7 +51,9 @@ impl Target {
     /// temporal timestamp or the sidecar's time columns.
     pub(crate) fn typed_columns(&self) -> Vec<String> {
         match self {
-            Self::Key(KeySpec::Temporal { columns, ts_column }) => {
+            Self::Key(KeySpec::Temporal {
+                columns, ts_column, ..
+            }) => {
                 let mut c = columns.clone();
                 c.push(ts_column.clone());
                 c

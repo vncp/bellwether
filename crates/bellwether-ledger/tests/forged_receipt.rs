@@ -403,6 +403,8 @@ fn only_a_rewrite_may_leave_the_manifest_unchanged() {
             before: "scan by batch_id".into(),
             after: "lookup by order_id".into(),
             invariant: "same rows".into(),
+            before_plan: None,
+            after_plan: None,
         },
     };
     let ph = ledger.put(&Record::Proposal(p)).unwrap();

@@ -804,6 +804,8 @@ fn propose(g: &Global, out: &Out, a: &ProposeArgs) -> Result<Outcome, Failure> {
                 before: before.clone(),
                 after: after.clone(),
                 invariant: invariant.clone(),
+                before_plan: None,
+                after_plan: None,
             },
         })
     } else {

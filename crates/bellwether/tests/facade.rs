@@ -213,7 +213,10 @@ fn propose_writes_a_scoreless_proposal_citing_resolving_evidence_only() {
     let key = ProposalBody::Key {
         spec: KeySpec::Exact {
             columns: vec!["batch".into()],
+            counts: false,
+            bounds: None,
         },
+        sidecars: Vec::new(),
     };
     assert!(e.propose(key.clone(), &[], "agent").is_err(), "no evidence");
     let missing = Hash::of(b"nothing");
@@ -222,7 +225,10 @@ fn propose_writes_a_scoreless_proposal_citing_resolving_evidence_only() {
     let unknown = ProposalBody::Key {
         spec: KeySpec::Exact {
             columns: vec!["nope".into()],
+            counts: false,
+            bounds: None,
         },
+        sidecars: Vec::new(),
     };
     assert!(e.propose(unknown, &[ev], "agent").is_err());
     let empty = ProposalBody::Rewrite {
@@ -230,6 +236,8 @@ fn propose_writes_a_scoreless_proposal_citing_resolving_evidence_only() {
             before: "a".into(),
             after: " ".into(),
             invariant: "c".into(),
+            before_plan: None,
+            after_plan: None,
         },
     };
     assert!(e.propose(empty, &[ev], "agent").is_err());

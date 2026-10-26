@@ -236,6 +236,8 @@ mod tests {
     fn exact(col: &str) -> KeySpec {
         KeySpec::Exact {
             columns: vec![col.into()],
+            counts: false,
+            bounds: None,
         }
     }
 
@@ -251,6 +253,9 @@ mod tests {
             chunk_size: None,
             chunks: None,
             extra: Extra::new(),
+            rowgroup_rows: None,
+            rowgroup_bytes: None,
+            column_bytes: None,
         }
     }
 
@@ -312,6 +317,7 @@ mod tests {
         other.schema.key_specs.push(KeySpec::Bloom {
             columns: vec!["id".into()],
             fpr: 0.01,
+            bounds: None,
         });
         let live = live_ids(&other.rowgroup_space).unwrap();
         assert!(!is_complete(&other, "exact:id", &live));
@@ -374,6 +380,7 @@ mod tests {
         let temporal = KeySpec::Temporal {
             columns: vec!["id".into()],
             ts_column: "ts".into(),
+            counts: false,
         };
         m.schema.key_specs = vec![temporal.clone()];
         m.key_spec_completeness.insert("temporal:id".into(), 3);
@@ -381,6 +388,7 @@ mod tests {
         let other_ts = KeySpec::Temporal {
             columns: vec!["id".into()],
             ts_column: "updated_at".into(),
+            counts: false,
         };
         assert_eq!(temporal.name(), other_ts.name());
         assert_eq!(completeness(&m, &temporal), Some(3));

@@ -158,17 +158,23 @@ fn guard_every_spec_kind_reads_only_the_plan_and_equals_the_scan() {
     let specs = [
         KeySpec::Exact {
             columns: vec!["id".into()],
+            counts: false,
+            bounds: None,
         },
         KeySpec::Temporal {
             columns: vec!["id".into()],
             ts_column: "ts".into(),
+            counts: false,
         },
         KeySpec::Exact {
             columns: vec!["id".into(), "status".into()],
+            counts: false,
+            bounds: None,
         },
         KeySpec::Bloom {
             columns: vec!["id".into()],
             fpr: 0.01,
+            bounds: None,
         },
         KeySpec::Range {
             column: "id".into(),
@@ -308,6 +314,8 @@ fn build_csv(dir: &std::path::Path, chunk: u64) -> (Arc<ObjectStoreBackend>, Str
             &canonical(dir),
             &[KeySpec::Exact {
                 columns: vec!["id".into()],
+                counts: false,
+                bounds: None,
             }],
             &opts,
         )

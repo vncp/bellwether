@@ -72,6 +72,7 @@ fn segments() -> Vec<(&'static str, Vec<u8>)> {
         KeySpec::Bloom {
             columns: vec!["id".into()],
             fpr: 0.1,
+            bounds: None,
         },
         opts(),
     )

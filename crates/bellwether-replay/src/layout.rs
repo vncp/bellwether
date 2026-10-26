@@ -410,6 +410,8 @@ fn modeled_costs(
             row_groups: selected.len(),
             bytes,
             exact: false,
+            exactness: bellwether_types::Exactness::Exact,
+            rows: None,
         });
     }
     Ok(costs)
@@ -419,6 +421,8 @@ fn exact_writer(columns: &[String]) -> ReplayResult<SegmentWriter> {
     Ok(SegmentWriter::new(
         KeySpec::Exact {
             columns: columns.to_vec(),
+            counts: false,
+            bounds: None,
         },
         WriterOptions::default(),
     )?)

@@ -31,9 +31,13 @@ fn specs() -> Vec<KeySpec> {
     vec![
         KeySpec::Exact {
             columns: vec!["entity_id".into()],
+            counts: false,
+            bounds: None,
         },
         KeySpec::Exact {
             columns: vec!["status".into(), "entity_id".into()],
+            counts: false,
+            bounds: None,
         },
         KeySpec::Range {
             column: "version_ts".into(),

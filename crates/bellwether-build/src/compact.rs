@@ -265,6 +265,8 @@ mod tests {
     fn groups_never_bridge_a_coverage_gap() {
         let spec = KeySpec::Exact {
             columns: vec!["id".into()],
+            counts: false,
+            bounds: None,
         };
         let segs = [
             seg(0, 10, 1),
@@ -285,6 +287,8 @@ mod tests {
     fn groups_respect_size_and_fan_in_and_accept_overlap() {
         let spec = KeySpec::Exact {
             columns: vec!["id".into()],
+            counts: false,
+            bounds: None,
         };
         let segs = [
             seg(0, 10, 40),

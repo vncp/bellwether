@@ -80,6 +80,8 @@ fn all_null_row_groups_are_covered_never_selected_and_split_invariant() {
         (
             KeySpec::Exact {
                 columns: cols(&["entity_id"]),
+                counts: false,
+                bounds: None,
             },
             true,
         ),
@@ -87,12 +89,15 @@ fn all_null_row_groups_are_covered_never_selected_and_split_invariant() {
             KeySpec::Temporal {
                 columns: cols(&["entity_id"]),
                 ts_column: "version_ts".into(),
+                counts: false,
             },
             true,
         ),
         (
             KeySpec::Exact {
                 columns: cols(&["entity_id", "batch_id"]),
+                counts: false,
+                bounds: None,
             },
             true,
         ),
@@ -106,6 +111,7 @@ fn all_null_row_groups_are_covered_never_selected_and_split_invariant() {
             KeySpec::Bloom {
                 columns: cols(&["entity_id"]),
                 fpr: 0.01,
+                bounds: None,
             },
             false,
         ),
@@ -225,6 +231,8 @@ fn a_run_of_only_null_tuples_has_no_keys_and_plans_nothing() {
     for spec in [
         KeySpec::Exact {
             columns: cols(&["entity_id"]),
+            counts: false,
+            bounds: None,
         },
         KeySpec::Range {
             column: "entity_id".into(),
@@ -295,6 +303,8 @@ fn catalogs_differing_only_by_an_all_null_row_group_are_keyed_apart() {
     assert_ne!(a.digest(), b.digest());
     let spec = KeySpec::Exact {
         columns: cols(&["entity_id"]),
+        counts: false,
+        bounds: None,
     };
     let cache = TransientCache::new(1 << 30);
     let lim = TransientLimits::default();

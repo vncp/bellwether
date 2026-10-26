@@ -633,6 +633,7 @@ fn lookback_lookup(
                 KeySpec::Temporal {
                     columns: c,
                     ts_column,
+                    ..
                 } if c.iter().all(|x| columns.contains(x)) => Some(ts_column),
                 _ => None,
             })
@@ -769,6 +770,7 @@ fn serving_temporal(
         KeySpec::Temporal {
             columns: c,
             ts_column,
+            ..
         } if c.iter().all(|x| columns.contains(x)) => Some(ts_column.clone()),
         _ => None,
     });
@@ -916,6 +918,9 @@ mod tests {
             bytes: 0,
             row_groups_total: 0,
             row_groups_selected: 0,
+            projected_bytes: None,
+            order: None,
+            rows: None,
         };
         let and = |all: Vec<Predicate>| Some(Predicate::And { all });
         assert!(

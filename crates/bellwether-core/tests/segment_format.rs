@@ -203,9 +203,15 @@ fn writer_rules() {
         .is_err());
     assert!(SegmentWriter::new(bloom(1.0), WriterOptions::default()).is_err());
     assert!(SegmentWriter::new(bloom(0.0), WriterOptions::default()).is_err());
-    assert!(
-        SegmentWriter::new(KeySpec::Exact { columns: vec![] }, WriterOptions::default()).is_err()
-    );
+    assert!(SegmentWriter::new(
+        KeySpec::Exact {
+            columns: vec![],
+            counts: false,
+            bounds: None,
+        },
+        WriterOptions::default()
+    )
+    .is_err());
     // Range lookups are refused on bloom segments; latest on non-temporal.
     let mut b = SegmentWriter::new(bloom(0.01), WriterOptions::default()).unwrap();
     b.insert(&key(1, "a"), RowGroupId(3)).unwrap();
@@ -304,6 +310,7 @@ fn reused_parquet_filters_are_probed_only_with_plain_hashes() {
     let single = KeySpec::Bloom {
         columns: vec!["id".into()],
         fpr: 0.01,
+        bounds: None,
     };
     let mut w = SegmentWriter::new(single.clone(), WriterOptions::default()).unwrap();
     w.insert_filter(RowGroupId(2), 3, &plain_filter(&[10, 20, 30]))
@@ -492,6 +499,8 @@ fn add_batch_is_all_or_nothing_and_leaves_the_writer_usable() {
     let dataset = DataType::Decimal128(10, 2);
     let spec = KeySpec::Exact {
         columns: vec!["amt".into()],
+        counts: false,
+        bounds: None,
     };
     let mut w = SegmentWriter::for_dataset(
         spec,
@@ -522,6 +531,8 @@ fn add_batch_is_all_or_nothing_and_leaves_the_writer_usable() {
 fn headers_record_key_types_and_differing_types_never_merge() {
     let spec = KeySpec::Exact {
         columns: vec!["amt".into()],
+        counts: false,
+        bounds: None,
     };
     let build = |dt: DataType, rg: u32| {
         let mut w =
@@ -589,6 +600,8 @@ fn temporal_headers_record_the_ts_type_and_unit() {
 fn open_for_dataset_refuses_segments_encoded_under_other_types() {
     let spec = KeySpec::Exact {
         columns: vec!["amt".into()],
+        counts: false,
+        bounds: None,
     };
     let (d102, d123) = (DataType::Decimal128(10, 2), DataType::Decimal128(12, 3));
     let mut w = SegmentWriter::for_dataset(

@@ -129,7 +129,9 @@ fn bloom_false_positive_rates_round_trip_through_the_ledger() {
             spec: KeySpec::Bloom {
                 columns: vec!["order_id".into()],
                 fpr,
+                bounds: None,
             },
+            sidecars: Vec::new(),
         };
         let h = ledger
             .put(&Record::Proposal(pr.clone()))
@@ -185,6 +187,8 @@ fn a_rewrite_proposal_replay_follows_the_same_exactness_rule() {
                 before: "join on batch_id".into(),
                 after: "join on (entity_id, batch_id)".into(),
                 invariant: "same rows for every trigger key".into(),
+                before_plan: None,
+                after_plan: None,
             },
         },
     );
