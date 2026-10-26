@@ -299,8 +299,8 @@ The build planner reads footers through its own source, which the test's countin
 
 The per-key resident overhead (contract v3, entry 32) was measured in a release build by `tests/resident.rs` (`cargo test --release -p bellwether-replay --test resident -- --ignored`), over 1,048,576 keys, on 2026-10-26 ([the measured document](../../docs/measured/2026-10-26-performance.md)). These are the documented constants:
 
-- **Open writer: 320 bytes resident per key.** An open transient segment writer over `UInt64` keys accounts 9 bytes per key and holds 320, which is 35.6 times the accounted bytes. A key cap therefore bounds resident memory at about 36 times itself for narrow keys.
-- **Layout map: 84 bytes resident per key.** The cluster-key map over 9-byte keys accounts 73 bytes per key (`CLUSTER_KEY_OVERHEAD` included) and holds 84, which is 1.16 times the accounted bytes.
+- **Open writer: 320 bytes resident per key.** An open transient segment writer over `UInt64` keys accounts 9 bytes per key and holds 320, which is 35.5 times the accounted bytes. A key cap therefore bounds resident memory at about 36 times itself for narrow keys.
+- **Layout map: 84 bytes resident per key.** The cluster-key map over 9-byte keys accounts 73 bytes per key (`CLUSTER_KEY_OVERHEAD` included) and holds 84, which is 1.15 times the accounted bytes.
 
 Earlier debug-build figures, for scale:
 

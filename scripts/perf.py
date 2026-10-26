@@ -242,6 +242,24 @@ def scrub(text, a):
     return text
 
 
+def normalize(doc):
+    """Applies this script's current classification to metrics an older
+    run wrote: DuckDB's times and reconcile meter peaks are context."""
+    for m in doc["metrics"]:
+        if m.get("side") == "duckdb" or m.get("metric") == "meter peak state":
+            m["direction"] = "none"
+
+
+def keep_previous_lookups(old, context):
+    """A lookups rerun keeps the attempt it replaces, as its warm plan p50s
+    and its section record, so the two can be compared."""
+    sec = old["environment"].get("sections", {}).get("lookups")
+    plans = {m["id"]: m["value"] for m in old["metrics"]
+             if m["id"].startswith("lookup/") and m["id"].endswith("/plan/warm/p50")}
+    if sec and plans:
+        context["lookups-previous-attempt"] = {"section": sec, "plan_warm_p50": plans}
+
+
 class Perf:
     def __init__(self, a):
         self.a = a
@@ -266,9 +284,12 @@ class Perf:
                         mine += (base,)
                     else:
                         mine += tuple(f"{base}{l}" for l in a.reconcile_budgets) + (f"{base}smallest-one-pass",)
+            normalize(doc)
             self.metrics = [m for m in doc["metrics"] if not m["id"].startswith(mine)]
             self.context = {k: v for k, v in doc["context"].items() if not k.startswith(mine)}
             self.sections = doc["environment"].get("sections", {})
+            if "lookups" in a.run_sections:
+                keep_previous_lookups(doc, self.context)
         spath = os.path.join(a.out, "samples.jsonl")
         if a.merge and os.path.exists(spath) and os.path.exists(old):
             # Drop the samples of what this run replaces.

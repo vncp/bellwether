@@ -44,6 +44,16 @@ class Doc:
                        f"{s.get('external_cpu_cores_p50', '-')} | "
                        + (f"{s['external_cpu_share_over_2_cores'] * 100:.0f}% of {s['external_cpu_samples']}"
                           if "external_cpu_samples" in s else "not recorded") + f" | {top} |")
+        prev = self.c.get("lookups-previous-attempt")
+        if prev:
+            s = prev["section"]
+            ratios = sorted(self.v(k) / v for k, v in prev["plan_warm_p50"].items() if v and self.v(k))
+            mid = ratios[(len(ratios) + 1) // 2 - 1]
+            out.append(f"\nThe lookups section replaced an earlier attempt, started {s['started_at']} at "
+                       f"`{s['commit']}`, whose outside load peaked at {s['external_cpu_cores_max']} cores "
+                       f"({(s.get('external_top_at_max') or ['-'])[0]}). Per lookup, the published warm plan p50 is "
+                       f"{ratios[0]:.2f} to {ratios[-1]:.2f} times that attempt's (median {mid:.2f}, "
+                       f"{len(ratios)} lookups; `context[\"lookups-previous-attempt\"]` in `perf.json`).")
         return "\n".join(out)
 
     def lookups(self):
@@ -187,9 +197,9 @@ class Doc:
             out.append(f"`{v['command']}`, {v['iterations']} iteration(s) at {v['rate_hz']} Hz"
                        + (f", {v['passes']} passes" if "passes" in v else "")
                        + f"; {cpu}. Each sample's CPU delta is credited to the stack the thread had at the "
-                       f"previous sample (the CPU was used in between); {idle:.0f}% of it is still charged to a "
-                       "wait primitive, which is the kernel time spent sleeping and waking threads. The self "
-                       "and inclusive tables below rank the rest.\n")
+                       f"previous sample (the CPU was used in between). {idle:.0f}% of it is CPU used between two "
+                       "samples that both found the thread waiting: the sampler did not see what ran. It is "
+                       "listed apart; the self and inclusive tables rank the rest.\n")
             out.append("| # | self % (CPU not charged to waits) | frame |")
             out.append("|---:|---:|---|")
             for i, t in enumerate(v["top"], 1):
@@ -201,7 +211,8 @@ class Doc:
                            f"{u['user_s']:.2f} s user, {u['sys_s']:.2f} s system, so {u['cores_busy']:.2f} cores "
                            "busy on average.\n")
             if v.get("waits") and idle >= 5:
-                out.append("\nCPU charged to wait primitives (% of all sampled CPU), and the code that waited:\n")
+                out.append("\nCPU used between two samples that both found the thread waiting (% of all sampled CPU; "
+                           "the sampler did not see what ran), by the wait frame and the code that waited:\n")
                 for wt in v["waits"]:
                     out.append(f"- `{wt['frame']}` {wt['cpu_pct']}: " + ("; ".join(
                         f"`{c['frame']}` {c['cpu_pct']}" for c in wt["callers"]) or "no caller named"))

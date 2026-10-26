@@ -52,7 +52,7 @@ Other agents stopped their work for these runs. The owner's desktop apps kept ru
   - How long the load lasted, beyond the peak, was recorded only from the lookups rerun on.
 - **Lookups (two attempts).** Both attempts overlapped someone's `rustc`, at 580% to 820% CPU.
   - In the published attempt, outside processes used more than 2 cores in 17% of the 196 five-second samples. The median was 1.17 cores.
-  - The two attempts agree: per lookup, the warm plan p50 of the published attempt is 0.86 to 1.05 times the other's, with a median of 0.97.
+  - The two attempts agree: per lookup, the warm plan p50 of the published attempt is 0.86 to 1.05 times the other's, with a median of 0.97. [How it ran](#how-it-ran) prints the comparison from the earlier attempt's numbers, which `perf.json` keeps.
   - The lookup timings are published with that record.
 - **Taxi at 64 MiB.** This row is from an earlier run, under 5.5 cores of outside load. It is 15 minutes per run, and was not repeated.
 
@@ -123,7 +123,7 @@ Load does not affect counts: row groups, bytes, passes, segments, meter peaks, a
 6. **Resident bytes per key (contract v3, entry 32)** were measured in a release build.
 
    - An open transient segment writer holds **320 bytes per key** resident, against 9 bytes accounted: 35.5 times.
-   - The layout map holds **84 bytes per key**, against 73 accounted: 1.16 times.
+   - The layout map holds **84 bytes per key**, against 73 accounted: 1.15 times.
 
    The build and replay READMEs now state both constants.
 
@@ -143,7 +143,7 @@ These are upper bounds, not predictions, and they overlap: hypotheses 1 and 4 bo
 |---:|---|---|---|---:|---|
 | 1 | Reconcile runs on one thread (`bellwether-verify` `reconcile`) | **reconcile-four-pass**:<ul><li>Run without the profiler: 15.27 s wall, 12.68 s user, 2.57 s system, so 1.00 core busy.</li><li>100% of sampled CPU is on one thread.</li><li>99.1% is under `read_row_group`.</li></ul> | Hash and partition each batch's rows across rayon threads under the meter, and read both sides' row groups concurrently, with at most two batches in flight. | 91% (99.1% × 11/12) | `cargo bench -p bellwether-verify --bench reconcile` |
 | 2 | Ledger-rung build uses one worker (`bellwether-build` work items) | **build-ledger-small-all-threads**:<ul><li>One worker thread holds 79.4% of the sampled CPU and a second holds 20.4%; the other 14 threads are idle.</li><li>Run without the profiler: 4.94 s wall and 5.98 s CPU, so 1.21 cores busy at `--threads` 12.</li><li>Build table: 1.17× speedup at 12 threads.</li><li>On that worker, 70.5% of CPU is `SegmentWriter::add_batch`, mostly `memcmp` in `insert` and `insert_version` (28.9% self).</li></ul> | Find which work item holds the rung's work (80 row groups make only a few items for two specs), and cut items finer where the specs allow it. | 90% (1 − 5.98 s / 12 / 4.94 s) | `cargo bench -p bellwether-build --bench build` |
-| 3 | Plan path: one store round trip per value read (`bellwether-build` `seg_io`, `bellwether-store` backend) | **window-3000**:<ul><li>94.3% of main-thread wall time is under `SegmentBytes::read_at`, and 89.5% under `ObjectStoreBackend::get_range`.</li><li>Run without the profiler: 5.52 s wall, 1.53 s user, 3.98 s system. The process is mostly kernel time.</li><li>Of the CPU not charged to wait primitives, 32.1% is `__open`, from object_store's `LocalFileSystem::get_opts`, which reopens the segment file for every ranged read.</li><li>78.2% of all sampled CPU is charged to `__psynch_cvwait` (thread sleep and wake): 26.2% under the main thread's `block_on`, the rest on the blocking-I/O pool.</li></ul>**latest-300** has the same shape: 87.3% under `get_range`. Plan time grows linearly with the number of keys (finding 2). | Read each segment's values for a sorted probe batch with one coalesced ranged read per run of nearby values (`get_ranges`). Read small committed segments whole. Add a local-file path that keeps the file open (`pread`). Drop the `to_vec` copy in `read_at`. | 89.5% of the 3,000-key plan (window-3000); 87.3% of latest-300 | `cargo bench -p bellwether-core --bench lookup`; plan p50 in `perf.py` lookups |
+| 3 | Plan path: one store round trip per value read (`bellwether-build` `seg_io`, `bellwether-store` backend) | **window-3000**:<ul><li>94.3% of main-thread wall time is under `SegmentBytes::read_at`, and 89.5% under `ObjectStoreBackend::get_range`.</li><li>Run without the profiler: 5.52 s wall, 1.53 s user, 3.98 s system, so most of the process's CPU is kernel time.</li><li>78.2% of the sampled CPU was used between two samples that both found the thread in `__psynch_cvwait`, so the sampler did not see what ran. 26.2% of it is under the main thread's `block_on`, and the rest is on the blocking-I/O pool's threads.</li><li>Of the rest of the sampled CPU, 32.1% is `__open`, from object_store's `LocalFileSystem::get_opts`, which reopens the segment file for every ranged read.</li></ul>**latest-300** has the same shape: 87.3% under `get_range`. Plan time grows linearly with the number of keys (finding 2). | Read each segment's values for a sorted probe batch with one coalesced ranged read per run of nearby values (`get_ranges`). Read small committed segments whole. Add a local-file path that keeps the file open (`pread`). Drop the `to_vec` copy in `read_at`. | 89.5% of the 3,000-key plan (window-3000); 87.3% of latest-300 | `cargo bench -p bellwether-core --bench lookup`; plan p50 in `perf.py` lookups |
 | 4 | Reconcile per-row work | **reconcile-four-pass**, self time:<ul><li>`encoding::put_escaped` 16.9%;</li><li>malloc under `fold_row` 12.5%;</li><li>`memmove` under `ParquetSource::read_columns` 9.9%.</li></ul>Also `i256::checked_pow` 4.0%, a power of ten computed per decimal value. | Encode keys into one reused buffer, with no escaping pass for fixed-width key types. Reuse `fold_row`'s per-row allocations. Compute each column's decimal rescale factor once. | 39% (16.9 + 12.5 + 9.9; the process is on one core) | as 1 |
 | 5 | `why` on a pre-registered workload: transient index build (`bellwether-replay`) | **why-200-runs**, by share of main-thread wall time (89% sample coverage):<ul><li>51.2% under `TransientIndex::build`;</li><li>33.0% under `SegmentWriter::insert`, whose `memcmp` is 18.7% of the sampled CPU.</li></ul>Warm p50: 6.0 s. | Build the transient segment from a sorted batch instead of inserting keys one at a time. | 33% | a new `-p bellwether-replay --bench plan` |
 | 6 | `why`: recording the workload rewrites stored records (`bellwether-store` cache) | **why-200-runs**:<ul><li>26.5% of main-thread wall time is under `put_cached` → `put_content_addressed` → `put_overwrite`.</li><li>Run without the profiler: 0.62 cores busy, so the process waits for about 38% of its wall time.</li><li>`put_content_addressed` overwrites unconditionally (read in the code).</li></ul> | Skip writing a content-addressed record that is already present. | 26.5% | as 5 |
@@ -175,6 +175,8 @@ Each row is one section of `perf.py`.
 | profiles | 2026-10-26T04:53:38Z | 2026-10-26T04:57:30Z | `5968066156f1` (dirty) | 4.19 / 4.28 | 3.06 / - | not recorded | other process 80% |
 | reconcile taxi | 2026-10-26T03:04:12Z | 2026-10-26T03:26:03Z | `bade62d1afaa` | 3.87 / 7.33 | 5.51 / - | not recorded | WindowServer 53% |
 | reconcile taxi at 8G,1G,256M | 2026-10-26T04:57:31Z | 2026-10-26T05:06:51Z | `5968066156f1` (dirty) | 4.1 / 4.1 | 2.35 / - | not recorded | other process 97% |
+
+The lookups section replaced an earlier attempt, started 2026-10-26T04:33:10Z at `5968066156f1`, whose outside load peaked at 9.21 cores (rustc 821%). Per lookup, the published warm plan p50 is 0.86 to 1.05 times that attempt's (median 0.97, 42 lookups; `context["lookups-previous-attempt"]` in `perf.json`).
 
 ## Lookups
 
@@ -451,7 +453,7 @@ Smallest budget with one pass (bisection to 10%): **592 MiB**; the meter's peak 
 `samply record --rate 4000` over the release binary, and the same command once more under `/usr/bin/time -p`, without the profiler. Repeated commands ran as `--iteration-count` processes with `--reuse-threads`. How the tables are computed:
 
 - **CPU weight.** Each sample carries the CPU its thread used since the previous sample (`threadCPUDelta`). A thread caught waiting at one sample was usually running just before it, so the weight is credited to the previous sample's stack.
-- **Wait primitives.** CPU still charged to a wait primitive is the kernel time spent sleeping and waking threads. It is reported in its own list, with the code that waited, and the self and inclusive tables rank the rest.
+- **Waiting at both samples.** Some CPU was used between two samples that both found the thread waiting, so the sampler did not see what ran. That CPU is listed apart, by the wait frame and the code that waited. The self and inclusive tables rank the rest, labelled "CPU not charged to waits".
 - **Main-thread wall.** This table counts every main-thread sample, running or waiting. samply records a thread only when it runs, so the table is given only where the main thread's samples cover at least half its wall time.
 - **Without store reads.** That column of the inclusive table leaves out every stack that passes through `SegmentBytes::read_at` or `ObjectStoreBackend::get_range`.
 
@@ -463,7 +465,7 @@ The raw profiles are not committed (they are 1 to 80 MB each). `perf.sh --sectio
 
 ### window-3000
 
-`bellwether locate $PERF_WORK/market-10x/data --keys $PERF_WORK/keys/market-10x-3000.parquet --window 2026-01-15T05:00:00.000000Z..2026-01-16T05:00:00.000000Z --ts ts --index $PERF_WORK/market-10x-idx --quiet`, 20 iteration(s) at 4000 Hz; 116.7 s of CPU sampled. Each sample's CPU delta is credited to the stack the thread had at the previous sample (the CPU was used in between); 80% of it is still charged to a wait primitive, which is the kernel time spent sleeping and waking threads. The self and inclusive tables below rank the rest.
+`bellwether locate $PERF_WORK/market-10x/data --keys $PERF_WORK/keys/market-10x-3000.parquet --window 2026-01-15T05:00:00.000000Z..2026-01-16T05:00:00.000000Z --ts ts --index $PERF_WORK/market-10x-idx --quiet`, 20 iteration(s) at 4000 Hz; 116.7 s of CPU sampled. Each sample's CPU delta is credited to the stack the thread had at the previous sample (the CPU was used in between). 80% of it is CPU used between two samples that both found the thread waiting: the sampler did not see what ran. It is listed apart; the self and inclusive tables rank the rest.
 
 | # | self % (CPU not charged to waits) | frame |
 |---:|---:|---|
@@ -481,7 +483,7 @@ The raw profiles are not committed (they are 1 to 80 MB each). `perf.sh --sectio
 Run once more without the profiler under `/usr/bin/time -p`: 5.52 s wall, 1.53 s user, 3.98 s system, so 1.00 cores busy on average.
 
 
-CPU charged to wait primitives (% of all sampled CPU), and the code that waited:
+CPU used between two samples that both found the thread waiting (% of all sampled CPU; the sampler did not see what ran), by the wait frame and the code that waited:
 
 - `__psynch_cvwait [libsystem_kernel.dylib]` 78.2: `<tokio::runtime::park::Inner>::park` 26.2; `<tokio::runtime::scheduler::multi_thread::worker::Context>::park_internal` 0.0
 - `__psynch_mutexwait [libsystem_kernel.dylib]` 1.8: `<tokio::runtime::park::Inner>::unpark` 0.0; `<tokio::runtime::blocking::pool::Spawner>::spawn_task` 0.0
@@ -538,7 +540,7 @@ Main thread wall time (481,893 samples, on CPU or waiting), by bellwether functi
 
 ### latest-300
 
-`bellwether latest $PERF_WORK/market-10x/data --keys $PERF_WORK/keys/market-10x-300.parquet --index $PERF_WORK/market-10x-idx --quiet`, 30 iteration(s) at 4000 Hz; 12.4 s of CPU sampled. Each sample's CPU delta is credited to the stack the thread had at the previous sample (the CPU was used in between); 79% of it is still charged to a wait primitive, which is the kernel time spent sleeping and waking threads. The self and inclusive tables below rank the rest.
+`bellwether latest $PERF_WORK/market-10x/data --keys $PERF_WORK/keys/market-10x-300.parquet --index $PERF_WORK/market-10x-idx --quiet`, 30 iteration(s) at 4000 Hz; 12.4 s of CPU sampled. Each sample's CPU delta is credited to the stack the thread had at the previous sample (the CPU was used in between). 79% of it is CPU used between two samples that both found the thread waiting: the sampler did not see what ran. It is listed apart; the self and inclusive tables rank the rest.
 
 | # | self % (CPU not charged to waits) | frame |
 |---:|---:|---|
@@ -556,7 +558,7 @@ Main thread wall time (481,893 samples, on CPU or waiting), by bellwether functi
 Run once more without the profiler under `/usr/bin/time -p`: 0.43 s wall, 0.11 s user, 0.29 s system, so 0.93 cores busy on average.
 
 
-CPU charged to wait primitives (% of all sampled CPU), and the code that waited:
+CPU used between two samples that both found the thread waiting (% of all sampled CPU; the sampler did not see what ran), by the wait frame and the code that waited:
 
 - `__psynch_cvwait [libsystem_kernel.dylib]` 76.7: `<tokio::runtime::park::Inner>::park` 26.0; `<tokio::runtime::scheduler::multi_thread::worker::Context>::park_internal` 0.0
 - `__psynch_mutexwait [libsystem_kernel.dylib]` 1.8: `<tokio::runtime::park::Inner>::unpark` 0.0
@@ -613,7 +615,7 @@ Main thread wall time (51,719 samples, on CPU or waiting), by bellwether functio
 
 ### build-market-10x-all-threads
 
-`bellwether index $PERF_WORK/market-10x/data --index $PERF_WORK/profile-build-idx --partitioning hive --key exact:symbol@ts --key range:ts --key temporal:symbol@ts --quiet`, 1 iteration(s) at 4000 Hz; 1.2 s of CPU sampled. Each sample's CPU delta is credited to the stack the thread had at the previous sample (the CPU was used in between); 0% of it is still charged to a wait primitive, which is the kernel time spent sleeping and waking threads. The self and inclusive tables below rank the rest.
+`bellwether index $PERF_WORK/market-10x/data --index $PERF_WORK/profile-build-idx --partitioning hive --key exact:symbol@ts --key range:ts --key temporal:symbol@ts --quiet`, 1 iteration(s) at 4000 Hz; 1.2 s of CPU sampled. Each sample's CPU delta is credited to the stack the thread had at the previous sample (the CPU was used in between). 0% of it is CPU used between two samples that both found the thread waiting: the sampler did not see what ran. It is listed apart; the self and inclusive tables rank the rest.
 
 | # | self % (CPU not charged to waits) | frame |
 |---:|---:|---|
@@ -663,7 +665,7 @@ The main thread has 102 samples, 2% of its wall time at this rate: samply record
 
 ### reconcile-four-pass
 
-`bellwether reconcile $PERF_WORK/ledger-small/data $PERF_WORK/ledger-small/data-copy --key entity_id --latest-by version_ts --totals amount --group-by status --memory-budget 148M --index $PERF_WORK/profile-reconcile-idx --quiet`, 1 iteration(s) at 4000 Hz, 4 passes; 15.8 s of CPU sampled. Each sample's CPU delta is credited to the stack the thread had at the previous sample (the CPU was used in between); 1% of it is still charged to a wait primitive, which is the kernel time spent sleeping and waking threads. The self and inclusive tables below rank the rest.
+`bellwether reconcile $PERF_WORK/ledger-small/data $PERF_WORK/ledger-small/data-copy --key entity_id --latest-by version_ts --totals amount --group-by status --memory-budget 148M --index $PERF_WORK/profile-reconcile-idx --quiet`, 1 iteration(s) at 4000 Hz, 4 passes; 15.8 s of CPU sampled. Each sample's CPU delta is credited to the stack the thread had at the previous sample (the CPU was used in between). 1% of it is CPU used between two samples that both found the thread waiting: the sampler did not see what ran. It is listed apart; the self and inclusive tables rank the rest.
 
 | # | self % (CPU not charged to waits) | frame |
 |---:|---:|---|
@@ -730,7 +732,7 @@ Main thread wall time (66,598 samples, on CPU or waiting), by bellwether functio
 
 ### build-ledger-small-all-threads
 
-`bellwether index $PERF_WORK/ledger-small/data --index $PERF_WORK/profile-build-ledger-idx --partitioning hive --key exact:entity_id --key temporal:entity_id@version_ts --quiet`, 1 iteration(s) at 4000 Hz; 5.9 s of CPU sampled. Each sample's CPU delta is credited to the stack the thread had at the previous sample (the CPU was used in between); 0% of it is still charged to a wait primitive, which is the kernel time spent sleeping and waking threads. The self and inclusive tables below rank the rest.
+`bellwether index $PERF_WORK/ledger-small/data --index $PERF_WORK/profile-build-ledger-idx --partitioning hive --key exact:entity_id --key temporal:entity_id@version_ts --quiet`, 1 iteration(s) at 4000 Hz; 5.9 s of CPU sampled. Each sample's CPU delta is credited to the stack the thread had at the previous sample (the CPU was used in between). 0% of it is CPU used between two samples that both found the thread waiting: the sampler did not see what ran. It is listed apart; the self and inclusive tables rank the rest.
 
 | # | self % (CPU not charged to waits) | frame |
 |---:|---:|---|
@@ -778,7 +780,7 @@ The main thread has 39 samples, 0% of its wall time at this rate: samply records
 
 ### why-200-runs
 
-`bellwether why $PERF_WORK/ledger-small/data --bench-workload $PERF_WORK/ledger-small --index $PERF_WORK/why-idx --quiet`, 1 iteration(s) at 4000 Hz; 3.7 s of CPU sampled. Each sample's CPU delta is credited to the stack the thread had at the previous sample (the CPU was used in between); 1% of it is still charged to a wait primitive, which is the kernel time spent sleeping and waking threads. The self and inclusive tables below rank the rest.
+`bellwether why $PERF_WORK/ledger-small/data --bench-workload $PERF_WORK/ledger-small --index $PERF_WORK/why-idx --quiet`, 1 iteration(s) at 4000 Hz; 3.7 s of CPU sampled. Each sample's CPU delta is credited to the stack the thread had at the previous sample (the CPU was used in between). 1% of it is CPU used between two samples that both found the thread waiting: the sampler did not see what ran. It is listed apart; the self and inclusive tables rank the rest.
 
 | # | self % (CPU not charged to waits) | frame |
 |---:|---:|---|
