@@ -7,7 +7,8 @@ use std::sync::{Arc, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use arrow::datatypes::SchemaRef;
-use bellwether_build::{Planner, SourceKind};
+use bellwether_build::{BuildOptions, Planner, SourceKind};
+use bellwether_core::sidecar::SidecarDef;
 use bellwether_ledger::Ledger;
 use bellwether_source::{
     fingerprint_with_policy, ChunkedTextSource, FingerprintPolicy, LocalFs, ParquetSource,
@@ -926,6 +927,23 @@ pub(crate) fn commit_age(m: &Manifest, now_nanos: i64) -> Result<Duration> {
 }
 
 impl Engine {
+    /// The build options every index commit uses (`index` and the apply
+    /// stage of `fix` alike), from this engine's options: the source format
+    /// (a CSV dialect included), chunk size, dataset schema, fingerprint
+    /// policy, and partitioning (hive or a path template), so whichever verb
+    /// builds an index first records the same `manifest.source`; plus
+    /// `sidecars` to declare and the index directory to exclude.
+    pub(crate) fn build_options(&self, sidecars: Vec<SidecarDef>) -> BuildOptions {
+        let mut options = BuildOptions::new(self.format().kind());
+        options.chunk_size = self.options.chunk_size;
+        options.schema.clone_from(&self.options.schema);
+        options.fingerprint_policy = self.options.fingerprint_policy;
+        options.partitioning.clone_from(&self.options.partitioning);
+        options.sidecars = sidecars;
+        options.exclude = self.excluded();
+        options
+    }
+
     /// Directories under the data root whose files are never data: the
     /// index location, when it is local and lies inside the root (its own
     /// `.json` files would otherwise pass for JSON lines). Spelled as the

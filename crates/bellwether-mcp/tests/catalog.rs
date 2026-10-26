@@ -115,8 +115,10 @@ fn schemas_are_closed_and_carry_no_dangerous_field() {
             assert!(!props.contains("keys") && !props.contains("workload"));
         }
     }
-    // The key spec in propose.key is the contract's KeySpec: its tagged
-    // variants, each closed.
+    // The key spec in propose.key is the contract's KeySpec (its tagged
+    // variants, each closed) or the short form `index --key` reads, so a
+    // sidecar declaration such as temporal2 passes the schema and reaches
+    // the facade's typed refusal (`sidecar_not_proposable`).
     let key = catalog()
         .into_iter()
         .find(|t| t.name == "propose.key")
@@ -125,6 +127,25 @@ fn schemas_are_closed_and_carry_no_dangerous_field() {
     for kind in ["exact", "bloom", "range", "temporal"] {
         assert!(text.contains(&format!("\"const\":\"{kind}\"")), "{kind}");
     }
+    let ev = "0".repeat(64);
+    for spec in [
+        serde_json::json!("temporal2:symbol@ts,known_at"),
+        serde_json::json!("exact:symbol@ts"),
+        serde_json::json!({"kind": "exact", "columns": ["id"]}),
+    ] {
+        let args = serde_json::json!({"spec": spec, "evidence": [ev], "by": "a"});
+        assert!(
+            bellwether_mcp::tools::validate(&key.input, &args).is_ok(),
+            "{args}"
+        );
+    }
+    // A score nested in the JSON form is still refused by the schema.
+    let args = serde_json::json!({
+        "spec": {"kind": "exact", "columns": ["id"], "score": 1},
+        "evidence": [ev],
+        "by": "a",
+    });
+    assert!(bellwether_mcp::tools::validate(&key.input, &args).is_err());
     // A hash is the contract's Hash: 64 lowercase hex characters.
     assert!(text.contains("^[0-9a-f]{64}$"));
     assert_closed(&output_schema(), "output");

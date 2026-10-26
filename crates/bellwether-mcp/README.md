@@ -27,7 +27,7 @@ Flags: `--index <PATH|URL>` (default `<ROOT>/.bellwether`), `--format parquet|cs
 |observe|`observe.locate`, `observe.asof`|`locate`, `asof`; with `at_manifest`, on an engine opened at that committed manifest (`EngineOptions::at_manifest`, the CLI's `--at-manifest`)|the `plan` Evidence, cache entries|
 |score|`score.why` (keys or a workload hash)|`why` with a workload|engine Proposals and Replays|
 |score|`score.verify`|`fix` with `verify_only`|Replay, plan Evidence, Certificate|
-|propose|`propose.key`, `propose.layout`, `propose.rewrite`|`propose`, or `propose_dry_run` with `dry_run`|one Proposal, or nothing|
+|propose|`propose.key` (`spec`: a key spec as JSON, or its short form as `index --key` reads it), `propose.layout`, `propose.rewrite`|`propose_key`, `propose`, or their `_dry_run` with `dry_run`; a sidecar declaration (`temporal2:id@valid,known`, `exact:a@ts`) is refused with `sidecar_not_proposable`|one Proposal, or nothing|
 |apply|`apply.receipt` (a certificate hash only)|`fix` with the certificate, or `apply_dry_run` with `dry_run`|the index commit, the realized Replay, the Receipt; nothing on a dry run or a refusal, unless another commit lands during the apply (`concurrent_commit`)|
 |jobs|`jobs.start`, `jobs.status`, `jobs.result`|the started tool's|the started tool's|
 

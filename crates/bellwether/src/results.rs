@@ -273,6 +273,28 @@ pub enum ProposeRefusal {
         /// The name given.
         name: String,
     },
+    /// The declaration builds a sidecar (`temporal2:id@valid,known`
+    /// bitemporal versions, or the per-key time bounds of
+    /// `exact:symbol@ts`), which a Proposal cannot carry: `ProposalBody::Key`
+    /// holds a key spec, and replay prices key specs only. It is built with
+    /// `bellwether index --key`, which gives it no receipt
+    /// (`docs/contract-v3.md`, entry 42).
+    SidecarNotProposable {
+        /// The declaration, as `index --key` reads it.
+        declaration: String,
+        /// The sidecar it declares, by its manifest name.
+        sidecar: String,
+        /// The key spec the sidecar rides beside, which can be proposed
+        /// alone; `None` for a sidecar declared alone (`temporal2`).
+        key: Option<String>,
+        /// The data root.
+        root: String,
+        /// The `bellwether index` command that builds it, with the source
+        /// flags this engine was opened with (`--format`, `--partitioning`
+        /// or `--path-template`), so a folder not yet indexed is built as it
+        /// was read.
+        command: String,
+    },
 }
 
 /// Whether a link of a receipt's chain resolved as expected.

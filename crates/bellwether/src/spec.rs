@@ -217,6 +217,20 @@ pub fn sidecar_label(def: &SidecarDef) -> String {
     def.name()
 }
 
+/// The `index --key` argument that declares `declared`;
+/// [`parse_declaration`] reads it back to an equal declaration.
+#[must_use]
+pub fn declaration_label(declared: &Declaration) -> String {
+    match (&declared.key, &declared.sidecar) {
+        (Some(key), Some(def)) if def.kind == SidecarKind::Bounds => {
+            format!("{}@{}", label(key), def.time_columns.join(","))
+        }
+        (_, Some(def)) => def.name(),
+        (Some(key), None) => label(key),
+        (None, None) => String::new(),
+    }
+}
+
 fn message(e: &Error) -> String {
     match e {
         Error::KeySpec(m) | Error::Other(m) => m.clone(),
@@ -306,5 +320,21 @@ mod tests {
         }
         // A key spec alone never carries the bound.
         assert!(parse("exact:symbol@ts").is_err());
+    }
+
+    #[test]
+    fn declaration_labels_read_back_to_equal_declarations() {
+        for s in [
+            "exact:symbol@ts",
+            "bloom:a,b@0.01@ts",
+            "temporal2:id@valid,known",
+            "temporal:id@ts",
+            "exact:a,b",
+            "range:ts",
+        ] {
+            let d = parse_declaration(s).unwrap();
+            assert_eq!(declaration_label(&d), s);
+            assert_eq!(parse_declaration(&declaration_label(&d)).unwrap(), d);
+        }
     }
 }

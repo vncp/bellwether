@@ -420,6 +420,18 @@ fn refusals(clock: Option<&str>) {
         // The text is the facade's typed refusal, as the CLI prints it.
         assert_eq!(json(&r)["outcome"], "refused");
     }
+    // A sidecar declaration has no receipt path: refused, typed, dry run or
+    // not, before anything is read or written.
+    for spec in ["temporal2:id@ts,batch", "exact:id@ts"] {
+        for dry in [true, false] {
+            let r = srv.call(
+                "propose.key",
+                json!({"spec": spec, "evidence": [ev], "by": "a", "dry_run": dry}),
+            );
+            assert_eq!(code(&r), "sidecar_not_proposable", "{spec} [dry={dry}]");
+            assert_eq!(json(&r)["refusal"]["declaration"], spec);
+        }
+    }
     assert_eq!(objects(&f.index), before);
 
     let r = srv.call("score.why", json!({"wait": true}));

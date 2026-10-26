@@ -161,6 +161,92 @@ fn every_tool_with_a_cli_counterpart_returns_the_cli_json_line() {
         3,
     );
     assert_eq!(refused["outcome"], "refused");
+    let canon = std::fs::canonicalize(&data).unwrap();
+    let canon = path(&canon);
+    // A sidecar declaration, in the short form `index --key` reads: the
+    // same typed refusal from both sides (exit 3), with its code, facts, and
+    // a next line naming the index command and, beside a key, the key to
+    // propose alone. The short form of a key spec proposes it.
+    for (declaration, key) in [
+        ("temporal2:id@ts,batch", None),
+        ("exact:id@ts", Some("exact:id")),
+    ] {
+        let args = json!({"spec": declaration, "evidence": [ev], "by": "agent"});
+        let refused = both(
+            &srv,
+            "propose.key",
+            args.clone(),
+            &[
+                "propose",
+                d,
+                "--evidence",
+                &ev,
+                "--by",
+                "agent",
+                "--key",
+                declaration,
+            ],
+            3,
+        );
+        assert_eq!(refused["outcome"], "refused");
+        assert_eq!(refused["refusal"]["kind"], "sidecar_not_proposable");
+        assert_eq!(refused["refusal"]["declaration"], declaration);
+        let r = srv.call("propose.key", args);
+        let refusal = r.envelope.refusal.unwrap();
+        assert_eq!(refusal.code.as_str(), "sidecar_not_proposable");
+        assert_eq!(refusal.fields["key"], json!(key));
+        assert_eq!(
+            refusal.fields["command"],
+            json!(format!("bellwether index {canon} --key {declaration}"))
+        );
+        // The next line names MCP fields and tools, never a CLI flag.
+        assert!(
+            refusal
+                .next
+                .contains(&format!("index {canon} with the declaration {declaration}")),
+            "{}",
+            refusal.next
+        );
+        assert!(!refusal.next.contains("--"), "{}", refusal.next);
+        if let Some(k) = key {
+            assert!(
+                refusal
+                    .next
+                    .contains(&format!("propose.key with `spec` \"{k}\"")),
+                "{}",
+                refusal.next
+            );
+        }
+        // The human line says the same and what to do.
+        let human = run(&["propose", d, "--evidence", &ev, "--key", declaration], 3);
+        assert!(
+            human.contains(&format!("bellwether index {canon} --key {declaration}")),
+            "{human}"
+        );
+        if let Some(k) = key {
+            assert!(
+                human.contains(&format!("alone with --key {k}\n")),
+                "{human}"
+            );
+        }
+    }
+    let short = both(
+        &srv,
+        "propose.key",
+        json!({"spec": "exact:id", "evidence": [ev], "by": "agent"}),
+        &[
+            "propose",
+            d,
+            "--evidence",
+            &ev,
+            "--by",
+            "agent",
+            "--key",
+            "exact:id",
+        ],
+        0,
+    );
+    assert_eq!(short["outcome"], "written");
     // propose.layout and propose.rewrite.
     both(
         &srv,

@@ -35,6 +35,11 @@ const US_PER_DAY: i64 = 86_400_000_000;
 /// every day, NVDA on the first two only. Returns (file, row group,
 /// symbol, ts) of every row.
 fn lake(root: &Path) -> Vec<(String, u64, String, i64)> {
+    lake_at(root, |date| format!("daily/{date}.parquet"))
+}
+
+/// [`lake`] with each session's file at `file_of(date)` below `root`.
+fn lake_at(root: &Path, file_of: fn(&str) -> String) -> Vec<(String, u64, String, i64)> {
     let schema = Arc::new(Schema::new(vec![
         Field::new("symbol", DataType::Utf8, false),
         Field::new(
@@ -61,7 +66,8 @@ fn lake(root: &Path) -> Vec<(String, u64, String, i64)> {
         }
         rows.push(("MSFT", day * US_PER_DAY + 4));
         let date = format!("2026-03-{:02}", 2 + i);
-        let file = root.join(format!("daily/{date}.parquet"));
+        let rel = file_of(&date);
+        let file = root.join(&rel);
         std::fs::create_dir_all(file.parent().unwrap()).unwrap();
         let batch = RecordBatch::try_new(
             Arc::clone(&schema),
@@ -89,12 +95,7 @@ fn lake(root: &Path) -> Vec<(String, u64, String, i64)> {
         w.write(&batch).unwrap();
         w.close().unwrap();
         for (k, (sym, ts)) in rows.iter().enumerate() {
-            out.push((
-                format!("daily/{date}.parquet"),
-                (k / 2) as u64,
-                (*sym).to_string(),
-                *ts,
-            ));
+            out.push((rel.clone(), (k / 2) as u64, (*sym).to_string(), *ts));
         }
     }
     out
@@ -774,5 +775,113 @@ fn why_takes_ts_for_an_asof_lookback_as_asof_does() {
         assert_eq!(out.status.code(), Some(2), "{args:?}");
         let err = String::from_utf8_lossy(&out.stderr);
         assert!(err.contains(says), "{args:?}: {err}");
+    }
+}
+
+/// The showcase defect: `fix` on a folder never indexed built the index
+/// without the partitioning it was opened with, so the manifest recorded
+/// none and a later lookup with the same flag was refused (exit 4, "built
+/// with partitioning none"). Through the binary, for a path template and
+/// for hive directories: an unindexed `why` over a window, `fix` of its
+/// recommendation, then `locate` with the same flag plans exactly what the
+/// receipt's replay predicted.
+#[test]
+fn fix_on_an_unindexed_partitioned_folder_records_its_partitioning() {
+    fn templated(d: &str) -> String {
+        format!("daily/{d}.parquet")
+    }
+    fn hive(d: &str) -> String {
+        format!("day={d}/part-0.parquet")
+    }
+    let template_flags = ["--path-template", TEMPLATE];
+    let hive_flags = ["--partitioning", "hive"];
+    for (flags, file_of) in [
+        (&template_flags[..], templated as fn(&str) -> String),
+        (&hive_flags[..], hive),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("lake");
+        let rows = lake_at(&root, file_of);
+        let r = path(&root);
+        let keys = dir.path().join("keys.parquet");
+        symbols(&keys, &["NVDA"]);
+        let k = path(&keys);
+        let with = |args: &[&str]| -> Vec<String> {
+            args.iter().chain(flags).map(|s| (*s).to_string()).collect()
+        };
+        let call = |args: &[&str], code: i32| {
+            let a = with(args);
+            run(&a.iter().map(String::as_str).collect::<Vec<_>>(), code)
+        };
+        let window = "2026-03-02..2026-03-03";
+        let why = json(&call(
+            &[
+                "why", r, "--from", k, "--window", window, "--ts", "day", "--json",
+            ],
+            0,
+        ));
+        let rec = &why["recommended"];
+        assert!(rec.is_object(), "{flags:?}: {why}");
+        let proposal = rec["proposal"].as_str().unwrap();
+        let workload = why["workload"]["hash"].as_str().unwrap();
+        // Proposing a sidecar on the folder not yet indexed is refused, and
+        // the index command it names carries the same source flag, so
+        // following it literally builds the folder as it was read.
+        let ev = why["evidence"]["hash"].as_str().unwrap();
+        let refused = call(
+            &["propose", r, "--evidence", ev, "--key", "exact:symbol@ts"],
+            3,
+        );
+        let flag = if flags[0] == "--path-template" {
+            format!("--path-template '{TEMPLATE}'")
+        } else {
+            flags.join(" ")
+        };
+        let canon = std::fs::canonicalize(&root).unwrap();
+        assert!(
+            refused.contains(&format!(
+                "`bellwether index {} {flag} --key exact:symbol@ts`",
+                path(&canon)
+            )),
+            "{refused}"
+        );
+        let fix = json(&call(
+            &[
+                "fix",
+                r,
+                "--proposal",
+                proposal,
+                "--workload",
+                workload,
+                "--json",
+            ],
+            0,
+        ));
+        assert_eq!(fix["outcome"]["kind"], "applied", "{flags:?}: {fix}");
+        let manifest: Value =
+            serde_json::from_slice(&std::fs::read(root.join(".bellwether/manifest.json")).unwrap())
+                .unwrap();
+        assert!(
+            manifest["source"]["partitioning"].is_string(),
+            "{flags:?}: {}",
+            manifest["source"]
+        );
+        let plan = json(&call(
+            &[
+                "locate", r, "--keys", k, "--window", window, "--ts", "day", "--json",
+            ],
+            0,
+        ));
+        // Exactly the row groups holding NVDA in the window's two days.
+        let want: BTreeSet<(String, u64)> = rows
+            .iter()
+            .filter(|row| row.2 == "NVDA")
+            .map(|row| (row.0.clone(), row.1))
+            .collect();
+        assert_eq!(planned(&plan, &root), want, "{flags:?}");
+        assert_eq!(
+            plan["planned"]["bytes"], rec["proposed"]["bytes"],
+            "{flags:?}"
+        );
     }
 }

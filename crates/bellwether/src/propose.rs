@@ -1,13 +1,17 @@
 //! `propose`: write a Proposal citing evidence. There is no score field in
 //! a Proposal and the facade adds none, anywhere (ADR 009).
 
+use std::fmt::Write as _;
+
 use bellwether_ledger::RecordKind;
+use bellwether_source::Partitioning;
 use bellwether_types::{
     format, Error, Hash, HashKind, KeySpec, Proposal, ProposalBody, Record, Result, RewriteShape,
 };
 
-use crate::engine::{guard, Engine};
+use crate::engine::{guard, Engine, SourceFormat};
 use crate::results::{ProposeRefusal, ProposeResult, Written};
+use crate::spec::Declaration;
 use crate::why::RESERVED_PROPOSERS;
 
 impl Engine {
@@ -41,6 +45,89 @@ impl Engine {
         proposed_by: &str,
     ) -> Result<ProposeResult> {
         guard(|| self.propose_inner(body, evidence, proposed_by, false))
+    }
+
+    /// [`Engine::propose`] of a key, given as the `index --key` argument
+    /// [`crate::spec::parse_declaration`] reads (`propose --key`, MCP
+    /// `propose.key`): a key spec is proposed as `ProposalBody::Key`. A
+    /// declaration that builds a sidecar (`temporal2:id@valid,known`, or
+    /// `exact:symbol@ts`, whose per-key time bounds ride beside the key) is
+    /// refused, typed ([`ProposeRefusal::SidecarNotProposable`]), before
+    /// anything is read or written: a Proposal holds a key spec only, and
+    /// replay prices key specs only, so it has no path to a receipt; the
+    /// refusal names the `index` command that builds it.
+    pub fn propose_key(
+        &self,
+        declared: &Declaration,
+        evidence: &[Hash],
+        proposed_by: &str,
+    ) -> Result<ProposeResult> {
+        guard(|| self.propose_declared(declared, evidence, proposed_by, true))
+    }
+
+    /// [`Engine::propose_key`] as [`Engine::propose_dry_run`]: the same
+    /// refusal, or the Proposal it would write; writes nothing.
+    pub fn propose_key_dry_run(
+        &self,
+        declared: &Declaration,
+        evidence: &[Hash],
+        proposed_by: &str,
+    ) -> Result<ProposeResult> {
+        guard(|| self.propose_declared(declared, evidence, proposed_by, false))
+    }
+
+    fn propose_declared(
+        &self,
+        declared: &Declaration,
+        evidence: &[Hash],
+        proposed_by: &str,
+        write: bool,
+    ) -> Result<ProposeResult> {
+        match (&declared.key, &declared.sidecar) {
+            (Some(spec), None) => self.propose_inner(
+                ProposalBody::Key { spec: spec.clone() },
+                evidence,
+                proposed_by,
+                write,
+            ),
+            (key, Some(sidecar)) => {
+                let declaration = crate::spec::declaration_label(declared);
+                Ok(ProposeResult::Refused {
+                    refusal: ProposeRefusal::SidecarNotProposable {
+                        command: self.index_command(&declaration),
+                        declaration,
+                        sidecar: crate::spec::sidecar_label(sidecar),
+                        key: key.as_ref().map(crate::spec::label),
+                        root: self.root().to_string(),
+                    },
+                })
+            }
+            (None, None) => Err(Error::KeySpec(
+                "the declaration names no key spec; pass one such as exact:<column>".into(),
+            )),
+        }
+    }
+
+    /// `bellwether index <root> --key <declaration>`, with the source flags
+    /// this engine was opened with, so a folder not yet indexed is built as
+    /// it is read here (an existing index keeps its recorded scheme and
+    /// accepts the same flags). Reads nothing.
+    fn index_command(&self, declaration: &str) -> String {
+        let mut cmd = format!("bellwether index {}", self.root());
+        match self.format() {
+            SourceFormat::Parquet => {}
+            SourceFormat::Csv { .. } => cmd.push_str(" --format csv"),
+            SourceFormat::JsonLines => cmd.push_str(" --format jsonl"),
+        }
+        match &self.options().partitioning {
+            None | Some(Partitioning::None) => {}
+            Some(Partitioning::Hive) => cmd.push_str(" --partitioning hive"),
+            Some(Partitioning::Template(t)) => {
+                let _ = write!(cmd, " --path-template '{}'", t.pattern());
+            }
+        }
+        let _ = write!(cmd, " --key {declaration}");
+        cmd
     }
 
     fn propose_inner(
