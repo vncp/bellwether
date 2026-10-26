@@ -1,0 +1,341 @@
+{
+ "clock": "2026-10-25T00:00:00Z",
+ "failing_certificate": "4faede1dfe71a8e15a78c49ddc78254c04db5e92ef8ac90d0623b15c7b69bfcf",
+ "lookups": [
+  {
+   "args": [
+    "locate",
+    "/private/tmp/bellwether-format-v1/data",
+    "--keys",
+    "<corpus>/keys-id.parquet"
+   ],
+   "json": [
+    "{\"lookup\":{\"kind\":\"locate\"},\"columns\":[\"id\"],\"keys\":4,\"null_tuples\":0,\"key_set\":\"57b62ed6455b63eeead0e56621905ef0cc6f9655aafc7890e9a0bad849eda08b\",\"sequence\":3,\"specs\":[{\"kind\":\"exact\",\"columns\":[\"id\"]},{\"kind\":\"bloom\",\"columns\":[\"id\"],\"fpr\":0.01},{\"kind\":\"range\",\"column\":\"ts\"},{\"kind\":\"temporal\",\"columns\":[\"id\"],\"ts_column\":\"ts\"},{\"kind\":\"exact\",\"columns\":[\"symbol\"]}],\"excluded_incomplete\":[],\"sidecars\":[],\"path_values\":null,\"files_total\":5,\"row_groups_total\":15,\"planned\":{\"files\":5,\"row_groups\":13,\"bytes\":7885},\"ordered_by\":\"ts\",\"unordered_reason\":null,\"evidence\":{\"hash\":\"fba31feca8cd0eee5c8025807b55fb6b05490587362b1a4c5497a3542f8d03e3\",\"record\":{\"record\":\"evidence\",\"record_version\":2,\"provenance\":{\"inputs\":[\"2499ca062c70bc52230a7e0a150a1a8afb95687bb009501acb6b7cf273e11ff7\",\"57b62ed6455b63eeead0e56621905ef0cc6f9655aafc7890e9a0bad849eda08b\"],\"oldest_input_age\":0,\"manifest_version\":\"3\",\"created_at\":\"2026-10-25T00:00:00.000Z\"},\"body\":{\"kind\":\"plan\",\"plan\":{\"manifest_version\":\"3\",\"entries\":[{\"file\":{\"path\":\"/private/tmp/bellwether-format-v1/data/day=2026-01-01/part-0.parquet\",\"size\":4430,\"etag\":\"2026-10-25T00:00:00.000000000Z\",\"tail_blake3\":\"f2d8e294c1c58fb467b692a61e0a583667018a175ac61408e1da5cd76c046e89\"},\"row_groups\":[0,1],\"bytes\":1240},{\"file\":{\"path\":\"/private/tmp/bellwether-format-v1/data/day=2026-01-01/part-1.parquet\",\"size\":4407,\"etag\":\"2026-10-25T00:00:00.000000000Z\",\"tail_blake3\":\"317cb5ec1a8c4f7b02f44a778542979afc48aa56fae83b015d3f0c9d397e1ef6\"},\"row_groups\":[0,1,2],\"bytes\":1809},{\"file\":{\"path\":\"/private/tmp/bellwether-format-v1/data/day=2026-01-02/part-0.parquet\",\"size\":4407,\"etag\":\"2026-10-25T00:00:00.000000000Z\",\"tail_blake3\":\"2852f467a5f695ec8467b0893fefac04941b9d38922d0709149a56446aa1eb9e\"},\"row_groups\":[0,1,2],\"bytes\":1809},{\"file\":{\"path\":\"/private/tmp/bellwether-format-v1/data/day=2026-01-02/part-1.parquet\",\"size\":4401,\"etag\":\"2026-10-25T00:00:00.000000000Z\",\"tail_blake3\":\"6dad5ee3f2d6b43772ec472955e1a5f9e0ecf565106b4a6014bc43478e528fc4\"},\"row_groups\":[0,1],\"bytes\":1224},{\"file\":{\"path\":\"/private/tmp/bellwether-format-v1/data/day=2026-01-03/part-0.parquet\",\"size\":4401,\"etag\":\"2026-10-25T00:00:00.000000000Z\",\"tail_blake3\":\"06f69397fbc534c0c7703caf15b4cc774d0ad32ad9801ed9676e63cb4b01bd05\"},\"row_groups\":[0,1,2],\"bytes\":1803}],\"residual\":{\"op\":\"in\",\"columns\":[\"id\"],\"values\":[[2,128,0,0,0,0,0,0,1],[2,128,0,0,0,0,0,0,4],[2,128,0,0,0,0,0,0,7],[2,128,0,0,0,0,0,0,42]]},\"bytes\":7885,\"row_groups_total\":15,\"row_groups_selected\":13}}}}}"
+   ]
+  },
+  {
+   "args": [
+    "locate",
+    "/private/tmp/bellwether-format-v1/data",
+    "--keys",
+    "<corpus>/keys-id.parquet",
+    "--at-manifest",
+    "1"
+   ],
+   "json": [
+    "{\"lookup\":{\"kind\":\"locate\"},\"columns\":[\"id\"],\"keys\":4,\"null_tuples\":0,\"key_set\":\"57b62ed6455b63eeead0e56621905ef0cc6f9655aafc7890e9a0bad849eda08b\",\"sequence\":1,\"specs\":[{\"kind\":\"exact\",\"columns\":[\"id\"]},{\"kind\":\"bloom\",\"columns\":[\"id\"],\"fpr\":0.01},{\"kind\":\"range\",\"column\":\"ts\"},{\"kind\":\"temporal\",\"columns\":[\"id\"],\"ts_column\":\"ts\"}],\"excluded_incomplete\":[],\"sidecars\":[],\"path_values\":null,\"files_total\":4,\"row_groups_total\":12,\"planned\":{\"files\":4,\"row_groups\":10,\"bytes\":6082},\"ordered_by\":\"ts\",\"unordered_reason\":null,\"evidence\":{\"hash\":\"a7d1dfcd69d86dd259cc3f972586dd7d7e1a3f5bd382030c202779c01a6eb924\",\"record\":{\"record\":\"evidence\",\"record_version\":2,\"provenance\":{\"inputs\":[\"ead8d52b1513d57b44a72ebd65f92fb80ad70573cfbb2b6b94a806599aa97682\",\"57b62ed6455b63eeead0e56621905ef0cc6f9655aafc7890e9a0bad849eda08b\"],\"oldest_input_age\":0,\"manifest_version\":\"1\",\"created_at\":\"2026-10-25T00:00:00.000Z\"},\"body\":{\"kind\":\"plan\",\"plan\":{\"manifest_version\":\"1\",\"entries\":[{\"file\":{\"path\":\"/private/tmp/bellwether-format-v1/data/day=2026-01-01/part-0.parquet\",\"size\":4430,\"etag\":\"2026-10-25T00:00:00.000000000Z\",\"tail_blake3\":\"f2d8e294c1c58fb467b692a61e0a583667018a175ac61408e1da5cd76c046e89\"},\"row_groups\":[0,1],\"bytes\":1240},{\"file\":{\"path\":\"/private/tmp/bellwether-format-v1/data/day=2026-01-01/part-1.parquet\",\"size\":4407,\"etag\":\"2026-10-25T00:00:00.000000000Z\",\"tail_blake3\":\"317cb5ec1a8c4f7b02f44a778542979afc48aa56fae83b015d3f0c9d397e1ef6\"},\"row_groups\":[0,1,2],\"bytes\":1809},{\"file\":{\"path\":\"/private/tmp/bellwether-format-v1/data/day=2026-01-02/part-0.parquet\",\"size\":4407,\"etag\":\"2026-10-25T00:00:00.000000000Z\",\"tail_blake3\":\"2852f467a5f695ec8467b0893fefac04941b9d38922d0709149a56446aa1eb9e\"},\"row_groups\":[0,1,2],\"bytes\":1809},{\"file\":{\"path\":\"/private/tmp/bellwether-format-v1/data/day=2026-01-02/part-1.parquet\",\"size\":4401,\"etag\":\"2026-10-25T00:00:00.000000000Z\",\"tail_blake3\":\"6dad5ee3f2d6b43772ec472955e1a5f9e0ecf565106b4a6014bc43478e528fc4\"},\"row_groups\":[0,1],\"bytes\":1224}],\"residual\":{\"op\":\"in\",\"columns\":[\"id\"],\"values\":[[2,128,0,0,0,0,0,0,1],[2,128,0,0,0,0,0,0,4],[2,128,0,0,0,0,0,0,7],[2,128,0,0,0,0,0,0,42]]},\"bytes\":6082,\"row_groups_total\":12,\"row_groups_selected\":10}}}}}"
+   ]
+  },
+  {
+   "args": [
+    "locate",
+    "/private/tmp/bellwether-format-v1/data",
+    "--keys",
+    "<corpus>/keys-id.parquet",
+    "--at-manifest",
+    "2"
+   ],
+   "json": [
+    "{\"lookup\":{\"kind\":\"locate\"},\"columns\":[\"id\"],\"keys\":4,\"null_tuples\":0,\"key_set\":\"57b62ed6455b63eeead0e56621905ef0cc6f9655aafc7890e9a0bad849eda08b\",\"sequence\":2,\"specs\":[{\"kind\":\"exact\",\"columns\":[\"id\"]},{\"kind\":\"bloom\",\"columns\":[\"id\"],\"fpr\":0.01},{\"kind\":\"range\",\"column\":\"ts\"},{\"kind\":\"temporal\",\"columns\":[\"id\"],\"ts_column\":\"ts\"}],\"excluded_incomplete\":[],\"sidecars\":[],\"path_values\":null,\"files_total\":5,\"row_groups_total\":15,\"planned\":{\"files\":5,\"row_groups\":13,\"bytes\":7885},\"ordered_by\":\"ts\",\"unordered_reason\":null,\"evidence\":{\"hash\":\"4727aaf6955c325934eb6c221bb6ab08fa52c2fd8fc9b5de938244acc3f224a1\",\"record\":{\"record\":\"evidence\",\"record_version\":2,\"provenance\":{\"inputs\":[\"6dc29dbfad05c7d61e5ea9b48b632ad04042f3b241814bcc6b1ea46648cf4f02\",\"57b62ed6455b63eeead0e56621905ef0cc6f9655aafc7890e9a0bad849eda08b\"],\"oldest_input_age\":0,\"manifest_version\":\"2\",\"created_at\":\"2026-10-25T00:00:00.000Z\"},\"body\":{\"kind\":\"plan\",\"plan\":{\"manifest_version\":\"2\",\"entries\":[{\"file\":{\"path\":\"/private/tmp/bellwether-format-v1/data/day=2026-01-01/part-0.parquet\",\"size\":4430,\"etag\":\"2026-10-25T00:00:00.000000000Z\",\"tail_blake3\":\"f2d8e294c1c58fb467b692a61e0a583667018a175ac61408e1da5cd76c046e89\"},\"row_groups\":[0,1],\"bytes\":1240},{\"file\":{\"path\":\"/private/tmp/bellwether-format-v1/data/day=2026-01-01/part-1.parquet\",\"size\":4407,\"etag\":\"2026-10-25T00:00:00.000000000Z\",\"tail_blake3\":\"317cb5ec1a8c4f7b02f44a778542979afc48aa56fae83b015d3f0c9d397e1ef6\"},\"row_groups\":[0,1,2],\"bytes\":1809},{\"file\":{\"path\":\"/private/tmp/bellwether-format-v1/data/day=2026-01-02/part-0.parquet\",\"size\":4407,\"etag\":\"2026-10-25T00:00:00.000000000Z\",\"tail_blake3\":\"2852f467a5f695ec8467b0893fefac04941b9d38922d0709149a56446aa1eb9e\"},\"row_groups\":[0,1,2],\"bytes\":1809},{\"file\":{\"path\":\"/private/tmp/bellwether-format-v1/data/day=2026-01-02/part-1.parquet\",\"size\":4401,\"etag\":\"2026-10-25T00:00:00.000000000Z\",\"tail_blake3\":\"6dad5ee3f2d6b43772ec472955e1a5f9e0ecf565106b4a6014bc43478e528fc4\"},\"row_groups\":[0,1],\"bytes\":1224},{\"file\":{\"path\":\"/private/tmp/bellwether-format-v1/data/day=2026-01-03/part-0.parquet\",\"size\":4401,\"etag\":\"2026-10-25T00:00:00.000000000Z\",\"tail_blake3\":\"06f69397fbc534c0c7703caf15b4cc774d0ad32ad9801ed9676e63cb4b01bd05\"},\"row_groups\":[0,1,2],\"bytes\":1803}],\"residual\":{\"op\":\"in\",\"columns\":[\"id\"],\"values\":[[2,128,0,0,0,0,0,0,1],[2,128,0,0,0,0,0,0,4],[2,128,0,0,0,0,0,0,7],[2,128,0,0,0,0,0,0,42]]},\"bytes\":7885,\"row_groups_total\":15,\"row_groups_selected\":13}}}}}"
+   ]
+  },
+  {
+   "args": [
+    "locate",
+    "/private/tmp/bellwether-format-v1/data",
+    "--keys",
+    "<corpus>/keys-symbol.parquet"
+   ],
+   "json": [
+    "{\"lookup\":{\"kind\":\"locate\"},\"columns\":[\"symbol\"],\"keys\":3,\"null_tuples\":0,\"key_set\":\"d52d1841c100c65908e46128e7f904439cbe1a7f24f22c0079f6c635c1f12bd4\",\"sequence\":3,\"specs\":[{\"kind\":\"exact\",\"columns\":[\"id\"]},{\"kind\":\"bloom\",\"columns\":[\"id\"],\"fpr\":0.01},{\"kind\":\"range\",\"column\":\"ts\"},{\"kind\":\"temporal\",\"columns\":[\"id\"],\"ts_column\":\"ts\"},{\"kind\":\"exact\",\"columns\":[\"symbol\"]}],\"excluded_incomplete\":[],\"sidecars\":[],\"path_values\":null,\"files_total\":5,\"row_groups_total\":15,\"planned\":{\"files\":5,\"row_groups\":8,\"bytes\":4849},\"ordered_by\":\"ts\",\"unordered_reason\":null,\"evidence\":{\"hash\":\"c9c600a1e5fa9614cdd91c6c62436442bf9f6d1eaddc57db96561bdbc99a9a37\",\"record\":{\"record\":\"evidence\",\"record_version\":2,\"provenance\":{\"inputs\":[\"2499ca062c70bc52230a7e0a150a1a8afb95687bb009501acb6b7cf273e11ff7\",\"d52d1841c100c65908e46128e7f904439cbe1a7f24f22c0079f6c635c1f12bd4\"],\"oldest_input_age\":0,\"manifest_version\":\"3\",\"created_at\":\"2026-10-25T00:00:00.000Z\"},\"body\":{\"kind\":\"plan\",\"plan\":{\"manifest_version\":\"3\",\"entries\":[{\"file\":{\"path\":\"/private/tmp/bellwether-format-v1/data/day=2026-01-01/part-0.parquet\",\"size\":4430,\"etag\":\"2026-10-25T00:00:00.000000000Z\",\"tail_blake3\":\"f2d8e294c1c58fb467b692a61e0a583667018a175ac61408e1da5cd76c046e89\"},\"row_groups\":[0,2],\"bytes\":1198},{\"file\":{\"path\":\"/private/tmp/bellwether-format-v1/data/day=2026-01-01/part-1.parquet\",\"size\":4407,\"etag\":\"2026-10-25T00:00:00.000000000Z\",\"tail_blake3\":\"317cb5ec1a8c4f7b02f44a778542979afc48aa56fae83b015d3f0c9d397e1ef6\"},\"row_groups\":[0,2],\"bytes\":1204},{\"file\":{\"path\":\"/private/tmp/bellwether-format-v1/data/day=2026-01-02/part-0.parquet\",\"size\":4407,\"etag\":\"2026-10-25T00:00:00.000000000Z\",\"tail_blake3\":\"2852f467a5f695ec8467b0893fefac04941b9d38922d0709149a56446aa1eb9e\"},\"row_groups\":[1],\"bytes\":620},{\"file\":{\"path\":\"/private/tmp/bellwether-format-v1/data/day=2026-01-02/part-1.parquet\",\"size\":4401,\"etag\":\"2026-10-25T00:00:00.000000000Z\",\"tail_blake3\":\"6dad5ee3f2d6b43772ec472955e1a5f9e0ecf565106b4a6014bc43478e528fc4\"},\"row_groups\":[1],\"bytes\":627},{\"file\":{\"path\":\"/private/tmp/bellwether-format-v1/data/day=2026-01-03/part-0.parquet\",\"size\":4401,\"etag\":\"2026-10-25T00:00:00.000000000Z\",\"tail_blake3\":\"06f69397fbc534c0c7703caf15b4cc774d0ad32ad9801ed9676e63cb4b01bd05\"},\"row_groups\":[0,2],\"bytes\":1200}],\"residual\":{\"op\":\"in\",\"columns\":[\"symbol\"],\"values\":[[6,65,65,65,0,0],[6,67,67,67,0,0],[6,90,90,90,0,0]]},\"bytes\":4849,\"row_groups_total\":15,\"row_groups_selected\":8}}}}}"
+   ]
+  },
+  {
+   "args": [
+    "locate",
+    "/private/tmp/bellwether-format-v1/data",
+    "--keys",
+    "<corpus>/keys-id.parquet",
+    "--window",
+    "2026-01-01T00:00:00Z..2026-01-01T06:00:00Z"
+   ],
+   "json": [
+    "{\"lookup\":{\"kind\":\"window\",\"from\":\"2026-01-01T00:00:00Z\",\"to\":\"2026-01-01T06:00:00Z\",\"lo\":1767225600000000,\"hi\":1767247200000000,\"ts_column\":\"ts\"},\"columns\":[\"id\"],\"keys\":4,\"null_tuples\":0,\"key_set\":\"57b62ed6455b63eeead0e56621905ef0cc6f9655aafc7890e9a0bad849eda08b\",\"sequence\":3,\"specs\":[{\"kind\":\"exact\",\"columns\":[\"id\"]},{\"kind\":\"bloom\",\"columns\":[\"id\"],\"fpr\":0.01},{\"kind\":\"range\",\"column\":\"ts\"},{\"kind\":\"temporal\",\"columns\":[\"id\"],\"ts_column\":\"ts\"},{\"kind\":\"exact\",\"columns\":[\"symbol\"]}],\"excluded_incomplete\":[],\"sidecars\":[\"bounds:id@ts\"],\"path_values\":null,\"files_total\":5,\"row_groups_total\":15,\"planned\":{\"files\":2,\"row_groups\":5,\"bytes\":3049},\"ordered_by\":\"ts\",\"unordered_reason\":null,\"evidence\":{\"hash\":\"6856c6204579cee52a77f4d53b14caea9d6d9a3aa472f5f4f0284e718467a9c3\",\"record\":{\"record\":\"evidence\",\"record_version\":2,\"provenance\":{\"inputs\":[\"2499ca062c70bc52230a7e0a150a1a8afb95687bb009501acb6b7cf273e11ff7\",\"57b62ed6455b63eeead0e56621905ef0cc6f9655aafc7890e9a0bad849eda08b\"],\"oldest_input_age\":0,\"manifest_version\":\"3\",\"created_at\":\"2026-10-25T00:00:00.000Z\"},\"body\":{\"kind\":\"plan\",\"plan\":{\"manifest_version\":\"3\",\"entries\":[{\"file\":{\"path\":\"/private/tmp/bellwether-format-v1/data/day=2026-01-01/part-0.parquet\",\"size\":4430,\"etag\":\"2026-10-25T00:00:00.000000000Z\",\"tail_blake3\":\"f2d8e294c1c58fb467b692a61e0a583667018a175ac61408e1da5cd76c046e89\"},\"row_groups\":[0,1],\"bytes\":1240},{\"file\":{\"path\":\"/private/tmp/bellwether-format-v1/data/day=2026-01-01/part-1.parquet\",\"size\":4407,\"etag\":\"2026-10-25T00:00:00.000000000Z\",\"tail_blake3\":\"317cb5ec1a8c4f7b02f44a778542979afc48aa56fae83b015d3f0c9d397e1ef6\"},\"row_groups\":[0,1,2],\"bytes\":1809}],\"residual\":{\"op\":\"and\",\"all\":[{\"op\":\"in\",\"columns\":[\"id\"],\"values\":[[2,128,0,0,0,0,0,0,1],[2,128,0,0,0,0,0,0,4],[2,128,0,0,0,0,0,0,7],[2,128,0,0,0,0,0,0,42]]},{\"op\":\"between\",\"column\":\"ts\",\"lo\":[8,4,3,128,6,71,72,70,32,64,0],\"hi\":[8,4,3,128,6,71,77,77,150,24,0]}]},\"bytes\":3049,\"row_groups_total\":15,\"row_groups_selected\":5}}}}}"
+   ]
+  },
+  {
+   "args": [
+    "locate",
+    "/private/tmp/bellwether-format-v1/data",
+    "--keys",
+    "<corpus>/keys-symbol.parquet",
+    "--from",
+    "2026-01-02T00:00:00Z",
+    "--to",
+    "2026-01-02T12:00:00Z"
+   ],
+   "json": [
+    "{\"lookup\":{\"kind\":\"window\",\"from\":\"2026-01-02T00:00:00Z\",\"to\":\"2026-01-02T12:00:00Z\",\"lo\":1767312000000000,\"hi\":1767355200000000,\"ts_column\":\"ts\"},\"columns\":[\"symbol\"],\"keys\":3,\"null_tuples\":0,\"key_set\":\"d52d1841c100c65908e46128e7f904439cbe1a7f24f22c0079f6c635c1f12bd4\",\"sequence\":3,\"specs\":[{\"kind\":\"exact\",\"columns\":[\"id\"]},{\"kind\":\"bloom\",\"columns\":[\"id\"],\"fpr\":0.01},{\"kind\":\"range\",\"column\":\"ts\"},{\"kind\":\"temporal\",\"columns\":[\"id\"],\"ts_column\":\"ts\"},{\"kind\":\"exact\",\"columns\":[\"symbol\"]}],\"excluded_incomplete\":[],\"sidecars\":[],\"path_values\":null,\"files_total\":5,\"row_groups_total\":15,\"planned\":{\"files\":2,\"row_groups\":2,\"bytes\":1247},\"ordered_by\":\"ts\",\"unordered_reason\":null,\"evidence\":{\"hash\":\"b62365690b9adb485c593933c65aa2f267e57e48422b2183a588b21fde11ffa7\",\"record\":{\"record\":\"evidence\",\"record_version\":2,\"provenance\":{\"inputs\":[\"2499ca062c70bc52230a7e0a150a1a8afb95687bb009501acb6b7cf273e11ff7\",\"d52d1841c100c65908e46128e7f904439cbe1a7f24f22c0079f6c635c1f12bd4\"],\"oldest_input_age\":0,\"manifest_version\":\"3\",\"created_at\":\"2026-10-25T00:00:00.000Z\"},\"body\":{\"kind\":\"plan\",\"plan\":{\"manifest_version\":\"3\",\"entries\":[{\"file\":{\"path\":\"/private/tmp/bellwether-format-v1/data/day=2026-01-02/part-0.parquet\",\"size\":4407,\"etag\":\"2026-10-25T00:00:00.000000000Z\",\"tail_blake3\":\"2852f467a5f695ec8467b0893fefac04941b9d38922d0709149a56446aa1eb9e\"},\"row_groups\":[1],\"bytes\":620},{\"file\":{\"path\":\"/private/tmp/bellwether-format-v1/data/day=2026-01-02/part-1.parquet\",\"size\":4401,\"etag\":\"2026-10-25T00:00:00.000000000Z\",\"tail_blake3\":\"6dad5ee3f2d6b43772ec472955e1a5f9e0ecf565106b4a6014bc43478e528fc4\"},\"row_groups\":[1],\"bytes\":627}],\"residual\":{\"op\":\"and\",\"all\":[{\"op\":\"in\",\"columns\":[\"symbol\"],\"values\":[[6,65,65,65,0,0],[6,67,67,67,0,0],[6,90,90,90,0,0]]},{\"op\":\"between\",\"column\":\"ts\",\"lo\":[8,4,3,128,6,71,92,99,247,160,0],\"hi\":[8,4,3,128,6,71,102,114,227,80,0]}]},\"bytes\":1247,\"row_groups_total\":15,\"row_groups_selected\":2}}}}}"
+   ]
+  },
+  {
+   "args": [
+    "latest",
+    "/private/tmp/bellwether-format-v1/data",
+    "--keys",
+    "<corpus>/keys-id.parquet"
+   ],
+   "json": [
+    "{\"lookup\":{\"kind\":\"latest\"},\"columns\":[\"id\"],\"keys\":4,\"null_tuples\":0,\"key_set\":\"57b62ed6455b63eeead0e56621905ef0cc6f9655aafc7890e9a0bad849eda08b\",\"sequence\":3,\"specs\":[{\"kind\":\"exact\",\"columns\":[\"id\"]},{\"kind\":\"bloom\",\"columns\":[\"id\"],\"fpr\":0.01},{\"kind\":\"range\",\"column\":\"ts\"},{\"kind\":\"temporal\",\"columns\":[\"id\"],\"ts_column\":\"ts\"},{\"kind\":\"exact\",\"columns\":[\"symbol\"]}],\"excluded_incomplete\":[],\"sidecars\":[],\"path_values\":null,\"files_total\":5,\"row_groups_total\":15,\"planned\":{\"files\":1,\"row_groups\":3,\"bytes\":1803},\"ordered_by\":\"ts\",\"unordered_reason\":null,\"evidence\":{\"hash\":\"b35e5e5d8ec559bededd85edfe8242d94fc2c87ebf17164ae4f4a0b91f184eda\",\"record\":{\"record\":\"evidence\",\"record_version\":2,\"provenance\":{\"inputs\":[\"2499ca062c70bc52230a7e0a150a1a8afb95687bb009501acb6b7cf273e11ff7\",\"57b62ed6455b63eeead0e56621905ef0cc6f9655aafc7890e9a0bad849eda08b\"],\"oldest_input_age\":0,\"manifest_version\":\"3\",\"created_at\":\"2026-10-25T00:00:00.000Z\"},\"body\":{\"kind\":\"plan\",\"plan\":{\"manifest_version\":\"3\",\"entries\":[{\"file\":{\"path\":\"/private/tmp/bellwether-format-v1/data/day=2026-01-03/part-0.parquet\",\"size\":4401,\"etag\":\"2026-10-25T00:00:00.000000000Z\",\"tail_blake3\":\"06f69397fbc534c0c7703caf15b4cc774d0ad32ad9801ed9676e63cb4b01bd05\"},\"row_groups\":[0,1,2],\"bytes\":1803}],\"residual\":{\"op\":\"and\",\"all\":[{\"op\":\"in\",\"columns\":[\"id\"],\"values\":[[2,128,0,0,0,0,0,0,1],[2,128,0,0,0,0,0,0,4],[2,128,0,0,0,0,0,0,7]]},{\"op\":\"not_older_than\",\"columns\":[\"id\"],\"ts_column\":\"ts\",\"bounds\":[[[2,128,0,0,0,0,0,0,1],[8,4,3,128,6,71,115,84,55,134,0]],[[2,128,0,0,0,0,0,0,4],[8,4,3,128,6,71,115,94,242,27,0]],[[2,128,0,0,0,0,0,0,7],[8,4,3,128,6,71,115,105,172,176,0]]]},{\"op\":\"latest_per_key\",\"columns\":[\"id\"],\"ts_column\":\"ts\"}]},\"bytes\":1803,\"row_groups_total\":15,\"row_groups_selected\":3}}}}}"
+   ]
+  },
+  {
+   "args": [
+    "asof",
+    "/private/tmp/bellwether-format-v1/data",
+    "--keys",
+    "<corpus>/keys-id.parquet",
+    "--at",
+    "2026-01-02T00:00:00Z"
+   ],
+   "json": [
+    "{\"lookup\":{\"kind\":\"asof\",\"at\":\"2026-01-02T00:00:00Z\",\"ts\":1767312000000000,\"ts_column\":\"ts\"},\"columns\":[\"id\"],\"keys\":4,\"null_tuples\":0,\"key_set\":\"57b62ed6455b63eeead0e56621905ef0cc6f9655aafc7890e9a0bad849eda08b\",\"sequence\":3,\"specs\":[{\"kind\":\"exact\",\"columns\":[\"id\"]},{\"kind\":\"bloom\",\"columns\":[\"id\"],\"fpr\":0.01},{\"kind\":\"range\",\"column\":\"ts\"},{\"kind\":\"temporal\",\"columns\":[\"id\"],\"ts_column\":\"ts\"},{\"kind\":\"exact\",\"columns\":[\"symbol\"]}],\"excluded_incomplete\":[],\"sidecars\":[],\"path_values\":null,\"files_total\":5,\"row_groups_total\":15,\"planned\":{\"files\":1,\"row_groups\":3,\"bytes\":1809},\"ordered_by\":\"ts\",\"unordered_reason\":null,\"evidence\":{\"hash\":\"e16f071c1d9a27b52fcc2f764dd28d23b507ed83e10f456124ef65f568fee457\",\"record\":{\"record\":\"evidence\",\"record_version\":2,\"provenance\":{\"inputs\":[\"2499ca062c70bc52230a7e0a150a1a8afb95687bb009501acb6b7cf273e11ff7\",\"57b62ed6455b63eeead0e56621905ef0cc6f9655aafc7890e9a0bad849eda08b\"],\"oldest_input_age\":0,\"manifest_version\":\"3\",\"created_at\":\"2026-10-25T00:00:00.000Z\"},\"body\":{\"kind\":\"plan\",\"plan\":{\"manifest_version\":\"3\",\"entries\":[{\"file\":{\"path\":\"/private/tmp/bellwether-format-v1/data/day=2026-01-01/part-1.parquet\",\"size\":4407,\"etag\":\"2026-10-25T00:00:00.000000000Z\",\"tail_blake3\":\"317cb5ec1a8c4f7b02f44a778542979afc48aa56fae83b015d3f0c9d397e1ef6\"},\"row_groups\":[0,1,2],\"bytes\":1809}],\"residual\":{\"op\":\"and\",\"all\":[{\"op\":\"in\",\"columns\":[\"id\"],\"values\":[[2,128,0,0,0,0,0,0,1],[2,128,0,0,0,0,0,0,4],[2,128,0,0,0,0,0,0,7]]},{\"op\":\"between\",\"column\":\"ts\",\"lo\":[8,4,3,128,6,71,72,148,205,218,0],\"hi\":[8,4,3,128,6,71,92,99,247,160,0]},{\"op\":\"not_older_than\",\"columns\":[\"id\"],\"ts_column\":\"ts\",\"bounds\":[[[2,128,0,0,0,0,0,0,1],[8,4,3,128,6,71,72,148,205,218,0]],[[2,128,0,0,0,0,0,0,4],[8,4,3,128,6,71,72,159,136,111,0]],[[2,128,0,0,0,0,0,0,7],[8,4,3,128,6,71,72,170,67,4,0]]]},{\"op\":\"latest_per_key\",\"columns\":[\"id\"],\"ts_column\":\"ts\"}]},\"bytes\":1809,\"row_groups_total\":15,\"row_groups_selected\":3}}}}}"
+   ]
+  },
+  {
+   "args": [
+    "asof",
+    "/private/tmp/bellwether-format-v1/data",
+    "--keys",
+    "<corpus>/keys-id.parquet",
+    "--valid",
+    "2026-01-01T00:00:00Z",
+    "--known",
+    "2026-01-02T12:00:00Z"
+   ],
+   "json": [
+    "{\"lookup\":{\"kind\":\"bitemporal\",\"valid\":\"2026-01-01T00:00:00Z\",\"known\":\"2026-01-02T12:00:00Z\",\"valid_ts\":1767225600000000,\"known_ts\":1767355200000000,\"valid_column\":\"valid\",\"known_column\":\"known\"},\"columns\":[\"id\"],\"keys\":4,\"null_tuples\":0,\"key_set\":\"57b62ed6455b63eeead0e56621905ef0cc6f9655aafc7890e9a0bad849eda08b\",\"sequence\":3,\"specs\":[{\"kind\":\"exact\",\"columns\":[\"id\"]},{\"kind\":\"bloom\",\"columns\":[\"id\"],\"fpr\":0.01},{\"kind\":\"range\",\"column\":\"ts\"},{\"kind\":\"temporal\",\"columns\":[\"id\"],\"ts_column\":\"ts\"},{\"kind\":\"exact\",\"columns\":[\"symbol\"]}],\"excluded_incomplete\":[],\"sidecars\":[\"temporal2:id@valid,known\"],\"path_values\":null,\"files_total\":5,\"row_groups_total\":15,\"planned\":{\"files\":2,\"row_groups\":3,\"bytes\":1829},\"ordered_by\":\"ts\",\"unordered_reason\":null,\"evidence\":{\"hash\":\"a3582b9e1f83e6a6837a8a75891e9def2ec41b62e178872a5b395c4dba88f5fe\",\"record\":{\"record\":\"evidence\",\"record_version\":2,\"provenance\":{\"inputs\":[\"2499ca062c70bc52230a7e0a150a1a8afb95687bb009501acb6b7cf273e11ff7\",\"57b62ed6455b63eeead0e56621905ef0cc6f9655aafc7890e9a0bad849eda08b\"],\"oldest_input_age\":0,\"manifest_version\":\"3\",\"created_at\":\"2026-10-25T00:00:00.000Z\"},\"body\":{\"kind\":\"plan\",\"plan\":{\"manifest_version\":\"3\",\"entries\":[{\"file\":{\"path\":\"/private/tmp/bellwether-format-v1/data/day=2026-01-01/part-1.parquet\",\"size\":4407,\"etag\":\"2026-10-25T00:00:00.000000000Z\",\"tail_blake3\":\"317cb5ec1a8c4f7b02f44a778542979afc48aa56fae83b015d3f0c9d397e1ef6\"},\"row_groups\":[1],\"bytes\":605},{\"file\":{\"path\":\"/private/tmp/bellwether-format-v1/data/day=2026-01-02/part-1.parquet\",\"size\":4401,\"etag\":\"2026-10-25T00:00:00.000000000Z\",\"tail_blake3\":\"6dad5ee3f2d6b43772ec472955e1a5f9e0ecf565106b4a6014bc43478e528fc4\"},\"row_groups\":[0,1],\"bytes\":1224}],\"residual\":{\"op\":\"and\",\"all\":[{\"op\":\"in\",\"columns\":[\"id\"],\"values\":[[2,128,0,0,0,0,0,0,1],[2,128,0,0,0,0,0,0,4],[2,128,0,0,0,0,0,0,7]]},{\"op\":\"between\",\"column\":\"valid\",\"lo\":[8,4,3,128,6,71,52,40,72,224,0],\"hi\":[8,4,3,128,6,71,72,70,32,64,0]},{\"op\":\"between\",\"column\":\"known\",\"lo\":[8,4,3,128,6,71,74,76,175,183,0],\"hi\":[8,4,3,128,6,71,102,114,227,80,0]},{\"op\":\"not_older_than\",\"columns\":[\"id\"],\"ts_column\":\"valid\",\"bounds\":[[[2,128,0,0,0,0,0,0,1],[8,4,3,128,6,71,72,70,32,64,0]],[[2,128,0,0,0,0,0,0,4],[8,4,3,128,6,71,52,40,72,224,0]],[[2,128,0,0,0,0,0,0,7],[8,4,3,128,6,71,72,70,32,64,0]]]},{\"op\":\"not_older_than\",\"columns\":[\"id\"],\"ts_column\":\"known\",\"bounds\":[[[2,128,0,0,0,0,0,0,1],[8,4,3,128,6,71,94,235,70,19,0]],[[2,128,0,0,0,0,0,0,4],[8,4,3,128,6,71,74,76,175,183,0]],[[2,128,0,0,0,0,0,0,7],[8,4,3,128,6,71,95,0,187,61,0]]]},{\"op\":\"latest_per_key\",\"columns\":[\"id\"],\"ts_column\":\"valid\"}]},\"bytes\":1829,\"row_groups_total\":15,\"row_groups_selected\":3}}}}}"
+   ]
+  }
+ ],
+ "proposal": "1739d905facb661f6ada0b2aa14be9f66e1e8710ceca029e95eb351790218877",
+ "receipt": "aa28b445deb74cbdec9f6ee2ed2f5d9024f6ac3446e9c257064a9119f2b007c7",
+ "receipt_text": "receipt aa28b445deb7: every link present\n  ff0581a7dcc4  evidence     2026-10-25T00:00:00.000Z  body=profile  root=/private/tmp/bellwether-format-v1/data  fanout=3  lints=2  inputs=3  age=0s  manifest=2\n  1739d905facb  proposal     2026-10-25T00:00:00.000Z  key=exact:symbol  by=fixture\n  6f224f6c5de9  replay       2026-10-25T00:00:00.000Z  runs=1  bytes_current=9043  bytes_proposed=4849  manifest=2\n  a860d2510096  certificate  2026-10-25T00:00:00.000Z  coverage=workload(3 keys)  pass=true  mismatched=0\n  aa28b445deb7  receipt      2026-10-25T00:00:00.000Z  manifest=2->3\nsignatures\n  unsigned: no signature beside the receipt or its certificate (`bellwether fix --signing-key <file>` signs what it writes)\n",
+ "records": [
+  "084eceedd1fa48e40c27479430489b4a35c644952951917d6c73126800f99393",
+  "1739d905facb661f6ada0b2aa14be9f66e1e8710ceca029e95eb351790218877",
+  "1e45e28150a04aab7792252e36c6fae0a2798b251e43102a692758ce51781b4d",
+  "4727aaf6955c325934eb6c221bb6ab08fa52c2fd8fc9b5de938244acc3f224a1",
+  "4faede1dfe71a8e15a78c49ddc78254c04db5e92ef8ac90d0623b15c7b69bfcf",
+  "6856c6204579cee52a77f4d53b14caea9d6d9a3aa472f5f4f0284e718467a9c3",
+  "6f224f6c5de94ec2d1104c2af0895b6cf64162df478b6e42ba2330198dcdd4ea",
+  "a3582b9e1f83e6a6837a8a75891e9def2ec41b62e178872a5b395c4dba88f5fe",
+  "a7d1dfcd69d86dd259cc3f972586dd7d7e1a3f5bd382030c202779c01a6eb924",
+  "a860d25100968c29aefc3d6723ac734083ac6f7000f645c0336e99cb844a0dfb",
+  "aa28b445deb74cbdec9f6ee2ed2f5d9024f6ac3446e9c257064a9119f2b007c7",
+  "b35e5e5d8ec559bededd85edfe8242d94fc2c87ebf17164ae4f4a0b91f184eda",
+  "b62365690b9adb485c593933c65aa2f267e57e48422b2183a588b21fde11ffa7",
+  "c9c600a1e5fa9614cdd91c6c62436442bf9f6d1eaddc57db96561bdbc99a9a37",
+  "ca28d48097602bb01fbe26e3a6fa8d54c6c46e37cbdeeb6e0db9ca90bf7bb5bd",
+  "e16f071c1d9a27b52fcc2f764dd28d23b507ed83e10f456124ef65f568fee457",
+  "f30d5d2ad52277c2e488df71f2fd45ef92dea3f07dd09c34e0fd6aa03367d770",
+  "fba31feca8cd0eee5c8025807b55fb6b05490587362b1a4c5497a3542f8d03e3",
+  "ff0581a7dcc4ede429ce67de4be5d2063423a6f5464c33052901f8425c46c813"
+ ],
+ "root": "/private/tmp/bellwether-format-v1",
+ "steps": [
+  {
+   "args": [
+    "index",
+    "/private/tmp/bellwether-format-v1/data",
+    "--partitioning",
+    "hive",
+    "--key",
+    "exact:id@ts",
+    "--key",
+    "bloom:id@0.01",
+    "--key",
+    "range:ts",
+    "--key",
+    "temporal:id@ts",
+    "--key",
+    "temporal2:id@valid,known"
+   ],
+   "exit": 0
+  },
+  {
+   "args": [
+    "index",
+    "/private/tmp/bellwether-format-v1/data"
+   ],
+   "exit": 0
+  },
+  {
+   "args": [
+    "--json",
+    "why",
+    "/private/tmp/bellwether-format-v1/data",
+    "--from",
+    "<corpus>/keys-symbol.parquet"
+   ],
+   "exit": 0
+  },
+  {
+   "args": [
+    "--json",
+    "propose",
+    "/private/tmp/bellwether-format-v1/data",
+    "--key",
+    "exact:symbol",
+    "--by",
+    "fixture",
+    "--evidence",
+    "ff0581a7dcc4ede429ce67de4be5d2063423a6f5464c33052901f8425c46c813"
+   ],
+   "exit": 0
+  },
+  {
+   "args": [
+    "--json",
+    "fix",
+    "/private/tmp/bellwether-format-v1/data",
+    "--proposal",
+    "1739d905facb661f6ada0b2aa14be9f66e1e8710ceca029e95eb351790218877",
+    "--workload",
+    "d9d119a729526563e791b649d567f3f6d6a0480544332d8b60809fe8998e2254"
+   ],
+   "exit": 0
+  },
+  {
+   "args": [
+    "--json",
+    "--partitioning",
+    "hive",
+    "reconcile",
+    "/private/tmp/bellwether-format-v1/data",
+    "/private/tmp/bellwether-format-v1/right",
+    "--key",
+    "id,ts",
+    "--totals",
+    "amount"
+   ],
+   "exit": 1
+  },
+  {
+   "args": [
+    "--json",
+    "locate",
+    "/private/tmp/bellwether-format-v1/data",
+    "--keys",
+    "<corpus>/keys-id.parquet"
+   ],
+   "exit": 0
+  },
+  {
+   "args": [
+    "--json",
+    "locate",
+    "/private/tmp/bellwether-format-v1/data",
+    "--keys",
+    "<corpus>/keys-id.parquet",
+    "--at-manifest",
+    "1"
+   ],
+   "exit": 0
+  },
+  {
+   "args": [
+    "--json",
+    "locate",
+    "/private/tmp/bellwether-format-v1/data",
+    "--keys",
+    "<corpus>/keys-id.parquet",
+    "--at-manifest",
+    "2"
+   ],
+   "exit": 0
+  },
+  {
+   "args": [
+    "--json",
+    "locate",
+    "/private/tmp/bellwether-format-v1/data",
+    "--keys",
+    "<corpus>/keys-symbol.parquet"
+   ],
+   "exit": 0
+  },
+  {
+   "args": [
+    "--json",
+    "locate",
+    "/private/tmp/bellwether-format-v1/data",
+    "--keys",
+    "<corpus>/keys-id.parquet",
+    "--window",
+    "2026-01-01T00:00:00Z..2026-01-01T06:00:00Z"
+   ],
+   "exit": 0
+  },
+  {
+   "args": [
+    "--json",
+    "locate",
+    "/private/tmp/bellwether-format-v1/data",
+    "--keys",
+    "<corpus>/keys-symbol.parquet",
+    "--from",
+    "2026-01-02T00:00:00Z",
+    "--to",
+    "2026-01-02T12:00:00Z"
+   ],
+   "exit": 0
+  },
+  {
+   "args": [
+    "--json",
+    "latest",
+    "/private/tmp/bellwether-format-v1/data",
+    "--keys",
+    "<corpus>/keys-id.parquet"
+   ],
+   "exit": 0
+  },
+  {
+   "args": [
+    "--json",
+    "asof",
+    "/private/tmp/bellwether-format-v1/data",
+    "--keys",
+    "<corpus>/keys-id.parquet",
+    "--at",
+    "2026-01-02T00:00:00Z"
+   ],
+   "exit": 0
+  },
+  {
+   "args": [
+    "--json",
+    "asof",
+    "/private/tmp/bellwether-format-v1/data",
+    "--keys",
+    "<corpus>/keys-id.parquet",
+    "--valid",
+    "2026-01-01T00:00:00Z",
+    "--known",
+    "2026-01-02T12:00:00Z"
+   ],
+   "exit": 0
+  },
+  {
+   "args": [
+    "receipt",
+    "show",
+    "/private/tmp/bellwether-format-v1/data",
+    "aa28b445deb74cbdec9f6ee2ed2f5d9024f6ac3446e9c257064a9119f2b007c7"
+   ],
+   "exit": 0
+  }
+ ],
+ "workload": "d9d119a729526563e791b649d567f3f6d6a0480544332d8b60809fe8998e2254"
+}
