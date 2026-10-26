@@ -337,6 +337,19 @@ fn typed_next(e: &Error) -> Option<String> {
             ),
             _ => None,
         },
+        Error::NotIndexed {
+            needs: Some(sketch),
+            operation,
+            ..
+        } if sketch.starts_with("sketch:") => Some(format!(
+            "ask the human to build the sketch with `bellwether index --key {sketch}` (a sketch is \
+             approximate and never planned with){}",
+            if *operation == "cardinality" {
+                ", or call the tool again with `transient: true` to read the files now"
+            } else {
+                ", then call the tool again"
+            }
+        )),
         Error::NotIndexed { needs, .. } => {
             let spec = needs
                 .as_deref()
@@ -491,10 +504,18 @@ pub fn from_propose(r: &ProposeRefusal) -> Refusal {
         } => {
             let mut r = Refusal::new(
                 RefusalCode::SidecarNotProposable,
-                format!(
-                    "{declaration} declares the sidecar {sidecar}, and a proposal can carry only \
-                     a key spec, so it has no replay, certificate, or receipt yet"
-                ),
+                if sidecar.starts_with("sketch:") {
+                    format!(
+                        "{declaration} declares the sketch {sidecar}, which is approximate and \
+                         never planned with, so no replay can price it and it has no \
+                         certificate or receipt"
+                    )
+                } else {
+                    format!(
+                        "{declaration} declares the sidecar {sidecar}, and a proposal can carry \
+                         only a key spec, so it has no replay, certificate, or receipt yet"
+                    )
+                },
                 json!({
                     "declaration": declaration,
                     "sidecar": sidecar,

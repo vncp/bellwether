@@ -42,6 +42,36 @@ pub struct ObserveWhy {
     /// Candidate key columns for the profile; default: every id-like column.
     #[serde(default)]
     pub columns: Option<Vec<String>>,
+    /// Diagnose from the index's complete sketches alone: no data file is
+    /// read, the profile's fanout table is empty, and the `sketch` column
+    /// and the `R-sketch-1` lint carry the (approximate) diagnosis. Refused
+    /// with `columns`, and without a complete sketch.
+    #[serde(default)]
+    pub sketches_only: bool,
+}
+
+/// `observe.cardinality`: approximate distinct counts from sketches.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ObserveCardinality {
+    /// Items to count: a column, or columns joined by `+` (`symbol+ts`);
+    /// default: every item of every complete sketch.
+    #[serde(default)]
+    pub items: Vec<String>,
+    /// Read the files now for items no complete sketch holds, instead of
+    /// refusing with `not_indexed`; the result says how many were read.
+    #[serde(default)]
+    pub transient: bool,
+}
+
+/// `observe.overlap`: approximate Jaccard similarity of two sketched items.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ObserveOverlap {
+    /// The left item: a column, or columns joined by `+`.
+    pub left: String,
+    /// The right item, in the same data folder.
+    pub right: String,
 }
 
 /// `observe.profile`: the newest recorded profile Evidence per root, with
@@ -267,6 +297,7 @@ pub struct ToolDef {
 
 /// Every tool, in listing order.
 #[must_use]
+#[allow(clippy::too_many_lines)] // one entry per tool
 pub fn catalog() -> Vec<ToolDef> {
     vec![
         def::<ObserveWhy>(
@@ -277,6 +308,24 @@ pub fn catalog() -> Vec<ToolDef> {
              fanout per column, and lints, as a profile Evidence (evidence.hash). No workload. \
              Writes the Evidence and cache entries only; with an unwritable index it writes \
              nothing (recorded: false).",
+        ),
+        def::<ObserveCardinality>(
+            "observe.cardinality",
+            Tier::Observe,
+            true,
+            "Approximate count(distinct) per item from the index's sketches (no data file read): \
+             the estimate with its 99.7% interval, exact sketched and null rows, rows per value \
+             (fanout), files per value, and files that repeat a value. Labelled approximate; \
+             exact_distinct is set where an exact key on the same columns holds the count. With \
+             transient, reads the files for items no sketch holds. Writes nothing.",
+        ),
+        def::<ObserveOverlap>(
+            "observe.overlap",
+            Tier::Observe,
+            true,
+            "Approximate Jaccard similarity of two sketched items' value sets (MinHash when both \
+             sketches keep signatures, else HyperLogLog inclusion-exclusion), with its interval. \
+             Labelled approximate. Writes nothing.",
         ),
         def::<ObserveProfile>(
             "observe.profile",

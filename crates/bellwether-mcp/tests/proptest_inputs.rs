@@ -114,6 +114,11 @@ fn make_world(signing: bool) -> World {
         let mut valid = BTreeMap::new();
         valid.insert("observe.why", json!({"columns": ["id"]}));
         valid.insert("observe.profile", json!({}));
+        valid.insert(
+            "observe.cardinality",
+            json!({"items": ["id"], "transient": true}),
+        );
+        valid.insert("observe.overlap", json!({"left": "id", "right": "batch"}));
         valid.insert("observe.locate", json!({"keys": k}));
         valid.insert(
             "observe.asof",
@@ -190,8 +195,10 @@ fn arb_json() -> impl Strategy<Value = Value> {
     })
 }
 
-const TOOLS: [&str; 13] = [
+const TOOLS: [&str; 15] = [
     "observe.why",
+    "observe.cardinality",
+    "observe.overlap",
     "observe.profile",
     "observe.locate",
     "observe.asof",
@@ -258,6 +265,7 @@ fn allowed(tool: &str, kinds: &[String], other: &[String], signing: bool) -> Res
         "propose.key" | "propose.layout" | "propose.rewrite" => {
             kinds.len() <= 1 && only(&["proposal"]) && other.is_empty()
         }
+        "observe.cardinality" | "observe.overlap" => kinds.is_empty() && cache_only,
         "observe.why" | "observe.profile" | "observe.locate" | "observe.asof" => {
             only(&["evidence"]) && cache_only
         }

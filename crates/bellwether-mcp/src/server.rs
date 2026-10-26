@@ -21,8 +21,9 @@ use crate::envelope::{cites_of, Chain, Envelope, Status};
 use crate::jobs::{job_id, Job, JobInfo, JobState, Jobs};
 use crate::refusal::{self, Refusal, RefusalCode};
 use crate::tools::{
-    self, ApplyReceipt, JobRef, JobsStart, KeyArg, ObserveAsof, ObserveLocate, ObserveWhy,
-    ProposeKey, ProposeLayout, ProposeRewrite, ScoreVerify, ScoreWhy, Tier,
+    self, ApplyReceipt, JobRef, JobsStart, KeyArg, ObserveAsof, ObserveCardinality, ObserveLocate,
+    ObserveOverlap, ObserveWhy, ProposeKey, ProposeLayout, ProposeRewrite, ScoreVerify, ScoreWhy,
+    Tier,
 };
 
 /// How the server is configured at startup. Nothing is read from the
@@ -293,8 +294,26 @@ impl Server {
                 let a = parse!(ObserveWhy);
                 match e.why(&WhyRequest {
                     columns: a.columns,
+                    sketches_only: a.sketches_only,
                     ..WhyRequest::default()
                 }) {
+                    Ok(r) => done(&r, None),
+                    Err(err) => failed(&err),
+                }
+            }
+            "observe.cardinality" => {
+                let a = parse!(ObserveCardinality);
+                match e.cardinality(&bellwether::CardinalityRequest {
+                    items: a.items,
+                    transient: a.transient,
+                }) {
+                    Ok(r) => done(&r, None),
+                    Err(err) => failed(&err),
+                }
+            }
+            "observe.overlap" => {
+                let a = parse!(ObserveOverlap);
+                match e.overlap(&a.left, &a.right, None) {
                     Ok(r) => done(&r, None),
                     Err(err) => failed(&err),
                 }
@@ -356,6 +375,7 @@ impl Server {
                     max_candidates: a
                         .max_candidates
                         .map_or(DEFAULT_MAX_CANDIDATES, |n| n as usize),
+                    sketches_only: false,
                 };
                 match e.why(&request) {
                     Ok(r) => done(&r, None),
@@ -411,6 +431,7 @@ impl Server {
                     KeyArg::Spec(spec) => bellwether::spec::Declaration {
                         key: Some(spec),
                         sidecar: None,
+                        sketch: None,
                     },
                 };
                 propose_done(if a.dry_run {

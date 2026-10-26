@@ -11,6 +11,7 @@
 mod bench;
 mod human;
 mod keys_cmds;
+mod sketch_cmds;
 mod verify_cmds;
 
 use std::io::{IsTerminal, Write};
@@ -101,6 +102,12 @@ enum Command {
     Bench {
         #[command(subcommand)]
         command: bench::BenchCommand,
+    },
+    /// Approximate distinct counts and overlaps from `sketch` sidecars
+    /// (never used to plan): cardinality per column, overlap of two.
+    Sketch {
+        #[command(subcommand)]
+        command: sketch_cmds::SketchCommand,
     },
     /// Signing keys: generate one, show a public key's id, or add a public
     /// key to a trust file (ADR 029).
@@ -196,6 +203,11 @@ struct WhyArgs {
     /// window (pass the same column to --latest-by).
     #[arg(long = "ts", value_name = "COLUMN")]
     ts: Option<String>,
+    /// Diagnose from the index's complete sketches alone (`index --key
+    /// sketch:...`): no data file is read; the sketch column and the
+    /// low-cardinality-key lint carry the diagnosis, approximate.
+    #[arg(long, conflicts_with_all = ["from", "bench_workload", "workload", "columns"])]
+    sketches_only: bool,
 }
 
 /// `why --mode`.
@@ -518,6 +530,18 @@ fn hint(e: &Error) -> Option<String> {
             }
             .to_string(),
         ),
+        Error::NotIndexed {
+            root,
+            needs: Some(sketch),
+            operation,
+        } if sketch.starts_with("sketch:") => Some(format!(
+            "run `bellwether index {root} --key {sketch}` first{}",
+            if *operation == "cardinality" {
+                ", or pass --transient to read the files now"
+            } else {
+                ""
+            }
+        )),
         Error::NotIndexed { root, needs, .. } => Some(format!(
             "run `bellwether index {root} --key {}` first",
             needs.as_deref().unwrap_or("<spec>")
@@ -740,6 +764,7 @@ fn run(cli: &Cli, out: &Out) -> Result<Outcome, Failure> {
             };
             done(&w, human, code)
         }
+        Command::Sketch { command } => sketch_cmds::run(g, out, command),
         Command::Keys { command } => keys_cmds::run(g, command),
         Command::Mcp(a) => mcp(g, a),
     }
@@ -927,6 +952,7 @@ fn why(g: &Global, out: &Out, a: &WhyArgs) -> Result<Outcome, Failure> {
         ts_column: a.ts.clone(),
         columns: a.columns.clone(),
         max_candidates: a.max_candidates,
+        sketches_only: a.sketches_only,
     };
     let mode = request.lookup_mode().map_err(Failure::Usage)?;
     if mode != bellwether::LookupMode::Locate && a.from.is_none() && a.workload.is_none() {

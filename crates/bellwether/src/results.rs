@@ -54,7 +54,8 @@ pub struct SpecState {
 /// while it is incomplete.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SidecarState {
-    /// The sidecar's name: `bounds:symbol@ts`, `temporal2:id@valid,known`.
+    /// The sidecar's name: `bounds:symbol@ts`, `temporal2:id@valid,known`,
+    /// or a sketch's `sketch:batch,id` (approximate; never planned with).
     pub sidecar: String,
     /// Completeness sequence.
     pub complete_at: Option<u64>,

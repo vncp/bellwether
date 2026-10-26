@@ -41,7 +41,6 @@ pub mod cache;
 pub mod evidence;
 pub mod fanout;
 pub mod footer;
-pub mod hll;
 pub mod lints;
 pub mod manifest;
 pub mod quantile;

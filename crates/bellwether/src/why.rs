@@ -28,6 +28,7 @@ use crate::index::{instant_in_unit, no_time_column};
 use crate::keys::KeyFile;
 use crate::lookback::Lookback;
 use crate::results::{total, Cost, LookbackWindow, LookupKind, Written};
+use crate::sketch::{CountingSource, ItemCardinality};
 use crate::spec::label;
 
 /// Who the engine's own candidate proposals are by.
@@ -141,6 +142,13 @@ pub struct WhyRequest {
     /// Most profile candidates replayed beyond the workload's own key
     /// columns.
     pub max_candidates: usize,
+    /// Diagnose from the index's complete `sketch` sidecars alone: the
+    /// profile's key-read pass is skipped, so no data file is read, and the
+    /// report's `sketch` column and the `R-sketch-1` lint carry the
+    /// diagnosis (approximate). Needs a complete sketch; refuses a workload
+    /// (its keys are priced by reading key columns) and `columns`.
+    #[serde(default)]
+    pub sketches_only: bool,
 }
 
 impl Default for WhyRequest {
@@ -157,6 +165,7 @@ impl Default for WhyRequest {
             ts_column: None,
             columns: None,
             max_candidates: DEFAULT_MAX_CANDIDATES,
+            sketches_only: false,
         }
     }
 }
@@ -334,6 +343,10 @@ pub struct Candidate {
     /// The Replay scoring that Proposal (`inputs`: the catalog digest; a
     /// key replay is exact, so no `model`; contract v2.1).
     pub replay: Written,
+    /// This candidate's index-kind column (`bellwether_types::KindColumn`),
+    /// when its kind contributes one; absent (omitted in JSON) otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind_column: Option<bellwether_types::KindColumn>,
 }
 
 /// The candidate that reads the least under the requested lookup kind
@@ -471,6 +484,22 @@ pub struct WhyReport {
     /// the identity re-read that stood in for one. Omitted for a folder.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tables: Vec<TableRun>,
+    /// The `sketch` column: for each item of the index's complete `sketch`
+    /// sidecars, its approximate distinct count with its bound, fanout
+    /// (`rows_per_value`), and files per value, read from the sketch's
+    /// segments (no data file). Labelled approximate; `exact_distinct` is
+    /// set where a complete `exact` key spec on the same columns holds the
+    /// exact count. Empty without a complete sketch. No plan reads it.
+    #[serde(default)]
+    pub sketch: Vec<ItemCardinality>,
+    /// The data this report read for its diagnosis.
+    #[serde(default)]
+    pub reads: DiagnosisReads,
+    /// Whether the diagnosis came from sketches alone
+    /// ([`WhyRequest::sketches_only`]): the profile read no data, and its
+    /// fanout table is empty.
+    #[serde(default)]
+    pub from_sketches: bool,
 }
 
 fn exact_default() -> bool {
@@ -480,6 +509,18 @@ fn exact_default() -> bool {
 #[allow(clippy::trivially_copy_pass_by_ref)]
 fn is_exact(e: &bool) -> bool {
     *e
+}
+
+/// Data a `why` read: row groups read through the source (the profile's
+/// key-read pass, a key file's replay), and the distinct files they belong
+/// to. Footer statistics are metadata, read (and cached) for every file,
+/// and not counted.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DiagnosisReads {
+    /// Files whose data pages were read.
+    pub files: u64,
+    /// Row groups read.
+    pub row_groups: u64,
 }
 
 impl Engine {
@@ -532,6 +573,21 @@ impl Engine {
     fn why_inner(&self, req: &WhyRequest) -> Result<WhyReport> {
         let has_workload = self.check_why_request(req)?;
         let pinned = self.pin()?;
+        let sketches = match &pinned {
+            Some(p) => crate::sketch::fold_complete_sketches(p)?,
+            None => Vec::new(),
+        };
+        if req.sketches_only && sketches.is_empty() {
+            return Err(Error::NotIndexed {
+                root: self.root().to_string(),
+                operation: "why --sketches-only",
+                needs: Some("sketch:<columns>".into()),
+            });
+        }
+        let (sketch, sketch_lints) = match &pinned {
+            Some(p) => sketch_view(p, &sketches)?,
+            None => (Vec::new(), Vec::new()),
+        };
         let folder = self.source(pinned.as_ref())?;
         // Pinned to an earlier manifest: the dataset is exactly the files
         // that manifest recorded, for the profile as for the replay.
@@ -540,11 +596,13 @@ impl Engine {
             (Some(p), Some(_)) => Box::new(SnapshotFiles::new(folder, p.manifest())),
             _ => folder,
         };
+        let counting = CountingSource::new(&*source);
+        let source: &dyn bellwether_types::Source = &counting;
         let sequence = pinned.as_ref().map_or(0, Pinned::sequence);
         let current_specs = pinned.as_ref().map(|p| p.specs().0).unwrap_or_default();
         let replayer = match &pinned {
-            Some(p) => Replayer::for_snapshot(&*source, &p.snapshot)?,
-            None => Replayer::unindexed(&*source, self.root(), &self.partitioning(None)?)?,
+            Some(p) => Replayer::for_snapshot(source, &p.snapshot)?,
+            None => Replayer::unindexed(source, self.root(), &self.partitioning(None)?)?,
         };
         let resolved_temporal = resolve_temporal(req, replayer.schema())?;
         let catalog = replayer.catalog();
@@ -570,7 +628,8 @@ impl Engine {
                 untracked.push(fp.path);
             }
         }
-        let (profile, evidence) = self.profile(req, &*source, pinned.as_ref(), has_workload)?;
+        let (profile, evidence) =
+            self.profile(req, source, pinned.as_ref(), has_workload, sketch_lints)?;
         let mut report = WhyReport {
             root: self.root().to_string(),
             sequence,
@@ -589,6 +648,9 @@ impl Engine {
             exact: true,
             model: None,
             tables: Vec::new(),
+            sketch,
+            reads: DiagnosisReads::default(),
+            from_sketches: req.sketches_only,
         };
         let workload = if has_workload {
             let cache = self.cache()?;
@@ -615,9 +677,119 @@ impl Engine {
             report.model = Some(MEASURED_AGGREGATES.to_string());
             report.tables = self.finish_tables()?;
         }
+        let (files, row_groups) = counting.reads();
+        report.reads = DiagnosisReads { files, row_groups };
         Ok(report)
     }
+}
 
+/// The `sketch` kind's funnel column for a candidate on `columns`: the
+/// fanout (rows per value) of the sketched item on exactly those columns,
+/// `≈` and labelled approximate (`Measured` by the sketch's estimator), or
+/// exact where a complete exact key spec holds the distinct count. `None`
+/// when no complete sketch holds that item.
+fn sketch_column(
+    sketch: &[ItemCardinality],
+    columns: &[String],
+) -> Option<bellwether_types::KindColumn> {
+    let item = sketch.iter().find(|i| i.cardinality.columns == columns)?;
+    let c = &item.cardinality;
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let fanout = c.rows_per_value.round() as u64;
+    let (value, exactness) = if c.rows_per_value_exact {
+        (fanout.to_string(), bellwether_types::Exactness::Exact)
+    } else {
+        (
+            format!("≈{fanout}"),
+            bellwether_types::Exactness::Measured {
+                model: "sketch.hll".into(),
+            },
+        )
+    };
+    Some(bellwether_types::KindColumn {
+        kind: "sketch".into(),
+        label: if c.rows_per_value_exact {
+            "rows per value (exact distinct count)".into()
+        } else {
+            format!(
+                "rows per value, approximate (±{:.1}% distinct)",
+                300.0 * c.relative_standard_error
+            )
+        },
+        value,
+        exactness,
+    })
+}
+
+/// The `sketch` column and the `R-sketch-1` lints from the folded complete
+/// sketches: one entry per distinct item (the finest sketch holding it),
+/// and the low-cardinality-key detector over each sketch's single-column
+/// items. Reads sketch and exact-key segments, no data.
+#[allow(clippy::type_complexity)]
+fn sketch_view(
+    pinned: &Pinned,
+    folded: &[crate::sketch::Folded],
+) -> Result<(Vec<ItemCardinality>, Vec<bellwether_types::Lint>)> {
+    let schema = pinned.planner.schema();
+    let mut column = Vec::new();
+    let mut seen: BTreeSet<String> = BTreeSet::new();
+    let mut lints: Vec<bellwether_types::Lint> = Vec::new();
+    for f in folded {
+        let mut singles = Vec::new();
+        for (i, item) in f.spec.items.iter().enumerate() {
+            let label = bellwether_types::SketchSpec::item_label(item);
+            let exact = crate::sketch::exact_distinct(pinned, item)?;
+            let card = f.totals.cardinality(i, exact)?;
+            if item.len() == 1 {
+                singles.push((i, card.clone()));
+            }
+            if seen.insert(label.clone()) {
+                if let Some((best, bi)) = crate::sketch::best_sketch(folded, &label) {
+                    let card = if std::ptr::eq(best, f) {
+                        card
+                    } else {
+                        best.totals.cardinality(bi, exact)?
+                    };
+                    column.push(ItemCardinality {
+                        source: crate::sketch::SketchSource::Index,
+                        sketch: Some(best.spec.label()),
+                        cardinality: card,
+                    });
+                }
+            }
+        }
+        let cols: Vec<bellwether_profile::lints::SketchedColumn> = singles
+            .iter()
+            .map(|(i, c)| {
+                Ok(bellwether_profile::lints::SketchedColumn {
+                    column: c.item.clone(),
+                    data_type: schema
+                        .field_with_name(&c.item)
+                        .map_err(|e| Error::KeySpec(e.to_string()))?
+                        .data_type()
+                        .clone(),
+                    rows: c.rows,
+                    distinct: c.exact_distinct.unwrap_or(c.distinct),
+                    distinct_exact: c.exact_distinct.is_some(),
+                    files_present: f.totals.copresent(*i, *i),
+                    copresent: singles
+                        .iter()
+                        .filter(|(j, _)| j != i)
+                        .map(|(j, o)| (o.item.clone(), f.totals.copresent(*i, *j)))
+                        .collect(),
+                })
+            })
+            .collect::<Result<_>>()?;
+        for l in bellwether_profile::lints::low_cardinality_key(&cols) {
+            if !lints.iter().any(|x| x.columns.first() == l.columns.first()) {
+                lints.push(l);
+            }
+        }
+    }
+    Ok((column, lints))
+}
+
+impl Engine {
     /// Refuses a `why` request whose flags contradict each other, before any
     /// work. Returns whether it carries a workload.
     fn check_why_request(&self, req: &WhyRequest) -> Result<bool> {
@@ -636,6 +808,23 @@ impl Engine {
         }
         if let Some(cols) = &req.columns {
             self.check_columns(&cols.iter().collect::<Vec<_>>())?;
+        }
+        if req.sketches_only && given.iter().any(|g| *g) {
+            return Err(Error::InvalidArgument {
+                field: "sketches_only",
+                reason: "a workload's keys are priced by reading their key columns, which a \
+                         diagnosis from sketches alone does not do; drop the sketches-only option \
+                         to replay them, or drop the workload"
+                    .into(),
+            });
+        }
+        if req.sketches_only && req.columns.is_some() {
+            return Err(Error::InvalidArgument {
+                field: "sketches_only",
+                reason: "columns choose what the profile reads and measures; a diagnosis from \
+                         sketches alone reads no column, so drop one of the two"
+                    .into(),
+            });
         }
         let mode = req.lookup_mode().map_err(Error::KeySpec)?;
         if req.window.is_some() && !(given[0] || given[1]) {
@@ -700,6 +889,7 @@ impl Engine {
         source: &dyn bellwether_types::Source,
         pinned: Option<&Pinned>,
         has_workload: bool,
+        sketch_lints: Vec<bellwether_types::Lint>,
     ) -> Result<(ProfileReport, ProfileEvidence)> {
         let writable = if has_workload {
             Some(Arc::clone(self.store()?))
@@ -732,6 +922,10 @@ impl Engine {
         };
         let mut options = ProfileOptions::for_source(&self.source_config(pinned)?);
         options.columns.clone_from(&req.columns);
+        if req.sketches_only {
+            // No candidate: the key-read pass reads nothing.
+            options.columns = Some(Vec::new());
+        }
         // A fixed clock asks for reproducible output: recompute the cached
         // artifacts rather than reuse them, so no input carries a wall-clock
         // age or a cache hit.
@@ -761,7 +955,11 @@ impl Engine {
                 }
             }
         }
-        let profile = bellwether_profile::profile(source, self.root(), &store, &options)?;
+        let mut profile = bellwether_profile::profile(source, self.root(), &store, &options)?;
+        // The sketch detector's lints join the profile's before the
+        // Evidence is built, so the Evidence records them; its provenance
+        // cites the manifest, which names the sketch segments by content.
+        profile.lints.extend(sketch_lints);
         let mut evidence = bellwether_profile::evidence(&profile)?;
         // Every record this engine writes carries the engine's clock.
         evidence.provenance.created_at = self.now();
@@ -1177,6 +1375,7 @@ impl Engine {
             } else {
                 None
             };
+            let kind_column = sketch_column(&report.sketch, spec.columns());
             report.candidates.push(Candidate {
                 spec,
                 origin,
@@ -1187,6 +1386,7 @@ impl Engine {
                     hash: replay_hash,
                     record: Record::Replay(scored.replay),
                 },
+                kind_column,
             });
         }
         let current = match report.candidates.first() {

@@ -571,7 +571,7 @@ fn p6_auto_selection_keeps_a_string_id_in_tiny_row_groups() {
 
 #[test]
 fn p7_stated_sampling_error_is_honest_over_many_seeds() {
-    use bellwether_profile::hll::Hll;
+    use bellwether_core::hll::Hll;
     let occurs = |v: u64, r: u64| mix(v.wrapping_mul(0x9E37_79B9) ^ r) % (1 + v % 9) == 0;
     let mut per: BTreeMap<u64, (BTreeSet<u64>, BTreeSet<u64>)> = BTreeMap::new();
     let mut files = Vec::new();

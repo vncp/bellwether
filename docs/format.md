@@ -59,6 +59,8 @@ Versioned from the first commit. `bellwether-types::format::STORAGE_VERSION` is 
                                            latest/asof return every row group at the winning ts (ties)
                                  bounds, temporal2: sidecar segments, their own layout (magic "BWSIDECR"); see
                                            "Sidecar kinds"
+                                 sketch:   sidecar segment, its own layout (magic "BWSKETCH"); approximate, never
+                                           read by a planner; see "Sketch segments"
   ledger/<blake3>.rec            Record (Evidence | Proposal | Replay | Certificate | Receipt), canonical JSON
                                  Receipt.certificate must resolve and have pass == true
   ledger/<blake3>.sig.<key id>.json
@@ -279,3 +281,39 @@ A block holds at most 1024 keys or 64 KiB of key bytes. Readers refuse a newer s
 | `temporal2 record valid=1 known=86400000000 rg=2` | `01 00 00 00 00 00 00 00 00 60 d7 1d 14 00 00 00 02 00 00 00` |
 | `bounds:symbol@ts blake3` | `56b28b58922841137a0d3b51f47293790dd8099934f56292360b683405863b95` |
 | `temporal2:symbol@valid,known blake3` | `63dc33afbfe97a78dcd5003a3390061bca9c20fdf19e811a24c839170548d31c` |
+
+## Sketch segments (storage version 1, additive sidecar kind, 2026-10-26)
+
+`schema.sidecars[]` holds structures the planner never reads, beside the key specs it plans with. `sketch` is the first that is approximate: per item, per file, HyperLogLog registers and an optional MinHash signature, answering `count(distinct item)` and the overlap of two items with an error bound. It is declared `{kind: "sketch", columns: [items], time_columns: [], params: {"p": "<precision>", "minhash": "<k>"}}`, where an item is one column or a `+`-joined tuple (`symbol+ts`), and named `sketch:<items joined by ,>` (no `@`: it has no time column). `params` omits `minhash` when no signature is kept; the default precision is 14. Its segments are listed with `kind: "sketch"` and that name as `key_spec`, are complete under that name exactly as a key spec is, and are built over the row groups they do not cover. **No planner path reads a sketch segment**: a plan built from an approximate number could miss a row group (invariant 1). A binary that does not know the kind keeps the declaration and the segments (see "Segment kinds").
+
+An item's value is its canonical bytes (ADR 016); a tuple is encoded like a composite key (ADR 014): a row whose leading column is null is not sketched and counts as a null, and a null trailing column is the `0x00` marker. Each value is hashed once with XXH3-128, seed `0x6265_6c6c_7765_7468` (the profiler's seed, so a column's merged registers equal the profiler's sketch of it). The low 64 bits feed the HyperLogLog: register index = the top `p` bits, rank = leading zeros of the remaining bits plus one, capped at `65 - p`. MinHash slot `i` is `mix64(h1 + i * (h2 | 1))`, wrapping, with `h1`/`h2` the low/high 64 bits and `mix64` SplitMix64's finalizer; the signature keeps each slot's minimum. Registers merge by maximum and slots by minimum, both lossless, so a file split across segments merges back to the sketch of the whole file.
+
+One entry per file stretch: the build starts an entry whenever the file changes or a row-group id does not follow the previous one, so an entry's row groups always belong to one file. Layout, all integers little-endian:
+
+```
+preamble  magic "BWSKETCH" | storage_version u32 | encoding_version u32 | header_len u32
+header    JSON {storage_version, encoding_version, kind:"sketch", items:[[col,..],..], item_types?:[[ColumnType,..],..],
+                precision, minhash:k|null, hash:"xxh3_128", seed, codec:"none", ..unknown preserved}
+body      entry*; entry = rg_start u32 | rg_end u32 | item* (header order)
+          item    = rows u64 | nulls u64 | hll | minhash?
+          hll     = 0x00 | n u32 | n x (index u32 | rank u8)    sparse, iff 4 + 5n < 2^p
+                  | 0x01 | 2^p x rank u8                        dense, otherwise
+          minhash = k x u64                                     present iff the header's minhash is k
+footer    entries u32 | range_start u32 | range_end u32 | BLAKE3 of every byte before the checksum (32) | magic "BWSKETCH"
+```
+
+Readers refuse: a newer storage or encoding version, any kind, codec, hash, or seed but the ones above, a checksum mismatch (so every damaged byte is refused, never read as another estimate), entries that are empty (`rg_start >= rg_end`), out of order, overlapping, or outside `[range_start, range_end)` (the row groups the writer processed, recorded so that two segments over different row groups never share bytes), sparse indices out of order or range, a rank of 0 in a sparse list or above `65 - p` anywhere, the encoding the size rule does not pick, and an item whose `rows` disagrees with its registers (`rows = 0` exactly when every register is 0 and every slot is `u64::MAX`). A reader also refuses a segment whose `item_types` differ from the dataset's types for those columns, because its hashes describe other bytes.
+
+Estimates. Distinct counts use Ertl's improved raw estimator (relative standard error about `1.04 / sqrt(2^p)`, 0.81 % at `p = 14`); the reported interval is three standard errors either side, clamped to `[1, rows]` when any row was sketched. Overlap is MinHash when both items keep signatures of one length (the share of agreeing slots, bounded by the Wilson score interval at three standard errors), else HyperLogLog inclusion-exclusion over the merged registers with bounds propagated from each estimate's interval. Items of different column types are refused (their values never compare equal), as are items at different precisions. Every number derived from a sketch is labelled `approximate` in every type and every output.
+
+## Sketch conformance vectors (storage version 1)
+
+`crates/bellwether-core/tests/sketch.rs` writes the reference segment (items `id` (Int64) and `id+tag` (Int64, Utf8), `p = 4`, `minhash = 2`; file 0 is one row group holding `(1, "a")` and `(2, null)`; file 1 is two row groups, `(1, "a")` then `(null, null)`; row groups 0..3) and checks every row of this table byte for byte.
+
+| Vector | Bytes |
+|---|---|
+| `value_hash(Int64 1)` | `d6ef277c610adb0706d0067c5aa355d5` |
+| `preamble` | `42 57 53 4b 45 54 43 48 01 00 00 00 01 00 00 00 f3 00 00 00` |
+| `first entry, item id` | `00 00 00 00 01 00 00 00 02 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 02 00 00 00 00 00 00 00 02 0f 00 00 00 03 08 a9 ce 44 2c 92 04 07 de 13 b3 66 ea df fb b4` |
+| `footer` | `02 00 00 00 00 00 00 00 03 00 00 00 ab 25 6d ba de e3 11 dd b0 80 2d e7 f2 40 53 1b a6 12 d6 4b 1e 04 dc d8 62 76 30 ad a5 67 a7 d0 42 57 53 4b 45 54 43 48` |
+| `segment blake3` | `e84c9be5a3d4bdad2674f98364b2d2440e40795bf7f91c35a5c923429ddfd4f3` |

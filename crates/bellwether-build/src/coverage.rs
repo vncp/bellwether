@@ -20,9 +20,9 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use bellwether_core::sidecar::SidecarDef;
 use bellwether_store::{Manifest, RowGroupSpace, SegmentRef, KNOWN_SEGMENT_KINDS};
-use bellwether_types::{Error, KeySpec, Result, RowGroupId};
+use bellwether_types::{Error, KeySpec, Result, RowGroupId, SketchSpec};
 
-use crate::target::{declared_sidecars, declared_targets, Target};
+use crate::target::{declared_sidecars, declared_sketches, declared_targets, Target};
 use roaring::RoaringBitmap;
 
 /// Every live id, failing if a tracked file lists an id twice or two files
@@ -114,6 +114,17 @@ pub fn sidecar_completeness(manifest: &Manifest, def: &SidecarDef) -> Option<u64
         return None;
     }
     recorded_and_covered(manifest, &def.name())
+}
+
+/// The sequence at which the sketch `spec` became complete in `manifest`,
+/// or `None`, by the same rules as [`completeness`]. A sketch is read only
+/// by `cardinality`, `overlap`, and the `why` report, never by a planner.
+#[must_use]
+pub fn sketch_completeness(manifest: &Manifest, spec: &SketchSpec) -> Option<u64> {
+    if !declared_sketches(manifest).contains(spec) {
+        return None;
+    }
+    recorded_and_covered(manifest, &spec.name())
 }
 
 fn recorded_and_covered(manifest: &Manifest, name: &str) -> Option<u64> {

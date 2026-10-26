@@ -103,4 +103,5 @@ Gaps the Phase 2 crates found in the contract and the docs, with interim behavio
 - SQL sources: scheduled as WP20 (ADR 027) now that the `Source` trait has survived two real sources.
 - Delta and Iceberg manifest-aware discovery: for now, folders of Parquet.
 - Learned components (churn-predicted layout, learned bloom oracle): research track; needs M3 data.
+- Learned or adaptive index structures: an approximate number must never reach a planner path (invariant 1); sketches (B2) are the only approximate structure and they never prune.
 - Distributed build: segments are already independent; a coordinator is a later convenience.

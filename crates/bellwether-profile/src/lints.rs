@@ -6,6 +6,7 @@
 //! | `low_selectivity_single_column` | the median value of `C` touches at least [`LOW_SELECTIVITY_MIN_FRACTION`] of all row groups, some id-like `O` that is not a batch stamp makes the composite's p95 at most half of that median, and `C` is not a batch stamp (a batch stamp is not a key at all) |
 //! | `scattered_time_column` | a date or timestamp column's overlap depth is at least `SCATTER_MIN_DEPTH` and its sortedness below `SCATTER_MAX_SORTEDNESS` (`bellwether_source::stats`) |
 //! | `declared_but_unused_key` | a manifest declares a key spec and a recorded workload exists whose runs never supply the spec's leading column |
+//! | `R-sketch-1` (low-cardinality key, [`low_cardinality_key`]) | from `sketch` sidecars, not the profile: a sketched column `B` whose values each cover at least [`LOW_CARDINALITY_MIN_ROWS_PER_VALUE`] rows, beside an id-like sketched column `K` with at least [`LOW_CARDINALITY_PARTNER_RATIO`] times `B`'s distinct values, present in at least [`LOW_CARDINALITY_COPRESENCE`] of the files `B` is present in |
 //! | `no_discriminating_column` | the dataset has at least 2 row groups and every measured single column (composites are not searched) has a median value touching at least [`NO_DISCRIMINATING_MIN_FRACTION`] of all row groups: the layout, not a missing index, sets the cost of a lookup |
 //!
 //! The two decisions the benchmark also makes are not reimplemented here:
@@ -66,6 +67,19 @@ pub const DECLARED_BUT_UNUSED_KEY: &str = "declared_but_unused_key";
 /// Rule id: no measured key prunes, because every value is spread over
 /// nearly every row group.
 pub const NO_DISCRIMINATING_COLUMN: &str = "no_discriminating_column";
+
+/// Rule id of the `sketch` detector (`docs/rule-catalog.md`): the
+/// low-cardinality key, read from sketches.
+pub const LOW_CARDINALITY_KEY_FROM_SKETCHES: &str = "R-sketch-1";
+/// `R-sketch-1`: the fewest rows one value of the column must cover on
+/// average (rows over approximate distinct values), the threshold of the
+/// low-cardinality-key lint.
+pub const LOW_CARDINALITY_MIN_ROWS_PER_VALUE: f64 = 100_000.0;
+/// `R-sketch-1`: the partner's distinct values over the column's, at least.
+pub const LOW_CARDINALITY_PARTNER_RATIO: f64 = 10.0;
+/// `R-sketch-1`: files holding both columns over files holding the column,
+/// at least.
+pub const LOW_CARDINALITY_COPRESENCE: f64 = 0.9;
 
 /// Confidence of a high finding.
 pub const HIGH: f64 = 0.9;
@@ -461,6 +475,101 @@ fn no_discriminating(entries: &[FanoutEntry]) -> Option<Lint> {
         confidence: if sampled { LOW } else { HIGH },
         site: None,
     })
+}
+
+/// One sketched single column, as [`low_cardinality_key`] reads it: the
+/// facade folds a `sketch` sidecar's segments into these. Every distinct
+/// count is approximate unless `distinct_exact`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SketchedColumn {
+    /// The column.
+    pub column: String,
+    /// Its dataset type (id-likeness of a partner).
+    pub data_type: arrow::datatypes::DataType,
+    /// Rows holding a value (non-null). Exact.
+    pub rows: u64,
+    /// Distinct values: the sketch's estimate, or the exact count.
+    pub distinct: u64,
+    /// Whether `distinct` is exact.
+    pub distinct_exact: bool,
+    /// Files holding a value of the column. Exact.
+    pub files_present: u64,
+    /// Per other column of the same sketch: files holding both. Exact.
+    pub copresent: Vec<(String, u64)>,
+}
+
+/// `R-sketch-1`, the low-cardinality key, from sketches alone (no data file
+/// is read): column `B` fires when its values each cover at least
+/// [`LOW_CARDINALITY_MIN_ROWS_PER_VALUE`] rows on average and an id-like
+/// column `K` of the same sketch has at least
+/// [`LOW_CARDINALITY_PARTNER_RATIO`] times as many distinct values and sits
+/// in at least [`LOW_CARDINALITY_COPRESENCE`] of `B`'s files: `B` behaves
+/// like a batch stamp beside the real id, and the advice is the composite
+/// `(K, B)`. The partner with the most distinct values is named. Medium
+/// confidence: the counts are approximate (or exact, which raises it to
+/// high when both are).
+#[must_use]
+pub fn low_cardinality_key(columns: &[SketchedColumn]) -> Vec<Lint> {
+    let mut out = Vec::new();
+    for b in columns {
+        if b.distinct == 0 {
+            continue;
+        }
+        #[allow(clippy::cast_precision_loss)]
+        let rows_per_value = b.rows as f64 / b.distinct as f64;
+        if rows_per_value < LOW_CARDINALITY_MIN_ROWS_PER_VALUE {
+            continue;
+        }
+        let partner = columns
+            .iter()
+            .filter(|k| k.column != b.column && crate::fanout::is_id_like(&k.data_type))
+            .filter(|k| {
+                #[allow(clippy::cast_precision_loss)]
+                let ratio = k.distinct as f64 / b.distinct as f64;
+                ratio >= LOW_CARDINALITY_PARTNER_RATIO
+            })
+            .filter(|k| {
+                let both = b
+                    .copresent
+                    .iter()
+                    .find(|(c, _)| *c == k.column)
+                    .map_or(0, |(_, n)| *n);
+                #[allow(clippy::cast_precision_loss)]
+                let share = both as f64 / b.files_present.max(1) as f64;
+                share >= LOW_CARDINALITY_COPRESENCE
+            })
+            .max_by_key(|k| k.distinct);
+        let Some(k) = partner else {
+            continue;
+        };
+        let exact = b.distinct_exact && k.distinct_exact;
+        let tag = |e: bool| if e { "exact" } else { "approximate" };
+        out.push(Lint {
+            rule: LOW_CARDINALITY_KEY_FROM_SKETCHES.to_string(),
+            columns: vec![b.column.clone(), k.column.clone()],
+            message: format!(
+                "{b_col} is a low-cardinality key: about {rpv} rows share each of its {bd} values \
+                 ({bt}, from sketches; no data file read), beside {k_col} with {kd} values ({kt}) \
+                 in the same files; a lookup keyed on {b_col} alone reads every row of a value, \
+                 so key on the composite ({k_col}, {b_col}) instead",
+                b_col = b.column,
+                k_col = k.column,
+                rpv = fmt_count(rows_per_value.round()),
+                bd = fmt_count(f64_of(b.distinct)),
+                kd = fmt_count(f64_of(k.distinct)),
+                bt = tag(b.distinct_exact),
+                kt = tag(k.distinct_exact),
+            ),
+            confidence: if exact { HIGH } else { MEDIUM },
+            site: None,
+        });
+    }
+    out
+}
+
+#[allow(clippy::cast_precision_loss)]
+fn f64_of(v: u64) -> f64 {
+    v as f64
 }
 
 #[cfg(test)]

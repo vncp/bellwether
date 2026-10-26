@@ -14,7 +14,7 @@ mod common;
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use bellwether_profile::hll::Hll;
+use bellwether_core::hll::Hll;
 use bellwether_profile::{
     profile, DistinctSource, FanoutEntry, ProfileOptions, DEFAULT_HLL_PRECISION,
 };
