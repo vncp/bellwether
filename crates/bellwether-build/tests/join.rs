@@ -615,7 +615,7 @@ fn a_missing_exact_key_on_either_side_is_refused_naming_it() {
     }
     // Nothing was declared by a refused refresh.
     assert!(!planner(&p.left).declared_specs().contains(&join(true)));
-    // A right exact key that is declared but not complete does not count.
+    // An exact key on other columns does not count.
     let fresh = Pair::new(false);
     let other = KeySpec::Join {
         dataset: "orders".into(),
@@ -631,6 +631,48 @@ fn a_missing_exact_key_on_either_side_is_refused_naming_it() {
         matches!(&err, Error::NotIndexed { needs: Some(n), .. } if n.starts_with("exact:amount")),
         "{err:?}"
     );
+    // An exact key declared, with its segments, but not complete (its
+    // completeness entry dropped, as a partial build leaves it) does not
+    // count either, on either side: a pair from it could miss row groups.
+    for (side, store, name) in [
+        ("right", &fresh.right, "exact:paid_order"),
+        ("left", &fresh.left, "exact:order_id"),
+    ] {
+        let staged = bellwether_store::StagedSegments::new();
+        bellwether_store::commit_with(
+            &**store,
+            "idx",
+            &staged,
+            bellwether_store::CommitOptions::default(),
+            |m| {
+                let mut next = m.clone();
+                assert!(next.key_spec_completeness.remove(name).is_some());
+                Ok(next)
+            },
+        )
+        .unwrap();
+        assert!(planner(store)
+            .declared_specs()
+            .iter()
+            .any(|s| s.identity() == name));
+        let err = builder(&fresh.left)
+            .refresh_join(&join(false), &fresh.right, "idx")
+            .unwrap_err();
+        assert!(
+            matches!(&err, Error::NotIndexed { needs: Some(n), .. }
+                if n.starts_with(name) && n.contains(&format!("{side} side"))),
+            "{side}: {err:?}"
+        );
+        let lsnap = Snapshot::open(Arc::clone(&fresh.left), "idx").unwrap();
+        let rsnap = Snapshot::open(Arc::clone(&fresh.right), "idx").unwrap();
+        assert!(
+            matches!(
+                transient_pair(&lsnap, &rsnap, &join(false)),
+                Err(Error::NotIndexed { .. })
+            ),
+            "{side}: the price is refused too"
+        );
+    }
 }
 
 #[test]
