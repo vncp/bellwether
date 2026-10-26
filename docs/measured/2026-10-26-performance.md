@@ -11,6 +11,7 @@ The README charts use the subset in [`results/perf.json`](results/perf.json), wh
   - Its sha256 is `3f05ece30dc06e847027a37400f6360ad9f17e60a3a9582b0667ad0dd85f2c70`. `perf.json` records it per run.
   - It was built from the sources at `f809e54`, the newest commit that touches a Rust source or a Cargo manifest. The tree had no modified sources at any run (`built_from_dirty: false`), and cargo rebuilds whenever one of those files changes.
   - The commits named in [How it ran](#how-it-ran) differ from `f809e54` only in scripts and documents.
+  - **Those hashes predate a rebase.** All of them, `f809e54` included, are from this branch before it was rebased onto `cacd4eb` (WP19, signed receipts), and the tag `wp22a-measured-2026-10-26` keeps them. The rebase brought in WP19's Rust changes, which this run did not measure.
 - **DuckDB.** v2.0.0 (d54cbbe3df), the CLI, on the same files.
 - **Cache.**
   - **Warm** means the same call ran just before.
