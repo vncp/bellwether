@@ -22,7 +22,8 @@ bellwether = { path = "../bellwether" }
 bellwether-bench = { path = "../bellwether-bench" }
 # The `mcp` subcommand only: `bellwether mcp` is `bellwether-mcp`.
 bellwether-mcp = { path = "../bellwether-mcp" }
-clap = { version = "4", features = ["derive"] }
+# `env`: BELLWETHER_SIGNING_KEY and BELLWETHER_TRUSTED_KEYS (paths only).
+clap = { version = "4", features = ["derive", "env"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 

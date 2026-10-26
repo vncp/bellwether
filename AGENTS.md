@@ -55,6 +55,30 @@ already holds.
 | apply | `apply.receipt` | Replay, the index commit, Receipt; nothing with `dry_run` or on a refusal, unless another commit lands during the apply (`concurrent_commit`: the key is built, the receipt withheld) |
 | jobs | `jobs.start`, `jobs.status`, `jobs.result` | whatever the started tool writes |
 
+## Signatures in `chains[]`
+
+Each receipt chain in a result's envelope lists `signatures`: one entry per
+signature object beside the receipt or its certificate, with `status`
+`valid` (it verifies under its own public key) or `invalid` (with a
+`reason`). When the server runs with `--trusted-keys`, the chain also has a
+`verdict`:
+
+- `signed`: every link is present, the receipt and its certificate are each
+  signed by a trusted key within its window, and the evidence is about this
+  server's data folder.
+- `links_flagged`: a link is missing, of the wrong kind, or unreadable.
+- `invalid`: a signature does not verify.
+- `untrusted`: signed, but by no trusted key within its window.
+- `unsigned`: no signature on the receipt or its certificate.
+- `other_root`: validly signed, but for another data folder (a chain copied
+  from another index); it vouches for nothing here.
+- `no_root`: signed, but no evidence in the chain names a data folder.
+
+Without `--trusted-keys` there is no verdict. You cannot sign anything: the
+engine signs only what `score.verify` and `apply.receipt` wrote, and only
+when the server was started with `--signing-key`. Quote the verdict as
+given; never call a chain signed unless its verdict is `signed`.
+
 ## Refusal codes
 
 Every refusal carries `code`, the facts you need to act, and one `next`

@@ -29,8 +29,10 @@
 //!
 //! # Write paths
 //!
-//! The only ways to write are [`Ledger::put`] and [`Ledger::put_receipt`].
-//! The wrapped store is not reachable through the ledger:
+//! The only ways to write are [`Ledger::put`], [`Ledger::put_receipt`], and
+//! [`Ledger::sign`], which writes a detached signature object beside a
+//! stored receipt or certificate (ADR 029). The wrapped store is not
+//! reachable through the ledger:
 //!
 //! ```compile_fail
 //! fn bypass<S, T>(ledger: &bellwether_ledger::Ledger<S>)
@@ -41,6 +43,15 @@
 //!     let _ = ledger.store();
 //! }
 //! ```
+//!
+//! # Signatures
+//!
+//! A signature is an object beside the record, never a record kind or a
+//! field ([`signature`] module docs). [`Ledger::signatures`] verifies every
+//! object beside a record on its own; [`Ledger::verify_against`] folds them
+//! against a reader's [`TrustedKeys`] into a [`Verdict`]. A [`SigningKey`]
+//! goes in by reference and never comes back out: no call returns secret
+//! key material, and nothing secret is written.
 //!
 //! # Append-only, no garbage collection
 //!
@@ -63,6 +74,7 @@
 
 mod explain;
 pub mod rfc3339;
+pub mod signature;
 
 use std::fmt;
 use std::ops::Deref;
@@ -75,6 +87,11 @@ use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 
 pub use explain::{Chain, Link, LinkStatus};
+pub use signature::{
+    is_utc_millis, printable, signature_message, InvalidReason, InvalidSignature, OutsideWindow,
+    PublicKey, SignaturePath, SignatureStatus, SignedBy, SigningKey, TrustError, TrustedKey,
+    TrustedKeys, Verdict, SIGNATURE_ALG, SIGNATURE_DOMAIN, SIGNATURE_VERSION,
+};
 
 /// Directory under the index root that holds ledger records.
 pub const LEDGER_PREFIX: &str = "ledger/";
@@ -496,7 +513,132 @@ where
     /// of the wrong kind, or unreadable is flagged, never an error; only a
     /// store failure or a `receipt` that is not a receipt fails.
     pub fn explain(&self, receipt: &Hash) -> Result<Chain> {
-        explain::explain(self, receipt)
+        explain::explain(self, receipt, None)
+    }
+
+    /// [`Ledger::explain`], with the receipt's and the certificate's
+    /// signatures folded against `trusted` ([`Link::verdict`]); the
+    /// rendering adds `sig=valid(<name>)`, `sig=untrusted(<id prefix>)`,
+    /// `sig=none`, or `sig=INVALID` to those two lines.
+    pub fn explain_verified(&self, receipt: &Hash, trusted: &TrustedKeys) -> Result<Chain> {
+        explain::explain(self, receipt, Some(trusted))
+    }
+
+    /// Signs the stored receipt or certificate `record` with `key` at
+    /// `signed_at` (RFC 3339 UTC with milliseconds), writing the detached
+    /// object `ledger/<record>.sig.<key id>.json` (ADR 029), and returns
+    /// where.
+    ///
+    /// Refused, writing nothing: a `signed_at` in another spelling; a hash
+    /// that is not a stored, readable Receipt or Certificate; a Receipt that
+    /// [`Ledger::put_receipt`] would refuse now (rules 11 to 18 re-run
+    /// against the stored chain, with the receipt's own `manifest_after` as
+    /// the current sequence, since the upper bound was checked when it was
+    /// written); a Certificate that [`Ledger::put`] would refuse now (rules
+    /// 8 to 10). A signature is therefore only made over a chain that passes
+    /// the rules at signing time.
+    ///
+    /// The object is written with `put_if_absent`: signing again with the
+    /// same key is idempotent only if the bytes are identical (ed25519 is
+    /// deterministic, so the same key, record, and `signed_at` give the
+    /// same bytes); a differing object already there is refused, never
+    /// overwritten.
+    pub fn sign(&self, record: &Hash, key: &SigningKey, signed_at: &str) -> Result<SignaturePath> {
+        if !is_utc_millis(signed_at) {
+            return Err(rule(format!(
+                "cannot sign {record}: signed_at {signed_at:?} is not RFC 3339 UTC with \
+                 milliseconds (2026-10-25T00:00:00.000Z)"
+            )));
+        }
+        let refuse = |why: String| rule(format!("cannot sign {record}: {why}"));
+        let bytes = match self.read_verified(record) {
+            Err(Error::NotFound(_)) => {
+                return Err(refuse("no such record in the ledger".to_string()))
+            }
+            other => other?,
+        };
+        let reason = |e: Error| match e {
+            Error::LedgerRule(m) => refuse(m),
+            other => other,
+        };
+        let kind = match decode(&bytes)? {
+            Record::Receipt(r) => {
+                check_write_version(r.record_version)
+                    .and_then(|()| self.check_receipt(&r, &r.manifest_after))
+                    .map_err(reason)?;
+                RecordKind::Receipt
+            }
+            Record::Certificate(c) => {
+                check_write_version(c.record_version)
+                    .and_then(|()| self.check_certificate(&c))
+                    .map_err(reason)?;
+                RecordKind::Certificate
+            }
+            other => {
+                return Err(refuse(format!(
+                    "it is {}; only receipts and certificates are signed",
+                    RecordKind::of(&other).with_article()
+                )))
+            }
+        };
+        let object = signature::signature_bytes(record, kind, key, signed_at)?;
+        let at = SignaturePath {
+            record: *record,
+            key_id: key.key_id(),
+        };
+        let path = at.path();
+        match self.store.put_if_absent(&path, Bytes::from(object.clone())) {
+            Ok(_) => Ok(at),
+            // Refused because something is already there (a store reports
+            // that as a version conflict, or in its own words): identical
+            // bytes are this signature again; anything else is refused.
+            Err(e) => match self.store.get(&path) {
+                Ok((existing, _)) if existing.as_ref() == object.as_slice() => Ok(at),
+                Ok(_) => Err(refuse(format!(
+                    "key {} already signed it with different bytes ({path}); a signature is \
+                     never overwritten",
+                    at.key_id
+                ))),
+                Err(_) => Err(e),
+            },
+        }
+    }
+
+    /// Every signature object beside `record`, each verified on its own
+    /// (no trust set), sorted by key id. A corrupt object is
+    /// [`SignatureStatus::Invalid`], never a panic or an error. The record
+    /// itself is read first: absent is [`Error::NotFound`], and bytes that
+    /// do not hash to its name are the ledger's tamper error, so an altered
+    /// record never reports a signature status at all. Writes nothing.
+    pub fn signatures(&self, record: &Hash) -> Result<Vec<SignatureStatus>> {
+        let bytes = self.read_verified(record)?;
+        let kind = peek(&bytes)?.into_kind()?;
+        let mut at: Vec<SignaturePath> = self
+            .store
+            .list(LEDGER_PREFIX)?
+            .iter()
+            .filter_map(|p| SignaturePath::parse(p))
+            .filter(|s| s.record == *record)
+            .collect();
+        at.sort();
+        at.dedup();
+        let mut out = Vec::with_capacity(at.len());
+        for a in &at {
+            match self.store.get(&a.path()) {
+                Ok((b, _)) => out.push(signature::check_object(&b, a, kind)),
+                Err(Error::NotFound(_)) => {}
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(out)
+    }
+
+    /// [`Ledger::signatures`] folded against `trusted` ([`Verdict::of`]).
+    /// Only a key in `trusted`, signing within its window, makes a record
+    /// [`Verdict::Signed`]; the public key an object carries proves only
+    /// that the object is self-consistent. Writes nothing.
+    pub fn verify_against(&self, record: &Hash, trusted: &TrustedKeys) -> Result<Verdict> {
+        Ok(Verdict::of(&self.signatures(record)?, trusted))
     }
 
     // -- internals ---------------------------------------------------------
