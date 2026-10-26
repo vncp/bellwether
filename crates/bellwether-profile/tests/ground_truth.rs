@@ -30,7 +30,7 @@ mod common;
 
 use std::path::{Path, PathBuf};
 
-use bellwether_profile::hll::Hll;
+use bellwether_core::hll::Hll;
 use bellwether_profile::sampler::high_water_at_most;
 use bellwether_profile::{
     lints, profile, FanoutEntry, ProfileOptions, ProfileReport, DEFAULT_HLL_PRECISION,

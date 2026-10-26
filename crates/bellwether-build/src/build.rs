@@ -17,7 +17,7 @@ use bellwether_store::{
     FileEntry, Manifest, RowGroupSpace, RowGroupTombstone, SchemaInfo, SegmentRef, SourceInfo,
     StagedSegments, StoreExt,
 };
-use bellwether_types::{Error, FileFingerprint, KeySpec, Result, RowGroupId};
+use bellwether_types::{Error, FileFingerprint, KeySpec, Result, RowGroupId, SketchSpec};
 use roaring::RoaringBitmap;
 
 use crate::config::{
@@ -27,7 +27,10 @@ use crate::config::{
 use crate::coverage::{completeness, completeness_map, covered, live_ids, Locator};
 use crate::segments::{self, Ctx, FileRow, SpecPlan};
 use crate::sources::{infer_schema, DataSource};
-use crate::target::{decl_of, declared_sidecars, declared_targets, def_of, unknown_kind, Target};
+use crate::target::{
+    decl_of, declared_sidecars, declared_sketches, declared_targets, known_decl, sketch_columns,
+    sketch_decl, unknown_kind, Target, SKETCH_KIND,
+};
 
 /// Most key specs one index may declare.
 pub const MAX_KEY_SPECS: usize = 64;
@@ -172,6 +175,40 @@ impl<S: StoreExt + ?Sized> Builder<S> {
         }
     }
 
+    /// Drops the segments and the completeness entry of the declared
+    /// sketch `spec`, keeping its declaration, in one manifest commit that
+    /// reads no source file: the next build then sketches every live row
+    /// group again. For a sketch whose segments are missing from the store
+    /// or damaged (a sketch is never planned with, so nothing else depends
+    /// on them). Returns the committed sequence, or `None` if the index does
+    /// not declare `spec`.
+    pub fn reset_sketch(&self, spec: &SketchSpec) -> Result<Option<u64>> {
+        let name = spec.name();
+        let absent = Cell::new(false);
+        let committed = commit_with(
+            &*self.store,
+            &self.index_root,
+            &StagedSegments::new(),
+            CommitOptions::default(),
+            |m| {
+                if !declared_sketches(m).contains(spec) {
+                    absent.set(true);
+                    return Err(Error::KeySpec(format!("sketch {name} is not declared")));
+                }
+                let mut next = m.clone();
+                next.segments
+                    .retain(|s| !(s.kind.as_deref() == Some(SKETCH_KIND) && s.key_spec == name));
+                next.key_spec_completeness.remove(&name);
+                Ok(next)
+            },
+        );
+        match committed {
+            Ok(c) => Ok(Some(c.sequence)),
+            Err(_) if absent.get() => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
     /// Builds or updates the index over the files under `source_root`, in
     /// one manifest commit. The index declares `key_specs` and keeps every
     /// spec it already declares under another name (a spec given under an
@@ -248,7 +285,8 @@ impl<S: StoreExt + ?Sized> Builder<S> {
         let cfg = Config::resolve(base.as_ref(), root, opts)?;
         let declared = declared_specs(base.as_ref(), key_specs, opts.remove_unlisted)?;
         let sidecars = declared_sidecar_defs(base.as_ref(), &opts.sidecars, opts.remove_unlisted)?;
-        let specs = plan_specs(&declared, &sidecars, &cfg.schema)?;
+        let sketches = declared_sketch_specs(base.as_ref(), &opts.sketches, opts.remove_unlisted)?;
+        let specs = plan_specs(&declared, &sidecars, &sketches, &cfg.schema)?;
         let chunk_sizes = base_chunk_sizes(base.as_ref())
             .into_iter()
             .chain(cfg.new_chunk_size.size());
@@ -307,7 +345,7 @@ impl<S: StoreExt + ?Sized> Builder<S> {
             planned_schema: base.as_ref().map(|m| m.schema.clone()).unwrap_or_default(),
             planned_source: base.as_ref().map(|m| m.source.clone()).unwrap_or_default(),
             source: cfg.source_info.clone(),
-            schema: schema_info(base.as_ref(), &cfg, &declared, &sidecars),
+            schema: schema_info(base.as_ref(), &cfg, &declared, &sidecars, &sketches),
             space: files.space.clone(),
             keep: &work.keep,
             replaced: &work.replaced,
@@ -543,14 +581,15 @@ fn declared_specs(
 }
 
 /// The schema this build commits: the dataset columns, the declared key
-/// specs and sidecars, the base's declarations of sidecar kinds this binary
-/// does not know (kept unchanged, as their segments are), and the base's
-/// unknown fields.
+/// specs, sidecars, and sketches, the base's declarations of sidecar kinds
+/// this binary does not know (kept unchanged, as their segments are), and
+/// the base's unknown fields.
 fn schema_info(
     base: Option<&Manifest>,
     cfg: &Config,
     declared: &[KeySpec],
     sidecars: &[SidecarDef],
+    sketches: &[SketchSpec],
 ) -> SchemaInfo {
     SchemaInfo {
         columns: cfg.columns.clone(),
@@ -558,13 +597,11 @@ fn schema_info(
         sidecars: sidecars
             .iter()
             .map(decl_of)
-            .chain(base.iter().flat_map(|m| {
-                m.schema
-                    .sidecars
-                    .iter()
-                    .filter(|d| def_of(d).is_none())
-                    .cloned()
-            }))
+            .chain(sketches.iter().map(sketch_decl))
+            .chain(
+                base.iter()
+                    .flat_map(|m| m.schema.sidecars.iter().filter(|d| !known_decl(d)).cloned()),
+            )
             .collect(),
         extra: base.map(|m| m.schema.extra.clone()).unwrap_or_default(),
     }
@@ -599,19 +636,60 @@ fn declared_sidecar_defs(
     Ok(out)
 }
 
-/// Validates the declared key specs and sidecars against the dataset
-/// schema: key specs first, in declaration order, then sidecars.
+/// The sketches a build declares, by the rules of [`declared_specs`]:
+/// `given`, plus, unless `remove_unlisted`, every sketch the base declares
+/// under another name (a given one under an existing name replaces it).
+fn declared_sketch_specs(
+    base: Option<&Manifest>,
+    given: &[SketchSpec],
+    remove_unlisted: bool,
+) -> Result<Vec<SketchSpec>> {
+    let mut names = BTreeSet::new();
+    for s in given {
+        if !names.insert(s.name()) {
+            return Err(Error::KeySpec(format!(
+                "the sketch {} is given twice",
+                s.name()
+            )));
+        }
+    }
+    if remove_unlisted {
+        return Ok(given.to_vec());
+    }
+    let mut out: Vec<SketchSpec> = Vec::new();
+    for s in base.map(declared_sketches).unwrap_or_default() {
+        out.push(
+            given
+                .iter()
+                .find(|g| g.name() == s.name())
+                .cloned()
+                .unwrap_or(s),
+        );
+    }
+    for s in given {
+        if !out.iter().any(|o| o.name() == s.name()) {
+            out.push(s.clone());
+        }
+    }
+    Ok(out)
+}
+
+/// Validates the declared key specs, sidecars, and sketches against the
+/// dataset schema: key specs first, in declaration order, then sidecars,
+/// then sketches.
 fn plan_specs(
     specs: &[KeySpec],
     sidecars: &[SidecarDef],
+    sketches: &[SketchSpec],
     schema: &Schema,
 ) -> Result<Vec<SpecPlan>> {
-    if specs.len() + sidecars.len() > MAX_KEY_SPECS {
+    if specs.len() + sidecars.len() + sketches.len() > MAX_KEY_SPECS {
         return Err(Error::KeySpec(format!(
-            "{} key specs and {} sidecars declared; at most {MAX_KEY_SPECS} together are \
-             supported",
+            "{} key specs, {} sidecars, and {} sketches declared; at most {MAX_KEY_SPECS} \
+             together are supported",
             specs.len(),
-            sidecars.len()
+            sidecars.len(),
+            sketches.len()
         )));
     }
     let column_type = |c: &str| {
@@ -692,7 +770,37 @@ fn plan_specs(
                 .collect(),
         });
     }
+    plan_sketches(sketches, schema, &mut names, &mut out)?;
     Ok(out)
+}
+
+/// Validates each sketch against the dataset schema (every item column
+/// present with a canonical encoding) and appends its plan.
+fn plan_sketches(
+    sketches: &[SketchSpec],
+    schema: &Schema,
+    names: &mut BTreeSet<String>,
+    out: &mut Vec<SpecPlan>,
+) -> Result<()> {
+    for spec in sketches {
+        bellwether_core::sketch::validate(spec)?;
+        let name = spec.name();
+        if !names.insert(name.clone()) {
+            return Err(Error::KeySpec(format!(
+                "the sketch {name} is declared twice"
+            )));
+        }
+        bellwether_core::sketch::item_types(spec, schema)?;
+        out.push(SpecPlan {
+            target: Target::Sketch(spec.clone()),
+            name,
+            key_types: Vec::new(),
+            ts_type: None,
+            time_types: Vec::new(),
+            columns: sketch_columns(spec),
+        });
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -1026,6 +1134,7 @@ impl Delta<'_> {
             let what = match missing {
                 Target::Key(_) => "key spec",
                 Target::Sidecar(_) => "sidecar",
+                Target::Sketch(_) => "sketch",
             };
             return Err(Error::Other(format!(
                 "the build would leave {what} {} incomplete; nothing was committed",

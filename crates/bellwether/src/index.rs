@@ -30,6 +30,7 @@ impl Engine {
             .map(|s| Declaration {
                 key: Some(s.clone()),
                 sidecar: None,
+                sketch: None,
             })
             .collect();
         self.index_declared(&declared)
@@ -57,10 +58,12 @@ impl Engine {
         for s in &specs {
             crate::spec::check(s)?;
         }
-        let options =
+        let mut options =
             self.build_options(declared.iter().filter_map(|d| d.sidecar.clone()).collect());
-        let report =
-            Builder::new(Arc::clone(self.store()?), "").build(self.root(), &specs, &options)?;
+        options.sketches = declared.iter().filter_map(|d| d.sketch.clone()).collect();
+        let builder = Builder::new(Arc::clone(self.store()?), "");
+        let sketches_rebuilt = self.reset_unreadable_sketches(&builder, &options.sketches)?;
+        let report = builder.build(self.root(), &specs, &options)?;
         let pinned = self.pin_required("index")?;
         let m = pinned.manifest();
         Ok(IndexResult {
@@ -87,8 +90,17 @@ impl Engine {
                     sidecar: d.name(),
                     complete_at: pinned.planner.sidecar_completeness(d),
                 })
+                .chain(
+                    bellwether_build::declared_sketches(m)
+                        .iter()
+                        .map(|s| SidecarState {
+                            sidecar: s.name(),
+                            complete_at: bellwether_build::sketch_completeness(m, s),
+                        }),
+                )
                 .collect(),
             unknown_segment_kinds: m.unknown_segment_kinds(),
+            sketches_rebuilt,
             files_new: report.files_new,
             files_changed: report.files_changed,
             files_removed: report.files_removed,
@@ -230,7 +242,7 @@ impl Engine {
     /// (`--at-manifest`) answers over the files that manifest recorded, so
     /// files that arrived since are out of scope by design; a recorded file
     /// that changed or vanished is still refused.
-    fn refuse_stale(&self, pinned: &Pinned, verb: &str) -> Result<()> {
+    pub(crate) fn refuse_stale(&self, pinned: &Pinned, verb: &str) -> Result<()> {
         let mut changes = folder_changes(self.root(), pinned, self.format(), &self.excluded())?;
         if self.options().at_manifest.is_some() {
             changes.untracked.clear();
