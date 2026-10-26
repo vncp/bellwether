@@ -583,7 +583,7 @@ class Showcase:
             "noun": q["noun"],
             "kind": k,
             "keys": f"{len(values)} {col} values",
-            "sql": all_sql if len(all_sql) < 600 else all_sql[:280] + " ... " + all_sql[-200:],
+            "sql": self.portable(all_sql if len(all_sql) < 600 else all_sql[:280] + " ... " + all_sql[-200:]),
         }
         log(
             self.logf,
@@ -591,6 +591,11 @@ class Showcase:
             f"bellwether unindexed {current['bytes']}, fixed {self.last('bytes', qid, 'bellwether-fixed')}, "
             f"on plan {on_plan['bytes']} ({on_plan['row_groups']} rg)",
         )
+
+    def portable(self, sql):
+        """The SQL with the scratch directory written as <work>, so the
+        results file names no local path."""
+        return sql.replace(self.work + "/", "<work>/").replace(os.path.realpath(self.work) + "/", "<work>/")
 
     def last(self, metric, qid, side):
         for r in reversed(self.rows):
@@ -635,7 +640,7 @@ class Showcase:
             "kind": "reconcile",
             "keys": f"key ({key})",
             "planted": planted,
-            "sql": diff,
+            "sql": self.portable(diff),
         }
         log(
             self.logf,
