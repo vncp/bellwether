@@ -6,7 +6,7 @@
 //! A driver runs one SQL text and hands back Arrow batches. It may return
 //! its own column types (ADBC and ODBC drivers do); the source then
 //! converts every column to the type it asked for, exactly or with an
-//! error ([`crate::cast`]). The SQLite driver, whose values carry no
+//! error (README, "Snapshot discipline"). The SQLite driver, whose values carry no
 //! column type, builds the asked types directly.
 
 use arrow::array::RecordBatch;
