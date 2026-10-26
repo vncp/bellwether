@@ -240,6 +240,35 @@ fn over_an_index_that_serves_nothing_the_funnel_names_min_max_pruning() {
     assert!(!human.contains("time window"), "{human}");
 }
 
+/// Round 2: when the current key serves every run, no run is priced by
+/// min/max, so the funnel's current row is plain `current` and no line
+/// speaks of min/max pruning.
+#[test]
+fn over_an_index_that_serves_every_run_the_current_row_is_plain() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    corpus(&data, 1, 8, 50, 1_000_000);
+    run(&["index", path(&data), "--key", "exact:id"], 0);
+    let kf = dir.path().join("k.parquet");
+    keys(&kf, "id", &[5, 7, 120]);
+    let why: WhyReport = typed(&run(
+        &["--json", "why", path(&data), "--from", path(&kf)],
+        0,
+    ));
+    assert_eq!(why.unserved, None, "every run is served");
+    assert!(why.full_scan.is_none());
+    let human = run(&["why", path(&data), "--from", path(&kf)], 0);
+    let current = human
+        .lines()
+        .find(|l| l.trim_start().starts_with("current"))
+        .unwrap_or_else(|| panic!("{human}"));
+    assert!(current.trim_start().starts_with("current "), "{current}");
+    // The funnel, culprit and recommendation (the lints below may discuss
+    // statistics on their own).
+    let head = human.split("\nfanout:").next().unwrap();
+    assert!(!head.contains("min/max"), "{head}");
+}
+
 /// Item 4, the other side: where min/max pruning keeps row groups the key
 /// does not hold, `why` still recommends the key, priced against them, and
 /// `fix` applies it. Row group `r` holds ids `r` and `1000 - r`, so its

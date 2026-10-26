@@ -63,6 +63,8 @@ pub(crate) fn heading(out: &Out, s: &str) -> String {
 
 /// The narrowest label column of the funnel.
 const MIN_FUNNEL_LABEL: usize = 34;
+/// The widest label the funnel's current row takes.
+const CURRENT_LABEL_WIDEST: &str = "current (min/max where no key serves)";
 /// The narrowest label column of the `index` table.
 const MIN_SPEC_LABEL: usize = 40;
 
@@ -517,7 +519,15 @@ pub(crate) fn why(r: &bellwether::WhyReport, out: &Out, fix_command: &str) -> St
             );
         }
         let labels: Vec<String> = r.candidates.iter().map(|c| label(&c.spec)).collect();
-        let w_col = label_width(labels.iter().map(String::as_str), MIN_FUNNEL_LABEL);
+        // The current row's label (the longest is the min/max one) sets the
+        // column too, so every row aligns.
+        let w_col = label_width(
+            labels
+                .iter()
+                .map(String::as_str)
+                .chain([CURRENT_LABEL_WIDEST]),
+            MIN_FUNNEL_LABEL,
+        );
         funnel_header(&mut s, w_col);
         funnel_row(&mut s, w_col, "dataset", &dataset, &rows);
         // Over Parquet files with statistics, a run no current key serves is

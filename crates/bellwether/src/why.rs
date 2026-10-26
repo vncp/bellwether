@@ -1242,13 +1242,29 @@ impl Engine {
                 &RunQuery::Locate,
             )?));
         }
-        // Over Parquet files a run no key serves is priced as the files' own
-        // statistics read it; say so only where they carry some on the
-        // workload's key columns, else name their absence. Without an
-        // index, the full scan is context beside it.
-        if replayer.unserved() == Baseline::ParquetStats {
-            let columns: BTreeSet<&str> = workload
-                .runs()
+        // Over Parquet files a run no current key serves is priced as the
+        // files' own statistics read it; say so only when some run is so
+        // priced (as the runs are priced: a locate run under --latest-by as
+        // the temporal lookup) and the files carry statistics on its
+        // columns, else name their absence. Without an index, the full scan
+        // is context beside it.
+        let unserved_runs: Vec<&bellwether_replay::RecordedRun> = workload
+            .runs()
+            .iter()
+            .filter(|r| {
+                let query = match (temporal, r.query()) {
+                    (Some(t), Ok(RunQuery::Locate)) => t.query.clone(),
+                    (_, Ok(q)) => q,
+                    (_, Err(_)) => return true,
+                };
+                !replayer
+                    .current_specs()
+                    .iter()
+                    .any(|s| serves_query(s, &r.columns, &query))
+            })
+            .collect();
+        if replayer.unserved() == Baseline::ParquetStats && !unserved_runs.is_empty() {
+            let columns: BTreeSet<&str> = unserved_runs
                 .iter()
                 .flat_map(|r| r.columns.iter().map(String::as_str))
                 .collect();
