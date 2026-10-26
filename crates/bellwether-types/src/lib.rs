@@ -29,6 +29,9 @@ pub mod format {
     pub const STORAGE_VERSION: u32 = 1;
     /// Version of the ledger record schemas. History: 1 (contract v2);
     /// 2 (contract v2.1, 2026-10-24: `Replay` gains `inputs` and `model`).
+    /// `Replay.unserved` (2026-10-26) is an additive label field under ADR
+    /// 017's 2026-10-26 amendment, not a version bump: an older reader drops
+    /// it without misreading any other field.
     pub const RECORD_VERSION: u32 = 2;
     /// Version of the canonical byte encoding (ADR 016).
     pub const ENCODING_VERSION: u32 = 1;
@@ -1171,6 +1174,12 @@ pub struct Replay {
     /// the proposal's kind. Absent in version-1 records.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// How the replay priced runs that no spec of the configuration serves:
+    /// absent means every live row group (a raw scan); `"parquet_stats"`
+    /// means the row groups the files' min/max statistics keep. Absent in
+    /// records written before it existed, which keep their bytes and hashes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unserved: Option<String>,
     /// For a rewrite measured in a query engine: the twin's prediction
     /// beside the engine's measurement (ADR 033). Absent otherwise.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1871,6 +1880,7 @@ mod schema_feature {
                 }],
                 proposed: vec![],
                 model: None,
+                unserved: None,
                 created_at: "2026-10-24T00:00:00.000Z".into(),
             }),
             Record::Certificate(Certificate {

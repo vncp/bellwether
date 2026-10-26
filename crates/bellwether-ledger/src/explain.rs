@@ -357,6 +357,11 @@ fn replay_link(hash: Hash, r: &Replay) -> Link {
     if let Some(p) = &r.prediction {
         prediction_facts(&mut facts, p);
     }
+    if let Some(u) = &r.unserved {
+        // Lookups no key serves were priced by the files' own statistics,
+        // not as a full scan.
+        facts.push(("unserved", u.clone()));
+    }
     Link::new(hash, RecordKind::Replay, &r.created_at, facts)
 }
 

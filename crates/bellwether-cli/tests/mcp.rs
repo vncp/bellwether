@@ -14,7 +14,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
 use std::process::{Command, Stdio};
 
-use common::{corpus, index_dir, keys, path, run};
+use common::{corpus, index_dir, keys, path, run, scattered};
 use serde_json::{json, Value};
 
 /// The fixed clock both sides use.
@@ -105,7 +105,7 @@ fn copy_tree(from: &Path, to: &Path) {
 fn every_tool_with_a_cli_counterpart_returns_the_cli_json_line() {
     let dir = tempfile::tempdir().unwrap();
     let data = dir.path().join("data");
-    corpus(&data, 2, 3, 30, 200);
+    scattered(&data, 2, 3, 30, 200);
     let kf = dir.path().join("k.parquet");
     keys(&kf, "id", &[7, 8, 150]);
     let (d, k) = (path(&data), path(&kf));

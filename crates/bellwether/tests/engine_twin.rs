@@ -866,6 +866,7 @@ fn a_fabricated_replay_never_reaches_a_receipt() {
         current: vec![cost(&fake)],
         proposed: vec![cost(&fake)],
         model: Some(MODEL.into()),
+        unserved: None,
         prediction: None,
         created_at: "2026-10-26T00:00:00.000Z".into(),
     };

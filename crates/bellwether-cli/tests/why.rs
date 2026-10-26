@@ -78,7 +78,14 @@ fn why_over_a_batch_stamp_index_recommends_the_true_key() {
     let rec = r.recommended.as_ref().unwrap();
     assert_eq!(rec.spec.columns(), ["entity_id".to_string()]);
     assert!(rec.proposed.bytes < rec.current.bytes);
-    assert_eq!(rec.current.row_groups, 6 * r.dataset.row_groups);
+    // The batch-stamp index serves no entity_id run, so each run is priced
+    // as the files' own min/max statistics read it: at most every row
+    // group, and the replay says so.
+    assert_eq!(Some(rec.current), r.current);
+    assert!(rec.current.row_groups <= 6 * r.dataset.row_groups);
+    assert!(r.full_scan.is_none(), "a key spec is current");
+    let floor = r.candidates.iter().find(|c| c.spec == rec.spec).unwrap();
+    assert!(matches!(&floor.replay.record, Record::Replay(rp) if rp.unserved.is_some()));
     // Human output leads with the funnel.
     let human = run(
         &["why", path(&data), "--bench-workload", path(&workload)],

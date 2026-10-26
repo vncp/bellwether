@@ -10,7 +10,7 @@ mod common;
 use std::path::Path;
 
 use bellwether::{FixOutcome, FixResult, GeneratedKey, PublicKeyFile, ReceiptResult, WhyReport};
-use common::{bw, corpus, index_dir, keys, path, typed};
+use common::{bw, index_dir, keys, path, scattered, typed};
 
 /// Runs the binary with no signing or trust variables inherited, asserts
 /// the exit code, and returns stdout and stderr.
@@ -125,7 +125,7 @@ fn why(data: &Path, kf: &Path) -> (String, String) {
 
 fn setup(dir: &Path) -> (std::path::PathBuf, String, String) {
     let data = dir.join("data");
-    corpus(&data, 3, 4, 25, 400);
+    scattered(&data, 3, 4, 25, 400);
     let kf = dir.join("k.parquet");
     keys(&kf, "id", &[5, 77, 123]);
     let (p, wl) = why(&data, &kf);
@@ -318,7 +318,7 @@ fn fix_signs_and_receipt_show_gates_on_the_signature() {
         ],
         0,
     );
-    assert!(human.contains("1 of 1 receipts signed"), "{human}");
+    assert!(human.contains("1 of 1 receipt signed"), "{human}");
 }
 
 #[test]

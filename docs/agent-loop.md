@@ -222,6 +222,7 @@ produce a byte-identical Replay (invariant 3).
       "row_groups": <R_fix>, "bytes": <B_fix> }
   ],
   "model": <absent for a key proposal; for a layout proposal, the name of the cost model behind the proposed costs>,
+  "unserved": <absent, or "parquet_stats" when a run no key spec serves was priced as the files' own min/max statistics and bloom filters read it>,
   "created_at": "<RFC 3339>"
 }
 ```
@@ -233,6 +234,12 @@ replay with no inputs, a replay whose current costs are not exact, a replay
 that names a model although every cost is exact or omits one although a
 proposed cost is inexact, and a key-proposal replay that is not exact in
 every run.
+
+Over Parquet files, a run that no key spec of a configuration serves is
+priced as the files' own footer statistics read it (what DuckDB or any
+Parquet reader skips to without an index), not as a full scan, and the
+replay says so in `unserved`. `why`'s numbers, the score `fix` gates on, and
+the realized cost after an apply are all this one measure.
 
 A Replay says how much less the fix would read. It does not say the fix is
 correct. That is the Certificate's job.

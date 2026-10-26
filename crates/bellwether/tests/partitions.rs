@@ -91,6 +91,9 @@ fn a_hive_partitioned_folder_indexes_plans_and_attests() {
     assert!(err.to_string().contains("partitioning"), "{err}");
 
     // Score, verify, apply, attest a key on `id` over the partitioned data.
+    // The files' own min/max statistics already find these ids, so the key
+    // saves nothing (`why` recommends none); apply it anyway, which is what
+    // this test is about.
     let ids = dir.path().join("ids.parquet");
     write_keys(&ids, "id", &[3, 42]);
     let w = e
@@ -103,6 +106,7 @@ fn a_hive_partitioned_folder_indexes_plans_and_attests() {
         .fix(&FixRequest {
             proposal: Some(w.candidates[0].proposal.hash),
             workload: Some(w.workload.as_ref().unwrap().hash),
+            allow_no_gain: true,
             ..FixRequest::default()
         })
         .unwrap();

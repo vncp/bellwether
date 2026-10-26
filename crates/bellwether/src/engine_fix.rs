@@ -424,6 +424,7 @@ impl Engine {
                 .map(|p| stats_cost(&p.after, twin.keys))
                 .collect(),
             model: Some(engine.model().to_string()),
+            unserved: None,
             prediction: Some(prediction.clone()),
             created_at: self.now(),
         };

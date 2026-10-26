@@ -14,7 +14,7 @@ use bellwether::types::Record;
 use bellwether::{
     FixOutcome, FixResult, ReceiptResult, ReconcileResult, Refusal, ReportResult, Score, WhyReport,
 };
-use common::{check_records, corpus, index_dir, keys, path, planted, run, typed};
+use common::{check_records, corpus, index_dir, keys, path, planted, run, scattered, typed};
 
 /// A `plan` Evidence hash to cite: index `exact:id` (a no-op when already
 /// indexed) and locate one key.
@@ -318,7 +318,9 @@ fn fix_on_a_rewrite_whose_outputs_differ_exits_1_and_writes_no_receipt() {
 fn applying_a_certificate_against_a_stale_manifest_exits_3_and_applies_nothing() {
     let dir = tempfile::tempdir().unwrap();
     let data = dir.path().join("data");
-    corpus(&data, 2, 3, 20, 100);
+    // Ids scattered over row groups: the files' min/max statistics skip
+    // nothing, so the key has a gain to apply.
+    scattered(&data, 2, 3, 20, 100);
     let index = index_dir(&data);
     let kf = dir.path().join("k.parquet");
     keys(&kf, "id", &[4, 9, 60]);
@@ -484,7 +486,7 @@ fn a_layout_proposal_is_refused_and_reconcile_exits_1_on_differences() {
 fn applying_a_certificate_after_the_data_changed_exits_3_naming_re_verification() {
     let dir = tempfile::tempdir().unwrap();
     let data = dir.path().join("data");
-    corpus(&data, 2, 3, 20, 100);
+    scattered(&data, 2, 3, 20, 100);
     let index = index_dir(&data);
     let kf = dir.path().join("k.parquet");
     keys(&kf, "id", &[4, 9, 60]);

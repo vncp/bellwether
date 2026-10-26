@@ -718,24 +718,28 @@ pub(crate) fn stale_index(root: &str, verb: &str, c: &FolderChanges) -> Error {
             shown.join(", ")
         }
     };
+    let files = |n: usize| if n == 1 { "file" } else { "files" };
     if !untracked.is_empty() {
         parts.push(format!(
-            "{} new file(s) the index does not cover ({})",
+            "{} new {} the index does not cover ({})",
             untracked.len(),
+            files(untracked.len()),
             list(&untracked)
         ));
     }
     if !changed.is_empty() {
         parts.push(format!(
-            "{} changed file(s) ({})",
+            "{} changed {} ({})",
             changed.len(),
+            files(changed.len()),
             list(&changed)
         ));
     }
     if !missing.is_empty() {
         parts.push(format!(
-            "{} removed file(s) ({})",
+            "{} removed {} ({})",
             missing.len(),
+            files(missing.len()),
             list(&missing)
         ));
     }

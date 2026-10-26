@@ -175,6 +175,7 @@ pub fn replay(proposal: Hash) -> Replay {
         current: vec![run("p50", 900_000), run("p95", 100_000)],
         proposed: vec![run("p50", 4_000), run("p95", 1_000)],
         model: None,
+        unserved: None,
         created_at: "2026-10-24T00:02:00Z".into(),
     }
 }

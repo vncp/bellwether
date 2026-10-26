@@ -54,6 +54,36 @@ All notable changes are documented here. The format follows Keep a Changelog; ve
 
 - `why --clock` over an indexed folder measured the manifest's age with the system clock, so the profile Evidence (and its hash) differed between two runs, and between the CLI's `--json` line and the MCP result (ADR 010). The age is now measured at the fixed clock (`ProfileOptions::now_millis`).
 - README "Results": the market questions are measured with the corpus's `day=` directories as a partition column on every side, through `fix` (which now records `--partitioning`); `scripts/showcase.sh` always reads the market corpus that way, and its `--market-hive` flag is gone.
+- `why` and `fix` priced a lookup no key serves, over Parquet files, as a
+  full scan, so on files sorted by the key `why` recommended a key that
+  DuckDB's own min/max pruning already matched, and `fix` attested it.
+  Every Parquet replay now prices such a run as the files' footer min/max
+  statistics and bloom filters read it (`Replayer::with_unserved`,
+  `Baseline::ParquetStats`), and the Replay says so in a new optional
+  field, `Replay.unserved = "parquet_stats"` (absent otherwise, so older
+  records keep their bytes). `why`'s number is therefore the Replay a
+  receipt cites: without an index the funnel prints it as
+  `current: no index (min/max pruning)` under the full scan
+  (`WhyReport::full_scan`, context only), and with an index whose keys
+  leave some run unserved as `current (min/max where no key serves)`; the
+  recommendation and `fix`'s `nothing_to_gain` gate
+  measure against it. In a workload mixing lookup columns, a key that
+  serves some runs is no longer charged a full scan for the others.
+  Pricing an unserved run reads a row group's bloom filters only when its
+  min/max keeps it (ADR 018), and treats a filter it cannot probe as absent.
+  The ledger accepts `unserved` only as `"parquet_stats"`; ADR 017 is
+  amended to allow such additive label fields.
+- A CSV or JSON lines `--schema` declaring `Timestamp(..., Some("UTC"))`
+  was accepted by `why` and refused by `index` (`Invalid timezone "UTC"`).
+  `UTC` is now loaded as `+00:00`; any other zone the decoder cannot parse
+  is refused by every verb with the decoder's message.
+- Human output: `fix`'s score line printed "MB bytes"; counts printed
+  "1 receipts", "1 profile evidence records", "run(s)", "pass(es)",
+  "file(s)", "record(s)"; now each count takes its noun's singular or
+  plural. A bitemporal `asof` planned by the `temporal2` sidecar alone
+  printed "specs: none (raw scan)"; it now names the sidecar.
+- `docs/measured/2026-10-24-realdata.md` named the machine's scratch
+  directory; it now reads `<scratch>`.
 - `fix` built a new index without the folder's partitioning, so a later
   `locate --partitioning hive` (or `--path-template`) was refused as "built
   with partitioning none". `index` and `fix` now share one set of build
