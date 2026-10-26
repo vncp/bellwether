@@ -163,7 +163,49 @@ impl EngineArgs {
             // `--at-manifest` on the CLI's lookups), never per session.
             at_manifest: None,
             clock: self.clock.clone(),
+            // Signing and trust are the server's own flags ([`KeyArgs`]);
+            // the CLI gives them per command.
+            signing_key: None,
+            trusted_keys: None,
         })
+    }
+}
+
+/// The server's signing and trust flags (ADR 029). Both are paths, read
+/// once at startup; nothing comes from the environment. A key or trust file
+/// that cannot be used stops the server before the handshake (exit 2).
+#[derive(Clone, Debug, Default, clap::Args)]
+pub struct KeyArgs {
+    /// Sign what `apply.receipt` and `score.verify` write (the engine's
+    /// attest stage): the file of the 32-byte seed `bellwether keys
+    /// generate` wrote, readable by its owner only. No other tool signs.
+    #[arg(long, value_name = "FILE")]
+    pub signing_key: Option<PathBuf>,
+    /// The trust file (`bellwether keys trust`): with it, every receipt
+    /// chain in a result's envelope carries a verdict, `signed`,
+    /// `untrusted`, `unsigned`, or `invalid`.
+    #[arg(long, value_name = "FILE")]
+    pub trusted_keys: Option<PathBuf>,
+}
+
+impl KeyArgs {
+    /// Loads the key and the trust file for the data at `root` into
+    /// `options`. Either one inside the index location is refused: a store
+    /// writer could read the key there, or choose who is trusted.
+    pub fn apply(&self, root: &str, options: &mut EngineOptions) -> Result<(), OptionsError> {
+        let usage = |e: bellwether::types::Error| OptionsError::Usage(e.to_string());
+        let index = options.index.clone();
+        if let Some(p) = &self.signing_key {
+            bellwether::refuse_inside_index(root, index.as_deref(), p, "signing_key")
+                .map_err(usage)?;
+            options.signing_key = Some(bellwether::load_signing_key(p).map_err(usage)?);
+        }
+        if let Some(p) = &self.trusted_keys {
+            bellwether::refuse_inside_index(root, index.as_deref(), p, "trusted_keys")
+                .map_err(usage)?;
+            options.trusted_keys = Some(bellwether::load_trusted_keys(p).map_err(usage)?);
+        }
+        Ok(())
     }
 }
 

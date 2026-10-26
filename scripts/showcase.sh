@@ -1,14 +1,18 @@
 #!/usr/bin/env bash
-# Reproduces the README's "Results" section and docs/measured/*-showcase.md:
+# Reproduces the README's "Results" section and docs/measured/showcase.md:
 # realistic questions on four datasets, each answered three ways (a full scan,
 # DuckDB on its own, Bellwether's plan after `why` -> `fix`), plus `reconcile`
 # against a DuckDB EXCEPT ALL, then the charts from the results file.
 #
 #   scripts/showcase.sh                                  # everything
-#   BELLWETHER=/path/to/bellwether scripts/showcase.sh   # skip the build
+#   BELLWETHER=/path/to/bellwether BELLWETHER_BUILD="release build of <sha> (rustc x)" \
+#     scripts/showcase.sh                                # skip the build
 #   SHOWCASE_DIR=/some/scratch scripts/showcase.sh       # where data and indexes go
 #   scripts/showcase.sh --only gh-repos10,rec-gh-planted # re-measure some ids
 #   scripts/showcase.sh --market-hive                    # market with hive partitioning
+#   scripts/showcase.sh --accept-new-inputs              # after a DuckDB upgrade or a
+#                                                        # republished download (measures
+#                                                        # everything; refused with --only)
 #
 # --market-hive needs an engine whose `fix` records --partitioning in the
 # index it builds. Without it the market folder is read as plain files (the
@@ -44,13 +48,19 @@ if [ -z "${BELLWETHER:-}" ]; then
   export CARGO_TARGET_DIR=${CARGO_TARGET_DIR:-$HOME/.cache/bellwether-target-showcase}
   (cd "$REPO" && cargo build --release -p bellwether-cli)
   BELLWETHER=$CARGO_TARGET_DIR/release/bellwether
+  # The engine's sources, not this branch's docs: the commit of the newest
+  # change to crates/ or Cargo.lock.
+  ENGINE=$(git -C "$REPO" log -1 --format=%h -- crates Cargo.lock Cargo.toml)
+  RUSTC=$(PATH="$HOME/.cargo/bin:$PATH" rustc -V 2>/dev/null | cut -d' ' -f1-2 || true)
+  BUILD="bellwether release build of $ENGINE (${RUSTC:-rustc unknown})"
+elif [ -n "${BELLWETHER_BUILD:-}" ]; then
+  BUILD=$BELLWETHER_BUILD
+else
+  echo "BELLWETHER is set, so this script did not build it: set BELLWETHER_BUILD to how it was built" >&2
+  echo "(for example \"bellwether release build of eca48d1 (rustc 1.99.1)\"); every result row records it" >&2
+  exit 2
 fi
 BW=$BELLWETHER
-# The engine's sources, not this branch's docs: the commit of the newest
-# change to crates/ or Cargo.lock.
-ENGINE=$(git -C "$REPO" log -1 --format=%h -- crates Cargo.lock Cargo.toml)
-RUSTC=$(PATH="$HOME/.cargo/bin:$PATH" rustc -V 2>/dev/null | cut -d' ' -f1-2 || true)
-BUILD=${BELLWETHER_BUILD:-"bellwether release build of $ENGINE (${RUSTC:-rustc unknown})"}
 if [ -n "${GITHUB_ACTIONS:-}" ]; then DISK="CI runner disk"; else DISK=${SHOWCASE_DISK:-local SSD}; fi
 
 # ---- downloads ---------------------------------------------------------------
@@ -59,6 +69,10 @@ if [ -n "${GITHUB_ACTIONS:-}" ]; then DISK="CI runner disk"; else DISK=${SHOWCAS
 bw_fetch_taxi "$DL" "$TAXI_MONTHS"
 bw_fetch_gh "$DL" "$GH_HOURS"
 bw_fetch_clickbench "$DL" "$CB_PARTS"
+# The bytes every number rests on; showcase.py records them and refuses a
+# rerun on different files (a republished month, say) unless told to accept it.
+(cd "$DL" && if command -v sha256sum >/dev/null; then sha256sum taxi/*.parquet gh/*.json.gz clickbench/*.parquet;
+  else shasum -a 256 taxi/*.parquet gh/*.json.gz clickbench/*.parquet; fi) >"$W/downloads.sha256"
 
 # ---- datasets (rebuilt every run; indexes live under work/idx) --------------
 cd "$W"
@@ -100,6 +114,10 @@ duckdb -no-agent -c "SET TimeZone='UTC'; COPY (SELECT * REPLACE (CASE WHEN repo_
   FROM read_parquet('gh/2024-01-01-05.parquet'))
   TO 'gh_mut/2024-01-01-05.parquet' (FORMAT PARQUET)" >/dev/null
 echo "planted (gh): type = 'PlantedEvent' where repo_id=$GR actor_id=$GA created_at=$GT UTC"
+# The planted keys as `reconcile` prints them; showcase.py fails if the
+# differing key it reports is any other.
+printf '{"rec-taxi-planted": ["%s", "%sZ", "%s", "%s"], "rec-gh-planted": ["%s", "%s", "%sZ"]}\n' \
+  "$MV" "${MT/ /T}" "$MP" "$MF" "$GR" "$GA" "${GT/ /T}" >planted.json
 
 # The market corpus is synthetic (seeded), written by the binary under test.
 "$BW" bench market --out market --rung medium --seed 7 >/dev/null
