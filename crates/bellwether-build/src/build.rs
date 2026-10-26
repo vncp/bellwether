@@ -103,7 +103,7 @@ pub struct BuildReport {
 }
 
 enum Attempt {
-    Done(BuildReport),
+    Done(Box<BuildReport>),
     Restart { claimed: bool },
 }
 
@@ -232,7 +232,7 @@ impl<S: StoreExt + ?Sized> Builder<S> {
                 Attempt::Done(mut report) => {
                     report.restarts = restarts;
                     report.elapsed = started.elapsed();
-                    return Ok(report);
+                    return Ok(*report);
                 }
                 Attempt::Restart { claimed } => {
                     restarts += 1;
@@ -293,7 +293,7 @@ impl<S: StoreExt + ?Sized> Builder<S> {
             // Nothing committed: a version 1 index stays at version 1 and
             // keeps planning as before (ADR 028); no statistics were recorded.
             report.files_filled = 0;
-            return Ok(Attempt::Done(report));
+            return Ok(Attempt::Done(Box::new(report)));
         }
         let items = segments::items(&files.rows, &work.needed, opts.max_segment_row_groups)?;
         let ctx = Ctx {
@@ -346,7 +346,7 @@ impl<S: StoreExt + ?Sized> Builder<S> {
                     .map(|m| m.storage_version)
                     .filter(|&v| v < STORAGE_VERSION);
                 report.segments = written.segments;
-                Ok(Attempt::Done(report))
+                Ok(Attempt::Done(Box::new(report)))
             }
             Err(_) if restart.get() => Ok(Attempt::Restart { claimed: false }),
             Err(Error::SegmentClaimed(_)) => Ok(Attempt::Restart { claimed: true }),
@@ -759,6 +759,7 @@ impl FilePlan {
 /// Pairs discovered files with tracked ones by path, retires the ids of
 /// changed and vanished files, and assigns fresh ids, in path order, to
 /// every file seen for the first time or changed.
+#[allow(clippy::too_many_lines)]
 fn plan_files(
     base: Option<&Manifest>,
     discovered: &[FileFingerprint],

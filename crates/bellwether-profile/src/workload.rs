@@ -166,6 +166,7 @@ pub fn age(path: &Path) -> Result<std::time::Duration> {
 }
 
 /// Reads and verifies a bench-format workload.
+#[allow(clippy::too_many_lines)]
 pub fn summarize(path: &Path) -> Result<WorkloadSummary> {
     let (dir, manifest) = locate(path);
     let (_, parsed) = read_manifest(&manifest)?;

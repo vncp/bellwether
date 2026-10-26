@@ -254,15 +254,17 @@ fn predicate_columns<'p>(p: &'p Predicate, out: &mut Vec<&'p String>) {
             out.extend(columns);
             out.push(ts_column);
         }
-        Predicate::LatestPerKey { .. } => {}
         Predicate::And { all } => {
             for q in all {
                 predicate_columns(q, out);
             }
         }
-        // Refused by `RowTest::compile`; they name no column a row test reads.
-        Predicate::SemiJoin { .. } | Predicate::Join { .. } | Predicate::WindowPartition { .. } => {
-        }
+        // Join and window predicates are refused by `RowTest::compile`;
+        // they name no column a row test reads.
+        Predicate::LatestPerKey { .. }
+        | Predicate::SemiJoin { .. }
+        | Predicate::Join { .. }
+        | Predicate::WindowPartition { .. } => {}
     }
 }
 

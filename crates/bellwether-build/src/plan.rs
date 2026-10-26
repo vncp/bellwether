@@ -267,6 +267,10 @@ struct SpecSegments {
     sources: Vec<SegSource>,
 }
 
+/// A key lookup's row groups, the rows of its keys and the spec that
+/// counted them (when one does), and its non-null probe keys.
+type SelectedKeys = (RoaringBitmap, Option<(u64, KeySpec)>, Vec<Vec<u8>>);
+
 /// How a spec serves a lookup (see the module docs).
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Serve {
@@ -1081,7 +1085,7 @@ impl<S: StoreExt + ?Sized> Planner<S> {
         segs: &[SpecSegments],
         columns: &[String],
         keys: &[Vec<u8>],
-    ) -> Result<(RoaringBitmap, Option<(u64, KeySpec)>, Vec<Vec<u8>>)> {
+    ) -> Result<SelectedKeys> {
         let types = self.column_types(columns)?;
         let (keys, spans) = non_null_probes(keys, &types)?;
         let serving = Self::serving(segs, columns)?;

@@ -288,6 +288,7 @@ pub struct ToolDef {
 
 /// Every tool, in listing order.
 #[must_use]
+#[allow(clippy::too_many_lines)]
 pub fn catalog() -> Vec<ToolDef> {
     vec![
         def::<ObserveWhy>(

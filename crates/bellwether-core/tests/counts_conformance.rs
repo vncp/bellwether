@@ -16,7 +16,12 @@
 //!   every position, of a counted exact and a counted temporal segment:
 //!   never a panic, and never a count that differs from the clean one (the
 //!   checksums refuse a corrupt record instead).
-#![allow(clippy::unwrap_used, missing_docs, clippy::cast_possible_truncation)]
+#![allow(
+    clippy::unwrap_used,
+    missing_docs,
+    clippy::cast_possible_truncation,
+    clippy::assert_is_empty
+)]
 
 use std::cell::Cell;
 use std::collections::BTreeMap;

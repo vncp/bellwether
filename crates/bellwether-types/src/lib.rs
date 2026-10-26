@@ -1899,6 +1899,7 @@ mod schema_feature {
     /// One record of every kind, touching every field with custom serde
     /// (`Hash`, the row-group bitmap, the nanosecond age) and every tagged
     /// enum.
+    #[allow(clippy::too_many_lines)]
     fn every_kind() -> Vec<Record> {
         let provenance = Provenance {
             inputs: vec![Hash::of(b"input")],

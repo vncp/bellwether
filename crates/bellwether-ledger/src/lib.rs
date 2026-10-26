@@ -267,18 +267,16 @@ fn check_exactness(r: &Replay) -> Result<()> {
     }
     let check = |what: &str, e: &Exactness| -> Result<()> {
         match e {
-            Exactness::Exact => Ok(()),
             Exactness::Bounded { low, high } if low > high => Err(rule(format!(
                 "replay {what} is bounded by [{low}, {high}], an empty interval"
             ))),
-            Exactness::Bounded { .. } => Ok(()),
             Exactness::Measured { model } if model.trim().is_empty() || model.trim() != model => {
                 Err(rule(format!(
                     "replay {what} is measured by a model with no name, or with surrounding \
                      whitespace; name the model"
                 )))
             }
-            Exactness::Measured { .. } => Ok(()),
+            Exactness::Exact | Exactness::Bounded { .. } | Exactness::Measured { .. } => Ok(()),
         }
     };
     for c in r.current.iter().chain(&r.proposed) {

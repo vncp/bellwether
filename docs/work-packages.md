@@ -19,7 +19,8 @@ One crate, one owner, one interface contract each. WP0 ships first and alone. Af
 | WP12 mcp | merged: observe, score, propose, apply, and jobs tools; resources; the prompt generated from `AGENTS.md`; typed refusals, dry runs, per-session budgets; ADR 010 against the CLI |
 | WP20 sql | in review: `bellwether-source-sql`, `sql://` roots through the facade, CLI, and MCP; reconcile a table against files; measured `why`; attest-only `fix` |
 | WP13 evolve | after M3 |
-| WP14 counted segments and column bytes, WP15 relational replay, WP16 engine adapters, WP17 CI receipts, WP18 transfer evaluation | planned 2026-10-24 (ADR 026) |
+| WP14 storage version 2 and record version 3 (ADR 028) | first of two pull requests open: per-key counts (`exact:col,counts`, `count`), checksummed segments, manifest row-group and column bytes (plans open no footer), identity keys, every record version 3 shape, `fixtures/format-v1/` and `fixtures/format-v0.1/`; the second fills the remaining record fields and folds the sidecars |
+| WP15 relational replay, WP16 engine adapters, WP17 CI receipts, WP18 transfer evaluation | planned 2026-10-24 (ADR 026) |
 | WP19 signed receipts | merged in wave A: detached ed25519 signatures beside receipts and certificates (ADR 029), no record or format version change; M8's signing half done |
 | WP21 time-series keys | merged: partition values from Hive-style paths, ordered plans, `--at-manifest` pinned lookups over a manifest history, per-key time bounds (`bounds` sidecar), bitemporal as-of (`temporal2` sidecar), the `market` bench corpus with measured funnels |
 | WP22 performance | next after WP21; measured in release builds |
@@ -65,7 +66,7 @@ One crate, one owner, one interface contract each. WP0 ships first and alone. Af
 
 | WP | Crate | Deliverables | Owns |
 |---|---|---|---|
-| WP14 | `bellwether-core`, `bellwether-build` | storage version 2: optional per-key, per-row-group counts in exact segments; per-column bytes in manifests and scan entries; conformance vectors for both; readers of version 1 unaffected | ADR 026; format.md |
+| WP14 | `bellwether-types`, `-core`, `-store`, `-build`, `-ledger`, `-replay`, `-profile`, `-verify`, the facade, `-cli` | storage version 2 and record version 3 in two pull requests. First: optional per-key, per-row-group counts in exact and temporal segments with `count`; checksums; per-row-group rows and bytes and per-column bytes in manifests, so plans open no footer; `ScanEntry.columns` and `projected_bytes`; full-spec identity keys; every record version 3 shape; conformance vectors; the version 1 and version 2 fixtures; readers of version 1 unaffected, upgraded on the first build with work. Second: verify, replay and profile fill the record fields; sidecars fold into the segment format; typed CSV dialect and column types in manifests | ADR 026, 028; format.md |
 | WP15 | `bellwether-replay` | the operator table in `docs/evolve.md` §14 priced exactly: projection, range, `latest`/`asof`, semi-join, two-sided join with cardinality, window partition prefilter, aggregation input; tri-state exactness on every cost; layout proposals exact under the stated model | ADR 005, 026 |
 | WP16 | `bellwether-adapters` | plans executed inside engines: DataFusion first (row-group access plans), DuckDB second (file lists plus pushed filters), a Spark shim third; each adapter's realized bytes must equal the plan's | ADR 010 |
 | WP17 | `bellwether-ci` | a GitHub Action that runs `why` on a pull request's pipeline changes and posts the receipt or the refusal as a comment; the gate is the receipt hash | threat model |
@@ -81,7 +82,7 @@ One crate, one owner, one interface contract each. WP0 ships first and alone. Af
 2. **M2** the index exists: WP1, WP4. `locate`, `latest`, `asof` on the synthetic ledger.
 3. **M3** receipts exist: WP6, WP7, WP8. `fix` produces a Receipt.
 4. **M4** agent-first: WP12. The loop runs end to end from a coding agent.
-5. **M5** format frozen after WP14, so the frozen version carries counts and per-column bytes; fixture committed.
+5. **M5** format frozen after WP14, so the frozen version carries counts and per-column bytes; fixtures committed. The first WP14 pull request freezes the shapes and commits `fixtures/format-v0.1/`; M5 is done when the second merges.
 6. **M6** `evolve`: reflective workload optimization over the synthetic ledger, with the rulebook as output and a replayable run in the ledger; WP15 makes the loss cover the operator table.
 7. **M7** a SQL table reconciles against a folder of files with a certificate (WP20); plans execute inside an engine (WP16); receipts gate pull requests (WP17).
 8. **M8** rules transfer across datasets and the exact-versus-estimated ablation is measured (WP18); receipts are signed (WP19, done: `fix --signing-key`, `receipt show --require-signature`).

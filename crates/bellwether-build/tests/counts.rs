@@ -20,7 +20,10 @@
     missing_docs,
     clippy::too_many_lines,
     clippy::type_complexity,
-    clippy::cast_possible_truncation
+    clippy::cast_possible_truncation,
+    clippy::assert_is_empty,
+    clippy::many_single_char_names,
+    clippy::similar_names
 )]
 
 mod common;

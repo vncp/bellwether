@@ -1,7 +1,7 @@
 //! Lints that depend on a recorded workload or a manifest, and the
 //! confidence rubric of `docs/rule-catalog.md`.
 
-#![allow(clippy::unwrap_used)]
+#![allow(clippy::unwrap_used, clippy::assert_is_empty)]
 
 mod common;
 

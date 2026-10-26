@@ -81,13 +81,15 @@ These `object_store` errors map to `Error::VersionConflict`:
 - `commit_nonce`
 - `source`
 - `schema{columns, key_specs, sidecars?[{kind, columns, time_columns}]}`
-- `rowgroup_space{next_id, files[{fingerprint, rowgroup_ids, chunk_size?, chunks?}], tombstones[{since, rowgroup_ids}]}`
-- `key_spec_completeness{name -> sequence}`
-- `segments[{id, kind?, key_spec, rowgroup_range{start, end}, bytes}]`
+- `rowgroup_space{next_id, files[{fingerprint, rowgroup_ids, rowgroup_rows?, rowgroup_bytes?, column_bytes?, chunk_size?, chunks?}], tombstones[{since, rowgroup_ids}]}`
+- `key_spec_completeness{identity -> sequence}`
+- `segments[{id, kind?, key_spec, rowgroup_range{start, end}, bytes}]` (`key_spec` is the spec's `KeySpec::identity()`, or a sidecar's name)
 - `segment_tombstones[{id, since}]`
 - `deleting[{id, claimed_at, token, lease_ms}]`
 
 `rowgroup_space.tombstones` holds only retired row-group ids (ADR 013). Unreferenced segments go in `segment_tombstones`.
+
+**Storage version 2 (ADR 028).** `FileEntry::{rowgroup_rows, rowgroup_bytes, column_bytes}` are the row-group statistics a plan reads instead of footers: `rowgroup_stats(i)` gives row group `i`'s rows and bytes, `column_bytes_of(i, column, columns)` one column chunk (row-group-major), and `has_rowgroup_stats()` whether they are recorded. `Manifest::from_slice` refuses a file whose arrays do not align with its row groups or the schema's columns. A version 1 manifest is read with its `segments[].key_spec` and `key_spec_completeness` keys rewritten from each spec's name to its identity, so every caller sees one shape; its `storage_version` stays 1 until a commit stamps 2. The loader's allow-lists are per version: `counts` on a key spec is refused in a version 1 manifest. `tests/manifest_v2.rs` pins the minimal version 2 manifest of `docs/format.md` byte for byte, the misalignment refusals, and an every-byte sweep.
 
 **Forward compatibility (ADR 017).** There are two rules, depending on who owns the type:
 

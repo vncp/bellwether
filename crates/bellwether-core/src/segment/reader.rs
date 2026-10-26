@@ -240,6 +240,7 @@ impl<R: ReadAt> SegmentReader<R> {
     /// else, validates the header against them (versions agree, codec,
     /// layout, `bloom_hash`), loads the index, and, for storage version 2,
     /// checks the footer's checksum over the preamble, header, and index.
+    #[allow(clippy::too_many_lines)]
     pub fn open(src: R) -> Result<Self> {
         let size = src.size()?;
         if size < (PREAMBLE_LEN + footer_len(1)) as u64 {

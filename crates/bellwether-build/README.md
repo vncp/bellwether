@@ -118,7 +118,9 @@ Either probe silently misses. **Callers must encode probes with the typed encode
 
 **Plan contents.**
 
-- **Bytes.** Bytes are exact: the Parquet footer's `RowGroupMeta.bytes`, or a text file's recorded chunk lengths. The manifest records no per-row-group bytes.
+- **Bytes.** Bytes are exact: the manifest's `rowgroup_bytes` (storage version 2), or, for a file the manifest has no statistics for (a version 1 manifest before its first version 2 commit), the Parquet footer's `RowGroupMeta.bytes`; a text file's recorded chunk lengths. On a version 2 manifest a plan opens no footer (`tests/counts.rs` counts the calls).
+- **Rows and projections.** A plan through a spec that stores counts (`exact:a,counts`, `temporal:id@ts,counts`) carries `rows`, the exact rows holding the keys, summed from the segments' per-key counts (`Planner::count` returns them per key with no plan). With a projection (`locate --columns`), every entry carries `columns` and the plan `projected_bytes`, summed from the manifest's `column_bytes`.
+- **Statistics.** The build records `rowgroup_rows`, `rowgroup_bytes` and `column_bytes` for every file it adds, and the first commit over a version 1 manifest fills them for every tracked file from its footer (`docs/format.md`, "Manifest, storage version 2"). A build with nothing to do commits nothing, so a version 1 index stays at version 1 until a build has work.
 - **Drift.** Every planned file is checked against its fingerprint, so a plan over a drifted file is an error.
 - **Totals.** `row_groups_total` is the number of live row groups. `manifest_version` is the sequence (ADR 020).
 
@@ -178,7 +180,8 @@ Ground truth never goes through the code under test:
 | `tests/fixtures.rs` | Every source fixture: manifest contents, inference, exact/composite/prefix/bloom/range/raw plans with exact bytes, an all-null row group, NaN, UInt32 ≥ 2³¹, Decimal(38,4), latest/asof, CSV and JSON lines chunks persisted, and each file read at its recorded chunk size after the option changes |
 | `tests/invariants.rs` | Invariant 1 and 5 property test over random layouts, caps, item sizes and thread counts; the pruned-newest-version scenario, with the bound shown to be load-bearing; a retired version never bounding live rows |
 | `tests/ids.rs` | Never-reused ids across rewrite, removal and re-add; mtime drift |
-| `tests/completeness.rs` | A spec added later: every row group, recorded at its commit; incomplete spec queries are errors; gap filling; failed builds commit nothing; same-name redefinition; explicit removal by `remove_unlisted` and `remove_spec` |
+| `tests/completeness.rs` | A spec added later: every row group, recorded at its commit; incomplete spec queries are errors; gap filling; failed builds commit nothing; same-name redefinition; completeness keyed by identity (`bloom:grp@0.01` and `bloom:grp@0.05` never share an entry); explicit removal by `remove_unlisted` and `remove_spec` |
+| `tests/counts.rs` | Per-key counts against an oracle that decodes every file (trailing-null tuples, a rewrite that retires ids); the manifest arrays equal the footers before and after the rewrite; a version 2 plan opens no footer and carries exact rows; projected bytes equal the footers' column chunks |
 | `tests/concurrency.rs` | A competing build at the CAS forces a restart with fresh ids; a concurrent compaction is rebased onto |
 | `tests/memory.rs` | Peak batches alive per worker, key-only projection, segment caps, thread-count independence |
 | `tests/incremental.rs` | Source calls linear in new files (counted); no-op builds; root, kind, policy and chunk-size refusals |
@@ -205,6 +208,6 @@ The bench crate cannot depend on this one (layering), so the benchmark lives her
 ## Known limits
 
 - Retired row-group ids stay inside segments written before the rewrite, because core's merge does not filter them. The planner drops them, and they cost space until the spec is rebuilt.
-- `KeySpec::name` omits `ts_column` and `fpr`, and the manifest keys segments and completeness by name. So two specs that differ only there cannot be declared together; the build refuses.
+- `KeySpec::name` omits `ts_column`, `fpr` and `counts`, and an index holds one spec per name: two specs that differ only there cannot be declared together (the build refuses), and declaring one over the other rebuilds it. Segments and completeness are keyed by `KeySpec::identity`, so the old definition's never serve the new one (`tests/completeness.rs`).
 - The manifest has no field for a CSV dialect. A non-default dialect is carried in `source.kind` as `csv;delimiter=<byte>;header=<bool>`, so a change is detected.
 - Sources read local files only (`LocalFs`), like `bellwether-source`. The index itself can live on any `bellwether-store` backend.
