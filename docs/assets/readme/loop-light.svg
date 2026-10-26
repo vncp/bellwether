@@ -1,0 +1,54 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1100 560" width="1100" height="560" role="img" aria-labelledby="title desc">
+<title id="title">The Bellwether loop</title>
+<desc id="desc">An agent or a person may observe and propose; only the engine may score, verify, apply, and attest. A trust boundary enforced by record types separates them: a proposal has no score field, and a receipt cannot be written without a passing certificate. Hashes cross to the engine; evidence, replays, certificates, receipts, and refusals with one next step come back. The engine reads your files' statistics and writes only its index beside them.</desc>
+<defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#656d76"/></marker></defs>
+<g font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif">
+<rect x="0.5" y="0.5" width="1099" height="559" rx="16" fill="#f6f8fa" stroke="#d0d7de" stroke-width="1"/>
+<rect x="30" y="56" width="420" height="344" rx="12" fill="#ffffff" stroke="#d0d7de" stroke-width="1"/>
+<text x="56" y="92" font-size="12" fill="#656d76" font-weight="600" letter-spacing="0.12em">THE AGENT, OR YOU</text>
+<text x="56" y="115" font-size="13" fill="#8c959f">any MCP client · the bellwether CLI</text>
+<line x1="56" y1="134" x2="424" y2="134" stroke="#d0d7de" stroke-width="1"/>
+<text x="56" y="200" font-size="19" fill="#1f2328" font-weight="600">observe</text>
+<text x="174" y="191" font-size="14" fill="#656d76">why · profile · locate · asof</text>
+<text x="174" y="210" font-size="14" fill="#656d76">read-only, from cache → Evidence</text>
+<line x1="56" y1="264.0" x2="424" y2="264.0" stroke="#d0d7de" stroke-width="1"/>
+<text x="56" y="320" font-size="19" fill="#1f2328" font-weight="600">propose</text>
+<text x="174" y="311" font-size="14" fill="#656d76">a key, a layout, a rewrite</text>
+<text x="174" y="330" font-size="14" fill="#656d76">no score field exists → Proposal</text>
+<rect x="650" y="56" width="420" height="344" rx="12" fill="#ffffff" stroke="#d0d7de" stroke-width="1"/>
+<text x="676" y="92" font-size="12" fill="#656d76" font-weight="600" letter-spacing="0.12em">ONLY THE ENGINE</text>
+<text x="676" y="115" font-size="13" fill="#8c959f">one binary · never calls a model</text>
+<line x1="676" y1="134" x2="1044" y2="134" stroke="#d0d7de" stroke-width="1"/>
+<text x="676" y="170" font-size="17" fill="#1f2328" font-weight="600">score</text>
+<text x="768" y="170" font-size="14" fill="#656d76">exact replay of recorded keys → Replay</text>
+<line x1="676" y1="205.0" x2="1044" y2="205.0" stroke="#d0d7de" stroke-width="1"/>
+<text x="676" y="232" font-size="17" fill="#1f2328" font-weight="600">verify</text>
+<text x="768" y="232" font-size="14" fill="#656d76">reconcile: same rows? → Certificate</text>
+<line x1="676" y1="267.0" x2="1044" y2="267.0" stroke="#d0d7de" stroke-width="1"/>
+<text x="676" y="294" font-size="17" fill="#1f2328" font-weight="600">apply</text>
+<text x="768" y="294" font-size="14" fill="#656d76">only with a passing certificate</text>
+<line x1="676" y1="329.0" x2="1044" y2="329.0" stroke="#d0d7de" stroke-width="1"/>
+<text x="676" y="356" font-size="17" fill="#1f2328" font-weight="600">attest</text>
+<text x="768" y="356" font-size="14" fill="#656d76">hash-links the chain → Receipt</text>
+<text x="240" y="430" font-size="13" fill="#8c959f" text-anchor="middle">may observe and propose; may say anything</text>
+<text x="840" y="430" font-size="13" fill="#8c959f" text-anchor="middle">the only writer of the index and the ledger</text>
+<line x1="550" y1="50" x2="550" y2="410" stroke="#cf222e" stroke-width="2" stroke-dasharray="6 6"/>
+<rect x="466" y="24" width="168" height="24" rx="12" fill="#f6f8fa"/>
+<text x="550" y="41" font-size="12" fill="#cf222e" font-weight="600" text-anchor="middle" letter-spacing="0.12em">TRUST BOUNDARY</text>
+<text x="550" y="430" font-size="13" fill="#cf222e" text-anchor="middle">record types, not prompts</text>
+<rect x="458" y="158" width="184" height="38" rx="0" fill="#f6f8fa"/>
+<text x="550" y="174" font-size="13" fill="#656d76" text-anchor="middle">Evidence and Proposal</text>
+<text x="550" y="191" font-size="13" fill="#656d76" text-anchor="middle">hashes; nothing scored</text>
+<line x1="458" y1="208" x2="640" y2="208" stroke="#656d76" stroke-width="1.5" marker-end="url(#arrow)"/>
+<line x1="642" y1="290" x2="460" y2="290" stroke="#656d76" stroke-width="1.5" marker-end="url(#arrow)"/>
+<rect x="454" y="302" width="192" height="38" rx="0" fill="#f6f8fa"/>
+<text x="550" y="318" font-size="13" fill="#656d76" text-anchor="middle">Replays, Certificates,</text>
+<text x="550" y="335" font-size="13" fill="#656d76" text-anchor="middle">Receipts; refusals + next step</text>
+<rect x="380" y="470" width="340" height="66" rx="12" fill="#ffffff" stroke="#656d76" stroke-width="1"/>
+<text x="550" y="498" font-size="17" fill="#1f2328" font-weight="600" text-anchor="middle">Your folder of files</text>
+<text x="550" y="520" font-size="13" fill="#656d76" text-anchor="middle">Parquet · CSV · JSON lines, local or object store</text>
+<path d="M1010 402C1010 470 990 503 726 503" fill="none" stroke="#656d76" stroke-width="1.5" marker-end="url(#arrow)"/>
+<text x="744" y="530" font-size="13" fill="#656d76">reads footers and statistics;</text>
+<text x="744" y="547" font-size="13" fill="#656d76">writes only its index, beside them</text>
+</g>
+</svg>

@@ -1,0 +1,34 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1100 260" width="1100" height="260" role="img" aria-labelledby="title desc">
+<title id="title">Bellwether in three steps</title>
+<desc id="desc">Three steps. 1 Ask: bellwether why ./data/ says which column is a real key and exactly how many bytes each index would save on your recorded queries. 2 Fix: bellwether fix ./data/ --proposal … scores, verifies the same rows come back, builds the index, and only then applies. 3 Proof: a receipt and an index; a hash-linked receipt a reviewer or CI can check, and lookups in milliseconds over plain files.</desc>
+<defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#8b949e"/></marker></defs>
+<g font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif">
+<rect x="0.5" y="0.5" width="1099" height="259" rx="16" fill="#0d1117" stroke="#30363d" stroke-width="1"/>
+<rect x="30" y="30" width="316" height="200" rx="12" fill="#161b22" stroke="#58a6ff" stroke-width="2"/>
+<circle cx="62" cy="66" r="15" fill="#58a6ff"/>
+<text x="62" y="71" font-size="15" fill="#0d1117" font-weight="700" text-anchor="middle">1</text>
+<text x="88" y="73" font-size="20" fill="#e6edf3" font-weight="600">Ask</text>
+<text x="54" y="110" font-size="12.5" fill="#58a6ff" font-family="ui-monospace,SFMono-Regular,'SF Mono',Menlo,Consolas,'DejaVu Sans Mono',monospace">bellwether why ./data/</text>
+<text x="54" y="142" font-size="14" fill="#8b949e">Which column is a real key, and</text>
+<text x="54" y="162" font-size="14" fill="#8b949e">exactly how many bytes each index</text>
+<text x="54" y="182" font-size="14" fill="#8b949e">would save on your recorded queries.</text>
+<line x1="352" y1="130" x2="386" y2="130" stroke="#8b949e" stroke-width="2" marker-end="url(#arrow)"/>
+<rect x="392" y="30" width="316" height="200" rx="12" fill="#161b22" stroke="#d29922" stroke-width="2"/>
+<circle cx="424" cy="66" r="15" fill="#d29922"/>
+<text x="424" y="71" font-size="15" fill="#0d1117" font-weight="700" text-anchor="middle">2</text>
+<text x="450" y="73" font-size="20" fill="#e6edf3" font-weight="600">Fix</text>
+<text x="416" y="110" font-size="12.5" fill="#d29922" font-family="ui-monospace,SFMono-Regular,'SF Mono',Menlo,Consolas,'DejaVu Sans Mono',monospace">bellwether fix ./data/ --proposal …</text>
+<text x="416" y="142" font-size="14" fill="#8b949e">Scores, verifies the same rows come</text>
+<text x="416" y="162" font-size="14" fill="#8b949e">back, builds the index, and only</text>
+<text x="416" y="182" font-size="14" fill="#8b949e">then applies.</text>
+<line x1="714" y1="130" x2="748" y2="130" stroke="#8b949e" stroke-width="2" marker-end="url(#arrow)"/>
+<rect x="754" y="30" width="316" height="200" rx="12" fill="#161b22" stroke="#3fb950" stroke-width="2"/>
+<circle cx="786" cy="66" r="15" fill="#3fb950"/>
+<text x="786" y="71" font-size="15" fill="#0d1117" font-weight="700" text-anchor="middle">3</text>
+<text x="812" y="73" font-size="20" fill="#e6edf3" font-weight="600">Proof</text>
+<text x="778" y="110" font-size="12.5" fill="#3fb950" font-family="ui-monospace,SFMono-Regular,'SF Mono',Menlo,Consolas,'DejaVu Sans Mono',monospace">receipt + index</text>
+<text x="778" y="142" font-size="14" fill="#8b949e">A hash-linked receipt a reviewer or</text>
+<text x="778" y="162" font-size="14" fill="#8b949e">CI can check, and lookups in</text>
+<text x="778" y="182" font-size="14" fill="#8b949e">milliseconds over plain files.</text>
+</g>
+</svg>

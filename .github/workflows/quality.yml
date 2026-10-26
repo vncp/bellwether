@@ -26,6 +26,16 @@ jobs:
       - uses: actions/checkout@v4
       - run: python3 scripts/render_charts.py --check
 
+  readme-assets:
+    name: README figures and captures match their sources
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: python3 scripts/render_figures.py --check
+      # The captures' text is committed beside each SVG; no engine run here.
+      # scripts/readme-captures.sh regenerates the text from a real session.
+      - run: python3 scripts/render_terminal.py --check
+
   supply-chain:
     name: licenses · advisories · sources
     runs-on: ubuntu-latest

@@ -1,0 +1,42 @@
+#! title: bellwether why
+#! caption: bellwether why on the bench ledger corpus (bench generate --seed 42: 16 files, 64 row groups, 128,000 rows; bench workload: 12 recorded runs), nothing indexed; debug build of eca48d1, 2026-10-26.
+$ bellwether why ledger/data --bench-workload ledger
+[1mwhy /private/tmp/bellwether-readme/ledger/data: not indexed[0m
+funnel: 12 run(s), keys p50/p95/max 20/400/400; exact sums of row-group statistics, summed over runs
+                                         files   row groups              bytes           
+  dataset                                   16           64         19,308,862    19.3 MB  128,000 rows
+  current (no index)                       192          768        231,706,344   231.7 MB  
+  exact:entity_id                          108          432        130,336,047   130.3 MB  floor: only row groups holding a key, recommended
+
+culprit (entity_id): no index serves this lookup, so it reads every row group; one value touches 1 / 2 / 4 files and 4 / 8 / 16 row groups (p50 / p95 / max)
+recommended: exact:entity_id reads 130,336,047 bytes (130.3 MB) instead of 231,706,344 (231.7 MB)
+  apply it: bellwether fix /private/tmp/bellwether-readme/ledger/data --proposal 1fbca7a5433d0d524e7b16378ef7dd9e7b4cb8733848397446981f003474c6f0 --workload 3a1921721b730b1ea76a1933a0cb7cccae1f2d7f1cd90a2ebfd34228807cb842
+
+fanout: files and row groups one value touches, p50 / p95 / max
+  key                                      distinct  files/value            row groups/value       sample
+  entity_id                                   6,855  1 / 2 / 4              4 / 8 / 16             exact
+  batch_id                                      288  4 / 4 / 4              4 / 4 / 4              exact
+  status                                          5  16 / 16 / 16           64 / 64 / 64           exact
+  payload                                   128,000  1 / 1 / 1              1 / 1 / 1              exact
+  entity_id, batch_id                       128,000  1 / 1 / 1              1 / 1 / 1              exact
+  entity_id, payload                        128,000  1 / 1 / 1              1 / 1 / 1              exact
+  batch_id, payload                         128,000  1 / 1 / 1              1 / 1 / 1              exact
+  status, payload                           128,000  1 / 1 / 1              1 / 1 / 1              exact
+  entity_id, status                          24,057  1 / 2 / 4              3 / 7 / 16             exact
+  batch_id, status                            1,438  4 / 4 / 4              4 / 4 / 4              exact
+  not candidates:
+    version_ts: Timestamp(µs, "UTC"): a time column, analyzed for range overlap
+    amount: Decimal128(18, 2): not an identifier type
+
+lints
+  batch_stamp_key [batch_id] 0.90
+    batch_id looks like an id but behaves like a write-batch stamp: it rises with version_ts across days, and one value touches 4 of 16 files and 4 row groups at the median, against 1 for (entity_id, batch_id), so look up or join on (entity_id, batch_id) or on entity_id alone instead.
+  low_selectivity_single_column [status] 0.60
+    As a single-column key status prunes almost nothing: its median value touches 64 of 64 row groups (100%), while (entity_id, status) touches at most 7 at p95, so index (entity_id, status) instead.
+  scattered_time_column [version_ts] 0.60
+    version_ts is out of order: a point in time falls inside 27.8 row-group ranges on average, and only 25% of consecutive row groups in a file ascend without overlapping, so range pruning on version_ts reads far more than it needs; sort or cluster each partition by version_ts when writing.
+
+records
+  evidence  8d750deb2ceca98bdd0e4d488620a982075166e1685d2bb42bdcaeafdc29cad8
+  workload  3a1921721b730b1ea76a1933a0cb7cccae1f2d7f1cd90a2ebfd34228807cb842
+  proposal  1fbca7a5433d0d524e7b16378ef7dd9e7b4cb8733848397446981f003474c6f0  replay dcccf81f71b0  exact:entity_id

@@ -1,0 +1,29 @@
+#! title: bellwether asof --valid --known
+#! caption: bellwether index and asof on the bench market corpus (bench market --rung small: 50 symbols, 10 days, prints with restatements and late arrivals), one as-of query of the corpus's own workload (10 symbols); debug build of eca48d1, 2026-10-26.
+$ bellwether index market/data --partitioning hive --key exact:symbol@ts --key range:ts --key temporal2:symbol@ts,known_at
+[1mindex /private/tmp/bellwether-readme/market/data: committed manifest sequence 1[0m
+  files: 20 new, 0 changed, 0 removed, 0 unchanged; 216 row groups read; 16 segments written, 16 live
+
+  key spec or sidecar                         complete at
+  exact:symbol                                          1
+  range:ts                                              1
+  bounds:symbol@ts                                      1
+  temporal2:symbol@ts,known_at                          1
+
+manifest 0ba37c56a9a2643bd2a586d2af8c51964783ae70ad54308ca014268a92b2d150
+
+$ bellwether asof market/data --keys market/workload/keys/q0019.parquet --valid 2026-01-01T14:33:36.594660Z --known 2026-01-02T15:29:06.427726Z
+[1mbitemporal ts <= 2026-01-01T14:33:36.594660Z (1767278016594660), known_at <= 2026-01-02T15:29:06.427726Z (1767367746427726): 10 keys on (symbol) at manifest sequence 1[0m
+                                         files   row groups              bytes
+  live                                      20          216                  -
+  planned                                    3            8             97,851    97.9 kB
+  specs: exact:symbol, range:ts
+  sidecars: temporal2:symbol@ts,known_at
+  order: unspecified; the row groups of /private/tmp/bellwether-readme/market/data/day=2026-01-01/part-0001.parquet are not in ts order, so no reading order of whole files is a time order; entries are ordered by each file's earliest row group
+
+  file                                                          row groups              bytes
+  ...ether-readme/market/data/day=2026-01-01/part-0001.parquet           4             48,946
+  ...ether-readme/market/data/day=2026-01-01/part-0000.parquet           3             34,995
+  ...ether-readme/market/data/day=2026-01-02/part-0000.parquet           1             13,910
+
+evidence 302db23d62c53e92f29939baaddf9159305af3714e11abc5829d9c5c9baaab58

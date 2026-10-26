@@ -1,0 +1,4 @@
+#! title: bellwether report
+#! caption: bellwether report over the ledger after the fix capture; below it, the receipt's section of the report.html it wrote, drawn from that HTML (funnel bars and table as the report renders them); debug build of eca48d1, 2026-10-26.
+$ bellwether report ledger/data --html report.html
+wrote report.html (6,318 bytes): 1 receipts (1 with realized bytes), 1 profile evidence records

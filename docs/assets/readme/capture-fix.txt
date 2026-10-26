@@ -1,0 +1,29 @@
+#! title: bellwether fix, then reconcile
+#! caption: bellwether fix with the proposal and workload the why capture printed, then reconcile against a copy with one entity's amount raised by 0.01 (planted with DuckDB); the bench ledger corpus (bench generate --seed 42: 16 files, 64 row groups, 128,000 rows; bench workload: 12 recorded runs); debug build of eca48d1, 2026-10-26.
+$ bellwether fix ledger/data --proposal 1fbca7a5433d0d524e7b16378ef7dd9e7b4cb8733848397446981f003474c6f0 --workload 3a1921721b730b1ea76a1933a0cb7cccae1f2d7f1cd90a2ebfd34228807cb842
+[1mfix 1fbca7a5433d: key exact:entity_id, against manifest sequence 0[0m
+  1 score     231.7 MB ->   130.3 MB bytes over the workload (768 -> 432 row groups), replay 52da3b0de2d5
+  2 verify  pass, coverage workload, 935 keys, 0 mismatched, 0 missing left, 0 missing right, certificate 71f9d02657df
+  3 apply   manifest 0 -> 1
+  4 attest  receipt f264c16ec8566dcc2de1781dd9efee0c5e56057a7bd38f06bb966d0791a0f568
+  realized 130,336,047 bytes at manifest 1, replay 17fc8287a36f
+
+$ bellwether reconcile ledger/data changed/data --key entity_id --latest-by version_ts --totals amount
+[1mreconcile: FAIL, coverage full[0m
+  keys compared                   6,855
+  matched                         6,854
+  mismatched                          1
+  missing on the left                 0
+  missing on the right                0
+  totals that differ                  1
+
+  first 1 of 1 mismatching keys (entity_id): every kept example is in --json
+    rows differ            (3)
+
+  exact totals, left and right
+    amount           all rows                                1546909874.77            1546909874.78  DIFFER
+
+  read 1 pass(es) over each side under a 268,435,456-byte state budget (0 restarts): 128,000 rows read on the left, 128,000 on the right
+
+certificate 8755117d5a73945b18abe6c4ed4350a161782dfb29c36142a41a3328d825aba0
+#! exit 1
