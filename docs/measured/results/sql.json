@@ -34,7 +34,7 @@
         "duckdb-table",
         "sqlite-table"
       ],
-      "takeaway": "Reconciling 20,314,139 keys took 41 s from a DuckDB table and 91 s from a SQLite table, against 39 s between two Parquet copies; each run read inside one snapshot and wrote a certificate naming both sides."
+      "takeaway": "Reconciling 20,314,139 keys took 42 s from a DuckDB table and 105 s from a SQLite table, against 42 s between two Parquet copies; each run read inside one snapshot and wrote a certificate naming both sides."
     }
   ],
   "rows": [
@@ -43,13 +43,13 @@
       "query": "reconcile",
       "side": "files-vs-files",
       "metric": "wall_ms",
-      "value": 38706,
+      "value": 41504,
       "unit": "ms",
       "exactness": "measured",
       "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1",
-      "build": "bellwether release build 9d24f02",
-      "date": "2026-10-25",
-      "notes": "load average at start: 3.72 5.76 5.61; at end: 18.34 36.79 23.42"
+      "build": "bellwether release build b4bc771",
+      "date": "2026-10-26",
+      "notes": "load average at start: 5.69 5.17 6.15; at end: 5.65 5.87 6.09"
     },
     {
       "dataset": "taxi",
@@ -60,9 +60,9 @@
       "unit": "keys",
       "exactness": "exact",
       "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1",
-      "build": "bellwether release build 9d24f02",
-      "date": "2026-10-25",
-      "notes": "load average at start: 3.72 5.76 5.61; at end: 18.34 36.79 23.42"
+      "build": "bellwether release build b4bc771",
+      "date": "2026-10-26",
+      "notes": "load average at start: 5.69 5.17 6.15; at end: 5.65 5.87 6.09"
     },
     {
       "dataset": "taxi",
@@ -73,9 +73,9 @@
       "unit": "rows",
       "exactness": "exact",
       "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1",
-      "build": "bellwether release build 9d24f02",
-      "date": "2026-10-25",
-      "notes": "load average at start: 3.72 5.76 5.61; at end: 18.34 36.79 23.42"
+      "build": "bellwether release build b4bc771",
+      "date": "2026-10-26",
+      "notes": "load average at start: 5.69 5.17 6.15; at end: 5.65 5.87 6.09"
     },
     {
       "dataset": "taxi",
@@ -86,9 +86,9 @@
       "unit": "passes",
       "exactness": "exact",
       "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1",
-      "build": "bellwether release build 9d24f02",
-      "date": "2026-10-25",
-      "notes": "load average at start: 3.72 5.76 5.61; at end: 18.34 36.79 23.42"
+      "build": "bellwether release build b4bc771",
+      "date": "2026-10-26",
+      "notes": "load average at start: 5.69 5.17 6.15; at end: 5.65 5.87 6.09"
     },
     {
       "dataset": "taxi",
@@ -99,35 +99,35 @@
       "unit": "verdict",
       "exactness": "exact",
       "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1",
-      "build": "bellwether release build 9d24f02",
-      "date": "2026-10-25",
-      "notes": "load average at start: 3.72 5.76 5.61; at end: 18.34 36.79 23.42"
+      "build": "bellwether release build b4bc771",
+      "date": "2026-10-26",
+      "notes": "load average at start: 5.69 5.17 6.15; at end: 5.65 5.87 6.09"
     },
     {
       "dataset": "taxi",
       "query": "reconcile",
       "side": "files-vs-files",
       "metric": "certificate",
-      "value": "059d40b2a097a5c61072375ef772a1d14e3dfa72e60f6c429c4d91c35872a07d",
+      "value": "a53d5f3d5d830a4ba035970a9da88fa04acd9cb51d01887f58d432001dc13b44",
       "unit": "hash",
       "exactness": "exact",
       "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1",
-      "build": "bellwether release build 9d24f02",
-      "date": "2026-10-25",
-      "notes": "load average at start: 3.72 5.76 5.61; at end: 18.34 36.79 23.42"
+      "build": "bellwether release build b4bc771",
+      "date": "2026-10-26",
+      "notes": "load average at start: 5.69 5.17 6.15; at end: 5.65 5.87 6.09"
     },
     {
       "dataset": "taxi",
       "query": "reconcile",
       "side": "duckdb-table",
       "metric": "wall_ms",
-      "value": 41383,
+      "value": 42075,
       "unit": "ms",
       "exactness": "measured",
       "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1",
-      "build": "bellwether release build 9d24f02",
-      "date": "2026-10-25",
-      "notes": "load average at start: 3.72 5.76 5.61; at end: 18.34 36.79 23.42"
+      "build": "bellwether release build b4bc771",
+      "date": "2026-10-26",
+      "notes": "load average at start: 5.69 5.17 6.15; at end: 5.65 5.87 6.09"
     },
     {
       "dataset": "taxi",
@@ -138,9 +138,9 @@
       "unit": "keys",
       "exactness": "exact",
       "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1",
-      "build": "bellwether release build 9d24f02",
-      "date": "2026-10-25",
-      "notes": "load average at start: 3.72 5.76 5.61; at end: 18.34 36.79 23.42"
+      "build": "bellwether release build b4bc771",
+      "date": "2026-10-26",
+      "notes": "load average at start: 5.69 5.17 6.15; at end: 5.65 5.87 6.09"
     },
     {
       "dataset": "taxi",
@@ -151,9 +151,9 @@
       "unit": "rows",
       "exactness": "exact",
       "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1",
-      "build": "bellwether release build 9d24f02",
-      "date": "2026-10-25",
-      "notes": "load average at start: 3.72 5.76 5.61; at end: 18.34 36.79 23.42"
+      "build": "bellwether release build b4bc771",
+      "date": "2026-10-26",
+      "notes": "load average at start: 5.69 5.17 6.15; at end: 5.65 5.87 6.09"
     },
     {
       "dataset": "taxi",
@@ -164,9 +164,9 @@
       "unit": "passes",
       "exactness": "exact",
       "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1",
-      "build": "bellwether release build 9d24f02",
-      "date": "2026-10-25",
-      "notes": "load average at start: 3.72 5.76 5.61; at end: 18.34 36.79 23.42"
+      "build": "bellwether release build b4bc771",
+      "date": "2026-10-26",
+      "notes": "load average at start: 5.69 5.17 6.15; at end: 5.65 5.87 6.09"
     },
     {
       "dataset": "taxi",
@@ -177,22 +177,22 @@
       "unit": "verdict",
       "exactness": "exact",
       "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1",
-      "build": "bellwether release build 9d24f02",
-      "date": "2026-10-25",
-      "notes": "load average at start: 3.72 5.76 5.61; at end: 18.34 36.79 23.42"
+      "build": "bellwether release build b4bc771",
+      "date": "2026-10-26",
+      "notes": "load average at start: 5.69 5.17 6.15; at end: 5.65 5.87 6.09"
     },
     {
       "dataset": "taxi",
       "query": "reconcile",
       "side": "duckdb-table",
       "metric": "certificate",
-      "value": "fc5e64a38d18bef7b4e76841941eb815a24e7d7b4f99647d13cf27e3cf7234db",
+      "value": "29473571d12316485284017aac642489656094c71baa7d8d76e00fc1348daa75",
       "unit": "hash",
       "exactness": "exact",
       "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1",
-      "build": "bellwether release build 9d24f02",
-      "date": "2026-10-25",
-      "notes": "load average at start: 3.72 5.76 5.61; at end: 18.34 36.79 23.42"
+      "build": "bellwether release build b4bc771",
+      "date": "2026-10-26",
+      "notes": "load average at start: 5.69 5.17 6.15; at end: 5.65 5.87 6.09"
     },
     {
       "dataset": "taxi",
@@ -203,9 +203,9 @@
       "unit": "units",
       "exactness": "exact",
       "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1",
-      "build": "bellwether release build 9d24f02",
-      "date": "2026-10-25",
-      "notes": "load average at start: 3.72 5.76 5.61; at end: 18.34 36.79 23.42"
+      "build": "bellwether release build b4bc771",
+      "date": "2026-10-26",
+      "notes": "load average at start: 5.69 5.17 6.15; at end: 5.65 5.87 6.09"
     },
     {
       "dataset": "taxi",
@@ -216,22 +216,22 @@
       "unit": "discipline",
       "exactness": "exact",
       "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1",
-      "build": "bellwether release build 9d24f02",
-      "date": "2026-10-25",
-      "notes": "load average at start: 3.72 5.76 5.61; at end: 18.34 36.79 23.42"
+      "build": "bellwether release build b4bc771",
+      "date": "2026-10-26",
+      "notes": "load average at start: 5.69 5.17 6.15; at end: 5.65 5.87 6.09"
     },
     {
       "dataset": "taxi",
       "query": "reconcile",
       "side": "sqlite-table",
       "metric": "wall_ms",
-      "value": 90560,
+      "value": 105301,
       "unit": "ms",
       "exactness": "measured",
       "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1",
-      "build": "bellwether release build 9d24f02",
-      "date": "2026-10-25",
-      "notes": "load average at start: 3.72 5.76 5.61; at end: 18.34 36.79 23.42"
+      "build": "bellwether release build b4bc771",
+      "date": "2026-10-26",
+      "notes": "load average at start: 5.69 5.17 6.15; at end: 5.65 5.87 6.09"
     },
     {
       "dataset": "taxi",
@@ -242,9 +242,9 @@
       "unit": "keys",
       "exactness": "exact",
       "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1",
-      "build": "bellwether release build 9d24f02",
-      "date": "2026-10-25",
-      "notes": "load average at start: 3.72 5.76 5.61; at end: 18.34 36.79 23.42"
+      "build": "bellwether release build b4bc771",
+      "date": "2026-10-26",
+      "notes": "load average at start: 5.69 5.17 6.15; at end: 5.65 5.87 6.09"
     },
     {
       "dataset": "taxi",
@@ -255,9 +255,9 @@
       "unit": "rows",
       "exactness": "exact",
       "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1",
-      "build": "bellwether release build 9d24f02",
-      "date": "2026-10-25",
-      "notes": "load average at start: 3.72 5.76 5.61; at end: 18.34 36.79 23.42"
+      "build": "bellwether release build b4bc771",
+      "date": "2026-10-26",
+      "notes": "load average at start: 5.69 5.17 6.15; at end: 5.65 5.87 6.09"
     },
     {
       "dataset": "taxi",
@@ -268,9 +268,9 @@
       "unit": "passes",
       "exactness": "exact",
       "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1",
-      "build": "bellwether release build 9d24f02",
-      "date": "2026-10-25",
-      "notes": "load average at start: 3.72 5.76 5.61; at end: 18.34 36.79 23.42"
+      "build": "bellwether release build b4bc771",
+      "date": "2026-10-26",
+      "notes": "load average at start: 5.69 5.17 6.15; at end: 5.65 5.87 6.09"
     },
     {
       "dataset": "taxi",
@@ -281,22 +281,22 @@
       "unit": "verdict",
       "exactness": "exact",
       "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1",
-      "build": "bellwether release build 9d24f02",
-      "date": "2026-10-25",
-      "notes": "load average at start: 3.72 5.76 5.61; at end: 18.34 36.79 23.42"
+      "build": "bellwether release build b4bc771",
+      "date": "2026-10-26",
+      "notes": "load average at start: 5.69 5.17 6.15; at end: 5.65 5.87 6.09"
     },
     {
       "dataset": "taxi",
       "query": "reconcile",
       "side": "sqlite-table",
       "metric": "certificate",
-      "value": "bf4e37b36ae9e5b4e288b00dffba564026e9e010e3e70942c08747ca91bc244b",
+      "value": "d65cd31775cfc55983154e574a55714e259aae165b9f80a864b7f3c480305491",
       "unit": "hash",
       "exactness": "exact",
       "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1",
-      "build": "bellwether release build 9d24f02",
-      "date": "2026-10-25",
-      "notes": "load average at start: 3.72 5.76 5.61; at end: 18.34 36.79 23.42"
+      "build": "bellwether release build b4bc771",
+      "date": "2026-10-26",
+      "notes": "load average at start: 5.69 5.17 6.15; at end: 5.65 5.87 6.09"
     },
     {
       "dataset": "taxi",
@@ -307,9 +307,9 @@
       "unit": "units",
       "exactness": "exact",
       "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1",
-      "build": "bellwether release build 9d24f02",
-      "date": "2026-10-25",
-      "notes": "load average at start: 3.72 5.76 5.61; at end: 18.34 36.79 23.42"
+      "build": "bellwether release build b4bc771",
+      "date": "2026-10-26",
+      "notes": "load average at start: 5.69 5.17 6.15; at end: 5.65 5.87 6.09"
     },
     {
       "dataset": "taxi",
@@ -320,9 +320,9 @@
       "unit": "discipline",
       "exactness": "exact",
       "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1",
-      "build": "bellwether release build 9d24f02",
-      "date": "2026-10-25",
-      "notes": "load average at start: 3.72 5.76 5.61; at end: 18.34 36.79 23.42"
+      "build": "bellwether release build b4bc771",
+      "date": "2026-10-26",
+      "notes": "load average at start: 5.69 5.17 6.15; at end: 5.65 5.87 6.09"
     },
     {
       "dataset": "taxi",
@@ -333,9 +333,9 @@
       "unit": "verdict",
       "exactness": "exact",
       "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1",
-      "build": "bellwether release build 9d24f02",
-      "date": "2026-10-25",
-      "notes": "load average at start: 3.72 5.76 5.61; at end: 18.34 36.79 23.42"
+      "build": "bellwether release build b4bc771",
+      "date": "2026-10-26",
+      "notes": "load average at start: 5.69 5.17 6.15; at end: 5.65 5.87 6.09"
     },
     {
       "dataset": "taxi",
@@ -346,9 +346,9 @@
       "unit": "keys",
       "exactness": "exact",
       "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1",
-      "build": "bellwether release build 9d24f02",
-      "date": "2026-10-25",
-      "notes": "load average at start: 3.72 5.76 5.61; at end: 18.34 36.79 23.42"
+      "build": "bellwether release build b4bc771",
+      "date": "2026-10-26",
+      "notes": "load average at start: 5.69 5.17 6.15; at end: 5.65 5.87 6.09"
     },
     {
       "dataset": "taxi",
@@ -359,9 +359,9 @@
       "unit": "keys",
       "exactness": "exact",
       "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1",
-      "build": "bellwether release build 9d24f02",
-      "date": "2026-10-25",
-      "notes": "load average at start: 3.72 5.76 5.61; at end: 18.34 36.79 23.42"
+      "build": "bellwether release build b4bc771",
+      "date": "2026-10-26",
+      "notes": "load average at start: 5.69 5.17 6.15; at end: 5.65 5.87 6.09"
     },
     {
       "dataset": "taxi",
@@ -372,22 +372,22 @@
       "unit": "keys",
       "exactness": "exact",
       "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1",
-      "build": "bellwether release build 9d24f02",
-      "date": "2026-10-25",
-      "notes": "load average at start: 3.72 5.76 5.61; at end: 18.34 36.79 23.42"
+      "build": "bellwether release build b4bc771",
+      "date": "2026-10-26",
+      "notes": "load average at start: 5.69 5.17 6.15; at end: 5.65 5.87 6.09"
     },
     {
       "dataset": "taxi",
       "query": "reconcile-planted",
       "side": "duckdb-table",
       "metric": "wall_ms",
-      "value": 40234,
+      "value": 42272,
       "unit": "ms",
       "exactness": "measured",
       "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1",
-      "build": "bellwether release build 9d24f02",
-      "date": "2026-10-25",
-      "notes": "load average at start: 3.72 5.76 5.61; at end: 18.34 36.79 23.42"
+      "build": "bellwether release build b4bc771",
+      "date": "2026-10-26",
+      "notes": "load average at start: 5.69 5.17 6.15; at end: 5.65 5.87 6.09"
     },
     {
       "dataset": "taxi",
@@ -398,9 +398,9 @@
       "unit": "verdict",
       "exactness": "exact",
       "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1",
-      "build": "bellwether release build 9d24f02",
-      "date": "2026-10-25",
-      "notes": "load average at start: 3.72 5.76 5.61; at end: 18.34 36.79 23.42"
+      "build": "bellwether release build b4bc771",
+      "date": "2026-10-26",
+      "notes": "load average at start: 5.69 5.17 6.15; at end: 5.65 5.87 6.09"
     },
     {
       "dataset": "taxi",
@@ -411,9 +411,9 @@
       "unit": "keys",
       "exactness": "exact",
       "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1",
-      "build": "bellwether release build 9d24f02",
-      "date": "2026-10-25",
-      "notes": "load average at start: 3.72 5.76 5.61; at end: 18.34 36.79 23.42"
+      "build": "bellwether release build b4bc771",
+      "date": "2026-10-26",
+      "notes": "load average at start: 5.69 5.17 6.15; at end: 5.65 5.87 6.09"
     },
     {
       "dataset": "taxi",
@@ -424,9 +424,9 @@
       "unit": "keys",
       "exactness": "exact",
       "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1",
-      "build": "bellwether release build 9d24f02",
-      "date": "2026-10-25",
-      "notes": "load average at start: 3.72 5.76 5.61; at end: 18.34 36.79 23.42"
+      "build": "bellwether release build b4bc771",
+      "date": "2026-10-26",
+      "notes": "load average at start: 5.69 5.17 6.15; at end: 5.65 5.87 6.09"
     },
     {
       "dataset": "taxi",
@@ -437,22 +437,22 @@
       "unit": "keys",
       "exactness": "exact",
       "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1",
-      "build": "bellwether release build 9d24f02",
-      "date": "2026-10-25",
-      "notes": "load average at start: 3.72 5.76 5.61; at end: 18.34 36.79 23.42"
+      "build": "bellwether release build b4bc771",
+      "date": "2026-10-26",
+      "notes": "load average at start: 5.69 5.17 6.15; at end: 5.65 5.87 6.09"
     },
     {
       "dataset": "taxi",
       "query": "reconcile-planted",
       "side": "sqlite-table",
       "metric": "wall_ms",
-      "value": 97455,
+      "value": 109131,
       "unit": "ms",
       "exactness": "measured",
       "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1",
-      "build": "bellwether release build 9d24f02",
-      "date": "2026-10-25",
-      "notes": "load average at start: 3.72 5.76 5.61; at end: 18.34 36.79 23.42"
+      "build": "bellwether release build b4bc771",
+      "date": "2026-10-26",
+      "notes": "load average at start: 5.69 5.17 6.15; at end: 5.65 5.87 6.09"
     },
     {
       "dataset": "taxi",
@@ -463,9 +463,9 @@
       "unit": "bytes",
       "exactness": "measured",
       "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1",
-      "build": "bellwether release build 9d24f02",
-      "date": "2026-10-25",
-      "notes": "load average at start: 3.72 5.76 5.61; at end: 18.34 36.79 23.42"
+      "build": "bellwether release build b4bc771",
+      "date": "2026-10-26",
+      "notes": "load average at start: 5.69 5.17 6.15; at end: 5.65 5.87 6.09"
     },
     {
       "dataset": "taxi",
@@ -476,22 +476,22 @@
       "unit": "row groups",
       "exactness": "exact",
       "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1",
-      "build": "bellwether release build 9d24f02",
-      "date": "2026-10-25",
-      "notes": "load average at start: 3.72 5.76 5.61; at end: 18.34 36.79 23.42"
+      "build": "bellwether release build b4bc771",
+      "date": "2026-10-26",
+      "notes": "load average at start: 5.69 5.17 6.15; at end: 5.65 5.87 6.09"
     },
     {
       "dataset": "taxi",
       "query": "why-pickup-zones",
       "side": "duckdb-table",
       "metric": "wall_ms",
-      "value": 12477,
+      "value": 12969,
       "unit": "ms",
       "exactness": "measured",
       "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1",
-      "build": "bellwether release build 9d24f02",
-      "date": "2026-10-25",
-      "notes": "load average at start: 3.72 5.76 5.61; at end: 18.34 36.79 23.42"
+      "build": "bellwether release build b4bc771",
+      "date": "2026-10-26",
+      "notes": "load average at start: 5.69 5.17 6.15; at end: 5.65 5.87 6.09"
     },
     {
       "dataset": "taxi",
@@ -502,9 +502,9 @@
       "unit": "key",
       "exactness": "exact",
       "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1",
-      "build": "bellwether release build 9d24f02",
-      "date": "2026-10-25",
-      "notes": "load average at start: 3.72 5.76 5.61; at end: 18.34 36.79 23.42"
+      "build": "bellwether release build b4bc771",
+      "date": "2026-10-26",
+      "notes": "load average at start: 5.69 5.17 6.15; at end: 5.65 5.87 6.09"
     },
     {
       "dataset": "taxi",
@@ -515,9 +515,9 @@
       "unit": "reason",
       "exactness": "exact",
       "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1",
-      "build": "bellwether release build 9d24f02",
-      "date": "2026-10-25",
-      "notes": "load average at start: 3.72 5.76 5.61; at end: 18.34 36.79 23.42"
+      "build": "bellwether release build b4bc771",
+      "date": "2026-10-26",
+      "notes": "load average at start: 5.69 5.17 6.15; at end: 5.65 5.87 6.09"
     },
     {
       "dataset": "taxi",
@@ -528,9 +528,9 @@
       "unit": "bytes",
       "exactness": "measured",
       "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1",
-      "build": "bellwether release build 9d24f02",
-      "date": "2026-10-25",
-      "notes": "load average at start: 3.72 5.76 5.61; at end: 18.34 36.79 23.42"
+      "build": "bellwether release build b4bc771",
+      "date": "2026-10-26",
+      "notes": "load average at start: 5.69 5.17 6.15; at end: 5.65 5.87 6.09"
     },
     {
       "dataset": "taxi",
@@ -541,22 +541,22 @@
       "unit": "row groups",
       "exactness": "exact",
       "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1",
-      "build": "bellwether release build 9d24f02",
-      "date": "2026-10-25",
-      "notes": "load average at start: 3.72 5.76 5.61; at end: 18.34 36.79 23.42"
+      "build": "bellwether release build b4bc771",
+      "date": "2026-10-26",
+      "notes": "load average at start: 5.69 5.17 6.15; at end: 5.65 5.87 6.09"
     },
     {
       "dataset": "taxi",
       "query": "why-pickup-zones",
       "side": "sqlite-table",
       "metric": "wall_ms",
-      "value": 663417,
+      "value": 55313,
       "unit": "ms",
       "exactness": "measured",
       "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1",
-      "build": "bellwether release build 9d24f02",
-      "date": "2026-10-25",
-      "notes": "load average at start: 3.72 5.76 5.61; at end: 18.34 36.79 23.42"
+      "build": "bellwether release build b4bc771",
+      "date": "2026-10-26",
+      "notes": "load average at start: 5.69 5.17 6.15; at end: 5.65 5.87 6.09"
     },
     {
       "dataset": "taxi",
@@ -567,9 +567,9 @@
       "unit": "key",
       "exactness": "exact",
       "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1",
-      "build": "bellwether release build 9d24f02",
-      "date": "2026-10-25",
-      "notes": "load average at start: 3.72 5.76 5.61; at end: 18.34 36.79 23.42"
+      "build": "bellwether release build b4bc771",
+      "date": "2026-10-26",
+      "notes": "load average at start: 5.69 5.17 6.15; at end: 5.65 5.87 6.09"
     },
     {
       "dataset": "taxi",
@@ -580,9 +580,9 @@
       "unit": "reason",
       "exactness": "exact",
       "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1",
-      "build": "bellwether release build 9d24f02",
-      "date": "2026-10-25",
-      "notes": "load average at start: 3.72 5.76 5.61; at end: 18.34 36.79 23.42"
+      "build": "bellwether release build b4bc771",
+      "date": "2026-10-26",
+      "notes": "load average at start: 5.69 5.17 6.15; at end: 5.65 5.87 6.09"
     },
     {
       "dataset": "taxi",
@@ -593,9 +593,9 @@
       "unit": "bytes",
       "exactness": "exact",
       "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1",
-      "build": "bellwether release build 9d24f02",
-      "date": "2026-10-25",
-      "notes": "load average at start: 3.72 5.76 5.61; at end: 18.34 36.79 23.42"
+      "build": "bellwether release build b4bc771",
+      "date": "2026-10-26",
+      "notes": "load average at start: 5.69 5.17 6.15; at end: 5.65 5.87 6.09"
     },
     {
       "dataset": "taxi",
@@ -606,22 +606,22 @@
       "unit": "row groups",
       "exactness": "exact",
       "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1",
-      "build": "bellwether release build 9d24f02",
-      "date": "2026-10-25",
-      "notes": "load average at start: 3.72 5.76 5.61; at end: 18.34 36.79 23.42"
+      "build": "bellwether release build b4bc771",
+      "date": "2026-10-26",
+      "notes": "load average at start: 5.69 5.17 6.15; at end: 5.65 5.87 6.09"
     },
     {
       "dataset": "taxi",
       "query": "why-pickup-zones",
       "side": "files (footer statistics)",
       "metric": "wall_ms",
-      "value": 12975,
+      "value": 11833,
       "unit": "ms",
       "exactness": "measured",
       "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1",
-      "build": "bellwether release build 9d24f02",
-      "date": "2026-10-25",
-      "notes": "load average at start: 3.72 5.76 5.61; at end: 18.34 36.79 23.42"
+      "build": "bellwether release build b4bc771",
+      "date": "2026-10-26",
+      "notes": "load average at start: 5.69 5.17 6.15; at end: 5.65 5.87 6.09"
     },
     {
       "dataset": "taxi",
@@ -632,9 +632,9 @@
       "unit": "key",
       "exactness": "exact",
       "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1",
-      "build": "bellwether release build 9d24f02",
-      "date": "2026-10-25",
-      "notes": "load average at start: 3.72 5.76 5.61; at end: 18.34 36.79 23.42"
+      "build": "bellwether release build b4bc771",
+      "date": "2026-10-26",
+      "notes": "load average at start: 5.69 5.17 6.15; at end: 5.65 5.87 6.09"
     },
     {
       "dataset": "taxi",
@@ -645,9 +645,9 @@
       "unit": "reason",
       "exactness": "exact",
       "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1",
-      "build": "bellwether release build 9d24f02",
-      "date": "2026-10-25",
-      "notes": "load average at start: 3.72 5.76 5.61; at end: 18.34 36.79 23.42"
+      "build": "bellwether release build b4bc771",
+      "date": "2026-10-26",
+      "notes": "load average at start: 5.69 5.17 6.15; at end: 5.65 5.87 6.09"
     },
     {
       "dataset": "taxi",
@@ -658,9 +658,9 @@
       "unit": "bytes",
       "exactness": "exact",
       "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1",
-      "build": "bellwether release build 9d24f02",
-      "date": "2026-10-25",
-      "notes": "load average at start: 3.72 5.76 5.61; at end: 18.34 36.79 23.42"
+      "build": "bellwether release build b4bc771",
+      "date": "2026-10-26",
+      "notes": "load average at start: 5.69 5.17 6.15; at end: 5.65 5.87 6.09"
     },
     {
       "dataset": "taxi",
@@ -671,35 +671,35 @@
       "unit": "row groups",
       "exactness": "exact",
       "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1",
-      "build": "bellwether release build 9d24f02",
-      "date": "2026-10-25",
-      "notes": "load average at start: 3.72 5.76 5.61; at end: 18.34 36.79 23.42"
+      "build": "bellwether release build b4bc771",
+      "date": "2026-10-26",
+      "notes": "load average at start: 5.69 5.17 6.15; at end: 5.65 5.87 6.09"
     },
     {
       "dataset": "taxi",
       "query": "locate-pickup-zones",
       "side": "files (indexed)",
       "metric": "wall_ms",
-      "value": 41,
+      "value": 46,
       "unit": "ms",
       "exactness": "measured",
       "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1",
-      "build": "bellwether release build 9d24f02",
-      "date": "2026-10-25",
-      "notes": "load average at start: 3.72 5.76 5.61; at end: 18.34 36.79 23.42"
+      "build": "bellwether release build b4bc771",
+      "date": "2026-10-26",
+      "notes": "load average at start: 5.69 5.17 6.15; at end: 5.65 5.87 6.09"
     },
     {
       "dataset": "taxi",
       "query": "lookup-pickup-zones",
       "side": "duckdb (engine)",
       "metric": "wall_ms",
-      "value": 239,
+      "value": 235,
       "unit": "ms",
       "exactness": "measured",
       "machine": "Apple M3 Pro, 12 cores, 36 GB, macOS 26.4.1",
       "build": "v2.0.0 d54cbbe3df",
-      "date": "2026-10-25",
-      "notes": "load average at start: 3.72 5.76 5.61; at end: 18.34 36.79 23.42"
+      "date": "2026-10-26",
+      "notes": "load average at start: 5.69 5.17 6.15; at end: 5.65 5.87 6.09"
     }
   ]
 }
