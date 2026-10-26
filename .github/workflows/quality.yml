@@ -19,6 +19,13 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - run: python3 dev/check-layering.py
 
+  charts:
+    name: charts and result tables match the committed results
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: python3 scripts/render_charts.py --check
+
   supply-chain:
     name: licenses · advisories · sources
     runs-on: ubuntu-latest
