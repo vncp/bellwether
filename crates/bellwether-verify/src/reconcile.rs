@@ -1251,6 +1251,7 @@ fn agg_side<'s>(
     };
     let mut causes = Vec::new();
     let mut next = None;
+    let mut compared_at = None;
     match scope {
         Scope::Full | Scope::Sampled { .. } | Scope::Workload { expr: None, .. } => {}
         Scope::Workload { expr: Some(_), .. } => causes.push(format!(
@@ -1315,6 +1316,7 @@ fn agg_side<'s>(
              total of {column}",
             if compared.len() == 1 { "is" } else { "are" }
         ));
+        compared_at = Some(causes.len() - 1);
         let mut ignore: Vec<&str> = plan.ignored.iter().map(String::as_str).collect();
         ignore.extend(compared.iter().map(|c| c.as_str()));
         ignore.sort_unstable();
@@ -1360,8 +1362,36 @@ fn agg_side<'s>(
             next,
         })
     };
-    if !causes.is_empty() {
-        return Ok(not_used(causes, next));
+    // The `--ignore` step is printed only when the compared columns are the
+    // one cause left; otherwise it names the causes that would remain, so
+    // following it never leaves the side still read.
+    let compared_cause = compared_at;
+    let remaining = |causes: &[String]| -> String {
+        let rest: Vec<&str> = causes
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| Some(*i) != compared_cause)
+            .map(|(_, c)| c.as_str())
+            .collect();
+        format!(
+            "ignoring {} too would not let the agg key answer: {}",
+            compared
+                .iter()
+                .map(|c| c.as_str())
+                .collect::<Vec<_>>()
+                .join(", "),
+            rest.join("; ")
+        )
+    };
+    let finish = |causes: Vec<String>, next: Option<String>| {
+        let next = match next {
+            Some(_) if causes.len() > 1 => Some(remaining(&causes)),
+            n => n,
+        };
+        not_used(causes, next)
+    };
+    if causes.len() > usize::from(compared_cause.is_some()) {
+        return Ok(finish(causes, next));
     }
     let all = count_rows(side.source, &ReadSet::Scan(files.to_vec()), None)?.rows;
     let mut rows = 0u64;
@@ -1372,28 +1402,27 @@ fn agg_side<'s>(
     match visited {
         Ok(()) => {}
         Err(e) if bellwether_core::agg::is_sum_overflow(&e) => {
-            return Ok(not_used(
-                vec![format!(
-                    "a key's total of {column} overflows the agg key's 128-bit sum, so the rows \
-                     are read to total it exactly"
-                )],
-                None,
+            causes.push(format!(
+                "a key's total of {column} overflows the agg key's 128-bit sum, so the rows \
+                 are read to total it exactly"
             ));
+            return Ok(finish(causes, next));
         }
         Err(e) => return Err(e.into()),
     }
     if rows != all {
         let nulls = all.saturating_sub(rows);
-        return Ok(not_used(
-            vec![format!(
-                "{nulls} of its {all} rows {} a null {} and {} in no agg key (ADR 014), so the \
-                 rows are read to compare them",
-                if nulls == 1 { "has" } else { "have" },
-                spec.key_columns[0],
-                if nulls == 1 { "is" } else { "are" },
-            )],
-            None,
+        causes.push(format!(
+            "{nulls} of its {all} rows {} a null {} and {} in no agg key (ADR 014), so the \
+             rows are read to compare them",
+            if nulls == 1 { "has" } else { "have" },
+            spec.key_columns[0],
+            if nulls == 1 { "is" } else { "are" },
         ));
+        return Ok(finish(causes, next));
+    }
+    if !causes.is_empty() {
+        return Ok(finish(causes, next));
     }
     Ok(AggUse::Served(AggSide {
         spec: totals.spec(),

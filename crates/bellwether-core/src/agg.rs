@@ -241,8 +241,10 @@ impl AggSum {
     fn zero(kind: SumKind) -> Self {
         match kind {
             SumKind::Int => Self::Int(0),
+            // -0.0 is the identity of IEEE 754 addition: a sum of only
+            // -0.0 values stays -0.0, and -0.0 + 0.0 is 0.0.
             SumKind::Float => Self::Float {
-                sum: 0.0,
+                sum: -0.0,
                 comp: 0.0,
             },
         }

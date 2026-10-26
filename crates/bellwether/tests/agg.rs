@@ -516,7 +516,7 @@ fn a_stale_agg_side_is_read_and_names_the_index_run() {
 
 /// A float column holding infinities and NaN: sums follow IEEE 754 across
 /// row groups (`[inf, 1]` is `inf`, `[-inf, inf]` and anything with NaN
-/// are `NaN`, `-0.0 + 0.0` prints `0.0` as a float does), `fix` certifies
+/// are `NaN`, `-0.0 + 0.0` is `0.0` and `-0.0 + -0.0` is `-0.0`), `fix` certifies
 /// its agg key
 /// (cells compare bit for bit), and every float sum is labelled measured.
 #[test]
@@ -534,9 +534,9 @@ fn a_float_column_with_inf_and_nan_certifies_and_sums_are_measured() {
         Field::new("v", DataType::Float64, true),
     ]));
     // Two row groups; per account: one value in each.
-    let groups: [[f64; 5]; 2] = [
-        [f64::INFINITY, f64::NAN, 1.5, f64::NEG_INFINITY, -0.0],
-        [1.0, 2.0, 2.25, f64::INFINITY, 0.0],
+    let groups: [[f64; 6]; 2] = [
+        [f64::INFINITY, f64::NAN, 1.5, f64::NEG_INFINITY, -0.0, -0.0],
+        [1.0, 2.0, 2.25, f64::INFINITY, 0.0, -0.0],
     ];
     let props = parquet::file::properties::WriterProperties::builder()
         .set_max_row_group_row_count(Some(usize::MAX))
@@ -551,7 +551,7 @@ fn a_float_column_with_inf_and_nan_certifies_and_sums_are_measured() {
         let b = RecordBatch::try_new(
             Arc::clone(&schema),
             vec![
-                Arc::new(Int64Array::from(vec![1, 2, 3, 4, 5])) as ArrayRef,
+                Arc::new(Int64Array::from(vec![1, 2, 3, 4, 5, 6])) as ArrayRef,
                 Arc::new(Float64Array::from(g.to_vec())),
             ],
         )
@@ -561,7 +561,7 @@ fn a_float_column_with_inf_and_nan_certifies_and_sums_are_measured() {
     }
     w.close().unwrap();
     let kf = dir.path().join("k.parquet");
-    write_keys(&kf, "account", &[1, 2, 3, 4, 5]);
+    write_keys(&kf, "account", &[1, 2, 3, 4, 5, 6]);
     let q = AggregateQuery {
         value: "v".into(),
         functions: vec![AggregateFn::Sum, AggregateFn::Count],
@@ -572,7 +572,7 @@ fn a_float_column_with_inf_and_nan_certifies_and_sums_are_measured() {
     let cert = why_then_fix(&e, &kf, &agg, false, &q);
     assert!(cert.pass);
     let check = cert.body.agg[0].checked.as_ref().unwrap();
-    assert_eq!((check.keys, check.differ), (5, 0));
+    assert_eq!((check.keys, check.differ), (6, 0));
 
     let a = e.aggregate(&KeyFile::new(&kf), "v", &q.functions).unwrap();
     assert!(a.complete);
@@ -597,6 +597,7 @@ fn a_float_column_with_inf_and_nan_certifies_and_sums_are_measured() {
         ("3", "3.75"),
         ("4", "NaN"),
         ("5", "0.0"),
+        ("6", "-0.0"),
     ];
     assert_eq!(
         sums,
@@ -744,4 +745,149 @@ fn an_agg_side_on_the_right_at_another_manifest_than_the_left() {
         panic!()
     };
     assert_eq!(c.provenance.manifest_version.as_deref(), Some("2"));
+}
+
+/// Writes one file of `(account: Int64, amount: Decimal128(18, 2), fee:
+/// Decimal128(18, 2))`, two row groups, `fee_of(row)` cents of fee per row.
+fn write_fees(dir: &Path, fee_of: impl Fn(i64) -> i128) {
+    use arrow::array::{ArrayRef, Decimal128Array, Int64Array, RecordBatch};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use std::sync::Arc;
+    std::fs::create_dir_all(dir).unwrap();
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("account", DataType::Int64, false),
+        Field::new("amount", DataType::Decimal128(18, 2), false),
+        Field::new("fee", DataType::Decimal128(18, 2), false),
+    ]));
+    let props = parquet::file::properties::WriterProperties::builder()
+        .set_max_row_group_row_count(Some(usize::MAX))
+        .build();
+    let mut w = parquet::arrow::ArrowWriter::try_new(
+        std::fs::File::create(dir.join("part-000.parquet")).unwrap(),
+        Arc::clone(&schema),
+        Some(props),
+    )
+    .unwrap();
+    for g in 0..2i64 {
+        let rows: Vec<i64> = (g * 20..g * 20 + 20).collect();
+        let dec = |v: Vec<i128>| {
+            Arc::new(
+                Decimal128Array::from(v)
+                    .with_precision_and_scale(18, 2)
+                    .unwrap(),
+            ) as ArrayRef
+        };
+        let b = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from_iter_values(rows.iter().map(|r| r % 4))) as ArrayRef,
+                dec(rows.iter().map(|r| i128::from(*r) * 100 + 7).collect()),
+                dec(rows.iter().map(|r| fee_of(*r)).collect()),
+            ],
+        )
+        .unwrap();
+        w.write(&b).unwrap();
+        w.flush().unwrap();
+    }
+    w.close().unwrap();
+}
+
+/// An agg key holds one total. A reconcile of two totals (`amount` and
+/// `fee`, both ignored row by row) whose second differs (one fee 1.00 on the
+/// left, 1.01 on the right) is never folded from the agg keys on `amount`:
+/// both sides are read, each says why, and the difference in `fee` fails it.
+#[test]
+fn two_totals_are_never_folded_from_an_agg_key_on_one() {
+    let dir = tempfile::tempdir().unwrap();
+    let (left, right) = (dir.path().join("left"), dir.path().join("right"));
+    write_fees(&left, |_| 100);
+    write_fees(&right, |r| if r == 13 { 101 } else { 100 });
+    for d in [&left, &right] {
+        open(d)
+            .index(&[
+                parse("exact:account,counts").unwrap(),
+                parse("agg:account@amount{sum,count}").unwrap(),
+            ])
+            .unwrap();
+    }
+    let req = ReconcileRequest {
+        key: vec!["account".into()],
+        ignore: vec!["amount".into(), "fee".into()],
+        totals: vec!["amount".into(), "fee".into()],
+        ..ReconcileRequest::default()
+    };
+    let r = open(&left)
+        .reconcile(right.to_str().unwrap(), &req)
+        .unwrap();
+    assert!(!r.outcome.pass);
+    assert!(r.outcome.agg.is_empty(), "{:?}", r.outcome.agg);
+    assert_eq!(r.outcome.memory.rows_read, [40, 40]);
+    assert_eq!(r.outcome.counts.totals_differ, 1, "{:?}", r.outcome.counts);
+    assert_eq!(
+        r.outcome.agg_not_used.len(),
+        2,
+        "{:?}",
+        r.outcome.agg_not_used
+    );
+    for n in &r.outcome.agg_not_used {
+        assert_eq!(
+            n.causes,
+            ["amount, fee are totalled, and an agg key stands in for one total"]
+        );
+        assert_eq!(n.next, None);
+    }
+}
+
+/// With a version rule as well as a compared total, the `--ignore` step
+/// alone would leave the side read, so the next step names the cause that
+/// remains; following the ignore step indeed still reads every row.
+#[test]
+fn the_ignore_step_is_offered_only_when_it_is_the_last_cause() {
+    let dir = tempfile::tempdir().unwrap();
+    let (left, right) = (dir.path().join("left"), dir.path().join("right"));
+    corpus_with(&left, 1, 2, 30, |_| {});
+    corpus_with(&right, 1, 2, 30, |_| {});
+    index_agg(&left);
+    index_agg(&right);
+    let versioned = |ignore: Vec<String>| ReconcileRequest {
+        ignore,
+        latest_by: Some("entry".into()),
+        ..reconcile_req()
+    };
+    let r = open(&left)
+        .reconcile(right.to_str().unwrap(), &versioned(Vec::new()))
+        .unwrap();
+    assert_eq!(
+        r.outcome.agg_not_used.len(),
+        2,
+        "{:?}",
+        r.outcome.agg_not_used
+    );
+    for n in &r.outcome.agg_not_used {
+        assert_eq!(n.causes.len(), 2, "{:?}", n.causes);
+        let next = n.next.as_deref().unwrap();
+        assert!(!next.contains("--ignore"), "{next}");
+        assert!(
+            next.starts_with("ignoring amount, entry too would not let the agg key answer: the newest row per key by \
+             entry"),
+            "{next}"
+        );
+    }
+    // Following an ignore step anyway: still read, the version rule named.
+    let r = open(&left)
+        .reconcile(
+            right.to_str().unwrap(),
+            &versioned(vec!["amount".into(), "entry".into()]),
+        )
+        .unwrap();
+    assert_eq!(r.outcome.memory.rows_read, [60, 60]);
+    for n in &r.outcome.agg_not_used {
+        assert_eq!(n.causes.len(), 1, "{:?}", n.causes);
+        assert!(
+            n.causes[0].starts_with("the newest row per key by entry"),
+            "{:?}",
+            n.causes
+        );
+        assert_eq!(n.next, None);
+    }
 }
