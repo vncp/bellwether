@@ -59,6 +59,7 @@ impl Engine {
         guard(|| self.report_inner(out))
     }
 
+    #[allow(clippy::too_many_lines)]
     fn report_inner(&self, out: &Path) -> Result<ReportResult> {
         let ledger = self.ledger()?;
         let mut unreadable: Vec<Hash> = Vec::new();
@@ -98,17 +99,22 @@ impl Engine {
                 Ok(Record::Certificate(c)) => Some(c),
                 _ => None,
             };
-            let realized = replay.as_ref().and_then(|p| {
-                replays
-                    .iter()
-                    .filter(|(_, r)| {
-                        r.proposal == receipt.proposal
-                            && r.workload == p.workload
-                            && r.manifest_version == receipt.manifest_after
-                    })
-                    .max_by(|a, b| a.1.created_at.cmp(&b.1.created_at).then(a.0.cmp(&b.0)))
-                    .map(|(h, r)| (*h, total(&r.current)))
-            });
+            // An attest-only receipt applied nothing: there is no realized
+            // cost after it, only the measurement and the prediction error.
+            let realized = replay
+                .as_ref()
+                .filter(|_| !receipt.attest_only)
+                .and_then(|p| {
+                    replays
+                        .iter()
+                        .filter(|(_, r)| {
+                            r.proposal == receipt.proposal
+                                && r.workload == p.workload
+                                && r.manifest_version == receipt.manifest_after
+                        })
+                        .max_by(|a, b| a.1.created_at.cmp(&b.1.created_at).then(a.0.cmp(&b.0)))
+                        .map(|(h, r)| (*h, total(&r.current)))
+                });
             let signature = self.verdicts(&h)?;
             receipts.push(ReceiptView {
                 hash: h,
@@ -228,7 +234,7 @@ h1{font-size:22px;margin:0 0 4px}h2{font-size:18px;margin:32px 0 8px;border-bott
 p.muted,span.muted{color:var(--muted)}code{font:13px ui-monospace,SFMono-Regular,Menlo,monospace}
 table{border-collapse:collapse;width:100%;margin:6px 0 12px;font-size:13px}th,td{border-bottom:1px solid var(--rule);padding:4px 8px;text-align:right;white-space:nowrap}
 th:first-child,td:first-child{text-align:left}.scroll{overflow-x:auto}svg text{fill:var(--fg);font:12px sans-serif}
-.pass{color:var(--ok)}.fail{color:var(--bad)}
+.pass{color:var(--ok)}.fail{color:var(--bad)}.measured,.attest{font-weight:600;border:1px solid var(--muted);border-radius:3px;padding:0 4px}
 ";
 
 fn render(
@@ -258,6 +264,7 @@ fn render(
         render_receipt(&mut h, r);
     }
     render_realized(&mut h, receipts);
+    render_predictions(&mut h, receipts);
     h.push_str("<h2>Fanout per profile evidence</h2>");
     if evidence.is_empty() {
         h.push_str("<p class=\"muted\">No profile evidence yet. <code>bellwether why</code> writes one.</p>");
@@ -286,11 +293,17 @@ fn proposal_label(p: Option<&Proposal>) -> String {
     match p.map(|p| &p.body) {
         Some(ProposalBody::Key { spec }) => format!("key {}", label(spec)),
         Some(ProposalBody::Layout { cluster_by }) => format!("layout by {}", cluster_by.join(", ")),
+        Some(ProposalBody::Rewrite { shape }) if !shape.pairs.is_empty() => format!(
+            "rewrite of {} engine query pair(s), compared by ({})",
+            shape.pairs.len(),
+            shape.key.join(", ")
+        ),
         Some(ProposalBody::Rewrite { shape }) => format!("rewrite to {}", shape.after),
         None => "proposal missing from the ledger".to_string(),
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn render_receipt(h: &mut String, r: &ReceiptView) {
     let _ = write!(
         h,
@@ -337,6 +350,17 @@ fn render_receipt(h: &mut String, r: &ReceiptView) {
     };
     let now = total(&replay.current);
     let fix = total(&replay.proposed);
+    let measured = replay
+        .current
+        .iter()
+        .chain(&replay.proposed)
+        .any(|c| !c.exact);
+    if r.receipt.attest_only {
+        h.push_str(
+            "<p><span class=\"attest\">attest-only</span>: verified, nothing applied; a human \
+             or a CI gate deploys it.</p>",
+        );
+    }
     let _ = write!(
         h,
         "<p class=\"muted\">Replay <code>{}</code> over workload <code>{}</code>, {} runs.</p>",
@@ -344,12 +368,26 @@ fn render_receipt(h: &mut String, r: &ReceiptView) {
         short(&replay.workload),
         replay.current.len()
     );
+    if measured {
+        let _ = write!(
+            h,
+            "<p><span class=\"measured\">measured, not exact</span>: every cost below is \
+             what <code>{}</code> recorded for the queries the engine submitted; units are the \
+             engine's storage units and bytes its bytes read.</p>",
+            esc(replay.model.as_deref().unwrap_or("an unnamed model"))
+        );
+    }
     funnel_svg(h, now, fix);
+    let (b, a) = if measured {
+        ("before (measured)", "after (measured)")
+    } else {
+        ("before", "after (predicted)")
+    };
     let _ = write!(
         h,
         "<div class=\"scroll\"><table><tr><th>summed over runs</th><th>files</th><th>row groups</th><th>bytes</th></tr>\
-         <tr><td>before</td><td>{}</td><td>{}</td><td>{}</td></tr>\
-         <tr><td>after (predicted)</td><td>{}</td><td>{}</td><td>{}</td></tr></table></div>",
+         <tr><td>{b}</td><td>{}</td><td>{}</td><td>{}</td></tr>\
+         <tr><td>{a}</td><td>{}</td><td>{}</td><td>{}</td></tr></table></div>",
         num(now.files),
         num(now.row_groups),
         num(now.bytes),
@@ -357,6 +395,29 @@ fn render_receipt(h: &mut String, r: &ReceiptView) {
         num(fix.row_groups),
         num(fix.bytes)
     );
+    if let Some(p) = &r.receipt.prediction {
+        let ratio = |x: &Option<String>| x.clone().unwrap_or_else(|| "undefined".into());
+        let _ = write!(
+            h,
+            "<div class=\"scroll\"><table><tr><th>prediction error</th><th>rows</th><th>bytes read</th><th>ratio to the twin's rows</th></tr>\
+             <tr><td>twin predicted (exact, lake)</td><td>{}</td><td>-</td><td>1.000</td></tr>",
+            num(p.predicted_rows)
+        );
+        for (i, q) in p.pairs.iter().enumerate() {
+            let _ = write!(
+                h,
+                "<tr><td>p{i} engine before (measured)</td><td>{}</td><td>{}</td><td>{}</td></tr>\
+                 <tr><td>p{i} engine after (measured)</td><td>{}</td><td>{}</td><td>{}</td></tr>",
+                num(q.before_read_rows),
+                num(q.before_read_bytes),
+                esc(&ratio(&q.before_ratio)),
+                num(q.after_read_rows),
+                num(q.after_read_bytes),
+                esc(&ratio(&q.after_ratio))
+            );
+        }
+        h.push_str("</table></div>");
+    }
 }
 
 /// Before and after bars per measure, each scaled to its "before" value.
@@ -463,12 +524,49 @@ fn render_realized(h: &mut String, receipts: &[ReceiptView]) {
     h.push_str("</table></div>");
 }
 
+/// The twin's prediction against each engine's measurement, over every
+/// attest-only receipt that carries one (ADR 033): whether `why` on the
+/// twin can be trusted for that engine, or the engine must be measured.
+fn render_predictions(h: &mut String, receipts: &[ReceiptView]) {
+    let with: Vec<(&ReceiptView, &bellwether_types::Prediction)> = receipts
+        .iter()
+        .filter_map(|r| r.receipt.prediction.as_ref().map(|p| (r, p)))
+        .collect();
+    if with.is_empty() {
+        return;
+    }
+    h.push_str(
+        "<h2>Twin prediction against the engine (measured, not exact)</h2><div class=\"scroll\"><table>\
+         <tr><th>receipt</th><th>pair</th><th>engine model</th><th>twin predicted rows</th><th>row groups</th>\
+         <th>engine read before</th><th>ratio</th><th>engine read after</th><th>ratio</th></tr>",
+    );
+    for (r, p) in with {
+        let ratio = |x: &Option<String>| x.clone().unwrap_or_else(|| "undefined".into());
+        for (i, q) in p.pairs.iter().enumerate() {
+            let _ = write!(
+                h,
+                "<tr><td><code>{}</code></td><td>p{i}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
+                short(&r.hash),
+                esc(r.replay.as_ref().and_then(|x| x.model.as_deref()).unwrap_or("-")),
+                num(p.predicted_rows),
+                num(p.predicted_row_groups),
+                num(q.before_read_rows),
+                esc(&ratio(&q.before_ratio)),
+                num(q.after_read_rows),
+                esc(&ratio(&q.after_ratio))
+            );
+        }
+    }
+    h.push_str("</table></div>");
+}
+
 fn render_evidence(h: &mut String, hash: &Hash, e: &Evidence) {
     let EvidenceBody::Profile {
         root,
         fanout,
         lints,
         workload_keys,
+        twin,
     } = &e.body
     else {
         return;
@@ -508,6 +606,22 @@ fn render_evidence(h: &mut String, hash: &Hash, e: &Evidence) {
         );
     }
     h.push_str("</table></div>");
+    if let Some(t) = twin {
+        let _ = write!(
+            h,
+            "<p>Lake twin of <code>{}</code>: the engine held {} rows in {} units (identity <code>{}</code>), the lake {} rows at sequence {}; the {} sampled keys hold {} rows in {} row groups and {} files of the lake.</p>",
+            esc(&t.engine),
+            num(t.engine_rows),
+            num(t.units),
+            short(&t.identity),
+            num(t.lake_rows),
+            t.sequence,
+            num(t.keys),
+            num(t.predicted_rows),
+            num(t.predicted_row_groups),
+            num(t.predicted_files)
+        );
+    }
     for l in lints {
         let _ = write!(
             h,

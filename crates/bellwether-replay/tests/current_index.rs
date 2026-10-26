@@ -373,6 +373,9 @@ fn irrelevant_specs_and_rewrites_are_refused() {
             &p,
             &ProposalBody::Rewrite {
                 shape: bellwether_types::RewriteShape {
+                    pairs: Vec::new(),
+                    key: Vec::new(),
+                    keys: None,
                     before: "a".into(),
                     after: "b".into(),
                     invariant: "c".into(),
@@ -419,6 +422,9 @@ fn refusals_are_typed_and_write_nothing() {
         &ledger,
         ProposalBody::Rewrite {
             shape: bellwether_types::RewriteShape {
+                pairs: Vec::new(),
+                key: Vec::new(),
+                keys: None,
                 before: "a".into(),
                 after: "b".into(),
                 invariant: "c".into(),
@@ -592,6 +598,7 @@ fn a_layout_proposal_is_costed_and_written_under_its_named_model() {
     let total = replayer.catalog().bytes_total();
     let half = total / 2;
     let want = |run: &str, rgs: u64, bytes: u64, keys: u64| RunCost {
+        measured: None,
         run_id: run.into(),
         keys,
         files: u64::from(rgs > 0),

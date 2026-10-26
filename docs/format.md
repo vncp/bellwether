@@ -167,6 +167,41 @@ No engine this release reads exposes a per-table snapshot id, so ADR 027's secon
 
 **Snapshot.** A run over a table holds one read transaction where the engine has a snapshot (`BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY` in Postgres, `BEGIN TRANSACTION` in DuckDB, a deferred read transaction in SQLite, `SNAPSHOT` isolation in SQL Server when the database allows it) and rolls it back at the end. Otherwise (`snapshot=reread`, Flight SQL, or SQL Server without snapshot isolation) every unit's identity, and the list of partitions, is read again when the run ends, and any difference is refused (`Error::SourceChanged`) before anything is recorded. A unit read returning another row count than its identity says is refused either way.
 
+## Query engine sources: `clickhouse://` and `kusto://` (2026-10-26, ADR 033)
+
+A query engine that owns its storage is reached through a `MeasuredEngine` adapter (`bellwether-source-engine`) and is a `Source` too, so its tables have an identity like a folder or a SQL table. Nothing in storage version 1 changes: an engine never has an index (the engine builds nothing inside it), so these identities and statistics appear only in records, through the fields below. Every field is additive with `skip_serializing_if`: a record written before them keeps its bytes and its hash (`crates/bellwether-source-engine/tests/conformance.rs`).
+
+**Root.** `clickhouse://[user@]host[:port]/<database>[/<table>[,<table>...]]` and `kusto://<cluster>/<database>[/<table>...]`. Parameters follow `?`: `password=env:NAME` (ClickHouse; a secret is read from the environment only), `scratch=<storage folder URL>` (Kusto, where `.export` writes). A recorded root has neither the user nor any parameter: `clickhouse://host:port/db/table`.
+
+**Units.** A unit plays a file of one row group. ClickHouse: one per partition of each MergeTree table, from the active parts in `system.parts`; path `<root>/<table>/<partition_id>`; size the partition's rows; identity string `v1;rows=<n>;blocks=<lo>-<hi>;mutation=<v>` (the lowest and highest block numbers of its parts and the highest mutation version), which an insert, a delete, or a mutation changes and a background merge does not. Kusto: one per extent, from `.show table <t> extents`; path `<root>/<table>/<extent id>`; identity string `v1;rows=<n>;extent=<extent id>` (an extent is immutable; a merge replaces extents, so a merge is seen as a change). In both, `etag` is the identity string and `tail_blake3` its BLAKE3.
+
+**Engine identity.** `Hash::of_record((root, [(unit path, identity string), ...]))` with the units sorted by path, beside the unit count and the rows they hold (`EngineIdentity`). `why --twin-of` records it in the profile Evidence (`twin.identity`); `fix` reads it before scoring and again, on a fresh connection, after the exports, cites both in the Certificate's provenance, and refuses a change between them (`Error::SourceChanged`).
+
+**Tags.** Every query bellwether submits runs under `bw-<run>-<role>`: `<run>` is 16 lowercase hex digits drawn per run (BLAKE3 of the clock, the process id, and a counter; the apply tier draws its own run), `<role>` names the query (`keys` for `workload record`, `p<i>-before` and `p<i>-after` for pair `i`). ASCII letters, digits, and `-` only, at most 96 bytes, so a tag is safe inside any engine's string literal. The engine logs it with the query (ClickHouse `query_id` = the tag; Kusto `ClientRequestId` = `bellwether;<tag>`) and statistics are read back by it, so a number in a record is always one the engine logged for a query bellwether submitted.
+
+**Record fields.**
+
+| Field | Meaning |
+|---|---|
+| `EvidenceBody::Profile.twin` (`TwinOf`) | `engine` (recorded root), `identity`, `units`, `engine_rows`, the lake's `sequence` and `lake_rows`, the key sample's `workload`, `keys`, the twin's prediction (`predicted_rows`, `predicted_row_groups`, `predicted_files`: the lake's rows, row groups, and files holding a sampled key, exact), and the `gates` compared against |
+| `RewriteShape.pairs` / `.key` / `.keys` | the (before, after) query texts, the result columns each pair is reconciled by, the key sample's workload |
+| `RunCost.measured` (`QueryStats`) | `tag`, `read_rows`, `read_bytes`, `peak_memory_bytes`, `cpu_ns?`, `duration_ns`, `result_rows`, `units_read?`, `units_total?`, as the engine's own log records them; such a cost is never `exact`, and its Replay names the model (`clickhouse.query_log`, `kusto.query_log`) |
+| `Replay.prediction`, `Receipt.prediction` (`Prediction`) | the twin Evidence, `predicted_rows`, `predicted_row_groups`, and `pairs`: one `PairPrediction` per pair in the proposal's order, each with the engine's `before_read_rows`, `after_read_rows`, `before_read_bytes`, `after_read_bytes` for that pair's queries and `before_ratio`, `after_ratio` = that pair's read rows / predicted rows as a decimal string with three places, rounded half to even, absent when nothing was predicted. Nothing is summed across pairs |
+| `Receipt.attest_only` | `true`: the engine scored and verified and applied nothing (`manifest_after == manifest_before`); written only for a rewrite whose current costs are measured |
+
+The ledger's rules (ADR 033 amendment of ADR 005): a Replay may carry inexact current costs only for a rewrite and only with its model named; a cost carrying `measured` is never `exact`; a receipt over a Replay with measured costs must be `attest_only`, leave the manifest where it was, and copy the Replay's `prediction` unchanged.
+
+**Conformance vectors** (`crates/bellwether-source-engine/tests/conformance.rs` checks each):
+
+| Vector | Value |
+|---|---|
+| tag, run `0123456789abcdef`, role `p0-before` | `bw-0123456789abcdef-p0-before` |
+| ratio 1600 / 2, 400 / 1600, 2 / 3, 1 / 2000, 3 / 2000, 7 / 2000, 9 / 0 | `800.000`, `0.250`, `0.667`, `0.000`, `0.002`, `0.004`, absent |
+| `tail_blake3` of `v1;rows=1000;blocks=1-3;mutation=0` | `97ddb63656c5d7e616b9f7d953d66097a154551af091837730c0ef76563f58c7` |
+| identity of `clickhouse://h:8123/db/orders` with units `0` (`v1;rows=500;blocks=1-1;mutation=0`) and `1` (`v1;rows=1000;blocks=2-4;mutation=0`), listed `1` first (units sort by path, not by identity string) | canonical bytes `["clickhouse://h:8123/db/orders",[["clickhouse://h:8123/db/orders/0","v1;rows=500;blocks=1-1;mutation=0"],["clickhouse://h:8123/db/orders/1","v1;rows=1000;blocks=2-4;mutation=0"]]]`, hash `2dfe8d56adbc1ecb0e1c9f5ebd4bcc91de6dedde8eeafe233aef35fc6c0aa8b1` |
+| a `RunCost` with `measured` (run and tag `bw-0123456789abcdef-p0-after`, 2 keys, 1 file, 1 row group, 16,000 bytes; 400 rows read, 1,048,576 peak, 1.5 ms CPU, 2 ms, 2 result rows, 1 of 4 units) | hash `39c0305370655bd56bc6602de676ecfb4bb4e9868858774e37a31944db9d0537` |
+| an attest-only Receipt (evidence, proposal, replay, certificate `e…`, `f…`, `a…`, `c…`; manifest `0` to `0`; prediction 2 rows in 1 row group; pair 0 read 1,600 then 400 rows, 64,000 then 16,000 bytes; pair 1 read 5 then 3 rows, 200 then 100 bytes) | hash `a75c47726b81d82a0e968c4aba143fc7feed9b5a32bfbc690e2dcd3379d81ac1` |
+
 ## Build-side memory (ADR 018 note)
 
 The lookup bound is one block index plus the bitmaps for the keys asked. The build bound is one segment: a writer holds a segment's distinct keys until the segment is finished, because the segment's name is the hash of its bytes. The build crate therefore caps segment size (keys and bytes) and emits many segments rather than one large one; merge compacts them later.

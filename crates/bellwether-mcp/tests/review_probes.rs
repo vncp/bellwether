@@ -881,7 +881,9 @@ fn schemas_are_closed_everywhere() {
             "jobs.start",
             json!({"tool": "propose.key", "arguments": {"spec": {"kind": "exact", "columns": ["id"], "score": 9}, "evidence": [e], "by": "a"}}),
         );
-        refused_as("jobs.start nested score", &r, "invalid_input");
+        // A score inside a tagged union is named too (ADR 033).
+        refused_as("jobs.start nested score", &r, "caller_supplied_cost");
+        assert_eq!(refusal(&r).fields["field"], "score");
         for spec in [
             json!({"kind": "bloom", "columns": ["id"], "fpr": 0.01, "score": 1}),
             json!({"kind": "temporal", "columns": ["id"], "ts_column": "ts", "score": 1}),
@@ -891,8 +893,14 @@ fn schemas_are_closed_everywhere() {
                 "propose.key",
                 json!({"spec": spec, "evidence": [e], "by": "a"}),
             );
-            refused_as("variant score", &r, "invalid_input");
+            refused_as("variant score", &r, "caller_supplied_cost");
         }
+        // Any other unknown field there stays a schema error.
+        let r = srv.call(
+            "propose.key",
+            json!({"spec": {"kind": "exact", "columns": ["id"], "colour": 1}, "evidence": [e], "by": "a"}),
+        );
+        refused_as("variant colour", &r, "invalid_input");
         assert_eq!(objects(&index), before, "[clock={clock:?}]");
     }
 }

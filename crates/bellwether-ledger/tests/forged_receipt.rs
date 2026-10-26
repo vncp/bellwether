@@ -400,6 +400,9 @@ fn only_a_rewrite_may_leave_the_manifest_unchanged() {
     let mut p = proposal(vec![f.evidence], "agent");
     p.body = bellwether_types::ProposalBody::Rewrite {
         shape: bellwether_types::RewriteShape {
+            pairs: Vec::new(),
+            key: Vec::new(),
+            keys: None,
             before: "scan by batch_id".into(),
             after: "lookup by order_id".into(),
             invariant: "same rows".into(),

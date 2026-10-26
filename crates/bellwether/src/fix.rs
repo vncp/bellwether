@@ -46,6 +46,7 @@ use roaring::RoaringBitmap;
 use serde::{Deserialize, Serialize};
 
 use crate::engine::{folder_changes, guard, Engine, Pinned};
+use crate::engine_fix::{engine_shape, EngineCompare, EngineRun};
 use crate::index::stale_index;
 use crate::results::{total, Cost, Written};
 
@@ -91,6 +92,10 @@ pub struct FixRequest {
     /// proposal is refused right after the score ([`Refusal::NothingToGain`]).
     #[serde(default)]
     pub allow_no_gain: bool,
+    /// For a rewrite of engine queries (ADR 033): how its before and after
+    /// results are compared (default: by the proposal's key columns alone).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub engine: Option<EngineCompare>,
 }
 
 /// The score stage's outcome.
@@ -106,18 +111,23 @@ pub enum Score {
         /// Summed over runs, under the proposal.
         proposed: Cost,
     },
-    /// Over a table (ADR 027): a Replay computed now with every cost
-    /// measured (`exact: false`, `model` named) and not recorded, since the
-    /// ledger keeps only exact current costs (ADR 005). Nothing is applied
-    /// to a table, so no gain gate runs.
+    /// Every cost measured (`exact: false`, `model` named). Over a table
+    /// (ADR 027): a Replay computed now and not recorded, since the ledger
+    /// keeps exact current costs only for anything but a measured rewrite
+    /// (ADR 005); nothing is applied to a table, so no gain gate runs. In a
+    /// query engine (ADR 033): the Replay of a rewrite measured from the
+    /// engine's own query log, recorded before anything else, with the
+    /// twin's prediction.
     Measured {
-        /// The Replay as it would be stored, with the hash it would have.
+        /// The Replay, recorded (engine) or as it would be stored (table),
+        /// with its hash.
         replay: Box<Written>,
         /// Summed over runs, under the current configuration (measured).
         current: Cost,
         /// Summed over runs, under the proposal (measured).
         proposed: Cost,
-        /// The cost model: `measured: engine plan statistics`.
+        /// The cost model: `measured: logical bytes from per-unit
+        /// aggregates` over a table, `<engine>.query_log` in an engine.
         model: String,
     },
     /// The proposal kind has no defined replay.
@@ -216,13 +226,25 @@ pub enum Refusal {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         proposed_rewrite: Option<String>,
     },
-    /// The Key proposal's replay predicts no saving on the workload: summed
+    /// A query engine refused to export a rewrite's results (ADR 033): the
+    /// export is the measured run, so nothing was measured, and there is no
+    /// certificate and no receipt. CLI exit 3.
+    ExportDenied {
+        /// The engine root.
+        engine: String,
+        /// The permission the export needs.
+        permission: String,
+        /// The whole message, naming what to grant.
+        message: String,
+    },
+    /// The proposal's replay predicts no saving on the workload: summed
     /// over its runs, the proposal reads at least as many bytes as the
-    /// current configuration (the measure `why` recommends by). Refused
-    /// right after the score, before the verify, so nothing but the Replay
-    /// is written; `allow_no_gain` goes on anyway. A verify-only run is
-    /// not gated (it applies nothing); applying its certificate is. CLI
-    /// exit 3.
+    /// current configuration (the measure `why` recommends by; for a
+    /// rewrite of engine queries, the bytes the engine's log says each
+    /// query read). Refused right after the score, before the verify, so
+    /// nothing but the Replay is written; `allow_no_gain` goes on anyway. A
+    /// verify-only run is not gated (it applies nothing); applying its
+    /// certificate is, on the apply tier's own measurement. CLI exit 3.
     NothingToGain {
         /// The Replay that predicts it.
         replay: Hash,
@@ -231,11 +253,43 @@ pub enum Refusal {
         /// Bytes with the proposal, summed over runs.
         proposed_bytes: u64,
     },
+    /// The apply tier ran a rewrite of engine queries again, in the state
+    /// the certificate verified, and one query's measurement disagrees with
+    /// the certified Replay's on rows read, bytes read, or result rows: the
+    /// numbers a receipt would attest are not the numbers verified. Nothing
+    /// is written. CLI exit 3.
+    MeasurementChanged {
+        /// The certificate.
+        certificate: Hash,
+        /// The measured Replay it cites.
+        replay: Hash,
+        /// The pair, in the proposal's order.
+        pair: u64,
+        /// `before` or `after`.
+        side: String,
+        /// Rows read, as certified.
+        certified_read_rows: u64,
+        /// Rows read now.
+        measured_read_rows: u64,
+        /// Bytes read, as certified.
+        certified_read_bytes: u64,
+        /// Bytes read now.
+        measured_read_bytes: u64,
+        /// Result rows, as certified.
+        certified_result_rows: u64,
+        /// Result rows now.
+        measured_result_rows: u64,
+    },
 }
 
 /// The gain gate: a refusal when the proposal reads no fewer bytes than the
 /// current configuration and the caller did not allow it.
-fn no_gain(replay: &Hash, current: &Cost, proposed: &Cost, allow: bool) -> Option<Refusal> {
+pub(crate) fn no_gain(
+    replay: &Hash,
+    current: &Cost,
+    proposed: &Cost,
+    allow: bool,
+) -> Option<Refusal> {
     (!allow && proposed.bytes >= current.bytes).then_some(Refusal::NothingToGain {
         replay: *replay,
         current_bytes: current.bytes,
@@ -258,6 +312,19 @@ pub enum FixOutcome {
         /// Set when the realized replay could not be computed after the
         /// receipt was written; the receipt stands.
         warning: Option<String>,
+    },
+    /// A rewrite of engine queries verified and attested (ADR 033): an
+    /// attest-only Receipt (nothing applied; `manifest_after ==
+    /// manifest_before`). A human or a CI gate deploys `deploy` in
+    /// `target`; the engine changes nothing there.
+    Attested {
+        /// The attest-only Receipt.
+        receipt: Box<Written>,
+        /// The engine the queries run in.
+        target: String,
+        /// The `after` query of each pair, as the agent wrote them, in the
+        /// proposal's order: what a human deploys after review.
+        deploy: Vec<String>,
     },
     /// Verified; `verify_only` was set, nothing applied.
     Verified,
@@ -307,6 +374,11 @@ pub struct FixResult {
     /// Empty without a signing key, and whenever nothing was attested or
     /// verified.
     pub signatures: Vec<SignatureWritten>,
+    /// For a rewrite of engine queries (ADR 033): what each query measured
+    /// in the engine, the exports, and the engine's identity before and
+    /// after. Omitted otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub engine: Option<EngineRun>,
 }
 
 /// One signature `fix` wrote.
@@ -445,6 +517,7 @@ impl Engine {
         }
         let before = pinned.as_ref().map_or(0, Pinned::sequence);
         let mut result = FixResult {
+            engine: None,
             proposal: written,
             manifest_before: before.to_string(),
             score: None,
@@ -571,6 +644,16 @@ impl Engine {
                 }
                 Ok(result)
             }
+            ProposalBody::Rewrite { shape } if engine_shape(&proposal.body).is_some() => self
+                .fix_engine_rewrite(
+                    result,
+                    hash,
+                    &proposal,
+                    shape,
+                    req,
+                    before,
+                    pinned.as_ref().map(anchor).as_ref(),
+                ),
             ProposalBody::Rewrite { shape } => {
                 result.score = Some(Score::NotScorable {
                     reason: "the replay crate defines no replay for rewrite proposals (contract \
@@ -639,6 +722,7 @@ impl Engine {
             .clone()
             .unwrap_or_default();
         let mut result = FixResult {
+            engine: None,
             proposal: written,
             manifest_before: certified.clone(),
             score: None,
@@ -662,6 +746,19 @@ impl Engine {
         match &proposal.body {
             ProposalBody::Layout { .. } => {
                 result.outcome = refused(Refusal::LayoutNotApplicable);
+            }
+            ProposalBody::Rewrite { shape } if engine_shape(&proposal.body).is_some() => {
+                return self.apply_engine_rewrite(
+                    result,
+                    cert_hash,
+                    &certificate,
+                    &proposal_hash,
+                    &proposal,
+                    shape,
+                    before,
+                    dry_run,
+                    allow_no_gain,
+                );
             }
             // A table: the gate passed, and the engine applies nothing to a
             // table (ADR 027).
@@ -1092,6 +1189,8 @@ impl Engine {
             Err(refusal) => return Ok((refused(refusal), Vec::new())),
         };
         let receipt = Receipt {
+            attest_only: false,
+            prediction: None,
             record_version: format::RECORD_VERSION,
             evidence: proposal.evidence.clone(),
             proposal: *proposal_hash,
@@ -1142,7 +1241,7 @@ impl Engine {
     ///
     /// `applied` names the change already committed (`manifest 3 -> 4`),
     /// so a signing failure after the apply says the change stands.
-    fn sign_written(
+    pub(crate) fn sign_written(
         &self,
         records: &[(Hash, RecordKind)],
         applied: Option<&str>,
@@ -1313,6 +1412,8 @@ pub(crate) mod test_seam {
 /// The sequence a Key apply produced, or the refusal: nothing committed (the
 /// key was already complete), or another commit landed first. A Key
 /// proposal must advance the manifest by exactly the apply's own commit.
+// The refusal is returned as is; it is built once per apply.
+#[allow(clippy::result_large_err)]
 fn advance(before: u64, committed: Option<u64>) -> std::result::Result<u64, Refusal> {
     let after = committed.unwrap_or(before);
     if after <= before {

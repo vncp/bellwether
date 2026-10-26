@@ -347,3 +347,86 @@ carry today.
   both distinct counts are exact. It never reaches a plan; it recommends a
   key that the planner then prices exactly.
 
+## Twin lints
+
+Four lints fire from the `why` report of a lake twin (`why --twin-of`, ADR
+033), from the twin pass's exact counts over the key sample. Each names a
+rewrite pattern for the query the agent rewrites in the engine. They are
+advice: they change no plan, write no Proposal, and choose no key; they are
+recorded in the profile Evidence's `lints` and the report's `twin.lints`.
+They use no engine's vocabulary: the agent writes the engine's language.
+
+Confidence: high (0.9) when the twin holds the engine's row count at the
+time of the diagnosis (`TwinOf.engine_rows == lake_rows`), medium (0.6)
+otherwise. Every count is exact for the lake; the engine stores its tables
+differently, which is why `fix` measures the rewrite in the engine.
+
+Thresholds are constants of the facade (`bellwether::LOW_CARDINALITY_ROWS`,
+`CARDINALITY_RATIO`, `NARROW_PERCENT`, `SELECTIVE_FILES_PERCENT`,
+`MEMBERSHIP_GATE`), stated here.
+
+### low_cardinality_key
+
+- **id**: `low_cardinality_key`
+- **Detector**: a single key column of the sample whose values each cover
+  more than 10⁵ rows of the twin (median rows per sampled value), while
+  another key column of the sample covers at least 100 times fewer rows per
+  value (a high-cardinality partner): for example a batch or load
+  timestamp shared by many rows beside an id.
+- **Estimator**: the twin's rows per key value for both columns, exact.
+- **Guidance template**: key the lookup by the composite (partner, column)
+  instead of the column alone. Before: `filter or join by <column>`. After:
+  `filter or join by (<partner>, <column>)`. Invariant: `the rows selected
+  are those whose (partner, column) is in the sample`.
+- **Verification method**: reconcile over the exported results (`fix` on
+  the rewrite).
+- **Confidence rubric**: as above.
+
+### unbounded_membership
+
+- **id**: `unbounded_membership`
+- **Detector**: the sample's distinct keys exceed the gate named `in`
+  (`--gate in:<n>`), the size of a membership list the engine accepts.
+- **Estimator**: the keyset size, exact.
+- **Guidance template**: count the keys first and branch: a membership list
+  under the gate, a join above it. Invariant: `both branches select the
+  same rows`.
+- **Verification method**: reconcile over the exported results.
+- **Confidence rubric**: as above.
+
+### wide_before_narrow
+
+- **id**: `wide_before_narrow`
+- **Detector**: the sampled keys select at most 10% of the twin's rows and
+  the key columns hold at most 10% of its bytes (footer column-chunk
+  bytes; the lint does not fire when a footer lacks them): a dedup or
+  filter over every column reads about bytes/key-bytes times what the key
+  columns need. (The plan rule `wide_projection_before_filter` above reads
+  the consumer's plan; this lint reads only the data's shape.)
+- **Estimator**: the key columns' share of the twin's bytes, exact.
+- **Guidance template**: project the key columns first, select, then join
+  the wide columns back. Invariant: `projection commutes with a selection
+  on the projected columns`.
+- **Verification method**: reconcile over the exported results.
+- **Confidence rubric**: as above.
+
+### dedup_before_filter
+
+- **id**: `dedup_before_filter`
+- **Detector**: the lookup asks for the latest row per key (`--latest-by`,
+  a latest or asof workload) and the sampled keys are in under 1% of the
+  twin's files.
+- **Estimator**: files holding a sampled key over all files, exact.
+- **Guidance template**: filter by the keys first, then take the latest per
+  key. Invariant: `the newest version per sampled key is unchanged`.
+- **Verification method**: reconcile over the exported results, with
+  `--latest-by`.
+- **Confidence rubric**: as above.
+
+### Kill criterion
+
+If after five receipts across two engines none of the four lints fired on a
+case where the agent found the rewrite anyway, the lints are wrong-shaped:
+fix or remove them before adding more. The receipts' twin Evidence records
+which lints fired (`bellwether ledger scorecard` counts them per rule id), so
+the count is read from the ledger, not remembered.

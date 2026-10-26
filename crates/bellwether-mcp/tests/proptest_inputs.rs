@@ -145,6 +145,11 @@ fn make_world(signing: bool) -> World {
             "score.verify",
             json!({"proposal": ev, "workload": ev, "wait": true}),
         );
+        // No query engine is configured here: refused, nothing written.
+        valid.insert(
+            "score.record",
+            json!({"keys_query": "SELECT 1", "wait": true}),
+        );
         valid.insert("jobs.status", json!({"job": "0".repeat(64)}));
         valid.insert("jobs.result", json!({"job": "0".repeat(64)}));
         valid.insert(
@@ -195,7 +200,7 @@ fn arb_json() -> impl Strategy<Value = Value> {
     })
 }
 
-const TOOLS: [&str; 15] = [
+const TOOLS: [&str; 16] = [
     "observe.why",
     "observe.cardinality",
     "observe.overlap",
@@ -204,6 +209,7 @@ const TOOLS: [&str; 15] = [
     "observe.asof",
     "score.why",
     "score.verify",
+    "score.record",
     "propose.key",
     "propose.layout",
     "propose.rewrite",
@@ -270,6 +276,7 @@ fn allowed(tool: &str, kinds: &[String], other: &[String], signing: bool) -> Res
             only(&["evidence"]) && cache_only
         }
         "apply.receipt" | "jobs.status" | "jobs.result" => kinds.is_empty() && other.is_empty(),
+        "score.record" => kinds.is_empty() && cache_only,
         "score.why" | "score.verify" | "jobs.start" => {
             only(&["evidence", "proposal", "replay", "certificate"]) && cache_only
         }

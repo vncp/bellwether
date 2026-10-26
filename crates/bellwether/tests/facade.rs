@@ -227,6 +227,9 @@ fn propose_writes_a_scoreless_proposal_citing_resolving_evidence_only() {
     assert!(e.propose(unknown, &[ev], "agent").is_err());
     let empty = ProposalBody::Rewrite {
         shape: RewriteShape {
+            pairs: Vec::new(),
+            key: Vec::new(),
+            keys: None,
             before: "a".into(),
             after: " ".into(),
             invariant: "c".into(),

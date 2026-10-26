@@ -36,6 +36,7 @@
 - **Ask time-series questions of plain files.** The current state of a set of keys, their state on March 3rd, and what was known at a given moment about the state at another (`asof --valid --known`, no lookahead), located to the row group.
 - **Let a coding agent drive it, safely.** `bellwether mcp` serves the same engine over MCP, in tiers of tools; every refusal carries a stable code and one next step.
 - **Reconcile a SQL table against files** *(landing with [#11](https://github.com/vncp/bellwether/pull/11))*. A table becomes one side of a reconcile, with costs labeled measured rather than exact.
+- **Diagnose a slow query in a warehouse through its lake copy.** When a query engine that keeps its own storage (ClickHouse, Kusto) has a Parquet twin, `why --twin-of` diagnoses the data's shape on the twin, the agent rewrites the query, and `fix` measures both versions in the engine from its own query log, reconciles their exported results, and writes an attest-only receipt with the twin's prediction error.
 
 ## In one minute
 
@@ -106,6 +107,7 @@ An agent (or a person) may **observe** and **propose**. Only the engine may **sc
 - [Planned: evolve](#planned-evolve)
 - [Architecture](#architecture)
 - [Run it](#run-it)
+- [Query engines as sources](#query-engines-as-sources)
 - [Status](#status)
 - [Docs](#docs)
 - [Where it came from](#where-it-came-from)
@@ -267,7 +269,7 @@ Then ask it to run the prompt `diagnose_slow_query`, which is [`AGENTS.md`](AGEN
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="docs/assets/readme/capture-mcp-dark.svg">
-    <img alt="A JSON-RPC exchange with bellwether mcp over stdio. After initialize and observe.why, the client sends tools/call propose.key with spec exact on entity_id, the evidence hash, by coding-agent, and score 0.99. The server replies with isError true and an envelope whose status is refused, tier propose, tool propose.key, and whose refusal has code invalid_input, the message 'the arguments do not match propose.key's input schema', the field error 'Additional properties are not allowed (score was unexpected)', and next: 'fix the arguments to match the tool's input schema; send no extra fields'. The session budget block is elided as { … }; chains and cites are empty." src="docs/assets/readme/capture-mcp-light.svg" width="100%">
+    <img alt="A JSON-RPC exchange with bellwether mcp over stdio. After initialize and observe.why, the client sends tools/call propose.key with spec exact on entity_id, the evidence hash, by coding-agent, and score 0.99. The server replies with isError true and an envelope whose status is refused, tier propose, tool propose.key, and whose refusal has code caller_supplied_cost, the message 'propose.key was given score: a caller cannot supply a cost, a measurement, a replay, a verdict, or a certificate; the engine measures and verifies itself', the fields naming score as the field and the schema error 'Additional properties are not allowed (score was unexpected)', and next: 'remove the field fields.field names and call again; the engine measures, verifies, and attests on its own'. The session budget block is elided as { … }; chains and cites are empty." src="docs/assets/readme/capture-mcp-light.svg" width="100%">
   </picture>
 </p>
 <p align="center"><em><code>bellwether mcp</code> over stdio, a smuggled <code>score</code> refused · bench ledger corpus · debug build of eca48d1</em></p>
@@ -277,7 +279,7 @@ The trust boundary at the wire: a proposal has no score field, so the input sche
 | Surface | What it can do | Worst case |
 |---|---|---|
 | `observe.*` (`observe.why` with no keys, `observe.profile`, `observe.locate`, `observe.asof`) | read footers and the index; write the profile Evidence and cache entries | the agent reads evidence |
-| `score.*` (`score.why` with keys or a workload, `score.verify`) | ask the engine to replay and verify; the engine writes its own Proposals, Replays, plan Evidence, and Certificates; charged to the session budget | the agent spends its budget and is refused with `budget_exceeded` |
+| `score.*` (`score.why` with keys or a workload, `score.verify`, `score.record` with a query engine) | ask the engine to replay and verify; the engine writes its own Proposals, Replays, plan Evidence, and Certificates; charged to the session budget; with `--twin-of`, the engine submits a keys query or a rewrite's queries read-only to the one engine the human named | the agent spends its budget and is refused with `budget_exceeded`; a cost or verdict field in the arguments is refused with `caller_supplied_cost` |
 | `propose.*` | write a `Proposal` with no score, or nothing with `dry_run` | the ledger holds a bad proposal that scores poorly and never gets a Certificate |
 | `apply.receipt` | take a Certificate hash only; the engine applies and then writes the Receipt | the agent asks to apply something unverified and is told no, with a typed code |
 | `jobs.*` | start a score or apply call as a job, poll it, read its result | whatever the started tool may do |
@@ -295,6 +297,7 @@ The trust boundary at the wire: a proposal has no score field, so the input sche
 | Tells you which key to index | measured fanout + exact replay | no | no | no | estimated (what-if API) |
 | Verifies a change returned the same rows | reconciliation certificate | no | no | no | no |
 | Agent interface | MCP, with trust boundary | no | no | no | no |
+| Diagnoses queries in an engine that owns its storage | via the lake twin, measured in the engine from its own query log | no | no | its own `EXPLAIN` and query log | its own `EXPLAIN` |
 | Data must be converted or loaded | no | yes (table format) | yes (Hudi table) | yes | yes |
 
 The honest summary: the index kinds are not new. What is new is the diagnosis, the receipt, and the agent boundary.
@@ -319,13 +322,15 @@ Most LLM query optimizers score their own suggestions with an estimate and verif
 </p>
 <p align="center"><em>Surfaces, crates, and storage · drawn by <code>scripts/render_figures.py</code></em></p>
 
-Thirteen crates, dependencies pointing one way, enforced by a script in CI. The CLI and the MCP server hold no engine logic: both call the `bellwether` facade, so what the CLI prints as `--json` is byte for byte what an agent receives.
+Fifteen crates, dependencies pointing one way, enforced by a script in CI. The CLI and the MCP server hold no engine logic: both call the `bellwether` facade, so what the CLI prints as `--json` is byte for byte what an agent receives.
 
 | Unit | What it holds | Rule |
 |---|---|---|
 | `bellwether-types` | records, traits, format constants | no logic; the contract every crate builds against |
 | `bellwether-core` | memcomparable keys, segment reader and writer, SBBF blooms, roaring bitmaps, temporal chains, merge | invariants 1 (no false negatives) and 5 (stale versions never win) |
 | `bellwether-source` | `Source` for Parquet (real row groups) and CSV / JSON lines (byte-range chunks); fingerprints | depends on the contract only |
+| `bellwether-source-sql` | `Source` for SQL tables (SQLite, DuckDB, Postgres, Flight SQL, SQL Server): units with an identity, statistics as bounds | costs over a table are measured, never exact; apply is attest-only (ADR 027) |
+| `bellwether-source-engine` | query engines that own their storage as measured sources: the `MeasuredEngine` trait (`submit`, `stats` from the engine's own query log, `export`), ClickHouse and Kusto adapters | costs are measured, never exact; creates nothing inside the engine (ADR 033) |
 | `bellwether-store` | `Store` over `object_store`; conditional PUT per backend; the manifest commit protocol; the cache | invariant 4 (readers see one manifest version) |
 | `bellwether-ledger` | content-addressed, append-only records; write-time rules | invariants 2 (a receipt implies a passing certificate) and 6 (provenance) |
 | `bellwether-build` | discover → fingerprint → assign ids → parallel segments → one manifest commit; incremental; compaction | memory bounded per row group (ADR 018) |
@@ -371,6 +376,12 @@ bellwether report ./orders/ --html report.html
 # Serve the same engine to a coding agent over MCP (stdio), bound to one folder
 bellwether mcp ./orders/
 
+# A query engine that keeps its own storage, diagnosed through its lake twin (ADR 033)
+bellwether workload record ./orders/ --from-engine "$ENGINE" --keys-query keys.sql
+bellwether why ./orders/ --workload <workload hash> --twin-of "$ENGINE" --gate in:100000
+bellwether propose ./orders/ --rewrite before.sql=after.sql --evidence <twin evidence> --by me
+bellwether fix ./orders/ --twin-of "$ENGINE" --proposal <proposal hash> --scratch ./orders/_scratch
+
 # Arriving later: evolve (M6)
 bellwether evolve ./pipeline/ --workload runs/ --budget 50g
 ```
@@ -409,6 +420,20 @@ scripts/sql-demo.sh
 ```
 
 Measured 2026-10-26 (UTC) on an Apple M3 Pro (12 cores, 36 GB, macOS 26.4.1), release build: reconciling 20,314,139 keys took 42 s from the DuckDB table and 105 s from the SQLite table against 42 s between two Parquet copies (host load average about 6), each PASS inside one snapshot; with one changed, one deleted, and one added row each table FAILed with exactly 1 mismatched, 1 missing on each side. Results: [`docs/measured/results/sql.json`](docs/measured/results/sql.json), written by [`scripts/sql-demo.sh`](scripts/sql-demo.sh). Which numbers over a table are counts, bounds, or measured: [the crate README](crates/bellwether-source-sql/README.md). A run without a snapshot re-reads every unit's identity at the end; that identity is a checksum of the unit's statistics unless the root names a version column (`version=<column>`), so an in-place update that keeps every column's bounds, null count, and bytes is not seen.
+
+## Query engines as sources
+
+A query engine that keeps its own storage is a measured source (ADR 033, `bellwether-source-engine`): ClickHouse is the reference adapter, Kusto the second, and another engine is one file implementing three operations (`submit` a query under a tag, `export` one run's rows as Parquet, read one run's `stats` from the engine's own query log). The diagnosis runs on the lake twin, exactly; the measurement runs in the engine, and no caller can hand bellwether a number.
+
+```bash
+ENGINE='clickhouse://reader@ch.internal:8123/sales/orders?password=env:CH_PASSWORD'
+bellwether workload record ./orders/ --from-engine "$ENGINE" --keys-query keys.sql      # the keys, from the engine
+bellwether why ./orders/ --workload <workload> --twin-of "$ENGINE" --gate in:100000    # gates, fanout, freshness, twin lints
+bellwether propose ./orders/ --rewrite before.sql=after.sql --evidence <twin evidence> --by me
+bellwether fix ./orders/ --twin-of "$ENGINE" --proposal <proposal> --scratch ./orders/_scratch
+```
+
+`fix` runs every query of the rewrite once, under its own tag, and that run exports its rows into the scratch folder (a hidden folder under the lake root); it reads that run's statistics from the engine's log (`measured`, never `exact`, the model named `clickhouse.query_log`; a run served from a cache, or whose logged rows are not the rows it exported, is refused), reconciles each pair by the proposal's key columns, and writes an attest-only receipt with the twin's prediction beside the engine's realized reads, pair by pair. Bellwether neither edits jobs nor creates anything inside the engine; a human or a CI gate deploys the rewrite. The agent's query text runs with every read privilege of the user bellwether connects as, network table functions included, so connect as a least-privilege user: `SELECT` on the twin's tables and the query log, nothing else. The worked example: [agent loop](docs/agent-loop.md#second-worked-example-a-query-engine-that-owns-its-storage); the adapter sketches for BigQuery, Snowflake, and Postgres: [the crate README](crates/bellwether-source-engine/README.md).
 
 ## Status
 

@@ -283,6 +283,7 @@ pub fn verify_plan(
         })
         .sum();
     let cost = RunCost {
+        measured: None,
         run_id: run_id.to_string(),
         keys,
         files: cells.len() as u64,

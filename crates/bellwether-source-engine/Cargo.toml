@@ -1,0 +1,40 @@
+[package]
+name = "bellwether-source-engine"
+description = "Query engines that own their storage as Bellwether sources (ADR 033): a MeasuredEngine adapter trait of three primitives (submit, stats from the engine's own query log, export), with ClickHouse as the reference adapter and Kusto as the second."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[features]
+default = ["kusto"]
+# The Kusto adapter: the REST API (query v2, management v1) with tokens
+# from the Azure Identity credential chain (azure_identity, MIT).
+kusto = ["dep:azure_identity", "dep:azure_core", "dep:tokio"]
+
+[dependencies]
+bellwether-types = { path = "../bellwether-types" }
+# The `MeasuredScorer` trait (ADR 027) the adapters implement.
+bellwether-source-sql = { path = "../bellwether-source-sql" }
+arrow = { workspace = true }
+parquet = { workspace = true, features = ["arrow"] }
+blake3 = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+url = { workspace = true }
+chrono = { workspace = true }
+# The HTTP interfaces of both adapters: the same reqwest the object stores
+# already bring in (rustls), blocking, no second HTTP stack.
+reqwest = { version = "0.13", default-features = false, features = ["blocking", "rustls", "json", "query"] }
+azure_identity = { version = "1.0", optional = true }
+azure_core = { version = "1.1", optional = true }
+tokio = { workspace = true, optional = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[lints]
+workspace = true

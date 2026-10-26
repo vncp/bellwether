@@ -225,6 +225,41 @@ pub enum Error {
         /// The operation refused (`index`, `locate`, ...).
         operation: &'static str,
     },
+    /// A query engine refused to export a result set (ADR 033): the
+    /// credentials bellwether runs with may query but may not export, or
+    /// the scratch folder cannot be written. Without the export there is no
+    /// certificate and so no receipt. `permission` names what to grant;
+    /// `message` is the whole sentence.
+    #[error("{message}")]
+    ExportDenied {
+        /// The engine root (`clickhouse://host/db`, credentials removed).
+        engine: String,
+        /// The permission the export needs, in the engine's own words.
+        permission: String,
+        /// The whole message, naming what to grant.
+        message: String,
+    },
+    /// A query engine's log entry for a run bellwether submitted cannot
+    /// stand as that run's measurement (ADR 033), so nothing is recorded.
+    /// `reason` is one of [`MEASUREMENT_REFUSALS`]: the run was served
+    /// from a cache (`cache_served`), the log lacks a statistic
+    /// (`statistics_missing`), the entry under the tag is not the query
+    /// submitted (`not_the_query_submitted`), more than one finished
+    /// entry holds the tag (`ambiguous_log_entry`), the statistics name
+    /// another tag (`tag_mismatch`), or the rows the run returned are not
+    /// the rows it exported (`result_rows_differ`). `message` is the whole
+    /// sentence, naming what to do.
+    #[error("{message}")]
+    MeasurementRefused {
+        /// The engine root (`clickhouse://host/db`, credentials removed).
+        engine: String,
+        /// The tag the run was submitted under.
+        tag: String,
+        /// One of [`MEASUREMENT_REFUSALS`].
+        reason: &'static str,
+        /// The whole message, naming what to do.
+        message: String,
+    },
     /// Serialization failure.
     #[error("serde error: {0}")]
     Serde(#[from] serde_json::Error),
@@ -232,6 +267,17 @@ pub enum Error {
     #[error("{0}")]
     Other(String),
 }
+
+/// The reasons an [`Error::MeasurementRefused`] carries, each a stable
+/// name.
+pub const MEASUREMENT_REFUSALS: [&str; 6] = [
+    "cache_served",
+    "statistics_missing",
+    "not_the_query_submitted",
+    "ambiguous_log_entry",
+    "tag_mismatch",
+    "result_rows_differ",
+];
 
 fn not_a_folder(root: &str, operation: &str) -> String {
     format!(
@@ -828,12 +874,76 @@ pub enum EvidenceBody {
         lints: Vec<Lint>,
         /// Recorded workload summary: key-set sizes at p50, p95, max.
         workload_keys: Option<[u64; 3]>,
+        /// When the dataset was profiled as the lake twin of a query engine
+        /// (`why --twin-of`, ADR 033): the engine's table identity beside
+        /// the lake's, and what the twin predicts the key sample reads.
+        /// Absent otherwise, and absent in records written before it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        twin: Option<TwinOf>,
     },
     /// Output of `locate`, `latest`, or `asof`.
     Plan {
         /// The plan.
         plan: ScanPlan,
     },
+}
+
+/// A named limit on a key set's size (`--gate <name>:<n>`): a membership
+/// list a query engine accepts (`in:1000000`), or the size below which it
+/// broadcasts the smaller side of a join (`join:200000`). The names are the
+/// caller's; the engine compares and never interprets them, except that
+/// the membership lint reads the gate named `in`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct Gate {
+    /// The gate's name.
+    pub name: String,
+    /// The largest key set the gate admits.
+    pub limit: u64,
+}
+
+/// The lake twin's side of a diagnosis (ADR 033): which engine tables the
+/// lake copies, their identity when the diagnosis ran, the lake's own state
+/// at that moment, and the twin's prediction for the key sample. Every
+/// count is exact for the lake and for the engine's table listing; nothing
+/// here is an engine cost.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct TwinOf {
+    /// The engine root (`clickhouse://host:port/db/table`), credentials and
+    /// connection parameters removed.
+    pub engine: String,
+    /// The engine's table identity when the diagnosis ran: BLAKE3 over the
+    /// engine root and every storage unit's path and identity, as the
+    /// engine lists them (format.md, "Query engine sources").
+    pub identity: Hash,
+    /// Storage units the engine listed (parts, partitions, or extents).
+    pub units: u64,
+    /// Rows the engine's tables held, from the same listing.
+    pub engine_rows: u64,
+    /// The lake's manifest sequence (`0` when unindexed).
+    pub sequence: u64,
+    /// Rows the lake held.
+    pub lake_rows: u64,
+    /// The key sample's recorded workload, when one was given.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workload: Option<Hash>,
+    /// Distinct keys in the sample (the largest run's).
+    #[serde(default)]
+    pub keys: u64,
+    /// Rows of the lake holding a sampled key: what the twin predicts a
+    /// query over these keys must read at least.
+    #[serde(default)]
+    pub predicted_rows: u64,
+    /// Row groups of the lake holding a sampled key.
+    #[serde(default)]
+    pub predicted_row_groups: u64,
+    /// Files of the lake holding a sampled key.
+    #[serde(default)]
+    pub predicted_files: u64,
+    /// The gates the key sample was compared against.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub gates: Vec<Gate>,
 }
 
 /// A record of something the engine observed. Agents read these.
@@ -849,6 +959,10 @@ pub struct Evidence {
 }
 
 /// A rewrite proposal is data, never code the engine runs (threat model).
+/// A rewrite of queries in a query engine (ADR 033) carries the query pairs
+/// as text: the engine submits them to the engine named by the twin
+/// Evidence the proposal cites, read-only, and never writes or emits a
+/// query of its own.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct RewriteShape {
@@ -858,6 +972,29 @@ pub struct RewriteShape {
     pub after: String,
     /// The algebraic or data invariant the rewrite must preserve.
     pub invariant: String,
+    /// For a rewrite of engine queries: the (before, after) query pairs,
+    /// scored and verified as one set (ADR 023). Empty for a rewrite
+    /// described in words, and absent in records written before it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pairs: Vec<QueryPair>,
+    /// The key columns each pair's before and after results are reconciled
+    /// by. Empty when `pairs` is.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub key: Vec<String>,
+    /// The key sample the diagnosis ran on: its recorded workload.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keys: Option<Hash>,
+}
+
+/// One query of an engine rewrite and its replacement, as the agent wrote
+/// them. Text only: never parsed, rewritten, or generated by the engine.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct QueryPair {
+    /// The query as it runs today.
+    pub before: String,
+    /// The query that replaces it.
+    pub after: String,
 }
 
 /// What an agent may propose. There is no score field in any variant; scoring
@@ -918,10 +1055,90 @@ pub struct RunCost {
     /// `false` when the number comes from a stated model instead: a
     /// `ProposalBody::Layout`, whose proposed file layout does not exist yet,
     /// or a `ProposalBody::Rewrite` whose cost is measured rather than
-    /// replayed, such as a step inside a database (ADR 027). The Replay must
-    /// then name the model. A key proposal is always exact. Never silently
-    /// estimated (ADR 005); contract v3 replaces this flag with a tri-state.
+    /// replayed, such as a step inside a database (ADR 027) or a query in a
+    /// query engine (ADR 033). The Replay must then name the model. A key
+    /// proposal is always exact. Never silently estimated (ADR 005);
+    /// contract v3 replaces this flag with a tri-state.
     pub exact: bool,
+    /// For a query run in a query engine (ADR 033): what the engine's own
+    /// query log recorded for it, read by the engine by the tag it
+    /// submitted the query under. Then `files` and `row_groups` are the
+    /// storage units the engine reports reading (0 when it reports none)
+    /// and `bytes` its `read_bytes`. Absent otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub measured: Option<QueryStats>,
+}
+
+/// One query's statistics as a query engine's own log records them (ADR
+/// 033). Measured, never exact: the model of the Replay holding them names
+/// the log (`clickhouse.query_log`, `kusto.query_log`).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct QueryStats {
+    /// The tag the engine submitted the query under (its query id).
+    pub tag: String,
+    /// Rows the engine read.
+    pub read_rows: u64,
+    /// Bytes the engine read.
+    pub read_bytes: u64,
+    /// Peak memory, in bytes.
+    pub peak_memory_bytes: u64,
+    /// CPU time, in nanoseconds, when the log records it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpu_ns: Option<u64>,
+    /// Wall-clock duration, in nanoseconds.
+    pub duration_ns: u64,
+    /// Rows in the result.
+    pub result_rows: u64,
+    /// Storage units read (parts, extents), when the log records them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub units_read: Option<u64>,
+    /// Storage units the queried tables held, when the log records them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub units_total: Option<u64>,
+}
+
+/// How well the lake twin predicted a query engine (ADR 033): the rows
+/// and row groups the twin says a query over the key sample must read,
+/// beside what the engine's log says each query of each pair read, and
+/// their ratio, pair by pair. Each pair is one query over the key sample,
+/// so each is compared with the prediction on its own; nothing is summed
+/// across pairs, which may read different tables. Recorded on the Replay
+/// (so a failing certificate keeps it) and copied onto the Receipt.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct Prediction {
+    /// The twin Evidence the prediction comes from.
+    pub evidence: Hash,
+    /// Rows of the twin holding a sampled key.
+    pub predicted_rows: u64,
+    /// Row groups of the twin holding a sampled key.
+    pub predicted_row_groups: u64,
+    /// Each pair's realized reads and ratios, in the proposal's order.
+    pub pairs: Vec<PairPrediction>,
+}
+
+/// One pair's side of a [`Prediction`]: what the engine's log says its
+/// before and after queries read, and each one's ratio to the twin's
+/// predicted rows.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct PairPrediction {
+    /// Rows the engine read for the pair's query before the rewrite.
+    pub before_read_rows: u64,
+    /// Rows the engine read for the pair's query after the rewrite.
+    pub after_read_rows: u64,
+    /// Bytes the engine read before the rewrite.
+    pub before_read_bytes: u64,
+    /// Bytes the engine read after the rewrite.
+    pub after_read_bytes: u64,
+    /// `before_read_rows / predicted_rows` as a decimal string with three
+    /// places, rounded half to even; absent when `predicted_rows` is 0.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub before_ratio: Option<String>,
+    /// `after_read_rows / predicted_rows`, likewise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after_ratio: Option<String>,
 }
 
 /// A record of replaying a recorded workload against a proposal.
@@ -949,11 +1166,15 @@ pub struct Replay {
     /// Cost per run under the proposal.
     pub proposed: Vec<RunCost>,
     /// Name of the cost model behind any cost with `exact == false`.
-    /// Present exactly when such a cost exists (a layout proposal), absent
-    /// otherwise; enforced by the ledger against the proposal's kind. Absent
-    /// in version-1 records.
+    /// Present exactly when such a cost exists (a layout proposal, or a
+    /// measured rewrite), absent otherwise; enforced by the ledger against
+    /// the proposal's kind. Absent in version-1 records.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// For a rewrite measured in a query engine: the twin's prediction
+    /// beside the engine's measurement (ADR 033). Absent otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prediction: Option<Prediction>,
     /// RFC 3339.
     pub created_at: String,
 }
@@ -1046,6 +1267,17 @@ pub struct Receipt {
     pub manifest_after: String,
     /// RFC 3339.
     pub created_at: String,
+    /// `true` for an attest-only receipt (ADR 033): the engine scored and
+    /// verified the proposal and applied nothing (`manifest_after ==
+    /// manifest_before`); a human or a CI gate deploys it. The ledger
+    /// accepts one for a rewrite only. Absent (`false`) for a receipt of an
+    /// apply.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub attest_only: bool,
+    /// For a rewrite measured in a query engine: the Replay's prediction,
+    /// copied so the receipt reads alone (the ledger checks they agree).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prediction: Option<Prediction>,
 }
 
 /// Any ledger record, for storage and listing.
@@ -1398,6 +1630,7 @@ mod tests {
                 record_version: format::RECORD_VERSION,
                 provenance: provenance(),
                 body: EvidenceBody::Profile {
+                    twin: None,
                     root: "./orders".into(),
                     fanout: vec![Fanout {
                         columns: vec!["batch_id".into()],
@@ -1436,6 +1669,8 @@ mod tests {
                 provenance: provenance(),
             }),
             Record::Receipt(Receipt {
+                attest_only: false,
+                prediction: None,
                 record_version: format::RECORD_VERSION,
                 evidence: vec![Hash::of(b"e")],
                 proposal: Hash::of(b"p"),
@@ -1521,6 +1756,7 @@ mod tests {
     #[test]
     fn run_cost_and_static_proof_round_trip() {
         let rc = RunCost {
+            measured: None,
             run_id: "r1".into(),
             keys: 10,
             files: 2,
@@ -1563,6 +1799,7 @@ mod schema_feature {
     /// One record of every kind, touching every field with custom serde
     /// (`Hash`, the row-group bitmap, the nanosecond age) and every tagged
     /// enum.
+    #[allow(clippy::too_many_lines)]
     fn every_kind() -> Vec<Record> {
         let provenance = Provenance {
             inputs: vec![Hash::of(b"input")],
@@ -1607,6 +1844,9 @@ mod schema_feature {
                 created_at: "2026-10-24T00:00:00.000Z".into(),
                 body: ProposalBody::Rewrite {
                     shape: RewriteShape {
+                        pairs: Vec::new(),
+                        key: Vec::new(),
+                        keys: None,
                         before: "b".into(),
                         after: "a".into(),
                         invariant: "i".into(),
@@ -1614,12 +1854,14 @@ mod schema_feature {
                 },
             }),
             Record::Replay(Replay {
+                prediction: None,
                 record_version: format::RECORD_VERSION,
                 proposal: Hash::of(b"p"),
                 manifest_version: "3".into(),
                 workload: Hash::of(b"w"),
                 inputs: vec![Hash::of(b"c")],
                 current: vec![RunCost {
+                    measured: None,
                     run_id: "r".into(),
                     keys: 2,
                     files: 3,
@@ -1649,6 +1891,8 @@ mod schema_feature {
                 provenance,
             }),
             Record::Receipt(Receipt {
+                attest_only: false,
+                prediction: None,
                 record_version: format::RECORD_VERSION,
                 evidence: vec![Hash::of(b"e")],
                 proposal: Hash::of(b"p"),

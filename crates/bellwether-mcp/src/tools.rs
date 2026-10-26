@@ -11,7 +11,7 @@
 //! paths name files the engine reads (key files, rewrite outputs), and a
 //! rewrite is `RewriteShape` data.
 
-use bellwether::types::{Hash, KeySpec, RewriteShape};
+use bellwether::types::{Gate, Hash, KeySpec, RewriteShape};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -73,6 +73,42 @@ pub struct ObserveOverlap {
     pub left: String,
     /// The right item, in the same data folder.
     pub right: String,
+}
+
+/// The comparison of a rewrite of engine queries' before and after
+/// results (the key columns are the proposal's).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct EngineCompare {
+    /// Compare the newest version per key by this column.
+    #[serde(default)]
+    pub latest_by: Option<String>,
+    /// Columns left out of the row hash.
+    #[serde(default)]
+    pub ignore: Vec<String>,
+    /// Columns totalled exactly (`col` decimal, `col:dec(S)` float).
+    #[serde(default)]
+    pub totals: Vec<String>,
+    /// Columns grouping the totals.
+    #[serde(default)]
+    pub group_by: Vec<String>,
+}
+
+/// `score.record`: the engine runs a query that produces keys in the query
+/// engine the server was started with (`--twin-of`), read-only, and
+/// records its result as a workload.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ScoreRecord {
+    /// One query in the engine's language whose result rows are the keys.
+    /// It runs read-only, under a tag the engine chooses.
+    pub keys_query: String,
+    /// Result columns to take as the key, in tuple order; default: all.
+    #[serde(default)]
+    pub key_columns: Option<Vec<String>>,
+    /// Run in this call instead of returning a job id.
+    #[serde(default)]
+    pub wait: bool,
 }
 
 /// `observe.profile`: the newest recorded profile Evidence per root, with
@@ -141,6 +177,11 @@ pub struct ScoreWhy {
     /// columns; default 8.
     #[serde(default)]
     pub max_candidates: Option<u32>,
+    /// With a twin (the server's `--twin-of`): limits each candidate's
+    /// keyset is compared against, such as `{"name": "in", "limit":
+    /// 1000000}`.
+    #[serde(default)]
+    pub gates: Vec<Gate>,
     /// Run in this call instead of returning a job id.
     #[serde(default)]
     pub wait: bool,
@@ -183,6 +224,10 @@ pub struct ScoreVerify {
     /// For a rewrite proposal: the outputs it is verified on.
     #[serde(default)]
     pub rewrite: Option<RewriteOutputs>,
+    /// For a rewrite of engine queries: how the exported results compare
+    /// (default: by the proposal's key columns alone).
+    #[serde(default)]
+    pub engine: Option<EngineCompare>,
     /// Run in this call instead of returning a job id.
     #[serde(default)]
     pub wait: bool,
@@ -232,7 +277,10 @@ pub struct ProposeLayout {
     pub dry_run: bool,
 }
 
-/// `propose.rewrite`: propose a rewrite, as data (never code).
+/// `propose.rewrite`: propose a rewrite, as data. A rewrite of engine
+/// queries carries the (before, after) query pairs in `shape.pairs`; the
+/// engine submits them, read-only, only to the engine the server was
+/// started with, and only in `score.verify`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ProposeRewrite {
@@ -368,6 +416,15 @@ pub fn catalog() -> Vec<ToolDef> {
              passing or failing); nothing is applied. Pass the certificate hash to \
              apply.receipt. Charged to the session budget. Returns a job id unless wait is true.",
         ),
+        def::<ScoreRecord>(
+            "score.record",
+            Tier::Score,
+            false,
+            "Run a query that produces keys in the query engine the server was started with \
+             (--twin-of), read-only, and record its rows as a workload (workload.hash) for \
+             score.why. Writes the workload to the cache. Charged to the session budget. Returns \
+             a job id unless wait is true.",
+        ),
         def::<ProposeKey>(
             "propose.key",
             Tier::Propose,
@@ -386,8 +443,11 @@ pub fn catalog() -> Vec<ToolDef> {
             "propose.rewrite",
             Tier::Propose,
             false,
-            "Propose a rewrite as data (before, after, invariant; never code), citing Evidence. \
-             Writes one Proposal, or nothing with dry_run.",
+            "Propose a rewrite as data (before, after, invariant), citing Evidence. A rewrite of \
+             queries in the server's query engine carries them as shape.pairs (before and after \
+             query text) and shape.key (the columns their results are compared by), citing the \
+             twin Evidence observe.why or score.why returned. Writes one Proposal, or nothing \
+             with dry_run.",
         ),
         def::<ApplyReceipt>(
             "apply.receipt",

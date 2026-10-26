@@ -329,12 +329,122 @@ whose commit is not yet current. The full rule list is in
 the Certificate, Replay, Proposal, and Evidence, so a reviewer or a CI gate
 reads one record and can check every step behind it.
 
+## Second worked example: a query engine that owns its storage
+
+The same loop runs when the slow query lives in a query engine that keeps
+its own storage (ClickHouse, Kusto) and a Parquet copy of the same tables,
+the lake *twin*, sits beside it (ADR 033). The diagnosis is about the
+data's shape, so it runs on the twin; the measurement is about the engine,
+so the engine measures it. Nothing the agent reports is recorded as a cost.
+
+Every command runs on the lake folder. `--twin-of` names the engine; a
+secret is read from the environment only (`password=env:NAME`).
+
+```text
+ENGINE='clickhouse://reader@ch.internal:8123/sales/orders?password=env:CH_PASSWORD'
+```
+
+### 1. Keys from the engine: a workload
+
+```text
+$ bellwether workload record ./orders --from-engine "$ENGINE" --keys-query keys.sql
+recorded workload <workload>: 603 keys over (id, batch) from 603 rows of clickhouse://ch.internal:8123/sales/orders (query bw-<run>-keys)
+```
+
+The keys query runs in the engine, read-only, under a tag bellwether
+chose; its rows are exported as Parquet into the scratch folder (or a
+temporary one), recorded as a workload over the twin's types, and deleted.
+
+### 2. Diagnose on the twin: Evidence with the engine's identity
+
+```text
+$ bellwether why ./orders --workload <workload> --twin-of "$ENGINE" --gate in:100 --gate join:100000
+why ./orders: not indexed
+  diagnosis on the lake twin of clickhouse://ch.internal:8123/sales/orders: every count is exact for the lake copy, and the engine stores its tables differently, so its own costs are measured by fix, never derived from these
+  freshness: the engine holds 600,000 rows in 4 units (identity <id>); the lake at sequence 0 holds 600,000 rows: the same row count
+...
+twin: 603 sampled keys hold 603 rows in 24 row groups and 4 files of the lake (the prediction fix compares the engine with); ...
+  candidate                              keyset  rows/key p50/p95/max     files/key          gates (in<=100, join<=100,000)
+  the sample's key                          603  1 / 1 / 1                1 / 1 / 1          in OVER, join fits
+  exact:id                                  201  3 / 3 / 3                1 / 1 / 1          in OVER, join fits
+  exact:batch                                 6  100,000 / 100,000 / 100,000 2 / 2 / 2      in fits, join fits
+  twin lints (advice; they change no plan)
+    unbounded_membership [id, batch]
+      the key sample holds 603 distinct keys, above the membership gate of 100: ...
+```
+
+The profile Evidence records `twin`: the engine root (no credentials), its
+table identity, unit and row counts, the lake's sequence and rows, the
+workload, and the rows, row groups, and files of the twin that hold a
+sampled key: the twin's prediction. The four twin lints of the rule
+catalog fire from these numbers and name a rewrite pattern; they change no
+plan.
+
+### 3. The agent rewrites the query: a Proposal
+
+The agent writes the rewrite in the engine's language; bellwether never
+writes or parses it.
+
+```text
+$ bellwether propose ./orders --rewrite before.sql=after.sql --evidence <twin evidence> --by agent
+proposal <proposal>
+```
+
+The Proposal's `RewriteShape` carries the pairs (`pairs`, any number,
+scored and verified as one set), the key columns their results are
+compared by (`key`, default the sample's), and the key sample (`keys`). It
+has no score field. A proposal that cites no twin Evidence is refused.
+
+### 4. The engine scores, exports, reconciles, and attests
+
+```text
+$ bellwether fix ./orders --twin-of "$ENGINE" --proposal <proposal> --scratch ./orders/_scratch
+fix <proposal>: rewrite of 1 engine query, compared by (id, batch), against manifest sequence 0
+  1 score   in clickhouse://ch.internal:8123/sales/orders, measured, not exact (clickhouse.query_log): replay <replay>
+                        rows read     bytes read    peak memory       cpu ms     result
+    p0 before        600,000        16.8 MB         4.1 MB           14        603  bw-<run>-p0-before
+    p0 after         600,000        12.0 MB         4.0 MB           10        603  bw-<run>-p0-after
+            twin predicted 603 rows in 24 row groups; the engine read 600,000 rows before (ratio 995.025) and 600,000 after (ratio 995.025)
+            engine identity <id> (4 units, 600,000 rows), unchanged through the exports
+            exports: 6.0 kB under ./orders/_scratch/bellwether-<run>, deleted after the certificate
+  2 verify  pass, coverage full, 0 mismatched, 0 missing left, 0 missing right, certificate <certificate>
+  3 apply   attest-only: nothing applied in clickhouse://ch.internal:8123/sales/orders; a human or a CI gate deploys the rewritten query
+  4 attest  receipt <receipt> (attest-only)
+  deploy p0: <the after query>
+```
+
+- **Score.** Every query of every pair is submitted with a tag bellwether
+  chose, read-only, and its statistics are read from the engine's own log
+  by that tag. The Replay holds them (`exact: false`, `model:
+  clickhouse.query_log`, `RunCost.measured`) and the prediction: the
+  twin's rows beside the rows the engine read, and their ratio. It is
+  written before anything else, so a failing certificate keeps it.
+- **Verify.** Each pair's results are exported as Parquet into a fresh
+  folder of the scratch folder and reconciled by the proposal's key
+  columns. One Certificate covers every pair and cites the engine's
+  identity before scoring and after the exports; a change between them is
+  refused (`source_changed`). Without the right to export there is no
+  certificate and no receipt: `export_denied` names the permission.
+- **Attest.** The Receipt is marked `attest_only` and leaves the manifest
+  where it was. It binds the twin Evidence, the Proposal (the query texts,
+  hashed with it), the measured Replay, the Certificate, and the
+  prediction. A human or a CI gate deploys the `after` queries; bellwether
+  changes nothing in the engine.
+
+`bellwether receipt show` prints the chain with `apply=attest-only`, the
+model, `costs=measured, not exact`, and the prediction; `bellwether report
+--html` marks the costs "measured, not exact" with the model's name and
+lists the prediction error per receipt, which says, over receipts, how far
+the twin can be trusted for that engine.
+
 ## What the agent never writes
 
 - It never writes a Replay, a Certificate, or a Receipt.
 - It never supplies a number the engine reports as measured.
-- It never passes a file path to write, a shell command, or a query string to
-  execute.
+- It never passes a file path to write or a shell command. The only query
+  text it hands over is a rewrite's pairs and a keys query, which the engine
+  submits read-only, under its own tags, to the one engine the operator
+  named (`--twin-of`), never to the lake or a shell (ADR 033).
 
 See [`threat-model.md`](threat-model.md) for the full list and the
 reasoning.

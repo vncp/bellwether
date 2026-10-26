@@ -129,6 +129,7 @@ pub fn evidence() -> Evidence {
         record_version: format::RECORD_VERSION,
         provenance: provenance(),
         body: EvidenceBody::Profile {
+            twin: None,
             root: "./orders".into(),
             fanout: vec![],
             lints: vec![],
@@ -153,6 +154,7 @@ pub fn proposal(evidence: Vec<Hash>, by: &str) -> Proposal {
 
 pub fn run(id: &str, bytes: u64) -> RunCost {
     RunCost {
+        measured: None,
         run_id: id.into(),
         keys: 40,
         files: 3,
@@ -164,6 +166,7 @@ pub fn run(id: &str, bytes: u64) -> RunCost {
 
 pub fn replay(proposal: Hash) -> Replay {
     Replay {
+        prediction: None,
         record_version: format::RECORD_VERSION,
         proposal,
         manifest_version: BEFORE.into(),
@@ -225,6 +228,8 @@ where
         )))
         .unwrap();
     let receipt = Receipt {
+        attest_only: false,
+        prediction: None,
         record_version: format::RECORD_VERSION,
         evidence: vec![evidence],
         proposal,

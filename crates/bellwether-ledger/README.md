@@ -93,8 +93,10 @@ Durations (`oldest_input_age`) are encoded as integer nanoseconds (contract v2),
 
 7. `proposal` must resolve to a stored Proposal. A missing record and a record of another kind are both refused.
 7a. `inputs` must not be empty: a replay names the identity of the data it read, at least the catalog digest over the discovered fingerprints and footers, so two replays of one proposal against different data never share a record even when the folder has no index yet and `manifest_version` is `"0"` (invariant 3).
-7b. Exactness. Every `current` cost is exact. `model` is present exactly when some `proposed` cost is inexact, naming the cost model behind it, and it is a non-empty name with no surrounding whitespace. A Key proposal's replay is exact throughout, so it never names a model. A layout proposal and a rewrite with a measured cost (ADR 027) are the inexact cases.
+7b. Exactness. Every `current` cost is exact, except in a rewrite's replay that names its cost model (a rewrite measured in a query engine, ADR 033, or over a table, ADR 027): there is no exact current cost to compare against, only the engine's measurement of the query as it runs today. `model` is present exactly when some cost is inexact, naming the cost model behind it, and it is a non-empty name with no surrounding whitespace. A Key proposal's replay is exact throughout, so it never names a model; a key proposal with an inexact current cost is refused. A layout proposal and a measured rewrite are the inexact cases.
 7c. Writes carry the current `record_version` only; older versions stay readable but are never produced, so an older build cannot misread a record carrying fields its version lacks (ADR 017). `put_receipt` re-runs 7a and 7b on the resolved replay, as rule 12 re-runs rule 9 on the certificate.
+7d. A cost carrying an engine's query statistics (`RunCost.measured`) is never `exact` (ADR 033): a number the engine's log recorded is measured.
+7e. A `prediction` (the lake twin's prediction beside the engine's measurement) belongs only to a rewrite whose current costs are measured.
 
 **Certificate** (invariant 6)
 
@@ -118,6 +120,8 @@ A certificate with `pass == false` is a legitimate record and is stored. So is a
     - **Sequences.** Manifest versions are sequences (ADR 020): a `u64` rendered as a string, compared numerically, so `9 < 10`. `manifest_before`, `manifest_after` and `current_manifest` must be canonical decimal: digits only, no sign, whitespace or leading zeros. Anything else is refused. This keeps string equality (rule 16) and numeric order in agreement.
     - **Upper bound.** Stage 4 is apply, then attest: the apply commits `manifest_after`, and the receipt is written afterwards. Maintenance commits (GC claim/release, compaction) also advance the sequence and may land in between. So `manifest_after` need only be no later than the current sequence, not equal to it. Re-writing a receipt at any later sequence is idempotent.
 18. `manifest_before == manifest_after` is allowed only for a `Rewrite` proposal. Key and Layout proposals must advance the manifest. No proposal may move it backwards.
+18a. Attest-only (ADR 033). A receipt whose replay's current costs are measured must be `attest_only`: the engine applied nothing it measured. An `attest_only` receipt is for a `Rewrite` proposal only and has `manifest_after == manifest_before`.
+18b. The receipt's `prediction` equals its replay's (both absent, or the same value): a receipt copies the prediction and adds none.
 
 **On read**
 
@@ -181,6 +185,7 @@ The hashes below are illustrative.
   A valid chain is then accepted.
 - `tests/provenance_required.rs` (invariant 6): Evidence and Certificate provenance.
 - `tests/write_paths.rs`: a store that counts mutations proves that reads, verification, and refused writes never write, `sign` writes exactly one object, and nothing ever deletes.
+- `tests/measured_rules.rs` (ADR 033, rules 7b, 7d, 7e, 18a, 18b): a measured rewrite's replay is accepted with its model and refused without one; a key or layout proposal with a measured current cost is refused; a measured cost marked exact is refused; a prediction on an exact replay is refused; a measured replay backs an attest-only receipt with the manifest unchanged and its prediction, and is refused behind a receipt that is not attest-only, that moves the manifest, or whose prediction differs or is missing, with nothing written; an attest-only receipt for a key proposal is refused; records that do not use the new fields do not serialize them.
 - `tests/signatures.rs` (ADR 029): a small-order key with a universal signature (`bad_signature`, `verify_strict`); store text with a newline and ESC never reaching a reason or a rendered line; an object beside a Proposal (`unsignable`); a valid chain signed and `Signed`; altered record bytes (the tamper error wins, `UNREADABLE` in `explain`); a moved signature, verbatim (`record_mismatch`) and re-addressed (`bad_signature`); an edited kind, `signed_at`, or key; one flipped bit of `sig`; an untrusted key; a revoked or not-yet-valid key (`Untrusted`, with its window); an unsigned receipt; a `signature_version: 2` object; an invalid signature beside a trusted one; `sign` refusing a Proposal, Evidence, Replay, an absent hash, and a planted chain `put_receipt` would refuse; an every-byte corruption sweep (every single-byte flip and every truncation is `Invalid`, never a panic); an independent oracle for the message bytes and the signature.
 - `tests/ledger.rs`:
   - content addressing and idempotence, and lowercase-only names
