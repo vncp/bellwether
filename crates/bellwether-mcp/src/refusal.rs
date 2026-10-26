@@ -466,9 +466,15 @@ pub fn from_propose(r: &ProposeRefusal) -> Refusal {
                     "command": command,
                 }),
             );
+            let how = if command.is_some() {
+                "the command in `fields.command`"
+            } else {
+                "`bellwether index` and this server's source options, which no command line \
+                 spells (`fields.command` is null)"
+            };
             let build = format!(
-                "ask the human to index {root} with the declaration {declaration} (the command \
-                 in `fields.command`; no receipt)"
+                "ask the human to index {root} with the declaration {declaration} ({how}; no \
+                 receipt)"
             );
             r.next = match key {
                 Some(k) => format!(

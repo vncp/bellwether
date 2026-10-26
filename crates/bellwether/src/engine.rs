@@ -142,6 +142,16 @@ pub struct EngineOptions {
     /// "now" when ages are computed, so two runs over the same inputs write
     /// byte-identical records. `None` uses the system clock.
     pub clock: Option<String>,
+    /// The command-line flags that shaped how this engine reads the folder
+    /// and where its index is (`--index`, `--format`, `--chunk-size`,
+    /// `--schema`, `--fingerprint-policy`, `--partitioning` or
+    /// `--path-template`), one argument per element, unquoted, paths made
+    /// absolute, as the shared flag definition (`bellwether_mcp::EngineArgs`)
+    /// renders them. The facade only assembles them into the `bellwether
+    /// index` command a refusal names (`ProposeRefusal::SidecarNotProposable`).
+    /// `None` for an engine a library caller opened: that command is then
+    /// given only when every source option above is the default.
+    pub source_flags: Option<Vec<String>>,
 }
 
 /// The pinned current manifest: its planner, its snapshot, and its content

@@ -15,6 +15,7 @@
 mod common;
 
 use std::collections::BTreeSet;
+use std::fmt::Write as _;
 use std::fs::File;
 use std::path::Path;
 use std::sync::Arc;
@@ -884,4 +885,145 @@ fn fix_on_an_unindexed_partitioned_folder_records_its_partitioning() {
             "{flags:?}"
         );
     }
+}
+
+/// The index command a sidecar refusal names carries every flag that
+/// shapes the build or locates the index, each argument shell-quoted:
+/// followed literally through a shell on a CSV folder whose root has a
+/// space, with a non-default chunk size, an index elsewhere, the full
+/// fingerprint policy, and a `--schema` file, it builds the manifest `fix`
+/// builds with the same flags (source, schema, row-group space), and the
+/// lookups with those flags find it. The refusal also comes only after
+/// the checks a proposal gets: an unknown column and a reserved proposer
+/// are refused as such.
+#[test]
+fn the_sidecar_refusal_command_builds_what_fix_builds() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("my lake");
+    std::fs::create_dir_all(&root).unwrap();
+    for i in 0..6 {
+        let mut text = String::from("symbol,ts,close\n");
+        for k in 0..6 {
+            let _ = writeln!(text, "S{i},2026-03-0{}T00:00:0{k}Z,{i}.{k}25", 2 + i % 3);
+        }
+        std::fs::write(root.join(format!("part-{i}.csv")), text).unwrap();
+    }
+    let schema = dir.path().join("schema s.json");
+    std::fs::write(
+        &schema,
+        r#"[{"name": "symbol", "type": "Utf8"},
+            {"name": "ts", "type": "Timestamp(Microsecond, Some(\"+00:00\"))"},
+            {"name": "close", "type": "Decimal128(10, 3)"}]"#,
+    )
+    .unwrap();
+    let index = dir.path().join("idx elsewhere");
+    let keys = dir.path().join("keys.parquet");
+    symbols(&keys, &["S3"]);
+    let (r, k) = (path(&root), path(&keys));
+    let flags = [
+        "--format",
+        "csv",
+        "--chunk-size",
+        "64",
+        "--schema",
+        path(&schema),
+        "--fingerprint-policy",
+        "full",
+        "--index",
+        path(&index),
+    ];
+    let call = |args: &[&str], code: i32| run(&[&flags[..], args].concat(), code);
+    let why = json(&call(&["why", r, "--from", k, "--json"], 0));
+    let ev = why["evidence"]["hash"].as_str().unwrap().to_string();
+
+    // The checks every proposal gets come first.
+    let out = bw()
+        .args(
+            [
+                &flags[..],
+                &["propose", r, "--evidence", &ev, "--key", "exact:nosuch@ts"],
+            ]
+            .concat(),
+        )
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(4));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("nosuch"));
+    let reserved = json(&call(
+        &[
+            "propose",
+            r,
+            "--evidence",
+            &ev,
+            "--by",
+            "engine",
+            "--key",
+            "exact:symbol@ts",
+            "--json",
+        ],
+        3,
+    ));
+    assert_eq!(reserved["refusal"]["kind"], "reserved_proposer");
+
+    let refused = json(&call(
+        &[
+            "propose",
+            r,
+            "--evidence",
+            &ev,
+            "--key",
+            "exact:symbol@ts",
+            "--json",
+        ],
+        3,
+    ));
+    assert_eq!(refused["refusal"]["kind"], "sidecar_not_proposable");
+    let command = refused["refusal"]["command"].as_str().unwrap();
+    let rest = command.strip_prefix("bellwether ").unwrap();
+    let bin = assert_cmd::cargo::cargo_bin("bellwether");
+    let out = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(format!("'{}' {rest}", bin.display()))
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{command}\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let manifest = || -> Value {
+        serde_json::from_slice(&std::fs::read(index.join("manifest.json")).unwrap()).unwrap()
+    };
+    let built = manifest();
+    call(&["locate", r, "--keys", k], 0);
+
+    // The same folder through why and fix with the same flags.
+    std::fs::remove_dir_all(&index).unwrap();
+    let why = json(&call(&["why", r, "--from", k, "--json"], 0));
+    let proposal = why["recommended"]["proposal"].as_str().unwrap();
+    let workload = why["workload"]["hash"].as_str().unwrap();
+    let fix = json(&call(
+        &[
+            "fix",
+            r,
+            "--proposal",
+            proposal,
+            "--workload",
+            workload,
+            "--json",
+        ],
+        0,
+    ));
+    assert_eq!(fix["outcome"]["kind"], "applied", "{fix}");
+    let fixed = manifest();
+    for part in ["source", "rowgroup_space"] {
+        assert_eq!(built[part], fixed[part], "{part}");
+    }
+    assert_eq!(built["schema"]["columns"], fixed["schema"]["columns"]);
+    assert_eq!(
+        built["source"]["fingerprint_policy"], "full",
+        "{}",
+        built["source"]
+    );
+    assert_eq!(built["rowgroup_space"]["files"][0]["chunk_size"], 64);
 }

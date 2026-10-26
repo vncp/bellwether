@@ -289,11 +289,16 @@ pub enum ProposeRefusal {
         key: Option<String>,
         /// The data root.
         root: String,
-        /// The `bellwether index` command that builds it, with the source
-        /// flags this engine was opened with (`--format`, `--partitioning`
-        /// or `--path-template`), so a folder not yet indexed is built as it
-        /// was read.
-        command: String,
+        /// The `bellwether index` command that builds it, every argument
+        /// shell-quoted, with the flags the engine was opened with that
+        /// shape a build or locate the index (`--index`, `--format`,
+        /// `--chunk-size`, `--schema`, `--fingerprint-policy`,
+        /// `--partitioning` or `--path-template`; `EngineOptions::source_flags`),
+        /// so following it builds the folder as it was read and where its
+        /// lookups look. `None` when a library caller opened the engine with
+        /// source options no flags spell (a CSV dialect other than comma
+        /// with a header, say).
+        command: Option<String>,
     },
 }
 

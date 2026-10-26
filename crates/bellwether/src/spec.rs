@@ -231,6 +231,21 @@ pub fn declaration_label(declared: &Declaration) -> String {
     }
 }
 
+/// `s` as one POSIX shell word, for a command a message names: unchanged
+/// when every character is one a shell never interprets, else in single
+/// quotes, each `'` written `'\''`.
+#[must_use]
+pub fn shell_quote(s: &str) -> String {
+    let plain = !s.is_empty()
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || "_@%+=:,./-".contains(c));
+    if plain {
+        s.to_string()
+    } else {
+        format!("'{}'", s.replace('\'', r"'\''"))
+    }
+}
+
 fn message(e: &Error) -> String {
     match e {
         Error::KeySpec(m) | Error::Other(m) => m.clone(),
@@ -336,5 +351,15 @@ mod tests {
             assert_eq!(declaration_label(&d), s);
             assert_eq!(parse_declaration(&declaration_label(&d)).unwrap(), d);
         }
+    }
+
+    #[test]
+    fn shell_quote_makes_one_word() {
+        assert_eq!(shell_quote("/a/b-c_d.parquet"), "/a/b-c_d.parquet");
+        assert_eq!(shell_quote("temporal2:id@v,k"), "temporal2:id@v,k");
+        assert_eq!(shell_quote("/tmp/my lake"), "'/tmp/my lake'");
+        assert_eq!(shell_quote("{day:date}.parquet"), "'{day:date}.parquet'");
+        assert_eq!(shell_quote("it's"), r"'it'\''s'");
+        assert_eq!(shell_quote(""), "''");
     }
 }

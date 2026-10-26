@@ -163,7 +163,59 @@ impl EngineArgs {
             // `--at-manifest` on the CLI's lookups), never per session.
             at_manifest: None,
             clock: self.clock.clone(),
+            source_flags: Some(self.source_flags()),
         })
+    }
+
+    /// The flags that shape a build or locate the index, as arguments of a
+    /// command run from anywhere (`EngineOptions::source_flags`): each one
+    /// given, in definition order, a local path made absolute (an index
+    /// URL kept as given). Unquoted; the facade quotes each argument.
+    fn source_flags(&self) -> Vec<String> {
+        let absolute = |p: &std::path::Path| {
+            std::path::absolute(p)
+                .unwrap_or_else(|_| p.to_path_buf())
+                .to_string_lossy()
+                .into_owned()
+        };
+        let mut flags = Vec::new();
+        if let Some(index) = &self.index {
+            let at = if index.contains("://") {
+                index.clone()
+            } else {
+                absolute(std::path::Path::new(index))
+            };
+            flags.extend(["--index".to_string(), at]);
+        }
+        match self.format {
+            FormatArg::Parquet => {}
+            FormatArg::Csv => flags.extend(["--format".into(), "csv".into()]),
+            FormatArg::Jsonl => flags.extend(["--format".into(), "jsonl".into()]),
+        }
+        if let Some(n) = self.chunk_size {
+            flags.extend(["--chunk-size".to_string(), n.to_string()]);
+        }
+        if let Some(p) = &self.schema {
+            flags.extend(["--schema".to_string(), absolute(p)]);
+        }
+        match self.fingerprint_policy {
+            None => {}
+            Some(PolicyArg::Tail64k) => {
+                flags.extend(["--fingerprint-policy".into(), "tail64k".into()]);
+            }
+            Some(PolicyArg::Full) => flags.extend(["--fingerprint-policy".into(), "full".into()]),
+        }
+        match (&self.path_template, self.partitioning) {
+            (Some(t), _) => flags.extend(["--path-template".to_string(), t.clone()]),
+            (None, Some(PartitioningArg::None)) => {
+                flags.extend(["--partitioning".into(), "none".into()]);
+            }
+            (None, Some(PartitioningArg::Hive)) => {
+                flags.extend(["--partitioning".into(), "hive".into()]);
+            }
+            (None, None) => {}
+        }
+        flags
     }
 }
 
