@@ -31,10 +31,18 @@ def section_of(mid, sections):
     parts = mid.split("/")
     name = SECTION.get(parts[0])
     if name == "reconcile":
+        # Keys look like "reconcile ledger,replay" or "reconcile taxi at 8G".
         short = parts[1].split("-")[0]
+        whole = None
         for key, rec in sections.items():
-            if key.startswith("reconcile ") and short in key.split(" ", 1)[1].split(","):
+            words = key.split(" ")
+            if words[0] != "reconcile" or short not in words[1].split(","):
+                continue
+            if len(words) == 4 and parts[2] in words[3].split(","):
                 return rec
+            if len(words) == 2:
+                whole = rec
+        return whole
     return sections.get(name)
 
 
