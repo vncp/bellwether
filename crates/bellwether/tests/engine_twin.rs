@@ -950,7 +950,8 @@ fn no_gain_is_refused_after_the_measurement() {
     let w = World::new();
     let rows = [(3, 0, 3)];
     w.query("SELECT before", &rows, stats(10, 100, 10));
-    w.query("SELECT after", &rows, stats(10, 100, 10));
+    // The same bytes read; a lower peak-memory sample is no gain.
+    w.query("SELECT after", &rows, stats(10, 100, 1));
     let e = w.engine();
     let (ev, _) = w.why(&e);
     let p = propose(&e, ev);

@@ -324,13 +324,14 @@ impl Engine {
             scratch: None,
             kept: keep,
         };
-        // The gain gate, on measured numbers: no pair set reads fewer bytes
-        // or peaks lower in memory.
+        // The gain gate, on the bytes the engine read, the measure `why`
+        // recommends by and the one a rerun of the same query on the same
+        // tables reproduces (peak memory, CPU, and duration are one noisy
+        // sample each and never pass a rewrite).
         let sum = |f: fn(&PairRun) -> u64| pairs.iter().map(f).sum::<u64>();
         let (current_bytes, proposed_bytes) =
             (sum(|p| p.before.read_bytes), sum(|p| p.after.read_bytes));
-        let gain = proposed_bytes < current_bytes
-            || sum(|p| p.after.peak_memory_bytes) < sum(|p| p.before.peak_memory_bytes);
+        let gain = proposed_bytes < current_bytes;
         if !gain && !req.allow_no_gain && !req.verify_only {
             run_info.pairs = pairs;
             result.engine = Some(run_info);

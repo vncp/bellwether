@@ -840,8 +840,8 @@ fn verify_and_outcome_human(s: &mut String, r: &FixResult) {
                     proposed_bytes,
                 } if r.engine.is_some() => format!(
                     "nothing_to_gain: replay {replay} measured the rewrite reading no fewer bytes \
-                     ({} before, {} after) and peaking no lower in memory, so nothing was \
-                     exported or verified; pass --allow-no-gain to go on anyway",
+                     in the engine ({} before, {} after), so nothing was exported or verified; \
+                     pass --allow-no-gain to go on anyway",
                     num(*current_bytes),
                     num(*proposed_bytes)
                 ),

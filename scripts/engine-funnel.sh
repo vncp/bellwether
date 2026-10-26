@@ -66,25 +66,36 @@ run() {
   cat "$dir/receipt.txt"
 }
 
+# Each shape's rewrite is dedup-before-filter: the before query numbers the
+# rows of every key newest first over the whole table and keeps the keys it
+# wants afterwards; the after query filters on the key first, so the
+# engine's primary index skips the granules no key touches. (A filter above
+# `LIMIT 1 BY` the engine pushes down by itself; above a window function it
+# does not.) Both tables are sorted by the key, with small granules so the
+# pruning shows on a small corpus; the newest-first order is unique per key,
+# so both queries pick the same row.
+
 # --- the ledger shape --------------------------------------------------
 "$BW" bench generate --out "$OUT/ledger-corpus" --seed 7 --days 8 --files 32 \
   --row-groups-per-file 4 --rows-per-row-group 2000 --entities 20000 --churn 0.1 >/dev/null
 sql "CREATE TABLE $DB.ledger (entity_id UInt64, batch_id Int64, version_ts DateTime64(6, 'UTC'),
   status String, amount Decimal(18, 2), payload String) ENGINE = MergeTree
-  PARTITION BY toYYYYMMDD(version_ts) ORDER BY (batch_id, entity_id)"
-load ledger "$OUT"/ledger-corpus/data/*.parquet
+  PARTITION BY toYYYYMMDD(version_ts) ORDER BY (entity_id, version_ts)
+  SETTINGS index_granularity = 1024"
+load ledger "$OUT"/ledger-corpus/data/*/*.parquet
 run ledger "$OUT/ledger-corpus/data" ledger \
-  "SELECT DISTINCT entity_id FROM $DB.ledger WHERE entity_id % 1000 = 7" \
-  "SELECT * FROM (SELECT entity_id, version_ts, amount, status FROM $DB.ledger ORDER BY version_ts DESC LIMIT 1 BY entity_id) WHERE entity_id % 1000 = 7" \
-  "SELECT entity_id, version_ts, amount, status FROM $DB.ledger WHERE entity_id % 1000 = 7 ORDER BY version_ts DESC LIMIT 1 BY entity_id"
+  "SELECT DISTINCT entity_id FROM $DB.ledger WHERE entity_id BETWEEN 7000 AND 7099" \
+  "SELECT entity_id, version_ts, amount, status, payload FROM (SELECT *, row_number() OVER (PARTITION BY entity_id ORDER BY version_ts DESC, batch_id DESC) AS rn FROM $DB.ledger) WHERE rn = 1 AND entity_id BETWEEN 7000 AND 7099" \
+  "SELECT entity_id, version_ts, amount, status, payload FROM (SELECT *, row_number() OVER (PARTITION BY entity_id ORDER BY version_ts DESC, batch_id DESC) AS rn FROM $DB.ledger WHERE entity_id BETWEEN 7000 AND 7099) WHERE rn = 1"
 
 # --- the time-series shape ---------------------------------------------
 "$BW" bench market --out "$OUT/market-corpus" --rung small >/dev/null
 sql "CREATE TABLE $DB.trades (symbol String, ts DateTime64(6, 'UTC'), known_at DateTime64(6, 'UTC'),
-  price Float64, size Int64) ENGINE = MergeTree PARTITION BY toYYYYMMDD(ts) ORDER BY ts"
+  price Float64, size Int64) ENGINE = MergeTree PARTITION BY toYYYYMMDD(ts) ORDER BY (symbol, ts)
+  SETTINGS index_granularity = 1024"
 load trades "$OUT"/market-corpus/data/day=*/*.parquet
 run market "$OUT/market-corpus/data" trades \
   "SELECT DISTINCT symbol FROM $DB.trades WHERE symbol IN ('S0003', 'S0017', 'S0029')" \
-  "SELECT * FROM (SELECT symbol, ts, known_at, price, size FROM $DB.trades ORDER BY ts DESC, known_at DESC LIMIT 1 BY symbol) WHERE symbol IN ('S0003', 'S0017', 'S0029')" \
-  "SELECT symbol, ts, known_at, price, size FROM $DB.trades WHERE symbol IN ('S0003', 'S0017', 'S0029') ORDER BY ts DESC, known_at DESC LIMIT 1 BY symbol" \
+  "SELECT symbol, ts, known_at, price, size FROM (SELECT *, row_number() OVER (PARTITION BY symbol ORDER BY ts DESC, known_at DESC) AS rn FROM $DB.trades) WHERE rn = 1 AND symbol IN ('S0003', 'S0017', 'S0029')" \
+  "SELECT symbol, ts, known_at, price, size FROM (SELECT *, row_number() OVER (PARTITION BY symbol ORDER BY ts DESC, known_at DESC) AS rn FROM $DB.trades WHERE symbol IN ('S0003', 'S0017', 'S0029')) WHERE rn = 1" \
   --partitioning hive
