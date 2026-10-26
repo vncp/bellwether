@@ -116,7 +116,10 @@ def environment(a):
         mem = next(int(l.split()[1]) * 1024 for l in open("/proc/meminfo") if l.startswith("MemTotal:"))
         osv = f"{platform.system()} {platform.release()}"
     commit = first(["git", "-C", REPO, "rev-parse", "--short=12", "HEAD"])
-    dirty = bool(subprocess.run(["git", "-C", REPO, "status", "--porcelain", "--untracked-files=no"],
+    # The chart rows this script writes itself (--showcase) do not make the
+    # measured tree dirty.
+    dirty = bool(subprocess.run(["git", "-C", REPO, "status", "--porcelain", "--untracked-files=no", "--",
+                                 ".", ":(exclude)docs/measured/results/perf.json"],
                                 capture_output=True, text=True).stdout.strip())
     machine = f"{cpu}, {cores} cores, {mem // 2**30} GiB, {osv}, {'CI runner disk' if os.environ.get('GITHUB_ACTIONS') else 'local SSD'}"
     return {
