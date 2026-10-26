@@ -44,6 +44,7 @@ THEMES = {
         "bw": "#1a7f37",
         "bw2": "#4ac26b",
         "pred": "#8250df",
+        "extra": "#bc4c00",
     },
     "dark": {
         "bg": "#0d1117",
@@ -55,6 +56,7 @@ THEMES = {
         "bw": "#3fb950",
         "bw2": "#2ea043",
         "pred": "#a371f7",
+        "extra": "#f0883e",
     },
 }
 FONT = "-apple-system,Segoe UI,Helvetica,Arial,sans-serif"
@@ -581,9 +583,9 @@ def generic_outputs(source, res):
         vals = [v for v in idx.values() if v and v > 0]
         log = spec.get("log", bool(vals) and max(vals) / min(vals) > 30)
         fmt = human_bytes if unit == "bytes" else human_ms if unit == "ms" else human_rate if unit == "rows/s" else (
-            lambda v, u=unit: f"{v:,.4g} {u}"
+            lambda v, u=unit: f"{v:,.0f} {u}" if v >= 1000 else f"{v:,.3g} {u}"
         )
-        palette = ["duckdb", "bw", "full", "pred", "bw2"]
+        palette = ["duckdb", "bw", "full", "pred", "extra"]
         series = [(sd, palette[i % len(palette)]) for i, sd in enumerate(sides)]
         prov = Results({"rows": rows}).provenance_line()
         name = f"results-{source}-{re.sub('[^a-z0-9]+', '-', spec['name'].lower()).strip('-')}"
