@@ -476,6 +476,41 @@ impl SegmentHeader {
     }
 }
 
+/// Parses a segment's JSON header. A storage version 2 header in a shape
+/// the next storage version 2 release adds (the `bitemporal` layout, a key
+/// spec with per-key `bounds` or of the bitemporal kind, a header `bounds`
+/// field, each of which changes the value records) is refused with
+/// [`Error::UnsupportedShape`], before the typed parse could misread it or
+/// fail with a serde error (ADR 028).
+pub(crate) fn parse_header(bytes: &[u8], storage: u32) -> Result<SegmentHeader> {
+    if storage >= 2 {
+        if let Ok(v) = serde_json::from_slice::<serde_json::Value>(bytes) {
+            let spec = v.get("key_spec");
+            let found = || {
+                spec.and_then(|s| serde_json::from_value::<KeySpec>(s.clone()).ok())
+                    .map_or_else(|| "in a segment".to_string(), |s| s.identity())
+            };
+            let shape = if v.get("layout").and_then(|l| l.as_str()) == Some("bitemporal") {
+                Some(("segment layout", "bitemporal".to_string()))
+            } else if spec.and_then(|s| s.get("kind")).and_then(|k| k.as_str())
+                == Some("bitemporal")
+            {
+                Some(("bitemporal key spec", found()))
+            } else if spec.is_some_and(|s| s.get("bounds").is_some()) {
+                Some(("key spec with per-key bounds", found()))
+            } else if v.get("bounds").is_some() {
+                Some(("segment header field", "bounds".to_string()))
+            } else {
+                None
+            };
+            if let Some((what, found)) = shape {
+                return Err(Error::UnsupportedShape { what, found });
+            }
+        }
+    }
+    Ok(serde_json::from_slice(bytes)?)
+}
+
 /// Checks the preamble's versions before anything else is parsed.
 pub fn check_versions(storage: u32, encoding: u32) -> Result<()> {
     if storage > STORAGE_VERSION {
@@ -671,5 +706,36 @@ impl<'a> Cursor<'a> {
             }
         }
         Err(corrupt("count exceeds 64 bits"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn leb(bytes: &[u8]) -> Result<u64> {
+        let mut c = Cursor::new(bytes);
+        let v = c.leb128()?;
+        assert!(c.is_done(), "{bytes:02x?} read past one value");
+        Ok(v)
+    }
+
+    /// Every count has exactly one spelling: the shortest LEB128 form reads
+    /// back, an over-long one (a zero last byte after the first) and one
+    /// past 64 bits are refused.
+    #[test]
+    fn leb128_reads_only_the_shortest_form() {
+        for v in [0u64, 1, 127, 128, 300, 16_383, 16_384, u64::from(u32::MAX), u64::MAX] {
+            let mut out = Vec::new();
+            put_leb128(&mut out, v);
+            assert_eq!(leb(&out).unwrap(), v);
+        }
+        for over_long in [&[0x80, 0x00][..], &[0x81, 0x00], &[0xac, 0x82, 0x00], &[0xff, 0x80, 0x00]] {
+            let err = leb(over_long).unwrap_err().to_string();
+            assert!(err.contains("shortest LEB128 form"), "{over_long:02x?}: {err}");
+        }
+        let too_wide = [0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x02];
+        assert!(leb(&too_wide).is_err());
+        assert!(leb(&[0xff; 11]).is_err());
     }
 }

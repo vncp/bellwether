@@ -15,7 +15,10 @@
 //!   one new file it commits at version 2, says so, records per-row-group
 //!   rows and bytes and per-column bytes equal to the files' footers, and
 //!   every v1 plan, pinned to its sequence, is unchanged.
-//! - A manifest of a newer storage version is refused.
+//! - A manifest of a newer storage version is refused; so, by name and
+//!   saying to upgrade, is a storage version 2 shape the next release adds.
+//! - `locate --columns` on a version 1 index reads its column bytes from
+//!   the footers and says so; a bad `--columns` is a usage error.
 //!
 //! A restore copies the corpus under a fresh root with every data file's
 //! mtime at the fixture clock (a fingerprint's etag is the mtime), copies the
@@ -450,4 +453,136 @@ fn a_newer_storage_version_is_refused() {
     );
     assert_eq!(code, 4, "{stderr}");
     assert!(stderr.contains("storage version 3"), "{stderr}");
+}
+
+/// The storage version 2 shapes the next release writes (a column's
+/// `data_type` as a type map, a source `dialect`, a key spec with per-key
+/// `bounds`, a bitemporal key spec; ADR 028) are refused by name, exit 4,
+/// saying to upgrade: never a serde error, never "a newer storage version".
+#[test]
+fn later_storage_version_2_shapes_are_refused_by_name() {
+    let keys = path(&corpus().join("keys-id.parquet")).to_string();
+    let edits: [(&str, &dyn Fn(&mut Value)); 4] = [
+        ("manifest column data_type of column \"id\" (a type map)", &|m| {
+            let cols = m["schema"]["columns"].as_array_mut().unwrap();
+            let id = cols.iter_mut().find(|c| c["name"] == "id").unwrap();
+            id["data_type"] = serde_json::json!({"type": "int64"});
+        }),
+        ("manifest source dialect", &|m| {
+            m["source"]["dialect"] = serde_json::json!({"delimiter": ",", "header": true});
+        }),
+        ("key spec with per-key bounds exact:id@ts", &|m| {
+            let specs = m["schema"]["key_specs"].as_array_mut().unwrap();
+            let exact = specs
+                .iter_mut()
+                .find(|s| s["kind"] == "exact" && s["columns"] == serde_json::json!(["id"]))
+                .unwrap();
+            exact["bounds"] = "ts".into();
+        }),
+        ("bitemporal key spec temporal2:id@valid,known", &|m| {
+            m["schema"]["key_specs"]
+                .as_array_mut()
+                .unwrap()
+                .push(serde_json::json!({"kind": "bitemporal", "columns": ["id"],
+                    "valid_column": "valid", "known_column": "known"}));
+        }),
+    ];
+    for (named, edit) in edits {
+        let r = Restored::new("format-v0.1");
+        let p = r.data.join(".bellwether/manifest.json");
+        let mut m = r.manifest();
+        edit(&mut m);
+        std::fs::write(&p, serde_json::to_vec_pretty(&m).unwrap()).unwrap();
+        let (code, _, stderr) = run(
+            &r,
+            &[
+                "locate".into(),
+                path(&r.data).into(),
+                "--keys".into(),
+                keys.clone(),
+            ],
+        );
+        assert_eq!(code, 4, "{stderr}");
+        assert!(
+            stderr.contains(named)
+                && stderr.contains(
+                    "storage version 2 segment/manifest shape not supported by this binary; \
+                     upgrade"
+                )
+                && !stderr.contains("serde")
+                && !stderr.contains("newer storage version"),
+            "{named}: {stderr}"
+        );
+    }
+}
+
+/// `locate --columns` on a storage version 1 index reads the per-column
+/// bytes its manifest lacks from the planned files' footers and says so,
+/// with the bytes the footers hold; after an upgrade, a plan pinned to the
+/// version 1 sequence says the same of that sequence. A column the dataset
+/// does not have, or an empty one, is a usage error naming `--columns`.
+#[test]
+fn locate_columns_on_a_version_1_index_reads_footers_and_names_bad_columns() {
+    let r = Restored::new("format-v1");
+    let keys = path(&corpus().join("keys-id.parquet")).to_string();
+    let locate = |extra: &[&str]| -> Vec<String> {
+        [
+            vec![
+                "locate".to_string(),
+                path(&r.data).to_string(),
+                "--keys".to_string(),
+                keys.clone(),
+            ],
+            extra.iter().map(|s| (*s).to_string()).collect(),
+        ]
+        .concat()
+    };
+    let out = ok(&r, &locate(&["--columns", "id,amount"]));
+    assert!(
+        out.contains(
+            "manifest sequence 3 is a storage version 1 manifest, which records no per-column \
+             bytes, so the projected bytes were read from"
+        ),
+        "{out}"
+    );
+    let json: Value = serde_json::from_str(&ok(
+        &r,
+        &[vec!["--json".to_string()], locate(&["--columns", "id,amount"])].concat(),
+    ))
+    .unwrap();
+    assert_eq!(json["column_bytes_from_footers"], json["planned"]["files"]);
+    let projected = json["projected_bytes"].as_u64().unwrap();
+    assert!(projected > 0 && projected <= json["planned"]["bytes"].as_u64().unwrap());
+
+    for (bad, needle) in [
+        ("nosuch", "\"nosuch\" is not in the dataset"),
+        ("", "--columns"),
+        ("id,id", "twice"),
+    ] {
+        let (code, _, stderr) = run(&r, &locate(&["--columns", bad]));
+        assert_eq!(code, 2, "{bad:?}: {stderr}");
+        assert!(
+            stderr.contains(needle) && stderr.contains("--columns"),
+            "{bad:?}: {stderr}"
+        );
+    }
+
+    // Upgrade with one new file; the version 1 sequence still answers from
+    // its footers, and the current one from the manifest.
+    let new = r.data.join("day=2026-01-04/part-0.parquet");
+    std::fs::create_dir_all(new.parent().unwrap()).unwrap();
+    std::fs::copy(r.data.join("day=2026-01-03/part-0.parquet"), &new).unwrap();
+    ok(&r, &["index".to_string(), path(&r.data).to_string()]);
+    let pinned = ok(
+        &r,
+        &[
+            locate(&["--columns", "id,amount"]),
+            vec!["--at-manifest".into(), "3".into()],
+        ]
+        .concat(),
+    );
+    assert!(pinned.contains("manifest sequence 3 is a storage version 1"), "{pinned}");
+    let now = ok(&r, &locate(&["--columns", "id,amount"]));
+    assert!(!now.contains("storage version 1"), "{now}");
+    assert!(now.contains("planned, projected columns"), "{now}");
 }

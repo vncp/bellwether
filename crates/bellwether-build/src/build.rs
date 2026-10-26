@@ -164,7 +164,9 @@ impl<S: StoreExt + ?Sized> Builder<S> {
                     }
                     Some(d) if d != spec => {
                         return Err(Error::KeySpec(format!(
-                            "the index declares {d:?} under the name {name}, not {spec:?}"
+                            "the index declares {} under the name {name}, not {}",
+                            d.identity(),
+                            spec.identity()
                         )))
                     }
                     Some(_) => {}

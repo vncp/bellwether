@@ -766,10 +766,13 @@ impl<S: StoreExt + ?Sized> Planner<S> {
     /// Fills each entry's `columns` and the plan's `projected_bytes` for a
     /// consumer that reads only `columns` (distinct dataset columns): the
     /// compressed bytes of each column over the entry's row groups, from the
-    /// manifest's `column_bytes` (storage version 2). A text source's
-    /// chunks have no per-column bytes, so its entries carry none and count
-    /// their whole bytes. `plan` must come from this planner.
-    pub fn project(&self, plan: &mut ScanPlan, columns: &[String]) -> Result<()> {
+    /// manifest's `column_bytes` (storage version 2). A storage version 1
+    /// manifest records none, so a Parquet file's are read from its footer;
+    /// the result is the number of footers read that way (0 on a version 2
+    /// manifest). A text source's chunks have no per-column bytes, so its
+    /// entries carry none and count their whole bytes. `plan` must come
+    /// from this planner.
+    pub fn project(&self, plan: &mut ScanPlan, columns: &[String]) -> Result<u64> {
         if plan.manifest_version != self.sequence().to_string() {
             return Err(Error::Other(format!(
                 "the plan is of manifest {} but the planner pins {}",
@@ -798,6 +801,7 @@ impl<S: StoreExt + ?Sized> Planner<S> {
             .map(|(i, f)| (f.fingerprint.path.as_str(), i))
             .collect();
         let mut projected = 0u64;
+        let mut from_footers = 0u64;
         for e in &mut plan.entries {
             let fi = *by_path.get(e.file.path.as_str()).ok_or_else(|| {
                 Error::Other(format!("{} is not tracked by the manifest", e.file.path))
@@ -808,22 +812,29 @@ impl<S: StoreExt + ?Sized> Planner<S> {
                 projected += e.bytes;
                 continue;
             }
-            if f.column_bytes.is_none() {
-                return Err(Error::Other(format!(
-                    "manifest sequence {} records no per-column bytes for {} (a storage version \
-                     1 index); run `bellwether index` on the folder once to record them",
-                    self.sequence(),
-                    f.fingerprint.path
-                )));
-            }
+            let footer;
+            let column_bytes = match &f.column_bytes {
+                Some(b) => b.as_slice(),
+                None => {
+                    footer = self.footer_column_bytes(fi)?;
+                    from_footers += 1;
+                    footer.as_slice()
+                }
+            };
             let mut out = Vec::with_capacity(columns.len());
             for (c, &j) in columns.iter().zip(&positions) {
                 let mut bytes = 0u64;
                 for idx in &e.row_groups {
                     let i = usize::try_from(idx).unwrap_or(usize::MAX);
-                    bytes += f.column_bytes_of(i, j, width).ok_or_else(|| {
-                        Error::Other(format!("row group {idx} out of range in {}", e.file.path))
-                    })?;
+                    bytes += i
+                        .checked_mul(width)
+                        .and_then(|at| column_bytes.get(at.checked_add(j)?))
+                        .ok_or_else(|| {
+                            Error::Other(format!(
+                                "row group {idx} out of range in {}",
+                                e.file.path
+                            ))
+                        })?;
                 }
                 projected += bytes;
                 out.push(ColumnBytes {
@@ -834,7 +845,46 @@ impl<S: StoreExt + ?Sized> Planner<S> {
             e.columns = Some(out);
         }
         plan.projected_bytes = Some(projected);
-        Ok(())
+        Ok(from_footers)
+    }
+
+    /// Compressed bytes of each column chunk of tracked Parquet file `fi`,
+    /// row-group-major over the dataset schema's columns (0 for a column
+    /// the file does not hold, a virtual partition column), read from its
+    /// footer: what a storage version 2 manifest records as
+    /// `column_bytes`, for a version 1 manifest that records none.
+    fn footer_column_bytes(&self, fi: usize) -> Result<Vec<u64>> {
+        let m = self.manifest();
+        let f = &m.rowgroup_space.files[fi];
+        let parquet = self.parquet.as_ref().ok_or_else(|| {
+            Error::Other(format!(
+                "{}: no Parquet reader for a Parquet index",
+                f.fingerprint.path
+            ))
+        })?;
+        self.footers.fetch_add(1, Ordering::Relaxed);
+        let metas = parquet.row_groups(&f.fingerprint)?;
+        if metas.len() != f.rowgroup_ids.len() {
+            return Err(Error::Source(format!(
+                "{}: the footer lists {} row groups, the manifest {}",
+                f.fingerprint.path,
+                metas.len(),
+                f.rowgroup_ids.len()
+            )));
+        }
+        let mut out = Vec::with_capacity(metas.len().saturating_mul(m.schema.columns.len()));
+        for rg in &metas {
+            for c in &m.schema.columns {
+                out.push(
+                    rg.stats
+                        .iter()
+                        .find(|s| s.column == c.name)
+                        .and_then(|s| s.bytes)
+                        .unwrap_or(0),
+                );
+            }
+        }
+        Ok(out)
     }
 
     // -- specs and segments ------------------------------------------------
@@ -887,7 +937,9 @@ impl<S: StoreExt + ?Sized> Planner<S> {
         match self.declared_specs().iter().find(|s| s.name() == name) {
             None => Error::KeySpec(format!("key spec {name} is not declared in this index")),
             Some(d) if d != spec => Error::KeySpec(format!(
-                "the index declares {d:?} under the name {name}, not {spec:?}"
+                "the index declares {} under the name {name}, not {}",
+                d.identity(),
+                spec.identity()
             )),
             Some(_) => Error::KeySpec(format!(
                 "key spec {name} is not complete at manifest sequence {seq} (ADR 012); a query on an \
@@ -919,9 +971,10 @@ impl<S: StoreExt + ?Sized> Planner<S> {
         let reader = SegmentReader::open_for_dataset(bytes, &self.schema)?;
         if reader.key_spec() != spec {
             return Err(Error::KeySpec(format!(
-                "a segment listed under {} indexes {:?}",
-                spec.name(),
-                reader.key_spec()
+                "a segment listed under {} indexes {}; the manifest lists it under another \
+                 spec, so restore the manifest from manifests/ or rebuild the spec",
+                spec.identity(),
+                reader.key_spec().identity()
             )));
         }
         Ok(reader)
@@ -976,10 +1029,22 @@ impl<S: StoreExt + ?Sized> Planner<S> {
                 }
                 let all: Vec<&[u8]> = owners.keys().copied().collect();
                 let live = self.locator.live();
+                // The row groups each probe was counted in so far: two
+                // segments counting one key in one row group would count
+                // its rows twice.
+                let mut counted_in: BTreeMap<&[u8], RoaringBitmap> = BTreeMap::new();
                 for src in &seg.sources {
                     let r = self.open_segment(&seg.spec, src, false)?;
                     for (probe, value) in r.get(&all)? {
                         if let Some(total) = rows.as_deref_mut() {
+                            let key = owners
+                                .get_key_value(probe.as_slice())
+                                .map_or(&[][..], |(k, _)| *k);
+                            let seen = counted_in.entry(key).or_default();
+                            if !(&*seen & &value.bitmap).is_empty() {
+                                return Err(overlapping_counts(&seg.spec));
+                            }
+                            *seen |= &value.bitmap;
                             // Probes are distinct (both zeros of a key are
                             // two stored keys), so no row counts twice.
                             let counted = value.counted().ok_or_else(|| {
@@ -2263,6 +2328,21 @@ fn non_null_probes(keys: &[Vec<u8>], types: &[(String, DataType)]) -> Result<Pro
         }
     }
     Ok(kept)
+}
+
+/// The refusal for two segments of one counting spec that both count a
+/// key in one row group. No build commits that (each row group is indexed
+/// by one segment of a spec, and merge refuses overlapping counts), so the
+/// manifest was written by another tool or edited; summing would count the
+/// rows twice.
+#[must_use]
+pub fn overlapping_counts(spec: &KeySpec) -> Error {
+    Error::Other(format!(
+        "corrupt index: two segments listed under {} count the same key in the same row group, \
+         which no build commits, so its rows would be counted twice; restore the manifest from \
+         manifests/ or rebuild the spec with `bellwether index`",
+        spec.identity()
+    ))
 }
 
 /// Every zero variant of every key, sorted and deduplicated.

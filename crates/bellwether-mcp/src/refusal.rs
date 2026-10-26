@@ -448,6 +448,12 @@ pub fn from_error(e: &Error) -> Refusal {
             RefusalCode::UnsupportedVersion,
             json!({ "what": what, "found": found, "supported": supported }),
         ),
+        // A storage version 2 shape a later release adds: the same next
+        // step as a newer version (upgrade), with the shape named.
+        Error::UnsupportedShape { what, found } => (
+            RefusalCode::UnsupportedVersion,
+            json!({ "what": what, "found": found }),
+        ),
         Error::SegmentClaimed(h) => (RefusalCode::SegmentClaimed, json!({ "segment": h })),
         Error::VersionConflict { expected, found } => (
             RefusalCode::VersionConflict,
@@ -697,6 +703,13 @@ mod tests {
                     found: "x".into(),
                 },
                 RefusalCode::UnknownKind,
+            ),
+            (
+                Error::UnsupportedShape {
+                    what: "bitemporal key spec",
+                    found: "temporal2:id@valid,known".into(),
+                },
+                RefusalCode::UnsupportedVersion,
             ),
             (Error::SegmentClaimed(h), RefusalCode::SegmentClaimed),
             (

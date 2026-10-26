@@ -146,7 +146,8 @@ impl<'a> Replayer<'a> {
         for spec in &current {
             if !have.contains(spec) {
                 return Err(Error::KeySpec(format!(
-                    "the planner has no segments for current spec {spec:?}"
+                    "the planner has no segments for current spec {}",
+                    spec.identity()
                 )));
             }
         }

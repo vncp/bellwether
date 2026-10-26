@@ -22,8 +22,8 @@ use bellwether_types::{Error, KeySpec, Result, RowGroupId};
 use roaring::RoaringBitmap;
 
 use super::format::{
-    check_versions, checksum, corrupt, footer_len, spec_types, ColumnType, Cursor, Layout, ReadAt,
-    SegmentHeader, MAGIC, PREAMBLE_LEN,
+    check_versions, checksum, corrupt, footer_len, parse_header, spec_types, ColumnType, Cursor,
+    Layout, ReadAt, SegmentHeader, MAGIC, PREAMBLE_LEN,
 };
 use super::types;
 use super::writer::KeyValue;
@@ -261,7 +261,7 @@ impl<R: ReadAt> SegmentReader<R> {
         }
         let header_len = c.u32()? as usize;
         let header_bytes = src.read_at(PREAMBLE_LEN as u64, header_len)?;
-        let header: SegmentHeader = serde_json::from_slice(&header_bytes)?;
+        let header = parse_header(&header_bytes, storage)?;
         header.validate(storage, encoding)?;
         let foot = src.read_at(size - foot_len as u64, foot_len)?;
         let mut c = Cursor::new(&foot);

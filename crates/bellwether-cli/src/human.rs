@@ -330,6 +330,20 @@ pub(crate) fn plan(r: &PlanResult, out: &Out) -> String {
             size(p)
         );
     }
+    if r.column_bytes_from_footers > 0 {
+        let footers = if r.column_bytes_from_footers == 1 {
+            "footer"
+        } else {
+            "footers"
+        };
+        let _ = writeln!(
+            s,
+            "  manifest sequence {} is a storage version 1 manifest, which records no \
+             per-column bytes, so the projected bytes were read from {} Parquet {footers}",
+            r.sequence,
+            num(r.column_bytes_from_footers)
+        );
+    }
     if let Some(rows) = r.rows {
         let _ = writeln!(
             s,

@@ -277,7 +277,8 @@ struct LocateArgs {
     ts: Option<String>,
     /// The columns the reader reads, comma-separated: each planned file also
     /// reports those columns' compressed bytes, and the plan their sum
-    /// (from the index, no footer read).
+    /// (from the index, no footer read; a storage version 1 index's are
+    /// read from the planned files' footers, and the output says so).
     #[arg(long, value_name = "COLS", value_delimiter = ',')]
     columns: Option<Vec<String>>,
 }
@@ -489,7 +490,7 @@ impl From<Error> for Failure {
             Error::InvalidArgument {
                 field:
                     "lookback" | "latest_by" | "signing_key" | "trusted_keys" | "public_key" | "out"
-                    | "name" | "valid_from" | "revoked_at" | "index" | "root",
+                    | "name" | "valid_from" | "revoked_at" | "index" | "root" | "columns",
                 ..
             } => Self::Usage(match hint(&e) {
                 Some(h) => format!("{e}; {h}"),
@@ -553,6 +554,7 @@ fn hint(e: &Error) -> Option<String> {
                 "workload" => "--from, --bench-workload, or --workload",
                 "rewrite" => "--before-output and --after-output",
                 "index" => "--index <dir>",
+                "columns" => "--columns",
                 _ => return None,
             };
             Some(format!("check {flag}"))

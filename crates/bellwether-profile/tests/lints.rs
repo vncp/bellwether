@@ -277,6 +277,78 @@ fn count_before_scan_does_not_fire_without_a_gated_count_or_with_counts() {
     assert!(rules(&run(&data, &store, None), lints::COUNT_BEFORE_SCAN).is_empty());
 }
 
+/// `R-counts-1` is silenced by any spec the planner counts the workload's
+/// key with: one storing counts whose key is exactly its columns, exact or
+/// temporal. A spec without counts, or storing counts on other columns,
+/// leaves it firing.
+#[test]
+fn count_before_scan_is_silenced_by_every_spec_the_planner_counts_with() {
+    let tmp = tempfile::tempdir().unwrap();
+    let data = Layout::flat().write(&tmp.path().join("data"));
+    let gated = tmp.path().join("gated");
+    write_bench_workload_queries(
+        &gated,
+        &[(Some("count"), vec![1, 2]), (Some("locate"), vec![1, 2])],
+    );
+    let temporal = |counts| KeySpec::Temporal {
+        columns: vec!["entity_id".into()],
+        ts_column: "version_ts".into(),
+        counts,
+    };
+    let exact_on = |columns: &[&str], counts| KeySpec::Exact {
+        columns: columns.iter().map(|c| (*c).to_string()).collect(),
+        counts,
+        bounds: None,
+    };
+    for (specs, fires) in [
+        (vec![temporal(true)], false),
+        (vec![exact_on(&["entity_id"], true)], false),
+        (vec![temporal(false)], true),
+        (vec![exact_on(&["status", "entity_id"], true)], true),
+        (vec![exact_on(&["entity_id"], false), temporal(true)], false),
+    ] {
+        let (_d, store) = temp_store();
+        index(&store, &path_str(&data), &specs);
+        let found = rules(&run(&data, &store, Some(&gated)), lints::COUNT_BEFORE_SCAN).len();
+        let names: Vec<String> = specs.iter().map(KeySpec::identity).collect();
+        assert_eq!(found, usize::from(fires), "{names:?}");
+    }
+}
+
+/// A workload summary cached by a binary whose summary had no
+/// `counts_before_scan` (format 1) is never served: the format is part of
+/// the cache key, so `R-counts-1` sees the count passes.
+#[test]
+fn a_workload_summary_cached_in_the_previous_format_is_not_reused() {
+    let tmp = tempfile::tempdir().unwrap();
+    let data = Layout::flat().write(&tmp.path().join("data"));
+    let gated = tmp.path().join("gated");
+    write_bench_workload_queries(
+        &gated,
+        &[(Some("count"), vec![1, 2]), (Some("locate"), vec![1, 2])],
+    );
+    let (_d, store) = temp_store();
+    // The key and the summary a format 1 binary wrote for this workload:
+    // the same key inputs, serialized in the same order, with format 1.
+    let key = serde_json::to_string(&bellwether_profile::workload::cache_key(&gated).unwrap())
+        .unwrap()
+        .replace(
+            bellwether_profile::workload::WORKLOAD_CACHE_FORMAT,
+            "bellwether-profile/workload-summary/1",
+        );
+    let old_key = bellwether_types::Hash::of(key.as_bytes());
+    let summary = bellwether_profile::workload::summarize(&gated).unwrap();
+    assert_eq!(summary.counts_before_scan, 1);
+    let mut old = serde_json::to_value(&summary).unwrap();
+    old.as_object_mut().unwrap().remove("counts_before_scan");
+    bellwether_store::Cache::new(std::sync::Arc::clone(&store), "")
+        .put_cached(&old_key, bytes::Bytes::from(serde_json::to_vec(&old).unwrap()))
+        .unwrap();
+    let report = run(&data, &store, Some(&gated));
+    assert_eq!(report.workload.as_ref().unwrap().counts_before_scan, 1);
+    assert_eq!(rules(&report, lints::COUNT_BEFORE_SCAN).len(), 1);
+}
+
 /// A run whose `query` is neither `locate` nor `count` is refused, naming
 /// both.
 #[test]

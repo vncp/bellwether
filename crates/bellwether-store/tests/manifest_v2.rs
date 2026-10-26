@@ -91,6 +91,86 @@ fn misaligned_arrays_and_newer_versions_are_refused() {
     assert!(matches!(err, Error::UnsupportedVersion { .. }), "{err:?}");
 }
 
+/// The shapes the next storage version 2 release writes (ADR 028: the
+/// record shapes are final in this release, the bytes of storage version 2
+/// from the next) are refused by name with `UnsupportedShape`, which says
+/// to upgrade: never a serde error, never "a newer storage version" (the
+/// version is the same).
+#[test]
+fn later_storage_version_2_shapes_are_refused_by_name() {
+    let shapes: Vec<(&str, &str, Box<dyn FnOnce(&mut serde_json::Value)>)> = vec![
+        (
+            "manifest column data_type",
+            "of column \"symbol\" (a type map)",
+            Box::new(|v| v["schema"]["columns"][0]["data_type"] = serde_json::json!({"type": "utf8"})),
+        ),
+        (
+            "manifest column data_type",
+            "of column \"day\" (a type map)",
+            Box::new(|v| {
+                v["schema"]["columns"][1]["data_type"] = serde_json::json!({"arrow": "Date32"});
+            }),
+        ),
+        (
+            "manifest source",
+            "dialect",
+            Box::new(|v| {
+                v["source"]["dialect"] =
+                    serde_json::json!({"delimiter": ";", "header": true, "quote": "\""});
+            }),
+        ),
+        (
+            "key spec with per-key bounds",
+            "exact:symbol@ts,counts",
+            Box::new(|v| v["schema"]["key_specs"][0]["bounds"] = "ts".into()),
+        ),
+        (
+            "bitemporal key spec",
+            "temporal2:symbol@valid,known",
+            Box::new(|v| {
+                v["schema"]["key_specs"]
+                    .as_array_mut()
+                    .unwrap()
+                    .push(serde_json::json!({"kind": "bitemporal", "columns": ["symbol"],
+                        "valid_column": "valid", "known_column": "known"}));
+            }),
+        ),
+    ];
+    for (what, found, edit) in shapes {
+        let err = edited(edit).unwrap_err();
+        let text = err.to_string();
+        match &err {
+            Error::UnsupportedShape { what: w, found: f } => {
+                assert_eq!((*w, f.as_str()), (what, found), "{text}");
+            }
+            other => panic!("{what}: expected UnsupportedShape, got {other:?}"),
+        }
+        assert!(
+            text.contains(
+                "storage version 2 segment/manifest shape not supported by this binary; upgrade"
+            ) && !text.contains("newer storage version")
+                && !text.contains("serde"),
+            "{text}"
+        );
+    }
+}
+
+/// A key or time column containing `,` or `@` (the separators of a key
+/// spec's identity) in a manifest is refused when the manifest is read,
+/// naming the column: two such specs could share an identity.
+#[test]
+fn identity_separators_in_spec_columns_are_refused_on_read() {
+    for column in ["sym,bol", "sym@bol"] {
+        let err = edited(|v| v["schema"]["key_specs"][0]["columns"][0] = column.into())
+            .unwrap_err();
+        assert!(
+            matches!(&err, Error::KeySpec(m) if m.contains(&format!("\"{column}\""))
+                && m.contains("',' or '@'")),
+            "{err:?}"
+        );
+    }
+}
+
 #[test]
 fn every_byte_value_of_the_minimal_manifest_is_refused_or_aligned() {
     let bytes = MINIMAL.as_bytes();

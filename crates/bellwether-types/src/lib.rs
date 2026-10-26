@@ -84,6 +84,25 @@ pub enum Error {
         /// The unknown value as found.
         found: String,
     },
+    /// A storage version 2 manifest or segment carries a shape this binary
+    /// does not read: a column's `data_type` as a type map, a source
+    /// `dialect`, a key spec with per-key `bounds`, or the bitemporal
+    /// layout. Storage version 2's record shapes are final, but its bytes
+    /// are final only from the release that adds those shapes (ADR 028), so
+    /// a binary without them refuses rather than misreading the index.
+    #[error(
+        "{what} {found}: storage version 2 segment/manifest shape not supported by this binary; \
+         upgrade bellwether to read this index"
+    )]
+    UnsupportedShape {
+        /// Which shape: "manifest column data_type", "manifest source
+        /// dialect", "key spec with bounds", "bitemporal key spec",
+        /// "segment header field".
+        what: &'static str,
+        /// Where it was found, as the index names it (a column name, a key
+        /// spec identity, a header field).
+        found: String,
+    },
     /// A commit referenced a segment that garbage collection has claimed for
     /// deletion; the writer re-uploads after the claim clears (ADR 013).
     #[error("segment {0} is claimed for deletion; re-upload after the claim clears")]
@@ -174,7 +193,7 @@ pub enum Error {
     InvalidArgument {
         /// The request field: `by`, `evidence`, `at`, `window`, `valid`,
         /// `known`, `keys`, `key_columns`, `cluster_by`, `shape`, `workload`,
-        /// `rewrite`, `lookback`, `latest_by`.
+        /// `rewrite`, `lookback`, `latest_by`, `columns`.
         field: &'static str,
         /// What is wrong with it, and what a usable value looks like.
         reason: String,
@@ -709,8 +728,10 @@ impl KeySpec {
     /// | bitemporal | `temporal2:id@valid,known` |
     ///
     /// The false-positive rate is Rust's shortest round-trip spelling of the
-    /// `f64`. The trailing `counts` is unambiguous because a spec whose last
-    /// key column of several is named `counts` is refused when declared.
+    /// `f64`. The identity is one-to-one: no key or time column a spec names
+    /// may contain `,` or `@`, the separators ([`KeySpec::check_names`]),
+    /// and a spec whose last key column of several is named `counts` is
+    /// refused when declared, so the trailing `counts` is unambiguous.
     #[must_use]
     pub fn identity(&self) -> String {
         let counts = if self.counts() { ",counts" } else { "" };
@@ -741,6 +762,37 @@ impl KeySpec {
                 "temporal2:{}@{valid_column},{known_column}",
                 columns.join(",")
             ),
+        }
+    }
+
+    /// Refuses a spec naming a key or time column that contains `,` or `@`,
+    /// the separators of [`KeySpec::identity`]: with one, two different
+    /// specs could share an identity (`exact:a,counts` is both the spec on
+    /// `a` that stores counts and the spec on a column named `a,counts`).
+    /// Every declaration and every manifest a binary reads is checked.
+    pub fn check_names(&self) -> Result<()> {
+        let times: Vec<&String> = match self {
+            Self::Exact { bounds, .. } | Self::Bloom { bounds, .. } => bounds.iter().collect(),
+            Self::Temporal { ts_column, .. } => vec![ts_column],
+            Self::Bitemporal {
+                valid_column,
+                known_column,
+                ..
+            } => vec![valid_column, known_column],
+            Self::Range { .. } => Vec::new(),
+        };
+        match self
+            .columns()
+            .iter()
+            .chain(times)
+            .find(|c| c.contains([',', '@']))
+        {
+            Some(c) => Err(Error::KeySpec(format!(
+                "the key spec column \"{c}\" contains ',' or '@', which separate the parts of a \
+                 key spec's identity, so a key or time column with one cannot be indexed; rename \
+                 the column"
+            ))),
+            None => Ok(()),
         }
     }
 }
@@ -2038,6 +2090,452 @@ mod schema_feature {
         3,
         "b59003f39b3c09092346c665bbe85b3b3ac44b1a376f0d4eb6c907d249a84449",
     );
+
+    /// Every field and variant record version 3 added, each set to a value
+    /// that is not its default, so it is serialized: the second golden.
+    #[allow(clippy::too_many_lines)]
+    fn every_v3_field() -> Vec<Record> {
+        let fp = FileFingerprint {
+            path: "a.parquet".into(),
+            size: 10,
+            etag: None,
+            tail_blake3: Hash::of(b"t"),
+        };
+        let mut rgs = RoaringBitmap::new();
+        rgs.insert(4);
+        let cols = |c: &[&str]| c.iter().map(|s| (*s).to_string()).collect::<Vec<_>>();
+        let plan = ConsumerPlan {
+            version: 1,
+            nodes: vec![
+                PlanNode::Scan {
+                    dataset: "trades".into(),
+                    columns: cols(&["symbol", "ts", "px"]),
+                },
+                PlanNode::Filter {
+                    input: 0,
+                    predicate: Predicate::WindowPartition {
+                        columns: cols(&["symbol"]),
+                    },
+                },
+                PlanNode::Latest {
+                    input: 1,
+                    columns: cols(&["symbol"]),
+                    ts: "ts".into(),
+                },
+                PlanNode::AsOf {
+                    input: 1,
+                    columns: cols(&["symbol"]),
+                    ts: "ts".into(),
+                },
+                PlanNode::SemiJoin {
+                    input: 0,
+                    columns: cols(&["symbol"]),
+                    keys: KeysFrom::Run,
+                },
+                PlanNode::Join {
+                    left: 4,
+                    right: 0,
+                    on: vec![("symbol".into(), "symbol".into())],
+                    kind: JoinKind::Inner,
+                },
+                PlanNode::Window {
+                    input: 5,
+                    partition_by: cols(&["symbol"]),
+                    keys: Some(KeysFrom::Node {
+                        node: 4,
+                        columns: cols(&["symbol"]),
+                    }),
+                },
+                PlanNode::Aggregate {
+                    input: 6,
+                    group_by: cols(&["symbol"]),
+                    measures: vec![
+                        Measure {
+                            function: AggregateFn::Count,
+                            column: None,
+                        },
+                        Measure {
+                            function: AggregateFn::Sum,
+                            column: Some("px".into()),
+                        },
+                        Measure {
+                            function: AggregateFn::Min,
+                            column: Some("px".into()),
+                        },
+                        Measure {
+                            function: AggregateFn::Max,
+                            column: Some("px".into()),
+                        },
+                    ],
+                },
+                PlanNode::Exchange {
+                    input: 7,
+                    by: cols(&["symbol"]),
+                },
+                PlanNode::Project {
+                    input: 8,
+                    columns: cols(&["symbol"]),
+                },
+            ],
+            root: 9,
+        };
+        let shape = RewriteShape {
+            before: "b".into(),
+            after: "a".into(),
+            invariant: "i".into(),
+            before_plan: Some(plan.clone()),
+            after_plan: Some(ConsumerPlan {
+                version: 1,
+                nodes: plan.nodes[..1].to_vec(),
+                root: 0,
+            }),
+        };
+        let provenance = Provenance {
+            inputs: vec![Hash::of(b"input")],
+            oldest_input_age: Duration::from_nanos(7),
+            manifest_version: Some("3".into()),
+            created_at: "2026-10-25T00:00:00.000Z".into(),
+        };
+        let measured = Exactness::Measured {
+            model: "measured: logical bytes".into(),
+        };
+        let cost = RunCost {
+            run_id: "r".into(),
+            keys: 2,
+            files: 1,
+            row_groups: 1,
+            bytes: 5,
+            exact: false,
+            exactness: measured.clone(),
+            rows: Some(Quantity {
+                value: 12,
+                exactness: Exactness::Bounded { low: 9, high: 12 },
+            }),
+        };
+        vec![
+            Record::Evidence(Evidence {
+                record_version: format::RECORD_VERSION,
+                provenance: provenance.clone(),
+                body: EvidenceBody::Plan {
+                    plan: ScanPlan {
+                        manifest_version: "3".into(),
+                        entries: vec![ScanEntry {
+                            file: fp,
+                            row_groups: rgs,
+                            bytes: 99,
+                            columns: Some(vec![ColumnBytes {
+                                column: "px".into(),
+                                bytes: 40,
+                            }]),
+                        }],
+                        residual: Some(Predicate::And {
+                            all: vec![
+                                Predicate::SemiJoin {
+                                    columns: cols(&["symbol"]),
+                                    keys_from: KeysFrom::Values {
+                                        values: vec![vec![6, 65]],
+                                    },
+                                },
+                                Predicate::Join {
+                                    left: cols(&["symbol"]),
+                                    right: cols(&["sym"]),
+                                    kind: JoinKind::Left,
+                                },
+                                Predicate::WindowPartition {
+                                    columns: cols(&["symbol"]),
+                                },
+                            ],
+                        }),
+                        bytes: 99,
+                        row_groups_total: 8,
+                        row_groups_selected: 1,
+                        projected_bytes: Some(40),
+                        order: Some(vec![(0, 4)]),
+                        rows: Some(Quantity::exact(3)),
+                    },
+                },
+            }),
+            Record::Evidence(Evidence {
+                record_version: format::RECORD_VERSION,
+                provenance: provenance.clone(),
+                body: EvidenceBody::Profile {
+                    root: "/data".into(),
+                    fanout: vec![Fanout {
+                        columns: cols(&["symbol"]),
+                        distinct: 50,
+                        sampled: true,
+                        files_per_value: [1.0, 2.0, 3.0],
+                        row_groups_per_value: [1.0, 2.5, 4.0],
+                        files_total: 6,
+                        row_groups_total: 24,
+                        sample_size: Some(40),
+                        quantile_error: Some(0.05),
+                    }],
+                    lints: vec![Lint {
+                        rule: "r".into(),
+                        columns: cols(&["symbol"]),
+                        message: "m.".into(),
+                        confidence: 0.5,
+                        site: None,
+                        fix: Some(shape.clone()),
+                    }],
+                    workload_keys: None,
+                },
+            }),
+            Record::Proposal(Proposal {
+                record_version: format::RECORD_VERSION,
+                evidence: vec![Hash::of(b"e")],
+                proposed_by: "agent".into(),
+                created_at: "2026-10-25T00:00:00.000Z".into(),
+                body: ProposalBody::Key {
+                    spec: KeySpec::Exact {
+                        columns: cols(&["symbol"]),
+                        counts: true,
+                        bounds: Some("ts".into()),
+                    },
+                    sidecars: vec![
+                        KeySpec::Bitemporal {
+                            columns: cols(&["symbol"]),
+                            valid_column: "valid".into(),
+                            known_column: "known".into(),
+                        },
+                        KeySpec::Bloom {
+                            columns: cols(&["venue"]),
+                            fpr: 0.01,
+                            bounds: Some("ts".into()),
+                        },
+                        KeySpec::Temporal {
+                            columns: cols(&["id"]),
+                            ts_column: "ts".into(),
+                            counts: true,
+                        },
+                    ],
+                },
+            }),
+            Record::Proposal(Proposal {
+                record_version: format::RECORD_VERSION,
+                evidence: vec![Hash::of(b"e")],
+                proposed_by: "agent".into(),
+                created_at: "2026-10-25T00:00:00.000Z".into(),
+                body: ProposalBody::Rewrite { shape },
+            }),
+            Record::Replay(Replay {
+                record_version: format::RECORD_VERSION,
+                proposal: Hash::of(b"p"),
+                manifest_version: "3".into(),
+                workload: Hash::of(b"w"),
+                inputs: vec![Hash::of(b"c")],
+                configuration: vec!["exact:symbol,counts".into()],
+                current: vec![cost.clone()],
+                proposed: vec![cost],
+                operators: vec![OperatorCost {
+                    node: 4,
+                    op: "semi_join".into(),
+                    bytes: Quantity {
+                        value: 5,
+                        exactness: measured,
+                    },
+                    rows_out: Quantity::exact(9),
+                }],
+                model: Some("measured: logical bytes".into()),
+                unserved: Some("parquet_stats".into()),
+                created_at: "2026-10-25T00:00:00.000Z".into(),
+            }),
+            Record::Certificate(Certificate {
+                record_version: format::RECORD_VERSION,
+                proposal: Some(Hash::of(b"p")),
+                coverage: Coverage::Full,
+                pass: false,
+                body: CertBody {
+                    missing_right: 1,
+                    missing_left: 1,
+                    mismatched: 1,
+                    ignored_columns: vec![],
+                    totals_delta: vec![],
+                    examples: vec![
+                        MismatchExample {
+                            kind: MismatchKind::MissingLeft,
+                            key: "AAPL".into(),
+                            values: vec![None, Some("1".into())],
+                        },
+                        MismatchExample {
+                            kind: MismatchKind::MissingRight,
+                            key: "MSFT".into(),
+                            values: vec![Some("1".into()), None],
+                        },
+                        MismatchExample {
+                            kind: MismatchKind::Mismatched,
+                            key: "IBM".into(),
+                            values: vec![Some("1".into()), Some("2".into())],
+                        },
+                        MismatchExample {
+                            kind: MismatchKind::Uncomparable,
+                            key: "ORCL".into(),
+                            values: vec![None, None],
+                        },
+                    ],
+                    uncomparable: 1,
+                    totals: vec![
+                        TotalSpec {
+                            column: "px".into(),
+                            quantize: Some(2),
+                        },
+                        TotalSpec {
+                            column: "qty".into(),
+                            quantize: None,
+                        },
+                    ],
+                    row_filter: Some(vec![Predicate::SemiJoin {
+                        columns: cols(&["symbol"]),
+                        keys_from: KeysFrom::Run,
+                    }]),
+                },
+                provenance,
+            }),
+        ]
+    }
+
+    /// Every record version 3 field, serialized: each name appears in the
+    /// bytes, and the bytes are pinned with the record version (a field
+    /// renamed, dropped, or retyped moves the hash; the fix is a
+    /// `RECORD_VERSION` bump with a fixture).
+    #[test]
+    fn every_record_version_3_field_is_pinned() {
+        let mut all = Vec::new();
+        for r in every_v3_field() {
+            let line = serde_json::to_vec(&r).unwrap();
+            let back: Record = serde_json::from_slice(&line).unwrap();
+            assert_eq!(back, r, "round trip");
+            all.extend(line);
+            all.push(b'\n');
+        }
+        let text = String::from_utf8(all.clone()).unwrap();
+        for field in [
+            "\"configuration\"",
+            "\"operators\"",
+            "\"unserved\"",
+            "\"examples\"",
+            "\"uncomparable\"",
+            "\"totals\"",
+            "\"row_filter\"",
+            "\"sidecars\"",
+            "\"before_plan\"",
+            "\"after_plan\"",
+            "\"order\"",
+            "\"sample_size\"",
+            "\"quantile_error\"",
+            "\"fix\"",
+            "\"semi_join\"",
+            "\"join\"",
+            "\"window_partition\"",
+            "\"keys_from\"",
+            "\"bounded\"",
+            "\"measured\"",
+            "\"bitemporal\"",
+            "\"bounds\"",
+            "\"counts\"",
+            "\"rows\"",
+            "\"projected_bytes\"",
+            "\"exactness\"",
+            "\"rows_out\"",
+        ] {
+            assert!(text.contains(field), "{field} is not serialized");
+        }
+        assert_eq!(
+            (format::RECORD_VERSION, Hash::of(&all).to_hex().as_str()),
+            GOLDEN_V3,
+            "record version 3 bytes moved: bump RECORD_VERSION, add fixtures/format-<next>/ \
+             and read it in crates/bellwether-cli/tests/format_compat.rs, then pin the new \
+             golden\n{text}"
+        );
+    }
+
+    /// The record version and the hash of `every_v3_field()`'s bytes at it.
+    const GOLDEN_V3: (u32, &str) = (
+        3,
+        "3a0b4e5617d7f91bbb26c399b27351355681eb6f56118212cb30a5e6b6376c14",
+    );
+
+    /// The sidecar proposals of record version 3 (`docs/format.md`, "Sidecar
+    /// proposal vectors"): a key proposal whose spec carries per-key bounds,
+    /// one of a bitemporal spec, and one of a key with specs applied beside
+    /// it. Each line of the document is the record's bytes, and reads back
+    /// to the record.
+    #[test]
+    fn sidecar_proposal_vectors_match_docs_format_md() {
+        let proposal = |spec: KeySpec, sidecars: Vec<KeySpec>| {
+            Record::Proposal(Proposal {
+                record_version: format::RECORD_VERSION,
+                evidence: vec![Hash::of(b"profile")],
+                proposed_by: "agent".into(),
+                created_at: "2026-10-25T00:00:00.000Z".into(),
+                body: ProposalBody::Key { spec, sidecars },
+            })
+        };
+        let symbol = vec!["symbol".to_string()];
+        let records = [
+            proposal(
+                KeySpec::Exact {
+                    columns: symbol.clone(),
+                    counts: false,
+                    bounds: Some("ts".into()),
+                },
+                Vec::new(),
+            ),
+            proposal(
+                KeySpec::Bitemporal {
+                    columns: vec!["id".into()],
+                    valid_column: "valid".into(),
+                    known_column: "known".into(),
+                },
+                Vec::new(),
+            ),
+            proposal(
+                KeySpec::Exact {
+                    columns: symbol.clone(),
+                    counts: true,
+                    bounds: None,
+                },
+                vec![KeySpec::Bloom {
+                    columns: symbol,
+                    fpr: 0.01,
+                    bounds: Some("ts".into()),
+                }],
+            ),
+        ];
+        let doc = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/format.md"),
+        )
+        .unwrap();
+        let section = doc
+            .split("### Sidecar proposal vectors")
+            .nth(1)
+            .unwrap_or_else(|| {
+                panic!(
+                    "docs/format.md has no \"Sidecar proposal vectors\" section; its block:\n{}",
+                    records
+                        .iter()
+                        .map(|r| serde_json::to_string(r).unwrap())
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                )
+            });
+        let lines: Vec<&str> = section
+            .split("```json\n")
+            .nth(1)
+            .and_then(|b| b.split("\n```").next())
+            .expect("a json block")
+            .lines()
+            .collect();
+        let got: Vec<String> = records
+            .iter()
+            .map(|r| serde_json::to_string(r).unwrap())
+            .collect();
+        assert_eq!(lines, got, "docs/format.md's sidecar proposal vectors");
+        for (line, r) in lines.iter().zip(&records) {
+            assert_eq!(&serde_json::from_str::<Record>(line).unwrap(), r);
+        }
+    }
 
     /// With the feature on, the schemas describe what serde writes: a hash
     /// is a 64-hex string, the bitmap a list of integers, the age an

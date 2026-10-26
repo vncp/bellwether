@@ -237,8 +237,12 @@ impl Engine {
     /// each plan entry also carries the compressed bytes of each of those
     /// columns over its row groups, and the result their sum
     /// (`projected_bytes`), from the manifest's per-column bytes (storage
-    /// version 2; no footer is read). A text source's chunks have no
-    /// per-column bytes, so its entries count their whole chunks.
+    /// version 2; no footer is read). A storage version 1 manifest records
+    /// none, so they are read from the planned files' footers and the
+    /// result says how many (`column_bytes_from_footers`). A text source's
+    /// chunks have no per-column bytes, so its entries count their whole
+    /// chunks. `columns` must be distinct dataset columns (the invalid
+    /// argument `columns` otherwise).
     pub fn locate_columns(
         &self,
         keys: &KeyFile,
@@ -330,6 +334,9 @@ impl Engine {
         let pinned = self.pin_required(verb)?;
         self.refuse_stale(&pinned, verb)?;
         let (specs, excluded) = pinned.specs();
+        if let Some(columns) = projection {
+            check_projection(pinned.planner.schema(), columns)?;
+        }
         let (run_keys, null_tuples) = keys.run_keys(pinned.planner.schema())?;
         let columns = run_keys.columns().to_vec();
         let tuples: Vec<Vec<u8>> = run_keys.tuples().map(<[u8]>::to_vec).collect();
@@ -350,9 +357,10 @@ impl Engine {
         ) {
             check_temporal_residual(&plan)?;
         }
-        if let Some(columns) = projection {
-            pinned.planner.project(&mut plan, columns)?;
-        }
+        let column_bytes_from_footers = match projection {
+            Some(columns) => pinned.planner.project(&mut plan, columns)?,
+            None => 0,
+        };
         let rows = plan.rows.as_ref().map(|q| q.value);
         let projected_bytes = plan.projected_bytes;
         let sidecars: Vec<String> = pinned
@@ -397,6 +405,7 @@ impl Engine {
             unordered_reason,
             rows,
             projected_bytes,
+            column_bytes_from_footers,
             evidence,
         })
     }
@@ -650,6 +659,43 @@ fn no_counts(root: &str, columns: &[String]) -> Error {
         operation: "count",
         needs: Some(format!("exact:{},counts", columns.join(","))),
     }
+}
+
+/// Refuses a projection that is not a list of distinct dataset columns:
+/// the typed invalid argument `columns`, naming the dataset's columns, so
+/// each surface reports it as its own flag or field.
+fn check_projection(schema: &arrow::datatypes::Schema, columns: &[String]) -> Result<()> {
+    let names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
+    let invalid = |reason: String| Error::InvalidArgument {
+        field: "columns",
+        reason,
+    };
+    if columns.is_empty() {
+        return Err(invalid(format!(
+            "a projection names no column; name one or more of {}",
+            names.join(", ")
+        )));
+    }
+    for (i, c) in columns.iter().enumerate() {
+        if c.is_empty() {
+            return Err(invalid(format!(
+                "a projection column name is empty; name one or more of {}",
+                names.join(", ")
+            )));
+        }
+        if !names.contains(&c.as_str()) {
+            return Err(invalid(format!(
+                "the projection column \"{c}\" is not in the dataset; its columns are {}",
+                names.join(", ")
+            )));
+        }
+        if columns[..i].contains(c) {
+            return Err(invalid(format!(
+                "the projection lists the column \"{c}\" twice; list each column once"
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// The refusal of a window lookup on `columns` with no time column named

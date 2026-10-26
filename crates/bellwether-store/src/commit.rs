@@ -45,8 +45,8 @@ use bytes::Bytes;
 
 use crate::backend::StoreExt;
 use crate::manifest::{
-    manifest_history_path, manifest_path, now_rfc3339, segment_path, Manifest, SegmentTombstone,
-    UNSUPPORTED_STORAGE,
+    manifest_history_path, manifest_path, now_rfc3339, segment_path, FileEntry, Manifest,
+    SegmentTombstone, UNSUPPORTED_STORAGE,
 };
 
 /// The typed refusal for referencing a claimed segment (contract v2
@@ -299,8 +299,22 @@ where
             });
         }
         // Never downgrade in place (ADR 017): the loader already refused
-        // anything newer than this build, so writing ours is an upgrade at most.
-        next.storage_version = STORAGE_VERSION;
+        // anything newer than this build, so writing ours is an upgrade at
+        // most. A version 1 manifest is upgraded only by a commit whose
+        // files all carry the version 2 row-group statistics (a build fills
+        // them); a commit that cannot (compaction, GC, removing a spec over
+        // a version 1 index) keeps it at version 1, in version 1's keys.
+        next.storage_version = if base_manifest.storage_version >= STORAGE_VERSION
+            || next
+                .rowgroup_space
+                .files
+                .iter()
+                .all(FileEntry::has_rowgroup_stats)
+        {
+            STORAGE_VERSION
+        } else {
+            base_manifest.storage_version
+        };
         next.sequence = base_manifest.sequence + 1;
         let now = now_rfc3339();
         next.created_at = if base.is_some() {

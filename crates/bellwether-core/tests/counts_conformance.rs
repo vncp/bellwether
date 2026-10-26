@@ -14,8 +14,8 @@
 //!   that both count a key in one row group;
 //! - every byte value at every body position, and a byte-flip sweep over
 //!   every position, of a counted exact and a counted temporal segment:
-//!   never a panic, and never a count that differs from the clean one (the
-//!   checksums refuse a corrupt record instead).
+//!   never a panic, and never counts other than the clean ones, no key
+//!   missing (the checksums refuse a corrupt record instead).
 #![allow(
     clippy::unwrap_used,
     missing_docs,
@@ -289,7 +289,9 @@ fn quietly(f: impl FnOnce()) -> bool {
 }
 
 /// Opens corrupted bytes and reads counts, values, and a merge. Returns a
-/// description of a wrong count, if one was read.
+/// description of a wrong answer, if one was read: every key's counts, no
+/// key missing (a corrupt index that drops a key is as wrong as one that
+/// changes a count), or a typed refusal.
 fn exercise(b: Vec<u8>, want: &Counted) -> Option<String> {
     let r = SegmentReader::open(b).ok()?;
     let keys: Vec<Vec<u8>> = want.keys().cloned().collect();
@@ -298,9 +300,8 @@ fn exercise(b: Vec<u8>, want: &Counted) -> Option<String> {
     let _ = r.latest(&keys);
     let _ = merge(std::slice::from_ref(&r), &WriterOptions::default());
     match r.counts(&keys) {
-        Ok(Some(got)) if got.iter().any(|(k, c)| want.get(k) != Some(c)) => {
-            Some(format!("{got:?}"))
-        }
+        Ok(Some(got)) if got != *want => Some(format!("{got:?}")),
+        Ok(None) => Some("no counts".into()),
         _ => None,
     }
 }

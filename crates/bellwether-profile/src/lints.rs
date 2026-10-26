@@ -49,7 +49,7 @@
 use bellwether_source::stats::{
     batch_stamp as batch_stamp_decision, partner_order, BatchStamp, PartnerCandidate,
 };
-use bellwether_types::{KeySpec, Lint, Result, RowGroupMeta};
+use bellwether_types::{Lint, Result, RowGroupMeta};
 
 use crate::fanout::{is_id_like, DistinctSource, FanoutEntry, KeyPlan};
 use crate::manifest::ManifestInfo;
@@ -426,10 +426,12 @@ fn declared_but_unused(inputs: &LintInputs<'_>) -> Vec<Lint> {
 
 /// `R-counts-1`: the recorded workload counts a key set and then looks the
 /// same keys up again (a count pass gating the query), and no declared
-/// `exact` spec on exactly its key columns stores counts, so every count
-/// costs what the query costs. Advice: `exact:<columns>,counts`, which
-/// answers the count from the index with no data file read, exactly. High
-/// confidence: both facts are exact (run hashes, declared specs).
+/// spec counts its key columns (one storing counts whose key is exactly
+/// those columns, in any order, exact or temporal, as the planner counts
+/// with), so every count costs what the query costs. Advice:
+/// `exact:<columns>,counts`, which answers the count from the index with
+/// no data file read, exactly. High confidence: both facts are exact (run
+/// hashes, declared specs).
 fn count_before_scan(inputs: &LintInputs<'_>) -> Vec<Lint> {
     let Some(workload) = inputs.workload else {
         return Vec::new();
@@ -439,9 +441,11 @@ fn count_before_scan(inputs: &LintInputs<'_>) -> Vec<Lint> {
     }
     let columns = &workload.key_columns;
     let counted = inputs.manifest.is_some_and(|m| {
-        m.key_specs
-            .iter()
-            .any(|s| matches!(s, KeySpec::Exact { columns: c, counts: true, .. } if c == columns))
+        m.key_specs.iter().any(|s| {
+            s.counts()
+                && s.columns().len() == columns.len()
+                && s.columns().iter().all(|c| columns.contains(c))
+        })
     });
     if counted {
         return Vec::new();

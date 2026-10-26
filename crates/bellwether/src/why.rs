@@ -507,8 +507,11 @@ impl Engine {
     ///    each candidate written as an engine Proposal citing the Evidence
     ///    and scored by a Replay record computed immediately before it is
     ///    written. Candidates are the exact key on each run's own key
-    ///    columns (the floor), then the profile's measured candidates that
-    ///    serve a run, at most `max_candidates`, minus specs already
+    ///    columns (the floor); for the columns of `count` runs, the exact
+    ///    key on them storing counts (`exact:<cols>,counts`, which answers a
+    ///    count from the index with no data file read), unless a current
+    ///    spec already counts them; then the profile's measured candidates
+    ///    that serve a run, at most `max_candidates`, minus specs already
     ///    current. A workload needs a writable index location: Proposals
     ///    cite a recorded Evidence.
     ///
@@ -1059,6 +1062,34 @@ impl Engine {
                 chosen.push((spec, CandidateOrigin::Workload));
             }
         }
+        // A count run: the exact key on its columns storing counts answers
+        // the count from the index with no data file read, so it is priced
+        // whenever no current spec counts those columns already (one that
+        // stores counts on exactly the run's columns, in any order).
+        if temporal.is_none() {
+            let counted: BTreeSet<Vec<String>> = workload
+                .runs()
+                .iter()
+                .filter(|r| matches!(r.query(), Ok(RunQuery::Count)))
+                .map(|r| r.columns.clone())
+                .collect();
+            for c in counted {
+                let answered = report.current_specs.iter().any(|s| {
+                    s.counts()
+                        && s.columns().len() == c.len()
+                        && s.columns().iter().all(|x| c.contains(x))
+                });
+                let spec = KeySpec::Exact {
+                    columns: c,
+                    counts: true,
+                    bounds: None,
+                };
+                if !answered && !current_names.contains(&label(&spec)) && names.insert(label(&spec))
+                {
+                    chosen.push((spec, CandidateOrigin::Workload));
+                }
+            }
+        }
         // A window run: the temporal key on its key columns and the
         // window's time column, whose version chains prune by time per key.
         let windowed: BTreeSet<(Vec<String>, String)> = workload
@@ -1576,9 +1607,13 @@ fn infer_workload_temporal(
         return Ok(None);
     };
     let query = first.query()?;
-    // A window run reads every row of its keys in a fixed window: no
-    // version is chosen, so there is no temporal lookup to infer.
-    if matches!(query, RunQuery::Locate | RunQuery::Window(_)) {
+    // A window run reads every row of its keys in a fixed window, and a
+    // count run counts every row of its keys: no version is chosen, so
+    // there is no temporal lookup to infer.
+    if matches!(
+        query,
+        RunQuery::Locate | RunQuery::Window(_) | RunQuery::Count
+    ) {
         return Ok(None);
     }
     let ts_column = current_specs

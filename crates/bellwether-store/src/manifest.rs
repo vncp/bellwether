@@ -521,6 +521,9 @@ impl Manifest {
         if found > u64::from(STORAGE_VERSION) {
             return Err(unsupported(UNSUPPORTED_STORAGE));
         }
+        if found >= 2 {
+            refuse_later_v2_shapes(&value)?;
+        }
         if !types_owned_fields_known(&value, found) {
             return Err(Error::UnknownKind {
                 what: UNSUPPORTED_SHAPE,
@@ -528,6 +531,19 @@ impl Manifest {
             });
         }
         let mut m: Self = serde_json::from_value(value)?;
+        for spec in &m.schema.key_specs {
+            spec.check_names().map_err(|e| {
+                Error::KeySpec(format!(
+                    "manifest sequence {} declares a key spec this binary cannot name \
+                     uniquely: {}",
+                    m.sequence,
+                    match e {
+                        Error::KeySpec(msg) => msg,
+                        other => other.to_string(),
+                    }
+                ))
+            })?;
+        }
         let columns = m.schema.columns.len();
         for f in &m.rowgroup_space.files {
             f.check_aligned(columns)?;
@@ -550,24 +566,51 @@ impl Manifest {
             .iter()
             .map(|s| (s.name(), s.identity()))
             .collect();
+        self.rekey(&by_name);
+    }
+
+    /// The inverse of [`Manifest::rekey_by_identity`], for writing a
+    /// storage version 1 manifest back in version 1's keys.
+    fn rekey_by_name(&mut self) {
+        let by_identity: BTreeMap<String, String> = self
+            .schema
+            .key_specs
+            .iter()
+            .map(|s| (s.identity(), s.name()))
+            .collect();
+        self.rekey(&by_identity);
+    }
+
+    /// Renames key spec segments' `key_spec` and `key_spec_completeness`
+    /// keys found in `map`; sidecar segments and other keys stay.
+    fn rekey(&mut self, map: &BTreeMap<String, String>) {
         for seg in &mut self.segments {
             if seg.kind.is_none() {
-                if let Some(id) = by_name.get(&seg.key_spec) {
-                    seg.key_spec.clone_from(id);
+                if let Some(to) = map.get(&seg.key_spec) {
+                    seg.key_spec.clone_from(to);
                 }
             }
         }
         self.key_spec_completeness = std::mem::take(&mut self.key_spec_completeness)
             .into_iter()
-            .map(|(k, v)| (by_name.get(&k).cloned().unwrap_or(k), v))
+            .map(|(k, v)| (map.get(&k).cloned().unwrap_or(k), v))
             .collect();
     }
 
-    /// Serializes to the canonical on-disk form (sorted keys, pretty).
+    /// Serializes to the canonical on-disk form (sorted keys, pretty). A
+    /// storage version 1 manifest (one no commit could upgrade yet, see
+    /// `commit`) is written in version 1's keys, each spec's name, so a
+    /// version 1 binary still reads it.
     pub fn to_vec(&self) -> Result<Vec<u8>> {
         // Round trip through `Value` so flattened extras and known fields
         // come out in one sorted key order.
-        let v = serde_json::to_value(self)?;
+        let v = if self.storage_version < 2 {
+            let mut v1 = self.clone();
+            v1.rekey_by_name();
+            serde_json::to_value(&v1)?
+        } else {
+            serde_json::to_value(self)?
+        };
         Ok(serde_json::to_vec_pretty(&v)?)
     }
 
@@ -707,6 +750,48 @@ fn types_owned_fields_known(manifest: &Value, storage_version: u64) -> bool {
         }
     }
     true
+}
+
+/// Refuses, with [`Error::UnsupportedShape`], a storage version 2 manifest
+/// in a shape the next storage version 2 release writes and this binary
+/// does not read (ADR 028): a column's `data_type` as a type map rather
+/// than a string, a `source.dialect` (a text source's delimiter, header and
+/// quote, which this binary reads from `source.kind`), a key spec with
+/// per-key `bounds`, or a bitemporal key spec. Reading any of them as this
+/// binary would is a serde error or, for the dialect, a misread source.
+fn refuse_later_v2_shapes(manifest: &Value) -> Result<()> {
+    let shape = |what, found: String| Err(Error::UnsupportedShape { what, found });
+    let columns = manifest
+        .pointer("/schema/columns")
+        .and_then(Value::as_array);
+    for c in columns.into_iter().flatten() {
+        if c.get("data_type").is_some_and(|t| !t.is_string()) {
+            let name = c.get("name").and_then(Value::as_str).unwrap_or("?");
+            return shape(
+                "manifest column data_type",
+                format!("of column \"{name}\" (a type map)"),
+            );
+        }
+    }
+    if manifest.pointer("/source/dialect").is_some() {
+        return shape("manifest source", "dialect".to_string());
+    }
+    let key_specs = manifest
+        .pointer("/schema/key_specs")
+        .and_then(Value::as_array);
+    for spec in key_specs.into_iter().flatten() {
+        let identity = || {
+            serde_json::from_value::<KeySpec>(spec.clone())
+                .map_or_else(|_| spec.to_string(), |s| s.identity())
+        };
+        if spec.get("kind").and_then(Value::as_str) == Some("bitemporal") {
+            return shape("bitemporal key spec", identity());
+        }
+        if spec.get("bounds").is_some() {
+            return shape("key spec with per-key bounds", identity());
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]

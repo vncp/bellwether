@@ -705,6 +705,7 @@ pub fn validate_spec(spec: &KeySpec) -> Result<()> {
     if spec.columns().is_empty() {
         return Err(Error::KeySpec("key spec needs at least one column".into()));
     }
+    spec.check_names()?;
     if let KeySpec::Bloom { fpr, .. } = spec {
         if !(*fpr > 0.0 && *fpr < 1.0) {
             return Err(Error::KeySpec(format!(

@@ -453,8 +453,9 @@ impl SpecSegments {
         for r in &readers {
             if r.key_spec() != &spec {
                 return Err(Error::KeySpec(format!(
-                    "a segment indexes {:?}, not {spec:?}",
-                    r.key_spec()
+                    "a segment indexes {}, not {}",
+                    r.key_spec().identity(),
+                    spec.identity()
                 )));
             }
         }
@@ -628,8 +629,8 @@ impl SegmentPlanner {
     fn add_shared(&mut self, segments: Arc<SpecSegments>) -> Result<()> {
         if self.find(&segments.spec).is_some() {
             return Err(Error::KeySpec(format!(
-                "key spec {:?} already has segments in this planner",
-                segments.spec
+                "key spec {} already has segments in this planner",
+                segments.spec.identity()
             )));
         }
         self.specs.push(segments);
@@ -655,7 +656,8 @@ impl SegmentPlanner {
             return Err(Error::KeySpec(why.clone()));
         }
         Err(Error::KeySpec(format!(
-            "no complete segments for {spec:?} at manifest {}",
+            "no complete segments for {} at manifest {}",
+            spec.identity(),
             self.catalog.manifest_version()
         )))
     }
@@ -678,9 +680,10 @@ impl SegmentPlanner {
             return Ok(None);
         };
         // Distinct probes: both zeros of a key are two stored keys, so no row
-        // counts twice.
+        // counts twice; two segments counting one key in one row group would.
         let probes = keys.all_probes(project);
         let mut total = 0u64;
+        let mut counted_in: BTreeMap<Vec<u8>, RoaringBitmap> = BTreeMap::new();
         for r in &segments.readers {
             let counted = r.counts(&probes)?.ok_or_else(|| {
                 Error::Other(format!(
@@ -688,6 +691,14 @@ impl SegmentPlanner {
                     segments.spec.identity()
                 ))
             })?;
+            for (key, row_groups) in &counted {
+                let seen = counted_in.entry(key.clone()).or_default();
+                for (rg, _) in row_groups {
+                    if !seen.insert(rg.0) {
+                        return Err(bellwether_build::overlapping_counts(&segments.spec));
+                    }
+                }
+            }
             for (rg, n) in counted.into_values().flatten() {
                 if live.contains(rg.0) {
                     total = total

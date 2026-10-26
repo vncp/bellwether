@@ -249,6 +249,11 @@ pub struct PlanResult {
     /// source has none and counts its whole chunks). Absent otherwise.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub projected_bytes: Option<u64>,
+    /// With `--columns` on a storage version 1 manifest, which records no
+    /// per-column bytes: the Parquet footers they were read from instead,
+    /// one per planned file. Zero (omitted) otherwise.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub column_bytes_from_footers: u64,
     /// The `plan` Evidence.
     pub evidence: Written,
 }
