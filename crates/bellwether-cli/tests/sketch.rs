@@ -4,7 +4,12 @@
 //! MCP tool's text byte for byte (ADR 010), refusals included; the human
 //! output labels every sketch number approximate and says what was read.
 
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::too_many_lines)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::too_many_lines,
+    clippy::many_single_char_names
+)]
 
 mod common;
 

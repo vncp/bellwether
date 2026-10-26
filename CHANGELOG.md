@@ -47,6 +47,7 @@ All notable changes are documented here. The format follows Keep a Changelog; ve
 
 ### Fixed
 
+- `why --clock` over an indexed folder measured the manifest's age with the system clock, so the profile Evidence (and its hash) differed between two runs, and between the CLI's `--json` line and the MCP result (ADR 010). The age is now measured at the fixed clock (`ProfileOptions::now_millis`).
 - README "Results": the market questions are measured with the corpus's `day=` directories as a partition column on every side, through `fix` (which now records `--partitioning`); `scripts/showcase.sh` always reads the market corpus that way, and its `--market-hive` flag is gone.
 - `fix` built a new index without the folder's partitioning, so a later
   `locate --partitioning hive` (or `--path-template`) was refused as "built

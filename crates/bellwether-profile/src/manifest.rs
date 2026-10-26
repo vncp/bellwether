@@ -30,8 +30,12 @@ pub struct ManifestInfo {
 }
 
 /// Reads the manifest at the store root, with its age (time since its
-/// commit), or `None` if the folder is not indexed.
-pub fn read<S: StoreExt + ?Sized>(store: &S) -> Result<Option<(ManifestInfo, Duration)>> {
+/// commit, measured at `now_millis`, else the system clock), or `None` if
+/// the folder is not indexed.
+pub fn read<S: StoreExt + ?Sized>(
+    store: &S,
+    now_millis: Option<i64>,
+) -> Result<Option<(ManifestInfo, Duration)>> {
     let Some((bytes, _)) = store.get_opt(&manifest_path(""))? else {
         return Ok(None);
     };
@@ -42,10 +46,15 @@ pub fn read<S: StoreExt + ?Sized>(store: &S) -> Result<Option<(ManifestInfo, Dur
         &manifest.committed_at
     };
     let millis = parse_rfc3339(committed)?.timestamp_millis();
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_err(|e| Error::Other(format!("system clock before 1970: {e}")))?;
-    let now_millis = i64::try_from(now.as_millis()).unwrap_or(i64::MAX);
+    let now_millis = match now_millis {
+        Some(n) => n,
+        None => {
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_err(|e| Error::Other(format!("system clock before 1970: {e}")))?;
+            i64::try_from(now.as_millis()).unwrap_or(i64::MAX)
+        }
+    };
     let age = Duration::from_millis(u64::try_from(now_millis.saturating_sub(millis)).unwrap_or(0));
     let mut segment_bytes: Vec<(String, u64)> = Vec::new();
     for seg in &manifest.segments {

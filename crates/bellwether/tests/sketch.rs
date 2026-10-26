@@ -9,7 +9,12 @@
 //! low-cardinality key beside an id and stays quiet otherwise; and a sketch
 //! is refused as a proposal.
 
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::too_many_lines)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::too_many_lines,
+    clippy::assert_is_empty
+)]
 
 mod common;
 
@@ -76,7 +81,7 @@ fn truth(dir: &Path) -> (BTreeSet<i64>, BTreeSet<i64>, u64) {
 #[test]
 fn cardinality_matches_the_files_and_the_transient_sketch() {
     let dir = tempfile::tempdir().unwrap();
-    ledger_corpus(dir.path(), 5, 3, 400, 2_500);
+    ledger_corpus(dir.path(), 5, 3, 400, 1_000);
     let e = engine(dir.path());
     declare(&e, "exact:batch");
     // Before the sketch: transient reads everything.
@@ -120,8 +125,8 @@ fn cardinality_matches_the_files_and_the_transient_sketch() {
     assert_eq!(b.exact_distinct, Some(batches.len() as u64));
     assert_eq!(b.exact_source, Some(ExactDistinctSource::ExactSegment));
     assert!(b.rows_per_value_exact);
-    // id repeats within files (2,500 ids over 2,000 rows per file).
-    assert!(c.items[0].cardinality.files_with_duplicates > 0);
+    // id repeats within every file (1,000 ids over 1,200 rows per file).
+    assert_eq!(c.items[0].cardinality.files_with_duplicates, 5);
     // (id, batch) never repeats in a file.
     assert_eq!(c.items[2].cardinality.files_with_duplicates, 0);
 }
@@ -136,7 +141,10 @@ fn changed_files_are_resketched_and_a_stale_folder_is_refused() {
     let rows: Vec<Row> = (0..500)
         .map(|k| (1_000_000 + k, 9_000, Some(k), format!("q{k}")))
         .collect();
-    write_file(&dir.path().join("part-000.parquet"), &[rows.clone()]);
+    write_file(
+        &dir.path().join("part-000.parquet"),
+        std::slice::from_ref(&rows),
+    );
     write_file(&dir.path().join("part-100.parquet"), &[rows]);
     let err = e.cardinality(&req(&["id"], false)).unwrap_err();
     assert!(matches!(err, Error::StaleIndex { .. }), "{err}");

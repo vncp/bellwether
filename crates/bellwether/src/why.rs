@@ -573,21 +573,7 @@ impl Engine {
     fn why_inner(&self, req: &WhyRequest) -> Result<WhyReport> {
         let has_workload = self.check_why_request(req)?;
         let pinned = self.pin()?;
-        let sketches = match &pinned {
-            Some(p) => crate::sketch::fold_complete_sketches(p)?,
-            None => Vec::new(),
-        };
-        if req.sketches_only && sketches.is_empty() {
-            return Err(Error::NotIndexed {
-                root: self.root().to_string(),
-                operation: "why --sketches-only",
-                needs: Some("sketch:<columns>".into()),
-            });
-        }
-        let (sketch, sketch_lints) = match &pinned {
-            Some(p) => sketch_view(p, &sketches)?,
-            None => (Vec::new(), Vec::new()),
-        };
+        let (sketch, sketch_lints) = self.sketch_inputs(req, pinned.as_ref())?;
         let folder = self.source(pinned.as_ref())?;
         // Pinned to an earlier manifest: the dataset is exactly the files
         // that manifest recorded, for the profile as for the replay.
@@ -680,6 +666,32 @@ impl Engine {
         let (files, row_groups) = counting.reads();
         report.reads = DiagnosisReads { files, row_groups };
         Ok(report)
+    }
+
+    /// The `sketch` column and the `R-sketch-1` lints from the index's
+    /// complete sketches (empty without an index); `sketches_only` without
+    /// a complete sketch is refused, naming the declaration that builds one.
+    #[allow(clippy::type_complexity)]
+    fn sketch_inputs(
+        &self,
+        req: &WhyRequest,
+        pinned: Option<&Pinned>,
+    ) -> Result<(Vec<ItemCardinality>, Vec<bellwether_types::Lint>)> {
+        let sketches = match pinned {
+            Some(p) => crate::sketch::fold_complete_sketches(p)?,
+            None => Vec::new(),
+        };
+        if req.sketches_only && sketches.is_empty() {
+            return Err(Error::NotIndexed {
+                root: self.root().to_string(),
+                operation: "why --sketches-only",
+                needs: Some("sketch:<columns>".into()),
+            });
+        }
+        match pinned {
+            Some(p) => sketch_view(p, &sketches),
+            None => Ok((Vec::new(), Vec::new())),
+        }
     }
 }
 
@@ -928,8 +940,11 @@ impl Engine {
         }
         // A fixed clock asks for reproducible output: recompute the cached
         // artifacts rather than reuse them, so no input carries a wall-clock
-        // age or a cache hit.
+        // age or a cache hit, and measure the manifest's age at that clock.
         options.reuse_cache = self.options().clock.is_none();
+        if self.options().clock.is_some() {
+            options.now_millis = Some(self.now_nanos()?.div_euclid(1_000_000));
+        }
         options.workload = req.bench_workload.as_ref().map(|p| {
             if p.is_dir() {
                 p.clone()

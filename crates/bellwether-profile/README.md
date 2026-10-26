@@ -39,6 +39,7 @@ Dependencies: `bellwether-types`, `-core` (canonical encoding), `-source` (sourc
 | `workload` | none | A bench-format workload directory. |
 | `source_config` | **none: required** | Folded into the footer cache key; unset is an error. It must change whenever the source would report other row groups for the same files, for example a text source's chunk size (`csv:chunk=67108864`). A Parquet source is `parquet`. |
 | `reuse_cache` | true | `false` recomputes and overwrites the cached artifacts. |
+| `now_millis` | `None` | The instant the manifest's commit age is measured at (milliseconds since the epoch); `None` is the system clock. The facade passes its fixed `--clock` here, so an indexed folder's Evidence is byte-identical across runs. |
 
 ## Fanout
 
@@ -151,7 +152,7 @@ On a cache hit, a profile reads exactly this:
 
 The other provenance fields:
 
-- `oldest_input_age` is the largest of their ages: the cache sidecar age, the workload manifest's mtime age, and the manifest's commit age. Tests back-date a workload and a manifest and check each becomes the oldest age.
+- `oldest_input_age` is the largest of their ages: the cache sidecar age, the workload manifest's mtime age, and the manifest's commit age (measured at `now_millis` when given, zero when that is before the commit). Tests back-date a workload and a manifest and check each becomes the oldest age.
 - `manifest_version` is the manifest sequence (ADR 020), or `None` for an unindexed folder.
 - `created_at` is RFC 3339 UTC.
 

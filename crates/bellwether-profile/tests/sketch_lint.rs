@@ -1,12 +1,11 @@
 //! `R-sketch-1` (the low-cardinality key, from sketches): fires at the
 //! catalog's thresholds and on nothing short of them.
 
-#![allow(clippy::unwrap_used, missing_docs)]
+#![allow(clippy::unwrap_used, missing_docs, clippy::assert_is_empty)]
 
 use arrow::datatypes::{DataType, TimeUnit};
 use bellwether_profile::lints::{
-    low_cardinality_key, SketchedColumn, HIGH, LOW_CARDINALITY_KEY_FROM_SKETCHES,
-    LOW_CARDINALITY_MIN_ROWS_PER_VALUE, MEDIUM,
+    low_cardinality_key, SketchedColumn, HIGH, LOW_CARDINALITY_KEY_FROM_SKETCHES, MEDIUM,
 };
 
 fn col(
@@ -79,7 +78,7 @@ fn fires_on_a_stamp_beside_an_id() {
 fn quiet_below_each_threshold() {
     // Values cover fewer rows than the threshold.
     let mut few = stamp_and_id();
-    few[0].distinct = (10_000_000.0 / LOW_CARDINALITY_MIN_ROWS_PER_VALUE) as u64 + 1;
+    few[0].distinct = 101; // 99,010 rows per value: one value short
     assert!(low_cardinality_key(&few).is_empty());
     // The partner has fewer than ten times the values.
     let mut close = stamp_and_id();

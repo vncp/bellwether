@@ -118,6 +118,11 @@ pub struct ProfileOptions {
     pub source_config: Option<String>,
     /// Reuse cached artifacts. `false` recomputes and overwrites them.
     pub reuse_cache: bool,
+    /// The instant the manifest's age is measured at, in milliseconds since
+    /// the epoch: a caller's fixed clock, so the age (and the Evidence that
+    /// cites it) is the same on every run. `None` is the system clock. An
+    /// instant before the commit gives age zero.
+    pub now_millis: Option<i64>,
     /// Never evict from sampler tables. Breaks the memory bound; exists only
     /// as the negative control of the memory-bound test.
     #[doc(hidden)]
@@ -139,6 +144,7 @@ impl Default for ProfileOptions {
             supplied_columns: Vec::new(),
             source_config: None,
             reuse_cache: true,
+            now_millis: None,
             unbounded_tables: false,
         }
     }
@@ -315,7 +321,7 @@ where
             cache_hit: table.hit,
         },
     );
-    let manifest = load_manifest(store, root, &mut inputs)?;
+    let manifest = load_manifest(store, root, options.now_millis, &mut inputs)?;
 
     let row_groups = footers.value.flat();
     let time_scatter = plan
@@ -511,12 +517,13 @@ where
 fn load_manifest<S>(
     store: &Arc<S>,
     root: &str,
+    now_millis: Option<i64>,
     inputs: &mut Vec<InputRef>,
 ) -> Result<Option<ManifestInfo>>
 where
     S: StoreExt + ?Sized,
 {
-    let Some((info, age)) = manifest::read(&**store)? else {
+    let Some((info, age)) = manifest::read(&**store, now_millis)? else {
         return Ok(None);
     };
     if !manifest::same_root(&info.source_root, root) {

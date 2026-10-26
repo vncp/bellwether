@@ -9,7 +9,8 @@
     clippy::unwrap_used,
     missing_docs,
     clippy::cast_possible_truncation,
-    clippy::too_many_lines
+    clippy::too_many_lines,
+    clippy::many_single_char_names
 )]
 
 mod common;
@@ -20,11 +21,11 @@ use std::sync::Arc;
 
 use arrow::array::{Int64Array, RecordBatch, StringArray, TimestampMicrosecondArray};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
-use bellwether_build::{declared_sketches, sketch_completeness, BuildOptions, Lookup, SourceKind};
+use bellwether_build::{declared_sketches, sketch_completeness, BuildOptions, Lookup};
 use bellwether_core::sidecar::{SidecarDef, SidecarKind};
 use bellwether_core::sketch::{item_types, FileSketcher, ItemSketch, SketchReader};
 use bellwether_store::{segment_path, Manifest, StoreExt};
-use bellwether_types::{KeySpec, SketchSpec};
+use bellwether_types::{KeySpec, SketchSpec, Store};
 use common::*;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
