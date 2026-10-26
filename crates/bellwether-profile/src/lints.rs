@@ -12,6 +12,7 @@
 //! | `R-text-1` | the workload records text runs (`contains`, `has_token`, `has_prefix`) on a string column, and for some of those matches no complete text key on the column serves it ([`text_lookups`]; the caller reads the workload's runs, so it is not part of [`run`]) |
 //! | `R-expr-1` | lookups supply a function of a dataset column (`bellwether_core::expr`, for example `json_get(payload,'$.symbol')`) that type-checks, and no declared `expr` key is over that expression, normalized |
 //! | `R-list-1` | the workload records list-membership runs (`array_contains`, `has_any`, `exists(unnest)`) on a list column that no complete list key serves ([`list_membership`]; the caller reads the workload's runs, so it is not part of [`run`]) |
+//! | `R-join-1` | the workload records at least [`JOIN_REPEAT_MIN_RUNS`] semi-join runs (`in (subquery)`, `exists`, a semi-join) between the data root and one right dataset on one column pair, and no complete join key holds that pair ([`repeated_semijoins`]; the caller reads the workload's runs, so it is not part of [`run`]) |
 //!
 //! The two decisions the benchmark also makes are not reimplemented here:
 //! `batch_stamp_key` is `bellwether_source::stats::batch_stamp` and
@@ -118,6 +119,14 @@ pub const NO_DISCRIMINATING_MIN_FRACTION: f64 = 0.75;
 
 /// Rule id (B4): list-membership lookups on a column no list key serves.
 pub const LIST_MEMBERSHIP: &str = "R-list-1";
+
+/// Rule id (B3): repeated semi-joins between two datasets on one column
+/// pair that no join key holds.
+pub const REPEATED_SEMIJOIN: &str = "R-join-1";
+
+/// The fewest semi-join runs on one column pair that `R-join-1` calls
+/// repeated: one run is a lookup, two are a pattern a join key pays for.
+pub const JOIN_REPEAT_MIN_RUNS: u64 = 2;
 
 /// Everything the detectors read.
 #[derive(Clone, Copy, Debug)]
@@ -886,9 +895,127 @@ pub fn list_membership(uses: &[MembershipUse], complete: &[KeySpec]) -> Vec<Lint
         .collect()
 }
 
+/// The semi-join runs of a recorded workload on one column pair (B3).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SemiJoinUse {
+    /// The data root's (the left dataset's) key columns.
+    pub columns: Vec<String>,
+    /// The right dataset: the folder of that name beside the data root.
+    pub right: String,
+    /// Its join columns, pairwise with `columns`.
+    pub right_columns: Vec<String>,
+    /// Runs on this pair.
+    pub runs: u64,
+    /// The most keys one run asks for.
+    pub keys_max: u64,
+}
+
+/// `R-join-1` (B3): a recorded workload semi-joins the data root (the left
+/// dataset, folder `left`) with one right dataset on one column pair at
+/// least [`JOIN_REPEAT_MIN_RUNS`] times (`in (subquery)`, `exists`, a
+/// semi-join), and none of `complete` (the key specs complete at the
+/// current manifest) is a join key on that pair, so each run locates every
+/// key on both datasets, whether the other holds it or not. Fires once per
+/// pair, high confidence (the runs are recorded and the specs are the
+/// manifest's). Does not fire for a single run, or when a complete join key
+/// on the pair exists (with counts or not).
+#[must_use]
+pub fn repeated_semijoins(uses: &[SemiJoinUse], left: &str, complete: &[KeySpec]) -> Vec<Lint> {
+    uses.iter()
+        .filter(|u| u.runs >= JOIN_REPEAT_MIN_RUNS)
+        .filter(|u| {
+            !complete.iter().any(|s| {
+                matches!(s, KeySpec::Join { columns, right, right_columns, .. }
+                    if *columns == u.columns && *right == u.right && *right_columns == u.right_columns)
+            })
+        })
+        .map(|u| {
+            let (cols, rcols) = (u.columns.join(","), u.right_columns.join(","));
+            Lint {
+                rule: REPEATED_SEMIJOIN.into(),
+                columns: u.columns.clone(),
+                message: format!(
+                    "{} recorded runs semi-join ({cols}) with {}.({rcols}) on up to {} keys \
+                     (in (subquery), exists, a semi-join), and no join key holds the pair, so \
+                     each run locates every key on both datasets, whether the other holds it or \
+                     not. A join key, join:{left}.{cols}={}.{rcols}, stores the row groups of \
+                     each key both datasets hold, per side; price it with `bellwether why \
+                     <root> --from <keys.parquet> --mode semijoin --join {}.{rcols}`.",
+                    u.runs, u.right, u.keys_max, u.right, u.right
+                ),
+                confidence: HIGH,
+                site: None,
+                fix: None,
+            }
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn semijoin_use(runs: u64) -> SemiJoinUse {
+        SemiJoinUse {
+            columns: vec!["order_id".into()],
+            right: "payables".into(),
+            right_columns: vec!["paid_order".into()],
+            runs,
+            keys_max: 1000,
+        }
+    }
+
+    /// `R-join-1` fires on repeated semi-joins on a pair no complete join
+    /// key holds, naming the key and how to price it; exact keys on both
+    /// columns, or a join key on another pair, do not silence it.
+    #[test]
+    fn repeated_semijoins_fire_without_a_join_key_on_the_pair() {
+        let other_pair = KeySpec::Join {
+            dataset: "orders".into(),
+            columns: vec!["order_id".into()],
+            right: "payables".into(),
+            right_columns: vec!["amount".into()],
+            counts: false,
+        };
+        let exact = KeySpec::Exact {
+            columns: vec!["order_id".into()],
+            counts: false,
+            bounds: None,
+        };
+        let lints = repeated_semijoins(&[semijoin_use(3)], "orders", &[exact, other_pair]);
+        assert_eq!(lints.len(), 1);
+        let l = &lints[0];
+        assert_eq!(l.rule, REPEATED_SEMIJOIN);
+        assert_eq!(l.columns, vec!["order_id".to_string()]);
+        assert!(
+            l.message
+                .contains("join:orders.order_id=payables.paid_order"),
+            "{}",
+            l.message
+        );
+        assert!(l
+            .message
+            .contains("--mode semijoin --join payables.paid_order"));
+        assert!(l.message.starts_with("3 recorded runs"));
+    }
+
+    /// It does not fire for one run, or with a complete join key on the
+    /// pair, counted or not.
+    #[test]
+    fn repeated_semijoins_stay_silent_for_one_run_or_a_join_key() {
+        assert_eq!(repeated_semijoins(&[semijoin_use(1)], "orders", &[]), []);
+        for counts in [false, true] {
+            let key = KeySpec::Join {
+                dataset: "orders".into(),
+                columns: vec!["order_id".into()],
+                right: "payables".into(),
+                right_columns: vec!["paid_order".into()],
+                counts,
+            };
+            assert_eq!(repeated_semijoins(&[semijoin_use(5)], "orders", &[key]), []);
+        }
+        assert_eq!(repeated_semijoins(&[], "orders", &[]), []);
+    }
     use crate::fanout::SampleInfo;
     use bellwether_types::Fanout;
 

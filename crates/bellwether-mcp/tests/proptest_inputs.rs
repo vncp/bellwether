@@ -92,6 +92,7 @@ fn signing_server(data: &std::path::Path, dir: &std::path::Path, signing: bool) 
         root: data.to_str().unwrap().to_string(),
         engine,
         budget: bellwether_mcp::Budget::default(),
+        join: None,
     })
     .unwrap()
 }

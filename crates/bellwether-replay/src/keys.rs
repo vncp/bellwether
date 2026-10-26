@@ -184,6 +184,26 @@ impl RunKeys {
             .collect()
     }
 
+    /// The same tuples under other column names and recorded types: a
+    /// semi-join run's keys (B3) as the right dataset's join columns name
+    /// them. The caller guarantees the encodings compare (core's
+    /// `join::check_comparable`); the column count must match.
+    pub fn relabel(&self, columns: &[String], key_types: &[ColumnType]) -> Result<Self> {
+        if columns.len() != self.columns.len() || key_types.len() != self.columns.len() {
+            return Err(Error::KeySpec(format!(
+                "{} key column(s) cannot be read as {} column(s)",
+                self.columns.len(),
+                columns.len()
+            )));
+        }
+        Ok(Self {
+            columns: columns.to_vec(),
+            key_types: key_types.to_vec(),
+            data: self.data.clone(),
+            ends: self.ends.clone(),
+        })
+    }
+
     /// The cache payload (module docs). Deterministic: equal key sets give
     /// equal bytes.
     pub fn to_payload(&self) -> Result<Vec<u8>> {

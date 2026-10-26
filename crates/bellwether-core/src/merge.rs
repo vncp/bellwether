@@ -125,6 +125,15 @@ pub fn merge<R: ReadAt>(
     inputs: &[SegmentReader<R>],
     opts: &WriterOptions,
 ) -> Result<EncodedSegment> {
+    if let Some(s) = inputs
+        .iter()
+        .find(|s| s.header().layout == crate::segment::Layout::KeyedJoin)
+    {
+        return Err(Error::KeySpec(format!(
+            "{} is one segment rebuilt whole from both datasets' exact keys, never merged",
+            s.key_spec().name()
+        )));
+    }
     let header = merged_header(inputs)?;
     let hull = inputs
         .iter()
@@ -304,6 +313,76 @@ fn advance<R: ReadAt>(
         heads[i] = Some(v);
     }
     Ok(())
+}
+
+/// The merge's key stream over the keyed segments of one spec, as an
+/// iterator: every distinct key once, ascending, with its values folded
+/// across the segments holding it (bitmaps OR-ed, counts combined as
+/// [`merge`] combines them). Holds one block per input at a time (ADR 018).
+pub(crate) struct MergedKeys<'a, R> {
+    cursors: Vec<KeyedCursor<'a, R>>,
+    heads: Vec<Option<KeyValue>>,
+    heap: BinaryHeap<Reverse<(Vec<u8>, usize)>>,
+}
+
+impl<'a, R: ReadAt> MergedKeys<'a, R> {
+    /// Opens the stream over `inputs`, which must all be keyed (exact or
+    /// temporal) segments.
+    pub(crate) fn new(inputs: &'a [SegmentReader<R>]) -> Result<Self> {
+        if let Some(s) = inputs.iter().find(|s| {
+            !matches!(s.index, Index::Keyed(_))
+                || s.header().layout == crate::segment::Layout::KeyedJoin
+        }) {
+            return Err(Error::KeySpec(format!(
+                "{} segments have no per-key values to merge",
+                s.header().key_spec.name()
+            )));
+        }
+        let mut cursors: Vec<KeyedCursor<'a, R>> = inputs
+            .iter()
+            .map(|seg| KeyedCursor {
+                seg,
+                block: 0,
+                pos: 0,
+                body: None,
+            })
+            .collect();
+        let mut heads: Vec<Option<KeyValue>> = Vec::with_capacity(cursors.len());
+        let mut heap = BinaryHeap::new();
+        for (i, c) in cursors.iter_mut().enumerate() {
+            match c.next()? {
+                Some((k, v)) => {
+                    heap.push(Reverse((k, i)));
+                    heads.push(Some(v));
+                }
+                None => heads.push(None),
+            }
+        }
+        Ok(Self {
+            cursors,
+            heads,
+            heap,
+        })
+    }
+
+    /// The next distinct key and its folded value, or `None` at the end.
+    pub(crate) fn next_key(&mut self) -> Result<Option<(Vec<u8>, KeyValue)>> {
+        let Some(Reverse((key, i))) = self.heap.pop() else {
+            return Ok(None);
+        };
+        let mut value = self.heads[i].take().unwrap_or_default();
+        advance(&mut self.cursors, &mut self.heads, &mut self.heap, i)?;
+        while self.heap.peek().is_some_and(|Reverse((k, _))| *k == key) {
+            let Some(Reverse((_, j))) = self.heap.pop() else {
+                break;
+            };
+            if let Some(v) = self.heads[j].take() {
+                fold(&mut value, v, &key)?;
+            }
+            advance(&mut self.cursors, &mut self.heads, &mut self.heap, j)?;
+        }
+        Ok(Some((key, value)))
+    }
 }
 
 /// Visits every distinct key of the keyed segments `inputs` in ascending

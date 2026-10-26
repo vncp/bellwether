@@ -126,6 +126,11 @@ pub struct IndexResult {
     /// table crate). Absent (omitted in JSON) when none was.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub text_rebuilt: Vec<TextRebuilt>,
+    /// Every declared join key (B3) after the build, with its state: each
+    /// that was not fresh is rebuilt from both datasets' exact keys
+    /// (`refreshed`). Absent (omitted in JSON) when none is declared.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub joins: Vec<crate::join::JoinKeyState>,
 }
 
 /// A text key `index` rebuilt because its segments recorded other Unicode
@@ -239,6 +244,15 @@ pub enum LookupKind {
         /// Why nothing was pruned, when nothing was.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         unpruned: Option<String>,
+    },
+    /// A workload's semi-join runs (B3), as `why` priced them: the rows of
+    /// the data root and of the right dataset whose key the other holds,
+    /// two steps per run.
+    SemiJoin {
+        /// The right dataset: the folder of that name beside the data root.
+        right: String,
+        /// Its join columns, pairwise with the runs' key columns.
+        right_columns: Vec<String>,
     },
     /// A workload's text runs (B5), as `why` priced them: rows whose string
     /// column matches one of each run's values, both sides case-folded.

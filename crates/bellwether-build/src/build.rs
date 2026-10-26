@@ -313,6 +313,7 @@ impl<S: StoreExt + ?Sized> Builder<S> {
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     fn attempt(&self, root: &str, key_specs: &[KeySpec], opts: &BuildOptions) -> Result<Attempt> {
         let base = read_manifest(&*self.store, &self.index_root)?.map(|(m, _)| m);
         if let Some(m) = &base {
@@ -328,7 +329,15 @@ impl<S: StoreExt + ?Sized> Builder<S> {
         }
         let sidecars = declared_sidecar_defs(base.as_ref(), &opts.sidecars, opts.remove_unlisted)?;
         let sketches = declared_sketch_specs(base.as_ref(), &opts.sketches, opts.remove_unlisted)?;
-        let specs = plan_specs(&declared, &sidecars, &sketches, &cfg.schema)?;
+        // A join key (B3) is not built row group by row group: it is
+        // checked here and built whole by `Builder::refresh_join`.
+        check_joins(root, &declared, &cfg.schema)?;
+        let row_specs: Vec<KeySpec> = declared
+            .iter()
+            .filter(|s| !matches!(s, KeySpec::Join { .. }))
+            .cloned()
+            .collect();
+        let specs = plan_specs(&row_specs, &sidecars, &sketches, &cfg.schema)?;
         let chunk_sizes = base_chunk_sizes(base.as_ref())
             .into_iter()
             .chain(cfg.new_chunk_size.size());
@@ -356,7 +365,13 @@ impl<S: StoreExt + ?Sized> Builder<S> {
         let stale = stale_text_specs(&*self.store, &self.index_root, base.as_ref())?;
         let work = plan_work(base.as_ref(), &specs, &cfg, &live, &stale);
         let mut report = files.report(&work);
-        if is_noop(base.as_ref(), &files, &work, &cfg, &specs)? {
+        // A join key declared, redefined, or removed changes the schema
+        // even when no row group needs indexing.
+        let joins_unchanged = base.as_ref().is_some_and(|m| {
+            crate::target::declared_joins(&m.schema.key_specs)
+                == crate::target::declared_joins(&declared)
+        });
+        if joins_unchanged && is_noop(base.as_ref(), &files, &work, &cfg, &specs)? {
             // Nothing committed: a version 1 index stays at version 1 and
             // keeps planning as before (ADR 028); no statistics were recorded.
             report.files_filled = 0;
@@ -599,7 +614,7 @@ fn recorded_chunk_size(base: Option<&Manifest>) -> NewChunkSize {
 /// the base does not already declare is a new declaration and must meet
 /// [`KeySpec::check_names`]; one it declares (a storage version 1 spec on a
 /// column named `a,b`) is indexed as it is.
-fn declared_specs(
+pub(crate) fn declared_specs(
     base: Option<&Manifest>,
     key_specs: &[KeySpec],
     remove_unlisted: bool,
@@ -693,7 +708,8 @@ fn shared_identity(root: &str, base: Option<&Manifest>, a: &KeySpec, b: &KeySpec
                 KeySpec::Range { .. }
                 | KeySpec::Expr { .. }
                 | KeySpec::Text { .. }
-                | KeySpec::List { .. } => {}
+                | KeySpec::List { .. }
+                | KeySpec::Join { .. } => {}
             }
             format!(
                 "re-declare {} under its name with a time column whose name has no ',' or '@', \
@@ -1417,9 +1433,11 @@ fn is_noop(
         && m.source == cfg.source_info
         && m.schema.columns == cfg.columns
         && declared_targets(m) == declared
-        && m.segments
-            .iter()
-            .all(|s| unknown_kind(s) || work.keep.contains(&s.key_spec));
+        && m.segments.iter().all(|s| {
+            unknown_kind(s)
+                || work.keep.contains(&s.key_spec)
+                || joins_of(&m.schema.key_specs).contains(&s.key_spec)
+        });
     Ok(
         unchanged
             && completeness_map(m, m, &declared, &BTreeSet::new())? == m.key_spec_completeness,
@@ -1471,9 +1489,13 @@ impl Delta<'_> {
         next.source = self.source.clone();
         next.schema = self.schema.clone();
         next.rowgroup_space = self.space.clone();
-        // Segments of kinds this binary does not know are kept unchanged.
-        next.segments
-            .retain(|s| unknown_kind(s) || self.keep.contains(&s.key_spec));
+        // Segments of kinds this binary does not know are kept unchanged,
+        // and so is a declared join key's pair segment (its completeness
+        // then says whether it still covers the left's row groups).
+        let joins = joins_of(&self.schema.key_specs);
+        next.segments.retain(|s| {
+            unknown_kind(s) || self.keep.contains(&s.key_spec) || joins.contains(&s.key_spec)
+        });
         for seg in self.added {
             next.add_segment(seg.clone());
         }
@@ -1493,4 +1515,52 @@ impl Delta<'_> {
         next.key_spec_completeness = map;
         Ok(next)
     }
+}
+
+/// The identities of the join keys (B3) among `specs`.
+fn joins_of(specs: &[KeySpec]) -> BTreeSet<String> {
+    crate::target::declared_joins(specs)
+        .iter()
+        .map(KeySpec::identity)
+        .collect()
+}
+
+/// Checks every declared join key (B3) against the left dataset: its rules
+/// (core's `join::check_spec`), its left dataset name equal to the data
+/// root's folder name (the left dataset is the root), and its left columns
+/// in the schema with types a join pairs. The right side is checked when
+/// the pair is built (`Builder::refresh_join`), which reads its index.
+pub(crate) fn check_joins(root: &str, declared: &[KeySpec], schema: &Schema) -> Result<()> {
+    let folder = std::path::Path::new(root)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or_default();
+    for spec in crate::target::declared_joins(declared) {
+        validate_spec(&spec)?;
+        let KeySpec::Join { dataset, .. } = &spec else {
+            continue;
+        };
+        if dataset != folder {
+            return Err(Error::KeySpec(format!(
+                "{} names the left dataset {dataset:?}, but the data root {root} is the folder \
+                 {folder:?}: a join key is declared on its left dataset, so pass that folder as \
+                 the root, or name this one: join:{folder}.<columns>=<right folder>.<columns>",
+                spec.name()
+            )));
+        }
+        for c in spec.columns() {
+            let t = schema.field_with_name(c).map_err(|_| {
+                Error::KeySpec(format!(
+                    "{}: {}",
+                    spec.name(),
+                    encoding::not_in_schema(schema, c)
+                ))
+            })?;
+            let ct = ColumnType::of(t.data_type())
+                .map_err(|e| Error::KeySpec(format!("{}: join column {c:?}: {e}", spec.name())))?;
+            // A float is refused here, before anything is built.
+            bellwether_core::join::check_column_type(c, &ct)?;
+        }
+    }
+    Ok(())
 }

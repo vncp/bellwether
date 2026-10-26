@@ -197,15 +197,29 @@ pub(crate) fn declared_sidecars(m: &Manifest) -> Vec<SidecarDef> {
     m.schema.sidecars.iter().filter_map(def_of).collect()
 }
 
-/// Every key spec, known sidecar, and sketch `m` declares, key specs first.
+/// Every key spec, known sidecar, and sketch `m` declares, key specs first:
+/// what a build indexes row group by row group. A join key (B3) is not
+/// one: it is built whole from both datasets' exact keys
+/// (`Builder::refresh_join`), and a build only keeps its segment and its
+/// completeness while the left's row groups stay covered ([`declared_joins`]).
 pub(crate) fn declared_targets(m: &Manifest) -> Vec<Target> {
     m.schema
         .key_specs
         .iter()
+        .filter(|s| !matches!(s, KeySpec::Join { .. }))
         .cloned()
         .map(Target::Key)
         .chain(declared_sidecars(m).into_iter().map(Target::Sidecar))
         .chain(declared_sketches(m).into_iter().map(Target::Sketch))
+        .collect()
+}
+
+/// The join keys (B3) `specs` declares.
+pub(crate) fn declared_joins(specs: &[KeySpec]) -> Vec<KeySpec> {
+    specs
+        .iter()
+        .filter(|s| matches!(s, KeySpec::Join { .. }))
+        .cloned()
         .collect()
 }
 
