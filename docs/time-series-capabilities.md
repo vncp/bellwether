@@ -36,7 +36,7 @@ Files (Parquet, CSV, or JSON lines) partitioned by date, each file holding rows 
 | Relational cost model | Exact cost of joins, windows, projections, and layouts over indexed data, so pipeline rewrites can be priced and proven | replay over the operator table | planned (WP15) |
 | Pipeline optimizer | Search over plans, keys, layouts, and multi-step pipelines with the exact cost as the loss and reconciliation as the gate | `bellwether evolve` | planned (WP13) |
 | Engine adapters | Plans executed inside DataFusion and DuckDB with no sidecar step | planned (WP16) |
-| Measured performance | Lookup p50 and p95, build throughput and its core-scaling curve, reconcile rows per second, in release builds | planned (WP22) |
+| Measured performance | Lookup p50 and p95, build throughput and its core-scaling curve, reconcile rows per second, in release builds | measured (WP22a, [2026-10-26](measured/2026-10-26-performance.md)); wins planned (WP22b) |
 | Multi-machine build | N workers writing segments, one committer, for lakes a single machine cannot index in time | planned (WP22) |
 | SQL table as a side | Reconcile a warehouse table against files, with measured costs | planned (WP20) |
 | Agent interface | The same engine as MCP tools with job handles, typed refusals, dry runs, budgets | building (WP12) |

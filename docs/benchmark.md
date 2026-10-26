@@ -368,7 +368,7 @@ Reason: the Phase 3 dependency upgrade moved the Parquet writer and the DataFusi
 
 ### 2026-10-25: release measurements and the perf schema (WP22a)
 
-Reason: WP22 publishes release-build measurements of every hot path and derives budgets from them (ADR 018, ADR 019). These definitions were fixed before the first measured run; [`docs/measured/2026-10-25-performance.md`](measured/2026-10-25-performance.md) is that run.
+Reason: WP22 publishes release-build measurements of every hot path and derives budgets from them (ADR 018, ADR 019). These definitions were fixed before the first measured run; [`docs/measured/2026-10-26-performance.md`](measured/2026-10-26-performance.md) is that run.
 
 - **The script.** [`scripts/perf.sh`](../scripts/perf.sh) builds the release binary (thin LTO, codegen-units 1, line-table debug info for the profiles) in a private target dir and runs [`scripts/perf.py`](../scripts/perf.py). Every number comes from a real `bellwether` process, from a time a binary reports about itself (`bellwether bench read`, the latency tests, DuckDB's `.timer`), or from a count the binary printed.
 - **Plan time** is the wall time of one `bellwether locate|latest|asof … --json` process: process start (measured on its own as `bellwether --version`), opening the manifest, reading the key file, planning, and recording the Evidence.
