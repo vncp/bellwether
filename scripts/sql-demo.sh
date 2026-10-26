@@ -89,8 +89,15 @@ t0=$(now)
 duck taxi.duckdb -c "CREATE TABLE trips AS SELECT * FROM read_parquet('$TAXI/*.parquet')" >/dev/null || exit 1
 say "loaded taxi.duckdb in $(perl -e 'printf "%.1f", $ARGV[1]-$ARGV[0]' "$t0" "$(now)") s"
 t0=$(now)
+# Declared types as the files hold them: DuckDB's SQLite writer would
+# declare the timestamps VARCHAR.
+sqlite3 taxi.sqlite "CREATE TABLE trips (VendorID INTEGER, tpep_pickup_datetime TIMESTAMP,
+  tpep_dropoff_datetime TIMESTAMP, passenger_count BIGINT, trip_distance DOUBLE, RatecodeID BIGINT,
+  store_and_fwd_flag VARCHAR, PULocationID INTEGER, DOLocationID INTEGER, payment_type BIGINT,
+  fare_amount DOUBLE, extra DOUBLE, mta_tax DOUBLE, tip_amount DOUBLE, tolls_amount DOUBLE,
+  improvement_surcharge DOUBLE, total_amount DOUBLE, congestion_surcharge DOUBLE, Airport_fee DOUBLE)" || exit 1
 duck -c "INSTALL sqlite; LOAD sqlite; ATTACH 'taxi.sqlite' AS s (TYPE sqlite);
-  CREATE TABLE s.trips AS SELECT * FROM read_parquet('$TAXI/*.parquet');" >/dev/null || exit 1
+  INSERT INTO s.trips SELECT * FROM read_parquet('$TAXI/*.parquet');" >/dev/null || exit 1
 sqlite3 taxi.sqlite "CREATE INDEX trips_pickup ON trips (tpep_pickup_datetime)" || exit 1
 say "loaded taxi.sqlite in $(perl -e 'printf "%.1f", $ARGV[1]-$ARGV[0]' "$t0" "$(now)") s"
 say "sqlite declared types: $(sqlite3 taxi.sqlite "SELECT group_concat(name || ' ' || type, ', ') FROM pragma_table_info('trips')")"
@@ -123,9 +130,9 @@ run reconcile-sqlite reconcile "$SQLITE_ROOT" "$TAXI" --key $K --totals fare_amo
 # 2. Planted differences, in copies of the tables: one changed tip_amount and
 #    one deleted row, each on a row whose 4-column key is unique, and one
 #    added row with a key the files do not hold.
-read -r PV PT PP PF <<<"$(duck -separator ' ' -c "SELECT VendorID, strftime(tpep_pickup_datetime, '%Y-%m-%d %H:%M:%S'), PULocationID, fare_amount
+IFS='|' read -r PV PT PP PF <<<"$(duckdb -no-agent -list -noheader -separator '|' -c "SELECT VendorID, strftime(tpep_pickup_datetime, '%Y-%m-%d %H:%M:%S'), PULocationID, fare_amount
   FROM read_parquet('$TAXI/*.parquet') GROUP BY ALL HAVING count(*) = 1 ORDER BY 2, 1, 3, 4 LIMIT 1 OFFSET 1000")"
-read -r DV DT DP DF <<<"$(duck -separator ' ' -c "SELECT VendorID, strftime(tpep_pickup_datetime, '%Y-%m-%d %H:%M:%S'), PULocationID, fare_amount
+IFS='|' read -r DV DT DP DF <<<"$(duckdb -no-agent -list -noheader -separator '|' -c "SELECT VendorID, strftime(tpep_pickup_datetime, '%Y-%m-%d %H:%M:%S'), PULocationID, fare_amount
   FROM read_parquet('$TAXI/*.parquet') GROUP BY ALL HAVING count(*) = 1 ORDER BY 2, 1, 3, 4 LIMIT 1 OFFSET 2000")"
 say "planted: tip_amount + 1 on ($PV, $PT, $PP, $PF); deleted ($DV, $DT, $DP, $DF); added a trip by VendorID 9"
 MATCH_P="VendorID = $PV AND tpep_pickup_datetime = '$PT' AND PULocationID = $PP AND fare_amount = $PF"
@@ -213,7 +220,8 @@ row("locate-pickup-zones", "files (indexed)", "row_groups", loc["planned"]["row_
 row("locate-pickup-zones", "files (indexed)", "wall_ms", times["locate-files"][1], "ms", "measured")
 text = (out / "explain-duckdb.json").read_text()
 plan = json.loads(text[text.find("{"):text.rfind("}") + 1])
-row("lookup-pickup-zones", "duckdb (engine)", "rows_scanned", plan.get("total_rows_scanned"), "rows", "measured", duck_version)
+if plan.get("total_rows_scanned") is not None:
+    row("lookup-pickup-zones", "duckdb (engine)", "rows_scanned", plan["total_rows_scanned"], "rows", "measured", duck_version)
 row("lookup-pickup-zones", "duckdb (engine)", "wall_ms", times["explain-duckdb"][1], "ms", "measured", duck_version)
 ms = {s: next(r["value"] for r in rows if r["query"] == "reconcile" and r["side"] == s and r["metric"] == "wall_ms")
       for s in sides.values()}

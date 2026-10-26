@@ -265,7 +265,7 @@ bellwether why 'sql://duckdb/main.trips?db=taxi.duckdb&range=tpep_pickup_datetim
 scripts/sql-demo.sh
 ```
 
-Results: [`docs/measured/results/sql.json`](docs/measured/results/sql.json), written by [`scripts/sql-demo.sh`](scripts/sql-demo.sh). Which numbers over a table are counts, bounds, or measured: [the crate README](crates/bellwether-source-sql/README.md).
+Measured 2026-10-25 on an Apple M3 Pro (12 cores, 36 GB, macOS 26.4.1), release build: reconciling 20,314,139 keys took 41 s from the DuckDB table and 91 s from the SQLite table against 39 s between two Parquet copies, each PASS inside one snapshot; with one changed, one deleted, and one added row each table FAILed with exactly 1 mismatched, 1 missing on each side. Results: [`docs/measured/results/sql.json`](docs/measured/results/sql.json), written by [`scripts/sql-demo.sh`](scripts/sql-demo.sh). Which numbers over a table are counts, bounds, or measured: [the crate README](crates/bellwether-source-sql/README.md).
 
 ## Time series
 
