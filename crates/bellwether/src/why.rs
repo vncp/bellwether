@@ -500,6 +500,11 @@ pub struct WhyReport {
     /// fanout table is empty.
     #[serde(default)]
     pub from_sketches: bool,
+    /// Why the `sketch` column is empty although the index declares a
+    /// sketch (a missing or damaged sketch segment), with the command that
+    /// rebuilds it. Absent (omitted in JSON) otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sketch_unavailable: Option<String>,
 }
 
 fn exact_default() -> bool {
@@ -573,7 +578,8 @@ impl Engine {
     fn why_inner(&self, req: &WhyRequest) -> Result<WhyReport> {
         let has_workload = self.check_why_request(req)?;
         let pinned = self.pin()?;
-        let (sketch, sketch_lints) = self.sketch_inputs(req, pinned.as_ref())?;
+        let (sketch, sketch_lints, sketch_unavailable) =
+            self.sketch_inputs(req, pinned.as_ref())?;
         let folder = self.source(pinned.as_ref())?;
         // Pinned to an earlier manifest: the dataset is exactly the files
         // that manifest recorded, for the profile as for the replay.
@@ -637,6 +643,7 @@ impl Engine {
             sketch,
             reads: DiagnosisReads::default(),
             from_sketches: req.sketches_only,
+            sketch_unavailable,
         };
         let workload = if has_workload {
             let cache = self.cache()?;
@@ -669,28 +676,71 @@ impl Engine {
     }
 
     /// The `sketch` column and the `R-sketch-1` lints from the index's
-    /// complete sketches (empty without an index); `sketches_only` without
-    /// a complete sketch is refused, naming the declaration that builds one.
+    /// complete sketches (empty without an index), and, when a declared
+    /// sketch cannot be read (a missing or damaged segment), why not: the
+    /// planner never needs a sketch, so `why` goes on without the column
+    /// and says how to rebuild it. `sketches_only` without a readable
+    /// complete sketch is refused, naming a declaration over the dataset's
+    /// id-like columns.
     #[allow(clippy::type_complexity)]
     fn sketch_inputs(
         &self,
         req: &WhyRequest,
         pinned: Option<&Pinned>,
-    ) -> Result<(Vec<ItemCardinality>, Vec<bellwether_types::Lint>)> {
-        let sketches = match pinned {
-            Some(p) => crate::sketch::fold_complete_sketches(p)?,
-            None => Vec::new(),
+    ) -> Result<(
+        Vec<ItemCardinality>,
+        Vec<bellwether_types::Lint>,
+        Option<String>,
+    )> {
+        let Some(p) = pinned else {
+            if req.sketches_only {
+                return Err(Error::NotIndexed {
+                    root: self.root().to_string(),
+                    operation: "why --sketches-only",
+                    needs: Some("sketch:<columns>".into()),
+                });
+            }
+            return Ok((Vec::new(), Vec::new(), None));
         };
-        if req.sketches_only && sketches.is_empty() {
-            return Err(Error::NotIndexed {
-                root: self.root().to_string(),
-                operation: "why --sketches-only",
-                needs: Some("sketch:<columns>".into()),
-            });
-        }
-        match pinned {
-            Some(p) => sketch_view(p, &sketches),
-            None => Ok((Vec::new(), Vec::new())),
+        let read = crate::sketch::fold_complete_sketches(p).and_then(|sketches| {
+            if req.sketches_only && sketches.is_empty() {
+                let cols: Vec<&str> = p
+                    .planner
+                    .schema()
+                    .fields()
+                    .iter()
+                    .filter(|f| bellwether_profile::fanout::is_id_like(f.data_type()))
+                    .map(|f| f.name().as_str())
+                    .collect();
+                return Err(Error::NotIndexed {
+                    root: self.root().to_string(),
+                    operation: "why --sketches-only",
+                    needs: Some(format!("sketch:{}", cols.join(","))),
+                });
+            }
+            sketch_view(p, &sketches)
+        });
+        match read {
+            Ok((column, lints)) => Ok((column, lints, None)),
+            Err(e) if req.sketches_only => Err(e),
+            Err(e @ Error::NotIndexed { .. }) => Err(e),
+            Err(e) => {
+                let labels: Vec<String> = bellwether_build::declared_sketches(p.manifest())
+                    .iter()
+                    .map(bellwether_types::SketchSpec::label)
+                    .collect();
+                Ok((
+                    Vec::new(),
+                    Vec::new(),
+                    Some(format!(
+                        "the sketch column is unavailable: {e}; rebuild it with `bellwether \
+                         index {} --key {}` (plans never read a sketch, so nothing else is \
+                         affected)",
+                        self.root(),
+                        labels.join(" --key ")
+                    )),
+                ))
+            }
         }
     }
 }

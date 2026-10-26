@@ -420,3 +420,70 @@ fn the_finest_sketch_holding_an_item_is_read() {
     assert_eq!(batch.sketch.as_deref(), Some("sketch:id,batch,p=12"));
     assert_eq!(batch.cardinality, c.items[0].cardinality);
 }
+
+/// A missing or damaged sketch segment never takes `why` down: plans never
+/// read a sketch, so `why` reports the column unavailable with the reason
+/// and the command that rebuilds it; `--sketches-only` refuses.
+#[test]
+fn a_missing_or_damaged_sketch_segment_leaves_why_working() {
+    let dir = tempfile::tempdir().unwrap();
+    ledger_corpus(dir.path(), 2, 2, 100, 300);
+    let e = engine(dir.path());
+    declare(&e, "sketch:id,batch");
+    let idx = dir.path().join(".bellwether");
+    let m: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(idx.join("manifest.json")).unwrap()).unwrap();
+    let ids: Vec<String> = m["segments"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|s| s["kind"] == "sketch")
+        .map(|s| s["id"].as_str().unwrap().to_string())
+        .collect();
+    assert!(!ids.is_empty());
+    // Damage one segment, delete the rest.
+    let first = idx.join("segments").join(format!("{}.seg", ids[0]));
+    let mut bytes = std::fs::read(&first).unwrap();
+    bytes[20] ^= 0x01;
+    std::fs::write(&first, bytes).unwrap();
+    for id in &ids[1..] {
+        std::fs::remove_file(idx.join("segments").join(format!("{id}.seg"))).unwrap();
+    }
+    let w = e.why(&WhyRequest::default()).unwrap();
+    assert!(w.sketch.is_empty());
+    let why_not = w.sketch_unavailable.unwrap();
+    assert!(why_not.contains("unavailable"), "{why_not}");
+    assert!(why_not.contains("--key sketch:id,batch"), "{why_not}");
+    assert!(e
+        .why(&WhyRequest {
+            sketches_only: true,
+            ..WhyRequest::default()
+        })
+        .is_err());
+}
+
+/// `--sketches-only` with no sketch names a declaration over the dataset's
+/// real id-like columns, never a template.
+#[test]
+fn sketches_only_without_a_sketch_names_real_columns() {
+    let dir = tempfile::tempdir().unwrap();
+    ledger_corpus(dir.path(), 2, 1, 50, 20);
+    let e = engine(dir.path());
+    declare(&e, "exact:id");
+    match e
+        .why(&WhyRequest {
+            sketches_only: true,
+            ..WhyRequest::default()
+        })
+        .unwrap_err()
+    {
+        Error::NotIndexed {
+            needs: Some(needs), ..
+        } => {
+            assert!(needs.starts_with("sketch:"), "{needs}");
+            assert!(!needs.contains('<'), "{needs}");
+            assert!(needs.contains("id"), "{needs}");
+        }
+        other => panic!("{other}"),
+    }
+}

@@ -60,11 +60,15 @@ fn fires_on_a_stamp_beside_an_id() {
     assert!((l.confidence - MEDIUM).abs() < 1e-12);
     assert!(
         l.message
-            .contains("about 138889 rows share each of its 72 values"),
+            .contains("about 138,889 rows share each of its 72 values"),
         "{}",
         l.message
     );
-    assert!(l.message.contains("approximate"), "{}", l.message);
+    assert!(
+        l.message.contains("1,000,000 values") && l.message.contains("no recorded workload"),
+        "{}",
+        l.message
+    );
     assert!(l.message.contains("(id, batch)"), "{}", l.message);
     // Exact counts on both sides raise the confidence.
     let mut exact = stamp_and_id();

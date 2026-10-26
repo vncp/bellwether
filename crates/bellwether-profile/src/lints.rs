@@ -544,6 +544,8 @@ pub fn low_cardinality_key(columns: &[SketchedColumn]) -> Vec<Lint> {
         };
         let exact = b.distinct_exact && k.distinct_exact;
         let tag = |e: bool| if e { "exact" } else { "approximate" };
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let rpv = crate::render::thousands(rows_per_value.round() as u64);
         out.push(Lint {
             rule: LOW_CARDINALITY_KEY_FROM_SKETCHES.to_string(),
             columns: vec![b.column.clone(), k.column.clone()],
@@ -551,12 +553,14 @@ pub fn low_cardinality_key(columns: &[SketchedColumn]) -> Vec<Lint> {
                 "{b_col} is a low-cardinality key: about {rpv} rows share each of its {bd} values \
                  ({bt}, from sketches; no data file read), beside {k_col} with {kd} values ({kt}) \
                  in the same files; a lookup keyed on {b_col} alone reads every row of a value, \
-                 so key on the composite ({k_col}, {b_col}) instead",
+                 so key on the composite ({k_col}, {b_col}) instead (no recorded workload: this \
+                 assumes lookups supply both {k_col} and {b_col}; a lookup supplying {b_col} \
+                 alone is not served by a key led by {k_col}, and a categorical {b_col} may not \
+                 be a key at all)",
                 b_col = b.column,
                 k_col = k.column,
-                rpv = fmt_count(rows_per_value.round()),
-                bd = fmt_count(f64_of(b.distinct)),
-                kd = fmt_count(f64_of(k.distinct)),
+                bd = crate::render::thousands(b.distinct),
+                kd = crate::render::thousands(k.distinct),
                 bt = tag(b.distinct_exact),
                 kt = tag(k.distinct_exact),
             ),
@@ -565,11 +569,6 @@ pub fn low_cardinality_key(columns: &[SketchedColumn]) -> Vec<Lint> {
         });
     }
     out
-}
-
-#[allow(clippy::cast_precision_loss)]
-fn f64_of(v: u64) -> f64 {
-    v as f64
 }
 
 #[cfg(test)]

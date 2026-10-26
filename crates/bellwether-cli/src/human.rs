@@ -776,6 +776,9 @@ pub(crate) fn why(r: &bellwether::WhyReport, out: &Out, fix_command: &str) -> St
              diagnosis, approximate"
         );
     }
+    if let Some(why_not) = &r.sketch_unavailable {
+        let _ = writeln!(s, "  {why_not}");
+    }
     let sketch_cell = |columns: &[String]| {
         r.sketch
             .iter()
@@ -1121,20 +1124,30 @@ pub(crate) fn cardinality(r: &bellwether::CardinalityResult, out: &Out) -> Strin
         );
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
         let (rpv, fpv) = (
-            num(c.rows_per_value.round() as u64),
+            c.rows_per_value.round() as u64,
             num(c.files_per_value.round() as u64),
         );
+        // A file is flagged only when its distinct estimate falls more than
+        // three standard errors below its rows: fewer repeated rows than
+        // that are invisible to a sketch, so uniqueness is never asserted.
+        #[allow(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            clippy::cast_precision_loss
+        )]
+        let floor = (3.0 * c.relative_standard_error * c.rows as f64 / c.files.max(1) as f64)
+            .ceil() as u64;
         let _ = writeln!(
             s,
-            "    {}{rpv} rows per value; each value in ≈{fpv} files; {} of {} files repeat a value{}",
+            "    {}{} {} per value; each value in ≈{fpv} files; {} of {} files repeat a value \
+             (a file repeating fewer than about {} of its rows is not detected; a sketch \
+             cannot prove uniqueness)",
             if c.rows_per_value_exact { "" } else { "≈" },
+            num(rpv),
+            if rpv == 1 { "row" } else { "rows" },
             num(c.files_with_duplicates),
             num(c.files),
-            if c.columns.len() > 1 && c.files_with_duplicates == 0 {
-                " (the tuple is unique within every file)"
-            } else {
-                ""
-            }
+            num(floor.max(1)),
         );
         let from = match (&i.source, &i.sketch) {
             (SketchSource::Index, Some(label)) => format!("read from {label}"),

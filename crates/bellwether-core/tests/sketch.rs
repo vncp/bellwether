@@ -275,6 +275,47 @@ fn hll_error_bound_holds_against_a_brute_force_oracle() {
     );
 }
 
+/// The 99.7 % label where it matters: at `n >= 10 * 2^p` the estimator's
+/// error is at its asymptotic relative standard error, so an interval of
+/// two standard errors would hold the exact count in about 95 % of trials
+/// and three in about 99.7 %. Over 600 trials at `p = 8` and `p = 10`, at
+/// least 98.5 % must hold it (a 2σ interval fails this with overwhelming
+/// probability; a 3σ one passes it with overwhelming probability).
+#[test]
+fn the_interval_covers_at_its_stated_confidence_at_large_n() {
+    let mut rng = Rng(11);
+    let mut inside = 0u32;
+    let mut trials = 0u32;
+    for &p in &[8u8, 10] {
+        let n = 20u64 << p;
+        let sp = spec(&[&["id"]], p, None);
+        for _ in 0..300 {
+            let mut s = ItemSketch::empty(&sp).unwrap();
+            let base = rng.next() as i64 >> 2;
+            // Every value twice: rows = 2n, so the interval's clamp to the
+            // row count never hides a too-narrow upper bound.
+            for i in 0..n as i64 {
+                let k = encode_tuple(&[Value::Int(base.wrapping_add(i))]).unwrap();
+                let h = bellwether_core::sketch::value_hash(&k) as u64;
+                s.hll.insert(h);
+                s.hll.insert(h);
+                s.rows += 2;
+            }
+            let mut t = SketchTotals::new(&sp).unwrap();
+            t.add_file(std::slice::from_ref(&s)).unwrap();
+            let c = t.cardinality(0, None).unwrap();
+            trials += 1;
+            if c.distinct_low <= n && n <= c.distinct_high {
+                inside += 1;
+            }
+        }
+    }
+    assert!(
+        f64::from(inside) >= 0.985 * f64::from(trials),
+        "{inside} of {trials} intervals held the exact count"
+    );
+}
+
 /// Sets `(A, B)` with a known Jaccard similarity, each value hashed as the
 /// sketch hashes it.
 fn overlap_sets(
