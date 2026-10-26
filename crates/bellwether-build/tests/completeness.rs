@@ -239,6 +239,77 @@ fn a_definition_change_under_the_same_name_rebuilds_the_spec() {
     );
 }
 
+/// Completeness and segments are keyed by [`KeySpec::identity`], which
+/// holds every field of the spec. `bloom:grp@0.01` and `bloom:grp@0.05`
+/// share the name `bloom:grp`; keyed by name, the old filter's segments
+/// and completeness entry would serve the new declaration.
+#[test]
+fn completeness_is_keyed_by_identity_not_name() {
+    let s = Scratch::new();
+    three_files(&s);
+    let store = memory_store();
+    let b = builder(&store);
+    let opts = parquet_opts(&simple_schema());
+    let tight = bloom(&["grp"]);
+    let loose = KeySpec::Bloom {
+        columns: cols(&["grp"]),
+        fpr: 0.05,
+        bounds: None,
+    };
+    assert_eq!(tight.name(), loose.name());
+    assert_ne!(tight.identity(), loose.identity());
+    build_ok(&b, &s.root_str(), std::slice::from_ref(&tight), &opts);
+    let m = b.manifest().unwrap().unwrap();
+    assert_eq!(
+        m.key_spec_completeness.keys().collect::<Vec<_>>(),
+        vec!["bloom:grp@0.01"]
+    );
+    assert_eq!(completeness(&m, &tight), Some(1));
+    assert_eq!(completeness(&m, &loose), None, "not declared");
+
+    let r = build_ok(&b, &s.root_str(), std::slice::from_ref(&loose), &opts);
+    assert_eq!(r.specs_rebuilt, vec!["bloom:grp@0.05".to_string()]);
+    let m = b.manifest().unwrap().unwrap();
+    assert_eq!(
+        m.key_spec_completeness.keys().collect::<Vec<_>>(),
+        vec!["bloom:grp@0.05"],
+        "recorded under the new identity only"
+    );
+    assert_eq!(completeness(&m, &loose), Some(2), "recorded at the rebuild");
+    assert_eq!(completeness(&m, &tight), None);
+    assert!(m.segments.iter().all(|x| x.key_spec == "bloom:grp@0.05"));
+    let specs = segment_specs(&store, "bloom:grp@0.05");
+    assert!(!specs.is_empty());
+    assert!(
+        specs.iter().all(|k| k == &loose),
+        "no segment of the 0.01 filter is live"
+    );
+
+    // A foreign writer re-declares the 0.01 filter but leaves the 0.05
+    // segments and entry: the 0.01 spec is not complete, and planning it
+    // is an error.
+    commit(&*store, "idx", &StagedSegments::new(), |cur| {
+        let mut next = cur.clone();
+        next.schema.key_specs = vec![tight.clone()];
+        Ok(next)
+    })
+    .unwrap();
+    let m = b.manifest().unwrap().unwrap();
+    assert_eq!(completeness(&m, &tight), None);
+    assert_eq!(completeness(&m, &loose), None);
+    let p = planner(&store);
+    let err = p
+        .plan(
+            std::slice::from_ref(&tight),
+            &Lookup::Keys {
+                columns: cols(&["grp"]),
+                keys: vec![b"g".to_vec()],
+            },
+        )
+        .unwrap_err();
+    assert!(matches!(err, Error::KeySpec(_)), "{err}");
+}
+
 #[test]
 fn removing_a_spec_takes_remove_unlisted_and_drops_its_segments_and_completeness() {
     let s = Scratch::new();

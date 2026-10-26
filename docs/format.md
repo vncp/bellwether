@@ -1,6 +1,6 @@
-# On-disk format, storage version 1
+# On-disk format, storage version 2
 
-Versioned from the first commit. `bellwether-types::format::STORAGE_VERSION` is written into the manifest and every segment header. A binary that reads a newer version refuses with `Error::UnsupportedVersion` and never downgrades in place (ADR 017). A fixture written by v0.1 lives under `fixtures/format-v0.1/` once the format is frozen, and every later version must read it in CI.
+Versioned from the first commit. `bellwether-types::format::STORAGE_VERSION` (2) is written into the manifest and every segment header. A binary that reads a newer version refuses with `Error::UnsupportedVersion` and never downgrades in place (ADR 017). This binary writes storage version 2 and reads version 1 ("Reading storage version 1"). The bytes of version 2 are frozen by ADR 028: `fixtures/format-v1/` (built by the last version 1 binary) and `fixtures/format-v0.1/` (built by this one) are read in CI by every later binary, and every plan and record hash they pin must replay identically (`crates/bellwether-cli/tests/format_compat.rs`).
 
 ```
 <index-root>/
@@ -14,11 +14,13 @@ Versioned from the first commit. `bellwether-types::format::STORAGE_VERSION` is 
                                             "Partition columns"; absent for none)
                                  schema{columns[{name, data_type, nullable}], key_specs[],
                                         sidecars?[{kind, columns[], time_columns[]}]}   (see "Sidecar kinds")
-                                 rowgroup_space{next_id, files[{fingerprint, rowgroup_ids[], chunk_size?, chunks?[{start,end}]}],
+                                 rowgroup_space{next_id, files[{fingerprint, rowgroup_ids[], rowgroup_rows[], rowgroup_bytes[],
+                                                column_bytes?[], chunk_size?, chunks?[{start,end}]}],
                                                 tombstones[{since, rowgroup_ids[]}]}   (retired row-group ids, ADR 013)
-                                 (chunk_size and chunks are present only for byte-range sources and are immutable per file)
-                                 key_spec_completeness{name -> sequence at which the spec became complete, that is, first covered every live row group (ADR 020)}
-                                 segments[{id=blake3, kind?, key_spec=KeySpec::name() or the sidecar's name,
+                                 (chunk_size and chunks are present only for byte-range sources and are immutable per file;
+                                  rowgroup_rows, rowgroup_bytes and column_bytes are storage version 2: see "Manifest, storage version 2")
+                                 key_spec_completeness{identity -> sequence at which the spec became complete, that is, first covered every live row group (ADR 020)}
+                                 segments[{id=blake3, kind?, key_spec=KeySpec::identity() or the sidecar's name,
                                            rowgroup_range{start, end} (half-open), bytes}]
                                            (rowgroup_range = the row groups the segment's writer processed, including
                                             any that held no keys; the spec's coverage, and recorded in the segment too;
@@ -41,10 +43,14 @@ Versioned from the first commit. `bellwether-types::format::STORAGE_VERSION` is 
                                  overwritten and never blocking a commit; see "Manifest history"
   segments/<blake3>.seg          header{storage_version, encoding_version, key_spec, codec, bloom_hash}
                                  bloom_hash ∈ {"canonical", "parquet_plain"}; readers refuse any other value
+                                 footer index_offset u64 | index_len u64 | checksum u64 | magic; every block,
+                                           filter and value record a read touches has its own checksum
+                                           (see "Segments, storage version 2")
                                  exact:    block index of sorted key blocks, one split-block bloom per block,
-                                           key → bitmap offset; bitmaps: roaring, over global RowGroupId,
-                                           always in the no-run serialized form (cookie 3a 30 00 00), never empty;
-                                           readers refuse any other cookie or an empty keyed bitmap
+                                           key → value record: bitmap_len u32 | bitmap | [counts]; bitmaps: roaring,
+                                           over global RowGroupId, always in the no-run serialized form
+                                           (cookie 3a 30 00 00), never empty; readers refuse any other cookie or an
+                                           empty keyed bitmap; counts (spec `counts`): one LEB128 row count per set bit
                                  header also records each key column's dataset type (and the temporal ts type
                                            and unit); segments with differing recorded types never merge
                                  index records the row-group range the writer processed (inclusive; a merge
@@ -55,8 +61,8 @@ Versioned from the first commit. `bellwether-types::format::STORAGE_VERSION` is 
                                  bloom:    one split-block bloom per row group (the shape Parquet embeds),
                                            header field bloom_hash names the hash input; newtypes keep the two apart
                                  range:    (min, max) canonical bytes per row group
-                                 temporal: exact layout plus key → [(ts, rowgroup_id)] chain + max_ts;
-                                           latest/asof return every row group at the winning ts (ties)
+                                 temporal: exact layout plus key → [(ts, rowgroup_id)] chain + max_ts after the
+                                           counts; latest/asof return every row group at the winning ts (ties)
                                  bounds, temporal2: sidecar segments, their own layout (magic "BWSIDECR"); see
                                            "Sidecar kinds"
   ledger/<blake3>.rec            Record (Evidence | Proposal | Replay | Certificate | Receipt), canonical JSON
@@ -84,7 +90,20 @@ rowgroup id      = dense u32 assigned at first sighting of (fingerprint, index_i
 
 ## Key specs
 
-`Exact{columns}`, `Bloom{columns, fpr}`, `Range{column}`, `Temporal{columns, ts_column}`. Composite is not a kind; every kind takes a column list and encodes it memcomparably (ADR 002). CSV and JSON lines sources define row groups as fixed byte-range chunks recorded in the manifest, so the rest of the system never knows the difference.
+`Exact{columns, counts?}`, `Bloom{columns, fpr}`, `Range{column}`, `Temporal{columns, ts_column, counts?}`. Composite is not a kind; every kind takes a column list and encodes it memcomparably (ADR 002). CSV and JSON lines sources define row groups as fixed byte-range chunks recorded in the manifest, so the rest of the system never knows the difference. `counts` (storage version 2) is serialized only when true, so a spec without it has the same JSON as in version 1; a version 1 manifest that carries it is refused.
+
+**Key-spec identity (storage version 2).** `KeySpec::identity()` is the canonical string of every field of a spec, and the key under which the manifest lists its segments (`segments[].key_spec`) and its completeness (`key_spec_completeness`):
+
+| Spec | Identity |
+|---|---|
+| `Exact{columns: [a, b]}` | `exact:a,b` |
+| `Exact{columns: [a], counts: true}` | `exact:a,counts` |
+| `Bloom{columns: [a], fpr: 0.01}` | `bloom:a@0.01` (the shortest decimal that reads back as the same `f64`) |
+| `Range{column: ts}` | `range:ts` |
+| `Temporal{columns: [id], ts_column: ts}` | `temporal:id@ts` |
+| `Temporal{columns: [id], ts_column: ts, counts: true}` | `temporal:id@ts,counts` |
+
+So `bloom:a@0.01` and `bloom:a@0.05` never share a segment list or a completeness entry. Because `,counts` ends a counted spec's identity, a composite exact spec whose last key column is named `counts` is refused (list that column first). `KeySpec::name()` is the display name and the spec's slot (`exact:a`, `bloom:a`, `temporal:id`): an index holds one spec per name, and declaring another spec under a declared name (another rate, counts on or off, another time column) rebuilds it and drops the old segments in the same commit. A storage version 1 manifest keyed both maps by name (one spec per name, so the rewrite is one-to-one); a version 2 reader rewrites those keys to identities when it reads one.
 
 ## Canonical encoding (ADR 016), encoding version 1
 
@@ -213,9 +232,147 @@ Both the core encoder and any source-side stats encoder must reproduce these byt
 
 Additional vectors (decimal rescale, Decimal256, floats including the canonical NaN) are appended by the conformance test as they are agreed, never by one side alone.
 
-## Planned for storage version 2 (ADR 026)
+## Segments, storage version 2
 
-Not part of version 1 and not read by version 1 readers: (1) exact segments may carry, per key and per set bit of its bitmap, a row count, enabled by `counts: true` on the key spec; (2) scan entries carry per-column bytes so a plan's projection cost is a sum of chunk sizes; (3) manifests record per-row-group bytes and per-column bytes at build time so plans need not open footers; (4) the version 1 sidecar kinds (`bounds`, `temporal2`, "Sidecar kinds" below) fold into the segment they ride beside: an exact or bloom segment's per-key value carries the per-row-group time bounds, and the bitemporal triples become a temporal layout, so one segment read answers what a key segment plus a sidecar answer in version 1. A version 2 reader still reads version 1 sidecars. The format freeze happens after these exist, so that version 2 is the frozen version.
+The preamble, header, block structure and the version 1 rules above are unchanged; version 2 adds checksums and the value record's counts. A checksum is XXH3-64, seed 0, little-endian `u64`.
+
+```
+footer                  index_offset u64 | index_len u64 | checksum u64 | magic "BWSEGMNT"
+                        (checksum over preamble ‖ header ‖ index)
+keyed index entry       first_key | last_key | bloom_off u64 | bloom_len u32 | bloom_checksum u64 |
+                        body_off u64 | body_len u32 | body_checksum u64 | n u32
+keyed directory         n u32 | (n+1) key end offsets u32 | key bytes |
+                        n x (value_offset u64 | value_len u32 | value_checksum u64)
+bloom index entry       rg u32 | off u64 | len u32 | ndv u64 | checksum u64
+min/max index entry     first_min | max_of_max | off u64 | len u32 | n u32 | checksum u64
+value record, exact     bitmap_len u32 | bitmap | [counts]
+value record, temporal  bitmap_len u32 | bitmap | [counts] | chain
+counts                  one unsigned LEB128 u64 per set bit of the bitmap, in ascending row-group order
+```
+
+- **Checksums.** A reader checks the footer's checksum when it opens a segment, and the checksum of every filter, directory block and value record before it decodes one. A mismatch is `Error::Corrupt`, never a decoded answer. A lookup still holds the index, one block and the values of the keys asked (ADR 018).
+- **Counts** are present exactly when the header's `key_spec` has `counts: true`. Each is the number of rows in that row group whose key tuple is this key: at least 1, in its shortest LEB128 form (an over-long form or one past 64 bits is refused), and nothing may follow the last one (or the chain). Rows whose leading key column is null are not indexed and not counted; a trailing null element of a composite key is the `0x00` marker and counts under that tuple (ADR 014). A temporal count is the key's rows in the row group over all versions, including rows with a null time, which never win. `SegmentReader::counts(keys)` returns `None` for a segment without counts, never zero.
+- **Merge** sums the counts of a (key, row group) only when the inputs' row groups are disjoint, as the build's contiguous groups are, and refuses inputs that both count one key in one row group. Its output is written at this build's storage version.
+- A segment header at storage version 1 that declares `counts` is refused.
+- **Not yet in version 2 (ADR 028).** Per-key time bounds (`exact:symbol@ts`) and bitemporal versions (`temporal2:id@valid,known`) are still the version 1 sidecar segments of "Sidecar kinds", declared in `schema.sidecars`. Folding them into the exact value record and a `bitemporal` layout is the second half of storage version 2; a manifest naming them as key specs is refused until then.
+
+## Manifest, storage version 2
+
+Each `rowgroup_space.files[]` entry gains three arrays:
+
+- `rowgroup_rows`: rows of each row group, aligned with `rowgroup_ids`.
+- `rowgroup_bytes`: compressed bytes of each row group (a text chunk's length), aligned with `rowgroup_ids`.
+- `column_bytes`: compressed bytes of each column chunk, row-group-major: entry `i * columns + j` is row group `i`'s chunk of schema column `j`. It is 0 for a virtual partition column, and the whole array is absent for a text source, whose chunks have no per-column bytes.
+
+A file whose arrays are present but do not align with its row groups or the schema's columns is refused. The build fills them for every file it adds. The first commit by a version 2 binary over a version 1 manifest fills them for every tracked file from its footer (one footer read per file; a footer whose row-group count disagrees with the manifest is drift, ADR 013) and stamps `storage_version: 2`; no commit ever lowers it. A plan over a manifest with the arrays opens no Parquet footer: bytes come from `rowgroup_bytes`, and `locate --columns` sums `column_bytes` into each entry's `columns` and the plan's `projected_bytes`. Counts (`count`, and the rows a plan through a counted spec reports) come from the segments.
+
+**Size.** The arrays cost about 8 bytes of decimal text per (row group, column). An index over 10^5 row groups of 50 columns carries a manifest of about 40 MB; beyond that, externalized statistics are a storage version 3 question, not solved here.
+
+The minimal version 2 manifest, in the canonical form `Manifest::to_vec` writes (sorted keys, two-space indent). `crates/bellwether-store/tests/manifest_v2.rs` reads it, writes it back byte for byte, checks that this section shows it exactly, and sweeps every byte of it:
+
+```json
+{
+  "commit_nonce": 1,
+  "committed_at": "2026-10-25T00:00:00.000Z",
+  "created_at": "2026-10-25T00:00:00.000Z",
+  "deleting": [],
+  "key_spec_completeness": {
+    "exact:symbol,counts": 1
+  },
+  "rowgroup_space": {
+    "files": [
+      {
+        "column_bytes": [
+          50,
+          0,
+          30,
+          0
+        ],
+        "fingerprint": {
+          "etag": "2026-10-25T00:00:00.000000000Z",
+          "path": "/data/day=2026-01-01/part-0.parquet",
+          "size": 1000,
+          "tail_blake3": "0000000000000000000000000000000000000000000000000000000000000000"
+        },
+        "rowgroup_bytes": [
+          60,
+          40
+        ],
+        "rowgroup_ids": [
+          0,
+          1
+        ],
+        "rowgroup_rows": [
+          4,
+          2
+        ]
+      }
+    ],
+    "next_id": 2,
+    "tombstones": []
+  },
+  "schema": {
+    "columns": [
+      {
+        "data_type": "Utf8",
+        "name": "symbol",
+        "nullable": true
+      },
+      {
+        "data_type": "Date32",
+        "name": "day",
+        "nullable": true
+      }
+    ],
+    "key_specs": [
+      {
+        "columns": [
+          "symbol"
+        ],
+        "counts": true,
+        "kind": "exact"
+      }
+    ]
+  },
+  "segment_tombstones": [],
+  "segments": [
+    {
+      "bytes": 300,
+      "id": "1111111111111111111111111111111111111111111111111111111111111111",
+      "key_spec": "exact:symbol,counts",
+      "rowgroup_range": {
+        "end": 2,
+        "start": 0
+      }
+    }
+  ],
+  "sequence": 1,
+  "source": {
+    "fingerprint_policy": "tail64k",
+    "kind": "parquet",
+    "partitioning": "hive",
+    "root": "/data"
+  },
+  "storage_version": 2
+}
+```
+
+## Counts conformance vectors
+
+`crates/bellwether-core/tests/counts_conformance.rs` writes a counted exact segment on `symbol` (row groups 0..4, no recorded types) holding `"AAPL"` in row groups 0 (3 rows) and 2 (1 row) and `"MSFT"` in row group 1 (300 rows). It finds each value record below exactly once in the segment's bytes, followed in the directory by its offset, length and checksum, and checks that this table lists exactly these vectors.
+
+| Vector | Bytes |
+|---|---|
+| `"AAPL"` key | `06 41 41 50 4c 00 00` |
+| exact value `"AAPL"`, row groups {0, 2}, counts [3, 1] | `14 00 00 00 3a 30 00 00 01 00 00 00 00 00 01 00 10 00 00 00 00 00 02 00 03 01` |
+| exact value `"MSFT"`, row group {1}, counts [300] | `12 00 00 00 3a 30 00 00 01 00 00 00 00 00 00 00 10 00 00 00 01 00 ac 02` |
+
+The same test checks that every segment in `fixtures/format-v1/` and `fixtures/format-v0.1/` is named by the blake3 of its bytes.
+
+## Reading storage version 1
+
+- **Segments.** A version 1 segment has the 24-byte footer without a checksum and no other checksums; an exact value record is the bare bitmap and a temporal one the length-prefixed bitmap and the chain. It never stores counts: `SegmentReader::counts` returns `None`, and its value bytes are never read as counts. Sidecar segments (`BWSIDECR`, "Sidecar kinds") are unchanged in version 2.
+- **Manifests.** Keys are rewritten from names to identities on read ("Key-spec identity"). Without the arrays, a plan opens each planned file's footer, as version 1 did. `storage_version` stays 1 until a commit: `bellwether index` with nothing to do commits nothing and leaves the index at version 1, readable by a version 1 binary; the first build with work fills the arrays, commits at version 2 and says so (`manifest upgraded to storage version 2`). Every plan of the version 1 index pinned to its earlier sequences (`--at-manifest`) is unchanged by the upgrade.
 
 ## Inference stability (2026-10-24)
 

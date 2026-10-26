@@ -1,4 +1,5 @@
-//! Segment files: `segments/<blake3>.seg` (docs/format.md, storage version 1).
+//! Segment files: `segments/<blake3>.seg` (docs/format.md, storage version
+//! 2; version 1 segments are read, never written).
 //!
 //! # Layout
 //!
@@ -11,8 +12,15 @@
 //!                  key_types?, ts_type?, ..unknown}
 //! body       layout-specific blocks (below)
 //! index      entries u64 | has_rg u8 | rg_min u32 | rg_max u32 | block_count u32 | entry*
-//! footer     index_offset u64 | index_len u64 | magic "BWSEGMNT"
+//! footer     index_offset u64 | index_len u64 | checksum u64 | magic "BWSEGMNT"
 //! ```
+//!
+//! The footer's checksum ([`checksum`], XXH3-64) covers the preamble, the
+//! header and the index; every index entry carries the checksum of the
+//! filter, block or row-group region it points at, and every directory
+//! entry the checksum of its value record. A reader verifies each before
+//! decoding it. A storage version 1 segment has the 24-byte footer
+//! ([`FOOTER_LEN`]) and no checksums.
 //!
 //! `has_rg | rg_min | rg_max` is the row-group range the segment records:
 //! the row groups its writer processed, inclusive, when the writer was
@@ -45,23 +53,27 @@
 //! [`WriterOptions::block_keys`] keys. Each block is written as its value
 //! records, then its SBBF bitset over the block's keys, then its key
 //! directory: `n u32 | (n+1) key end offsets u32 | key bytes | n x
-//! (value_offset u64, value_len u32)`. An index entry is `first_key | last_key
-//! | bloom_off u64 | bloom_len u32 | body_off u64 | body_len u32 | n u32`. A
-//! value record is a roaring bitmap over global `RowGroupId`; for temporal
-//! segments it is the length-prefixed bitmap followed by the version chain
-//! (see [`crate::temporal::VersionChain::write_to`]). The bitmap is always in
-//! roaring's no-run serialized form (cookie `3a 30 00 00`), fills its bytes
-//! exactly, and is never empty; a reader refuses anything else.
+//! (value_offset u64, value_len u32, value_checksum u64)`. An index entry is
+//! `first_key | last_key | bloom_off u64 | bloom_len u32 | bloom_checksum u64
+//! | body_off u64 | body_len u32 | body_checksum u64 | n u32`. A value record
+//! is `bitmap_len u32 | bitmap`, a roaring bitmap over global `RowGroupId`;
+//! then, for a spec with `counts`, one shortest-form LEB128 row count per
+//! set bit in ascending row-group order; then, for temporal segments, the
+//! version chain (see [`crate::temporal::VersionChain::write_to`]). The
+//! bitmap is always in roaring's no-run serialized form (cookie
+//! `3a 30 00 00`), fills its bytes exactly, and is never empty; a reader
+//! refuses anything else. (Version 1: no checksums, and an exact value
+//! record is the bare bitmap.)
 //!
 //! **Bloom per row group** (bloom). One SBBF per row group over that row
 //! group's distinct keys, sized from the spec's `fpr`; structure and sizing
 //! are those of a Parquet embedded filter. Index entry: `rg u32 | off u64 |
-//! len u32 | ndv u64`. A row group may have more than one entry (merge keeps
+//! len u32 | ndv u64 | checksum u64`. A row group may have more than one entry (merge keeps
 //! filters of different sizes); a lookup unions over them.
 //!
 //! **Min/max** (range). One `(min, max)` per row group, sorted by
 //! `(min, max, rg)`, in blocks of `rg u32 | min | max` entries. Index entry:
-//! `first_min | max_of_max | off u64 | len u32 | n u32`. Bounds may come
+//! `first_min | max_of_max | off u64 | len u32 | n u32 | checksum u64`. Bounds may come
 //! from statistics, which exclude NaN, so a probe that includes the
 //! canonical NaN matches every row group. Stored bounds follow the Parquet
 //! signed-zero reading rule: a +0.0 minimum is stored as -0.0 and a -0.0

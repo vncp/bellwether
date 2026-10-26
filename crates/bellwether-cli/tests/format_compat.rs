@@ -241,8 +241,10 @@ fn pinned_lookups(r: &Restored, upgrade: bool, extra: &[&str]) -> usize {
 }
 
 /// The receipt chain: `receipt show` prints the pinned text, every ledger
-/// record is named by its hash and parses, and the set is the pinned one.
-fn chain(r: &Restored) {
+/// record is named by its hash and parses, and the pinned records are all
+/// there: exactly them when `exact` (before any command that records
+/// evidence), among later ones otherwise.
+fn chain(r: &Restored, exact: bool) {
     let receipt = r.expected["receipt"].as_str().unwrap();
     let text = ok(
         r,
@@ -278,7 +280,13 @@ fn chain(r: &Restored) {
         .iter()
         .map(|v| v.as_str().unwrap().to_string())
         .collect();
-    assert_eq!(names, want);
+    if exact {
+        assert_eq!(names, want);
+    } else {
+        for w in &want {
+            assert!(names.contains(w), "pinned record {w} is gone");
+        }
+    }
     for key in ["proposal", "receipt", "failing_certificate"] {
         let h = r.expected[key].as_str().unwrap();
         assert!(
@@ -292,8 +300,9 @@ fn chain(r: &Restored) {
 fn the_storage_version_1_fixture_reads_as_it_was_written() {
     let r = Restored::new("format-v1");
     assert_eq!(r.manifest()["storage_version"], 1);
+    chain(&r, true);
     assert_eq!(pinned_lookups(&r, true, &[]), 9);
-    chain(&r);
+    chain(&r, false);
     // Reading changed nothing: still version 1.
     assert_eq!(r.manifest()["storage_version"], 1);
 }
@@ -306,8 +315,9 @@ fn the_storage_version_2_fixture_reads_byte_for_byte() {
     for f in m["rowgroup_space"]["files"].as_array().unwrap() {
         assert!(f.get("rowgroup_bytes").is_some(), "{f}");
     }
+    chain(&r, true);
     assert_eq!(pinned_lookups(&r, false, &[]), 12);
-    chain(&r);
+    chain(&r, false);
     let counts: Vec<String> = r.expected["lookups"]
         .as_array()
         .unwrap()
@@ -356,6 +366,7 @@ fn u64s(v: &Value) -> Vec<u64> {
 #[test]
 fn a_storage_version_1_copy_upgrades_on_its_next_commit() {
     let r = Restored::new("format-v1");
+    chain(&r, true);
     let index = ["index".to_string(), path(&r.data).to_string()];
     let manifest_bytes = || std::fs::read(r.data.join(".bellwether/manifest.json")).unwrap();
 
@@ -421,7 +432,7 @@ fn a_storage_version_1_copy_upgrades_on_its_next_commit() {
     // Every v1 plan, pinned to the v1 sequence it was answered at, is the
     // pinned plan.
     assert_eq!(pinned_lookups(&r, true, &["--at-manifest", "3"]), 9);
-    chain(&r);
+    chain(&r, false);
 }
 
 #[test]
