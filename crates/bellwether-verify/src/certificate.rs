@@ -41,7 +41,8 @@ pub struct CertificateContext {
     /// ledger refuses a certificate whose proposal does not resolve.
     pub proposal: Option<Hash>,
     /// The manifest to anchor to: the left side's. When the left side is
-    /// indexed it must name that side's sequence. Without
+    /// indexed it must name that side's sequence, or, when both sides are
+    /// indexed, the right's (naming the side the certificate is for). Without
     /// one, and with no side indexed, the certificate is anchored at
     /// manifest `"0"` (contract-v3 #29).
     pub manifest: Option<ManifestAnchor>,
@@ -211,7 +212,7 @@ pub(crate) fn build(
 fn manifest_version(indexed: [Option<u64>; 2], anchor: Option<&ManifestAnchor>) -> Result<u64> {
     match (anchor, indexed) {
         (Some(a), [None, _]) => Ok(a.sequence),
-        (Some(a), [Some(l), _]) if l == a.sequence => Ok(a.sequence),
+        (Some(a), [Some(l), r]) if l == a.sequence || r == Some(a.sequence) => Ok(a.sequence),
         (Some(a), seqs) => Err(VerifyError::Manifest(format!(
             "the context names manifest {} but the indexed sides are at {:?}",
             a.sequence,
@@ -289,9 +290,12 @@ mod tests {
             manifest_version([Some(7), Some(3)], Some(&a(7))).unwrap(),
             7
         );
-        // An indexed left at another manifest is refused even when the
-        // right side's sequence equals the anchor.
-        assert!(manifest_version([Some(3), Some(7)], Some(&a(7))).is_err());
+        // Two indexed sides at different manifests: the anchor names the
+        // one the certificate is for (`tests/planner.rs`).
+        assert_eq!(
+            manifest_version([Some(3), Some(7)], Some(&a(7))).unwrap(),
+            7
+        );
         assert_eq!(manifest_version([None, None], None).unwrap(), 0);
         assert!(manifest_version([Some(3), Some(7)], None).is_err());
         assert!(manifest_version([Some(3), None], Some(&a(7))).is_err());
