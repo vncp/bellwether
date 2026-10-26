@@ -451,6 +451,7 @@ impl Reconciler {
     }
 
     /// Discovery, schemas, scope, and read sets.
+    #[allow(clippy::too_many_lines)] // per side: read set, catalog, agg key, report
     fn prepare<'s>(&self, sides: [Side<'s>; 2]) -> Result<Prepared<'s>> {
         let (left_files, left_index) = discover(&sides[0], 0)?;
         let (right_files, right_index) = discover(&sides[1], 1)?;
@@ -1338,7 +1339,10 @@ fn agg_side<'s>(
     };
     let side_schema = side.source.schema(side.root)?;
     for c in std::iter::once(column).chain(&spec.key_columns) {
-        let mine = side_schema.field_with_name(c).ok().map(|f| f.data_type());
+        let mine = side_schema
+            .field_with_name(c)
+            .ok()
+            .map(arrow::datatypes::Field::data_type);
         let theirs = in_index(c);
         if mine != theirs.as_ref() {
             causes.push(format!(

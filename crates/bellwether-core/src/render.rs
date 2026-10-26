@@ -211,6 +211,7 @@ fn decode(bytes: &[u8], at: usize, dt: &DataType) -> Option<(ArrayRef, usize)> {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
     use arrow::array::Array;

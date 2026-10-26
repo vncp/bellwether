@@ -1584,12 +1584,12 @@ mod tests {
             value_type: arrow::datatypes::DataType::Decimal256(40, 6),
             ..rescan(Vec::new())
         };
-        assert!(reconcile_rescans(&[wide]).is_empty());
+        assert_eq!(reconcile_rescans(&[wide]), Vec::<Lint>::new());
         let nulls = ReconcileRescan {
             null_key_rows: 1,
             ..rescan(Vec::new())
         };
-        assert!(reconcile_rescans(&[nulls]).is_empty());
+        assert_eq!(reconcile_rescans(&[nulls]), Vec::<Lint>::new());
     }
 
     /// `R-agg-1` fires on a reconcile side read to total per key when its

@@ -178,6 +178,7 @@ impl Engine {
         guard(|| self.reconcile_inner(right, request))
     }
 
+    #[allow(clippy::too_many_lines)] // sides, context, each side's agg index, lints
     fn reconcile_inner(&self, right: &str, req: &ReconcileRequest) -> Result<ReconcileResult> {
         if req.key.is_empty() {
             return Err(Error::KeySpec(
@@ -404,14 +405,14 @@ fn agg_index(
     let Some(agg) = agg else {
         return Ok((None, None));
     };
-    let changes = folder_changes(engine.root(), &pinned, engine.format(), &engine.excluded())?;
-    if !changes.is_empty() {
-        let (untracked, changed, missing) = changes.paths();
+    let drift = folder_changes(engine.root(), &pinned, engine.format(), &engine.excluded())?;
+    if !drift.is_empty() {
+        let (added, changed, removed) = drift.paths();
         let mut causes = Vec::new();
         for (paths, what) in [
             (&changed, "changed"),
-            (&untracked, "added"),
-            (&missing, "removed"),
+            (&added, "added"),
+            (&removed, "removed"),
         ] {
             if let Some(first) = paths.first() {
                 causes.push(format!(

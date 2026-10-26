@@ -334,6 +334,7 @@ impl WhyRequest {
     /// is not a whole number with an optional unit) is refused with one
     /// sentence saying what to pass instead. Needs no schema, so a caller
     /// can tell a usage error from an engine failure before any work.
+    #[allow(clippy::too_many_lines)] // one refusal per contradictory flag pair
     pub fn lookup_mode(&self) -> std::result::Result<LookupMode, String> {
         if let Some(l) = &self.lookback {
             Lookback::parse(l).map_err(|e| e.to_string())?;
