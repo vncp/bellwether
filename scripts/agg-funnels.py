@@ -43,9 +43,10 @@ rows it read, and whether the reconcile passed. Copies hard-link the data
 files, so they cost no space.
 
 Usage: scripts/agg-funnels.py --bin PATH/TO/bellwether [--work DIR]
-       [--label "debug build"] [--small]
+       [--label "debug build"] [--small] [--reuse]
 
---small writes a 10^5-row ledger instead of 10^7, for a quick check. Needs
+--small writes a 10^5-row ledger instead of 10^7, for a quick check;
+--reuse keeps a ledger already generated and indexed under --work. Needs
 python3 with pyarrow. Prints markdown; the label line names the machine and
 the build (ADR 019). No timing is measured.
 """
@@ -252,8 +253,10 @@ def reconcile_rows(bin_, ledger, work):
         plant(d, files[len(files) // 2])
     for d in (right, bad):
         run(bin_, ["index", d, "--key", "exact:account,counts", "--key", LEDGER_AGG])
+    # One total per account: about 6 x 10^5 groups on the 10^7-row ledger,
+    # more than the default 256 MiB state budget holds, so it is raised.
     args = ["--key", "account", "--ignore", "version,amount", "--totals", "amount",
-            "--group-by", "account"]
+            "--group-by", "account", "--memory-budget", str(4 << 30)]
     out = []
     for label, l, r in [
         ("agg keys on both sides", data, right),
@@ -306,6 +309,8 @@ def main():
     ap.add_argument("--work")
     ap.add_argument("--label", default="debug build")
     ap.add_argument("--small", action="store_true")
+    ap.add_argument("--reuse", action="store_true",
+                    help="keep a ledger corpus and index already under --work")
     a = ap.parse_args()
     work = os.path.realpath(a.work or tempfile.mkdtemp(prefix="bw-agg-"))
     os.makedirs(work, exist_ok=True)
@@ -317,14 +322,15 @@ def main():
 
     # Ledger.
     ledger = os.path.join(work, "ledger")
-    shutil.rmtree(ledger, ignore_errors=True)
-    gen = ["bench", "agg", "--out", ledger]
-    if a.small:
-        gen += ["--files", "10", "--row-groups-per-file", "10", "--rows-per-row-group", "1000",
-                "--accounts", "200000", "--keys", "10,1000,10000"]
-    run(a.bin, gen)
     data = os.path.join(ledger, "data")
-    run(a.bin, ["index", data, "--key", "exact:account,counts", "--key", LEDGER_AGG])
+    if not (a.reuse and os.path.exists(os.path.join(ledger, "workload", "truth.json"))):
+        shutil.rmtree(ledger, ignore_errors=True)
+        gen = ["bench", "agg", "--out", ledger]
+        if a.small:
+            gen += ["--files", "10", "--row-groups-per-file", "10", "--rows-per-row-group", "1000",
+                    "--accounts", "200000", "--keys", "10,1000,10000"]
+        run(a.bin, gen)
+        run(a.bin, ["index", data, "--key", "exact:account,counts", "--key", LEDGER_AGG])
     truth = json.load(open(os.path.join(ledger, "workload", "truth.json")))
     sets = {}
     for r in truth["runs"]:
