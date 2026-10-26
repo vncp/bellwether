@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 899" width="1000" height="899" role="img" aria-labelledby="title desc">
 <title id="title">bellwether mcp (stdio)</title>
-<desc id="desc">A JSON-RPC session with bellwether mcp over stdio on the bench ledger corpus (bench generate --seed 42: 16 files, 64 row groups, 128,000 rows; bench workload: 12 recorded runs): observe.why, then propose.key with a score smuggled in; the request as sent, the reply pretty-printed with its session budget block elided, nothing else edited; debug build of d39d283, 2026-10-26.</desc>
+<desc id="desc">A JSON-RPC session with bellwether mcp over stdio on the bench ledger corpus (bench generate --seed 42: 16 files, 64 row groups, 128,000 rows; bench workload: 12 recorded runs): observe.why, then propose.key with a score smuggled in; the request as sent, the reply pretty-printed with its session budget block elided, nothing else edited; debug build of 3b35ce7, 2026-10-26.</desc>
 <rect x="0.5" y="0.5" width="999" height="898" rx="10" fill="#f6f8fa" stroke="#d0d7de"/>
 <path d="M0.5 40V10.5a10 10 0 0 1 10-10H989.5a10 10 0 0 1 10 10V40Z" fill="#eaeef2"/>
 <line x1="0.5" y1="40" x2="999.5" y2="40" stroke="#d0d7de"/>
@@ -10,10 +10,10 @@
 <text x="500.0" y="24.5" text-anchor="middle" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" fill="#656d76">bellwether mcp (stdio)</text>
 <g font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="13" fill="#1f2328">
 <text x="24.0" y="77" textLength="218.4" lengthAdjust="spacing" xml:space="preserve" style="white-space:pre"><tspan fill="#1a7f37">$ </tspan><tspan fill="#0969da">bellwether mcp ledger/data</tspan></text>
-<text x="24.0" y="95" textLength="553.8" lengthAdjust="spacing" xml:space="preserve" style="white-space:pre"><tspan fill="#656d76">(initialize, then observe.why, which returned evidence 2bdebe23731f...)</tspan></text>
+<text x="24.0" y="95" textLength="553.8" lengthAdjust="spacing" xml:space="preserve" style="white-space:pre"><tspan fill="#656d76">(initialize, then observe.why, which returned evidence 61120a4fb93c...)</tspan></text>
 <text x="24.0" y="113" textLength="265.2" lengthAdjust="spacing" xml:space="preserve" style="white-space:pre"><tspan fill="#656d76">client -&gt; server, the line as sent</tspan></text>
 <text x="24.0" y="131" textLength="904.8" lengthAdjust="spacing" xml:space="preserve" style="white-space:pre">{&quot;jsonrpc&quot;: &quot;2.0&quot;, &quot;id&quot;: 3, &quot;method&quot;: &quot;tools/call&quot;, &quot;params&quot;: {&quot;name&quot;: &quot;propose.key&quot;, &quot;arguments&quot;: {&quot;spec&quot;: {&quot;kind&quot;:</text>
-<text x="55.2" y="149" textLength="912.6" lengthAdjust="spacing" xml:space="preserve" style="white-space:pre">&quot;exact&quot;, &quot;columns&quot;: [&quot;entity_id&quot;]}, &quot;evidence&quot;: [&quot;2bdebe23731f37390bae1f0190746c20d259dc1608428baaac10756282edfe88&quot;],</text>
+<text x="55.2" y="149" textLength="912.6" lengthAdjust="spacing" xml:space="preserve" style="white-space:pre">&quot;exact&quot;, &quot;columns&quot;: [&quot;entity_id&quot;]}, &quot;evidence&quot;: [&quot;61120a4fb93c7389f4244eeb50cdc99d78605dde07913d42c40757b53e2b3619&quot;],</text>
 <text x="55.2" y="167" textLength="296.4" lengthAdjust="spacing" xml:space="preserve" style="white-space:pre">&quot;by&quot;: &quot;coding-agent&quot;, &quot;score&quot;: 0.99}}}</text>
 <text x="24.0" y="185" textLength="507.0" lengthAdjust="spacing" xml:space="preserve" style="white-space:pre"><tspan fill="#656d76">server -&gt; client, pretty-printed; the session budget block elided</tspan></text>
 <text x="24.0" y="203" textLength="7.8" lengthAdjust="spacing" xml:space="preserve" style="white-space:pre">{</text>
@@ -54,5 +54,5 @@
 <line x1="24" y1="822" x2="976" y2="822" stroke="#d0d7de"/>
 <text x="24" y="844" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" font-style="italic" fill="#656d76">A JSON-RPC session with bellwether mcp over stdio on the bench ledger corpus (bench generate --seed 42: 16 files, 64 row groups, 128,000 rows; bench</text>
 <text x="24" y="861" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" font-style="italic" fill="#656d76">workload: 12 recorded runs): observe.why, then propose.key with a score smuggled in; the request as sent, the reply pretty-printed with its session</text>
-<text x="24" y="878" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" font-style="italic" fill="#656d76">budget block elided, nothing else edited; debug build of d39d283, 2026-10-26.</text>
+<text x="24" y="878" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" font-style="italic" fill="#656d76">budget block elided, nothing else edited; debug build of 3b35ce7, 2026-10-26.</text>
 </svg>

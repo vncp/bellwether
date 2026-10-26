@@ -1,5 +1,5 @@
 #! title: bellwether why
-#! caption: bellwether why on the bench ledger corpus (bench generate --seed 42: 16 files, 64 row groups, 128,000 rows; bench workload: 12 recorded runs), nothing indexed; debug build of d39d283, 2026-10-26.
+#! caption: bellwether why on the bench ledger corpus (bench generate --seed 42: 16 files, 64 row groups, 128,000 rows; bench workload: 12 recorded runs), nothing indexed; debug build of 3b35ce7, 2026-10-26.
 $ bellwether why ledger/data --bench-workload ledger
 [1mwhy /private/tmp/bellwether-readme/ledger/data: not indexed[0m
 funnel: 12 runs, keys p50/p95/max 20/400/400; exact sums of row-group statistics, summed over runs
@@ -11,20 +11,20 @@ funnel: 12 runs, keys p50/p95/max 20/400/400; exact sums of row-group statistics
 
 culprit (entity_id): no key index serves this lookup; the files' own min/max statistics already narrow it to 444 of the 768 row groups the runs span; one value touches 1 / 2 / 4 files and 4 / 8 / 16 row groups (p50 / p95 / max)
 recommended: exact:entity_id reads 130,336,047 bytes (130.3 MB) instead of 133,956,413 (134.0 MB) with min/max pruning
-  apply it: bellwether fix /private/tmp/bellwether-readme/ledger/data --proposal 954c3319b8274ffa02a12fe7e12668d46e73a52b89a7500d4cb7217550bc68a4 --workload 3a1921721b730b1ea76a1933a0cb7cccae1f2d7f1cd90a2ebfd34228807cb842
+  apply it: bellwether fix /private/tmp/bellwether-readme/ledger/data --proposal 77b0d2f3f7cf2ceea87655d41b388ec7a98ebb513a5d6a744dc4e733c09d92f2 --workload 3a1921721b730b1ea76a1933a0cb7cccae1f2d7f1cd90a2ebfd34228807cb842
 
 fanout: files and row groups one value touches, p50 / p95 / max
-  key                                      distinct  files/value            row groups/value       sample
-  entity_id                                   6,855  1 / 2 / 4              4 / 8 / 16             exact
-  batch_id                                      288  4 / 4 / 4              4 / 4 / 4              exact
-  status                                          5  16 / 16 / 16           64 / 64 / 64           exact
-  payload                                   128,000  1 / 1 / 1              1 / 1 / 1              exact
-  entity_id, batch_id                       128,000  1 / 1 / 1              1 / 1 / 1              exact
-  entity_id, payload                        128,000  1 / 1 / 1              1 / 1 / 1              exact
-  batch_id, payload                         128,000  1 / 1 / 1              1 / 1 / 1              exact
-  status, payload                           128,000  1 / 1 / 1              1 / 1 / 1              exact
-  entity_id, status                          24,057  1 / 2 / 4              3 / 7 / 16             exact
-  batch_id, status                            1,438  4 / 4 / 4              4 / 4 / 4              exact
+  key                                      distinct  files/value            row groups/value       sample   
+  entity_id                                   6,855  1 / 2 / 4              4 / 8 / 16             exact    
+  batch_id                                      288  4 / 4 / 4              4 / 4 / 4              exact    
+  status                                          5  16 / 16 / 16           64 / 64 / 64           exact    
+  payload                                   128,000  1 / 1 / 1              1 / 1 / 1              exact    
+  entity_id, batch_id                       128,000  1 / 1 / 1              1 / 1 / 1              exact    
+  entity_id, payload                        128,000  1 / 1 / 1              1 / 1 / 1              exact    
+  batch_id, payload                         128,000  1 / 1 / 1              1 / 1 / 1              exact    
+  status, payload                           128,000  1 / 1 / 1              1 / 1 / 1              exact    
+  entity_id, status                          24,057  1 / 2 / 4              3 / 7 / 16             exact    
+  batch_id, status                            1,438  4 / 4 / 4              4 / 4 / 4              exact    
   not candidates:
     version_ts: Timestamp(µs, "UTC"): a time column, analyzed for range overlap
     amount: Decimal128(18, 2): not an identifier type
@@ -37,7 +37,9 @@ lints
   scattered_time_column [version_ts] 0.60
     version_ts is out of order: a point in time falls inside 27.8 row-group ranges on average, and only 25% of consecutive row groups in a file ascend without overlapping, so range pruning on version_ts reads far more than it needs; sort or cluster each partition by version_ts when writing.
 
+data read: 16 files, 128 row groups; footers of 16 files
+
 records
-  evidence  3176a4bb58e3ca31ef79f1a717d7910a4b8845ea80ef73e2453c376ee1e87a83
+  evidence  dde3cf0bf64b5bba774789d789ddff865a06905202c13dc0feab7f85aa50ada4
   workload  3a1921721b730b1ea76a1933a0cb7cccae1f2d7f1cd90a2ebfd34228807cb842
-  proposal  954c3319b8274ffa02a12fe7e12668d46e73a52b89a7500d4cb7217550bc68a4  replay 280efc9cb578  exact:entity_id
+  proposal  77b0d2f3f7cf2ceea87655d41b388ec7a98ebb513a5d6a744dc4e733c09d92f2  replay 96f55cd2c630  exact:entity_id
