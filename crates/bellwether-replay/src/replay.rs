@@ -70,9 +70,9 @@
 //! [`TransientCache`]'s byte cap).
 
 use std::borrow::Cow;
-use std::collections::BTreeMap;
 use std::ops::Deref;
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 use arrow::datatypes::{Schema, SchemaRef};
 use bellwether_build::Planner;
@@ -85,7 +85,7 @@ use bellwether_types::{
     Error, Hash, KeySpec, ProposalBody, Record, Replay, Result, RunCost, ScanPlan, Source, Store,
 };
 
-use crate::baseline::{column_filters, Baseline, BaselinePlanner, ColumnFilters};
+use crate::baseline::{unserved_selection, Baseline, BaselinePlanner};
 use crate::catalog::Catalog;
 use crate::error::{ReplayError, ReplayResult};
 use crate::keys::RunKeys;
@@ -123,9 +123,9 @@ pub struct Replayer<'a> {
     limits: TransientLimits,
     cache: TransientCache,
     unserved: Baseline,
-    /// Embedded bloom filters read for [`Baseline::ParquetStats`], by
-    /// column, read once per replayer.
-    filters: Mutex<BTreeMap<String, Arc<ColumnFilters>>>,
+    /// Embedded bloom filters read pricing unserved runs, for
+    /// [`Replayer::bloom_filters_read`].
+    filters_read: AtomicU64,
 }
 
 impl std::fmt::Debug for Replayer<'_> {
@@ -173,7 +173,7 @@ impl<'a> Replayer<'a> {
             limits: TransientLimits::default(),
             cache: TransientCache::new(DEFAULT_CACHE_BYTES),
             unserved: Baseline::RawScan,
-            filters: Mutex::new(BTreeMap::new()),
+            filters_read: AtomicU64::new(0),
         })
     }
 
@@ -248,14 +248,14 @@ impl<'a> Replayer<'a> {
     #[must_use]
     pub fn with_fingerprint_policy(mut self, policy: FingerprintPolicy) -> Self {
         self.policy = policy;
-        self.filters = Mutex::new(BTreeMap::new());
         self
     }
 
     /// Sets the baseline a run that no spec of a configuration serves is
     /// priced under (module docs); [`Baseline::RawScan`] by default.
-    /// [`Baseline::ParquetStats`] reads the files' embedded bloom filters on
-    /// the run columns the first time it prices such a run.
+    /// [`Baseline::ParquetStats`] reads a row group's embedded bloom filters
+    /// only when its footer min/max keeps it, one file at a time, and drops
+    /// them after the run (ADR 018).
     #[must_use]
     pub fn with_unserved(mut self, baseline: Baseline) -> Self {
         self.unserved = baseline;
@@ -268,25 +268,12 @@ impl<'a> Replayer<'a> {
         self.unserved
     }
 
-    /// The [`Baseline::ParquetStats`] planner for keys on `columns`, its
-    /// filters read once per replayer.
-    fn stats_planner(&self, columns: &[String]) -> ReplayResult<BaselinePlanner<'_>> {
-        let mut cache = self
-            .filters
-            .lock()
-            .map_err(|_| Error::Other("baseline filter cache lock poisoned".into()))?;
-        let mut filters = BTreeMap::new();
-        for column in columns {
-            let f = if let Some(f) = cache.get(column) {
-                Arc::clone(f)
-            } else {
-                let f = Arc::new(column_filters(&self.catalog, column, self.policy)?);
-                cache.insert(column.clone(), Arc::clone(&f));
-                f
-            };
-            filters.insert(column.clone(), f);
-        }
-        Ok(BaselinePlanner::parquet_stats_with(&self.catalog, filters))
+    /// How many embedded bloom filters pricing unserved runs has read so
+    /// far: never more than the row groups the footer min/max kept times
+    /// the run's key columns (ADR 018).
+    #[must_use]
+    pub fn bloom_filters_read(&self) -> u64 {
+        self.filters_read.load(Ordering::Relaxed)
     }
 
     /// The manifest sequence every replay is pinned to, as a string.
@@ -396,9 +383,9 @@ impl<'a> Replayer<'a> {
         let (Some(window), Baseline::ParquetStats) = (unserved, self.unserved) else {
             return Ok((plan, false));
         };
-        let kept = self
-            .stats_planner(keys.columns())?
-            .select(keys, window.as_ref())?;
+        let (kept, filters) =
+            unserved_selection(&self.catalog, keys, window.as_ref(), self.policy)?;
+        self.filters_read.fetch_add(filters, Ordering::Relaxed);
         let read = if plan.row_groups_selected == plan.row_groups_total {
             kept
         } else {
@@ -540,7 +527,7 @@ impl<'a> Replayer<'a> {
                     .collect();
                 columns.sort();
                 columns.dedup();
-                self.stats_planner(&columns)?
+                BaselinePlanner::parquet_stats(&self.catalog, &columns, self.policy)?
             }
         };
         workload

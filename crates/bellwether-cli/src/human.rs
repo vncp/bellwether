@@ -483,7 +483,7 @@ pub(crate) fn why(r: &bellwether::WhyReport, out: &Out, fix_command: &str) -> St
         row_groups: r.dataset.row_groups,
         bytes: r.dataset.bytes,
     };
-    let rows = format!("{} rows", num(r.dataset.rows));
+    let rows = count(r.dataset.rows, "row", "rows");
     let kind_label = r.workload.as_ref().and_then(|w| {
         let kind = match &w.lookup {
             Some(LookupKind::Latest) => "latest".to_string(),
@@ -520,19 +520,21 @@ pub(crate) fn why(r: &bellwether::WhyReport, out: &Out, fix_command: &str) -> St
         let w_col = label_width(labels.iter().map(String::as_str), MIN_FUNNEL_LABEL);
         funnel_header(&mut s, w_col);
         funnel_row(&mut s, w_col, "dataset", &dataset, &rows);
-        // Without an index, over Parquet files, the current cost is what the
-        // files' own statistics leave (the Replays' `unserved`); the full
-        // scan is context above it.
-        let current_name = match (r.current_specs.is_empty(), r.full_scan) {
-            (true, Some(_)) => "unindexed (min/max pruning)",
-            (true, None) => "current (no index)",
-            (false, _) => "current",
+        // Over Parquet files with statistics, a run no current key serves is
+        // priced as the files' own min/max statistics read it (the Replays'
+        // `unserved`); without an index the full scan is context above it.
+        let by_stats = r.unserved.is_some();
+        let current_name = match (r.current_specs.is_empty(), by_stats) {
+            (true, true) => "current: no index (min/max pruning)",
+            (true, false) => "current (no index)",
+            (false, true) => "current (min/max where no key serves)",
+            (false, false) => "current",
         };
         if let Some(f) = &r.full_scan {
             funnel_row(
                 &mut s,
                 w_col,
-                "unindexed (full scan)",
+                "full scan",
                 f,
                 "context: what a reader that skips nothing reads",
             );
@@ -544,10 +546,16 @@ pub(crate) fn why(r: &bellwether::WhyReport, out: &Out, fix_command: &str) -> St
                 num(loc.bytes),
                 size(loc.bytes)
             ),
-            (_, None) if r.full_scan.is_some() => {
+            (_, None) if by_stats && r.current_specs.is_empty() => {
                 "what the files' own footer statistics skip to without an index; a key must \
                  read less"
                     .to_string()
+            }
+            (_, None) if by_stats => "lookups no current key serves read what the files' own \
+                                      footer statistics skip to"
+                .to_string(),
+            (_, None) if r.no_statistics => {
+                "the files carry no min/max statistics on the lookup columns".to_string()
             }
             _ => String::new(),
         };
@@ -624,10 +632,16 @@ pub(crate) fn why(r: &bellwether::WhyReport, out: &Out, fix_command: &str) -> St
             } => format!("lint {rule} (confidence {confidence:.2})"),
             CulpritReason::NoIndexServes => {
                 let span = r.dataset.row_groups * r.workload.as_ref().map_or(1, |w| w.runs);
-                match (r.full_scan, r.current) {
-                    (Some(_), Some(m)) if m.row_groups < span => format!(
-                        "no key index serves this lookup; the files' own min/max statistics \
+                let has_window = r.workload.as_ref().is_some_and(|w| !w.windows.is_empty());
+                match (r.unserved.is_some(), r.current) {
+                    (true, Some(m)) if m.row_groups < span => format!(
+                        "no key index serves this lookup; the files' own min/max statistics{} \
                          already narrow it to {} of the {} the runs span{}",
+                        if has_window {
+                            " and the time window"
+                        } else {
+                            ""
+                        },
                         num(m.row_groups),
                         count(span, "row group", "row groups"),
                         if r.recommended.is_none() {
@@ -637,15 +651,19 @@ pub(crate) fn why(r: &bellwether::WhyReport, out: &Out, fix_command: &str) -> St
                             ""
                         }
                     ),
-                    (Some(_), _) => "no index serves this lookup, and the files' min/max \
-                                     statistics skip nothing, so it reads every row group"
+                    (true, _) => "no index serves this lookup, and the files' min/max \
+                                  statistics skip nothing, so it reads every row group"
                         .to_string(),
-                    (None, Some(cur)) if cur.row_groups < r.dataset.row_groups => format!(
+                    (false, Some(cur)) if has_window && cur.row_groups < span => format!(
                         "no key index serves this lookup; only the time window narrows it, to {} \
                          of {}",
                         num(cur.row_groups),
-                        count(r.dataset.row_groups, "row group", "row groups")
+                        count(span, "row group", "row groups")
                     ),
+                    _ if r.no_statistics => "no index serves this lookup, and the files carry \
+                                             no min/max statistics on its columns, so it reads \
+                                             every row group"
+                        .to_string(),
                     _ => "no index serves this lookup, so it reads every row group".to_string(),
                 }
             }
@@ -706,7 +724,7 @@ pub(crate) fn why(r: &bellwether::WhyReport, out: &Out, fix_command: &str) -> St
         let for_kind = kind_label
             .as_ref()
             .map_or_else(String::new, |k| format!(" (for {k})"));
-        let baseline = if r.full_scan.is_some() {
+        let baseline = if r.unserved.is_some() {
             " with min/max pruning"
         } else {
             ""
@@ -743,6 +761,14 @@ pub(crate) fn why(r: &bellwether::WhyReport, out: &Out, fix_command: &str) -> St
                     s,
                     "recommended{for_kind}: none; no candidate reads fewer bytes than the files' \
                      own min/max statistics already read without an index"
+                );
+            }
+            None if r.unserved.is_some() => {
+                let _ = writeln!(
+                    s,
+                    "recommended{for_kind}: none; no candidate reads fewer bytes than the current \
+                     configuration, where the files' own min/max statistics price the lookups no \
+                     current key serves"
                 );
             }
             None => {

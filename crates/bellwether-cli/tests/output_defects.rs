@@ -115,8 +115,11 @@ fn on_sorted_files_why_and_fix_measure_a_key_against_min_max_pruning() {
 
     let human = run(&["why", path(&data), "--from", path(&kf)], 0);
     assert!(human.contains("funnel: 1 run,"), "{human}");
-    assert!(human.contains("unindexed (full scan)"), "{human}");
-    assert!(human.contains("unindexed (min/max pruning)"), "{human}");
+    assert!(human.contains("  full scan "), "{human}");
+    assert!(
+        human.contains("current: no index (min/max pruning)"),
+        "{human}"
+    );
     assert!(!human.contains("current (no index)"), "{human}");
     assert!(
         human.contains(
@@ -178,6 +181,63 @@ fn on_sorted_files_why_and_fix_measure_a_key_against_min_max_pruning() {
         "{human}"
     );
     assert!(human.contains("--allow-no-gain"), "{human}");
+
+    // A verify-only run is not gated; applying its certificate re-scores
+    // with the same min/max pricing and refuses the same way.
+    let verified: FixResult = typed(&fix(&["--json", "--verify-only"], 0));
+    let cert = verified.certificate.expect("verified").hash.to_hex();
+    let applied: FixResult = typed(&run(
+        &["--json", "fix", path(&data), "--certificate", &cert],
+        3,
+    ));
+    let Some(Score::Replayed {
+        current: rescored, ..
+    }) = &applied.score
+    else {
+        panic!("{:?}", applied.score)
+    };
+    assert_eq!(*rescored, current, "the rescore prices as why did");
+    assert!(
+        matches!(
+            applied.outcome,
+            FixOutcome::Refused {
+                refusal: Refusal::NothingToGain { .. }
+            }
+        ),
+        "{:?}",
+        applied.outcome
+    );
+}
+
+/// Item 1 (r1): over an index whose key serves none of the runs, the
+/// current cost is the files' own min/max pricing of those runs: the funnel
+/// labels it so and the culprit names min/max as what narrows the lookup,
+/// never a time window the request does not have.
+#[test]
+fn over_an_index_that_serves_nothing_the_funnel_names_min_max_pruning() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    corpus(&data, 1, 8, 50, 1_000_000);
+    run(&["index", path(&data), "--key", "exact:batch"], 0);
+    let kf = dir.path().join("k.parquet");
+    keys(&kf, "id", &[5, 7, 120]);
+    let why: WhyReport = typed(&run(
+        &["--json", "why", path(&data), "--from", path(&kf)],
+        0,
+    ));
+    assert_eq!(why.unserved.as_deref(), Some("parquet_stats"));
+    assert!(why.full_scan.is_none(), "an index exists");
+    assert_eq!(why.current.unwrap().row_groups, 2);
+    let human = run(&["why", path(&data), "--from", path(&kf)], 0);
+    assert!(
+        human.contains("current (min/max where no key serves)"),
+        "{human}"
+    );
+    assert!(
+        human.contains("min/max statistics already narrow it to 2 of the 8 row groups"),
+        "{human}"
+    );
+    assert!(!human.contains("time window"), "{human}");
 }
 
 /// Item 4, the other side: where min/max pruning keeps row groups the key
@@ -361,16 +421,63 @@ fn a_csv_schema_time_zone_gets_the_same_answer_from_why_and_index() {
         &[&base[..], &["index", path(&data), "--key", "exact:id"]].concat(),
         0,
     );
-    let ts = bellwether::schema_from_json(
-        r#"[{"name": "ts", "type": "Timestamp(Microsecond, Some(\"UTC\"))"}]"#,
+    // Over Parquet the schema keeps "UTC" as written: an index built with it
+    // is not rewritten by the next `index` (no empty commit).
+    let pq = dir.path().join("pq");
+    std::fs::create_dir_all(&pq).unwrap();
+    let ts_schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new(
+            "ts",
+            DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, Some("UTC".into())),
+            false,
+        ),
+    ]));
+    let batch = RecordBatch::try_new(
+        Arc::clone(&ts_schema),
+        vec![
+            Arc::new(Int64Array::from(vec![1, 2, 3])) as ArrayRef,
+            Arc::new(
+                arrow::array::TimestampMicrosecondArray::from(vec![1, 2, 3]).with_timezone("UTC"),
+            ),
+        ],
     )
     .unwrap();
-    assert_eq!(
-        ts.field(0).data_type(),
-        &DataType::Timestamp(
-            arrow::datatypes::TimeUnit::Microsecond,
-            Some("+00:00".into())
+    let mut w = ArrowWriter::try_new(
+        File::create(pq.join("a.parquet")).unwrap(),
+        Arc::clone(&ts_schema),
+        None,
+    )
+    .unwrap();
+    w.write(&batch).unwrap();
+    w.close().unwrap();
+    let pq_schema = dir.path().join("schema-pq.json");
+    std::fs::write(
+        &pq_schema,
+        r#"[{"name": "id", "type": "Int64", "nullable": false},
+            {"name": "ts", "type": "Timestamp(Microsecond, Some(\"UTC\"))", "nullable": false}]"#,
+    )
+    .unwrap();
+    let index = |code| {
+        run(
+            &[
+                "--schema",
+                path(&pq_schema),
+                "index",
+                path(&pq),
+                "--key",
+                "exact:id",
+            ],
+            code,
         )
+    };
+    index(0);
+    let manifest = std::fs::read(pq.join(".bellwether").join("manifest.json")).unwrap();
+    let again = index(0);
+    assert_eq!(
+        std::fs::read(pq.join(".bellwether").join("manifest.json")).unwrap(),
+        manifest,
+        "no commit: {again}"
     );
 
     let zone = "America/New_York";

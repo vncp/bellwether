@@ -211,6 +211,15 @@ fn keys_of(column: &str, vs: &[i64]) -> RecordBatch {
         "k_str" => Arc::new(StringArray::from(
             vs.iter().map(|v| str_of(*v)).collect::<Vec<_>>(),
         )),
+        "k_d256" => Arc::new(
+            Decimal256Array::from(
+                vs.iter()
+                    .map(|v| i256::from_i128(i128::from(*v)))
+                    .collect::<Vec<_>>(),
+            )
+            .with_precision_and_scale(40, 2)
+            .unwrap(),
+        ),
         other => panic!("{other}"),
     };
     RecordBatch::try_from_iter(vec![(column, arr)]).unwrap()
@@ -434,4 +443,56 @@ fn a_filter_the_baseline_cannot_probe_is_refused() {
         matches!(&err, ReplayError::UnprobeableFilter { column, why, .. } if column == "k_d256" && why.contains("Decimal256")),
         "{err}"
     );
+}
+
+/// The run of `vs` on `column`, priced as an unserved run under
+/// `Baseline::ParquetStats` (no current spec serves it), and the replayer.
+fn unserved_cost(data: &str, column: &str, vs: &[i64]) -> (bellwether_types::RunCost, u64) {
+    let source = ParquetSource::new().with_schema(schema());
+    let replayer = Replayer::unindexed(&source, data, &bellwether_source::Partitioning::None)
+        .unwrap()
+        .with_unserved(bellwether_replay::Baseline::ParquetStats);
+    let keys = MemoryKeySets::new();
+    let mut rec = WorkloadRecorder::new(&keys, schema());
+    rec.record("run", KeyInput::Batch(&keys_of(column, vs)))
+        .unwrap();
+    let workload = rec.finish().unwrap();
+    let cost = replayer.replay_current(&workload, &keys).unwrap().remove(0);
+    (cost, replayer.bloom_filters_read())
+}
+
+/// Pricing a run no key serves never refuses a filter it cannot probe: it
+/// treats the filter as absent and keeps the row group (sound), so `why`
+/// works on any folder the bench baseline refuses.
+#[test]
+fn an_unserved_run_keeps_row_groups_whose_filter_cannot_be_probed() {
+    let (_dir, data) = write();
+    let (cost, _) = unserved_cost(&data, "k_d256", &[5, 77]);
+    let source = ParquetSource::new().with_schema(schema());
+    let all = Replayer::unindexed(&source, &data, &bellwether_source::Partitioning::None)
+        .unwrap()
+        .catalog()
+        .len() as u64;
+    // Shuffled values: every row group's min/max spans them, and the
+    // unprobeable filter prunes nothing.
+    assert_eq!(cost.row_groups, all);
+}
+
+/// ADR 018: a run reads the embedded filters of the row groups whose
+/// footer min/max keeps it, and no others. Keys outside every row group's
+/// range read no filter at all; keys inside read at most one per row group.
+#[test]
+fn an_unserved_run_reads_filters_only_where_min_max_keeps_the_row_group() {
+    let (_dir, data) = write();
+    let source = ParquetSource::new().with_schema(schema());
+    let all = Replayer::unindexed(&source, &data, &bellwether_source::Partitioning::None)
+        .unwrap()
+        .catalog()
+        .len() as u64;
+    // 0 and 700 lie outside 1..=600, every row group's range.
+    let (outside, read) = unserved_cost(&data, "k_f64", &[0, 700]);
+    assert_eq!((outside.row_groups, read), (0, 0));
+    let (inside, read) = unserved_cost(&data, "k_f64", &[5, 77, 300]);
+    assert!(read <= all, "{read} filters for {all} row groups");
+    assert!(read > 0 && inside.row_groups < all, "the filters prune");
 }

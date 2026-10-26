@@ -452,6 +452,18 @@ pub struct WhyReport {
     /// measured against it. Absent (`None`, omitted in JSON) otherwise.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub full_scan: Option<Cost>,
+    /// With a workload over Parquet files whose footers carry min/max
+    /// statistics on some key column of the runs: `"parquet_stats"`, the
+    /// pricing of runs no current key serves (the Replays' `unserved`), so
+    /// `current` is what a reader skips to by those statistics. Absent
+    /// (`None`, omitted in JSON) otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unserved: Option<String>,
+    /// With a workload over Parquet files whose footers carry no min/max
+    /// statistics on any key column of the runs: nothing but an index can
+    /// skip a row group for them. Omitted in JSON when false.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub no_statistics: bool,
     /// Candidates replayed: the floor key(s) on each run's key columns, then
     /// the profile's measured candidates that serve a run in the profile's
     /// rank order, minus specs already current.
@@ -593,6 +605,8 @@ impl Engine {
             current: None,
             current_locate: None,
             full_scan: None,
+            unserved: None,
+            no_statistics: false,
             candidates: Vec::new(),
             not_serving: Vec::new(),
             recommended: None,
@@ -1228,14 +1242,36 @@ impl Engine {
                 &RunQuery::Locate,
             )?));
         }
-        // Without an index, over Parquet files, `current` is what the files'
-        // own statistics leave; the full scan is context beside it.
-        if replayer.current_specs().is_empty() && replayer.unserved() == Baseline::ParquetStats {
-            report.full_scan = Some(total(
-                &replayer
-                    .replay_baseline(Baseline::RawScan, workload, cache)
-                    .map_err(Error::from)?,
-            ));
+        // Over Parquet files a run no key serves is priced as the files' own
+        // statistics read it; say so only where they carry some on the
+        // workload's key columns, else name their absence. Without an
+        // index, the full scan is context beside it.
+        if replayer.unserved() == Baseline::ParquetStats {
+            let columns: BTreeSet<&str> = workload
+                .runs()
+                .iter()
+                .flat_map(|r| r.columns.iter().map(String::as_str))
+                .collect();
+            let carries = |column: &str| {
+                replayer.catalog().row_groups().iter().any(|rg| {
+                    rg.meta
+                        .stats
+                        .iter()
+                        .any(|s| s.column == column && s.min.is_some() && s.max.is_some())
+                })
+            };
+            if columns.iter().any(|c| carries(c)) {
+                report.unserved = Some(Baseline::ParquetStats.name().to_string());
+                if replayer.current_specs().is_empty() {
+                    report.full_scan = Some(total(
+                        &replayer
+                            .replay_baseline(Baseline::RawScan, workload, cache)
+                            .map_err(Error::from)?,
+                    ));
+                }
+            } else {
+                report.no_statistics = true;
+            }
         }
         report.recommended = report
             .candidates

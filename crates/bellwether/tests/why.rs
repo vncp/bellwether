@@ -359,6 +359,35 @@ fn a_key_serving_some_runs_is_recommended_on_the_replay_it_cites() {
     );
 }
 
+/// A window run that no key serves is priced as the files' own statistics
+/// read it, the window included: a row group whose `ts` range lies wholly
+/// outside the window is skipped even though its id range spans every key.
+#[test]
+fn an_unserved_window_run_skips_row_groups_outside_the_window() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    // Rows 0..300, 25 per row group; ts = k seconds (µs), ids scattered so
+    // min/max on id keeps every row group.
+    scattered_corpus(&data, 3, 4, 25, 1_000);
+    // ids of rows 10 and 110: row groups 0 and 4.
+    let kf = dir.path().join("k.parquet");
+    write_keys(&kf, "id", &[370, 70]);
+    let r = open(&data)
+        .why(&WhyRequest {
+            keys: Some(KeyFile::new(&kf)),
+            window: Some(bellwether::TimeWindow {
+                from: "0".into(),
+                to: "24000000".into(),
+            }),
+            ts_column: Some("ts".into()),
+            max_candidates: 0,
+            ..WhyRequest::default()
+        })
+        .unwrap();
+    // Only row group 0 holds ts in [0, 24 s]; min/max on id alone keeps 12.
+    assert_eq!(r.current.unwrap().row_groups, 1, "{:?}", r.current);
+}
+
 #[test]
 fn a_candidate_that_saves_nothing_is_not_recommended() {
     let dir = tempfile::tempdir().unwrap();

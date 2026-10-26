@@ -208,6 +208,12 @@ fn short(h: &Hash) -> String {
     h.to_hex()[..12].to_string()
 }
 
+/// `n` with its noun in the singular or the plural, `n` grouped by
+/// thousands.
+fn count(n: u64, one: &str, many: &str) -> String {
+    format!("{} {}", num(n), if n == 1 { one } else { many })
+}
+
 fn num(n: u64) -> String {
     let s = n.to_string();
     let mut out = String::new();
@@ -305,9 +311,9 @@ fn render_receipt(h: &mut String, r: &ReceiptView) {
     if let Some(c) = &r.certificate {
         let coverage = match &c.coverage {
             Coverage::Full => "full".to_string(),
-            Coverage::Workload { keys, .. } => format!("workload, {} keys", num(*keys)),
+            Coverage::Workload { keys, .. } => format!("workload, {}", count(*keys, "key", "keys")),
             Coverage::Sampled { keys, fraction } => {
-                format!("sampled, {} keys ({fraction})", num(*keys))
+                format!("sampled, {} ({fraction})", count(*keys, "key", "keys"))
             }
             Coverage::StaticProof { identity } => format!("static proof {identity}"),
         };
@@ -339,10 +345,10 @@ fn render_receipt(h: &mut String, r: &ReceiptView) {
     let fix = total(&replay.proposed);
     let _ = write!(
         h,
-        "<p class=\"muted\">Replay <code>{}</code> over workload <code>{}</code>, {} runs.</p>",
+        "<p class=\"muted\">Replay <code>{}</code> over workload <code>{}</code>, {}.</p>",
         short(&r.receipt.replay),
         short(&replay.workload),
-        replay.current.len()
+        count(replay.current.len() as u64, "run", "runs")
     );
     funnel_svg(h, now, fix);
     let _ = write!(
@@ -475,7 +481,7 @@ fn render_evidence(h: &mut String, hash: &Hash, e: &Evidence) {
     };
     let _ = write!(
         h,
-        "<h3><code>{}</code> {}</h3><p class=\"muted\">{}, manifest {}, {} lints{}</p>",
+        "<h3><code>{}</code> {}</h3><p class=\"muted\">{}, manifest {}, {}{}</p>",
         short(hash),
         esc(root),
         esc(&e.provenance.created_at),
@@ -484,7 +490,7 @@ fn render_evidence(h: &mut String, hash: &Hash, e: &Evidence) {
             .manifest_version
             .as_deref()
             .unwrap_or("none (not indexed)")),
-        lints.len(),
+        count(lints.len() as u64, "lint", "lints"),
         workload_keys.map_or_else(String::new, |k| format!(
             ", workload keys p50/p95/max {}/{}/{}",
             num(k[0]),

@@ -182,7 +182,7 @@ Configurations:
 
 A value the file column cannot hold fails the probe. A run column whose filter has none of these shapes is refused with `ReplayError::UnprobeableFilter`: `BOOLEAN`, `INT96`, a decimal stored as `BYTE_ARRAY`, or a `Decimal256` dataset column. The baseline is never silently weaker than `docs/benchmark.md` defines it.
 
-The baseline reads its filters once, after verifying each file's fingerprint on the opened handle, and **holds every embedded filter of every run column of every file** for its lifetime. A replayer pricing unserved runs under `ParquetStats` reads each column's filters the first time it needs them and holds them for its own lifetime.
+The baseline reads its filters once, after verifying each file's fingerprint on the opened handle, and **holds every embedded filter of every run column of every file** for its lifetime. A replayer pricing unserved runs under `ParquetStats` reads a row group's filters only when its footer min/max (and the window) keeps it, one file at a time, and drops them after the run (ADR 018; `Replayer::bloom_filters_read` counts them). A filter it cannot probe exactly is treated as absent there, which keeps the row group; only the bench baseline refuses it.
 
 ## The Replay record
 

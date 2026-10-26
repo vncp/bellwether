@@ -329,6 +329,11 @@ fn replay_link(hash: Hash, r: &Replay) -> Link {
         // A modelled number must never read like a measured one.
         facts.push(("model", m.clone()));
     }
+    if let Some(u) = &r.unserved {
+        // Lookups no key serves were priced by the files' own statistics,
+        // not as a full scan.
+        facts.push(("unserved", u.clone()));
+    }
     Link::new(hash, RecordKind::Replay, &r.created_at, facts)
 }
 

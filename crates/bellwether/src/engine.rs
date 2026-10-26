@@ -823,6 +823,9 @@ impl Engine {
                 Box::new(s)
             }
             Some(text) => {
+                // The text decoders take offset zones only: a supplied
+                // "UTC" is read as "+00:00", the same instants.
+                let schema = schema.map(|s| utc_as_offset(&s));
                 let mut s = ChunkedTextSource::new(text).with_fingerprint_policy(policy);
                 for dir in self.excluded() {
                     s = s.with_excluded(dir);
@@ -1122,7 +1125,12 @@ impl Engine {
     pub(crate) fn build_options(&self, sidecars: Vec<SidecarDef>) -> BuildOptions {
         let mut options = BuildOptions::new(self.format().kind());
         options.chunk_size = self.options.chunk_size;
-        options.schema.clone_from(&self.options.schema);
+        // A text index records the schema its decoders read ("UTC" as
+        // "+00:00"); a Parquet index records it as given.
+        options.schema = match self.format().text() {
+            Some(_) => self.options.schema.as_ref().map(utc_as_offset),
+            None => self.options.schema.clone(),
+        };
         options.fingerprint_policy = self.options.fingerprint_policy;
         options.partitioning.clone_from(&self.options.partitioning);
         options.sidecars = sidecars;
@@ -1226,10 +1234,11 @@ fn nullable_default() -> bool {
 /// of `{"name": ..., "type": ..., "nullable": ...}` objects in column order,
 /// each `type` spelled as Arrow prints it and as the manifest records it
 /// (`"Int64"`, `"Decimal128(12, 4)"`, `"Timestamp(Microsecond, Some(\"UTC\"))"`).
-/// `nullable` defaults to true. A timestamp in the named zone `"UTC"` is
-/// loaded as the offset `"+00:00"`, the same instants: the CSV and JSON
-/// lines decoders take only offset zones. Another named zone is refused by
-/// those sources when they open the folder (`why` and `index` alike).
+/// `nullable` defaults to true. The types are kept as written; over CSV
+/// and JSON lines a timestamp in the named zone `"UTC"` is read as the
+/// offset `"+00:00"` (the same instants), because their decoders take only
+/// offset zones, and another named zone is refused when those sources open
+/// the folder (`why` and `index` alike). Parquet keeps `"UTC"` as written.
 pub fn schema_from_json(json: &str) -> Result<SchemaRef> {
     use std::str::FromStr;
     let cols: Vec<SchemaColumn> = serde_json::from_str(json).map_err(|e| {
@@ -1254,12 +1263,6 @@ pub fn schema_from_json(json: &str) -> Result<SchemaRef> {
                     c.name, c.data_type
                 ))
             })?;
-            let dt = match dt {
-                arrow::datatypes::DataType::Timestamp(unit, Some(tz)) if &*tz == "UTC" => {
-                    arrow::datatypes::DataType::Timestamp(unit, Some("+00:00".into()))
-                }
-                other => other,
-            };
             Ok(arrow::datatypes::Field::new(c.name, dt, c.nullable))
         })
         .collect::<Result<Vec<_>>>()?;
@@ -1267,6 +1270,33 @@ pub fn schema_from_json(json: &str) -> Result<SchemaRef> {
         return Err(Error::Other("the schema lists no columns".into()));
     }
     Ok(Arc::new(arrow::datatypes::Schema::new(fields)))
+}
+
+/// `schema` with every timestamp in the named zone `"UTC"` given the
+/// offset `"+00:00"` instead (the same instants), for the CSV and JSON
+/// lines decoders, which take offset zones only.
+fn utc_as_offset(schema: &SchemaRef) -> SchemaRef {
+    use arrow::datatypes::{DataType, Field};
+    let utc =
+        |f: &Field| matches!(f.data_type(), DataType::Timestamp(_, Some(tz)) if &**tz == "UTC");
+    if !schema.fields().iter().any(|f| utc(f)) {
+        return SchemaRef::clone(schema);
+    }
+    let fields: Vec<Field> = schema
+        .fields()
+        .iter()
+        .map(|f| match f.data_type() {
+            DataType::Timestamp(unit, Some(tz)) if &**tz == "UTC" => f
+                .as_ref()
+                .clone()
+                .with_data_type(DataType::Timestamp(*unit, Some("+00:00".into()))),
+            _ => f.as_ref().clone(),
+        })
+        .collect();
+    Arc::new(arrow::datatypes::Schema::new_with_metadata(
+        fields,
+        schema.metadata().clone(),
+    ))
 }
 
 /// A value that does not fit the dataset type usually means the dataset

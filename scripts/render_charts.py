@@ -754,9 +754,9 @@ def why_text(res, q):
     saved = 1 - res.v(q, "bellwether-predicted", "bytes") / unindexed
     if res.v(q, "duckdb", "row_groups") <= res.v(q, "duckdb-on-plan", "row_groups"):
         return (
-            f"{pruning_cause(res, q)}, as many as `{key}` plans; `why` compared the key against a full scan "
-            f"({res.v(q, 'bellwether-unindexed', 'row_groups')} row groups), not that min/max baseline, so it recommended "
-            "the key and `fix` attested it"
+            f"{pruning_cause(res, q)}, as many as `{key}` plans; the build measured here compared the key against a full scan "
+            f"({res.v(q, 'bellwether-unindexed', 'row_groups')} row groups), not that min/max pruning, so `why` recommended "
+            "the key and `fix` attested it; `why` now prices min/max pruning and recommends none here"
         )
     return (
         f"the keys sit in {fixed_rg} of {full_rg} row groups; `why` still recommended `{key}`, which saves "

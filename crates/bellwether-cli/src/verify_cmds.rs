@@ -466,10 +466,10 @@ pub(crate) fn tables_human(s: &mut String, tables: &[bellwether::TableRun]) {
         };
         let _ = writeln!(
             s,
-            "  table {}: {} rows in {} units ({}), {held}",
+            "  table {}: {} in {} ({}), {held}",
             t.root,
-            num(t.rows),
-            num(t.units),
+            count(t.rows, "row", "rows"),
+            count(t.units, "unit", "units"),
             t.units_by
         );
     }
@@ -558,12 +558,12 @@ fn fix_human(r: &FixResult, out: &Out, table: bool) -> String {
         }) => {
             let _ = writeln!(
                 s,
-                "  1 score   {:>10} -> {:>10} bytes over the workload ({} -> {} units), {model}: \
+                "  1 score   {:>10} -> {:>10} over the workload ({} -> {}), {model}: \
                  not exact, so replay {} is not recorded",
                 size(current.bytes),
                 size(proposed.bytes),
                 num(current.row_groups),
-                num(proposed.row_groups),
+                count(proposed.row_groups, "unit", "units"),
                 short(&replay.hash)
             );
         }

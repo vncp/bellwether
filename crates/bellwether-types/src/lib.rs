@@ -29,6 +29,9 @@ pub mod format {
     pub const STORAGE_VERSION: u32 = 1;
     /// Version of the ledger record schemas. History: 1 (contract v2);
     /// 2 (contract v2.1, 2026-10-24: `Replay` gains `inputs` and `model`).
+    /// `Replay.unserved` (2026-10-26) is an additive label field under ADR
+    /// 017's 2026-10-26 amendment, not a version bump: an older reader drops
+    /// it without misreading any other field.
     pub const RECORD_VERSION: u32 = 2;
     /// Version of the canonical byte encoding (ADR 016).
     pub const ENCODING_VERSION: u32 = 1;

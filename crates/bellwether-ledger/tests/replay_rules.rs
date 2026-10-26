@@ -67,6 +67,24 @@ fn a_key_proposal_replay_must_not_name_a_model() {
     }
 }
 
+/// `unserved` names how runs no spec serves were priced: only
+/// `"parquet_stats"`, or absent for a raw scan. Any other spelling (blank,
+/// padded, a second name for "absent") is refused.
+#[test]
+fn a_replay_names_its_unserved_pricing_only_as_parquet_stats() {
+    let store = MemStore::default();
+    let ledger = Ledger::new(&store);
+    let p = key_proposal_hash(&ledger);
+    for bad in ["", "   ", "bogus", "raw_scan", " parquet_stats "] {
+        let mut r = replay(p);
+        r.unserved = Some(bad.into());
+        assert_rule(ledger.put(&Record::Replay(r)), "unserved must be");
+    }
+    let mut r = replay(p);
+    r.unserved = Some("parquet_stats".into());
+    ledger.put(&Record::Replay(r)).unwrap();
+}
+
 #[test]
 fn a_record_written_now_carries_the_current_version_only() {
     let store = MemStore::default();

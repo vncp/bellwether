@@ -256,6 +256,10 @@ fn all_exact(costs: &[RunCost]) -> bool {
     costs.iter().all(|c| c.exact)
 }
 
+/// The one value `Replay.unserved` may take: runs no spec serves were
+/// priced as the files' own min/max statistics read them.
+const UNSERVED_PARQUET_STATS: &str = "parquet_stats";
+
 /// Contract v2.1 replay rules, independent of where the replay is checked:
 /// inputs are non-empty; current costs are exact; a cost model is named
 /// exactly when some proposed cost is inexact, and it is a non-empty name
@@ -275,6 +279,14 @@ fn check_replay_content(r: &Replay, proposal: &Proposal) -> Result<()> {
                  absent",
             ));
         }
+    }
+    if r.unserved
+        .as_deref()
+        .is_some_and(|u| u != UNSERVED_PARQUET_STATS)
+    {
+        return Err(rule(format!(
+            "replay unserved must be {UNSERVED_PARQUET_STATS:?} or absent (absent is a raw scan)"
+        )));
     }
     if !all_exact(&r.current) {
         return Err(rule(

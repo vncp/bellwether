@@ -60,6 +60,10 @@ All notable changes are documented here. The format follows Keep a Changelog; ve
   context only), and the recommendation and `fix`'s `nothing_to_gain` gate
   measure against it. In a workload mixing lookup columns, a key that
   serves some runs is no longer charged a full scan for the others.
+  Pricing an unserved run reads a row group's bloom filters only when its
+  min/max keeps it (ADR 018), and treats a filter it cannot probe as absent.
+  The ledger accepts `unserved` only as `"parquet_stats"`; ADR 017 is
+  amended to allow such additive label fields.
 - A CSV or JSON lines `--schema` declaring `Timestamp(..., Some("UTC"))`
   was accepted by `why` and refused by `index` (`Invalid timezone "UTC"`).
   `UTC` is now loaded as `+00:00`; any other zone the decoder cannot parse

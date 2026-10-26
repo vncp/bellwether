@@ -47,7 +47,8 @@
 //! fingerprint is verified on the opened handle first, and are held for the
 //! baseline's lifetime: every embedded filter of every run column of every
 //! file. A [`crate::Replayer`] pricing unserved runs under `ParquetStats`
-//! reads each column's filters once and keeps them for its own lifetime.
+//! reads only the filters of row groups their min/max keeps, one file at a
+//! time, and treats one it cannot probe as absent (`unserved_selection`).
 //! Nothing else of a file is read. On `bellwether-bench` corpora this is
 //! the bench's `parquet_stats` strategy, and the bench tests check
 //! equality run by run.
@@ -672,20 +673,11 @@ impl<'a> BaselinePlanner<'a> {
                 filters.insert(column.clone(), Arc::new(loaded));
             }
         }
-        Ok(Self::parquet_stats_with(catalog, filters))
-    }
-
-    /// The Parquet-statistics baseline over filters already read by
-    /// [`column_filters`], one entry per key column a run may name.
-    pub(crate) fn parquet_stats_with(
-        catalog: &'a Catalog,
-        filters: BTreeMap<String, Arc<ColumnFilters>>,
-    ) -> Self {
-        Self {
+        Ok(Self {
             catalog,
             kind: Baseline::ParquetStats,
             filters,
-        }
+        })
     }
 
     /// The baseline.
@@ -706,18 +698,6 @@ impl<'a> BaselinePlanner<'a> {
         Ok(with_residual(plan, keys, window.as_ref()))
     }
 
-    /// The ids of the row groups [`BaselinePlanner::plan`] reads.
-    pub(crate) fn select(
-        &self,
-        keys: &RunKeys,
-        window: Option<&RunWindow>,
-    ) -> ReplayResult<RoaringBitmap> {
-        let window = window
-            .map(|w| EncodedWindow::new(self.catalog.schema(), w))
-            .transpose()?;
-        self.selection(keys, window.as_ref())
-    }
-
     fn selection(
         &self,
         keys: &RunKeys,
@@ -734,6 +714,7 @@ impl<'a> BaselinePlanner<'a> {
             }
         }
     }
+
     fn stats_selection(
         &self,
         keys: &RunKeys,
@@ -862,6 +843,130 @@ pub(crate) fn column_filters(
         }
     }
     Ok(filters)
+}
+
+/// The row groups the files' own statistics keep for one unserved run
+/// (`Replayer::with_unserved`), with the number of embedded filters read:
+/// [`Baseline::ParquetStats`]'s selection, read lazily to bound memory
+/// (ADR 018). A row group is first tested by its footer min/max (and the
+/// window, if any); only one that passes has its embedded filters read,
+/// one file at a time, and they are dropped when the file is done, so the
+/// filters read never exceed those of row groups min/max kept. A filter
+/// that cannot be probed exactly or read is treated as absent: the row
+/// group is kept, which is sound (invariant 1). [`BaselinePlanner`]
+/// refuses such a filter instead, since the bench baseline must never be
+/// weaker than its definition.
+#[allow(clippy::too_many_lines)]
+pub(crate) fn unserved_selection(
+    catalog: &Catalog,
+    keys: &RunKeys,
+    window: Option<&RunWindow>,
+    policy: FingerprintPolicy,
+) -> ReplayResult<(RoaringBitmap, u64)> {
+    let mut selected = RoaringBitmap::new();
+    if keys.is_empty() {
+        return Ok((selected, 0));
+    }
+    let window = window
+        .map(|w| EncodedWindow::new(catalog.schema(), w))
+        .transpose()?;
+    let all: Vec<usize> = (0..keys.columns().len()).collect();
+    let passes = |pos: usize, filters: &[Option<Embedded>]| -> ReplayResult<bool> {
+        let rg = &catalog.row_groups()[pos];
+        let stats: Vec<Option<&ColumnStats>> = keys
+            .columns()
+            .iter()
+            .map(|c| stats_of(&rg.meta.stats, c))
+            .collect();
+        for i in 0..keys.len() {
+            for probe_bytes in keys.probes(i, &all) {
+                let mut pass = true;
+                for (j, elem) in split(&probe_bytes, keys, i).into_iter().enumerate() {
+                    let filter = filters.get(j).and_then(Option::as_ref);
+                    if !in_range(elem, stats[j]) || !BaselinePlanner::in_filter(elem, filter)? {
+                        pass = false;
+                        break;
+                    }
+                }
+                if pass {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
+    };
+    // Pass 1: footer min/max and the window. Row groups with a declared
+    // filter on a key column wait for pass 2, by file.
+    let mut probe_later: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
+    for (pos, rg) in catalog.row_groups().iter().enumerate() {
+        if let Some(w) = &window {
+            let outside = stats_of(&rg.meta.stats, &w.window.ts_column).is_some_and(|s| {
+                matches!((&s.min, &s.max), (Some(lo), Some(hi))
+                    if hi.as_slice() < w.lo.as_slice() || lo.as_slice() > w.hi.as_slice())
+            });
+            if outside {
+                continue;
+            }
+        }
+        if !passes(pos, &[])? {
+            continue;
+        }
+        let bloom = keys
+            .columns()
+            .iter()
+            .any(|c| stats_of(&rg.meta.stats, c).is_some_and(|s| s.has_bloom));
+        if bloom {
+            probe_later.entry(rg.file).or_default().push(pos);
+        } else {
+            selected.insert(rg.id.0);
+        }
+    }
+    // Pass 2: the filters of the row groups that passed, one file at a time.
+    let mut read = 0u64;
+    for (fi, positions) in probe_later {
+        let fp = &catalog.files()[fi];
+        let reader = open_verified(fp, policy)?;
+        let options = ReadOptionsBuilder::new()
+            .with_reader_properties(
+                ReaderProperties::builder()
+                    .set_read_bloom_filter(true)
+                    .build(),
+            )
+            .build();
+        let file = SerializedFileReader::new_with_options(reader, options)
+            .map_err(|e| Error::Source(format!("{}: {e}", fp.path)))?;
+        let descr = file.metadata().file_metadata().schema_descr_ptr();
+        for pos in positions {
+            let rg = &catalog.row_groups()[pos];
+            let row_group = file
+                .get_row_group(rg.meta.index_in_file as usize)
+                .map_err(|e| Error::Source(format!("{}: {e}", fp.path)))?;
+            let mut filters = Vec::with_capacity(keys.columns().len());
+            for column in keys.columns() {
+                let declared = stats_of(&rg.meta.stats, column).is_some_and(|s| s.has_bloom);
+                let embedded = declared
+                    .then(|| {
+                        let ci = (0..descr.num_columns())
+                            .find(|&i| descr.column(i).path().parts() == [column.as_str()])?;
+                        let dataset = dataset_type(catalog.schema(), column).ok()?;
+                        let conversion = conversion(&dataset, &descr.column(ci)).ok()?;
+                        let filter = row_group.get_column_bloom_filter(ci)?.clone();
+                        Some(Embedded {
+                            filter,
+                            conversion,
+                            dataset,
+                        })
+                    })
+                    .flatten();
+                read += u64::from(embedded.is_some());
+                filters.push(embedded);
+            }
+            if passes(pos, &filters)? {
+                selected.insert(rg.id.0);
+            }
+        }
+    }
+    Ok((selected, read))
 }
 
 fn dataset_type(schema: &Schema, column: &str) -> ReplayResult<DataType> {
