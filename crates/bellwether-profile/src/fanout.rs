@@ -795,8 +795,12 @@ impl CachedEntry {
                 row_groups_per_value: self.row_groups.map(f64::from),
                 files_total: self.files_total,
                 row_groups_total: self.row_groups_total,
-                sample_size: None,
-                quantile_error: None,
+                // A sampled entry's quantiles come from the retained values,
+                // within the DKW rank error (contract v3).
+                sample_size: self.sampled.then_some(self.retained),
+                quantile_error: self
+                    .sampled
+                    .then(|| dkw_epsilon(self.retained, QUANTILE_ALPHA)),
             },
             sample: SampleInfo {
                 retained: self.retained,

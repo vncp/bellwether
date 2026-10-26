@@ -55,7 +55,7 @@ use bellwether_core::expr::{suggested_name, Expr, Typed};
 use bellwether_source::stats::{
     batch_stamp as batch_stamp_decision, partner_order, BatchStamp, PartnerCandidate,
 };
-use bellwether_types::{KeySpec, Lint, Result, RowGroupMeta, TextOp};
+use bellwether_types::{KeySpec, Lint, Result, RewriteShape, RowGroupMeta, TextOp};
 
 use crate::fanout::{is_id_like, DistinctSource, FanoutEntry, KeyPlan};
 use crate::manifest::ManifestInfo;
@@ -253,7 +253,11 @@ fn expression_lookups(inputs: &LintInputs<'_>) -> Vec<Lint> {
             ),
             confidence: HIGH,
             site: None,
-            fix: None,
+            fix: rewrite(
+                format!("filter {norm} in keys over every row group"),
+                format!("index expr:{name}={norm}:exact, then locate by {norm}"),
+                "a row group holding a row whose expression equals a key is planned (invariant 1)",
+            ),
         });
     }
     out
@@ -396,7 +400,11 @@ fn batch_stamp(inputs: &LintInputs<'_>) -> Result<Vec<Lint>> {
             ),
             confidence,
             site: None,
-            fix: None,
+            fix: rewrite(
+                format!("join on {name}"),
+                format!("join on {key} or join on {}", label(composite)),
+                &format!("the set of output rows per {key} is unchanged"),
+            ),
         });
     }
     Ok(out)
@@ -469,7 +477,11 @@ fn low_selectivity(inputs: &LintInputs<'_>, stamps: &[String]) -> Vec<Lint> {
             ),
             confidence,
             site: None,
-            fix: None,
+            fix: rewrite(
+                format!("key = [{name}]"),
+                format!("key = {}", label(composite)),
+                "every row group holding a queried key is still selected (invariant 1)",
+            ),
         });
     }
     out
@@ -495,7 +507,11 @@ fn scattered_time(inputs: &LintInputs<'_>) -> Vec<Lint> {
                 ),
                 confidence: MEDIUM,
                 site: None,
-                fix: None,
+                fix: rewrite(
+                    "written in arrival order".to_string(),
+                    format!("sorted or clustered by {name} within each partition"),
+                    "the multiset of rows is unchanged",
+                ),
             }
         })
         .collect()
@@ -540,7 +556,11 @@ fn declared_but_unused(inputs: &LintInputs<'_>) -> Vec<Lint> {
             ),
             confidence: MEDIUM,
             site: None,
-            fix: None,
+            fix: rewrite(
+                format!("{} declared", spec.identity()),
+                "removed".to_string(),
+                "no recorded run's ScanPlan changes",
+            ),
         });
     }
     out
@@ -586,7 +606,11 @@ fn count_before_scan(inputs: &LintInputs<'_>) -> Vec<Lint> {
         ),
         confidence: HIGH,
         site: None,
-        fix: None,
+        fix: rewrite(
+            format!("exact:{cols}"),
+            format!("exact:{cols},counts"),
+            "every count equals the rows a locate of the same keys reads that hold the key",
+        ),
     }]
 }
 
@@ -636,7 +660,12 @@ fn no_discriminating(entries: &[FanoutEntry]) -> Option<Lint> {
             fraction * 100.0,
         ),
         confidence: if sampled { LOW } else { HIGH },
-        site: None, fix: None,
+        site: None,
+        fix: rewrite(
+            "written in arrival (often time) order".to_string(),
+            "clustered by the column lookups supply".to_string(),
+            "the multiset of rows is unchanged",
+        ),
     })
 }
 
@@ -729,7 +758,11 @@ pub fn low_cardinality_key(columns: &[SketchedColumn]) -> Vec<Lint> {
             ),
             confidence: if exact { HIGH } else { MEDIUM },
             site: None,
-            fix: None,
+            fix: rewrite(
+                format!("filter or join by {}", b.column),
+                format!("filter or join by ({}, {})", k.column, b.column),
+                "the rows selected are those whose (partner, column) is in the sample",
+            ),
         });
     }
     out
@@ -820,10 +853,30 @@ pub fn text_lookups(uses: &[TextUse], complete: &[KeySpec]) -> Vec<Lint> {
                 ),
                 confidence: HIGH,
                 site: None,
-                fix: None,
+                fix: rewrite(
+                    format!("scan every row group, then filter {c} by text"),
+                    format!(
+                        "plan through {}, then apply the residual",
+                        text_keys(&unserved, c)
+                    ),
+                    "the rows the filter keeps are unchanged",
+                ),
             })
         })
         .collect()
+}
+
+/// The text keys that serve `unserved` on column `c`, `+`-joined: a trigram
+/// key for substrings, a words key for words and prefixes.
+fn text_keys(unserved: &[TextOp], c: &str) -> String {
+    let mut keys = Vec::new();
+    if unserved.contains(&TextOp::Contains) {
+        keys.push(format!("text:{c},tokenizer=trigram"));
+    }
+    if unserved.iter().any(|op| *op != TextOp::Contains) {
+        keys.push(format!("text:{c},tokenizer=words"));
+    }
+    keys.join(" + ")
 }
 
 /// One list column a recorded workload looks up by membership (B4).
@@ -880,10 +933,33 @@ pub fn list_membership(uses: &[MembershipUse], complete: &[KeySpec]) -> Vec<Lint
                 ),
                 confidence: HIGH,
                 site: None,
-                fix: None,
+                fix: rewrite(
+                    format!("no list key on {c}"),
+                    format!("list:{c}"),
+                    "every row group holding a row whose list holds a queried value is still \
+                     selected (invariant 1)",
+                ),
             }
         })
         .collect()
+}
+
+/// A lint's fix (`Lint.fix`): the rule catalog's before shape, after shape
+/// and invariant (`docs/rule-catalog.md`, each rule's guidance template),
+/// with the finding's columns filled in. No pairs or plans: a described
+/// rewrite, never one the engine runs.
+#[allow(clippy::unnecessary_wraps)] // every lint sets `fix` through this
+fn rewrite(before: String, after: String, invariant: &str) -> Option<RewriteShape> {
+    Some(RewriteShape {
+        before,
+        after,
+        invariant: invariant.to_string(),
+        pairs: Vec::new(),
+        key: Vec::new(),
+        keys: None,
+        before_plan: None,
+        after_plan: None,
+    })
 }
 
 #[cfg(test)]
@@ -1087,6 +1163,13 @@ mod tests {
         assert!(l.message.contains("--mode contains-any"), "{}", l.message);
         assert!(l.message.contains("4 recorded run(s)"), "{}", l.message);
         assert!((l.confidence - HIGH).abs() < f64::EPSILON);
+        // Lint.fix: the rule catalog's shapes with the column filled in
+        let fix = l.fix.as_ref().expect("a lint carries its fix");
+        assert_eq!(
+            (fix.before.as_str(), fix.after.as_str()),
+            ("no list key on tags", "list:tags")
+        );
+        assert!(fix.invariant.contains("invariant 1"), "{}", fix.invariant);
         // contains_all only: the pricing command says so
         let all = list_membership(&[uses("tags", 0, 2)], &[]);
         assert!(

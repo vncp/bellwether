@@ -1,6 +1,8 @@
-//! WP21 item 2: plans ordered by a timestamp range key's row-group
-//! minimum. Ground truth: every planned row group decoded with the `parquet`
-//! crate, its minimum timestamp computed from the rows themselves.
+//! WP21 item 2 and M5: plans ordered by a timestamp range key's row-group
+//! minimum, interleaving files (`ScanPlan.order`) when no order of whole
+//! files is a time order. Ground truth: every planned row group decoded
+//! with the `parquet` crate, its minimum timestamp computed from the rows
+//! themselves.
 
 #![allow(
     clippy::unwrap_used,
@@ -66,13 +68,35 @@ fn decoded_mins(s: &Scratch, names: &[&str]) -> BTreeMap<(String, u32), Option<V
     out
 }
 
-/// The planned row groups in reading order: entries in order, each
-/// entry's row groups ascending.
-fn reading_order(plan: &ScanPlan) -> Vec<(String, u32)> {
+/// The planned row groups, entries in order, each entry's row groups
+/// ascending: how whole files are read.
+fn whole_files(plan: &ScanPlan) -> Vec<(String, u32)> {
     plan.entries
         .iter()
         .flat_map(|e| e.row_groups.iter().map(move |rg| (e.file.path.clone(), rg)))
         .collect()
+}
+
+/// The planned row groups in reading order: the plan's `order` when it
+/// has one (each planned row group exactly once), else [`whole_files`].
+fn reading_order(plan: &ScanPlan) -> Vec<(String, u32)> {
+    let Some(order) = &plan.order else {
+        return whole_files(plan);
+    };
+    let seen: Vec<(String, u32)> = order
+        .iter()
+        .map(|(e, rg)| {
+            let entry = &plan.entries[*e as usize];
+            assert!(entry.row_groups.contains(*rg), "{e} {rg}");
+            (entry.file.path.clone(), *rg)
+        })
+        .collect();
+    let mut a = seen.clone();
+    let mut b = whole_files(plan);
+    a.sort();
+    b.sort();
+    assert_eq!(a, b, "the order lists every planned row group once");
+    seen
 }
 
 /// Whether the decoded minimums are non-decreasing along `order`, a row
@@ -157,12 +181,17 @@ fn entries_follow_the_range_key_minimum_across_files_and_nulls_sort_last() {
         .map(|e| e.file.path.rsplit('/').next().unwrap())
         .collect();
     assert_eq!(files, ["c.parquet", "b.parquet", "a.parquet", "z.parquet"]);
+    // Whole files are in order: no interleaved order is needed.
+    assert_eq!(plan.order, None);
     // Deterministic.
     assert_eq!(p.plan_ordered(&specs, &lookup).unwrap().0, plan);
 }
 
+/// When no order of whole files is a time order, the plan's `order`
+/// interleaves files so its row groups are still read in time order; the
+/// entries and row groups planned are unchanged.
 #[test]
-fn an_order_that_does_not_hold_is_never_claimed() {
+fn files_that_overlap_in_time_are_read_interleaved() {
     let s = Scratch::new();
     // b's two row groups straddle a's: no order of whole files is a time
     // order.
@@ -192,17 +221,33 @@ fn an_order_that_does_not_hold_is_never_claimed() {
         .build(&s.root_str(), &specs, &opts())
         .unwrap();
     let p = planner(&store);
+    let plain = p.plan(&specs, &every_id(&[1])).unwrap();
     let (plan, order) = p.plan_ordered(&specs, &every_id(&[1])).unwrap();
-    let mins = decoded_mins(&s, &["a.parquet", "b.parquet"]);
-    assert!(!time_ordered(&reading_order(&plan), &mins));
-    let PlanOrder::Unspecified { reason } = order else {
-        panic!("{order:?}")
-    };
-    assert!(
-        reason.contains("a.parquet") && reason.contains("b.parquet"),
-        "{reason}"
+    assert_eq!(
+        order,
+        PlanOrder::Ordered {
+            column: "ts".into()
+        }
     );
-    // Still deterministic: b holds the earliest row group.
+    assert_eq!(plan_rgs(&plan), plan_rgs(&plain));
+    let mins = decoded_mins(&s, &["a.parquet", "b.parquet"]);
+    assert!(!time_ordered(&whole_files(&plan), &mins));
+    let read = reading_order(&plan);
+    assert!(time_ordered(&read, &mins), "{read:?}");
+    let names: Vec<(&str, u32)> = read
+        .iter()
+        .map(|(p, rg)| (p.rsplit('/').next().unwrap(), *rg))
+        .collect();
+    assert_eq!(
+        names,
+        [
+            ("b.parquet", 0),
+            ("a.parquet", 0),
+            ("b.parquet", 1),
+            ("a.parquet", 1)
+        ]
+    );
+    // Entries are by each file's earliest row group: b first.
     assert!(plan.entries[0].file.path.ends_with("b.parquet"));
 
     // A file whose own row groups run backwards in time.
@@ -223,14 +268,11 @@ fn an_order_that_does_not_hold_is_never_claimed() {
         .unwrap();
     let p = planner(&store);
     let (plan, order) = p.plan_ordered(&specs, &every_id(&[1])).unwrap();
-    assert!(!time_ordered(
-        &reading_order(&plan),
-        &decoded_mins(&s, &["d.parquet"])
-    ));
-    assert!(
-        matches!(&order, PlanOrder::Unspecified { reason } if reason.contains("d.parquet")),
-        "{order:?}"
-    );
+    let mins = decoded_mins(&s, &["d.parquet"]);
+    assert!(!time_ordered(&whole_files(&plan), &mins));
+    assert!(matches!(order, PlanOrder::Ordered { .. }), "{order:?}");
+    assert_eq!(plan.order, Some(vec![(0, 1), (0, 0)]));
+    assert!(time_ordered(&reading_order(&plan), &mins));
     // One planned row group of that file is trivially in order.
     let one = Lookup::Between {
         column: "ts".into(),
@@ -240,6 +282,7 @@ fn an_order_that_does_not_hold_is_never_claimed() {
     let (plan, order) = p.plan_ordered(&specs, &one).unwrap();
     assert_eq!(plan.row_groups_selected, 1);
     assert!(matches!(order, PlanOrder::Ordered { .. }), "{order:?}");
+    assert_eq!(plan.order, None);
 }
 
 fn ts_value(v: i64) -> bellwether_core::encoding::Value<'static> {

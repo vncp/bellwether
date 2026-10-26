@@ -78,6 +78,13 @@ fn lookup(keys: &RunKeys, query: &RunQuery) -> Result<Lookup> {
             column: columns.join(","),
             values: tuples,
         },
+        RunQuery::Bitemporal(b) => Lookup::Bitemporal {
+            columns,
+            clocks: Some((b.valid_column.clone(), b.known_column.clone())),
+            keys: tuples,
+            valid: b.valid,
+            known: b.known,
+        },
         RunQuery::Text(_) => {
             let (column, op, values) = text_run(keys, query)?
                 .ok_or_else(|| Error::Other("a text run without a text match".into()))?;
@@ -136,6 +143,7 @@ where
         out.push(TransientSpec {
             spec: t.spec().clone(),
             segments: t.segment_bytes(),
+            bounds: t.bounds_bytes().to_vec(),
         });
     }
     Ok(out)

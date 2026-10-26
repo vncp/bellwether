@@ -8,15 +8,19 @@
 //!   version 3 (so its hash), and the manifest it cites is the restored one
 //!   (its bytes hold the restore root). The receipt chain reads as it did,
 //!   byte for byte.
-//! - `fixtures/format-v0.1/` (storage version 2, record version 3, per-key
-//!   counts): every pinned line byte for byte, `count` and `locate
-//!   --columns` included.
+//! - `fixtures/format-v0.1-pre/` (storage version 2 before M5, record
+//!   version 3, per-key counts, time bounds and bitemporal versions in
+//!   version 1 sidecars): every pinned line byte for byte, `count` and
+//!   `locate --columns` included.
+//! - `fixtures/format-v0.1/` (storage version 2 as frozen at M5): the same,
+//!   over the folded layouts (`exact:id@ts,counts`, a bitemporal key spec, a
+//!   bloom with its bounds segment, a proposal with bounds applied by
+//!   `fix`), `ColumnType` spellings, and a CSV index with `source.dialect`.
 //! - Upgrade on commit: a v1 copy with nothing to do stays at version 1; with
 //!   one new file it commits at version 2, says so, records per-row-group
 //!   rows and bytes and per-column bytes equal to the files' footers, and
 //!   every v1 plan, pinned to its sequence, is unchanged.
-//! - A manifest of a newer storage version is refused; so, by name and
-//!   saying to upgrade, is a storage version 2 shape the next release adds.
+//! - A manifest of a newer storage version is refused.
 //! - `locate --columns` on a version 1 index reads its column bytes from
 //!   the footers and says so; a bad `--columns` is a usage error.
 //! - `fixtures/format-v1-separators/` (storage version 1 specs on columns
@@ -121,11 +125,33 @@ impl Restored {
         copy_tree(&corpus().join("extra"), &data, true);
         let index = data.join(".bellwether");
         copy_tree(&dir.join("index"), &index, false);
+        let mut indexes = vec![index];
+        // The M5 fixture also holds an index of a CSV folder (`text/`).
+        if dir.join("index-text").is_dir() {
+            let text = Path::new(&root).join("text");
+            copy_tree(&corpus().join("text"), &text, true);
+            copy_tree(&dir.join("index-text"), &text.join(".bellwether"), false);
+            indexes.push(text.join(".bellwether"));
+        }
+        // ... and of a folder with nested and dictionary columns.
+        if dir.join("index-nested").is_dir() {
+            let nested = Path::new(&root).join("nested");
+            copy_tree(&corpus().join("nested"), &nested, true);
+            copy_tree(
+                &dir.join("index-nested"),
+                &nested.join(".bellwether"),
+                false,
+            );
+            indexes.push(nested.join(".bellwether"));
+        }
         let old_root = expected["root"].as_str().unwrap().to_string();
         let mut subs = vec![(old_root.clone(), root.clone())];
-        let mut manifests = vec![index.join("manifest.json")];
-        for e in std::fs::read_dir(index.join("manifests")).unwrap() {
-            manifests.push(e.unwrap().path());
+        let mut manifests = Vec::new();
+        for index in &indexes {
+            manifests.push(index.join("manifest.json"));
+            for e in std::fs::read_dir(index.join("manifests")).unwrap() {
+                manifests.push(e.unwrap().path());
+            }
         }
         for m in manifests {
             let before = std::fs::read(&m).unwrap();
@@ -314,26 +340,28 @@ fn the_storage_version_1_fixture_reads_as_it_was_written() {
     assert_eq!(r.manifest()["storage_version"], 1);
 }
 
-#[test]
-fn the_storage_version_2_fixture_reads_byte_for_byte() {
-    let r = Restored::new("format-v0.1");
+/// A storage version 2 fixture: every file carries the row-group arrays,
+/// the ledger chain reads as pinned, and every pinned lookup (`lookups` of
+/// them, `counts` of which are `count`s) replays byte for byte.
+fn storage_version_2(fixture: &str, lookups: usize, counts: usize) -> Restored {
+    let r = Restored::new(fixture);
     let m = r.manifest();
     assert_eq!(m["storage_version"], 2);
     for f in m["rowgroup_space"]["files"].as_array().unwrap() {
         assert!(f.get("rowgroup_bytes").is_some(), "{f}");
     }
     chain(&r, true);
-    assert_eq!(pinned_lookups(&r, false, &[]), 12);
+    assert_eq!(pinned_lookups(&r, false, &[]), lookups);
     chain(&r, false);
-    let counts: Vec<String> = r.expected["lookups"]
+    let pinned: Vec<String> = r.expected["lookups"]
         .as_array()
         .unwrap()
         .iter()
-        .filter(|l| l["args"][0] == "count")
+        .filter(|l| l["args"].as_array().unwrap().iter().any(|a| a == "count"))
         .map(|l| l["json"][0].as_str().unwrap().to_string())
         .collect();
-    assert_eq!(counts.len(), 2);
-    for c in counts {
+    assert_eq!(pinned.len(), counts);
+    for c in pinned {
         let v: Value = serde_json::from_str(&c).unwrap();
         assert!(v["rows"].as_u64().unwrap() > 0, "{v}");
         assert!(
@@ -341,6 +369,80 @@ fn the_storage_version_2_fixture_reads_byte_for_byte() {
             "{v}"
         );
     }
+    r
+}
+
+#[test]
+fn the_pre_m5_storage_version_2_fixture_reads_byte_for_byte() {
+    let r = storage_version_2("format-v0.1-pre", 12, 2);
+    // Its time bounds and bitemporal versions are storage version 1
+    // sidecars, read as they were written.
+    let m = r.manifest();
+    assert_eq!(m["schema"]["sidecars"].as_array().unwrap().len(), 2);
+    assert!(m["schema"]["columns"][0]["data_type"].is_string());
+}
+
+/// The M5 fixture holds every storage version 2 shape the freeze added:
+/// per-key bounds in an exact spec's value records (beside counts), a
+/// bitemporal key spec with its own segments, a bloom with its `bounds`
+/// segment listed under the bloom, a counted proposal with bounds applied
+/// by `fix`, `data_type` in `ColumnType` spelling, no `schema.sidecars`,
+/// a CSV index whose manifest holds `source.dialect`, and an index whose
+/// manifest spells list, struct, map and dictionary columns as
+/// `{"arrow": "<display>"}` (pinned here, so an Arrow upgrade that spells
+/// them otherwise must still read these).
+#[test]
+fn the_m5_fixture_reads_byte_for_byte() {
+    let r = storage_version_2("format-v0.1", 15, 3);
+    let m = r.manifest();
+    assert!(m["schema"].get("sidecars").is_none(), "{}", m["schema"]);
+    for c in m["schema"]["columns"].as_array().unwrap() {
+        assert!(c["data_type"].is_object(), "{c}");
+    }
+    let identities: Vec<&str> = m["key_spec_completeness"]
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    for want in [
+        "exact:id@ts,counts",
+        "bloom:id@0.01@ts",
+        "temporal2:id@valid,known",
+        "exact:symbol@ts,counts",
+    ] {
+        assert!(identities.contains(&want), "{identities:?}");
+    }
+    for s in m["segments"].as_array().unwrap() {
+        match s.get("kind").and_then(Value::as_str) {
+            None => {}
+            Some("bounds") => assert_eq!(s["key_spec"], "bloom:id@0.01@ts", "{s}"),
+            Some(k) => panic!("a segment of kind {k}: {s}"),
+        }
+    }
+    let text: Value = serde_json::from_slice(
+        &std::fs::read(Path::new(&r.root).join("text/.bellwether/manifest.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        text["source"]["dialect"],
+        serde_json::json!({"delimiter": 44, "header": true, "quote": 34})
+    );
+    let nested: Value = serde_json::from_slice(
+        &std::fs::read(Path::new(&r.root).join("nested/.bellwether/manifest.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        nested["schema"]["columns"],
+        serde_json::json!([
+            {"name": "id", "data_type": {"type": "int64"}, "nullable": false},
+            {"name": "ts", "data_type": {"type": "timestamp", "unit": "microsecond", "tz": "UTC"}, "nullable": true},
+            {"name": "tags", "data_type": {"arrow": "List(Utf8, field: 'element')"}, "nullable": true},
+            {"name": "attrs", "data_type": {"arrow": "Struct(\"venue\": Utf8, \"lot\": Int32)"}, "nullable": true},
+            {"name": "props", "data_type": {"arrow": "Map(\"key_value\": non-null Struct(\"key\": non-null Utf8, \"value\": Int64), unsorted)"}, "nullable": true},
+            {"name": "side", "data_type": {"arrow": "Dictionary(Int32, Utf8)"}, "nullable": true},
+        ])
+    );
 }
 
 /// Per-row-group rows and bytes and per-column bytes of every tracked file,
@@ -423,23 +525,234 @@ fn a_storage_version_1_copy_upgrades_on_its_next_commit() {
         assert_eq!(u64s(&f["column_bytes"]), cols, "{p}");
         assert_eq!(f["rowgroup_ids"].as_array().unwrap().len(), rows.len());
     }
-    // Segments and completeness keyed by full identities; every v1 segment
-    // kept, unrewritten.
+    // Segments and completeness keyed by full identities. The first build
+    // with work folds the v1 sidecars into key specs (ADR 028): the per-key
+    // bounds beside `exact:id` make it `exact:id@ts`, and `temporal2`
+    // becomes a bitemporal key; every other v1 spec keeps its segments.
     let complete = m["key_spec_completeness"].as_object().unwrap();
-    for id in [
-        "exact:id",
-        "bloom:id@0.01",
-        "range:ts",
-        "temporal:id@ts",
-        "exact:symbol",
-    ] {
-        assert!(complete.contains_key(id), "{id}: {complete:?}");
-    }
+    let ids: Vec<&str> = complete.keys().map(String::as_str).collect();
+    assert_eq!(
+        ids,
+        [
+            "bloom:id@0.01",
+            "exact:id@ts",
+            "exact:symbol",
+            "range:ts",
+            "temporal2:id@valid,known",
+            "temporal:id@ts",
+        ],
+        "{complete:?}"
+    );
+    assert!(m["schema"].get("sidecars").is_none(), "{m}");
 
     // Every v1 plan, pinned to the v1 sequence it was answered at, is the
     // pinned plan.
     assert_eq!(pinned_lookups(&r, true, &["--at-manifest", "3"]), 9);
     chain(&r, false);
+}
+
+/// The pre-M5 fixture's first build with work (here a new key spec, so the
+/// data and every plan stay the same) folds its two storage version 1
+/// sidecars into key specs, says so, rebuilds them in the folded layouts,
+/// and drops `schema.sidecars`; every pinned lookup then plans the same
+/// row groups and bytes at the new sequence, the window and bitemporal
+/// ones included, and every lookup pinned to its sequence is unchanged.
+#[test]
+fn a_pre_m5_copy_folds_its_sidecars_on_its_next_commit() {
+    let r = Restored::new("format-v0.1-pre");
+    let data = path(&r.data).to_string();
+    let manifest_bytes = || std::fs::read(r.data.join(".bellwether/manifest.json")).unwrap();
+
+    // Nothing to do: nothing committed, the sidecars stay.
+    let before = manifest_bytes();
+    let out = ok(&r, &["index".into(), data.clone()]);
+    assert!(out.contains("nothing to do"), "{out}");
+    assert_eq!(manifest_bytes(), before);
+
+    let json = ok(
+        &r,
+        &[
+            "--json".into(),
+            "index".into(),
+            data,
+            "--key".into(),
+            "range:amount".into(),
+        ],
+    );
+    let v: Value = serde_json::from_str(&json).unwrap();
+    assert_eq!(
+        v["sidecars_folded"],
+        serde_json::json!([
+            {"sidecar": "bounds:id@ts", "into": "exact:id@ts"},
+            {"sidecar": "temporal2:id@valid,known", "into": "temporal2:id@valid,known"},
+        ]),
+        "{v}"
+    );
+    let m = r.manifest();
+    assert_eq!(m["sequence"], 4);
+    assert!(m["schema"].get("sidecars").is_none(), "{}", m["schema"]);
+    let complete: Vec<&str> = m["key_spec_completeness"]
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(
+        complete,
+        [
+            "bloom:id@0.01",
+            "exact:id@ts",
+            "exact:symbol,counts",
+            "range:amount",
+            "range:ts",
+            "temporal2:id@valid,known",
+            "temporal:id@ts,counts",
+        ]
+    );
+    for s in m["segments"].as_array().unwrap() {
+        assert!(s.get("kind").is_none(), "a sidecar segment is left: {s}");
+    }
+    // The commit respells every column type in `ColumnType` JSON.
+    for c in m["schema"]["columns"].as_array().unwrap() {
+        assert!(c["data_type"].is_object(), "{c}");
+    }
+
+    // The folded specs answer what the sidecars answered.
+    for l in r.expected["lookups"].as_array().unwrap() {
+        let args = r.args(&l["args"]);
+        if args.iter().any(|a| a == "--at-manifest") || args[0] == "count" {
+            continue;
+        }
+        let got = ok(&r, &[vec!["--json".to_string()], args.clone()].concat());
+        let want = r.sub(l["json"][0].as_str().unwrap());
+        assert_eq!(planned(&got), planned(&want), "{args:?}");
+    }
+    assert_eq!(pinned_lookups(&r, false, &["--at-manifest", "3"]), 12);
+    chain(&r, false);
+}
+
+/// The `index` human output over a pre-M5 index says what the fold does:
+/// on a no-op, the folds its next build with work makes; on that build,
+/// each fold and each sidecar it keeps. A kept `temporal2` sidecar beside
+/// the folded bitemporal key gives `id` two bitemporal sources: an as-of
+/// naming no clocks is refused naming both and the flags that pick each,
+/// and `--valid-by`/`--known-by` (MCP `valid_by`/`known_by`) pick one.
+#[test]
+fn index_says_what_the_fold_does_and_two_bitemporal_sources_are_picked_by_their_clocks() {
+    let r = Restored::new("format-v0.1-pre");
+    let data = path(&r.data).to_string();
+    let index = || ok(&r, &["index".into(), data.clone()]);
+
+    let out = index();
+    assert!(out.contains("nothing to do"), "{out}");
+    assert!(
+        out.contains(
+            "this index was written before M5: its next build with work (new or changed files, \
+             or a new --key) folds bounds:id@ts into exact:id@ts, temporal2:id@valid,known into \
+             temporal2:id@valid,known"
+        ),
+        "{out}"
+    );
+
+    // A third sidecar, as a binary of that release declared it: its
+    // bitemporal key's slot is the folded one's, so it is kept.
+    let file = r.data.join(".bellwether/manifest.json");
+    let mut m: Value = serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
+    m["schema"]["sidecars"]
+        .as_array_mut()
+        .unwrap()
+        .push(serde_json::json!(
+            {"kind": "temporal2", "columns": ["id"], "time_columns": ["ts", "known"]}
+        ));
+    std::fs::write(&file, serde_json::to_vec_pretty(&m).unwrap()).unwrap();
+    let out = index();
+    for line in [
+        "folded the pre-M5 sidecar bounds:id@ts into the key spec exact:id@ts (rebuilt; the \
+         sidecar's declaration and segments are dropped)",
+        "folded the pre-M5 sidecar temporal2:id@valid,known into the key spec \
+         temporal2:id@valid,known",
+        "kept the pre-M5 sidecar temporal2:id@ts,known as a sidecar: a key spec on its key \
+         columns keeps another time column, so no spec can take it; it is still built and \
+         still plans",
+    ] {
+        assert!(out.contains(line), "{line}\n{out}");
+    }
+    assert!(!out.contains("next build with work"), "{out}");
+
+    // The pinned bitemporal as-of, now with two sources on `id`.
+    let pinned = r.expected["lookups"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|l| l["args"].as_array().unwrap().iter().any(|a| a == "--valid"))
+        .unwrap();
+    let args = r.args(&pinned["args"]);
+    let (code, _, err) = run(&r, &args);
+    assert_eq!(code, 4, "{err}");
+    for want in [
+        "several bitemporal keys serve a lookup on (id)",
+        "temporal2:id@valid,known (--valid-by valid --known-by known)",
+        "temporal2:id@ts,known (--valid-by ts --known-by known)",
+        "pick one by its clock columns with --valid-by <valid-time column> --known-by \
+         <known-time column>",
+    ] {
+        assert!(err.contains(want), "{want}\n{err}");
+    }
+    let picked = |valid_by: &str| {
+        let mut a = vec!["--json".to_string()];
+        a.extend(args.clone());
+        a.extend([
+            "--valid-by".into(),
+            valid_by.into(),
+            "--known-by".into(),
+            "known".into(),
+        ]);
+        ok(&r, &a)
+    };
+    // Picking the folded key plans what the sidecar planned.
+    let got = picked("valid");
+    assert_eq!(
+        planned(&got),
+        planned(&r.sub(pinned["json"][0].as_str().unwrap()))
+    );
+    let on_ts = picked("ts");
+    let v: Value = serde_json::from_str(on_ts.trim()).unwrap();
+    assert_eq!(v["lookup"]["valid_column"], "ts", "{v}");
+    // MCP `observe.asof` takes the same pick and answers the CLI's line.
+    let srv = bellwether_mcp::Server::new(&bellwether_mcp::Config {
+        root: data.clone(),
+        engine: bellwether::EngineOptions {
+            clock: Some(r.expected["clock"].as_str().unwrap().into()),
+            ..bellwether::EngineOptions::default()
+        },
+        budget: bellwether_mcp::Budget::default(),
+    })
+    .unwrap();
+    let at = |flag: &str| {
+        let i = args.iter().position(|a| a == flag).unwrap();
+        args[i + 1].clone()
+    };
+    let call = |extra: Value| {
+        let mut a = serde_json::json!({
+            "keys": at("--keys"), "valid": at("--valid"), "known": at("--known"),
+        });
+        a.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        srv.call("observe.asof", a)
+    };
+    let refused = call(serde_json::json!({}));
+    assert!(
+        refused
+            .text
+            .contains("temporal2:id@ts,known (--valid-by ts --known-by known)"),
+        "{}",
+        refused.text
+    );
+    let r_ts = call(serde_json::json!({"valid_by": "ts", "known_by": "known"}));
+    assert_eq!(r_ts.text + "\n", on_ts);
+    let half = call(serde_json::json!({"valid_by": "ts"}));
+    assert!(half.text.contains("known_by"), "{}", half.text);
 }
 
 #[test]
@@ -457,73 +770,6 @@ fn a_newer_storage_version_is_refused() {
     );
     assert_eq!(code, 4, "{stderr}");
     assert!(stderr.contains("storage version 3"), "{stderr}");
-}
-
-/// A manifest edit.
-type ManifestEdit<'a> = &'a dyn Fn(&mut Value);
-
-/// The storage version 2 shapes the next release writes (a column's
-/// `data_type` as a type map, a source `dialect`, a key spec with per-key
-/// `bounds`, a bitemporal key spec; ADR 028) are refused by name, exit 4,
-/// saying to upgrade: never a serde error, never "a newer storage version".
-#[test]
-fn later_storage_version_2_shapes_are_refused_by_name() {
-    let keys = path(&corpus().join("keys-id.parquet")).to_string();
-    let edits: [(&str, ManifestEdit<'_>); 4] = [
-        (
-            "manifest column data_type of column \"id\" (a type map)",
-            &|m| {
-                let cols = m["schema"]["columns"].as_array_mut().unwrap();
-                let id = cols.iter_mut().find(|c| c["name"] == "id").unwrap();
-                id["data_type"] = serde_json::json!({"type": "int64"});
-            },
-        ),
-        ("manifest source dialect", &|m| {
-            m["source"]["dialect"] = serde_json::json!({"delimiter": ",", "header": true});
-        }),
-        ("key spec with per-key bounds exact:id@ts", &|m| {
-            let specs = m["schema"]["key_specs"].as_array_mut().unwrap();
-            let exact = specs
-                .iter_mut()
-                .find(|s| s["kind"] == "exact" && s["columns"] == serde_json::json!(["id"]))
-                .unwrap();
-            exact["bounds"] = "ts".into();
-        }),
-        ("bitemporal key spec temporal2:id@valid,known", &|m| {
-            m["schema"]["key_specs"]
-                .as_array_mut()
-                .unwrap()
-                .push(serde_json::json!({"kind": "bitemporal", "columns": ["id"],
-                    "valid_column": "valid", "known_column": "known"}));
-        }),
-    ];
-    for (named, edit) in edits {
-        let r = Restored::new("format-v0.1");
-        let p = r.data.join(".bellwether/manifest.json");
-        let mut m = r.manifest();
-        edit(&mut m);
-        std::fs::write(&p, serde_json::to_vec_pretty(&m).unwrap()).unwrap();
-        let (code, _, stderr) = run(
-            &r,
-            &[
-                "locate".into(),
-                path(&r.data).into(),
-                "--keys".into(),
-                keys.clone(),
-            ],
-        );
-        assert_eq!(code, 4, "{stderr}");
-        assert!(
-            stderr.contains(named)
-                && stderr.contains(
-                    "storage version 2 segment/manifest shape not supported by this binary; \
-                     upgrade"
-                )
-                && !stderr.contains("serde")
-                && !stderr.contains("newer storage version"),
-            "{named}: {stderr}"
-        );
-    }
 }
 
 /// `locate --columns` on a storage version 1 index reads the per-column

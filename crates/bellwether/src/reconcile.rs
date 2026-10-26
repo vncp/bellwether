@@ -229,11 +229,14 @@ impl Engine {
         if let Some(budget) = req.memory_budget {
             options.memory_budget = budget;
         }
-        let certified = self.reconciler(spec, options)?.certify(
-            &Side::new(&*left_source, self.root()),
-            &Side::new(&*right_source, &right_root),
-            &ctx,
-        )?;
+        let certified = self
+            .reconciler(spec, options)?
+            .certify(
+                &Side::new(&*left_source, self.root()),
+                &Side::new(&*right_source, &right_root),
+                &ctx,
+            )
+            .map_err(|e| schema_step(Error::from(e)))?;
         let certificate = self.record_certified(&certified)?;
         Ok(ReconcileResult {
             certificate,
@@ -371,4 +374,22 @@ pub(crate) fn total_columns(given: &[String]) -> Result<Vec<TotalColumn>> {
         .iter()
         .map(|t| TotalColumn::parse(t).map_err(Error::KeySpec))
         .collect()
+}
+
+/// A comparison refused because a column's two dataset types share no
+/// encoding (two folders whose inferred decimal scales or time units
+/// differ), with the step a command-line user can take: `--schema`, which
+/// reads both sides under the one schema it gives.
+fn schema_step(e: Error) -> Error {
+    const STEP: &str = ". Write that schema as a JSON list of {\"name\", \"type\", \
+                        \"nullable\"} (the column at the wider type, for example \
+                        \"Decimal128(12, 4)\") and pass it with --schema <file>: every folder \
+                        side without an index is then read under it (an indexed side reads \
+                        under its index's schema), each value converted exactly or refused";
+    match e {
+        Error::KeySpec(m) if m.contains("do not share a canonical encoding") => {
+            Error::KeySpec(m + STEP)
+        }
+        other => other,
+    }
 }

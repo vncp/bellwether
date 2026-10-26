@@ -70,7 +70,8 @@ pub use engine::{
 };
 pub use engine_fix::{EngineCompare, EngineRun, PairRun};
 pub use fix::{
-    DataState, FixOutcome, FixRequest, FixResult, Refusal, RewriteOutputs, Score, SignatureWritten,
+    uncomparable_cause, DataState, FixOutcome, FixRequest, FixResult, Refusal, RewriteOutputs,
+    Score, SignatureWritten,
 };
 pub use keys::KeyFile;
 pub use ledger_views::{
@@ -82,8 +83,8 @@ pub use receipt::signature_summary;
 pub use reconcile::{ReconcileProblem, ReconcileRequest, ReconcileResult};
 pub use results::{
     ChainLink, Cost, CountResult, IndexResult, LinkStatus, LookbackWindow, LookupKind, NotSigned,
-    PlanResult, ProposeRefusal, ProposeResult, ReceiptResult, ReportResult, SidecarState,
-    SpecState, TextRebuilt, Written,
+    PlanResult, ProposeRefusal, ProposeResult, ReceiptResult, ReportResult, SidecarFolded,
+    SidecarState, SpecState, TextRebuilt, Written,
 };
 pub use signing::{
     generate_key, load_signing_key, load_trusted_keys, public_path, read_public_key,

@@ -419,13 +419,13 @@ fn probe_identity_collision_in_an_index() {
     );
 }
 
-/// Every record of both fixtures' ledgers keeps its bytes and hash when
+/// Every record of the fixtures' ledgers keeps its bytes and hash when
 /// read and written back; so do hand-built record version 1 records.
 #[test]
 fn probe_old_records_keep_bytes_and_hashes() {
     let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let mut n = 0;
-    for fx in ["format-v1", "format-v0.1"] {
+    for fx in ["format-v1", "format-v0.1-pre", "format-v0.1"] {
         let dir = repo.join("fixtures").join(fx).join("index/ledger");
         for e in std::fs::read_dir(dir).unwrap() {
             let p = e.unwrap().path();

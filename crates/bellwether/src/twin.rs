@@ -20,7 +20,7 @@ use bellwether_profile::render::thousands;
 use bellwether_replay::{Catalog, RunKeys, Workload};
 use bellwether_source_engine::{EngineAdapter, EngineIdentity};
 use bellwether_store::{Cache, ObjectStoreBackend};
-use bellwether_types::{Error, Gate, Hash, KeySpec, Lint, Result, Source, TwinOf};
+use bellwether_types::{Error, Gate, Hash, KeySpec, Lint, Result, RewriteShape, Source, TwinOf};
 use serde::{Deserialize, Serialize};
 
 use crate::engine::Engine;
@@ -399,7 +399,13 @@ pub(crate) fn measured(p: &TwinPass, columns: &[String]) -> Option<TwinColumns> 
         })
 }
 
-fn lint(rule: &str, columns: Vec<String>, message: String, fresh: bool) -> Lint {
+fn lint(
+    rule: &str,
+    columns: Vec<String>,
+    message: String,
+    fresh: bool,
+    [before, after, invariant]: [String; 3],
+) -> Lint {
     Lint {
         rule: rule.to_string(),
         columns,
@@ -409,11 +415,23 @@ fn lint(rule: &str, columns: Vec<String>, message: String, fresh: bool) -> Lint 
         // (0.6) when it does not.
         confidence: if fresh { 0.9 } else { 0.6 },
         site: None,
-        fix: None,
+        // The rule catalog's guidance template, "Twin lints": a described
+        // rewrite of the agent's engine query, never one the engine runs.
+        fix: Some(RewriteShape {
+            before,
+            after,
+            invariant,
+            pairs: Vec::new(),
+            key: Vec::new(),
+            keys: None,
+            before_plan: None,
+            after_plan: None,
+        }),
     }
 }
 
 /// The four twin lints (rule catalog, "Twin lints"), from the pass.
+#[allow(clippy::too_many_lines)]
 pub(crate) fn lints(p: &TwinPass, gates: &[Gate], latest_per_key: bool, fresh: bool) -> Vec<Lint> {
     let mut out = Vec::new();
     // 1. low-cardinality key.
@@ -446,6 +464,14 @@ pub(crate) fn lints(p: &TwinPass, gates: &[Gate], latest_per_key: bool, fresh: b
                     low.columns[0]
                 ),
                 fresh,
+                [
+                    format!("filter or join by {}", low.columns[0]),
+                    format!(
+                        "filter or join by ({}, {})",
+                        high.columns[0], low.columns[0]
+                    ),
+                    "the rows selected are those whose (partner, column) is in the sample".into(),
+                ],
             ));
         }
     }
@@ -466,6 +492,12 @@ pub(crate) fn lints(p: &TwinPass, gates: &[Gate], latest_per_key: bool, fresh: b
                     thousands(g.limit)
                 ),
                 fresh,
+                [
+                    format!("a membership list of {} keys", thousands(whole.keyset)),
+                    "count the keys first: a membership list under the gate, a join above it"
+                        .into(),
+                    "both branches select the same rows".into(),
+                ],
             ));
         }
     }
@@ -491,6 +523,11 @@ pub(crate) fn lints(p: &TwinPass, gates: &[Gate], latest_per_key: bool, fresh: b
                     thousands(all_bytes / key_bytes.max(1))
                 ),
                 fresh,
+                [
+                    "select over every column".into(),
+                    "project the key columns first, select, then join the wide columns back".into(),
+                    "projection commutes with a selection on the projected columns".into(),
+                ],
             ));
         }
     }
@@ -510,6 +547,11 @@ pub(crate) fn lints(p: &TwinPass, gates: &[Gate], latest_per_key: bool, fresh: b
                 thousands(p.files_total)
             ),
             fresh,
+            [
+                "take the latest per key over the whole table, then filter by the keys".into(),
+                "filter by the keys first, then take the latest per key".into(),
+                "the newest version per sampled key is unchanged".into(),
+            ],
         ));
     }
     out

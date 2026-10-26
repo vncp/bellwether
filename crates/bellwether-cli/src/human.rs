@@ -140,6 +140,39 @@ fn text_rebuilt(s: &mut String, rebuilt: &[bellwether::TextRebuilt]) {
     }
 }
 
+/// What `index` did with the sidecars of an index written before M5: the
+/// folds it made, the sidecars it kept, or (nothing to do) the folds its
+/// next build with work makes.
+fn sidecar_fold(s: &mut String, r: &IndexResult) {
+    for f in &r.sidecars_folded {
+        let _ = writeln!(
+            s,
+            "  folded the pre-M5 sidecar {} into the key spec {} (rebuilt; the sidecar's \
+             declaration and segments are dropped)",
+            f.sidecar, f.into
+        );
+    }
+    for name in &r.kept_legacy {
+        let _ = writeln!(
+            s,
+            "  kept the pre-M5 sidecar {name} as a sidecar: a key spec on its key columns keeps \
+             another time column, so no spec can take it; it is still built and still plans"
+        );
+    }
+    if !r.fold_pending.is_empty() {
+        let _ = writeln!(
+            s,
+            "  this index was written before M5: its next build with work (new or changed files, \
+             or a new --key) folds {}",
+            r.fold_pending
+                .iter()
+                .map(|f| format!("{} into {}", f.sidecar, f.into))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+}
+
 pub(crate) fn index(r: &IndexResult, out: &Out) -> String {
     let mut s = String::new();
     let what = match r.committed {
@@ -168,6 +201,7 @@ pub(crate) fn index(r: &IndexResult, out: &Out) -> String {
             num(r.files_filled)
         );
     }
+    sidecar_fold(&mut s, r);
     for spec in &r.specs_repaired {
         let _ = writeln!(
             s,
@@ -558,17 +592,32 @@ pub(crate) fn plan(r: &PlanResult, out: &Out) -> String {
         let ex: Vec<String> = r.excluded_incomplete.iter().map(label).collect();
         let _ = writeln!(s, "  not used, incomplete: {}", ex.join(", "));
     }
-    match (&r.ordered_by, &r.unordered_reason) {
-        (Some(c), _) => {
+    let interleaved = match &r.evidence.record {
+        Record::Evidence(e) => match &e.body {
+            EvidenceBody::Plan { plan } => plan.order.as_ref().map(Vec::len),
+            EvidenceBody::Profile { .. } => None,
+        },
+        _ => None,
+    };
+    match (&r.ordered_by, &r.unordered_reason, interleaved) {
+        (Some(c), _, None) => {
             let _ = writeln!(
                 s,
                 "  order: by {c} (each row group's minimum, files below in reading order)"
             );
         }
-        (None, Some(why)) => {
+        (Some(c), _, Some(n)) => {
+            let _ = writeln!(
+                s,
+                "  order: by {c} (each row group's minimum); whole files are not in {c} order, \
+                 so the {n} row groups are read in the plan's order, across files (`order` in \
+                 --json); files below by their earliest row group"
+            );
+        }
+        (None, Some(why), _) => {
             let _ = writeln!(s, "  order: unspecified; {why}");
         }
-        (None, None) => {}
+        (None, None, _) => {}
     }
     if let Record::Evidence(e) = &r.evidence.record {
         if let EvidenceBody::Plan { plan } = &e.body {
@@ -639,20 +688,13 @@ pub(crate) fn propose(r: &ProposeResult, _out: &Out) -> String {
         ),
         ProposeResult::Refused {
             refusal:
-                bellwether::ProposeRefusal::SidecarNotProposable {
+                bellwether::ProposeRefusal::SketchNotProposable {
                     declaration,
-                    sidecar,
-                    key,
+                    sketch,
                     command,
                     ..
                 },
         } => {
-            let alone = key.as_deref().map_or_else(String::new, |k| {
-                format!(
-                    "; to reach a receipt, propose the key alone with --key {}",
-                    bellwether::spec::shell_quote(k)
-                )
-            });
             let build = command.as_deref().map_or_else(
                 || {
                     "build it with `bellwether index` and the source options this engine was \
@@ -661,18 +703,10 @@ pub(crate) fn propose(r: &ProposeResult, _out: &Out) -> String {
                 },
                 |c| format!("build it with `{c}`"),
             );
-            let why = if sidecar.starts_with("sketch:") {
-                format!(
-                    "{declaration} declares the sketch {sidecar}, which is approximate and never \
-                     planned with, so no replay can price it"
-                )
-            } else {
-                format!(
-                    "{declaration} declares the sidecar {sidecar}, and a proposal can carry only \
-                     a key spec, so it has no replay, certificate, or receipt yet"
-                )
-            };
-            format!("refused: {why}; {build} (no receipt){alone}\n")
+            format!(
+                "refused: {declaration} declares the sketch {sketch}, which is approximate and \
+                 never planned with, so no replay can price it; {build} (no receipt)\n"
+            )
         }
     }
 }
@@ -783,9 +817,11 @@ pub(crate) fn why(r: &bellwether::WhyReport, out: &Out, fix_command: &str) -> St
         let kind = match &w.lookup {
             Some(LookupKind::Latest) => "latest".to_string(),
             Some(LookupKind::Asof { at, .. }) => format!("asof {at}"),
-            Some(k @ LookupKind::TextRuns { .. }) => lookup_label(k),
-            // `why` prices locate (in a window or not), latest, asof, or
-            // text lookups.
+            Some(k @ (LookupKind::TextRuns { .. } | LookupKind::Bitemporal { .. })) => {
+                lookup_label(k)
+            }
+            // `why` prices locate (in a window or not), latest, asof,
+            // bitemporal, or text lookups.
             _ => return None,
         };
         Some(match &w.lookback {
@@ -954,6 +990,21 @@ pub(crate) fn why(r: &bellwether::WhyReport, out: &Out, fix_command: &str) -> St
                         }
                         _ => "floor: only row groups holding a value".to_string(),
                     });
+                }
+                (
+                    CandidateOrigin::Workload,
+                    KeySpec::Bitemporal {
+                        valid_column,
+                        known_column,
+                        ..
+                    },
+                    _,
+                ) => {
+                    notes.push(format!(
+                        "floor (bitemporal as-of): only row groups holding each key's winning \
+                         version, the greatest {valid_column} among versions known by the \
+                         {known_column} bound"
+                    ));
                 }
                 (CandidateOrigin::Workload, _, Some(_)) => {
                     notes.push("floor (locate): only row groups holding a key".to_string());

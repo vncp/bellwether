@@ -25,8 +25,8 @@
 //!   discovered files sorted by path, ids assigned densely from 0 in file
 //!   and row-group order; nothing retired.
 //!
-//! This is the replay crate's `Catalog` digest, byte for byte; the replay
-//! crate's tests check the two agree on real folders.
+//! The replay crate's `Catalog` computes its digest with [`digest`], so
+//! there is one definition; its tests check it on real folders.
 
 use arrow::datatypes::{DataType, Schema};
 use bellwether_types::{ColumnStats, Error, FileFingerprint, Hash, Result, RowGroupMeta};

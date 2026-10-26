@@ -78,29 +78,93 @@ pub enum Layout {
     BloomPerRowGroup,
     /// Per-row-group `(min, max)`, sorted by `min`, in blocks. Range.
     MinMax,
+    /// As `Keyed`, and each key's value also carries its distinct
+    /// `(valid, known, row group)` triples. Bitemporal (`temporal2`).
+    Bitemporal,
 }
 
 impl Layout {
-    /// The layout a key spec is stored in; `None` for a bitemporal spec,
-    /// whose versions this release still stores in a `temporal2` sidecar
-    /// segment ([`crate::sidecar`]), and for a spec with per-key time
-    /// bounds, which ride in a `bounds` sidecar beside the key's segments.
+    /// The layout a key spec's own segments are stored in. An exact spec
+    /// with per-key time bounds keeps them in its value records (`keyed`);
+    /// a bloom has no per-key record, so a bloom with bounds keeps them in
+    /// a second kind of segment, its `bounds` segment, in the `keyed`
+    /// layout with `bitmap | bounds` records ([`Layout::admits`]).
     #[must_use]
-    pub fn for_spec(spec: &KeySpec) -> Option<Self> {
+    pub fn for_spec(spec: &KeySpec) -> Self {
         match spec {
-            KeySpec::Exact { bounds: None, .. }
-            | KeySpec::Text { bloom: None, .. }
-            | KeySpec::List { .. } => Some(Self::Keyed),
-            KeySpec::Temporal { .. } => Some(Self::KeyedTemporal),
-            KeySpec::Bloom { bounds: None, .. } | KeySpec::Text { bloom: Some(_), .. } => {
-                Some(Self::BloomPerRowGroup)
+            KeySpec::Exact { .. } | KeySpec::Text { bloom: None, .. } | KeySpec::List { .. } => {
+                Self::Keyed
             }
-            KeySpec::Range { .. } => Some(Self::MinMax),
-            KeySpec::Exact { .. } | KeySpec::Bloom { .. } | KeySpec::Bitemporal { .. } => None,
+            KeySpec::Temporal { .. } => Self::KeyedTemporal,
+            KeySpec::Bloom { .. } | KeySpec::Text { bloom: Some(_), .. } => Self::BloomPerRowGroup,
+            KeySpec::Range { .. } => Self::MinMax,
+            KeySpec::Bitemporal { .. } => Self::Bitemporal,
             KeySpec::Expr { over, .. } => Self::for_spec(over),
         }
     }
+
+    /// Whether a segment whose header names `spec` may have this layout:
+    /// the spec's own ([`Layout::for_spec`]), or `keyed` for a bloom with
+    /// per-key bounds (its `bounds` segment).
+    #[must_use]
+    pub fn admits(self, spec: &KeySpec) -> bool {
+        self == Self::for_spec(spec) || (self == Self::Keyed && bloom_bounds_column(spec).is_some())
+    }
+
+    /// Whether the layout stores keys with value records (`keyed`,
+    /// `keyed_temporal`, `bitemporal`).
+    #[must_use]
+    pub fn is_keyed(self) -> bool {
+        matches!(self, Self::Keyed | Self::KeyedTemporal | Self::Bitemporal)
+    }
 }
+
+/// What a keyed value record holds after its bitmap (`docs/format.md`,
+/// "Segments, storage version 2"), from the segment's spec and layout.
+/// Each flag is one independent optional part of the record.
+#[allow(clippy::struct_excessive_bools)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ValueShape {
+    /// One LEB128 count per row group of the bitmap.
+    pub counts: bool,
+    /// One `min i64 | max i64` per row group of the bitmap (an exact spec
+    /// with per-key bounds, or a bloom's `bounds` segment).
+    pub bounds: bool,
+    /// The version chain (temporal).
+    pub chain: bool,
+    /// The `(valid, known, row group)` triples (bitemporal).
+    pub triples: bool,
+}
+
+impl ValueShape {
+    /// The value record shape of `spec`'s segments in `layout`: a bloom's
+    /// `bounds` segment (`keyed`) holds `bitmap | bounds`.
+    #[must_use]
+    pub fn of(spec: &KeySpec, layout: Layout) -> Self {
+        if layout == Layout::Keyed && bloom_bounds_column(spec).is_some() {
+            return Self {
+                bounds: true,
+                ..Self::default()
+            };
+        }
+        Self {
+            counts: spec.counts(),
+            bounds: matches!(
+                spec.physical(),
+                KeySpec::Exact {
+                    bounds: Some(_),
+                    ..
+                }
+            ),
+            chain: layout == Layout::KeyedTemporal,
+            triples: layout == Layout::Bitemporal,
+        }
+    }
+}
+
+/// The sentinel `[min, max]` of a row group where every row of the key has a
+/// null time (`min = i64::MAX`, `max = i64::MIN`): it overlaps no window.
+pub const ALL_NULL_BOUNDS: (i64, i64) = (i64::MAX, i64::MIN);
 
 /// A time unit as recorded in a segment header.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -264,6 +328,51 @@ impl ColumnType {
     }
 }
 
+impl ColumnType {
+    /// The Arrow type this spelling records. [`ColumnType::of`] records a
+    /// dictionary column as its value type, so `of(dt)?.data_type() == dt`
+    /// for every type with a recorded form except a dictionary.
+    #[must_use]
+    pub fn data_type(&self) -> DataType {
+        let unit = |u: &RecordedUnit| match u {
+            RecordedUnit::Second => TimeUnit::Second,
+            RecordedUnit::Millisecond => TimeUnit::Millisecond,
+            RecordedUnit::Microsecond => TimeUnit::Microsecond,
+            RecordedUnit::Nanosecond => TimeUnit::Nanosecond,
+        };
+        match self {
+            Self::Boolean => DataType::Boolean,
+            Self::Int8 => DataType::Int8,
+            Self::Int16 => DataType::Int16,
+            Self::Int32 => DataType::Int32,
+            Self::Int64 => DataType::Int64,
+            Self::UInt8 => DataType::UInt8,
+            Self::UInt16 => DataType::UInt16,
+            Self::UInt32 => DataType::UInt32,
+            Self::UInt64 => DataType::UInt64,
+            Self::Float16 => DataType::Float16,
+            Self::Float32 => DataType::Float32,
+            Self::Float64 => DataType::Float64,
+            Self::Decimal128 { precision, scale } => DataType::Decimal128(*precision, *scale),
+            Self::Decimal256 { precision, scale } => DataType::Decimal256(*precision, *scale),
+            Self::Utf8 => DataType::Utf8,
+            Self::LargeUtf8 => DataType::LargeUtf8,
+            Self::Utf8View => DataType::Utf8View,
+            Self::Binary => DataType::Binary,
+            Self::LargeBinary => DataType::LargeBinary,
+            Self::BinaryView => DataType::BinaryView,
+            Self::FixedSizeBinary { size } => DataType::FixedSizeBinary(*size),
+            Self::Date32 => DataType::Date32,
+            Self::Date64 => DataType::Date64,
+            Self::Time32 { unit: u } => DataType::Time32(unit(u)),
+            Self::Time64 { unit: u } => DataType::Time64(unit(u)),
+            Self::Timestamp { unit: u, tz } => {
+                DataType::Timestamp(unit(u), tz.as_deref().map(Into::into))
+            }
+        }
+    }
+}
+
 /// Key types and an optional timestamp type as one phrase for an error
 /// message: `(Int64, Utf8)` or `(Int64) with ts Timestamp(µs, "UTC")`.
 #[must_use]
@@ -370,6 +479,77 @@ pub fn spec_types(spec: &KeySpec, schema: &Schema) -> Result<(Vec<DataType>, Opt
     Ok((keys, ts))
 }
 
+/// The time columns a spec's value records carry times of, other than a
+/// temporal spec's chain: an exact spec's bounds column, a bitemporal
+/// spec's valid and known columns. Empty for every other spec (a bloom's
+/// bounds column is its `bounds` segment's: [`record_time_columns`]).
+#[must_use]
+pub fn time_columns(spec: &KeySpec) -> Vec<String> {
+    match spec.physical() {
+        KeySpec::Exact {
+            bounds: Some(ts), ..
+        } => vec![ts.clone()],
+        KeySpec::Bitemporal {
+            valid_column,
+            known_column,
+            ..
+        } => vec![valid_column.clone(), known_column.clone()],
+        _ => Vec::new(),
+    }
+}
+
+/// The bounds column of a bloom spec with per-key bounds
+/// (`bloom:a@0.01@ts`): its `bounds` segment keeps each key's `[min, max]`
+/// of that column per row group. `None` for any other spec.
+#[must_use]
+pub fn bloom_bounds_column(spec: &KeySpec) -> Option<&str> {
+    match spec {
+        KeySpec::Bloom {
+            bounds: Some(ts), ..
+        } => Some(ts),
+        _ => None,
+    }
+}
+
+/// The time columns the value records of a segment of `spec` in `layout`
+/// carry times of: [`time_columns`], or for a bloom's `bounds` segment
+/// (`keyed`) its bounds column.
+#[must_use]
+pub fn record_time_columns(spec: &KeySpec, layout: Layout) -> Vec<String> {
+    match bloom_bounds_column(spec) {
+        Some(ts) if layout == Layout::Keyed => vec![ts.to_string()],
+        _ => time_columns(spec),
+    }
+}
+
+/// The dataset types of [`time_columns`] in `schema`: each a timestamp,
+/// date or integer column a version or window orders by
+/// ([`encoding::check_ts_type`]).
+pub fn time_types(spec: &KeySpec, schema: &Schema) -> Result<Vec<DataType>> {
+    column_time_types(&time_columns(spec), schema)
+}
+
+/// The dataset types of [`record_time_columns`] in `schema`.
+pub fn record_time_types(spec: &KeySpec, layout: Layout, schema: &Schema) -> Result<Vec<DataType>> {
+    column_time_types(&record_time_columns(spec, layout), schema)
+}
+
+fn column_time_types(columns: &[String], schema: &Schema) -> Result<Vec<DataType>> {
+    columns
+        .iter()
+        .map(|c| {
+            let dt = schema
+                .field_with_name(c)
+                .map_err(|_| Error::KeySpec(format!("column {c} is not in the dataset schema")))?
+                .data_type()
+                .clone();
+            encoding::check_supported(&dt)?;
+            encoding::check_ts_type(&dt)?;
+            Ok(dt)
+        })
+        .collect()
+}
+
 /// The JSON header after the preamble. Unknown fields are preserved in
 /// `extra` so a rewrite does not drop them, and merge carries them through
 /// when every input agrees (ADR 017).
@@ -403,6 +583,12 @@ pub struct SegmentHeader {
     /// together with `key_types` for temporal specs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ts_type: Option<ColumnType>,
+    /// The time columns' dataset types and units, recorded together with
+    /// `key_types` for the specs whose value records carry times other than
+    /// a temporal chain: `[bounds column]` for an exact spec with per-key
+    /// bounds, `[valid, known]` for a bitemporal spec (storage version 2).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub time_types: Option<Vec<ColumnType>>,
     /// For a text key (and only a text key): the Unicode tables its tokens
     /// were folded and split under (`docs/format.md`, "Text keys"). A
     /// reader built on other tables refuses the segment.
@@ -420,7 +606,7 @@ impl SegmentHeader {
     /// so no such segment is ever written.
     #[must_use]
     pub fn new(spec: KeySpec) -> Self {
-        let layout = Layout::for_spec(&spec).unwrap_or(Layout::Keyed);
+        let layout = Layout::for_spec(&spec);
         let spec_is_text = matches!(spec, KeySpec::Text { .. });
         Self {
             storage_version: STORAGE_VERSION,
@@ -431,6 +617,7 @@ impl SegmentHeader {
             codec: CODEC_NONE.to_string(),
             key_types: None,
             ts_type: None,
+            time_types: None,
             text_unicode: spec_is_text.then(crate::text::UnicodeTables::current),
             extra: serde_json::Map::new(),
         }
@@ -457,19 +644,19 @@ impl SegmentHeader {
                 self.codec
             )));
         }
-        let Some(layout) = Layout::for_spec(&self.key_spec) else {
-            return Err(Error::KeySpec(format!(
-                "{} has no key segment of its own in this release: per-key time bounds and \
-                 bitemporal versions are stored as sidecar segments",
-                self.key_spec.identity()
-            )));
-        };
-        if self.layout != layout {
+        if !self.layout.admits(&self.key_spec) {
             return Err(corrupt("layout does not match key spec"));
         }
         if self.key_spec.counts() && self.storage_version < 2 {
             return Err(corrupt(
                 "a storage version 1 segment cannot store counts (they arrived in version 2)",
+            ));
+        }
+        let shape = ValueShape::of(&self.key_spec, self.layout);
+        if (shape.bounds || shape.triples) && self.storage_version < 2 {
+            return Err(corrupt(
+                "a storage version 1 segment cannot store per-key bounds or bitemporal versions \
+                 (they arrived in storage version 2)",
             ));
         }
         // Only bloom segments may hold reused Parquet filters.
@@ -487,9 +674,25 @@ impl SegmentHeader {
                 return Err(corrupt("parquet_plain filters cover exactly one column"));
             }
         }
-        // Recorded types: one per key column, and the ts type exactly when a
-        // temporal spec records key types.
+        // Recorded types: one per key column, the ts type exactly when a
+        // temporal spec records key types, and the time types exactly when
+        // a spec with bounds or bitemporal versions does.
         let temporal = matches!(self.key_spec, KeySpec::Temporal { .. });
+        let times = record_time_columns(&self.key_spec, self.layout).len();
+        match (&self.key_types, &self.time_types) {
+            (Some(_), Some(t)) if t.len() != times || times == 0 => {
+                return Err(corrupt(
+                    "time_types does not match the key spec's time columns",
+                ));
+            }
+            (Some(_), None) if times > 0 => {
+                return Err(corrupt(
+                    "time_types is recorded with key_types for this key spec",
+                ));
+            }
+            (None, Some(_)) => return Err(corrupt("time_types without key_types")),
+            _ => {}
+        }
         match &self.key_types {
             Some(types) if types.len() != self.key_spec.columns().len() => {
                 return Err(corrupt("key_types does not match the key spec's columns"));
@@ -533,38 +736,8 @@ impl SegmentHeader {
     }
 }
 
-/// Parses a segment's JSON header. A storage version 2 header in a shape
-/// the next storage version 2 release adds (the `bitemporal` layout, a key
-/// spec with per-key `bounds` or of the bitemporal kind, a header `bounds`
-/// field, each of which changes the value records) is refused with
-/// [`Error::UnsupportedShape`], before the typed parse could misread it or
-/// fail with a serde error (ADR 028).
-pub(crate) fn parse_header(bytes: &[u8], storage: u32) -> Result<SegmentHeader> {
-    if storage >= 2 {
-        if let Ok(v) = serde_json::from_slice::<serde_json::Value>(bytes) {
-            let spec = v.get("key_spec");
-            let found = || {
-                spec.and_then(|s| serde_json::from_value::<KeySpec>(s.clone()).ok())
-                    .map_or_else(|| "in a segment".to_string(), |s| s.identity())
-            };
-            let shape = if v.get("layout").and_then(|l| l.as_str()) == Some("bitemporal") {
-                Some(("segment layout", "bitemporal".to_string()))
-            } else if spec.and_then(|s| s.get("kind")).and_then(|k| k.as_str())
-                == Some("bitemporal")
-            {
-                Some(("bitemporal key spec", found()))
-            } else if spec.is_some_and(|s| s.get("bounds").is_some()) {
-                Some(("key spec with per-key bounds", found()))
-            } else if v.get("bounds").is_some() {
-                Some(("segment header field", "bounds".to_string()))
-            } else {
-                None
-            };
-            if let Some((what, found)) = shape {
-                return Err(Error::UnsupportedShape { what, found });
-            }
-        }
-    }
+/// Parses a segment's JSON header.
+pub(crate) fn parse_header(bytes: &[u8]) -> Result<SegmentHeader> {
     Ok(serde_json::from_slice(bytes)?)
 }
 
@@ -741,6 +914,11 @@ impl<'a> Cursor<'a> {
 
     pub(crate) fn is_done(&self) -> bool {
         self.pos == self.buf.len()
+    }
+
+    /// Bytes not yet read.
+    pub(crate) fn remaining(&self) -> usize {
+        self.buf.len() - self.pos
     }
 
     /// An unsigned LEB128 value in its shortest form: an over-long encoding

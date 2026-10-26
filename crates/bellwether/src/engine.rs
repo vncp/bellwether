@@ -8,7 +8,6 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use arrow::datatypes::SchemaRef;
 use bellwether_build::{BuildOptions, Planner, SourceKind};
-use bellwether_core::sidecar::SidecarDef;
 use bellwether_ledger::Ledger;
 use bellwether_source::{
     fingerprint_with_policy, ChunkedTextSource, FingerprintPolicy, LocalFs, ParquetSource,
@@ -113,8 +112,9 @@ pub struct EngineOptions {
     /// Chunk size for text files seen for the first time. `None` keeps the
     /// size the index records, or 64 MiB for a new index.
     pub chunk_size: Option<u64>,
-    /// The dataset schema, overriding inference from the first file (for
-    /// example when files hold one decimal column at different scales).
+    /// The dataset schema, overriding inference (the first file's schema,
+    /// each decimal column widened to the widest any file stores; for
+    /// example when files hold one column at different time units).
     /// An index records its schema at its first build; afterwards the
     /// index's schema is used to read and plan.
     pub schema: Option<SchemaRef>,
@@ -149,7 +149,7 @@ pub struct EngineOptions {
     /// `--path-template`), one argument per element, unquoted, paths made
     /// absolute, as the shared flag definition (`bellwether_mcp::EngineArgs`)
     /// renders them. The facade only assembles them into the `bellwether
-    /// index` command a refusal names (`ProposeRefusal::SidecarNotProposable`).
+    /// index` command a refusal names (`ProposeRefusal::SketchNotProposable`).
     /// `None` for an engine a library caller opened: that command is then
     /// given only when every source option above is the default.
     pub source_flags: Option<Vec<String>>,
@@ -387,14 +387,14 @@ impl Engine {
             tables_open: Mutex::new(Vec::new()),
         };
         if let Some(m) = engine.manifest()? {
-            let recorded = SourceKind::parse(&m.source.kind)?;
+            let recorded = SourceKind::of(&m.source)?;
             if recorded != engine.options.format.kind() {
                 return Err(Error::Source(format!(
                     "the index at {} was built over {} files, not {}; open it with the same \
                      format",
                     engine.index,
-                    m.source.kind,
-                    engine.options.format.kind().manifest_kind()
+                    recorded.label(),
+                    engine.options.format.kind().label()
                 )));
             }
             let recorded = Partitioning::parse(m.source.partitioning.as_deref())?;
@@ -1187,9 +1187,9 @@ impl Engine {
     /// stage of `fix` alike), from this engine's options: the source format
     /// (a CSV dialect included), chunk size, dataset schema, fingerprint
     /// policy, and partitioning (hive or a path template), so whichever verb
-    /// builds an index first records the same `manifest.source`; plus
-    /// `sidecars` to declare and the index directory to exclude.
-    pub(crate) fn build_options(&self, sidecars: Vec<SidecarDef>) -> BuildOptions {
+    /// builds an index first records the same `manifest.source`; plus the
+    /// index directory to exclude.
+    pub(crate) fn build_options(&self) -> BuildOptions {
         let mut options = BuildOptions::new(self.format().kind());
         options.chunk_size = self.options.chunk_size;
         // A text index records the schema its decoders read ("UTC" as
@@ -1200,7 +1200,6 @@ impl Engine {
         };
         options.fingerprint_policy = self.options.fingerprint_policy;
         options.partitioning.clone_from(&self.options.partitioning);
-        options.sidecars = sidecars;
         options.exclude = self.excluded();
         options.threads = self.options.threads;
         options
@@ -1299,8 +1298,9 @@ fn nullable_default() -> bool {
 
 /// Parses a dataset schema for [`EngineOptions::schema`] from JSON: a list
 /// of `{"name": ..., "type": ..., "nullable": ...}` objects in column order,
-/// each `type` spelled as Arrow prints it and as the manifest records it
-/// (`"Int64"`, `"Decimal128(12, 4)"`, `"Timestamp(Microsecond, Some(\"UTC\"))"`).
+/// each `type` spelled as Arrow prints it, as a storage version 1 manifest
+/// recorded it (`"Int64"`, `"Decimal128(12, 4)"`,
+/// `"Timestamp(Microsecond, Some(\"UTC\"))"`).
 /// `nullable` defaults to true. The types are kept as written; over CSV
 /// and JSON lines a timestamp in the named zone `"UTC"` is read as the
 /// offset `"+00:00"` (the same instants), because their decoders take only
@@ -1382,21 +1382,19 @@ pub(crate) fn schema_hint(e: Error) -> Error {
     }
 }
 
-/// `e`, with a text key's rebuild step (core's `text::REBUILD_STEP`)
-/// naming the data root instead of "the data folder".
+/// `e`, with an engine step that says to run "`bellwether index` on the
+/// data folder" (core's text `REBUILD_STEP`, replay's step for a bitemporal
+/// run priced without an index) naming the data root instead.
 pub(crate) fn root_hint(root: &str, e: Error) -> Error {
-    let step = bellwether_core::text::REBUILD_STEP;
+    const STEP: &str = "`bellwether index` on the data folder";
     let named = |m: String| {
         m.replace(
-            step,
-            &step.replace(
-                "`bellwether index` on the data folder",
-                &format!("`bellwether index {}`", crate::spec::shell_quote(root)),
-            ),
+            STEP,
+            &format!("`bellwether index {}`", crate::spec::shell_quote(root)),
         )
     };
     match e {
-        Error::KeySpec(m) if m.contains(step) => Error::KeySpec(named(m)),
+        Error::KeySpec(m) if m.contains(STEP) => Error::KeySpec(named(m)),
         other => other,
     }
 }

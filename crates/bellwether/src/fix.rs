@@ -150,9 +150,14 @@ pub enum Refusal {
         /// The failing certificate (stored; a failing certificate is a
         /// legitimate record).
         certificate: Hash,
-        /// Keys on both sides whose compared versions differ, or that could
-        /// not be compared.
+        /// Keys on both sides whose compared versions differ (the
+        /// certificate's `mismatched`).
         mismatched: u64,
+        /// Keys that could not be compared: every row of the key on some
+        /// side has a null version time, and a null never wins (ADR 014;
+        /// the certificate's `uncomparable`).
+        #[serde(default)]
+        uncomparable: u64,
         /// Keys on the right only.
         missing_left: u64,
         /// Keys on the left only.
@@ -538,10 +543,11 @@ impl Engine {
                 result.outcome = refused(Refusal::LayoutNotApplicable);
                 Ok(result)
             }
-            ProposalBody::Key { spec, .. } => {
+            ProposalBody::Key { spec, sidecars } => {
+                let specs = proposed_keys(spec, sidecars);
                 // A key already complete has nothing to apply: refused
                 // before anything is scored, so the refusal writes nothing.
-                if !req.verify_only && complete(pinned.as_ref(), spec) {
+                if !req.verify_only && complete(pinned.as_ref(), &specs) {
                     result.outcome = refused(Refusal::NothingToApply {
                         sequence: before.to_string(),
                     });
@@ -604,7 +610,7 @@ impl Engine {
                 // 2. Verify.
                 let (plan, cert, verification) = self.verify_key(
                     hash,
-                    spec,
+                    &specs,
                     &replayer,
                     &*source,
                     &workload,
@@ -638,7 +644,7 @@ impl Engine {
                         (result.outcome, result.signatures) = self.apply_and_attest(
                             &proposal,
                             hash,
-                            spec,
+                            &specs,
                             &replay_hash,
                             &cert.hash,
                             true,
@@ -815,7 +821,9 @@ impl Engine {
             // Already complete: the apply would commit nothing. Refused
             // here, before the replay is scored, so the dry run and the
             // real apply agree and the refusal writes nothing.
-            ProposalBody::Key { spec, .. } if complete(self.pin()?.as_ref(), spec) => {
+            ProposalBody::Key { spec, sidecars }
+                if complete(self.pin()?.as_ref(), &proposed_keys(spec, sidecars)) =>
+            {
                 result.outcome = refused(Refusal::NothingToApply {
                     sequence: before.to_string(),
                 });
@@ -829,7 +837,8 @@ impl Engine {
                     expected: before.saturating_add(1),
                 };
             }
-            ProposalBody::Key { spec, .. } => {
+            ProposalBody::Key { spec, sidecars } => {
+                let specs = proposed_keys(spec, sidecars);
                 let Coverage::Workload { workload, .. } = &certificate.coverage else {
                     return Err(not_workload_covered(cert_hash));
                 };
@@ -857,7 +866,7 @@ impl Engine {
                 (result.outcome, result.signatures) = self.apply_and_attest(
                     &proposal,
                     &proposal_hash,
-                    spec,
+                    &specs,
                     &replay_hash,
                     cert_hash,
                     false,
@@ -920,14 +929,25 @@ impl Engine {
     fn verify_key(
         &self,
         proposal: &Hash,
-        spec: &KeySpec,
+        proposed: &[KeySpec],
         replayer: &Replayer<'_>,
         source: &dyn Source,
         workload: &Workload,
         cache: &Cache<ObjectStoreBackend>,
         pinned: Option<&Pinned>,
     ) -> Result<(Written, Written, Reconciliation)> {
-        let specs = proposed_specs(replayer.current_specs(), spec);
+        // The configuration the apply commits: each proposed spec replaces
+        // the current spec of its name.
+        let specs = proposed
+            .iter()
+            .fold(replayer.current_specs().to_vec(), |c, s| {
+                proposed_specs(&c, s)
+            });
+        let named = proposed
+            .iter()
+            .map(crate::spec::label)
+            .collect::<Vec<_>>()
+            .join(" --key ");
         let runs = workload.runs();
         let columns =
             runs.first()
@@ -988,10 +1008,12 @@ impl Engine {
                 keys.extend(rk.all_probes(&all));
             }
             let column = replayer.planned_time_column(&specs, rk.columns(), &query)?;
+            let window = replayer.planned_lookback_window(&specs, rk.columns(), &query)?;
             asked.push(AskedRun {
                 keys: rk,
                 query,
                 column,
+                window,
                 residual: plan.residual,
             });
         }
@@ -1033,9 +1055,9 @@ impl Engine {
                      column to compare rows by and cannot certify {}; build it without a \
                      receipt with `bellwether index {} --key {}`",
                     self.root(),
-                    crate::spec::label(spec),
+                    named,
                     self.root(),
-                    crate::spec::label(spec)
+                    named
                 )));
             }
             (
@@ -1246,7 +1268,7 @@ impl Engine {
         &self,
         proposal: &Proposal,
         proposal_hash: &Hash,
-        spec: &KeySpec,
+        specs: &[KeySpec],
         replay: &Hash,
         cert_hash: &Hash,
         certificate_written: bool,
@@ -1255,12 +1277,9 @@ impl Engine {
     ) -> Result<(FixOutcome, Vec<SignatureWritten>)> {
         #[cfg(test)]
         test_seam::before_apply(self);
-        let options = self.build_options(Vec::new());
-        let report = Builder::new(Arc::clone(self.store()?), "").build(
-            self.root(),
-            std::slice::from_ref(spec),
-            &options,
-        )?;
+        let options = self.build_options();
+        let report =
+            Builder::new(Arc::clone(self.store()?), "").build(self.root(), specs, &options)?;
         let after = match advance(before, report.sequence) {
             Ok(after) => after,
             Err(refusal) => return Ok((refused(refusal), Vec::new())),
@@ -1516,10 +1535,16 @@ fn refused(refusal: Refusal) -> FixOutcome {
     FixOutcome::Refused { refusal }
 }
 
-/// Whether `spec` is complete at the pinned manifest: applying it would
-/// commit nothing.
-fn complete(pinned: Option<&Pinned>, spec: &KeySpec) -> bool {
-    pinned.is_some_and(|p| p.planner.completeness(spec).is_some())
+/// Whether every one of `specs` is complete at the pinned manifest:
+/// applying them would commit nothing.
+fn complete(pinned: Option<&Pinned>, specs: &[KeySpec]) -> bool {
+    pinned.is_some_and(|p| specs.iter().all(|s| p.planner.completeness(s).is_some()))
+}
+
+/// The specs a key proposal applies in one commit: its spec, then the specs
+/// proposed beside it (`ProposalBody::Key.sidecars`).
+fn proposed_keys(spec: &KeySpec, sidecars: &[KeySpec]) -> Vec<KeySpec> {
+    std::iter::once(spec).chain(sidecars).cloned().collect()
 }
 
 fn not_workload_covered(cert_hash: &Hash) -> Error {
@@ -1543,10 +1568,29 @@ fn failed(hash: &Hash, c: &Certificate) -> Option<Refusal> {
     (!c.pass).then_some(Refusal::CertificateFailed {
         certificate: *hash,
         mismatched: c.body.mismatched,
+        uncomparable: c.body.uncomparable,
         missing_left: c.body.missing_left,
         missing_right: c.body.missing_right,
         totals_differ: c.body.totals_delta.len() as u64,
     })
+}
+
+/// Why `n` keys could not be compared and what to do, in the words `fix`,
+/// `reconcile` and the MCP refusal use.
+#[must_use]
+pub fn uncomparable_cause(n: u64) -> String {
+    let keys = if n == 1 {
+        "1 key".to_string()
+    } else {
+        format!("{n} keys")
+    };
+    format!(
+        "{keys} could not be compared (uncomparable): every row of such a key on one side has a \
+         null version time, and a null never wins (ADR 014), so the key has no version to compare \
+         there. Give those rows a time in the data, or compare without a version column (record \
+         the workload without --latest-by, or reconcile without --latest-by) so every row of the \
+         key is compared"
+    )
 }
 
 /// The manifest anchor for a certificate when an index exists: its sequence,
@@ -1631,6 +1675,10 @@ struct AskedRun {
     keys: RunKeys,
     query: RunQuery,
     column: Option<String>,
+    /// An `asof` lookback run's window as the plan was priced on: on
+    /// `column`, converted from the run's own unit rounding outward
+    /// (`Replayer::planned_lookback_window`).
+    window: Option<bellwether_replay::RunWindow>,
     residual: Option<Predicate>,
 }
 
@@ -1713,13 +1761,16 @@ fn rows_asked(
         match (&run.query, &run.column) {
             (RunQuery::Window(w), _) => tests.push(between(&w.ts_column, w.lo, w.hi)?),
             (RunQuery::Asof { ts }, Some(c)) => tests.push(between(c, i64::MIN, *ts)?),
-            (
-                RunQuery::Lookback {
-                    asof: Some(at),
-                    lookback,
-                },
-                Some(c),
-            ) => tests.push(between(c, at.saturating_sub(*lookback), *at)?),
+            (RunQuery::Lookback { asof: Some(_), .. }, Some(_)) => {
+                // Without a window, the run's units do not convert to the
+                // planned column's: it was planned without one, so every
+                // row of its keys is compared.
+                let Some(w) = &run.window else {
+                    filter.push(Predicate::And { all: tests });
+                    continue;
+                };
+                tests.push(between(&w.ts_column, w.lo, w.hi)?);
+            }
             (
                 RunQuery::Lookback {
                     asof: None,
@@ -1727,6 +1778,12 @@ fn rows_asked(
                 },
                 Some(c),
             ) => tests.extend(newest_windows(source, catalog, run, c, *lookback)?),
+            // Each key's winning version, from the data: the rows at its
+            // greatest valid time within the bound, and among those its
+            // greatest known time within the bound.
+            (RunQuery::Bitemporal(b), _) => {
+                tests = bitemporal_winners(source, catalog, run, b)?;
+            }
             _ => {
                 filter.push(Predicate::And { all: tests });
                 continue;
@@ -1848,6 +1905,122 @@ fn newest_windows(
             bounds,
         },
     ])
+}
+
+/// A bitemporal run's winning rows, from every live row group of `source`
+/// (the left side, never the index under test): per key (the columns the
+/// plan's residual keys its versions by, the run's columns otherwise), the
+/// greatest valid time at or before the run's valid bound among rows known
+/// at or before its known bound, then the greatest known time at that valid
+/// time. As predicates: `In` over the keys with a winner, each clock within
+/// its bound, and `NotOlderThan` at each key's winning valid and known
+/// times, which together keep exactly the winning rows. Memory: one winner
+/// per looked-up key (ADR 018).
+#[allow(clippy::many_single_char_names)]
+fn bitemporal_winners(
+    source: &dyn Source,
+    catalog: &Catalog,
+    run: &AskedRun,
+    b: &bellwether_replay::RunBitemporal,
+) -> Result<Vec<Predicate>> {
+    fn key_columns(p: &Predicate) -> Option<&Vec<String>> {
+        match p {
+            Predicate::NotOlderThan { columns, .. } => Some(columns),
+            Predicate::And { all } => all.iter().find_map(key_columns),
+            _ => None,
+        }
+    }
+    let columns = run
+        .residual
+        .as_ref()
+        .and_then(key_columns)
+        .cloned()
+        .unwrap_or_else(|| run.keys.columns().to_vec());
+    let positions = run.keys.positions(&columns).ok_or_else(|| {
+        Error::Other(format!(
+            "the bitemporal key columns {columns:?} are not all among the run's {:?}",
+            run.keys.columns()
+        ))
+    })?;
+    let wanted: std::collections::HashSet<Vec<u8>> =
+        run.keys.all_probes(&positions).into_iter().collect();
+    let schema = catalog.schema();
+    let mut read: Vec<String> = columns.clone();
+    read.push(b.valid_column.clone());
+    read.push(b.known_column.clone());
+    let types: Vec<arrow::datatypes::DataType> = read
+        .iter()
+        .map(|c| {
+            schema
+                .field_with_name(c)
+                .map(|f| f.data_type().clone())
+                .map_err(|_| Error::KeySpec(format!("column {c:?} is not in the dataset")))
+        })
+        .collect::<Result<_>>()?;
+    let n = columns.len();
+    let mut winners: BTreeMap<Vec<u8>, (i64, i64)> = BTreeMap::new();
+    let mut key = Vec::new();
+    for rg in catalog.row_groups() {
+        let batch = source.read_columns(&rg.meta, &read)?;
+        'rows: for row in 0..batch.num_rows() {
+            key.clear();
+            for (i, t) in types[..n].iter().enumerate() {
+                if !bellwether_core::encoding::encode_array_value_as(
+                    batch.column(i).as_ref(),
+                    row,
+                    t,
+                    &mut key,
+                )? {
+                    continue 'rows;
+                }
+            }
+            if !wanted.contains(&key) {
+                continue;
+            }
+            let clock = |i: usize| {
+                bellwether_core::encoding::ts_value_as(batch.column(i).as_ref(), row, &types[i])
+            };
+            let (Some(v), Some(k)) = (clock(n)?, clock(n + 1)?) else {
+                continue;
+            };
+            if b.valid.is_some_and(|at| v > at) || b.known.is_some_and(|at| k > at) {
+                continue;
+            }
+            let e = winners.entry(key.clone()).or_insert((v, k));
+            *e = (*e).max((v, k));
+        }
+    }
+    let (valid_type, known_type) = (&types[n], &types[n + 1]);
+    let mut tests = vec![Predicate::In {
+        columns: columns.clone(),
+        values: winners.keys().cloned().collect(),
+    }];
+    let bound = |c: &str, t: &arrow::datatypes::DataType, at: i64| -> Result<Predicate> {
+        Ok(Predicate::Between {
+            column: c.to_string(),
+            lo: encode_ts(bellwether_core::encoding::ts_min(t)?, t)?,
+            hi: encode_ts(at, t)?,
+        })
+    };
+    if let Some(at) = b.valid {
+        tests.push(bound(&b.valid_column, valid_type, at)?);
+    }
+    if let Some(at) = b.known {
+        tests.push(bound(&b.known_column, known_type, at)?);
+    }
+    let per_key = |clock: &str, t: &arrow::datatypes::DataType, pick: fn(&(i64, i64)) -> i64| {
+        Ok::<_, Error>(Predicate::NotOlderThan {
+            columns: columns.clone(),
+            ts_column: clock.to_string(),
+            bounds: winners
+                .iter()
+                .map(|(k, w)| Ok((k.clone(), encode_ts(pick(w), t)?)))
+                .collect::<Result<Vec<_>>>()?,
+        })
+    };
+    tests.push(per_key(&b.valid_column, valid_type, |w| w.0)?);
+    tests.push(per_key(&b.known_column, known_type, |w| w.1)?);
+    Ok(tests)
 }
 
 pub(crate) fn load_workload(
@@ -2573,14 +2746,16 @@ mod tests {
     /// (2026-01-09, part-2 row group 2).
     #[derive(Clone, Copy, Debug)]
     enum Plant {
-        /// Dropped: the index's newest time for `A` is two days too old.
+        /// Its time dropped (the all-null sentinel): the index's newest
+        /// time for `A` is two days too old.
         TooOld,
         /// Its maximum raised five days: the index's newest is too new.
         TooNew,
     }
 
-    /// Commits per-key bounds for the [`daily`] corpus over `e`'s index in
-    /// place of the ones `index` built, `A`'s corrupted by `plant`.
+    /// Commits the `exact:symbol@ts` segment for the [`daily`] corpus over
+    /// `e`'s index in place of the one `index` built, `A`'s per-key bounds
+    /// corrupted by `plant` (its membership kept).
     #[allow(
         clippy::many_single_char_names,
         clippy::cast_possible_wrap,
@@ -2588,7 +2763,7 @@ mod tests {
     )]
     fn plant_bounds(e: &Engine, plant: Option<Plant>) {
         use bellwether_core::encoding::{encode_value_as, Value};
-        use bellwether_core::sidecar::{SidecarDef, SidecarKind, SidecarWriter};
+        use bellwether_core::segment::{SegmentWriter, WriterOptions};
         use bellwether_store::{commit, RowGroupRange, SegmentRef, StagedSegments};
         use bellwether_types::RowGroupId;
 
@@ -2599,17 +2774,18 @@ mod tests {
             .unwrap()
             .manifest()
             .clone();
-        let def = SidecarDef {
-            kind: SidecarKind::Bounds,
-            columns: vec!["symbol".into()],
-            time_columns: vec!["ts".into()],
-        };
+        let spec = crate::spec::parse("exact:symbol@ts").unwrap();
         let schema = e.pin().unwrap().unwrap().planner.schema().clone();
-        let mut w = SidecarWriter::for_dataset(def.clone(), &schema).unwrap();
+        let mut w =
+            SegmentWriter::for_dataset(spec.clone(), &schema, WriterOptions::default()).unwrap();
         let enc = |s: &str| {
             let mut out = Vec::new();
             encode_value_as(&Value::Utf8(s), &arrow::datatypes::DataType::Utf8, &mut out).unwrap();
             out
+        };
+        let mut timed = |key: &str, rg: RowGroupId, lo: Option<i64>, hi: Option<i64>| {
+            w.insert_timed(&enc(key), rg, lo).unwrap();
+            w.insert_timed(&enc(key), rg, hi).unwrap();
         };
         let (mut lo_id, mut hi_id) = (u32::MAX, 0);
         for f in &m.rowgroup_space.files {
@@ -2623,18 +2799,17 @@ mod tests {
                 let d = fi * 3 + r as i64;
                 let t = |i: i64| (FIRST + d) * DAY + i * 1_000_000 + 1;
                 if d % 2 == 0 {
-                    let (lo, mut hi) = (t(0), t(2));
+                    let (lo, hi) = (t(0), t(2));
                     match (plant, d) {
-                        (Some(Plant::TooOld), 8) => {}
+                        (Some(Plant::TooOld), 8) => timed("A", *id, None, None),
                         (Some(Plant::TooNew), 8) => {
-                            hi += 5 * DAY;
-                            w.insert_bounds(&enc("A"), *id, lo, hi).unwrap();
+                            timed("A", *id, Some(lo), Some(hi + 5 * DAY));
                         }
-                        _ => w.insert_bounds(&enc("A"), *id, lo, hi).unwrap(),
+                        _ => timed("A", *id, Some(lo), Some(hi)),
                     }
-                    w.insert_bounds(&enc("B"), *id, t(1), t(3)).unwrap();
+                    timed("B", *id, Some(t(1)), Some(t(3)));
                 } else {
-                    w.insert_bounds(&enc("B"), *id, t(0), t(3)).unwrap();
+                    timed("B", *id, Some(t(0)), Some(t(3)));
                 }
             }
         }
@@ -2643,14 +2818,15 @@ mod tests {
         let seg = w.finish().unwrap();
         let mut staged = StagedSegments::new();
         staged.stage(bytes::Bytes::from(seg.bytes.clone()));
+        let identity = spec.identity();
         commit(&**store, "", &staged, |cur| {
             let mut next = cur.clone();
             next.segments
-                .retain(|s| s.kind.as_deref() != Some("bounds"));
+                .retain(|s| !(s.kind.is_none() && s.key_spec == identity));
             next.segments.push(SegmentRef {
                 id: seg.id,
-                kind: Some("bounds".into()),
-                key_spec: def.name(),
+                kind: None,
+                key_spec: identity.clone(),
                 rowgroup_range: RowGroupRange {
                     start: RowGroupId(lo_id),
                     end: RowGroupId(hi_id + 1),

@@ -19,10 +19,12 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use bellwether_core::sidecar::SidecarDef;
-use bellwether_store::{Manifest, RowGroupSpace, SegmentRef, KNOWN_SEGMENT_KINDS};
+use bellwether_store::{Manifest, RowGroupSpace, SegmentRef};
 use bellwether_types::{Error, KeySpec, Result, RowGroupId, SketchSpec};
 
-use crate::target::{declared_sidecars, declared_sketches, declared_targets, Target};
+use crate::target::{
+    declared_sketches, declared_targets, targets_of, timed_sources, Target, TimedSource,
+};
 use roaring::RoaringBitmap;
 
 /// Every live id, failing if a tracked file lists an id twice or two files
@@ -51,25 +53,24 @@ pub(crate) fn retired_ids(space: &RowGroupSpace) -> RoaringBitmap {
         .collect()
 }
 
-/// Whether `seg` is a segment of the key spec or sidecar named `name`: its
-/// `kind` is absent for a key spec and the sidecar's kind for a sidecar
-/// (whose names always start with `<kind>:`). A segment of a kind this
-/// binary does not know is never one (docs/format.md, "Segment kinds").
-pub(crate) fn segment_of(seg: &SegmentRef, name: &str) -> bool {
-    seg.key_spec == name
-        && match seg.kind.as_deref() {
-            None => !KNOWN_SEGMENT_KINDS
-                .iter()
-                .any(|k| name.starts_with(&format!("{k}:"))),
-            Some(k) => KNOWN_SEGMENT_KINDS.contains(&k) && name.starts_with(&format!("{k}:")),
-        }
+/// Whether `seg` is a segment listed under `name` with `kind`: absent for a
+/// key spec, the sidecar's kind for a sidecar or a bloom's bounds. A
+/// bitemporal key spec and the `temporal2` sidecar of an index written
+/// before M5 share a name (`temporal2:id@valid,known`) and differ by kind.
+/// A segment of a kind this binary does not know is never one
+/// (docs/format.md, "Segment kinds").
+pub(crate) fn segment_of(seg: &SegmentRef, name: &str, kind: Option<&str>) -> bool {
+    seg.key_spec == name && seg.kind.as_deref() == kind
 }
 
-/// The ids covered by the live segments of the key spec or sidecar named
-/// `name`.
-pub(crate) fn covered(manifest: &Manifest, name: &str) -> RoaringBitmap {
+/// The ids covered by the live segments listed under `name` with `kind`.
+pub(crate) fn covered(manifest: &Manifest, name: &str, kind: Option<&str>) -> RoaringBitmap {
     let mut out = RoaringBitmap::new();
-    for s in manifest.segments.iter().filter(|s| segment_of(s, name)) {
+    for s in manifest
+        .segments
+        .iter()
+        .filter(|s| segment_of(s, name, kind))
+    {
         let (start, end) = (s.rowgroup_range.start.0, s.rowgroup_range.end.0);
         if start < end {
             out.insert_range(start..end);
@@ -78,9 +79,18 @@ pub(crate) fn covered(manifest: &Manifest, name: &str) -> RoaringBitmap {
     out
 }
 
-/// Whether the key spec or sidecar named `name` covers every id in `live`.
-pub(crate) fn is_complete(manifest: &Manifest, name: &str, live: &RoaringBitmap) -> bool {
-    live.is_subset(&covered(manifest, name))
+/// Whether the segments of `target` cover every id in `live`.
+pub(crate) fn is_complete(manifest: &Manifest, target: &Target, live: &RoaringBitmap) -> bool {
+    live.is_subset(&covered(manifest, &target.name(), target.kind()))
+}
+
+/// Whether every target named `name` among `targets` (a key spec, and a
+/// bloom's bounds beside it) covers every id in `live`.
+fn all_complete(manifest: &Manifest, targets: &[Target], name: &str, live: &RoaringBitmap) -> bool {
+    targets
+        .iter()
+        .filter(|t| t.name() == name)
+        .all(|t| is_complete(manifest, t, live))
 }
 
 /// The sequence at which `spec` became complete in `manifest`, or `None`.
@@ -97,18 +107,23 @@ pub fn completeness(manifest: &Manifest, spec: &KeySpec) -> Option<u64> {
     if !manifest.schema.key_specs.contains(spec) {
         return None;
     }
-    recorded_and_covered(manifest, &spec.identity())
+    recorded_and_covered(manifest, &targets_of(spec))
 }
 
-/// The sequence at which the sidecar `def` became complete in `manifest`,
-/// or `None`, by the same rules as [`completeness`]: declared exactly so,
-/// recorded, and covering every live row group.
+/// The sequence at which the per-key bounds or bitemporal versions `def`
+/// became complete in `manifest`, or `None`, by the same rules as
+/// [`completeness`]: the spec that holds them (an exact or bloom spec with
+/// bounds, a bitemporal spec), or the sidecar of an index written before
+/// M5, declared exactly so, recorded, and covering every live row group.
 #[must_use]
 pub fn sidecar_completeness(manifest: &Manifest, def: &SidecarDef) -> Option<u64> {
-    if !declared_sidecars(manifest).contains(def) {
-        return None;
+    let (_, src) = timed_sources(manifest)
+        .into_iter()
+        .find(|(d, _)| d == def)?;
+    match src {
+        TimedSource::Spec(spec) | TimedSource::BloomBounds(spec) => completeness(manifest, &spec),
+        TimedSource::Legacy => recorded_and_covered(manifest, &[Target::Sidecar(def.clone())]),
     }
-    recorded_and_covered(manifest, &def.name())
 }
 
 /// The sequence at which the sketch `spec` became complete in `manifest`,
@@ -119,13 +134,17 @@ pub fn sketch_completeness(manifest: &Manifest, spec: &SketchSpec) -> Option<u64
     if !declared_sketches(manifest).contains(spec) {
         return None;
     }
-    recorded_and_covered(manifest, &spec.name())
+    recorded_and_covered(manifest, &[Target::Sketch(spec.clone())])
 }
 
-fn recorded_and_covered(manifest: &Manifest, name: &str) -> Option<u64> {
-    let seq = *manifest.key_spec_completeness.get(name)?;
+/// The completeness recorded under the name of `targets` (one name: a key
+/// spec, and a bloom's bounds beside it), when every one covers every live
+/// row group.
+fn recorded_and_covered(manifest: &Manifest, targets: &[Target]) -> Option<u64> {
+    let name = targets.first()?.name();
+    let seq = *manifest.key_spec_completeness.get(&name)?;
     let live = live_ids(&manifest.rowgroup_space).ok()?;
-    is_complete(manifest, name, &live).then_some(seq)
+    all_complete(manifest, targets, &name, &live).then_some(seq)
 }
 
 /// The completeness map for `next`, a manifest about to be committed on top
@@ -148,12 +167,15 @@ pub(crate) fn completeness_map(
     let mut out = BTreeMap::new();
     for target in declared {
         let name = target.name();
-        if !is_complete(next, &name, &live_next) {
+        if out.contains_key(&name) || !all_complete(next, declared, &name, &live_next) {
             continue;
         }
         let continued = !replaced.contains(&name)
-            && base_targets.contains(target)
-            && is_complete(base, &name, &live_base);
+            && declared
+                .iter()
+                .filter(|t| t.name() == name)
+                .all(|t| base_targets.contains(t))
+            && all_complete(base, &base_targets, &name, &live_base);
         let seq = match base.key_spec_completeness.get(&name) {
             Some(&recorded) if continued => recorded,
             _ => base.sequence + 1,
@@ -265,6 +287,11 @@ mod tests {
         }
     }
 
+    /// Whether the key spec segments listed under `name` cover `live`.
+    fn covers(m: &Manifest, name: &str, live: &RoaringBitmap) -> bool {
+        live.is_subset(&covered(m, name, None))
+    }
+
     fn seg(name: &str, start: u32, end: u32) -> SegmentRef {
         SegmentRef {
             id: Hash::of(format!("{name}{start}{end}").as_bytes()),
@@ -291,7 +318,7 @@ mod tests {
     fn coverage_gaps_at_start_middle_and_end_are_incomplete() {
         let live = live_ids(&manifest(vec![]).rowgroup_space).unwrap();
         let full = manifest(vec![seg("exact:id", 0, 4), seg("exact:id", 4, 10)]);
-        assert!(is_complete(&full, "exact:id", &live));
+        assert!(covers(&full, "exact:id", &live));
         for gaps in [
             vec![seg("exact:id", 1, 10)],
             vec![seg("exact:id", 0, 4), seg("exact:id", 5, 10)],
@@ -299,7 +326,7 @@ mod tests {
             vec![],
         ] {
             assert!(
-                !is_complete(&manifest(gaps.clone()), "exact:id", &live),
+                !covers(&manifest(gaps.clone()), "exact:id", &live),
                 "{gaps:?}"
             );
         }
@@ -317,7 +344,7 @@ mod tests {
             extra: Extra::new(),
         });
         let live = live_ids(&m.rowgroup_space).unwrap();
-        assert!(is_complete(&m, "exact:id", &live));
+        assert!(covers(&m, "exact:id", &live));
         // a segment of another spec covering the gap does not help
         let mut other = manifest(vec![seg("exact:id", 0, 5), seg("bloom:id", 5, 10)]);
         other.schema.key_specs.push(KeySpec::Bloom {
@@ -326,8 +353,8 @@ mod tests {
             bounds: None,
         });
         let live = live_ids(&other.rowgroup_space).unwrap();
-        assert!(!is_complete(&other, "exact:id", &live));
-        assert!(!is_complete(&other, "bloom:id", &live));
+        assert!(!covers(&other, "exact:id", &live));
+        assert!(!covers(&other, "bloom:id", &live));
     }
 
     #[test]
@@ -336,7 +363,7 @@ mod tests {
         // recorded range still covers it.
         let m = manifest(vec![seg("exact:id", 0, 10)]);
         let live = live_ids(&m.rowgroup_space).unwrap();
-        assert!(is_complete(&m, "exact:id", &live));
+        assert!(covers(&m, "exact:id", &live));
     }
 
     #[test]

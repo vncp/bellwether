@@ -56,22 +56,22 @@ Gaps in `bellwether-types` (contract v2) and in the docs that the Phase 2 author
 
 ## Dispositions in the storage version 2 / record version 3 freeze (WP14, ADR 028)
 
-The freeze lands in two pull requests. The first makes the record version 3 shapes final; the second fills the fields the first declares but leaves at their defaults, and freezes the bytes of storage version 2 (M5). Until it merges, a first-release binary refuses the version 2 shapes only the second writes with `Error::UnsupportedShape`. Entries marked done above are complete. The others:
+The freeze landed in two pull requests. The first made the record version 3 shapes final; the second filled the fields the first declared but left at their defaults, and froze the bytes of storage version 2: **M5 is declared**. Entries marked done above are complete; every entry below marked done is complete too, its "Proposed resolution" above superseded by this table. A first-release binary refuses the version 2 shapes only the second writes with `Error::UnsupportedShape`.
 
-| # | Shape landed (PR 1) | Filled by |
-|---|---|---|
-| 5 | `Fanout.{sample_size, quantile_error}` | PR 2: profile fills both |
-| 7 | `Lint.fix: Option<RewriteShape>` | PR 2: profile fills it from the catalog's rewrite shape |
-| 8 | none: `source.kind` keeps `csv;delimiter=…` | PR 2: typed `source.dialect`; a byte change, so it lands with its own fixture |
-| 9 | none: Arrow `Display` strings, unchanged | PR 2: core's `ColumnType` spelling, the version 1 string still read |
-| 23 | `Predicate::{SemiJoin { columns, keys_from }, Join { left, right, kind }, WindowPartition { columns }}`; the verifier refuses them | WP15: priced and planned by relational replay |
-| 25 | `CertBody.examples: Vec<MismatchExample>` | PR 2: verify fills it, capped at its `max_examples` (100) |
-| 26 | `CertBody.uncomparable: u64`; ledger rule 9 passes a certificate only when it is 0 | PR 2: verify moves these keys out of `mismatched` into it |
-| 30 | none | PR 2: replay adopts `bellwether_source::catalog` and deletes its own digest |
-| 31 | `Replay.configuration: Vec<String>` (identities) | PR 2: replay fills it |
-| 33 | none | PR 2: widest decimal precision and scale across files, deterministically |
-| 37 | `CertBody.totals: Vec<TotalSpec { column, quantize }>` | PR 2: verify fills it for every total column |
-| 40 | `ScanPlan.order: Option<Vec<(u32, u32)>>` | PR 2: `plan_ordered` fills it, so two files can interleave |
-| 41 | `KeySpec::Exact.bounds`, `KeySpec::Bloom.bounds`, `KeySpec::Bitemporal` in the types; a manifest naming them as key specs is refused | PR 2: folded into the exact value record and a `bitemporal` layout |
-| 42 | `ProposalBody::Key.sidecars: Vec<KeySpec>` | PR 2: the facade's `fix` fills it; replay and verify of window and bitemporal runs in WP15 |
-| 44 | `CertBody.row_filter: Option<Vec<Predicate>>` | PR 2: verify fills it from `Reconciliation.row_filter` |
+| # | Shape landed (PR 1) | Filled by (PR 2, M5) | Status |
+|---|---|---|---|
+| 5 | `Fanout.{sample_size, quantile_error}` | profile fills both | done |
+| 7 | `Lint.fix: Option<RewriteShape>` | profile fills it from the catalog's rewrite shape | done |
+| 8 | none: `source.kind` keeps `csv;delimiter=…` | typed `source.dialect` (`{delimiter, header, quote}`, bytes as numbers); the version 1 encoding still read; pinned by `fixtures/format-v0.1/index-text` | done |
+| 9 | none: Arrow `Display` strings, unchanged | core's `ColumnType` JSON (`{"arrow": …}` for a nested or dictionary type), the version 1 string still read | done |
+| 23 | `Predicate::{SemiJoin { columns, keys_from }, Join { left, right, kind }, WindowPartition { columns }}`; the verifier refuses them | WP15: priced and planned by relational replay. **Constraint (M5, ADR 028):** the shapes are frozen; WP15 adds behaviour only, never a field, variant or serialized form (a shape it cannot use is a new record version with a fixture) | open (WP15) |
+| 25 | `CertBody.examples: Vec<MismatchExample>` | verify fills it, capped at its `max_examples` (100) | done |
+| 26 | `CertBody.uncomparable: u64`; ledger rule 9 passes a certificate only when it is 0 | verify moves these keys out of `mismatched` into it; the `fix` refusal adds them back so its number keeps its meaning | done |
+| 30 | none | replay's `Catalog` computes its digest with `bellwether_source::catalog::digest`; its own digest is deleted | done |
+| 31 | `Replay.configuration: Vec<String>` (identities) | replay fills it | done |
+| 33 | none | widest decimal precision and scale across files, deterministically | done |
+| 37 | `CertBody.totals: Vec<TotalSpec { column, quantize }>` | verify fills it for every total column | done |
+| 40 | `ScanPlan.order: Option<Vec<(u32, u32)>>` | `plan_ordered` fills it when no order of whole files is a time order, so two files can interleave | done |
+| 41 | `KeySpec::Exact.bounds`, `KeySpec::Bloom.bounds`, `KeySpec::Bitemporal` in the types; a manifest naming them as key specs is refused | declarable key specs: bounds folded into the exact value record (with the all-null sentinel), a `bitemporal` layout, a bloom's `bounds` segment under its identity; pre-M5 sidecars fold on the first build with work | done |
+| 42 | `ProposalBody::Key.sidecars: Vec<KeySpec>` | `propose` takes the spec and its sidecars (CLI repeated `--key`, MCP `sidecars`), `fix` builds, verifies and receipts them together; `why --valid-by/--known-by` (MCP `score.why` `valid_by`/`known_by`) records and prices a bitemporal run; `asof --valid --known` plans it | done (relational replay of joins stays WP15) |
+| 44 | `CertBody.row_filter: Option<Vec<Predicate>>` | verify fills it from `Reconciliation.row_filter` (bitemporal runs: the winners) | done |

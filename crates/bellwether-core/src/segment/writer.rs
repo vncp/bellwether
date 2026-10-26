@@ -11,8 +11,9 @@ use bellwether_types::{Error, Hash, KeySpec, Result, RowGroupId};
 use roaring::RoaringBitmap;
 
 use super::format::{
-    checksum, len_u32, put_leb128, spec_types, ColumnType, Layout, Put, SegmentHeader,
-    FOOTER_LEN_V2, MAGIC,
+    bloom_bounds_column, checksum, corrupt, len_u32, put_leb128, record_time_columns,
+    record_time_types, spec_types, ColumnType, Layout, Put, SegmentHeader, ValueShape,
+    ALL_NULL_BOUNDS, FOOTER_LEN_V2, MAGIC,
 };
 use crate::bloom::{BloomHash, CanonicalHash, FilterHash, Sbbf};
 use crate::encoding::{self, KeyColumns, NEG_ZERO_KEY, POS_ZERO_KEY};
@@ -217,6 +218,16 @@ pub struct KeyValue {
     /// rows of this key in each row group of `bitmap`, in ascending row
     /// group order, each at least 1. `None` for a segment without counts.
     pub counts: Option<Vec<u64>>,
+    /// For an exact spec with per-key bounds (storage version 2), the
+    /// `[min, max]` of the bounds column over this key's rows in each row
+    /// group of `bitmap`, in ascending row group order; the sentinel
+    /// [`ALL_NULL_BOUNDS`] where every such row has a null time. `None` for
+    /// a segment without bounds.
+    pub bounds: Option<Vec<(i64, i64)>>,
+    /// For a bitemporal spec (storage version 2), the key's distinct
+    /// `(valid, known, row group)` triples, strictly ascending; `bitmap` is
+    /// exactly their row groups. Empty for every other spec.
+    pub triples: Vec<(i64, i64, u32)>,
 }
 
 impl KeyValue {
@@ -234,26 +245,87 @@ impl KeyValue {
         )
     }
 
+    /// `(row group, min, max)` for every row group where the key has a
+    /// non-null time, ascending; the row groups holding the sentinel (every
+    /// time null) are left out, as they overlap no window. `None` when the
+    /// segment stores no bounds.
+    #[must_use]
+    pub fn bounded(&self) -> Option<Vec<(RowGroupId, i64, i64)>> {
+        let bounds = self.bounds.as_ref()?;
+        Some(
+            self.bitmap
+                .iter()
+                .zip(bounds.iter().copied())
+                .filter(|(_, b)| *b != ALL_NULL_BOUNDS)
+                .map(|(rg, (lo, hi))| (RowGroupId(rg), lo, hi))
+                .collect(),
+        )
+    }
+
+    /// Checks the parts the shape adds against the bitmap: one count and one
+    /// `[min, max]` (or the sentinel) per row group, and triples that are
+    /// strictly ascending and name exactly the bitmap's row groups.
+    fn check(&self, shape: ValueShape) -> Result<()> {
+        let bad = |what: &str| Err(Error::Other(format!("corrupt segment: {what}")));
+        let n = self.bitmap.len();
+        if let Some(counts) = &self.counts {
+            if !shape.counts || counts.len() as u64 != n || counts.contains(&0) {
+                return bad("a key's counts must be one positive count per row group holding it");
+            }
+        } else if shape.counts {
+            return bad("a key of a counted spec has no counts");
+        }
+        match (&self.bounds, shape.bounds) {
+            (Some(b), true) if b.len() as u64 == n => {
+                if b.iter()
+                    .any(|&(lo, hi)| lo > hi && (lo, hi) != ALL_NULL_BOUNDS)
+                {
+                    return bad("a key's bounds have min > max and are not the all-null sentinel");
+                }
+            }
+            (None, false) => {}
+            _ => return bad("a key's bounds must be one [min, max] per row group holding it"),
+        }
+        if shape.triples {
+            if self.triples.is_empty() || self.triples.windows(2).any(|w| w[0] >= w[1]) {
+                return bad("a key's bitemporal versions are empty or not strictly ascending");
+            }
+            let rgs: RoaringBitmap = self.triples.iter().map(|t| t.2).collect();
+            if rgs != self.bitmap {
+                return bad("a key's bitemporal versions name other row groups than its bitmap");
+            }
+        } else if !self.triples.is_empty() {
+            return bad("bitemporal versions on a spec that is not bitemporal");
+        }
+        Ok(())
+    }
+
     /// The storage version 2 value record: `bitmap_len u32 | bitmap |
-    /// [counts] | [chain]` (`docs/format.md`).
-    pub(crate) fn encode(&self, temporal: bool, out: &mut Vec<u8>) -> Result<()> {
+    /// [counts] | [bounds] | [chain] | [triples]` (`docs/format.md`).
+    pub(crate) fn encode(&self, shape: ValueShape, out: &mut Vec<u8>) -> Result<()> {
+        self.check(shape)?;
         let mut bm = Vec::with_capacity(self.bitmap.serialized_size());
         self.bitmap
             .serialize_into(&mut bm)
             .map_err(|e| Error::Other(e.to_string()))?;
         out.put_bytes(&bm)?;
-        if let Some(counts) = &self.counts {
-            if counts.len() as u64 != self.bitmap.len() || counts.contains(&0) {
-                return Err(Error::Other(
-                    "a key's counts must be one positive count per row group holding it".into(),
-                ));
-            }
-            for &n in counts {
-                put_leb128(out, n);
-            }
+        for &n in self.counts.iter().flatten() {
+            put_leb128(out, n);
         }
-        if temporal {
+        for &(lo, hi) in self.bounds.iter().flatten() {
+            out.extend_from_slice(&lo.to_le_bytes());
+            out.extend_from_slice(&hi.to_le_bytes());
+        }
+        if shape.chain {
             self.chain.write_to(out)?;
+        }
+        if shape.triples {
+            out.put_u32(len_u32(self.triples.len())?);
+            for &(valid, known, rg) in &self.triples {
+                out.extend_from_slice(&valid.to_le_bytes());
+                out.extend_from_slice(&known.to_le_bytes());
+                out.put_u32(rg);
+            }
         }
         Ok(())
     }
@@ -264,11 +336,14 @@ impl KeyValue {
     /// non-empty: every stored key is held by at least one row group
     /// (`docs/format.md`). Version 1: an exact record is the bare bitmap, a
     /// temporal one the length-prefixed bitmap and the chain. Version 2:
-    /// always the length-prefixed bitmap, then, with `counts`, one shortest
-    /// LEB128 count of at least 1 per row group, then the chain for temporal
-    /// specs; nothing may follow. Anything else is corruption and is
+    /// always the length-prefixed bitmap, then what `shape` adds, in order:
+    /// one shortest LEB128 count of at least 1 per row group, one `min i64 |
+    /// max i64` per row group (min <= max, or the all-null sentinel), the
+    /// chain, the bitemporal triples (`count u32 | count x (valid i64 |
+    /// known i64 | rg u32)`, strictly ascending, exactly the bitmap's row
+    /// groups); nothing may follow. Anything else is corruption and is
     /// refused, never decoded into a wrong answer.
-    pub(crate) fn decode(bytes: &[u8], temporal: bool, counts: bool, storage: u32) -> Result<Self> {
+    pub(crate) fn decode(bytes: &[u8], shape: ValueShape, storage: u32) -> Result<Self> {
         let read_bm = |b: &[u8]| -> Result<RoaringBitmap> {
             if b.get(..4) != Some(&NO_RUN_COOKIE[..]) {
                 return Err(Error::Other(
@@ -285,64 +360,94 @@ impl KeyValue {
             Ok(bm)
         };
         if storage < 2 {
-            return if temporal {
+            return if shape.chain {
                 let mut c = super::format::Cursor::new(bytes);
                 let bitmap = read_bm(c.bytes()?)?;
                 Ok(Self {
                     bitmap,
                     chain: VersionChain::read_from(c.rest())?,
-                    counts: None,
+                    ..Self::default()
                 })
             } else {
                 Ok(Self {
                     bitmap: read_bm(bytes)?,
-                    chain: VersionChain::new(),
-                    counts: None,
+                    ..Self::default()
                 })
             };
         }
         let mut c = super::format::Cursor::new(bytes);
         let bitmap = read_bm(c.bytes()?)?;
-        let counts = if counts {
-            let mut v =
-                Vec::with_capacity(usize::try_from(bitmap.len()).unwrap_or(0).min(bytes.len()));
-            for _ in 0..bitmap.len() {
-                let n = c.leb128()?;
-                if n == 0 {
+        let n = usize::try_from(bitmap.len()).unwrap_or(usize::MAX);
+        let counts = if shape.counts {
+            let mut v = Vec::with_capacity(n.min(bytes.len()));
+            for _ in 0..n {
+                let k = c.leb128()?;
+                if k == 0 {
                     return Err(Error::Other(
                         "corrupt segment: a count of zero rows for a row group holding the key"
                             .into(),
                     ));
                 }
-                v.push(n);
+                v.push(k);
             }
             Some(v)
         } else {
             None
         };
-        let chain = if temporal {
+        let i64_at = |c: &mut super::format::Cursor<'_>| -> Result<i64> {
+            let b = c.take(8)?;
+            Ok(i64::from_le_bytes(
+                b.try_into().map_err(|_| corrupt("i64"))?,
+            ))
+        };
+        let bounds = if shape.bounds {
+            let mut v = Vec::with_capacity(n.min(bytes.len() / 16));
+            for _ in 0..n {
+                v.push((i64_at(&mut c)?, i64_at(&mut c)?));
+            }
+            Some(v)
+        } else {
+            None
+        };
+        let chain = if shape.chain {
             VersionChain::read_from(c.rest())?
         } else {
-            if !c.is_done() {
-                return Err(Error::Other(
-                    "corrupt segment: trailing bytes after a value record".into(),
-                ));
-            }
             VersionChain::new()
         };
-        Ok(Self {
+        let mut triples = Vec::new();
+        if shape.triples {
+            let k = c.u32()? as usize;
+            if k.saturating_mul(20) != c.remaining() {
+                return Err(corrupt("bitemporal versions do not fill the value record"));
+            }
+            triples.reserve(k);
+            for _ in 0..k {
+                let valid = i64_at(&mut c)?;
+                let known = i64_at(&mut c)?;
+                triples.push((valid, known, c.u32()?));
+            }
+        }
+        if !c.is_done() {
+            return Err(Error::Other(
+                "corrupt segment: trailing bytes after a value record".into(),
+            ));
+        }
+        let v = Self {
             bitmap,
             chain,
             counts,
-        })
+            bounds,
+            triples,
+        };
+        v.check(shape)?;
+        Ok(v)
     }
 }
 
 pub(crate) struct KeyedEmitter {
     f: Framing,
-    temporal: bool,
-    /// Whether every value carries counts (the spec stores them).
-    counts: bool,
+    /// What every value record holds after its bitmap.
+    shape: ValueShape,
     opts: WriterOptions,
     keys: Vec<Vec<u8>>,
     key_bytes: usize,
@@ -354,8 +459,7 @@ impl KeyedEmitter {
     pub(crate) fn new(header: &SegmentHeader, opts: &WriterOptions) -> Result<Self> {
         Ok(Self {
             f: Framing::start(header)?,
-            temporal: header.layout == Layout::KeyedTemporal,
-            counts: header.key_spec.counts(),
+            shape: ValueShape::of(&header.key_spec, header.layout),
             opts: opts.clone(),
             keys: Vec::new(),
             key_bytes: 0,
@@ -388,20 +492,11 @@ impl KeyedEmitter {
                 "keyed emitter: a key must be held by at least one row group".into(),
             ));
         };
-        if value.counts.is_some() != self.counts {
-            return Err(Error::Other(format!(
-                "keyed emitter: the spec {} counts, but a value {} counts",
-                if self.counts { "stores" } else { "stores no" },
-                if value.counts.is_some() {
-                    "carries"
-                } else {
-                    "carries no"
-                },
-            )));
-        }
         self.f.note_rg(lo, hi);
         let before = self.values.len();
-        value.encode(self.temporal, &mut self.values)?;
+        // Refuses a value whose counts, bounds or versions do not match the
+        // spec's shape.
+        value.encode(self.shape, &mut self.values)?;
         self.value_lens.push(len_u32(self.values.len() - before)?);
         self.key_bytes += key.len();
         self.keys.push(key.to_vec());
@@ -641,6 +736,31 @@ struct KeyAcc {
     /// Rows per row group holding the key, kept only when the spec stores
     /// counts.
     rows: BTreeMap<u32, u64>,
+    /// `[min, max]` of the non-null times per row group holding the key,
+    /// kept only when the spec stores per-key bounds; a row group with
+    /// none is the all-null sentinel.
+    bounds: BTreeMap<u32, (i64, i64)>,
+    /// `(valid, known, row group)` triples, bitemporal specs only.
+    triples: Vec<(i64, i64, u32)>,
+    /// Length of `triples` after its last sort and dedup.
+    compacted: usize,
+}
+
+impl KeyAcc {
+    /// Adds a bitemporal triple, sorting and deduplicating whenever the
+    /// buffer doubles, so a key repeated in many rows holds its distinct
+    /// triples plus at most as many again.
+    fn push_triple(&mut self, t: (i64, i64, u32)) {
+        if self.triples.last() == Some(&t) {
+            return;
+        }
+        self.triples.push(t);
+        if self.triples.len() > 2 * self.compacted.max(32) {
+            self.triples.sort_unstable();
+            self.triples.dedup();
+            self.compacted = self.triples.len();
+        }
+    }
 }
 
 /// The accumulator of `key`, created on first sight. The key is copied only
@@ -674,6 +794,10 @@ struct DatasetTypes {
     ts: Option<DataType>,
     recorded_keys: Vec<ColumnType>,
     recorded_ts: Option<ColumnType>,
+    /// The bounds column (exact with bounds) or the valid and known columns
+    /// (bitemporal), and their recorded form.
+    times: Vec<DataType>,
+    recorded_times: Vec<ColumnType>,
     /// The checked expression of an `expr` key.
     expr: Option<crate::expr::Typed>,
 }
@@ -694,6 +818,9 @@ struct DatasetTypes {
 /// size (`docs/format.md`, build-side memory).
 pub struct SegmentWriter {
     spec: KeySpec,
+    /// The segment's layout: the spec's own, or `keyed` for a bloom's
+    /// `bounds` segment.
+    layout: Layout,
     opts: WriterOptions,
     acc: Acc,
     dataset: Option<DatasetTypes>,
@@ -726,6 +853,29 @@ pub fn validate_spec(spec: &KeySpec) -> Result<()> {
             return Err(Error::KeySpec("a text key needs a column name".into()));
         }
     }
+    // Per-key bounds and bitemporal versions: each time column is named,
+    // and none is a key column or the other clock.
+    let times = match spec {
+        KeySpec::Bloom {
+            bounds: Some(ts), ..
+        } => vec![ts.clone()],
+        _ => super::format::time_columns(spec),
+    };
+    for (i, t) in times.iter().enumerate() {
+        if t.is_empty() {
+            return Err(Error::KeySpec(format!(
+                "{}: a time column name is empty",
+                spec.identity()
+            )));
+        }
+        if spec.columns().contains(t) || times[..i].contains(t) {
+            return Err(Error::KeySpec(format!(
+                "{}: the time column {t:?} is also a key column or the other clock; key and time \
+                 columns must all be distinct",
+                spec.identity()
+            )));
+        }
+    }
     crate::expr::check_spec(spec)
 }
 
@@ -734,21 +884,37 @@ impl SegmentWriter {
     /// friends). [`SegmentWriter::add_batch`] needs
     /// [`SegmentWriter::for_dataset`] instead.
     pub fn new(spec: KeySpec, opts: WriterOptions) -> Result<Self> {
+        let layout = Layout::for_spec(&spec);
+        Self::in_layout(spec, layout, opts)
+    }
+
+    /// A writer of the `bounds` segment of `spec`, a bloom with per-key
+    /// bounds (`bloom:a@0.01@ts`), for already-encoded keys
+    /// ([`SegmentWriter::insert_timed`]): the `keyed` layout under the
+    /// bloom spec, each value record `bitmap | bounds`. Any other spec is
+    /// refused.
+    pub fn bloom_bounds(spec: KeySpec, opts: WriterOptions) -> Result<Self> {
+        if bloom_bounds_column(&spec).is_none() {
+            return Err(Error::KeySpec(format!(
+                "{} is not a bloom with per-key bounds",
+                spec.identity()
+            )));
+        }
+        Self::in_layout(spec, Layout::Keyed, opts)
+    }
+
+    fn in_layout(spec: KeySpec, layout: Layout, opts: WriterOptions) -> Result<Self> {
         validate_spec(&spec)?;
-        let acc = match Layout::for_spec(&spec) {
-            Some(Layout::Keyed | Layout::KeyedTemporal) => Acc::Keyed(BTreeMap::new()),
-            Some(Layout::BloomPerRowGroup) => Acc::Bloom(BTreeMap::new()),
-            Some(Layout::MinMax) => Acc::Range(BTreeMap::new()),
-            None => {
-                return Err(Error::KeySpec(format!(
-                    "{} has no key segment of its own in this release: per-key time bounds and \
-                     bitemporal versions are written as sidecar segments",
-                    spec.identity()
-                )))
+        let acc = match layout {
+            Layout::Keyed | Layout::KeyedTemporal | Layout::Bitemporal => {
+                Acc::Keyed(BTreeMap::new())
             }
+            Layout::BloomPerRowGroup => Acc::Bloom(BTreeMap::new()),
+            Layout::MinMax => Acc::Range(BTreeMap::new()),
         };
         Ok(Self {
             spec,
+            layout,
             opts,
             acc,
             dataset: None,
@@ -762,22 +928,40 @@ impl SegmentWriter {
     /// column take their declared types from it, and the segment header
     /// records those types (`key_types`, `ts_type`).
     pub fn for_dataset(spec: KeySpec, schema: &Schema, opts: WriterOptions) -> Result<Self> {
-        let mut w = Self::new(spec, opts)?;
-        let (keys, ts) = spec_types(&w.spec, schema)?;
+        Self::new(spec, opts)?.with_dataset(schema)
+    }
+
+    /// [`SegmentWriter::bloom_bounds`] for Arrow batches of a dataset whose
+    /// schema is `schema`: the header records the key columns' types and
+    /// the bounds column's (`time_types`).
+    pub fn bloom_bounds_for_dataset(
+        spec: KeySpec,
+        schema: &Schema,
+        opts: WriterOptions,
+    ) -> Result<Self> {
+        Self::bloom_bounds(spec, opts)?.with_dataset(schema)
+    }
+
+    fn with_dataset(mut self, schema: &Schema) -> Result<Self> {
+        let (keys, ts) = spec_types(&self.spec, schema)?;
         let recorded_keys = keys.iter().map(ColumnType::of).collect::<Result<_>>()?;
         let recorded_ts = ts.as_ref().map(ColumnType::of).transpose()?;
-        let expr = match &w.spec {
-            KeySpec::Expr { .. } => Some(crate::expr::typed_spec(&w.spec, schema)?),
+        let times = record_time_types(&self.spec, self.layout, schema)?;
+        let recorded_times = times.iter().map(ColumnType::of).collect::<Result<_>>()?;
+        let expr = match &self.spec {
+            KeySpec::Expr { .. } => Some(crate::expr::typed_spec(&self.spec, schema)?),
             _ => None,
         };
-        w.dataset = Some(DatasetTypes {
+        self.dataset = Some(DatasetTypes {
             keys,
             ts,
             recorded_keys,
             recorded_ts,
+            times,
+            recorded_times,
             expr,
         });
-        Ok(w)
+        Ok(self)
     }
 
     /// The key spec.
@@ -845,6 +1029,24 @@ impl SegmentWriter {
                 "temporal segments need a timestamp; use insert_version".into(),
             ));
         }
+        if self.shape().bounds || self.shape().triples {
+            return Err(Error::KeySpec(
+                "segments with per-key bounds need each row's time, and bitemporal segments \
+                 its two times; use insert_timed or insert_triple"
+                    .into(),
+            ));
+        }
+        self.insert_counted(key, rg, rows)
+    }
+
+    /// The value record shape of this writer's spec and layout.
+    fn shape(&self) -> ValueShape {
+        ValueShape::of(&self.spec, self.layout)
+    }
+
+    /// Records `rows` rows of `key` in `rg` (membership, and the count when
+    /// the spec stores counts).
+    fn insert_counted(&mut self, key: &[u8], rg: RowGroupId, rows: u64) -> Result<()> {
         if rows == 0 {
             return Err(Error::Other(
                 "a row group holding a key holds at least one row of it".into(),
@@ -882,6 +1084,54 @@ impl SegmentWriter {
                 }
             }
         }
+        Ok(())
+    }
+
+    /// Records one row of `key` in row group `rg` whose bounds column holds
+    /// `ts` (an exact spec with per-key bounds only), in the column's
+    /// dataset unit: membership, the count when the spec stores counts, and
+    /// `ts` widening the key's `[min, max]` there. A `None` time records the
+    /// row but no time: a row group where every row of the key has a null
+    /// time stores the all-null sentinel, which overlaps no window.
+    pub fn insert_timed(&mut self, key: &[u8], rg: RowGroupId, ts: Option<i64>) -> Result<()> {
+        if !self.shape().bounds {
+            return Err(Error::KeySpec(
+                "insert_timed on a spec without per-key bounds".into(),
+            ));
+        }
+        self.insert_counted(key, rg, 1)?;
+        if let (Some(t), Acc::Keyed(m)) = (ts, &mut self.acc) {
+            key_acc(m, key)?
+                .bounds
+                .entry(rg.0)
+                .and_modify(|b| *b = (b.0.min(t), b.1.max(t)))
+                .or_insert((t, t));
+        }
+        Ok(())
+    }
+
+    /// Records one bitemporal version of `key`, true from `valid` and known
+    /// from `known`, in row group `rg` (bitemporal only), each in its
+    /// column's dataset unit. A row whose valid or known time is null is not
+    /// a version and is never recorded (ADR 014).
+    pub fn insert_triple(
+        &mut self,
+        key: &[u8],
+        valid: i64,
+        known: i64,
+        rg: RowGroupId,
+    ) -> Result<()> {
+        if !self.shape().triples {
+            return Err(Error::KeySpec(
+                "insert_triple on a spec that is not bitemporal".into(),
+            ));
+        }
+        let Acc::Keyed(m) = &mut self.acc else {
+            return Err(Error::KeySpec("insert_triple on a non-keyed spec".into()));
+        };
+        let v = key_acc(m, key)?;
+        v.bitmap.insert(rg.0);
+        v.push_triple((valid, known, rg.0));
         Ok(())
     }
 
@@ -1061,7 +1311,19 @@ impl SegmentWriter {
             }
             _ => None,
         };
+        let times = record_time_columns(&self.spec, self.layout)
+            .iter()
+            .zip(&dataset.times)
+            .map(|(c, declared)| {
+                let arr = column(c)?;
+                encoding::check_convertible(arr.data_type(), declared)?;
+                Ok((arr, declared.clone()))
+            })
+            .collect::<Result<Vec<_>>>()?;
         self.check_insertable(rg)?;
+        if !times.is_empty() {
+            return self.add_timed_batch(rg, batch.num_rows(), &keys, &times);
+        }
         // Stage the batch; nothing is recorded until every row has converted.
         let mut staged: Vec<(Vec<u8>, Option<i64>)> = Vec::with_capacity(batch.num_rows());
         let mut buf = Vec::new();
@@ -1087,23 +1349,68 @@ impl SegmentWriter {
         Ok(())
     }
 
+    /// [`SegmentWriter::add_batch`] for a spec whose value records carry
+    /// times: each row's bounds-column time (exact with bounds), or its
+    /// valid and known times (bitemporal; a row missing either is no
+    /// version). Every row converts before any is recorded.
+    fn add_timed_batch(
+        &mut self,
+        rg: RowGroupId,
+        rows: usize,
+        keys: &KeyColumns,
+        times: &[(ArrayRef, DataType)],
+    ) -> Result<()> {
+        let mut staged: Vec<(Vec<u8>, Vec<Option<i64>>)> = Vec::with_capacity(rows);
+        let mut buf = Vec::new();
+        for row in 0..rows {
+            if !keys.encode_into(row, &mut buf)? {
+                continue;
+            }
+            let t = times
+                .iter()
+                .map(|(arr, declared)| encoding::ts_value_as(arr.as_ref(), row, declared))
+                .collect::<Result<Vec<_>>>()?;
+            staged.push((buf.clone(), t));
+        }
+        for (key, t) in &staged {
+            match t.as_slice() {
+                [ts] => self.insert_timed(key, rg, *ts)?,
+                [Some(valid), Some(known)] => self.insert_triple(key, *valid, *known, rg)?,
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
     /// Writes the segment.
     pub fn finish(self) -> Result<EncodedSegment> {
         let processed = self.processed;
         let mut header = SegmentHeader::new(self.spec.clone());
+        header.layout = self.layout;
         if let Some(d) = &self.dataset {
             header.key_types = Some(d.recorded_keys.clone());
             header.ts_type.clone_from(&d.recorded_ts);
+            header.time_types = (!d.recorded_times.is_empty()).then(|| d.recorded_times.clone());
         }
-        let counts = self.spec.counts();
+        let shape = self.shape();
         match self.acc {
             Acc::Keyed(m) => {
                 let mut e = KeyedEmitter::new(&header, &self.opts)?;
-                for (k, acc) in m {
+                for (k, mut acc) in m {
+                    let bounds = shape.bounds.then(|| {
+                        acc.bitmap
+                            .iter()
+                            .map(|rg| acc.bounds.get(&rg).copied().unwrap_or(ALL_NULL_BOUNDS))
+                            .collect()
+                    });
+                    acc.triples.sort_unstable();
+                    acc.triples.dedup();
                     let v = KeyValue {
                         bitmap: acc.bitmap,
                         chain: acc.versions.finish(),
-                        counts: counts.then(|| acc.rows.values().copied().collect()),
+                        counts: shape.counts.then(|| acc.rows.values().copied().collect()),
+                        bounds,
+                        triples: acc.triples,
                     };
                     e.push(&k, &v)?;
                 }
@@ -1170,6 +1477,16 @@ impl SegmentWriter {
 mod tests {
     use super::*;
 
+    /// The value shape of a temporal (`chain`) or exact spec, with or
+    /// without counts.
+    fn shape(chain: bool, counts: bool) -> ValueShape {
+        ValueShape {
+            counts,
+            chain,
+            ..ValueShape::default()
+        }
+    }
+
     fn serialized(bm: &RoaringBitmap) -> Vec<u8> {
         let mut v = Vec::new();
         bm.serialize_into(&mut v).unwrap();
@@ -1182,38 +1499,44 @@ mod tests {
         let bm: RoaringBitmap = [1u32, 7].into_iter().collect();
         let good = serialized(&bm);
         assert_eq!(good[..4], NO_RUN_COOKIE);
-        assert_eq!(KeyValue::decode(&good, false, false, 1).unwrap().bitmap, bm);
+        assert_eq!(
+            KeyValue::decode(&good, shape(false, false), 1)
+                .unwrap()
+                .bitmap,
+            bm
+        );
         let mut run = good.clone();
         run[0] = 0x3b;
         assert!(
-            KeyValue::decode(&run, false, false, 1).is_err(),
+            KeyValue::decode(&run, shape(false, false), 1).is_err(),
             "run cookie"
         );
         let empty = serialized(&RoaringBitmap::new());
         assert!(
-            KeyValue::decode(&empty, false, false, 1).is_err(),
+            KeyValue::decode(&empty, shape(false, false), 1).is_err(),
             "empty bitmap"
         );
         let mut trailing = good.clone();
         trailing.push(0);
         assert!(
-            KeyValue::decode(&trailing, false, false, 1).is_err(),
+            KeyValue::decode(&trailing, shape(false, false), 1).is_err(),
             "trailing bytes"
         );
         // version 1 bytes are not a version 2 record (no length prefix)
-        assert!(KeyValue::decode(&good, false, false, 2).is_err());
+        assert!(KeyValue::decode(&good, shape(false, false), 2).is_err());
         // temporal records: a length-prefixed bitmap, then the chain
         let v = KeyValue {
             bitmap: bm,
             chain: VersionChain::from_versions(vec![(3, RowGroupId(1))]),
             counts: None,
+            ..KeyValue::default()
         };
         let mut rec = Vec::new();
-        v.encode(true, &mut rec).unwrap();
-        assert_eq!(KeyValue::decode(&rec, true, false, 2).unwrap(), v);
-        assert_eq!(KeyValue::decode(&rec, true, false, 1).unwrap(), v);
+        v.encode(shape(true, false), &mut rec).unwrap();
+        assert_eq!(KeyValue::decode(&rec, shape(true, false), 2).unwrap(), v);
+        assert_eq!(KeyValue::decode(&rec, shape(true, false), 1).unwrap(), v);
         rec[4] = 0x3b; // the bitmap's cookie, after its u32 length
-        assert!(KeyValue::decode(&rec, true, false, 2).is_err());
+        assert!(KeyValue::decode(&rec, shape(true, false), 2).is_err());
     }
 
     /// Storage version 2 value records with counts: one shortest LEB128
@@ -1226,19 +1549,20 @@ mod tests {
             bitmap: bm.clone(),
             chain: VersionChain::new(),
             counts: Some(vec![3, 300]),
+            ..KeyValue::default()
         };
         let mut rec = Vec::new();
-        v.encode(false, &mut rec).unwrap();
+        v.encode(shape(false, true), &mut rec).unwrap();
         let bm_len = serialized(&bm).len();
         // 300 = 0b10_0101100 -> ac 02
         assert_eq!(rec[4 + bm_len..], [0x03, 0xac, 0x02]);
-        assert_eq!(KeyValue::decode(&rec, false, true, 2).unwrap(), v);
+        assert_eq!(KeyValue::decode(&rec, shape(false, true), 2).unwrap(), v);
         assert_eq!(
             v.counted().unwrap(),
             vec![(RowGroupId(0), 3), (RowGroupId(2), 300)]
         );
         // read without counts: the counts are trailing bytes
-        assert!(KeyValue::decode(&rec, false, false, 2).is_err());
+        assert!(KeyValue::decode(&rec, shape(false, false), 2).is_err());
         // a missing count, a zero count, an over-long count, trailing bytes
         let base = rec[..4 + bm_len].to_vec();
         for tail in [
@@ -1252,7 +1576,10 @@ mod tests {
         ] {
             let mut bad = base.clone();
             bad.extend_from_slice(&tail);
-            assert!(KeyValue::decode(&bad, false, true, 2).is_err(), "{tail:?}");
+            assert!(
+                KeyValue::decode(&bad, shape(false, true), 2).is_err(),
+                "{tail:?}"
+            );
         }
         // the writer refuses counts that do not match the bitmap
         for counts in [vec![1], vec![1, 0], vec![1, 2, 3]] {
@@ -1260,17 +1587,18 @@ mod tests {
                 counts: Some(counts),
                 ..v.clone()
             };
-            assert!(bad.encode(false, &mut Vec::new()).is_err());
+            assert!(bad.encode(shape(false, true), &mut Vec::new()).is_err());
         }
         // temporal: counts, then the chain
         let t = KeyValue {
             bitmap: bm,
             chain: VersionChain::from_versions(vec![(5, RowGroupId(0)), (9, RowGroupId(2))]),
             counts: Some(vec![1, 2]),
+            ..KeyValue::default()
         };
         let mut rec = Vec::new();
-        t.encode(true, &mut rec).unwrap();
-        assert_eq!(KeyValue::decode(&rec, true, true, 2).unwrap(), t);
+        t.encode(shape(true, true), &mut rec).unwrap();
+        assert_eq!(KeyValue::decode(&rec, shape(true, true), 2).unwrap(), t);
     }
 
     /// A genuine run-format serialization (cookie `3b 30`): nine containers,
@@ -1302,7 +1630,7 @@ mod tests {
         let bm = RoaringBitmap::deserialize_from(&rec[..]).unwrap();
         assert_eq!(bm.len(), 10);
         assert_eq!(bm.serialized_size(), rec.len());
-        assert!(KeyValue::decode(&rec, false, false, 1).is_err());
+        assert!(KeyValue::decode(&rec, shape(false, false), 1).is_err());
     }
 
     #[test]

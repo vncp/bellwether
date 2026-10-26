@@ -47,10 +47,10 @@ Files (Parquet, CSV, or JSON lines) partitioned by date, each file holding rows 
 
 - **Cross-sectional pulls on a date-partitioned lake.** Any universe of symbols over any window, read from only the row groups that hold them, instead of a scan. This is the pattern most strategy research is built on, and it is usually the one that takes minutes.
 - **Event studies.** For a set of event timestamps per symbol, `asof` gives the state at each event and a window lookup gives the aftermath, located to the row group.
-- **Point-in-time features without lookahead.** Features computed from `asof` reads carry no future information by construction, and once bitemporal keys land, restated fundamentals and corrected prints are handled by the two clocks rather than by hand.
+- **Point-in-time features without lookahead.** Features computed from `asof` reads carry no future information by construction, and with a bitemporal key (`temporal2:<keys>@<valid>,<known>`), restated fundamentals and corrected prints are handled by the two clocks rather than by hand: `asof --valid V --known K` plans only versions known by `K`.
 - **Reproducible backtests.** Pinning the index snapshot means a backtest run next month over a larger lake reads exactly what it read today.
 - **Data-quality gates.** Reconcile vendor data against your own derivation after every ingest, with exact totals per symbol, and keep the certificate.
-- **Exact data sizing.** Once counts land, "how much data does this universe have" is a lookup, not a scan.
+- **Exact data sizing.** With a counts key (`exact:<keys>,counts`), "how much data does this universe have" is a lookup, not a scan.
 - **Interactive iteration.** Lookups are index probes, so the question-per-hour rate on a laptop goes up, which is where strategy ideas actually come from.
 
 ## Limits to design around

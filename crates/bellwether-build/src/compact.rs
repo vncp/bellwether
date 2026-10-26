@@ -104,8 +104,11 @@ impl<S: StoreExt + ?Sized> Builder<S> {
         let mut groups = Vec::new();
         for spec in &m.schema.key_specs {
             let name = spec.identity();
-            let mut segs: Vec<&SegmentRef> =
-                m.segments.iter().filter(|s| segment_of(s, &name)).collect();
+            let mut segs: Vec<&SegmentRef> = m
+                .segments
+                .iter()
+                .filter(|s| segment_of(s, &name, None))
+                .collect();
             segs.sort_by_key(|s| (s.rowgroup_range.start, s.rowgroup_range.end, s.id));
             groups.extend(plan_groups(spec, &segs, options));
         }

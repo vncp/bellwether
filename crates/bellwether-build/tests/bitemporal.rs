@@ -1,5 +1,6 @@
-//! WP21 item 5: bitemporal as-of through a `temporal2` sidecar
-//! (`temporal2:id@valid,known`). Ground truth: rows decoded with the
+//! WP21 item 5: bitemporal as-of through a bitemporal key spec
+//! (`temporal2:id@valid,known`, the `bitemporal` layout at M5). Ground
+//! truth: rows decoded with the
 //! `parquet` crate and the rule written out here: per key, among rows whose
 //! valid time is at or before V and whose known time is at or before K
 //! (nulls never qualify), the greatest valid time, then the greatest known
@@ -23,6 +24,7 @@ use arrow::array::{Int64Array, RecordBatch, TimestampMicrosecondArray};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use bellwether_build::{BuildOptions, Lookup, SourceKind};
 use bellwether_core::sidecar::{SidecarDef, SidecarKind};
+use bellwether_types::KeySpec;
 use common::*;
 
 fn schema() -> SchemaRef {
@@ -41,6 +43,19 @@ fn def() -> SidecarDef {
         columns: vec!["id".into()],
         time_columns: vec!["valid".into(), "known".into()],
     }
+}
+
+/// `temporal2:id@valid,known`.
+fn spec() -> KeySpec {
+    KeySpec::Bitemporal {
+        columns: cols(&["id"]),
+        valid_column: "valid".into(),
+        known_column: "known".into(),
+    }
+}
+
+fn specs() -> [KeySpec; 2] {
+    [exact(&["id"]), spec()]
 }
 
 type R = (Option<i64>, Option<i64>, Option<i64>);
@@ -148,12 +163,12 @@ fn the_newest_valid_version_known_by_k_wins_for_every_v_and_k() {
     let mut all = parquet_rows(&s.path("a.parquet"), &schema());
     all.extend(parquet_rows(&s.path("b.parquet"), &schema()));
     let store = memory_store();
-    let opts = BuildOptions {
-        sidecars: vec![def()],
-        ..BuildOptions::new(SourceKind::Parquet)
-    };
     builder(&store)
-        .build(&s.root_str(), &[exact(&["id"])], &opts)
+        .build(
+            &s.root_str(),
+            &specs(),
+            &BuildOptions::new(SourceKind::Parquet),
+        )
         .unwrap();
     let p = planner(&store);
     assert_eq!(p.sidecar_completeness(&def()), Some(1));
@@ -185,9 +200,10 @@ fn the_newest_valid_version_known_by_k_wins_for_every_v_and_k() {
                 let key_set: BTreeSet<Vec<u8>> = keys.iter().cloned().collect();
                 let plan = p
                     .plan(
-                        &[],
+                        &specs(),
                         &Lookup::Bitemporal {
                             columns: cols(&["id"]),
+                            clocks: None,
                             keys: keys.to_vec(),
                             valid,
                             known,
@@ -231,12 +247,12 @@ fn a_rewritten_file_s_versions_no_longer_win() {
     let s = Scratch::new();
     corpus(&s);
     let store = memory_store();
-    let opts = BuildOptions {
-        sidecars: vec![def()],
-        ..BuildOptions::new(SourceKind::Parquet)
-    };
     builder(&store)
-        .build(&s.root_str(), &[exact(&["id"])], &opts)
+        .build(
+            &s.root_str(),
+            &specs(),
+            &BuildOptions::new(SourceKind::Parquet),
+        )
         .unwrap();
     // b.parquet is rewritten without its restatements: its old row-group
     // ids are retired, and the original reports win again.
@@ -244,7 +260,7 @@ fn a_rewritten_file_s_versions_no_longer_win() {
     builder(&store)
         .build(
             &s.root_str(),
-            &[exact(&["id"])],
+            &specs(),
             &BuildOptions::new(SourceKind::Parquet),
         )
         .unwrap();
@@ -255,9 +271,10 @@ fn a_rewritten_file_s_versions_no_longer_win() {
     let keys = vec![enc_i64(1)];
     let plan = p
         .plan(
-            &[],
+            &specs(),
             &Lookup::Bitemporal {
                 columns: cols(&["id"]),
+                clocks: None,
                 keys: keys.clone(),
                 valid: None,
                 known: None,
@@ -287,6 +304,7 @@ fn a_rewritten_file_s_versions_no_longer_win() {
             &[],
             &Lookup::Bitemporal {
                 columns: cols(&["id"]),
+                clocks: None,
                 keys: vec![enc_i64(1)],
                 valid: None,
                 known: None,
@@ -294,4 +312,45 @@ fn a_rewritten_file_s_versions_no_longer_win() {
         )
         .unwrap_err();
     assert!(err.to_string().contains("temporal2:"), "{err}");
+}
+
+/// A bitemporal key holds only the rows where both clocks are set, so it
+/// never serves a plain lookup: `locate` beside it plans every row group
+/// holding the key, the ones whose rows have a null clock included (id 3's
+/// first row group holds only a row with a null valid time).
+#[test]
+fn a_bitemporal_key_never_narrows_a_plain_lookup() {
+    let s = Scratch::new();
+    corpus(&s);
+    let mut all = parquet_rows(&s.path("a.parquet"), &schema());
+    all.extend(parquet_rows(&s.path("b.parquet"), &schema()));
+    let store = memory_store();
+    builder(&store)
+        .build(
+            &s.root_str(),
+            &specs(),
+            &BuildOptions::new(SourceKind::Parquet),
+        )
+        .unwrap();
+    let p = planner(&store);
+    for id in [1, 2, 3, 4] {
+        let key = enc_i64(id);
+        let plan = p
+            .plan(
+                &specs(),
+                &Lookup::Keys {
+                    columns: cols(&["id"]),
+                    keys: vec![key.clone()],
+                },
+            )
+            .unwrap();
+        let want = holding(&all, |r| r.get("id") == Some(&key));
+        assert_eq!(plan_rgs(&plan), want, "id {id}");
+    }
+    let three = holding(&all, |r| r.get("id") == Some(&enc_i64(3)));
+    assert_eq!(
+        three.len(),
+        2,
+        "id 3 sits in two row groups, one without a version"
+    );
 }

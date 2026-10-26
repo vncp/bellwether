@@ -158,8 +158,8 @@ fn a_panic_prints_one_line_naming_the_tracker_and_exits_4() {
     );
 }
 
-/// Files that store one decimal column at different scales need the dataset
-/// schema: the refusal names --schema, and --schema makes it work.
+/// Files that store one decimal column at different scales: a new index
+/// infers the widest decimal across them (M5), and --schema still works.
 #[test]
 fn schema_flag_supplies_the_dataset_schema() {
     use std::sync::Arc;
@@ -193,9 +193,8 @@ fn schema_flag_supplies_the_dataset_schema() {
         .args(["index", path(&data), "--key", "exact:amount"])
         .output()
         .unwrap();
-    assert_eq!(out.status.code(), Some(4));
-    let err = String::from_utf8(out.stderr).unwrap();
-    assert!(err.contains("--schema"), "{err}");
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    std::fs::remove_dir_all(data.join(".bellwether")).ok();
     let schema = dir.path().join("schema.json");
     std::fs::write(
         &schema,

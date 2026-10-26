@@ -8,9 +8,11 @@ use std::sync::Arc;
 
 use arrow::array::RecordBatch;
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
-use bellwether_core::sidecar::SidecarDef;
+use bellwether_core::segment::ColumnType;
 use bellwether_source::{FingerprintPolicy, Partitioning, TextFormat};
-use bellwether_store::{ColumnDef, CommitOptions, Extra};
+use bellwether_store::{
+    ColumnDataType, ColumnDef, CommitOptions, Extra, SourceDialect, SourceInfo,
+};
 use bellwether_types::{Error, FileFingerprint, Result, RowGroupId, SketchSpec};
 
 /// Default cap on the keys one segment accumulates (see [`BuildOptions`]).
@@ -49,48 +51,80 @@ impl SourceKind {
         }
     }
 
-    /// The manifest's `source.kind` string: `parquet`, `jsonl`, `csv` (comma
-    /// with a header), or `csv;delimiter=<byte>;header=<bool>` for any other
-    /// dialect. `docs/format.md` has no field for a CSV dialect, so it is
-    /// carried in the kind string, where a change is detected.
+    /// The manifest's `source.kind` string: `parquet`, `jsonl` or `csv`.
+    /// A CSV source's delimiter, header and quote are in `source.dialect`
+    /// ([`SourceKind::dialect`], storage version 2).
     #[must_use]
-    pub fn manifest_kind(&self) -> String {
+    pub fn manifest_kind(&self) -> &'static str {
         match *self {
-            Self::Parquet => "parquet".into(),
-            Self::JsonLines => "jsonl".into(),
-            Self::Csv {
-                delimiter: b',',
-                has_header: true,
-            } => "csv".into(),
-            Self::Csv {
-                delimiter,
-                has_header,
-            } => format!("csv;delimiter={delimiter};header={has_header}"),
+            Self::Parquet => "parquet",
+            Self::JsonLines => "jsonl",
+            Self::Csv { .. } => "csv",
         }
     }
 
-    /// Parses a manifest `source.kind` string written by
-    /// [`SourceKind::manifest_kind`]. Anything else is
-    /// [`Error::UnknownKind`].
-    pub fn parse(kind: &str) -> Result<Self> {
-        let unknown = || Error::UnknownKind {
-            what: "source kind",
-            found: kind.to_string(),
-        };
-        match kind {
-            "parquet" => return Ok(Self::Parquet),
-            "jsonl" => return Ok(Self::JsonLines),
-            "csv" => return Ok(Self::csv()),
+    /// The manifest's `source.dialect`: present for a CSV source, with the
+    /// quote every CSV source reads (`"`).
+    #[must_use]
+    pub fn dialect(&self) -> Option<SourceDialect> {
+        match *self {
+            Self::Csv {
+                delimiter,
+                has_header,
+            } => Some(SourceDialect {
+                delimiter,
+                header: has_header,
+                quote: CSV_QUOTE,
+                extra: Extra::new(),
+            }),
+            Self::Parquet | Self::JsonLines => None,
+        }
+    }
+
+    /// Writes [`SourceKind::manifest_kind`] and [`SourceKind::dialect`]
+    /// into `info`.
+    pub fn record(&self, info: &mut SourceInfo) {
+        info.kind = self.manifest_kind().to_string();
+        info.dialect = self.dialect();
+    }
+
+    /// The source a manifest records: `source.kind` and, for a CSV source,
+    /// `source.dialect` (storage version 2), or the dialect a storage
+    /// version 1 manifest carried in the kind
+    /// (`csv;delimiter=<byte>;header=<bool>`, or `csv` for comma with a
+    /// header). Anything else is [`Error::UnknownKind`]: another kind, a
+    /// dialect beside a kind that has none, or a quote other than `"`.
+    pub fn of(info: &SourceInfo) -> Result<Self> {
+        let kind = info.kind.as_str();
+        let unknown = |what: &'static str, found: String| Error::UnknownKind { what, found };
+        match (kind, &info.dialect) {
+            ("csv", Some(d)) => {
+                if d.quote != CSV_QUOTE {
+                    return Err(unknown(
+                        "source dialect quote",
+                        char::from(d.quote).to_string(),
+                    ));
+                }
+                return Ok(Self::Csv {
+                    delimiter: d.delimiter,
+                    has_header: d.header,
+                });
+            }
+            (_, Some(_)) => return Err(unknown("source dialect for kind", kind.to_string())),
+            ("parquet", None) => return Ok(Self::Parquet),
+            ("jsonl", None) => return Ok(Self::JsonLines),
+            ("csv", None) => return Ok(Self::csv()),
             _ => {}
         }
-        let rest = kind.strip_prefix("csv;").ok_or_else(unknown)?;
+        let bad = || unknown("source kind", kind.to_string());
+        let rest = kind.strip_prefix("csv;").ok_or_else(bad)?;
         let mut delimiter = None;
         let mut has_header = None;
         for part in rest.split(';') {
             match part.split_once('=') {
-                Some(("delimiter", v)) => delimiter = Some(v.parse::<u8>().map_err(|_| unknown())?),
-                Some(("header", v)) => has_header = Some(v.parse::<bool>().map_err(|_| unknown())?),
-                _ => return Err(unknown()),
+                Some(("delimiter", v)) => delimiter = Some(v.parse::<u8>().map_err(|_| bad())?),
+                Some(("header", v)) => has_header = Some(v.parse::<bool>().map_err(|_| bad())?),
+                _ => return Err(bad()),
             }
         }
         match (delimiter, has_header) {
@@ -98,7 +132,24 @@ impl SourceKind {
                 delimiter,
                 has_header,
             }),
-            _ => Err(unknown()),
+            _ => Err(bad()),
+        }
+    }
+
+    /// The source as a message names it: `parquet`, `jsonl`, `csv`, or
+    /// `csv (delimiter ';', no header)` for another dialect.
+    #[must_use]
+    pub fn label(&self) -> String {
+        match *self {
+            Self::Csv {
+                delimiter,
+                has_header,
+            } if (delimiter, has_header) != (b',', true) => format!(
+                "csv (delimiter {:?}, {})",
+                char::from(delimiter),
+                if has_header { "header" } else { "no header" }
+            ),
+            other => other.manifest_kind().to_string(),
         }
     }
 
@@ -117,6 +168,9 @@ impl SourceKind {
         }
     }
 }
+
+/// The quote character of every CSV source (`source.dialect.quote`).
+pub const CSV_QUOTE: u8 = b'"';
 
 /// The manifest's `source.fingerprint_policy` string (`docs/format.md`).
 pub(crate) fn policy_name(policy: FingerprintPolicy) -> &'static str {
@@ -186,15 +240,11 @@ pub struct BuildOptions {
     /// template included) is refused, because it changes the dataset schema
     /// and every row group's statistics.
     pub partitioning: Option<Partitioning>,
-    /// Sidecars to declare beside the key specs (per-key time bounds,
-    /// bitemporal versions; `bellwether_core::sidecar`), in addition to those
+    /// Sketches to declare (`bellwether_core::sketch`): approximate per-file
+    /// distinct-count sketches that no planner reads, in addition to those
     /// the manifest declares (or instead of them, with `remove_unlisted`).
     /// Each is built over every live row group it does not cover yet, like a
     /// key spec, and recorded complete only when it covers all of them.
-    pub sidecars: Vec<SidecarDef>,
-    /// Sketches to declare (`bellwether_core::sketch`): approximate per-file
-    /// distinct-count sketches that no planner reads. Declared, built, and
-    /// recorded complete by the same rules as [`Self::sidecars`].
     pub sketches: Vec<SketchSpec>,
     /// Chunk size for text files seen for the first time. `None` uses the
     /// chunk size the manifest's text files record, or 64 MiB for a new
@@ -244,7 +294,6 @@ impl Default for BuildOptions {
             source: SourceKind::Parquet,
             fingerprint_policy: None,
             partitioning: None,
-            sidecars: Vec::new(),
             sketches: Vec::new(),
             chunk_size: None,
             schema: None,
@@ -267,7 +316,6 @@ impl fmt::Debug for BuildOptions {
             .field("source", &self.source)
             .field("fingerprint_policy", &self.fingerprint_policy)
             .field("partitioning", &self.partitioning)
-            .field("sidecars", &self.sidecars)
             .field("sketches", &self.sketches)
             .field("chunk_size", &self.chunk_size)
             .field("schema", &self.schema.as_ref().map(|s| s.fields().len()))
@@ -327,8 +375,9 @@ impl Default for CompactOptions {
 // Schema persistence
 // ---------------------------------------------------------------------------
 
-/// The manifest columns for `schema`: name, Arrow `Display` type, nullable.
-/// Extra fields of an existing column of the same name are kept (ADR 017).
+/// The manifest columns for `schema`: name, type ([`manifest_type`]),
+/// nullable. Extra fields of an existing column of the same name are kept
+/// (ADR 017).
 pub(crate) fn schema_to_columns(schema: &Schema, old: &[ColumnDef]) -> Vec<ColumnDef> {
     let extras: BTreeMap<&str, &Extra> = old.iter().map(|c| (c.name.as_str(), &c.extra)).collect();
     schema
@@ -336,7 +385,7 @@ pub(crate) fn schema_to_columns(schema: &Schema, old: &[ColumnDef]) -> Vec<Colum
         .iter()
         .map(|f| ColumnDef {
             name: f.name().clone(),
-            data_type: f.data_type().to_string(),
+            data_type: manifest_type(f.data_type()),
             nullable: f.is_nullable(),
             extra: extras
                 .get(f.name().as_str())
@@ -366,7 +415,7 @@ pub(crate) fn columns_to_schema(columns: &[ColumnDef]) -> Result<SchemaRef> {
                     c.name
                 )));
             }
-            let dt = parse_manifest_type(&c.data_type).map_err(|e| {
+            let dt = read_manifest_type(&c.data_type).map_err(|e| {
                 Error::Other(format!(
                     "the manifest records column {:?} with the type `{}`, which this build of \
                      Arrow cannot read ({e}); the manifest was written by a build this one \
@@ -378,6 +427,44 @@ pub(crate) fn columns_to_schema(columns: &[ColumnDef]) -> Result<SchemaRef> {
         })
         .collect::<Result<Vec<_>>>()?;
     Ok(Arc::new(Schema::new(fields)))
+}
+
+/// A column's type as a storage version 2 manifest spells it (the catalog
+/// digest's rule, `docs/format.md`): core's `ColumnType` JSON when that
+/// spelling reads back to exactly this type, else `{"arrow": "<Arrow's
+/// display form>"}` (a nested column, a dictionary, a type with no
+/// canonical encoding).
+#[must_use]
+pub(crate) fn manifest_type(dt: &DataType) -> ColumnDataType {
+    let recorded = ColumnType::of(dt)
+        .ok()
+        .filter(|t| t.data_type() == *dt)
+        .and_then(|t| serde_json::to_value(t).ok());
+    if let Some(serde_json::Value::Object(m)) = recorded {
+        ColumnDataType::Typed(m)
+    } else {
+        let mut m = serde_json::Map::new();
+        m.insert("arrow".into(), dt.to_string().into());
+        ColumnDataType::Typed(m)
+    }
+}
+
+/// The Arrow type of a manifest column: `ColumnType` JSON, `{"arrow":
+/// "<display>"}` (storage version 2), or a display string (storage version
+/// 1, [`parse_manifest_type`]).
+pub(crate) fn read_manifest_type(
+    spelled: &ColumnDataType,
+) -> std::result::Result<DataType, String> {
+    match spelled {
+        ColumnDataType::Display(s) => parse_manifest_type(s),
+        ColumnDataType::Typed(m) => match m.get("arrow") {
+            Some(serde_json::Value::String(s)) if m.len() == 1 => parse_manifest_type(s),
+            Some(_) => Err("an \"arrow\" type is one display string and nothing else".into()),
+            None => serde_json::from_value::<ColumnType>(serde_json::Value::Object(m.clone()))
+                .map(|t| t.data_type())
+                .map_err(|e| e.to_string()),
+        },
+    }
 }
 
 /// A manifest column type: Arrow's `Display` form as this build prints it,
@@ -452,7 +539,7 @@ pub(crate) fn legacy_type_spelling(spelled: &str) -> Option<String> {
 pub(crate) fn persistable(schema: &Schema) -> Result<SchemaRef> {
     let columns = schema_to_columns(schema, &[]);
     for (f, c) in schema.fields().iter().zip(&columns) {
-        let back = parse_manifest_type(&c.data_type);
+        let back = read_manifest_type(&c.data_type);
         if back.as_ref().ok() != Some(f.data_type()) {
             let read = match back {
                 Ok(b) => format!("it reads back as `{b}`"),
@@ -475,7 +562,7 @@ mod tests {
     use arrow::datatypes::{IntervalUnit, TimeUnit};
 
     #[test]
-    fn source_kinds_round_trip_through_the_manifest_string() {
+    fn source_kinds_round_trip_through_the_manifest_kind_and_dialect() {
         for kind in [
             SourceKind::Parquet,
             SourceKind::JsonLines,
@@ -489,9 +576,27 @@ mod tests {
                 has_header: true,
             },
         ] {
-            assert_eq!(SourceKind::parse(&kind.manifest_kind()).unwrap(), kind);
+            let mut info = SourceInfo::default();
+            kind.record(&mut info);
+            assert_eq!(SourceKind::of(&info).unwrap(), kind);
+            assert_eq!(
+                info.dialect.is_some(),
+                matches!(kind, SourceKind::Csv { .. })
+            );
         }
-        assert_eq!(SourceKind::csv().manifest_kind(), "csv");
+        let legacy = |kind: &str| SourceInfo {
+            kind: kind.into(),
+            ..SourceInfo::default()
+        };
+        // Storage version 1 spellings: the dialect in the kind string.
+        assert_eq!(SourceKind::of(&legacy("csv")).unwrap(), SourceKind::csv());
+        assert_eq!(
+            SourceKind::of(&legacy("csv;delimiter=59;header=false")).unwrap(),
+            SourceKind::Csv {
+                delimiter: b';',
+                has_header: false
+            }
+        );
         for bad in [
             "",
             "orc",
@@ -500,10 +605,24 @@ mod tests {
             "csv;header=true",
         ] {
             assert!(
-                matches!(SourceKind::parse(bad), Err(Error::UnknownKind { .. })),
+                matches!(SourceKind::of(&legacy(bad)), Err(Error::UnknownKind { .. })),
                 "{bad}"
             );
         }
+        // A quote other than '"', and a dialect beside a kind without one.
+        let mut info = SourceInfo::default();
+        SourceKind::csv().record(&mut info);
+        info.dialect.as_mut().unwrap().quote = b'\'';
+        assert!(matches!(
+            SourceKind::of(&info),
+            Err(Error::UnknownKind { .. })
+        ));
+        info.kind = "parquet".into();
+        info.dialect.as_mut().unwrap().quote = b'"';
+        assert!(matches!(
+            SourceKind::of(&info),
+            Err(Error::UnknownKind { .. })
+        ));
     }
 
     #[test]
@@ -569,9 +688,9 @@ mod tests {
             assert_eq!(f.data_type(), t);
         }
         assert_eq!(
-            schema_to_columns(&schema, &[])[1].data_type,
-            "Int8",
-            "the spelling is Arrow's Display form"
+            schema_to_columns(&schema, &[])[1].data_type.to_string(),
+            r#"{"type":"int8"}"#,
+            "the spelling is core's ColumnType"
         );
     }
 
@@ -676,7 +795,7 @@ mod tests {
             .enumerate()
             .map(|(i, (old, _))| ColumnDef {
                 name: format!("c{i}"),
-                data_type: (*old).to_string(),
+                data_type: (*old).into(),
                 nullable: true,
                 extra: Extra::new(),
             })
@@ -793,7 +912,7 @@ mod tests {
             Field::new("b", DataType::Utf8, true),
         ]);
         let cols = schema_to_columns(&schema, &old);
-        assert_eq!(cols[0].data_type, "Int32");
+        assert_eq!(cols[0].data_type.to_string(), r#"{"type":"int32"}"#);
         assert!(cols[0].extra.contains_key("future"));
         assert!(cols[1].extra.is_empty());
         let mut dup = cols.clone();

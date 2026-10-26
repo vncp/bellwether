@@ -1,6 +1,8 @@
-//! WP21 item 4: per-key time bounds (`exact:symbol@ts`), a `bounds` sidecar
-//! beside an exact spec. Ground truth: rows decoded with the `parquet`
-//! crate; the expected plan is computed from them, never from the index.
+//! WP21 item 4: per-key time bounds (`exact:symbol@ts`), folded into the
+//! exact spec's value records at M5, and the `bounds` sidecar a bloom with
+//! bounds (`bloom:symbol@0.01@ts`) keeps. Ground truth: rows decoded with
+//! the `parquet` crate; the expected plan is computed from them, never from
+//! the index.
 
 #![allow(
     clippy::unwrap_used,
@@ -20,10 +22,11 @@ use std::sync::Arc;
 
 use arrow::array::{Int64Array, RecordBatch, StringArray, TimestampMicrosecondArray};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
-use bellwether_build::{BuildOptions, Lookup, SourceKind};
+use bellwether_build::{BuildOptions, Lookup, SourceKind, TimedSource};
 use bellwether_core::encoding::ts_value_as;
 use bellwether_core::sidecar::{SidecarDef, SidecarKind};
 use bellwether_store::{commit, StagedSegments};
+use bellwether_types::KeySpec;
 use common::*;
 
 /// Year 9999-12-31T23:59:59.999999 in microseconds: a common "open end"
@@ -50,15 +53,26 @@ fn bounds_def() -> SidecarDef {
     }
 }
 
-fn opts(sidecars: bool) -> BuildOptions {
-    BuildOptions {
-        sidecars: if sidecars {
-            vec![bounds_def()]
-        } else {
-            Vec::new()
-        },
-        ..BuildOptions::new(SourceKind::Parquet)
+/// `exact:symbol@ts`: the exact spec with per-key bounds over `ts`.
+fn exact_bounds() -> KeySpec {
+    KeySpec::Exact {
+        columns: cols(&["symbol"]),
+        counts: false,
+        bounds: Some("ts".into()),
     }
+}
+
+/// `bloom:symbol@0.01@ts`: a bloom with its `bounds` sidecar.
+fn bloom_bounds() -> KeySpec {
+    KeySpec::Bloom {
+        columns: cols(&["symbol"]),
+        fpr: 0.01,
+        bounds: Some("ts".into()),
+    }
+}
+
+fn opts() -> BuildOptions {
+    BuildOptions::new(SourceKind::Parquet)
 }
 
 type Print = (Option<&'static str>, Option<i64>);
@@ -195,17 +209,19 @@ fn a_window_plans_exactly_the_row_groups_where_the_key_s_own_times_overlap() {
     let all = rows(&s);
     let bounds = key_bounds(&all);
     let with = memory_store();
-    let specs = [exact(&["symbol"]), range("ts")];
+    let specs = [exact_bounds(), range("ts")];
     builder(&with)
-        .build(&s.root_str(), &specs, &opts(true))
+        .build(&s.root_str(), &specs, &opts())
         .unwrap();
     let without = memory_store();
+    let base_specs = [exact(&["symbol"]), range("ts")];
     builder(&without)
-        .build(&s.root_str(), &specs, &opts(false))
+        .build(&s.root_str(), &base_specs, &opts())
         .unwrap();
     let (p, q) = (planner(&with), planner(&without));
     assert_eq!(p.sidecar_completeness(&bounds_def()), Some(1));
-
+    // The bounds are the exact spec's own segments: no sidecar segment.
+    assert!(p.manifest().segments.iter().all(|x| x.kind.is_none()));
     let points = [
         i64::MIN + 1,
         -5,
@@ -231,7 +247,7 @@ fn a_window_plans_exactly_the_row_groups_where_the_key_s_own_times_overlap() {
             for keys in key_sets {
                 let l = window(&["symbol"], keys, lo, hi);
                 let plan = p.plan(&specs, &l).unwrap();
-                let base = q.plan(&specs, &l).unwrap();
+                let base = q.plan(&base_specs, &l).unwrap();
                 let key_bytes: BTreeSet<Vec<u8>> = keys.iter().map(|k| enc_str(k)).collect();
                 // The bounds oracle: (file, rg) where a queried key's own
                 // [min, max] overlaps the window.
@@ -275,19 +291,30 @@ fn a_window_plans_exactly_the_row_groups_where_the_key_s_own_times_overlap() {
     );
 }
 
+/// A bloom with bounds keeps its `bounds` sidecar, listed under the
+/// bloom's identity: dropping the sidecar's coverage of a row group makes
+/// the bloom incomplete, so neither it nor its bounds are used, and the
+/// plan stays correct. A segment and declaration of a kind this binary
+/// does not know are kept and ignored.
 #[test]
 fn an_incomplete_sidecar_is_not_used_and_unknown_kinds_are_kept_and_ignored() {
     let s = Scratch::new();
     corpus(&s);
     let all = rows(&s);
     let store = memory_store();
-    let specs = [exact(&["symbol"])];
+    let specs = [bloom_bounds()];
     builder(&store)
-        .build(&s.root_str(), &specs, &opts(true))
+        .build(&s.root_str(), &specs, &opts())
         .unwrap();
-    // Another writer adds a segment and a declaration of a kind this binary
-    // does not know, under the exact spec's own name.
     let m = builder(&store).manifest().unwrap().unwrap();
+    let sidecar = m
+        .segments
+        .iter()
+        .find(|x| x.kind.as_deref() == Some("bounds"))
+        .unwrap();
+    assert_eq!(sidecar.key_spec, bloom_bounds().identity());
+    // Another writer adds a segment and a declaration of a kind this binary
+    // does not know, under the bloom's own name.
     let foreign = bellwether_store::SegmentRef {
         kind: Some("counts".into()),
         ..m.segments[0].clone()
@@ -311,6 +338,10 @@ fn an_incomplete_sidecar_is_not_used_and_unknown_kinds_are_kept_and_ignored() {
     );
     let l = window(&["symbol"], &["AAPL"], 100, 200);
     let plan = p.plan(&specs, &l).unwrap();
+    assert_eq!(
+        p.sidecars_for(&specs, &l),
+        vec![(bounds_def(), TimedSource::BloomBounds(bloom_bounds()))]
+    );
     let got = apply_residual(plan.residual.as_ref().unwrap(), planned_rows(&plan, &all));
     assert_eq!(got.len(), 2);
     // A rebuild over a new file keeps the unknown segment and declaration
@@ -333,8 +364,10 @@ fn an_incomplete_sidecar_is_not_used_and_unknown_kinds_are_kept_and_ignored() {
         "continuously complete"
     );
 
-    // Dropping the sidecar's coverage of a row group makes it incomplete:
-    // it is no longer used, and the plan is still correct.
+    // Dropping the sidecar's coverage of a row group makes the bloom
+    // incomplete (its bounds are one of its targets): a plan through it is
+    // refused, never partial (ADR 012), and a plan with the complete specs
+    // (none here) is still correct.
     commit(&*store, "idx", &StagedSegments::new(), |cur| {
         let mut next = cur.clone();
         let victim = next
@@ -348,13 +381,23 @@ fn an_incomplete_sidecar_is_not_used_and_unknown_kinds_are_kept_and_ignored() {
     .unwrap();
     let p = planner(&store);
     assert_eq!(p.sidecar_completeness(&bounds_def()), None);
-    assert_eq!(p.sidecars_for(&l), Vec::<SidecarDef>::new());
+    assert_eq!(p.completeness(&bloom_bounds()), None);
+    let err = p.plan(&specs, &l).unwrap_err();
+    assert!(err.to_string().contains("not complete"), "{err}");
+    let complete: Vec<KeySpec> = p
+        .declared_specs()
+        .iter()
+        .filter(|s| p.completeness(s).is_some())
+        .cloned()
+        .collect();
+    assert_eq!(complete, Vec::<KeySpec>::new());
+    assert_eq!(p.sidecars_for(&complete, &l), Vec::new());
     let all = {
         let mut a = all;
         a.extend(parquet_rows(&s.path("d3.parquet"), &schema()));
         a
     };
-    let plan = p.plan(&specs, &l).unwrap();
+    let plan = p.plan(&complete, &l).unwrap();
     let got = apply_residual(plan.residual.as_ref().unwrap(), planned_rows(&plan, &all));
     assert_eq!(got.len(), 2);
 }
@@ -435,9 +478,9 @@ fn a_bounds_lookback_plans_exactly_each_key_s_own_window() {
         }
         let bounds = key_bounds(&all);
         let store = memory_store();
-        let specs = [exact(&["symbol"])];
+        let specs = [exact_bounds()];
         builder(&store)
-            .build(&s.root_str(), &specs, &opts(true))
+            .build(&s.root_str(), &specs, &opts())
             .unwrap();
         let p = planner(&store);
         let live = holding(&all, |_| true);

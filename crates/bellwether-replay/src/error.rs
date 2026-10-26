@@ -24,7 +24,11 @@ pub enum ReplayError {
     RewriteNotScorable,
     /// A proposed key spec serves none of the workload's runs, so scoring it
     /// would report "no change" for a spec that was never applicable.
-    #[error("proposed spec {spec} serves none of the workload's runs (their key columns: {run_columns:?})")]
+    #[error(
+        "proposed spec {spec} serves none of the workload's runs (their key columns: {}); \
+         propose a key on the columns the runs look up",
+        .run_columns.iter().map(|c| c.join(",")).collect::<Vec<_>>().join("; ")
+    )]
     SpecServesNoRun {
         /// The proposed spec's name.
         spec: String,
@@ -122,6 +126,14 @@ mod tests {
             }),
             Error::KeySpec(_)
         ));
+        // Plain text, never Debug: each run's columns comma-joined.
+        let m = ReplayError::SpecServesNoRun {
+            spec: "exact:x".into(),
+            run_columns: vec![vec!["a".into(), "b".into()], vec!["c".into()]],
+        }
+        .to_string();
+        assert!(m.contains("(their key columns: a,b; c)"), "{m}");
+        assert!(!m.contains('"') && !m.contains('['), "{m}");
         assert!(matches!(
             Error::from(ReplayError::BenchMismatch {
                 run_id: Some("r".into()),

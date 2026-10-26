@@ -834,12 +834,18 @@ fn fix_on_an_unindexed_partitioned_folder_records_its_partitioning() {
             .unwrap();
         let proposal = rec["proposal"]["hash"].as_str().unwrap();
         let workload = why["workload"]["hash"].as_str().unwrap();
-        // Proposing a sidecar on the folder not yet indexed is refused, and
-        // the index command it names carries the same source flag, so
-        // following it literally builds the folder as it was read.
+        // Per-key bounds are a key spec (M5): proposing one on the folder
+        // not yet indexed writes a proposal. A sketch is refused, and the
+        // index command it names carries the same source flag, so following
+        // it literally builds the folder as it was read.
         let ev = why["evidence"]["hash"].as_str().unwrap();
-        let refused = call(
+        let written = call(
             &["propose", r, "--evidence", ev, "--key", "exact:symbol@ts"],
+            0,
+        );
+        assert!(written.starts_with("proposal "), "{written}");
+        let refused = call(
+            &["propose", r, "--evidence", ev, "--key", "sketch:symbol"],
             3,
         );
         let flag = if flags[0] == "--path-template" {
@@ -850,7 +856,7 @@ fn fix_on_an_unindexed_partitioned_folder_records_its_partitioning() {
         let canon = std::fs::canonicalize(&root).unwrap();
         assert!(
             refused.contains(&format!(
-                "`bellwether index {} {flag} --key exact:symbol@ts`",
+                "`bellwether index {} {flag} --key sketch:symbol`",
                 path(&canon)
             )),
             "{refused}"
@@ -897,7 +903,7 @@ fn fix_on_an_unindexed_partitioned_folder_records_its_partitioning() {
     }
 }
 
-/// The index command a sidecar refusal names carries every flag that
+/// The index command a sketch refusal names carries every flag that
 /// shapes the build or locates the index, each argument shell-quoted:
 /// followed literally through a shell on a CSV folder whose root has a
 /// space, with a non-default chunk size, an index elsewhere, the full
@@ -907,7 +913,7 @@ fn fix_on_an_unindexed_partitioned_folder_records_its_partitioning() {
 /// the checks a proposal gets: an unknown column and a reserved proposer
 /// are refused as such.
 #[test]
-fn the_sidecar_refusal_command_builds_what_fix_builds() {
+fn the_sketch_refusal_command_builds_what_fix_builds() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join("my lake");
     std::fs::create_dir_all(&root).unwrap();
@@ -951,7 +957,7 @@ fn the_sidecar_refusal_command_builds_what_fix_builds() {
         .args(
             [
                 &flags[..],
-                &["propose", r, "--evidence", &ev, "--key", "exact:nosuch@ts"],
+                &["propose", r, "--evidence", &ev, "--key", "sketch:nosuch"],
             ]
             .concat(),
         )
@@ -982,12 +988,12 @@ fn the_sidecar_refusal_command_builds_what_fix_builds() {
             "--evidence",
             &ev,
             "--key",
-            "exact:symbol@ts",
+            "sketch:symbol",
             "--json",
         ],
         3,
     ));
-    assert_eq!(refused["refusal"]["kind"], "sidecar_not_proposable");
+    assert_eq!(refused["refusal"]["kind"], "sketch_not_proposable");
     let command = refused["refusal"]["command"].as_str().unwrap();
     let rest = command.strip_prefix("bellwether ").unwrap();
     let bin = assert_cmd::cargo::cargo_bin("bellwether");
@@ -1005,7 +1011,9 @@ fn the_sidecar_refusal_command_builds_what_fix_builds() {
         serde_json::from_slice(&std::fs::read(index.join("manifest.json")).unwrap()).unwrap()
     };
     let built = manifest();
-    call(&["locate", r, "--keys", k], 0);
+    // The same flags find what the command built: nothing left to do.
+    let again = json(&call(&["index", r, "--key", "sketch:symbol", "--json"], 0));
+    assert!(again["committed"].is_null(), "{again}");
 
     // The same folder through why and fix with the same flags.
     std::fs::remove_dir_all(&index).unwrap();

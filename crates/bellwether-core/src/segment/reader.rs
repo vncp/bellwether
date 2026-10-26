@@ -23,7 +23,7 @@ use roaring::RoaringBitmap;
 
 use super::format::{
     check_versions, checksum, corrupt, footer_len, parse_header, spec_types, ColumnType, Cursor,
-    Layout, ReadAt, SegmentHeader, MAGIC, PREAMBLE_LEN,
+    Layout, ReadAt, SegmentHeader, ValueShape, MAGIC, PREAMBLE_LEN,
 };
 use super::types;
 use super::writer::KeyValue;
@@ -261,7 +261,7 @@ impl<R: ReadAt> SegmentReader<R> {
         }
         let header_len = c.u32()? as usize;
         let header_bytes = src.read_at(PREAMBLE_LEN as u64, header_len)?;
-        let header = parse_header(&header_bytes, storage)?;
+        let header = parse_header(&header_bytes)?;
         header.validate(storage, encoding)?;
         let foot = src.read_at(size - foot_len as u64, foot_len)?;
         let mut c = Cursor::new(&foot);
@@ -292,7 +292,7 @@ impl<R: ReadAt> SegmentReader<R> {
         let blocks = claimed as usize;
         let reserve = |min_entry| reserve_hint(u64::from(claimed), index_len as u64, min_entry);
         let index = match header.layout {
-            Layout::Keyed | Layout::KeyedTemporal => {
+            Layout::Keyed | Layout::KeyedTemporal | Layout::Bitemporal => {
                 let mut v = Vec::with_capacity(reserve(MIN_KEYED_ENTRY));
                 for _ in 0..blocks {
                     v.push(KeyedBlock {
@@ -360,8 +360,9 @@ impl<R: ReadAt> SegmentReader<R> {
         Ok(r)
     }
 
-    /// Checks that this segment's recorded key types (and temporal ts type)
-    /// equal the types `schema` declares for the key spec's columns. A
+    /// Checks that this segment's recorded key types (and temporal ts type,
+    /// and the time types of per-key bounds or bitemporal versions) equal
+    /// the types `schema` declares for the key spec's columns. A
     /// segment written from already-encoded keys records no types and is
     /// refused here, because its encoding cannot be verified.
     pub fn check_dataset(&self, schema: &Schema) -> Result<()> {
@@ -377,6 +378,29 @@ impl<R: ReadAt> SegmentReader<R> {
                 self.header.key_spec.name()
             )));
         };
+        let want_times =
+            super::format::record_time_types(&self.header.key_spec, self.header.layout, schema)?
+                .iter()
+                .map(ColumnType::of)
+                .collect::<Result<Vec<_>>>()?;
+        let have_times = self.header.time_types.clone().unwrap_or_default();
+        if have_times != want_times {
+            return Err(Error::KeySpec(format!(
+                "segment for {} recorded its time columns as ({}); the dataset declares ({}); \
+                 re-index the folder",
+                self.header.key_spec.identity(),
+                have_times
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                want_times
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            )));
+        }
         if have_keys != &want_keys || self.header.ts_type != want_ts {
             return Err(Error::KeySpec(format!(
                 "segment for {} was encoded under key types {}; the dataset declares {}; \
@@ -471,8 +495,7 @@ impl<R: ReadAt> SegmentReader<R> {
         let bytes = verified(self.src.read_at(off, len)?, sum, "value record")?;
         KeyValue::decode(
             &bytes,
-            matches!(self.header.layout, Layout::KeyedTemporal),
-            self.header.key_spec.counts(),
+            ValueShape::of(&self.header.key_spec, self.header.layout),
             self.header.storage_version,
         )
     }
@@ -517,6 +540,80 @@ impl<R: ReadAt> SegmentReader<R> {
             return Err(corrupt("a counted segment holds a value without counts"));
         }
         Ok(Some(out))
+    }
+
+    /// Whether the segment stores per-key time bounds (an exact spec with
+    /// `bounds`, storage version 2).
+    #[must_use]
+    pub fn has_bounds(&self) -> bool {
+        ValueShape::of(&self.header.key_spec, self.header.layout).bounds
+    }
+
+    /// For each key of `keys` present, its `[min, max]` time per row group
+    /// where it has a non-null time, ascending by row group; a row group
+    /// where every row of the key has a null time (the stored all-null
+    /// sentinel) is left out, as it overlaps no window. `None` when the
+    /// segment stores no bounds (never an empty answer: a reader cannot
+    /// tell a segment without bounds from keys without times). Holds the
+    /// block index, one block, and the values of the keys asked (ADR 018).
+    #[allow(clippy::type_complexity)]
+    pub fn bounds<K: AsRef<[u8]>>(
+        &self,
+        keys: &[K],
+    ) -> Result<Option<BTreeMap<Vec<u8>, Vec<crate::sidecar::RgBounds>>>> {
+        if !self.has_bounds() {
+            return Ok(None);
+        }
+        let mut out = BTreeMap::new();
+        let mut missing = false;
+        self.visit_keys(keys, |k, v| match v.bounded() {
+            Some(b) => {
+                out.insert(
+                    k.to_vec(),
+                    b.into_iter()
+                        .map(|(rg, min, max)| crate::sidecar::RgBounds { rg, min, max })
+                        .collect(),
+                );
+            }
+            None => missing = true,
+        })?;
+        if missing {
+            return Err(corrupt(
+                "a segment with bounds holds a value without bounds",
+            ));
+        }
+        Ok(Some(out))
+    }
+
+    /// For each key of `keys` present, its distinct `(valid, known, row
+    /// group)` versions, ascending (a bitemporal segment only; refused
+    /// otherwise). Holds the block index, one block, and the values of the
+    /// keys asked (ADR 018).
+    pub fn triples<K: AsRef<[u8]>>(
+        &self,
+        keys: &[K],
+    ) -> Result<BTreeMap<Vec<u8>, Vec<crate::sidecar::Triple>>> {
+        if self.header.layout != Layout::Bitemporal {
+            return Err(Error::KeySpec(format!(
+                "{} is not a bitemporal key spec",
+                self.header.key_spec.identity()
+            )));
+        }
+        let mut out = BTreeMap::new();
+        self.visit_keys(keys, |k, v| {
+            out.insert(
+                k.to_vec(),
+                v.triples
+                    .iter()
+                    .map(|&(valid, known, rg)| crate::sidecar::Triple {
+                        valid,
+                        known,
+                        rg: RowGroupId(rg),
+                    })
+                    .collect(),
+            );
+        })?;
+        Ok(out)
     }
 
     /// The keys of block `i` of a keyed segment, ascending; `None` past the

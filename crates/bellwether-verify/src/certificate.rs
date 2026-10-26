@@ -4,7 +4,10 @@ use std::ops::Deref;
 use std::time::{Duration, Instant};
 
 use bellwether_ledger::{Ledger, RecordKind};
-use bellwether_types::{format, CertBody, Certificate, Evidence, Hash, Provenance, Record, Store};
+use bellwether_types::{
+    format, CertBody, Certificate, Evidence, Hash, MismatchExample, MismatchKind, Provenance,
+    Record, Store, MAX_MISMATCH_EXAMPLES,
+};
 
 use crate::error::{Result, VerifyError};
 use crate::outcome::{Mismatch, Reconciliation};
@@ -166,13 +169,15 @@ pub(crate) fn build(
         body: CertBody {
             missing_right: o.counts.missing_right,
             missing_left: o.counts.missing_left,
-            mismatched: o.counts.mismatched,
+            // A key that failed to compare is counted in `uncomparable`,
+            // never in `mismatched` (contract v3 #26).
+            mismatched: o.counts.mismatched - o.counts.no_comparable_version,
             ignored_columns: o.ignored_columns.clone(),
             totals_delta,
-            examples: Vec::new(),
-            uncomparable: 0,
-            totals: Vec::new(),
-            row_filter: None,
+            examples: examples(&o.mismatches),
+            uncomparable: o.counts.no_comparable_version,
+            totals: exec.totals.clone(),
+            row_filter: o.row_filter.clone(),
         },
         provenance: Provenance {
             inputs,
@@ -186,6 +191,31 @@ pub(crate) fn build(
         certificate,
         evidence: exec.evidence,
     })
+}
+
+/// The certificate's examples: the per-key differences of `mismatches` in
+/// their (canonical key) order, at most [`MAX_MISMATCH_EXAMPLES`] (a run with a larger
+/// `max_examples` still certifies only that many); totals are in
+/// `totals_delta`, not here.
+fn examples(mismatches: &[Mismatch]) -> Vec<MismatchExample> {
+    mismatches
+        .iter()
+        .filter_map(|m| {
+            let (kind, key) = match m {
+                Mismatch::MissingOnLeft { key, .. } => (MismatchKind::MissingLeft, key),
+                Mismatch::MissingOnRight { key, .. } => (MismatchKind::MissingRight, key),
+                Mismatch::RowHashDiffers { key, .. } => (MismatchKind::Mismatched, key),
+                Mismatch::NoComparableVersion { key, .. } => (MismatchKind::Uncomparable, key),
+                Mismatch::TotalDiffers { .. } => return None,
+            };
+            Some(MismatchExample {
+                kind,
+                key: key.canonical.clone(),
+                values: key.values.clone(),
+            })
+        })
+        .take(MAX_MISMATCH_EXAMPLES)
+        .collect()
 }
 
 /// The manifest sequence the certificate names.

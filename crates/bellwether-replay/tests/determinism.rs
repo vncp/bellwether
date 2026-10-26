@@ -56,7 +56,10 @@ const CHILD_CORPUS: &str = "BELLWETHER_REPLAY_DETERMINISM_CORPUS";
 /// parquet 53 -> 59 upgrade: every run's files and row groups are unchanged;
 /// only `bytes` moved, because the new writer omits page-header statistics,
 /// so the fixture's column chunks are smaller (docs/benchmark.md).
-const GOLDEN: &str = "d314032d2f3fc97fc8064175568d8c525a34ab40bfc39d3b578e5978b056a166";
+/// Re-pinned 2026-10-26 for M5 (ADR 028): replay fills `configuration`
+/// (the current specs' identities, here `range:entity_id` and
+/// `exact:batch_id`); every cost is unchanged.
+const GOLDEN: &str = "cc01571a670250d62ffd8aaa85b500b46d78bc73d9216017303dcc9033a74525";
 
 fn cols(c: &[&str]) -> Vec<String> {
     c.iter().map(|s| (*s).to_string()).collect()

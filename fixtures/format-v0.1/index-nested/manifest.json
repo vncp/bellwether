@@ -1,0 +1,124 @@
+{
+  "commit_nonce": 12999748449762052805,
+  "committed_at": "2026-10-26T21:34:46.834Z",
+  "created_at": "2026-10-26T21:34:46.834Z",
+  "deleting": [],
+  "key_spec_completeness": {
+    "exact:id": 1
+  },
+  "rowgroup_space": {
+    "files": [
+      {
+        "column_bytes": [
+          106,
+          115,
+          73,
+          150,
+          173,
+          76,
+          106,
+          115,
+          73,
+          155,
+          195,
+          76
+        ],
+        "fingerprint": {
+          "etag": "2026-10-25T00:00:00.000000000Z",
+          "path": "/private/tmp/bellwether-format-v0.1/nested/part-0.parquet",
+          "size": 4205,
+          "tail_blake3": "2f9b87768a635841da1b4e2572374365809574b3a917450c13d5bc7aaab331df"
+        },
+        "rowgroup_bytes": [
+          693,
+          720
+        ],
+        "rowgroup_ids": [
+          0,
+          1
+        ],
+        "rowgroup_rows": [
+          3,
+          3
+        ]
+      }
+    ],
+    "next_id": 2,
+    "tombstones": []
+  },
+  "schema": {
+    "columns": [
+      {
+        "data_type": {
+          "type": "int64"
+        },
+        "name": "id",
+        "nullable": false
+      },
+      {
+        "data_type": {
+          "type": "timestamp",
+          "tz": "UTC",
+          "unit": "microsecond"
+        },
+        "name": "ts",
+        "nullable": true
+      },
+      {
+        "data_type": {
+          "arrow": "List(Utf8, field: 'element')"
+        },
+        "name": "tags",
+        "nullable": true
+      },
+      {
+        "data_type": {
+          "arrow": "Struct(\"venue\": Utf8, \"lot\": Int32)"
+        },
+        "name": "attrs",
+        "nullable": true
+      },
+      {
+        "data_type": {
+          "arrow": "Map(\"key_value\": non-null Struct(\"key\": non-null Utf8, \"value\": Int64), unsorted)"
+        },
+        "name": "props",
+        "nullable": true
+      },
+      {
+        "data_type": {
+          "arrow": "Dictionary(Int32, Utf8)"
+        },
+        "name": "side",
+        "nullable": true
+      }
+    ],
+    "key_specs": [
+      {
+        "columns": [
+          "id"
+        ],
+        "kind": "exact"
+      }
+    ]
+  },
+  "segment_tombstones": [],
+  "segments": [
+    {
+      "bytes": 582,
+      "id": "f57199dfc1a19d5a79a5ddce07d2ae9adba2fb1e8e849b8a3889af5866c5e450",
+      "key_spec": "exact:id",
+      "rowgroup_range": {
+        "end": 2,
+        "start": 0
+      }
+    }
+  ],
+  "sequence": 1,
+  "source": {
+    "fingerprint_policy": "tail64k",
+    "kind": "parquet",
+    "root": "/private/tmp/bellwether-format-v0.1/nested"
+  },
+  "storage_version": 2
+}

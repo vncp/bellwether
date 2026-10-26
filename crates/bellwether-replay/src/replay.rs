@@ -92,11 +92,11 @@ use crate::error::{ReplayError, ReplayResult};
 use crate::keys::RunKeys;
 use crate::layout::{replay_layout, LayoutModel, LayoutReplay};
 use crate::plan::{
-    count_cost, lookback_window, planned_time_column, run_cost, serves_query, PlanSource,
+    converted_lookback_window, count_cost, planned_time_column, run_cost, serves_query, PlanSource,
     SegmentPlanner,
 };
 use crate::transient::{CacheStats, TransientCache, TransientIndex, TransientLimits};
-use crate::workload::{KeySetSource, RunQuery, Workload};
+use crate::workload::{KeySetSource, RunQuery, RunWindow, Workload};
 
 /// Default byte cap of a replayer's transient cache: 2 GiB.
 pub const DEFAULT_CACHE_BYTES: u64 = 2 << 30;
@@ -340,7 +340,12 @@ impl<'a> Replayer<'a> {
     /// and under `ParquetStats` only those of them the files' statistics
     /// keep for the keys and the window, if any: both keep every row group
     /// holding a key, so their intersection does (invariant 1). An `asof`
-    /// lookback run is planned as its window on that column.
+    /// lookback run is planned as its window on that column. Its instant
+    /// and length are measured on the column the current configuration
+    /// plans it on (or, with none, on the planned column itself); a
+    /// configuration that plans it on another column gets the window
+    /// converted to that column's unit ([`converted_lookback_window`]), or,
+    /// when the units do not convert, no window.
     fn verified_plan(
         &self,
         planner: &dyn PlanSource,
@@ -368,12 +373,9 @@ impl<'a> Replayer<'a> {
                     lookback,
                 },
                 Some(ts),
-            ) => Some(Cow::Owned(RunQuery::Window(lookback_window(
-                self.catalog.schema(),
-                ts,
-                *at,
-                *lookback,
-            )?))),
+            ) => self
+                .converted_window(keys.columns(), query, ts, *at, *lookback)?
+                .map(|w| Cow::Owned(RunQuery::Window(w))),
             (q, column) if !q.is_temporal() || column.is_some() => Some(Cow::Borrowed(q)),
             _ => None,
         };
@@ -420,6 +422,27 @@ impl<'a> Replayer<'a> {
         Ok((narrowed, true))
     }
 
+    /// The window an `asof` lookback run (`at`, `lookback`) keyed on
+    /// `run_columns` is planned as on `ts`, the column `query` is planned on
+    /// under the configuration being priced: its instant and length are
+    /// measured on the column the current configuration plans it on (or,
+    /// with none, on `ts` itself), and converted to `ts`'s unit rounding
+    /// outward ([`converted_lookback_window`]). `None` when the units do not
+    /// convert.
+    fn converted_window(
+        &self,
+        run_columns: &[String],
+        query: &RunQuery,
+        ts: String,
+        at: i64,
+        lookback: i64,
+    ) -> Result<Option<RunWindow>> {
+        let recorded =
+            planned_time_column(self.planner.as_ref(), &self.current, run_columns, query)?
+                .unwrap_or_else(|| ts.clone());
+        converted_lookback_window(self.catalog.schema(), &recorded, ts, at, lookback)
+    }
+
     /// The time column `query` is planned on for a run keyed on
     /// `run_columns` under `specs` ([`planned_time_column`]), so a caller
     /// can check that it measures the run's instants and lengths on the
@@ -432,6 +455,32 @@ impl<'a> Replayer<'a> {
     ) -> Result<Option<String>> {
         let planner = self.planner_for(specs)?;
         planned_time_column(planner.as_ref(), specs, run_columns, query)
+    }
+
+    /// The window an `asof` lookback run keyed on `run_columns` is planned
+    /// as under `specs`: on the column [`Replayer::planned_time_column`]
+    /// names, its instant and length converted from the column the current
+    /// configuration measures them on, rounding outward (the conversion
+    /// replay prices with, so verify compares the rows the plan covers).
+    /// `None` for any other query, when nothing plans the run on a time
+    /// column, or when the units do not convert.
+    pub fn planned_lookback_window(
+        &self,
+        specs: &[KeySpec],
+        run_columns: &[String],
+        query: &RunQuery,
+    ) -> Result<Option<RunWindow>> {
+        let RunQuery::Lookback {
+            asof: Some(at),
+            lookback,
+        } = query
+        else {
+            return Ok(None);
+        };
+        match self.planned_time_column(specs, run_columns, query)? {
+            Some(ts) => self.converted_window(run_columns, query, ts, *at, *lookback),
+            None => Ok(None),
+        }
     }
 
     /// The exact cost of one ad hoc `locate` key set under `specs`.
@@ -602,19 +651,24 @@ impl<'a> Replayer<'a> {
             .into());
         }
         let (proposed, layout, proposed_stats) = match body {
-            ProposalBody::Key { spec, .. } => {
-                validate_spec(spec)?;
-                if !workload
-                    .runs()
-                    .iter()
-                    .any(|r| r.query().is_ok_and(|q| serves_query(spec, &r.columns, &q)))
-                {
-                    return Err(ReplayError::SpecServesNoRun {
-                        spec: spec.name(),
-                        run_columns: distinct_columns(workload),
-                    });
+            ProposalBody::Key { spec, sidecars } => {
+                // The spec and the specs proposed beside it, applied in one
+                // commit: each replaces the current spec of its name.
+                let mut specs = self.current.clone();
+                for s in std::iter::once(spec).chain(sidecars) {
+                    validate_spec(s)?;
+                    if !workload
+                        .runs()
+                        .iter()
+                        .any(|r| r.query().is_ok_and(|q| serves_query(s, &r.columns, &q)))
+                    {
+                        return Err(ReplayError::SpecServesNoRun {
+                            spec: s.name(),
+                            run_columns: distinct_columns(workload),
+                        });
+                    }
+                    specs = proposed_specs(&specs, s);
                 }
-                let specs = proposed_specs(&self.current, spec);
                 let (costs, stats) = self.costs(&specs, workload, keys, None)?;
                 (costs, None, stats)
             }
@@ -673,7 +727,7 @@ impl<'a> Replayer<'a> {
                 created_at: created_at.to_string(),
                 inputs: vec![self.catalog.digest()],
                 model,
-                configuration: Vec::new(),
+                configuration: self.current.iter().map(KeySpec::identity).collect(),
                 operators: Vec::new(),
                 unserved: (current_stats || proposed_stats)
                     .then(|| Baseline::ParquetStats.name().to_string()),

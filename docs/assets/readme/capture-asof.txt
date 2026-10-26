@@ -1,29 +1,27 @@
 #! title: bellwether asof --valid --known
-#! caption: bellwether index and asof on the bench market corpus (bench market --rung small: 50 symbols, 10 days, prints with restatements and late arrivals), one as-of query of the corpus's own workload (10 symbols); release build of 3a0c26a, 2026-10-26.
+#! caption: bellwether index and asof on the bench market corpus (bench market --rung small: 50 symbols, 10 days, prints with restatements and late arrivals), one as-of query of the corpus's own workload (10 symbols); debug build of 325c1df, 2026-10-26.
 $ bellwether index market/data --partitioning hive --key exact:symbol@ts --key range:ts --key temporal2:symbol@ts,known_at
 [1mindex /private/tmp/bellwether-readme/market/data: committed manifest sequence 1[0m
-  files: 20 new, 0 changed, 0 removed, 0 unchanged; 216 row groups read; 16 segments written, 16 live
+  files: 20 new, 0 changed, 0 removed, 0 unchanged; 216 row groups read; 12 segments written, 12 live
 
-  key spec or sidecar                         complete at
-  exact:symbol                                          1
+  key spec                                    complete at
+  exact:symbol@ts                                       1
   range:ts                                              1
-  bounds:symbol@ts                                      1
   temporal2:symbol@ts,known_at                          1
 
-manifest 8b5da262e807bd698822985affa931a053d90f2414607070d99fc60f2b996298
+manifest b1945d623e627f8342cc1bb0ebbbead66ffa9a666d9b01abcb1af6608c2d549b
 
 $ bellwether asof market/data --keys market/workload/keys/q0019.parquet --valid 2026-01-01T14:33:36.594660Z --known 2026-01-02T15:29:06.427726Z
 [1mbitemporal ts <= 2026-01-01T14:33:36.594660Z (1767278016594660), known_at <= 2026-01-02T15:29:06.427726Z (1767367746427726): 10 keys on (symbol) at manifest sequence 1[0m
                                          files   row groups              bytes
   live                                      20          216                  -
   planned                                    3            8             97,851    97.9 kB
-  specs: exact:symbol, range:ts
-  sidecars: temporal2:symbol@ts,known_at
-  order: unspecified; the row groups of /private/tmp/bellwether-readme/market/data/day=2026-01-01/part-0001.parquet are not in ts order, so no reading order of whole files is a time order; entries are ordered by each file's earliest row group
+  specs: exact:symbol@ts, range:ts, temporal2:symbol@ts,known_at
+  order: by ts (each row group's minimum); whole files are not in ts order, so the 8 row groups are read in the plan's order, across files (`order` in --json); files below by their earliest row group
 
   file                                                          row groups              bytes
   ...ether-readme/market/data/day=2026-01-01/part-0001.parquet           4             48,946
   ...ether-readme/market/data/day=2026-01-01/part-0000.parquet           3             34,995
   ...ether-readme/market/data/day=2026-01-02/part-0000.parquet           1             13,910
 
-evidence 4a4c130630d451a32202e1a3ec13cd8365a4ad7bc8850369188fb9eb85fb6fdc
+evidence 1e3e8611e3e902a8f214388d27bcbaf2ed128dc069a575850314c477268882ef

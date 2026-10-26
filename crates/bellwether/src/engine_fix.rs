@@ -702,6 +702,7 @@ impl Engine {
                     refusal: Refusal::CertificateFailed {
                         certificate: cert.hash,
                         mismatched: certificate.body.mismatched,
+                        uncomparable: certificate.body.uncomparable,
                         missing_left: certificate.body.missing_left,
                         missing_right: certificate.body.missing_right,
                         totals_differ: certificate.body.totals_delta.len() as u64,

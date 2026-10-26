@@ -103,9 +103,72 @@ pub struct SourceInfo {
     /// unknown field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub partitioning: Option<String>,
+    /// How a delimited text source is parsed, for `kind: "csv"` (storage
+    /// version 2): its delimiter, header and quote. A storage version 1
+    /// manifest carried a dialect other than comma-with-header in `kind`
+    /// (`csv;delimiter=<byte>;header=<bool>`), which is still read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dialect: Option<SourceDialect>,
     /// Unknown fields (ADR 017).
     #[serde(flatten)]
     pub extra: Extra,
+}
+
+/// A delimited text source's dialect (`source.dialect`, storage version 2).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SourceDialect {
+    /// The field delimiter, as its byte value (44 for `,`).
+    pub delimiter: u8,
+    /// Whether the first line of each file is a header row.
+    pub header: bool,
+    /// The quote character, as its byte value (34 for `"`).
+    pub quote: u8,
+    /// Unknown fields (ADR 017).
+    #[serde(flatten)]
+    pub extra: Extra,
+}
+
+/// A manifest column's `data_type`: in a storage version 2 manifest, the
+/// segment format's `ColumnType` JSON (`{"type":"int64"}`), or `{"arrow":
+/// "<display>"}` for a type without one (a nested or dictionary column);
+/// in a storage version 1 manifest, Arrow's display form as a string. The
+/// store keeps it as written; the build reads either form.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ColumnDataType {
+    /// Arrow's display form (storage version 1).
+    Display(String),
+    /// A JSON object: `ColumnType` JSON or `{"arrow": "<display>"}`
+    /// (storage version 2).
+    Typed(Map<String, Value>),
+}
+
+impl Default for ColumnDataType {
+    fn default() -> Self {
+        Self::Display(String::new())
+    }
+}
+
+impl From<&str> for ColumnDataType {
+    fn from(s: &str) -> Self {
+        Self::Display(s.to_string())
+    }
+}
+
+impl From<String> for ColumnDataType {
+    fn from(s: String) -> Self {
+        Self::Display(s)
+    }
+}
+
+/// The display string, or the object's compact JSON.
+impl std::fmt::Display for ColumnDataType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Display(s) => f.write_str(s),
+            Self::Typed(m) => f.write_str(&Value::Object(m.clone()).to_string()),
+        }
+    }
 }
 
 /// One column of the indexed dataset.
@@ -113,9 +176,9 @@ pub struct SourceInfo {
 pub struct ColumnDef {
     /// Column name.
     pub name: String,
-    /// Arrow data type, as its `Display` form.
+    /// The column's type ([`ColumnDataType`]).
     #[serde(default)]
-    pub data_type: String,
+    pub data_type: ColumnDataType,
     /// Whether the column is nullable.
     #[serde(default)]
     pub nullable: bool,
@@ -126,10 +189,15 @@ pub struct ColumnDef {
 
 /// A sidecar segment declaration in `schema.sidecars`.
 ///
-/// Sidecar kinds (such as `"bounds"` or `"temporal2"`) live in a manifest-owned
-/// list rather than `bellwether_types::KeySpec`, so a binary that predates a
-/// sidecar kind can still open the manifest, preserve the declaration on
-/// rewrite, and report the unknown kind via [`Manifest::unknown_segment_kinds`].
+/// Sidecar kinds live in a manifest-owned list rather than
+/// `bellwether_types::KeySpec`, so a binary that predates a sidecar kind can
+/// still open the manifest, preserve the declaration on rewrite, and report
+/// the unknown kind via [`Manifest::unknown_segment_kinds`]. Storage version
+/// 2 declares only sketches here; per-key time bounds and bitemporal
+/// versions are key specs (`KeySpec::Exact.bounds`, `KeySpec::Bitemporal`).
+/// The `"bounds"` and `"temporal2"` declarations of an index written before
+/// M5 are read as they were, and the next build with work folds them into
+/// key specs (docs/format.md, "Reading storage version 1").
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SidecarDecl {
     /// Sidecar kind, for example `"bounds"` or `"temporal2"`.
@@ -355,13 +423,15 @@ impl RowGroupRange {
 pub struct SegmentRef {
     /// blake3 of the segment bytes; also its file name.
     pub id: Hash,
-    /// Sidecar segment kind (`"bounds"`, `"temporal2"`, or a future kind), or
-    /// `None` for an ordinary key-spec segment.
+    /// Sidecar segment kind (`"bounds"`, `"temporal2"`, `"sketch"`, or a
+    /// future kind), or `None` for an ordinary key-spec segment.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kind: Option<String>,
     /// The key spec's identity ([`KeySpec::identity`]; its name in a
-    /// storage version 1 file) when `kind` is `None`, or the sidecar's
-    /// [`SidecarDecl::name`] when `kind` is `Some`.
+    /// storage version 1 file) when `kind` is `None`; the sidecar's
+    /// [`SidecarDecl::name`] when `kind` is `Some`, except the `bounds`
+    /// sidecar of a bloom spec with per-key bounds, listed under the bloom's
+    /// identity (`bloom:symbol@0.01@ts`).
     pub key_spec: String,
     /// Row groups covered.
     pub rowgroup_range: RowGroupRange,
@@ -535,9 +605,6 @@ impl Manifest {
         };
         if found > u64::from(STORAGE_VERSION) {
             return Err(unsupported(UNSUPPORTED_STORAGE));
-        }
-        if found >= 2 {
-            refuse_later_v2_shapes(&value)?;
         }
         if !types_owned_fields_known(&value, found) {
             return Err(Error::UnknownKind {
@@ -752,8 +819,9 @@ pub fn spec_json(spec: &KeySpec) -> String {
 fn key_spec_fields(kind: &str, storage_version: u64) -> Option<&'static [&'static str]> {
     let v2 = storage_version >= 2;
     match kind {
-        "exact" if v2 => Some(&["kind", "columns", "counts"]),
+        "exact" if v2 => Some(&["kind", "columns", "counts", "bounds"]),
         "exact" => Some(&["kind", "columns"]),
+        "bloom" if v2 => Some(&["kind", "columns", "fpr", "bounds"]),
         "bloom" => Some(&["kind", "columns", "fpr"]),
         "range" => Some(&["kind", "column"]),
         // a list key (B4) is a storage version 2 kind: a version 1 build
@@ -761,6 +829,9 @@ fn key_spec_fields(kind: &str, storage_version: u64) -> Option<&'static [&'stati
         "list" if v2 => Some(&["kind", "column"]),
         "temporal" if v2 => Some(&["kind", "columns", "ts_column", "counts"]),
         "temporal" => Some(&["kind", "columns", "ts_column"]),
+        // Per-key bounds and bitemporal key specs are storage version 2
+        // (M5); version 1 declared them as sidecars.
+        "bitemporal" if v2 => Some(&["kind", "columns", "valid_column", "known_column"]),
         // --- phase 5 kinds ---
         // Storage version 2 on: a reader of version 1 refuses the kind.
         "expr" if v2 => Some(&["kind", "name", "expr", "over", "conformance"]),
@@ -830,48 +901,6 @@ fn types_owned_fields_known(manifest: &Value, storage_version: u64) -> bool {
         }
     }
     true
-}
-
-/// Refuses, with [`Error::UnsupportedShape`], a storage version 2 manifest
-/// in a shape the next storage version 2 release writes and this binary
-/// does not read (ADR 028): a column's `data_type` as a type map rather
-/// than a string, a `source.dialect` (a text source's delimiter, header and
-/// quote, which this binary reads from `source.kind`), a key spec with
-/// per-key `bounds`, or a bitemporal key spec. Reading any of them as this
-/// binary would is a serde error or, for the dialect, a misread source.
-fn refuse_later_v2_shapes(manifest: &Value) -> Result<()> {
-    let shape = |what, found: String| Err(Error::UnsupportedShape { what, found });
-    let columns = manifest
-        .pointer("/schema/columns")
-        .and_then(Value::as_array);
-    for c in columns.into_iter().flatten() {
-        if c.get("data_type").is_some_and(|t| !t.is_string()) {
-            let name = c.get("name").and_then(Value::as_str).unwrap_or("?");
-            return shape(
-                "manifest column data_type",
-                format!("of column \"{name}\" (a type map)"),
-            );
-        }
-    }
-    if manifest.pointer("/source/dialect").is_some() {
-        return shape("manifest source", "dialect".to_string());
-    }
-    let key_specs = manifest
-        .pointer("/schema/key_specs")
-        .and_then(Value::as_array);
-    for spec in key_specs.into_iter().flatten() {
-        let identity = || {
-            serde_json::from_value::<KeySpec>(spec.clone())
-                .map_or_else(|_| spec.to_string(), |s| s.identity())
-        };
-        if spec.get("kind").and_then(Value::as_str) == Some("bitemporal") {
-            return shape("bitemporal key spec", identity());
-        }
-        if spec.get("bounds").is_some() {
-            return shape("key spec with per-key bounds", identity());
-        }
-    }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -997,12 +1026,17 @@ mod tests {
             KeySpec::Exact {
                 columns: vec!["a".into()],
                 counts: true,
-                bounds: None,
+                bounds: Some("t".into()),
             },
             KeySpec::Bloom {
                 columns: vec!["a".into()],
                 fpr: 0.01,
-                bounds: None,
+                bounds: Some("t".into()),
+            },
+            KeySpec::Bitemporal {
+                columns: vec!["a".into()],
+                valid_column: "v".into(),
+                known_column: "k".into(),
             },
             KeySpec::Range { column: "a".into() },
             KeySpec::Temporal {
@@ -1053,11 +1087,11 @@ mod tests {
             kinds_seen.insert(kind);
         }
         assert_eq!(kinds_seen.len(), specs.len());
-        // Per-key time bounds and bitemporal specs are declared as sidecars
-        // in this release, so a manifest naming them as key specs is refused.
-        assert!(key_spec_fields("bitemporal", 2).is_none());
+        // Per-key time bounds and bitemporal specs are key specs from
+        // storage version 2 (M5); version 1 declared them as sidecars.
+        assert!(key_spec_fields("bitemporal", 1).is_none());
         for kind in ["exact", "bloom"] {
-            assert!(!key_spec_fields(kind, 2).unwrap().contains(&"bounds"));
+            assert!(!key_spec_fields(kind, 1).unwrap().contains(&"bounds"));
         }
         // counts arrived in storage version 2
         for kind in ["exact", "temporal"] {

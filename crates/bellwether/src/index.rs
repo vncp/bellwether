@@ -4,9 +4,8 @@
 use std::sync::Arc;
 
 use arrow::datatypes::{DataType, TimeUnit};
-use bellwether_build::{Builder, Lookup, PlanOrder};
+use bellwether_build::{Builder, Lookup, PlanOrder, TimedSource};
 use bellwether_core::encoding;
-use bellwether_core::sidecar::SidecarDef;
 use bellwether_core::text;
 use bellwether_store::parse_rfc3339;
 use bellwether_types::{
@@ -19,7 +18,8 @@ use crate::engine::{folder_changes, guard, root_hint, schema_hint, Engine, Folde
 use crate::keys::KeyFile;
 use crate::lookback::Lookback;
 use crate::results::{
-    Cost, CountResult, IndexResult, LookupKind, PlanResult, SidecarState, SpecState, TextRebuilt,
+    Cost, CountResult, IndexResult, LookupKind, PlanResult, SidecarFolded, SidecarState, SpecState,
+    TextRebuilt,
 };
 use crate::spec::Declaration;
 use crate::text::TextQuery;
@@ -34,7 +34,6 @@ impl Engine {
             .iter()
             .map(|s| Declaration {
                 key: Some(s.clone()),
-                sidecar: None,
                 sketch: None,
             })
             .collect();
@@ -42,9 +41,10 @@ impl Engine {
     }
 
     /// [`Engine::index`] for `index --key` arguments as
-    /// [`crate::spec::parse_declaration`] reads them: key specs, and the
-    /// sidecars beside or instead of them (per-key time bounds
-    /// `exact:symbol@ts`, bitemporal versions `temporal2:id@valid,known`).
+    /// [`crate::spec::parse_declaration`] reads them: key specs (per-key
+    /// time bounds `exact:symbol@ts` and bitemporal versions
+    /// `temporal2:id@valid,known` among them) and the approximate
+    /// declarations it reads beside them.
     pub fn index_declared(&self, declared: &[Declaration]) -> Result<IndexResult> {
         guard(|| self.index_inner(declared)).map_err(|e| root_hint(self.root(), schema_hint(e)))
     }
@@ -63,8 +63,7 @@ impl Engine {
         for s in &specs {
             crate::spec::check(s)?;
         }
-        let mut options =
-            self.build_options(declared.iter().filter_map(|d| d.sidecar.clone()).collect());
+        let mut options = self.build_options();
         options.sketches = declared.iter().filter_map(|d| d.sketch.clone()).collect();
         let builder = Builder::new(Arc::clone(self.store()?), "");
         let sketches_rebuilt = self.reset_unreadable_sketches(&builder, &options.sketches)?;
@@ -116,6 +115,17 @@ impl Engine {
             row_groups_retired: report.row_groups_retired,
             files_filled: report.files_filled,
             upgraded_from: report.upgraded_from,
+            sidecars_folded: report
+                .sidecars_folded
+                .into_iter()
+                .map(|(sidecar, into)| SidecarFolded { sidecar, into })
+                .collect(),
+            kept_legacy: report.sidecars_kept,
+            fold_pending: report
+                .sidecars_fold_pending
+                .into_iter()
+                .map(|(sidecar, into)| SidecarFolded { sidecar, into })
+                .collect(),
             text_rebuilt: report
                 .text_tables_replaced
                 .into_iter()
@@ -187,18 +197,33 @@ impl Engine {
     /// The bitemporal as-of: per key, the newest row by valid time among
     /// rows known at or before `known` and valid at or before `valid`, ties
     /// on valid time going to the later known time, through the one
-    /// complete `temporal2` sidecar serving the key columns. Either bound
-    /// may be omitted (unbounded); `latest --known K` is `valid = None`. A
-    /// null in either clock never wins (ADR 014). The residual carries both
-    /// bounds, `NotOlderThan` on each clock, then `LatestPerKey`.
+    /// complete bitemporal key serving the key columns (or the pre-M5
+    /// `temporal2` sidecar), or, with `clocks` (`(valid column, known
+    /// column)`), through the one on those clocks; several serving and no
+    /// `clocks` is refused, naming each with the clocks that pick it.
+    /// Either bound may be omitted (unbounded); `latest --known K` is
+    /// `valid = None`. A null in either clock never wins (ADR 014). The
+    /// residual carries both bounds, `NotOlderThan` on each clock, then
+    /// `LatestPerKey`.
     pub fn asof_bitemporal(
         &self,
         keys: &KeyFile,
         valid: Option<&str>,
         known: Option<&str>,
+        clocks: Option<(&str, &str)>,
     ) -> Result<PlanResult> {
-        guard(|| self.plan_lookup(keys, Mode::Bitemporal { valid, known }, None))
-            .map_err(|e| root_hint(self.root(), schema_hint(e)))
+        guard(|| {
+            self.plan_lookup(
+                keys,
+                Mode::Bitemporal {
+                    valid,
+                    known,
+                    clocks,
+                },
+                None,
+            )
+        })
+        .map_err(|e| root_hint(self.root(), schema_hint(e)))
     }
 
     /// Plans the rows of the keys in `keys` in the lookback window ending at
@@ -551,11 +576,15 @@ impl Engine {
         };
         let rows = plan.rows.as_ref().map(|q| q.value);
         let projected_bytes = plan.projected_bytes;
+        // The sidecars of an index written before M5 a plan read; per-key
+        // bounds and bitemporal versions held by a key spec are among
+        // `specs`.
         let sidecars: Vec<String> = pinned
             .planner
-            .sidecars_for(&lookup)
+            .sidecars_for(&specs, &lookup)
             .iter()
-            .map(SidecarDef::name)
+            .filter(|(_, src)| matches!(src, TimedSource::Legacy))
+            .map(|(d, _)| d.name())
             .collect();
         let path_values = pinned.planner.path_column_for(&lookup)?;
         let files_total = pinned.manifest().rowgroup_space.files.len() as u64;
@@ -669,50 +698,54 @@ impl Engine {
                 lookback,
                 ts_column,
             )?,
-            Mode::Bitemporal { valid, known } => {
-                self.bitemporal_lookup(pinned, columns, tuples, valid, known)?
-            }
+            Mode::Bitemporal {
+                valid,
+                known,
+                clocks,
+            } => self.bitemporal_lookup(pinned, specs, columns, tuples, valid, known, clocks)?,
         })
     }
 
     /// The bitemporal lookup on `columns` through the one complete
-    /// `temporal2` sidecar serving them, with both bounds converted to their
-    /// columns' units exactly.
+    /// bitemporal key serving them (or the `temporal2` sidecar of an index
+    /// written before M5), on `clocks` when given, with both bounds
+    /// converted to their columns' units exactly.
+    #[allow(clippy::too_many_arguments)]
     fn bitemporal_lookup(
         &self,
         pinned: &Pinned,
+        specs: &[KeySpec],
         columns: &[String],
         tuples: Vec<Vec<u8>>,
         valid: Option<&str>,
         known: Option<&str>,
+        clocks: Option<(&str, &str)>,
     ) -> Result<(Lookup, LookupKind)> {
         let probe = Lookup::Bitemporal {
             columns: columns.to_vec(),
+            clocks: clocks.map(|(v, k)| (v.to_string(), k.to_string())),
             keys: Vec::new(),
             valid: None,
             known: None,
         };
-        let def = match pinned.planner.sidecars_for(&probe).as_slice() {
-            [one] => one.clone(),
+        let def = match pinned.planner.sidecars_for(specs, &probe).as_slice() {
+            [(one, _)] => one.clone(),
             [] => {
+                let (v, k) = clocks.unwrap_or(("<valid>", "<known>"));
+                let picked = clocks.map_or(String::new(), |(v, k)| {
+                    format!(" on the clocks {v} (valid) and {k} (known)")
+                });
                 return Err(Error::KeySpec(format!(
-                    "no complete temporal2 sidecar serves a lookup on ({}); declare one with \
-                     `bellwether index {} --key temporal2:{}@<valid>,<known>`",
+                    "no complete bitemporal key{picked} serves a lookup on ({}); declare one \
+                     with `bellwether index {} --key temporal2:{}@{v},{k}`",
                     columns.join(", "),
                     self.root(),
                     columns.join(",")
-                )))
+                )));
             }
             many => {
-                return Err(Error::KeySpec(format!(
-                    "several temporal2 sidecars serve a lookup on ({}): {}; pass a key file with \
-                     exactly the key columns of one (--key)",
-                    columns.join(", "),
-                    many.iter()
-                        .map(SidecarDef::name)
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                )))
+                let defs: Vec<_> = many.iter().map(|(d, _)| d.clone()).collect();
+                return Err(bellwether_build::several_bitemporal_keys(columns, &defs));
             }
         };
         let (valid_column, known_column) =
@@ -734,6 +767,7 @@ impl Engine {
         Ok((
             Lookup::Bitemporal {
                 columns: columns.to_vec(),
+                clocks: Some((valid_column.clone(), known_column.clone())),
                 keys: tuples,
                 valid: valid_ts,
                 known: known_ts,
@@ -768,6 +802,9 @@ enum Mode<'a> {
     Bitemporal {
         valid: Option<&'a str>,
         known: Option<&'a str>,
+        /// `(valid column, known column)` of the bitemporal key to plan
+        /// through, when the caller names it.
+        clocks: Option<(&'a str, &'a str)>,
     },
     /// A membership lookup on a list column (B4): any of the values, or
     /// every one (`all`).

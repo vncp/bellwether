@@ -230,7 +230,7 @@ In order, every time: **score** the proposal by exact replay, **verify** that th
 
 ## Questions over time
 
-For folders of market data (partitioned by date, many symbols per file), five additions, all additive to storage version 1 ([format](docs/format.md), [capabilities and status](docs/time-series-capabilities.md)):
+For folders of market data (partitioned by date, many symbols per file), five additions, built additive to storage version 1 and folded into the frozen storage version 2 at M5, where per-key time bounds and bitemporal versions are key specs that `why` prices and `fix` proposes, verifies and receipts ([format](docs/format.md), [capabilities and status](docs/time-series-capabilities.md)):
 
 ```bash
 # day=2026-01-02/ directories become a `day` column: pruned on, never read
@@ -246,10 +246,10 @@ bellwether locate ./data --keys universe.parquet --at-manifest 3
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="docs/assets/readme/capture-asof-dark.svg">
-    <img alt="Terminal output of bellwether index on the market corpus with exact:symbol@ts, range:ts, and temporal2:symbol@ts,known_at: manifest sequence 1, 20 files and 216 row groups read, 16 segments, every key spec and sidecar complete at 1. Then bellwether asof for 10 symbols with --valid 2026-01-01T14:33:36.594660Z and --known 2026-01-02T15:29:06.427726Z: of 20 files and 216 live row groups it plans 3 files, 8 row groups, 97,851 bytes, through exact:symbol, range:ts, and the temporal2 sidecar; the order line says why the plan has no time order; the three planned files follow with their row groups and bytes, and the plan's evidence hash." src="docs/assets/readme/capture-asof-light.svg" width="100%">
+    <img alt="Terminal output of bellwether index on the market corpus with exact:symbol@ts, range:ts, and temporal2:symbol@ts,known_at: manifest sequence 1, 20 files and 216 row groups read, 12 segments, every key spec complete at 1. Then bellwether asof for 10 symbols with --valid 2026-01-01T14:33:36.594660Z and --known 2026-01-02T15:29:06.427726Z: of 20 files and 216 live row groups it plans 3 files, 8 row groups, 97,851 bytes, through exact:symbol@ts, range:ts, and temporal2:symbol@ts,known_at; the order line says the plan is ordered by ts and, because whole files are not in ts order, its 8 row groups are read in the plan's order across files; the three planned files follow with their row groups and bytes, and the plan's evidence hash." src="docs/assets/readme/capture-asof-light.svg" width="100%">
   </picture>
 </p>
-<p align="center"><em><code>bellwether index</code>, then <code>asof --valid --known</code> · bench market corpus, one 10-symbol query · release build of 3a0c26a</em></p>
+<p align="center"><em><code>bellwether index</code>, then <code>asof --valid --known</code> · bench market corpus, one 10-symbol query · debug build of 325c1df</em></p>
 
 Measured on the synthetic `market` corpus (`bellwether bench market --rung small`: 50 symbols, 10 days, 216 row groups, 102,739 prints with 3,786 restatements and 3,929 late prints; debug build, [`scripts/market-funnels.py`](scripts/market-funnels.py)), six one-hour windows over 1, 10, and 50 symbols together planned:
 
@@ -412,7 +412,7 @@ python3 scripts/render_figures.py --check     # README figures match their defin
 python3 scripts/render_terminal.py --check    # README captures match their committed text
 ```
 
-CI also asserts the latency budgets in release builds (the bench SLOs, replay's p50-run budget, and `observe.why` under 100 ms in process and over stdio) and checks that a frozen format fixture still reads once one exists (M5). The README's captures come from [`scripts/readme-captures.sh`](scripts/readme-captures.sh): it generates its data with `bellwether bench`, runs every command shown in a pseudo-terminal, stores the text beside each image, and redraws them.
+CI also asserts the latency budgets in release builds (the bench SLOs, replay's p50-run budget, and `observe.why` under 100 ms in process and over stdio) and checks that every persisted format fixture still reads byte for byte, the M5 one included (`fixtures/format-v1/`, `fixtures/format-v0.1-pre/`, `fixtures/format-v0.1/`). The README's captures come from [`scripts/readme-captures.sh`](scripts/readme-captures.sh): it generates its data with `bellwether bench`, runs every command shown in a pseudo-terminal, stores the text beside each image, and redraws them.
 
 ## Tables as sources
 
@@ -455,7 +455,7 @@ Pre-alpha. The architecture and on-disk format are fixed and documented; the cra
 - [x] **M2** the index: `index`, `locate`, `latest`, `asof`
 - [x] **M3** receipts: `fix` writes one
 - [x] **M4** agent-first: the loop runs end to end from an MCP client
-- [ ] **M5** the format frozen after storage version 2 (per-key counts and per-column bytes), with a compatibility fixture
+- [x] **M5** the format frozen: storage version 2 (per-key counts, per-column bytes, per-key time bounds and bitemporal versions folded into key specs) and record version 3, with compatibility fixtures read byte for byte in CI (ADR 028)
 - [ ] **M6** staged optimization against your recorded workload: `advise` first (no language model; enumeration, knob descent, layout and materialization search, with receipts), then `evolve --llm` only if `advise` leaves structural anti-patterns, then rulebook promotion; each stage a replayable run in the ledger; the loss covers the relational operators (projection, joins, windows, aggregation input) exactly
 - [ ] **M7** a SQL table reconciles against a folder of files with a certificate; plans execute inside DataFusion and DuckDB without a sidecar step; receipts gate pull requests
 - [ ] **M8** rules transfer across datasets and the exact-versus-estimated ablation is measured; receipts are signed (signing landed with [#10](https://github.com/vncp/bellwether/pull/10))
@@ -465,7 +465,7 @@ Built beyond the milestones: the time-series keys (partition values from paths, 
 Not built, or not yet measured:
 
 - **SQL tables as a source.** In review ([#11](https://github.com/vncp/bellwether/pull/11)).
-- **Receipts for bitemporal keys.** A `temporal2` key is built with `index` and serves `asof --valid --known`; proposing and receipting one needs storage version 2.
+- **Relational replay.** Joins, windows and aggregation input are recorded predicates that the verifier refuses; WP15 prices and plans them.
 - **`advise` and `evolve`.** Designed in stages ([`docs/evolve.md`](docs/evolve.md), ADRs 021 to 025, 031, 032); no code yet.
 - **Engine adapters, CI receipts, a multi-machine build.** Planned (WP16, WP17, WP22). Today a plan is a list of files and row groups your engine reads, on one machine.
 - **Performance.** Latency is measured only where the Results say so; planning beat DuckDB alone on 2 of 14 questions. WP22 measures the rest in release builds.

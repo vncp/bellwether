@@ -48,21 +48,20 @@ impl Engine {
         guard(|| self.propose_inner(body, evidence, proposed_by, false))
     }
 
-    /// [`Engine::propose`] of a key, given as the `index --key` argument
+    /// [`Engine::propose`] of a key, given as the `index --key` arguments
     /// [`crate::spec::parse_declaration`] reads (`propose --key`, MCP
-    /// `propose.key`): a key spec is proposed as `ProposalBody::Key`. A
-    /// declaration that builds a sidecar (`temporal2:id@valid,known`, or
-    /// `exact:symbol@ts`, whose per-key time bounds ride beside the key) is
-    /// refused, typed ([`ProposeRefusal::SidecarNotProposable`]), and
-    /// nothing is written: a Proposal holds a key spec only, and replay
-    /// prices key specs only, so it has no path to a receipt. The refusal
-    /// comes after every check a proposal gets (proposer, evidence, and the
-    /// key and time columns against the dataset), so both next steps it
-    /// names work: the `index` command that builds the sidecar, and, beside
-    /// a key, proposing the key alone.
+    /// `propose.key`): the first key spec is proposed as `ProposalBody::Key`,
+    /// and any further ones beside it (`sidecars`), applied in the same
+    /// commit. Per-key time bounds (`exact:symbol@ts`, `bloom:symbol@0.01@ts`)
+    /// and bitemporal versions (`temporal2:id@valid,known`) are key specs
+    /// like any other (M5). A sketch (`sketch:...`) is approximate and never
+    /// planned with, so no replay prices it: it is refused, typed
+    /// ([`ProposeRefusal::SketchNotProposable`]), after every check a
+    /// proposal gets (proposer, evidence, and its columns against the
+    /// dataset), and nothing is written.
     pub fn propose_key(
         &self,
-        declared: &Declaration,
+        declared: &[Declaration],
         evidence: &[Hash],
         proposed_by: &str,
     ) -> Result<ProposeResult> {
@@ -73,7 +72,7 @@ impl Engine {
     /// refusal, or the Proposal it would write; writes nothing.
     pub fn propose_key_dry_run(
         &self,
-        declared: &Declaration,
+        declared: &[Declaration],
         evidence: &[Hash],
         proposed_by: &str,
     ) -> Result<ProposeResult> {
@@ -82,12 +81,15 @@ impl Engine {
 
     fn propose_declared(
         &self,
-        declared: &Declaration,
+        declared: &[Declaration],
         evidence: &[Hash],
         proposed_by: &str,
         write: bool,
     ) -> Result<ProposeResult> {
-        if let Some(sketch) = &declared.sketch {
+        if let Some((d, sketch)) = declared
+            .iter()
+            .find_map(|d| d.sketch.as_ref().map(|s| (d, s)))
+        {
             // A sketch is approximate and never planned with: no replay can
             // price it, so it has no path to a receipt.
             if let Some(refused) = self.check_proposer_and_evidence(evidence, proposed_by, false)? {
@@ -95,73 +97,38 @@ impl Engine {
             }
             let schema = self.check_columns(&sketch.items.iter().flatten().collect::<Vec<_>>())?;
             bellwether_core::sketch::item_types(sketch, &schema)?;
-            let declaration = crate::spec::declaration_label(declared);
+            let declaration = crate::spec::declaration_label(d);
             return Ok(ProposeResult::Refused {
-                refusal: ProposeRefusal::SidecarNotProposable {
+                refusal: ProposeRefusal::SketchNotProposable {
                     command: self.index_command(&declaration),
                     declaration,
-                    sidecar: sketch.name(),
-                    key: None,
+                    sketch: sketch.name(),
                     root: self.root().to_string(),
                 },
             });
         }
-        let sidecar = match (&declared.key, &declared.sidecar) {
-            (Some(spec), None) => {
-                return self.propose_inner(
-                    ProposalBody::Key {
-                        spec: spec.clone(),
-                        sidecars: Vec::new(),
-                    },
-                    evidence,
-                    proposed_by,
-                    write,
-                )
+        let mut keys = declared.iter().filter_map(|d| d.key.clone());
+        let spec = keys.next().ok_or_else(|| {
+            Error::KeySpec(
+                "the declaration names no key spec; pass one such as exact:<column>".into(),
+            )
+        })?;
+        let sidecars: Vec<KeySpec> = keys.collect();
+        for (i, s) in sidecars.iter().enumerate() {
+            if s.name() == spec.name() || sidecars[..i].iter().any(|o| o.name() == s.name()) {
+                return Err(Error::KeySpec(format!(
+                    "two proposed key specs share the name {}; an index holds one spec per name, \
+                     so propose one of them",
+                    s.name()
+                )));
             }
-            (_, Some(sidecar)) => sidecar,
-            (None, None) => {
-                return Err(Error::KeySpec(
-                    "the declaration names no key spec; pass one such as exact:<column>".into(),
-                ))
-            }
-        };
-        // Every check a proposal gets, without creating the index location:
-        // the refusal writes nothing.
-        if let Some(refused) = self.check_proposer_and_evidence(evidence, proposed_by, false)? {
-            return Ok(refused);
         }
-        if let Some(spec) = &declared.key {
-            self.check_body(&ProposalBody::Key {
-                spec: spec.clone(),
-                sidecars: Vec::new(),
-            })?;
-        }
-        let schema = self.check_columns(
-            &sidecar
-                .columns
-                .iter()
-                .chain(&sidecar.time_columns)
-                .collect::<Vec<_>>(),
-        )?;
-        // The checks the build applies to a sidecar's columns: encodable
-        // keys, and time columns of a type a sidecar orders by.
-        sidecar
-            .key_types(&schema)
-            .and_then(|_| sidecar.time_types(&schema))
-            .map_err(|e| match e {
-                Error::KeySpec(m) => Error::KeySpec(format!("{}: {m}", sidecar.name())),
-                other => other,
-            })?;
-        let declaration = crate::spec::declaration_label(declared);
-        Ok(ProposeResult::Refused {
-            refusal: ProposeRefusal::SidecarNotProposable {
-                command: self.index_command(&declaration),
-                declaration,
-                sidecar: crate::spec::sidecar_label(sidecar),
-                key: declared.key.as_ref().map(crate::spec::label),
-                root: self.root().to_string(),
-            },
-        })
+        self.propose_inner(
+            ProposalBody::Key { spec, sidecars },
+            evidence,
+            proposed_by,
+            write,
+        )
     }
 
     /// `bellwether index <root> <source flags> --key <declaration>`, every
@@ -314,49 +281,10 @@ impl Engine {
 
     fn check_body(&self, body: &ProposalBody) -> Result<()> {
         match body {
-            ProposalBody::Key { spec, .. } => {
-                crate::spec::check(spec)?;
-                if let KeySpec::Expr { .. } = spec {
-                    // The expression's input columns exist, it type-checks,
-                    // and its virtual column is not a dataset column.
-                    let inputs = bellwether_core::expr::input_columns(spec)?;
-                    let schema = self.check_columns(&inputs.iter().collect::<Vec<_>>())?;
-                    bellwether_core::expr::typed_spec(spec, &schema)?;
-                    return Ok(());
-                }
-                // A spec the index does not declare yet is a new
-                // declaration: it must name its columns uniquely.
-                if !self
-                    .manifest()?
-                    .is_some_and(|m| m.schema.key_specs.contains(spec))
-                {
-                    spec.check_names()?;
-                }
-                let mut cols: Vec<&String> = spec.columns().iter().collect();
-                if let KeySpec::Temporal { ts_column, .. } = spec {
-                    cols.push(ts_column);
-                }
-                let schema = self.check_columns(&cols)?;
-                // A key column needs a canonical encoding: refuse a nested
-                // one now, with the sentence `index` gives, not at `fix`.
-                for c in spec.columns() {
-                    let dt = schema
-                        .field_with_name(c)
-                        .map_err(|e| Error::KeySpec(e.to_string()))?
-                        .data_type();
-                    if bellwether_core::encoding::check_supported(dt).is_err() {
-                        return Err(Error::KeySpec(format!(
-                            "{}: key column {c:?}: {}",
-                            spec.name(),
-                            bellwether_core::encoding::no_encoding(dt)
-                        )));
-                    }
-                    if matches!(spec, KeySpec::Text { .. }) {
-                        bellwether_core::text::check_column_type(c, dt)?;
-                    }
-                }
-                Ok(())
-            }
+            // The spec and every spec applied beside it get the same checks.
+            ProposalBody::Key { spec, sidecars } => std::iter::once(spec)
+                .chain(sidecars)
+                .try_for_each(|s| self.check_key(s)),
             ProposalBody::Layout { cluster_by } => {
                 if cluster_by.is_empty() {
                     return Err(Error::InvalidArgument {
@@ -369,6 +297,71 @@ impl Engine {
             }
             ProposalBody::Rewrite { shape } => check_shape(shape),
         }
+    }
+
+    /// A proposed key spec is valid (core's rules), names its columns
+    /// uniquely when it is a new declaration, and its key and time columns
+    /// are in the dataset with the types `index` accepts, so a proposal
+    /// `index` would refuse is refused now, not at `fix`.
+    fn check_key(&self, spec: &KeySpec) -> Result<()> {
+        crate::spec::check(spec)?;
+        if let KeySpec::Expr { .. } = spec {
+            // The expression's input columns exist, it type-checks, and its
+            // virtual column is not a dataset column.
+            let inputs = bellwether_core::expr::input_columns(spec)?;
+            let schema = self.check_columns(&inputs.iter().collect::<Vec<_>>())?;
+            bellwether_core::expr::typed_spec(spec, &schema)?;
+            return Ok(());
+        }
+        // A spec the index does not declare yet is a new declaration: it
+        // must name its columns uniquely.
+        if !self
+            .manifest()?
+            .is_some_and(|m| m.schema.key_specs.contains(spec))
+        {
+            spec.check_names()?;
+        }
+        // Its time columns: a temporal spec's version column, per-key
+        // bounds (exact and bloom) and a bitemporal spec's two clocks.
+        let layout = bellwether_core::segment::Layout::Keyed;
+        let mut times = bellwether_core::segment::record_time_columns(spec, layout);
+        if let KeySpec::Temporal { ts_column, .. } = spec {
+            times.push(ts_column.clone());
+        }
+        let schema =
+            self.check_columns(&spec.columns().iter().chain(&times).collect::<Vec<_>>())?;
+        for c in &times {
+            let dt = schema
+                .field_with_name(c)
+                .map_err(|e| Error::KeySpec(e.to_string()))?
+                .data_type();
+            if bellwether_core::encoding::check_ts_type(dt).is_err() {
+                return Err(Error::KeySpec(format!(
+                    "{}: the time column {c:?} is of type {dt}, which cannot order versions; \
+                     name a timestamp, date, time or integer column",
+                    spec.identity()
+                )));
+            }
+        }
+        // A key column needs a canonical encoding: refuse a nested one now,
+        // with the sentence `index` gives, not at `fix`.
+        for c in spec.columns() {
+            let dt = schema
+                .field_with_name(c)
+                .map_err(|e| Error::KeySpec(e.to_string()))?
+                .data_type();
+            if bellwether_core::encoding::check_supported(dt).is_err() {
+                return Err(Error::KeySpec(format!(
+                    "{}: key column {c:?}: {}",
+                    spec.name(),
+                    bellwether_core::encoding::no_encoding(dt)
+                )));
+            }
+            if matches!(spec, KeySpec::Text { .. }) {
+                bellwether_core::text::check_column_type(c, dt)?;
+            }
+        }
+        Ok(())
     }
 
     /// A rewrite of engine queries (ADR 033) cites the twin diagnosis it

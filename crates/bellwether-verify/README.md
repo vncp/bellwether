@@ -31,7 +31,7 @@ Dependencies, as `dev/check-layering.py` permits: `bellwether-types` (the contra
 
 - A null value never wins (ADR 014), wherever it sits in the files.
 - Rows tied at the newest value are compared as a multiset.
-- A key whose rows on a side all have a null value has no version there. It *fails to compare*: it is a `NoComparableVersion` mismatch, it **counts in `mismatched`** (the certificate's counter; the typed result also breaks it out in `no_comparable_version`), and the reconcile cannot pass. A dedicated certificate counter is proposed in `docs/contract-v3.md` #26.
+- A key whose rows on a side all have a null value has no version there. It *fails to compare*: it is a `NoComparableVersion` mismatch, and the reconcile cannot pass. The certificate counts it in `uncomparable`, never in `mismatched` (contract v3 #26); the typed result counts it in `mismatched` and again in `no_comparable_version`, and `reconcile` and `fix` show it apart as `uncomparable`, with its cause and what to do.
 
 Without `latest_by`, the multiset of row hashes per key must match, so a duplicated row is a difference. Multisets are compared by row count and the wrapping sum of their 128-bit row hashes: equal multisets always match, and different ones collide only on a 128-bit sum.
 
@@ -46,7 +46,7 @@ The shared order is the left dataset schema's column order minus `ignored_column
 **The shared dataset schema.** Each side encodes at its own `Source::schema(root)` types, the single source of column types. A compared column must exist on both sides, and its two dataset types must have the same canonical encoding: the same family, and for decimals the same width and scale, for times and timestamps the same unit (the zone is not encoded). Types within one encoding differ only in range or precision, which each side checks against its own dataset type. Everything else is an error, never a pass:
 
 - a column present on one side only (unless it is ignored, and then it is listed on the certificate);
-- two dataset types without a shared encoding (`Int64` against `UInt64`, `Decimal(18,2)` against `Decimal(18,4)`). To compare across them, build one side's source with the other's dataset schema (`with_schema`), which casts every value exactly or refuses it;
+- two dataset types without a shared encoding (`Int64` against `UInt64`, `Decimal(18,2)` against `Decimal(18,4)`). To compare across them, read both sides under one dataset schema (`with_schema` here; on the command line, a schema file passed with `--schema <file>`), which casts every value exactly or refuses it;
 - a type with no canonical encoding (nested types, durations), unless ignored;
 - a value that does not convert to its dataset type exactly, such as a decimal not representable at the dataset scale (`VerifyError::Unrepresentable`, naming the side, file, row group and column);
 - a file missing a dataset column.
@@ -79,7 +79,7 @@ Values in rows outside the coverage (other workload keys, unsampled keys) are no
 | `proposal` | `CertificateContext::proposal` (the ledger refuses one that does not resolve to a Proposal) |
 | `coverage` | what actually ran (above) |
 | `pass` | the pass rule |
-| `body.missing_left`, `missing_right`, `mismatched` | the exact counts |
+| `body.missing_left`, `missing_right`, `mismatched`, `uncomparable` | the exact counts (`mismatched` without the keys that failed to compare, which are `uncomparable`) |
 | `body.ignored_columns` | sorted |
 | `body.totals_delta` | every differing `(group, column)` as `(label, left, right)`: the label is canonical JSON `{"column":<total column>,"group":[[<group column>,<value or null>],...]}`, the values are decimals rendered at the declared scale |
 | `provenance.inputs` | in order, without repeats: each side's catalog digest (below); each indexed side's manifest hash and, when the side was planned, the hash of the `plan` Evidence recording the exact `ScanPlan` read; the workload hash; the context's manifest anchor hash; the context's inputs |
@@ -87,9 +87,9 @@ Values in rows outside the coverage (other workload keys, unsampled keys) are no
 | `provenance.oldest_input_age` | the largest input age when the certificate is made, in exact nanoseconds: data read by the run is as old as the run; a manifest is as old as its commit; the workload and context inputs carry the ages their callers give, plus the time since they were handed over. Under `CertificateContext::clock` (a fixed time, the facade's `--clock`) no time elapses: each input's age is the age it was given |
 | `provenance.created_at` | RFC 3339 UTC with nanoseconds, or `CertificateContext::clock` when set, so two runs over the same inputs make byte-identical certificates |
 
-**Catalog digests** are defined once, in `docs/format.md` ("Catalog digest"), and computed by `bellwether_source::catalog`, which is byte for byte the replay crate's `Catalog` digest, so a certificate and a replay over the same data cite the same input. It covers the dataset schema and every row group's id and report: an unindexed side at manifest version `"0"` under its source's dataset schema (`catalog::unindexed`), an indexed side from its manifest's ids, the source's reports, and the manifest's dataset schema (`catalog::indexed`).
+**Catalog digests** are defined once, in `docs/format.md` ("Catalog digest"), and computed by `bellwether_source::catalog`, which the replay crate's `Catalog` calls for its digest too, so a certificate and a replay over the same data cite the same input. It covers the dataset schema and every row group's id and report: an unindexed side at manifest version `"0"` under its source's dataset schema (`catalog::unindexed`), an indexed side from its manifest's ids, the source's reports, and the manifest's dataset schema (`catalog::indexed`).
 
-A key that failed to compare counts in `mismatched`, so a failing certificate always carries a nonzero count; the typed result names the keys.
+A key that failed to compare (every version of it has a null timestamp, ADR 014) counts in `uncomparable`, not in `mismatched`, and a certificate passes only when both are 0 (ledger rule 9), so a failing certificate always carries a nonzero count; the typed result names the keys. The certificate also records the first differences (`examples`, up to `max_examples`), the total columns (`totals`) and the row filter it compared under (`row_filter`).
 
 ## Indexed sides
 
@@ -154,7 +154,7 @@ A release build was measured on 2026-10-26 with `scripts/perf.sh`: full coverage
 | `tests/memory_bound.rs` | the bound at `P > 1` and equality with `P = 1`; restarts on an underestimate; a budget too small; too many groups; the key-range estimate |
 | `tests/real_memory.rs` | the real heap peak of a multi-pass run stays within the budget plus one batch, and the meter over-approximates it (a counting global allocator, one test per binary) |
 | `tests/text_sources.rs` | byte-range chunks as row groups: a CSV side against a JSON lines side read with one schema agree, a changed text row is found, and inferred schemas that disagree are refused |
-| `tests/certificate.rs` | every field of a passing certificate and its round trip through the ledger; a failing one with counts and `totals_delta`; a key that failed to compare, counted in `mismatched`; an unindexed reconcile anchored at manifest `"0"` with both catalog digests, restated independently; the ledger refusing an unknown proposal; a workload certificate's inputs and age |
+| `tests/certificate.rs` | every field of a passing certificate and its round trip through the ledger; a failing one with counts and `totals_delta`; a key that failed to compare, counted in `uncomparable` and not in `mismatched`; an unindexed reconcile anchored at manifest `"0"` with both catalog digests, restated independently; the ledger refusing an unknown proposal; a workload certificate's inputs and age |
 | `tests/planner.rs` | the real `IndexPlanner` over a built index: only planned row groups are read, the result equals the scanned result, the certificate cites the manifest, its catalog digest (restated from the stored manifest), and the plan Evidence, which `record` writes; an indexed side under full coverage still anchors; and, with a deliberately wrong planner, refusal of a stale index, a plan against another manifest, an unknown file or row group, a file listed twice, and a key encoded differently; two indexes need an explicit anchor |
 | `tests/random_edits.rs` | property test: random edits to a copy (cells, amounts, nulls, deletions, duplicates, additions, versions, groups) produce exactly the mismatch set and differing totals an independent typed model predicts, with and without `latest_by`, at one pass and at several |
 | `tests/gaps.rs` | each lone difference fails: a key only on the right, a key only on the left, a group only on the right; a golden row hash with a multi-byte column name |
@@ -171,4 +171,3 @@ Deliberate breaks, each in a scratch copy built in its own target directory, eac
 
 - Without a value range (a string or composite key), `P` is chosen from row counts, which over-count keys with many versions; the run then makes more passes than it needs. A wrong guess the other way costs a restart, never the bound.
 - A planner's completeness is trusted (invariant 1 is the build crate's).
-- Record version 3 gives `CertBody` the fields `examples`, `uncomparable`, `totals` and `row_filter` (`docs/contract-v3.md` #25, #26, #37, #44; ADR 028), but this crate still writes them empty: keys that failed to compare share the `mismatched` counter, and the typed result carries the examples and the filter. Filling them is the second pull request of the freeze. The ledger already refuses a passing certificate with `uncomparable > 0`.

@@ -86,25 +86,6 @@ pub enum Error {
         /// The unknown value as found.
         found: String,
     },
-    /// A storage version 2 manifest or segment carries a shape this binary
-    /// does not read: a column's `data_type` as a type map, a source
-    /// `dialect`, a key spec with per-key `bounds`, or the bitemporal
-    /// layout. Storage version 2's record shapes are final, but its bytes
-    /// are final only from the release that adds those shapes (ADR 028), so
-    /// a binary without them refuses rather than misreading the index.
-    #[error(
-        "{what} {found}: storage version 2 segment/manifest shape not supported by this binary; \
-         upgrade bellwether to read this index"
-    )]
-    UnsupportedShape {
-        /// Which shape: `manifest column data_type`, `manifest source`,
-        /// `key spec with per-key bounds`, `bitemporal key spec`, `segment
-        /// layout`, `segment header field`.
-        what: &'static str,
-        /// Where it was found, as the index names it (a column name, a key
-        /// spec identity, a header field).
-        found: String,
-    },
     /// A commit referenced a segment that garbage collection has claimed for
     /// deletion; the writer re-uploads after the claim clears (ADR 013).
     #[error("segment {0} is claimed for deletion; re-upload after the claim clears")]
@@ -1254,10 +1235,13 @@ pub struct ScanPlan {
     /// Absent without a projection (contract v3).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub projected_bytes: Option<u64>,
-    /// A read order that interleaves files: `(entry, row group)` pairs, in
-    /// non-decreasing time minimum, when a complete range key on the
-    /// lookup's time column gives one (contract v3). Absent otherwise;
-    /// verify ignores it.
+    /// A read order that interleaves files: `(entry, row group)` pairs,
+    /// `entry` an index into `entries` and `row group` its `index_in_file`
+    /// (one of that entry's `row_groups`), in non-decreasing time minimum,
+    /// when a complete range key on the lookup's time column gives one and
+    /// reading the entries whole in entry order is not a time order
+    /// (contract v3). Absent otherwise, and then the plan is read in entry
+    /// order, each entry's row groups ascending. Verify ignores it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub order: Option<Vec<(u32, u32)>>,
     /// The rows holding the queried keys in the planned row groups: Exact

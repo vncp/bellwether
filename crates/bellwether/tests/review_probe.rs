@@ -659,20 +659,29 @@ fn probe_why_over_unrepresentable_mixed_scales() {
     let mut w = ArrowWriter::try_new(File::create(&kf).unwrap(), kschema, None).unwrap();
     w.write(&b).unwrap();
     w.close().unwrap();
-    // Inferred from the first file (scale 2), 1.5001 does not fit: refused,
-    // and the error says how to supply the schema.
-    let why = e.why(&WhyRequest {
-        keys: Some(KeyFile::new(&kf)),
-        ..WhyRequest::default()
-    });
-    let err = why.unwrap_err().to_string();
-    assert!(err.contains("--schema"), "{err}");
-    let err = e
-        .index(&[spec::parse("exact:amount").unwrap()])
-        .unwrap_err()
-        .to_string();
-    assert!(err.contains("--schema"), "{err}");
-    // With the dataset schema supplied at scale 4, both work and agree.
+    // The schema is inferred with the widest decimal across the files
+    // (M5): Decimal128(12, 4), so 1.5001 fits and why and index both work
+    // with no schema supplied, and agree.
+    let inferred = e
+        .why(&WhyRequest {
+            keys: Some(KeyFile::new(&kf)),
+            ..WhyRequest::default()
+        })
+        .unwrap();
+    assert_eq!(inferred.dataset.row_groups, 3);
+    e.index(&[spec::parse("exact:amount").unwrap()]).unwrap();
+    let r = e.locate(&KeyFile::new(&kf)).unwrap();
+    assert_eq!(
+        planned(&r),
+        [
+            ("a.parquet".to_string(), 0u32),
+            ("b.parquet".to_string(), 1),
+        ]
+        .into()
+    );
+    assert_eq!(inferred.candidates[0].proposed, r.planned);
+    // With the dataset schema supplied at scale 4 (and a fresh index, so
+    // why still has a candidate to price), both work and agree.
     let schema = bellwether::schema_from_json(
         r#"[{"name": "amount", "type": "Decimal128(12, 4)", "nullable": true}]"#,
     )
@@ -681,6 +690,7 @@ fn probe_why_over_unrepresentable_mixed_scales() {
         data.to_str().unwrap(),
         EngineOptions {
             schema: Some(schema),
+            index: Some("memory://".into()),
             ..EngineOptions::default()
         },
     )

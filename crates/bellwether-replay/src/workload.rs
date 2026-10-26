@@ -106,6 +106,29 @@ pub const QUERY_KIND_CONTAINS_ANY: &str = "contains_any";
 /// The query kind of a recorded run that looks up the rows whose list
 /// column holds every one of its values (`contains_all`; B4).
 pub const QUERY_KIND_CONTAINS_ALL: &str = "contains_all";
+/// The query kind of a recorded run that looks up each key's version true
+/// at a valid time as known at a known time (`bitemporal`, `asof --valid
+/// --known`; [`RunBitemporal`]).
+pub const QUERY_KIND_BITEMPORAL: &str = "bitemporal";
+
+/// The clocks of a `bitemporal` run: each key's version with the greatest
+/// valid time at or before `valid`, and among those the greatest known
+/// time at or before `known` (a `None` bound leaves that clock unbounded),
+/// both in their column's dataset unit, as `asof --valid --known` plans
+/// through a bitemporal key (`temporal2:<key>@<valid_column>,<known_column>`).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunBitemporal {
+    /// The column a version is true from.
+    pub valid_column: String,
+    /// The column a version became known at.
+    pub known_column: String,
+    /// The valid-time bound, inclusive.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub valid: Option<i64>,
+    /// The known-time bound, inclusive.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub known: Option<i64>,
+}
 
 /// The time window of a `window` run: the rows of its keys whose
 /// `ts_column` lies in `[lo, hi]`, both inclusive and in the column's
@@ -169,6 +192,10 @@ pub enum RunQuery {
     /// The rows whose list column holds every one of the run's values
     /// ([`QUERY_KIND_CONTAINS_ALL`]).
     ContainsAll,
+    /// Each key's version true at a valid time as known at a known time
+    /// ([`QUERY_KIND_BITEMPORAL`]). Only a bitemporal key on its two
+    /// clocks can plan it.
+    Bitemporal(RunBitemporal),
 }
 
 impl RunQuery {
@@ -187,6 +214,7 @@ impl RunQuery {
             Self::Text(TextOp::HasPrefix) => QUERY_KIND_HAS_PREFIX,
             Self::ContainsAny => QUERY_KIND_CONTAINS_ANY,
             Self::ContainsAll => QUERY_KIND_CONTAINS_ALL,
+            Self::Bitemporal(_) => QUERY_KIND_BITEMPORAL,
         }
     }
 
@@ -203,7 +231,8 @@ impl RunQuery {
             | Self::Count
             | Self::Text(_)
             | Self::ContainsAny
-            | Self::ContainsAll => None,
+            | Self::ContainsAll
+            | Self::Bitemporal(_) => None,
         }
     }
 
@@ -219,7 +248,8 @@ impl RunQuery {
             | Self::Count
             | Self::Text(_)
             | Self::ContainsAny
-            | Self::ContainsAll => None,
+            | Self::ContainsAll
+            | Self::Bitemporal(_) => None,
         }
     }
 
@@ -228,6 +258,15 @@ impl RunQuery {
     pub fn window(&self) -> Option<&RunWindow> {
         match self {
             Self::Window(w) => Some(w),
+            _ => None,
+        }
+    }
+
+    /// The clocks of a [`RunQuery::Bitemporal`] run.
+    #[must_use]
+    pub fn bitemporal(&self) -> Option<&RunBitemporal> {
+        match self {
+            Self::Bitemporal(b) => Some(b),
             _ => None,
         }
     }
@@ -241,13 +280,14 @@ impl RunQuery {
         }
     }
 
-    /// Whether this asks for versions (`latest`, `asof`, or a lookback), so
-    /// only a temporal key spec can plan it.
+    /// Whether this asks for versions (`latest`, `asof`, a lookback, or a
+    /// bitemporal as-of), so only a temporal (or, for a bitemporal run, a
+    /// bitemporal) key spec can plan it.
     #[must_use]
     pub fn is_temporal(&self) -> bool {
         matches!(
             self,
-            Self::Latest | Self::Asof { .. } | Self::Lookback { .. }
+            Self::Latest | Self::Asof { .. } | Self::Lookback { .. } | Self::Bitemporal(_)
         )
     }
 
@@ -297,12 +337,40 @@ pub struct RecordedRun {
     /// `locate` run hashes as before) otherwise.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub window: Option<RunWindow>,
+    /// The clocks of a `bitemporal` run; absent (and not serialized, so
+    /// every other run hashes as before) otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bitemporal: Option<RunBitemporal>,
 }
 
 impl RecordedRun {
     /// The typed query kind of this run, or an error if `query_kind`,
     /// `asof`, `lookback`, and `window` disagree or name an unknown kind.
+    #[allow(clippy::too_many_lines)]
     pub fn query(&self) -> Result<RunQuery> {
+        if self.query_kind == QUERY_KIND_BITEMPORAL {
+            return match (&self.bitemporal, &self.window, self.asof, self.lookback) {
+                (Some(b), None, None, None)
+                    if !b.valid_column.is_empty()
+                        && !b.known_column.is_empty()
+                        && b.valid_column != b.known_column =>
+                {
+                    Ok(RunQuery::Bitemporal(b.clone()))
+                }
+                _ => Err(Error::Other(format!(
+                    "run {:?} is a bitemporal run; it records its two distinct clock columns \
+                     and no window, asof or lookback",
+                    self.run_id
+                ))),
+            };
+        }
+        if self.bitemporal.is_some() {
+            return Err(Error::Other(format!(
+                "run {:?} has query_kind {:?} but records bitemporal clocks; only a bitemporal \
+                 run records them",
+                self.run_id, self.query_kind
+            )));
+        }
         if self.query_kind == QUERY_KIND_WINDOW {
             return match (&self.window, self.asof, self.lookback) {
                 (Some(w), None, None) if !w.ts_column.is_empty() && w.lo <= w.hi => {
@@ -855,6 +923,16 @@ impl<'a> WorkloadRecorder<'a> {
         };
         check_text(run_id, &built, &query, &self.schema)?;
         check_membership(run_id, &built, &query, &self.schema)?;
+        if let RunQuery::Bitemporal(b) = &query {
+            for c in [&b.valid_column, &b.known_column] {
+                if self.schema.field_with_name(c).is_err() {
+                    return Err(Error::KeySpec(format!(
+                        "run {run_id:?}: the bitemporal clock column {c:?} is not in the dataset \
+                         schema"
+                    )));
+                }
+            }
+        }
         if matches!(query, RunQuery::ContainsAll) && null_tuples > 0 {
             // A null value is in no list (ADR 014), so no row holds every
             // value; dropping it, as a key lookup drops a null key, would
@@ -884,6 +962,7 @@ impl<'a> WorkloadRecorder<'a> {
                 null_tuples,
                 key_set,
                 window: query.window().cloned(),
+                bitemporal: query.bitemporal().cloned(),
             },
             payload,
         })

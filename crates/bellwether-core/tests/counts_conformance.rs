@@ -9,12 +9,15 @@
 //!   decodes by `docs/format.md`'s "Roaring bitmaps" rules alone to the row
 //!   groups the reader returns, and the bitmap is the one the document
 //!   spells out;
-//! - every fixture segment (`fixtures/format-v1/`, `fixtures/format-v0.1/`)
-//!   is named by its BLAKE3, opens with the reader of its magic and refuses
-//!   the other's, is listed under its spec's identity (version 2; its name
-//!   in version 1), and reports counts exactly when it stores them (a
-//!   storage version 1 segment never: its value bytes are never read as
-//!   counts);
+//! - every fixture segment (`fixtures/format-v1/`,
+//!   `fixtures/format-v0.1-pre/`, `fixtures/format-v0.1/` and its CSV and
+//!   nested-column indexes) is named by its BLAKE3, opens with the reader
+//!   of its magic and refuses the other's, is listed under its spec's
+//!   identity (version 2; its name in version 1), and reports counts
+//!   exactly when it stores them (a storage version 1 segment never: its
+//!   value bytes are never read as counts), and bounds exactly when its
+//!   spec has them; at M5 a `bounds` segment is a bloom's, a storage
+//!   version 2 `keyed` segment, never the version 1 sidecar layout;
 //! - merge sums counts of inputs over disjoint row groups and refuses inputs
 //!   that both count a key in one row group;
 //! - every byte value at every body position, and a byte-flip sweep over
@@ -35,7 +38,7 @@ use std::path::PathBuf;
 use std::sync::Once;
 
 use bellwether_core::encoding::{encode_tuple, Value};
-use bellwether_core::segment::{checksum, FOOTER_LEN_V2, MAGIC, PREAMBLE_LEN};
+use bellwether_core::segment::{checksum, Layout, FOOTER_LEN_V2, MAGIC, PREAMBLE_LEN};
 use bellwether_core::sidecar::SidecarReader;
 use bellwether_core::{merge, SegmentReader, SegmentWriter, WriterOptions};
 use bellwether_types::{Hash, KeySpec, RowGroupId};
@@ -317,17 +320,26 @@ fn the_worked_segment_in_docs_format_md_is_the_pinned_segment() {
     );
 }
 
-fn fixture(name: &str) -> PathBuf {
+fn fixture(name: &str, index: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../fixtures")
         .join(name)
-        .join("index")
+        .join(index)
 }
 
 #[test]
 fn every_fixture_segment_is_named_by_its_hash_and_counts_only_when_it_stores_them() {
-    for (name, storage) in [("format-v1", 1u32), ("format-v0.1", 2)] {
-        let dir = fixture(name);
+    let mut bounded = 0;
+    let mut bloom_bounds = 0;
+    // (fixture, index, storage version, whether a spec counts, M5)
+    for (name, index, storage, counts, m5) in [
+        ("format-v1", "index", 1u32, false, false),
+        ("format-v0.1-pre", "index", 2, true, false),
+        ("format-v0.1", "index", 2, true, true),
+        ("format-v0.1", "index-text", 2, true, true),
+        ("format-v0.1", "index-nested", 2, false, true),
+    ] {
+        let dir = fixture(name, index);
         let manifest: serde_json::Value =
             serde_json::from_slice(&std::fs::read(dir.join("manifest.json")).unwrap()).unwrap();
         let mut counted = 0;
@@ -337,8 +349,37 @@ fn every_fixture_segment_is_named_by_its_hash_and_counts_only_when_it_stores_the
             let id = seg["id"].as_str().unwrap();
             let bytes = std::fs::read(dir.join("segments").join(format!("{id}.seg"))).unwrap();
             assert_eq!(Hash::of(&bytes).to_hex(), id, "{name}: {id}");
-            if seg.get("kind").is_some_and(|k| !k.is_null()) {
-                // A sidecar (storage version 1 layout, in both fixtures).
+            let kind = seg.get("kind").and_then(serde_json::Value::as_str);
+            if m5 {
+                // At M5 the only kinded segment is a bloom's bounds: a
+                // storage version 2 `keyed` segment under the bloom spec.
+                if let Some(kind) = kind {
+                    assert_eq!(kind, "bounds", "{name}: {id}");
+                    assert!(SidecarReader::open(bytes.clone()).is_err(), "{name}: {id}");
+                    let r = SegmentReader::open(bytes).unwrap();
+                    assert_eq!(r.header().storage_version, 2, "{name}: {id}");
+                    assert_eq!(r.header().layout, Layout::Keyed, "{name}: {id}");
+                    assert!(
+                        matches!(
+                            r.header().key_spec,
+                            KeySpec::Bloom {
+                                bounds: Some(_),
+                                ..
+                            }
+                        ),
+                        "{name}: {id}"
+                    );
+                    assert!(r.has_bounds() && !r.has_counts(), "{name}: {id}");
+                    assert_eq!(
+                        seg["key_spec"],
+                        r.header().key_spec.identity(),
+                        "{name}: {id}"
+                    );
+                    bloom_bounds += 1;
+                    continue;
+                }
+            } else if kind.is_some() {
+                // A sidecar (storage version 1 layout, before M5).
                 SidecarReader::open(bytes.clone()).unwrap();
                 assert!(SegmentReader::open(bytes).is_err(), "{name}: {id}");
                 continue;
@@ -353,6 +394,15 @@ fn every_fixture_segment_is_named_by_its_hash_and_counts_only_when_it_stores_the
                 assert_eq!(r.counts(&[utf8("AAPL")]).unwrap(), None);
             }
             counted += usize::from(stores);
+            let has_bounds = matches!(
+                r.header().key_spec,
+                KeySpec::Exact {
+                    bounds: Some(_),
+                    ..
+                }
+            );
+            assert_eq!(r.has_bounds(), has_bounds, "{name}: {id}");
+            bounded += usize::from(has_bounds);
             // Version 2 keys segments by full identity; version 1 by name
             // (a reader re-keys it on load).
             let spec = &r.header().key_spec;
@@ -363,12 +413,12 @@ fn every_fixture_segment_is_named_by_its_hash_and_counts_only_when_it_stores_the
             };
             assert_eq!(seg["key_spec"].as_str().unwrap(), key, "{name}: {id}");
         }
-        assert_eq!(
-            counted > 0,
-            storage == 2,
-            "{name}: {counted} counted segments"
-        );
+        assert_eq!(counted > 0, counts, "{name}: {counted} counted segments");
     }
+    // Only the M5 fixture folds bounds into exact value records, and keeps
+    // a bloom's bounds in a storage version 2 segment.
+    assert!(bounded > 0);
+    assert!(bloom_bounds > 0);
 }
 
 #[test]
