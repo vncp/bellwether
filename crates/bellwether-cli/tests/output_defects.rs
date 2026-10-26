@@ -269,6 +269,30 @@ fn over_an_index_that_serves_every_run_the_current_row_is_plain() {
     assert!(!head.contains("min/max"), "{head}");
 }
 
+/// The funnel header and the fanout table end at their last cell: with no
+/// sketch column, no line of `why` pads past `exact` or `bytes`.
+#[test]
+fn why_tables_carry_no_trailing_padding() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    corpus(&data, 1, 8, 50, 1_000_000);
+    let kf = dir.path().join("k.parquet");
+    keys(&kf, "id", &[5, 7, 120]);
+    let human = run(&["why", path(&data), "--from", path(&kf)], 0);
+    assert!(human.contains("\nfanout:"), "{human}");
+    let header = human
+        .lines()
+        .find(|l| l.trim_start().starts_with("key ") && l.contains("files/value"))
+        .unwrap_or_else(|| panic!("{human}"));
+    assert!(
+        header.ends_with("sample"),
+        "no sketch column here: {header:?}"
+    );
+    for line in human.lines() {
+        assert_eq!(line, line.trim_end(), "trailing padding in: {line:?}");
+    }
+}
+
 /// Item 4, the other side: where min/max pruning keeps row groups the key
 /// does not hold, `why` still recommends the key, priced against them, and
 /// `fix` applies it. Row group `r` holds ids `r` and `1000 - r`, so its
