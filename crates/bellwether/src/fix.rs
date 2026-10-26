@@ -14,7 +14,9 @@
 //!    current manifest sequence: build the key (WP4) in one commit
 //!    (`manifest_after`).
 //! 4. **Attest**: `Ledger::put_receipt` links evidence, proposal, replay,
-//!    and certificate, with `manifest_before < manifest_after`.
+//!    and certificate, with `manifest_before < manifest_after`; with a
+//!    signing key, the receipt and the certificate this call wrote are then
+//!    signed (ADR 029). A verify-only run signs its passing certificate.
 //!
 //! A failing certificate writes no Receipt and returns a typed refusal
 //! naming the mismatch counts.
@@ -27,6 +29,7 @@ use arrow::array::RecordBatch;
 use arrow::datatypes::SchemaRef;
 use bellwether_build::encode_ts;
 use bellwether_build::{BuildOptions, Builder};
+use bellwether_ledger::RecordKind;
 use bellwether_replay::{proposed_specs, Catalog, Replayer, RunKeys, RunQuery, Workload};
 use bellwether_source_sql::{is_sql_root, SqlUrl, MEASURED_PLAN};
 use bellwether_store::{parse_rfc3339, Cache, ObjectStoreBackend};
@@ -291,6 +294,29 @@ pub struct FixResult {
     pub verification: Option<Reconciliation>,
     /// Stages 3 and 4.
     pub outcome: FixOutcome,
+    /// The signatures this call wrote (ADR 029): with a signing key, the
+    /// Receipt and the Certificate this call wrote, signed right after the
+    /// Receipt was written, or the passing Certificate of a verify-only run.
+    /// Empty without a signing key, and whenever nothing was attested or
+    /// verified.
+    pub signatures: Vec<SignatureWritten>,
+}
+
+/// One signature `fix` wrote.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SignatureWritten {
+    /// The record signed.
+    pub record: Hash,
+    /// Its kind: a receipt or a certificate.
+    pub kind: RecordKind,
+    /// The signing key's id (BLAKE3 of its public key).
+    pub key_id: Hash,
+    /// When it was signed: the engine's clock, RFC 3339 UTC with
+    /// milliseconds.
+    pub signed_at: String,
+    /// The signature object's store path,
+    /// `ledger/<record>.sig.<key id>.json`.
+    pub path: String,
 }
 
 /// What scoring, verifying, and applying depend on now: the current
@@ -420,6 +446,7 @@ impl Engine {
             invariant: None,
             verification: None,
             outcome: FixOutcome::Verified,
+            signatures: Vec::new(),
         };
         match &proposal.body {
             ProposalBody::Layout { .. } => {
@@ -497,6 +524,10 @@ impl Engine {
                     return Ok(result);
                 }
                 if req.verify_only {
+                    // A verify-only run's attestation is its passing
+                    // certificate, written by this call.
+                    result.signatures =
+                        self.sign_written(&[(cert.hash, RecordKind::Certificate)], None)?;
                     return Ok(result);
                 }
                 let Some(replay_hash) = replay_hash else {
@@ -505,18 +536,21 @@ impl Engine {
                     return Ok(result);
                 };
                 // 3 and 4, behind the trust-boundary gate.
-                result.outcome = match self.gate(&cert.hash, &certificate, true)? {
-                    Err(r) => refused(r),
-                    Ok(before) => self.apply_and_attest(
-                        &proposal,
-                        hash,
-                        spec,
-                        &replay_hash,
-                        &cert.hash,
-                        before,
-                        &workload,
-                    )?,
-                };
+                match self.gate(&cert.hash, &certificate, true)? {
+                    Err(r) => result.outcome = refused(r),
+                    Ok(before) => {
+                        (result.outcome, result.signatures) = self.apply_and_attest(
+                            &proposal,
+                            hash,
+                            spec,
+                            &replay_hash,
+                            &cert.hash,
+                            true,
+                            before,
+                            &workload,
+                        )?;
+                    }
+                }
                 Ok(result)
             }
             ProposalBody::Rewrite { shape } => {
@@ -539,7 +573,11 @@ impl Engine {
                     self.is_table() || is_sql_root(&outputs.before) || is_sql_root(&outputs.after);
                 result.outcome = match failed(&cert.hash, &certificate) {
                     Some(r) => refused(r),
-                    None if req.verify_only => FixOutcome::Verified,
+                    None if req.verify_only => {
+                        result.signatures =
+                            self.sign_written(&[(cert.hash, RecordKind::Certificate)], None)?;
+                        FixOutcome::Verified
+                    }
                     None if table => refused(self.attest_only(&cert.hash, &proposal.body)?),
                     None => refused(Refusal::NoReplay {
                         certificate: cert.hash,
@@ -589,6 +627,7 @@ impl Engine {
             invariant: None,
             verification: None,
             outcome: FixOutcome::Verified,
+            signatures: Vec::new(),
         };
         // The gate runs before anything is written; for a key proposal it
         // also checks that the data is still the data certified.
@@ -657,12 +696,16 @@ impl Engine {
                     result.outcome = refused(r);
                     return Ok(result);
                 }
-                result.outcome = self.apply_and_attest(
+                // The certificate was written by an earlier call (which
+                // signed it then, if it had a key); this call signs only
+                // the receipt it writes.
+                (result.outcome, result.signatures) = self.apply_and_attest(
                     &proposal,
                     &proposal_hash,
                     spec,
                     &replay_hash,
                     cert_hash,
+                    false,
                     before,
                     &workload,
                 )?;
@@ -966,7 +1009,9 @@ impl Engine {
     }
 
     /// Stages 3 and 4, after the gate: build the key in one commit, which
-    /// must be exactly `before + 1`, then write the receipt.
+    /// must be exactly `before + 1`, then write the receipt and, with a
+    /// signing key, sign it (and the certificate, when `certificate_written`
+    /// says this call wrote it) right after `put_receipt` returns.
     #[allow(clippy::too_many_arguments)]
     fn apply_and_attest(
         &self,
@@ -975,9 +1020,10 @@ impl Engine {
         spec: &KeySpec,
         replay: &Hash,
         cert_hash: &Hash,
+        certificate_written: bool,
         before: u64,
         workload: &Workload,
-    ) -> Result<FixOutcome> {
+    ) -> Result<(FixOutcome, Vec<SignatureWritten>)> {
         #[cfg(test)]
         test_seam::before_apply(self);
         let mut options = BuildOptions::new(self.format().kind());
@@ -992,7 +1038,7 @@ impl Engine {
         )?;
         let after = match advance(before, report.sequence) {
             Ok(after) => after,
-            Err(refusal) => return Ok(refused(refusal)),
+            Err(refusal) => return Ok((refused(refusal), Vec::new())),
         };
         let receipt = Receipt {
             record_version: format::RECORD_VERSION,
@@ -1006,6 +1052,14 @@ impl Engine {
         };
         let now = self.manifest()?.map_or(0, |m| m.sequence);
         let hash = self.ledger()?.put_receipt(&receipt, &now.to_string())?;
+        // Attest: sign only what this call wrote, and only now that the
+        // ledger has accepted the receipt.
+        let mut signed = vec![(hash, RecordKind::Receipt)];
+        if certificate_written {
+            signed.push((*cert_hash, RecordKind::Certificate));
+        }
+        let applied = format!("manifest {before} -> {after}");
+        let signatures = self.sign_written(&signed, Some(&applied))?;
         // After the apply: the same proposal replayed at manifest_after, the
         // realized cost `report` sets beside the predicted one.
         let (realized, warning) = match self.realize(proposal_hash, workload) {
@@ -1018,14 +1072,69 @@ impl Engine {
                 )),
             ),
         };
-        Ok(FixOutcome::Applied {
-            receipt: Box::new(Written {
-                hash,
-                record: Record::Receipt(receipt),
-            }),
-            realized,
-            warning,
-        })
+        Ok((
+            FixOutcome::Applied {
+                receipt: Box::new(Written {
+                    hash,
+                    record: Record::Receipt(receipt),
+                }),
+                realized,
+                warning,
+            },
+            signatures,
+        ))
+    }
+
+    /// Signs records this call wrote with the configured key, at the
+    /// engine's clock; nothing without a key. The hashes come from this
+    /// call's own writes, never from a request.
+    ///
+    /// `applied` names the change already committed (`manifest 3 -> 4`),
+    /// so a signing failure after the apply says the change stands.
+    fn sign_written(
+        &self,
+        records: &[(Hash, RecordKind)],
+        applied: Option<&str>,
+    ) -> Result<Vec<SignatureWritten>> {
+        let Some(key) = &self.options().signing_key else {
+            return Ok(Vec::new());
+        };
+        let ledger = self.ledger()?;
+        let signed_at = self.now();
+        let mut out = Vec::with_capacity(records.len());
+        for (i, (record, kind)) in records.iter().enumerate() {
+            let at = ledger.sign(record, key, &signed_at).map_err(|e| {
+                let applied = applied
+                    .map_or_else(String::new, |a| format!("the change is applied ({a}) and "));
+                // Signing stops at the first failure: name what else this
+                // call wrote that is left unsigned with it.
+                let rest: Vec<String> = records[i + 1..]
+                    .iter()
+                    .map(|(h, k)| format!("the {} {h} this call wrote", k.as_str()))
+                    .collect();
+                let also = if rest.is_empty() {
+                    String::new()
+                } else {
+                    format!(" (and so is {})", rest.join(" and "))
+                };
+                Error::Other(format!(
+                    "{applied}{} {record} is written, but it could not be signed ({e}); it \
+                     stands unsigned{also}, since only the call that writes a record signs it. \
+                     Check that the index location is writable for `ledger/` (each signature \
+                     is a new file there), then sign the next change; `bellwether receipt \
+                     show` shows this one as unsigned",
+                    kind.as_str()
+                ))
+            })?;
+            out.push(SignatureWritten {
+                record: *record,
+                kind: *kind,
+                key_id: at.key_id,
+                signed_at: signed_at.clone(),
+                path: at.path(),
+            });
+        }
+        Ok(out)
     }
 }
 

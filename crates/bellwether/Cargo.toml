@@ -36,6 +36,11 @@ roaring = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 bytes = { workspace = true }
+# Signing keys (ADR 029): a fresh seed from the operating system's RNG,
+# wiped from memory after use; the trust file is TOML.
+rand_core = { version = "0.6", features = ["getrandom"] }
+zeroize = "1"
+toml = "1"
 
 [features]
 # SQL Server tables through ODBC (links the system ODBC driver manager).

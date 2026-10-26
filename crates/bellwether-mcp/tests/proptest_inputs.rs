@@ -10,6 +10,11 @@
 //! entries; jobs whatever the tool they start may. Inputs are drawn both
 //! fully at random and as mutations of valid arguments (an extra field, a
 //! dropped field, a replaced value), so most cases reach the facade.
+//!
+//! Signatures (ADR 029): without `--signing-key` no tool writes a
+//! `.sig.` object; with one, only `apply.receipt` and `score.verify` (or a
+//! job running them) may, and over the loop they sign exactly what they
+//! wrote.
 
 #![allow(
     clippy::unwrap_used,
@@ -22,7 +27,7 @@ mod common;
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
-use std::sync::OnceLock;
+use std::sync::LazyLock;
 
 use bellwether_mcp::{Server, Status};
 use common::{delta, finish, json, ledger_corpus, objects, ok, server, write_keys};
@@ -34,19 +39,73 @@ struct World {
     data: PathBuf,
     index: PathBuf,
     server: Server,
+    /// Whether the server has a signing key.
+    signing: bool,
     /// Valid arguments per tool, to mutate.
     valid: BTreeMap<&'static str, Value>,
 }
 
+static WORLD: LazyLock<World> = LazyLock::new(|| make_world(false));
+/// The same world, served with a signing key.
+static KEYED_WORLD: LazyLock<World> = LazyLock::new(|| make_world(true));
+
 fn world() -> &'static World {
-    static W: OnceLock<World> = OnceLock::new();
-    W.get_or_init(|| {
+    &WORLD
+}
+
+fn keyed_world() -> &'static World {
+    &KEYED_WORLD
+}
+
+/// A server over `data` under the fixed clock, with a signing key whose
+/// seed lives in `dir` (outside the data folder and the index) when
+/// `signing`, and trusting it.
+fn signing_server(data: &std::path::Path, dir: &std::path::Path, signing: bool) -> Server {
+    let mut engine = bellwether::EngineOptions {
+        clock: Some(common::CLOCK.into()),
+        ..bellwether::EngineOptions::default()
+    };
+    if signing {
+        let path = dir.join("signer");
+        if !path.exists() {
+            bellwether::generate_key(&path, Some("ci"), None).unwrap();
+            bellwether::trust_key(
+                &dir.join("trusted.toml"),
+                &bellwether::public_path(&path),
+                None,
+                None,
+            )
+            .unwrap();
+        }
+        // Through the server's own flags, as `--signing-key` and
+        // `--trusted-keys` load them.
+        bellwether_mcp::KeyArgs {
+            signing_key: Some(path),
+            trusted_keys: Some(dir.join("trusted.toml")),
+        }
+        .apply(data.to_str().unwrap(), &mut engine)
+        .unwrap();
+    }
+    Server::new(&bellwether_mcp::Config {
+        root: data.to_str().unwrap().to_string(),
+        engine,
+        budget: bellwether_mcp::Budget::default(),
+    })
+    .unwrap()
+}
+
+fn make_world(signing: bool) -> World {
+    {
         let dir = tempfile::tempdir().unwrap();
         let data = dir.path().join("data");
         ledger_corpus(&data, 2, 2, 20, 100);
         let keys = dir.path().join("k.parquet");
         write_keys(&keys, "id", &[3, 41]);
-        let server = server(&data);
+        let server = if signing {
+            signing_server(&data, dir.path(), true)
+        } else {
+            server(&data)
+        };
         let ev = json(&ok(&server, "observe.why", json!({})))["evidence"]["hash"]
             .as_str()
             .unwrap()
@@ -56,7 +115,10 @@ fn world() -> &'static World {
         valid.insert("observe.why", json!({"columns": ["id"]}));
         valid.insert("observe.profile", json!({}));
         valid.insert("observe.locate", json!({"keys": k}));
-        valid.insert("observe.asof", json!({"keys": k, "at": "1970-01-01T00:00:10Z"}));
+        valid.insert(
+            "observe.asof",
+            json!({"keys": k, "at": "1970-01-01T00:00:10Z"}),
+        );
         valid.insert(
             "propose.key",
             json!({"spec": {"kind": "exact", "columns": ["id"]}, "evidence": [ev], "by": "p"}),
@@ -70,7 +132,10 @@ fn world() -> &'static World {
             json!({"shape": {"before": "b", "after": "a", "invariant": "i"}, "evidence": [ev], "by": "p"}),
         );
         valid.insert("apply.receipt", json!({"certificate": ev, "wait": true}));
-        valid.insert("score.why", json!({"keys": k, "max_candidates": 1, "wait": true}));
+        valid.insert(
+            "score.why",
+            json!({"keys": k, "max_candidates": 1, "wait": true}),
+        );
         valid.insert(
             "score.verify",
             json!({"proposal": ev, "workload": ev, "wait": true}),
@@ -86,9 +151,10 @@ fn world() -> &'static World {
             data,
             _dir: dir,
             server,
+            signing,
             valid,
         }
-    })
+    }
 }
 
 fn arb_json() -> impl Strategy<Value = Value> {
@@ -168,8 +234,24 @@ fn mutate(valid: &Value, op: u8, key: &str, value: Value, pick: usize) -> Value 
     v
 }
 
-/// The ledger kinds and other paths a tool may add.
-fn allowed(tool: &str, kinds: &[String], other: &[String]) -> Result<(), String> {
+/// Whether a path is a signature object (or the local store's lock file
+/// beside one).
+fn is_signature(p: &str) -> bool {
+    p.starts_with("ledger/") && p.contains(".sig.")
+}
+
+/// The ledger kinds and other paths a tool may add. Signature objects only
+/// with a signing key, and only from the tools that are engine stages.
+fn allowed(tool: &str, kinds: &[String], other: &[String], signing: bool) -> Result<(), String> {
+    let (sigs, other): (Vec<&String>, Vec<&String>) = other.iter().partition(|p| is_signature(p));
+    if !sigs.is_empty() {
+        let may_sign = signing && matches!(tool, "score.verify" | "apply.receipt" | "jobs.start");
+        if !may_sign {
+            return Err(format!(
+                "{tool} wrote signature objects {sigs:?} (signing key: {signing})"
+            ));
+        }
+    }
     let only = |ok: &[&str]| kinds.iter().all(|k| ok.contains(&k.as_str()));
     let cache_only = other.iter().all(|p| p.starts_with("cache/"));
     let fine = match tool {
@@ -199,11 +281,10 @@ fn one() -> std::sync::MutexGuard<'static, ()> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-fn check(tool: &str, args: Value) -> Result<(), TestCaseError> {
+fn check(w: &World, tool: &str, args: Value) -> Result<(), TestCaseError> {
     // One call at a time over the shared folder, so the object lists
     // compared belong to this call alone.
     let _one = one();
-    let w = world();
     let before = objects(&w.index);
     let reply = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         w.server.call(tool, args.clone())
@@ -219,7 +300,7 @@ fn check(tool: &str, args: Value) -> Result<(), TestCaseError> {
         prop_assert!(!r.message.is_empty());
     }
     let (kinds, other) = delta(&before, &objects(&w.index));
-    allowed(tool, &kinds, &other).map_err(TestCaseError::fail)?;
+    allowed(tool, &kinds, &other, w.signing).map_err(TestCaseError::fail)?;
     let _ = &w.data;
     Ok(())
 }
@@ -232,7 +313,7 @@ proptest! {
         t in 0usize..TOOLS.len(),
         args in arb_json(),
     ) {
-        check(TOOLS[t], args)?;
+        check(world(), TOOLS[t], args)?;
     }
 
     #[test]
@@ -245,7 +326,119 @@ proptest! {
     ) {
         let tool = TOOLS[t];
         let args = mutate(&world().valid[tool], op, &key, value, pick);
-        check(tool, args)?;
+        check(world(), tool, args)?;
+    }
+
+    #[test]
+    fn with_a_signing_key_only_apply_and_verify_may_sign(
+        t in 0usize..TOOLS.len(),
+        op in any::<u8>(),
+        key in prop_oneof![Just("score".to_string()), "[a-z_]{1,6}".prop_map(String::from)],
+        value in arb_json(),
+        pick in any::<usize>(),
+    ) {
+        let tool = TOOLS[t];
+        let w = keyed_world();
+        let args = mutate(&w.valid[tool], op, &key, value, pick);
+        check(w, tool, args)?;
+    }
+}
+
+/// The signature objects (not their lock files) under `index`.
+fn signatures(index: &std::path::Path) -> Vec<String> {
+    objects(index)
+        .into_keys()
+        .filter(|p| is_signature(p) && !p.contains(".lock#"))
+        .collect()
+}
+
+/// Over the whole loop with a signing key: every tool but `score.verify`
+/// and `apply.receipt` signs nothing; `score.verify` signs the certificate
+/// it wrote, `apply.receipt` the receipt it wrote, and the receipt's chain
+/// in the envelope carries both signatures and the verdict. Without a key
+/// the same loop signs nothing.
+#[test]
+fn the_loop_signs_exactly_what_the_engine_stages_wrote() {
+    for signing in [true, false] {
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("data");
+        ledger_corpus(&data, 2, 2, 20, 100);
+        let keys = dir.path().join("k.parquet");
+        write_keys(&keys, "id", &[3, 41]);
+        let index = data.join(".bellwether");
+        let srv = signing_server(&data, dir.path(), signing);
+        let k = keys.to_str().unwrap();
+
+        let ev = json(&ok(&srv, "observe.why", json!({})))["evidence"]["hash"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let scored = json(&ok(&srv, "score.why", json!({"keys": k, "wait": true})));
+        let workload = scored["workload"]["hash"].as_str().unwrap().to_string();
+        // Refused here (no index yet); it must sign nothing either way.
+        let _ = srv.call("observe.locate", json!({"keys": k}));
+        let p = json(&ok(
+            &srv,
+            "propose.key",
+            json!({"spec": {"kind": "exact", "columns": ["id"]}, "evidence": [ev], "by": "agent"}),
+        ))["proposal"]["hash"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(
+            signatures(&index).is_empty(),
+            "observe, score.why, propose signed"
+        );
+
+        let v = json(&ok(
+            &srv,
+            "score.verify",
+            json!({"proposal": p, "workload": workload, "wait": true}),
+        ));
+        let cert = v["certificate"]["hash"].as_str().unwrap().to_string();
+        let after_verify = signatures(&index);
+        let dry = ok(
+            &srv,
+            "apply.receipt",
+            json!({"certificate": cert, "dry_run": true}),
+        );
+        assert_eq!(json(&dry)["outcome"]["kind"], "would_apply");
+        assert_eq!(signatures(&index), after_verify, "the apply dry run signed");
+        let applied = ok(
+            &srv,
+            "apply.receipt",
+            json!({"certificate": cert, "wait": true}),
+        );
+        let receipt = json(&applied)["outcome"]["receipt"]["hash"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let after_apply = signatures(&index);
+        let chain = applied
+            .envelope
+            .chains
+            .iter()
+            .find(|c| c.receipt.to_hex() == receipt)
+            .unwrap();
+        if signing {
+            assert_eq!(after_verify.len(), 1);
+            assert!(after_verify[0].starts_with(&format!("ledger/{cert}.sig.")));
+            assert_eq!(after_apply.len(), 2);
+            assert!(after_apply
+                .iter()
+                .any(|s| s.starts_with(&format!("ledger/{receipt}.sig."))));
+            assert_eq!(chain.signatures.len(), 2);
+            assert!(chain.signatures.iter().all(|s| s.status == "valid"));
+            assert_eq!(chain.verdict.as_deref(), Some("signed"));
+        } else {
+            assert_eq!(after_apply, Vec::<String>::new());
+            assert_eq!(chain.signatures, vec![]);
+            assert_eq!(chain.verdict, None);
+        }
+        // Reading back signs nothing.
+        srv.resource(bellwether_mcp::RECEIPTS).unwrap();
+        ok(&srv, "observe.profile", json!({}));
+        assert_eq!(signatures(&index), after_apply);
     }
 }
 
@@ -261,4 +454,35 @@ fn the_valid_arguments_reach_the_facade() {
             assert_ne!(r.code.as_str(), "invalid_input", "{tool}: {}", r.message);
         }
     }
+}
+
+/// The server's `--signing-key` and `--trusted-keys` are refused inside the
+/// index location, as the CLI's are.
+#[test]
+fn key_args_refuse_paths_inside_the_index() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    ledger_corpus(&data, 1, 1, 10, 10);
+    let index = data.join(".bellwether");
+    std::fs::create_dir_all(&index).unwrap();
+    let key = index.join("signer");
+    bellwether::generate_key(&key, None, None).unwrap();
+    let mut options = bellwether::EngineOptions::default();
+    let e = bellwether_mcp::KeyArgs {
+        signing_key: Some(key.clone()),
+        trusted_keys: None,
+    }
+    .apply(data.to_str().unwrap(), &mut options)
+    .unwrap_err();
+    assert!(matches!(e, bellwether_mcp::args::OptionsError::Usage(_)));
+    assert!(e.to_string().contains("inside the index location"), "{e}");
+    let trust = index.join("t.toml");
+    bellwether::trust_key(&trust, &bellwether::public_path(&key), None, None).unwrap();
+    let e = bellwether_mcp::KeyArgs {
+        signing_key: None,
+        trusted_keys: Some(trust),
+    }
+    .apply(data.to_str().unwrap(), &mut options)
+    .unwrap_err();
+    assert!(e.to_string().contains("choose who is trusted"), "{e}");
 }

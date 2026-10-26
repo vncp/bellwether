@@ -142,6 +142,17 @@ pub struct EngineOptions {
     /// "now" when ages are computed, so two runs over the same inputs write
     /// byte-identical records. `None` uses the system clock.
     pub clock: Option<String>,
+    /// The key `fix` signs with (ADR 029): right after it writes a Receipt
+    /// it signs that Receipt and, when the same call wrote it, the
+    /// Certificate; a verify-only run signs its passing Certificate. Only
+    /// records the same call wrote are signed. `None` signs nothing.
+    /// Load it with [`crate::load_signing_key`].
+    pub signing_key: Option<bellwether_ledger::SigningKey>,
+    /// The keys a reader trusts (ADR 029): with them, `receipt`,
+    /// `receipts`, and `report` fold each receipt's and certificate's
+    /// signatures into a verdict. Load them with
+    /// [`crate::load_trusted_keys`].
+    pub trusted_keys: Option<bellwether_ledger::TrustedKeys>,
 }
 
 /// The pinned current manifest: its planner, its snapshot, and its content
@@ -1147,7 +1158,7 @@ impl Source for TableSource {
 }
 
 /// The index location as a local directory, or `None` for an object store.
-fn local_path(index: &str) -> Result<Option<PathBuf>> {
+pub(crate) fn local_path(index: &str) -> Result<Option<PathBuf>> {
     let path = match index.split_once("://") {
         None => index,
         Some(("file", rest)) => rest,

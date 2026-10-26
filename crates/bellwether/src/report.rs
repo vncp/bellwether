@@ -27,7 +27,7 @@ use bellwether_types::{
 };
 
 use crate::engine::{guard, Engine};
-use crate::results::{total, Cost, ReportResult};
+use crate::results::{total, Cost, ReceiptResult, ReportResult};
 use crate::spec::label;
 
 /// Profile Evidence rendered, newest first; older ones are counted.
@@ -40,6 +40,15 @@ struct ReceiptView {
     replay: Option<Replay>,
     certificate: Option<Certificate>,
     realized: Option<(Hash, Cost)>,
+    /// With trusted keys: the chain as `receipt` shows it, whose `signed`
+    /// is the one rule every surface applies.
+    signature: Option<ReceiptResult>,
+}
+
+impl ReceiptView {
+    fn signed(&self) -> bool {
+        self.signature.as_ref().and_then(|r| r.signed) == Some(true)
+    }
 }
 
 impl Engine {
@@ -100,6 +109,7 @@ impl Engine {
                     .max_by(|a, b| a.1.created_at.cmp(&b.1.created_at).then(a.0.cmp(&b.0)))
                     .map(|(h, r)| (*h, total(&r.current)))
             });
+            let signature = self.verdicts(&h)?;
             receipts.push(ReceiptView {
                 hash: h,
                 receipt,
@@ -107,6 +117,7 @@ impl Engine {
                 replay,
                 certificate,
                 realized,
+                signature,
             });
         }
         receipts.sort_by(|a, b| {
@@ -148,7 +159,25 @@ impl Engine {
             evidence: evidence.iter().map(|(h, _)| *h).collect(),
             realized: receipts.iter().filter(|r| r.realized.is_some()).count() as u64,
             unreadable,
+            signed: self.signed_count(&receipts),
         })
+    }
+
+    /// With trusted keys: how many receipts are signed (receipt and
+    /// certificate).
+    fn signed_count(&self, receipts: &[ReceiptView]) -> Option<u64> {
+        self.options()
+            .trusted_keys
+            .as_ref()
+            .map(|_| receipts.iter().filter(|r| r.signed()).count() as u64)
+    }
+
+    /// With trusted keys: the chain behind `hash` as `receipt` shows it.
+    fn verdicts(&self, hash: &Hash) -> Result<Option<ReceiptResult>> {
+        if self.options().trusted_keys.is_none() {
+            return Ok(None);
+        }
+        self.receipt(hash).map(Some)
     }
 }
 
@@ -292,6 +321,14 @@ fn render_receipt(h: &mut String, r: &ReceiptView) {
             num(c.body.mismatched),
             num(c.body.missing_left),
             num(c.body.missing_right)
+        );
+    }
+    if let Some(shown) = &r.signature {
+        let class = if r.signed() { "pass" } else { "fail" };
+        let _ = write!(
+            h,
+            "<p>Signatures: <span class=\"{class}\">{}</span>.</p>",
+            esc(&crate::receipt::signature_summary(shown))
         );
     }
     let Some(replay) = &r.replay else {

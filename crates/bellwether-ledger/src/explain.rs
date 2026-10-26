@@ -10,7 +10,7 @@ use bellwether_types::{
 };
 use serde::Serialize;
 
-use crate::{Ledger, RecordKind};
+use crate::{printable, Ledger, RecordKind, SignatureStatus, TrustedKeys, Verdict};
 
 /// Hex characters of the hash shown per line in the text rendering.
 const HASH_PREFIX: usize = 12;
@@ -51,6 +51,16 @@ pub struct Link {
     pub status: LinkStatus,
     /// Key facts, as ordered `(name, value)` pairs.
     pub facts: Vec<(String, String)>,
+    /// For the receipt and its certificate, when they resolved: every
+    /// signature object beside the record, verified on its own (ADR 029).
+    /// `None` for other links and flagged ones.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub signatures: Option<Vec<SignatureStatus>>,
+    /// For the receipt and its certificate, when explained against a trust
+    /// set ([`crate::Ledger::explain_verified`]): the signatures folded
+    /// against it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub verdict: Option<Verdict>,
 }
 
 impl Link {
@@ -58,9 +68,16 @@ impl Link {
         Self {
             hash,
             kind,
-            created_at: Some(created_at.to_owned()),
+            // Every value comes from a stored record, which a store writer
+            // controls: escaped before it can reach a terminal.
+            created_at: Some(printable(created_at)),
             status: LinkStatus::Ok,
-            facts: facts.into_iter().map(|(k, v)| (k.to_owned(), v)).collect(),
+            facts: facts
+                .into_iter()
+                .map(|(k, v)| (k.to_owned(), printable(&v)))
+                .collect(),
+            signatures: None,
+            verdict: None,
         }
     }
 
@@ -71,7 +88,22 @@ impl Link {
             created_at: None,
             status,
             facts: Vec::new(),
+            signatures: None,
+            verdict: None,
         }
+    }
+
+    /// Attaches the record's signatures, and its verdict when a trust set
+    /// is given.
+    fn signed<S>(mut self, ledger: &Ledger<S>, trusted: Option<&TrustedKeys>) -> Result<Self>
+    where
+        S: Deref,
+        S::Target: Store,
+    {
+        let statuses = ledger.signatures(&self.hash)?;
+        self.verdict = trusted.map(|t| Verdict::of(&statuses, t));
+        self.signatures = Some(statuses);
+        Ok(self)
     }
 }
 
@@ -132,6 +164,9 @@ impl fmt::Display for Chain {
             for (k, v) in &link.facts {
                 write!(f, "  {k}={v}")?;
             }
+            if let Some(v) = &link.verdict {
+                write!(f, "  sig={}", v.token())?;
+            }
             writeln!(f)?;
         }
         Ok(())
@@ -155,7 +190,7 @@ where
             | Error::Serde(_)
             | Error::Other(_)),
         ) => Ok(Err(LinkStatus::Unreadable {
-            reason: e.to_string(),
+            reason: printable(&e.to_string()),
         })),
         Err(e) => Err(e),
     }
@@ -178,7 +213,11 @@ macro_rules! resolve_link {
     };
 }
 
-pub(crate) fn explain<S>(ledger: &Ledger<S>, receipt_hash: &Hash) -> Result<Chain>
+pub(crate) fn explain<S>(
+    ledger: &Ledger<S>,
+    receipt_hash: &Hash,
+    trusted: Option<&TrustedKeys>,
+) -> Result<Chain>
 where
     S: Deref,
     S::Target: Store,
@@ -219,10 +258,10 @@ where
         Err(flagged) => flagged,
     });
     links.push(match cert {
-        Ok(c) => certificate_link(receipt.certificate, &c),
+        Ok(c) => certificate_link(receipt.certificate, &c).signed(ledger, trusted)?,
         Err(flagged) => flagged,
     });
-    links.push(receipt_link(*receipt_hash, &receipt));
+    links.push(receipt_link(*receipt_hash, &receipt).signed(ledger, trusted)?);
     Ok(Chain {
         receipt: *receipt_hash,
         links,
