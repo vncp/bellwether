@@ -2,7 +2,7 @@
 """Writes docs/measured/budgets.toml from a perf.json (bellwether-perf/1).
 
   scripts/perf-budgets.py --perf benches/out/perf.json \
-      --document docs/measured/2026-10-25-performance.md > docs/measured/budgets.toml
+      --document docs/measured/2026-10-26-performance.md > docs/measured/budgets.toml
 
 Every metric with a direction gets a budget: a latency (direction "lower")
 gets measured x 1.25, a throughput (direction "higher") measured / 1.25.
@@ -66,6 +66,7 @@ def main():
         "# Nothing asserts these yet: WP22b's `bellwether bench perf-check` does.",
         'format = "bellwether-budgets/1"',
         f"document = {q(a.document)}",
+        f"perf = {q(a.perf)}",
         f"date = {q(env['date'])}",
         f"commit = {q(env['commit'])}",
         f"machine = {q(env['machine'])}",
@@ -91,7 +92,10 @@ def main():
             f"budget = {round(budget, 3)}",
         ]
         if sec:
-            out += [f"measured_at = {q(sec['started_at'])}", f"commit = {q(sec['commit'])}"]
+            out += [f"measured_at = {q(sec['started_at'])}", f"commit = {q(sec['commit'])}",
+                    # Cores busy outside the run during its section: a loaded
+                    # section's budgets are loose by that much.
+                    f"outside_cores_max = {sec.get('external_cpu_cores_max', 0)}"]
         out.append("")
         n += 1
     out += [

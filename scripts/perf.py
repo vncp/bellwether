@@ -197,6 +197,18 @@ def external_cpu():
     return sum(c for c, _ in ext) / 100.0, [f"{n} {c:.0f}%" for c, n in ext[:5]]
 
 
+def scrub(text, a):
+    """Machine-local paths in recorded commands, as the variables that name
+    them, so a committed perf.json carries no home directory."""
+    pairs = [(a.work, "$PERF_WORK")]
+    if a.realdata:
+        pairs += [(os.path.realpath(a.realdata), "$REALDATA_WORK"), (os.path.abspath(a.realdata), "$REALDATA_WORK")]
+    pairs.append((os.path.expanduser("~"), "~"))
+    for old, new in sorted(pairs, key=lambda p: -len(p[0])):
+        text = text.replace(old, new)
+    return text
+
+
 class Perf:
     def __init__(self, a):
         self.a = a
@@ -283,8 +295,7 @@ class Perf:
                "cold": self.cache.label}, "context": self.context, "metrics": self.metrics}
         path = os.path.join(self.a.out, "perf.json")
         with open(path, "w") as f:
-            json.dump(doc, f, indent=1)
-            f.write("\n")
+            f.write(scrub(json.dumps(doc, indent=1), self.a) + "\n")
         if self.a.showcase:
             rows, queries = self.showcase_rows()
             os.makedirs(os.path.dirname(os.path.abspath(self.a.showcase)), exist_ok=True)
@@ -1009,6 +1020,8 @@ def demangle(sym):
 
 # bellwether's own functions (any workspace crate), by demangled name.
 OWN = re.compile(r"(^|[<&\s])bellwether(_[a-z]+)?::")
+GENERIC = re.compile(r"^(bellwether::main|bellwether::run|bellwether::\w+_cmds::run|<?rayon|<?core::|<?std::"
+                     r"|<?alloc::)")
 
 
 def top_frames(profile, syms, n=10):
@@ -1082,21 +1095,36 @@ def top_frames(profile, syms, n=10):
             mine = own_frames(s)
             for nm in set(mine):
                 inclusive[nm] = inclusive.get(nm, 0) + w
-            if mine and not OWN.search(name):
-                c = leaf_callers.setdefault(key, {})
-                c[mine[0]] = c.get(mine[0], 0) + w
+            if not OWN.search(name):
+                # The nearest bellwether function, or on a thread with none
+                # (a blocking-I/O pool), the nearest named library function.
+                caller = mine[0] if mine else None
+                q = stk["prefix"][s]
+                while caller is None and q is not None:
+                    nm, lib = frame_name(stk["frame"][q])
+                    if lib == "bellwether" and nm != "?" and not GENERIC.search(nm) and not nm.startswith(("tokio::", "<tokio::")):
+                        caller = nm
+                    q = stk["prefix"][q]
+                if caller:
+                    c = leaf_callers.setdefault(key, {})
+                    c[caller] = c.get(caller, 0) + w
     top = sorted(agg.items(), key=lambda kv: -kv[1])[:n]
     pct = lambda v: round(100 * v / max(1, total), 1)
+
+    def ranked(d):
+        # Entry points and thread-pool plumbing are on every stack; leave
+        # them out so the table shows where the time goes.
+        keep = [(k, v) for k, v in d.items() if not GENERIC.search(k)]
+        return sorted(keep, key=lambda kv: -kv[1])[:15]
     return {"on_cpu_weight": total, "idle_weight": idle,
             "top": [{"frame": k, "self_pct": pct(v)} for k, v in top],
-            "inclusive": [{"frame": k, "total_pct": pct(v)}
-                          for k, v in sorted(inclusive.items(), key=lambda kv: -kv[1])[:n]],
+            "inclusive": [{"frame": k, "total_pct": pct(v)} for k, v in ranked(inclusive)],
             "callers": {k: [{"frame": c, "pct": pct(v)} for c, v in
                             sorted(leaf_callers.get(k, {}).items(), key=lambda kv: -kv[1])[:3]]
                         for k, _ in top[:3]},
             "main_thread_wall_samples": wall,
             "main_thread_wall": [{"frame": k, "wall_pct": round(100 * v / max(1, wall), 1)}
-                                 for k, v in sorted(wall_inclusive.items(), key=lambda kv: -kv[1])[:n]]}
+                                 for k, v in ranked(wall_inclusive)]}
 
 
 def section_profiles(p, mkt10, ledger):
