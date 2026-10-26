@@ -44,7 +44,7 @@ Each table is cut into units, each a "file" of one row group: its declared parti
 | `ColumnStats.bytes`, `RowGroupMeta.bytes` | **measured**: logical bytes, the non-null count times the type's width, or the engine's octet length summed for strings and binaries; not storage bytes |
 | `ColumnStats.distinct_count`, `has_bloom` | `None`, `false` |
 | unit counts, units read, rows read in `why`, `fix`, and reconcile | counts |
-| bytes in `why` and `fix` over a table, the dataset's bytes | **measured** (`exact: false`, model `measured: logical bytes from per-unit aggregates`) |
+| bytes in `why` and `fix` over a table, the dataset's bytes | **measured** (`exact: false`, `exactness: Measured { model }`, model `measured: logical bytes from per-unit aggregates`) |
 | `MeasuredScore` | **measured**: wall-clock nanoseconds (`measured: wall time`), or Postgres buffers / DuckDB rows scanned from `EXPLAIN ANALYZE` (`measured: engine plan statistics`), with the noise as a bound |
 
 Bounds are reported only where the engine's `MIN`/`MAX` order is the order of the values read: SQLite times, dates, and decimals only when every value has one storage class and (for text) the one canonical shape (`YYYY-MM-DD HH:MM:SS[.f]`, `YYYY-MM-DD`); none for Postgres `bytea` (no `MIN`) or `character(n)` (compared without trailing blanks, read padded); strings in byte order under any column collation.
@@ -65,7 +65,7 @@ Every value is read at the dataset type and converted exactly or refused, never 
 
 ## Measured costs and attest-only apply
 
-Over a table every cost is measured, never exact (ADR 027). `why` and `fix` compute the same replay as over files, mark every cost `exact: false` with the model `measured: logical bytes from per-unit aggregates`, and report it; the ledger keeps a Replay only when its current costs are exact (ADR 005), so these are never recorded, and nothing measured is ever stored as exact. The `MeasuredScorer` trait (`TimingScorer`, `ExplainScorer`) has the shape of evolve's `Scorer` (`docs/evolve.md` §10) and is for evolve once it lands; nothing in the engine calls it, since it runs SQL text and a Proposal's text is an agent's.
+Over a table every cost is measured, never exact (ADR 027). `why` and `fix` compute the same replay as over files (runs no spec serves are priced as a raw scan), mark every cost `exact: false` and `exactness: Measured { model }` with the model `measured: logical bytes from per-unit aggregates`, and report it; the ledger keeps a Replay only when its current costs are exact (ADR 005), so these are never recorded, and nothing measured is ever stored as exact. The `MeasuredScorer` trait (`TimingScorer`, `ExplainScorer`) has the shape of evolve's `Scorer` (`docs/evolve.md` §10) and is for evolve once it lands; nothing in the engine calls it, since it runs SQL text and a Proposal's text is an agent's.
 
 Apply is attest-only. The engine creates no index inside a database and deploys no job, so `fix` over a table scores, verifies, writes the Certificate, applies the same gain gate as over files (`nothing_to_gain`, `--allow-no-gain`), and refuses with `attest_only`: for a key it names the `CREATE INDEX "bw_<table>_<cols>" ON ...` per table a human runs (`run`); for a rewrite it returns the agent's `after` text as `proposed_rewrite`, which the engine never ran, for a human to review. No Receipt is written: a Receipt attests an apply the engine made against `manifest_before`, and here the engine made none.
 

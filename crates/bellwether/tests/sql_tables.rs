@@ -363,11 +363,21 @@ fn why_over_a_table_never_reports_or_stores_a_measured_cost_as_exact() {
             let Record::Replay(rp) = &c.replay.record else {
                 panic!()
             };
+            // Record version 3: `exact` agrees with `exactness`, which names
+            // the model; runs no spec serves are priced as a raw scan
+            // (`unserved` absent, ADR 027).
+            let measured = bellwether_types::Exactness::Measured {
+                model: MEASURED_AGGREGATES.to_string(),
+            };
             assert!(
-                rp.current.iter().chain(&rp.proposed).all(|c| !c.exact),
+                rp.current
+                    .iter()
+                    .chain(&rp.proposed)
+                    .all(|c| !c.exact && c.exactness == measured),
                 "{engine}"
             );
             assert_eq!(rp.model.as_deref(), Some(MEASURED_AGGREGATES));
+            assert_eq!(rp.unserved, None, "{engine}");
             assert_eq!(c.replay.record.hash().unwrap(), c.replay.hash);
         }
         let json = serde_json::to_value(&r).unwrap();
@@ -581,6 +591,8 @@ fn a_rewrite_over_a_table_is_attest_only_and_names_the_agent_s_text() {
                     before: "SELECT * FROM trips".into(),
                     after: "DROP TABLE trips".into(),
                     invariant: "same rows".into(),
+                    before_plan: None,
+                    after_plan: None,
                 },
             },
             &[ev],

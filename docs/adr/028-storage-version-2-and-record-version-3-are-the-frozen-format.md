@@ -29,7 +29,7 @@ It lands in two pull requests. The first freezes every shape: what a record, a m
 **Filled by the second:**
 
 - **Verify** fills `examples`, `uncomparable`, `totals` and `row_filter`.
-- **Replay** fills `configuration`. It already sets `exactness`: `Exact` everywhere, and `Measured { model }` for a layout replay.
+- **Replay** fills `configuration`. It already sets `exactness`: `Exact` everywhere, and `Measured { model }` for a layout replay; the facade sets `Measured { model }` on every cost of a replay over a SQL table (ADR 027), whose runs no spec serves stay priced as a raw scan (`unserved` absent).
 - **Profile** fills `sample_size`, `quantile_error` and `Lint.fix`, and the facade fills a key proposal's `sidecars`.
 - **Plans:** `plan_ordered` fills `ScanPlan.order`, so two files can interleave.
 - **Folded sidecars:**

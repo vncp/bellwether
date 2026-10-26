@@ -156,7 +156,7 @@ The pinned digests in `bellwether_source::catalog`'s tests were refreshed with t
 
 ## SQL sources: the `sql://` identity scheme (2026-10-25, ADR 027)
 
-A table is read through the same `Source` trait as a folder of files (`bellwether-source-sql`). Nothing in storage version 1 changes: a table never has an index (the engine builds none over a database), so these identities appear only in what a reconcile, `why`, or `fix` over a table records, through the catalog digest above and the source identity below.
+A table is read through the same `Source` trait as a folder of files (`bellwether-source-sql`). Nothing in the index format (storage version 1 or 2) changes: a table never has an index (the engine builds none over a database), so these identities appear only in what a reconcile, `why`, or `fix` over a table records, through the catalog digest above and the source identity below.
 
 **Root.** `sql://<engine>/<schema>.<table>[,<schema>.<table>...]` with `engine` one of `sqlite`, `duckdb`, `postgres`, `flightsql`, `mssql`. The connection and the unit configuration follow `?` (`db=`, `driver=`, `range=`, `units=`, `version=`, `snapshot=`) and are never part of a recorded root: a record names `sql://<engine>/<tables>` only, so a password in a connection string never reaches the ledger. Every table of one root holds the same columns and declared types.
 

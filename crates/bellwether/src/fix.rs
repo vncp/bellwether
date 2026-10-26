@@ -772,7 +772,7 @@ impl Engine {
     fn attest_only(&self, certificate: &Hash, body: &ProposalBody) -> Result<Refusal> {
         let target = self.root().to_string();
         let (run, proposed_rewrite) = match body {
-            ProposalBody::Key { spec } => match self.table_url() {
+            ProposalBody::Key { spec, .. } => match self.table_url() {
                 Some(url) => (
                     SqlUrl::parse(url)?.create_index_statements(spec.columns()),
                     None,
@@ -1220,10 +1220,15 @@ pub(crate) fn measured_score(
     Ok((hash, scored))
 }
 
-/// Marks every cost of `replay` measured and names the model.
+/// Marks every cost of `replay` measured and names the model, on both
+/// `exact` and `exactness` (record version 3: they agree, ledger rule 7b).
+/// Runs no spec serves stay priced as a raw scan (`unserved` absent).
 pub(crate) fn mark_measured(replay: &mut bellwether_types::Replay) {
     for c in replay.current.iter_mut().chain(replay.proposed.iter_mut()) {
         c.exact = false;
+        c.exactness = bellwether_types::Exactness::Measured {
+            model: MEASURED_AGGREGATES.to_string(),
+        };
     }
     replay.model = Some(MEASURED_AGGREGATES.to_string());
 }

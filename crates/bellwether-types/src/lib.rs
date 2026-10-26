@@ -2013,8 +2013,11 @@ mod schema_feature {
         ]
     }
 
-    /// The canonical bytes of every record kind, pinned. A derive that
-    /// changed serialization would change this hash.
+    /// The canonical bytes of every record kind at this record version,
+    /// pinned (the drift test). A field added, renamed or newly written, or
+    /// a derive that changed serialization, changes this hash; the fix is a
+    /// `RECORD_VERSION` bump with a fixture, never an edit of the golden
+    /// alone.
     #[test]
     fn record_bytes_are_the_same_with_and_without_the_schema_feature() {
         let mut all = Vec::new();
@@ -2022,10 +2025,19 @@ mod schema_feature {
             all.extend(serde_json::to_vec(&r).unwrap());
             all.push(b'\n');
         }
-        assert_eq!(Hash::of(&all).to_hex(), GOLDEN);
+        assert_eq!(
+            (format::RECORD_VERSION, Hash::of(&all).to_hex().as_str()),
+            GOLDEN,
+            "record bytes moved: bump RECORD_VERSION, add fixtures/format-<next>/ and read it in \
+             crates/bellwether-cli/tests/format_compat.rs, then pin the new golden"
+        );
     }
 
-    const GOLDEN: &str = "b59003f39b3c09092346c665bbe85b3b3ac44b1a376f0d4eb6c907d249a84449";
+    /// The record version and the hash of `every_kind()`'s bytes at it.
+    const GOLDEN: (u32, &str) = (
+        3,
+        "b59003f39b3c09092346c665bbe85b3b3ac44b1a376f0d4eb6c907d249a84449",
+    );
 
     /// With the feature on, the schemas describe what serde writes: a hash
     /// is a 64-hex string, the bitmap a list of integers, the age an
