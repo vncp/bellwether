@@ -48,6 +48,7 @@ pub mod baseline;
 pub mod build_plan;
 pub mod catalog;
 pub mod error;
+pub mod join;
 pub mod keys;
 pub mod layout;
 pub mod plan;
@@ -62,6 +63,7 @@ pub use attribution::{Alternative, CostDelta, RunDelta, RunInteraction};
 pub use baseline::{Baseline, BaselinePlanner};
 pub use catalog::{Catalog, CatalogRowGroup};
 pub use error::{ReplayError, ReplayResult};
+pub use join::{pair_cost, PairInput};
 pub use keys::{RunKeys, RunKeysBuilder};
 pub use layout::{replay_layout, LayoutModel, LayoutReplay, LAYOUT_MODEL_VERSION};
 pub use plan::{

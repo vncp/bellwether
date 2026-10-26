@@ -771,3 +771,40 @@ Conformance vectors (`crates/bellwether-core/tests/list.rs`): a `list:tags` segm
 | `AAPL` bitmap {0} | `3a 30 00 00 01 00 00 00 00 00 00 00 10 00 00 00 00 00` |
 | `MSFT` bitmap {0, 1} | `3a 30 00 00 01 00 00 00 00 00 01 00 10 00 00 00 00 00 01 00` |
 | `list:tags blake3` | `972f0deeeb42ea46c6402160dae27f6ac7dfd87102ad9480e83798db78ad232d` |
+
+## Join keys (B3, `join:<left>.<cols>=<right>.<cols>`, 2026-10-26)
+
+`KeySpec::Join { dataset, columns, right, right_columns, counts? }` (JSON `{"kind": "join", "dataset": "orders", "columns": ["id"], "right": "payables", "right_columns": ["order_id"]}`, `"counts": true` only when set) is the key overlap of a dataset pair on one column pair, for semi-joins, anti-joins, and `in (subquery)` between them. Its name is `join:<dataset>.<columns joined by ,>=<right>.<right columns joined by ,>` (`join:orders.id=payables.order_id`); its identity adds `,counts` when it counts. It is a key spec of its own, admitted by storage version 2 like `list` (a version 1 manifest declaring it, or a join key with an unknown field, is refused with the typed shape error), declared in the **left** dataset's `schema.key_specs`, with ordinary key-spec segments (`segments[].kind` absent, `key_spec` = its identity).
+
+- **Datasets.** The left dataset is the data root, and `dataset` must be its folder's name. The right dataset is the folder named `right` beside the data root (`<parent of the root>/<right>`, resolved after symlinks; a symlink there points anywhere), read through its own index at its default location. A dataset name is one folder name of letters, digits, `_`, and `-`; a column named by a new join key may not contain `,`, `@`, or `=`, and its last right column may not be named `counts`, so the name parses one way.
+- **Built from both exact keys.** A join key is not built row group by row group. `bellwether index` on the left builds it whole from the complete exact keys on the join columns in both indexes (`exact:<columns>` in the left, `exact:<right columns>` in the right; with `counts`, both counted), by a merge join over their sorted key streams that holds one block per segment (ADR 018). A missing exact key on either side is refused (`not_indexed`, naming the key to declare), never guessed. Join columns pair only when their canonical encodings compare: signed integers of any width with signed integers, unsigned with unsigned, strings with strings, binaries with binaries, decimals of one width and scale, dates, times, and timestamps of one unit. A float column is refused: `-0.0` and `0.0` are equal in SQL and encode differently, and engines disagree on `NaN`.
+- **Pinned (ADR 020).** The segment's header records `left_sequence`, the left manifest whose exact segments it read, and `right_sequence`, the right manifest it read; the manifest entry repeats `right_sequence` (`segments[].right_sequence`, absent for every other segment), and a reader refuses a segment whose two disagree. The commit that writes it records the key complete. A later left commit keeps it complete while its recorded range covers every live left row group (a commit that adds a key or compacts changes none); a commit that adds, changes, or removes left files leaves it incomplete: **stale on the left**. A right dataset whose current sequence is not `right_sequence` makes it **stale on the right**. A stale join key is never planned with (`stale_join`, naming the side); `bellwether index` on the left rebuilds it, and `bellwether join verify` reports each join key's state.
+- **Nulls (ADR 014).** A tuple with a null element equals nothing: exact keys never index a null leading column, and a stored composite tuple with a trailing null marker is never paired and counts as one-sided on its side. A null probe matches nothing.
+- **Live row groups.** Each side's bitmaps and counts keep only its live row groups; a key held only in retired ones (ADR 013) is absent from that side.
+
+The segment is the keyed layout with a pair per key, `layout: "keyed_join"`:
+
+```
+header       the storage version 2 header, with key_spec the join key, key_types the left columns'
+             types, right_key_types the right columns' (both or neither), left_sequence, right_sequence
+keys         the keys both sides hold, strictly ascending, canonical encodings at the left types;
+             blocks, block blooms and directories as the exact layout
+value record left record | right record, each  bitmap_len u32 | bitmap | [counts]  as the exact
+             layout's (left bitmap over left row-group ids, right bitmap over right ids, both
+             non-empty; counts present exactly when the key counts), nothing after
+index        the keyed index (entries = shared keys; rg_min..rg_max the left row groups covered),
+             then left_only u64 | right_only u64: the keys on one side only, per side
+```
+
+The recorded row-group range is the left's (every live left row group when built); right ids never widen it. Every region is checksummed as in the exact layout (the one-sided counts by the footer's checksum over the index), so a damaged byte is refused, never read as another pair. A join segment is rebuilt whole and never merged; a key lookup on it is refused.
+
+**Lookups.** `semijoin(keys)`, with keys on the left columns: per key both sides hold, its row groups on each side. The plan is two steps: the left row groups holding a matched key (what `left ⋉ right` reads for these keys), then the right row groups holding one, each with an `In` residual over the matched keys on its side's columns; with counts, each step's rows are exact. Invariant 1 holds per side: no row of a matched key is outside its side's plan, and a key one side lacks has no row in the semi-join (an anti-join's keys are the asked keys that did not match). `overlap_stats()`: `|L ∩ R|` (shared keys), `|L \ R|` and `|R \ L|` (the index's one-sided counts), and per shared key the most and the sum of its row groups on each side (the mean is the sum over the shared keys); with counts, the rows each side keeps and the rows of the inner join (per shared key, left rows times right rows). Both read the pair index alone, no data file.
+
+Conformance vectors (`crates/bellwether-core/tests/join.rs`): the counted pair of `join:orders.id=payables.order_id` built from a left exact key (`Int64`) holding `1` in left row groups 0 (3 rows) and 2 (1 row), `2` in 1 (2 rows), `3` in 3 (1 row), and a right exact key (`Int32`) holding `1` in right row groups 10 (1 row), `3` in 11 (4 rows) and 12 (1 row), `4` in 12 (2 rows); left live 0..4, right live 10..13, `left_sequence` 5, `right_sequence` 7, default writer options. It holds `1` and `3`; `2` and `4` are one-sided.
+
+| Vector | Bytes |
+|---|---|
+| shared key `1` | `02 80 00 00 00 00 00 00 01` |
+| pair value of `1` | `14 00 00 00 3a 30 00 00 01 00 00 00 00 00 01 00 10 00 00 00 00 00 02 00 03 01 12 00 00 00 3a 30 00 00 01 00 00 00 00 00 00 00 10 00 00 00 0a 00 01` |
+| one-sided counts (index suffix) | `01 00 00 00 00 00 00 00 01 00 00 00 00 00 00 00` |
+| pinned pair blake3 | `98bc9822d3ff2ae1d520be134bcde77dc1fb38476c83ea0a8fd8d92699a03812` |

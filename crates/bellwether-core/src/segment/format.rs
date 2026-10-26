@@ -78,6 +78,10 @@ pub enum Layout {
     BloomPerRowGroup,
     /// Per-row-group `(min, max)`, sorted by `min`, in blocks. Range.
     MinMax,
+    /// As `Keyed`, with a value record per side: each key's left and right
+    /// row-group bitmaps (each in its own dataset's id space), and an index
+    /// that ends with the one-sided key counts. Join (B3).
+    KeyedJoin,
 }
 
 impl Layout {
@@ -96,6 +100,7 @@ impl Layout {
                 Some(Self::BloomPerRowGroup)
             }
             KeySpec::Range { .. } => Some(Self::MinMax),
+            KeySpec::Join { .. } => Some(Self::KeyedJoin),
             KeySpec::Exact { .. } | KeySpec::Bloom { .. } | KeySpec::Bitemporal { .. } => None,
             KeySpec::Expr { over, .. } => Self::for_spec(over),
         }
@@ -408,6 +413,22 @@ pub struct SegmentHeader {
     /// reader built on other tables refuses the segment.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub text_unicode: Option<crate::text::UnicodeTables>,
+    /// For a join key (B3) only: the left dataset's manifest sequence whose
+    /// exact segments the pair index was built from. Provenance: the pair
+    /// stays valid while the left's row groups do (a later commit that
+    /// changes none, adding another key, leaves it complete).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub left_sequence: Option<u64>,
+    /// For a join key (B3) only: the right dataset's manifest sequence the
+    /// pair index was built at (ADR 020). The pair index describes the
+    /// right dataset only at that sequence; a reader whose right dataset is
+    /// at another refuses to plan with it (`Error::StaleJoin`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub right_sequence: Option<u64>,
+    /// For a join key (B3) only: each right key column's dataset type, as
+    /// `key_types` records the left's; present together with `key_types`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub right_key_types: Option<Vec<ColumnType>>,
     /// Fields written by a newer minor writer, preserved verbatim.
     #[serde(flatten)]
     pub extra: serde_json::Map<String, serde_json::Value>,
@@ -432,6 +453,9 @@ impl SegmentHeader {
             key_types: None,
             ts_type: None,
             text_unicode: spec_is_text.then(crate::text::UnicodeTables::current),
+            left_sequence: None,
+            right_sequence: None,
+            right_key_types: None,
             extra: serde_json::Map::new(),
         }
     }
@@ -527,8 +551,53 @@ impl SegmentHeader {
             }
             (_, None) => {}
         }
+        // A join key's header pins the right dataset's manifest sequence,
+        // and records the right key types exactly when it records the
+        // left's; no other segment carries either.
+        match (&self.key_spec, self.right_sequence, &self.right_key_types) {
+            (KeySpec::Join { .. }, _, _) if self.left_sequence.is_none() => {
+                return Err(corrupt(
+                    "a join segment records the left manifest sequence it was built from",
+                ));
+            }
+            (_, None, None) if self.left_sequence.is_some() => {
+                return Err(corrupt("left_sequence on a segment that is not a join key"));
+            }
+            (KeySpec::Join { .. }, None, _) => {
+                return Err(corrupt(
+                    "a join segment records the right manifest sequence it was built at",
+                ));
+            }
+            (KeySpec::Join { right_columns, .. }, Some(_), right) => {
+                if self.storage_version < 2 {
+                    return Err(corrupt(
+                        "a join segment is a storage version 2 kind; version 1 has none",
+                    ));
+                }
+                if right.is_some() != self.key_types.is_some() {
+                    return Err(corrupt(
+                        "right_key_types is recorded exactly when key_types is",
+                    ));
+                }
+                if right
+                    .as_ref()
+                    .is_some_and(|t| t.len() != right_columns.len())
+                {
+                    return Err(corrupt(
+                        "right_key_types does not match the join key's right columns",
+                    ));
+                }
+            }
+            (_, None, None) => {}
+            _ => {
+                return Err(corrupt(
+                    "right_sequence or right_key_types on a segment that is not a join key",
+                ))
+            }
+        }
         // An expr key's header carries its expression and conformance
         // vectors; a reader recomputes them before trusting the keys.
+        crate::join::check_spec(&self.key_spec)?;
         crate::expr::check_spec(&self.key_spec)
     }
 }

@@ -28,6 +28,7 @@ fn seg(staged: &mut StagedSegments, body: &str, n: u32) -> SegmentRef {
         key_spec: "exact:id".into(),
         rowgroup_range: RowGroupRange::new(n, n + 1),
         bytes: body.len() as u64,
+        right_sequence: None,
         extra: Extra::new(),
     }
 }

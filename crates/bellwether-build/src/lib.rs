@@ -31,6 +31,7 @@ mod build;
 mod compact;
 mod config;
 mod coverage;
+mod join;
 mod keys;
 mod plan;
 mod seg_io;
@@ -46,6 +47,7 @@ pub use config::{
     DEFAULT_MAX_SEGMENT_BYTES, DEFAULT_MAX_SEGMENT_KEYS, DEFAULT_MAX_SEGMENT_ROW_GROUPS,
 };
 pub use coverage::{completeness, sidecar_completeness, sketch_completeness};
+pub use join::{join_side_spec, JoinRefresh, JoinState, SemiJoinPlan};
 pub use keys::encode_ts;
 pub use plan::{
     default_window_column, overlapping_counts, partition_columns, KeyCount, Lookup, PlanOrder,

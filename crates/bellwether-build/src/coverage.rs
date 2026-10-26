@@ -160,6 +160,21 @@ pub(crate) fn completeness_map(
         };
         out.insert(name, seq);
     }
+    // A join key (B3) becomes complete only by its own commit
+    // (`Builder::refresh_join`); any later commit keeps its entry while its
+    // pair still covers every live left row group, and drops it (the key is
+    // then stale on the left) once the left's row groups change.
+    for spec in crate::target::declared_joins(&next.schema.key_specs) {
+        let name = spec.identity();
+        if let Some(&recorded) = base.key_spec_completeness.get(&name) {
+            if base.schema.key_specs.contains(&spec)
+                && is_complete(base, &name, &live_base)
+                && is_complete(next, &name, &live_next)
+            {
+                out.insert(name, recorded);
+            }
+        }
+    }
     Ok(out)
 }
 
@@ -272,6 +287,7 @@ mod tests {
             rowgroup_range: RowGroupRange::new(start, end),
             bytes: 1,
             kind: None,
+            right_sequence: None,
             extra: Extra::new(),
         }
     }

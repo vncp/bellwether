@@ -367,6 +367,12 @@ pub struct SegmentRef {
     pub rowgroup_range: RowGroupRange,
     /// Size of the segment in bytes.
     pub bytes: u64,
+    /// For a join key's segment (B3): the right dataset's manifest sequence
+    /// the pair index was built at (ADR 020), as its header records it. The
+    /// key is stale once the right dataset's sequence differs. Absent for
+    /// every other segment.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub right_sequence: Option<u64>,
     /// Unknown fields (ADR 017).
     #[serde(flatten)]
     pub extra: Extra,
@@ -759,6 +765,15 @@ fn key_spec_fields(kind: &str, storage_version: u64) -> Option<&'static [&'stati
         // a list key (B4) is a storage version 2 kind: a version 1 build
         // refuses a manifest declaring one
         "list" if v2 => Some(&["kind", "column"]),
+        // a join key (B3) likewise
+        "join" if v2 => Some(&[
+            "kind",
+            "dataset",
+            "columns",
+            "right",
+            "right_columns",
+            "counts",
+        ]),
         "temporal" if v2 => Some(&["kind", "columns", "ts_column", "counts"]),
         "temporal" => Some(&["kind", "columns", "ts_column"]),
         // --- phase 5 kinds ---
@@ -1026,6 +1041,13 @@ mod tests {
                 bloom: Some(0.01),
             },
             KeySpec::List { column: "a".into() },
+            KeySpec::Join {
+                dataset: "l".into(),
+                columns: vec!["a".into()],
+                right: "r".into(),
+                right_columns: vec!["b".into()],
+                counts: true,
+            },
         ];
         let mut kinds_seen = BTreeSet::new();
         for spec in &specs {
@@ -1039,7 +1061,8 @@ mod tests {
                 | KeySpec::Bitemporal { .. }
                 | KeySpec::Expr { .. }
                 | KeySpec::Text { .. }
-                | KeySpec::List { .. } => {}
+                | KeySpec::List { .. }
+                | KeySpec::Join { .. } => {}
             }
             let v = serde_json::to_value(spec).unwrap();
             let kind = v["kind"].as_str().unwrap().to_string();
@@ -1224,6 +1247,48 @@ mod tests {
         expect_unsupported_shape(
             r#"{"storage_version": 2, "created_at": "x",
                 "schema": {"key_specs": [{"kind": "list", "column": "t", "keys_only": true}]}}"#,
+        );
+    }
+
+    /// A join key (B3) is a storage version 2 kind, like a list key: a
+    /// version 2 manifest declaring it reads back as written, with its
+    /// segment's pinned right sequence; a version 1 manifest declaring it,
+    /// or a join key with a field this build does not know, is refused
+    /// with the typed shape error.
+    #[test]
+    fn a_join_key_is_a_storage_version_2_kind_and_its_segment_pins_the_right() {
+        let json = |version: u32| {
+            format!(
+                r#"{{"storage_version": {version}, "created_at": "x",
+                "schema": {{"key_specs": [{{"kind": "join", "dataset": "orders",
+                    "columns": ["id"], "right": "payables", "right_columns": ["order_id"]}}]}},
+                "segments": [{{"id": "{}", "key_spec": "join:orders.id=payables.order_id",
+                    "rowgroup_range": {{"start": 0, "end": 4}}, "bytes": 10,
+                    "right_sequence": 7}}]}}"#,
+                "11".repeat(32)
+            )
+        };
+        let m = Manifest::from_slice(json(2).as_bytes()).unwrap();
+        assert_eq!(
+            m.schema.key_specs[0].name(),
+            "join:orders.id=payables.order_id"
+        );
+        assert_eq!(m.segments[0].right_sequence, Some(7));
+        let back: Value = serde_json::from_slice(&m.to_vec().unwrap()).unwrap();
+        assert_eq!(back["schema"]["key_specs"][0]["kind"], "join");
+        assert_eq!(back["segments"][0]["right_sequence"], 7);
+        assert!(key_spec_fields("join", 1).is_none());
+        match Manifest::from_slice(json(1).as_bytes()) {
+            Err(Error::UnknownKind {
+                what: UNSUPPORTED_SHAPE,
+                ..
+            }) => {}
+            other => panic!("expected UnknownKind (shape), got {other:?}"),
+        }
+        expect_unsupported_shape(
+            r#"{"storage_version": 2, "created_at": "x",
+                "schema": {"key_specs": [{"kind": "join", "dataset": "a", "columns": ["x"],
+                "right": "b", "right_columns": ["y"], "outer": true}]}}"#,
         );
     }
 

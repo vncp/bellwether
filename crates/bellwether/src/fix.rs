@@ -2657,6 +2657,7 @@ mod tests {
                     extra: Default::default(),
                 },
                 bytes: seg.bytes.len() as u64,
+                right_sequence: None,
                 extra: Default::default(),
             });
             Ok(next)
