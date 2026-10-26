@@ -120,7 +120,10 @@ impl std::error::Error for OptionsError {}
 
 impl EngineArgs {
     /// The engine options these flags name; reads the `--schema` file and
-    /// parses the `--path-template`.
+    /// parses the `--path-template`. `--chunk-size` with Parquet files is a
+    /// usage error for every verb: Parquet row groups are the files' own,
+    /// so a chunk size there would be ignored by some verbs and refused by
+    /// others.
     pub fn options(&self) -> Result<EngineOptions, OptionsError> {
         let format = match self.format {
             FormatArg::Parquet => SourceFormat::Parquet,
@@ -130,6 +133,13 @@ impl EngineArgs {
             },
             FormatArg::Jsonl => SourceFormat::JsonLines,
         };
+        if let (FormatArg::Parquet, Some(n)) = (self.format, self.chunk_size) {
+            return Err(OptionsError::Usage(format!(
+                "--chunk-size {n} applies to CSV and JSON lines files only; Parquet row groups \
+                 are the files' own. Drop --chunk-size, or pass --format csv or --format jsonl \
+                 for a text folder"
+            )));
+        }
         let schema = match &self.schema {
             None => None,
             Some(p) => {
@@ -163,11 +173,65 @@ impl EngineArgs {
             // `--at-manifest` on the CLI's lookups), never per session.
             at_manifest: None,
             clock: self.clock.clone(),
+            source_flags: Some(self.source_flags()),
             // Signing and trust are the server's own flags ([`KeyArgs`]);
             // the CLI gives them per command.
             signing_key: None,
             trusted_keys: None,
         })
+    }
+
+    /// The flags that shape a build or locate the index, as arguments of a
+    /// command run from anywhere (`EngineOptions::source_flags`): each one
+    /// given, in definition order, a local path made absolute (an index
+    /// URL kept as given). Unquoted; the facade quotes each argument.
+    fn source_flags(&self) -> Vec<String> {
+        let absolute = |p: &std::path::Path| {
+            std::path::absolute(p)
+                .unwrap_or_else(|_| p.to_path_buf())
+                .to_string_lossy()
+                .into_owned()
+        };
+        let mut flags = Vec::new();
+        if let Some(index) = &self.index {
+            let at = if index.contains("://") {
+                index.clone()
+            } else {
+                absolute(std::path::Path::new(index))
+            };
+            flags.extend(["--index".to_string(), at]);
+        }
+        match self.format {
+            FormatArg::Parquet => {}
+            FormatArg::Csv => flags.extend(["--format".into(), "csv".into()]),
+            FormatArg::Jsonl => flags.extend(["--format".into(), "jsonl".into()]),
+        }
+        // Parquet row groups are the files' own: `options` refuses a chunk
+        // size there, and the command never carries one.
+        if let (Some(n), FormatArg::Csv | FormatArg::Jsonl) = (self.chunk_size, self.format) {
+            flags.extend(["--chunk-size".to_string(), n.to_string()]);
+        }
+        if let Some(p) = &self.schema {
+            flags.extend(["--schema".to_string(), absolute(p)]);
+        }
+        match self.fingerprint_policy {
+            None => {}
+            Some(PolicyArg::Tail64k) => {
+                flags.extend(["--fingerprint-policy".into(), "tail64k".into()]);
+            }
+            Some(PolicyArg::Full) => flags.extend(["--fingerprint-policy".into(), "full".into()]),
+        }
+        match (&self.path_template, self.partitioning) {
+            (Some(t), _) => flags.extend(["--path-template".to_string(), t.clone()]),
+            (None, Some(PartitioningArg::None)) => {
+                flags.extend(["--partitioning".into(), "none".into()]);
+            }
+            (None, Some(PartitioningArg::Hive)) => {
+                flags.extend(["--partitioning".into(), "hive".into()]);
+            }
+            (None, None) => {}
+        }
+        flags
     }
 }
 
@@ -230,5 +294,39 @@ impl From<BudgetArgs> for Budget {
             rows: a.budget_rows,
             seconds: a.budget_seconds,
         }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use clap::Parser;
+
+    use super::EngineArgs;
+
+    #[derive(Parser)]
+    struct Cli {
+        #[command(flatten)]
+        engine: EngineArgs,
+    }
+
+    fn args(argv: &[&str]) -> EngineArgs {
+        Cli::try_parse_from([&["bw"][..], argv].concat())
+            .unwrap()
+            .engine
+    }
+
+    /// The rendered source flags never carry a chunk size for Parquet
+    /// (`options` refuses one there), and do for text.
+    #[test]
+    fn chunk_size_is_rendered_for_text_only() {
+        let parquet = args(&["--chunk-size", "64"]);
+        assert!(parquet.options().is_err());
+        assert!(!parquet.source_flags().contains(&"--chunk-size".to_string()));
+        let csv = args(&["--format", "csv", "--chunk-size", "64"]);
+        assert_eq!(
+            csv.options().unwrap().source_flags.unwrap(),
+            ["--format", "csv", "--chunk-size", "64"]
+        );
     }
 }

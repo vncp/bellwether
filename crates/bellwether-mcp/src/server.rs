@@ -21,8 +21,8 @@ use crate::envelope::{cites_of, Chain, Envelope, Status};
 use crate::jobs::{job_id, Job, JobInfo, JobState, Jobs};
 use crate::refusal::{self, Refusal, RefusalCode};
 use crate::tools::{
-    self, ApplyReceipt, JobRef, JobsStart, ObserveAsof, ObserveLocate, ObserveWhy, ProposeKey,
-    ProposeLayout, ProposeRewrite, ScoreVerify, ScoreWhy, Tier,
+    self, ApplyReceipt, JobRef, JobsStart, KeyArg, ObserveAsof, ObserveLocate, ObserveWhy,
+    ProposeKey, ProposeLayout, ProposeRewrite, ScoreVerify, ScoreWhy, Tier,
 };
 
 /// How the server is configured at startup. Nothing is read from the
@@ -384,13 +384,23 @@ impl Server {
             }
             "propose.key" => {
                 let a = parse!(ProposeKey);
-                propose(
-                    e,
-                    ProposalBody::Key { spec: a.spec },
-                    &a.evidence,
-                    &a.by,
-                    a.dry_run,
-                )
+                // The short form is read as `index --key` reads it, so a
+                // sidecar declaration reaches the facade's typed refusal.
+                let declared = match a.spec {
+                    KeyArg::Short(s) => match bellwether::spec::parse_declaration(&s) {
+                        Ok(d) => d,
+                        Err(err) => return failed(&err),
+                    },
+                    KeyArg::Spec(spec) => bellwether::spec::Declaration {
+                        key: Some(spec),
+                        sidecar: None,
+                    },
+                };
+                propose_done(if a.dry_run {
+                    e.propose_key_dry_run(&declared, &a.evidence, &a.by)
+                } else {
+                    e.propose_key(&declared, &a.evidence, &a.by)
+                })
             }
             "propose.layout" => {
                 let a = parse!(ProposeLayout);
@@ -684,11 +694,14 @@ fn propose(
     by: &str,
     dry_run: bool,
 ) -> Done {
-    let r = if dry_run {
+    propose_done(if dry_run {
         e.propose_dry_run(body, evidence, by)
     } else {
         e.propose(body, evidence, by)
-    };
+    })
+}
+
+fn propose_done(r: bellwether::types::Result<ProposeResult>) -> Done {
     match r {
         Ok(r) => {
             let refusal = match &r {

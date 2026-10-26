@@ -319,7 +319,9 @@ struct ProposeArgs {
     /// Who proposes: an agent name or a user.
     #[arg(long, value_name = "NAME", default_value = "cli")]
     by: String,
-    /// Propose an index key (a key spec, as for `index`).
+    /// Propose an index key (a key spec, as for `index`). A sidecar
+    /// declaration (temporal2:id@valid,known, or exact:a@ts) is refused: it
+    /// is built with `index --key` and has no receipt yet.
     #[arg(long, value_name = "SPEC", group = "body")]
     key: Option<String>,
     /// Propose clustering files by these columns, comma-separated.
@@ -755,23 +757,30 @@ fn lookup(
 }
 
 fn propose(g: &Global, out: &Out, a: &ProposeArgs) -> Result<Outcome, Failure> {
-    let body = if let Some(k) = &a.key {
-        ProposalBody::Key {
-            spec: bellwether::spec::parse(k).map_err(|e| Failure::Usage(e.to_string()))?,
-        }
+    enum What {
+        Key(bellwether::spec::Declaration),
+        Body(ProposalBody),
+    }
+    // A key is read as `index --key` reads it, so a sidecar declaration
+    // reaches the facade's typed refusal rather than an unknown-kind usage
+    // error.
+    let what = if let Some(k) = &a.key {
+        What::Key(
+            bellwether::spec::parse_declaration(k).map_err(|e| Failure::Usage(e.to_string()))?,
+        )
     } else if let Some(cols) = &a.layout {
-        ProposalBody::Layout {
+        What::Body(ProposalBody::Layout {
             cluster_by: cols.clone(),
-        }
+        })
     } else if let (Some(before), Some(after), Some(invariant)) = (&a.before, &a.after, &a.invariant)
     {
-        ProposalBody::Rewrite {
+        What::Body(ProposalBody::Rewrite {
             shape: RewriteShape {
                 before: before.clone(),
                 after: after.clone(),
                 invariant: invariant.clone(),
             },
-        }
+        })
     } else {
         return Err(Failure::Usage(
             "say what to propose: --key <spec>, --layout <cols>, or --before/--after/--invariant"
@@ -783,7 +792,11 @@ fn propose(g: &Global, out: &Out, a: &ProposeArgs) -> Result<Outcome, Failure> {
         .iter()
         .map(|e| hash(e, "evidence"))
         .collect::<Result<Vec<_>, _>>()?;
-    let r = engine(g, &a.root.root)?.propose(body, &evidence, &a.by)?;
+    let e = engine(g, &a.root.root)?;
+    let r = match what {
+        What::Key(declared) => e.propose_key(&declared, &evidence, &a.by)?,
+        What::Body(body) => e.propose(body, &evidence, &a.by)?,
+    };
     let code = match r {
         bellwether::ProposeResult::Written { .. }
         | bellwether::ProposeResult::WouldWrite { .. } => EXIT_OK,

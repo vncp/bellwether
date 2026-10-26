@@ -217,6 +217,35 @@ pub fn sidecar_label(def: &SidecarDef) -> String {
     def.name()
 }
 
+/// The `index --key` argument that declares `declared`;
+/// [`parse_declaration`] reads it back to an equal declaration.
+#[must_use]
+pub fn declaration_label(declared: &Declaration) -> String {
+    match (&declared.key, &declared.sidecar) {
+        (Some(key), Some(def)) if def.kind == SidecarKind::Bounds => {
+            format!("{}@{}", label(key), def.time_columns.join(","))
+        }
+        (_, Some(def)) => def.name(),
+        (Some(key), None) => label(key),
+        (None, None) => String::new(),
+    }
+}
+
+/// `s` as one POSIX shell word, for a command a message names: unchanged
+/// when every character is one a shell never interprets, else in single
+/// quotes, each `'` written `'\''`.
+#[must_use]
+pub fn shell_quote(s: &str) -> String {
+    let plain = !s.is_empty()
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || "_@%+=:,./-".contains(c));
+    if plain {
+        s.to_string()
+    } else {
+        format!("'{}'", s.replace('\'', r"'\''"))
+    }
+}
+
 fn message(e: &Error) -> String {
     match e {
         Error::KeySpec(m) | Error::Other(m) => m.clone(),
@@ -306,5 +335,31 @@ mod tests {
         }
         // A key spec alone never carries the bound.
         assert!(parse("exact:symbol@ts").is_err());
+    }
+
+    #[test]
+    fn declaration_labels_read_back_to_equal_declarations() {
+        for s in [
+            "exact:symbol@ts",
+            "bloom:a,b@0.01@ts",
+            "temporal2:id@valid,known",
+            "temporal:id@ts",
+            "exact:a,b",
+            "range:ts",
+        ] {
+            let d = parse_declaration(s).unwrap();
+            assert_eq!(declaration_label(&d), s);
+            assert_eq!(parse_declaration(&declaration_label(&d)).unwrap(), d);
+        }
+    }
+
+    #[test]
+    fn shell_quote_makes_one_word() {
+        assert_eq!(shell_quote("/a/b-c_d.parquet"), "/a/b-c_d.parquet");
+        assert_eq!(shell_quote("temporal2:id@v,k"), "temporal2:id@v,k");
+        assert_eq!(shell_quote("/tmp/my lake"), "'/tmp/my lake'");
+        assert_eq!(shell_quote("{day:date}.parquet"), "'{day:date}.parquet'");
+        assert_eq!(shell_quote("it's"), r"'it'\''s'");
+        assert_eq!(shell_quote(""), "''");
     }
 }

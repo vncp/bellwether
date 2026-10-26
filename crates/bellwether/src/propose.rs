@@ -1,13 +1,17 @@
 //! `propose`: write a Proposal citing evidence. There is no score field in
 //! a Proposal and the facade adds none, anywhere (ADR 009).
 
+use std::fmt::Write as _;
+
 use bellwether_ledger::RecordKind;
+use bellwether_source::Partitioning;
 use bellwether_types::{
     format, Error, Hash, HashKind, KeySpec, Proposal, ProposalBody, Record, Result, RewriteShape,
 };
 
-use crate::engine::{guard, Engine};
+use crate::engine::{guard, Engine, SourceFormat};
 use crate::results::{ProposeRefusal, ProposeResult, Written};
+use crate::spec::Declaration;
 use crate::why::RESERVED_PROPOSERS;
 
 impl Engine {
@@ -43,13 +47,137 @@ impl Engine {
         guard(|| self.propose_inner(body, evidence, proposed_by, false))
     }
 
-    fn propose_inner(
+    /// [`Engine::propose`] of a key, given as the `index --key` argument
+    /// [`crate::spec::parse_declaration`] reads (`propose --key`, MCP
+    /// `propose.key`): a key spec is proposed as `ProposalBody::Key`. A
+    /// declaration that builds a sidecar (`temporal2:id@valid,known`, or
+    /// `exact:symbol@ts`, whose per-key time bounds ride beside the key) is
+    /// refused, typed ([`ProposeRefusal::SidecarNotProposable`]), and
+    /// nothing is written: a Proposal holds a key spec only, and replay
+    /// prices key specs only, so it has no path to a receipt. The refusal
+    /// comes after every check a proposal gets (proposer, evidence, and the
+    /// key and time columns against the dataset), so both next steps it
+    /// names work: the `index` command that builds the sidecar, and, beside
+    /// a key, proposing the key alone.
+    pub fn propose_key(
         &self,
-        body: ProposalBody,
+        declared: &Declaration,
+        evidence: &[Hash],
+        proposed_by: &str,
+    ) -> Result<ProposeResult> {
+        guard(|| self.propose_declared(declared, evidence, proposed_by, true))
+    }
+
+    /// [`Engine::propose_key`] as [`Engine::propose_dry_run`]: the same
+    /// refusal, or the Proposal it would write; writes nothing.
+    pub fn propose_key_dry_run(
+        &self,
+        declared: &Declaration,
+        evidence: &[Hash],
+        proposed_by: &str,
+    ) -> Result<ProposeResult> {
+        guard(|| self.propose_declared(declared, evidence, proposed_by, false))
+    }
+
+    fn propose_declared(
+        &self,
+        declared: &Declaration,
         evidence: &[Hash],
         proposed_by: &str,
         write: bool,
     ) -> Result<ProposeResult> {
+        let sidecar = match (&declared.key, &declared.sidecar) {
+            (Some(spec), None) => {
+                return self.propose_inner(
+                    ProposalBody::Key { spec: spec.clone() },
+                    evidence,
+                    proposed_by,
+                    write,
+                )
+            }
+            (_, Some(sidecar)) => sidecar,
+            (None, None) => {
+                return Err(Error::KeySpec(
+                    "the declaration names no key spec; pass one such as exact:<column>".into(),
+                ))
+            }
+        };
+        // Every check a proposal gets, without creating the index location:
+        // the refusal writes nothing.
+        if let Some(refused) = self.check_proposer_and_evidence(evidence, proposed_by, false)? {
+            return Ok(refused);
+        }
+        if let Some(spec) = &declared.key {
+            self.check_body(&ProposalBody::Key { spec: spec.clone() })?;
+        }
+        let schema = self.check_columns(
+            &sidecar
+                .columns
+                .iter()
+                .chain(&sidecar.time_columns)
+                .collect::<Vec<_>>(),
+        )?;
+        // The checks the build applies to a sidecar's columns: encodable
+        // keys, and time columns of a type a sidecar orders by.
+        sidecar
+            .key_types(&schema)
+            .and_then(|_| sidecar.time_types(&schema))
+            .map_err(|e| match e {
+                Error::KeySpec(m) => Error::KeySpec(format!("{}: {m}", sidecar.name())),
+                other => other,
+            })?;
+        let declaration = crate::spec::declaration_label(declared);
+        Ok(ProposeResult::Refused {
+            refusal: ProposeRefusal::SidecarNotProposable {
+                command: self.index_command(&declaration),
+                declaration,
+                sidecar: crate::spec::sidecar_label(sidecar),
+                key: declared.key.as_ref().map(crate::spec::label),
+                root: self.root().to_string(),
+            },
+        })
+    }
+
+    /// `bellwether index <root> <source flags> --key <declaration>`, every
+    /// argument POSIX shell-quoted, the source flags those the engine was
+    /// opened with ([`crate::EngineOptions::source_flags`]), so following it
+    /// builds the folder as it was read here and where its lookups look.
+    /// `None` when a library caller opened the engine with source options
+    /// and no flags spell them. Reads nothing.
+    fn index_command(&self, declaration: &str) -> Option<String> {
+        let o = self.options();
+        let flags: &[String] = match &o.source_flags {
+            Some(flags) => flags,
+            None if o.index.is_none()
+                && o.format == SourceFormat::Parquet
+                && o.chunk_size.is_none()
+                && o.schema.is_none()
+                && o.fingerprint_policy.is_none()
+                && matches!(o.partitioning, None | Some(Partitioning::None)) =>
+            {
+                &[]
+            }
+            None => return None,
+        };
+        let mut cmd = format!("bellwether index {}", crate::spec::shell_quote(self.root()));
+        for f in flags {
+            let _ = write!(cmd, " {}", crate::spec::shell_quote(f));
+        }
+        let _ = write!(cmd, " --key {}", crate::spec::shell_quote(declaration));
+        Some(cmd)
+    }
+
+    /// The proposer and evidence checks every proposal gets: a typed
+    /// refusal for a reserved proposer name, or an error for an empty name,
+    /// no evidence, or a hash that is not Evidence in this ledger. `create`
+    /// lets the check create the index location (a real write); otherwise
+    /// a folder with no ledger resolves no evidence.
+    fn check_proposer_and_evidence(
+        &self,
+        evidence: &[Hash],
+        proposed_by: &str,
+        create: bool,
+    ) -> Result<Option<ProposeResult>> {
         if proposed_by.trim().is_empty() {
             return Err(Error::InvalidArgument {
                 field: "by",
@@ -62,11 +190,11 @@ impl Engine {
             .any(|r| name.eq_ignore_ascii_case(r))
         {
             // A trust-boundary refusal, typed: nothing is written.
-            return Ok(ProposeResult::Refused {
+            return Ok(Some(ProposeResult::Refused {
                 refusal: ProposeRefusal::ReservedProposer {
                     name: name.to_string(),
                 },
-            });
+            }));
         }
         if evidence.is_empty() {
             return Err(Error::InvalidArgument {
@@ -83,7 +211,7 @@ impl Engine {
         };
         // A dry run never creates the index location: with no ledger yet,
         // no evidence can resolve.
-        let ledger = if write {
+        let ledger = if create {
             self.ledger()?
         } else {
             match self.existing_store()? {
@@ -104,6 +232,19 @@ impl Engine {
                 Err(Error::NotFound(_)) => return Err(not_found(h)),
                 Err(e) => return Err(e),
             }
+        }
+        Ok(None)
+    }
+
+    fn propose_inner(
+        &self,
+        body: ProposalBody,
+        evidence: &[Hash],
+        proposed_by: &str,
+        write: bool,
+    ) -> Result<ProposeResult> {
+        if let Some(refused) = self.check_proposer_and_evidence(evidence, proposed_by, write)? {
+            return Ok(refused);
         }
         self.check_body(&body)?;
         let proposal = Proposal {

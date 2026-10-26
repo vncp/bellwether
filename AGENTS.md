@@ -17,8 +17,9 @@ fail if the two differ.
 2. **Read the evidence.** Quote the lint (`rule`, columns, message) and the
    fanout that explain the read. Every number is an exact sum of footer
    statistics; none is an estimate.
-3. **Propose.** Call `propose.key` (a key spec) or `propose.rewrite` (before,
-   after, invariant: a description, never code), citing the evidence hash in
+3. **Propose.** Call `propose.key` (a key spec, as JSON or in the short form
+   such as `"exact:id"`) or `propose.rewrite` (before, after, invariant: a
+   description, never code), citing the evidence hash in
    `evidence` and your own name in `by`. Pass `dry_run: true` first if you
    want to see the Proposal without writing it. A proposal has no score
    field; anything that looks like one is rejected by the schema.
@@ -95,6 +96,7 @@ line. No refusal is prose only.
 | `layout_not_applicable` | Layout proposals cannot be applied in this release. |
 | `no_replay` | A rewrite verified but cannot be attested yet (rewrites have no replay). |
 | `reserved_proposer` | The name in `by` is reserved for the engine. Pass your own name. |
+| `sidecar_not_proposable` | The key in `spec` declares a sidecar (`temporal2:id@valid,known`, or `exact:a@ts` with per-key time bounds), which a proposal cannot carry yet, so it has no replay, certificate, or receipt. `fields` has `declaration`, `sidecar`, `key` (the key spec it rides beside, or null), `root`, and `command` (the `bellwether index` command that builds it, shell-quoted, with this server's source flags; null when no command line spells them). Propose `fields.key` alone to reach a receipt, or ask the human to run `fields.command`. |
 | `no_workload` | Scoring needs input that was not given: `keys` or a recorded `workload` for `score.why`, `workload` for a key proposal, `rewrite` outputs for a rewrite; `fields.field` names it. |
 | `stale_index` | Files landed, changed, or vanished since the index was built; `fields` lists them. Ask the human to run `bellwether index`. |
 | `not_indexed` | The lookup needs an index the folder does not have (none at all, or no complete key spec of the kind it plans with, in `fields.needs`). Ask the human to index the folder. |

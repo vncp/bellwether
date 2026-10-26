@@ -43,5 +43,18 @@ All notable changes are documented here. The format follows Keep a Changelog; ve
 
 ### Fixed
 
+- `fix` built a new index without the folder's partitioning, so a later
+  `locate --partitioning hive` (or `--path-template`) was refused as "built
+  with partitioning none". `index` and `fix` now share one set of build
+  options (`Engine::build_options`), which records the scheme in
+  `manifest.source`.
+- `propose --key temporal2:id@valid,known` (and `exact:a@ts`) failed with
+  "unknown kind". `propose` now reads `--key` as `index --key` does, and
+  refuses a sidecar with a typed refusal (exit 3, MCP
+  `sidecar_not_proposable`) that names the `index` command that builds it.
+  MCP `propose.key` also takes the short form.
+- `--chunk-size` on a Parquet folder was accepted by `why` and `propose`
+  and refused by `index` and `fix`; every verb now refuses it as a usage
+  error (exit 2) naming `--format csv|jsonl`.
 - CI workflow never ran: GitHub rejects `hashFiles()` in a job-level `if`.
   Replaced with step-level presence checks.
