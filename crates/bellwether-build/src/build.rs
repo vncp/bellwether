@@ -823,6 +823,22 @@ fn plan_specs(
                      so at most one of them can be declared"
                 )));
             }
+            if let KeySpec::Expr { .. } = spec {
+                // The one key column is the virtual column, at the
+                // expression's type; the worker reads the expression's
+                // inputs and derives it per row group.
+                let typed = bellwether_core::expr::typed_spec(spec, schema)?;
+                ColumnType::of(typed.data_type())
+                    .map_err(|e| Error::KeySpec(format!("{name}: {e}")))?;
+                return Ok(SpecPlan {
+                    target: Target::Key(spec.clone()),
+                    name,
+                    key_types: vec![typed.data_type().clone()],
+                    ts_type: None,
+                    time_types: Vec::new(),
+                    columns: typed.input_columns(),
+                });
+            }
             let mut seen = BTreeSet::new();
             let mut key_types = Vec::new();
             for c in spec.columns() {

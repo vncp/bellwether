@@ -294,6 +294,10 @@ impl RunKeys {
 #[derive(Debug)]
 pub struct RunKeysBuilder {
     columns: Vec<String>,
+    /// The key columns as the batches name them: `columns`, except that an
+    /// expression column is named as given while `columns` holds its
+    /// normalized form.
+    names: Vec<String>,
     declared: Vec<DataType>,
     key_types: Vec<ColumnType>,
     tuples: Vec<(Vec<u8>, Vec<usize>)>,
@@ -305,7 +309,9 @@ impl RunKeysBuilder {
     /// A builder for key tuples over `columns`, encoded at the types the
     /// dataset schema declares for them. Every column must exist in the
     /// schema with a type that has a canonical encoding, and no column may
-    /// repeat.
+    /// repeat. One column may instead be an expression over dataset columns
+    /// (`bellwether_core::expr`), alone: its keys are values of the
+    /// expression, typed as it is, and the run records it normalized.
     pub fn new(columns: &[String], schema: &Schema) -> Result<Self> {
         if columns.is_empty() {
             return Err(Error::KeySpec(
@@ -315,20 +321,38 @@ impl RunKeysBuilder {
         check_distinct_columns(columns)?;
         let mut declared = Vec::with_capacity(columns.len());
         let mut key_types = Vec::with_capacity(columns.len());
+        let mut normalized = Vec::with_capacity(columns.len());
         for c in columns {
-            let dt = schema
-                .field_with_name(c)
-                .map_err(|_| Error::KeySpec(format!("key {}", encoding::not_in_schema(schema, c))))?
-                .data_type()
-                .clone();
+            let (name, dt) = match schema.field_with_name(c) {
+                Ok(f) => (c.clone(), f.data_type().clone()),
+                Err(_) if bellwether_core::expr::is_expression(c, schema) => {
+                    if columns.len() > 1 {
+                        return Err(Error::KeySpec(format!(
+                            "a run keyed on an expression names that expression alone, not \
+                             with other columns ({})",
+                            columns.join(", ")
+                        )));
+                    }
+                    let t = bellwether_core::expr::Typed::parse(c, schema)?;
+                    (t.expr().to_string(), t.data_type().clone())
+                }
+                Err(_) => {
+                    return Err(Error::KeySpec(format!(
+                        "key {}",
+                        encoding::not_in_schema(schema, c)
+                    )))
+                }
+            };
             key_types.push(
                 ColumnType::of(&dt)
                     .map_err(|e| Error::KeySpec(format!("key column {c:?}: {e}")))?,
             );
             declared.push(dt);
+            normalized.push(name);
         }
         Ok(Self {
-            columns: columns.to_vec(),
+            columns: normalized,
+            names: columns.to_vec(),
             declared,
             key_types,
             tuples: Vec::new(),
@@ -352,10 +376,13 @@ impl RunKeysBuilder {
             )));
         }
         let mut cols: Vec<ArrayRef> = Vec::with_capacity(self.columns.len());
-        for (c, dt) in self.columns.iter().zip(&self.declared) {
-            let arr = batch.column_by_name(c).ok_or_else(|| {
-                Error::KeySpec(format!("a key batch is missing key column {c:?}"))
-            })?;
+        for ((c, n), dt) in self.columns.iter().zip(&self.names).zip(&self.declared) {
+            let arr = batch
+                .column_by_name(n)
+                .or_else(|| batch.column_by_name(c))
+                .ok_or_else(|| {
+                    Error::KeySpec(format!("a key batch is missing key column {c:?}"))
+                })?;
             encoding::check_convertible(arr.data_type(), dt)?;
             cols.push(ArrayRef::clone(arr));
         }
@@ -470,6 +497,23 @@ fn single_element(elem: &[u8]) -> bool {
         }
     }
     false
+}
+
+/// The dataset type a run key column takes: a dataset column's own, or,
+/// for a column named by an expression (`bellwether_core::expr`), the
+/// expression's value type.
+pub(crate) fn declared_type(schema: &Schema, column: &str) -> Result<DataType> {
+    if let Ok(f) = schema.field_with_name(column) {
+        return Ok(f.data_type().clone());
+    }
+    if bellwether_core::expr::is_expression(column, schema) {
+        return Ok(bellwether_core::expr::Typed::parse(column, schema)?
+            .data_type()
+            .clone());
+    }
+    Err(Error::KeySpec(format!(
+        "key column {column:?} is not in the dataset"
+    )))
 }
 
 pub(crate) fn check_distinct_columns(columns: &[String]) -> Result<()> {

@@ -279,6 +279,11 @@ enum Serve {
 }
 
 fn serve(spec: &KeySpec, columns: &[String]) -> Option<Serve> {
+    // An expr key serves only a lookup on its expression (`plan_expr`),
+    // never one that names its virtual column.
+    if matches!(spec, KeySpec::Expr { .. }) {
+        return None;
+    }
     let p = spec.columns();
     let positions: Option<Vec<usize>> = p
         .iter()
@@ -425,6 +430,17 @@ impl<S: StoreExt + ?Sized> Planner<S> {
         if columns.is_empty() {
             return Err(Error::KeySpec("a lookup needs at least one column".into()));
         }
+        if columns.len() > 1
+            && columns
+                .iter()
+                .any(|c| bellwether_core::expr::is_expression(c, &self.schema))
+        {
+            return Err(Error::KeySpec(format!(
+                "a lookup on an expression names that expression alone, not with other columns \
+                 ({}); look it up by the expression only",
+                columns.join(", ")
+            )));
+        }
         let mut seen = BTreeSet::new();
         columns
             .iter()
@@ -432,13 +448,32 @@ impl<S: StoreExt + ?Sized> Planner<S> {
                 if !seen.insert(c) {
                     return Err(Error::KeySpec(format!("lookup lists column {c:?} twice")));
                 }
-                let f = self
-                    .schema
-                    .field_with_name(c)
-                    .map_err(|_| Error::KeySpec(encoding::not_in_schema(&self.schema, c)))?;
-                Ok((c.clone(), f.data_type().clone()))
+                if let Ok(f) = self.schema.field_with_name(c) {
+                    return Ok((c.clone(), f.data_type().clone()));
+                }
+                if bellwether_core::expr::is_expression(c, &self.schema) {
+                    let t = bellwether_core::expr::Typed::parse(c, &self.schema)?;
+                    return Ok((t.expr().to_string(), t.data_type().clone()));
+                }
+                Err(Error::KeySpec(self.missing_column(c)))
             })
             .collect()
+    }
+
+    /// Why `c` is not a lookup column: not in the schema, or the virtual
+    /// column of an `expr` key, which a lookup names by its expression.
+    fn missing_column(&self, c: &str) -> String {
+        let named = self.declared_specs().iter().find_map(|s| match s {
+            KeySpec::Expr { name, expr, .. } if name == c => Some((s.name(), expr.clone())),
+            _ => None,
+        });
+        match named {
+            Some((spec, expr)) => format!(
+                "{c:?} is the virtual column of the expr key {spec}, which a lookup matches only \
+                 by its expression: name the key column {expr}"
+            ),
+            None => encoding::not_in_schema(&self.schema, c),
+        }
     }
 
     /// Canonical key tuples over `columns` for every row of `batch`, each
@@ -677,6 +712,36 @@ impl<S: StoreExt + ?Sized> Planner<S> {
         extra: &[TransientSpec],
     ) -> Result<ScanPlan> {
         let segs = self.resolve(specs, extra)?;
+        let lookup_columns: &[String] = match lookup {
+            Lookup::Keys { columns, .. }
+            | Lookup::Latest { columns, .. }
+            | Lookup::AsOf { columns, .. }
+            | Lookup::Lookback { columns, .. }
+            | Lookup::Window { columns, .. }
+            | Lookup::Bitemporal { columns, .. } => columns,
+            Lookup::Between { column, .. } => std::slice::from_ref(column),
+        };
+        if let Some(e) = lookup_columns
+            .iter()
+            .find(|c| bellwether_core::expr::is_expression(c, &self.schema))
+        {
+            return match lookup {
+                Lookup::Keys { keys, .. } if lookup_columns.len() == 1 => {
+                    self.plan_expr(&segs, e, keys)
+                }
+                Lookup::Keys { .. } => {
+                    self.column_types(lookup_columns)?;
+                    Err(Error::KeySpec(
+                        "an expression lookup takes one column".into(),
+                    ))
+                }
+                _ => Err(Error::KeySpec(format!(
+                    "{e} is an expression; an expression key answers point lookups (locate) \
+                     only, so a latest, asof, lookback, window, or range lookup needs dataset \
+                     columns"
+                ))),
+            };
+        }
         match lookup {
             Lookup::Keys { columns, keys } => self.plan_keys(&segs, columns, keys),
             Lookup::Latest { columns, keys } => {
@@ -1014,7 +1079,10 @@ impl<S: StoreExt + ?Sized> Planner<S> {
             })
             .collect();
         let mut out = vec![RoaringBitmap::new(); keys.len()];
-        let keyed = matches!(seg.spec, KeySpec::Exact { .. } | KeySpec::Temporal { .. });
+        let keyed = matches!(
+            seg.spec.physical(),
+            KeySpec::Exact { .. } | KeySpec::Temporal { .. }
+        );
         match (keyed, how) {
             (true, Serve::Project(_)) => {
                 let mut owners: BTreeMap<&[u8], Vec<usize>> = BTreeMap::new();
@@ -1123,6 +1191,75 @@ impl<S: StoreExt + ?Sized> Planner<S> {
     }
 
     // -- lookups -------------------------------------------------------------
+
+    /// A point lookup on an expression (`text`, as the lookup spells it):
+    /// the `expr` keys among `segs` whose expression normalizes to the
+    /// lookup's serve it, intersected per key; none serving (with any key
+    /// given) is an error naming the expr keys that do exist, never a guess.
+    /// The residual recomputes the expression per row (`ExprIn`).
+    fn plan_expr(&self, segs: &[SpecSegments], text: &str, keys: &[Vec<u8>]) -> Result<ScanPlan> {
+        let typed = bellwether_core::expr::Typed::parse(text, &self.schema)?;
+        let normalized = typed.expr().to_string();
+        let key_types = vec![(normalized.clone(), typed.data_type().clone())];
+        let (keys, spans) = non_null_probes(keys, &key_types)?;
+        let serving: Vec<(&SpecSegments, Serve)> = segs
+            .iter()
+            .filter(|s| matches!(&s.spec, KeySpec::Expr { expr, .. } if *expr == normalized))
+            .map(|s| (s, Serve::Project(vec![0])))
+            .collect();
+        // The manifest's spec, not only its segments' headers, must carry
+        // every vector this binary pins (a manifest edited to drop them is
+        // refused before any segment is read).
+        for (s, _) in &serving {
+            bellwether_core::expr::check_spec(&s.spec)?;
+        }
+        if !segs.is_empty() && serving.is_empty() {
+            let others: Vec<String> = segs
+                .iter()
+                .filter(|s| matches!(s.spec, KeySpec::Expr { .. }))
+                .map(|s| s.spec.name())
+                .collect();
+            let declare = format!(
+                "bellwether index {} --key {}",
+                bellwether_core::expr::shell_quote(&self.manifest().source.root),
+                bellwether_core::expr::shell_quote(&format!(
+                    "expr:{}={normalized}:exact",
+                    bellwether_core::expr::suggested_name(typed.expr(), &self.schema)
+                ))
+            );
+            return Err(Error::KeySpec(if others.is_empty() {
+                format!(
+                    "no expr key indexes {normalized}, and no other key spec can serve a lookup \
+                     on an expression; declare one with `{declare}`"
+                )
+            } else {
+                format!(
+                    "no expr key indexes {normalized}: the expr keys here are {}; a lookup \
+                     matches an expr key only when its expression normalizes to the key's \
+                     (an expression that differs at all is another value, so it is never \
+                     guessed); look up one of those expressions, or declare this one with \
+                     `{declare}`",
+                    others.join(", ")
+                )
+            }));
+        }
+        let selected = if keys.is_empty() {
+            RoaringBitmap::new()
+        } else if segs.is_empty() {
+            self.locator.live().clone()
+        } else {
+            let mut acc = vec![None; keys.len()];
+            self.intersect(&mut acc, &serving, &keys, &spans)?;
+            acc.into_iter()
+                .flatten()
+                .fold(RoaringBitmap::new(), |u, b| u | b)
+        };
+        let residual = Predicate::ExprIn {
+            expr: normalized,
+            values: expanded(keys.iter()),
+        };
+        self.finish(&selected, residual)
+    }
 
     fn plan_keys(
         &self,

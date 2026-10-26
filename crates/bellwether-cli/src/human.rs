@@ -891,7 +891,14 @@ pub(crate) fn why(r: &bellwether::WhyReport, out: &Out, fix_command: &str) -> St
                     f.row_groups_per_value[0]
                         >= bellwether::LAYOUT_BOUND_FRACTION * f.row_groups_total as f64
                 });
-                let because = if spread {
+                let because = if lowest_fanout.is_none() && c.columns.len() == 1 {
+                    // An expression run: no profiled column holds its
+                    // derived values, so the sentence is about them.
+                    format!(
+                        "because the rows whose {} equals a requested value are spread over nearly every row group",
+                        c.columns[0]
+                    )
+                } else if spread {
                     "because each value is spread over nearly every row group".to_string()
                 } else {
                     let col = lowest_fanout

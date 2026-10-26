@@ -990,15 +990,29 @@ impl Engine {
             None => cache.get_cached(&workload.hash())?,
         };
         let workload_age = cached.map_or(Duration::ZERO, |(_, age)| age);
-        let ignored = unhashable(replayer.schema(), &columns);
-        let rec_spec =
-            ReconcileSpec::new(columns)
+        // A workload keyed on an expression (an expr key's runs) compares
+        // the rows whose expression value is one of its keys, each row
+        // identified by the expression's input columns.
+        let keys_of = match columns.as_slice() {
+            [c] if bellwether_core::expr::is_expression(c, replayer.schema()) => Some(c.clone()),
+            _ => None,
+        };
+        let key_columns = match &keys_of {
+            Some(e) => bellwether_core::expr::Expr::parse(e)?.columns(),
+            None => columns,
+        };
+        let ignored = unhashable(replayer.schema(), &key_columns);
+        let mut rec_spec =
+            ReconcileSpec::new(key_columns)
                 .ignore(ignored)
                 .coverage(CoverageRequest::Workload(WorkloadKeys {
                     workload: workload.hash(),
                     age: workload_age,
                     keys,
                 }));
+        if let Some(e) = keys_of {
+            rec_spec = rec_spec.keys_of(e);
+        }
         let rec_spec = rows_asked(source, replayer.catalog(), &asked, rec_spec)?;
         let ctx = CertificateContext {
             proposal: Some(*proposal),
@@ -1569,10 +1583,17 @@ fn rows_asked(
     let mut filter = Vec::with_capacity(runs.len());
     for run in runs {
         let all: Vec<usize> = (0..run.keys.columns().len()).collect();
-        let mut tests = vec![Predicate::In {
-            columns: run.keys.columns().to_vec(),
-            values: run.keys.all_probes(&all),
-        }];
+        let keyed = match run.keys.columns() {
+            [c] if bellwether_core::expr::is_expression(c, schema) => Predicate::ExprIn {
+                expr: c.clone(),
+                values: run.keys.all_probes(&all),
+            },
+            columns => Predicate::In {
+                columns: columns.to_vec(),
+                values: run.keys.all_probes(&all),
+            },
+        };
+        let mut tests = vec![keyed];
         let between = |c: &str, lo: i64, hi: i64| -> Result<Predicate> {
             let t = ty(c)?;
             let floor = bellwether_core::encoding::ts_min(&t)?;

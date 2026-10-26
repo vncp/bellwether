@@ -23,7 +23,7 @@ Replay reads very little. The current index costs no data reads at all. A hypoth
 | `catalog` | `Catalog` | Every live row group of one manifest version, under the dataset schema. Sizes and statistics come from `Source::row_groups`. Its digest names the data. |
 | `plan` | `PlanSource`, `SegmentPlanner`, `servable` | The plan-building seam, and this crate's implementation of it over core segments. |
 | `build_plan` | `impl PlanSource for bellwether_build::Planner` | The build crate's planner, the one the index answers queries with, behind the same seam. |
-| `transient` | `TransientIndex`, `TransientCache`, `TransientLimits` | A hypothetical spec's segments, built over key reads, and their cache. |
+| `transient` | `TransientIndex`, `TransientCache`, `TransientLimits` | A hypothetical spec's segments, built over key reads, and their cache. An `expr` key's index derives its virtual column per row group from the expression's input columns (bounded like any transient build); `BuildStats::null_rows` and `TransientIndex::distinct_keys` give `why`'s `expr` column. |
 | `baseline` | `Baseline::{RawScan, ParquetStats}` | Costs without a Bellwether index. |
 | `layout` | `LayoutModel`, `replay_layout` | Layout proposals under a stated model, `exact: false`. |
 | `sketch` | `TransientSketch` | What a `sketch` sidecar would hold, computed now: reads only the sketch's item columns, one row group at a time in catalog order, through core's `FileSketcher` (the code a build writes segments with), so its registers equal a committed sketch's over the same files (the facade's `tests/sketch.rs` checks predicted equals built). It reports the files, row groups, and rows it read. **Approximate**, like every sketch, and never handed to a planner. Memory: one row group's item columns, one file's open sketch, and the running totals (`2^p` registers and `k` slots per item). |
@@ -88,6 +88,9 @@ A mismatch is a `ReplayError::BenchMismatch` that names the run. A mismatch foun
 The bench hashes are `u64`-specific. The replay hashes cover canonical encodings of any key type. Both are checked, and they differ by design.
 
 ## Plans
+
+A run keyed on an expression (its one key column named by an expression over dataset columns, recorded normalized) is served only by an `expr` key over that expression, and only as a point lookup; its residual is `ExprIn`. `tests/expr.rs` checks that the replay's prediction equals the build planner's plan per run (files, row groups, bytes) for exact and bloom `expr` keys.
+
 
 `PlanSource` is the surface replay plans through. The build crate's `Planner` implements it (`build_plan`), and so does this crate's `SegmentPlanner`; see "The two planners" below.
 

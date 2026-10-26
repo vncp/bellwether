@@ -718,6 +718,26 @@ pub enum KeySpec {
         /// The time at which a version became known.
         known_column: String,
     },
+    // --- phase 5 kinds ---
+    /// An index over a value derived from columns by a closed expression
+    /// (`json_get`, `lower`, `substr`, `cast`, `date_trunc`, `hash`; no user
+    /// code): the derived value is a virtual column `name`, indexed by an
+    /// ordinary exact (optionally with counts) or bloom segment (`over`).
+    /// Lookups match it only by normalized expression equality, never by
+    /// `name`.
+    Expr {
+        /// The virtual column's name. Never a dataset column.
+        name: String,
+        /// The expression in normalized form (`bellwether_core::expr`).
+        expr: String,
+        /// The segment built over the virtual column: `Exact { columns:
+        /// [name], counts }` or `Bloom { columns: [name], fpr }`.
+        over: Box<KeySpec>,
+        /// Conformance vectors for every function the expression calls, so
+        /// a reader recomputes them and refuses the key if its evaluator
+        /// disagrees.
+        conformance: Vec<ExprVector>,
+    },
 }
 
 #[allow(clippy::trivially_copy_pass_by_ref)] // serde's skip_serializing_if signature
@@ -725,8 +745,21 @@ fn is_false(b: &bool) -> bool {
     !*b
 }
 
+/// One conformance vector of an [`KeySpec::Expr`]: a closed expression (no
+/// column) and the canonical encoding (ADR 016) of its value, lowercase
+/// hex, or `None` when the value is null.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct ExprVector {
+    /// A closed expression over literals, in normalized form.
+    pub expr: String,
+    /// Its value's canonical encoding in lowercase hex; `None` for null.
+    pub value: Option<String>,
+}
+
 impl KeySpec {
-    /// The key columns, in prefix order.
+    /// The key columns, in prefix order. For an [`KeySpec::Expr`], the
+    /// virtual column.
     #[must_use]
     pub fn columns(&self) -> &[String] {
         match self {
@@ -735,16 +768,30 @@ impl KeySpec {
             | Self::Temporal { columns, .. }
             | Self::Bitemporal { columns, .. } => columns,
             Self::Range { column } => std::slice::from_ref(column),
+            Self::Expr { over, .. } => over.columns(),
+        }
+    }
+
+    /// The spec whose layout the segments are stored in: `over` for an
+    /// [`KeySpec::Expr`], the spec itself otherwise.
+    #[must_use]
+    pub fn physical(&self) -> &KeySpec {
+        match self {
+            Self::Expr { over, .. } => over.physical(),
+            other => other,
         }
     }
 
     /// Whether the spec stores per-key per-row-group counts.
     #[must_use]
     pub fn counts(&self) -> bool {
-        matches!(
-            self,
-            Self::Exact { counts: true, .. } | Self::Temporal { counts: true, .. }
-        )
+        match self {
+            Self::Expr { over, .. } => over.counts(),
+            other => matches!(
+                other,
+                Self::Exact { counts: true, .. } | Self::Temporal { counts: true, .. }
+            ),
+        }
     }
 
     /// The display name and the spec's slot: the kind and the key columns
@@ -761,6 +808,13 @@ impl KeySpec {
             Self::Range { .. } => "range",
             Self::Temporal { .. } => "temporal",
             Self::Bitemporal { .. } => "temporal2",
+            Self::Expr {
+                name, expr, over, ..
+            } => {
+                let inner = over.name();
+                let inner = inner.split(':').next().unwrap_or_default();
+                return format!("expr:{name}={expr}:{inner}");
+            }
         };
         format!("{kind}:{}", self.columns().join(","))
     }
@@ -779,6 +833,7 @@ impl KeySpec {
     /// | range | `range:ts` |
     /// | temporal | `temporal:id@ts` (with counts `temporal:id@ts,counts`) |
     /// | bitemporal | `temporal2:id@valid,known` |
+    /// | expr | `expr:sym=json_get(payload,'$.symbol'):exact` (with counts `...:exact,counts`; bloom `...:bloom@0.01`) |
     ///
     /// The false-positive rate is Rust's shortest round-trip spelling of the
     /// `f64`. The identity is one-to-one: no key or time column a spec names
@@ -815,6 +870,15 @@ impl KeySpec {
                 "temporal2:{}@{valid_column},{known_column}",
                 columns.join(",")
             ),
+            // The name is an identifier and the expression is normalized
+            // (a `:` only inside quotes), so the inner kind after the last
+            // unquoted `:` is unambiguous.
+            Self::Expr {
+                name, expr, over, ..
+            } => match over.as_ref() {
+                Self::Bloom { fpr, .. } => format!("expr:{name}={expr}:bloom@{fpr}"),
+                _ => format!("expr:{name}={expr}:exact{counts}"),
+            },
         }
     }
 
@@ -838,7 +902,9 @@ impl KeySpec {
                 known_column,
                 ..
             } => vec![valid_column, known_column],
-            Self::Range { .. } => Vec::new(),
+            // An expr key's name is an identifier and its expression is
+            // checked by `bellwether_core::expr::check_spec`.
+            Self::Range { .. } | Self::Expr { .. } => Vec::new(),
         };
         if let Some(c) = self
             .columns()
@@ -955,6 +1021,16 @@ pub enum Predicate {
     WindowPartition {
         /// Partition columns.
         columns: Vec<String>,
+    },
+    // --- phase 5 kinds ---
+    /// The value of `expr`, recomputed per row from the row's columns
+    /// (`bellwether_core::expr`), is one of the listed canonical-encoded
+    /// values. A row whose value is null matches nothing (ADR 014).
+    ExprIn {
+        /// The expression, in normalized form.
+        expr: String,
+        /// Canonical-encoded values of the expression's type.
+        values: Vec<Vec<u8>>,
     },
 }
 

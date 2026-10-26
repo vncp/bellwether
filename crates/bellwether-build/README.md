@@ -85,6 +85,9 @@ A writer is finished and uploaded (`put_content_addressed`) as soon as the next 
 
 ## Planning
 
+A lookup on an expression (a key column named by an expression over dataset columns) is served only by an `expr` key whose expression normalizes to the lookup's. Any other expression is refused with `Error::KeySpec` naming the `expr` keys that exist and the `index --key` spelling that would declare it; so is a lookup naming an `expr` key's virtual column, an expression beside other columns, and a latest, asof, lookback, window, or range lookup on an expression (an `expr` key answers point lookups only).
+
+
 **Serving rules.** A lookup over columns `C` is served by a spec over `P` when either:
 
 1. every column of `P` is in `C`: the key is projected onto `P`, an exact lookup (exact, temporal, bloom; range is `P = [c]`); or
@@ -130,6 +133,7 @@ Either probe silently misses. **Callers must encode probes with the typed encode
 | Lookup | Residual |
 |---|---|
 | `Keys` | `In` over the lookup columns |
+| `Keys` on an expression (`expr` key) | `ExprIn`: the expression recomputed per row |
 | `Latest` | `And[In, NotOlderThan, LatestPerKey]` |
 | `AsOf` | `And[In, Between(ts ≤ asof), NotOlderThan, LatestPerKey]` |
 | `Lookback` | `And[In, NotOlderThan(newest − lookback per key)]` |
@@ -161,6 +165,9 @@ Details:
 
 ## Memory (ADR 018)
 
+An `expr` key's build reads the expression's input columns and derives its virtual column one row group at a time, never more; JSON documents are scanned without building a tree.
+
+
 - **Build.**
   - Each worker holds one row group's key columns and one open segment per spec it builds.
   - A segment is capped by `max_segment_keys` and `max_segment_bytes`. These are counted as sums over its row groups of distinct key tuples (temporal: distinct `(key, ts)` pairs; bloom: 8 bytes per key; range: one entry), which bound the writer's contents from above. A row group larger than the cap gets a segment of its own.
@@ -184,6 +191,7 @@ Ground truth never goes through the code under test:
 
 | File | Covers |
 |---|---|
+| `tests/expr.rs` | `expr` keys against files decoded with `parquet` and documents read with `serde_json`: invariant 1 for exact and bloom keys (an exact key plans exactly the holding row groups), the `ExprIn` residual keeps exactly the oracle's rows, equal spellings plan the same, and near misses, the virtual column's name, mixed columns, and latest lookups are refused naming the declared keys |
 | `tests/fixtures.rs` | Every source fixture: manifest contents, inference, exact/composite/prefix/bloom/range/raw plans with exact bytes, an all-null row group, NaN, UInt32 ≥ 2³¹, Decimal(38,4), latest/asof, CSV and JSON lines chunks persisted, and each file read at its recorded chunk size after the option changes |
 | `tests/invariants.rs` | Invariant 1 and 5 property test over random layouts, caps, item sizes and thread counts; the pruned-newest-version scenario, with the bound shown to be load-bearing; a retired version never bounding live rows |
 | `tests/ids.rs` | Never-reused ids across rewrite, removal and re-add; mtime drift |

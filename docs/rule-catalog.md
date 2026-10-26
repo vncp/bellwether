@@ -8,8 +8,8 @@ request, and a new rule id is never reused for a different pattern.
 Status (2026-10-24): the five statistics rules (`batch_stamp_key`,
 `low_selectivity_single_column`, `declared_but_unused_key`,
 `scattered_time_column`, `no_discriminating_column`) are implemented in
-`bellwether-profile` (WP5), and so is the workload rule `R-counts-1`
-(storage version 2), with
+`bellwether-profile` (WP5), and so are the workload rule `R-counts-1`
+(storage version 2) and `R-expr-1` (the `expr` key kind), with
 the detectors and thresholds stated in their entries below. Two decisions
 are defined once in `bellwether_source::stats` and called by both the
 profiler and the benchmark's ground truth: `overlap_depth` decides
@@ -380,6 +380,36 @@ prices a projection from them; no detector reads them yet.
 - **Confidence rubric**: medium (the counts are approximate); high when
   both distinct counts are exact. It never reaches a plan; it recommends a
   key that the planner then prices exactly.
+
+### R-expr-1
+
+- **id**: `R-expr-1`
+- **Detector**: lookups supply a function of a dataset column: a recorded
+  workload's run, or a key file's column, is named by an expression over
+  dataset columns (`bellwether_core::expr`, for example
+  `json_get(payload,'$.symbol')` or `date_trunc(ts,day)`), and no declared
+  `expr` key is over that expression after normalization. Implemented in
+  `bellwether-profile` (`lints::EXPR_RULE`). Plain columns never fire it,
+  and neither does an expression a declared `expr` key serves, however it is
+  spelled.
+- **Estimator**: not a fanout rule, since no column holds the derived
+  values. Bytes come from exact replay: `bellwether why --from <keys>`
+  prices the `expr` key on the expression from a transient derived column
+  per row group, and its `expr` column states the rows whose expression is
+  null and the distinct derived values.
+- **Guidance template**: Before: `filter json_get(payload,'$.symbol') in
+  keys` over every row group, recomputing the expression per row. After:
+  `bellwether index --key "expr:<name>=<expression>:exact"`, then `locate`
+  with a key file whose column is named by the same expression; the
+  residual `ExprIn` recomputes it per row. Invariant: `a row group holding a
+  row whose expression equals a key is planned` (invariant 1). The lint
+  names the suggested key spec and, when other `expr` keys are declared,
+  says that a lookup matches one only when its expression normalizes to the
+  key's.
+- **Verification method**: reconcile over touched keys. `fix` certifies the
+  key with workload coverage over the expression's values.
+- **Confidence rubric**: high: the runs state the predicate; nothing is
+  inferred.
 
 ## Twin lints
 

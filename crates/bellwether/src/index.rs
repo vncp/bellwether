@@ -352,6 +352,25 @@ impl Engine {
         }
         let (run_keys, null_tuples) = keys.run_keys(pinned.planner.schema())?;
         let columns = run_keys.columns().to_vec();
+        // An expression key column is answered by an `expr` key, which
+        // serves point lookups only: refuse every other lookup here, before
+        // any temporal or window rule would name a key that cannot exist.
+        if let ([c], false) = (columns.as_slice(), matches!(mode, Mode::Locate)) {
+            if bellwether_core::expr::is_expression(c, pinned.planner.schema()) {
+                return Err(Error::KeySpec(format!(
+                    "the key column {c} is an expression; an expr key answers point lookups \
+                     only, so {} on an expression is not supported; find the \
+                     rows holding these values with `bellwether locate {} --keys <key file>`, \
+                     or key the lookup on dataset columns",
+                    if matches!(mode, Mode::Window { .. }) {
+                        "a window (--from/--to)".to_string()
+                    } else {
+                        verb.to_string()
+                    },
+                    crate::spec::shell_quote(self.root())
+                )));
+            }
+        }
         let tuples: Vec<Vec<u8>> = run_keys.tuples().map(<[u8]>::to_vec).collect();
         let payload = run_keys.to_payload()?;
         let key_set = bellwether_types::Hash::of(&payload);

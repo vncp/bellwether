@@ -9,6 +9,8 @@
 //!   ADR 014).
 //! - [`merge`](mod@merge): merge N segments of one key spec into one.
 //! - [`sidecar`]: `bounds` and `temporal2` sidecar segments.
+//! - [`expr`]: the expression language of `expr` keys: parse, normalize,
+//!   type-check, evaluate one batch at a time, and conformance vectors.
 //! - [`hll`]: the HyperLogLog sketch the profiler and the `sketch` sidecar
 //!   share.
 //! - [`sketch`]: `sketch` sidecar segments (per item, per file HyperLogLog
@@ -28,6 +30,7 @@
 pub mod bloom;
 pub mod encoding;
 pub mod hll;
+pub mod expr;
 pub mod merge;
 pub mod segment;
 pub mod sidecar;
