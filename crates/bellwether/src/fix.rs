@@ -904,8 +904,8 @@ impl Engine {
                 }
                 // A join key's right certificate is checked as the real
                 // apply checks it, so the two agree.
-                if let KeySpec::Join { right, .. } = spec {
-                    let r = self.right_engine(right)?;
+                if matches!(spec, KeySpec::Join { .. }) {
+                    let r = self.right_engine(spec)?;
                     let rpin = r.pin_required("a join key")?;
                     if let Err(refusal) =
                         self.right_certificate(cert_hash, &certificate, r.root(), &rpin)?
@@ -1207,13 +1207,13 @@ impl Engine {
     /// proposal; and the current configuration could not plan with it, so
     /// no replay of it would be the plan.
     fn refuse_stale_join(&self, pinned: Option<&Pinned>, spec: &KeySpec) -> Result<()> {
-        let (Some(p), KeySpec::Join { right, .. }) = (pinned, spec) else {
+        let (Some(p), KeySpec::Join { .. }) = (pinned, spec) else {
             return Ok(());
         };
         if !p.planner.declared_specs().contains(spec) {
             return Ok(());
         }
-        let right = self.right_engine(right)?;
+        let right = self.right_engine(spec)?;
         let rpin = right.pin_required("a join key")?;
         let state = self.join_key_state(p, spec, &right, &rpin)?;
         match state.state {

@@ -318,12 +318,22 @@ impl Engine {
         Err(Error::JoinNotServed { served, message })
     }
 
-    /// The right dataset `right` of a join key on this (the left) dataset:
-    /// the folder of that name beside the data root (a symbolic link there
-    /// must resolve to a folder beside it too), opened through its own
-    /// index at its default location, in this engine's file format and
-    /// clock. Its index must exist.
-    pub(crate) fn right_engine(&self, right: &str) -> Result<Engine> {
+    /// The right dataset of the join key `spec` on this (the left)
+    /// dataset: the folder of that name beside the data root (a symbolic
+    /// link there must resolve to a folder beside it too), opened through
+    /// its own index at its default location, in this engine's file format
+    /// and clock. Its index must exist; an unindexed right is refused
+    /// naming the exact key the join key reads there.
+    pub(crate) fn right_engine(&self, spec: &KeySpec) -> Result<Engine> {
+        let KeySpec::Join {
+            right,
+            right_columns,
+            counts,
+            ..
+        } = spec
+        else {
+            return Err(Error::KeySpec(format!("{} is not a join key", spec.name())));
+        };
         self.require_folder("a join key")?;
         let path = right_root_of(self.root(), right)?;
         if !Path::new(&path).is_dir() {
@@ -363,7 +373,7 @@ impl Engine {
             return Err(Error::NotIndexed {
                 root: e.root().to_string(),
                 operation: "a join key",
-                needs: None,
+                needs: Some(bellwether_core::join::side_spec(right_columns, *counts).identity()),
             });
         }
         Ok(e)
@@ -451,7 +461,7 @@ impl Engine {
         given: &[KeySpec],
         left_committed: bool,
     ) -> Result<Vec<JoinKeyState>> {
-        let mut joins: Vec<KeySpec> = self
+        let declared: Vec<KeySpec> = self
             .pin()?
             .map(|p| {
                 p.planner
@@ -462,6 +472,7 @@ impl Engine {
                     .collect()
             })
             .unwrap_or_default();
+        let mut joins = declared.clone();
         for g in given.iter().filter(|s| matches!(s, KeySpec::Join { .. })) {
             joins.retain(|j| j.name() != g.name());
             joins.push(g.clone());
@@ -475,7 +486,7 @@ impl Engine {
                 continue;
             };
             let refreshed = (|| {
-                let right = self.right_engine(right)?;
+                let right = self.right_engine(&spec)?;
                 let rpin = right.pin_required("a join key")?;
                 right.refuse_stale(&rpin, "a join key")?;
                 let done = builder
@@ -505,18 +516,54 @@ impl Engine {
                     committed |= state.refreshed;
                     out.push(state);
                 }
-                Err(e) if committed => out.push(JoinKeyState {
-                    right_root: right_root_of(self.root(), right)?,
-                    message: format!("{}: not rebuilt: {e}", spec.identity()),
-                    spec,
-                    state: JoinFreshness::NotRebuilt,
-                    next: Some(self.refresh_command()),
-                    refreshed: false,
-                }),
+                Err(e) if committed => {
+                    let right_root = right_root_of(self.root(), right)?;
+                    // A key this call declares is not in the manifest yet:
+                    // the command that rebuilds it must name it again.
+                    let mut refresh = self.refresh_command();
+                    if !declared.contains(&spec) {
+                        refresh = format!("{refresh} --key {}", shell_quote(&spec.identity()));
+                    }
+                    out.push(JoinKeyState {
+                        next: Some(self.next_after(&e, &right_root, &refresh)),
+                        right_root,
+                        message: format!("{}: not rebuilt: {e}", spec.identity()),
+                        spec,
+                        state: JoinFreshness::NotRebuilt,
+                        refreshed: false,
+                    });
+                }
                 Err(e) => return Err(e),
             }
         }
         Ok(out)
+    }
+
+    /// What to run when a join key could not be rebuilt for `e`, its right
+    /// dataset at `right_root`: a cause on the right is fixed there first
+    /// (its exact key declared, or its files indexed), then `refresh` (this
+    /// dataset's `bellwether index`, naming the key when it is not declared
+    /// yet) rebuilds the key; any other cause, `refresh` alone.
+    fn next_after(&self, e: &Error, right_root: &str, refresh: &str) -> String {
+        let right_index = format!("bellwether index {}", shell_quote(right_root));
+        match e {
+            Error::NotIndexed {
+                root,
+                needs: Some(needs),
+                ..
+            } if root != self.root() => format!(
+                "bellwether index {} --key {} && {refresh}",
+                shell_quote(root),
+                shell_quote(needs)
+            ),
+            // This dataset's own exact key: the same `index` declares it
+            // and then rebuilds the join key.
+            Error::NotIndexed {
+                needs: Some(needs), ..
+            } => format!("{refresh} --key {}", shell_quote(needs)),
+            Error::StaleIndex { .. } => format!("{right_index} && {refresh}"),
+            _ => refresh.to_string(),
+        }
     }
 
     /// A missing exact key on one side of a join key, named with the full
@@ -638,10 +685,7 @@ impl Engine {
         let pinned = self.pin_required(verb)?;
         self.refuse_stale(&pinned, verb)?;
         let spec = self.resolve_join(&pinned, join, left_columns)?;
-        let KeySpec::Join { right, .. } = &spec else {
-            return Err(Error::KeySpec(format!("{} is not a join key", spec.name())));
-        };
-        let right = self.right_engine(right)?;
+        let right = self.right_engine(&spec)?;
         let rpin = right.pin_required(verb)?;
         right.refuse_stale(&rpin, verb)?;
         let state = self.join_key_state(&pinned, &spec, &right, &rpin)?;
@@ -794,10 +838,10 @@ impl Engine {
             }
             let mut joins = Vec::with_capacity(specs.len());
             for spec in &specs {
-                let KeySpec::Join { right, .. } = spec else {
+                if !matches!(spec, KeySpec::Join { .. }) {
                     continue;
-                };
-                let right = self.right_engine(right)?;
+                }
+                let right = self.right_engine(spec)?;
                 let rpin = right.pin_required("join verify")?;
                 let mut state = self.join_key_state(&pinned, spec, &right, &rpin)?;
                 // Fresh against the right manifest, and the right's files
@@ -979,7 +1023,7 @@ impl Engine {
             });
         };
         self.check_join_scope(spec)?;
-        let r = self.right_engine(right)?;
+        let r = self.right_engine(spec)?;
         let rpin = r.pin_required("a join key's price")?;
         r.refuse_stale(&rpin, "a join key's price")?;
         let mut priced = vec![spec.clone()];

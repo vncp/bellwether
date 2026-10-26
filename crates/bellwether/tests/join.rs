@@ -191,16 +191,30 @@ fn index_declares_the_join_key_and_refuses_a_missing_exact_key_with_its_command(
     assert!(!j.refreshed);
     assert!(j.message.contains(r.to_str().unwrap()), "{}", j.message);
     assert!(j.message.contains("not rebuilt"), "{}", j.message);
-    assert!(
-        j.next.as_deref().unwrap().starts_with("bellwether index "),
+    // The cause is on the right: index it with the exact key the join key
+    // reads there, then the left, naming the join key this call declares
+    // (review round 2).
+    assert_eq!(
+        j.next.as_deref().unwrap(),
+        format!(
+            "bellwether index {} --key exact:paid_order && bellwether index {} --key {}",
+            r.to_str().unwrap(),
+            l.to_str().unwrap(),
+            join().identity()
+        ),
         "{j:?}"
     );
-    // Nothing else to commit: the refusal itself, typed.
+    // Nothing else to commit: the refusal itself, typed, naming the key.
     let err = left.index(&[exact("order_id"), join()]).unwrap_err();
     match &err {
         Error::NotIndexed {
-            root, needs: None, ..
-        } => assert_eq!(root, r.to_str().unwrap()),
+            root,
+            needs: Some(n),
+            ..
+        } => {
+            assert_eq!(root, r.to_str().unwrap());
+            assert_eq!(n, "exact:paid_order");
+        }
         other => panic!("{other:?}"),
     }
     // Indexed without the right exact key: named, with its root.

@@ -545,14 +545,62 @@ fn join_reader_pass_states_the_cause_and_the_next_step() {
         idx.contains(&format!("{counted}: not rebuilt: {rd} has 1 new file")),
         "{idx}"
     );
+    // The cause is on the right (its files moved on), so the next step
+    // indexes the right first, then the left (review round 2).
     assert!(
-        idx.contains(&format!("run `bellwether index {d}`")),
+        idx.contains(&format!(
+            "run `bellwether index {rd} && bellwether index {d}` to rebuild it"
+        )),
         "{idx}"
     );
     run(&["index", rd], 0);
     let idx = human(&["index", d], 0);
     assert!(idx.contains(&format!("rebuilt; {counted}: fresh")), "{idx}");
     assert!(human(&["join", "verify", d], 0).contains("every join key is fresh"));
+    // The right lacks the exact key a counted join key reads: the next step
+    // declares it there (`needs`), then rebuilds on the left; and a right
+    // never indexed names the same key, never a placeholder.
+    for indexed in [true, false] {
+        let dir = tempfile::tempdir().unwrap();
+        let (l, r) = corpus(dir.path());
+        let (d, rd) = (path(&l), path(&r));
+        if indexed {
+            run(&["index", rd, "--key", "exact:paid_order"], 0);
+        }
+        let idx = human(
+            &[
+                "index",
+                d,
+                "--key",
+                "exact:order_id,counts",
+                "--key",
+                &counted,
+            ],
+            1,
+        );
+        assert!(idx.contains("committed manifest sequence 1"), "{idx}");
+        assert!(
+            idx.contains(&format!("{counted}: not rebuilt: {rd}")),
+            "{idx}"
+        );
+        // The join key was named on this call and is not declared yet, so
+        // the command names it again; followed literally, it is fresh.
+        let next = format!(
+            "bellwether index {rd} --key exact:paid_order,counts && bellwether index {d} --key \
+             {counted}"
+        );
+        assert!(
+            idx.contains(&format!("run `{next}` to rebuild it")),
+            "{indexed}: {idx}"
+        );
+        assert!(!idx.contains("<spec>"), "{idx}");
+        let mut out = String::new();
+        for step in next.split(" && ") {
+            let words: Vec<&str> = step.split(' ').skip(1).collect();
+            out = human(&words, 0);
+        }
+        assert!(out.contains(&format!("rebuilt; {counted}: fresh")), "{out}");
+    }
     // i: a link beside the root to a folder elsewhere is refused by name,
     // as a usage error.
     let outside = dir.path().join("outside").join("extern");
