@@ -536,6 +536,85 @@ fn why_prices_the_join_key_and_fix_applies_it_with_both_certificates() {
     let _ = (left, l, r);
 }
 
+/// A certificate of a join key declared since, applied after the right
+/// dataset advanced: refused `stale_join` with the refresh command (dry
+/// run and real apply alike), never `nothing_to_apply` because the left
+/// side reads complete.
+#[test]
+fn applying_a_certificate_of_a_stale_declared_join_key_is_refused_stale_join() {
+    let dir = tempfile::tempdir().unwrap();
+    let (l, r) = corpus(dir.path());
+    engine(&r).index(&[exact("paid_order")]).unwrap();
+    let left = engine(&l);
+    left.index(&[exact("order_id")]).unwrap();
+    let keys = dir.path().join("keys.parquet");
+    let asked: Vec<Option<i64>> = (0..40).map(|i| Some(i * 11)).collect();
+    write_keys(&keys, &asked);
+    let w = left
+        .why(&WhyRequest {
+            keys: Some(KeyFile::new(&keys)),
+            mode: Some(LookupMode::SemiJoin),
+            join: Some("payables.paid_order".into()),
+            ..WhyRequest::default()
+        })
+        .unwrap();
+    let rec = w.recommended.as_ref().unwrap();
+    assert_eq!(rec.spec, join());
+    let workload = w.workload.as_ref().unwrap().hash;
+    // The join key is declared by `index`, then certified (verify only) at
+    // that sequence: the certificate is of the current left manifest.
+    left.index(&[join()]).unwrap();
+    let verified = left
+        .fix(&FixRequest {
+            proposal: Some(rec.proposal),
+            workload: Some(workload),
+            verify_only: true,
+            ..FixRequest::default()
+        })
+        .unwrap();
+    assert!(
+        matches!(verified.outcome, FixOutcome::Verified),
+        "{:?}",
+        verified.outcome
+    );
+    let cert = verified.certificate.as_ref().unwrap().hash;
+    // The right dataset commits again; the left is unchanged.
+    write(&r.join("p-9.parquet"), "paid_order", &[Some(5)], 30);
+    engine(&r).index(&[]).unwrap();
+    let stale = |err: Error| match err {
+        Error::StaleJoin { side, message, .. } => {
+            assert_eq!(side, "right");
+            assert!(
+                message.contains(&format!("`bellwether index {}`", l.to_str().unwrap())),
+                "{message}"
+            );
+        }
+        other => panic!("{other:?}"),
+    };
+    stale(left.apply_dry_run(&cert).unwrap_err());
+    stale(
+        left.fix(&FixRequest {
+            certificate: Some(cert),
+            ..FixRequest::default()
+        })
+        .unwrap_err(),
+    );
+    // Following the refusal: `index` refreshes the key in a new left
+    // commit, so this certificate is now of an older manifest.
+    left.index(&[]).unwrap();
+    let after = left.apply_dry_run(&cert).unwrap();
+    assert!(
+        matches!(
+            &after.outcome,
+            FixOutcome::Refused {
+                refusal: bellwether::Refusal::StaleManifest { .. }
+            }
+        ),
+        "{:?}",
+        after.outcome
+    );
+}
+
 #[test]
 fn why_semijoin_refuses_what_it_cannot_price() {
     let dir = tempfile::tempdir().unwrap();

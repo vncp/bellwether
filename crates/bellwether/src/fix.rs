@@ -811,6 +811,15 @@ impl Engine {
             }
             Ok(before) => before,
         };
+        // A join key (B3) declared and stale is rebuilt by `index`: refused
+        // with that command before any other check reads the key, so a
+        // stale key is never reported as complete (`nothing_to_apply`), and
+        // the dry run and the real apply agree.
+        if let ProposalBody::Key { spec, .. } = &proposal.body {
+            if !self.is_table() {
+                self.refuse_stale_join(self.pin()?.as_ref(), spec)?;
+            }
+        }
         match &proposal.body {
             ProposalBody::Layout { .. } => {
                 result.outcome = refused(Refusal::LayoutNotApplicable);
@@ -897,7 +906,6 @@ impl Engine {
                     return Err(not_workload_covered(cert_hash));
                 };
                 let pinned = self.pin()?;
-                self.refuse_stale_join(pinned.as_ref(), spec)?;
                 let source = self.source(pinned.as_ref())?;
                 let pair = self.pair_of(pinned.as_ref(), spec)?;
                 let right_cert = match &pair {
