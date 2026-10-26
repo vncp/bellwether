@@ -80,6 +80,9 @@ jobs:
           # this reuses its build instead of recompiling four crates.
           cargo test --workspace --all-features --test clickhouse -- --nocapture 2>&1 | tee clickhouse.log
           ! grep -q 'SKIPPED:' clickhouse.log
+      - name: disk left after the build
+        if: always()
+        run: df -h / && du -sh target
 
   format-compat:
     name: persisted format v0.1 fixture
