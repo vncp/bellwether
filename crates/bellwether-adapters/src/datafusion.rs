@@ -28,7 +28,7 @@ use bellwether_types::ScanPlan;
 use serde::Serialize;
 use serde_json::Value as Json;
 
-use crate::layout::{layout, Layout};
+use crate::layout::layout;
 use crate::residual::{compile, Residual};
 use crate::{AdapterError, ColumnDef, EmitOptions, Result};
 
@@ -130,8 +130,6 @@ pub struct ScanConfig {
     pub(crate) compiled: Residual,
     #[serde(skip)]
     pub(crate) schema: Vec<ColumnDef>,
-    #[serde(skip)]
-    pub(crate) layout: Layout,
 }
 
 impl ScanConfig {
@@ -145,6 +143,12 @@ impl ScanConfig {
     #[must_use]
     pub fn residual(&self) -> &Residual {
         &self.compiled
+    }
+
+    /// The dataset schema the scan was built against.
+    #[must_use]
+    pub fn schema(&self) -> &[ColumnDef] {
+        &self.schema
     }
 }
 
@@ -256,6 +260,5 @@ pub fn scan_config(plan: &ScanPlan, schema: &[ColumnDef], opts: &EmitOptions) ->
         ordered: opts.ordered,
         compiled,
         schema: schema.to_vec(),
-        layout: lay,
     })
 }

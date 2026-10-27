@@ -136,8 +136,28 @@ fn cond_sql(c: &Cond) -> Result<Option<String>> {
             rows,
             raw,
         } => {
+            let what = format!("the In key list on {}", columns.join(", "));
             if !complete_zero_classes(raw.iter()) {
-                return Err(zero_refusal(E, "the residual's key list"));
+                return Err(zero_refusal(E, &what));
+            }
+            if let Some(c) = columns
+                .iter()
+                .zip(types)
+                .enumerate()
+                .find(|(i, (_, t))| is_float(t) && rows.iter().any(|r| matches!(r[*i], Scalar::Float(f) if f.is_nan())))
+                .map(|(_, (c, _))| c)
+            {
+                return Err(AdapterError::Unsupported {
+                    engine: E,
+                    what: format!("{what}, which lists NaN for float column {c:?}"),
+                    reason: "prunes a Parquet row group by its min/max statistics, which by the \
+                             Parquet spec leave NaN out, so DuckDB (checked on 2.0) drops rows \
+                             holding a queried NaN"
+                        .into(),
+                    next: "emit for DataFusion, which compares floats as the plan's canonical \
+                           bytes do, or look the NaN key up through bellwether"
+                        .into(),
+                });
             }
             if rows.is_empty() {
                 return Ok(Some("FALSE".into()));
@@ -161,11 +181,11 @@ fn cond_sql(c: &Cond) -> Result<Option<String>> {
             if zero_or_nan(lo) || zero_or_nan(hi) {
                 return Err(AdapterError::Unsupported {
                     engine: E,
-                    what: format!("a range on float column {column:?} bounded by a zero or NaN"),
+                    what: format!("the Between range on float column {column:?}, bounded by a zero or NaN"),
                     reason: "orders -0.0 before +0.0 and NaN last in the plan, which SQL \
                              comparison does not"
                         .into(),
-                    next: "emit for DataFusion".into(),
+                    next: "emit for DataFusion, which orders floats as the plan's canonical bytes do".into(),
                 });
             }
             format!(
@@ -207,7 +227,7 @@ fn cond_sql(c: &Cond) -> Result<Option<String>> {
             raw,
         } => {
             if !complete_zero_classes(raw.iter()) {
-                return Err(zero_refusal(E, "the residual's list membership"));
+                return Err(zero_refusal(E, &format!("the ContainsAny values on list column {column:?}")));
             }
             if values.is_empty() {
                 return Ok(Some("FALSE".into()));
@@ -231,7 +251,7 @@ fn cond_sql(c: &Cond) -> Result<Option<String>> {
         } => {
             for g in raw {
                 if !complete_zero_classes(g.iter()) {
-                    return Err(zero_refusal(E, "the residual's list membership"));
+                    return Err(zero_refusal(E, &format!("the ContainsAll values on list column {column:?}")));
                 }
             }
             let list = list_expr(column, *map)?;
@@ -251,7 +271,7 @@ fn cond_sql(c: &Cond) -> Result<Option<String>> {
             tombstone,
         } => {
             if matches!(tombstone, Scalar::Float(f) if *f == 0.0) {
-                return Err(zero_refusal(E, "the tombstone value"));
+                return Err(zero_refusal(E, &format!("the Live tombstone on column {column:?}")));
             }
             let q = ident(column, E)?;
             format!(
@@ -474,7 +494,11 @@ pub fn sql(plan: &ScanPlan, schema: &[ColumnDef], opts: &EmitOptions) -> Result<
                 ts_type,
                 bounds,
             } => {
-                let bounds = keys::sql_bounds(bounds, E)?;
+                let bounds = keys::sql_bounds(
+                    bounds,
+                    E,
+                    &format!("the NotOlderThan bounds on {}", columns.join(", ")),
+                )?;
                 if bounds.is_empty() {
                     format!("SELECT * FROM {prev}")
                 } else {

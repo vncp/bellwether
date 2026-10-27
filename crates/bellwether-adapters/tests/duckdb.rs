@@ -25,14 +25,7 @@ fn opts(c: &common::Corpus) -> EmitOptions {
 
 #[test]
 fn every_lookup_shape_returns_the_reference_rows() {
-    let bin = match common::duckdb() {
-        Ok(b) => b,
-        Err(why) => {
-            assert!(std::env::var_os("BELLWETHER_REQUIRE_DUCKDB").is_none(), "{why}");
-            eprintln!("SKIPPED: {why}");
-            return;
-        }
-    };
+    let Some(bin) = common::require_duckdb() else { return };
     let tmp = tempfile::tempdir().unwrap();
     let c = common::corpus(tmp.path());
     let schema = common::dataset();
@@ -41,17 +34,19 @@ fn every_lookup_shape_returns_the_reference_rows() {
     for case in common::cases(&c) {
         let sql = duckdb::sql(&case.plan, &schema, &opts(&c));
         if !case.sql_exact {
-            assert!(
-                matches!(sql, Err(AdapterError::Unsupported { engine: "duckdb", .. })),
-                "{}: {sql:?}",
-                case.name
-            );
+            match sql {
+                Err(e @ AdapterError::Unsupported { engine: "duckdb", .. }) => {
+                    let msg = e.to_string();
+                    assert!(msg.contains("emit for DataFusion"), "{}: {msg}", case.name);
+                }
+                other => panic!("{}: not refused: {other:?}", case.name),
+            }
             continue;
         }
         let sql = sql.unwrap_or_else(|e| panic!("{}: {e}", case.name));
         let got = common::rendered(&common::duckdb_rows(&bin, &sql, tmp.path(), ""), &columns);
         let want = common::expected(&c, &case.plan, &columns);
-        assert_eq!(got, want, "{}:\n{sql}", case.name);
+        common::assert_rows(&got, &want, &format!("{}:\n{sql}", case.name));
         ran += 1;
     }
     assert!(ran >= 20, "{ran}");
@@ -59,10 +54,7 @@ fn every_lookup_shape_returns_the_reference_rows() {
 
 #[test]
 fn ordered_output_follows_the_read_order() {
-    let Ok(bin) = common::duckdb() else {
-        eprintln!("SKIPPED: no duckdb CLI");
-        return;
-    };
+    let Some(bin) = common::require_duckdb() else { return };
     let tmp = tempfile::tempdir().unwrap();
     let c = common::corpus(tmp.path());
     let mut plan = common::locate(&c, &["id"], &common::ids(&[1, 2, 3, 4, 5]));
@@ -118,17 +110,12 @@ fn ordered_output_follows_the_read_order() {
 
 #[test]
 fn bytes_read_are_measured_at_a_range_server() {
-    let bin = match common::duckdb() {
-        Ok(b) => b,
-        Err(why) => {
-            eprintln!("SKIPPED: {why}");
-            return;
-        }
-    };
+    let Some(bin) = common::require_duckdb() else { return };
     let tmp = tempfile::tempdir().unwrap();
     let c = common::corpus(tmp.path());
     if let Err(e) = common::duckdb_run(&bin, "INSTALL httpfs; LOAD httpfs;") {
-        eprintln!("SKIPPED: DuckDB's httpfs extension is not installable here ({e})");
+        let why = format!("DuckDB's httpfs extension is not installable here ({e})");
+        common::skip_or_fail::<()>("BELLWETHER_REQUIRE_DUCKDB", &why);
         return;
     }
     let server = RangeServer::start(&c.root);
@@ -154,7 +141,7 @@ fn bytes_read_are_measured_at_a_range_server() {
             &common::duckdb_rows(&bin, &sql, tmp.path(), "LOAD httpfs;\n"),
             &columns,
         );
-        assert_eq!(got, common::expected(&c, &case.plan, &columns), "{}", case.name);
+        common::assert_rows(&got, &common::expected(&c, &case.plan, &columns), case.name);
         let realized = classify(&server.fetches(), &spans);
         let planned: BTreeSet<(String, u32)> = case
             .plan
@@ -211,4 +198,24 @@ fn bytes_read_are_measured_at_a_range_server() {
         ));
     }
     eprintln!("DuckDB at the range server (data = column-chunk bytes served):\n{}", table.join("\n"));
+}
+
+#[test]
+fn a_nan_key_is_refused_by_name_not_run_loosely() {
+    // DuckDB prunes row groups by min/max statistics that leave NaN out
+    // (checked on 2.0): the NaN row of `nan_case` would be lost. The
+    // adapter refuses before any SQL exists, inline or as a relation.
+    let tmp = tempfile::tempdir().unwrap();
+    let nan = common::nan_case(tmp.path());
+    let o = EmitOptions {
+        row_offsets: Some(nan.offsets.clone()),
+        ..EmitOptions::default()
+    };
+    for plan in [&nan.plan, &nan.composite] {
+        let err = duckdb::sql(plan, &nan.schema, &o).unwrap_err();
+        let msg = err.to_string();
+        assert!(matches!(err, AdapterError::Unsupported { engine: "duckdb", .. }), "{msg}");
+        assert!(msg.contains("In key list") && msg.contains("NaN") && msg.contains("\"f\""), "{msg}");
+        assert!(msg.contains("emit for DataFusion"), "{msg}");
+    }
 }

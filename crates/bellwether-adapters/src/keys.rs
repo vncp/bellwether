@@ -93,13 +93,17 @@ pub(crate) fn zero_refusal(engine: &'static str, what: &str) -> AdapterError {
     }
 }
 
-/// The bounds of a `NotOlderThan`, one per SQL equality class (a float
-/// zero key's two encodings are one class and must share one bound), keys
-/// holding a null dropped (they match no row).
-pub(crate) fn sql_bounds<'a>(bounds: &'a [Bound], engine: &'static str) -> Result<Vec<&'a Bound>> {
+/// The bounds of a `NotOlderThan` (`what` names it in refusals), one per
+/// SQL equality class (a float zero key's two encodings are one class and
+/// must share one bound), keys holding a null dropped (they match no row).
+pub(crate) fn sql_bounds<'a>(
+    bounds: &'a [Bound],
+    engine: &'static str,
+    what: &str,
+) -> Result<Vec<&'a Bound>> {
     let listed: Vec<&Vec<u8>> = bounds.iter().map(|b| &b.raw_key).collect();
     if !complete_zero_classes(listed.iter().copied()) {
-        return Err(zero_refusal(engine, "the residual's per-key bounds"));
+        return Err(zero_refusal(engine, what));
     }
     let mut by_class: std::collections::BTreeMap<Vec<u8>, &Bound> =
         std::collections::BTreeMap::new();
@@ -112,11 +116,12 @@ pub(crate) fn sql_bounds<'a>(bounds: &'a [Bound], engine: &'static str) -> Resul
             if prev.ts != b.ts {
                 return Err(AdapterError::Unsupported {
                     engine,
-                    what: "the residual's per-key bounds".into(),
-                    reason: "give -0.0 and +0.0 of one key different bounds, and the engine \
+                    what: what.to_string(),
+                    reason: "gives -0.0 and +0.0 of one key different bounds, and the engine \
                              compares them equal"
                         .into(),
-                    next: "emit for DataFusion".into(),
+                    next: "emit for DataFusion, which keeps the two zeros apart as the plan does"
+                        .into(),
                 });
             }
         } else {

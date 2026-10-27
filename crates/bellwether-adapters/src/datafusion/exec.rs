@@ -184,7 +184,7 @@ pub(crate) fn scalar_value(s: &Scalar, dt: &DataType) -> Result<ScalarValue> {
         (Scalar::UInt(v), DataType::UInt32) => ScalarValue::UInt32(Some(*v as u32)),
         (Scalar::UInt(v), DataType::UInt64) => ScalarValue::UInt64(Some(*v)),
         (Scalar::Float(f), DataType::Float16) => {
-            ScalarValue::Float16(Some(arrow::datatypes::f16::from_f64(*f)))
+            ScalarValue::Float16(Some(udf::F16::from_f64(*f)))
         }
         (Scalar::Float(f), DataType::Float32) => ScalarValue::Float32(Some(*f as f32)),
         (Scalar::Float(f), DataType::Float64) => ScalarValue::Float64(Some(*f)),
@@ -344,13 +344,22 @@ fn is_float(dt: &DataType) -> bool {
 }
 
 /// A key expression compared as canonical bytes compare: a float column
-/// with every NaN made the canonical NaN (Arrow compares floats in total
-/// order, so `-0.0` and `+0.0` stay apart, as their encodings do).
+/// as its canonical order key (`udf::canonical_order`), since DataFusion's
+/// `=` and hash join compare `-0.0` equal to `+0.0`, and the plan does
+/// not; any other column as it is.
 fn key_expr(e: Expr, dt: &DataType) -> Expr {
     if is_float(dt) {
-        udf::canonical_nan(value_type(dt)).call(vec![e])
+        udf::canonical_order(value_type(dt)).call(vec![e])
     } else {
         e
+    }
+}
+
+/// A literal compared against [`key_expr`] of a `dt` column.
+fn key_lit(s: &Scalar, dt: &DataType) -> Result<Expr> {
+    match s {
+        Scalar::Float(f) if is_float(dt) => Ok(lit(ScalarValue::UInt64(Some(udf::float_order(*f))))),
+        _ => scalar_value(s, dt).map(lit),
     }
 }
 
@@ -396,7 +405,7 @@ pub async fn logical_plan(config: &ScanConfig, ctx: &SessionContext) -> Result<L
                     } else if !use_join {
                         let lits = rows
                             .iter()
-                            .map(|r| scalar_value(&r[0], &types[0]).map(lit))
+                            .map(|r| key_lit(&r[0], &types[0]))
                             .collect::<Result<Vec<_>>>()?;
                         b.filter(key_expr(scan_col(&keys[0]), &types[0]).in_list(lits, false))
                             .map_err(exec_err)?
@@ -465,8 +474,8 @@ pub async fn logical_plan(config: &ScanConfig, ctx: &SessionContext) -> Result<L
                     hi,
                 } => b
                     .filter(key_expr(scan_col(column), data_type).between(
-                        lit(scalar_value(lo, data_type)?),
-                        lit(scalar_value(hi, data_type)?),
+                        key_lit(lo, data_type)?,
+                        key_lit(hi, data_type)?,
                     ))
                     .map_err(exec_err)?,
                 Cond::Text {
@@ -530,7 +539,7 @@ pub async fn logical_plan(config: &ScanConfig, ctx: &SessionContext) -> Result<L
                     b.filter(
                         c.clone()
                             .is_not_null()
-                            .and(c.not_eq(lit(scalar_value(tombstone, data_type)?))),
+                            .and(c.not_eq(key_lit(tombstone, data_type)?)),
                     )
                     .map_err(exec_err)?
                 }
@@ -596,7 +605,8 @@ pub async fn logical_plan(config: &ScanConfig, ctx: &SessionContext) -> Result<L
                         .filter(
                             rcol(BOUND)
                                 .is_null()
-                                .or(scan_col(ts_column).gt_eq(rcol(BOUND))),
+                                .or(key_expr(scan_col(ts_column), ts_type)
+                                    .gt_eq(key_expr(rcol(BOUND), ts_type))),
                         )
                         .map_err(exec_err)?;
                     keep(joined)?
@@ -616,7 +626,11 @@ pub async fn logical_plan(config: &ScanConfig, ctx: &SessionContext) -> Result<L
                     .collect::<Result<Vec<_>>>()?;
                 let rank = datafusion::functions_window::expr_fn::rank()
                     .partition_by(partition)
-                    .order_by(vec![SortExpr::new(scan_col(ts_column), false, true)])
+                    .order_by(vec![SortExpr::new(
+                        key_expr(scan_col(ts_column), column_type(dataset, ts_column, "LatestPerKey")?),
+                        false,
+                        true,
+                    )])
                     .build()
                     .map_err(exec_err)?
                     .alias(RANK);
@@ -656,6 +670,3 @@ pub async fn execute(config: &ScanConfig, ctx: &SessionContext) -> Result<Sendab
         .await
         .map_err(exec_err)
 }
-
-#[allow(dead_code)]
-fn _schema_is_used(_: &Schema) {}

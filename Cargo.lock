@@ -630,6 +630,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "bellwether-adapters"
+version = "0.1.0"
+dependencies = [
+ "arrow",
+ "async-trait",
+ "bellwether-core",
+ "bellwether-types",
+ "bytes",
+ "datafusion",
+ "futures",
+ "parquet",
+ "proptest",
+ "roaring",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokio",
+]
+
+[[package]]
 name = "bellwether-bench"
 version = "0.1.0"
 dependencies = [
@@ -679,6 +700,7 @@ dependencies = [
  "arrow",
  "assert_cmd",
  "bellwether",
+ "bellwether-adapters",
  "bellwether-bench",
  "bellwether-mcp",
  "clap",
@@ -687,6 +709,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+ "tokio",
 ]
 
 [[package]]

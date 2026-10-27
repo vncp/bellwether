@@ -3,21 +3,28 @@
 //! text matches (full case folding, UAX #29 words), expression values
 //! (the expression language, bit for bit), and list membership over
 //! canonical element encodings. Each returns `false` for a null, so a
-//! filter drops the row (ADR 014). One more maps every float NaN to the
-//! canonical NaN, so an equality under Arrow's total order compares floats
-//! as canonical bytes do.
+//! filter drops the row (ADR 014). One more maps a float to its canonical
+//! order key (the 8 bytes of its canonical encoding as a `UInt64`), so
+//! equality, grouping, joins, and ranges compare floats exactly as
+//! canonical bytes do: `-0.0` apart from `+0.0` (DataFusion's hash join
+//! and `=` compare them equal), every NaN one value, ordered last.
 
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use arrow::array::{Array, ArrayRef, AsArray, BooleanArray, BooleanBuilder, RecordBatch};
-use arrow::datatypes::{DataType, Field, Float16Type, Float32Type, Float64Type, Schema};
+use arrow::array::{Array, AsArray, BooleanArray, BooleanBuilder, RecordBatch, UInt64Array};
+use arrow::datatypes::{
+    ArrowPrimitiveType, DataType, Field, Float16Type, Float32Type, Float64Type, Schema,
+};
 use bellwether_core::encoding::KeyColumns;
 use bellwether_core::expr::Typed;
 use bellwether_core::list::ListElements;
 use bellwether_types::TextOp;
 use datafusion::error::DataFusionError;
 use datafusion::logical_expr::{create_udf, ColumnarValue, ScalarUDF, Volatility};
+
+/// Arrow's half-precision float.
+pub(crate) type F16 = <Float16Type as ArrowPrimitiveType>::Native;
 
 fn df(e: impl std::fmt::Display) -> DataFusionError {
     DataFusionError::Execution(e.to_string())
@@ -27,32 +34,53 @@ fn bools(v: Vec<bool>) -> ColumnarValue {
     ColumnarValue::Array(Arc::new(BooleanArray::from(v)))
 }
 
-/// Maps every NaN of a float column of type `dt` to the canonical NaN.
-pub(crate) fn canonical_nan(dt: &DataType) -> ScalarUDF {
+/// The canonical order key of `f` (widened to `f64`): the big-endian
+/// integer of the 8 bytes after the tag of its canonical encoding.
+#[must_use]
+pub(crate) fn float_order(f: f64) -> u64 {
+    let bits = if f.is_nan() {
+        0x7FF8_0000_0000_0000
+    } else {
+        f.to_bits()
+    };
+    if bits >> 63 == 1 {
+        !bits
+    } else {
+        bits | (1 << 63)
+    }
+}
+
+/// Maps a float column of type `dt` to its canonical order key
+/// ([`float_order`]); a null stays null.
+pub(crate) fn canonical_order(dt: &DataType) -> ScalarUDF {
     let t = dt.clone();
     create_udf(
-        &format!("bellwether_canonical_nan_{}", dt.to_string().to_lowercase()),
+        &format!("bellwether_float_order_{}", dt.to_string().to_lowercase()),
         vec![dt.clone()],
-        dt.clone(),
+        DataType::UInt64,
         Volatility::Immutable,
         Arc::new(move |args: &[ColumnarValue]| {
             let arrays = ColumnarValue::values_to_arrays(args)?;
             let a = &arrays[0];
-            let out: ArrayRef = match t {
-                DataType::Float64 => Arc::new(
-                    a.as_primitive::<Float64Type>()
-                        .unary::<_, Float64Type>(|v| if v.is_nan() { f64::NAN } else { v }),
-                ),
-                DataType::Float32 => Arc::new(
-                    a.as_primitive::<Float32Type>()
-                        .unary::<_, Float32Type>(|v| if v.is_nan() { f32::NAN } else { v }),
-                ),
-                DataType::Float16 => Arc::new(a.as_primitive::<Float16Type>().unary::<_, Float16Type>(
-                    |v| if v.is_nan() { arrow::datatypes::f16::NAN } else { v },
-                )),
-                _ => return Err(df(format!("canonical NaN of a {t} column"))),
+            let out: UInt64Array = match t {
+                DataType::Float64 => a
+                    .as_primitive::<Float64Type>()
+                    .iter()
+                    .map(|v| v.map(float_order))
+                    .collect(),
+                DataType::Float32 => a
+                    .as_primitive::<Float32Type>()
+                    .iter()
+                    .map(|v| v.map(|v| float_order(f64::from(v))))
+                    .collect(),
+                DataType::Float16 => a
+                    .as_primitive::<Float16Type>()
+                    .iter()
+                    .map(|v| v.map(|v| float_order(v.to_f64())))
+                    .collect(),
+                _ => return Err(df(format!("the float order key of a {t} column"))),
             };
-            Ok(ColumnarValue::Array(out))
+            Ok(ColumnarValue::Array(Arc::new(out)))
         }),
     )
 }
@@ -155,12 +183,3 @@ pub(crate) fn contains(
         }),
     )
 }
-
-/// Whether a list-typed array (for the `contains` input) is supported.
-#[must_use]
-pub(crate) fn is_list(dt: &DataType) -> bool {
-    matches!(dt, DataType::List(_) | DataType::LargeList(_) | DataType::Map(_, _))
-}
-
-#[allow(dead_code)]
-fn _assert_array(_: &dyn Array) {}

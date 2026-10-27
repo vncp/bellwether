@@ -1,9 +1,10 @@
 //! Spark: a JSON manifest that `shims/spark/bellwether_plan.py` reads with
 //! `read(spark, manifest_path) -> DataFrame`.
 //!
-//! File level only: Spark's Parquet reader prunes row groups by its own
-//! statistics and the shim does not pin them, so the bytes Spark reads are
-//! at most the planned files' bytes. When the plan reads a strict subset of
+//! File level only: Spark opens the planned files and no other, but its
+//! Parquet reader prunes or reads their row groups by its own statistics,
+//! and the shim pins none, so Spark's bytes are not the plan's and are not
+//! claimed to be. When the plan reads a strict subset of
 //! a file's row groups, the shim keeps only those row groups' rows by
 //! `_metadata.row_index` ranges from the row counts, so the rows are
 //! exactly the plan's. The residual is the typed form of
@@ -136,16 +137,16 @@ fn check(residual: &Residual) -> Result<()> {
                         .into(),
                 })
             }
-            Stage::Filter(Cond::In { raw, .. }) if !complete_zero_classes(raw.iter()) => {
-                return Err(zero_refusal(E, "the residual's key list"));
+            Stage::Filter(Cond::In { columns, raw, .. }) if !complete_zero_classes(raw.iter()) => {
+                return Err(zero_refusal(E, &format!("the In key list on {}", columns.join(", "))));
             }
-            Stage::Filter(Cond::ContainsAny { raw, .. }) if !complete_zero_classes(raw.iter()) => {
-                return Err(zero_refusal(E, "the residual's list membership"));
+            Stage::Filter(Cond::ContainsAny { column, raw, .. }) if !complete_zero_classes(raw.iter()) => {
+                return Err(zero_refusal(E, &format!("the ContainsAny values on list column {column:?}")));
             }
-            Stage::Filter(Cond::ContainsAll { raw, .. })
+            Stage::Filter(Cond::ContainsAll { column, raw, .. })
                 if raw.iter().any(|g| !complete_zero_classes(g.iter())) =>
             {
-                return Err(zero_refusal(E, "the residual's list membership"));
+                return Err(zero_refusal(E, &format!("the ContainsAll values on list column {column:?}")));
             }
             Stage::Filter(Cond::Between {
                 column, lo, hi, data_type, ..
@@ -156,17 +157,17 @@ fn check(residual: &Residual) -> Result<()> {
             {
                 return Err(AdapterError::Unsupported {
                     engine: E,
-                    what: format!("a range on float column {column:?} bounded by a zero or NaN"),
+                    what: format!("the Between range on float column {column:?}, bounded by a zero or NaN"),
                     reason: "orders -0.0 before +0.0 and NaN last in the plan, which Spark's \
                              comparison does not"
                         .into(),
-                    next: "emit for DataFusion".into(),
+                    next: "emit for DataFusion, which orders floats as the plan's canonical bytes do".into(),
                 });
             }
-            Stage::Filter(Cond::Live { tombstone, .. })
+            Stage::Filter(Cond::Live { column, tombstone, .. })
                 if matches!(tombstone, Scalar::Float(f) if *f == 0.0) =>
             {
-                return Err(zero_refusal(E, "the tombstone value"));
+                return Err(zero_refusal(E, &format!("the Live tombstone on column {column:?}")));
             }
             _ => {}
         }
@@ -180,13 +181,14 @@ fn residual_json(residual: &Residual) -> Result<Json> {
     let mut out = residual.to_json();
     for (i, s) in residual.stages.iter().enumerate() {
         if let Stage::NotOlderThan {
+            columns,
             types,
             ts_type,
             bounds,
             ..
         } = s
         {
-            let kept = keys::sql_bounds(bounds, E)?;
+            let kept = keys::sql_bounds(bounds, E, &format!("the NotOlderThan bounds on {}", columns.join(", ")))?;
             out["stages"][i]["bounds"] = Json::Array(
                 kept.iter()
                     .map(|b| {
@@ -294,8 +296,8 @@ pub fn manifest(plan: &ScanPlan, schema: &[ColumnDef], opts: &EmitOptions) -> Re
             "row_groups": plan.row_groups_selected,
             "files": lay.files.len(),
         },
-        "realized": "file-level, at most the files' bytes: Spark prunes row groups by its own \
-                     statistics and the shim does not pin them",
+        "realized": "file level: Spark opens only the planned files; it prunes or reads their \
+                     row groups by its own statistics, and the shim pins none",
         "files": files,
         "partition_columns": lay.partition_columns,
         "read_schema": read_schema.join(", "),

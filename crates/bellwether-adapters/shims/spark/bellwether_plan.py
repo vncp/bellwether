@@ -14,21 +14,24 @@ What it does, exactly:
   of those row groups (`_metadata.row_index` ranges from the index's row
   counts), so the rows are exactly the plan's;
 - adds partition columns from the index's own reading of each path;
-- applies the residual stage by stage, in order: key membership, ranges,
-  list membership, the per-key lower bound (`not_older_than`, a left join
-  on the key), the newest rows per key (`latest_per_key`: every row at the
+- applies the residual stage by stage, in the plan's order: key
+  membership (a queried NaN by `isnan`, which Spark never pushes into the
+  Parquet reader, whose statistics leave NaN out), ranges, list
+  membership, the per-key lower bound (`not_older_than`, a left join on
+  the key), the newest rows per key (`latest_per_key`: every row at the
   key's greatest timestamp, ties kept, a null key or timestamp never
   winning), and the live-row test;
 - with `ordered`, returns rows in the plan's read order.
 
-File level only: Spark prunes row groups by its own statistics, and this
-shim does not pin them; the bytes Spark reads are at most the planned
-files' bytes. Every literal is built from typed JSON with Spark's typed
-constructors; no SQL text is assembled from the manifest.
+File level only: Spark opens the planned files and no other, but prunes
+or reads their row groups by its own statistics; this shim pins none.
+Every literal is built from typed JSON with Spark's typed constructors;
+no SQL text is assembled from the manifest.
 """
 
 import datetime
 import json
+import math
 import struct
 from decimal import Decimal
 from functools import reduce
@@ -48,7 +51,9 @@ class PlanError(ValueError):
 
 
 def _scale(unscaled, scale):
-    return Decimal(int(unscaled)).scaleb(-int(scale))
+    # Decimal's constructor is exact; arithmetic (scaleb) would round to
+    # the context's 28 digits.
+    return Decimal(f"{int(unscaled)}E{-int(scale)}")
 
 
 def _float(bits):
@@ -102,7 +107,7 @@ def literal(value, spark_type):
         d = datetime.date(1970, 1, 1) + datetime.timedelta(days=day)
         hour, rem = divmod(rem, 3_600_000_000)
         minute, rem = divmod(rem, 60_000_000)
-        secs = Decimal(rem).scaleb(-6)
+        secs = _scale(rem, 6)
         return F.make_timestamp_ntz(
             F.lit(d.year),
             F.lit(d.month),
@@ -179,16 +184,17 @@ def _stage(spark, df, s, m):
         if not rows:
             return df.where(F.lit(False))
         if len(cols) == 1 and len(rows) <= 1024:
-            return df.where(_col(cols[0]).isin([literal(r[0], types[cols[0]]) for r in rows]))
-        keys = reduce(
-            lambda a, b: a.unionAll(b),
-            [
-                spark.range(1).select(
-                    *[literal(v, types[c]).alias(c) for c, v in zip(cols, r)]
-                )
-                for r in rows
-            ],
-        )
+            c = cols[0]
+            nan = any(_is_nan(r[0]) for r in rows)
+            vals = [literal(r[0], types[c]) for r in rows if not _is_nan(r[0])]
+            test = _col(c).isin(vals) if vals else F.lit(False)
+            if nan:
+                # A queried NaN is matched by isnan(), which Spark never
+                # pushes into the Parquet reader: the reader's min/max
+                # statistics leave NaN out and would drop its row group.
+                test = test | F.isnan(_col(c))
+            return df.where(test)
+        keys = _relation(spark, [[(c, v, types[c]) for c, v in zip(cols, r)] for r in rows])
         return _semi(df, keys, cols)
     if op == "between":
         c = s["column"]
@@ -223,14 +229,13 @@ def _stage(spark, df, s, m):
         ts = s["ts_column"]
         if not s["bounds"]:
             return df
-        rows = [
-            spark.range(1).select(
-                *[_null_or(k, types[c]).alias(c) for c, k in zip(cols, b["key"])],
-                literal(b["ts"], types[ts]).alias(_BOUND),
-            )
-            for b in s["bounds"]
-        ]
-        bounds = reduce(lambda a, b: a.unionAll(b), rows).alias("b")
+        bounds = _relation(
+            spark,
+            [
+                [(c, k, types[c]) for c, k in zip(cols, b["key"])] + [(_BOUND, b["ts"], types[ts])]
+                for b in s["bounds"]
+            ],
+        ).alias("b")
         left = df.alias("s")
         cond = reduce(
             lambda a, b: a & b,
@@ -258,6 +263,23 @@ def _stage(spark, df, s, m):
 
 def _q(name):
     return "`" + name.replace("`", "``") + "`"
+
+
+def _is_nan(value):
+    return value is not None and value["type"] in ("float32", "float64") and math.isnan(
+        _float(value["bits"])
+    )
+
+
+def _relation(spark, rows):
+    """A DataFrame of `rows`, each a list of `(column, typed JSON value or
+    None, Spark type)`: one array of typed structs, inlined, so a long
+    list is one plan node, not a union per row."""
+    names = [c for c, _, _ in rows[0]]
+    structs = [
+        F.struct(*[_null_or(v, t).alias(c) for c, v, t in row]) for row in rows
+    ]
+    return spark.range(1).select(F.inline(F.array(*structs))).select(*[_col(c) for c in names])
 
 
 def _semi(df, keys, cols):

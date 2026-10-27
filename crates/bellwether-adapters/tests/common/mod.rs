@@ -205,8 +205,11 @@ fn batch(fi: usize, rg: usize) -> RecordBatch {
     let g = |r: usize| (fi * RGS + rg) * n + r;
     // File 1's last row group holds no key at all: an all-null row group.
     let all_null = fi == 1 && rg == RGS - 1;
+    // Keys are clustered: three per row group, each shared with the next
+    // row group (and file), so a key lookup plans a strict subset of a
+    // file's row groups and a key's versions span row groups and files.
     let id: Int64Array = (0..n)
-        .map(|r| (!all_null).then(|| i64::try_from(g(r) * 7 % 23).unwrap()))
+        .map(|r| (!all_null).then(|| i64::try_from(((fi * RGS + rg) * 2 + r % 3) % 23).unwrap()))
         .collect();
     let sym: StringArray = (0..n)
         .map(|r| (g(r) % 17 != 0).then(|| SYMS[g(r) % SYMS.len()]))
@@ -638,6 +641,23 @@ pub fn rendered(batches: &[RecordBatch], columns: &[String]) -> Vec<Vec<String>>
     out
 }
 
+/// Panics with the rows `got` lacks and has beyond `want` (both sorted
+/// renders) unless they are equal.
+pub fn assert_rows(got: &[Vec<String>], want: &[Vec<String>], context: &str) {
+    if got == want {
+        return;
+    }
+    let g: BTreeSet<&Vec<String>> = got.iter().collect();
+    let w: BTreeSet<&Vec<String>> = want.iter().collect();
+    let missing: Vec<_> = w.difference(&g).collect();
+    let extra: Vec<_> = g.difference(&w).collect();
+    panic!(
+        "{context}: {} rows, want {}; missing {missing:?}; extra {extra:?}",
+        got.len(),
+        want.len()
+    );
+}
+
 /// The partition values of the corpus's files.
 pub fn partitions(c: &Corpus) -> Partitions {
     Partitions {
@@ -813,6 +833,24 @@ pub fn duckdb() -> Result<String, String> {
     }
 }
 
+/// The DuckDB CLI, or `None` after printing `SKIPPED:` and the reason.
+/// With `BELLWETHER_REQUIRE_DUCKDB` set (CI installs a pinned CLI), a
+/// missing CLI fails the test instead: no silent skip.
+pub fn require_duckdb() -> Option<String> {
+    match duckdb() {
+        Ok(b) => Some(b),
+        Err(why) => skip_or_fail("BELLWETHER_REQUIRE_DUCKDB", &why),
+    }
+}
+
+/// Prints `SKIPPED: <why>` and returns `None`, or fails when `require`
+/// is set in the environment.
+pub fn skip_or_fail<T>(require: &str, why: &str) -> Option<T> {
+    assert!(std::env::var_os(require).is_none(), "{require} is set: {why}");
+    eprintln!("SKIPPED: {why}");
+    None
+}
+
 /// Runs `script` in the DuckDB CLI exactly as the bench does
 /// (`-no-agent -init /dev/null`, `AI_AGENT` removed); any stderr output or
 /// a failure is an error.
@@ -915,18 +953,18 @@ pub fn bitemporal(c: &Corpus, keys: &[Vec<u8>], valid: &Vec<u8>, known: &Vec<u8>
     plan(c, &rgs, Some(Predicate::And { all }))
 }
 
-/// Every lookup shape the planner emits, over the corpus, by name. Text
-/// and expression residuals are `sql_exact == false`: only DataFusion
-/// evaluates them; DuckDB and Spark refuse them by type.
+/// Every lookup shape the planner emits, over the corpus, by name. A case
+/// an engine cannot run exactly is refused by that engine with a typed
+/// `Unsupported` (the engine tests assert it): text and expression
+/// residuals everywhere but DataFusion, and a NaN key in DuckDB.
 pub struct Case {
     /// Name.
     pub name: &'static str,
     /// The plan.
     pub plan: ScanPlan,
-    /// Whether SQL engines (DuckDB, Spark) can run it exactly.
+    /// Whether DuckDB runs it exactly.
     pub sql_exact: bool,
-    /// Whether Spark reads every type it touches (no nanosecond, time,
-    /// unsigned 64-bit, or float16 column).
+    /// Whether Spark runs it exactly.
     pub spark: bool,
 }
 
@@ -940,7 +978,8 @@ pub fn cases(c: &Corpus) -> Vec<Case> {
     let base = 1_704_067_200_000_000i64;
     let mut out = vec![
         Case { name: "locate int64", plan: locate(c, &["id"], &ids(&[0, 5, 22, 999])), sql_exact: true, spark: true },
-        Case { name: "locate float zeros and NaN", plan: locate(c, &["f"], &[f(-0.0), f(0.0), f(f64::NAN), f(1.5)]), sql_exact: true, spark: true },
+        Case { name: "locate float zeros and NaN", plan: locate(c, &["f"], &[f(-0.0), f(0.0), f(f64::NAN), f(1.5)]), sql_exact: false, spark: true },
+        Case { name: "locate float zeros", plan: locate(c, &["f"], &[f(-0.0), f(0.0), f(1.5)]), sql_exact: true, spark: true },
         Case { name: "locate decimal scale 2", plan: locate(c, &["d2"], &[d(-575, 2, &dt("d2")), d(-7, 0, &dt("d2"))]), sql_exact: true, spark: true },
         Case { name: "locate decimal scale 4", plan: locate(c, &["d4"], &[d(-61_725, 4, &dt("d4")), d(0, 0, &dt("d4"))]), sql_exact: true, spark: true },
         Case { name: "locate timestamp us utc", plan: locate(c, &["ts"], &[ts(base), ts(base + 3_000_003)]), sql_exact: true, spark: true },
@@ -954,7 +993,8 @@ pub fn cases(c: &Corpus) -> Vec<Case> {
         Case { name: "latest with ties and null timestamps", plan: latest(c, "id", "ts", &ids(&[1, 2, 3, 4, 5, 6, 7]), None, false), sql_exact: true, spark: true },
         Case { name: "asof", plan: latest(c, "id", "ts", &ids(&[1, 2, 3, 8, 9]), Some(&ts(base + 2_000_002)), false), sql_exact: true, spark: true },
         Case { name: "latest live (latest then live)", plan: latest(c, "id", "ts", &ids(&(0..23).collect::<Vec<_>>()), None, true), sql_exact: true, spark: true },
-        Case { name: "latest on a float key keeps zero signs apart", plan: latest(c, "f", "ts", &[f(-0.0), f(0.0), f(f64::NAN)], None, false), sql_exact: true, spark: true },
+        Case { name: "latest on a float key keeps zero signs apart", plan: latest(c, "f", "ts", &[f(-0.0), f(0.0), f(f64::NAN)], None, false), sql_exact: false, spark: true },
+        Case { name: "latest on float zeros", plan: latest(c, "f", "ts", &[f(-0.0), f(0.0), f(-2.25)], None, false), sql_exact: true, spark: true },
         Case { name: "bitemporal", plan: bitemporal(c, &ids(&[1, 4, 9, 16]), &ts(base + 3_000_003), &ms(1_700_000_001_994)), sql_exact: true, spark: true },
         Case { name: "text has token (full case folding)", plan: text(c, TextOp::HasToken, &["strasse"]), sql_exact: false, spark: false },
         Case { name: "text contains", plan: text(c, TextOp::Contains, &["GUIDANCE r"]), sql_exact: false, spark: false },
@@ -1024,4 +1064,100 @@ pub fn cases(c: &Corpus) -> Vec<Case> {
         spark: true,
     });
     out
+}
+
+/// A NaN key outside the statistics: one file `nan.parquet` under `dir`
+/// of three row groups of `(id, f)`: `f` all `1.0`; fifteen `5.0` and one
+/// NaN; all `-1.0`. Parquet's min/max statistics leave NaN out, so the
+/// middle row group's say `[5.0, 5.0]`, and a reader that prunes by them
+/// for `f IN (-1.0, NaN)` loses the NaN row.
+pub struct NanCase {
+    /// `f` in {-1.0, NaN}, every row group.
+    pub plan: ScanPlan,
+    /// The same rows as a composite `(f, id)` key list (a relation).
+    pub composite: ScanPlan,
+    /// The rows both return, rendered over `id, f`.
+    pub want: Vec<Vec<String>>,
+    /// The dataset schema.
+    pub schema: Vec<ColumnDef>,
+    /// The file's rows per row group.
+    pub offsets: RowOffsets,
+}
+
+/// Writes [`NanCase`] under `dir`.
+pub fn nan_case(dir: &Path) -> NanCase {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, true),
+        Field::new("f", DataType::Float64, true),
+    ]));
+    let f: Vec<f64> = std::iter::repeat_n(1.0, 16)
+        .chain(std::iter::repeat_n(5.0, 15))
+        .chain([f64::NAN])
+        .chain(std::iter::repeat_n(-1.0, 16))
+        .collect();
+    let id: Vec<i64> = (0..48).collect();
+    let b = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![Arc::new(Int64Array::from(id.clone())), Arc::new(Float64Array::from(f.clone()))],
+    )
+    .unwrap();
+    std::fs::create_dir_all(dir).unwrap();
+    let path = dir.join("nan.parquet");
+    let props = WriterProperties::builder().set_max_row_group_row_count(Some(16)).build();
+    let mut w = ArrowWriter::try_new(File::create(&path).unwrap(), schema, Some(props)).unwrap();
+    w.write(&b).unwrap();
+    let md = w.close().unwrap();
+    assert_eq!(md.row_groups().len(), 3);
+    let fenc = |v: f64| enc(Value::Float(v), &DataType::Float64);
+    let ienc = |v: i64| enc(Value::Int(v), &DataType::Int64);
+    let path_s = path.canonicalize().unwrap().display().to_string();
+    let bytes: u64 = md
+        .row_groups()
+        .iter()
+        .flat_map(|g| g.columns().iter().map(|c| c.byte_range().1))
+        .sum();
+    let with = |residual: Predicate| ScanPlan {
+        manifest_version: "1".into(),
+        entries: vec![ScanEntry {
+            file: FileFingerprint {
+                path: path_s.clone(),
+                size: std::fs::metadata(&path).unwrap().len(),
+                etag: None,
+                tail_blake3: Hash([0; 32]),
+            },
+            row_groups: (0..3).collect(),
+            bytes,
+            columns: None,
+        }],
+        residual: Some(residual),
+        bytes,
+        row_groups_total: 3,
+        row_groups_selected: 3,
+        projected_bytes: None,
+        order: None,
+        rows: None,
+    };
+    let hits: Vec<(i64, f64)> = id
+        .iter()
+        .zip(&f)
+        .filter(|(_, v)| v.is_nan() || **v == -1.0)
+        .map(|(i, v)| (*i, *v))
+        .collect();
+    let plan = with(Predicate::In {
+        columns: vec!["f".into()],
+        values: vec![fenc(-1.0), fenc(f64::NAN)],
+    });
+    let composite = with(Predicate::In {
+        columns: vec!["f".into(), "id".into()],
+        values: hits.iter().map(|(i, v)| [fenc(*v), ienc(*i)].concat()).collect(),
+    });
+    let mut want: Vec<Vec<String>> = hits.iter().map(|(i, v)| vec![hex(&ienc(*i)), hex(&fenc(*v))]).collect();
+    want.sort();
+    NanCase {
+        plan,
+        composite,
+        want,
+        schema: vec![ColumnDef::new("id", DataType::Int64), ColumnDef::new("f", DataType::Float64)],
+        offsets: RowOffsets([(path_s, vec![16, 16, 16])].into_iter().collect()),
+    }
 }

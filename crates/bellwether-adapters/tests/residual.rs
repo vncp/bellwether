@@ -107,6 +107,12 @@ fn ts_enc(v: i64) -> Vec<u8> {
     )
 }
 
+/// `FLOATS[i]`'s canonical encoding, a zero in both signs (as the planner
+/// lists a queried zero).
+fn zeros(i: usize) -> Vec<Vec<u8>> {
+    common::zero_variants(&enc(Value::Float(FLOATS[i]), &DataType::Float64))
+}
+
 /// Writes the table as one file of row groups of 16 rows; returns the
 /// plan of every row group with `residual` and the decoded rows.
 fn setup(dir: &Path, t: &Table, residual: Predicate) -> (ScanPlan, Vec<common::Row>, RowOffsets) {
@@ -336,13 +342,7 @@ fn datafusion_agrees_with_the_reference_on_random_rows() {
 
 #[test]
 fn duckdb_agrees_with_the_reference_on_random_rows() {
-    let bin = match common::duckdb() {
-        Ok(b) => b,
-        Err(why) => {
-            eprintln!("SKIPPED: {why}");
-            return;
-        }
-    };
+    let Some(bin) = common::require_duckdb() else { return };
     // A DuckDB process per case: fewer cases than in process.
     let mut runner = TestRunner::new(Config::with_cases(48));
     runner
@@ -353,7 +353,25 @@ fn duckdb_agrees_with_the_reference_on_random_rows() {
                 row_offsets: Some(offsets),
                 ..EmitOptions::default()
             };
-            let sql = bellwether_adapters::duckdb::sql(&plan, &schema(), &o).unwrap();
+            let nan = enc(Value::Float(f64::NAN), &DataType::Float64);
+            let lists_nan = match plan.residual.as_ref().unwrap() {
+                Predicate::In { values, .. } => values.contains(&nan),
+                Predicate::And { all } => all
+                    .iter()
+                    .any(|p| matches!(p, Predicate::In { values, .. } if values.contains(&nan))),
+                _ => false,
+            };
+            let sql = match bellwether_adapters::duckdb::sql(&plan, &schema(), &o) {
+                Ok(sql) => {
+                    prop_assert!(!lists_nan, "a NaN key list was not refused: {:?}", s);
+                    sql
+                }
+                Err(bellwether_adapters::AdapterError::Unsupported { what, .. }) if lists_nan => {
+                    prop_assert!(what.contains("NaN") && what.contains("In key list"), "{}", what);
+                    return Ok(());
+                }
+                Err(e) => return Err(TestCaseError::fail(format!("{s:?}: {e}"))),
+            };
             let got = common::duckdb_rows(&bin, &sql, tmp.path(), "");
             prop_assert_eq!(rendered(&got), expected(&plan, rows), "{:?}\n{}", s, sql);
             Ok(())
