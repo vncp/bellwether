@@ -103,6 +103,38 @@ pub const LEDGER_PREFIX: &str = "ledger/";
 /// File extension of a ledger record.
 pub const RECORD_EXT: &str = ".rec";
 
+/// The signature objects of a ledger by the record each signs, from one
+/// listing ([`Ledger::signature_index`]). Holds paths only, one per
+/// signature object.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SignatureIndex {
+    by_record: std::collections::BTreeMap<Hash, Vec<SignaturePath>>,
+}
+
+impl SignatureIndex {
+    /// The index of the signature objects among `paths` (a listing of the
+    /// ledger; every other path is ignored), each record's sorted by key id
+    /// without duplicates.
+    pub fn from_paths<'a>(paths: impl IntoIterator<Item = &'a str>) -> Self {
+        let mut by_record: std::collections::BTreeMap<Hash, Vec<SignaturePath>> =
+            std::collections::BTreeMap::new();
+        for s in paths.into_iter().filter_map(SignaturePath::parse) {
+            by_record.entry(s.record).or_default().push(s);
+        }
+        for v in by_record.values_mut() {
+            v.sort();
+            v.dedup();
+        }
+        Self { by_record }
+    }
+
+    /// The signature objects listed beside `record`, sorted by key id.
+    #[must_use]
+    pub fn of(&self, record: &Hash) -> &[SignaturePath] {
+        self.by_record.get(record).map_or(&[], Vec::as_slice)
+    }
+}
+
 /// The kind of a ledger record, matching the `record` tag in its JSON.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -726,7 +758,7 @@ where
     /// of the wrong kind, or unreadable is flagged, never an error; only a
     /// store failure or a `receipt` that is not a receipt fails.
     pub fn explain(&self, receipt: &Hash) -> Result<Chain> {
-        explain::explain(self, receipt, None)
+        explain::explain(self, receipt, None, &self.signature_index()?)
     }
 
     /// [`Ledger::explain`], with the receipt's and the certificate's
@@ -734,7 +766,7 @@ where
     /// rendering adds `sig=valid(<name>)`, `sig=untrusted(<id prefix>)`,
     /// `sig=none`, or `sig=INVALID` to those two lines.
     pub fn explain_verified(&self, receipt: &Hash, trusted: &TrustedKeys) -> Result<Chain> {
-        explain::explain(self, receipt, Some(trusted))
+        explain::explain(self, receipt, Some(trusted), &self.signature_index()?)
     }
 
     /// Signs the stored receipt or certificate `record` with `key` at
@@ -824,19 +856,32 @@ where
     /// do not hash to its name are the ledger's tamper error, so an altered
     /// record never reports a signature status at all. Writes nothing.
     pub fn signatures(&self, record: &Hash) -> Result<Vec<SignatureStatus>> {
+        self.signatures_in(record, &self.signature_index()?)
+    }
+
+    /// Every signature object's path in the ledger, by the record it signs,
+    /// from one listing of `ledger/`. A command that reads the signatures
+    /// of many records lists once and passes the index to
+    /// [`Ledger::signatures_in`] and [`Ledger::explain_in`]; a signature
+    /// written after the listing is not in it.
+    pub fn signature_index(&self) -> Result<SignatureIndex> {
+        Ok(SignatureIndex::from_paths(
+            self.store.list(LEDGER_PREFIX)?.iter().map(String::as_str),
+        ))
+    }
+
+    /// [`Ledger::signatures`] of the objects `index` lists beside
+    /// `record`, with no listing of its own.
+    pub fn signatures_in(
+        &self,
+        record: &Hash,
+        index: &SignatureIndex,
+    ) -> Result<Vec<SignatureStatus>> {
         let bytes = self.read_verified(record)?;
         let kind = peek(&bytes)?.into_kind()?;
-        let mut at: Vec<SignaturePath> = self
-            .store
-            .list(LEDGER_PREFIX)?
-            .iter()
-            .filter_map(|p| SignaturePath::parse(p))
-            .filter(|s| s.record == *record)
-            .collect();
-        at.sort();
-        at.dedup();
+        let at = index.of(record);
         let mut out = Vec::with_capacity(at.len());
-        for a in &at {
+        for a in at {
             match self.store.get(&a.path()) {
                 Ok((b, _)) => out.push(signature::check_object(&b, a, kind)),
                 Err(Error::NotFound(_)) => {}
@@ -844,6 +889,17 @@ where
             }
         }
         Ok(out)
+    }
+
+    /// [`Ledger::explain`] (with `trusted`, [`Ledger::explain_verified`])
+    /// reading signatures from `index` instead of listing the ledger.
+    pub fn explain_in(
+        &self,
+        receipt: &Hash,
+        trusted: Option<&TrustedKeys>,
+        index: &SignatureIndex,
+    ) -> Result<Chain> {
+        explain::explain(self, receipt, trusted, index)
     }
 
     /// [`Ledger::signatures`] folded against `trusted` ([`Verdict::of`]).

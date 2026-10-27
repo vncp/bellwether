@@ -405,7 +405,8 @@ impl Engine {
         }
         let payload = serde_json::to_vec(query)?;
         let key_set = bellwether_types::Hash::of(&payload);
-        self.cache()?.put_cached(&key_set, Bytes::from(payload))?;
+        self.cache()?
+            .put_cached_once(&key_set, Bytes::from(payload))?;
         let lookup = Lookup::Text {
             column: query.column.clone(),
             op: query.op,
@@ -625,7 +626,8 @@ impl Engine {
         let tuples: Vec<Vec<u8>> = run_keys.tuples().map(<[u8]>::to_vec).collect();
         let payload = run_keys.to_payload()?;
         let key_set = bellwether_types::Hash::of(&payload);
-        self.cache()?.put_cached(&key_set, Bytes::from(payload))?;
+        self.cache()?
+            .put_cached_once(&key_set, Bytes::from(payload))?;
         let (lookup, kind) = self.lookup_of(&pinned, &specs, &columns, tuples, mode, verb)?;
         // A membership lookup plans with the list key on its column alone:
         // no other kind answers it.

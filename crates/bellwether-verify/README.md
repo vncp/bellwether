@@ -119,40 +119,42 @@ The planner is engine code and must include every row group holding a queried ke
 
 ## Memory bound (ADR 018)
 
-> Peak memory is at most `memory_budget` of accounted comparison state, plus one decoded row group of projected columns (the sides are read one after the other, so one batch is alive at a time), plus both sides' fingerprint lists, the workload key set as the caller supplied it (copied once, sorted), for a planned side, its selected row-group indices, and, while each side's catalog digest is computed before the first pass, that side's row-group reports. The sources' own caches are outside the budget and bounded by the source: `ParquetSource` keeps footers up to 256 MiB, `ChunkedTextSource` layouts and scans up to 64 MiB each.
+> Peak memory is at most `memory_budget` of accounted comparison state, plus one decoded batch of projected columns, at most `READ_BATCH_ROWS` (8,192) rows of one row group whatever the row group's width (`Source::read_column_batches`; the sides are read one after the other, so one batch is alive at a time), plus both sides' fingerprint lists, the workload key set as the caller supplied it (copied once, sorted), for a planned side, its selected row-group indices, and, while each side's catalog digest is computed before the first pass, that side's row-group reports. The sources' own caches are outside the budget and bounded by the source: `ParquetSource` keeps footers up to 256 MiB, `ChunkedTextSource` layouts and scans up to 64 MiB each.
 
 The comparison runs in `P` passes over hash-partitioned key space. Pass `p` reads every row group of both read sets, encodes each row's key, and keeps only keys with `xxh3_64(key, PARTITION_SEED) mod P = p`. Its state, dropped when the pass ends, is per key and both sides: rows seen, the newest version value, the compared rows' count and hash sum, and (with both `latest_by` and totals) the compared rows' totals by group. Under `Sampled` coverage the pass also keeps every unsampled key of its partition, so the realized fraction counts all distinct keys exactly. Group totals and the kept examples persist across passes.
 
 - **Accounting.** Every structure that grows with the data is charged to a meter before it grows: hash tables by capacity at their maximum load, including the moment during a resize when the old and the new table are both alive; keys, per-key totals, group totals, and examples by their heap allocations rounded up to 16 bytes. A charge past the budget is refused before anything is allocated. The meter's peak never exceeds the budget, and the accounting over-approximates what the allocator holds.
 - **Choosing `P`.** From row counts in the sources' statistics: the keys a pass may hold are at most the rows of the larger side (assuming the sides share their keys), at most the value range of a single integer key column (from its min and max statistics, plus one for null), and at most the workload's keys. `P` is the smallest pass count whose largest partition (the mean plus 5% plus three standard deviations) fits the meter's own model of a pass: the table's growth, including the moment of its last resize, plus each key's heap. It is checked against the budget minus a reserve for the examples (capped at 1/8) and, with totals, 1/16 for the group table. `P = 1` when that fits; `P` never exceeds `MAX_PASSES` (1024). Measured on the review's probes, the meter then peaks at 64% to 97% of the budget for integer keys (where an earlier, worst-case estimate peaked near 15%); with string keys longer than the 32 bytes the estimate assumes, the first attempt can overflow and restart.
+- **Grouping passes by the keys counted.** When `P > 1`, the first pass keeps partition 0 and also counts the distinct keys of every row it reads in a HyperLogLog (core's `Hll`, precision up to 14, its registers charged to the meter). The later passes then take as many partitions each as the model says fit, from that count raised by three relative standard errors, instead of from row counts: a key with many versions is one key. The count only groups partitions into passes. Every row is still kept or skipped by its exact partition hash, and the count never enters a result, a total, a digest, or the report. A grouped pass the count undersized overflows the meter, and the run restarts with one partition per pass, the schedule the statistics alone give.
 - **Restarts.** If a pass outgrows the budget anyway (long string keys, or sides that share no keys), the run abandons the attempt and restarts with twice the passes. The result is identical at any `P`. A budget that cannot hold the state even at `MAX_PASSES` is `VerifyError::Budget`, and so is a group table that outgrows half the budget (more passes cannot shrink it).
-- **Cost.** Every pass reads both read sets once: `P` reads in all.
+- **Cost.** Every pass reads both read sets once: one read per pass, fewer than `P` when the first pass's count groups partitions.
 
 `tests/memory_bound.rs` holds the bound at `P > 1` with the meter's peak and checks the results equal the `P = 1` results across five specs (plain, totals by group, `latest_by` with totals, sampled, workload), forces an underestimate that restarts, and checks the integer key range lowers `P`. `tests/real_memory.rs` measures the real heap with a counting allocator: on 600,000 keys under a 64 MiB budget, the heap grew 59.4 MB while the meter peaked at 58.9 MB, over five passes.
 
 ### Measured budgets
 
-A release build was measured on 2026-10-26 with `scripts/perf.sh`: full coverage, with `latest_by` and totals by group, one run per budget. The full tables are in [the measured document](../../docs/measured/2026-10-26-performance.md#reconcile).
+A release build was measured on 2026-10-27 with `scripts/perf.py`: full coverage, with `latest_by` and totals by group, one run per budget. The full tables, and the build before WP22b beside it, are in [the measured document](../../docs/measured/2026-10-27-performance.md#reconcile-memory).
 
-- **The ledger small rung** has 8,000,000 rows and 401,325 keys a side. It reconciles in one pass from a 592 MiB budget, so **640 MiB** is recommended. The meter's peak there is 164.4 MiB. `P` is chosen from row counts, not keys (see Known limits).
+- **The ledger small rung** has 8,000,000 rows and 401,325 keys a side. It reconciles in one pass from a 592 MiB budget, so **640 MiB** is recommended. The meter's peak there is 164.4 MiB. `P` is chosen from row counts, not keys; the first pass's distinct-key count then groups the later passes (see Known limits): at 256 MiB, 2 passes instead of 3.
 - **The six taxi months** have 20,332,093 rows and 20,314,139 keys. They reconcile in one pass from **16 GiB**, which is recommended, with a meter peak of 9.68 GiB.
 - **Below one pass, the cost is the extra passes.** On taxi:
 
   | Budget | Passes | Rows per second per side |
   |---|---:|---:|
-  | 8 GiB | 2 | 372,364 |
-  | 1 GiB | 14 | 214,183 |
-  | 64 MiB | 224 | 22,737 |
+  | 8 GiB | 2 | 363,874 |
+  | 1 GiB | 14 | 213,364 |
+  | 256 MiB | 56 | 82,583 |
+  | 64 MiB | 224 | 23,780 |
 
-- **Measured peak memory exceeds the bound stated above.** On the ledger rung, whose row groups are 100,000 rows wide, the bound is the budget, plus one decoded batch (37.8 MiB), plus the 256 MiB footer cache:
+- **Measured peak memory, against the bound stated above** (the budget, plus one decoded batch, plus the 256 MiB footer cache). Row groups are now decoded 8,192 rows at a time, so peak memory no longer follows row-group width. On the ledger rung (100,000-row row groups), the 2026-10-26 measurement was 4.5 times the bound at 64 MiB:
 
-  | Budget | Bound | Peak RSS | Peak footprint |
-  |---|---:|---:|---:|
-  | 64 MiB | 357.8 MiB | 1,625.3 MiB | 1,616.5 MiB |
-  | 256 MiB | 549.8 MiB | 1,303.9 MiB | 1,268.4 MiB |
-  | 1 GiB | 1,317.8 MiB | 456.3 MiB | 447.7 MiB |
+  | Budget | Bound | Peak RSS | Peak footprint | 2026-10-26 footprint |
+  |---|---:|---:|---:|---:|
+  | 64 MiB | 322.5 MiB | 81.1 MiB | 71.6 MiB | 1,616.5 MiB |
+  | 256 MiB | 514.5 MiB | 257.8 MiB | 220.7 MiB | 1,268.4 MiB |
+  | 1 GiB | 1,282.5 MiB | 263.5 MiB | 254.2 MiB | 447.7 MiB |
 
-  The taxi pair stays within its bound at every budget. Peak memory follows row-group size: on a corpus with 10,000-row row groups it stays at 31 to 41 MiB. The cause is under investigation as a defect. Until it is fixed, size memory for wide row groups from these measurements, not from `--memory-budget`.
+  Taxi stays within its bound at every budget but one: at 8 GiB, peak RSS is 8,484.8 MiB against an 8,449.1 MiB bound (0.4% over), while the peak footprint is 7,316.8 MiB. The build before WP22b held 5,507 MiB of footprint there, so 1,810 MiB more is held outside the meter. The cause is not isolated yet; it is an open item of the measured document.
 
 ## Tests
 
@@ -183,5 +185,6 @@ Deliberate breaks, each in a scratch copy built in its own target directory, eac
 
 ## Known limits
 
-- Without a value range (a string or composite key), `P` is chosen from row counts, which over-count keys with many versions; the run then makes more passes than it needs. A wrong guess the other way costs a restart, never the bound.
+- Without a value range (a string or composite key), `P` is chosen from row counts, which over-count keys with many versions. The first pass's distinct-key count then groups the remaining partitions into fewer passes, but the first pass itself is sized from row counts, so a run makes at least two passes whenever row counts alone say one pass does not fit. A wrong guess the other way costs a restart, never the bound.
+- Reconcile runs on one thread (hypothesis 1 of the 2026-10-26 measurements, not taken in WP22b).
 - A planner's completeness is trusted (invariant 1 is the build crate's).

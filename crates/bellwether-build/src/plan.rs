@@ -82,7 +82,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use arrow::array::{ArrayRef, RecordBatch};
 use arrow::datatypes::{DataType, SchemaRef};
 use bellwether_core::encoding::{self, tag, KeyColumns, Value};
-use bellwether_core::segment::{Layout, ReadAt};
+use bellwether_core::segment::Layout;
 use bellwether_core::sidecar::{
     bitemporal_winner, BitemporalHit, RgBounds, SidecarDef, SidecarKind, SidecarReader, Triple,
 };
@@ -1499,11 +1499,9 @@ impl<S: StoreExt + ?Sized> Planner<S> {
         whole: bool,
     ) -> Result<SegmentReader<SegmentBytes<'_, S>>> {
         let bytes = match src {
-            SegSource::Committed { id, size } if !whole => SegmentBytes::Ranged {
-                snapshot: &self.snapshot,
-                id: *id,
-                size: *size,
-            },
+            SegSource::Committed { id, size } if !whole => {
+                SegmentBytes::committed(&self.snapshot, *id, *size)?
+            }
             SegSource::Committed { id, .. } => {
                 SegmentBytes::Memory(self.snapshot.read_segment(id)?)
             }
@@ -1562,7 +1560,7 @@ impl<S: StoreExt + ?Sized> Planner<S> {
         how: &Serve,
         keys: &[Vec<u8>],
         spans: &[Vec<std::ops::Range<usize>>],
-        mut rows: Option<&mut u64>,
+        rows: Option<&mut u64>,
     ) -> Result<Vec<RoaringBitmap>> {
         let probes: Vec<Vec<Vec<u8>>> = keys
             .iter()
@@ -1572,80 +1570,81 @@ impl<S: StoreExt + ?Sized> Planner<S> {
                 Serve::Prefix => zero_variants(k),
             })
             .collect();
-        let mut out = vec![RoaringBitmap::new(); keys.len()];
+        let n = keys.len();
         let keyed = matches!(
             seg.spec.physical(),
             KeySpec::Exact { .. } | KeySpec::Temporal { .. }
         );
-        match (keyed, how) {
+        let union = |mut a: Vec<RoaringBitmap>, b: Vec<RoaringBitmap>| {
+            for (x, y) in a.iter_mut().zip(b) {
+                *x |= y;
+            }
+            a
+        };
+        let out = match (keyed, how) {
             (true, Serve::Project(_)) => {
-                let mut owners: BTreeMap<&[u8], Vec<usize>> = BTreeMap::new();
-                for (i, ps) in probes.iter().enumerate() {
-                    for p in ps {
-                        owners.entry(p.as_slice()).or_default().push(i);
+                // Every distinct probe once, ascending, with the keys it is
+                // a variant of: sorted once for every segment.
+                let mut pairs: Vec<(&[u8], usize)> = probes
+                    .iter()
+                    .enumerate()
+                    .flat_map(|(i, ps)| ps.iter().map(move |p| (p.as_slice(), i)))
+                    .collect();
+                pairs.sort_unstable();
+                let mut all: Vec<&[u8]> = Vec::with_capacity(pairs.len());
+                let mut owners: Vec<Vec<usize>> = Vec::with_capacity(pairs.len());
+                for (p, i) in pairs {
+                    match (all.last(), owners.last_mut()) {
+                        (Some(&last), Some(o)) if last == p => o.push(i),
+                        _ => {
+                            all.push(p);
+                            owners.push(vec![i]);
+                        }
                     }
                 }
-                let all: Vec<&[u8]> = owners.keys().copied().collect();
-                let live = self.locator.live();
-                // The live row groups each probe was counted in so far: two
-                // segments counting one key in one live row group would
-                // count its rows twice (a retired one is never counted).
-                let mut counted_in: BTreeMap<&[u8], RoaringBitmap> = BTreeMap::new();
-                for src in &seg.sources {
-                    let r = self.open_segment(&seg.spec, src, false)?;
-                    for (probe, value) in r.get(&all)? {
-                        if let Some(total) = rows.as_deref_mut() {
-                            let key = owners
-                                .get_key_value(probe.as_slice())
-                                .map_or(&[][..], |(k, _)| *k);
-                            let seen = counted_in.entry(key).or_default();
-                            let counts_in = &value.bitmap & live;
-                            if !seen.is_disjoint(&counts_in) {
-                                return Err(overlapping_counts(&seg.spec));
-                            }
-                            *seen |= counts_in;
-                            // Probes are distinct (both zeros of a key are
-                            // two stored keys), so no row counts twice.
-                            let counted = value.counted().ok_or_else(|| {
-                                Error::Other(format!(
-                                    "corrupt segment: a segment of {} holds a key without its \
-                                     counts",
-                                    seg.spec.identity()
-                                ))
-                            })?;
-                            for (rg, n) in counted {
-                                if live.contains(rg.0) {
-                                    *total = total.checked_add(n).ok_or_else(|| {
-                                        Error::Other("row count overflows u64".into())
-                                    })?;
+                match rows {
+                    Some(total) => self.counted_per_key(seg, &all, &owners, n, total)?,
+                    None => Self::fold_segments(
+                        &seg.sources,
+                        || vec![RoaringBitmap::new(); n],
+                        |out, src| {
+                            let r = self.open_segment(&seg.spec, src, false)?;
+                            r.visit_sorted(&all, |at, value| {
+                                for &i in &owners[at] {
+                                    out[i] |= &value.bitmap;
                                 }
-                            }
-                        }
-                        for &i in owners.get(probe.as_slice()).map_or(&[][..], Vec::as_slice) {
-                            out[i] |= &value.bitmap;
-                        }
-                    }
+                                Ok(())
+                            })
+                        },
+                        union,
+                    )?,
                 }
             }
-            (true, Serve::Prefix) => {
-                for src in &seg.sources {
+            (true, Serve::Prefix) => Self::fold_segments(
+                &seg.sources,
+                || vec![RoaringBitmap::new(); n],
+                |out, src| {
                     let r = self.open_segment(&seg.spec, src, false)?;
                     for (i, ps) in probes.iter().enumerate() {
                         for p in ps {
                             out[i] |= r.lookup_prefix(p)?;
                         }
                     }
-                }
-            }
+                    Ok(())
+                },
+                union,
+            )?,
             (false, Serve::Project(_)) => {
                 // Bloom and range segments are scanned per probe; hold one
                 // whole segment at a time.
+                let mut out = vec![RoaringBitmap::new(); n];
                 for src in &seg.sources {
                     let r = self.open_segment(&seg.spec, src, true)?;
                     for (i, ps) in probes.iter().enumerate() {
                         out[i] |= r.lookup(ps)?;
                     }
                 }
+                out
             }
             (false, Serve::Prefix) => {
                 return Err(Error::KeySpec(format!(
@@ -1653,8 +1652,88 @@ impl<S: StoreExt + ?Sized> Planner<S> {
                     seg.spec.name()
                 )))
             }
+        };
+        Ok(out)
+    }
+
+    /// [`Self::per_key`] for a spec that counts rows: per key, its row
+    /// groups, and the rows of every probe in live row groups added to
+    /// `total`. Segments are read in order, one at a time, so two segments
+    /// counting one key in one live row group are refused.
+    fn counted_per_key(
+        &self,
+        seg: &SpecSegments,
+        all: &[&[u8]],
+        owners: &[Vec<usize>],
+        n: usize,
+        total: &mut u64,
+    ) -> Result<Vec<RoaringBitmap>> {
+        let mut out = vec![RoaringBitmap::new(); n];
+        let live = self.locator.live();
+        // The live row groups each probe was counted in so far: two
+        // segments counting one key in one live row group would count its
+        // rows twice (a retired one is never counted).
+        let mut counted_in = vec![RoaringBitmap::new(); all.len()];
+        for src in &seg.sources {
+            let r = self.open_segment(&seg.spec, src, false)?;
+            r.visit_sorted(all, |at, value| {
+                let seen = &mut counted_in[at];
+                let counts_in = &value.bitmap & live;
+                if !seen.is_disjoint(&counts_in) {
+                    return Err(overlapping_counts(&seg.spec));
+                }
+                *seen |= counts_in;
+                // Probes are distinct (both zeros of a key are two stored
+                // keys), so no row counts twice.
+                let counted = value.counted().ok_or_else(|| {
+                    Error::Other(format!(
+                        "corrupt segment: a segment of {} holds a key without its counts",
+                        seg.spec.identity()
+                    ))
+                })?;
+                for (rg, k) in counted {
+                    if live.contains(rg.0) {
+                        *total = total
+                            .checked_add(k)
+                            .ok_or_else(|| Error::Other("row count overflows u64".into()))?;
+                    }
+                }
+                for &i in &owners[at] {
+                    out[i] |= &value.bitmap;
+                }
+                Ok(())
+            })?;
         }
         Ok(out)
+    }
+
+    /// Folds `per` over `sources` on the rayon pool: each worker opens one
+    /// segment at a time (ADR 018: the bound is one block and one window
+    /// per worker) and folds into its own accumulator from `init`; `merge`
+    /// combines them and must not depend on their order (a union), so the
+    /// result is the sequential one. On any error the sources are walked
+    /// again in order, so the error returned is the first in source order,
+    /// as a sequential walk reports it.
+    fn fold_segments<A, I, P, M>(sources: &[SegSource], init: I, per: P, merge: M) -> Result<A>
+    where
+        A: Send,
+        I: Fn() -> A + Sync + Send,
+        P: Fn(&mut A, &SegSource) -> Result<()> + Sync + Send,
+        M: Fn(A, A) -> A + Sync + Send,
+    {
+        use rayon::prelude::*;
+        let folded = sources
+            .par_iter()
+            .try_fold(&init, |mut a, src| per(&mut a, src).map(|()| a))
+            .try_reduce(&init, |a, b| Ok(merge(a, b)));
+        if let Ok(a) = folded {
+            return Ok(a);
+        }
+        let mut a = init();
+        for src in sources {
+            per(&mut a, src)?;
+        }
+        Ok(a)
     }
 
     /// Intersects per-key row groups across `serving` into `acc`. With
@@ -1881,14 +1960,9 @@ impl<S: StoreExt + ?Sized> Planner<S> {
             .zip(&spans)
             .map(|(k, sp)| zero_variants(&project(k, sp, positions)))
             .collect();
-        let readers = t
-            .sources
-            .iter()
-            .map(|src| self.open_segment(&t.spec, src, false))
-            .collect::<Result<Vec<_>>>()?;
         let (selection, mut acc) = match versions {
             Versions::Latest | Versions::Asof(_) => {
-                let mut winners = self.winners(&readers, &variants, versions.asof())?;
+                let mut winners = self.winners(t, &variants, versions.asof())?;
                 let mut acc: Vec<Option<RoaringBitmap>> = winners
                     .iter()
                     .map(|w| Some(w.as_ref().map(|h| h.row_groups.clone()).unwrap_or_default()))
@@ -1913,17 +1987,25 @@ impl<S: StoreExt + ?Sized> Planner<S> {
                 (Selection::Winners(winners), acc)
             }
             Versions::Lookback(lookback) => {
-                let hits = self.chain_lookbacks(&readers, &variants, &ts_type, lookback)?;
+                let hits = self.chain_lookbacks(t, &variants, &ts_type, lookback)?;
                 let acc = lookback_rows(&hits);
                 (Selection::Lookbacks(hits), acc)
             }
         };
-        let others: Vec<(&SpecSegments, Serve)> = serving
-            .iter()
-            .filter(|(s, _)| !std::ptr::eq(*s, t))
-            .map(|(s, h)| (*s, h.clone()))
-            .collect();
-        self.intersect(&mut acc, &others, keys, &spans, None)?;
+        // When the temporal spec keys the whole lookup tuple, its versions
+        // are rows of the key itself, so every row group they keep holds the
+        // key, and every other serving spec's row groups for the key contain
+        // them (invariant 1): intersecting with those changes nothing, so
+        // their segments are not read. A temporal spec on part of the tuple
+        // keeps the versions of that part, which the others narrow.
+        if positions.len() < columns.len() {
+            let others: Vec<(&SpecSegments, Serve)> = serving
+                .iter()
+                .filter(|(s, _)| !std::ptr::eq(*s, t))
+                .map(|(s, h)| (*s, h.clone()))
+                .collect();
+            self.intersect(&mut acc, &others, keys, &spans, None)?;
+        }
         let selected = acc
             .into_iter()
             .flatten()
@@ -2032,21 +2114,20 @@ impl<S: StoreExt + ?Sized> Planner<S> {
     /// Each key's index-wide winning version (latest, or at `asof`): every
     /// zero variant of the key's projection is probed, and the variants'
     /// hits fold into one, since they are one key under SQL equality.
-    fn winners<R: ReadAt>(
+    fn winners(
         &self,
-        readers: &[SegmentReader<R>],
+        t: &SpecSegments,
         variants: &[Vec<Vec<u8>>],
         asof: Option<i64>,
     ) -> Result<Vec<Option<VersionHit>>> {
-        let mut probes: Vec<Vec<u8>> = variants.iter().flatten().cloned().collect();
-        probes.sort_unstable();
-        probes.dedup();
-        let hits = self.temporal_hits(readers, &probes, asof)?;
+        let probes = sorted_probes(variants);
+        let hits = self.temporal_hits(t, &probes, asof)?;
+        let hit = |v: &Vec<u8>| probes.binary_search(v).ok().and_then(|i| hits[i].as_ref());
         Ok(variants
             .iter()
             .map(|vs| {
                 vs.iter()
-                    .filter_map(|v| hits.get(v))
+                    .filter_map(hit)
                     .fold(None, |acc: Option<VersionHit>, h| {
                         Some(match acc {
                             Some(mut a) => {
@@ -2063,77 +2144,124 @@ impl<S: StoreExt + ?Sized> Planner<S> {
     /// Each key's lookback window (module docs) from the version chains of
     /// every segment of the spec, counting only live row groups; a chain
     /// naming a row group the manifest never assigned is an error.
-    fn chain_lookbacks<R: ReadAt>(
+    fn chain_lookbacks(
         &self,
-        readers: &[SegmentReader<R>],
+        t: &SpecSegments,
         variants: &[Vec<Vec<u8>>],
         ts_type: &DataType,
         lookback: i64,
     ) -> Result<Vec<Option<LookbackHit>>> {
         let probes = sorted_probes(variants);
-        let chains = temporal::chains(readers, &probes)?;
-        for chain in chains.values() {
+        // Every version of each probe across the spec's segments: the
+        // segments' chains merged (a merge is order-free).
+        let chains = Self::fold_segments(
+            &t.sources,
+            || vec![None; probes.len()],
+            |acc: &mut Vec<Option<VersionChain>>, src| {
+                let r = self.open_segment(&t.spec, src, false)?;
+                r.visit_sorted(&probes, |at, v| {
+                    acc[at]
+                        .get_or_insert_with(VersionChain::new)
+                        .merge(&v.chain);
+                    Ok(())
+                })
+            },
+            |mut a, b| {
+                for (x, y) in a.iter_mut().zip(b) {
+                    match (x.as_mut(), y) {
+                        (Some(x), Some(y)) => x.merge(&y),
+                        (None, Some(y)) => *x = Some(y),
+                        (_, None) => {}
+                    }
+                }
+                a
+            },
+        )?;
+        for chain in chains.iter().flatten() {
             let ids: RoaringBitmap = chain.versions().iter().map(|(_, rg)| rg.0).collect();
             self.locator.check_known(&ids)?;
         }
         let floor = encoding::ts_min(ts_type)?;
         let live = self.locator.live();
+        let chain = |v: &Vec<u8>| {
+            probes
+                .binary_search(v)
+                .ok()
+                .and_then(|i| chains[i].as_ref())
+        };
         Ok(variants
             .iter()
-            .map(|vs| {
-                temporal::lookback(
-                    vs.iter().filter_map(|v| chains.get(v)),
-                    live,
-                    lookback,
-                    floor,
-                )
-            })
+            .map(|vs| temporal::lookback(vs.iter().filter_map(chain), live, lookback, floor))
             .collect())
     }
 
-    /// Index-wide newest version per probe, from core's cross-segment
-    /// `latest` or `asof` over every segment of the spec (invariant 5),
-    /// restricted to live row groups. A winner that lives only in retired
-    /// row groups (its file was rewritten) is recomputed from the stored
-    /// version chains over live row groups, so a retired version never
-    /// becomes the `NotOlderThan` bound of a live key.
-    fn temporal_hits<R: ReadAt>(
+    /// Index-wide newest version per probe of `probes` (sorted, distinct),
+    /// by position: the newest version of each segment of the spec,
+    /// combined across every segment (invariant 5; a combination is
+    /// order-free, so the segments are read on the rayon pool), restricted
+    /// to live row groups. A winner that lives only in retired row groups
+    /// (its file was rewritten) is recomputed from the stored version
+    /// chains over live row groups, so a retired version never becomes the
+    /// `NotOlderThan` bound of a live key.
+    fn temporal_hits(
         &self,
-        readers: &[SegmentReader<R>],
+        t: &SpecSegments,
         probes: &[Vec<u8>],
         asof: Option<i64>,
-    ) -> Result<BTreeMap<Vec<u8>, VersionHit>> {
-        let raw = match asof {
-            None => temporal::latest(readers, probes)?,
-            Some(ts) => temporal::asof(readers, probes, ts)?,
+    ) -> Result<Vec<Option<VersionHit>>> {
+        let combine = |slot: &mut Option<VersionHit>, hit: VersionHit| match slot {
+            Some(acc) => acc.combine(&hit),
+            None => *slot = Some(hit),
         };
+        let mut out = Self::fold_segments(
+            &t.sources,
+            || vec![None; probes.len()],
+            |acc: &mut Vec<Option<VersionHit>>, src| {
+                let r = self.open_segment(&t.spec, src, false)?;
+                r.visit_sorted(probes, |at, v| {
+                    let hit = match asof {
+                        None => v.chain.latest(),
+                        Some(ts) => v.chain.asof(ts),
+                    };
+                    if let Some(hit) = hit {
+                        combine(&mut acc[at], hit);
+                    }
+                    Ok(())
+                })
+            },
+            |mut a, b| {
+                for (x, y) in a.iter_mut().zip(b) {
+                    if let Some(y) = y {
+                        combine(x, y);
+                    }
+                }
+                a
+            },
+        )?;
         let live = self.locator.live();
-        let mut out = BTreeMap::new();
         let mut redo = Vec::new();
-        for (key, mut hit) in raw {
+        for (at, slot) in out.iter_mut().enumerate() {
+            let Some(hit) = slot else { continue };
             self.locator.check_known(&hit.row_groups)?;
             hit.row_groups &= live;
             if hit.row_groups.is_empty() {
-                redo.push(key);
-            } else {
-                out.insert(key, hit);
+                *slot = None;
+                redo.push(at);
             }
         }
         if redo.is_empty() {
             return Ok(out);
         }
-        for r in readers {
-            for (key, value) in r.get(&redo)? {
+        let again: Vec<&Vec<u8>> = redo.iter().map(|&at| &probes[at]).collect();
+        for src in &t.sources {
+            let r = self.open_segment(&t.spec, src, false)?;
+            r.visit_sorted(&again, |i, value| {
                 self.locator.check_known(&value.bitmap)?;
                 if let Some(h) = live_winner(&value.chain, live, asof) {
-                    match out.get_mut(&key) {
-                        Some(acc) => acc.combine(&h),
-                        None => {
-                            out.insert(key, h);
-                        }
-                    }
+                    combine(&mut out[redo[i]], h);
                 }
-            }
+                Ok(())
+            })?;
         }
         Ok(out)
     }
@@ -2226,11 +2354,7 @@ impl<S: StoreExt + ?Sized> Planner<S> {
         seg: &SegSource,
     ) -> Result<SidecarReader<SegmentBytes<'_, S>>> {
         let bytes = match seg {
-            SegSource::Committed { id, size } => SegmentBytes::Ranged {
-                snapshot: &self.snapshot,
-                id: *id,
-                size: *size,
-            },
+            SegSource::Committed { id, size } => SegmentBytes::ranged(&self.snapshot, *id, *size),
             SegSource::Transient(b) => SegmentBytes::Memory(b.clone()),
         };
         let reader = SidecarReader::open_for_dataset(bytes, &self.schema)?;
@@ -2304,12 +2428,7 @@ impl<S: StoreExt + ?Sized> Planner<S> {
             } else {
                 self.open_segment(spec, seg, false)?
             };
-            let found = r.bounds(probes)?.ok_or_else(|| {
-                Error::Other(format!(
-                    "corrupt index: a segment of {} stores no per-key bounds",
-                    spec.identity()
-                ))
-            })?;
+            let found = r.bounds(probes)?.ok_or_else(|| no_bounds(spec))?;
             for (key, bounds) in found {
                 out.entry(key).or_default().extend(bounds);
             }
@@ -2422,8 +2541,9 @@ impl<S: StoreExt + ?Sized> Planner<S> {
                 });
             }
         };
+        let intersected = not_narrowed_again(&serving, sidecars, columns, ts_column);
         let mut acc: Vec<Option<RoaringBitmap>> = vec![None; keys.len()];
-        self.intersect(&mut acc, &serving, &keys, &spans, None)?;
+        self.intersect(&mut acc, &intersected, &keys, &spans, None)?;
         if let Some(w) = &window {
             narrow(&mut acc, w);
         }
@@ -2490,20 +2610,29 @@ impl<S: StoreExt + ?Sized> Planner<S> {
         hi: i64,
     ) -> Result<BTreeMap<Vec<u8>, RoaringBitmap>> {
         let probes = sorted_probes(variants);
-        let mut inside: BTreeMap<Vec<u8>, RoaringBitmap> = BTreeMap::new();
-        for src in &t.sources {
-            let r = self.open_segment(&t.spec, src, false)?;
-            for (key, value) in r.get(&probes)? {
-                self.locator.check_known(&value.bitmap)?;
-                let e = inside.entry(key).or_default();
-                for &(ts, rg) in value.chain.versions() {
-                    if lo <= ts && ts <= hi {
-                        e.insert(rg.0);
+        let found = Self::fold_segments(
+            &t.sources,
+            || vec![None; probes.len()],
+            |found: &mut Vec<Option<RoaringBitmap>>, src| {
+                let r = self.open_segment(&t.spec, src, false)?;
+                r.visit_sorted(&probes, |at, value| {
+                    self.locator.check_known(&value.bitmap)?;
+                    let e = found[at].get_or_insert_with(RoaringBitmap::new);
+                    for &(ts, rg) in value.chain.versions() {
+                        if lo <= ts && ts <= hi {
+                            e.insert(rg.0);
+                        }
                     }
-                }
-            }
-        }
-        Ok(inside)
+                    Ok(())
+                })
+            },
+            union_found,
+        )?;
+        Ok(probes
+            .into_iter()
+            .zip(found)
+            .filter_map(|(p, b)| b.map(|b| (p, b)))
+            .collect())
     }
 
     /// Per probe of `variants`, the row groups where the per-key bounds
@@ -2519,14 +2648,62 @@ impl<S: StoreExt + ?Sized> Planner<S> {
         hi: i64,
     ) -> Result<BTreeMap<Vec<u8>, RoaringBitmap>> {
         let probes = sorted_probes(variants);
-        let mut inside: BTreeMap<Vec<u8>, RoaringBitmap> = BTreeMap::new();
-        for (key, bounds) in self.read_bounds(segs, def, src, &probes)? {
-            let e = inside.entry(key).or_default();
-            for b in bounds.iter().filter(|b| b.overlaps(lo, hi)) {
-                e.insert(b.rg.0);
+        let sources = match src {
+            TimedSource::Spec(spec) => {
+                Some((spec, &Self::spec_segments(segs, spec)?.sources, false))
             }
-        }
-        Ok(inside)
+            TimedSource::BloomBounds(spec) => {
+                Some((spec, &Self::spec_segments(segs, spec)?.bounds, true))
+            }
+            TimedSource::Legacy => None,
+        };
+        let Some((spec, sources, bloom)) = sources else {
+            let mut inside: BTreeMap<Vec<u8>, RoaringBitmap> = BTreeMap::new();
+            for (key, bounds) in self.read_bounds(segs, def, src, &probes)? {
+                let e = inside.entry(key).or_default();
+                for b in bounds.iter().filter(|b| b.overlaps(lo, hi)) {
+                    e.insert(b.rg.0);
+                }
+            }
+            return Ok(inside);
+        };
+        // The per-key bounds a key spec holds, read segment by segment on
+        // the rayon pool: the bounds overlapping `[lo, hi]` of each probe.
+        let found = Self::fold_segments(
+            sources,
+            || vec![None; probes.len()],
+            |found: &mut Vec<Option<RoaringBitmap>>, seg| {
+                let r = if bloom {
+                    self.open_bloom_bounds(spec, seg)?
+                } else {
+                    self.open_segment(spec, seg, false)?
+                };
+                if !r.has_bounds() {
+                    return Err(no_bounds(spec));
+                }
+                r.visit_sorted(&probes, |at, value| {
+                    let bounds = value.bounded().ok_or_else(|| {
+                        Error::Other(
+                            "corrupt segment: a segment with bounds holds a value without bounds"
+                                .into(),
+                        )
+                    })?;
+                    let e = found[at].get_or_insert_with(RoaringBitmap::new);
+                    for (rg, min, max) in bounds {
+                        if (RgBounds { rg, min, max }).overlaps(lo, hi) {
+                            e.insert(rg.0);
+                        }
+                    }
+                    Ok(())
+                })
+            },
+            union_found,
+        )?;
+        Ok(probes
+            .into_iter()
+            .zip(found)
+            .filter_map(|(p, b)| b.map(|b| (p, b)))
+            .collect())
     }
 
     /// The live row groups whose file's path gives `ts_column` a value in
@@ -3324,6 +3501,43 @@ fn expanded<'a>(keys: impl Iterator<Item = &'a Vec<u8>>) -> Vec<Vec<u8>> {
     out
 }
 
+/// The serving specs a window plan intersects: all but those a narrowing
+/// reads again with the same projection (a temporal spec on the window's
+/// time column, its chains; an exact spec with bounds, its bounds). Per
+/// key, what the narrowing keeps is a subset of that spec's own row groups
+/// for the key, so intersecting with them too changes nothing, and each of
+/// its segments is read once.
+fn not_narrowed_again<'s>(
+    serving: &[(&'s SpecSegments, Serve)],
+    sidecars: &[(SidecarDef, TimedSource)],
+    columns: &[String],
+    ts_column: &str,
+) -> Vec<(&'s SpecSegments, Serve)> {
+    let positions_of = |def: &SidecarDef| -> Option<Vec<usize>> {
+        def.columns
+            .iter()
+            .map(|c| columns.iter().position(|x| x == c))
+            .collect()
+    };
+    let narrowed_again = |s: &SpecSegments, how: &Serve| -> bool {
+        let Serve::Project(positions) = how else {
+            return false;
+        };
+        match &s.spec {
+            KeySpec::Temporal { ts_column: tc, .. } if tc == ts_column => true,
+            _ => sidecars.iter().any(|(def, src)| {
+                matches!(src, TimedSource::Spec(spec) if spec.identity() == s.spec.identity())
+                    && positions_of(def).as_ref() == Some(positions)
+            }),
+        }
+    };
+    serving
+        .iter()
+        .filter(|(s, how)| !narrowed_again(s, how))
+        .map(|(s, how)| (*s, how.clone()))
+        .collect()
+}
+
 /// Every zero variant of each key's projection onto `positions`.
 fn key_variants(
     keys: &[Vec<u8>],
@@ -3342,6 +3556,30 @@ fn sorted_probes(variants: &[Vec<Vec<u8>>]) -> Vec<Vec<u8>> {
     probes.sort_unstable();
     probes.dedup();
     probes
+}
+
+/// Merges two workers' per-probe row groups: a probe found by either is
+/// found, with the union of its row groups.
+fn union_found(
+    mut a: Vec<Option<RoaringBitmap>>,
+    b: Vec<Option<RoaringBitmap>>,
+) -> Vec<Option<RoaringBitmap>> {
+    for (x, y) in a.iter_mut().zip(b) {
+        match (x.as_mut(), y) {
+            (Some(x), Some(y)) => *x |= y,
+            (None, Some(y)) => *x = Some(y),
+            (_, None) => {}
+        }
+    }
+    a
+}
+
+/// A segment listed as holding per-key bounds that stores none.
+fn no_bounds(spec: &KeySpec) -> Error {
+    Error::Other(format!(
+        "corrupt index: a segment of {} stores no per-key bounds",
+        spec.identity()
+    ))
 }
 
 /// Narrows each key's row groups in `acc` to the union of what `inside`

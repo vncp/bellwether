@@ -34,5 +34,9 @@ criterion = { workspace = true }
 name = "replay"
 harness = false
 
+[[bench]]
+name = "plan"
+harness = false
+
 [lints]
 workspace = true

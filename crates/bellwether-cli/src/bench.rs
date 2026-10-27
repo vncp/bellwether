@@ -88,11 +88,45 @@ pub(crate) enum BenchCommand {
     /// rows in time order (2 x 10^6 by default), `latest`/`asof` runs of 10,
     /// 10^3, and 10^5 keys, and exact per-run truth.
     Tombstone(TombstoneArgs),
+    /// Check a `scripts/perf.sh` results file against the performance
+    /// budgets: exit 1 on a regression (two consecutive nightly runs past a
+    /// budget, or a pull-request run past it by the 1.5x tolerance) or a
+    /// budgeted metric missing from the results; one nightly run past a
+    /// budget is reported, not failed.
+    PerfCheck(PerfCheckArgs),
     /// Write the two-dataset corpus relational replay is priced on: an
     /// event log (`events`, keyed by `repo_id`, in time order) beside the
     /// repositories (`repos`, one row each plus restated rows), key files of
     /// 10, 100, and 1,000 repositories, and the consumer plans over them.
     Relational(RelationalArgs),
+}
+
+#[derive(Args)]
+pub(crate) struct PerfCheckArgs {
+    /// The results file (`benches/out/perf.json`, bellwether-perf/1).
+    #[arg(long, value_name = "FILE")]
+    results: PathBuf,
+    /// The budget file (`docs/measured/budgets.toml`); the documents it
+    /// names are read relative to the current directory (the repository
+    /// root).
+    #[arg(long, value_name = "FILE")]
+    budgets: PathBuf,
+    /// Compare against the CI runner's baseline (`[runner]`) instead of the
+    /// measurement machine's budgets.
+    #[arg(long)]
+    runner: bool,
+    /// A nightly run: the previous nightly run's results file, when there
+    /// is one. A metric fails only when past its budget in both runs.
+    #[arg(long, value_name = "FILE", conflicts_with = "pull_request")]
+    previous: Option<PathBuf>,
+    /// A labeled pull-request run: a metric fails when past its budget
+    /// widened by 1.5x, in this run alone.
+    #[arg(long)]
+    pull_request: bool,
+    /// Also append the report's Markdown table to this file (a CI step
+    /// summary).
+    #[arg(long, value_name = "FILE")]
+    summary: Option<PathBuf>,
 }
 
 #[derive(Args)]
@@ -525,7 +559,9 @@ fn file_hash(path: &Path) -> Result<Option<Hash>, Error> {
     }
 }
 
-/// Runs one benchmark subcommand. Returns what it wrote.
+/// Runs one benchmark subcommand. Returns what it wrote. One arm per
+/// subcommand, so its length grows with them.
+#[allow(clippy::too_many_lines)]
 pub(crate) fn run(cmd: &BenchCommand) -> Result<Wrote, Error> {
     let (what, path, failed, market) = match cmd {
         BenchCommand::Generate(a) => {
@@ -609,6 +645,11 @@ pub(crate) fn run(cmd: &BenchCommand) -> Result<Wrote, Error> {
         BenchCommand::Joins(a) => return joins(a),
         BenchCommand::Agg(a) => return agg(a),
         BenchCommand::Tombstone(a) => return tombstone(a),
+        BenchCommand::PerfCheck(_) => {
+            return Err(Error::Other(
+                "perf-check reports through bench::perf_check".into(),
+            ))
+        }
         BenchCommand::Relational(a) => return relational(a),
     };
     Ok(Wrote {
@@ -1067,6 +1108,54 @@ fn expr(a: &ExprArgs) -> Result<Wrote, Error> {
         tombstone: None,
         relational: None,
     })
+}
+
+/// `bench perf-check`: the report as JSON or a Markdown table; exit 1 on a
+/// regression or a missing metric, a usage error on budgets that cannot be
+/// trusted.
+pub(crate) fn perf_check(a: &PerfCheckArgs) -> Result<crate::Outcome, crate::Failure> {
+    use bellwether_bench::perfcheck::{
+        check, read_budgets, read_perf, Mode, PULL_REQUEST_TOLERANCE,
+    };
+    let usage = |e: &dyn std::fmt::Display| crate::Failure::Usage(e.to_string());
+    let budgets = read_budgets(&a.budgets, Path::new(".")).map_err(|e| usage(&e))?;
+    let results = read_perf(&a.results).map_err(|e| usage(&e))?;
+    let mode = if a.pull_request {
+        Mode::PullRequest {
+            tolerance: PULL_REQUEST_TOLERANCE,
+        }
+    } else {
+        Mode::Nightly {
+            previous: a
+                .previous
+                .as_deref()
+                .map(read_perf)
+                .transpose()
+                .map_err(|e| usage(&e))?,
+        }
+    };
+    let report = check(&budgets, &results, a.runner, &mode).map_err(|e| usage(&e))?;
+    let table = report.markdown();
+    if let Some(path) = &a.summary {
+        use std::io::Write as _;
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .and_then(|mut f| f.write_all(table.as_bytes()))
+            .map_err(|e| {
+                crate::Failure::Engine(Error::Other(format!(
+                    "cannot append the report to {} ({e})",
+                    path.display()
+                )))
+            })?;
+    }
+    let code = if report.failures().is_empty() {
+        crate::EXIT_OK
+    } else {
+        crate::EXIT_FAILED
+    };
+    crate::done(&report, table, code)
 }
 
 /// `bench read`: the row groups of a plan, or of a whole folder, through the

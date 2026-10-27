@@ -8,9 +8,10 @@
 //! changes what the snapshot observes. The view advances only when the
 //! reader calls [`Snapshot::reopen`].
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::ops::ControlFlow;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, LazyLock, Mutex, MutexGuard, PoisonError};
 
 use bellwether_types::{Error, Hash, Result, StoreVersion};
 use bytes::Bytes;
@@ -54,6 +55,96 @@ pub fn retained_sequences<S: StoreExt + ?Sized>(store: &S, root: &str) -> Result
     Ok(seqs.into_iter().collect())
 }
 
+/// Bytes [`Snapshot::read_segment_range`] reads ahead and keeps: segment
+/// ranges are fetched in aligned windows of this size.
+pub const SEGMENT_WINDOW_BYTES: u64 = 64 * 1024;
+
+/// Cap on the segment windows every snapshot of this process keeps, in
+/// total. The cache never holds more, whatever the size of the index or
+/// the number of snapshots open at once (ADR 018).
+pub const SEGMENT_CACHE_BYTES: usize = 32 * 1024 * 1024;
+
+/// A read of more windows than this is not cached: it is fetched exactly.
+const MAX_CACHED_READ_WINDOWS: u64 = 16;
+
+/// A window of one snapshot's reads: the snapshot's tag, the segment, and
+/// the window's index in it.
+type WindowKey = (u64, Hash, u64);
+
+/// The windows of segment bytes the open snapshots have read, oldest
+/// evicted first, bounded by [`SEGMENT_CACHE_BYTES`] across all of them.
+/// Each window is tagged with the snapshot that read it and served only to
+/// that snapshot and its clones; segments are immutable and
+/// content-addressed, so a window never goes stale while its snapshot is
+/// open.
+#[derive(Default)]
+struct Windows {
+    map: HashMap<WindowKey, Bytes>,
+    order: VecDeque<WindowKey>,
+    bytes: usize,
+}
+
+impl Windows {
+    fn insert(&mut self, key: WindowKey, window: Bytes) {
+        if window.len() > SEGMENT_CACHE_BYTES || self.map.contains_key(&key) {
+            return;
+        }
+        self.bytes += window.len();
+        self.map.insert(key, window);
+        self.order.push_back(key);
+        while self.bytes > SEGMENT_CACHE_BYTES {
+            let Some(old) = self.order.pop_front() else {
+                break;
+            };
+            if let Some(w) = self.map.remove(&old) {
+                self.bytes -= w.len();
+            }
+        }
+    }
+
+    /// Drops every window `owner` read.
+    fn forget(&mut self, owner: u64) {
+        let bytes = &mut self.bytes;
+        self.map.retain(|k, w| {
+            let keep = k.0 != owner;
+            if !keep {
+                *bytes -= w.len();
+            }
+            keep
+        });
+        self.order.retain(|k| k.0 != owner);
+    }
+}
+
+/// The process-wide window cache.
+static WINDOWS: LazyLock<Mutex<Windows>> = LazyLock::new(Mutex::default);
+
+/// The next snapshot's tag in [`WINDOWS`].
+static NEXT_OWNER: AtomicU64 = AtomicU64::new(0);
+
+fn windows() -> MutexGuard<'static, Windows> {
+    // A poisoned lock only means another thread panicked mid-insert; every
+    // entry is still a whole window of an immutable segment.
+    WINDOWS.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// A snapshot's tag in [`WINDOWS`], shared by its clones; dropping the
+/// last of them drops the windows it read.
+struct WindowOwner(u64);
+
+impl Drop for WindowOwner {
+    fn drop(&mut self) {
+        windows().forget(self.0);
+    }
+}
+
+/// Bytes the process-wide segment window cache holds now (at most
+/// [`SEGMENT_CACHE_BYTES`]).
+#[must_use]
+pub fn segment_cache_bytes() -> usize {
+    windows().bytes
+}
+
 /// A read handle pinned to one manifest version.
 #[derive(Clone)]
 pub struct Snapshot<S: StoreExt + ?Sized> {
@@ -63,6 +154,10 @@ pub struct Snapshot<S: StoreExt + ?Sized> {
     version: StoreVersion,
     pinned_sequence: Option<u64>,
     content_hash: Hash,
+    /// Each referenced segment's size, from the manifest.
+    sizes: Arc<HashMap<Hash, u64>>,
+    /// This snapshot's (and its clones') windows in [`WINDOWS`].
+    windows: Arc<WindowOwner>,
 }
 
 impl<S: StoreExt + ?Sized> std::fmt::Debug for Snapshot<S> {
@@ -82,14 +177,28 @@ impl<S: StoreExt + ?Sized> Snapshot<S> {
     pub fn open(store: Arc<S>, root: &str) -> Result<Self> {
         let (manifest, version, bytes) = read_manifest_raw(&*store, root)?
             .ok_or_else(|| Error::Store(format!("no manifest under {root:?}")))?;
-        Ok(Self {
+        Ok(Self::pinned(store, root, manifest, version, None, &bytes))
+    }
+
+    fn pinned(
+        store: Arc<S>,
+        root: &str,
+        manifest: Manifest,
+        version: StoreVersion,
+        pinned_sequence: Option<u64>,
+        bytes: &[u8],
+    ) -> Self {
+        let sizes = manifest.segments.iter().map(|s| (s.id, s.bytes)).collect();
+        Self {
             store,
             root: root.to_string(),
             manifest: Arc::new(manifest),
             version,
-            pinned_sequence: None,
-            content_hash: Hash::of(&bytes),
-        })
+            pinned_sequence,
+            content_hash: Hash::of(bytes),
+            sizes: Arc::new(sizes),
+            windows: Arc::new(WindowOwner(NEXT_OWNER.fetch_add(1, Ordering::Relaxed))),
+        }
     }
 
     /// Opens a snapshot of the committed manifest at `sequence` under `root`.
@@ -113,25 +222,25 @@ impl<S: StoreExt + ?Sized> Snapshot<S> {
                     manifest.sequence
                 )));
             }
-            return Ok(Some(Self {
+            return Ok(Some(Self::pinned(
                 store,
-                root: root.to_string(),
-                manifest: Arc::new(manifest),
+                root,
+                manifest,
                 version,
-                pinned_sequence: Some(sequence),
-                content_hash: Hash::of(&bytes),
-            }));
+                Some(sequence),
+                &bytes,
+            )));
         }
         if let Some((current, version, bytes)) = read_manifest_raw(&*store, root)? {
             if current.sequence == sequence {
-                return Ok(Some(Self {
+                return Ok(Some(Self::pinned(
                     store,
-                    root: root.to_string(),
-                    manifest: Arc::new(current),
+                    root,
+                    current,
                     version,
-                    pinned_sequence: Some(sequence),
-                    content_hash: Hash::of(&bytes),
-                }));
+                    Some(sequence),
+                    &bytes,
+                )));
             }
         }
         Ok(None)
@@ -200,16 +309,107 @@ impl<S: StoreExt + ?Sized> Snapshot<S> {
     /// block-index and bitmap reads that must not load a whole segment
     /// (ADR 018). Refuses ids not in the pinned manifest. Unlike
     /// [`Self::read_segment`], a partial read cannot be checked against the
-    /// content id.
+    /// content id; the segment format checks its records' own sums.
+    ///
+    /// Reads go to the store in aligned windows of
+    /// [`SEGMENT_WINDOW_BYTES`] (clipped to the segment's size in the
+    /// manifest), kept in a cache this process's snapshots share up to
+    /// [`SEGMENT_CACHE_BYTES`] in total, so a plan probing many keys of
+    /// one segment makes one store round trip per window instead of one
+    /// per value. A snapshot (with its clones) reads only the windows it
+    /// fetched itself, and they leave the cache when it is dropped: a new
+    /// snapshot reads the store afresh. A read wider than a few windows is
+    /// fetched exactly and not kept.
     pub fn read_segment_range(&self, id: &Hash, range: std::ops::Range<u64>) -> Result<Bytes> {
-        if !self.manifest.references(id) {
+        let Some(&size) = self.sizes.get(id) else {
             return Err(Error::Store(format!(
                 "segment {id} is not in the pinned manifest version"
             )));
+        };
+        let path = || segment_path(&self.root, id);
+        let missing = || Error::Store(format!("segment {id} missing from store"));
+        let (first, last) = (
+            range.start / SEGMENT_WINDOW_BYTES,
+            range.end.saturating_sub(1) / SEGMENT_WINDOW_BYTES,
+        );
+        if range.end <= range.start || range.end > size || last - first >= MAX_CACHED_READ_WINDOWS {
+            return self.store.get_range(&path(), range)?.ok_or_else(missing);
         }
-        self.store
-            .get_range(&segment_path(&self.root, id), range)?
-            .ok_or_else(|| Error::Store(format!("segment {id} missing from store")))
+        let offset = |at: u64| usize::try_from(at % SEGMENT_WINDOW_BYTES).unwrap_or(usize::MAX);
+        let end_in_last = usize::try_from(range.end - last * SEGMENT_WINDOW_BYTES)
+            .map_err(|_| Error::Store("segment range".into()))?;
+        let owner = self.owner();
+        if first == last {
+            if let Some(w) = windows().map.get(&(owner, *id, first)) {
+                return Ok(w.slice(offset(range.start)..end_in_last));
+            }
+        }
+        let have: Vec<Option<Bytes>> = {
+            let w = windows();
+            (first..=last)
+                .map(|i| w.map.get(&(owner, *id, i)).cloned())
+                .collect()
+        };
+        let mut parts: Vec<Bytes> = Vec::with_capacity(have.len());
+        if have.iter().all(Option::is_some) {
+            parts.extend(have.into_iter().flatten());
+        } else {
+            // One request for every window from the first missing to the
+            // last missing one.
+            let lo = first + have.iter().position(Option::is_none).unwrap_or(0) as u64;
+            let hi = first + have.iter().rposition(Option::is_none).unwrap_or(0) as u64;
+            let start = lo * SEGMENT_WINDOW_BYTES;
+            let end = ((hi + 1) * SEGMENT_WINDOW_BYTES).min(size);
+            let fetched = self
+                .store
+                .get_range(&path(), start..end)?
+                .ok_or_else(missing)?;
+            if fetched.len() as u64 != end - start {
+                return Err(Error::Store(format!(
+                    "segment {id}: asked for {} bytes at {start}, got {}; the segment is shorter \
+                     than the manifest says",
+                    end - start,
+                    fetched.len()
+                )));
+            }
+            let mut w = windows();
+            for (i, had) in (first..=last).zip(have) {
+                if let Some(b) = had {
+                    parts.push(b);
+                    continue;
+                }
+                let at = usize::try_from((i - lo) * SEGMENT_WINDOW_BYTES)
+                    .map_err(|_| Error::Store("segment window offset".into()))?;
+                let len =
+                    usize::try_from(SEGMENT_WINDOW_BYTES.min(size - i * SEGMENT_WINDOW_BYTES))
+                        .map_err(|_| Error::Store("segment window length".into()))?;
+                // A window owns its bytes: a slice would keep the whole
+                // response (or a backend's whole object) alive past what
+                // the cache counts.
+                let b = Bytes::copy_from_slice(&fetched[at..at + len]);
+                w.insert((owner, *id, i), b.clone());
+                parts.push(b);
+            }
+        }
+        if parts.len() == 1 {
+            return Ok(parts[0].slice(offset(range.start)..end_in_last));
+        }
+        let mut out = Vec::with_capacity(
+            usize::try_from(range.end - range.start)
+                .map_err(|_| Error::Store("segment range".into()))?,
+        );
+        let n = parts.len();
+        for (k, b) in parts.iter().enumerate() {
+            let from = if k == 0 { offset(range.start) } else { 0 };
+            let to = if k + 1 == n { end_in_last } else { b.len() };
+            out.extend_from_slice(&b[from..to]);
+        }
+        Ok(Bytes::from(out))
+    }
+
+    /// This snapshot's tag in the process-wide window cache.
+    fn owner(&self) -> u64 {
+        self.windows.0
     }
 
     /// Reads a segment of the pinned manifest and verifies its bytes against

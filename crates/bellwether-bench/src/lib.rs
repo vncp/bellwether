@@ -23,6 +23,10 @@
 //! - [`perf`] reads a lookup's planned row groups (or every row group under a
 //!   folder) through the byte-counting reader, for the release measurements
 //!   of `scripts/perf.sh`.
+//! - [`perfcheck`] judges a `scripts/perf.sh` results file against the
+//!   budgets in `docs/measured/budgets.toml` (`bellwether bench perf-check`,
+//!   WP22b): two consecutive nightly runs past a budget, or one labeled
+//!   pull-request run past it by the 1.5x tolerance, is a regression.
 //! - [`text`] writes a text corpus (1–4 KB documents with planted terms at
 //!   1% and 0.01% of rows) in the ledger or market shape, with exact ground
 //!   truth, for text keys (B5; `scripts/text-funnels.py`).
@@ -78,6 +82,7 @@ pub mod lists;
 pub mod market;
 pub mod mem;
 pub mod perf;
+pub mod perfcheck;
 pub mod relational;
 pub mod report;
 pub mod results;

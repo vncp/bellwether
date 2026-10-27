@@ -268,7 +268,12 @@ pub(crate) fn completeness_map(
 pub(crate) struct Locator {
     by_id: HashMap<u32, (usize, u32)>,
     live: RoaringBitmap,
-    retired: RoaringBitmap,
+    /// Every live or retired id.
+    known: RoaringBitmap,
+    /// `[min, max]` of `known` when it holds every id in between (no
+    /// retired id was dropped from the manifest): a bitmap is then known
+    /// with two comparisons.
+    known_span: Option<(u32, u32)>,
 }
 
 impl Locator {
@@ -302,10 +307,16 @@ impl Locator {
                 )));
             }
         }
+        let known = &live | &retired;
+        let known_span = match (known.min(), known.max()) {
+            (Some(lo), Some(hi)) if known.len() == u64::from(hi - lo) + 1 => Some((lo, hi)),
+            _ => None,
+        };
         Ok(Self {
             by_id,
             live,
-            retired,
+            known,
+            known_span,
         })
     }
 
@@ -322,9 +333,16 @@ impl Locator {
     /// references an id the manifest never assigned was built against
     /// another manifest than this one.
     pub(crate) fn check_known(&self, ids: &RoaringBitmap) -> Result<()> {
-        let mut unknown = ids - &self.live;
-        unknown -= &self.retired;
-        match unknown.min() {
+        // Both tests allocate nothing; they run once per value a plan reads.
+        let inside = match (self.known_span, ids.min(), ids.max()) {
+            (_, None, _) | (_, _, None) => true,
+            (Some((lo, hi)), Some(a), Some(b)) => lo <= a && b <= hi,
+            (None, ..) => ids.is_subset(&self.known),
+        };
+        if inside {
+            return Ok(());
+        }
+        match (ids - &self.known).min() {
             None => Ok(()),
             Some(id) => Err(Error::Other(format!(
                 "a segment references row-group id {id}, which this manifest neither tracks nor \
@@ -579,5 +597,31 @@ mod tests {
         let mut high = m;
         high.rowgroup_space.next_id = 9;
         assert!(Locator::new(&high.rowgroup_space).is_err());
+    }
+
+    #[test]
+    fn check_known_refuses_an_unknown_id_with_or_without_gaps() {
+        // WP22b: a contiguous known space is checked by its span, a space
+        // with a gap bitmap by bitmap; both refuse the same ids.
+        let m = manifest(vec![]);
+        let contiguous = Locator::new(&m.rowgroup_space).unwrap();
+        assert!(contiguous.known_span.is_some());
+        let mut gap = m.clone();
+        gap.rowgroup_space.files[1].rowgroup_ids.remove(0);
+        let gappy = Locator::new(&gap.rowgroup_space).unwrap();
+        assert!(gappy.known_span.is_none());
+        let missing = m.rowgroup_space.files[1].rowgroup_ids[0].0;
+        let ids = |v: &[u32]| v.iter().copied().collect::<RoaringBitmap>();
+        for loc in [&contiguous, &gappy] {
+            assert!(loc.check_known(&RoaringBitmap::new()).is_ok());
+            assert!(loc.check_known(&ids(&[0, 9])).is_ok());
+            assert!(loc.check_known(&ids(&[0, 10])).is_err());
+        }
+        assert!(contiguous.check_known(&ids(&[missing])).is_ok());
+        let msg = gappy
+            .check_known(&ids(&[0, missing]))
+            .unwrap_err()
+            .to_string();
+        assert!(msg.contains(&format!("row-group id {missing}")), "{msg}");
     }
 }

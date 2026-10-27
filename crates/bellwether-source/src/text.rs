@@ -605,8 +605,10 @@ impl<S: Storage> ChunkedTextSource<S> {
     }
 
     /// Decodes chunk `idx`, projected to file-schema column `indices`
-    /// (sorted, deduplicated), handing each batch to `f`. Holds one chunk's
-    /// raw bytes and one decoded batch at a time.
+    /// (sorted, deduplicated), handing each batch of at most `batch_rows`
+    /// rows to `f`. Holds one chunk's raw bytes and one decoded batch at a
+    /// time.
+    #[allow(clippy::too_many_arguments)]
     fn scan_chunk(
         &self,
         reader: &S::Reader,
@@ -614,8 +616,10 @@ impl<S: Storage> ChunkedTextSource<S> {
         layout: &Layout,
         idx: usize,
         indices: Vec<usize>,
+        batch_rows: usize,
         mut f: impl FnMut(RecordBatch) -> Result<()>,
     ) -> Result<()> {
+        let batch_rows = batch_rows.max(1);
         let range = layout.chunks[idx].clone();
         let bytes = get_bytes(reader, path, range.clone())?;
         match self.format {
@@ -636,7 +640,7 @@ impl<S: Storage> ChunkedTextSource<S> {
                     .with_header(has_header && idx == 0)
                     .with_delimiter(delimiter)
                     .with_projection(indices)
-                    .with_batch_size(BATCH_ROWS)
+                    .with_batch_size(batch_rows)
                     .build(Cursor::new(&bytes[..]))
                     .map_err(|e| src_err(path, e))?;
                 for batch in reader {
@@ -649,7 +653,7 @@ impl<S: Storage> ChunkedTextSource<S> {
                     .project(&indices)
                     .map_err(|e| src_err(path, e))?;
                 let reader = arrow::json::ReaderBuilder::new(Arc::new(projected))
-                    .with_batch_size(BATCH_ROWS)
+                    .with_batch_size(batch_rows)
                     .build(Cursor::new(&bytes[..]))
                     .map_err(|e| src_err(path, e))?;
                 for batch in reader {
@@ -670,6 +674,88 @@ impl<S: Storage> ChunkedTextSource<S> {
         }
     }
 
+    /// Decodes `columns` of chunk `rg` in batches of at most `batch_rows`
+    /// rows, each with exactly `columns` in that order (no columns: a
+    /// batch of rows alone), handing each to `f` before decoding the next,
+    /// and returns their schema. Fails when the chunk is not the one the
+    /// row group was built from, or when it decodes other than the row
+    /// group's rows (checked once the chunk is read). Holds the chunk's
+    /// raw bytes and one decoded batch at a time.
+    fn decode(
+        &self,
+        rg: &RowGroupMeta,
+        columns: &[String],
+        batch_rows: usize,
+        f: &mut dyn FnMut(RecordBatch) -> Result<()>,
+    ) -> Result<SchemaRef> {
+        let path = &rg.file.path;
+        let reader = open_verified(&self.storage, &rg.file, self.policy)?;
+        let layout = self.layout_from(&rg.file, &reader)?;
+        let idx = usize::try_from(rg.index_in_file).unwrap_or(usize::MAX);
+        let Some(range) = layout.chunks.get(idx) else {
+            return Err(Error::Source(format!(
+                "{path}: chunk {} out of range ({} chunks); was it built with another chunk size?",
+                rg.index_in_file,
+                layout.chunks.len()
+            )));
+        };
+        if range.end - range.start != rg.bytes {
+            return Err(Error::Source(format!(
+                "{path}: chunk {} is {} bytes at chunk size {}, but the row group records {} \
+                 bytes; it was built with a different chunk size",
+                rg.index_in_file,
+                range.end - range.start,
+                self.chunk_size,
+                rg.bytes
+            )));
+        }
+        // Length and row count alone do not pin where a chunk starts: a chunk
+        // built at one size can land at a different offset with the same length
+        // at another size (common for fixed-width lines). The recorded range,
+        // when present, pins both ends.
+        if let Some((start, end)) = rg.byte_range {
+            if (range.start, range.end) != (start, end) {
+                return Err(Error::Source(format!(
+                    "{path}: chunk {} spans bytes {}..{} at chunk size {}, but the row group \
+                     records {start}..{end}; it was built with a different chunk size",
+                    rg.index_in_file, range.start, range.end, self.chunk_size
+                )));
+            }
+        }
+        let wanted = resolve_columns(&layout.schema, columns)?;
+        let decode = Self::decode_indices(&layout.schema, &wanted);
+        let decoded_schema = Arc::new(
+            layout
+                .schema
+                .project(&decode)
+                .map_err(|e| src_err(path, e))?,
+        );
+        let schema = if columns.is_empty() {
+            Arc::new(Schema::empty())
+        } else {
+            reorder(&RecordBatch::new_empty(decoded_schema), columns)?.schema()
+        };
+        let mut rows = 0u64;
+        self.scan_chunk(&reader, path, &layout, idx, decode, batch_rows, |b| {
+            rows += b.num_rows() as u64;
+            let out = if columns.is_empty() {
+                let opts = RecordBatchOptions::new().with_row_count(Some(b.num_rows()));
+                RecordBatch::try_new_with_options(Arc::clone(&schema), vec![], &opts)
+                    .map_err(|e| src_err(path, e))?
+            } else {
+                reorder(&b, columns)?
+            };
+            f(out)
+        })?;
+        if rows != rg.rows {
+            return Err(Error::Source(format!(
+                "{path}: chunk {} decoded {rows} rows, but the row group records {}",
+                rg.index_in_file, rg.rows
+            )));
+        }
+        Ok(schema)
+    }
+
     fn scan_file(&self, file: &FileFingerprint) -> Result<Vec<RowGroupMeta>> {
         let reader = open_verified(&self.storage, file, self.policy)?;
         let layout = self.layout_from(file, &reader)?;
@@ -680,16 +766,24 @@ impl<S: Storage> ChunkedTextSource<S> {
         for (k, range) in layout.chunks.iter().enumerate() {
             let mut rows = 0u64;
             let mut accs: Vec<StatsAccumulator> = vec![StatsAccumulator::default(); stat_idx.len()];
-            self.scan_chunk(&reader, &file.path, &layout, k, decode.clone(), |batch| {
-                rows += u64::try_from(batch.num_rows()).unwrap_or(0);
-                for (acc, &col) in accs.iter_mut().zip(&stat_idx) {
-                    let field = schema.field(col);
-                    if let Some(array) = batch.column_by_name(field.name()) {
-                        acc.update(self.canonical.as_ref(), array.as_ref(), field.data_type());
+            self.scan_chunk(
+                &reader,
+                &file.path,
+                &layout,
+                k,
+                decode.clone(),
+                BATCH_ROWS,
+                |batch| {
+                    rows += u64::try_from(batch.num_rows()).unwrap_or(0);
+                    for (acc, &col) in accs.iter_mut().zip(&stat_idx) {
+                        let field = schema.field(col);
+                        if let Some(array) = batch.column_by_name(field.name()) {
+                            acc.update(self.canonical.as_ref(), array.as_ref(), field.data_type());
+                        }
                     }
-                }
-                Ok(())
-            })?;
+                    Ok(())
+                },
+            )?;
             let stats = schema
                 .fields()
                 .iter()
@@ -807,71 +901,32 @@ impl<S: Storage> Source for ChunkedTextSource<S> {
 
     fn read_columns(&self, rg: &RowGroupMeta, columns: &[String]) -> Result<RecordBatch> {
         let path = &rg.file.path;
-        let reader = open_verified(&self.storage, &rg.file, self.policy)?;
-        let layout = self.layout_from(&rg.file, &reader)?;
-        let idx = usize::try_from(rg.index_in_file).unwrap_or(usize::MAX);
-        let Some(range) = layout.chunks.get(idx) else {
-            return Err(Error::Source(format!(
-                "{path}: chunk {} out of range ({} chunks); was it built with another chunk size?",
-                rg.index_in_file,
-                layout.chunks.len()
-            )));
-        };
-        if range.end - range.start != rg.bytes {
-            return Err(Error::Source(format!(
-                "{path}: chunk {} is {} bytes at chunk size {}, but the row group records {} \
-                 bytes; it was built with a different chunk size",
-                rg.index_in_file,
-                range.end - range.start,
-                self.chunk_size,
-                rg.bytes
-            )));
-        }
-        // Length and row count alone do not pin where a chunk starts: a chunk
-        // built at one size can land at a different offset with the same length
-        // at another size (common for fixed-width lines). The recorded range,
-        // when present, pins both ends.
-        if let Some((start, end)) = rg.byte_range {
-            if (range.start, range.end) != (start, end) {
-                return Err(Error::Source(format!(
-                    "{path}: chunk {} spans bytes {}..{} at chunk size {}, but the row group \
-                     records {start}..{end}; it was built with a different chunk size",
-                    rg.index_in_file, range.start, range.end, self.chunk_size
-                )));
-            }
-        }
-        let wanted = resolve_columns(&layout.schema, columns)?;
-        let decode = Self::decode_indices(&layout.schema, &wanted);
         let mut batches = Vec::new();
-        self.scan_chunk(&reader, path, &layout, idx, decode.clone(), |b| {
+        let schema = self.decode(rg, columns, BATCH_ROWS, &mut |b| {
             batches.push(b);
             Ok(())
         })?;
-        let decoded_schema = Arc::new(
-            layout
-                .schema
-                .project(&decode)
-                .map_err(|e| src_err(path, e))?,
-        );
-        let batch = if batches.is_empty() {
-            RecordBatch::new_empty(decoded_schema)
-        } else {
-            concat_batches(&batches[0].schema(), &batches).map_err(|e| src_err(path, e))?
-        };
-        if u64::try_from(batch.num_rows()).ok() != Some(rg.rows) {
-            return Err(Error::Source(format!(
-                "{path}: chunk {} decoded {} rows, but the row group records {}",
-                rg.index_in_file,
-                batch.num_rows(),
-                rg.rows
-            )));
-        }
         if columns.is_empty() {
-            let opts = RecordBatchOptions::new().with_row_count(Some(batch.num_rows()));
-            return RecordBatch::try_new_with_options(Arc::new(Schema::empty()), vec![], &opts)
+            let rows = batches.iter().map(RecordBatch::num_rows).sum();
+            let opts = RecordBatchOptions::new().with_row_count(Some(rows));
+            return RecordBatch::try_new_with_options(schema, vec![], &opts)
                 .map_err(|e| src_err(path, e));
         }
-        reorder(&batch, columns)
+        match batches.len() {
+            0 => Ok(RecordBatch::new_empty(schema)),
+            1 => Ok(batches.swap_remove(0)),
+            _ => concat_batches(&schema, &batches).map_err(|e| src_err(path, e)),
+        }
+    }
+
+    fn read_column_batches(
+        &self,
+        rg: &RowGroupMeta,
+        columns: &[String],
+        max_rows: usize,
+        f: &mut dyn FnMut(RecordBatch) -> Result<()>,
+    ) -> Result<()> {
+        self.decode(rg, columns, max_rows, f).map(|_| ())
     }
 
     fn schema(&self, root: &str) -> Result<SchemaRef> {

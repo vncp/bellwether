@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use bellwether_store::{
     claimed_segment, commit, gc, gc_with, manifest_history_path, manifest_path, read_manifest,
-    retained_sequences, segment_path, DeleteClaim, Extra, GcOptions, Manifest, ObjectMeta,
+    retained_sequences, segment_path, Cache, DeleteClaim, Extra, GcOptions, Manifest, ObjectMeta,
     ObjectStoreBackend, RowGroupRange, SegmentRef, Snapshot, StagedSegments, StoreExt,
 };
 use bellwether_types::{Error, Hash, Result, Store, StoreVersion};
@@ -1124,4 +1124,55 @@ fn a_history_object_that_differs_is_kept_and_never_blocks_a_commit() {
         matches!(&err, Error::Store(msg) if msg.contains("sequence 99, expected 1")),
         "{err:?}"
     );
+}
+
+/// Hypothesis 6: a lookup stores its key set once (`Cache::put_cached_once`),
+/// so the entry keeps its first stamp however often the same keys are
+/// looked up again. That is safe only if no GC decision reads a cache
+/// entry's age: GC scans `segments/` and never lists, tombstones, or
+/// deletes `cache/`. Here a key set stamped 26 years ago, beside a
+/// tombstoned segment and an orphan, survives GC runs at retention zero
+/// that delete both, byte for byte, and is still skipped, not rewritten.
+#[test]
+fn gc_never_ages_out_a_key_set_stored_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(ObjectStoreBackend::local(dir.path()).unwrap());
+    let (x, _staged) = tombstoned_x(&store);
+    let mut orphans = StagedSegments::new();
+    let orphan = seg(&mut orphans, "abandoned", 9);
+    let orphan_path = segment_path("idx", &orphan.id);
+    store
+        .put_content_addressed(&orphan_path, orphans.get(&orphan.id).unwrap().clone())
+        .unwrap();
+
+    let cache = Cache::new(Arc::clone(&store), "idx");
+    let keys = Bytes::from_static(b"{\"keys\":[\"AAPL\",\"MSFT\"]}");
+    let key_set = Hash::of(&keys);
+    cache.put_cached_once(&key_set, keys.clone()).unwrap();
+    // Back-date the sidecar far past any retention.
+    let meta_path = cache.meta_path(&key_set);
+    let mut meta: serde_json::Value =
+        serde_json::from_slice(&store.get(&meta_path).unwrap().0).unwrap();
+    meta["created_at"] = "2000-01-01T00:00:00.000Z".into();
+    let old_meta = Bytes::from(serde_json::to_vec(&meta).unwrap());
+    store
+        .put_content_addressed(&meta_path, old_meta.clone())
+        .unwrap();
+    let payload_path = cache.payload_path(&key_set);
+
+    let first = gc(&*store, "idx", Duration::ZERO).unwrap();
+    let second = gc(&*store, "idx", Duration::ZERO).unwrap();
+    assert_eq!(first.deleted + second.deleted, 2, "{first:?} {second:?}");
+    assert!(!store.exists(&segment_path("idx", &x.id)).unwrap());
+    assert!(!store.exists(&orphan_path).unwrap());
+
+    assert_eq!(store.get(&payload_path).unwrap().0, keys);
+    assert_eq!(store.get(&meta_path).unwrap().0, old_meta);
+    let (read, age) = cache.get_cached(&key_set).unwrap().unwrap();
+    assert_eq!(read, keys);
+    assert!(age > Duration::from_secs(20 * 365 * 86_400), "{age:?}");
+    cache.put_cached_once(&key_set, keys).unwrap();
+    assert_eq!(store.get(&meta_path).unwrap().0, old_meta);
+    let (m, _) = read_manifest(&*store, "idx").unwrap().unwrap();
+    assert!(m.segment_tombstones.is_empty() && m.deleting.is_empty());
 }

@@ -20,7 +20,7 @@ use crate::canonical::{normalize_float_bounds, Canonical, DefaultCanonical};
 use crate::fingerprint::{fingerprint_with_policy, FingerprintPolicy};
 use crate::partition::{infer_column_type, repeat, typed_value, PartitionValue, Partitioning};
 use crate::storage::{LocalFs, Storage};
-use crate::{open_verified, reorder, resolve_columns, BoundedCache};
+use crate::{open_verified, resolve_columns, BoundedCache};
 
 /// File extension [`ParquetSource::discover`] lists.
 pub const PARQUET_EXTENSION: &str = "parquet";
@@ -230,6 +230,122 @@ impl<S: Storage> ParquetSource<S> {
         // A poisoned cache only means another thread panicked mid-insert; the
         // map itself is still a valid cache.
         self.footers.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Decodes `columns` of one row group in batches of at most `max_rows`
+    /// rows (the whole row group at once with `None`), each with exactly
+    /// `columns` in that order, partition columns the file does not store
+    /// synthesized from the path. Hands each batch to `f` before decoding
+    /// the next and returns the batches' schema. The handle decoded from
+    /// is verified against the fingerprint first: a cached footer must
+    /// never drive reads into a file that has since been rewritten or
+    /// replaced.
+    fn decode(
+        &self,
+        rg: &RowGroupMeta,
+        columns: &[String],
+        max_rows: Option<usize>,
+        f: &mut dyn FnMut(RecordBatch) -> Result<()>,
+    ) -> Result<SchemaRef> {
+        let reader = open_verified(&self.storage, &rg.file, self.policy)?;
+        let meta = self.footer_from(&rg.file, &reader)?;
+        let idx = usize::try_from(rg.index_in_file).unwrap_or(usize::MAX);
+        let md = meta.metadata();
+        if idx >= md.num_row_groups() {
+            return Err(Error::Source(format!(
+                "{}: row group {} out of range ({} row groups)",
+                rg.file.path,
+                rg.index_in_file,
+                md.num_row_groups()
+            )));
+        }
+        let partitions = self.partitions(&rg.file.path)?;
+        let file_schema = Arc::clone(meta.schema());
+        // Columns the path supplies and the file does not store are
+        // synthesized; only the rest is decoded.
+        let virtual_cols: Vec<&PartitionValue> = partitions
+            .iter()
+            .filter(|p| columns.contains(&p.name) && file_schema.field_with_name(&p.name).is_err())
+            .collect();
+        let stored: Vec<String> = columns
+            .iter()
+            .filter(|c| !virtual_cols.iter().any(|p| &p.name == *c))
+            .cloned()
+            .collect();
+        let roots = resolve_columns(&file_schema, &stored)?;
+        let rows = usize::try_from(md.row_group(idx).num_rows()).unwrap_or(0);
+        let mask = ProjectionMask::roots(md.file_metadata().schema_descr(), roots);
+        let batches = ParquetRecordBatchReaderBuilder::new_with_metadata(reader, meta)
+            .with_row_groups(vec![idx])
+            .with_projection(mask)
+            .with_batch_size(max_rows.unwrap_or(rows).clamp(1, rows.max(1)))
+            .build()
+            .map_err(|e| Error::Source(format!("{}: {e}", rg.file.path)))?;
+        let decoded = batches.schema();
+        // Where each requested column comes from: a decoded column, or a
+        // partition value repeated for every row.
+        let mut fields = Vec::with_capacity(columns.len());
+        let mut from: Vec<std::result::Result<usize, ArrayRef>> = Vec::with_capacity(columns.len());
+        for c in columns {
+            if let Some(p) = virtual_cols.iter().find(|p| &p.name == c) {
+                let target = self.partition_type(p, &file_schema)?.ok_or_else(|| {
+                    Error::KeySpec(format!(
+                        "column {c:?} is a partition column the dataset schema does not declare"
+                    ))
+                })?;
+                let one = typed_value(&p.name, p.value.as_deref(), &target)?;
+                fields.push(Field::new(c.clone(), target, true));
+                from.push(Err(one));
+            } else {
+                let i = decoded
+                    .index_of(c)
+                    .map_err(|_| Error::KeySpec(format!("column {c:?} not in decoded batch")))?;
+                fields.push(decoded.field(i).clone());
+                from.push(Ok(i));
+            }
+        }
+        // Without synthesized columns the batch is a projection of the
+        // decoded one and keeps its schema metadata.
+        let schema = if virtual_cols.is_empty() {
+            let idx: Vec<usize> = from
+                .iter()
+                .filter_map(|s| s.as_ref().ok().copied())
+                .collect();
+            Arc::new(
+                decoded
+                    .project(&idx)
+                    .map_err(|e| Error::Source(format!("projection: {e}")))?,
+            )
+        } else {
+            Arc::new(Schema::new(fields))
+        };
+        let mut decoded_rows = 0usize;
+        for batch in batches {
+            let batch = batch.map_err(|e| Error::Source(format!("{}: {e}", rg.file.path)))?;
+            let n = batch.num_rows();
+            decoded_rows += n;
+            let arrays = from
+                .iter()
+                .map(|s| match s {
+                    Ok(i) => Ok(Arc::clone(batch.column(*i))),
+                    Err(one) => repeat(one, n),
+                })
+                .collect::<Result<Vec<ArrayRef>>>()?;
+            let out = RecordBatch::try_new_with_options(
+                Arc::clone(&schema),
+                arrays,
+                &arrow::array::RecordBatchOptions::new().with_row_count(Some(n)),
+            )
+            .map_err(|e| Error::Source(format!("{}: {e}", rg.file.path)))?;
+            f(out)?;
+        }
+        if decoded_rows != rows {
+            return Err(Error::Source(format!(
+                "{}: row group {} decoded {decoded_rows} rows, the footer says {rows}",
+                rg.file.path, rg.index_in_file
+            )));
+        }
+        Ok(schema)
     }
 
     /// The dataset type of column `name`, falling back to the file type.
@@ -643,86 +759,27 @@ impl<S: Storage> Source for ParquetSource<S> {
     }
 
     fn read_columns(&self, rg: &RowGroupMeta, columns: &[String]) -> Result<RecordBatch> {
-        // Verify on the handle we decode from: a cached footer must never
-        // drive reads into a file that has since been rewritten or replaced.
-        let reader = open_verified(&self.storage, &rg.file, self.policy)?;
-        let meta = self.footer_from(&rg.file, &reader)?;
-        let idx = usize::try_from(rg.index_in_file).unwrap_or(usize::MAX);
-        let md = meta.metadata();
-        if idx >= md.num_row_groups() {
-            return Err(Error::Source(format!(
-                "{}: row group {} out of range ({} row groups)",
-                rg.file.path,
-                rg.index_in_file,
-                md.num_row_groups()
-            )));
+        let mut batches = Vec::with_capacity(1);
+        let schema = self.decode(rg, columns, None, &mut |b| {
+            batches.push(b);
+            Ok(())
+        })?;
+        match batches.len() {
+            0 => Ok(RecordBatch::new_empty(schema)),
+            1 => Ok(batches.swap_remove(0)),
+            _ => concat_batches(&schema, &batches)
+                .map_err(|e| Error::Source(format!("{}: {e}", rg.file.path))),
         }
-        let partitions = self.partitions(&rg.file.path)?;
-        let file_schema = Arc::clone(meta.schema());
-        // Columns the path supplies and the file does not store are
-        // synthesized; only the rest is decoded.
-        let virtual_cols: Vec<&PartitionValue> = partitions
-            .iter()
-            .filter(|p| columns.contains(&p.name) && file_schema.field_with_name(&p.name).is_err())
-            .collect();
-        let stored: Vec<String> = columns
-            .iter()
-            .filter(|c| !virtual_cols.iter().any(|p| &p.name == *c))
-            .cloned()
-            .collect();
-        let roots = resolve_columns(&file_schema, &stored)?;
-        let rows = usize::try_from(md.row_group(idx).num_rows()).unwrap_or(0);
-        let mask = ProjectionMask::roots(md.file_metadata().schema_descr(), roots);
-        let batches = ParquetRecordBatchReaderBuilder::new_with_metadata(reader, meta)
-            .with_row_groups(vec![idx])
-            .with_projection(mask)
-            .with_batch_size(rows.max(1))
-            .build()
-            .map_err(|e| Error::Source(format!("{}: {e}", rg.file.path)))?;
-        let schema = batches.schema();
-        let batches = batches
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(|e| Error::Source(format!("{}: {e}", rg.file.path)))?;
-        let batch = concat_batches(&schema, &batches)
-            .map_err(|e| Error::Source(format!("{}: {e}", rg.file.path)))?;
-        if virtual_cols.is_empty() {
-            return reorder(&batch, columns);
-        }
-        if batch.num_rows() != rows {
-            return Err(Error::Source(format!(
-                "{}: row group {} decoded {} rows, the footer says {rows}",
-                rg.file.path,
-                rg.index_in_file,
-                batch.num_rows()
-            )));
-        }
-        let mut fields = Vec::with_capacity(columns.len());
-        let mut arrays: Vec<ArrayRef> = Vec::with_capacity(columns.len());
-        for c in columns {
-            if let Some(p) = virtual_cols.iter().find(|p| &p.name == c) {
-                let target = self.partition_type(p, &file_schema)?.ok_or_else(|| {
-                    Error::KeySpec(format!(
-                        "column {c:?} is a partition column the dataset schema does not declare"
-                    ))
-                })?;
-                let one = typed_value(&p.name, p.value.as_deref(), &target)?;
-                fields.push(Field::new(c.clone(), target, true));
-                arrays.push(repeat(&one, rows)?);
-            } else {
-                let i = batch
-                    .schema()
-                    .index_of(c)
-                    .map_err(|_| Error::KeySpec(format!("column {c:?} not in decoded batch")))?;
-                fields.push(batch.schema().field(i).clone());
-                arrays.push(Arc::clone(batch.column(i)));
-            }
-        }
-        RecordBatch::try_new_with_options(
-            Arc::new(Schema::new(fields)),
-            arrays,
-            &arrow::array::RecordBatchOptions::new().with_row_count(Some(rows)),
-        )
-        .map_err(|e| Error::Source(format!("{}: {e}", rg.file.path)))
+    }
+
+    fn read_column_batches(
+        &self,
+        rg: &RowGroupMeta,
+        columns: &[String],
+        max_rows: usize,
+        f: &mut dyn FnMut(RecordBatch) -> Result<()>,
+    ) -> Result<()> {
+        self.decode(rg, columns, Some(max_rows), f).map(|_| ())
     }
 
     fn schema(&self, root: &str) -> Result<SchemaRef> {

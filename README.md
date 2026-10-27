@@ -188,10 +188,10 @@ Reproduce everything above, downloads included, with [`scripts/showcase.sh`](scr
 - **Agent-first.** MCP tools in tiers (`observe.*`, `propose.*`, `score.*`, `apply.receipt`, `jobs.*`), typed refusals, dry runs, and per-session budgets.
 - **Parquet stays Parquet.** Immutable sidecar segments and a manifest committed by conditional PUT. No table format conversion, no locks, no new file format. Local disk, S3, Azure, GCS.
 - **Time travel without a table format.** `latest` and `asof` work across a folder of history files, no snapshots or table metadata needed.
-- **Runs on a laptop.** Memory is bounded per operation and stated in the docs. The "which files do I need" question no longer needs a cluster or a JVM. [Measured on one](docs/measured/2026-10-26-performance.md), with three caveats from that page:
-  - `reconcile` exceeds its stated memory bound on wide row groups at small `--memory-budget` values: 1.6 GiB at 64 MiB on the ledger rung. This is [an open defect](docs/measured/2026-10-26-performance.md#findings).
-  - Plan plus read was slower than both a full scan and DuckDB in all 42 measured lookups. The plan makes one store round trip per indexed value ([the measured cause](docs/measured/2026-10-26-performance.md#hypotheses-for-wp22b-ranked-by-expected-gain)). The index saves bytes read, not yet wall time.
-  - The lookup timings overlapped another process's compile; [the load record](docs/measured/2026-10-26-performance.md#measured-under-load) shows by how much.
+- **Runs on a laptop.** Memory is bounded per operation and stated in the docs. The "which files do I need" question no longer needs a cluster or a JVM. [Measured on one](docs/measured/2026-10-27-performance.md), with three caveats from that page:
+  - A plan has a fixed cost of about 13.5 ms: process start, reading the manifest, and a durable write of its evidence. On small folders a full scan is faster: 4 to 5 ms on the two smallest measured corpora. On the 10× `market` corpus (2,268 row groups), every lookup of 10 and 300 keys plans faster than its 40 ms full scan, and 3,000 keys plan in 36 to 46 ms, down from 3.7 to 7.4 s.
+  - End to end, plan plus read beat the full scan in 11 of 42 measured lookups and DuckDB in 3, all on the 10× corpus ([the headline table](docs/measured/2026-10-27-performance.md#headline-plan-time-under-full-scan-time)).
+  - `reconcile` stays within its stated memory bound at every measured budget except one: on the taxi months at 8 GiB, peak RSS is 0.4% over it, an [open item](docs/measured/2026-10-27-performance.md#reconcile-memory).
 
 ## Index kinds
 
@@ -493,8 +493,8 @@ Built beyond the milestones: the time-series keys (partition values from paths, 
 Not built, or not yet measured:
 
 - **`advise`.** Designed and reduced ([`docs/evolve.md`](docs/evolve.md) §3.1, ADR 032); no code yet. `evolve --llm` and the rulebook are deferred.
-- **Engine adapters, CI receipts.** In progress (WP16) and planned (WP17). Today a plan is a list of files and row groups your engine reads. A multi-machine build is parked (WP22b); builds run on one machine.
-- **Performance.** Release-build measurements ([`docs/measured/2026-10-26-performance.md`](docs/measured/2026-10-26-performance.md)): plan plus read lost to both a full scan and DuckDB in all 42 lookups, though it read far fewer bytes, because planning makes one store round trip per indexed value. WP22b fixes that first.
+- **CI receipts.** Planned (WP17). A multi-machine build is parked (WP22b); builds run on one machine.
+- **Performance.** Release-build measurements ([`docs/measured/2026-10-26-performance.md`](docs/measured/2026-10-26-performance.md), then [`2026-10-27-performance.md`](docs/measured/2026-10-27-performance.md)). WP22a found plan plus read lost to both a full scan and DuckDB in all 42 lookups, though it read far fewer bytes, because planning made one store round trip per indexed value. WP22b fixed that first: plan plus read now beats the full scan in 11 of 42 lookups and DuckDB in 3, and planning beats the full scan on the 10× `market` corpus at 10 and 300 keys. On folders a full scan reads in 4 to 5 ms it does not: a plan's fixed cost is about 13.5 ms, half of it the durable write of its evidence.
 
 ## Docs
 

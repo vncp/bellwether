@@ -71,7 +71,7 @@ WP2. Implements `bellwether_types::Source` for Parquet and for CSV / JSON lines,
 ## Memory bound (ADR 018)
 
 - Parquet `row_groups` holds one footer.
-- Parquet `read_columns` holds the projected column chunks of one row group, decoded into a single batch.
+- Parquet `read_columns` holds the projected column chunks of one row group, decoded into a single batch. `read_column_batches` (`Source`, WP22b) decodes the same chunks at most `max_rows` rows at a time and hands each batch over before decoding the next, so a caller holds one batch whatever the row group's width; reconcile reads this way (8,192 rows). Text and SQL sources stream it too; the trait's default hands over one whole row group.
 - Text `row_groups` holds one chunk's raw bytes (at most 4× `chunk_size`) and one decoded batch of at most 8192 rows, projected to the stats columns.
 - Text `read_columns` holds one chunk's raw bytes and its projected columns.
 - Caches are bounded by bytes, with FIFO eviction: footers 256 MiB (`ParquetMetaData::memory_size`), text layouts 64 MiB, and text scans 64 MiB.

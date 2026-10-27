@@ -48,4 +48,6 @@ pub use manifest::{
     V1_SHARED_IDENTITY,
 };
 pub use object_store::ObjectMeta;
-pub use snapshot::{retained_sequences, Snapshot};
+pub use snapshot::{
+    retained_sequences, segment_cache_bytes, Snapshot, SEGMENT_CACHE_BYTES, SEGMENT_WINDOW_BYTES,
+};

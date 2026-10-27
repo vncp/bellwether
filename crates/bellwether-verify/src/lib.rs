@@ -59,7 +59,7 @@ pub use outcome::{
     SidePath, SideReport, Sides, VersionDigest,
 };
 pub use planner::{AggTotals, ManifestIdentity, SidePlanner};
-pub use reconcile::{Reconciler, Side, PARTITION_SEED};
+pub use reconcile::{Reconciler, Side, PARTITION_SEED, READ_BATCH_ROWS};
 pub use rowhash::{push_hashed_column, row_hash};
 pub use spec::{
     CoverageRequest, Options, ReconcileSpec, TotalColumn, WorkloadKeys, DEFAULT_MAX_EXAMPLES,

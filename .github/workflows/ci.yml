@@ -59,8 +59,8 @@ jobs:
           echo '993ad89e7dfca66cd6da994c2cad090c2fc160ddf9f550498a098ab4bb13cfb1  duckdb-shared-libs-linux-amd64.tar.gz' | sha256sum -c -
           tar -xzf duckdb-shared-libs-linux-amd64.tar.gz libduckdb.so
           echo "BELLWETHER_DUCKDB_DRIVER=$RUNNER_TEMP/libduckdb/libduckdb.so" >> "$GITHUB_ENV"
-      - name: install the ODBC driver manager (the `odbc` feature of bellwether-source-sql links it)
-        run: sudo apt-get update && sudo apt-get install -y unixodbc-dev
+      - name: install the ODBC driver manager (the `odbc` feature of bellwether-source-sql links it) and GNU time (the reconcile footprint test measures the process with it)
+        run: sudo apt-get update && sudo apt-get install -y unixodbc-dev time
       # The engine adapters (bellwether-adapters, `--emit`) run their
       # artifacts in real engines. Installed outside PATH and named only in
       # the step that requires it, so no other test changes behavior. Spark

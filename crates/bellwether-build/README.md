@@ -95,7 +95,7 @@ A lookup on an expression (a key column named by an expression over dataset colu
 
 **Intersection.**
 
-- Bitmaps are intersected per key tuple across serving specs, then unioned.
+- Bitmaps are intersected per key tuple across serving specs, then unioned. A spec is skipped where intersecting with it cannot change the answer, so its segments are not read for nothing: in a window, a spec that a narrowing reads again with the same projection (a temporal spec on the window's time column, an exact spec with bounds), since what the narrowing keeps is a subset of that spec's own row groups; in `latest` and `asof`, every other spec when the temporal spec keys the whole lookup tuple, since its winners are rows of the key itself and every spec's row groups for the key contain them (invariant 1). The plans are byte-identical either way (WP22b, checked over every lookup of the measured document).
 - No spec means a raw scan of every live row group.
 - No key means no row group and an empty `In`, never a full scan, with or without specs.
 - A probe containing a null matches nothing (ADR 014). It is dropped before any lookup (point, prefix or projection) and from the residual.
@@ -161,7 +161,7 @@ Details:
 **Sketches (B2): built here, never planned with.**
 
 - `BuildOptions::sketches` declares `bellwether_types::SketchSpec`s (`sketch:a,b,a+b[,p=14][,minhash=K]` on the command line): per item, per file, the HyperLogLog registers and optional MinHash signature of `bellwether_core::sketch`. Each is recorded in `schema.sidecars[]` with kind `sketch` (items in `columns`, no time column, `p` and `minhash` in `params`), its segments carry `segments[].kind = "sketch"`, and it is built, covered, and recorded complete by the sidecar rules (`sketch_completeness`; `declared_sketches` lists them). A malformed sketch declaration is kept unchanged like an unknown kind and never used.
-- **No planner path reads a sketch.** `declared_sidecars`, the only sidecars the planner sees, never yields one, and the planner modules never name the kind. `tests/sketch.rs` proves it: every lookup plans byte-identically with and without a sketch, and still does after every sketch segment is deleted from the store; a source tripwire fails if a planner file ever mentions the sketch kind.
+- **No planner path reads a sketch.** `declared_sidecars`, the only sidecars the planner sees, never yields one. `tests/sketch.rs` proves it by behavior: every lookup plans byte-identically with and without a sketch, and still does after every sketch segment is deleted from the store. The facade's `tests/sketch.rs` does the same for `locate`, `latest`, `asof`, window plans, `why`, and a multi-pass `reconcile`.
 - Memory: a sketch writer grows by one entry per file stretch, each at most `sketch::max_entry_bytes` (`2^p` registers and `k` slots per item); that bound is charged against `max_segment_bytes` when an entry starts, so a segment closes before the cap is crossed.
 
 ### List keys (B4)
@@ -195,12 +195,13 @@ An `expr` key's build reads the expression's input columns and derives its virtu
   - Bound: `threads × (one row group's key columns + specs × max(cap, one row group))`.
   - `tests/memory.rs` holds weak references to every column a worker is handed and checks that at most one batch per worker is alive at any read, and exactly one with one worker. It also checks that only key columns are read, and that every segment respects the cap.
 - **Plan.** A plan holds:
-  - the block indexes of the keyed segments it probes (ranged reads through the snapshot);
+  - the block indexes of the keyed segments it probes (ranged reads through the snapshot), or, for a keyed segment of at most 1 MiB (`seg_io::WHOLE_SEGMENT_BYTES`), the segment itself, read in one request;
   - the blocks it touches;
   - one whole bloom or range segment at a time (they are scanned per probe);
   - the bitmaps and version hits for the keys asked.
+  - A spec's segments are read on the rayon pool, each worker one segment at a time, so these hold per worker.
 - **Compaction.** Holds a group's inputs and its output, so about twice `max_output_bytes`.
-- **Resident bytes per key (contract v3, entry 32).** The caps count accounted key bytes, not resident memory. A release build measured an open segment writer over `UInt64` keys at **320 resident bytes per key**, against 9 bytes accounted: 35.5 times. Over 9-byte keys, the layout map measured 84 resident bytes per key, against 73 accounted: 1.15 times. For narrow keys, then, the resident memory of `specs × cap` is about 36 times the cap. The figures come from `bellwether-replay`'s `tests/resident.rs` and are listed in [the measured document](../../docs/measured/2026-10-26-performance.md). Charging that overhead to the caps is a WP22b candidate.
+- **Resident bytes per key (contract v3, entry 32).** The caps count accounted key bytes, not resident memory. A release build measured an open segment writer over `UInt64` keys at **1,001 resident bytes per key**, against 9 bytes accounted: 111 times. The writer accumulates keys in a hash map sorted once when the segment finishes (WP22b, H5: builds 17% to 25% faster), which holds 379 bytes per key more than the ordered map it replaced (622 bytes). Over 9-byte keys, the layout map measured 84 resident bytes per key, against 73 accounted: 1.15 times. For narrow keys, then, the resident memory of `specs × cap` is about 111 times the cap, and at the rows cap (2^20 keys) an open writer holds about 1 GB. The figures come from `bellwether-replay`'s `tests/resident.rs` and are listed in [the measured document](../../docs/measured/2026-10-27-performance.md#resident-bytes-per-key). Charging that overhead to the caps is not taken yet.
 
 ## Tests
 
@@ -231,7 +232,7 @@ Ground truth never goes through the code under test:
 | `tests/invariant1_by_value.rs` | Invariant 1 against an oracle comparing decoded values (SQL equality) over two decimal scales, two time units, nulls, signed zero, NaN, and CSV/JSONL chunks |
 | `tests/invariant5_retired.rs` | Latest and asof give the live answer when an old segment still holds a retired newest version, including ties, signed-zero variants, and asof with a pruned winner |
 | `tests/ledger.rs` | A ledger shaped like `bellwether-bench`'s; `real_bench_corpus` (ignored) runs the same checks over a corpus the bench crate wrote: `BELLWETHER_BENCH_CORPUS=<dir> cargo test -p bellwether-build --test ledger -- --ignored` |
-| `tests/sketch.rs` | Stored sketches equal sketches of the decoded files (the `parquet` crate's reader fed to core's sketcher), complete like a sidecar; new and changed files re-sketched, retired entries unused; a sketch on a missing column refused with nothing committed; no planner path reads a sketch (plans equal with, without, and after deleting every sketch segment; the planner sources never name the kind) |
+| `tests/sketch.rs` | Stored sketches equal sketches of the decoded files (the `parquet` crate's reader fed to core's sketcher), complete like a sidecar; new and changed files re-sketched, retired entries unused; a sketch on a missing column refused with nothing committed; no planner path reads a sketch (plans equal with, without, and after deleting every sketch segment) |
 
 ## Benchmark
 

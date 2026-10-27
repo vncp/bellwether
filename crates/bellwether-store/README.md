@@ -63,6 +63,7 @@ These `object_store` errors map to `Error::VersionConflict`:
 - **Cleanup.** After a successful conditional write, leftover `<target>#<digits>` staging files from crashed writers are removed. This is safe because every conditional write to that target holds the lock. The lock file's single-digit suffix never matches.
 - **Why this is not a stale lock.** ADRs 003 and 015 reject "file locks with stale healing". This lock has nothing to heal: the kernel releases it when the handle drops or the process dies, and the lock file's existence means nothing. Readers never take the lock.
 - **Limits.** The guarantee is only as strong as `flock`: correct on local disks, **not** on NFS or other network filesystems.
+- **Reads.** Whole-object and ranged reads of the local backend run on the calling thread (`std::fs` and positioned reads), not through `object_store`'s blocking pool, which cost more than the read itself on the lookup path (WP22b). A range past the end of the file is an error naming both lengths, as `object_store` refuses it.
 
 `object_store`'s local listing hides file names of the form `name#<digits>` (`is_valid_file_path` in its `local.rs`). Staging and lock files use that form, so they never show up in `list`, which a test checks. The flip side is that a staging file left by a crashed *unconditional* write (a segment or cache entry) is invisible to GC too, and is not cleaned up automatically.
 
@@ -158,7 +159,7 @@ The commit returns `sequence`. That is the identity callers record in `key_spec_
 - refuses ids that the pinned manifest does not reference
 - checks the bytes against their blake3 id
 
-`Snapshot::read_segment_range(id, range)` serves block-index and bitmap reads without loading a whole segment (ADR 018). It refuses the same ids, but a partial read cannot be checked against the content hash. `Snapshot::sequence()` is the pinned manifest's identity.
+`Snapshot::read_segment_range(id, range)` serves block-index and bitmap reads without loading a whole segment (ADR 018). It refuses the same ids, but a partial read cannot be checked against the content hash; the segment format checks its records' own sums. Reads go to the store in aligned windows of `SEGMENT_WINDOW_BYTES` (64 KiB), kept in one cache every snapshot of the process shares, capped at `SEGMENT_CACHE_BYTES` (32 MiB) in total whatever the number of snapshots open: a plan probing many keys of one segment makes one store round trip per window, not one per value. A snapshot and its clones read only the windows they fetched, which leave the cache when the last of them drops, so a new snapshot reads the store afresh; a read wider than a few windows is fetched exactly and not kept (`tests/window_cache.rs`). `Snapshot::sequence()` is the pinned manifest's identity.
 
 The view of a snapshot opened with `Snapshot::open` changes only through `Snapshot::reopen()`. Two things guarantee this:
 
@@ -176,6 +177,8 @@ The view of a snapshot opened with `Snapshot::open` changes only through `Snapsh
 ## Cache
 
 `Cache::put_cached(input_hash, bytes)` writes `cache/<hash>.bin` and then the `cache/<hash>.meta.json` sidecar, `{created_at, payload_blake3}`. `Cache::get_cached(input_hash) -> Result<Option<(Bytes, Duration)>>` returns the payload and its age; `Cache::get_cached_at(input_hash, now)` measures the age to a caller's fixed clock instead (zero when the entry is newer). A missing or unparsable sidecar, or one that disagrees with the payload, counts as a miss. Store I/O errors are returned as errors, not hidden as misses.
+
+`Cache::put_cached_once(input_hash, bytes)` is for a payload named by its own BLAKE3 (a lookup's key set): it writes nothing when that entry is already stored whole, so a repeated lookup with the same keys writes and fsyncs nothing, and the entry keeps its first `created_at`. A missing, torn, or unparsable entry is written afresh; a payload not named by its hash is refused. Only payloads whose age no reader uses are stored this way: GC never lists, ages, or deletes `cache/` (`tests/gc.rs`, `gc_never_ages_out_a_key_set_stored_once`).
 
 ## Garbage collection (ADR 013): claim, delete, scan, release
 

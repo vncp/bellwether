@@ -209,6 +209,64 @@ fn current_token(target: &Path) -> Result<Option<StoreVersion>> {
     }
 }
 
+/// Reads `target` whole on the calling thread: `None` when it is absent (or
+/// a directory, as `object_store`'s local `get` answers). The local
+/// backend's reads skip `object_store`'s blocking-pool round trip, which
+/// cost more than the read itself on the plan path.
+pub(crate) fn read_whole(target: &Path) -> Result<Option<bytes::Bytes>> {
+    match std::fs::read(target) {
+        Ok(b) => Ok(Some(bytes::Bytes::from(b))),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(_) if target.is_dir() => Ok(None),
+        Err(e) => Err(io_err("read", target, &e)),
+    }
+}
+
+/// Reads `range` of `target` on the calling thread, `None` when it is
+/// absent. A range past the end of the file is an error naming both
+/// lengths, as `object_store`'s local `get_range` refuses it.
+pub(crate) fn read_range(
+    target: &Path,
+    range: std::ops::Range<u64>,
+) -> Result<Option<bytes::Bytes>> {
+    #[cfg(unix)]
+    use std::os::unix::fs::FileExt as _;
+    let file = match File::open(target) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(io_err("open", target, &e)),
+    };
+    let len = usize::try_from(range.end.saturating_sub(range.start))
+        .map_err(|_| Error::Store(format!("range {range:?} of {}", target.display())))?;
+    let mut buf = vec![0u8; len];
+    let mut done = 0;
+    while done < len {
+        #[cfg(unix)]
+        let read = file.read_at(&mut buf[done..], range.start + done as u64);
+        #[cfg(windows)]
+        let read = std::os::windows::fs::FileExt::seek_read(
+            &file,
+            &mut buf[done..],
+            range.start + done as u64,
+        );
+        match read {
+            Ok(0) => {
+                let size = file.metadata().map_or(0, |m| m.len());
+                return Err(Error::Store(format!(
+                    "read {}: asked for bytes {}..{}, the file holds {size}",
+                    target.display(),
+                    range.start,
+                    range.end
+                )));
+            }
+            Ok(n) => done += n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(io_err("read", target, &e)),
+        }
+    }
+    Ok(Some(bytes::Bytes::from(buf)))
+}
+
 /// Creates `target` only if absent.
 pub(crate) fn put_if_absent(target: &Path, body: &[u8]) -> Result<StoreVersion> {
     let _guard = lock(target)?;

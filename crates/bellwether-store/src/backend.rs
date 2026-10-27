@@ -370,6 +370,12 @@ impl ObjectStoreBackend {
     }
 
     fn get_opt_inner(&self, path: &str) -> Result<Option<(Bytes, StoreVersion)>> {
+        if let Some(target) = self.local_target(path)? {
+            return Ok(local::read_whole(&target)?.map(|b| {
+                let token = content_token(&b);
+                (b, token)
+            }));
+        }
         let location = obj_path(path)?;
         let local = self.kind == BackendKind::Local;
         self.block_on(async {
@@ -510,6 +516,9 @@ impl StoreExt for ObjectStoreBackend {
     }
 
     fn get_range(&self, path: &str, range: std::ops::Range<u64>) -> Result<Option<Bytes>> {
+        if let Some(target) = self.local_target(path)? {
+            return local::read_range(&target, range);
+        }
         let location = obj_path(path)?;
         self.block_on(async {
             match self.inner.get_range(&location, range).await {

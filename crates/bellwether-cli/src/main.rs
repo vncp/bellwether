@@ -1104,6 +1104,9 @@ fn run(cli: &Cli, out: &Out) -> Result<Outcome, Failure> {
             done(&r, human::report(&r, out), EXIT_OK)
         }
         Command::Verify(c) => verify_cmds::run(g, out, c),
+        Command::Bench {
+            command: bench::BenchCommand::PerfCheck(a),
+        } => bench::perf_check(a),
         Command::Bench { command } => {
             let w = bench::run(command)?;
             let code = if w.failed.is_empty() {

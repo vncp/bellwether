@@ -543,12 +543,14 @@ fn sketches_only_opens_no_data_file() {
     assert!(control.is_err(), "a full why must open the files");
 }
 
-/// Through the facade, a sketch never reaches a plan: twin folders with the
-/// same files and key specs, one also declaring a sketch, give byte-equal
-/// `locate`, `latest`, `asof`, and window plans (JSON, apart from the
-/// evidence each records, which cites its own manifest) and the same `why
-/// --from` costs, candidates, and recommendation; and again after the
-/// sketch's segments are deleted from the store.
+/// Through the facade, a sketch never reaches a plan or a reconcile: twin
+/// folders with the same files and key specs, one also declaring a sketch,
+/// give byte-equal `locate`, `latest`, `asof`, and window plans (JSON, apart
+/// from the evidence each records, which cites its own manifest), the same
+/// `why --from` costs, candidates, and recommendation, and the same
+/// multi-pass reconcile (counts, coverage, and memory report, passes
+/// included); and again after the sketch's segments are deleted from the
+/// store.
 #[test]
 fn twin_folders_plan_identically_with_and_without_a_sketch() {
     let plain = tempfile::tempdir().unwrap();
@@ -618,7 +620,26 @@ fn twin_folders_plan_identically_with_and_without_a_sketch() {
         ))
         .unwrap()
     };
+    // A reconcile of each folder against itself, under a budget that makes
+    // it run in several passes.
+    let reconciled = |e: &Engine, dir: &Path| -> String {
+        let r = e
+            .reconcile(
+                dir.to_str().unwrap(),
+                &bellwether::ReconcileRequest {
+                    key: vec!["id".into()],
+                    latest_by: Some("ts".into()),
+                    memory_budget: Some(64 * 1024),
+                    ..bellwether::ReconcileRequest::default()
+                },
+            )
+            .unwrap();
+        let o = &r.outcome;
+        assert!(o.pass && o.memory.passes > 1, "{:?}", o.memory);
+        serde_json::to_string(&(o.pass, &o.counts, &o.coverage, &o.memory)).unwrap()
+    };
     let (pa, wa) = (plans(&a, plain.path()), why(&a));
+    let ra = reconciled(&a, plain.path());
     // Non-vacuous: the locate plan prunes, and why priced candidates.
     let locate: serde_json::Value = serde_json::from_str(&pa[0]).unwrap();
     assert!(
@@ -628,6 +649,7 @@ fn twin_folders_plan_identically_with_and_without_a_sketch() {
     );
     assert!(wa.contains("proposed") || wa.contains("row_groups"), "{wa}");
     assert_eq!(pa, plans(&b, sketched.path()), "with a sketch");
+    assert_eq!(ra, reconciled(&b, sketched.path()), "with a sketch");
     assert_eq!(wa, why(&b), "with a sketch");
     // Delete every sketch segment from the sketched folder's store.
     let idx = sketched.path().join(".bellwether");
@@ -644,6 +666,11 @@ fn twin_folders_plan_identically_with_and_without_a_sketch() {
     assert!(deleted > 0);
     assert_eq!(pa, plans(&b, sketched.path()), "sketch segments deleted");
     assert_eq!(wa, why(&b), "sketch segments deleted");
+    assert_eq!(
+        ra,
+        reconciled(&b, sketched.path()),
+        "sketch segments deleted"
+    );
 }
 
 /// A file repeating fewer rows than the detection floor is not flagged,
