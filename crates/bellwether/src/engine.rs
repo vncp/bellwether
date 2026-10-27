@@ -682,6 +682,15 @@ impl Engine {
         }
     }
 
+    /// Pins the committed manifest at sequence `seq` (the current one, or
+    /// one the history retains), or `None` if the folder is not indexed.
+    pub(crate) fn pin_sequence(&self, seq: u64) -> Result<Option<Pinned>> {
+        let Some(store) = self.existing_store()? else {
+            return Ok(None);
+        };
+        self.pin_at(store, seq).map(Some)
+    }
+
     /// Pins the current manifest with its content hash, or `None` if the
     /// folder is not indexed. The bytes hashed and the snapshot pinned are
     /// the same commit (sequence and nonce agree), retried a few times if a

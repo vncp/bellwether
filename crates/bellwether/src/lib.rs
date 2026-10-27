@@ -31,6 +31,7 @@
 #![deny(clippy::unwrap_used, clippy::expect_used)]
 
 mod agg;
+mod emit;
 mod engine;
 mod engine_fix;
 mod fix;
@@ -67,6 +68,7 @@ pub use bellwether_types as types;
 pub use bellwether_verify::{
     ExactTotal, GroupTotal, KeyRepr, Mismatch, Reconciliation, TotalColumn,
 };
+pub use emit::{EmitInputs, EmitPartitions};
 pub use engine::{
     schema_from_json, ConnectFn, Engine, EngineConnector, EngineOptions, FolderStatus,
     SourceFormat, DEFAULT_INDEX_DIR, ISSUE_TRACKER,

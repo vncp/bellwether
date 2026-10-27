@@ -9,6 +9,7 @@
 #![forbid(unsafe_code)]
 
 mod bench;
+mod emit_cmds;
 mod human;
 mod join_cmds;
 mod keys_cmds;
@@ -495,6 +496,8 @@ struct LocateArgs {
     /// values in --keys, as --any.
     #[arg(long, conflicts_with_all = ["from", "to", "window", "ts", "columns", "contains", "has", "prefix"])]
     all: bool,
+    #[command(flatten)]
+    emit: emit_cmds::EmitArgs,
 }
 
 #[derive(Args)]
@@ -547,6 +550,8 @@ struct LatestArgs {
     /// tombstone answers no row.
     #[arg(long, conflicts_with = "lookback")]
     live: bool,
+    #[command(flatten)]
+    emit: emit_cmds::EmitArgs,
 }
 
 #[derive(Args)]
@@ -587,6 +592,8 @@ struct AsofArgs {
     /// newest row then is a tombstone answers no row.
     #[arg(long, conflicts_with_all = ["lookback", "ts"])]
     live: bool,
+    #[command(flatten)]
+    emit: emit_cmds::EmitArgs,
 }
 
 #[derive(Args)]
@@ -1014,7 +1021,7 @@ fn run(cli: &Cli, out: &Out) -> Result<Outcome, Failure> {
         }
         Command::Latest(a) => {
             check_lookback(a.lookback.as_deref())?;
-            lookup(g, out, &a.lookup, |e, keys| match (&a.known, &a.lookback) {
+            lookup(g, out, &a.lookup, &a.emit, |e, keys| match (&a.known, &a.lookback) {
                 (Some(known), _) => e.asof_bitemporal(
                     keys,
                     None,
@@ -1029,7 +1036,7 @@ fn run(cli: &Cli, out: &Out) -> Result<Outcome, Failure> {
         }
         Command::Asof(a) => {
             check_lookback(a.lookback.as_deref())?;
-            lookup(g, out, &a.lookup, |e, keys| match (&a.at, &a.lookback) {
+            lookup(g, out, &a.lookup, &a.emit, |e, keys| match (&a.at, &a.lookback) {
                 (Some(at), Some(n)) => e.asof_lookback(keys, at, n, a.ts.as_deref()),
                 (Some(at), None) if a.live => e.asof_live(keys, at),
                 (Some(at), None) => e.asof(keys, at),
@@ -1155,16 +1162,19 @@ fn mcp(g: &Global, a: &McpArgs) -> Result<Outcome, Failure> {
 }
 
 /// A plan lookup (`locate`, `latest`, `asof`): the engine, pinned to
-/// `--at-manifest` when given, and the key file, handed to `plan`.
+/// `--at-manifest` when given, and the key file, handed to `plan`; with
+/// `--emit`, the plan translated for an engine after the plan line.
 fn lookup(
     g: &Global,
     out: &Out,
     args: &LookupArgs,
+    emit: &emit_cmds::EmitArgs,
     plan: impl FnOnce(&Engine, &KeyFile) -> Result<bellwether::PlanResult, Error>,
 ) -> Result<Outcome, Failure> {
     let engine = engine_at(g, &args.root.root, args.at_manifest)?;
     let result = plan(&engine, &key_file(&args.keys, args.key.as_ref()))?;
-    done(&result, human::plan(&result, out), EXIT_OK)
+    let outcome = done(&result, human::plan(&result, out), EXIT_OK)?;
+    emit_cmds::with_emit(&engine, &result, Some(&args.keys), emit, outcome)
 }
 
 fn propose(g: &Global, out: &Out, a: &ProposeArgs) -> Result<Outcome, Failure> {
@@ -1292,13 +1302,15 @@ fn locate(g: &Global, out: &Out, a: &LocateArgs) -> Result<Outcome, Failure> {
     let engine = engine_at(g, &a.root.root, a.at_manifest)?;
     if let Some(query) = text_query(a.contains.as_deref(), a.has.as_deref(), a.prefix.as_deref())? {
         let result = engine.locate_text(&query)?;
-        return done(&result, human::plan(&result, out), EXIT_OK);
+        let outcome = done(&result, human::plan(&result, out), EXIT_OK)?;
+        return emit_cmds::with_emit(&engine, &result, None, &a.emit, outcome);
     }
     let Some(keys) = &a.keys else {
         return Err(Failure::Usage(
             "say what to locate: --keys <file> or --contains, --has, or --prefix COL=TEXT".into(),
         ));
     };
+    let key_path = keys.clone();
     let keys = key_file(keys, a.key.as_ref());
     let result = match (window, &a.columns) {
         (w, Some(columns)) => {
@@ -1308,7 +1320,8 @@ fn locate(g: &Global, out: &Out, a: &LocateArgs) -> Result<Outcome, Failure> {
         (None, None) if a.any || a.all => engine.locate_contains(&keys, a.all)?,
         (None, None) => engine.locate(&keys)?,
     };
-    done(&result, human::plan(&result, out), EXIT_OK)
+    let outcome = done(&result, human::plan(&result, out), EXIT_OK)?;
+    emit_cmds::with_emit(&engine, &result, Some(&key_path), &a.emit, outcome)
 }
 
 /// The text lookup `--contains`, `--has`, or `--prefix` gives (at most one;
