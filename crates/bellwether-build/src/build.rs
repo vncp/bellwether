@@ -781,7 +781,8 @@ fn shared_identity(root: &str, base: Option<&Manifest>, a: &KeySpec, b: &KeySpec
                 | KeySpec::Expr { .. }
                 | KeySpec::Text { .. }
                 | KeySpec::List { .. }
-                | KeySpec::Join { .. } => {}
+                | KeySpec::Join { .. }
+                | KeySpec::Agg { .. } => {}
             }
             format!(
                 "re-declare {} under its name with a time column whose name has no ',' or '@', \
@@ -1006,6 +1007,34 @@ fn plan_specs(
                 ColumnType::of(t).map_err(within)?;
                 if !columns.contains(&c) {
                     columns.push(c);
+                }
+            }
+            if let KeySpec::Agg { value, .. } = spec {
+                // The value column is read beside the key, at its dataset
+                // type, and the agg key needs a counted key on exactly its
+                // columns beside it: those counts prove which aggregates
+                // answer a lookup.
+                // Named once: the refusal's own message carries no prefix.
+                bellwether_core::agg::value_type(spec, schema).map_err(|e| match e {
+                    Error::KeySpec(m) => Error::KeySpec(format!("{name}: {m}")),
+                    e => e,
+                })?;
+                columns.push(value.clone());
+                let beside = specs.iter().any(|s| {
+                    matches!(s, KeySpec::Exact { .. } | KeySpec::Temporal { .. })
+                        && s.counts()
+                        && s.columns().len() == spec.columns().len()
+                        && s.columns().iter().all(|c| spec.columns().contains(c))
+                });
+                if !beside {
+                    let cols = spec.columns().join(",");
+                    return Err(Error::KeySpec(format!(
+                        "{} needs a key counting rows on exactly ({cols}) beside it, whose \
+                         counts prove which aggregates answer a lookup, and none is declared; \
+                         declare both, for example `--key 'exact:{cols},counts' --key '{}'`",
+                        spec.identity(),
+                        spec.identity()
+                    )));
                 }
             }
             // A spec with a tombstone (B8) builds its own segments as the

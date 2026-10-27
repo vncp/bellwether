@@ -11,7 +11,7 @@
 //! paths name files the engine reads (key files, rewrite outputs), and a
 //! rewrite is `RewriteShape` data.
 
-use bellwether::types::{Gate, Hash, KeySpec, RewriteShape, TextOp};
+use bellwether::types::{AggregateFn, Gate, Hash, KeySpec, RewriteShape, TextOp};
 use bellwether::TextQuery;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -170,6 +170,29 @@ pub struct ObserveCount {
     pub key_columns: Option<Vec<String>>,
     /// Count against the committed manifest at this sequence instead of the
     /// current one. Default: the current manifest.
+    #[serde(default)]
+    pub at_manifest: Option<u64>,
+}
+
+/// `observe.aggregate` (B7): per key, `sum`, `count`, `min`, `max` of one
+/// column over the keys in a Parquet key file, from the index's agg key
+/// (`bellwether aggregate`).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ObserveAggregate {
+    /// A Parquet file of keys (read, never written); an absolute path.
+    pub keys: String,
+    /// Key columns to take from the file, in tuple order; default: all.
+    #[serde(default)]
+    pub key_columns: Option<Vec<String>>,
+    /// The column to aggregate.
+    pub value: String,
+    /// The functions (`sum`, `count`, `min`, `max`); `count` is always
+    /// answered. Default: `sum`, `count` (as `aggregate --fn`).
+    #[serde(default)]
+    pub functions: Option<Vec<AggregateFn>>,
+    /// Answer against the committed manifest at this sequence instead of
+    /// the current one. Default: the current manifest.
     #[serde(default)]
     pub at_manifest: Option<u64>,
 }
@@ -333,6 +356,13 @@ pub struct ScoreWhy {
     /// priced from both datasets' complete exact keys.
     #[serde(default)]
     pub join: bool,
+    /// Price `keys` as one aggregate lookup (B7; `why --mode aggregate
+    /// --value V --fn F`): per key, `functions` of `value`, with the agg
+    /// key on the key columns as the candidate once a key counting rows on
+    /// exactly those columns is complete (else that counted key first).
+    /// With `workload`, its runs must already be these aggregate runs.
+    #[serde(default)]
+    pub aggregate: Option<AggregateArg>,
     /// Run in this call instead of returning a job id.
     #[serde(default)]
     pub wait: bool,
@@ -369,6 +399,25 @@ pub struct ScoreWhy {
     /// Default: none (every row of the newest version).
     #[serde(default)]
     pub tombstone: Option<String>,
+}
+
+/// What an aggregate lookup computes per key.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AggregateArg {
+    /// The column to aggregate.
+    pub value: String,
+    /// The functions (`sum`, `count`, `min`, `max`); `count` is always
+    /// computed. Default: `sum`, `count` (as `why --fn`).
+    #[serde(default)]
+    pub functions: Option<Vec<AggregateFn>>,
+}
+
+/// The functions an aggregate computes when none are given: `sum` and
+/// `count`, as the CLI's `--fn` defaults.
+#[must_use]
+pub fn default_functions() -> Vec<AggregateFn> {
+    vec![AggregateFn::Sum, AggregateFn::Count]
 }
 
 /// The outputs a rewrite proposal is verified on (folders the engine reads).
@@ -587,6 +636,18 @@ pub fn catalog() -> Vec<ToolDef> {
              exact, from the per-key counts of a key spec with counts on exactly those columns \
              (exact:<cols>,counts): rows, row groups, files. No data file is read. Writes \
              nothing; refused with not_indexed when no such spec is complete.",
+        ),
+        def::<ObserveAggregate>(
+            "observe.aggregate",
+            Tier::Observe,
+            true,
+            "Per key, sum, count, min, and max of one column over the keys in a Parquet key file \
+             (fn(value) ... group by key), from the index's agg key beside a key counting rows \
+             on exactly the key columns (agg:<cols>@<value>{...} and exact:<cols>,counts). \
+             Exact for counts, integer and decimal sums, min and max; a float sum is labelled \
+             measured (agg.kahan_f64). Where the counts do not prove a row group answered, the \
+             result names the row groups still to read. No data file is read. Writes nothing; \
+             refused with not_indexed naming the key to declare when none serves.",
         ),
         def::<ObserveAsof>(
             "observe.asof",

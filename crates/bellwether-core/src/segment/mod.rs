@@ -77,6 +77,11 @@
 //! groups (the storage version 1 `temporal2` sidecar record, behind a
 //! bitmap). A key with no such row is not stored.
 //!
+//! **Agg** (B7, storage version 2). As keyed, and the value record ends
+//! with one aggregate cell per set bit, in ascending row-group order
+//! ([`crate::agg::AggCell`]): `rows LEB128 | nulls LEB128 | [sum] | [min] |
+//! [max]`, as the spec's functions ask (`docs/format.md`, "Agg keys").
+//!
 //! **Bloom per row group** (bloom). One SBBF per row group over that row
 //! group's distinct keys, sized from the spec's `fpr`; structure and sizing
 //! are those of a Parquet embedded filter. Index entry: `rg u32 | off u64 |
@@ -135,6 +140,6 @@ pub use writer::{
     segment_path, validate_spec, EncodedSegment, KeyValue, SegmentWriter, WriterOptions,
 };
 
-pub(crate) use format::{corrupt, Cursor};
+pub(crate) use format::{corrupt, put_leb128, Cursor, Put};
 pub(crate) use reader::{BlockView, Index};
 pub(crate) use writer::{stored_bounds, BloomEmitter, KeyedEmitter, RangeEmitter};

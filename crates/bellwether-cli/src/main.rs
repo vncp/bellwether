@@ -84,6 +84,12 @@ enum Command {
     /// from the index's per-key counts (a key spec exact:COLS,counts); no
     /// data file is read.
     Count(CountArgs),
+    /// Aggregate a column per key over the keys (sum, count, min, max ...
+    /// group by key where key in ...), from the index's agg keys (a key spec
+    /// agg:COLS@VALUE{sum,count,min,max} beside exact:COLS,counts); no data
+    /// file is read, and the row groups still to read are named when the
+    /// index answers only part.
+    Aggregate(AggregateArgs),
     /// Plan the version of each key current at an instant (--at), or the
     /// bitemporal version valid at --valid as known at --known.
     Asof(AsofArgs),
@@ -211,9 +217,10 @@ struct WhyArgs {
     /// file of one list column's values (named after the column):
     /// `contains-any` (rows whose list holds any of them) or `contains-all`
     /// (every one), priced against list:<column>, `bitemporal` (with
-    /// --valid-by and --known-by), or `semijoin` (the rows of this folder
-    /// and of the --join dataset whose key the other holds), priced against
-    /// the join key on the pair [default: asof with --at, latest with
+    /// --valid-by and --known-by), `semijoin` (the rows of this folder and
+    /// of the --join dataset whose key the other holds), priced against the
+    /// join key on the pair, or `aggregate` (per-key aggregates of --value)
+    /// [default: aggregate with --value, asof with --at, latest with
     /// --latest-by, bitemporal with --valid-by, else locate].
     #[arg(long, value_enum, value_name = "MODE")]
     mode: Option<ModeArg>,
@@ -317,6 +324,20 @@ struct WhyArgs {
     /// the diagnosis, approximate.
     #[arg(long, conflicts_with_all = ["from", "bench_workload", "workload", "columns"])]
     sketches_only: bool,
+    /// Price the keys as one aggregate lookup of this column per key (B7,
+    /// `--mode aggregate`, as `bellwether aggregate`): the candidate is the
+    /// agg key on the key columns beside exact:<cols>,counts.
+    #[arg(long, value_name = "COLUMN", conflicts_with_all = ["bench_workload", "latest_by", "window"])]
+    value: Option<String>,
+    /// With --value: the functions, comma-separated: sum, count, min, max
+    /// [default: sum,count].
+    #[arg(
+        long = "fn",
+        value_name = "FNS",
+        value_delimiter = ',',
+        requires = "value"
+    )]
+    functions: Vec<String>,
 }
 
 /// `--gate NAME:N`.
@@ -356,6 +377,7 @@ enum ModeArg {
     ContainsAll,
     Bitemporal,
     Semijoin,
+    Aggregate,
 }
 
 impl From<ModeArg> for bellwether::LookupMode {
@@ -371,6 +393,7 @@ impl From<ModeArg> for bellwether::LookupMode {
             ModeArg::ContainsAll => Self::ContainsAll,
             ModeArg::Bitemporal => Self::Bitemporal,
             ModeArg::Semijoin => Self::SemiJoin,
+            ModeArg::Aggregate => Self::Aggregate,
         }
     }
 }
@@ -478,6 +501,23 @@ struct LocateArgs {
 struct CountArgs {
     #[command(flatten)]
     lookup: LookupArgs,
+}
+
+#[derive(Args)]
+struct AggregateArgs {
+    #[command(flatten)]
+    lookup: LookupArgs,
+    /// The column to aggregate.
+    #[arg(long, value_name = "COLUMN")]
+    value: String,
+    /// The functions, comma-separated: sum, count, min, max [default: sum,count].
+    #[arg(
+        long = "fn",
+        value_name = "FNS",
+        value_delimiter = ',',
+        default_value = "sum,count"
+    )]
+    functions: Vec<String>,
 }
 
 #[derive(Args)]
@@ -721,7 +761,7 @@ impl From<Error> for Failure {
                 field:
                     "lookback" | "latest_by" | "signing_key" | "trusted_keys" | "public_key" | "out"
                     | "name" | "valid_from" | "revoked_at" | "index" | "root" | "scratch" | "items"
-                    | "columns" | "text" | "join",
+                    | "columns" | "text" | "join" | "functions",
                 ..
             } => Self::Usage(match hint(&e) {
                 Some(h) => format!("{e}; {h}"),
@@ -778,6 +818,18 @@ fn hint(e: &Error) -> Option<String> {
                 ""
             }
         )),
+        Error::NotIndexed {
+            root,
+            needs: Some(agg),
+            ..
+        } if agg.starts_with("agg:") => Some(format!(
+            "run `bellwether index {root} --key 'exact:{},counts' --key '{agg}'` first (an agg \
+             key is declared beside the counted key on its columns)",
+            agg.trim_start_matches("agg:")
+                .split('@')
+                .next()
+                .unwrap_or_default()
+        )),
         Error::NotIndexed { root, needs, .. } => Some(format!(
             "run `bellwether index {root} --key {}` first",
             needs.as_deref().unwrap_or("<spec>")
@@ -804,6 +856,7 @@ fn hint(e: &Error) -> Option<String> {
                 "items" => "--column",
                 "columns" => "--columns",
                 "text" => "--contains, --has, or --prefix",
+                "functions" => "--fn",
                 "join" => {
                     "the right side the join key names (--join <right>.<column>[,<column>...], or \
                      the right side of a join: key spec): a folder beside the data root, one \
@@ -948,6 +1001,16 @@ fn run(cli: &Cli, out: &Out) -> Result<Outcome, Failure> {
             let engine = engine_at(g, &a.lookup.root.root, a.lookup.at_manifest)?;
             let r = engine.count(&key_file(&a.lookup.keys, a.lookup.key.as_ref()))?;
             done(&r, human::count_result(&r, out), EXIT_OK)
+        }
+        Command::Aggregate(a) => {
+            let functions = aggregate_functions(&a.functions)?;
+            let engine = engine_at(g, &a.lookup.root.root, a.lookup.at_manifest)?;
+            let r = engine.aggregate(
+                &key_file(&a.lookup.keys, a.lookup.key.as_ref()),
+                &a.value,
+                &functions,
+            )?;
+            done(&r, human::aggregate_result(&r, engine.root(), out), EXIT_OK)
         }
         Command::Latest(a) => {
             check_lookback(a.lookback.as_deref())?;
@@ -1295,6 +1358,22 @@ fn why_text(a: &WhyArgs) -> Result<Vec<bellwether::TextQuery>, Failure> {
     Ok(out)
 }
 
+/// `--fn sum,count,min,max` as aggregate functions; an unknown name is a
+/// usage error (exit 2).
+fn aggregate_functions(given: &[String]) -> Result<Vec<bellwether::types::AggregateFn>, Failure> {
+    given
+        .iter()
+        .map(|f| {
+            bellwether::types::AggregateFn::parse(f.trim()).ok_or_else(|| {
+                Failure::Usage(format!(
+                    "--fn {f:?} is not an aggregate function; pass a comma-separated list of \
+                     sum, count, min, max, for example --fn sum,count"
+                ))
+            })
+        })
+        .collect()
+}
+
 /// A malformed `--lookback` is a usage error (exit 2), refused before any
 /// engine work.
 fn check_lookback(lookback: Option<&str>) -> Result<(), Failure> {
@@ -1306,7 +1385,7 @@ fn check_lookback(lookback: Option<&str>) -> Result<(), Failure> {
     }
 }
 
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_lines)] // one branch per lookup mode
 fn why(g: &Global, out: &Out, a: &WhyArgs) -> Result<Outcome, Failure> {
     check_lookback(a.lookback.as_deref())?;
     let window = a
@@ -1378,6 +1457,23 @@ fn why(g: &Global, out: &Out, a: &WhyArgs) -> Result<Outcome, Failure> {
             .map(bellwether::spec::parse_tombstone)
             .transpose()
             .map_err(|e| Failure::Usage(e.to_string()))?,
+        aggregate: a
+            .value
+            .as_ref()
+            .map(|value| -> Result<_, Failure> {
+                Ok(bellwether::AggregateQuery {
+                    value: value.clone(),
+                    functions: if a.functions.is_empty() {
+                        vec![
+                            bellwether::types::AggregateFn::Sum,
+                            bellwether::types::AggregateFn::Count,
+                        ]
+                    } else {
+                        aggregate_functions(&a.functions)?
+                    },
+                })
+            })
+            .transpose()?,
     };
     // Text lookups take none of the lookup-mode flags; the facade refuses
     // them first, with that cause.

@@ -208,6 +208,7 @@ pub fn certificate(proposal: Option<Hash>, pass: bool) -> Certificate {
             uncomparable: 0,
             totals: Vec::new(),
             row_filter: None,
+            agg: Vec::new(),
         },
         provenance,
     }

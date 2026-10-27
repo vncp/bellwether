@@ -97,6 +97,7 @@ fn merged_header<R: ReadAt>(inputs: &[SegmentReader<R>]) -> Result<SegmentHeader
             || h.ts_type != h0.ts_type
             || h.time_types != h0.time_types
             || h.tombstone_type != h0.tombstone_type
+            || h.value_type != h0.value_type
         {
             return Err(Error::KeySpec(format!(
                 "cannot merge segments whose recorded types differ: {} and {}",
@@ -123,6 +124,7 @@ fn merged_header<R: ReadAt>(inputs: &[SegmentReader<R>]) -> Result<SegmentHeader
     header.ts_type.clone_from(&h0.ts_type);
     header.time_types.clone_from(&h0.time_types);
     header.tombstone_type.clone_from(&h0.tombstone_type);
+    header.value_type.clone_from(&h0.value_type);
     header.extra.clone_from(&h0.extra);
     Ok(header)
 }
@@ -352,9 +354,46 @@ fn fold(value: &mut KeyValue, other: KeyValue, key: &[u8]) -> Result<()> {
             ))
         }
     };
+    let agg = match (value.agg.take(), other.agg) {
+        (None, None) => None,
+        (Some(a), Some(b)) => {
+            // Disjointness was checked above when counts are kept; agg
+            // values carry no counts, so check it here too.
+            if !(&value.bitmap & &other.bitmap).is_empty() {
+                return Err(Error::Other(format!(
+                    "cannot merge agg segments that both aggregate key {} in row group {}: \
+                     segments of one spec cover disjoint row groups",
+                    hex(key),
+                    (&value.bitmap & &other.bitmap).min().unwrap_or_default()
+                )));
+            }
+            let mut left = value.bitmap.iter().zip(a).peekable();
+            let mut right = other.bitmap.iter().zip(b).peekable();
+            let mut merged = Vec::new();
+            loop {
+                let take_left = match (left.peek(), right.peek()) {
+                    (Some(l), Some(r)) => l.0 < r.0,
+                    (Some(_), None) => true,
+                    (None, Some(_)) => false,
+                    (None, None) => break,
+                };
+                let next = if take_left { left.next() } else { right.next() };
+                if let Some((_, c)) = next {
+                    merged.push(c);
+                }
+            }
+            Some(merged)
+        }
+        _ => {
+            return Err(Error::Other(
+                "cannot merge an aggregated value with one without aggregates".into(),
+            ))
+        }
+    };
     value.bitmap |= other.bitmap;
     value.chain.merge(&other.chain);
     value.counts = counts;
+    value.agg = agg;
     Ok(())
 }
 
@@ -496,6 +535,59 @@ pub fn visit_merged_keys<R: ReadAt>(
             advance(&mut cursors, &mut heads, &mut heap, j)?;
         }
         f(&key, &bitmap)?;
+    }
+    Ok(())
+}
+
+/// Visits every distinct key of the keyed segments `inputs` in ascending
+/// order with its value folded across them as [`merge`] folds it (bitmaps
+/// united; counts and aggregate cells, of disjoint row groups, interleaved
+/// in row-group order; two inputs holding one key in one row group are
+/// refused): the merge's value stream, without writing a segment. Holds
+/// one block per input at a time (ADR 018).
+pub fn visit_merged_values<R: ReadAt>(
+    inputs: &[SegmentReader<R>],
+    mut f: impl FnMut(&[u8], KeyValue) -> Result<()>,
+) -> Result<()> {
+    if let Some(s) = inputs.iter().find(|s| !matches!(s.index, Index::Keyed(_))) {
+        return Err(Error::KeySpec(format!(
+            "{} segments have no keys to visit",
+            s.header().key_spec.name()
+        )));
+    }
+    let mut cursors: Vec<KeyedCursor<'_, R>> = inputs
+        .iter()
+        .map(|seg| KeyedCursor {
+            seg,
+            block: 0,
+            pos: 0,
+            body: None,
+        })
+        .collect();
+    let mut heads: Vec<Option<KeyValue>> = Vec::with_capacity(cursors.len());
+    let mut heap = BinaryHeap::new();
+    for (i, c) in cursors.iter_mut().enumerate() {
+        match c.next()? {
+            Some((k, v)) => {
+                heap.push(Reverse((k, i)));
+                heads.push(Some(v));
+            }
+            None => heads.push(None),
+        }
+    }
+    while let Some(Reverse((key, i))) = heap.pop() {
+        let mut value = heads[i].take().unwrap_or_default();
+        advance(&mut cursors, &mut heads, &mut heap, i)?;
+        while heap.peek().is_some_and(|Reverse((k, _))| *k == key) {
+            let Some(Reverse((_, j))) = heap.pop() else {
+                break;
+            };
+            if let Some(v) = heads[j].take() {
+                fold(&mut value, v, &key)?;
+            }
+            advance(&mut cursors, &mut heads, &mut heap, j)?;
+        }
+        f(&key, value)?;
     }
     Ok(())
 }

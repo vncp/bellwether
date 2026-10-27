@@ -30,6 +30,10 @@ same `profile` Evidence.
 
 `R-join-1` (2026-10-26, join keys) likewise reads the recorded workload's
 semi-join runs.
+`R-agg-1` (2026-10-26, agg keys) reads the recorded workload's aggregate
+runs, or a reconcile that just ran, rather than footer statistics; `why`
+raises the first into the same `profile` Evidence and `reconcile` returns
+the second in its `lints`.
 
 ## How to read an entry
 
@@ -604,3 +608,58 @@ kind.
   receipt cites, cites the right one).
 - **Confidence rubric**: high: the runs are recorded and the specs are the
   manifest's; nothing is sampled. Advice only: it changes no plan.
+### R-agg-1
+
+Added 2026-10-26 with agg keys (B7), the detector that recommends the
+kind (`docs/adding-an-index-kind.md`: no kind without its detector).
+
+- **id**: `R-agg-1`
+- **Detector**: two sources, one rule.
+  - From the recorded workload: some run asks a grouped aggregate over a
+    key set, `sum/count/min/max(value) ... where (key) in (...) group by
+    key` (`query_kind` `aggregate`, recorded by `why --from <keys.parquet>
+    --value <v> --fn sum,count` or found in a recorded workload), and no
+    key spec complete at the current manifest is an agg key on `value`
+    whose columns are among the run's and which stores every function
+    asked, beside `exact:<columns>,counts`. One lint per (columns, value)
+    (`bellwether_profile::lints::grouped_aggregates`, raised by `why` into
+    the same `profile` Evidence).
+  - From a reconcile: a side's rows were read to compare per-key rows and
+    one exact decimal total (every compared column a key column), and the
+    side's index has no complete agg key on exactly the key columns storing
+    the total's sum. One lint per such side
+    (`bellwether_profile::lints::reconcile_rescans`, in the reconcile
+    result's `lints`). It never names a key that could not answer: it does
+    not fire when the total is a Decimal256 (no agg key sums one, so
+    `index` would refuse it), when a row of the side has a null leading key
+    column (no agg key holds that row, ADR 014, so the side is read
+    whatever the index), when an agg key answered the side, or when one is
+    declared complete and was not used, for a reason the reconcile states
+    in `agg_not_used` with the next step (a compared non-key column, the
+    total included, with the `--ignore` that drops it; a changed file, with
+    the `index` run; a row whose leading key is null; a version rule, row
+    filter, or grouping the agg key cannot answer).
+- **Estimator**: without an agg key every aggregate run reads every row
+  group holding its keys (the locate plan through the counted key, or every
+  live row group without one), and every reconcile reads every row of the
+  side. Bytes: `why --value <v> --fn <fns>` replays the runs under the
+  transient agg key and reports, in the `agg` column, the row groups still
+  read against the row groups holding the keys (0 of them when the agg
+  key's columns are the run's); the reconcile lint reports the rows read.
+- **Guidance template**: file `bellwether.toml` (or `bellwether index`),
+  step `key_specs`. Before: no agg key on `<columns>@<value>`. After:
+  `exact:<columns>,counts` (when missing; its own `fix` needs
+  `--allow-no-gain` when every row group holds a key, since on its own it
+  reads no less) and then `agg:<columns>@<value>{<functions>}`. Invariant:
+  `every row group holding a key is either answered by a cell whose rows
+  equal the key's counted rows there, or read` (invariant 1 for
+  aggregates).
+- **Verification method**: `fix` reconciles the rows of the workload's keys
+  (the locate plan on one side, every live row group on the other), and
+  checks every cell the proposed agg key would store for those keys
+  against the decoded rows: rows, nulls, sum, minimum, and maximum per key
+  per row group (`CertBody.agg`, `side: "proposed"`, with the cells
+  checked). One differing cell fails the certificate (`agg_cells_differ`).
+- **Confidence rubric**: high: the runs (or the reconcile) are recorded and
+  the specs are the manifest's; nothing is sampled. Advice only: it changes
+  no plan.

@@ -56,8 +56,9 @@ pub use join::{
 };
 pub use keys::encode_ts;
 pub use plan::{
-    default_window_column, overlapping_counts, partition_columns, several_bitemporal_keys,
-    KeyCount, LiveOutcome, Lookup, PlanOrder, Planner, TransientSpec,
+    aggregate_answer, counting_spec, default_window_column, overlapping_counts, partition_columns,
+    serving_agg, several_bitemporal_keys, AggAnswer, AggLookup, Aggregated, KeyAggregate, KeyCount,
+    LiveOutcome, Lookup, PlanOrder, Planner, TotalsVisitor, TransientSpec,
 };
 pub use target::{declared_key_specs, declared_sketches, tombstone_name, TimedSource};
 pub use verify::Drift;

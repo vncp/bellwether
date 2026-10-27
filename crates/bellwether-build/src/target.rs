@@ -98,7 +98,8 @@ impl Target {
     /// Every column whose type a segment records: key columns, then the
     /// temporal timestamp or the sidecar's time columns; for an `expr` key,
     /// the dataset columns its expression reads (the virtual column's type
-    /// follows from theirs); for a tombstone, also the tombstone column.
+    /// follows from theirs); for an `agg` key, its key columns and its
+    /// value column; for a tombstone, also the tombstone column.
     pub(crate) fn typed_columns(&self) -> Vec<String> {
         match self {
             Self::Key(KeySpec::Temporal {
@@ -108,7 +109,7 @@ impl Target {
                 c.push(ts_column.clone());
                 c
             }
-            Self::Key(k @ KeySpec::Expr { .. }) => {
+            Self::Key(k @ (KeySpec::Expr { .. } | KeySpec::Agg { .. })) => {
                 bellwether_core::expr::input_columns(k).unwrap_or_default()
             }
             Self::Key(k) => {

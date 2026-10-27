@@ -706,6 +706,7 @@ impl Engine {
                         missing_left: certificate.body.missing_left,
                         missing_right: certificate.body.missing_right,
                         totals_differ: certificate.body.totals_delta.len() as u64,
+                        agg_cells_differ: 0,
                     },
                 };
                 return Ok(result);
@@ -758,6 +759,7 @@ impl Engine {
                 manifest: anchor.cloned(),
                 inputs: Vec::new(),
                 clock: self.options().clock.clone(),
+                agg: Vec::new(),
             };
             let (rb, ra) = (path_str(&db)?, path_str(&da)?);
             let (sb, sa) = (ParquetSource::new(), ParquetSource::new());
@@ -822,6 +824,7 @@ impl Engine {
             // Each pair's exports are reconciled whole: every row of every
             // key is compared.
             row_filter: None,
+            agg: Vec::new(),
         };
         let mut inputs = vec![before.hash, after.hash, replay];
         let mut age = Duration::ZERO;

@@ -13,6 +13,7 @@
 //! | `R-expr-1` | lookups supply a function of a dataset column (`bellwether_core::expr`, for example `json_get(payload,'$.symbol')`) that type-checks, and no declared `expr` key is over that expression, normalized |
 //! | `R-list-1` | the workload records list-membership runs (`array_contains`, `has_any`, `exists(unnest)`) on a list column that no complete list key serves ([`list_membership`]; the caller reads the workload's runs, so it is not part of [`run`]) |
 //! | `R-join-1` | the workload records at least [`JOIN_REPEAT_MIN_RUNS`] semi-join runs (`in (subquery)`, `exists`, a semi-join) between the data root and one right dataset on one column pair, and no complete join key holds that pair ([`repeated_semijoins`]; the caller reads the workload's runs, so it is not part of [`run`]) |
+//! | `R-agg-1` | the workload records grouped aggregates over key sets (`aggregate` runs: `sum/count/min/max(value) ... where key in (...) group by key`) that no complete agg key beside a counted key on the runs' columns answers ([`grouped_aggregates`]), or a reconcile of per-key totals read a side's rows where an agg key would have answered them ([`reconcile_rescans`]); the caller reads the runs or the reconcile, so neither is part of [`run`] |
 //! | `R-tombstone-1` | the workload records `latest` or `asof` runs (or bitemporal ones) followed by a filter on a boolean or state column (`where not void`, `where status <> 'VOID'`), and no complete temporal key on their key columns declares that tombstone ([`latest_then_filter`]; the caller reads the workload's runs, so it is not part of [`run`]) |
 //!
 //! The two decisions the benchmark also makes are not reimplemented here:
@@ -57,7 +58,9 @@ use bellwether_core::expr::{suggested_name, Expr, Typed};
 use bellwether_source::stats::{
     batch_stamp as batch_stamp_decision, partner_order, BatchStamp, PartnerCandidate,
 };
-use bellwether_types::{KeySpec, Lint, Result, RewriteShape, RowGroupMeta, TextOp, Tombstone};
+use bellwether_types::{
+    AggregateFn, KeySpec, Lint, Result, RewriteShape, RowGroupMeta, TextOp, Tombstone,
+};
 
 use crate::fanout::{is_id_like, DistinctSource, FanoutEntry, KeyPlan};
 use crate::manifest::ManifestInfo;
@@ -132,6 +135,9 @@ pub const LATEST_THEN_FILTER: &str = "R-tombstone-1";
 /// The fewest semi-join runs on one column pair that `R-join-1` calls
 /// repeated: one run is a lookup, two are a pattern a join key pays for.
 pub const JOIN_REPEAT_MIN_RUNS: u64 = 2;
+/// Rule id (B7): grouped aggregates over key sets, or reconciles of per-key
+/// totals, that read rows an agg key would answer.
+pub const GROUPED_AGGREGATES: &str = "R-agg-1";
 
 /// Everything the detectors read.
 #[derive(Clone, Copy, Debug)]
@@ -973,6 +979,209 @@ pub struct SemiJoinUse {
     pub keys_max: u64,
 }
 
+/// One aggregate a recorded workload asks of key sets (B7): `functions` of
+/// `value` grouped by `columns`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AggregateUse {
+    /// The key columns the runs group by.
+    pub columns: Vec<String>,
+    /// The aggregated column.
+    pub value: String,
+    /// Every function the runs ask, in the order sum, count, min, max.
+    pub functions: Vec<AggregateFn>,
+    /// Runs that ask it.
+    pub runs: u64,
+    /// The most keys one run asks for.
+    pub keys_max: u64,
+}
+
+/// Whether `complete` answers `functions` of `value` grouped by `columns`
+/// from the index (B7): an agg key on `value` whose columns are all among
+/// `columns` and which stores every function, beside a key counting rows on
+/// exactly `columns` (the build planner's rule).
+fn agg_answers(
+    complete: &[KeySpec],
+    columns: &[String],
+    value: &str,
+    functions: &[AggregateFn],
+) -> (bool, bool) {
+    let agg = complete.iter().any(|s| {
+        matches!(s, KeySpec::Agg { columns: c, value: v, functions: f }
+            if v == value
+                && c.iter().all(|x| columns.contains(x))
+                && functions.iter().all(|g| f.contains(g)))
+    });
+    let counted = complete.iter().any(|s| {
+        matches!(s, KeySpec::Exact { .. } | KeySpec::Temporal { .. })
+            && s.counts()
+            && s.columns().len() == columns.len()
+            && s.columns().iter().all(|c| columns.contains(c))
+    });
+    (agg, counted)
+}
+
+/// The declarations that answer `functions` of `value` by `columns`, as
+/// `--key` arguments: the agg key, and the counted key when `counted` is
+/// false.
+fn agg_declarations(
+    columns: &[String],
+    value: &str,
+    functions: &[AggregateFn],
+    counted: bool,
+) -> String {
+    let cols = columns.join(",");
+    let fns = AggregateFn::canonical(functions)
+        .iter()
+        .map(|f| f.as_str())
+        .collect::<Vec<_>>()
+        .join(",");
+    let agg = format!("--key 'agg:{cols}@{value}{{{fns}}}'");
+    if counted {
+        agg
+    } else {
+        format!("--key 'exact:{cols},counts' {agg}")
+    }
+}
+
+/// `R-agg-1` (B7), from a recorded workload: its runs ask grouped
+/// aggregates (`sum/count/min/max(value) ... where key in (...) group by
+/// key`) that none of `complete` (the key specs complete at the current
+/// manifest) answers from the index, so each run reads every row of its
+/// keys to compute them. Fires once per (columns, value), high confidence
+/// (the runs are recorded and the specs are the manifest's), naming the
+/// declarations that answer them and how to price them. Does not fire when
+/// a complete agg key beside a counted key answers the runs, or without
+/// aggregate runs.
+#[must_use]
+pub fn grouped_aggregates(uses: &[AggregateUse], complete: &[KeySpec]) -> Vec<Lint> {
+    uses.iter()
+        .filter(|u| u.runs > 0)
+        .filter_map(|u| {
+            let (agg, counted) = agg_answers(complete, &u.columns, &u.value, &u.functions);
+            if agg && counted {
+                return None;
+            }
+            let cols = u.columns.join(", ");
+            let fns = u
+                .functions
+                .iter()
+                .map(|f| f.as_str())
+                .collect::<Vec<_>>()
+                .join(",");
+            let next = if counted {
+                format!(
+                    "`bellwether why` prices it beside the complete counted key and proposes \
+                     it, or declare it with `bellwether index <root> {}`",
+                    agg_declarations(&u.columns, &u.value, &u.functions, true)
+                )
+            } else {
+                format!(
+                    "it needs exact:{},counts complete beside it first, which `bellwether why` \
+                     proposes (its fix needs --allow-no-gain: on its own it reads no less), and \
+                     `why` then prices and proposes the agg key; or declare both with \
+                     `bellwether index <root> {}`",
+                    u.columns.join(","),
+                    agg_declarations(&u.columns, &u.value, &u.functions, false)
+                )
+            };
+            Some(Lint {
+                rule: GROUPED_AGGREGATES.into(),
+                columns: u.columns.iter().chain([&u.value]).cloned().collect(),
+                message: format!(
+                    "{} recorded run(s) compute {fns} of {} per key over up to {} keys of \
+                     ({cols}), and no agg key answers them, so each run reads every row of its \
+                     keys. An agg key stores, per key and row group, the rows, the nulls and \
+                     the aggregates it declares, so the index answers the aggregate without a \
+                     read; {next}.",
+                    u.runs, u.value, u.keys_max,
+                ),
+                confidence: HIGH,
+                site: None,
+                fix: None,
+            })
+        })
+        .collect()
+}
+
+/// One reconcile side whose rows were read to total a decimal column per
+/// key (B7): every compared column was a key column, so an agg key could
+/// have answered the side.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReconcileRescan {
+    /// `left` or `right`.
+    pub side: String,
+    /// The side's root.
+    pub root: String,
+    /// The reconcile's key columns, in order.
+    pub key: Vec<String>,
+    /// The totalled decimal column.
+    pub value: String,
+    /// Its type on the side.
+    pub value_type: arrow::datatypes::DataType,
+    /// Rows read on the side.
+    pub rows: u64,
+    /// Rows read whose leading key column is null.
+    pub null_key_rows: u64,
+    /// The specs complete in the side's index (empty when unindexed).
+    pub complete: Vec<KeySpec>,
+}
+
+/// `R-agg-1` (B7), from a reconcile: a side's rows were read to compare
+/// per-key rows and an exact decimal total (every compared column a key
+/// column), and the side's index has no complete agg key on exactly the
+/// key columns storing the total's sum, so the next reconcile reads them
+/// all again. Fires once per such side, high confidence (the reconcile ran;
+/// the specs are the side's manifest's). Never names a key that could not
+/// answer the side: it does not fire when the total cannot be summed into
+/// an agg key (a Decimal256, which `index` refuses), when a row's leading
+/// key column is null (no agg key holds that row, ADR 014, so the side is
+/// read whatever the index), when the side was answered by an agg key, or
+/// when its index declares one complete (then the reconcile's
+/// `agg_not_used` states why it did not answer: a changed file, a null
+/// leading key, a compared non-key column, ...).
+#[must_use]
+pub fn reconcile_rescans(rescans: &[ReconcileRescan]) -> Vec<Lint> {
+    rescans
+        .iter()
+        .filter(|r| {
+            matches!(
+                bellwether_core::agg::sum_kind(&r.value, &r.value_type),
+                Ok(bellwether_core::agg::SumKind::Int)
+            ) && r.null_key_rows == 0
+                && !r.complete.iter().any(|s| {
+                    matches!(s, KeySpec::Agg { columns, value, functions }
+                        if *columns == r.key
+                            && *value == r.value
+                            && functions.contains(&AggregateFn::Sum))
+                })
+        })
+        .map(|r| {
+            let functions = [AggregateFn::Sum, AggregateFn::Count];
+            let (_, counted) = agg_answers(&r.complete, &r.key, &r.value, &functions);
+            Lint {
+                rule: GROUPED_AGGREGATES.into(),
+                columns: r.key.iter().chain([&r.value]).cloned().collect(),
+                message: format!(
+                    "this reconcile read all {} rows of the {} side to compare rows and the \
+                     exact total of {} per key ({}), and it will read them again on every \
+                     reconcile: an agg key on exactly those key columns answers per-key rows \
+                     and sums from the index instead. Declare it with `bellwether index {} {}`, \
+                     and the certificate's agg will say when it stood in for the rows.",
+                    r.rows,
+                    r.side,
+                    r.value,
+                    r.key.join(", "),
+                    r.root,
+                    agg_declarations(&r.key, &r.value, &functions, counted)
+                ),
+                confidence: HIGH,
+                site: None,
+                fix: None,
+            }
+        })
+        .collect()
+}
+
 /// `R-join-1` (B3): a recorded workload semi-joins the data root (the left
 /// dataset, folder `left`) with one right dataset on one column pair at
 /// least [`JOIN_REPEAT_MIN_RUNS`] times (`in (subquery)`, `exists`, a
@@ -1534,5 +1743,177 @@ mod tests {
         );
         assert!(latest_then_filter(&[tombstone_use(None, &["ts"], 0)], &[]).is_empty());
         assert!(latest_then_filter(&[], &[]).is_empty());
+    }
+
+    fn cols(c: &[&str]) -> Vec<String> {
+        c.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    fn agg_use(runs: u64) -> AggregateUse {
+        AggregateUse {
+            columns: cols(&["account"]),
+            value: "amount".into(),
+            functions: vec![AggregateFn::Sum, AggregateFn::Count],
+            runs,
+            keys_max: 1000,
+        }
+    }
+
+    fn counted(c: &[&str]) -> KeySpec {
+        KeySpec::Exact {
+            columns: cols(c),
+            counts: true,
+            bounds: None,
+        }
+    }
+
+    fn agg(c: &[&str], value: &str, functions: &[AggregateFn]) -> KeySpec {
+        KeySpec::Agg {
+            columns: cols(c),
+            value: value.into(),
+            functions: AggregateFn::canonical(functions),
+        }
+    }
+
+    /// `R-agg-1` fires on recorded aggregate runs no complete agg key
+    /// answers: with neither key it names both declarations; with the
+    /// counted key only, just the agg key; an agg key on another value, or
+    /// one missing a function asked, does not silence it.
+    #[test]
+    fn grouped_aggregates_fire_without_an_agg_key_answering() {
+        let none = grouped_aggregates(&[agg_use(3)], &[]);
+        assert_eq!(none.len(), 1);
+        let l = &none[0];
+        assert_eq!(l.rule, GROUPED_AGGREGATES);
+        assert_eq!(l.columns, cols(&["account", "amount"]));
+        assert!(
+            l.message
+                .contains("--key 'exact:account,counts' --key 'agg:account@amount{sum,count}'"),
+            "{}",
+            l.message
+        );
+        assert!(
+            l.message.contains("its fix needs --allow-no-gain"),
+            "{}",
+            l.message
+        );
+        assert!(l.message.contains("3 recorded run(s)"), "{}", l.message);
+        assert!((l.confidence - HIGH).abs() < f64::EPSILON);
+        let only_counts = grouped_aggregates(&[agg_use(3)], &[counted(&["account"])]);
+        assert_eq!(only_counts.len(), 1);
+        assert!(
+            !only_counts[0].message.contains("exact:account,counts"),
+            "{}",
+            only_counts[0].message
+        );
+        let other_value = grouped_aggregates(
+            &[agg_use(3)],
+            &[
+                counted(&["account"]),
+                agg(&["account"], "fee", &[AggregateFn::Sum]),
+            ],
+        );
+        assert_eq!(other_value.len(), 1);
+        let no_sum = grouped_aggregates(
+            &[agg_use(3)],
+            &[
+                counted(&["account"]),
+                agg(&["account"], "amount", &[AggregateFn::Min]),
+            ],
+        );
+        assert_eq!(no_sum.len(), 1);
+        // an agg key without the counted key beside it answers nothing
+        let no_counts = grouped_aggregates(
+            &[agg_use(3)],
+            &[agg(&["account"], "amount", &[AggregateFn::Sum])],
+        );
+        assert_eq!(no_counts.len(), 1);
+        assert!(no_counts[0].message.contains("exact:account,counts"));
+    }
+
+    /// It does not fire when an agg key beside the counted key answers the
+    /// runs (one on fewer columns than the runs' included), or without
+    /// aggregate runs.
+    #[test]
+    #[allow(clippy::assert_is_empty)]
+    fn grouped_aggregates_do_not_fire_when_answered_or_without_runs() {
+        let answered = grouped_aggregates(
+            &[agg_use(3)],
+            &[
+                counted(&["account"]),
+                agg(&["account"], "amount", &[AggregateFn::Sum]),
+            ],
+        );
+        assert!(answered.is_empty(), "{answered:?}");
+        let coarser = AggregateUse {
+            columns: cols(&["account", "day"]),
+            ..agg_use(2)
+        };
+        assert!(grouped_aggregates(
+            &[coarser],
+            &[
+                counted(&["day", "account"]),
+                agg(&["account"], "amount", &[AggregateFn::Sum])
+            ],
+        )
+        .is_empty());
+        assert!(grouped_aggregates(&[agg_use(0)], &[]).is_empty());
+        assert!(grouped_aggregates(&[], &[]).is_empty());
+    }
+
+    fn rescan(complete: Vec<KeySpec>) -> ReconcileRescan {
+        ReconcileRescan {
+            side: "right".into(),
+            root: "/data/copy".into(),
+            key: cols(&["account"]),
+            value: "amount".into(),
+            value_type: arrow::datatypes::DataType::Decimal128(18, 6),
+            rows: 5000,
+            null_key_rows: 0,
+            complete,
+        }
+    }
+
+    /// `R-agg-1` never names a key that could not answer the side: a
+    /// Decimal256 total, which `index` refuses to sum, and a side with a
+    /// null leading key, whose rows no agg key holds, stay quiet.
+    #[test]
+    fn reconcile_rescans_do_not_fire_where_no_agg_key_could_answer() {
+        let wide = ReconcileRescan {
+            value_type: arrow::datatypes::DataType::Decimal256(40, 6),
+            ..rescan(Vec::new())
+        };
+        assert_eq!(reconcile_rescans(&[wide]), Vec::<Lint>::new());
+        let nulls = ReconcileRescan {
+            null_key_rows: 1,
+            ..rescan(Vec::new())
+        };
+        assert_eq!(reconcile_rescans(&[nulls]), Vec::<Lint>::new());
+    }
+
+    /// `R-agg-1` fires on a reconcile side read to total per key when its
+    /// index has no agg key on the key and total, naming the side's root
+    /// and the declarations; not when one is declared complete.
+    #[test]
+    fn reconcile_rescans_fire_without_the_agg_key_and_not_with_it() {
+        let fired = reconcile_rescans(&[rescan(Vec::new())]);
+        assert_eq!(fired.len(), 1);
+        let m = &fired[0].message;
+        assert!(m.contains("all 5000 rows of the right side"), "{m}");
+        assert!(
+            m.contains(
+                "bellwether index /data/copy --key 'exact:account,counts' --key \
+                 'agg:account@amount{sum,count}'"
+            ),
+            "{m}"
+        );
+        let with_counts = reconcile_rescans(&[rescan(vec![counted(&["account"])])]);
+        assert!(!with_counts[0].message.contains("exact:account,counts"));
+        let quiet = reconcile_rescans(&[rescan(vec![
+            counted(&["account"]),
+            agg(&["account"], "amount", &[AggregateFn::Sum]),
+        ])]);
+        assert!(quiet.is_empty(), "{quiet:?}");
+        assert_eq!(reconcile_rescans(&[]), Vec::new());
     }
 }

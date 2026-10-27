@@ -68,6 +68,7 @@ fn probe_receipt_and_report_over_a_real_receipt() {
             uncomparable: 0,
             totals: Vec::new(),
             row_filter: None,
+            agg: Vec::new(),
         },
         provenance: Provenance {
             inputs: vec![Hash::of(b"stand-in for verify")],

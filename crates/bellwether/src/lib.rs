@@ -30,6 +30,7 @@
 #![forbid(unsafe_code)]
 #![deny(clippy::unwrap_used, clippy::expect_used)]
 
+mod agg;
 mod engine;
 mod engine_fix;
 mod fix;
@@ -50,6 +51,7 @@ mod text;
 mod twin;
 mod why;
 
+pub use agg::{AggValue, AggregateGroup, AggregateResult};
 pub use bellwether_ledger::{
     printable, InvalidReason, InvalidSignature, OutsideWindow, PublicKey, RecordKind,
     SignatureStatus, SignedBy, SigningKey, TrustError, TrustedKey, TrustedKeys, Verdict,
@@ -104,7 +106,8 @@ pub use twin::{
     LOW_CARDINALITY_ROWS, MEMBERSHIP_GATE, NARROW_PERCENT, SELECTIVE_FILES_PERCENT,
 };
 pub use why::{
-    Candidate, CandidateOrigin, Culprit, CulpritReason, Dataset, DiagnosisReads, LookupMode,
-    ProfileEvidence, Recommendation, TextMatch, TimeWindow, WhyReport, WhyRequest, WorkloadInfo,
-    DEFAULT_MAX_CANDIDATES, ENGINE_PROPOSER, LAYOUT_BOUND_FRACTION, RESERVED_PROPOSERS,
+    AggregateQuery, Candidate, CandidateOrigin, Culprit, CulpritReason, Dataset, DiagnosisReads,
+    LookupMode, ProfileEvidence, Recommendation, TextMatch, TimeWindow, WhyReport, WhyRequest,
+    WorkloadInfo, DEFAULT_MAX_CANDIDATES, ENGINE_PROPOSER, LAYOUT_BOUND_FRACTION,
+    RESERVED_PROPOSERS,
 };

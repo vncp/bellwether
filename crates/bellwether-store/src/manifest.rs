@@ -874,6 +874,7 @@ fn key_spec_fields(kind: &str, storage_version: u64) -> Option<&'static [&'stati
         // Storage version 2 on: a reader of version 1 refuses the kind.
         "expr" if v2 => Some(&["kind", "name", "expr", "over", "conformance"]),
         "text" if v2 => Some(&["kind", "column", "tokenizer", "bloom"]),
+        "agg" if v2 => Some(&["kind", "columns", "value", "functions"]),
         _ => None,
     }
 }
@@ -1107,6 +1108,11 @@ mod tests {
                 right_columns: vec!["b".into()],
                 counts: true,
             },
+            KeySpec::Agg {
+                columns: vec!["a".into()],
+                value: "v".into(),
+                functions: bellwether_types::AggregateFn::CANONICAL.to_vec(),
+            },
         ];
         let mut kinds_seen = BTreeSet::new();
         for spec in &specs {
@@ -1121,7 +1127,8 @@ mod tests {
                 | KeySpec::Expr { .. }
                 | KeySpec::Text { .. }
                 | KeySpec::List { .. }
-                | KeySpec::Join { .. } => {}
+                | KeySpec::Join { .. }
+                | KeySpec::Agg { .. } => {}
             }
             let v = serde_json::to_value(spec).unwrap();
             let kind = v["kind"].as_str().unwrap().to_string();
@@ -1379,6 +1386,40 @@ mod tests {
             r#"{"storage_version": 2, "created_at": "x",
                 "schema": {"key_specs": [{"kind": "join", "dataset": "a", "columns": ["x"],
                 "right": "b", "right_columns": ["y"], "outer": true}]}}"#,
+        );
+    }
+
+    /// Agg keys (B7) are a storage version 2 kind: read and written back
+    /// as declared, and refused by name in a version 1 manifest.
+    #[test]
+    fn an_agg_key_is_a_storage_version_2_kind() {
+        let json = |version: u32| {
+            format!(
+                r#"{{"storage_version": {version}, "created_at": "x",
+                "schema": {{"key_specs": [{{"kind": "agg", "columns": ["account"],
+                "value": "amount", "functions": ["sum", "count"]}}]}}}}"#
+            )
+        };
+        let m = Manifest::from_slice(json(2).as_bytes()).unwrap();
+        assert_eq!(
+            m.schema.key_specs[0].identity(),
+            "agg:account@amount{sum,count}"
+        );
+        let back: Value = serde_json::from_slice(&m.to_vec().unwrap()).unwrap();
+        assert_eq!(back["schema"]["key_specs"][0]["kind"], "agg");
+        assert_eq!(back["schema"]["key_specs"][0]["value"], "amount");
+        assert!(key_spec_fields("agg", 1).is_none());
+        match Manifest::from_slice(json(1).as_bytes()) {
+            Err(Error::UnknownKind {
+                what: UNSUPPORTED_SHAPE,
+                ..
+            }) => {}
+            other => panic!("expected UnknownKind (shape), got {other:?}"),
+        }
+        expect_unsupported_shape(
+            r#"{"storage_version": 2, "created_at": "x",
+                "schema": {"key_specs": [{"kind": "agg", "columns": ["a"], "value": "v",
+                "functions": ["count"], "weights": true}]}}"#,
         );
     }
 

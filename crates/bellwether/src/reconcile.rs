@@ -1,9 +1,9 @@
 //! `reconcile`: compare two folders by key (WP8) and write the Certificate.
 
-use bellwether_types::{Error, Result};
+use bellwether_types::{AggregateFn, Error, KeySpec, Result};
 use bellwether_verify::{
-    CertificateContext, CoverageRequest, ManifestAnchor, Options, ReconcileSpec, Reconciliation,
-    Side, TotalColumn,
+    AggNotUsed, CertificateContext, CoverageRequest, IndexPlanner, ManifestAnchor, Options,
+    ReconcileSpec, Reconciliation, Side, TotalColumn,
 };
 use serde::{Deserialize, Serialize};
 
@@ -17,7 +17,7 @@ use std::sync::Arc;
 
 use bellwether_source_sql::SqlSource;
 
-use crate::engine::{guard, Engine, Pinned, TableSource};
+use crate::engine::{folder_changes, guard, Engine, EngineOptions, Pinned, TableSource};
 use crate::results::Written;
 
 /// How to reconcile two folders.
@@ -60,6 +60,12 @@ pub struct ReconcileResult {
     /// stood in for one. Empty (and omitted) when both sides are folders.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tables: Vec<TableRun>,
+    /// `R-agg-1` (B7): each folder side read to compare per-key rows and
+    /// one exact decimal total, where an agg key on the key and total
+    /// would have answered it from its index. Empty (and omitted)
+    /// otherwise.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub lints: Vec<bellwether_types::Lint>,
 }
 
 /// A reconcile request the engine would refuse for what it asks, not for
@@ -172,6 +178,7 @@ impl Engine {
         guard(|| self.reconcile_inner(right, request))
     }
 
+    #[allow(clippy::too_many_lines)] // sides, context, each side's agg index, lints
     fn reconcile_inner(&self, right: &str, req: &ReconcileRequest) -> Result<ReconcileResult> {
         if req.key.is_empty() {
             return Err(Error::KeySpec(
@@ -224,24 +231,75 @@ impl Engine {
                 })
                 .collect(),
             clock: self.options().clock.clone(),
+            agg: Vec::new(),
         };
         let mut options = Options::default();
         if let Some(budget) = req.memory_budget {
             options.memory_budget = budget;
         }
-        let certified = self
+        // A side whose fresh index holds an agg key on the reconcile's key
+        // and a total (B7) is handed to the verifier with its index: it
+        // reads the agg key's per-key rows and sums instead of the side's
+        // rows when every other condition holds (the certificate's `agg`
+        // says so), and says why not otherwise (`agg_not_used`), as this
+        // does for a stale index.
+        let (left_agg, left_stale) = agg_index(self, req, "left")?;
+        let right_engine = if is_sql_root(&right) {
+            None
+        } else {
+            let options = EngineOptions {
+                format: self.options().format,
+                schema: self.options().schema.clone(),
+                ..EngineOptions::default()
+            };
+            Engine::open(&right, options).ok()
+        };
+        let (right_agg, right_stale) = match &right_engine {
+            Some(e) => agg_index(e, req, "right")?,
+            None => (None, None),
+        };
+        let mut left = Side::new(&*left_source, self.root());
+        if let Some(p) = &left_agg {
+            left = left.indexed(p);
+        }
+        let mut right_side = Side::new(&*right_source, &right_root);
+        if let Some(p) = &right_agg {
+            right_side = right_side.indexed(p);
+        }
+        let mut certified = self
             .reconciler(spec, options)?
-            .certify(
-                &Side::new(&*left_source, self.root()),
-                &Side::new(&*right_source, &right_root),
-                &ctx,
-            )
+            .certify(&left, &right_side, &ctx)
             .map_err(|e| schema_step(Error::from(e)))?;
         let certificate = self.record_certified(&certified)?;
+        let not_used = &mut certified.outcome.agg_not_used;
+        not_used.extend(left_stale.into_iter().chain(right_stale));
+        not_used.sort_by_key(|n| n.side != "left");
+        let total_type = |source: &dyn bellwether_types::Source, root: &str| {
+            let column = req
+                .totals
+                .first()
+                .and_then(|t| TotalColumn::parse(t).ok())?;
+            let schema = source.schema(root).ok()?;
+            let field = schema.field_with_name(&column.column).ok()?;
+            Some(field.data_type().clone())
+        };
+        let lints = rescan_lints(
+            req,
+            &certified.outcome,
+            [
+                (self.table_url().is_none()).then(|| complete_specs(self)),
+                right_engine.as_ref().map(complete_specs),
+            ],
+            [
+                total_type(&*left_source, self.root()),
+                total_type(&*right_source, &right_root),
+            ],
+        );
         Ok(ReconcileResult {
             certificate,
             outcome: certified.outcome,
             tables: self.finish_tables()?,
+            lints,
         })
     }
 
@@ -306,6 +364,147 @@ impl Engine {
             .collect::<Result<Vec<_>>>()?;
         Ok((left, right_src, identities))
     }
+}
+
+/// The index of `engine`'s folder (the reconcile's `side`) as the side's
+/// planner, when it holds an agg key (B7) that could stand in for the
+/// side's rows: a complete agg key on exactly the key columns, in order,
+/// storing the sum of one of the request's totals, in a fresh index (no
+/// file changed since its build). The verifier checks every other
+/// condition and says why when one fails (`agg_side`). A stale index is
+/// not used: the side is read, and the returned note says why and names
+/// the `index` run that brings it up to date. `(None, None)` when the
+/// folder holds no such key.
+#[allow(clippy::type_complexity)]
+fn agg_index(
+    engine: &Engine,
+    req: &ReconcileRequest,
+    side: &str,
+) -> Result<(
+    Option<IndexPlanner<bellwether_store::ObjectStoreBackend>>,
+    Option<AggNotUsed>,
+)> {
+    if engine.table_url().is_some() {
+        return Ok((None, None));
+    }
+    let Some(pinned) = engine.pin()? else {
+        return Ok((None, None));
+    };
+    let (specs, _) = pinned.specs();
+    let agg = req
+        .totals
+        .iter()
+        .filter_map(|given| TotalColumn::parse(given).ok())
+        .find_map(|total| {
+            specs.iter().find(|s| {
+                matches!(s, KeySpec::Agg { columns, value, functions }
+                    if *columns == req.key
+                        && *value == total.column
+                        && functions.contains(&AggregateFn::Sum))
+            })
+        });
+    let Some(agg) = agg else {
+        return Ok((None, None));
+    };
+    let drift = folder_changes(engine.root(), &pinned, engine.format(), &engine.excluded())?;
+    if !drift.is_empty() {
+        let (added, changed, removed) = drift.paths();
+        let mut causes = Vec::new();
+        for (paths, what) in [
+            (&changed, "changed"),
+            (&added, "added"),
+            (&removed, "removed"),
+        ] {
+            if let Some(first) = paths.first() {
+                causes.push(format!(
+                    "{} {what} since the index was built ({first}{}), so its aggregates may not \
+                     be the files' and the rows are read",
+                    if paths.len() == 1 {
+                        "a file was".to_string()
+                    } else {
+                        format!("{} files were", paths.len())
+                    },
+                    if paths.len() > 1 { ", ..." } else { "" }
+                ));
+            }
+        }
+        return Ok((
+            None,
+            Some(AggNotUsed {
+                side: side.to_string(),
+                spec: agg.identity(),
+                causes,
+                next: Some(format!(
+                    "run `bellwether index {}` to bring the index up to date",
+                    engine.root()
+                )),
+            }),
+        ));
+    }
+    let Some(store) = engine.existing_store()? else {
+        return Ok((None, None));
+    };
+    Ok((Some(IndexPlanner::open(store, "")?), None))
+}
+
+/// The key specs complete in `engine`'s index; empty when the folder is not
+/// indexed or its index cannot be read (the lint then names every
+/// declaration).
+fn complete_specs(engine: &Engine) -> Vec<KeySpec> {
+    engine
+        .pin()
+        .ok()
+        .flatten()
+        .map(|p| p.specs().0)
+        .unwrap_or_default()
+}
+
+/// `R-agg-1` (B7) for a finished reconcile: when it compared per-key rows
+/// and one exact decimal total (every compared column a key column, the
+/// total grouped by nothing or the key, no version rule), each folder side
+/// it read rather than answered from an agg key (`specs[s]` are the side's
+/// complete specs, `None` for a table side; `types[s]` the total column's
+/// type there). The lint itself skips a side no agg key could answer.
+fn rescan_lints(
+    req: &ReconcileRequest,
+    outcome: &Reconciliation,
+    specs: [Option<Vec<KeySpec>>; 2],
+    types: [Option<arrow::datatypes::DataType>; 2],
+) -> Vec<bellwether_types::Lint> {
+    let [given] = req.totals.as_slice() else {
+        return Vec::new();
+    };
+    let Ok(total) = TotalColumn::parse(given) else {
+        return Vec::new();
+    };
+    if total.quantize.is_some()
+        || req.latest_by.is_some()
+        || !(req.group_by.is_empty() || req.group_by == req.key)
+        || !outcome.hashed_columns.iter().all(|c| req.key.contains(c))
+    {
+        return Vec::new();
+    }
+    let rescans: Vec<bellwether_profile::lints::ReconcileRescan> = ["left", "right"]
+        .into_iter()
+        .zip(specs.into_iter().zip(types))
+        .zip(&outcome.sides)
+        .filter_map(|((side, (complete, value_type)), report)| {
+            let (complete, value_type) = (complete?, value_type?);
+            (!outcome.agg.iter().any(|a| a.side == side)).then(|| {
+                bellwether_profile::lints::ReconcileRescan {
+                    side: side.to_string(),
+                    root: report.root.clone(),
+                    key: req.key.clone(),
+                    value: total.column.clone(),
+                    value_type,
+                    rows: report.rows,
+                    null_key_rows: report.null_key_rows,
+                    complete,
+                }
+            })
+        })
+        .collect();
+    bellwether_profile::lints::reconcile_rescans(&rescans)
 }
 
 /// The dataset types a table side takes from the folder it is compared

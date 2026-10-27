@@ -28,6 +28,11 @@
 //! `exact:counts,counts`.
 //! | `Text { column: body, tokenizer: words, bloom: None }` | `text:body,tokenizer=words` |
 //! | `Text { column: body, tokenizer: trigram, bloom: Some(0.01) }` | `text:body,tokenizer=trigram,bloom=0.01` |
+//! | `Agg { columns: [account], value: amount, functions: [sum, count] }` | `agg:account@amount{sum,count}` |
+//!
+//! An agg key's functions are listed in braces, each once, in any order;
+//! `count` is always stored and its label lists them in the order sum,
+//! count, min, max.
 //!
 //! An `expr` key's expression is in the closed language of
 //! `bellwether_core::expr`; it is stored normalized, so `label` gives the
@@ -50,7 +55,7 @@
 
 use bellwether_core::segment::validate_spec;
 use bellwether_types::{
-    Error, KeySpec, Result, SketchSpec, Tokenizer, Tombstone, SKETCH_DEFAULT_PRECISION,
+    AggregateFn, Error, KeySpec, Result, SketchSpec, Tokenizer, Tombstone, SKETCH_DEFAULT_PRECISION,
 };
 
 /// Parses the short form or the JSON form.
@@ -93,8 +98,8 @@ fn bad(s: &str, why: &str) -> Error {
     Error::KeySpec(format!(
         "{s:?} is not a key spec ({why}); write it as exact:a,b, exact:a@ts (per-key time \
          bounds), temporal:a@ts, temporal2:a@valid,known, bloom:a@0.01, range:ts, \
-         text:body,tokenizer=words (or tokenizer=trigram), expr:name=<expression>:exact, or \
-         list:tags"
+         text:body,tokenizer=words (or tokenizer=trigram), expr:name=<expression>:exact, \
+         list:tags, or agg:a@amount{{sum,count,min,max}}"
     ))
 }
 
@@ -344,6 +349,12 @@ fn parse_short(s: &str) -> Result<KeySpec> {
             s,
             "a join key takes no '@'; write join:<left>.<columns>=<right>.<columns>",
         )),
+        ("agg", Some(rest)) => parse_agg(s, cols, rest),
+        ("agg", None) => Err(bad(
+            s,
+            "an agg key names its value column after '@' and its functions in braces, \
+             agg:account@amount{sum,count,min,max}",
+        )),
         (other, _) => Err(bad(s, &format!("unknown kind {other:?}"))),
     }
 }
@@ -407,6 +418,43 @@ pub fn parse_join_side(s: &str) -> Result<(String, Vec<String>)> {
         return Err(bad_side("a name is empty"));
     }
     Ok((dataset.trim().to_string(), columns))
+}
+
+/// `agg:<key>[,<key>]@<value>{<fn>[,<fn>]}`: key columns, the value
+/// column, and the functions (`sum`, `count`, `min`, `max`, each once, in
+/// any order; `count` is always stored).
+fn parse_agg(s: &str, cols: &str, rest: &str) -> Result<KeySpec> {
+    let (value, fns) = rest
+        .split_once('{')
+        .and_then(|(v, f)| Some((v.trim(), f.trim().strip_suffix('}')?)))
+        .ok_or_else(|| {
+            bad(
+                s,
+                "an agg key lists its functions in braces after the value column, \
+                 agg:account@amount{sum,count,min,max}",
+            )
+        })?;
+    if value.is_empty() {
+        return Err(bad(s, "an agg key names its value column after '@'"));
+    }
+    let mut functions = Vec::new();
+    for f in fns.split(',').map(str::trim) {
+        let parsed = AggregateFn::parse(f).ok_or_else(|| {
+            bad(
+                s,
+                &format!("{f:?} is not an agg function; use sum, count, min, or max"),
+            )
+        })?;
+        if functions.contains(&parsed) {
+            return Err(bad(s, &format!("{f} is listed twice")));
+        }
+        functions.push(parsed);
+    }
+    Ok(KeySpec::Agg {
+        columns: columns(s, cols)?,
+        value: value.to_string(),
+        functions: AggregateFn::canonical(&functions),
+    })
 }
 
 /// `text:<column>,tokenizer=words|trigram[,bloom=<fpr>]`: the column, then
@@ -700,6 +748,49 @@ mod tests {
         assert_eq!(parse_tombstone("void").unwrap().value, None);
         for bad in ["", "=x", "a=", "a,b", "a@b"] {
             assert!(parse_tombstone(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    /// Agg keys (B7): functions in any order parse to the canonical one,
+    /// with `count` always stored; the label is the identity and reads back;
+    /// a function set is part of the identity, not of the name.
+    #[test]
+    fn agg_specs_parse_to_canonical_functions_and_read_back() {
+        use bellwether_types::AggregateFn;
+        for s in [
+            "agg:account@amount{sum,count}",
+            "agg:account,day@size{sum,count,min,max}",
+            "agg:a@v{count}",
+        ] {
+            let spec = parse(s).unwrap();
+            assert_eq!(label(&spec), s);
+            assert_eq!(spec.identity(), s);
+            assert_eq!(parse(&label(&spec)).unwrap(), spec);
+        }
+        let spec = parse("agg:a@v{max,sum}").unwrap();
+        assert_eq!(
+            spec,
+            KeySpec::Agg {
+                columns: vec!["a".into()],
+                value: "v".into(),
+                functions: vec![AggregateFn::Sum, AggregateFn::Count, AggregateFn::Max],
+            }
+        );
+        assert_eq!(spec.name(), "agg:a@v");
+        assert_eq!(spec.identity(), "agg:a@v{sum,count,max}");
+        assert_eq!(
+            parse("agg:a@v{sum,count}").unwrap().name(),
+            parse("agg:a@v{sum,count,min}").unwrap().name()
+        );
+        for bad in [
+            "agg:a",
+            "agg:a@v",
+            "agg:a@v{avg}",
+            "agg:@v{sum}",
+            "agg:a@{sum}",
+        ] {
+            let e = parse(bad).unwrap_err().to_string();
+            assert!(e.contains("agg"), "{bad}: {e}");
         }
     }
 

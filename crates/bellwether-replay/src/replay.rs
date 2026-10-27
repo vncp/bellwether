@@ -92,8 +92,8 @@ use crate::error::{ReplayError, ReplayResult};
 use crate::keys::RunKeys;
 use crate::layout::{replay_layout, LayoutModel, LayoutReplay};
 use crate::plan::{
-    converted_lookback_window, count_cost, planned_time_column, run_cost, serves_query, PlanSource,
-    SegmentPlanner,
+    aggregate_specs, converted_lookback_window, count_cost, planned_time_column, run_cost,
+    serves_query, PlanSource, SegmentPlanner,
 };
 use crate::transient::{CacheStats, TransientCache, TransientIndex, TransientLimits};
 use crate::workload::{KeySetSource, RunQuery, RunWindow, Workload};
@@ -382,9 +382,18 @@ impl<'a> Replayer<'a> {
         // the planner plans (every row group), under either baseline.
         let text = query.text_op().is_some();
         let query_is_membership = query.is_membership();
-        // A count is planned as the locate of its keys; [`cost_of`] prices it.
+        // An aggregate run an agg key answers (B7) reads only the row groups
+        // its counted key does not prove answered; else it is planned, and
+        // read, as the locate of its keys, as a count is ([`cost_of`]).
+        if let RunQuery::Aggregate(a) = query {
+            if let Some((agg, counting)) = aggregate_specs(specs, keys.columns(), a) {
+                let plan = planner.plan_aggregate(&[agg, counting], keys, a)?;
+                self.catalog.verify_plan(&plan)?;
+                return Ok((plan, false));
+            }
+        }
         let query = match query {
-            RunQuery::Count => &RunQuery::Locate,
+            RunQuery::Count | RunQuery::Aggregate(_) => &RunQuery::Locate,
             q => q,
         };
         let column = planned_time_column(planner, specs, keys.columns(), query)?;
@@ -704,6 +713,9 @@ impl<'a> Replayer<'a> {
                     }
                     specs = proposed_specs(&specs, s);
                 }
+                for s in std::iter::once(spec).chain(sidecars) {
+                    check_counted_beside(s, &specs, workload)?;
+                }
                 let (costs, stats) = self.costs(&specs, workload, keys, None)?;
                 (costs, None, stats)
             }
@@ -968,6 +980,46 @@ fn distinct_columns(workload: &Workload) -> Vec<Vec<String>> {
     out.sort();
     out.dedup();
     out
+}
+
+/// An agg key is built only beside a key counting rows on exactly its
+/// columns, and answers an aggregate run only beside one counting rows on
+/// exactly the run's columns: those counts prove which of its aggregates
+/// cover each key. A proposed agg key without either in `specs` (the
+/// configuration it is priced in) is refused, naming the counted key to
+/// declare first, rather than priced as reading everything.
+fn check_counted_beside(spec: &KeySpec, specs: &[KeySpec], workload: &Workload) -> Result<()> {
+    if !matches!(spec, KeySpec::Agg { .. }) {
+        return Ok(());
+    }
+    let refuse = |cols: &[String], what: String| {
+        let cols = cols.join(",");
+        Error::KeySpec(format!(
+            "{} {what} only beside a key counting rows on exactly ({cols}), which proves which \
+             of its aggregates cover each key, and the index has none complete; propose it \
+             first with `bellwether propose <root> --evidence <hash> --key 'exact:{cols},counts'` \
+             and apply it with `bellwether fix` (with --allow-no-gain when it saves no bytes on \
+             its own), then propose the agg key",
+            spec.identity()
+        ))
+    };
+    if bellwether_build::counting_spec(specs, spec.columns()).is_none() {
+        return Err(refuse(spec.columns(), "is built".into()));
+    }
+    for run in workload.runs() {
+        let Ok(RunQuery::Aggregate(a)) = run.query() else {
+            continue;
+        };
+        if serves_query(spec, &run.columns, &RunQuery::Aggregate(a))
+            && bellwether_build::counting_spec(specs, &run.columns).is_none()
+        {
+            return Err(refuse(
+                &run.columns,
+                format!("answers aggregate run {:?}", run.run_id),
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// A run's cost under its verified plan: [`count_cost`] for a `count` run,

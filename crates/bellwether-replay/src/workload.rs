@@ -59,7 +59,7 @@ use arrow::record_batch::RecordBatchReader;
 use bellwether_core::segment::ColumnType;
 use bellwether_store::{Cache, StoreExt};
 use bellwether_types::format::ENCODING_VERSION;
-use bellwether_types::{Error, Hash, Result, TextOp, Tombstone};
+use bellwether_types::{AggregateFn, Error, Hash, Result, TextOp, Tombstone};
 use bytes::Bytes;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use serde::{Deserialize, Serialize};
@@ -150,6 +150,34 @@ pub struct RunJoin {
     pub right_columns: Vec<String>,
 }
 
+/// The query kind of a recorded run that aggregates one value column per
+/// key over its keys (`sum/count/min/max(value) ... where key in (...)
+/// group by key`; B7), with the value and functions in
+/// [`RecordedRun::aggregate`].
+pub const QUERY_KIND_AGGREGATE: &str = "aggregate";
+
+/// What an `aggregate` run computes per key: `functions` of `value`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunAggregate {
+    /// The aggregated column.
+    pub value: String,
+    /// The functions, in the order sum, count, min, max, `count` always
+    /// among them (`AggregateFn::canonical`).
+    pub functions: Vec<AggregateFn>,
+}
+
+impl RunAggregate {
+    /// `functions` of `value`, the functions put in canonical order with
+    /// `count` among them.
+    #[must_use]
+    pub fn new(value: &str, functions: &[AggregateFn]) -> Self {
+        Self {
+            value: value.to_string(),
+            functions: AggregateFn::canonical(functions),
+        }
+    }
+}
+
 /// The time window of a `window` run: the rows of its keys whose
 /// `ts_column` lies in `[lo, hi]`, both inclusive and in the column's
 /// dataset unit (days for `Date32`, milliseconds for `Date64`, the
@@ -221,6 +249,12 @@ pub enum RunQuery {
     /// dataset then the right. Only a join key on the pair answers it
     /// alone; otherwise each side is planned by its own keys.
     SemiJoin(RunJoin),
+    /// Per key, `functions` of one value column over the key's rows
+    /// ([`QUERY_KIND_AGGREGATE`]; B7): answered from an agg key on the value
+    /// beside the key counting rows on exactly the run's columns, reading
+    /// only the row groups their counts do not prove answered; else
+    /// planned, and read, as a `locate`.
+    Aggregate(RunAggregate),
     /// A `latest` or `asof` run that keeps only live rows (B8): each key's
     /// newest version at or before `asof`, of which the rows that are not
     /// tombstones ([`RecordedRun::tombstone`]). Only a temporal key plans
@@ -240,7 +274,7 @@ pub struct RunLive {
 
 impl RunQuery {
     /// The `query_kind` tag (`locate`, `latest`, `asof`, `window`,
-    /// `contains_any`, or `contains_all`).
+    /// `contains_any`, `contains_all`, or `aggregate`).
     #[must_use]
     pub fn kind_str(&self) -> &'static str {
         match self {
@@ -260,6 +294,7 @@ impl RunQuery {
             Self::ContainsAll => QUERY_KIND_CONTAINS_ALL,
             Self::Bitemporal(_) => QUERY_KIND_BITEMPORAL,
             Self::SemiJoin(_) => QUERY_KIND_SEMIJOIN,
+            Self::Aggregate(_) => QUERY_KIND_AGGREGATE,
         }
     }
 
@@ -279,7 +314,8 @@ impl RunQuery {
             | Self::ContainsAny
             | Self::ContainsAll
             | Self::Bitemporal(_)
-            | Self::SemiJoin(_) => None,
+            | Self::SemiJoin(_)
+            | Self::Aggregate(_) => None,
         }
     }
 
@@ -298,6 +334,7 @@ impl RunQuery {
             | Self::ContainsAll
             | Self::Bitemporal(_)
             | Self::SemiJoin(_)
+            | Self::Aggregate(_)
             | Self::Live(_) => None,
         }
     }
@@ -325,6 +362,15 @@ impl RunQuery {
     pub fn text_op(&self) -> Option<TextOp> {
         match self {
             Self::Text(op) => Some(*op),
+            _ => None,
+        }
+    }
+
+    /// What an [`RunQuery::Aggregate`] run computes.
+    #[must_use]
+    pub fn aggregate(&self) -> Option<&RunAggregate> {
+        match self {
+            Self::Aggregate(a) => Some(a),
             _ => None,
         }
     }
@@ -382,7 +428,8 @@ pub struct RecordedRun {
     /// recorders that know the query or pipeline step pass it instead.
     pub template: String,
     /// What the run asked of the index: [`QUERY_KIND_LOCATE`],
-    /// [`QUERY_KIND_LATEST`], [`QUERY_KIND_ASOF`], or [`QUERY_KIND_WINDOW`].
+    /// [`QUERY_KIND_LATEST`], [`QUERY_KIND_ASOF`], [`QUERY_KIND_WINDOW`],
+    /// [`QUERY_KIND_AGGREGATE`], or another `QUERY_KIND_*`.
     pub query_kind: String,
     /// For [`QUERY_KIND_ASOF`] runs: the instant in the timestamp column's
     /// dataset unit. Absent (`None`, omitted in JSON) for `locate` and
@@ -424,12 +471,16 @@ pub struct RecordedRun {
     /// every other run hashes as before) otherwise.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tombstone: Option<Tombstone>,
+    /// The value and functions of an `aggregate` run; absent (and not
+    /// serialized, so other runs hash as before) otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub aggregate: Option<RunAggregate>,
 }
 
 impl RecordedRun {
     /// The typed query kind of this run, or an error if `query_kind`,
     /// `asof`, `lookback`, and `window` disagree or name an unknown kind.
-    #[allow(clippy::too_many_lines)]
+    #[allow(clippy::too_many_lines)] // one arm per query kind
     pub fn query(&self) -> Result<RunQuery> {
         if self.query_kind == QUERY_KIND_BITEMPORAL {
             return match (&self.bitemporal, &self.window, self.asof, self.lookback) {
@@ -508,9 +559,38 @@ impl RecordedRun {
                 ))),
             };
         }
+        if self.query_kind == QUERY_KIND_AGGREGATE {
+            return match (&self.aggregate, self.asof, self.lookback) {
+                (Some(a), None, None)
+                    if !a.value.is_empty()
+                        && a.functions == AggregateFn::canonical(&a.functions)
+                        && !self.columns.contains(&a.value) =>
+                {
+                    Ok(RunQuery::Aggregate(a.clone()))
+                }
+                (Some(a), None, None) => Err(Error::Other(format!(
+                    "run {:?} aggregates {:?} with {:?}; an aggregate run names a value column \
+                     that is not a key column and lists its functions once each in the order \
+                     sum, count, min, max, count among them",
+                    self.run_id, a.value, a.functions
+                ))),
+                _ => Err(Error::Other(format!(
+                    "run {:?} is an aggregate run; it records its value and functions and no \
+                     asof, lookback, or window",
+                    self.run_id
+                ))),
+            };
+        }
         if self.join.is_some() {
             return Err(Error::Other(format!(
                 "run {:?} has query_kind {:?} but records a right dataset; only a semijoin run \
+                 records one",
+                self.run_id, self.query_kind
+            )));
+        }
+        if self.aggregate.is_some() {
+            return Err(Error::Other(format!(
+                "run {:?} has query_kind {:?} but records an aggregate; only an aggregate run \
                  records one",
                 self.run_id, self.query_kind
             )));
@@ -1088,6 +1168,7 @@ impl<'a> WorkloadRecorder<'a> {
                 )));
             }
         }
+        check_aggregate(run_id, &built, &query, &self.schema)?;
         if matches!(query, RunQuery::ContainsAll) && null_tuples > 0 {
             // A null value is in no list (ADR 014), so no row holds every
             // value; dropping it, as a key lookup drops a null key, would
@@ -1119,10 +1200,11 @@ impl<'a> WorkloadRecorder<'a> {
                 window: query.window().cloned(),
                 bitemporal: query.bitemporal().cloned(),
                 join: query.join().cloned(),
-                tombstone: match query {
+                tombstone: match &query {
                     RunQuery::Live(l) => Some(l.tombstone.clone()),
                     _ => None,
                 },
+                aggregate: query.aggregate().cloned(),
             },
             payload,
         })
@@ -1230,6 +1312,26 @@ fn check_membership(run_id: &str, keys: &RunKeys, query: &RunQuery, schema: &Sch
             query.kind_str()
         )));
     }
+    Ok(())
+}
+
+/// An aggregate run's value column is in the dataset, is no key column, has
+/// one value per row, and can be summed when the run asks for `sum`, by
+/// the rules an agg key on the run's columns would be declared under
+/// (core's `agg::value_type`). Refused naming what to change.
+fn check_aggregate(run_id: &str, keys: &RunKeys, query: &RunQuery, schema: &Schema) -> Result<()> {
+    let Some(a) = query.aggregate() else {
+        return Ok(());
+    };
+    let spec = bellwether_types::KeySpec::Agg {
+        columns: keys.columns().to_vec(),
+        value: a.value.clone(),
+        functions: a.functions.clone(),
+    };
+    bellwether_core::agg::value_type(&spec, schema).map_err(|e| match e {
+        Error::KeySpec(m) => Error::KeySpec(format!("run {run_id:?}: {m}")),
+        other => other,
+    })?;
     Ok(())
 }
 

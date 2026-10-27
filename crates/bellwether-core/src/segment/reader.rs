@@ -299,6 +299,7 @@ impl<R: ReadAt> SegmentReader<R> {
             | Layout::KeyedTemporal
             | Layout::KeyedJoin
             | Layout::Bitemporal
+            | Layout::KeyedAgg
             | Layout::KeyedTombstone => {
                 let mut v = Vec::with_capacity(reserve(MIN_KEYED_ENTRY));
                 for _ in 0..blocks {
@@ -439,6 +440,21 @@ impl<R: ReadAt> SegmentReader<R> {
                         .map_or_else(|| "no type".to_string(), ToString::to_string),
                 )));
             }
+        }
+        let want_value = crate::agg::value_type(&self.header.key_spec, schema)?
+            .as_ref()
+            .map(ColumnType::of)
+            .transpose()?;
+        if self.header.value_type != want_value {
+            let show =
+                |t: Option<&ColumnType>| t.map_or_else(|| "none".into(), ToString::to_string);
+            return Err(Error::KeySpec(format!(
+                "segment for {} aggregated its values as {}; the dataset declares {}; re-index \
+                 the folder",
+                self.header.key_spec.name(),
+                show(self.header.value_type.as_ref()),
+                show(want_value.as_ref()),
+            )));
         }
         Ok(())
     }
@@ -654,6 +670,38 @@ impl<R: ReadAt> SegmentReader<R> {
                     .collect(),
             );
         })?;
+        Ok(out)
+    }
+
+    /// For each key of `keys` present in an agg key's segment, `(row group,
+    /// cell)` for every row group holding it, ascending. An error for a
+    /// segment of any other spec. Holds the block index, one block, and the
+    /// values of the keys asked (ADR 018).
+    #[allow(clippy::type_complexity)]
+    pub fn agg_cells<K: AsRef<[u8]>>(
+        &self,
+        keys: &[K],
+    ) -> Result<BTreeMap<Vec<u8>, Vec<(RowGroupId, crate::agg::AggCell)>>> {
+        if self.header.layout != Layout::KeyedAgg {
+            return Err(Error::KeySpec(format!(
+                "{} is not an agg key; its segments hold no aggregates",
+                self.header.key_spec.name()
+            )));
+        }
+        let mut out = BTreeMap::new();
+        let mut missing = false;
+        self.visit_keys(keys, |k, v| match v.agg {
+            Some(cells) => {
+                out.insert(
+                    k.to_vec(),
+                    v.bitmap.iter().map(RowGroupId).zip(cells).collect(),
+                );
+            }
+            None => missing = true,
+        })?;
+        if missing {
+            return Err(corrupt("an agg segment holds a value without aggregates"));
+        }
         Ok(out)
     }
 

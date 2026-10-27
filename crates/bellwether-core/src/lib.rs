@@ -22,6 +22,8 @@
 //! - [`join`]: join keys (B3), the keys two datasets share on one column
 //!   pair: the pair build from both sides' exact segments, `semijoin`, and
 //!   `overlap_stats`.
+//! - [`agg`]: agg keys (B7), per-key, per-row-group aggregates of one value
+//!   column, and the rule that decides which row groups they answer.
 //! - [`tombstone`]: tombstones on temporal and bitemporal keys (B8): the
 //!   `keyed_tombstone` liveness entries, the row test, and the pruning
 //!   rule of `latest`/`asof` with `live`.
@@ -37,6 +39,7 @@
 // Proper names (HyperLogLog, MinHash, BLAKE3) read better without backticks.
 #![allow(clippy::doc_markdown)]
 
+pub mod agg;
 pub mod bloom;
 pub mod encoding;
 pub mod expr;
@@ -44,6 +47,7 @@ pub mod hll;
 pub mod join;
 pub mod list;
 pub mod merge;
+pub mod render;
 pub mod segment;
 pub mod sidecar;
 pub mod sketch;

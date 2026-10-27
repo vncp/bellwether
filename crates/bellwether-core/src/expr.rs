@@ -2031,11 +2031,17 @@ pub fn typed_spec(spec: &KeySpec, schema: &Schema) -> Result<Typed> {
     Typed::parse(expr, schema)
 }
 
-/// The dataset columns an `expr` key reads; a spec of another kind reads
-/// its own columns.
+/// The dataset columns an `expr` key reads; an `agg` key reads its key
+/// columns and its value column; a spec of another kind reads its own
+/// columns.
 pub fn input_columns(spec: &KeySpec) -> Result<Vec<String>> {
     match spec {
         KeySpec::Expr { expr, .. } => Ok(Expr::parse(expr)?.columns()),
+        KeySpec::Agg { columns, value, .. } => {
+            let mut out = columns.clone();
+            out.push(value.clone());
+            Ok(out)
+        }
         other => Ok(other.columns().to_vec()),
     }
 }
