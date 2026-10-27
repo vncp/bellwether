@@ -586,6 +586,7 @@ pub(crate) fn plan(r: &PlanResult, out: &Out) -> String {
     }
     text_plan(&mut s, &r.lookup);
     membership_residual(&mut s, &r.lookup);
+    live_lines(&mut s, r);
     if let Some(c) = &r.path_values {
         let _ = writeln!(
             s,
@@ -647,6 +648,39 @@ pub(crate) fn plan(r: &PlanResult, out: &Out) -> String {
     }
     let _ = writeln!(s, "\nevidence {}", r.evidence.hash);
     s
+}
+
+/// A `live` plan's lines (B8): the filter the residual applies after the
+/// newest version, and what the tombstones pruned or why they did not.
+fn live_lines(s: &mut String, r: &PlanResult) {
+    let Some(l) = &r.live else { return };
+    let _ = writeln!(
+        s,
+        "  live: rows where {} among each key's newest version (a key whose newest row is a \
+         tombstone has none; a null is not live)",
+        l.filter
+    );
+    match (&l.pruned_by, &l.unpruned) {
+        (Some(by), _) => {
+            let _ = writeln!(
+                s,
+                "  tombstones: {} of {} with a version have a tombstone as their newest row \
+                 and are not read; {} {} pruned by {by}",
+                num(l.keys_retracted),
+                count(l.keys_with_version, "key", "keys"),
+                count(l.row_groups_pruned, "row group", "row groups"),
+                if l.row_groups_pruned == 1 {
+                    "was"
+                } else {
+                    "were"
+                }
+            );
+        }
+        (None, Some(why)) => {
+            let _ = writeln!(s, "  tombstones: not used for pruning; {why}");
+        }
+        (None, None) => {}
+    }
 }
 
 /// The plan's specs line: the specs it used, or, with none, the sidecar

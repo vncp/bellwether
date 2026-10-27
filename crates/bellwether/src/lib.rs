@@ -87,7 +87,7 @@ pub use propose::engine_rewrite;
 pub use receipt::signature_summary;
 pub use reconcile::{ReconcileProblem, ReconcileRequest, ReconcileResult};
 pub use results::{
-    ChainLink, Cost, CountResult, IndexResult, LinkStatus, LookbackWindow, LookupKind, NotSigned,
+    ChainLink, Cost, CountResult, IndexResult, LinkStatus, LivePlan, LookbackWindow, LookupKind, NotSigned,
     PlanResult, ProposeRefusal, ProposeResult, ReceiptResult, ReportResult, SidecarFolded,
     SidecarState, SpecState, TextRebuilt, Written,
 };

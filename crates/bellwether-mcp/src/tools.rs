@@ -205,6 +205,14 @@ pub struct ObserveAsof {
     /// Bitemporal: the known-time column of that key (with `valid_by`).
     #[serde(default)]
     pub known_by: Option<String>,
+    /// Keep only live rows (B8; the CLI's `--live`): each key's newest
+    /// version at the instant, without its tombstone rows, through the
+    /// tombstone the serving temporal or temporal2 key declares
+    /// (`temporal:id@ts,tombstone=void`). A key whose newest row is a
+    /// tombstone answers no row. Default `false`: every row of the newest
+    /// version.
+    #[serde(default)]
+    pub live: bool,
     /// Plan against the committed manifest at this sequence (a plan's
     /// `sequence`) instead of the current one, so a lookup repeated over a
     /// grown folder reads exactly what it read then: files indexed since are
@@ -579,7 +587,8 @@ pub fn catalog() -> Vec<ToolDef> {
             true,
             "Plan the version of each key current at an instant (at), or its bitemporal version \
              valid at valid as known at known (a temporal2 key), against the current manifest or \
-             a committed one (at_manifest). Writes the plan Evidence and the key set to the cache \
+             a committed one (at_manifest); with live, only its rows that are not tombstones (the \
+             key's declared tombstone). Writes the plan Evidence and the key set to the cache \
              only.",
         ),
         def::<ObserveText>(

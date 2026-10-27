@@ -4,13 +4,13 @@
 use std::sync::Arc;
 
 use arrow::datatypes::{DataType, TimeUnit};
-use bellwether_build::{Builder, Lookup, PlanOrder, TimedSource};
+use bellwether_build::{Builder, LiveOutcome, Lookup, PlanOrder, TimedSource};
 use bellwether_core::encoding;
 use bellwether_core::text;
 use bellwether_store::parse_rfc3339;
 use bellwether_types::{
     format, Error, Evidence, EvidenceBody, KeySpec, Predicate, Provenance, Record, Result,
-    ScanPlan, TextOp, Tokenizer,
+    ScanPlan, TextOp, Tokenizer, Tombstone,
 };
 use bytes::Bytes;
 
@@ -18,7 +18,7 @@ use crate::engine::{folder_changes, guard, root_hint, schema_hint, Engine, Folde
 use crate::keys::KeyFile;
 use crate::lookback::Lookback;
 use crate::results::{
-    Cost, CountResult, IndexResult, LookupKind, PlanResult, SidecarFolded, SidecarState, SpecState,
+    Cost, CountResult, IndexResult, LivePlan, LookupKind, PlanResult, SidecarFolded, SidecarState, SpecState,
     TextRebuilt,
 };
 use crate::spec::Declaration;
@@ -175,7 +175,23 @@ impl Engine {
     /// that serves the key columns. The residual carries `NotOlderThan` and
     /// `LatestPerKey` (invariant 5).
     pub fn latest(&self, keys: &KeyFile) -> Result<PlanResult> {
-        guard(|| self.plan_lookup(keys, Mode::Latest, None))
+        guard(|| self.plan_lookup(keys, Mode::Latest { live: false }, None))
+            .map_err(|e| root_hint(self.root(), schema_hint(e)))
+    }
+
+    /// [`Engine::latest`] keeping only live rows (B8): `arg_max(ts, *) by
+    /// key` then `where not retracted`, through the serving temporal key's
+    /// declared tombstone (`temporal:id@ts,tombstone=void`). A key whose
+    /// newest row is a tombstone, or whose only rows are, answers no row; a
+    /// key written again after its tombstone answers the later live row.
+    /// The residual ends with [`Predicate::Live`]; the complete tombstone
+    /// sidecar prunes the row groups holding no live row at each key's
+    /// newest time, and [`PlanResult::live`] says what it pruned, or, when
+    /// the sidecar is not complete, that nothing was pruned by tombstones
+    /// and which command completes it. A serving key with no tombstone is
+    /// [`Error::NotIndexed`] naming the spec to declare.
+    pub fn latest_live(&self, keys: &KeyFile) -> Result<PlanResult> {
+        guard(|| self.plan_lookup(keys, Mode::Latest { live: true }, None))
             .map_err(|e| root_hint(self.root(), schema_hint(e)))
     }
 
@@ -185,7 +201,17 @@ impl Engine {
     /// exact. The residual carries `NotOlderThan` and `LatestPerKey`
     /// (invariant 5).
     pub fn asof(&self, keys: &KeyFile, at: &str) -> Result<PlanResult> {
-        guard(|| self.plan_lookup(keys, Mode::Asof(at), None))
+        guard(|| self.plan_lookup(keys, Mode::Asof { at, live: false }, None))
+            .map_err(|e| root_hint(self.root(), schema_hint(e)))
+    }
+
+    /// [`Engine::asof`] keeping only live rows (B8), as
+    /// [`Engine::latest_live`]: per key, the rows at its newest time at or
+    /// before `at`, of which the ones that are not tombstones. Equal to
+    /// `asof` followed by the tombstone filter, row for row; the mechanical
+    /// guard against reading a retracted value in a backtest.
+    pub fn asof_live(&self, keys: &KeyFile, at: &str) -> Result<PlanResult> {
+        guard(|| self.plan_lookup(keys, Mode::Asof { at, live: true }, None))
             .map_err(|e| root_hint(self.root(), schema_hint(e)))
     }
 
@@ -228,13 +254,17 @@ impl Engine {
     /// Either bound may be omitted (unbounded); `latest --known K` is
     /// `valid = None`. A null in either clock never wins (ADR 014). The
     /// residual carries both bounds, `NotOlderThan` on each clock, then
-    /// `LatestPerKey`.
+    /// `LatestPerKey`. With `live` (B8), only live rows of the winning
+    /// version answer, through the bitemporal key's declared tombstone
+    /// (`temporal2:id@valid,known,tombstone=void`), as
+    /// [`Engine::latest_live`] describes.
     pub fn asof_bitemporal(
         &self,
         keys: &KeyFile,
         valid: Option<&str>,
         known: Option<&str>,
         clocks: Option<(&str, &str)>,
+        live: bool,
     ) -> Result<PlanResult> {
         guard(|| {
             self.plan_lookup(
@@ -243,6 +273,7 @@ impl Engine {
                     valid,
                     known,
                     clocks,
+                    live,
                 },
                 None,
             )
@@ -413,6 +444,7 @@ impl Engine {
             projected_bytes: None,
             column_bytes_from_footers: 0,
             evidence,
+            live: None,
         })
     }
 
@@ -552,10 +584,10 @@ impl Engine {
     ) -> Result<PlanResult> {
         let verb = match mode {
             Mode::Locate | Mode::Window { .. } | Mode::Contains { .. } => "locate",
-            Mode::Latest
+            Mode::Latest { .. }
             | Mode::Bitemporal { valid: None, .. }
             | Mode::Lookback { at: None, .. } => "latest",
-            Mode::Asof(_) | Mode::Bitemporal { .. } | Mode::Lookback { .. } => "asof",
+            Mode::Asof { .. } | Mode::Bitemporal { .. } | Mode::Lookback { .. } => "asof",
         };
         self.require_folder(verb)?;
         let pinned = self.pin_for_lookup(verb, keys, &mode)?;
@@ -581,18 +613,35 @@ impl Engine {
             }
             _ => specs,
         };
-        let (mut plan, order) = pinned.planner.plan_ordered(&specs, &lookup).map_err(|e| {
+        let not_complete = |e: Error| {
             if specs.is_empty() && !excluded.is_empty() {
                 not_complete_yet(self.root(), verb, &excluded)
             } else {
                 e
             }
-        })?;
+        };
+        let (mut plan, order, live) = match live_tombstone(&lookup) {
+            None => {
+                let (plan, order) = pinned
+                    .planner
+                    .plan_ordered(&specs, &lookup)
+                    .map_err(not_complete)?;
+                (plan, order, None)
+            }
+            Some(tombstone) => {
+                let (plan, order, outcome) = pinned
+                    .planner
+                    .plan_ordered_live(&specs, &lookup)
+                    .map_err(not_complete)?;
+                let live = live_plan(self.root(), &pinned, tombstone, outcome);
+                (plan, order, Some(live))
+            }
+        };
         if matches!(
             kind,
             LookupKind::Latest | LookupKind::Asof { .. } | LookupKind::Bitemporal { .. }
         ) {
-            check_temporal_residual(&plan)?;
+            check_temporal_residual(&plan, live.is_some())?;
         }
         let column_bytes_from_footers = match projection {
             Some(columns) => pinned.planner.project(&mut plan, columns)?,
@@ -648,6 +697,7 @@ impl Engine {
             projected_bytes,
             column_bytes_from_footers,
             evidence,
+            live,
         })
     }
 
@@ -691,17 +741,23 @@ impl Engine {
                 },
                 LookupKind::Locate,
             ),
-            Mode::Latest => {
-                serving_temporal(self.root(), verb, specs, columns)?;
+            Mode::Latest { live } => {
+                let serving = serving_temporal_spec(self.root(), verb, specs, columns)?;
+                let live = live
+                    .then(|| declared_tombstone(self.root(), verb, pinned, specs, serving))
+                    .transpose()?;
                 (
                     Lookup::Latest {
                         columns: columns.to_vec(),
                         keys: tuples,
+                        live,
                     },
                     LookupKind::Latest,
                 )
             }
-            Mode::Asof(at) => asof_lookup(self.root(), verb, pinned, specs, columns, tuples, at)?,
+            Mode::Asof { at, live } => {
+                asof_lookup(self.root(), verb, pinned, specs, columns, tuples, at, live)?
+            }
             Mode::Window {
                 from,
                 to,
@@ -726,7 +782,16 @@ impl Engine {
                 valid,
                 known,
                 clocks,
-            } => self.bitemporal_lookup(pinned, specs, columns, tuples, valid, known, clocks)?,
+                live,
+            } => self.bitemporal_lookup(
+                pinned,
+                specs,
+                columns,
+                tuples,
+                (valid, known),
+                clocks,
+                live,
+            )?,
         })
     }
 
@@ -741,9 +806,9 @@ impl Engine {
         specs: &[KeySpec],
         columns: &[String],
         tuples: Vec<Vec<u8>>,
-        valid: Option<&str>,
-        known: Option<&str>,
+        (valid, known): (Option<&str>, Option<&str>),
         clocks: Option<(&str, &str)>,
+        live: bool,
     ) -> Result<(Lookup, LookupKind)> {
         let probe = Lookup::Bitemporal {
             columns: columns.to_vec(),
@@ -751,6 +816,7 @@ impl Engine {
             keys: Vec::new(),
             valid: None,
             known: None,
+            live: None,
         };
         let def = match pinned.planner.sidecars_for(specs, &probe).as_slice() {
             [(one, _)] => one.clone(),
@@ -788,6 +854,24 @@ impl Engine {
             };
         let valid_ts = in_unit("valid", valid, &valid_column)?;
         let known_ts = in_unit("known", known, &known_column)?;
+        let live = if live {
+            let serving = KeySpec::Bitemporal {
+                columns: def.columns.clone(),
+                valid_column: valid_column.clone(),
+                known_column: known_column.clone(),
+                tombstone: None,
+            };
+            let verb = if valid.is_none() { "latest" } else { "asof" };
+            Some(declared_tombstone(
+                self.root(),
+                verb,
+                pinned,
+                specs,
+                &serving,
+            )?)
+        } else {
+            None
+        };
         Ok((
             Lookup::Bitemporal {
                 columns: columns.to_vec(),
@@ -795,6 +879,7 @@ impl Engine {
                 keys: tuples,
                 valid: valid_ts,
                 known: known_ts,
+                live,
             },
             LookupKind::Bitemporal {
                 valid: valid.map(str::to_string),
@@ -811,8 +896,14 @@ impl Engine {
 #[derive(Clone, Copy)]
 enum Mode<'a> {
     Locate,
-    Latest,
-    Asof(&'a str),
+    /// `live` (B8): only live rows, by the serving key's tombstone.
+    Latest {
+        live: bool,
+    },
+    Asof {
+        at: &'a str,
+        live: bool,
+    },
     Window {
         from: &'a str,
         to: &'a str,
@@ -829,6 +920,7 @@ enum Mode<'a> {
         /// `(valid column, known column)` of the bitemporal key to plan
         /// through, when the caller names it.
         clocks: Option<(&'a str, &'a str)>,
+        live: bool,
     },
     /// A membership lookup on a list column (B4): any of the values, or
     /// every one (`all`).
@@ -934,7 +1026,9 @@ fn membership_lookup(
 }
 
 /// The as-of lookup through the one temporal spec serving `columns`, its
-/// instant converted to the timestamp column's unit exactly.
+/// instant converted to the timestamp column's unit exactly; with `live`
+/// (B8), through that spec's declared tombstone.
+#[allow(clippy::too_many_arguments)]
 fn asof_lookup(
     root: &str,
     verb: &'static str,
@@ -943,8 +1037,13 @@ fn asof_lookup(
     columns: &[String],
     tuples: Vec<Vec<u8>>,
     at: &str,
+    live: bool,
 ) -> Result<(Lookup, LookupKind)> {
-    let ts_column = serving_temporal(root, verb, specs, columns)?;
+    let serving = serving_temporal_spec(root, verb, specs, columns)?;
+    let live = live
+        .then(|| declared_tombstone(root, verb, pinned, specs, serving))
+        .transpose()?;
+    let ts_column = temporal_ts(serving).to_string();
     let ts_type = pinned
         .planner
         .column_types(std::slice::from_ref(&ts_column))?
@@ -956,6 +1055,7 @@ fn asof_lookup(
             columns: columns.to_vec(),
             keys: tuples,
             ts,
+            live,
         },
         LookupKind::Asof {
             at: at.to_string(),
@@ -1335,16 +1435,23 @@ fn serving_temporal(
     specs: &[KeySpec],
     columns: &[String],
 ) -> Result<String> {
-    let mut found = specs.iter().filter_map(|s| match s {
-        KeySpec::Temporal {
-            columns: c,
-            ts_column,
-            ..
-        } if c.iter().all(|x| columns.contains(x)) => Some(ts_column.clone()),
-        _ => None,
+    serving_temporal_spec(root, operation, specs, columns).map(|s| temporal_ts(s).to_string())
+}
+
+/// The one complete temporal spec whose columns are all key columns, as
+/// [`serving_temporal`] finds it.
+fn serving_temporal_spec<'a>(
+    root: &str,
+    operation: &'static str,
+    specs: &'a [KeySpec],
+    columns: &[String],
+) -> Result<&'a KeySpec> {
+    let mut found = specs.iter().filter(|s| match s {
+        KeySpec::Temporal { columns: c, .. } => c.iter().all(|x| columns.contains(x)),
+        _ => false,
     });
     match (found.next(), found.next()) {
-        (Some(ts), None) => Ok(ts),
+        (Some(s), None) => Ok(s),
         (None, _) => Err(Error::NotIndexed {
             root: root.to_string(),
             operation,
@@ -1360,10 +1467,90 @@ fn serving_temporal(
     }
 }
 
+/// The timestamp column of a temporal spec (empty for any other).
+fn temporal_ts(spec: &KeySpec) -> &str {
+    match spec {
+        KeySpec::Temporal { ts_column, .. } => ts_column,
+        _ => "",
+    }
+}
+
+/// The tombstone a `live` lookup (B8) through `serving` (the temporal or
+/// bitemporal key that plans it, as usable at the pinned sequence) keeps
+/// live rows by: the one the index declares on that key. A key whose
+/// tombstone sidecar is not complete plans without it (its own segments
+/// are complete), and the tombstone still comes from the declaration, so
+/// the residual drops tombstone rows and [`live_plan`] says nothing was
+/// pruned by them. A key declared without a tombstone is
+/// [`Error::NotIndexed`], naming the spec to declare.
+fn declared_tombstone(
+    root: &str,
+    verb: &'static str,
+    pinned: &Pinned,
+    specs: &[KeySpec],
+    serving: &KeySpec,
+) -> Result<Tombstone> {
+    let plain = serving.without_tombstone();
+    let declared = specs
+        .iter()
+        .chain(pinned.planner.declared_specs().iter())
+        .find_map(|s| {
+            (s.without_tombstone() == plain)
+                .then(|| s.tombstone().cloned())
+                .flatten()
+        });
+    declared.ok_or_else(|| Error::NotIndexed {
+        root: root.to_string(),
+        operation: if verb == "latest" {
+            "a live latest"
+        } else {
+            "a live asof"
+        },
+        needs: Some(format!("{},tombstone=<column>", plain.identity())),
+    })
+}
+
+/// The tombstone of a `live` lookup (B8), if it is one.
+fn live_tombstone(lookup: &Lookup) -> Option<Tombstone> {
+    match lookup {
+        Lookup::Latest { live, .. }
+        | Lookup::AsOf { live, .. }
+        | Lookup::Bitemporal { live, .. } => live.clone(),
+        _ => None,
+    }
+}
+
+/// What a `live` lookup's tombstones did, for [`PlanResult::live`]: the
+/// sidecar that pruned, or why none did and the command that fixes it.
+fn live_plan(root: &str, pinned: &Pinned, tombstone: Tombstone, o: LiveOutcome) -> LivePlan {
+    let unpruned = o.pruned_by.is_none().then(|| {
+        format!(
+            "the key's tombstone sidecar is not complete at manifest sequence {}: row groups \
+             were added after it was built (by a binary without tombstones, or an index run \
+             that has not finished it), so tombstones pruned nothing and the plan reads every \
+             row group holding a key's newest version; the residual still drops every \
+             tombstone row, so the rows are exact. Run `bellwether index {}` to complete it",
+            pinned.sequence(),
+            crate::spec::shell_quote(root)
+        )
+    });
+    LivePlan {
+        filter: tombstone.live_sql(),
+        tombstone,
+        pruned_by: o.pruned_by,
+        unpruned,
+        keys_with_version: o.keys_with_version,
+        keys_retracted: o.keys_retracted,
+        row_groups_pruned: o.row_groups_pruned,
+    }
+}
+
 /// Invariant 5 at the boundary: a temporal plan's residual must apply
 /// `NotOlderThan` before `LatestPerKey`, or a superseded row could be
-/// returned. A plan without both is refused, never passed on.
-fn check_temporal_residual(plan: &ScanPlan) -> Result<()> {
+/// returned; a `live` plan's (B8) must apply `Live` after `LatestPerKey`,
+/// or an older live row could stand in for a newest tombstone. A plan
+/// without them in that order is refused, never passed on.
+fn check_temporal_residual(plan: &ScanPlan, live: bool) -> Result<()> {
     let ok = match &plan.residual {
         Some(Predicate::And { all }) => {
             let not_older = all
@@ -1372,7 +1559,15 @@ fn check_temporal_residual(plan: &ScanPlan) -> Result<()> {
             let latest = all
                 .iter()
                 .position(|p| matches!(p, Predicate::LatestPerKey { .. }));
+            let tombstones = all
+                .iter()
+                .position(|p| matches!(p, Predicate::Live { .. }));
             matches!((not_older, latest), (Some(a), Some(b)) if a < b)
+                && match (live, latest, tombstones) {
+                    (false, _, None) => true,
+                    (true, Some(b), Some(c)) => b < c,
+                    _ => false,
+                }
         }
         _ => false,
     };
@@ -1380,8 +1575,9 @@ fn check_temporal_residual(plan: &ScanPlan) -> Result<()> {
         Ok(())
     } else {
         Err(Error::Other(format!(
-            "the planner returned a temporal plan without NotOlderThan then LatestPerKey in its \
-             residual (invariant 5); this is a bug, please report it at {}",
+            "the planner returned a temporal plan without NotOlderThan then LatestPerKey (then \
+             Live, for a live lookup) in its residual (invariant 5); this is a bug, please \
+             report it at {}",
             crate::engine::ISSUE_TRACKER
         )))
     }
@@ -1492,9 +1688,35 @@ mod tests {
             rows: None,
         };
         let and = |all: Vec<Predicate>| Some(Predicate::And { all });
-        assert!(
-            check_temporal_residual(&plan(and(vec![not_older.clone(), latest.clone()]))).is_ok()
-        );
+        let live = Predicate::Live {
+            column: "void".into(),
+            tombstone: vec![0x01, 0x01],
+        };
+        assert!(check_temporal_residual(
+            &plan(and(vec![not_older.clone(), latest.clone()])),
+            false
+        )
+        .is_ok());
+        // A live lookup (B8): `Live` after `LatestPerKey`, never before or
+        // missing; a plain lookup carries none.
+        assert!(check_temporal_residual(
+            &plan(and(vec![not_older.clone(), latest.clone(), live.clone()])),
+            true
+        )
+        .is_ok());
+        for (bad, is_live) in [
+            (
+                and(vec![not_older.clone(), live.clone(), latest.clone()]),
+                true,
+            ),
+            (and(vec![not_older.clone(), latest.clone()]), true),
+            (
+                and(vec![not_older.clone(), latest.clone(), live.clone()]),
+                false,
+            ),
+        ] {
+            assert!(check_temporal_residual(&plan(bad), is_live).is_err());
+        }
         for bad in [
             and(vec![latest.clone(), not_older.clone()]),
             and(vec![latest.clone()]),
@@ -1502,7 +1724,7 @@ mod tests {
             Some(latest),
             None,
         ] {
-            assert!(check_temporal_residual(&plan(bad)).is_err());
+            assert!(check_temporal_residual(&plan(bad), false).is_err());
         }
     }
 

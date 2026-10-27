@@ -107,7 +107,7 @@ fn specs() -> Vec<KeySpec> {
             counts: true,
             bounds: None,
         },
-        KeySpec::Temporal {
+        KeySpec::Temporal { tombstone: None,
             columns: cols(&["a"]),
             ts_column: "ts".into(),
             counts: true,

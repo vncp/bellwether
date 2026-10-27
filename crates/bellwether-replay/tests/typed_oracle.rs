@@ -225,7 +225,7 @@ fn configs(run: &Run, corpus: &Corpus) -> Vec<(Vec<KeySpec>, Want)> {
             (vec![exact(&["k_i64", "k_str"])], Want::Equal),
             (vec![exact(&["k_str", "k_i64"])], Want::Equal),
             (
-                vec![KeySpec::Temporal {
+                vec![KeySpec::Temporal { tombstone: None,
                     columns: cols(&["k_i64", "k_str"]),
                     ts_column: "ts".into(),
                     counts: false,
@@ -267,7 +267,7 @@ fn configs(run: &Run, corpus: &Corpus) -> Vec<(Vec<KeySpec>, Want)> {
     vec![
         (vec![exact(&[c])], Want::Equal),
         (
-            vec![KeySpec::Temporal {
+            vec![KeySpec::Temporal { tombstone: None,
                 columns: cols(&[c]),
                 ts_column: "ts".into(),
                 counts: false,

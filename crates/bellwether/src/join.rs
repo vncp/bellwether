@@ -605,9 +605,8 @@ impl Engine {
         join: &str,
         left_columns: Option<&[String]>,
     ) -> Result<KeySpec> {
-        let declared: Vec<&KeySpec> = pinned
-            .planner
-            .declared_specs()
+        let all = pinned.planner.declared_specs();
+        let declared: Vec<&KeySpec> = all
             .iter()
             .filter(|s| matches!(s, KeySpec::Join { .. }))
             .collect();
@@ -1027,7 +1026,7 @@ impl Engine {
         let rpin = r.pin_required("a join key's price")?;
         r.refuse_stale(&rpin, "a join key's price")?;
         let mut priced = vec![spec.clone()];
-        for d in pinned.planner.declared_specs() {
+        for d in &pinned.planner.declared_specs() {
             if let KeySpec::Join {
                 columns: c,
                 right: rr,

@@ -494,6 +494,12 @@ struct LatestArgs {
     /// hours of UTC), or w (7 days), for example 252d; no trading days.
     #[arg(long, value_name = "N")]
     lookback: Option<String>,
+    /// Only live rows (B8): each key's newest version without its tombstone
+    /// rows, by the tombstone its temporal or temporal2 key declares
+    /// (temporal:id@ts,tombstone=void); a key whose newest row is a
+    /// tombstone answers no row.
+    #[arg(long, conflicts_with = "lookback")]
+    live: bool,
 }
 
 #[derive(Args)]
@@ -528,6 +534,12 @@ struct AsofArgs {
     /// Bitemporal: the known-time column of that key (with --valid-by).
     #[arg(long, value_name = "COL", requires = "valid_by")]
     known_by: Option<String>,
+    /// Only live rows (B8): each key's version current at the instant
+    /// without its tombstone rows, by the tombstone its temporal or
+    /// temporal2 key declares (temporal:id@ts,tombstone=void); a key whose
+    /// newest row then is a tombstone answers no row.
+    #[arg(long, conflicts_with = "lookback")]
+    live: bool,
 }
 
 #[derive(Args)]
@@ -938,8 +950,10 @@ fn run(cli: &Cli, out: &Out) -> Result<Outcome, Failure> {
                     None,
                     Some(known),
                     a.valid_by.as_deref().zip(a.known_by.as_deref()),
+                    a.live,
                 ),
                 (None, Some(n)) => e.latest_lookback(keys, n),
+                (None, None) if a.live => e.latest_live(keys),
                 (None, None) => e.latest(keys),
             })
         }
@@ -947,12 +961,14 @@ fn run(cli: &Cli, out: &Out) -> Result<Outcome, Failure> {
             check_lookback(a.lookback.as_deref())?;
             lookup(g, out, &a.lookup, |e, keys| match (&a.at, &a.lookback) {
                 (Some(at), Some(n)) => e.asof_lookback(keys, at, n, a.ts.as_deref()),
+                (Some(at), None) if a.live => e.asof_live(keys, at),
                 (Some(at), None) => e.asof(keys, at),
                 (None, _) => e.asof_bitemporal(
                     keys,
                     a.valid.as_deref(),
                     a.known.as_deref(),
                     a.valid_by.as_deref().zip(a.known_by.as_deref()),
+                    a.live,
                 ),
             })
         }

@@ -202,7 +202,7 @@ fn the_newest_valid_version_known_by_k_wins_for_every_v_and_k() {
                 let plan = p
                     .plan(
                         &specs(),
-                        &Lookup::Bitemporal {
+                        &Lookup::Bitemporal { live: None,
                             columns: cols(&["id"]),
                             clocks: None,
                             keys: keys.to_vec(),
@@ -273,7 +273,7 @@ fn a_rewritten_file_s_versions_no_longer_win() {
     let plan = p
         .plan(
             &specs(),
-            &Lookup::Bitemporal {
+            &Lookup::Bitemporal { live: None,
                 columns: cols(&["id"]),
                 clocks: None,
                 keys: keys.clone(),
@@ -303,7 +303,7 @@ fn a_rewritten_file_s_versions_no_longer_win() {
     let err = planner(&bare)
         .plan(
             &[],
-            &Lookup::Bitemporal {
+            &Lookup::Bitemporal { live: None,
                 columns: cols(&["id"]),
                 clocks: None,
                 keys: vec![enc_i64(1)],

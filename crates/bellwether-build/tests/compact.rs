@@ -58,7 +58,7 @@ fn lookups() -> Vec<(Vec<bellwether_types::KeySpec>, Lookup)> {
         ),
         (
             vec![temporal(&["id"], "ts")],
-            Lookup::Latest {
+            Lookup::Latest { live: None,
                 columns: cols(&["id"]),
                 keys: ids.clone(),
             },

@@ -3216,6 +3216,7 @@ mod schema_feature {
                             columns: cols(&["symbol"]),
                             valid_column: "valid".into(),
                             known_column: "known".into(),
+                            tombstone: None,
                         },
                         KeySpec::Bloom {
                             columns: cols(&["venue"]),
@@ -3226,6 +3227,7 @@ mod schema_feature {
                             columns: cols(&["id"]),
                             ts_column: "ts".into(),
                             counts: true,
+                            tombstone: None,
                         },
                     ],
                 },

@@ -696,6 +696,7 @@ fn why_with_latest_by_prices_temporal_and_locate_and_equals_latest_and_asof_plan
             columns: vec!["pu".into()],
             ts_column: "pickup_ts".into(),
             counts: false,
+            tombstone: None,
         }
     );
     assert_eq!(rec.lookup, LookupKind::Latest);

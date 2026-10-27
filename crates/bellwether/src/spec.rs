@@ -17,6 +17,9 @@
 //! | `Bitemporal { columns: [id], valid_column: valid, known_column: known }` | `temporal2:id@valid,known` |
 //! | `Join { dataset: orders, columns: [order_id], right: payables, right_columns: [order_id] }` | `join:orders.order_id=payables.order_id` |
 //! | `Join { .., counts: true }` | `join:orders.order_id=payables.order_id,counts` |
+//! | `Temporal { .., tombstone: Some(Tombstone { column: void, value: None }) }` | `temporal:id@ts,tombstone=void` (B8; after `,counts` when both) |
+//! | `Temporal { .., tombstone: Some(Tombstone { column: status, value: Some(VOID) }) }` | `temporal:id@ts,tombstone=status=VOID` |
+//! | `Bitemporal { .., tombstone: Some(..) }` | `temporal2:id@valid,known,tombstone=void` |
 //!
 //! A trailing `,counts` asks the spec to store, per key and per row group,
 //! the number of rows (storage version 2, ADR 028); it is the last element
@@ -46,7 +49,9 @@
 //! spec, so `parse` refuses it and names `index --key`.
 
 use bellwether_core::segment::validate_spec;
-use bellwether_types::{Error, KeySpec, Result, SketchSpec, Tokenizer, SKETCH_DEFAULT_PRECISION};
+use bellwether_types::{
+    Error, KeySpec, Result, SketchSpec, Tokenizer, Tombstone, SKETCH_DEFAULT_PRECISION,
+};
 
 /// Parses the short form or the JSON form.
 pub fn parse(s: &str) -> Result<KeySpec> {
@@ -160,6 +165,34 @@ fn strip_counts(list: &str) -> (&str, bool) {
     }
 }
 
+/// `list` (a temporal or bitemporal spec's part after `@`) without its
+/// trailing `,tombstone=col` or `,tombstone=col=value` (B8), which comes
+/// last, and the tombstone. Everything after the column's `=` is the value,
+/// which may hold any character; the column may not hold `=`.
+fn strip_tombstone<'a>(s: &str, list: &'a str) -> Result<(&'a str, Option<Tombstone>)> {
+    let Some((head, t)) = list.split_once(",tombstone=") else {
+        return Ok((list, None));
+    };
+    let (column, value) = match t.split_once('=') {
+        Some((c, v)) => (c.trim(), Some(v.trim().to_string())),
+        None => (t.trim(), None),
+    };
+    if column.is_empty() {
+        return Err(bad(
+            s,
+            "tombstone= names no column; write tombstone=<boolean column> or \
+             tombstone=<column>=<value>",
+        ));
+    }
+    Ok((
+        head,
+        Some(Tombstone {
+            column: column.to_string(),
+            value,
+        }),
+    ))
+}
+
 #[allow(clippy::too_many_lines)]
 fn parse_short(s: &str) -> Result<KeySpec> {
     let (kind, rest) = s
@@ -208,17 +241,20 @@ fn parse_short(s: &str) -> Result<KeySpec> {
             }
         }
         ("temporal", Some(ts)) if !ts.is_empty() => {
+            let (ts, tombstone) = strip_tombstone(s, ts)?;
             let (ts, counts) = strip_counts(ts);
             match columns(s, ts)?.as_slice() {
                 [one] => Ok(KeySpec::Temporal {
                     columns: columns(s, cols)?,
                     ts_column: one.clone(),
                     counts,
+                    tombstone,
                 }),
                 _ => Err(bad(
                     s,
-                    "a temporal spec has one timestamp column, then optionally counts: \
-                     temporal:id@ts or temporal:id@ts,counts",
+                    "a temporal spec has one timestamp column, then optionally counts, then \
+                     optionally a tombstone: temporal:id@ts, temporal:id@ts,counts or \
+                     temporal:id@ts,tombstone=void",
                 )),
             }
         }
@@ -236,19 +272,22 @@ fn parse_short(s: &str) -> Result<KeySpec> {
                 bounds: Some(one_column(s, ts, "bounds")?),
             })
         }
-        ("temporal2", Some(times)) => match columns(s, times)?.as_slice() {
-            [valid, known] => Ok(KeySpec::Bitemporal {
-                columns: columns(s, cols)?,
-                valid_column: valid.clone(),
-                known_column: known.clone(),
-                tombstone: None,
-            }),
-            _ => Err(bad(
-                s,
-                "a bitemporal key names its valid and known time columns, \
-                 temporal2:id@valid,known",
-            )),
-        },
+        ("temporal2", Some(times)) => {
+            let (times, tombstone) = strip_tombstone(s, times)?;
+            match columns(s, times)?.as_slice() {
+                [valid, known] => Ok(KeySpec::Bitemporal {
+                    columns: columns(s, cols)?,
+                    valid_column: valid.clone(),
+                    known_column: known.clone(),
+                    tombstone,
+                }),
+                _ => Err(bad(
+                    s,
+                    "a bitemporal key names its valid and known time columns, then optionally a \
+                     tombstone: temporal2:id@valid,known or temporal2:id@valid,known,tombstone=void",
+                )),
+            }
+        }
         ("temporal2", None) => Err(bad(
             s,
             "a bitemporal key names its valid and known time columns, temporal2:id@valid,known",
@@ -564,7 +603,7 @@ mod tests {
         );
         assert_eq!(
             parse("temporal:id@ts,counts").unwrap(),
-            KeySpec::Temporal {
+            KeySpec::Temporal { tombstone: None,
                 columns: vec!["id".into()],
                 ts_column: "ts".into(),
                 counts: true,
@@ -627,7 +666,7 @@ mod tests {
         );
         assert_eq!(
             parse("temporal2:id@valid,known").unwrap(),
-            KeySpec::Bitemporal {
+            KeySpec::Bitemporal { tombstone: None,
                 columns: vec!["id".into()],
                 valid_column: "valid".into(),
                 known_column: "known".into(),

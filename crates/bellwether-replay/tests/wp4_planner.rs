@@ -42,7 +42,7 @@ fn specs() -> Vec<KeySpec> {
             counts: false,
             bounds: None,
         },
-        KeySpec::Temporal {
+        KeySpec::Temporal { tombstone: None,
             columns: cols(&["entity_id"]),
             ts_column: "version_ts".into(),
             counts: false,
@@ -221,11 +221,11 @@ fn committed_and_transient_segments_plan_identically_through_wp4_and_this_crate(
             for run in t_workload.runs() {
                 let rk = t_workload.run_keys(&t_keys, run).unwrap();
                 let lookup = match &query {
-                    RunQuery::Latest => BuildLookup::Latest {
+                    RunQuery::Latest => BuildLookup::Latest { live: None,
                         columns: rk.columns().to_vec(),
                         keys: rk.tuples().map(<[u8]>::to_vec).collect(),
                     },
-                    RunQuery::Asof { ts } => BuildLookup::AsOf {
+                    RunQuery::Asof { ts } => BuildLookup::AsOf { live: None,
                         columns: rk.columns().to_vec(),
                         keys: rk.tuples().map(<[u8]>::to_vec).collect(),
                         ts: *ts,
@@ -255,7 +255,8 @@ fn committed_and_transient_segments_plan_identically_through_wp4_and_this_crate(
                     | RunQuery::ContainsAny
                     | RunQuery::ContainsAll
                     | RunQuery::Bitemporal(_)
-                    | RunQuery::SemiJoin(_) => unreachable!(),
+                    | RunQuery::SemiJoin(_)
+                    | RunQuery::Live(_) => unreachable!(),
                 };
                 let build_plan = planner.plan(config, &lookup).unwrap();
                 let committed = PlanSource::plan_query(&planner, config, &rk, &query).unwrap();

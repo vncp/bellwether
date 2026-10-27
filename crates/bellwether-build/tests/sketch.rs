@@ -248,14 +248,14 @@ fn lookups(
     ];
     out.push((
         specs.clone(),
-        Lookup::Latest {
+        Lookup::Latest { live: None,
             columns: cols(&["id"]),
             keys: keys.clone(),
         },
     ));
     out.push((
         specs.clone(),
-        Lookup::AsOf {
+        Lookup::AsOf { live: None,
             columns: cols(&["id"]),
             keys: keys.clone(),
             ts: 250_000,

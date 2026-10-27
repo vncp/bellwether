@@ -342,6 +342,9 @@ fn rows_asked(filter: &[Predicate]) -> String {
             Predicate::ContainsAll { column, .. } => {
                 format!("{column} holding every one of the workload's values")
             }
+            Predicate::Live { column, .. } => {
+                format!("live rows only: {column} not null and not the tombstone value")
+            }
             Predicate::And { all } => {
                 // A bitemporal run's winners: a per-key bound on each of
                 // its two clocks, read from the data, not a lookback.

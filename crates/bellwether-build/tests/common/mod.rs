@@ -531,6 +531,10 @@ pub fn apply_residual(pred: &Predicate, rows: Vec<Row>) -> Vec<Row> {
                     .is_some_and(|items| values.iter().all(|g| items.iter().any(|e| g.contains(e))))
             })
             .collect(),
+        Predicate::Live { column, tombstone } => rows
+            .into_iter()
+            .filter(|r| r.get(column).is_some_and(|v| v != tombstone))
+            .collect(),
     }
 }
 
@@ -646,11 +650,11 @@ pub fn check_latest(
     asof: Option<(i64, Vec<u8>)>,
 ) -> ScanPlan {
     let lookup = match &asof {
-        None => bellwether_build::Lookup::Latest {
+        None => bellwether_build::Lookup::Latest { live: None,
             columns: columns.to_vec(),
             keys: keys.to_vec(),
         },
-        Some((ts, _)) => bellwether_build::Lookup::AsOf {
+        Some((ts, _)) => bellwether_build::Lookup::AsOf { live: None,
             columns: columns.to_vec(),
             keys: keys.to_vec(),
             ts: *ts,

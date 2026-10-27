@@ -420,6 +420,7 @@ fn defect_9_why_latest_by_prices_temporal_lookups_and_matches_latest_and_asof_pl
             columns: vec!["pu".into()],
             ts_column: "pickup_ts".into(),
             counts: false,
+            tombstone: None,
         }
     );
     assert_eq!(rec.lookup, LookupKind::Latest);

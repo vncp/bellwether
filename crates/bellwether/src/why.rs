@@ -2343,7 +2343,7 @@ impl Engine {
             if !orderable || columns.contains(&ts_column) {
                 continue;
             }
-            let spec = KeySpec::Temporal {
+            let spec = KeySpec::Temporal { tombstone: None,
                 columns,
                 ts_column,
                 counts: false,
@@ -3323,7 +3323,7 @@ fn resolve_bitemporal(req: &WhyRequest, schema: &Schema) -> Result<ResolvedTempo
         .transpose()?;
     Ok(ResolvedTemporal {
         ts_column: valid_column.to_string(),
-        query: RunQuery::Bitemporal(RunBitemporal {
+        query: RunQuery::Bitemporal(RunBitemporal { tombstone: None,
             valid_column: valid_column.to_string(),
             known_column: known_column.to_string(),
             valid: valid_ts,
