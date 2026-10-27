@@ -25,7 +25,9 @@
     clippy::cast_possible_wrap,
     clippy::cast_sign_loss,
     clippy::cast_possible_truncation,
-    clippy::too_many_lines
+    clippy::too_many_lines,
+    clippy::similar_names,
+    clippy::many_single_char_names
 )]
 
 mod common;
@@ -492,7 +494,7 @@ fn an_incomplete_sidecar_plans_without_pruning_until_a_build_completes_it() {
     assert_eq!(p.completeness(&spec), None);
     let (usable, excluded) = p.usable_specs();
     assert_eq!(usable, vec![plain.clone()], "planned without its tombstone");
-    assert!(excluded.is_empty());
+    assert_eq!(excluded, Vec::<KeySpec>::new());
     assert_eq!(p.declared_specs(), vec![spec.clone()], "still declared");
     for keys in keysets() {
         for asof in INSTANTS {
@@ -594,7 +596,7 @@ fn the_manifest_holds_the_plain_spec_and_a_tombstone_sidecar() {
     );
     b.remove_spec(&plain).unwrap();
     let m = b.manifest().unwrap().unwrap();
-    assert!(m.schema.key_specs.is_empty());
+    assert_eq!(m.schema.key_specs, Vec::<KeySpec>::new());
     assert!(m.schema.sidecars.iter().all(|d| d.kind != "tombstone"));
     assert!(m.segments.is_empty(), "{:?}", m.segments);
 }

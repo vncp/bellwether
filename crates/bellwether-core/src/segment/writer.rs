@@ -489,35 +489,20 @@ impl KeyValue {
             }
         }
         let agg = AggCell::decode_n(&mut c, n, shape.agg)?;
-        let liveness = if shape.clocks > 0 {
-            let per = 16 * usize::from(shape.clocks) + 1;
-            if n.saturating_mul(per) != c.remaining() {
-                return Err(corrupt(
-                    "tombstone liveness entries do not fill the value record",
-                ));
-            }
-            let mut v = Vec::with_capacity(n);
-            for _ in 0..n {
-                v.push(crate::tombstone::Liveness::read(&mut c, shape.clocks)?);
-            }
-            Some(v)
-        } else {
-            None
-        };
-        if !c.is_done() {
-            return Err(Error::Other(
-                "corrupt segment: trailing bytes after a value record".into(),
-            ));
-        }
         let v = Self {
             bitmap,
             chain,
             counts,
             bounds,
             triples,
-            liveness,
+            liveness: crate::tombstone::Liveness::read_n(&mut c, n, shape.clocks)?,
             agg,
         };
+        if !c.is_done() {
+            return Err(Error::Other(
+                "corrupt segment: trailing bytes after a value record".into(),
+            ));
+        }
         v.check(shape)?;
         Ok(v)
     }

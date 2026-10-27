@@ -1241,6 +1241,7 @@ impl SegmentPlanner {
     /// ones, invariant 5) or every live version in the key's own lookback
     /// window, per-key intersection with any other serving specs, and the
     /// `NotOlderThan` / `LatestPerKey` residual, or the lookback's.
+    #[allow(clippy::too_many_lines)] // latest, asof, live, and lookback in one walk
     fn plan_temporal(
         &self,
         serving: &[(&SpecSegments, Lookup)],

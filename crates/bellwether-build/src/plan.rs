@@ -970,6 +970,7 @@ impl<S: StoreExt + ?Sized> Planner<S> {
 
     /// [`Planner::plan_with_transient`], recording a `live` lookup's
     /// tombstone outcome in `outcome`.
+    #[allow(clippy::too_many_lines)] // one arm per lookup kind
     fn plan_inner(
         &self,
         specs: &[KeySpec],
@@ -2772,7 +2773,7 @@ impl<S: StoreExt + ?Sized> Planner<S> {
     }
 
     /// The bitemporal as-of (see [`Lookup::Bitemporal`]).
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     fn plan_bitemporal(
         &self,
         segs: &[SpecSegments],
@@ -2882,13 +2883,11 @@ impl<S: StoreExt + ?Sized> Planner<S> {
                             .map(|h| ((h.valid, h.known), h.row_groups.clone()))
                     })
                     .collect();
-                let kept = match segs.iter().find(|s| s.spec == spec) {
-                    Some(seg) => self.prune_live(seg, lt, &variants, &hits, outcome)?,
-                    None => {
-                        outcome.keys_with_version =
-                            hits.iter().filter(|h| h.is_some()).count() as u64;
-                        None
-                    }
+                let kept = if let Some(seg) = segs.iter().find(|s| s.spec == spec) {
+                    self.prune_live(seg, lt, &variants, &hits, outcome)?
+                } else {
+                    outcome.keys_with_version = hits.iter().filter(|h| h.is_some()).count() as u64;
+                    None
                 };
                 for (w, k) in winners.iter_mut().zip(kept.into_iter().flatten()) {
                     match (w.as_mut(), k) {

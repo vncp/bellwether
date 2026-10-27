@@ -60,7 +60,9 @@ fn lake(dir: &Path, files: std::ops::Range<u64>) -> Vec<LakeRow> {
         let mut w = ArrowWriter::try_new(file, Arc::clone(&schema), Some(props)).unwrap();
         for rg in 0..4u64 {
             let first = (f * 4 + rg) * 30;
-            let ks: Vec<i64> = (first..first + 30).map(|k| k as i64).collect();
+            let ks: Vec<i64> = (first..first + 30)
+                .map(|k| i64::try_from(k).unwrap())
+                .collect();
             let id: Vec<i64> = ks.iter().map(|k| (k * 7) % 20).collect();
             let void: Vec<Option<bool>> = ks
                 .iter()

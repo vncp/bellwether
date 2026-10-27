@@ -210,8 +210,8 @@ fn strip_tombstone<'a>(s: &str, list: &'a str) -> Result<(&'a str, Option<Tombst
     }
     // The tombstone comes last: `,counts` after it is ambiguous (a column
     // `void,counts`, or a value ending in it), so it is refused.
-    let last = value.as_deref().unwrap_or(column);
-    if column.contains([',', '@']) || last.ends_with(",counts") {
+    let tail = value.as_deref().unwrap_or(column);
+    if column.contains([',', '@']) || tail.ends_with(",counts") {
         return Err(bad(
             s,
             "the tombstone comes last, after ,counts, and its column holds no ',' or '@'; write \

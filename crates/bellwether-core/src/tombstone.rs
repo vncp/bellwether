@@ -116,6 +116,27 @@ impl Liveness {
         out.push(u8::from(self.live.is_some()) | (u8::from(self.newest_is_tombstone) << 1));
     }
 
+    /// Reads a value record's `n` entries (one per row group of its
+    /// bitmap) for a segment whose entries have `clocks` clocks, which must
+    /// fill the rest of the record; `None` when `clocks` is 0 (no tombstone
+    /// segment).
+    pub(crate) fn read_n(c: &mut Cursor<'_>, n: usize, clocks: u8) -> Result<Option<Vec<Self>>> {
+        if clocks == 0 {
+            return Ok(None);
+        }
+        let per = 16 * usize::from(clocks) + 1;
+        if n.saturating_mul(per) != c.remaining() {
+            return Err(corrupt(
+                "tombstone liveness entries do not fill the value record",
+            ));
+        }
+        let mut v = Vec::with_capacity(n);
+        for _ in 0..n {
+            v.push(Self::read(c, clocks)?);
+        }
+        Ok(Some(v))
+    }
+
     /// Reads one entry written by [`Liveness::write`], refusing unknown
     /// flag bits, a live time without the flag (or the flag without one),
     /// and an entry that breaks [`Liveness::check`].

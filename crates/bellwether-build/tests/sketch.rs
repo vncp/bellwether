@@ -229,7 +229,7 @@ fn lookups(
 ) -> Vec<(Vec<KeySpec>, Lookup)> {
     let id = |v: i64| enc_i64(v);
     let keys: Vec<Vec<u8>> = [0, 3, 49, 120, 333, 999].into_iter().map(id).collect();
-    let specs = p.declared_specs().to_vec();
+    let specs = p.declared_specs();
     let mut out = vec![
         (
             specs.clone(),

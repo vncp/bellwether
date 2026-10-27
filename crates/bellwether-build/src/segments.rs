@@ -319,6 +319,7 @@ fn process_item<S: StoreExt + ?Sized>(ctx: &Ctx<'_, S>, item: &Item) -> Result<I
 }
 
 /// An open segment writer: a key spec's, a sidecar's, or a sketch's.
+#[allow(clippy::large_enum_variant)] // one per open segment, never in bulk
 enum AnyWriter {
     Key(SegmentWriter),
     Sidecar(SidecarWriter),
@@ -395,11 +396,15 @@ impl<'a> SpecWriter<'a> {
                 self.keys = 0;
                 self.bytes = 0;
                 slot.insert(match &self.plan.target {
-                    Target::Key(spec) => AnyWriter::Key(SegmentWriter::for_dataset(
-                        spec.clone(),
-                        ctx.schema,
-                        WriterOptions::default(),
-                    )?),
+                    // A spec with its tombstone names the `keyed_tombstone`
+                    // layout (core's `Layout::for_spec`).
+                    Target::Key(spec) | Target::Tombstone(spec) => {
+                        AnyWriter::Key(SegmentWriter::for_dataset(
+                            spec.clone(),
+                            ctx.schema,
+                            WriterOptions::default(),
+                        )?)
+                    }
                     Target::Sidecar(def) => {
                         AnyWriter::Sidecar(SidecarWriter::for_dataset(def.clone(), ctx.schema)?)
                     }
@@ -410,13 +415,6 @@ impl<'a> SpecWriter<'a> {
                             WriterOptions::default(),
                         )?)
                     }
-                    // The spec with its tombstone names the
-                    // `keyed_tombstone` layout (core's `Layout::for_spec`).
-                    Target::Tombstone(spec) => AnyWriter::Key(SegmentWriter::for_dataset(
-                        spec.clone(),
-                        ctx.schema,
-                        WriterOptions::default(),
-                    )?),
                     Target::Sketch(spec) => {
                         AnyWriter::Sketch(SketchWriter::for_dataset(spec, ctx.schema)?)
                     }

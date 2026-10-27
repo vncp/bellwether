@@ -56,11 +56,14 @@ fn schema() -> SchemaRef {
     ]))
 }
 
+/// One row: `(id, ts, void)`.
+type Row = (Option<i64>, Option<i64>, Option<bool>);
+
 /// `(id, ts, void)` rows: five files of four row groups of 20 rows, each
 /// id's versions rising with the file, a third of the newest versions
 /// retracted, some keys retracted then written again, null keys, times and
 /// tombstone columns.
-fn rows() -> Vec<Vec<Vec<(Option<i64>, Option<i64>, Option<bool>)>>> {
+fn rows() -> Vec<Vec<Vec<Row>>> {
     let mut g = Rng(23);
     (0..5i64)
         .map(|f| {

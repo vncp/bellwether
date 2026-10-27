@@ -1060,6 +1060,7 @@ mod tests {
     /// this test, so the allow-list and the `storage_version` bump it
     /// implies (ADR 017) cannot be forgotten.
     #[test]
+    #[allow(clippy::too_many_lines)] // one assertion per kind and field
     fn allow_lists_match_types_serialization() {
         let specs = [
             KeySpec::Exact {

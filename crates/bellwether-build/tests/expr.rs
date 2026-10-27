@@ -414,7 +414,7 @@ fn a_spec_without_its_conformance_vectors_is_refused_at_index_and_plan() {
     )
     .unwrap();
     let planner = Planner::open(Arc::clone(&store), "idx").unwrap();
-    let specs = planner.declared_specs().to_vec();
+    let specs = planner.declared_specs();
     let e = planner.plan(&specs, &lookup(SYM, &["ab3"])).unwrap_err();
     assert!(
         matches!(&e, Error::KeySpec(m) if m.contains("does not record the conformance vector")),

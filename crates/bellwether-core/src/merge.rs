@@ -297,29 +297,7 @@ fn fold(value: &mut KeyValue, other: KeyValue, key: &[u8]) -> Result<()> {
         value.triples.sort_unstable();
         value.triples.dedup();
     }
-    let liveness = match (value.liveness.take(), other.liveness) {
-        (None, None) => None,
-        (Some(a), Some(b)) => {
-            let mut per_rg: std::collections::BTreeMap<u32, crate::tombstone::Liveness> =
-                value.bitmap.iter().zip(a).collect();
-            for (rg, e) in other.bitmap.iter().zip(b) {
-                if per_rg.insert(rg, e).is_some() {
-                    return Err(Error::Other(format!(
-                        "cannot merge tombstone segments that both hold key {} in row group \
-                         {rg}: segments of one spec cover disjoint row groups",
-                        hex(key)
-                    )));
-                }
-            }
-            Some(per_rg.into_values().collect())
-        }
-        _ => {
-            return Err(Error::Other(
-                "cannot merge a value with liveness entries with one without".into(),
-            ))
-        }
-    };
-    value.liveness = liveness;
+    value.liveness = fold_liveness(value, &other, key)?;
     let counts = match (value.counts.take(), other.counts) {
         (None, None) => None,
         (Some(a), Some(b)) => {
@@ -395,6 +373,37 @@ fn fold(value: &mut KeyValue, other: KeyValue, key: &[u8]) -> Result<()> {
     value.counts = counts;
     value.agg = agg;
     Ok(())
+}
+
+/// The liveness entries (B8) of `value` and `other`, a key's entries in
+/// two tombstone segments, interleaved by row group; two entries for one
+/// row group are refused (segments of one spec cover disjoint row groups).
+/// Takes `value`'s entries.
+fn fold_liveness(
+    value: &mut KeyValue,
+    other: &KeyValue,
+    key: &[u8],
+) -> Result<Option<Vec<crate::tombstone::Liveness>>> {
+    match (value.liveness.take(), &other.liveness) {
+        (None, None) => Ok(None),
+        (Some(a), Some(b)) => {
+            let mut per_rg: std::collections::BTreeMap<u32, crate::tombstone::Liveness> =
+                value.bitmap.iter().zip(a).collect();
+            for (rg, e) in other.bitmap.iter().zip(b.iter().copied()) {
+                if per_rg.insert(rg, e).is_some() {
+                    return Err(Error::Other(format!(
+                        "cannot merge tombstone segments that both hold key {} in row group \
+                         {rg}: segments of one spec cover disjoint row groups",
+                        hex(key)
+                    )));
+                }
+            }
+            Ok(Some(per_rg.into_values().collect()))
+        }
+        _ => Err(Error::Other(
+            "cannot merge a value with liveness entries with one without".into(),
+        )),
+    }
 }
 
 fn hex(b: &[u8]) -> String {

@@ -3744,7 +3744,7 @@ fn resolve_temporal(req: &WhyRequest, schema: &Schema) -> Result<Option<Resolved
         (None, Some(t)) => {
             check_tombstone(
                 t,
-                KeySpec::Temporal {
+                &KeySpec::Temporal {
                     columns: Vec::new(),
                     ts_column: ts_column.to_string(),
                     counts: false,
@@ -3811,7 +3811,7 @@ fn time_column_type(
 /// whose type or value cannot mark a tombstone, on the temporal or
 /// bitemporal key `plain` (its time columns; no key columns yet), with
 /// what to pass instead (`bellwether_core::tombstone::column_type`).
-fn check_tombstone(t: &Tombstone, plain: KeySpec, schema: &Schema) -> Result<()> {
+fn check_tombstone(t: &Tombstone, plain: &KeySpec, schema: &Schema) -> Result<()> {
     let spec = plain
         .with_tombstone(t.clone())
         .ok_or_else(|| Error::KeySpec("--tombstone needs a temporal lookup".into()))?;
@@ -3851,7 +3851,7 @@ fn resolve_bitemporal(req: &WhyRequest, schema: &Schema) -> Result<ResolvedTempo
     if let Some(t) = &req.tombstone {
         check_tombstone(
             t,
-            KeySpec::Bitemporal {
+            &KeySpec::Bitemporal {
                 columns: Vec::new(),
                 valid_column: valid_column.to_string(),
                 known_column: known_column.to_string(),

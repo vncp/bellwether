@@ -576,6 +576,7 @@ impl Engine {
         }
     }
 
+    #[allow(clippy::too_many_lines)] // one arm per lookup mode
     fn plan_lookup(
         &self,
         keys: &KeyFile,

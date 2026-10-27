@@ -919,6 +919,27 @@ pub struct Tombstone {
 }
 
 impl Tombstone {
+    /// A new declaration's tombstone names a column without `,`, `@` or
+    /// `=` (they separate the parts of a key spec's identity) and, in the
+    /// `=value` form, a value ([`KeySpec::check_names`]).
+    fn check_names(&self) -> Result<()> {
+        if self.column.is_empty() || self.column.contains([',', '@', '=']) {
+            return Err(Error::KeySpec(format!(
+                "the tombstone column {:?} is empty or contains ',', '@' or '=', which \
+                 separate the parts of a key spec's identity, so a new key spec cannot name \
+                 it; rename the column",
+                self.column
+            )));
+        }
+        if self.value.as_deref() == Some("") {
+            return Err(Error::KeySpec(format!(
+                "tombstone={}= names no value; write tombstone={} for a boolean column, or \
+                 tombstone={}=<value> for the value that marks a tombstone",
+                self.column, self.column, self.column
+            )));
+        }
+        Ok(())
+    }
     /// The spelling in a spec: `tombstone=col` or `tombstone=col=value`.
     #[must_use]
     pub fn spelling(&self) -> String {
@@ -1244,21 +1265,7 @@ impl KeySpec {
             }
         }
         if let Some(t) = self.tombstone() {
-            if t.column.is_empty() || t.column.contains([',', '@', '=']) {
-                return Err(Error::KeySpec(format!(
-                    "the tombstone column {:?} is empty or contains ',', '@' or '=', which \
-                     separate the parts of a key spec's identity, so a new key spec cannot name \
-                     it; rename the column",
-                    t.column
-                )));
-            }
-            if t.value.as_deref() == Some("") {
-                return Err(Error::KeySpec(format!(
-                    "tombstone={}= names no value; write tombstone={} for a boolean column, or \
-                     tombstone={}=<value> for the value that marks a tombstone",
-                    t.column, t.column, t.column
-                )));
-            }
+            t.check_names()?;
         }
         Ok(())
     }

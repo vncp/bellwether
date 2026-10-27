@@ -285,7 +285,7 @@ fn nulls_follow_adr_014() {
         ],
     ];
     let bytes = build(&spec(None), &layout, 0..2);
-    let got = tombstone::liveness(&open(&[bytes.clone()]), &probes()).unwrap();
+    let got = tombstone::liveness(&open(std::slice::from_ref(&bytes)), &probes()).unwrap();
     assert_eq!(got, oracle(&layout));
     assert!(!got.contains_key(&key("")));
     assert_eq!(
@@ -377,7 +377,7 @@ fn bitemporal_entries_hold_both_clocks() {
         .unwrap();
     w.insert_liveness(&a, RowGroupId(1), (2, 20), true).unwrap();
     let r = open(&[w.finish().unwrap().bytes]);
-    let got = tombstone::liveness(&r, &[a.clone()]).unwrap();
+    let got = tombstone::liveness(&r, std::slice::from_ref(&a)).unwrap();
     assert_eq!(
         got[&a],
         BTreeMap::from([
@@ -603,10 +603,12 @@ fn sweep(clean: &[u8], positions: std::ops::Range<usize>, every_value: bool) -> 
         SWEEPING.with(|s| s.set(true));
         let got = catch_unwind(AssertUnwindSafe(|| exercise(bad)));
         SWEEPING.with(|s| s.set(false));
+        let Ok(got) = got else {
+            panic!("{what}: panicked")
+        };
         match got {
-            Err(_) => panic!("{what}: panicked"),
-            Ok(Err(_)) => refused += 1,
-            Ok(Ok(got)) => assert_eq!(got, want, "{what}: a different answer"),
+            Err(_) => refused += 1,
+            Ok(got) => assert_eq!(got, want, "{what}: a different answer"),
         }
     };
     for len in 0..clean.len() {
