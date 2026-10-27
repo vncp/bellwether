@@ -1672,7 +1672,7 @@ impl Engine {
                     let payload = run_keys.to_payload()?;
                     let hash = Hash::of(&payload);
                     if let Some(cache) = self.writable_store().and_then(|_| self.cache().ok()) {
-                        cache.put_cached(&hash, bytes::Bytes::from(payload))?;
+                        cache.put_cached_once(&hash, bytes::Bytes::from(payload))?;
                     }
                     inputs.push(hash);
                     add(
@@ -1740,7 +1740,7 @@ impl Engine {
                 let payload = run_keys.to_payload()?;
                 let hash = Hash::of(&payload);
                 if let Some(cache) = self.writable_store().and_then(|_| self.cache().ok()) {
-                    cache.put_cached(&hash, bytes::Bytes::from(payload))?;
+                    cache.put_cached_once(&hash, bytes::Bytes::from(payload))?;
                 }
                 inputs.push(hash);
                 let RunQuery::Aggregate(a) = asked.run_query() else {

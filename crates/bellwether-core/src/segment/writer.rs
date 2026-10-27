@@ -2,13 +2,14 @@
 //! and hands them to a streaming emitter that writes one block at a time.
 //! [`crate::merge`] drives the same emitters from already-sorted inputs.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use arrow::array::{ArrayRef, RecordBatch};
 use arrow::datatypes::{DataType, Schema};
 use bellwether_types::format::STORAGE_VERSION;
 use bellwether_types::{Error, Hash, KeySpec, Result, RowGroupId};
 use roaring::RoaringBitmap;
+use xxhash_rust::xxh3::Xxh3DefaultBuilder;
 
 use super::format::{
     bloom_bounds_column, checksum, corrupt, len_u32, put_leb128, record_time_columns,
@@ -932,9 +933,15 @@ impl KeyAcc {
     }
 }
 
+/// The keyed accumulators: a hash map (one hash and one probe per row,
+/// where an ordered map compares keys at every level), sorted once by key
+/// when the segment is finished (WP22b). The hasher has a fixed seed; the
+/// segment's bytes depend only on the sorted keys.
+type KeyedAcc = HashMap<Vec<u8>, KeyAcc, Xxh3DefaultBuilder>;
+
 /// The accumulator of `key`, created on first sight. The key is copied only
 /// then, never per row.
-fn key_acc<'m>(m: &'m mut BTreeMap<Vec<u8>, KeyAcc>, key: &[u8]) -> Result<&'m mut KeyAcc> {
+fn key_acc<'m>(m: &'m mut KeyedAcc, key: &[u8]) -> Result<&'m mut KeyAcc> {
     if !m.contains_key(key) {
         m.insert(key.to_vec(), KeyAcc::default());
     }
@@ -950,7 +957,7 @@ enum BloomAcc {
 }
 
 enum Acc {
-    Keyed(BTreeMap<Vec<u8>, KeyAcc>),
+    Keyed(KeyedAcc),
     Bloom(BTreeMap<u32, BloomAcc>),
     Range(BTreeMap<u32, (Vec<u8>, Vec<u8>)>),
 }
@@ -1125,7 +1132,7 @@ impl SegmentWriter {
             | Layout::KeyedTemporal
             | Layout::Bitemporal
             | Layout::KeyedAgg
-            | Layout::KeyedTombstone => Acc::Keyed(BTreeMap::new()),
+            | Layout::KeyedTombstone => Acc::Keyed(KeyedAcc::default()),
             Layout::KeyedJoin => {
                 return Err(Error::KeySpec(format!(
                     "{} is built from both datasets' exact keys by \
@@ -1861,7 +1868,9 @@ impl SegmentWriter {
         match self.acc {
             Acc::Keyed(m) => {
                 let mut e = KeyedEmitter::new(&header, &self.opts)?;
-                for (k, mut acc) in m {
+                let mut sorted: Vec<(Vec<u8>, KeyAcc)> = m.into_iter().collect();
+                sorted.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+                for (k, mut acc) in sorted {
                     let bounds = shape.bounds.then(|| {
                         acc.bitmap
                             .iter()

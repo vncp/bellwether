@@ -7,9 +7,10 @@
 //! at a time for bloom.
 
 use std::borrow::Cow;
+use std::cell::RefCell;
 
 use bellwether_core::segment::ReadAt;
-use bellwether_store::{Snapshot, StoreExt};
+use bellwether_store::{Snapshot, StoreExt, SEGMENT_WINDOW_BYTES};
 use bellwether_types::{Error, Hash, Result};
 use bytes::Bytes;
 
@@ -23,10 +24,27 @@ pub(crate) enum SegmentBytes<'a, S: StoreExt + ?Sized> {
         id: Hash,
         /// Its size from the manifest.
         size: u64,
+        /// The window of the last read: its index and bytes. Probes walk a
+        /// segment in key order, so most reads land in the window before
+        /// and skip the snapshot's shared cache (WP22b). One window per open
+        /// reader (ADR 018).
+        last: RefCell<Option<(u64, Bytes)>>,
     },
     /// Whole segment bytes: a verified read of a committed segment, or a
     /// transient segment built in memory.
     Memory(Bytes),
+}
+
+impl<'a, S: StoreExt + ?Sized> SegmentBytes<'a, S> {
+    /// Ranged reads of segment `id` (of `size` bytes) pinned by `snapshot`.
+    pub(crate) fn ranged(snapshot: &'a Snapshot<S>, id: Hash, size: u64) -> Self {
+        Self::Ranged {
+            snapshot,
+            id,
+            size,
+            last: RefCell::new(None),
+        }
+    }
 }
 
 fn corrupt(what: &str) -> Error {
@@ -43,11 +61,38 @@ impl<S: StoreExt + ?Sized> ReadAt for SegmentBytes<'_, S> {
 
     fn read_at(&self, offset: u64, len: usize) -> Result<Cow<'_, [u8]>> {
         match self {
-            Self::Ranged { snapshot, id, size } => {
+            Self::Ranged {
+                snapshot,
+                id,
+                size,
+                last,
+            } => {
                 let len64 = u64::try_from(len).map_err(|_| corrupt("read length"))?;
                 let end = offset.checked_add(len64).ok_or_else(|| corrupt("range"))?;
                 if end > *size {
                     return Err(corrupt("range past end"));
+                }
+                let window = offset / SEGMENT_WINDOW_BYTES;
+                let start = window * SEGMENT_WINDOW_BYTES;
+                if len > 0 && (end - 1) / SEGMENT_WINDOW_BYTES == window {
+                    // Inside one window: from the last one read, or that
+                    // window whole (cached by the snapshot).
+                    let mut last = last.borrow_mut();
+                    if last.as_ref().is_none_or(|(w, _)| *w != window) {
+                        let wend = (start + SEGMENT_WINDOW_BYTES).min(*size);
+                        let bytes = snapshot.read_segment_range(id, start..wend)?;
+                        if bytes.len() as u64 != wend - start {
+                            return Err(Error::Store(format!(
+                                "segment {id}: asked for {} bytes at {start}, got {}",
+                                wend - start,
+                                bytes.len()
+                            )));
+                        }
+                        *last = Some((window, bytes));
+                    }
+                    let (_, w) = last.as_ref().ok_or_else(|| corrupt("window"))?;
+                    let at = usize::try_from(offset - start).map_err(|_| corrupt("offset"))?;
+                    return Ok(Cow::Owned(w[at..at + len].to_vec()));
                 }
                 let bytes = snapshot.read_segment_range(id, offset..end)?;
                 if bytes.len() != len {

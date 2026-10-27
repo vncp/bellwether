@@ -1,0 +1,123 @@
+name: perf
+
+# The performance budget check (WP22b, docs/benchmark.md 2026-10-27).
+#
+# Nightly, and on a pull request labeled `perf`: a release build runs
+# scripts/perf.sh --ci (the small corpora: replay-small, the bench quick
+# corpus, market defaults, and the 10k-file ledger), then
+# `bellwether bench perf-check` compares the results with the runner's own
+# budgets in docs/measured/budgets.toml ([runner]).
+#
+# - A nightly run fails when a metric is past its runner budget in this run
+#   and in the previous nightly run (one noisy run never fails), and then
+#   opens or updates the single issue titled "perf regression".
+# - A labeled pull-request run fails when a metric is past its runner budget
+#   by more than 1.5x.
+# - A budgeted metric missing from the results fails, never skips.
+# - `workflow_dispatch` with `baseline` measures without checking: its
+#   perf.json is the runner baseline a pull request commits under [runner]
+#   (scripts/perf-budgets.py --runner), together with the measured document.
+#
+# This check is never a required status: hosted runners are noisy.
+
+on:
+  schedule:
+    - cron: "17 4 * * *"
+  pull_request:
+    types: [opened, synchronize, reopened, labeled]
+  workflow_dispatch:
+    inputs:
+      baseline:
+        description: "Measure the runner baseline only (no check)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  actions: read
+  issues: write
+
+concurrency:
+  group: perf-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  perf:
+    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'perf')
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: install the DuckDB command-line tool (v2.0.0, the lookups' baseline)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/duckdb" && cd "$RUNNER_TEMP/duckdb"
+          gh release download v2.0.0 --repo duckdb/duckdb --pattern 'duckdb-cli-linux-amd64.tar.gz'
+          tar -xzf duckdb-cli-linux-amd64.tar.gz && sudo install -m 0755 duckdb /usr/local/bin/duckdb
+          duckdb -no-agent --version
+      - name: measure (scripts/perf.sh --ci, release build)
+        env:
+          CARGO_TARGET_DIR: target
+          PERF_WORK: ${{ runner.temp }}/perf
+        run: scripts/perf.sh --ci --build-label "release (thin LTO, codegen-units 1, line-table debug info), ubuntu-latest"
+      - name: upload perf.json
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: perf-json
+          path: |
+            benches/out/perf.json
+            benches/out/samples.jsonl
+          if-no-files-found: warn
+      - name: fetch the previous nightly run's results
+        id: previous
+        if: github.event_name == 'schedule'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          prev=$(gh run list --workflow perf.yml --event schedule --status completed --limit 5 \
+            --json databaseId --jq "[.[] | select(.databaseId != ${{ github.run_id }})][0].databaseId // empty")
+          if [ -n "$prev" ] && gh run download "$prev" -n perf-json -D "$RUNNER_TEMP/previous"; then
+            echo "run=$prev" >> "$GITHUB_OUTPUT"
+            echo "args=--previous $RUNNER_TEMP/previous/perf.json" >> "$GITHUB_OUTPUT"
+          else
+            echo "no previous nightly results: a metric past its budget is reported, not failed"
+          fi
+      - name: perf-check against the runner budgets
+        if: ${{ !inputs.baseline }}
+        run: |
+          if ! grep -q '^\[\[runner\.budget\]\]' docs/measured/budgets.toml; then
+            echo "docs/measured/budgets.toml has no runner baseline yet: this run's perf.json (artifact perf-json) is one; commit it with scripts/perf-budgets.py --runner-perf" | tee -a "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          mode="${{ steps.previous.outputs.args }}"
+          if [ "${{ github.event_name }}" = pull_request ]; then mode=--pull-request; fi
+          target/release/bellwether bench perf-check --results benches/out/perf.json \
+            --budgets docs/measured/budgets.toml --runner $mode \
+            --summary "$GITHUB_STEP_SUMMARY" | tee "$RUNNER_TEMP/perf-check.md"
+      - name: open or update the "perf regression" issue
+        if: failure() && github.event_name == 'schedule'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          body="$RUNNER_TEMP/issue.md"
+          {
+            echo "Nightly perf runs ${{ steps.previous.outputs.run }} and ${{ github.run_id }} were both past a runner budget (docs/measured/budgets.toml)."
+            echo
+            cat "$RUNNER_TEMP/perf-check.md" 2>/dev/null || echo "perf-check did not run; see run ${{ github.run_id }}."
+          } > "$body"
+          n=$(gh issue list --state open --search 'in:title "perf regression"' --json number,title \
+            --jq '[.[] | select(.title == "perf regression")][0].number // empty')
+          if [ -n "$n" ]; then
+            gh issue comment "$n" --body-file "$body"
+          else
+            gh issue create --title "perf regression" --body-file "$body"
+          fi

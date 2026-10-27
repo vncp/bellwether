@@ -197,7 +197,35 @@ impl<'a> BlockView<'a> {
     }
 
     fn lower_bound(&self, key: &[u8]) -> Result<usize> {
-        let (mut lo, mut hi) = (0, self.n);
+        self.lower_bound_from(key, 0)
+    }
+
+    /// The first position at or after `from` whose key is not below `key`;
+    /// `from` must be at most that position over the whole block (a
+    /// previous, smaller key's lower bound).
+    pub(crate) fn lower_bound_from(&self, key: &[u8], from: usize) -> Result<usize> {
+        // Gallop from `from` (dense probes land a step or two further on),
+        // then binary search the last stride.
+        let mut lo = from.min(self.n);
+        if lo == self.n || self.key(lo)? >= key {
+            return Ok(lo);
+        }
+        let (mut step, mut hi) = (1, self.n);
+        loop {
+            let probe = lo + step;
+            if probe >= self.n {
+                break;
+            }
+            if self.key(probe)? < key {
+                lo = probe;
+                step *= 2;
+            } else {
+                hi = probe;
+                break;
+            }
+        }
+        // `key(lo) < key`; the answer is in `(lo, hi]`.
+        lo += 1;
         while lo < hi {
             let mid = usize::midpoint(lo, hi);
             if self.key(mid)? < key {
@@ -751,17 +779,57 @@ impl<R: ReadAt> SegmentReader<R> {
         keys: &[K],
         mut f: impl FnMut(&[u8], &BlockView<'_>, usize) -> Result<()>,
     ) -> Result<()> {
+        let mut sorted: Vec<&[u8]> = probes(keys).collect();
+        sorted.sort_unstable();
+        sorted.dedup();
+        self.visit_ascending(sorted.into_iter().map(|k| (0, k)), |_, key, view, i| {
+            f(key, view, i)
+        })
+    }
+
+    /// Visits each probe of `probes` present in this keyed segment, with its
+    /// position in `probes` and its stored value. `probes` must be strictly
+    /// ascending (refused otherwise, since an unordered probe could be
+    /// missed): a planner sorts its probes once for every segment instead of
+    /// once per segment. A probe tuple that contains a null matches nothing
+    /// (ADR 014). Holds the block index, one block, and one value at a time
+    /// (ADR 018).
+    pub fn visit_sorted<K: AsRef<[u8]>>(
+        &self,
+        probes: &[K],
+        mut f: impl FnMut(usize, KeyValue) -> Result<()>,
+    ) -> Result<()> {
+        if !probes.windows(2).all(|w| w[0].as_ref() < w[1].as_ref()) {
+            return Err(Error::Other(
+                "segment probes must be strictly ascending".into(),
+            ));
+        }
+        let ordered = probes
+            .iter()
+            .map(AsRef::as_ref)
+            .enumerate()
+            .filter(|(_, k)| tuple_has_null(k) != Some(true));
+        self.visit_ascending(ordered, |at, _, view, i| f(at, self.value_at(view, i)?))
+    }
+
+    /// [`Self::visit_found`] over keys already strictly ascending and free
+    /// of null tuples, each with a caller's tag. Within one block, each key
+    /// is searched for from the previous key's position on.
+    fn visit_ascending<'k>(
+        &self,
+        keys: impl Iterator<Item = (usize, &'k [u8])>,
+        mut f: impl FnMut(usize, &[u8], &BlockView<'_>, usize) -> Result<()>,
+    ) -> Result<()> {
         let Index::Keyed(blocks) = &self.index else {
             return Err(Error::KeySpec(format!(
                 "{} segments have no per-key values",
                 self.header.key_spec.name()
             )));
         };
-        let mut sorted: Vec<&[u8]> = probes(keys).collect();
-        sorted.sort_unstable();
-        sorted.dedup();
         let mut cur: Option<LoadedBlock<'_>> = None;
-        for key in sorted {
+        // Where the previous key's search ended in the current block.
+        let mut from = 0;
+        for (tag, key) in keys {
             let i = blocks.partition_point(|b| b.first.as_slice() <= key);
             if i == 0 {
                 continue;
@@ -773,6 +841,7 @@ impl<R: ReadAt> SegmentReader<R> {
             }
             if cur.as_ref().is_none_or(|c| c.0 != bi) {
                 cur = Some((bi, self.block_bloom(b)?, None));
+                from = 0;
             }
             let Some((_, bloom_bits, body)) = cur.as_mut() else {
                 continue;
@@ -787,8 +856,10 @@ impl<R: ReadAt> SegmentReader<R> {
                 continue;
             };
             let view = BlockView::parse(body, b.n, self.checked())?;
-            if let Some(idx) = view.find(key)? {
-                f(key, &view, idx)?;
+            let at = view.lower_bound_from(key, from)?;
+            from = at;
+            if at < view.len() && view.key(at)? == key {
+                f(tag, key, &view, at)?;
             }
         }
         Ok(())

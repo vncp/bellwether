@@ -136,8 +136,9 @@ def environment(a):
     # manifest changes, so the binary matches the newest commit touching
     # them, provided none is modified in the tree.
     src = ["--", "crates/**/*.rs", "crates/*/Cargo.toml", "crates/*/build.rs", "Cargo.toml", "Cargo.lock"]
-    sources = first(["git", "-C", REPO, "log", "-1", "--format=%h", "--abbrev=12", *src])
-    sources_dirty = bool(subprocess.run(["git", "-C", REPO, "status", "--porcelain", *src],
+    tree = a.built_from or REPO
+    sources = first(["git", "-C", tree, "log", "-1", "--format=%h", "--abbrev=12", *src])
+    sources_dirty = bool(subprocess.run(["git", "-C", tree, "status", "--porcelain", *src],
                                         capture_output=True, text=True).stdout.strip())
     with open(a.bin, "rb") as f:
         sha = hashlib.sha256(f.read()).hexdigest()
@@ -1488,7 +1489,8 @@ def main():
     ap.add_argument("--showcase", help="also write the README chart rows here")
     ap.add_argument("--sections", default="lookups,build,reconcile,latency,profiles,ledger")
     ap.add_argument("--ci", action="store_true",
-                    help="small corpora only (replay-small, the quick corpus, market defaults); no profiles, no ledger")
+                    help="small corpora only (replay-small, the quick corpus, market defaults, the 10k-file "
+                         "ledger); no profiles")
     ap.add_argument("--merge", action="store_true",
                     help="keep the other sections' results in an existing <out>/perf.json")
     ap.add_argument("--max-load", type=float, default=3.0,
@@ -1506,6 +1508,9 @@ def main():
     ap.add_argument("--key-sets", default="10,300,3000")
     ap.add_argument("--profile-rate", type=int, default=4000)
     ap.add_argument("--build-label", default="release (thin LTO, codegen-units 1, line-table debug info)")
+    ap.add_argument("--built-from",
+                    help="the git work tree --bin was built from, when not this one (a before/after "
+                         "pair measured with one script)")
     ap.add_argument("--reanalyze-profiles", action="store_true",
                     help="recompute the frame tables of the profiles already saved under <out>/profiles "
                          "into <out>/perf.json, without running anything")
@@ -1525,7 +1530,7 @@ def main():
     os.makedirs(a.work, exist_ok=True)
     sections = set(a.sections.split(","))
     if a.ci:
-        sections -= {"profiles", "ledger"}
+        sections -= {"profiles"}
     unknown = sections - set(SECTION_PREFIXES)
     if unknown:
         sys.exit(f"unknown sections {sorted(unknown)}; choose from {sorted(SECTION_PREFIXES)}")

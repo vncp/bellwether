@@ -718,7 +718,8 @@ impl Engine {
         let tuples: Vec<Vec<u8>> = run_keys.tuples().map(<[u8]>::to_vec).collect();
         let payload = run_keys.to_payload()?;
         let key_set = bellwether_types::Hash::of(&payload);
-        self.cache()?.put_cached(&key_set, Bytes::from(payload))?;
+        self.cache()?
+            .put_cached_once(&key_set, Bytes::from(payload))?;
         let plan = pinned
             .planner
             .plan_semijoin(&spec, &tuples, &rpin.planner)?;

@@ -263,11 +263,7 @@ fn open_side<'a, S: StoreExt + ?Sized>(
         .filter(|s| segment_of(s, &identity, None))
         .map(|s| {
             let r = SegmentReader::open_for_dataset(
-                SegmentBytes::Ranged {
-                    snapshot,
-                    id: s.id,
-                    size: s.bytes,
-                },
+                SegmentBytes::ranged(snapshot, s.id, s.bytes),
                 &schema,
             )?;
             if r.key_spec() != spec {
@@ -629,11 +625,7 @@ fn pair_built_from<S: StoreExt + ?Sized>(snapshot: &Snapshot<S>, spec: &KeySpec)
     let Some(s) = pair_segments(m, spec).first().copied() else {
         return Ok(0);
     };
-    let r = SegmentReader::open(SegmentBytes::Ranged {
-        snapshot,
-        id: s.id,
-        size: s.bytes,
-    })?;
+    let r = SegmentReader::open(SegmentBytes::ranged(snapshot, s.id, s.bytes))?;
     Ok(cj::header_pins(&r)?.left_sequence)
 }
 
@@ -741,11 +733,7 @@ impl<S: StoreExt + ?Sized> Planner<S> {
             .into_iter()
             .map(|s| {
                 let r = SegmentReader::open_for_dataset(
-                    SegmentBytes::Ranged {
-                        snapshot: &self.snapshot,
-                        id: s.id,
-                        size: s.bytes,
-                    },
+                    SegmentBytes::ranged(&self.snapshot, s.id, s.bytes),
                     &self.schema,
                 )?;
                 if r.key_spec() != spec {
