@@ -194,6 +194,13 @@ pub struct EngineOptions {
     /// refused with [`Error::JoinNotServed`] before any folder is read, so
     /// the refusal says nothing about what exists beside the root.
     pub join_scope: crate::JoinScope,
+    /// The datasets a consumer plan may scan besides the data root
+    /// (relational replay, WP15), by name: each name to the folder (or
+    /// table) its operator bound (`--dataset NAME=ROOT` on the command line
+    /// or when the MCP server starts). A tool argument names datasets
+    /// only from these, never a new root. A binding to the data root
+    /// itself names the data root (`main`).
+    pub datasets: std::collections::BTreeMap<String, String>,
 }
 
 /// Opens an engine adapter for a `twin_of` root and an optional scratch

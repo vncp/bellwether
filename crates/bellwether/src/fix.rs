@@ -2280,6 +2280,9 @@ pub(crate) fn replayer<'a>(
         crate::SourceFormat::Parquet if !engine.is_table() => {
             replayer.with_unserved(Baseline::ParquetStats)
         }
+        // A table's statistics are the engine's per-unit aggregates: a
+        // plan node reading it is measured, never exact (ADR 027).
+        _ if engine.is_table() => replayer.with_measured(MEASURED_AGGREGATES),
         _ => replayer,
     })
 }

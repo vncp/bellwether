@@ -206,6 +206,9 @@ impl EngineArgs {
             // narrows it to its `--join` (`Server::new`).
             join_scope: bellwether::JoinScope::Any,
             engine_adapter: None,
+            // Dataset bindings for consumer plans (WP15) are added by the
+            // command that takes `--dataset`.
+            datasets: std::collections::BTreeMap::new(),
         })
     }
 

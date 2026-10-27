@@ -105,6 +105,30 @@ pub fn check_column_type(column: &str, t: &ColumnType) -> Result<()> {
     domain(column, t).map(|_| ())
 }
 
+/// Checks that two columns' canonical encodings compare as join or key
+/// columns: both can pair at all ([`check_column_type`]) and their value
+/// domains are equal (integers of either width with integers of the same
+/// signedness, strings with strings, decimals at one width and scale,
+/// times in one unit), so equal SQL values have equal bytes. The one rule
+/// a join key's sides and a consumer plan's join and key columns are held
+/// to (relational replay, WP15).
+pub fn check_same_domain(
+    left: &str,
+    left_type: &ColumnType,
+    right: &str,
+    right_type: &ColumnType,
+) -> Result<()> {
+    let (l, r) = (domain(left, left_type)?, domain(right, right_type)?);
+    if l != r {
+        return Err(Error::KeySpec(format!(
+            "{left:?} is {left_type} and {right:?} is {right_type}, whose values never encode \
+             alike ({l} against {r}), so no key would pair; pair columns of one kind (cast one \
+             side so both are {l} or both {r})"
+        )));
+    }
+    Ok(())
+}
+
 /// The canonical encoding's value domain of a join column type: two
 /// columns pair only when their domains are equal, so that equal SQL
 /// values have equal bytes. A float is refused.

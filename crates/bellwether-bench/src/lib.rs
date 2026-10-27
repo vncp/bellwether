@@ -41,6 +41,11 @@
 //!   (the ledger with voids, market prints with retractions): rows in time
 //!   order, `latest`/`asof` runs of 10, 10^3, and 10^5 keys, and exact
 //!   per-run truth (`scripts/tombstone-funnels.py`).
+//! - [`relational`] writes the two-dataset corpus relational replay is
+//!   priced on (WP15): `events` (an event log keyed by `repo_id`, in time
+//!   order) beside `repos` (one row per repository plus restated rows, so
+//!   per-key counts differ from 1), key files of 10, 100, and 1,000
+//!   repositories, and the consumer plans over them (`plans/*.json`).
 
 #![forbid(unsafe_code)]
 // Benchmark arithmetic converts freely between counts, sizes, and floating
@@ -73,6 +78,7 @@ pub mod lists;
 pub mod market;
 pub mod mem;
 pub mod perf;
+pub mod relational;
 pub mod report;
 pub mod results;
 pub mod slo;
