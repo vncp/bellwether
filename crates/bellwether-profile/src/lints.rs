@@ -13,6 +13,7 @@
 //! | `R-expr-1` | lookups supply a function of a dataset column (`bellwether_core::expr`, for example `json_get(payload,'$.symbol')`) that type-checks, and no declared `expr` key is over that expression, normalized |
 //! | `R-list-1` | the workload records list-membership runs (`array_contains`, `has_any`, `exists(unnest)`) on a list column that no complete list key serves ([`list_membership`]; the caller reads the workload's runs, so it is not part of [`run`]) |
 //! | `R-join-1` | the workload records at least [`JOIN_REPEAT_MIN_RUNS`] semi-join runs (`in (subquery)`, `exists`, a semi-join) between the data root and one right dataset on one column pair, and no complete join key holds that pair ([`repeated_semijoins`]; the caller reads the workload's runs, so it is not part of [`run`]) |
+//! | `R-tombstone-1` | the workload records `latest` or `asof` runs (or bitemporal ones) followed by a filter on a boolean or state column (`where not void`, `where status <> 'VOID'`), and no complete temporal key on their key columns declares that tombstone ([`latest_then_filter`]; the caller reads the workload's runs, so it is not part of [`run`]) |
 //!
 //! The two decisions the benchmark also makes are not reimplemented here:
 //! `batch_stamp_key` is `bellwether_source::stats::batch_stamp` and
@@ -56,7 +57,7 @@ use bellwether_core::expr::{suggested_name, Expr, Typed};
 use bellwether_source::stats::{
     batch_stamp as batch_stamp_decision, partner_order, BatchStamp, PartnerCandidate,
 };
-use bellwether_types::{KeySpec, Lint, Result, RewriteShape, RowGroupMeta, TextOp};
+use bellwether_types::{KeySpec, Lint, Result, RewriteShape, RowGroupMeta, TextOp, Tombstone};
 
 use crate::fanout::{is_id_like, DistinctSource, FanoutEntry, KeyPlan};
 use crate::manifest::ManifestInfo;
@@ -123,6 +124,10 @@ pub const LIST_MEMBERSHIP: &str = "R-list-1";
 /// Rule id (B3): repeated semi-joins between two datasets on one column
 /// pair that no join key holds.
 pub const REPEATED_SEMIJOIN: &str = "R-join-1";
+
+/// Rule id (B8): `latest`/`asof` followed by a filter on a boolean or
+/// state column that no temporal key's tombstone answers.
+pub const LATEST_THEN_FILTER: &str = "R-tombstone-1";
 
 /// The fewest semi-join runs on one column pair that `R-join-1` calls
 /// repeated: one run is a lookup, two are a pattern a join key pays for.
@@ -1008,6 +1013,104 @@ pub fn repeated_semijoins(uses: &[SemiJoinUse], left: &str, complete: &[KeySpec]
                     format!("join:{left}.{cols}={}.{rcols}", u.right),
                     "every row group holding a key both datasets hold is still selected, on \
                      each side (invariant 1)",
+                ),
+            }
+        })
+        .collect()
+}
+
+/// The `latest`/`asof` runs of a recorded workload that keep only live
+/// rows (B8): each key's newest version followed by a filter on a boolean
+/// or state column, on one key-column tuple, time column(s) and filter.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TombstoneUse {
+    /// The runs' key columns.
+    pub columns: Vec<String>,
+    /// The column ordering versions (`latest --latest-by`'s), or a
+    /// bitemporal run's valid-time and known-time columns.
+    pub times: Vec<String>,
+    /// The filter: the boolean column whose true marks a retracted row, or
+    /// the state column and the value that does.
+    pub tombstone: Tombstone,
+    /// Runs on this tuple, time columns and filter.
+    pub runs: u64,
+}
+
+/// `R-tombstone-1` (B8): a recorded workload takes each key's newest
+/// version (`latest`, `asof`, or a bitemporal as-of) and then filters on a
+/// boolean or state column (`where not void`, `where status <> 'VOID'`),
+/// and none of `complete` (the key specs complete at the current manifest)
+/// is a temporal or bitemporal key on those columns and times declaring
+/// that tombstone, so each run reads every row group holding a key's
+/// newest version, also for keys whose newest row the filter then drops.
+/// Fires once per (columns, times, filter), high confidence (the runs are
+/// recorded and the specs are the manifest's). Does not fire without such
+/// runs, or when a complete key with exactly that tombstone serves them.
+#[must_use]
+pub fn latest_then_filter(uses: &[TombstoneUse], complete: &[KeySpec]) -> Vec<Lint> {
+    uses.iter()
+        .filter(|u| u.runs > 0)
+        .filter(|u| {
+            !complete.iter().any(|s| {
+                let times_match = match s {
+                    KeySpec::Temporal { ts_column, .. } => u.times == [ts_column.clone()],
+                    KeySpec::Bitemporal {
+                        valid_column,
+                        known_column,
+                        ..
+                    } => u.times == [valid_column.clone(), known_column.clone()],
+                    _ => false,
+                };
+                times_match
+                    && s.tombstone() == Some(&u.tombstone)
+                    && s.columns().iter().all(|c| u.columns.contains(c))
+            })
+        })
+        .map(|u| {
+            let cols = u.columns.join(",");
+            let (key, flags) = match u.times.as_slice() {
+                [valid, known] => (
+                    format!(
+                        "temporal2:{cols}@{valid},{known},{}",
+                        u.tombstone.spelling()
+                    ),
+                    format!("--valid-by {valid} --known-by {known}"),
+                ),
+                times => {
+                    let ts = times.first().map_or("<ts>", String::as_str);
+                    (
+                        format!("temporal:{cols}@{ts},{}", u.tombstone.spelling()),
+                        format!("--latest-by {ts}"),
+                    )
+                }
+            };
+            let arg = u.tombstone.spelling();
+            let arg = arg.trim_start_matches("tombstone=");
+            Lint {
+                rule: LATEST_THEN_FILTER.into(),
+                columns: u.columns.clone(),
+                message: format!(
+                    "{} recorded run(s) take the newest version of each ({cols}) and then keep \
+                     rows where {}, a filter on a boolean or state column, and no temporal key \
+                     on ({cols}) declares that tombstone, so each run reads every row group \
+                     holding a key's newest version, also for keys whose newest row the filter \
+                     then drops. A key with a tombstone, {key}, stores per key and row group \
+                     the newest time of a live row, so those row groups are never read; price \
+                     it with `bellwether why <root> --from <keys.parquet> {flags} --tombstone \
+                     {arg}`.",
+                    u.runs,
+                    u.tombstone.live_sql(),
+                ),
+                confidence: HIGH,
+                site: None,
+                fix: rewrite(
+                    format!(
+                        "latest on ({cols}), then where {}",
+                        u.tombstone.live_sql()
+                    ),
+                    key,
+                    "every row group holding a live row at a key's newest time is still \
+                     selected (invariant 1), and the residual drops the tombstone rows",
                 ),
             }
         })

@@ -227,6 +227,13 @@ struct WhyArgs {
     /// versions, for `latest` and `asof` pricing.
     #[arg(long, value_name = "COL", conflicts_with = "bench_workload")]
     latest_by: Option<String>,
+    /// Price latest or asof runs (or bitemporal ones) that keep only live
+    /// rows (B8): each key's newest version, then `where not COL` (a
+    /// boolean column) or `where COL <> VALUE`; the floor candidate is the
+    /// temporal key with this tombstone, and its column the fraction of
+    /// keys whose newest row is a tombstone.
+    #[arg(long, value_name = "COL[=VALUE]", conflicts_with = "lookback")]
+    tombstone: Option<String>,
     /// The instant for `asof` pricing (with `--latest-by`): RFC 3339, a date
     /// (YYYY-MM-DD), or an integer in the timestamp column's unit.
     #[arg(long, value_name = "INSTANT", requires = "latest_by")]
@@ -1365,6 +1372,12 @@ fn why(g: &Global, out: &Out, a: &WhyArgs) -> Result<Outcome, Failure> {
         sketches_only: a.sketches_only,
         text: why_text(a)?,
         join: a.join.clone(),
+        tombstone: a
+            .tombstone
+            .as_deref()
+            .map(bellwether::spec::parse_tombstone)
+            .transpose()
+            .map_err(|e| Failure::Usage(e.to_string()))?,
     };
     // Text lookups take none of the lookup-mode flags; the facade refuses
     // them first, with that cause.

@@ -165,6 +165,25 @@ fn strip_counts(list: &str) -> (&str, bool) {
     }
 }
 
+/// A tombstone as `why --tombstone` takes it (B8): `col` (a boolean column)
+/// or `col=value`, the spelling after `tombstone=` in a key spec.
+pub fn parse_tombstone(s: &str) -> Result<Tombstone> {
+    let (column, value) = match s.trim().split_once('=') {
+        Some((c, v)) => (c.trim(), Some(v.trim().to_string())),
+        None => (s.trim(), None),
+    };
+    if column.is_empty() || column.contains([',', '@']) || value.as_deref() == Some("") {
+        return Err(Error::KeySpec(format!(
+            "{s:?} is not a tombstone; write <column> for a boolean column whose true marks a \
+             retracted row, or <column>=<value> for the value that marks one"
+        )));
+    }
+    Ok(Tombstone {
+        column: column.to_string(),
+        value,
+    })
+}
+
 /// `list` (a temporal or bitemporal spec's part after `@`) without its
 /// trailing `,tombstone=col` or `,tombstone=col=value` (B8), which comes
 /// last, and the tombstone. Everything after the column's `=` is the value,

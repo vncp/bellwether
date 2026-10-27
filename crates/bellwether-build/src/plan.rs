@@ -591,7 +591,9 @@ impl<S: StoreExt + ?Sized> Planner<S> {
                 },
                 _ => continue,
             };
-            push(def, TimedSource::Spec(spec.clone()));
+            // A bitemporal spec with a tombstone (B8) reads its versions
+            // from its own segments, the spec's without it.
+            push(def, TimedSource::Spec(spec.without_tombstone()));
         }
         for spec in specs {
             if let Some(def) = bloom_bounds_def(spec) {

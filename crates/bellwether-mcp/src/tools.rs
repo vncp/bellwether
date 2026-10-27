@@ -362,6 +362,13 @@ pub struct ScoreWhy {
     /// `known_by`'s unit likewise; default: unbounded.
     #[serde(default)]
     pub known: Option<String>,
+    /// With a bitemporal lookup (B8; `why --tombstone`): the runs keep only
+    /// live rows, `<column>` (a boolean column whose true marks a
+    /// retracted row) or `<column>=<value>`; the floor candidate is
+    /// `temporal2:<key columns>@<valid_by>,<known_by>,tombstone=<column>`.
+    /// Default: none (every row of the newest version).
+    #[serde(default)]
+    pub tombstone: Option<String>,
 }
 
 /// The outputs a rewrite proposal is verified on (folders the engine reads).
