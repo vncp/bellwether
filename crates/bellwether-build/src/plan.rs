@@ -349,13 +349,13 @@ pub struct LiveOutcome {
     /// Queried keys with a version at the lookup's instant (before the
     /// tombstone rule).
     pub keys_with_version: u64,
-    /// Of those, keys whose every winning row group the tombstones pruned:
-    /// their newest row (at the instant) is a tombstone, so they answer no
-    /// row. Zero when nothing pruned.
-    pub keys_retracted: u64,
-    /// Winning row groups the tombstones pruned, summed over keys before
-    /// the union (a row group pruned for one key may stay for another).
-    pub row_groups_pruned: u64,
+    /// Queried keys for which sidecar pruning kept no winning row group.
+    /// Not the number of retracted keys: the residual may remove all
+    /// winners even when a row group remains. Zero without pruning.
+    pub keys_without_row_groups: u64,
+    /// Winning (key, row group) pairs removed before the union across keys.
+    /// A row group removed for one key may remain for another.
+    pub key_row_group_pairs_pruned: u64,
 }
 
 /// One segment of a spec taking part in a plan.
@@ -2019,9 +2019,9 @@ impl<S: StoreExt + ?Sized> Planner<S> {
             };
             let maps: Vec<&tomb::KeyLiveness> = vs.iter().filter_map(|v| entries.get(v)).collect();
             let kept = tomb::prune(rgs, *winner, &maps)?;
-            outcome.row_groups_pruned += rgs.len() - kept.len();
+            outcome.key_row_group_pairs_pruned += rgs.len() - kept.len();
             if kept.is_empty() {
-                outcome.keys_retracted += 1;
+                outcome.keys_without_row_groups += 1;
             }
             out.push(Some(kept));
         }

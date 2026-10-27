@@ -10,7 +10,7 @@ Machine: Darwin 25.4.0 arm64, Apple M3 Pro, 12 cores. Build: debug build, commit
 
 Over the corpus: 40,007 keys (20.0%) have a retraction as their newest row, 36 hold only retractions, 132,599 were retracted and written again; 1,990 rows have a null tombstone column. `why --latest-by ts --tombstone` on the keys-1000 run, before the sidecar: `tombstone` column '40,182 of 199,989 (20.1%)', lints R-tombstone-1. Index bytes: 75,328,546 for the temporal key, 75,435,283 for the tombstone sidecar.
 
-| keys | lookup | keys with a version | newest not live | asof + filter: row groups | asof + filter: bytes | --live: row groups | --live: bytes | --live: pruned by | --live: keys retracted | oracle row groups (newest / live newest) | plans = oracle |
+| keys | lookup | keys with a version | newest not live | asof + filter: row groups | asof + filter: bytes | --live: row groups | --live: bytes | --live: pruned by | --live: keys with no row group read | oracle row groups (newest / live newest) | plans = oracle |
 |---:|---|---:|---:|---:|---:|---:|---:|---|---:|---:|---|
 | 10 | latest | 10 | 3 | 10 of 200 | 2,103,473 | 7 | 1,472,387 | `tombstone:order_id@ts` | 3 | 10 / 7 | yes |
 | 10 | asof | 10 | 2 | 9 of 200 | 1,892,883 | 8 | 1,682,662 | `tombstone:order_id@ts` | 2 | 9 / 8 | yes |
@@ -23,7 +23,7 @@ Over the corpus: 40,007 keys (20.0%) have a retraction as their newest row, 36 h
 
 Over the corpus: 9,979 keys (5.0%) have a retraction as their newest row, 6 hold only retractions, 68,518 were retracted and written again; 0 rows have a null tombstone column. `why --latest-by ts --tombstone` on the keys-1000 run, before the sidecar: `tombstone` column '9,979 of 199,993 (5.0%)', lints R-tombstone-1, low_selectivity_single_column. Index bytes: 75,311,120 for the temporal key, 75,427,890 for the tombstone sidecar.
 
-| keys | lookup | keys with a version | newest not live | asof + filter: row groups | asof + filter: bytes | --live: row groups | --live: bytes | --live: pruned by | --live: keys retracted | oracle row groups (newest / live newest) | plans = oracle |
+| keys | lookup | keys with a version | newest not live | asof + filter: row groups | asof + filter: bytes | --live: row groups | --live: bytes | --live: pruned by | --live: keys with no row group read | oracle row groups (newest / live newest) | plans = oracle |
 |---:|---|---:|---:|---:|---:|---:|---:|---|---:|---:|---|
 | 10 | latest | 10 | 0 | 9 of 200 | 2,330,175 | 9 | 2,330,175 | `tombstone:trade_id@ts` | 0 | 9 / 9 | yes |
 | 10 | asof | 10 | 1 | 10 of 200 | 2,593,918 | 9 | 2,334,838 | `tombstone:trade_id@ts` | 1 | 10 / 9 | yes |
@@ -35,7 +35,7 @@ Over the corpus: 9,979 keys (5.0%) have a retraction as their newest row, 6 hold
 Reading it:
 
 - **Where it pays: small key sets and many retractions.** On the ledger, 20% of rows are voids and 20% of orders end voided. A `latest --live` of 10 orders reads 7 row groups (1.47 MB) where `latest` plus `where not void` reads 10 (2.10 MB): the three voided orders' newest rows sit in row groups that hold no live newest row of any asked key, so they are never read. The 10-trade market run saves one row group of ten on `asof`.
-- **Every answer is exact either way.** Both plans hold exactly the oracle's row groups for every run, and `--live` reports exactly the oracle's retracted keys (`keys retracted` = `newest not live`): a key whose newest row is a void, whose `void` is null (not live, ADR 014), or whose only rows are voids reads no row group, and a key voided then booked again keeps its later live row.
+- **Every answer is exact either way.** Both plans hold exactly the oracle's row groups for these measured runs. Here the number of keys with no row group read equals the number whose newest row is not live, but that equality is not guaranteed: a row group retained for its later live time can still have a retracted winner at an earlier as-of instant. The residual removes that winner. `keys_without_row_groups` counts only keys eliminated by pruning; `key_row_group_pairs_pruned` counts eliminated pairs before the union across keys, not distinct row groups.
 - **Where it does not pay: large key sets on unclustered rows.** Rows are appended in time order and keys are drawn uniformly, so each row group holds the newest rows of thousands of keys. A row group is pruned only when every asked key whose newest row it holds is retracted there, which large key sets almost never meet: at 10^5 keys the live plans read 180 of 182 (ledger) and 178 of 178 (market) row groups, and the filter does the work. The kind is a guard here, not a saving.
 - **`why` says which case you are in, before building.** Its `tombstone` column counts the keys whose newest row is not live, out of the keys with a version, over the whole folder, exactly: 40,182 of 199,989 (20.1%) on the ledger (the 40,007 voids plus 175 null `void`s, checked against the decoded files) and 9,979 of 199,993 (5.0%) on the market, equal to `truth.json`. Near zero, a live lookup reads what `latest` reads. `R-tombstone-1` fired on both recorded workloads before the sidecar existed.
 - **What it costs.** The tombstone sidecar is about the size of the temporal key's segments (75 MB beside 75 MB here): one 17-byte liveness entry per key per row group holding it.

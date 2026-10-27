@@ -196,7 +196,7 @@ def shape_rows(bin_, shape, work, small):
                 "plain_rg": plain["planned"]["row_groups"], "plain_bytes": plain["planned"]["bytes"],
                 "live_rg": live["planned"]["row_groups"], "live_bytes": live["planned"]["bytes"],
                 "pruned_by": live["live"].get("pruned_by") or "(none)",
-                "keys_retracted": live["live"]["keys_retracted"],
+                "keys_without_row_groups": live["live"]["keys_without_row_groups"],
                 "oracle": (len(newest_rg), len(live_rg)), "exact": exact,
                 "total": plain["row_groups_total"],
             })
@@ -222,13 +222,13 @@ def table(res):
           f"`tombstone` column {res['why_column']!r}, lints {', '.join(res['why_lints']) or '(none)'}. "
           f"Index bytes: {res['key_bytes']:,} for the temporal key, {res['side_bytes']:,} for the tombstone sidecar.\n")
     print("| keys | lookup | keys with a version | newest not live | asof + filter: row groups | asof + filter: bytes | "
-          "--live: row groups | --live: bytes | --live: pruned by | --live: keys retracted | "
+          "--live: row groups | --live: bytes | --live: pruned by | --live: keys with no row group read | "
           "oracle row groups (newest / live newest) | plans = oracle |")
     print("|---:|---|---:|---:|---:|---:|---:|---:|---|---:|---:|---|")
     for r in res["rows"]:
         print(f"| {r['keys']:,} | {r['lookup']} | {r['with_version']:,} | {r['retracted']:,} | "
               f"{r['plain_rg']:,} of {r['total']:,} | {r['plain_bytes']:,} | {r['live_rg']:,} | {r['live_bytes']:,} | "
-              f"`{r['pruned_by']}` | {r['keys_retracted']:,} | {r['oracle'][0]:,} / {r['oracle'][1]:,} | "
+              f"`{r['pruned_by']}` | {r['keys_without_row_groups']:,} | {r['oracle'][0]:,} / {r['oracle'][1]:,} | "
               f"{'yes' if r['exact'] else 'NO'} |")
     print()
 

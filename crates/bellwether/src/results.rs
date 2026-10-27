@@ -501,13 +501,13 @@ pub struct LivePlan {
     /// Looked-up keys with a version at the instant (before the tombstone
     /// filter).
     pub keys_with_version: u64,
-    /// Of those, keys whose newest row is a tombstone, so the plan reads
-    /// nothing for them: exact when `pruned_by` is set, zero otherwise
-    /// (unknown without the sidecar; the residual still drops them).
-    pub keys_retracted: u64,
-    /// Row groups holding a key's newest version that the tombstones
-    /// pruned (no live row of it there), summed over keys.
-    pub row_groups_pruned: u64,
+    /// Queried keys for which sidecar pruning kept no row group. This is
+    /// not a count of retracted keys: a retained row group may contain only
+    /// retracted winners, which the residual removes. Zero without pruning.
+    pub keys_without_row_groups: u64,
+    /// Winning (key, row group) pairs removed by sidecar pruning, before
+    /// unioning row groups across keys. Not a count of distinct row groups.
+    pub key_row_group_pairs_pruned: u64,
 }
 
 /// What [`crate::Engine::count`] answered: `count(*) where (columns) in

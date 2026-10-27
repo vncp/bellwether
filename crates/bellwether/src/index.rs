@@ -1603,8 +1603,8 @@ fn live_plan(root: &str, pinned: &Pinned, tombstone: Tombstone, o: LiveOutcome) 
         pruned_by: o.pruned_by,
         unpruned,
         keys_with_version: o.keys_with_version,
-        keys_retracted: o.keys_retracted,
-        row_groups_pruned: o.row_groups_pruned,
+        keys_without_row_groups: o.keys_without_row_groups,
+        key_row_group_pairs_pruned: o.key_row_group_pairs_pruned,
     }
 }
 

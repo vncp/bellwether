@@ -318,7 +318,7 @@ fn live_lookups_are_the_lookup_then_the_filter_on_decoded_files() {
                     Some("tombstone:id@ts"),
                     "the complete sidecar prunes"
                 );
-                pruned_somewhere |= outcome.row_groups_pruned > 0;
+                pruned_somewhere |= outcome.key_row_group_pairs_pruned > 0;
                 if asof.is_none() {
                     // keys retracted = keys with a version and no answer
                     let with_version: BTreeSet<Vec<u8>> =
@@ -332,7 +332,7 @@ fn live_lookups_are_the_lookup_then_the_filter_on_decoded_files() {
                         .collect();
                     assert_eq!(outcome.keys_with_version, with_version.len() as u64);
                     assert_eq!(
-                        outcome.keys_retracted,
+                        outcome.keys_without_row_groups,
                         (with_version.len() - answered.len()) as u64
                     );
                 }
@@ -446,7 +446,7 @@ fn live_bitemporal_lookups_are_the_winner_then_the_filter() {
                     outcome.pruned_by.as_deref(),
                     Some("tombstone:id@valid,known")
                 );
-                pruned += outcome.row_groups_pruned;
+                pruned += outcome.key_row_group_pairs_pruned;
             }
         }
     }
@@ -501,7 +501,7 @@ fn an_incomplete_sidecar_plans_without_pruning_until_a_build_completes_it() {
         for asof in INSTANTS {
             let (planned, outcome) = check(&p, &usable, &rows, &keys, asof, &tomb(None));
             assert_eq!(outcome.pruned_by, None, "nothing pruned by tombstones");
-            assert_eq!(outcome.row_groups_pruned, 0);
+            assert_eq!(outcome.key_row_group_pairs_pruned, 0);
             let lookup = match asof {
                 None => Lookup::Latest {
                     columns: cols(&["id"]),
@@ -532,7 +532,7 @@ fn an_incomplete_sidecar_plans_without_pruning_until_a_build_completes_it() {
         &tomb(None),
     );
     assert_eq!(outcome.pruned_by.as_deref(), Some("tombstone:id@ts"));
-    assert_eq!(outcome.keys_retracted, 1);
+    assert_eq!(outcome.keys_without_row_groups, 1);
 }
 
 /// The manifest declares the spec without its tombstone and the tombstone

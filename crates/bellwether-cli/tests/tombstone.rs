@@ -394,7 +394,7 @@ fn a_tombstone_key_goes_from_why_to_receipt_to_live_lookups_on_both_sides() {
     assert_eq!(latest["live"]["pruned_by"], "tombstone:id@ts", "{latest}");
     assert_eq!(latest["live"]["filter"], "not void");
     assert_eq!(
-        latest["live"]["keys_retracted"],
+        latest["live"]["keys_without_row_groups"],
         json!(ids.iter().filter(|i| retracted.contains(i)).count()),
         "{latest}"
     );
@@ -420,13 +420,13 @@ fn a_tombstone_key_goes_from_why_to_receipt_to_live_lookups_on_both_sides() {
         text.contains(&format!(
             "tombstones: {} of {} with a version answered with no row group read (no live row \
              at their newest time); {} (key, row group) pair",
-            latest["live"]["keys_retracted"],
+            latest["live"]["keys_without_row_groups"],
             if latest["live"]["keys_with_version"] == 1 {
                 "1 key".to_string()
             } else {
                 format!("{} keys", latest["live"]["keys_with_version"])
             },
-            latest["live"]["row_groups_pruned"]
+            latest["live"]["key_row_group_pairs_pruned"]
         )),
         "{text}"
     );
@@ -666,6 +666,49 @@ fn an_incomplete_tombstone_sidecar_is_stated_and_fixed_by_index() {
         plan_row_groups(&asof, &data),
         truth(&rows, &ids, Some(1000))
     );
+}
+
+/// Pruning counters count eliminated candidates, not retracted results:
+/// a retained group can still have no live winner at the as-of instant.
+#[test]
+fn live_pruning_counts_are_not_retraction_counts() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    std::fs::create_dir_all(&data).unwrap();
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("ts", DataType::Int64, false),
+        Field::new("void", DataType::Boolean, false),
+    ]));
+    let batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(Int64Array::from(vec![1, 1, 2])) as ArrayRef,
+            Arc::new(Int64Array::from(vec![5, 10, 5])),
+            Arc::new(BooleanArray::from(vec![true, false, true])),
+        ],
+    )
+    .unwrap();
+    let mut writer = ArrowWriter::try_new(
+        std::fs::File::create(data.join("part.parquet")).unwrap(),
+        schema,
+        None,
+    )
+    .unwrap();
+    writer.write(&batch).unwrap();
+    writer.close().unwrap();
+    let kf = dir.path().join("keys.parquet");
+    keys(&kf, "id", &[1, 2]);
+    let (d, k) = (path(&data), path(&kf));
+    cli(&["index", d, "--key", "temporal:id@ts,tombstone=void"], 0);
+    let plan: Value =
+        serde_json::from_str(&cli(&["asof", d, "--keys", k, "--at", "7", "--live"], 0)).unwrap();
+    // Both keys' winners at 7 are retracted. Key 1's group must still be
+    // read because its later live row makes the stored bounds conservative.
+    assert_eq!(plan["live"]["keys_with_version"], 2);
+    assert_eq!(plan["live"]["keys_without_row_groups"], 1);
+    assert_eq!(plan["live"]["key_row_group_pairs_pruned"], 1);
+    assert_eq!(plan["planned"]["row_groups"], 1);
 }
 
 /// The last 8 bytes of a canonical encoding (ADR 016) of an i64, as the

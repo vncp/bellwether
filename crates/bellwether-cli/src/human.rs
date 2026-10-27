@@ -861,10 +861,10 @@ fn live_lines(s: &mut String, r: &PlanResult) {
                 s,
                 "  tombstones: {} of {} with a version answered with no row group read (no \
                  live row at their newest time); {} (key, row group) {} pruned by {by}",
-                num(l.keys_retracted),
+                num(l.keys_without_row_groups),
                 count(l.keys_with_version, "key", "keys"),
-                num(l.row_groups_pruned),
-                if l.row_groups_pruned == 1 {
+                num(l.key_row_group_pairs_pruned),
+                if l.key_row_group_pairs_pruned == 1 {
                     "pair"
                 } else {
                     "pairs"
@@ -1072,7 +1072,8 @@ pub(crate) fn why(r: &bellwether::WhyReport, out: &Out, fix_command: &str) -> St
             "  {} declares its tombstone, and its tombstone sidecar does not cover the row \
              groups added since it was built (by a binary without tombstones, or an index run \
              that has not finished), so live lookups through it prune nothing; `bellwether \
-             index {}` completes it (no proposal is needed)",
+             index {}` completes it directly; any recommendation below prices rebuilding \
+             this declared sidecar through the verified fix workflow",
             label(t),
             r.root
         );
