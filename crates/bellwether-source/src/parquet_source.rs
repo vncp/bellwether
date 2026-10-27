@@ -331,6 +331,7 @@ impl<S: Storage> ParquetSource<S> {
                     Err(one) => repeat(one, n),
                 })
                 .collect::<Result<Vec<ArrayRef>>>()?;
+            drop(batch);
             let out = RecordBatch::try_new_with_options(
                 Arc::clone(&schema),
                 arrays,

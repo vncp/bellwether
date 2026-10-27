@@ -13,11 +13,12 @@
 //!    manifest that references a segment a GC run has claimed for deletion.
 //! 5. Reconcile segment tombstones: a segment the new manifest drops gets one
 //!    stamped now; a segment it references loses its tombstone (ADR 013).
-//! 6. Make sure every segment the new manifest adds is present. A staged
-//!    segment is uploaded on every attempt, unconditionally (content-addressed,
-//!    so idempotent); trusting `exists` would assume read-after-delete
-//!    consistency. An unstaged (pre-uploaded) segment must `exist`. A
-//!    manifest referencing a missing segment is never published.
+//! 6. Make sure every segment the new manifest adds is present, then run the
+//!    segments durability barrier ([`StoreExt::sync_segments`]; ADR 034). A
+//!    staged segment is uploaded on every attempt, unconditionally
+//!    (content-addressed, so idempotent); trusting `exists` would assume
+//!    read-after-delete consistency. An unstaged (pre-uploaded) segment must
+//!    `exist`. A manifest referencing a missing segment is never published.
 //! 7. CAS the manifest: `put_if_absent` for the first, `put_if_version` after.
 //! 8. If the CAS reports **any** error, re-read once. If the current manifest
 //!    carries this attempt's nonce, the write was applied and only the
@@ -342,7 +343,7 @@ where
             backfill_history(store, root, m.sequence, base_bytes);
         }
         ensure_segments_present(store, root, staged, base_manifest, &next)?;
-
+        store.sync_segments(root)?;
         let body = Bytes::from(next.to_vec()?);
         let res = match &base {
             None => store.put_if_absent(&path, body.clone()),
@@ -911,6 +912,119 @@ mod tests {
         let a = add(&mut staged, "segment a", 0);
         commit(&store, "", &staged, adding(&a)).unwrap();
         assert!(store.inner.exists(&segment_path("", &a.id)).unwrap());
+    }
+
+    struct BarrierRecorder {
+        inner: ObjectStoreBackend,
+        events: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl Store for BarrierRecorder {
+        fn get(&self, p: &str) -> Result<(Bytes, StoreVersion)> {
+            self.inner.get(p)
+        }
+        fn put_if_absent(&self, p: &str, b: Bytes) -> Result<StoreVersion> {
+            self.events
+                .lock()
+                .unwrap()
+                .push(format!("put_if_absent:{p}"));
+            self.inner.put_if_absent(p, b)
+        }
+        fn put_if_version(&self, p: &str, b: Bytes, e: &StoreVersion) -> Result<StoreVersion> {
+            self.events
+                .lock()
+                .unwrap()
+                .push(format!("put_if_version:{p}"));
+            self.inner.put_if_version(p, b, e)
+        }
+        fn put_content_addressed(&self, p: &str, b: Bytes) -> Result<()> {
+            self.events
+                .lock()
+                .unwrap()
+                .push(format!("put_content_addressed:{p}"));
+            self.inner.put_content_addressed(p, b)
+        }
+        fn list(&self, p: &str) -> Result<Vec<String>> {
+            self.inner.list(p)
+        }
+        fn delete(&self, p: &str) -> Result<()> {
+            self.inner.delete(p)
+        }
+    }
+
+    impl StoreExt for BarrierRecorder {
+        fn get_opt(&self, p: &str) -> Result<Option<(Bytes, StoreVersion)>> {
+            self.inner.get_opt(p)
+        }
+        fn exists(&self, p: &str) -> Result<bool> {
+            self.events.lock().unwrap().push(format!("exists:{p}"));
+            self.inner.exists(p)
+        }
+        fn get_range(&self, p: &str, r: std::ops::Range<u64>) -> Result<Option<Bytes>> {
+            self.inner.get_range(p, r)
+        }
+        fn list_pages(
+            &self,
+            p: &str,
+            n: usize,
+            f: &mut dyn FnMut(&[crate::ObjectMeta]) -> Result<std::ops::ControlFlow<()>>,
+        ) -> Result<()> {
+            self.inner.list_pages(p, n, f)
+        }
+        fn sync_segments(&self, root: &str) -> Result<()> {
+            self.events
+                .lock()
+                .unwrap()
+                .push(format!("sync_segments:{root}"));
+            self.inner.sync_segments(root)
+        }
+    }
+
+    /// ADR 034: `commit` calls `sync_segments` after every new segment is
+    /// uploaded or verified present and before updating `manifest.json`, both
+    /// on the first commit and on subsequent updates (including pre-uploaded
+    /// segments).
+    #[test]
+    fn sync_segments_runs_after_segment_uploads_and_before_manifest_cas() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = BarrierRecorder {
+            inner: ObjectStoreBackend::local(dir.path()).unwrap(),
+            events: std::sync::Mutex::new(Vec::new()),
+        };
+        let mut staged = StagedSegments::new();
+        let a = add(&mut staged, "segment a", 0);
+        commit(&store, "idx", &staged, adding(&a)).unwrap();
+        let first = std::mem::take(&mut *store.events.lock().unwrap());
+        assert_eq!(
+            first,
+            vec![
+                format!("put_content_addressed:{}", segment_path("idx", &a.id)),
+                "sync_segments:idx".to_string(),
+                "put_if_absent:idx/manifest.json".to_string(),
+                "put_if_absent:idx/manifests/00000000000000000001.json".to_string(),
+            ]
+        );
+
+        // Pre-uploaded segment: uploaded before `commit`, verified via `exists`,
+        // then synced by `sync_segments` before `put_if_version` on `manifest.json`.
+        let b_bytes = Bytes::from_static(b"segment b");
+        let b = seg(Hash::of(&b_bytes), 1);
+        store
+            .put_content_addressed(&segment_path("idx", &b.id), b_bytes)
+            .unwrap();
+        store.events.lock().unwrap().clear();
+        commit(&store, "idx", &StagedSegments::new(), adding(&b)).unwrap();
+        let second = std::mem::take(&mut *store.events.lock().unwrap());
+        assert_eq!(
+            second,
+            vec![
+                "put_if_absent:idx/manifests/00000000000000000001.json".to_string(),
+                format!("exists:{}", segment_path("idx", &b.id)),
+                "sync_segments:idx".to_string(),
+                "put_if_version:idx/manifest.json".to_string(),
+                "put_if_absent:idx/manifests/00000000000000000002.json".to_string(),
+            ]
+        );
     }
 
     #[test]

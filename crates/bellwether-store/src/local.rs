@@ -5,10 +5,16 @@
 //! itself:
 //!
 //! - Every write goes to a staging file `<target>#<20 random digits>` in the
-//!   same directory. The staging file is fsynced, moved into place (`rename`
-//!   to overwrite, `hard_link` to create without clobbering), and then the
-//!   parent directory is fsynced, so a crash leaves either the old or the new
-//!   file.
+//!   same directory and is moved into place (`rename` to overwrite,
+//!   `hard_link` to create without clobbering), so a crash or concurrent
+//!   reader never sees a partial file.
+//! - Durability follows the commit boundary (ADR 034): conditional writes
+//!   (`manifest.json`, `manifests/`, detached signatures) and ledger records
+//!   (`ledger/`) fsync their staging file and parent directory on write;
+//!   segment writes (`segments/`) defer their directory sync to
+//!   [`crate::StoreExt::sync_segments`], called once by `commit` before
+//!   updating `manifest.json`; rebuildable cache entries (`cache/`) skip
+//!   `sync_all`.
 //! - Conditional writes (`put_if_absent`, `put_if_version`) run under an
 //!   exclusive kernel `flock` on `<target>.lock#0`, taken with `try_lock`
 //!   until a deadline ([`LOCK_TIMEOUT`]), then [`Error::Store`]. The kernel
@@ -45,7 +51,7 @@ pub(crate) fn content_token(bytes: &[u8]) -> StoreVersion {
     StoreVersion(Hash::of(bytes).to_hex())
 }
 
-fn sync_dir(dir: &Path) -> Result<()> {
+pub(crate) fn sync_dir(dir: &Path) -> Result<()> {
     #[cfg(unix)]
     {
         File::open(dir)
@@ -54,6 +60,14 @@ fn sync_dir(dir: &Path) -> Result<()> {
     }
     #[cfg(not(unix))]
     let _ = dir;
+    Ok(())
+}
+
+/// Syncs `dir` when it exists; a no-op when it has not been created yet.
+pub(crate) fn sync_dir_if_exists(dir: &Path) -> Result<()> {
+    if dir.is_dir() {
+        sync_dir(dir)?;
+    }
     Ok(())
 }
 
@@ -117,24 +131,38 @@ fn is_staging_of(file_name: &str, target_name: &str) -> bool {
         .is_some_and(|d| d.len() > 1 && d.bytes().all(|b| b.is_ascii_digit()))
 }
 
-/// Writes `body` to a fsynced staging file next to `target`.
-fn write_staging(target: &Path, body: &[u8]) -> Result<PathBuf> {
+/// Writes `body` to a staging file next to `target`, fsyncing the file when
+/// `durable` is true.
+fn write_staging_with(target: &Path, body: &[u8], durable: bool) -> Result<PathBuf> {
     let parent = target
         .parent()
         .ok_or_else(|| Error::Store(format!("no parent for {}", target.display())))?;
-    create_dirs_durably(parent)?;
+    if durable {
+        create_dirs_durably(parent)?;
+    } else if !parent.is_dir() {
+        std::fs::create_dir_all(parent).map_err(|e| io_err("create directory", parent, &e))?;
+    }
     let staging = staging_name(target);
     let mut f = OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(&staging)
         .map_err(|e| io_err("create staging file", &staging, &e))?;
-    let res = f.write_all(body).and_then(|()| f.sync_all());
+    let res = if durable {
+        f.write_all(body).and_then(|()| f.sync_all())
+    } else {
+        f.write_all(body)
+    };
     if let Err(e) = res {
         let _ = std::fs::remove_file(&staging);
         return Err(io_err("write staging file", &staging, &e));
     }
     Ok(staging)
+}
+
+/// Writes `body` to a fsynced staging file next to `target`.
+fn write_staging(target: &Path, body: &[u8]) -> Result<PathBuf> {
+    write_staging_with(target, body, true)
 }
 
 fn parent_of(target: &Path) -> &Path {
@@ -149,6 +177,38 @@ pub(crate) fn put_overwrite(target: &Path, body: &[u8]) -> Result<()> {
         return Err(io_err("rename into", target, &e));
     }
     sync_dir(parent_of(target))
+}
+
+/// Atomic unconditional write without per-file fsync (ADR 034): staging +
+/// rename. Readers never see a partial file; durability is either not
+/// required (`cache/`) or deferred to the commit barrier (`segments/`).
+pub(crate) fn put_atomic(target: &Path, body: &[u8]) -> Result<()> {
+    let staging = write_staging_with(target, body, false)?;
+    if let Err(e) = std::fs::rename(&staging, target) {
+        let _ = std::fs::remove_file(&staging);
+        return Err(io_err("rename into", target, &e));
+    }
+    Ok(())
+}
+
+/// Content-addressed write of `path` (`target` on disk): segments and
+/// rebuildable cache entries use atomic staging + rename without per-file
+/// `sync_all` (`segments/` is synced at the commit barrier before
+/// `manifest.json` is updated; `cache/` is regenerable scratch), while ledger
+/// records and any other content-addressed objects sync on write (ADR 034).
+pub(crate) fn put_content_addressed(path: &str, target: &Path, body: &[u8]) -> Result<()> {
+    let dir = path
+        .trim_matches('/')
+        .rsplit_once('/')
+        .and_then(|(parent, _)| parent.rsplit('/').next());
+    if matches!(
+        dir,
+        Some(crate::manifest::SEGMENTS_DIR | crate::manifest::CACHE_DIR)
+    ) {
+        put_atomic(target, body)
+    } else {
+        put_overwrite(target, body)
+    }
 }
 
 /// Holds the per-path lock until dropped.
@@ -383,5 +443,34 @@ mod tests {
         assert!(!t.is_finished());
         drop(held);
         t.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn cache_and_segment_writes_are_atomic_and_leave_no_staging_files() {
+        let dir = tempfile::tempdir().unwrap();
+        for rel in [
+            "idx/cache/entry.bin",
+            "idx/cache/entry.meta.json",
+            "idx/segments/abc.seg",
+            "ledger/rec.rec",
+        ] {
+            let target = dir.path().join(rel);
+            put_content_addressed(rel, &target, b"first").unwrap();
+            assert_eq!(std::fs::read(&target).unwrap(), b"first");
+            put_content_addressed(rel, &target, b"second-longer").unwrap();
+            assert_eq!(std::fs::read(&target).unwrap(), b"second-longer");
+            let parent = target.parent().unwrap();
+            let names: Vec<String> = std::fs::read_dir(parent)
+                .unwrap()
+                .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                .collect();
+            assert!(
+                names.iter().all(|n| !n.contains('#')),
+                "no staging files left in {parent:?}: {names:?}"
+            );
+        }
+        // `sync_dir_if_exists` succeeds whether `segments/` exists or not.
+        sync_dir_if_exists(&dir.path().join("idx/segments")).unwrap();
+        sync_dir_if_exists(&dir.path().join("absent/segments")).unwrap();
     }
 }

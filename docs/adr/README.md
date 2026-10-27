@@ -34,3 +34,4 @@ Short, dated, and final until superseded by a later ADR. Each states what was ch
 - [ADR 031](031-scoped-proposers-and-a-frozen-outer-loop.md) — Scoped proposers and a frozen outer loop
 - [ADR 032](032-staged-delivery-with-a-measured-trigger.md) — Staged delivery with a measured trigger
 - [ADR 033](033-query-engines-are-measured-sources.md) — Query engines are measured sources
+- [ADR 034](034-commit-boundary-durability-on-local-stores.md) — Commit-boundary durability on local stores
