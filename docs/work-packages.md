@@ -2,7 +2,7 @@
 
 One crate, one owner, one interface contract each. WP0 ships first and alone. After it, packages in the same row have no dependency on each other and are built concurrently, each on its own branch, each landing by PR reviewed against the invariants and ADRs it owns. Done means: public API matches the contract in `bellwether-types`, assigned invariants have tests, a docs page exists, and a benchmark is registered if the crate has a latency budget.
 
-## Status (2026-10-24)
+## Status (2026-10-27)
 
 | Work | State |
 |---|---|
@@ -17,16 +17,18 @@ One crate, one owner, one interface contract each. WP0 ships first and alone. Af
 | WP9 facade and cli | merged: why, index, locate, latest, asof, propose, reconcile, fix, receipt, report; profile wired into `why` |
 | Dependency upgrade | merged: arrow/parquet 59, object_store 0.14, DataFusion 55 (bench feature); `deny.toml` has no advisory ignores |
 | WP12 mcp | merged: observe, score, propose, apply, and jobs tools; resources; the prompt generated from `AGENTS.md`; typed refusals, dry runs, per-session budgets; ADR 010 against the CLI |
-| WP20 sql | in review: `bellwether-source-sql`, `sql://` roots through the facade, CLI, and MCP; reconcile a table against files; measured `why`; attest-only `fix` |
-| WP20b engines | in review: `bellwether-source-engine` (ADR 033), the `MeasuredEngine` trait with ClickHouse (reference, CI container) and Kusto adapters; `workload record --from-engine`; `why --twin-of --gate` with the twin lints; `propose --rewrite`; `fix` scoring, exporting, reconciling, and attesting a rewrite of engine queries |
-| WP13a advise | after M3; no language model (ADR 032) |
-| WP13b evolve, WP13c rulebook v2 | each opens only when its measured trigger in `docs/evolve.md` §3 is met |
+| WP20 sql | merged (#11): `bellwether-source-sql`, `sql://` roots through the facade, CLI, and MCP; reconcile a table against files; measured `why`; attest-only `fix` |
+| WP20b engines | merged (#24): `bellwether-source-engine` (ADR 033), the `MeasuredEngine` trait with ClickHouse (reference, CI container) and Kusto adapters; `workload record --from-engine`; `why --twin-of --gate` with the twin lints; `propose --rewrite`; `fix` scoring, exporting, reconciling, and attesting a rewrite of engine queries |
+| WP13a advise | reduced and scheduled after WP22b's lookup fix (ADR 032 amendment 2026-10-27): key-set selection, knob descent, Pareto with anchors, receipts; no language model, no layout or materialization search |
+| WP13b evolve, WP13c rulebook v2 | deferred, not scheduled (ADR 032 amendment 2026-10-27): reopened only by a new amendment naming a recorded multi-step pipeline workload on which reduced `advise` leaves a structural anti-pattern |
 | WP14 storage version 2 and record version 3 (ADR 028) | both pull requests done, **M5 declared**: the first brought per-key counts (`exact:col,counts`, `count`), checksummed segments, manifest row-group and column bytes (plans open no footer), identity keys and every record version 3 shape; the second filled the remaining record fields, folded the sidecars (`exact:col@ts` bounds in the value record, a `bitemporal` layout, both proposable and fixable), spelled column types and the CSV dialect in the manifest, and froze the bytes. Fixtures: `fixtures/format-v1/`, `fixtures/format-v0.1-pre/` (pre-M5), `fixtures/format-v0.1/` (M5) |
-| WP15 relational replay, WP17 CI receipts, WP18 transfer evaluation | planned 2026-10-24 (ADR 026) |
+| WP15 relational replay | done: consumer plans (typed DAGs, shared nodes evaluated once) priced node by node with tri-state exactness (projection, `in`/semi-join, range, `latest`/`asof`, two-sided joins with counted cardinality, window prefilter, aggregation input, exchange bounds); `why --plan` with `--dataset` bindings and MCP `score.why` `plan`/`datasets`/`at`; a rewrite with `before_plan`/`after_plan` scored, its outputs reconciled, and attested; a key over a plan workload verified on the keys the plan looks up. Cut (ADR 032 amendment 2026-10-27): layout pricing and plan-node counterfactuals |
 | WP16 engine adapters | merged: `bellwether-adapters`, plans executed inside engines through `locate`, `latest`, `asof --emit`: DataFusion 55 with row-group access plans (data bytes equal the plan's at the storage boundary), one DuckDB statement over the planned files (row groups not pinnable; bytes measured), a Spark manifest and shim (planned files only); the residual decoded at the dataset types and run in the plan's order, or refused by name |
+| WP17 CI receipts | after WP15 |
+| WP18 transfer evaluation | deferred with WP13c: it evaluates the rulebook |
 | WP19 signed receipts | merged in wave A: detached ed25519 signatures beside receipts and certificates (ADR 029), no record or format version change; M8's signing half done |
 | WP21 time-series keys | merged: partition values from Hive-style paths, ordered plans, `--at-manifest` pinned lookups over a manifest history, per-key time bounds (`bounds` sidecar), bitemporal as-of (`temporal2` sidecar), the `market` bench corpus with measured funnels |
-| WP22 performance | next after WP21; measured in release builds |
+| WP22 performance | WP22a merged (#16, `docs/measured/2026-10-26-performance.md`); WP22b in progress: lookup planning, reconcile memory, and ledger listing on `wp22b-performance` first; the multi-machine build (ADR 030) is parked as a work-in-progress commit on `wp22b-distributed` |
 | B2 sketch | phase 5: per item, per file HyperLogLog registers and optional MinHash signatures as a `sketch` sidecar in `schema.sidecars[]`, approximate and never read by a planner; `cardinality`, `overlap`, the `why` `sketch` column and `--sketches-only`, the low-cardinality-key detector `R-sketch-1`; benched on the ledger and `market` shapes over 10⁴ files |
 
 ## WP0 · first, alone
@@ -62,7 +64,7 @@ One crate, one owner, one interface contract each. WP0 ships first and alone. Af
 
 ## Row 4 · after M3
 
-WP13 is three packages in `bellwether-evolve`, owning ADR 021–025, 031, 032 and the threat model extension in `docs/evolve.md` §9. Each has a done-when the ledger can prove and a trigger that opens the next (ADR 032; the triggers, the kill criterion, and the stage-2 budget are in `docs/evolve.md` §3).
+WP13 is three packages in `bellwether-evolve`, owning ADR 021–025, 031, 032 and the threat model extension in `docs/evolve.md` §9. Each has a done-when the ledger can prove and a trigger that opens the next (ADR 032; the triggers, the kill criterion, and the stage-2 budget are in `docs/evolve.md` §3). **Since 2026-10-27 (ADR 032 amendment) only a reduced 13a is scheduled:** the scope below without the `Layout` and `Cadence` artifacts, materialization-set search, lineage-edge attribution, bisect-on-failed-certificate, plan-node attribution and the interaction matrix over plans, and the pipeline DAG; 13b and 13c are deferred and their rows are the design for when they reopen.
 
 | WP | Scope | Done when | Opens the next WP when |
 | --- | --- | --- | --- |
@@ -79,7 +81,7 @@ WP13 is three packages in `bellwether-evolve`, owning ADR 021–025, 031, 032 an
 | WP | Crate | Deliverables | Owns |
 |---|---|---|---|
 | WP14 | `bellwether-types`, `-core`, `-store`, `-build`, `-ledger`, `-replay`, `-profile`, `-verify`, the facade, `-cli` | storage version 2 and record version 3 in two pull requests. First: optional per-key, per-row-group counts in exact and temporal segments with `count`; checksums; per-row-group rows and bytes and per-column bytes in manifests, so plans open no footer; `ScanEntry.columns` and `projected_bytes`; full-spec identity keys; every record version 3 shape; conformance vectors; the version 1 and version 2 fixtures; readers of version 1 unaffected, upgraded on the first build with work. Second: verify, replay and profile fill the record fields; sidecars fold into the segment format; typed CSV dialect and column types in manifests | ADR 026, 028; format.md |
-| WP15 | `bellwether-replay` | the operator table in `docs/evolve.md` §14 priced exactly: projection, range, `latest`/`asof`, semi-join, two-sided join with cardinality, window partition prefilter, aggregation input; tri-state exactness on every cost; layout proposals exact under the stated model | ADR 005, 026 |
+| WP15 | `bellwether-replay` | the operator table in `docs/evolve.md` §14 priced exactly: projection, range, `latest`/`asof`, semi-join, two-sided join with cardinality, window partition prefilter, aggregation input; tri-state exactness on every cost; rewrite replay of `before`/`after` plans so a rewrite reaches attest (done). Cut 2026-10-27 (ADR 032 amendment): plan-node counterfactuals (`replace_node`/`interaction` over `ConsumerPlan`) and layout pricing, whose only consumers were evolve's proposers and layout apply | ADR 005, 026 |
 | WP16 | `bellwether-adapters` (merged) | plans executed inside engines: DataFusion first (row-group access plans; realized data bytes equal the plan's, measured at the storage boundary), DuckDB second (file lists plus pushed filters; row groups cannot be pinned, so its bytes are measured as an upper bound of the plan's), a Spark shim third (file level: only the planned files are opened); rows and the exact decimal total equal the bench oracle's in every engine | ADR 010 |
 | WP17 | `bellwether-ci` | a GitHub Action that runs `why` on a pull request's pipeline changes and posts the receipt or the refusal as a comment; the gate is the receipt hash | threat model |
 | WP18 | evaluation | transfer: the rulebook learned on one dataset applied to another and validated by replay there; the exact-versus-estimated-loss ablation at equal budget; public datasets (ClickBench slices, GH Archive, NYC taxi) beside the synthetic ledger | ADR 019, 025 |
@@ -97,9 +99,9 @@ WP13 is three packages in `bellwether-evolve`, owning ADR 021–025, 031, 032 an
 3. **M3** receipts exist: WP6, WP7, WP8. `fix` produces a Receipt.
 4. **M4** agent-first: WP12. The loop runs end to end from a coding agent.
 5. **M5** (done) format frozen after WP14, so the frozen version carries counts and per-column bytes; fixtures committed. The first WP14 pull request made the record version 3 shapes final and committed the pre-M5 fixture (now `fixtures/format-v0.1-pre/`); the second froze the bytes of storage version 2 with `fixtures/format-v0.1/` (ADR 028).
-6. **M6** staged (ADR 032): `advise` (WP13a) produces a frontier with receipts on the synthetic ledger and one real workload, with no language model; `evolve` (WP13b) ships only if `advise` leaves anti-patterns that need a structural rewrite, and recovers them under the budget in `docs/evolve.md` §3; rulebook v2 (WP13c) ships once a rule reproduces its gain on a temporally held-out template. Each stage is a replayable run in the ledger; WP15 makes the loss cover the operator table.
+6. **M6** reduced (ADR 032 amendment 2026-10-27): `advise` (WP13a, reduced) chooses a key set and knobs with receipts on the synthetic ledger and one real workload, with no language model, after WP22b makes plan time track bytes; WP15 makes the loss cover the operator table. `evolve` (WP13b) and rulebook v2 (WP13c) are deferred and are no longer part of M6; their design and triggers stay in `docs/evolve.md` §3.
 7. **M7** a SQL table reconciles against a folder of files with a certificate (WP20); plans execute inside an engine (WP16); receipts gate pull requests (WP17).
-8. **M8** rules transfer across datasets and the exact-versus-estimated ablation is measured (WP18); receipts are signed (WP19, done: `fix --signing-key`, `receipt show --require-signature`).
+8. **M8** receipts are signed (WP19, done: `fix --signing-key`, `receipt show --require-signature`). Rule transfer and the exact-versus-estimated ablation (WP18) are deferred with WP13c.
 
 ## Dependency upgrade (start of Phase 3)
 

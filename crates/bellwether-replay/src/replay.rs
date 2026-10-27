@@ -115,11 +115,29 @@ pub struct Scored {
     pub layout: Option<LayoutReplay>,
 }
 
+/// Every run of a workload priced under one configuration.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PricedRuns {
+    /// Each run's cost, in workload order.
+    pub costs: Vec<RunCost>,
+    /// Each run's per-node costs, in workload order: a run priced through
+    /// a consumer plan has one per node, in plan order; any other run none.
+    pub operators: Vec<Vec<bellwether_types::OperatorCost>>,
+    /// Whether some run was priced under [`Baseline::ParquetStats`] as
+    /// unserved.
+    pub unserved: bool,
+    /// The model a measured dataset's costs come from, when a plan read one.
+    pub model: Option<String>,
+    /// The catalog digests of the datasets the runs' plans scan besides
+    /// `main`, sorted.
+    pub inputs: Vec<Hash>,
+}
+
 /// Replays workloads against one pinned manifest version (module docs).
 pub struct Replayer<'a> {
     source: &'a dyn Source,
     catalog: Arc<Catalog>,
-    planner: Box<dyn PlanSource + 'a>,
+    pub(crate) planner: Box<dyn PlanSource + 'a>,
     current: Vec<KeySpec>,
     policy: FingerprintPolicy,
     limits: TransientLimits,
@@ -131,7 +149,22 @@ pub struct Replayer<'a> {
     /// The right dataset semi-join runs are priced with (B3), when given
     /// ([`Replayer::with_pair`]).
     pub(crate) pair: Option<Box<crate::join::PairInput<'a>>>,
+    /// The datasets a consumer plan scans besides `main`, by name
+    /// ([`Replayer::with_datasets`], WP15).
+    pub(crate) datasets: std::collections::BTreeMap<String, Replayer<'a>>,
+    /// The model this dataset's costs are measured by, when they are
+    /// ([`Replayer::with_measured`]).
+    pub(crate) measured: Option<String>,
+    /// Other names a plan gives this dataset ([`Replayer::with_main_alias`]).
+    pub(crate) aliases: Vec<String>,
+    /// For a replayer over a committed index: opens its committed segments
+    /// in this crate's form, once, when relational replay first streams a
+    /// committed spec's key blocks.
+    committed: Option<CommittedLoader<'a>>,
+    committed_planner: std::sync::Mutex<Option<Arc<SegmentPlanner>>>,
 }
+
+type CommittedLoader<'a> = Box<dyn Fn() -> Result<SegmentPlanner> + Send + Sync + 'a>;
 
 impl std::fmt::Debug for Replayer<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -181,6 +214,11 @@ impl<'a> Replayer<'a> {
             unserved: Baseline::RawScan,
             filters_read: AtomicU64::new(0),
             pair: None,
+            datasets: std::collections::BTreeMap::new(),
+            measured: None,
+            aliases: Vec::new(),
+            committed: None,
+            committed_planner: std::sync::Mutex::new(None),
         })
     }
 
@@ -214,6 +252,10 @@ impl<'a> Replayer<'a> {
         };
         let mut r = Self::new(source, catalog, Box::new(planner), current)?;
         r.policy = policy;
+        let (snap, cat) = (snapshot.clone(), Arc::clone(&r.catalog));
+        r.committed = Some(Box::new(move || {
+            SegmentPlanner::from_snapshot(&snap, Arc::clone(&cat))
+        }));
         Ok(r)
     }
 
@@ -324,6 +366,27 @@ impl<'a> Replayer<'a> {
         self.cache.get_or_build(&self.catalog, spec, || {
             TransientIndex::build(self.source, &self.catalog, spec, &self.limits)
         })
+    }
+
+    /// The committed segments of `spec` in this crate's form, for a
+    /// replayer over a committed index (opened once, by range through the
+    /// pinned snapshot); `None` for any other replayer, or a spec the index
+    /// does not hold complete.
+    pub(crate) fn committed_segments(
+        &self,
+        spec: &KeySpec,
+    ) -> Result<Option<Arc<crate::plan::SpecSegments>>> {
+        let Some(load) = &self.committed else {
+            return Ok(None);
+        };
+        let mut held = self
+            .committed_planner
+            .lock()
+            .map_err(|_| Error::Other("the committed segment view's lock is poisoned".into()))?;
+        if held.is_none() {
+            *held = Some(Arc::new(load()?));
+        }
+        Ok(held.as_ref().and_then(|p| p.spec_segments(spec)))
     }
 
     /// The planner for `specs`: the base planner plus transient segments for
@@ -566,12 +629,25 @@ impl<'a> Replayer<'a> {
         workload: &Workload,
         keys: &dyn KeySetSource,
     ) -> Result<Vec<RunCost>> {
-        Ok(self.costs(specs, workload, keys, None)?.0)
+        Ok(self.costs(specs, workload, keys, None)?.costs)
+    }
+
+    /// Every run's cost under `specs` with, for a run priced through a
+    /// consumer plan ([`RecordedRun::plan`](crate::RecordedRun::plan)),
+    /// each node's cost (relational replay, WP15).
+    pub fn replay_runs(
+        &self,
+        specs: &[KeySpec],
+        workload: &Workload,
+        keys: &dyn KeySetSource,
+    ) -> Result<PricedRuns> {
+        self.costs(specs, workload, keys, None)
     }
 
     /// Every run's exact cost under `specs` when every run is planned with
     /// `query` (for example `RunQuery::Locate` to price point lookups on a
-    /// temporal workload), in workload order.
+    /// temporal workload), in workload order. A run priced through a
+    /// consumer plan is priced by its plan.
     pub fn replay_specs_as(
         &self,
         specs: &[KeySpec],
@@ -579,48 +655,74 @@ impl<'a> Replayer<'a> {
         keys: &dyn KeySetSource,
         query: &RunQuery,
     ) -> Result<Vec<RunCost>> {
-        Ok(self.costs(specs, workload, keys, Some(query))?.0)
+        Ok(self.costs(specs, workload, keys, Some(query))?.costs)
     }
 
-    /// Every run's exact cost under `specs`, each planned with `query` or
-    /// else its recorded query kind, and whether some run was priced under
-    /// [`Baseline::ParquetStats`] as unserved.
+    /// Every run's cost under `specs`, each planned with `query` or else
+    /// its recorded query kind, or through its consumer plan; and whether
+    /// some run was priced under [`Baseline::ParquetStats`] as unserved. A
+    /// workload whose runs carry plans carries one on every run, so the
+    /// per-node costs line up run by run.
     fn costs(
         &self,
         specs: &[KeySpec],
         workload: &Workload,
         keys: &dyn KeySetSource,
         query: Option<&RunQuery>,
-    ) -> Result<(Vec<RunCost>, bool)> {
+    ) -> Result<PricedRuns> {
+        let with_plans = workload.runs().iter().filter(|r| r.plan.is_some()).count();
+        if with_plans != 0 && with_plans != workload.runs().len() {
+            return Err(Error::InvalidArgument {
+                field: "workload",
+                reason: "the workload mixes runs priced through a consumer plan with plain \
+                         lookups; record each as its own workload"
+                    .into(),
+            });
+        }
         let planner = self.planner_for(specs)?;
-        let mut stats = false;
-        let costs = workload
-            .runs()
-            .iter()
-            .map(|run| {
-                let rk = workload.run_keys(keys, run)?;
-                let recorded;
-                let query = if let Some(q) = query {
-                    q
-                } else {
-                    recorded = run.query()?;
-                    &recorded
-                };
-                let (cost, unserved) = if let Some(j) = query.join() {
-                    self.semijoin_cost(planner.as_ref(), specs, &run.run_id, &rk, j)?
-                } else {
-                    let (plan, unserved) =
-                        self.verified_plan(planner.as_ref(), specs, &rk, query)?;
-                    (
-                        cost_of(query, &run.run_id, rk.len() as u64, &plan),
-                        unserved,
-                    )
-                };
-                stats |= unserved;
-                Ok(cost)
-            })
-            .collect::<Result<Vec<_>>>()?;
-        Ok((costs, stats))
+        let mut out = PricedRuns::default();
+        let mut checked: std::collections::BTreeMap<Hash, crate::relational::CheckedPlan> =
+            std::collections::BTreeMap::new();
+        for run in workload.runs() {
+            let rk = workload.run_keys(keys, run)?;
+            let recorded = run.query()?;
+            if let Some(h) = &run.plan {
+                if !checked.contains_key(h) {
+                    let plan = crate::workload::load_plan(keys, h)?;
+                    checked.insert(*h, self.check_plan(&plan).map_err(Error::from)?);
+                }
+                let p = self
+                    .price_checked(&checked[h], specs, &run.run_id, &rk, recorded.asof_ts())
+                    .map_err(Error::from)?;
+                out.unserved |= p.unserved;
+                if out.model.is_none() {
+                    out.model.clone_from(&p.model);
+                }
+                for d in self.plan_inputs(&checked[h]) {
+                    if !out.inputs.contains(&d) {
+                        out.inputs.push(d);
+                    }
+                }
+                out.costs.push(p.cost);
+                out.operators.push(p.operators);
+                continue;
+            }
+            let query = query.unwrap_or(&recorded);
+            let (cost, unserved) = if let Some(j) = query.join() {
+                self.semijoin_cost(planner.as_ref(), specs, &run.run_id, &rk, j)?
+            } else {
+                let (plan, unserved) = self.verified_plan(planner.as_ref(), specs, &rk, query)?;
+                (
+                    cost_of(query, &run.run_id, rk.len() as u64, &plan),
+                    unserved,
+                )
+            };
+            out.unserved |= unserved;
+            out.costs.push(cost);
+            out.operators.push(Vec::new());
+        }
+        out.inputs.sort();
+        Ok(out)
     }
 
     /// Every run's exact cost under the current configuration.
@@ -694,18 +796,14 @@ impl<'a> Replayer<'a> {
             ))
             .into());
         }
-        let (proposed, layout, proposed_stats) = match body {
+        let (proposed, layout) = match body {
             ProposalBody::Key { spec, sidecars } => {
                 // The spec and the specs proposed beside it, applied in one
                 // commit: each replaces the current spec of its name.
                 let mut specs = self.current.clone();
                 for s in std::iter::once(spec).chain(sidecars) {
                     validate_spec(s)?;
-                    if !workload
-                        .runs()
-                        .iter()
-                        .any(|r| r.query().is_ok_and(|q| serves_query(s, &r.columns, &q)))
-                    {
+                    if !self.serves_some_run(s, workload, keys)? {
                         return Err(ReplayError::SpecServesNoRun {
                             spec: s.name(),
                             run_columns: distinct_columns(workload),
@@ -716,10 +814,18 @@ impl<'a> Replayer<'a> {
                 for s in std::iter::once(spec).chain(sidecars) {
                     check_counted_beside(s, &specs, workload)?;
                 }
-                let (costs, stats) = self.costs(&specs, workload, keys, None)?;
-                (costs, None, stats)
+                (self.costs(&specs, workload, keys, None)?, None)
             }
             ProposalBody::Layout { cluster_by } => {
+                if workload.runs().iter().any(|r| r.plan.is_some()) {
+                    return Err(Error::Other(
+                        "a layout proposal is priced by a model of key lookups, and this \
+                         workload's runs are consumer plans; score the layout against a \
+                         workload of locate runs"
+                            .into(),
+                    )
+                    .into());
+                }
                 if let Some(run) = workload
                     .runs()
                     .iter()
@@ -751,36 +857,167 @@ impl<'a> Replayer<'a> {
                     keys,
                     &self.limits,
                 )?;
-                (lr.costs.clone(), Some(lr), false)
+                let priced = PricedRuns {
+                    costs: lr.costs.clone(),
+                    operators: vec![Vec::new(); lr.costs.len()],
+                    ..PricedRuns::default()
+                };
+                (priced, Some(lr))
             }
-            ProposalBody::Rewrite { .. } => return Err(ReplayError::RewriteNotScorable),
+            ProposalBody::Rewrite { shape } => {
+                return self.score_rewrite(proposal, body, shape, workload, keys, created_at);
+            }
         };
-        let (current, current_stats) = self.costs(&self.current, workload, keys, None)?;
-        // A cost model is named exactly when some proposed cost comes from
-        // it (contract v2.1): a layout replay of a workload with runs.
+        let current = self.costs(&self.current, workload, keys, None)?;
+        // A cost model is named exactly when some cost comes from one
+        // (contract v2.1): a layout replay of a workload with runs, or a
+        // plan that reads a measured dataset.
         let model = layout
             .as_ref()
             .filter(|l| l.costs.iter().any(|c| !c.exact))
-            .map(|l| l.description.clone());
+            .map(|l| l.description.clone())
+            .or_else(|| current.model.clone())
+            .or_else(|| proposed.model.clone());
+        let replay = self.replay_record(proposal, workload, &current, &proposed, model, created_at);
         Ok(Scored {
-            replay: Replay {
-                prediction: None,
-                record_version: RECORD_VERSION,
-                proposal: *proposal,
-                manifest_version: self.manifest_version(),
-                workload: workload.hash(),
-                current,
-                proposed,
-                created_at: created_at.to_string(),
-                inputs: self.inputs(workload),
-                model,
-                configuration: self.current.iter().map(KeySpec::identity).collect(),
-                operators: Vec::new(),
-                unserved: (current_stats || proposed_stats)
-                    .then(|| Baseline::ParquetStats.name().to_string()),
-            },
+            replay,
             body: Hash::of_record(body)?,
             layout,
+        })
+    }
+
+    /// Whether `spec` serves some run of `workload`: a plain run it can
+    /// plan, or a run priced through a consumer plan that probes `main` on
+    /// its columns (relational replay).
+    fn serves_some_run(
+        &self,
+        spec: &KeySpec,
+        workload: &Workload,
+        keys: &dyn KeySetSource,
+    ) -> Result<bool> {
+        let mut seen = std::collections::BTreeSet::new();
+        for r in workload.runs() {
+            match &r.plan {
+                Some(h) => {
+                    if seen.insert(*h) {
+                        let plan = crate::workload::load_plan(keys, h)?;
+                        let checked = self.check_plan(&plan).map_err(Error::from)?;
+                        if checked.serves(spec) {
+                            return Ok(true);
+                        }
+                    }
+                }
+                None => {
+                    if r.query().is_ok_and(|q| serves_query(spec, &r.columns, &q)) {
+                        return Ok(true);
+                    }
+                }
+            }
+        }
+        Ok(false)
+    }
+
+    /// The [`Replay`] of `current` and `proposed`: per-node costs run by
+    /// run, each run's current configuration's nodes then the proposed
+    /// one's (a run priced without a plan has none); inputs the catalog
+    /// digest, the right dataset's for semi-join runs, and every other
+    /// dataset a plan scans.
+    fn replay_record(
+        &self,
+        proposal: &Hash,
+        workload: &Workload,
+        current: &PricedRuns,
+        proposed: &PricedRuns,
+        model: Option<String>,
+        created_at: &str,
+    ) -> Replay {
+        let mut inputs = self.inputs(workload);
+        for d in current.inputs.iter().chain(&proposed.inputs) {
+            if !inputs.contains(d) {
+                inputs.push(*d);
+            }
+        }
+        let operators = current
+            .operators
+            .iter()
+            .zip(&proposed.operators)
+            .flat_map(|(c, p)| c.iter().chain(p).cloned())
+            .collect();
+        Replay {
+            prediction: None,
+            record_version: RECORD_VERSION,
+            proposal: *proposal,
+            manifest_version: self.manifest_version(),
+            workload: workload.hash(),
+            current: current.costs.clone(),
+            proposed: proposed.costs.clone(),
+            created_at: created_at.to_string(),
+            inputs,
+            model,
+            configuration: self.current.iter().map(KeySpec::identity).collect(),
+            operators,
+            unserved: (current.unserved || proposed.unserved)
+                .then(|| Baseline::ParquetStats.name().to_string()),
+        }
+    }
+
+    /// Scores a rewrite (relational replay, WP15): `current` is each run
+    /// through the shape's `before_plan`, `proposed` through its
+    /// `after_plan`, both under the current configuration of every
+    /// dataset; the run's keys and instant feed both. A shape without both
+    /// plans has no replay ([`ReplayError::RewriteNotScorable`]). Exact when
+    /// every dataset is file-backed; measured, naming the model, when a
+    /// plan reads a measured dataset (a SQL table, ADR 027).
+    fn score_rewrite(
+        &self,
+        proposal: &Hash,
+        body: &ProposalBody,
+        shape: &bellwether_types::RewriteShape,
+        workload: &Workload,
+        keys: &dyn KeySetSource,
+        created_at: &str,
+    ) -> ReplayResult<Scored> {
+        let (Some(before), Some(after)) = (&shape.before_plan, &shape.after_plan) else {
+            return Err(ReplayError::RewriteNotScorable);
+        };
+        let before = self.check_plan(before)?;
+        let after = self.check_plan(after)?;
+        let mut current = PricedRuns::default();
+        let mut proposed = PricedRuns::default();
+        for run in workload.runs() {
+            let q = run.query()?;
+            if !matches!(q, RunQuery::Locate | RunQuery::Asof { .. }) {
+                return Err(Error::InvalidArgument {
+                    field: "workload",
+                    reason: format!(
+                        "run {:?} is a {} run; a rewrite's plans are priced over locate runs \
+                         (their keys feed the plans) or asof runs (their instant too)",
+                        run.run_id, run.query_kind
+                    ),
+                }
+                .into());
+            }
+            let rk = workload.run_keys(keys, run)?;
+            for (checked, out) in [(&before, &mut current), (&after, &mut proposed)] {
+                let p =
+                    self.price_checked(checked, &self.current, &run.run_id, &rk, q.asof_ts())?;
+                out.unserved |= p.unserved;
+                if out.model.is_none() {
+                    out.model.clone_from(&p.model);
+                }
+                out.costs.push(p.cost);
+                out.operators.push(p.operators);
+            }
+        }
+        for (checked, out) in [(&before, &mut current), (&after, &mut proposed)] {
+            out.inputs = self.plan_inputs(checked);
+        }
+        let model = current.model.clone().or_else(|| proposed.model.clone());
+        let replay = self.replay_record(proposal, workload, &current, &proposed, model, created_at);
+        Ok(Scored {
+            replay,
+            body: Hash::of_record(body)?,
+            layout: None,
         })
     }
 
@@ -820,14 +1057,18 @@ where
 /// Writes a scored replay through the ledger after checking it against the
 /// proposal it cites, which it resolves itself (the ledger checks again on
 /// `put`). The proposal's body must be the body the costs were computed for
-/// ([`Scored::body`]); the replay must name its inputs; current costs are
-/// exact; and the costs must be the proposal kind's:
+/// ([`Scored::body`]); the replay must name its inputs; and the costs must
+/// be the proposal kind's:
 ///
 /// - a key proposal's costs are all exact and name no model;
-/// - a layout proposal's costs are the layout model's, each inexact, for
-///   the body's `cluster_by`, and `Replay::model` is that model's statement
-///   (absent only for a workload with no runs, which has no costs);
-/// - a rewrite has no replay ([`ReplayError::RewriteNotScorable`]).
+/// - a layout proposal's current costs are exact and its proposed costs
+///   the layout model's, each inexact, for the body's `cluster_by`, and
+///   `Replay::model` is that model's statement (absent only for a workload
+///   with no runs, which has no costs);
+/// - a rewrite has a replay only when its shape carries `before_plan` and
+///   `after_plan` ([`ReplayError::RewriteNotScorable`] otherwise): its
+///   costs are exact unless a plan reads a measured dataset, and then the
+///   replay names the model; it lists every run's per-node costs.
 ///
 /// Nothing is written unless every check passes.
 pub fn write_replay<L>(ledger: &Ledger<L>, scored: &Scored) -> ReplayResult<Hash>
@@ -852,11 +1093,27 @@ where
             "the replay names no inputs; it must cite the catalog digest of the data it read",
         ));
     }
-    if r.current.iter().any(|c| !c.exact) {
+    if !matches!(body, ProposalBody::Rewrite { .. }) && r.current.iter().any(|c| !c.exact) {
         return Err(mismatch("current costs are always exact (ADR 005)"));
     }
     match &body {
-        ProposalBody::Rewrite { .. } => return Err(ReplayError::RewriteNotScorable),
+        ProposalBody::Rewrite { shape } => {
+            if shape.before_plan.is_none() || shape.after_plan.is_none() {
+                return Err(ReplayError::RewriteNotScorable);
+            }
+            let inexact = r.current.iter().chain(&r.proposed).any(|c| !c.exact);
+            if scored.layout.is_some() || inexact != r.model.is_some() {
+                return Err(mismatch(
+                    "a rewrite's costs come from its plans: exact, or measured by the model the \
+                     replay names",
+                ));
+            }
+            if !r.current.is_empty() && r.operators.is_empty() {
+                return Err(mismatch(
+                    "a rewrite's replay lists every run's per-node costs",
+                ));
+            }
+        }
         ProposalBody::Key { .. } => {
             if r.proposed.iter().any(|c| !c.exact) || r.model.is_some() || scored.layout.is_some() {
                 return Err(mismatch(

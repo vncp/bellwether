@@ -21,7 +21,14 @@ fail if the two differ.
    "limit": 1000}`): the report says the diagnosis is on a copy, records
    the engine's table identity beside the lake's sequence, gives per
    candidate the keyset against each gate, rows per key, and files per key,
-   and adds the twin lints (advice that names a rewrite pattern).
+   and adds the twin lints (advice that names a rewrite pattern). When the
+   slow query is more than a lookup (a join, a window, an aggregate), pass
+   its plan as a typed plan DAG in `plan` (a JSON file path; the datasets
+   it scans besides the folder are the ones the human bound with
+   `--dataset NAME=ROOT` when starting the server, named in `datasets`):
+   each run is priced through the plan, and `plans` holds per node its
+   bytes and rows, each `exact`, `bounded` (an interval holding the truth),
+   or `measured`.
 2. **Read the evidence.** Quote the lint (`rule`, columns, message) and the
    fanout that explain the read. Every number is an exact sum of footer
    statistics; none is an estimate, except those labelled `approximate`:
@@ -35,7 +42,9 @@ fail if the two differ.
    description, never code; for a query engine, `shape.pairs` holds one or
    more `{before, after}` query texts you wrote in the engine's language,
    scored and verified as one set, and the proposal must cite the twin
-   Evidence), citing the evidence hash in
+   Evidence; for a rewrite of lake queries, `shape.before_plan` and
+   `shape.after_plan` hold the two shapes as typed plan DAGs, which the
+   engine prices), citing the evidence hash in
    `evidence` and your own name in `by`. Pass `dry_run: true` first if you
    want to see the Proposal without writing it. A proposal has no score
    field; anything that looks like one is rejected by the schema.
@@ -61,10 +70,11 @@ fail if the two differ.
    certificate computed against an older manifest, data that changed since
    verification, or a key that is already complete is refused with a typed
    code before anything is written. On success it returns the Receipt. For
-   a rewrite of engine queries the engine measures the queries again and
-   writes an attest-only Receipt (`attest_only: true`, the manifest
-   unchanged): nothing is deployed; a human or a CI gate deploys the
-   `after` queries.
+   a rewrite of engine queries the engine measures the queries again, and
+   for a rewrite with `before_plan` and `after_plan` it prices both plans
+   again; either way it writes an attest-only Receipt (`attest_only: true`,
+   the manifest unchanged): nothing is deployed; a human or a CI gate
+   deploys the `after` shape.
 6. **Report.** Quote the receipt hash to the human verbatim, with the
    predicted and realized bytes. `bellwether receipt show <hash>` (or the
    `explain` chain in the result) shows every record behind it.
@@ -122,7 +132,7 @@ line. No refusal is prose only.
 | `nothing_to_apply` | The key is already complete; there is nothing to apply or attest. |
 | `nothing_to_gain` | The proposal's replay predicts no saving on the workload; `fields` has `replay`, `current_bytes`, `proposed_bytes`. Nothing but the Replay was written. Propose another key; only the human can continue, with `bellwether fix --allow-no-gain` (no tool takes it). |
 | `layout_not_applicable` | Layout proposals cannot be applied in this release. |
-| `no_replay` | A rewrite verified but cannot be attested yet (rewrites have no replay). |
+| `no_replay` | A rewrite verified but cannot be attested: its shape states the plans only in prose, so it has no replay. Propose it again with `shape.before_plan` and `shape.after_plan` (typed plan DAGs), which the engine prices and attests. |
 | `attest_only` | The proposal verified and its target is a table (`sql://`): the engine applies nothing to a table and writes no receipt. For a key, `fields.run` lists the `CREATE INDEX` per table the engine wrote, for a human to run; for a rewrite, `fields.proposed_rewrite` is your own proposed text, which the engine never ran, for the human to review. Report the certificate and those fields to the human. The same gain gate as over files applies first (`nothing_to_gain`). |
 | `reserved_proposer` | The name in `by` is reserved for the engine. Pass your own name. |
 | `sketch_not_proposable` | The key in `spec` (or `sidecars`) declares a sketch (`sketch:a`), which is approximate and never planned with, so no replay can price it and it has no certificate or receipt. `fields` has `declaration`, `sketch`, `root`, and `command` (the `bellwether index` command that builds it, shell-quoted, with this server's source flags; null when no command line spells them). Propose a key spec to reach a receipt, or ask the human to run `fields.command`. Per-key time bounds (`exact:a@ts`) and bitemporal keys (`temporal2:id@valid,known`) are key specs and propose like any other. |

@@ -427,20 +427,33 @@ fn advance<R: ReadAt>(
     Ok(())
 }
 
-/// The merge's key stream over the keyed segments of one spec, as an
+/// The merge's key stream over the keyed segments of one spec, as a pull
 /// iterator: every distinct key once, ascending, with its values folded
 /// across the segments holding it (bitmaps OR-ed, counts combined as
-/// [`merge`] combines them). Holds one block per input at a time (ADR 018).
-pub(crate) struct MergedKeys<'a, R> {
+/// [`merge`] combines them). Holds one block per input at a time (ADR
+/// 018), so two of them merge-join two indexes' sorted key blocks with one
+/// block per segment of each side in memory (relational replay prices a
+/// two-sided join this way, WP15; a join key's pair index is built this
+/// way, B3).
+pub struct MergedKeys<'a, R> {
     cursors: Vec<KeyedCursor<'a, R>>,
     heads: Vec<Option<KeyValue>>,
     heap: BinaryHeap<Reverse<(Vec<u8>, usize)>>,
 }
 
+impl<R> std::fmt::Debug for MergedKeys<'_, R> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MergedKeys")
+            .field("inputs", &self.cursors.len())
+            .finish_non_exhaustive()
+    }
+}
+
 impl<'a, R: ReadAt> MergedKeys<'a, R> {
     /// Opens the stream over `inputs`, which must all be keyed (exact or
-    /// temporal) segments.
-    pub(crate) fn new(inputs: &'a [SegmentReader<R>]) -> Result<Self> {
+    /// temporal) segments; any other layout, a join key's pair segments
+    /// included, is refused with [`Error::KeySpec`].
+    pub fn new(inputs: &'a [SegmentReader<R>]) -> Result<Self> {
         if let Some(s) = inputs.iter().find(|s| {
             !matches!(s.index, Index::Keyed(_))
                 || s.header().layout == crate::segment::Layout::KeyedJoin
@@ -478,7 +491,7 @@ impl<'a, R: ReadAt> MergedKeys<'a, R> {
     }
 
     /// The next distinct key and its folded value, or `None` at the end.
-    pub(crate) fn next_key(&mut self) -> Result<Option<(Vec<u8>, KeyValue)>> {
+    pub fn next_key(&mut self) -> Result<Option<(Vec<u8>, KeyValue)>> {
         let Some(Reverse((key, i))) = self.heap.pop() else {
             return Ok(None);
         };
