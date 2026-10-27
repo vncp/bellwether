@@ -176,6 +176,15 @@ impl<V> MeteredMap<V> {
         self.map.iter().map(|(k, v)| (&**k, v))
     }
 
+    /// Clears the map's entries, keeps its bucket table allocated for the
+    /// next pass so a multi-pass run does not reallocate a second multi-GiB
+    /// table in another virtual region, and returns only the entries' heap
+    /// charge to the meter.
+    pub(crate) fn clear(&mut self, meter: &mut Meter) {
+        self.map.clear();
+        meter.release(std::mem::take(&mut self.charged_heap));
+    }
+
     /// Frees the map and returns its charge to the meter.
     pub(crate) fn free(self, meter: &mut Meter) {
         meter.release(self.charged_table + self.charged_heap);
@@ -441,6 +450,30 @@ mod tests {
             assert!(map.charged_table >= table_bytes(map.map.capacity(), MeteredMap::<u64>::SLOT));
         }
         assert!(m.peak() >= m.used());
+        map.free(&mut m);
+        assert_eq!(m.used(), 0);
+    }
+
+    #[test]
+    fn metered_map_clear_keeps_table_allocation_and_releases_entry_heap() {
+        let mut m = Meter::new(u64::MAX);
+        let mut map: MeteredMap<u64> = MeteredMap::new();
+        for i in 0u64..1_000 {
+            map.insert_new(&mut m, &i.to_be_bytes(), i, 32).unwrap();
+        }
+        let cap = map.map.capacity();
+        let table = map.charged_table;
+        assert!(table > 0);
+        assert!(map.charged_heap > 0);
+        map.clear(&mut m);
+        assert_eq!(map.len(), 0);
+        assert_eq!(map.map.capacity(), cap);
+        assert_eq!(map.charged_heap, 0);
+        assert_eq!(m.used(), table);
+        for i in 1_000u64..2_000 {
+            map.insert_new(&mut m, &i.to_be_bytes(), i, 32).unwrap();
+        }
+        assert_eq!(map.map.capacity(), cap);
         map.free(&mut m);
         assert_eq!(m.used(), 0);
     }

@@ -154,7 +154,7 @@ A release build was measured on 2026-10-27 with `scripts/perf.py`: full coverage
   | 256 MiB | 514.5 MiB | 257.8 MiB | 220.7 MiB | 1,268.4 MiB |
   | 1 GiB | 1,282.5 MiB | 263.5 MiB | 254.2 MiB | 447.7 MiB |
 
-  Taxi stays within its bound at every budget but one: at 8 GiB, peak RSS is 8,484.8 MiB against an 8,449.1 MiB bound (0.4% over), while the peak footprint is 7,316.8 MiB. The build before WP22b held 5,507 MiB of footprint there, so 1,810 MiB more is held outside the meter. The cause is not isolated yet; it is an open item of the measured document.
+  Taxi stays within its bound at every budget but one in the 2026-10-27 S1 run: at 8 GiB, peak RSS was 8,484.8 MiB against an 8,449.1 MiB bound (0.4% over), while the peak footprint was 7,316.8 MiB (up from 5,507 MiB before WP22b). WP22c closes that retention by reusing `PassState`'s `MeteredMap` bucket tables across passes (`MeteredMap::clear`) instead of dropping and reallocating a second multi-GiB table in pass 2, and by trimming `Scratch` per pass.
 
 ## Tests
 

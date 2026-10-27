@@ -8,7 +8,7 @@ WP3. This crate implements the `bellwether_types::Store` contract over `object_s
 - a content-addressed cache
 - garbage collection, by claim-then-delete
 
-It owns invariant 4 ("readers see one manifest version") and implements ADRs 003, 013, 015, 017, 018 and 020.
+It owns invariant 4 ("readers see one manifest version") and implements ADRs 003, 013, 015, 017, 018, 020 and 034.
 
 ```text
 <root>/manifest.json            committed by conditional PUT
@@ -58,7 +58,7 @@ These `object_store` errors map to `Error::VersionConflict`:
 
 **Local writes.** `object_store`'s local backend neither implements `PutMode::Update` nor fsyncs. The local backend therefore does its own writes:
 
-- **Durability.** Every write (segment, cache entry, manifest) goes to a staging file `<target>#<20 random digits>`. The staging file is fsynced and moved into place (`rename`, or `hard_link` for create-if-absent), then the parent directory is fsynced. A crash leaves either the old file or the new one. Directories created on first write (a new index root, `segments/`, `cache/`) are fsynced together with the nearest pre-existing ancestor, so their entries survive a crash too.
+- **Durability (ADR 034).** Every write goes to a staging file `<target>#<20 random digits>` and is moved into place (`rename`, or `hard_link` for create-if-absent), so a crash or concurrent reader never sees a partial file. Conditional writes (`manifest.json`, `manifests/`, detached signatures) and ledger records (`ledger/`) fsync the staging file and parent directory on write; segment writes (`segments/`) defer their directory fsync to `StoreExt::sync_segments`, called once by `commit` before CASing `manifest.json`; rebuildable cache entries (`cache/`) skip `sync_all`. Directories created on first write for durable objects are fsynced together with the nearest pre-existing ancestor.
 - **CAS.** Conditional writes take an exclusive kernel `flock` (via `fs4`) on `<target>.lock#0`. The lock is taken with `try_lock` until a 30 s deadline (`LOCAL_LOCK_TIMEOUT`) and otherwise fails with `Error::Store`; it never blocks unboundedly. With the lock held, `put_if_version` compares the blake3 of the current file with the expected token before writing.
 - **Cleanup.** After a successful conditional write, leftover `<target>#<digits>` staging files from crashed writers are removed. This is safe because every conditional write to that target holds the lock. The lock file's single-digit suffix never matches.
 - **Why this is not a stale lock.** ADRs 003 and 015 reject "file locks with stale healing". This lock has nothing to heal: the kernel releases it when the handle drops or the process dies, and the lock file's existence means nothing. Readers never take the lock.
@@ -135,10 +135,11 @@ Per attempt:
    - `deleting`, restored from the base whatever `f` returned
 4. If the new manifest references a segment in `deleting`, refuse with the claim conflict (see `claimed_segment(&err)`).
 5. Reconcile segment tombstones. A dropped segment gets one stamped now; a segment that is referenced again loses its tombstone.
-6. Make sure every added segment is present.
+6. Make sure every added segment is present, then run the segments durability barrier (`StoreExt::sync_segments`, ADR 034).
    - A **staged** segment is uploaded on every attempt, unconditionally. It is content-addressed, so the write is idempotent, and not trusting `exists` removes any read-after-delete assumption on S3-compatible stores.
    - An **unstaged** (pre-uploaded) segment must `exist`. That check does rely on read-after-delete consistency, which S3, GCS, Azure and local disks provide.
    - Otherwise fail before touching the manifest. A manifest that references a missing segment is never published.
+   - Once every added segment is present, `StoreExt::sync_segments(root)` flushes `<root>/segments/` once on the local backend before `manifest.json` is CASed.
 7. CAS the manifest: `put_if_absent` for the first commit, `put_if_version(base_version)` after that.
 8. If the CAS reports **any** error, re-read the manifest once:
    - If it carries this attempt's `commit_nonce`, the write landed and only the response was lost: a retried request answered 412, a timeout after the write, a failed fsync after the rename. Return success without re-applying `f`. An applied write is never reported as failed, which apply-then-attest depends on.

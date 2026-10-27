@@ -382,6 +382,26 @@ struct Scratch {
     filter: Vec<u8>,
 }
 
+impl Scratch {
+    /// Drops capacity beyond a single row's working size at the end of a
+    /// pass so a wide row does not pin buffers across passes.
+    fn trim(&mut self) {
+        const CAP: usize = 4_096;
+        for buf in [
+            &mut self.key,
+            &mut self.row,
+            &mut self.decimal,
+            &mut self.group,
+            &mut self.filter,
+        ] {
+            buf.clear();
+            if buf.capacity() > CAP {
+                buf.shrink_to(CAP);
+            }
+        }
+    }
+}
+
 impl Reconciler {
     /// Validates `spec` (everything that does not need a schema) and builds
     /// a reconciler.
@@ -1296,21 +1316,24 @@ fn attempt(
         }
         _ => None,
     };
+    let mut pass = PassState {
+        keys: MeteredMap::new(),
+        unsampled: MeteredMap::new(),
+    };
     let mut part = Part { of, lo: 0, hi: 1 };
     let mut made = 0;
     while part.lo < of {
         a.grouped = part.hi - part.lo > 1;
-        let mut pass = PassState {
-            keys: MeteredMap::new(),
-            unsampled: MeteredMap::new(),
-        };
         let outcome = run_pass(prep, part, &mut pass, a, &mut scratch);
+        scratch.trim();
         let seen = pass.keys.len() as u64;
         let unsampled = pass.unsampled.len() as u64;
         let classified = outcome.and_then(|()| classify(prep, &pass.keys, a));
-        pass.keys.free(&mut a.meter);
-        pass.unsampled.free(&mut a.meter);
-        classified?;
+        if let Err(abort) = classified {
+            pass.keys.free(&mut a.meter);
+            pass.unsampled.free(&mut a.meter);
+            return Err(abort);
+        }
         a.seen += seen;
         a.unsampled += unsampled;
         made += 1;
@@ -1323,7 +1346,13 @@ fn attempt(
         };
         part.lo = part.hi;
         part.hi = part.hi.saturating_add(per).min(of);
+        if part.lo < of {
+            pass.keys.clear(&mut a.meter);
+            pass.unsampled.clear(&mut a.meter);
+        }
     }
+    pass.keys.free(&mut a.meter);
+    pass.unsampled.free(&mut a.meter);
     Ok(made)
 }
 
