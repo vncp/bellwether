@@ -173,6 +173,7 @@ fn hypothetical_specs_never_report_fewer_row_groups_than_the_oracle() {
             columns: cols(&["entity_id"]),
             ts_column: "version_ts".into(),
             counts: false,
+            tombstone: None,
         },
     ];
     for run in workload.runs() {

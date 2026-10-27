@@ -22,6 +22,9 @@
 //! - [`join`]: join keys (B3), the keys two datasets share on one column
 //!   pair: the pair build from both sides' exact segments, `semijoin`, and
 //!   `overlap_stats`.
+//! - [`tombstone`]: tombstones on temporal and bitemporal keys (B8): the
+//!   `keyed_tombstone` liveness entries, the row test, and the pruning
+//!   rule of `latest`/`asof` with `live`.
 //!
 //! Invariants owned here: 1 (no false negatives in pruning,
 //! `tests/no_false_negatives.rs`) and 5 (stale-version rejection,
@@ -46,6 +49,7 @@ pub mod sidecar;
 pub mod sketch;
 pub mod temporal;
 pub mod text;
+pub mod tombstone;
 
 pub use merge::{count_live_keys, merge};
 pub use segment::{EncodedSegment, SegmentReader, SegmentWriter, WriterOptions};

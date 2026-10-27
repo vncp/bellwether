@@ -165,6 +165,7 @@ fn guard_every_spec_kind_reads_only_the_plan_and_equals_the_scan() {
             columns: vec!["id".into()],
             ts_column: "ts".into(),
             counts: false,
+            tombstone: None,
         },
         KeySpec::Exact {
             columns: vec!["id".into(), "status".into()],

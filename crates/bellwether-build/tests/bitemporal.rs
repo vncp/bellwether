@@ -51,6 +51,7 @@ fn spec() -> KeySpec {
         columns: cols(&["id"]),
         valid_column: "valid".into(),
         known_column: "known".into(),
+        tombstone: None,
     }
 }
 

@@ -90,6 +90,7 @@ fn bench_build(c: &mut Criterion) {
             columns: vec!["id".into()],
             ts_column: "ts".into(),
             counts: false,
+            tombstone: None,
         },
         KeySpec::Bloom {
             columns: vec!["grp".into()],

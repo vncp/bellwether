@@ -47,7 +47,9 @@ pub use config::{
     BuildObserver, BuildOptions, CompactOptions, SourceKind, DEFAULT_MAX_RESTARTS,
     DEFAULT_MAX_SEGMENT_BYTES, DEFAULT_MAX_SEGMENT_KEYS, DEFAULT_MAX_SEGMENT_ROW_GROUPS,
 };
-pub use coverage::{completeness, sidecar_completeness, sketch_completeness};
+pub use coverage::{
+    completeness, sidecar_completeness, sketch_completeness, tombstone_completeness,
+};
 pub use join::{
     join_side_spec, transient_pair, JoinRefresh, JoinState, PairBuild, RightManifest, SemiJoinPlan,
     DEFAULT_PAIR_CAPS,
@@ -55,7 +57,7 @@ pub use join::{
 pub use keys::encode_ts;
 pub use plan::{
     default_window_column, overlapping_counts, partition_columns, several_bitemporal_keys,
-    KeyCount, Lookup, PlanOrder, Planner, TransientSpec,
+    KeyCount, LiveOutcome, Lookup, PlanOrder, Planner, TransientSpec,
 };
-pub use target::{declared_sketches, TimedSource};
+pub use target::{declared_key_specs, declared_sketches, tombstone_name, TimedSource};
 pub use verify::Drift;

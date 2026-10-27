@@ -154,7 +154,14 @@ impl<S: StoreExt + ?Sized + Send + Sync> SidePlanner for IndexPlanner<S> {
         keys: &[Vec<u8>],
     ) -> bellwether_types::Result<ScanPlan> {
         self.planner.plan(
-            self.planner.declared_specs(),
+            // A point lookup reads no tombstone (B8): every spec plans as
+            // the spec without one.
+            &self
+                .planner
+                .declared_specs()
+                .iter()
+                .map(bellwether_types::KeySpec::without_tombstone)
+                .collect::<Vec<_>>(),
             &Lookup::Keys {
                 columns: columns.to_vec(),
                 keys: keys.to_vec(),

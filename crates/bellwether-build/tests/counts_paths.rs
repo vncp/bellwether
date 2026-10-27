@@ -658,6 +658,7 @@ fn a_spec_column_with_an_identity_separator_is_refused_when_declared() {
                 columns: cols(&["a"]),
                 ts_column: "t@s".into(),
                 counts: false,
+                tombstone: None,
             },
             "t@s",
         ),

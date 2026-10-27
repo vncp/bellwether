@@ -124,6 +124,7 @@ pub fn temporal() -> KeySpec {
         columns: vec!["id".into(), "tag".into()],
         ts_column: "ts".into(),
         counts: false,
+        tombstone: None,
     }
 }
 

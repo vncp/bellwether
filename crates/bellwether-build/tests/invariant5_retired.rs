@@ -77,6 +77,7 @@ fn temporal() -> KeySpec {
         columns: vec!["id".into()],
         ts_column: "ts".into(),
         counts: false,
+        tombstone: None,
     }
 }
 
@@ -305,6 +306,7 @@ fn a_retired_zero_variant_does_not_bound_the_other_zero() {
         columns: vec!["k".into()],
         ts_column: "ts".into(),
         counts: false,
+        tombstone: None,
     };
     let o = BuildOptions {
         schema: Some(Arc::clone(&fschema)),

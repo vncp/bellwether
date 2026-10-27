@@ -225,6 +225,7 @@ pub fn temporal(cols: &[&str], ts: &str) -> KeySpec {
         columns: cols.iter().map(|c| (*c).to_string()).collect(),
         ts_column: ts.into(),
         counts: false,
+        tombstone: None,
     }
 }
 

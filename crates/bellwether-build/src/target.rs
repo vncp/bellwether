@@ -34,14 +34,16 @@
 use std::collections::BTreeMap;
 
 use bellwether_core::sidecar::{SidecarDef, SidecarKind};
+use bellwether_core::tombstone::TOMBSTONE_KIND;
 use bellwether_store::{Extra, Manifest, SegmentRef, SidecarDecl, KNOWN_SEGMENT_KINDS};
-use bellwether_types::{KeySpec, SketchSpec, SKETCH_DEFAULT_PRECISION};
+use bellwether_types::{KeySpec, SketchSpec, Tombstone, SKETCH_DEFAULT_PRECISION};
 
 /// A key spec or a sidecar: one thing a build indexes, with its own
 /// segments and completeness.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Target {
-    /// A key spec (`segments[].kind` absent).
+    /// A key spec (`segments[].kind` absent). Never one with a tombstone:
+    /// the spec without it ([`targets_of`]).
     Key(KeySpec),
     /// The `bounds` segments of a bloom spec with per-key bounds
     /// (`segments[].kind` = `bounds`, `key_spec` = the bloom's identity).
@@ -51,6 +53,10 @@ pub(crate) enum Target {
     Sidecar(SidecarDef),
     /// A sketch (`segments[].kind` = `sketch`). Never planned with.
     Sketch(SketchSpec),
+    /// The tombstone sidecar (B8) of a temporal or bitemporal spec with a
+    /// tombstone, the spec held whole (`segments[].kind` = `tombstone`,
+    /// `key_spec` = [`tombstone_name`]).
+    Tombstone(KeySpec),
 }
 
 impl Target {
@@ -61,6 +67,7 @@ impl Target {
             Self::Key(k) | Self::BloomBounds(k) => k.identity(),
             Self::Sidecar(d) => d.name(),
             Self::Sketch(s) => s.name(),
+            Self::Tombstone(k) => tombstone_name(k),
         }
     }
 
@@ -73,6 +80,7 @@ impl Target {
             Self::BloomBounds(k) => format!("bounds:{}", k.name()),
             Self::Sidecar(d) => d.name(),
             Self::Sketch(s) => s.name(),
+            Self::Tombstone(k) => format!("{TOMBSTONE_KIND}:{}", k.name()),
         }
     }
 
@@ -83,13 +91,14 @@ impl Target {
             Self::BloomBounds(_) => Some(SidecarKind::Bounds.as_str()),
             Self::Sidecar(d) => Some(d.kind.as_str()),
             Self::Sketch(_) => Some(SKETCH_KIND),
+            Self::Tombstone(_) => Some(TOMBSTONE_KIND),
         }
     }
 
     /// Every column whose type a segment records: key columns, then the
     /// temporal timestamp or the sidecar's time columns; for an `expr` key,
     /// the dataset columns its expression reads (the virtual column's type
-    /// follows from theirs).
+    /// follows from theirs); for a tombstone, also the tombstone column.
     pub(crate) fn typed_columns(&self) -> Vec<String> {
         match self {
             Self::Key(KeySpec::Temporal {
@@ -112,6 +121,11 @@ impl Target {
                 .unwrap_or_default(),
             Self::Sidecar(d) => d.columns.iter().chain(&d.time_columns).cloned().collect(),
             Self::Sketch(s) => sketch_columns(s),
+            Self::Tombstone(k) => {
+                let mut c = Self::Key(k.without_tombstone()).typed_columns();
+                c.extend(k.tombstone().map(|t| t.column.clone()));
+                c
+            }
         }
     }
 }
@@ -134,14 +148,109 @@ pub(crate) fn bloom_bounds_def(spec: &KeySpec) -> Option<SidecarDef> {
     }
 }
 
-/// The targets a key spec's segments are: the spec, and, for a bloom with
-/// per-key bounds, its `bounds` segments.
+/// The targets a key spec's segments are: the spec (without its tombstone),
+/// for a bloom with per-key bounds its `bounds` segments, and for a spec
+/// with a tombstone its tombstone sidecar.
 pub(crate) fn targets_of(spec: &KeySpec) -> Vec<Target> {
-    let mut out = vec![Target::Key(spec.clone())];
+    let mut out = vec![Target::Key(spec.without_tombstone())];
     if bloom_bounds_def(spec).is_some() {
         out.push(Target::BloomBounds(spec.clone()));
     }
+    if spec.tombstone().is_some() {
+        out.push(Target::Tombstone(spec.clone()));
+    }
     out
+}
+
+/// The time columns of a temporal (`[ts]`) or bitemporal (`[valid,
+/// known]`) spec; empty for any other.
+fn clock_columns(spec: &KeySpec) -> Vec<String> {
+    match spec {
+        KeySpec::Temporal { ts_column, .. } => vec![ts_column.clone()],
+        KeySpec::Bitemporal {
+            valid_column,
+            known_column,
+            ..
+        } => vec![valid_column.clone(), known_column.clone()],
+        _ => Vec::new(),
+    }
+}
+
+/// The name a tombstone sidecar is declared, listed, and complete under:
+/// `tombstone:<key columns>@<time columns>` (`tombstone:id@ts`,
+/// `tombstone:id@valid,known`), the shape of every sidecar's name
+/// (`SidecarDecl::name`). One per key spec: a key's slot holds one temporal
+/// and one bitemporal spec, whose names differ by their time columns.
+#[must_use]
+pub fn tombstone_name(spec: &KeySpec) -> String {
+    tombstone_decl(spec).name()
+}
+
+/// The manifest declaration of `spec`'s tombstone sidecar: the key
+/// columns, the time columns, and `params` `column` and, for the value
+/// form, `value`.
+pub(crate) fn tombstone_decl(spec: &KeySpec) -> SidecarDecl {
+    let mut params = BTreeMap::new();
+    if let Some(t) = spec.tombstone() {
+        params.insert("column".to_string(), t.column.clone());
+        if let Some(v) = &t.value {
+            params.insert("value".to_string(), v.clone());
+        }
+    }
+    SidecarDecl {
+        kind: TOMBSTONE_KIND.to_string(),
+        columns: spec.columns().to_vec(),
+        time_columns: clock_columns(spec),
+        params,
+        extra: Extra::new(),
+    }
+}
+
+/// The tombstone a declaration names, when it is a well-formed tombstone
+/// declaration (`params` exactly `column` and an optional `value`).
+fn tombstone_param(decl: &SidecarDecl) -> Option<Tombstone> {
+    if decl.kind != TOMBSTONE_KIND || decl.params.keys().any(|k| k != "column" && k != "value") {
+        return None;
+    }
+    Some(Tombstone {
+        column: decl.params.get("column")?.clone(),
+        value: decl.params.get("value").cloned(),
+    })
+}
+
+/// The spec with a tombstone a declaration names: the temporal or
+/// bitemporal spec of `specs` on its key and time columns, with the
+/// tombstone. `None` for a declaration of another kind, a malformed one,
+/// or one whose spec `specs` does not hold.
+pub(crate) fn tombstone_of(decl: &SidecarDecl, specs: &[KeySpec]) -> Option<KeySpec> {
+    let t = tombstone_param(decl)?;
+    specs
+        .iter()
+        .find(|s| {
+            matches!(s, KeySpec::Temporal { .. } | KeySpec::Bitemporal { .. })
+                && s.tombstone().is_none()
+                && s.columns() == decl.columns.as_slice()
+                && clock_columns(s) == decl.time_columns
+        })
+        .and_then(|s| s.with_tombstone(t))
+}
+
+/// The key specs `m` declares, each temporal or bitemporal spec with the
+/// tombstone its `tombstone` sidecar declares (B8): the specs as declared,
+/// where `schema.key_specs` holds each without its tombstone.
+#[must_use]
+pub fn declared_key_specs(m: &Manifest) -> Vec<KeySpec> {
+    m.schema
+        .key_specs
+        .iter()
+        .map(|s| {
+            m.schema
+                .sidecars
+                .iter()
+                .find_map(|d| tombstone_of(d, std::slice::from_ref(s)))
+                .unwrap_or_else(|| s.clone())
+        })
+        .collect()
 }
 
 /// Where a planner reads per-key time bounds or bitemporal versions
@@ -187,6 +296,7 @@ pub(crate) fn timed_sources(m: &Manifest) -> Vec<(SidecarDef, TimedSource)> {
                 columns,
                 valid_column,
                 known_column,
+                ..
             } => SidecarDef {
                 kind: SidecarKind::Bitemporal,
                 columns: columns.clone(),
@@ -250,9 +360,10 @@ pub(crate) fn fold_legacy(specs: &[KeySpec], sidecars: &[SidecarDef]) -> Fold {
                         columns: def.columns.clone(),
                         valid_column: valid.clone(),
                         known_column: known.clone(),
+                        tombstone: None,
                     };
                     match out.specs.iter().find(|s| s.name() == spec.name()) {
-                        Some(s) if *s == spec => Some(spec.identity()),
+                        Some(s) if s.without_tombstone() == spec => Some(spec.identity()),
                         Some(_) => None,
                         None => {
                             out.specs.push(spec.clone());
@@ -400,10 +511,12 @@ pub fn declared_sketches(m: &Manifest) -> Vec<SketchSpec> {
     m.schema.sidecars.iter().filter_map(sketch_of).collect()
 }
 
-/// Whether this binary uses `decl` (a known sidecar or a sketch); others are
-/// kept unchanged.
+/// Whether this binary uses `decl` (a known sidecar, a sketch, or a
+/// tombstone, B8); others are kept unchanged. A build writes every
+/// tombstone declaration again from the specs it declares, so one whose
+/// spec is no longer declared goes with the spec.
 pub(crate) fn known_decl(decl: &SidecarDecl) -> bool {
-    def_of(decl).is_some() || sketch_of(decl).is_some()
+    def_of(decl).is_some() || sketch_of(decl).is_some() || decl.kind == TOMBSTONE_KIND
 }
 
 /// The sidecar a declaration names, or `None` for a kind this binary does
@@ -428,8 +541,7 @@ pub(crate) fn declared_sidecars(m: &Manifest) -> Vec<SidecarDef> {
 /// its segment and its completeness while the left's row groups stay
 /// covered ([`declared_joins`]).
 pub(crate) fn declared_targets(m: &Manifest) -> Vec<Target> {
-    m.schema
-        .key_specs
+    declared_key_specs(m)
         .iter()
         .filter(|s| !matches!(s, KeySpec::Join { .. }))
         .flat_map(targets_of)

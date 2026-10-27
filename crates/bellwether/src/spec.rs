@@ -241,6 +241,7 @@ fn parse_short(s: &str) -> Result<KeySpec> {
                 columns: columns(s, cols)?,
                 valid_column: valid.clone(),
                 known_column: known.clone(),
+                tombstone: None,
             }),
             _ => Err(bad(
                 s,

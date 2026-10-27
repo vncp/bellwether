@@ -236,8 +236,11 @@ impl SidecarDecl {
 }
 
 /// Segment kinds this build understands in [`SegmentRef::kind`] and
-/// [`SidecarDecl::kind`].
-pub const KNOWN_SEGMENT_KINDS: [&str; 3] = ["bounds", "temporal2", "sketch"];
+/// [`SidecarDecl::kind`]. `tombstone` (B8) is the tombstone sidecar of a
+/// temporal or bitemporal key: a binary built before it treats it as any
+/// unknown kind (keeps it, never plans with it), which is what makes the
+/// tombstone parameter additive to storage version 2.
+pub const KNOWN_SEGMENT_KINDS: [&str; 4] = ["bounds", "temporal2", "sketch", "tombstone"];
 
 /// Dataset schema, declared key specs, and declared sidecars.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -1072,12 +1075,14 @@ mod tests {
                 columns: vec!["a".into()],
                 valid_column: "v".into(),
                 known_column: "k".into(),
+                tombstone: None,
             },
             KeySpec::Range { column: "a".into() },
             KeySpec::Temporal {
                 columns: vec!["a".into()],
                 ts_column: "t".into(),
                 counts: true,
+                tombstone: None,
             },
             KeySpec::Expr {
                 name: "k".into(),
@@ -1140,6 +1145,29 @@ mod tests {
         for kind in ["exact", "temporal"] {
             assert!(!key_spec_fields(kind, 1).unwrap().contains(&"counts"));
         }
+        // A tombstone (B8) is never a field of a manifest's key spec: the
+        // manifest declares the spec without it and the tombstone as a
+        // `tombstone` sidecar, so a reader without tombstones reads the
+        // spec as before. A key spec carrying one is refused.
+        let with = KeySpec::Temporal {
+            columns: vec!["a".into()],
+            ts_column: "t".into(),
+            counts: false,
+            tombstone: Some(bellwether_types::Tombstone {
+                column: "void".into(),
+                value: None,
+            }),
+        };
+        let v = serde_json::to_value(&with).unwrap();
+        assert!(v.get("tombstone").is_some());
+        for kind in ["temporal", "bitemporal"] {
+            assert!(!key_spec_fields(kind, 2).unwrap().contains(&"tombstone"));
+        }
+        expect_unsupported_shape(
+            r#"{"storage_version": 2, "created_at": "x",
+                "schema": {"key_specs": [{"kind": "temporal", "columns": ["a"], "ts_column": "t",
+                  "tombstone": {"column": "void"}}]}}"#,
+        );
 
         let fp = FileFingerprint {
             path: "a".into(),

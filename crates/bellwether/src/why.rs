@@ -2377,6 +2377,7 @@ impl Engine {
                         columns: cols.clone(),
                         ts_column: t.ts_column.clone(),
                         counts: false,
+                        tombstone: None,
                     };
                     if !current_names.contains(&label(&tspec))
                         && !names.contains(&label(&tspec))
@@ -3132,11 +3133,13 @@ impl ResolvedTemporal {
                 columns: columns.to_vec(),
                 valid_column: b.valid_column.clone(),
                 known_column: b.known_column.clone(),
+                tombstone: None,
             },
             None => KeySpec::Temporal {
                 columns: columns.to_vec(),
                 ts_column: self.ts_column.clone(),
                 counts: false,
+                tombstone: None,
             },
         }
     }

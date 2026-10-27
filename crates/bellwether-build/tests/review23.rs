@@ -372,11 +372,13 @@ fn probe_identity_is_injective() {
         columns: cols(&["id"]),
         ts_column: "ts".into(),
         counts: true,
+        tombstone: None,
     };
     let t2 = KeySpec::Temporal {
         columns: cols(&["id"]),
         ts_column: "ts,counts".into(),
         counts: false,
+        tombstone: None,
     };
     let c1 = ex(&["a", "b"], false);
     let c2 = ex(&["a,b"], false);

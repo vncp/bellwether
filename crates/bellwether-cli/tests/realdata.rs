@@ -1175,6 +1175,7 @@ fn request_3_why_mode_prices_latest_and_asof_lookback_windows() {
         columns: vec!["pu".into()],
         ts_column: "pickup_ts".into(),
         counts: false,
+        tombstone: None,
     };
     let floor = |r: &WhyReport| {
         r.candidates

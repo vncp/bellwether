@@ -80,6 +80,7 @@ fn bitemporal() -> KeySpec {
         columns: vec!["symbol".into()],
         valid_column: "valid".into(),
         known_column: "known".into(),
+        tombstone: None,
     }
 }
 

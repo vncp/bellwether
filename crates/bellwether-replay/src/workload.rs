@@ -59,7 +59,7 @@ use arrow::record_batch::RecordBatchReader;
 use bellwether_core::segment::ColumnType;
 use bellwether_store::{Cache, StoreExt};
 use bellwether_types::format::ENCODING_VERSION;
-use bellwether_types::{Error, Hash, Result, TextOp};
+use bellwether_types::{Error, Hash, Result, TextOp, Tombstone};
 use bytes::Bytes;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use serde::{Deserialize, Serialize};
@@ -128,6 +128,9 @@ pub struct RunBitemporal {
     /// The known-time bound, inclusive.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub known: Option<i64>,
+    /// With a tombstone (B8), only live rows of the winning version answer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tombstone: Option<Tombstone>,
 }
 /// The query kind of a recorded run that semi-joins its keys with a right
 /// dataset (`semijoin`: `in (subquery)`, `exists`, a semi-join; B3): its
@@ -218,6 +221,21 @@ pub enum RunQuery {
     /// dataset then the right. Only a join key on the pair answers it
     /// alone; otherwise each side is planned by its own keys.
     SemiJoin(RunJoin),
+    /// A `latest` or `asof` run that keeps only live rows (B8): each key's
+    /// newest version at or before `asof`, of which the rows that are not
+    /// tombstones ([`RecordedRun::tombstone`]). Only a temporal key plans
+    /// it; one with exactly this tombstone also prunes by it.
+    Live(RunLive),
+}
+
+/// A `latest` (`asof: None`) or `asof` run with a tombstone (B8).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RunLive {
+    /// The instant, in the timestamp column's dataset unit; `None` for
+    /// `latest`.
+    pub asof: Option<i64>,
+    /// The tombstone whose rows the run drops.
+    pub tombstone: Tombstone,
 }
 
 impl RunQuery {
@@ -227,8 +245,12 @@ impl RunQuery {
     pub fn kind_str(&self) -> &'static str {
         match self {
             Self::Locate => QUERY_KIND_LOCATE,
-            Self::Latest | Self::Lookback { asof: None, .. } => QUERY_KIND_LATEST,
-            Self::Asof { .. } | Self::Lookback { asof: Some(_), .. } => QUERY_KIND_ASOF,
+            Self::Latest
+            | Self::Lookback { asof: None, .. }
+            | Self::Live(RunLive { asof: None, .. }) => QUERY_KIND_LATEST,
+            Self::Asof { .. }
+            | Self::Lookback { asof: Some(_), .. }
+            | Self::Live(RunLive { asof: Some(_), .. }) => QUERY_KIND_ASOF,
             Self::Window(_) => QUERY_KIND_WINDOW,
             Self::Count => QUERY_KIND_COUNT,
             Self::Text(TextOp::HasToken) => QUERY_KIND_HAS_TOKEN,
@@ -248,6 +270,7 @@ impl RunQuery {
         match self {
             Self::Asof { ts } => Some(*ts),
             Self::Lookback { asof, .. } => *asof,
+            Self::Live(l) => l.asof,
             Self::Locate
             | Self::Latest
             | Self::Window(_)
@@ -274,7 +297,8 @@ impl RunQuery {
             | Self::ContainsAny
             | Self::ContainsAll
             | Self::Bitemporal(_)
-            | Self::SemiJoin(_) => None,
+            | Self::SemiJoin(_)
+            | Self::Live(_) => None,
         }
     }
 
@@ -312,8 +336,23 @@ impl RunQuery {
     pub fn is_temporal(&self) -> bool {
         matches!(
             self,
-            Self::Latest | Self::Asof { .. } | Self::Lookback { .. } | Self::Bitemporal(_)
+            Self::Latest
+                | Self::Asof { .. }
+                | Self::Lookback { .. }
+                | Self::Bitemporal(_)
+                | Self::Live(_)
         )
+    }
+
+    /// The tombstone of a run that keeps only live rows (B8): a
+    /// [`RunQuery::Live`] run's, or a bitemporal run's.
+    #[must_use]
+    pub fn tombstone(&self) -> Option<&Tombstone> {
+        match self {
+            Self::Live(l) => Some(&l.tombstone),
+            Self::Bitemporal(b) => b.tombstone.as_ref(),
+            _ => None,
+        }
     }
 
     /// Whether this asks which rows' list column holds the run's values
@@ -377,9 +416,14 @@ pub struct RecordedRun {
     pub bitemporal: Option<RunBitemporal>,
     /// The right side of a semi-join run ([`QUERY_KIND_SEMIJOIN`]; B3);
     /// absent (and not serialized, so every other run hashes as before)
-    /// otherwise.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub join: Option<RunJoin>,
+    /// For a `latest` or `asof` run (B8): the run keeps only live rows of
+    /// each key's newest version, `latest`/`asof` followed by `where not
+    /// <column>` (or `<column> <> value`). Absent (and not serialized, so
+    /// every other run hashes as before) otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tombstone: Option<Tombstone>,
 }
 
 impl RecordedRun {
@@ -390,7 +434,8 @@ impl RecordedRun {
         if self.query_kind == QUERY_KIND_BITEMPORAL {
             return match (&self.bitemporal, &self.window, self.asof, self.lookback) {
                 (Some(b), None, None, None)
-                    if !b.valid_column.is_empty()
+                    if self.tombstone.is_none()
+                        && !b.valid_column.is_empty()
                         && !b.known_column.is_empty()
                         && b.valid_column != b.known_column =>
                 {
@@ -398,7 +443,8 @@ impl RecordedRun {
                 }
                 _ => Err(Error::Other(format!(
                     "run {:?} is a bitemporal run; it records its two distinct clock columns \
-                     and no window, asof or lookback",
+                     (and any tombstone with them) and no window, asof, lookback, or run \
+                     tombstone",
                     self.run_id
                 ))),
             };
@@ -407,6 +453,18 @@ impl RecordedRun {
             return Err(Error::Other(format!(
                 "run {:?} has query_kind {:?} but records bitemporal clocks; only a bitemporal \
                  run records them",
+                self.run_id, self.query_kind
+            )));
+        }
+        if self.tombstone.is_some()
+            && !matches!(
+                self.query_kind.as_str(),
+                QUERY_KIND_LATEST | QUERY_KIND_ASOF
+            )
+        {
+            return Err(Error::Other(format!(
+                "run {:?} is a {} run and records a tombstone, which applies to latest and asof \
+                 runs",
                 self.run_id, self.query_kind
             )));
         }
@@ -514,22 +572,44 @@ impl RecordedRun {
                 })
             }
         };
-        match (point, self.lookback) {
-            (q, None) => Ok(q),
-            (q @ (RunQuery::Locate | RunQuery::Count), Some(_)) => Err(Error::Other(format!(
-                "run {:?} has query_kind {:?} but sets a lookback; a lookback window applies \
-                 to latest and asof runs",
+        let q = match (point, self.lookback) {
+            (q, None) => q,
+            (q @ (RunQuery::Locate | RunQuery::Count), Some(_)) => {
+                return Err(Error::Other(format!(
+                    "run {:?} has query_kind {:?} but sets a lookback; a lookback window applies \
+                     to latest and asof runs",
+                    self.run_id,
+                    q.kind_str()
+                )))
+            }
+            (_, Some(l)) if l < 0 => {
+                return Err(Error::Other(format!(
+                    "run {:?} has a negative lookback {l}",
+                    self.run_id
+                )))
+            }
+            (q, Some(lookback)) => RunQuery::Lookback {
+                asof: q.asof_ts(),
+                lookback,
+            },
+        };
+        // A tombstone (B8): a latest or asof run that keeps only live rows.
+        match (&self.tombstone, q) {
+            (None, q) => Ok(q),
+            (Some(t), RunQuery::Latest) => Ok(RunQuery::Live(RunLive {
+                asof: None,
+                tombstone: t.clone(),
+            })),
+            (Some(t), RunQuery::Asof { ts }) => Ok(RunQuery::Live(RunLive {
+                asof: Some(ts),
+                tombstone: t.clone(),
+            })),
+            (Some(_), q) => Err(Error::Other(format!(
+                "run {:?} records a tombstone, which applies to latest and asof runs without a \
+                 lookback, and it is a {} run",
                 self.run_id,
                 q.kind_str()
             ))),
-            (_, Some(l)) if l < 0 => Err(Error::Other(format!(
-                "run {:?} has a negative lookback {l}",
-                self.run_id
-            ))),
-            (q, Some(lookback)) => Ok(RunQuery::Lookback {
-                asof: q.asof_ts(),
-                lookback,
-            }),
         }
     }
 }
@@ -1039,6 +1119,10 @@ impl<'a> WorkloadRecorder<'a> {
                 window: query.window().cloned(),
                 bitemporal: query.bitemporal().cloned(),
                 join: query.join().cloned(),
+                tombstone: match query {
+                    RunQuery::Live(l) => Some(l.tombstone.clone()),
+                    _ => None,
+                },
             },
             payload,
         })

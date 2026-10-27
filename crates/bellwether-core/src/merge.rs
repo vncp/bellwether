@@ -93,7 +93,11 @@ fn merged_header<R: ReadAt>(inputs: &[SegmentReader<R>]) -> Result<SegmentHeader
                 "cannot merge segments whose filters hash different inputs".into(),
             ));
         }
-        if h.key_types != h0.key_types || h.ts_type != h0.ts_type || h.time_types != h0.time_types {
+        if h.key_types != h0.key_types
+            || h.ts_type != h0.ts_type
+            || h.time_types != h0.time_types
+            || h.tombstone_type != h0.tombstone_type
+        {
             return Err(Error::KeySpec(format!(
                 "cannot merge segments whose recorded types differ: {} and {}",
                 crate::segment::types(
@@ -118,6 +122,7 @@ fn merged_header<R: ReadAt>(inputs: &[SegmentReader<R>]) -> Result<SegmentHeader
     header.key_types.clone_from(&h0.key_types);
     header.ts_type.clone_from(&h0.ts_type);
     header.time_types.clone_from(&h0.time_types);
+    header.tombstone_type.clone_from(&h0.tombstone_type);
     header.extra.clone_from(&h0.extra);
     Ok(header)
 }
@@ -290,6 +295,29 @@ fn fold(value: &mut KeyValue, other: KeyValue, key: &[u8]) -> Result<()> {
         value.triples.sort_unstable();
         value.triples.dedup();
     }
+    let liveness = match (value.liveness.take(), other.liveness) {
+        (None, None) => None,
+        (Some(a), Some(b)) => {
+            let mut per_rg: std::collections::BTreeMap<u32, crate::tombstone::Liveness> =
+                value.bitmap.iter().zip(a).collect();
+            for (rg, e) in other.bitmap.iter().zip(b) {
+                if per_rg.insert(rg, e).is_some() {
+                    return Err(Error::Other(format!(
+                        "cannot merge tombstone segments that both hold key {} in row group \
+                         {rg}: segments of one spec cover disjoint row groups",
+                        hex(key)
+                    )));
+                }
+            }
+            Some(per_rg.into_values().collect())
+        }
+        _ => {
+            return Err(Error::Other(
+                "cannot merge a value with liveness entries with one without".into(),
+            ))
+        }
+    };
+    value.liveness = liveness;
     let counts = match (value.counts.take(), other.counts) {
         (None, None) => None,
         (Some(a), Some(b)) => {

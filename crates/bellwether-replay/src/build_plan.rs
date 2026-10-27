@@ -50,11 +50,26 @@ fn lookup(keys: &RunKeys, query: &RunQuery) -> Result<Lookup> {
         RunQuery::Latest => Lookup::Latest {
             columns,
             keys: tuples,
+            live: None,
         },
         RunQuery::Asof { ts } => Lookup::AsOf {
             columns,
             keys: tuples,
             ts: *ts,
+            live: None,
+        },
+        RunQuery::Live(l) => match l.asof {
+            None => Lookup::Latest {
+                columns,
+                keys: tuples,
+                live: Some(l.tombstone.clone()),
+            },
+            Some(ts) => Lookup::AsOf {
+                columns,
+                keys: tuples,
+                ts,
+                live: Some(l.tombstone.clone()),
+            },
         },
         RunQuery::Lookback { lookback, .. } => Lookup::Lookback {
             columns,
@@ -84,6 +99,7 @@ fn lookup(keys: &RunKeys, query: &RunQuery) -> Result<Lookup> {
             keys: tuples,
             valid: b.valid,
             known: b.known,
+            live: b.tombstone.clone(),
         },
         RunQuery::SemiJoin(_) => {
             return Err(Error::Other(
@@ -151,6 +167,7 @@ where
             spec: t.spec().clone(),
             segments: t.segment_bytes(),
             bounds: t.bounds_bytes().to_vec(),
+            tombstones: t.tombstone_bytes().to_vec(),
         });
     }
     Ok(out)

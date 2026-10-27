@@ -233,6 +233,10 @@ pub struct KeyValue {
     /// `(valid, known, row group)` triples, strictly ascending; `bitmap` is
     /// exactly their row groups. Empty for every other spec.
     pub triples: Vec<(i64, i64, u32)>,
+    /// For a tombstone segment (B8), one liveness entry per row group of
+    /// `bitmap`, in ascending row group order. `None` for every other
+    /// segment.
+    pub liveness: Option<Vec<crate::tombstone::Liveness>>,
 }
 
 impl KeyValue {
@@ -302,11 +306,24 @@ impl KeyValue {
         } else if !self.triples.is_empty() {
             return bad("bitemporal versions on a spec that is not bitemporal");
         }
+        match (&self.liveness, shape.clocks) {
+            (None, 0) => {}
+            (Some(l), c) if c > 0 && l.len() as u64 == n => {
+                for e in l {
+                    e.check()?;
+                    if c == 1 && (e.newest.1 != 0 || e.live.is_some_and(|t| t.1 != 0)) {
+                        return bad("a temporal key's liveness entry has a second clock");
+                    }
+                }
+            }
+            _ => return bad("a tombstone segment's key needs one liveness entry per row group"),
+        }
         Ok(())
     }
 
     /// The storage version 2 value record: `bitmap_len u32 | bitmap |
-    /// [counts] | [bounds] | [chain] | [triples]` (`docs/format.md`).
+    /// [counts] | [bounds] | [chain] | [triples] | [liveness]`
+    /// (`docs/format.md`).
     pub(crate) fn encode(&self, shape: ValueShape, out: &mut Vec<u8>) -> Result<()> {
         self.check(shape)?;
         let mut bm = Vec::with_capacity(self.bitmap.serialized_size());
@@ -332,6 +349,9 @@ impl KeyValue {
                 out.put_u32(rg);
             }
         }
+        for e in self.liveness.iter().flatten() {
+            e.write(shape.clocks, out);
+        }
         Ok(())
     }
 
@@ -346,8 +366,9 @@ impl KeyValue {
     /// max i64` per row group (min <= max, or the all-null sentinel), the
     /// chain, the bitemporal triples (`count u32 | count x (valid i64 |
     /// known i64 | rg u32)`, strictly ascending, exactly the bitmap's row
-    /// groups); nothing may follow. Anything else is corruption and is
-    /// refused, never decoded into a wrong answer.
+    /// groups), a tombstone segment's liveness entries (one per row group,
+    /// [`crate::tombstone::Liveness`]); nothing may follow. Anything else is
+    /// corruption and is refused, never decoded into a wrong answer.
     pub(crate) fn decode(bytes: &[u8], shape: ValueShape, storage: u32) -> Result<Self> {
         let read_bm = |b: &[u8]| -> Result<RoaringBitmap> {
             if b.get(..4) != Some(&NO_RUN_COOKIE[..]) {
@@ -432,6 +453,21 @@ impl KeyValue {
                 triples.push((valid, known, c.u32()?));
             }
         }
+        let liveness = if shape.clocks > 0 {
+            let per = 16 * usize::from(shape.clocks) + 1;
+            if n.saturating_mul(per) != c.remaining() {
+                return Err(corrupt(
+                    "tombstone liveness entries do not fill the value record",
+                ));
+            }
+            let mut v = Vec::with_capacity(n);
+            for _ in 0..n {
+                v.push(crate::tombstone::Liveness::read(&mut c, shape.clocks)?);
+            }
+            Some(v)
+        } else {
+            None
+        };
         if !c.is_done() {
             return Err(Error::Other(
                 "corrupt segment: trailing bytes after a value record".into(),
@@ -443,6 +479,7 @@ impl KeyValue {
             counts,
             bounds,
             triples,
+            liveness,
         };
         v.check(shape)?;
         Ok(v)
@@ -850,6 +887,8 @@ struct KeyAcc {
     triples: Vec<(i64, i64, u32)>,
     /// Length of `triples` after its last sort and dedup.
     compacted: usize,
+    /// Per row group, the key's liveness so far (tombstone segments only).
+    liveness: BTreeMap<u32, crate::tombstone::LiveAcc>,
 }
 
 impl KeyAcc {
@@ -906,6 +945,8 @@ struct DatasetTypes {
     recorded_times: Vec<ColumnType>,
     /// The checked expression of an `expr` key.
     expr: Option<crate::expr::Typed>,
+    /// A tombstone segment's (B8) row test and its column's recorded type.
+    tombstone: Option<(crate::tombstone::Matcher, ColumnType)>,
 }
 
 /// Builds one segment for one key spec.
@@ -982,6 +1023,34 @@ pub fn validate_spec(spec: &KeySpec) -> Result<()> {
             )));
         }
     }
+    // A tombstone (B8): a named column that is no key or time column.
+    if let Some(t) = spec.tombstone() {
+        let ts = match spec {
+            KeySpec::Temporal { ts_column, .. } => Some(ts_column),
+            _ => None,
+        };
+        if t.column.is_empty()
+            || spec.columns().contains(&t.column)
+            || times.contains(&t.column)
+            || ts == Some(&t.column)
+        {
+            return Err(Error::KeySpec(format!(
+                "{}: the tombstone column {:?} is empty or is a key or time column of the key; \
+                 name the column that marks a row as retracted",
+                spec.identity(),
+                t.column
+            )));
+        }
+        if t.value.as_deref() == Some("") {
+            return Err(Error::KeySpec(format!(
+                "{}: the tombstone names no value; write tombstone={} for a boolean column, or \
+                 tombstone={}=<value>",
+                spec.identity(),
+                t.column,
+                t.column
+            )));
+        }
+    }
     crate::join::check_spec(spec)?;
     crate::expr::check_spec(spec)
 }
@@ -1013,7 +1082,7 @@ impl SegmentWriter {
     fn in_layout(spec: KeySpec, layout: Layout, opts: WriterOptions) -> Result<Self> {
         validate_spec(&spec)?;
         let acc = match layout {
-            Layout::Keyed | Layout::KeyedTemporal | Layout::Bitemporal => {
+            Layout::Keyed | Layout::KeyedTemporal | Layout::Bitemporal | Layout::KeyedTombstone => {
                 Acc::Keyed(BTreeMap::new())
             }
             Layout::KeyedJoin => {
@@ -1066,6 +1135,13 @@ impl SegmentWriter {
             KeySpec::Expr { .. } => Some(crate::expr::typed_spec(&self.spec, schema)?),
             _ => None,
         };
+        let tombstone = if self.layout == Layout::KeyedTombstone {
+            let m = crate::tombstone::Matcher::for_spec(&self.spec, schema)?;
+            let recorded = ColumnType::of(m.declared())?;
+            Some((m, recorded))
+        } else {
+            None
+        };
         self.dataset = Some(DatasetTypes {
             keys,
             ts,
@@ -1074,6 +1150,7 @@ impl SegmentWriter {
             times,
             recorded_times,
             expr,
+            tombstone,
         });
         Ok(self)
     }
@@ -1167,6 +1244,12 @@ impl SegmentWriter {
             ));
         }
         self.check_insertable(rg)?;
+        if self.layout == Layout::KeyedTombstone {
+            return Err(Error::KeySpec(
+                "a tombstone segment records each row's time and liveness; use insert_liveness"
+                    .into(),
+            ));
+        }
         let counts = self.spec.counts();
         match &mut self.acc {
             Acc::Keyed(m) => {
@@ -1260,7 +1343,7 @@ impl SegmentWriter {
                 "insert_version on a non-temporal spec".into(),
             ));
         };
-        if !matches!(self.spec, KeySpec::Temporal { .. }) {
+        if self.layout != Layout::KeyedTemporal {
             return Err(Error::KeySpec(
                 "insert_version on a non-temporal spec".into(),
             ));
@@ -1417,6 +1500,9 @@ impl SegmentWriter {
                 .collect::<Result<Vec<_>>>()?,
         };
         let keys = KeyColumns::new(&cols, &dataset.keys)?;
+        if self.layout == Layout::KeyedTombstone {
+            return self.add_tombstone_batch(rg, batch, &keys, &dataset);
+        }
         let ts = match (&self.spec, &dataset.ts) {
             (KeySpec::Temporal { ts_column, .. }, Some(declared)) => {
                 let arr = column(ts_column)?;
@@ -1496,6 +1582,114 @@ impl SegmentWriter {
         Ok(())
     }
 
+    /// [`SegmentWriter::add_batch`] for a tombstone segment (B8): per row
+    /// whose time is not null (both clocks, for a bitemporal key), its time
+    /// and whether it is live ([`crate::tombstone::Matcher`]). A row with a
+    /// null time is never a version, so it is not recorded (ADR 014). Every
+    /// row converts before any is recorded.
+    fn add_tombstone_batch(
+        &mut self,
+        rg: RowGroupId,
+        batch: &RecordBatch,
+        keys: &KeyColumns,
+        dataset: &DatasetTypes,
+    ) -> Result<()> {
+        let column = |name: &str| -> Result<ArrayRef> {
+            batch
+                .column_by_name(name)
+                .cloned()
+                .ok_or_else(|| Error::KeySpec(format!("column {name} not in batch")))
+        };
+        let Some((matcher, _)) = &dataset.tombstone else {
+            return Err(Error::KeySpec(
+                "a tombstone segment's writer has no tombstone column".into(),
+            ));
+        };
+        let mut clocks: Vec<(ArrayRef, DataType)> = Vec::new();
+        match &self.spec {
+            KeySpec::Temporal { ts_column, .. } => {
+                let declared = dataset
+                    .ts
+                    .clone()
+                    .ok_or_else(|| Error::KeySpec("a temporal key without a ts type".into()))?;
+                clocks.push((column(ts_column)?, declared));
+            }
+            KeySpec::Bitemporal {
+                valid_column,
+                known_column,
+                ..
+            } => {
+                for (c, declared) in [valid_column, known_column].into_iter().zip(&dataset.times) {
+                    clocks.push((column(c)?, declared.clone()));
+                }
+            }
+            _ => {
+                return Err(Error::KeySpec(
+                    "a tombstone segment belongs to a temporal or bitemporal key".into(),
+                ))
+            }
+        }
+        for (arr, declared) in &clocks {
+            encoding::check_convertible(arr.data_type(), declared)?;
+        }
+        let marks = column(matcher.column())?;
+        encoding::check_convertible(marks.data_type(), matcher.declared())?;
+        let mut staged: Vec<(Vec<u8>, crate::tombstone::Clock, bool)> =
+            Vec::with_capacity(batch.num_rows());
+        let (mut buf, mut scratch) = (Vec::new(), Vec::new());
+        'rows: for row in 0..batch.num_rows() {
+            if !keys.encode_into(row, &mut buf)? {
+                continue;
+            }
+            let mut t = [0i64; 2];
+            for (i, (arr, declared)) in clocks.iter().enumerate() {
+                match encoding::ts_value_as(arr.as_ref(), row, declared)? {
+                    Some(v) => t[i] = v,
+                    None => continue 'rows,
+                }
+            }
+            let live = matcher.is_live(marks.as_ref(), row, &mut scratch)?;
+            staged.push((buf.clone(), (t[0], t[1]), live));
+        }
+        for (key, time, live) in &staged {
+            self.insert_liveness(key, rg, *time, *live)?;
+        }
+        Ok(())
+    }
+
+    /// Records one timed row of `key` in row group `rg` of a tombstone
+    /// segment (B8): its time (`(ts, 0)` on a temporal key, `(valid,
+    /// known)` on a bitemporal one, each in its column's dataset unit) and
+    /// whether it is live. A row with a null time is never recorded.
+    pub fn insert_liveness(
+        &mut self,
+        key: &[u8],
+        rg: RowGroupId,
+        time: crate::tombstone::Clock,
+        live: bool,
+    ) -> Result<()> {
+        if self.layout != Layout::KeyedTombstone {
+            return Err(Error::KeySpec(
+                "insert_liveness on a segment that is not a tombstone segment".into(),
+            ));
+        }
+        if self.shape().clocks == 1 && time.1 != 0 {
+            return Err(Error::KeySpec(
+                "a temporal key's tombstone entry has one clock; its second must be 0".into(),
+            ));
+        }
+        let Acc::Keyed(m) = &mut self.acc else {
+            return Err(Error::KeySpec("insert_liveness on a non-keyed spec".into()));
+        };
+        let v = key_acc(m, key)?;
+        v.bitmap.insert(rg.0);
+        v.liveness
+            .entry(rg.0)
+            .and_modify(|a| a.push(time, live))
+            .or_insert_with(|| crate::tombstone::LiveAcc::new(time, live));
+        Ok(())
+    }
+
     /// Writes the segment.
     pub fn finish(self) -> Result<EncodedSegment> {
         let processed = self.processed;
@@ -1505,6 +1699,7 @@ impl SegmentWriter {
             header.key_types = Some(d.recorded_keys.clone());
             header.ts_type.clone_from(&d.recorded_ts);
             header.time_types = (!d.recorded_times.is_empty()).then(|| d.recorded_times.clone());
+            header.tombstone_type = d.tombstone.as_ref().map(|(_, t)| t.clone());
         }
         let shape = self.shape();
         match self.acc {
@@ -1519,12 +1714,19 @@ impl SegmentWriter {
                     });
                     acc.triples.sort_unstable();
                     acc.triples.dedup();
+                    let liveness = (shape.clocks > 0).then(|| {
+                        acc.liveness
+                            .values()
+                            .map(|a| a.finish())
+                            .collect::<Vec<_>>()
+                    });
                     let v = KeyValue {
                         bitmap: acc.bitmap,
                         chain: acc.versions.finish(),
                         counts: shape.counts.then(|| acc.rows.values().copied().collect()),
                         bounds,
                         triples: acc.triples,
+                        liveness,
                     };
                     e.push(&k, &v)?;
                 }
@@ -1799,6 +2001,7 @@ mod tests {
                 columns: vec!["k".into()],
                 ts_column: "t".into(),
                 counts: false,
+                tombstone: None,
             },
         ]
     }

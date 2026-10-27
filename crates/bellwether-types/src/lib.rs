@@ -720,6 +720,14 @@ pub enum KeySpec {
         /// of that key there, over all versions (storage version 2).
         #[serde(default, skip_serializing_if = "is_false")]
         counts: bool,
+        /// The column that marks a row as a tombstone (B8,
+        /// `temporal:id@ts,tombstone=col`), so `latest`/`asof` with `live`
+        /// return no row for a key whose newest row is one. Kept beside the
+        /// spec as a `tombstone` sidecar (`docs/format.md`, "Tombstones"):
+        /// a manifest's `key_specs` never holds it, so the spec's own
+        /// segments and identity there are those of the spec without it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tombstone: Option<Tombstone>,
     },
     /// Bitemporal versions per key (`temporal2:id@valid,known`): every
     /// distinct `(valid, known, row group)` triple over rows where neither
@@ -732,6 +740,11 @@ pub enum KeySpec {
         valid_column: String,
         /// The time at which a version became known.
         known_column: String,
+        /// The column that marks a row as a tombstone (B8,
+        /// `temporal2:id@valid,known,tombstone=col`), as on
+        /// [`KeySpec::Temporal`].
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tombstone: Option<Tombstone>,
     },
     // --- phase 5 kinds ---
     /// An index over a value derived from columns by a closed expression
@@ -867,6 +880,45 @@ fn is_false(b: &bool) -> bool {
     !*b
 }
 
+/// The tombstone parameter of a temporal or bitemporal key (B8): a row is a
+/// tombstone when `column` holds `value`, or, with no `value`, when the
+/// boolean `column` is true. A row is **live** when its column is not null
+/// and does not hold the tombstone value; a null is not live (`where not
+/// col` keeps no null row, ADR 014). Spelled `tombstone=col` or
+/// `tombstone=col=value` as the last part of the spec.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct Tombstone {
+    /// The column marking tombstones: a boolean column (no `value`), or a
+    /// string, integer, or boolean column compared with `value`.
+    pub column: String,
+    /// The value that marks a tombstone, as written (`VOID`, `3`, `true`).
+    /// `None`: the column is boolean and `true` marks one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value: Option<String>,
+}
+
+impl Tombstone {
+    /// The spelling in a spec: `tombstone=col` or `tombstone=col=value`.
+    #[must_use]
+    pub fn spelling(&self) -> String {
+        match &self.value {
+            Some(v) => format!("tombstone={}={v}", self.column),
+            None => format!("tombstone={}", self.column),
+        }
+    }
+
+    /// The predicate a reader keeps live rows with, in SQL: `not col` (or
+    /// `col <> 'value'`), which keeps no null.
+    #[must_use]
+    pub fn live_sql(&self) -> String {
+        match &self.value {
+            Some(v) => format!("{} <> '{}'", self.column, v.replace('\'', "''")),
+            None => format!("not {}", self.column),
+        }
+    }
+}
+
 /// One conformance vector of an [`KeySpec::Expr`]: a closed expression (no
 /// column) and the canonical encoding (ADR 016) of its value, lowercase
 /// hex, or `None` when the value is null.
@@ -979,7 +1031,8 @@ impl KeySpec {
     /// | bloom at `0.01` | `bloom:a@0.01` (with bounds `bloom:a@0.01@ts`) |
     /// | range | `range:ts` |
     /// | temporal | `temporal:id@ts` (with counts `temporal:id@ts,counts`) |
-    /// | bitemporal | `temporal2:id@valid,known` |
+    /// | temporal with a tombstone (B8) | `temporal:id@ts,tombstone=void` (`...,counts,tombstone=status=VOID`) |
+    /// | bitemporal | `temporal2:id@valid,known` (with a tombstone `...,tombstone=void`) |
     /// | expr | `expr:sym=json_get(payload,'$.symbol'):exact` (with counts `...:exact,counts`; bloom `...:bloom@0.01`) |
     /// | list (B4) | `list:tags` |
     /// | join (B3) | `join:orders.order_id=payables.order_id` (with counts `...,counts`) |
@@ -988,7 +1041,12 @@ impl KeySpec {
     /// `f64`. The identity is one-to-one: no key or time column a spec names
     /// may contain `,` or `@`, the separators ([`KeySpec::check_names`]),
     /// and a spec whose last key column of several is named `counts` is
-    /// refused when declared, so the trailing `counts` is unambiguous.
+    /// refused when declared, so the trailing `counts` is unambiguous. A
+    /// tombstone comes last, and its column may not contain `,`, `@` or
+    /// `=`, so its value (everything after the column's `=`) is too. A
+    /// tombstone is never part of the identity a manifest keys the spec's
+    /// own segments by: the manifest declares the spec without it
+    /// ([`KeySpec::without_tombstone`]) and the tombstone as a sidecar.
     #[must_use]
     pub fn identity(&self) -> String {
         let counts = if self.counts() { ",counts" } else { "" };
@@ -1011,15 +1069,24 @@ impl KeySpec {
             Self::List { column } => format!("list:{column}"),
             Self::Join { .. } => format!("{}{counts}", self.name()),
             Self::Temporal {
-                columns, ts_column, ..
-            } => format!("temporal:{}@{ts_column}{counts}", columns.join(",")),
+                columns,
+                ts_column,
+                tombstone,
+                ..
+            } => format!(
+                "temporal:{}@{ts_column}{counts}{}",
+                columns.join(","),
+                tombstone_suffix(tombstone.as_ref())
+            ),
             Self::Bitemporal {
                 columns,
                 valid_column,
                 known_column,
+                tombstone,
             } => format!(
-                "temporal2:{}@{valid_column},{known_column}",
-                columns.join(",")
+                "temporal2:{}@{valid_column},{known_column}{}",
+                columns.join(","),
+                tombstone_suffix(tombstone.as_ref())
             ),
             Self::Text {
                 column,
@@ -1126,6 +1193,23 @@ impl KeySpec {
                 ));
             }
         }
+        if let Some(t) = self.tombstone() {
+            if t.column.is_empty() || t.column.contains([',', '@', '=']) {
+                return Err(Error::KeySpec(format!(
+                    "the tombstone column {:?} is empty or contains ',', '@' or '=', which \
+                     separate the parts of a key spec's identity, so a new key spec cannot name \
+                     it; rename the column",
+                    t.column
+                )));
+            }
+            if t.value.as_deref() == Some("") {
+                return Err(Error::KeySpec(format!(
+                    "tombstone={}= names no value; write tombstone={} for a boolean column, or \
+                     tombstone={}=<value> for the value that marks a tombstone",
+                    t.column, t.column, t.column
+                )));
+            }
+        }
         Ok(())
     }
 
@@ -1143,6 +1227,49 @@ impl KeySpec {
                 .map(|b| (a, b))
         })
     }
+
+    /// The tombstone parameter of a temporal or bitemporal key (B8), if
+    /// any.
+    #[must_use]
+    pub fn tombstone(&self) -> Option<&Tombstone> {
+        match self {
+            Self::Temporal { tombstone, .. } | Self::Bitemporal { tombstone, .. } => {
+                tombstone.as_ref()
+            }
+            _ => None,
+        }
+    }
+
+    /// The spec without its tombstone parameter: the spec a manifest's
+    /// `key_specs` declares and whose identity keys its own segments (the
+    /// tombstone is a sidecar beside it). Every other spec unchanged.
+    #[must_use]
+    pub fn without_tombstone(&self) -> KeySpec {
+        let mut out = self.clone();
+        if let Self::Temporal { tombstone, .. } | Self::Bitemporal { tombstone, .. } = &mut out {
+            *tombstone = None;
+        }
+        out
+    }
+
+    /// This temporal or bitemporal spec with `tombstone` as its tombstone
+    /// parameter; `None` for any other kind of spec.
+    #[must_use]
+    pub fn with_tombstone(&self, tombstone: Tombstone) -> Option<KeySpec> {
+        let mut out = self.clone();
+        match &mut out {
+            Self::Temporal { tombstone: t, .. } | Self::Bitemporal { tombstone: t, .. } => {
+                *t = Some(tombstone);
+                Some(out)
+            }
+            _ => None,
+        }
+    }
+}
+
+/// `,tombstone=...` for a spec with a tombstone, else empty.
+fn tombstone_suffix(t: Option<&Tombstone>) -> String {
+    t.map_or_else(String::new, |t| format!(",{}", t.spelling()))
 }
 
 /// A residual predicate the consumer applies after reading the planned row
@@ -1257,6 +1384,19 @@ pub enum Predicate {
         column: String,
         /// One group of canonical element encodings per queried value.
         values: Vec<Vec<Vec<u8>>>,
+    },
+    /// Keep the rows whose `column` is not null and is not the canonical
+    /// encoding (ADR 016) `tombstone`, at the column's dataset type: the
+    /// live rows of a `latest`/`asof` lookup with `live` (B8,
+    /// [`Tombstone`]). `where not col` for a boolean column (`tombstone` is
+    /// the encoding of `true`), `col <> value` otherwise; a null is not live
+    /// (ADR 014). Applied after `LatestPerKey`: the newest row is chosen
+    /// first, so a key whose newest row is a tombstone keeps no row.
+    Live {
+        /// The tombstone column.
+        column: String,
+        /// The canonical encoding of the value that marks a tombstone.
+        tombstone: Vec<u8>,
     },
 }
 
@@ -2695,6 +2835,7 @@ mod tests {
             columns: vec!["id".into(), "version".into()],
             ts_column: "ts".into(),
             counts: false,
+            tombstone: None,
         };
         assert_eq!(k.name(), "temporal:id,version");
         assert_eq!(
@@ -3265,6 +3406,7 @@ mod schema_feature {
                     columns: vec!["id".into()],
                     valid_column: "valid".into(),
                     known_column: "known".into(),
+                    tombstone: None,
                 },
                 Vec::new(),
             ),

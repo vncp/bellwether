@@ -29,9 +29,11 @@ use crate::coverage::{completeness, completeness_map, covered, live_ids, segment
 use crate::segments::{self, Ctx, FileRow, SpecPlan};
 use crate::sources::{infer_schema, DataSource};
 use crate::target::{
-    bloom_bounds_def, decl_of, declared_sidecars, declared_sketches, declared_targets, fold_legacy,
-    known_decl, sketch_columns, sketch_decl, unknown_kind, Target, SKETCH_KIND,
+    bloom_bounds_def, decl_of, declared_key_specs, declared_sidecars, declared_sketches,
+    declared_targets, fold_legacy, known_decl, sketch_columns, sketch_decl, tombstone_decl,
+    tombstone_name, tombstone_of, unknown_kind, Target, SKETCH_KIND,
 };
+use bellwether_core::tombstone::TOMBSTONE_KIND;
 
 /// Most key specs one index may declare.
 pub const MAX_KEY_SPECS: usize = 64;
@@ -187,7 +189,10 @@ impl<S: StoreExt + ?Sized> Builder<S> {
     /// collector. Returns the committed sequence, or `None` if the index
     /// does not declare `spec`. A different spec declared under the same
     /// name ([`KeySpec::name`] omits `ts_column` and `fpr`) is an error,
-    /// never removed in its place.
+    /// never removed in its place. A temporal or bitemporal spec given
+    /// with the tombstone it is declared with (B8) removes that tombstone
+    /// only (its sidecar declaration, segments and completeness), keeping
+    /// the spec; given without it, the spec goes with its tombstone.
     pub fn remove_spec(&self, spec: &KeySpec) -> Result<Option<u64>> {
         let name = spec.name();
         let absent = Cell::new(false);
@@ -197,27 +202,41 @@ impl<S: StoreExt + ?Sized> Builder<S> {
             &StagedSegments::new(),
             CommitOptions::default(),
             |m| {
-                match m.schema.key_specs.iter().find(|s| s.name() == name) {
+                let declared = declared_key_specs(m);
+                let d = match declared.iter().find(|s| s.name() == name) {
                     None => {
                         absent.set(true);
                         return Err(Error::KeySpec(format!("key spec {name} is not declared")));
                     }
-                    Some(d) if d != spec => {
+                    Some(d) if d != spec && d.without_tombstone() != *spec => {
                         return Err(Error::KeySpec(format!(
                             "the index declares {} under the name {name}, not {}",
                             d.identity(),
                             spec.identity()
                         )))
                     }
-                    Some(_) => {}
-                }
-                // Segments and completeness are keyed by the declared
-                // spec's identity (storage version 2).
-                let identity = spec.identity();
+                    Some(d) => d.clone(),
+                };
                 let mut next = m.clone();
-                next.schema.key_specs.retain(|s| s.name() != name);
-                next.segments.retain(|s| s.key_spec != identity);
-                next.key_spec_completeness.remove(&identity);
+                if d.tombstone().is_some() {
+                    let tomb = tombstone_name(&d);
+                    next.schema.sidecars.retain(|s| {
+                        !(s.kind == TOMBSTONE_KIND
+                            && tombstone_of(s, &m.schema.key_specs).as_ref() == Some(&d))
+                    });
+                    next.segments.retain(|s| {
+                        !(s.kind.as_deref() == Some(TOMBSTONE_KIND) && s.key_spec == tomb)
+                    });
+                    next.key_spec_completeness.remove(&tomb);
+                }
+                if spec.tombstone().is_none() {
+                    // Segments and completeness are keyed by the declared
+                    // spec's identity (storage version 2).
+                    let identity = spec.identity();
+                    next.schema.key_specs.retain(|s| s.name() != name);
+                    next.segments.retain(|s| s.key_spec != identity);
+                    next.key_spec_completeness.remove(&identity);
+                }
                 Ok(next)
             },
         );
@@ -656,13 +675,16 @@ fn recorded_chunk_size(base: Option<&Manifest>) -> NewChunkSize {
 /// replaces that definition in place, and new specs follow. A given spec
 /// the base does not already declare is a new declaration and must meet
 /// [`KeySpec::check_names`]; one it declares (a storage version 1 spec on a
-/// column named `a,b`) is indexed as it is.
+/// column named `a,b`) is indexed as it is. The base's specs carry their
+/// tombstones (B8, [`declared_key_specs`]); a given spec without one that
+/// is the base's spec without its tombstone keeps the tombstone (removing
+/// it is explicit: `remove_unlisted`, or `Builder::remove_spec` on it).
 pub(crate) fn declared_specs(
     base: Option<&Manifest>,
     key_specs: &[KeySpec],
     remove_unlisted: bool,
 ) -> Result<Vec<KeySpec>> {
-    let base_specs = base.map_or(&[][..], |m| m.schema.key_specs.as_slice());
+    let base_specs = base.map(declared_key_specs).unwrap_or_default();
     let mut given: BTreeMap<String, &KeySpec> = BTreeMap::new();
     for spec in key_specs {
         if given.insert(spec.name(), spec).is_some() {
@@ -679,12 +701,19 @@ pub(crate) fn declared_specs(
     if remove_unlisted {
         return Ok(key_specs.to_vec());
     }
+    let keep_tombstone = |base: &KeySpec, g: &KeySpec| -> KeySpec {
+        if g.tombstone().is_none() && base.tombstone().is_some() && base.without_tombstone() == *g {
+            base.clone()
+        } else {
+            g.clone()
+        }
+    };
     let mut out: Vec<KeySpec> = Vec::with_capacity(key_specs.len());
-    for spec in base_specs {
+    for spec in &base_specs {
         out.push(
             given
                 .get(&spec.name())
-                .map_or_else(|| spec.clone(), |g| (*g).clone()),
+                .map_or_else(|| spec.clone(), |g| keep_tombstone(spec, g)),
         );
     }
     for spec in key_specs {
@@ -776,9 +805,10 @@ fn shared_identity(root: &str, base: Option<&Manifest>, a: &KeySpec, b: &KeySpec
 }
 
 /// The schema this build commits: the dataset columns, the declared key
-/// specs, sidecars, and sketches, the base's declarations of sidecar kinds
-/// this binary does not know (kept unchanged, as their segments are), and
-/// the base's unknown fields.
+/// specs (each without its tombstone), sidecars, sketches, and tombstones
+/// (B8, a `tombstone` sidecar per spec with one), the base's declarations
+/// of sidecar kinds this binary does not know (kept unchanged, as their
+/// segments are), and the base's unknown fields.
 fn schema_info(
     base: Option<&Manifest>,
     cfg: &Config,
@@ -788,11 +818,17 @@ fn schema_info(
 ) -> SchemaInfo {
     SchemaInfo {
         columns: cfg.columns.clone(),
-        key_specs: declared.to_vec(),
+        key_specs: declared.iter().map(KeySpec::without_tombstone).collect(),
         sidecars: sidecars
             .iter()
             .map(decl_of)
             .chain(sketches.iter().map(sketch_decl))
+            .chain(
+                declared
+                    .iter()
+                    .filter(|s| s.tombstone().is_some())
+                    .map(tombstone_decl),
+            )
             .chain(
                 base.iter()
                     .flat_map(|m| m.schema.sidecars.iter().filter(|d| !known_decl(d)).cloned()),
@@ -972,14 +1008,36 @@ fn plan_specs(
                     columns.push(c);
                 }
             }
+            // A spec with a tombstone (B8) builds its own segments as the
+            // spec without it, and its tombstone sidecar beside them, which
+            // reads the tombstone column too.
+            let tombstone = match spec.tombstone() {
+                Some(t) => {
+                    let dt = bellwether_core::tombstone::column_type(spec, schema)?;
+                    ColumnType::of(&dt).map_err(within)?;
+                    let mut tcols = columns.clone();
+                    tcols.push(t.column.clone());
+                    Some(SpecPlan {
+                        target: Target::Tombstone(spec.clone()),
+                        name: tombstone_name(spec),
+                        key_types: key_types.clone(),
+                        ts_type: ts_type.clone(),
+                        time_types: time_types.clone(),
+                        columns: tcols,
+                    })
+                }
+                None => None,
+            };
+            let plain = spec.without_tombstone();
             let mut plans = vec![SpecPlan {
-                target: Target::Key(spec.clone()),
-                name: spec.identity(),
+                target: Target::Key(plain.clone()),
+                name: plain.identity(),
                 key_types: key_types.clone(),
                 ts_type,
                 time_types,
                 columns,
             }];
+            plans.extend(tombstone);
             // A bloom with bounds keeps them in `bounds` segments under its
             // identity: a bloom has no per-key record to carry them.
             if let Some(def) = bloom_bounds_def(spec) {
@@ -1610,6 +1668,7 @@ impl Delta<'_> {
                 Target::BloomBounds(_) => "the per-key bounds of key spec",
                 Target::Sidecar(_) => "sidecar",
                 Target::Sketch(_) => "sketch",
+                Target::Tombstone(_) => "tombstone sidecar",
             };
             return Err(Error::Other(format!(
                 "the build would leave {what} {} incomplete; nothing was committed",

@@ -74,6 +74,7 @@ fn check_entity_runs(spec: &CorpusSpec, runs: usize, seed: u64) -> usize {
         columns: cols(&["entity_id"]),
         ts_column: "version_ts".into(),
         counts: false,
+        tombstone: None,
     };
     let footer = common::footer_bytes(&corpus.files());
     let mut nonempty = 0;

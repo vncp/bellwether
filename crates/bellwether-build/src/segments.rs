@@ -410,6 +410,13 @@ impl<'a> SpecWriter<'a> {
                             WriterOptions::default(),
                         )?)
                     }
+                    // The spec with its tombstone names the
+                    // `keyed_tombstone` layout (core's `Layout::for_spec`).
+                    Target::Tombstone(spec) => AnyWriter::Key(SegmentWriter::for_dataset(
+                        spec.clone(),
+                        ctx.schema,
+                        WriterOptions::default(),
+                    )?),
                     Target::Sketch(spec) => {
                         AnyWriter::Sketch(SketchWriter::for_dataset(spec, ctx.schema)?)
                     }
@@ -509,11 +516,36 @@ pub(crate) fn measure(plan: &SpecPlan, batch: &RecordBatch) -> Result<(u64, u64)
             &bounds_records
         }
         Target::Sketch(spec) => return Ok((1, sketch_seg::max_entry_bytes(spec))),
+        // A tombstone sidecar (B8): one liveness entry per distinct key of
+        // the row group, its key bytes plus 17 (33 with two clocks).
+        Target::Tombstone(spec) => {
+            let cols = spec
+                .columns()
+                .iter()
+                .map(|c| {
+                    batch
+                        .column_by_name(c)
+                        .cloned()
+                        .ok_or_else(|| Error::KeySpec(format!("column {c} not in batch")))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let keys = KeyColumns::new(&cols, &plan.key_types)?;
+            let per = 16 * u64::from(bellwether_core::tombstone::clocks(spec)) + 1;
+            let (mut seen, mut bytes, mut buf) = (HashSet::new(), 0u64, Vec::new());
+            for row in 0..batch.num_rows() {
+                if keys.encode_into(row, &mut buf)? && !seen.contains(buf.as_slice()) {
+                    bytes += buf.len() as u64 + per;
+                    seen.insert(buf.clone());
+                }
+            }
+            return Ok((seen.len() as u64, bytes));
+        }
     };
     if let KeySpec::Bitemporal {
         columns,
         valid_column,
         known_column,
+        ..
     } = spec
     {
         // The bitemporal layout's records are the temporal2 sidecar's.
@@ -765,6 +797,7 @@ mod tests {
                 columns: vec!["id".into()],
                 ts_column: "ts".into(),
                 counts: false,
+                tombstone: None,
             },
             &schema,
         );

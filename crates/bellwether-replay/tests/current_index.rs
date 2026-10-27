@@ -219,6 +219,7 @@ fn replaying_the_current_index_reads_no_columns_and_a_candidate_reads_only_its_k
         columns: cols(&["entity_id"]),
         ts_column: "version_ts".into(),
         counts: false,
+        tombstone: None,
     };
     replayer
         .replay_specs(std::slice::from_ref(&candidate), &workload, &keys)

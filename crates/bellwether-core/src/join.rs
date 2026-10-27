@@ -267,6 +267,7 @@ fn live_only(value: KeyValue, live: &RoaringBitmap) -> Option<KeyValue> {
         counts,
         bounds: None,
         triples: Vec::new(),
+        liveness: None,
     })
 }
 
@@ -491,6 +492,7 @@ pub fn build_pair<RL: ReadAt, RR: ReadAt>(
                                 counts: None,
                                 bounds: None,
                                 triples: Vec::new(),
+                                liveness: None,
                             };
                             out.push_join(lk, &bare(lv), &bare(rv))?;
                         }
@@ -539,6 +541,7 @@ fn read_side(c: &mut Cursor<'_>, counts: bool) -> Result<KeyValue> {
         counts,
         bounds: None,
         triples: Vec::new(),
+        liveness: None,
     })
 }
 

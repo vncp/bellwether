@@ -295,7 +295,11 @@ impl<R: ReadAt> SegmentReader<R> {
         let blocks = claimed as usize;
         let reserve = |min_entry| reserve_hint(u64::from(claimed), index_len as u64, min_entry);
         let index = match header.layout {
-            Layout::Keyed | Layout::KeyedTemporal | Layout::KeyedJoin | Layout::Bitemporal => {
+            Layout::Keyed
+            | Layout::KeyedTemporal
+            | Layout::KeyedJoin
+            | Layout::Bitemporal
+            | Layout::KeyedTombstone => {
                 let mut v = Vec::with_capacity(reserve(MIN_KEYED_ENTRY));
                 for _ in 0..blocks {
                     v.push(KeyedBlock {
@@ -418,6 +422,23 @@ impl<R: ReadAt> SegmentReader<R> {
                 types(have_keys, self.header.ts_type.as_ref()),
                 types(&want_keys, want_ts.as_ref()),
             )));
+        }
+        if self.header.layout == Layout::KeyedTombstone {
+            let want = ColumnType::of(&crate::tombstone::column_type(
+                &self.header.key_spec,
+                schema,
+            )?)?;
+            if self.header.tombstone_type.as_ref() != Some(&want) {
+                return Err(Error::KeySpec(format!(
+                    "the tombstone segment of {} recorded its tombstone column as {}; the dataset \
+                     declares {want}; re-index the folder",
+                    self.header.key_spec.identity(),
+                    self.header
+                        .tombstone_type
+                        .as_ref()
+                        .map_or_else(|| "no type".to_string(), ToString::to_string),
+                )));
+            }
         }
         Ok(())
     }
