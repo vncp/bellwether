@@ -438,7 +438,7 @@ struct DfRun {
 fn datafusion(desc: &Path, spans: &BTreeMap<String, FileSpans>, gap: u64) -> Option<DfRun> {
     let text = std::fs::read_to_string(desc).unwrap();
     let cfg = bellwether_adapters::datafusion::from_json(&text).unwrap();
-    let hints = cfg
+    let hints: BTreeMap<String, Option<u64>> = cfg
         .files
         .iter()
         .map(|f| (f.plan_path.clone(), f.metadata_size_hint))
