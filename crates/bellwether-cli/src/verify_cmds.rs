@@ -1104,7 +1104,7 @@ fn verify_and_outcome_human(s: &mut String, r: &FixResult) {
                     "the key is already complete at sequence {sequence}, so applying it changes nothing; no receipt"
                 ),
                 Refusal::LayoutNotApplicable => {
-                    "layout proposals are applied by evolve, which has not landed".into()
+                    "layout proposals cannot be applied in this release; propose a key or a rewrite".into()
                 }
                 Refusal::NoReplay { .. } => {
                     "the rewrite verified, but a receipt cites a replay, and this rewrite states its plans only in prose, so it has none; propose it again with --before-plan and --after-plan (typed plan DAGs, as why --plan reads) to have it priced and attested".into()

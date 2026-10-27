@@ -9,7 +9,7 @@
 //!    for, bounded by the workload and the data, never by the index), against a source exposing only the row groups
 //!    the hypothetical plan selects (coverage `Workload`). A Rewrite: reconcile the before and
 //!    after outputs the caller names (coverage `Full`). A Layout proposal is
-//!    refused: layout apply arrives with evolve.
+//!    refused: layout apply is deferred (ADR 032, amended 2026-10-27).
 //! 3. **Apply**, only if the certificate passed and was computed against the
 //!    current manifest sequence: build the key (WP4) in one commit
 //!    (`manifest_after`).
@@ -219,7 +219,7 @@ pub enum Refusal {
         /// The unchanged sequence.
         sequence: String,
     },
-    /// A Layout proposal: layout apply arrives with evolve.
+    /// A Layout proposal: layout apply is deferred (ADR 032, amended 2026-10-27).
     LayoutNotApplicable,
     /// A passing Rewrite whose shape states its plans only in prose cannot
     /// be attested: a receipt cites a Replay, and only a shape with

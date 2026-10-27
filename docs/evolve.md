@@ -2,6 +2,8 @@
 
 Design document for `bellwether-evolve` (WP13a `advise`, WP13b `evolve`, WP13c rulebook v2; milestone M6). Governing decisions: ADR 021 (the loop), ADR 022 (what "gradient" means here), ADR 023 (joint and whole-pipeline optimization), ADR 024 (counterfactual attribution), ADR 025 (rulebook validation), ADR 031 (scoped proposers and a frozen outer loop), ADR 032 (staged delivery with a measured trigger).
 
+**Scope as of 2026-10-27 (ADR 032 amendment).** Only a reduced stage 1 is scheduled: workload-level key-set selection, exact knob descent, Pareto with anchors, and receipts (§3.1). Layout and materialization search, edge and plan-node attribution, stage 2 (`evolve --llm`), and stage 3 (rulebook v2) are deferred until a recorded multi-step pipeline workload exists and reduced `advise` leaves a structural anti-pattern on it. The rest of this document is the design for that case.
+
 ## 1. The problem, stated precisely
 
 A data pipeline is a DAG of steps. Each step has a logical plan (a DAG of operators), reads from a physical design (which indexes and layouts exist), and runs many times with different inputs (a trigger batch of keys, a date window). Engineers tune three things: the plan (operator order, join strategy, projection), the physical design (keys, layouts, knobs), and the step boundaries (what is materialized, what is pushed upstream). Today they tune by hand, scoring with estimates and verifying by hope.
@@ -85,6 +87,8 @@ Keep evolve. It is the one place in this field where the optimizer has an exact 
 | 3 · rulebook v2 | Rules as predicated templates with counters, temporal holdout, caps, staleness that must be re-earned | Distillation only | A rule learned on one workload reproduces a gain on a held-out template under replay |
 
 **Kill criterion for stages 2 and 3.** If stage 1 captures the frontier on the real workloads you have (frontier within 5% of stage 2's on bytes read at p50 and p95), stop. An exact what-if advisor with receipts is already a product; the language-model search is the part that must prove it adds rewrites enumeration cannot reach.
+
+**Reduced stage 1 (2026-10-27, ADR 032 amendment).** The stage-1 row above now ships without layout and materialization search: `advise` chooses a set of key specs and the numeric knobs replay prices, against every recorded run, with Pareto, anchors, and receipts. It starts after WP22b's lookup fix (plan time under full-scan time), because the loss is bytes read and on 2026-10-26 fewer bytes did not yet mean less time. Stages 2 and 3 are not scheduled; the trigger and kill criterion above apply when they are reopened.
 
 **The stage-2 budget.** Cost per accepted mutation is replays plus model calls charged to one budget (§11, item 2). Its bound is the owner's decision and is deliberately unset here; it must be written into this section and recorded as a ledger row before WP13b's first search, as ADR 019 requires of every threshold an evaluation is judged by. WP13b's done-when cannot be met until it is.
 
