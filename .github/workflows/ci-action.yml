@@ -1,0 +1,91 @@
+name: ci-action
+
+# The composite Action in action/ (WP17), run against a fixture repository
+# built in a temporary directory: a head whose changed step carries a
+# signed receipt passes, and a head missing one fails the job with exit 1.
+# The comment script is tested against a stand-in for the GitHub API.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_PROFILE_DEV_DEBUG: "0"
+  CARGO_PROFILE_TEST_DEBUG: "0"
+
+jobs:
+  action:
+    name: bellwether ci action
+    runs-on: ubuntu-latest
+    env:
+      # One target directory for the fixture's test build and the Action's
+      # `version: build`, so the second reuses the first.
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/free-runner-disk
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: the comment is updated in place, never posted twice
+        run: action/tests/comment-updates-in-place.sh
+
+      - name: build the fixture repository
+        env:
+          BELLWETHER_CI_FIXTURE: ${{ runner.temp }}/fixture
+        run: |
+          cargo test -p bellwether-cli --test ci -- --ignored --exact action_fixture
+          cat "$BELLWETHER_CI_FIXTURE/shas.env" >> "$GITHUB_ENV"
+
+      - name: gate a head with its receipt
+        id: pass
+        uses: ./action
+        with:
+          version: build
+          build-profile: debug
+          checkout: 'false'
+          comment: 'false'
+          path: ${{ env.REPO }}
+          base: ${{ env.BASE }}
+          head: ${{ env.PASS }}
+
+      - name: the step summary holds the verdict
+        env:
+          COMMENT: ${{ steps.pass.outputs.comment-file }}
+          OUTCOME: ${{ steps.pass.outputs.outcome }}
+        run: |
+          cat "$COMMENT"
+          test "$OUTCOME" = pass
+          head -n 2 "$COMMENT" | grep -qxF '### ✅ 1 step verified'
+
+      - name: gate a head missing its receipt
+        id: missing
+        continue-on-error: true
+        uses: ./action
+        with:
+          version: build
+          build-profile: debug
+          checkout: 'false'
+          comment: 'false'
+          path: ${{ env.REPO }}
+          base: ${{ env.BASE }}
+          head: ${{ env.MISSING }}
+
+      - name: the job fails with exit 1 and the verdict names the step
+        env:
+          COMMENT: ${{ steps.missing.outputs.comment-file }}
+          STEP_OUTCOME: ${{ steps.missing.outcome }}
+          CODE: ${{ steps.missing.outputs.exit-code }}
+        run: |
+          cat "$COMMENT"
+          test "$STEP_OUTCOME" = failure
+          test "$CODE" = 1
+          head -n 2 "$COMMENT" | grep -qxF '### ❌ 1 of 1 step failed the receipt gate'
+          grep -qF '#### `repo_counts`: no receipt given' "$COMMENT"

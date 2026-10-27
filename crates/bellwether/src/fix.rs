@@ -2531,7 +2531,7 @@ pub(crate) fn mark_measured(replay: &mut bellwether_types::Replay) {
 /// (`bellwether_source::catalog::unindexed` over every discovered file and
 /// row group, with core's type spelling): what a certificate's left side
 /// cites.
-fn data_digest(root: &str, source: &dyn Source) -> Result<Hash> {
+pub(crate) fn data_digest(root: &str, source: &dyn Source) -> Result<Hash> {
     let schema = source.schema(root)?;
     let spelled = bellwether_source::catalog::schema_identity(&schema, |t| {
         bellwether_core::segment::ColumnType::of(t)

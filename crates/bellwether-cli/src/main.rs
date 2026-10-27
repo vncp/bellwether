@@ -9,6 +9,7 @@
 #![forbid(unsafe_code)]
 
 mod bench;
+mod ci;
 mod emit_cmds;
 mod human;
 mod join_cmds;
@@ -139,6 +140,11 @@ enum Command {
     /// Serve the engine over MCP on stdin and stdout, bound to one data
     /// folder (the same server as `bellwether-mcp`).
     Mcp(McpArgs),
+    /// Gate a pull request on receipts (WP17): every changed pipeline step
+    /// needs a receipt that passes the ledger's own checks. Exit 0 pass (or
+    /// advisory, or nothing changed), 1 a step failed, 2 usage or a
+    /// malformed configuration, 4 the ledger could not be read.
+    Ci(ci::CiArgs),
     /// Record workloads: the keys a diagnosis replays.
     Workload {
         #[command(subcommand)]
@@ -967,7 +973,7 @@ pub(crate) fn engine_keyed(
 }
 
 /// The engine options the global flags name.
-fn engine_options(global: &Global) -> Result<EngineOptions, Failure> {
+pub(crate) fn engine_options(global: &Global) -> Result<EngineOptions, Failure> {
     global.engine.options().map_err(|e| match e {
         OptionsError::Usage(m) => Failure::Usage(m),
         OptionsError::Engine(e) => Failure::Engine(e),
@@ -1144,6 +1150,7 @@ fn run(cli: &Cli, out: &Out) -> Result<Outcome, Failure> {
         Command::Sketch { command } => sketch_cmds::run(g, out, command),
         Command::Keys { command } => keys_cmds::run(g, command),
         Command::Mcp(a) => mcp(g, a),
+        Command::Ci(a) => ci::run(g, out, a),
         Command::Workload {
             command: WorkloadCommand::Record(a),
         } => {

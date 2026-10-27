@@ -17,16 +17,11 @@
 
 mod common;
 
-use std::collections::{BTreeMap, BTreeSet};
-use std::fs::File;
 use std::path::{Path, PathBuf};
 
-use arrow::array::{Array, ArrayRef, Int64Array, RecordBatch};
 use bellwether::{CulpritReason, FixOutcome, FixResult, Refusal, WhyReport};
 use bellwether_bench::relational::{generate_relational, RelationalParams};
-use common::{check_records, index_dir, path, run, typed};
-use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
-use parquet::arrow::ArrowWriter;
+use common::{check_records, counts_output, index_dir, path, run, sparse_keys, typed};
 use serde_json::{json, Value};
 
 const CLOCK: &str = "2026-10-27T12:00:00.000Z";
@@ -85,107 +80,6 @@ fn server(c: &Corpus) -> bellwether_mcp::Server {
 
 fn cli(args: &[&str], code: i32) -> String {
     run(&[&["--clock", CLOCK, "--json"], args].concat(), code)
-}
-
-/// Per row group of `events` (files in name order), its `repo_id`s.
-fn repo_ids_by_row_group(events: &Path) -> Vec<Vec<Option<i64>>> {
-    let mut files: Vec<PathBuf> = std::fs::read_dir(events)
-        .unwrap()
-        .map(|e| e.unwrap().path())
-        .filter(|p| p.extension().is_some_and(|x| x == "parquet"))
-        .collect();
-    files.sort();
-    let mut out = Vec::new();
-    for f in files {
-        let groups = ParquetRecordBatchReaderBuilder::try_new(File::open(&f).unwrap())
-            .unwrap()
-            .metadata()
-            .num_row_groups();
-        for g in 0..groups {
-            let reader = ParquetRecordBatchReaderBuilder::try_new(File::open(&f).unwrap())
-                .unwrap()
-                .with_row_groups(vec![g])
-                .build()
-                .unwrap();
-            let mut ids = Vec::new();
-            for batch in reader {
-                let b = batch.unwrap();
-                let id = b
-                    .column_by_name("repo_id")
-                    .unwrap()
-                    .as_any()
-                    .downcast_ref::<Int64Array>()
-                    .unwrap()
-                    .clone();
-                ids.extend(id.iter());
-            }
-            out.push(ids);
-        }
-    }
-    out
-}
-
-/// The rarest `n` repositories with events (fewest row groups, then id),
-/// written to `path` as a key file: their events sit in a strict subset of
-/// the row groups, asserted, so a key on `repo_id` prunes.
-fn sparse_keys(events: &Path, n: usize, path: &Path) -> BTreeSet<i64> {
-    let groups = repo_ids_by_row_group(events);
-    let mut at: BTreeMap<i64, BTreeSet<usize>> = BTreeMap::new();
-    for (g, ids) in groups.iter().enumerate() {
-        for id in ids.iter().flatten() {
-            at.entry(*id).or_default().insert(g);
-        }
-    }
-    let mut rare: Vec<(usize, i64)> = at.iter().map(|(k, g)| (g.len(), *k)).collect();
-    rare.sort_unstable();
-    let keys: BTreeSet<i64> = rare.iter().take(n).map(|(_, k)| *k).collect();
-    let covered: BTreeSet<usize> = keys.iter().flat_map(|k| at[k].iter().copied()).collect();
-    assert!(
-        covered.len() * 2 <= groups.len(),
-        "the keys sit in {} of {} row groups",
-        covered.len(),
-        groups.len()
-    );
-    common::keys(path, "repo_id", &keys.iter().copied().collect::<Vec<_>>());
-    keys
-}
-
-/// What a consumer's `select repo_id, count(*) ... where repo_id in (keys)
-/// group by repo_id` returns over `events`, written to `out/part.parquet`.
-fn counts_output(events: &Path, keys: &BTreeSet<i64>, out: &Path) {
-    std::fs::create_dir_all(out).unwrap();
-    let mut counts: BTreeMap<i64, i64> = BTreeMap::new();
-    for id in repo_ids_by_row_group(events)
-        .into_iter()
-        .flatten()
-        .flatten()
-    {
-        if keys.contains(&id) {
-            *counts.entry(id).or_default() += 1;
-        }
-    }
-    let batch = RecordBatch::try_from_iter([
-        (
-            "repo_id",
-            std::sync::Arc::new(Int64Array::from(counts.keys().copied().collect::<Vec<_>>()))
-                as ArrayRef,
-        ),
-        (
-            "count",
-            std::sync::Arc::new(Int64Array::from(
-                counts.values().copied().collect::<Vec<_>>(),
-            )) as ArrayRef,
-        ),
-    ])
-    .unwrap();
-    let mut w = ArrowWriter::try_new(
-        File::create(out.join("part.parquet")).unwrap(),
-        batch.schema(),
-        None,
-    )
-    .unwrap();
-    w.write(&batch).unwrap();
-    w.close().unwrap();
 }
 
 #[test]

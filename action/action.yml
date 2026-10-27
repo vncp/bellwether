@@ -1,0 +1,134 @@
+name: bellwether ci
+description: >-
+  Gate a pull request on receipts: every pipeline step the pull request
+  changes needs a receipt whose chain passes the ledger's own checks. Posts
+  one comment, updated in place, and fails the job when a step fails under
+  gate = "require".
+author: vncp
+branding:
+  icon: check-circle
+  color: gray-dark
+
+inputs:
+  version:
+    description: >-
+      A bellwether release tag: the binary is downloaded from that release
+      and checked against the SHA-256 in its checksums.txt before it runs.
+      Or `build`: compile the bellwether at this action's own ref (the tag
+      you pinned it by) with cargo; never code from the pull request.
+    required: true
+  config:
+    description: The gate's configuration, a path in the repository read from the base commit.
+    default: .bellwether/ci.toml
+  comment:
+    description: >-
+      Post the verdict as one pull request comment, updated in place on
+      every push (needs `pull-requests: write`). The same markdown always
+      goes to the job's step summary.
+    default: 'true'
+  comment-author:
+    description: The login the token posts as; only its own marked comment is ever updated.
+    default: github-actions[bot]
+  path:
+    description: Where the pipeline repository is checked out.
+    default: .
+  checkout:
+    description: Check out the pull request's head with full history into `path` first.
+    default: 'true'
+  base:
+    description: The base commit [default: the pull request's].
+    default: ${{ github.event.pull_request.base.sha }}
+  head:
+    description: The head commit [default: the pull request's].
+    default: ${{ github.event.pull_request.head.sha }}
+  build-profile:
+    description: With `version: build`, the cargo profile (`release` or `debug`).
+    default: release
+  token:
+    description: The token that downloads the release and posts the comment.
+    default: ${{ github.token }}
+
+outputs:
+  outcome:
+    description: pass, fail, advisory, or nothing_to_check (empty when the gate could not run).
+    value: ${{ steps.gate.outputs.outcome }}
+  exit-code:
+    description: 0 pass, advisory, or nothing to check; 1 a step failed; 2 usage or configuration; 4 the ledger could not be read.
+    value: ${{ steps.gate.outputs.exit-code }}
+  comment-file:
+    description: The comment's markdown, exactly as posted and as written to the step summary.
+    value: ${{ steps.gate.outputs.comment-file }}
+
+runs:
+  using: composite
+  steps:
+    # The head is data to the gate: path names and receipt files, read with
+    # git. No script, hook, or build step from it ever runs, and the token
+    # is not left in the checkout.
+    - name: check out the head
+      if: inputs.checkout == 'true'
+      uses: actions/checkout@v4
+      with:
+        ref: ${{ inputs.head }}
+        fetch-depth: 0
+        path: ${{ inputs.path }}
+        persist-credentials: false
+
+    - name: install bellwether
+      shell: bash
+      env:
+        BELLWETHER_VERSION: ${{ inputs.version }}
+        BELLWETHER_BUILD_PROFILE: ${{ inputs.build-profile }}
+        BELLWETHER_RELEASES: ${{ github.action_repository || 'vncp/bellwether' }}
+        GH_TOKEN: ${{ inputs.token }}
+      run: '"$GITHUB_ACTION_PATH/install.sh"'
+
+    - name: gate the pull request
+      id: gate
+      shell: bash
+      working-directory: ${{ inputs.path }}
+      env:
+        CONFIG: ${{ inputs.config }}
+        BASE: ${{ inputs.base }}
+        HEAD: ${{ inputs.head }}
+        # Passed through the environment, never pasted into the script.
+        PR_BODY: ${{ github.event.pull_request.body }}
+      run: |
+        out="$RUNNER_TEMP/bellwether-ci"
+        mkdir -p "$out"
+        printf '%s' "$PR_BODY" > "$out/body.md"
+        set +e
+        bellwether ci --config "$CONFIG" --base "$BASE" --head "$HEAD" \
+          --pr-body "$out/body.md" --json --comment-out "$out/comment.md" > "$out/report.json"
+        code=$?
+        set -e
+        echo "exit-code=$code" >> "$GITHUB_OUTPUT"
+        if [ -s "$out/report.json" ]; then
+          echo "outcome=$(jq -r .outcome "$out/report.json")" >> "$GITHUB_OUTPUT"
+        fi
+        if [ -f "$out/comment.md" ]; then
+          echo "comment-file=$out/comment.md" >> "$GITHUB_OUTPUT"
+          cat "$out/comment.md" >> "$GITHUB_STEP_SUMMARY"
+        fi
+
+    - name: post or update the comment
+      if: inputs.comment == 'true' && github.event.pull_request.number != '' && steps.gate.outputs.comment-file != ''
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.token }}
+        REPO: ${{ github.repository }}
+        PR: ${{ github.event.pull_request.number }}
+        AUTHOR: ${{ inputs.comment-author }}
+        COMMENT_FILE: ${{ steps.gate.outputs.comment-file }}
+      run: |
+        # A fork's pull request gets a read-only token: the step summary
+        # holds the same markdown.
+        if ! "$GITHUB_ACTION_PATH/comment.sh" "$COMMENT_FILE"; then
+          echo "::notice::the comment could not be posted (a read-only token: give the workflow pull-requests: write); the step summary has it"
+        fi
+
+    - name: conclusion
+      shell: bash
+      env:
+        CODE: ${{ steps.gate.outputs.exit-code }}
+      run: exit "$CODE"

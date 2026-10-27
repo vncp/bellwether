@@ -36,6 +36,8 @@ bellwether-adapters = { path = "../bellwether-adapters" }
 clap = { version = "4", features = ["derive", "env"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
+# `ci` reads the gate's configuration (`.bellwether/ci.toml`).
+toml = "1"
 
 [dev-dependencies]
 # Writes the SQLite table the sql:// root tests read.
