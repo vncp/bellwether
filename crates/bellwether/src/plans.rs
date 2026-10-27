@@ -16,12 +16,11 @@
 //! estimate ([`SharedEstimate`]), and memory stays unmeasured.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::PathBuf;
+use std::path::Path;
 
 use bellwether_replay::{load_plan, KeySetSource, Replayer, Workload, MAIN_DATASET};
 use bellwether_types::{
-    ConsumerPlan, Error, Exactness, Hash, KeySpec, OperatorCost, PlanNode, Quantity,
-    Result, Source,
+    ConsumerPlan, Error, Exactness, Hash, KeySpec, OperatorCost, PlanNode, Quantity, Result, Source,
 };
 use serde::{Deserialize, Serialize};
 
@@ -149,7 +148,7 @@ pub(crate) fn workload_plans(
 }
 
 /// Reads a plan file (read only): a consumer plan's JSON.
-pub(crate) fn read_plan(path: &PathBuf) -> Result<ConsumerPlan> {
+pub fn read_plan(path: &Path) -> Result<ConsumerPlan> {
     let bytes = std::fs::read(path).map_err(|e| Error::InvalidArgument {
         field: "plan",
         reason: format!("cannot read the plan file {} ({e})", path.display()),
@@ -338,7 +337,9 @@ fn shown(root: &str) -> String {
 /// Each node's cost summed over runs: blocks of one plan's nodes, in plan
 /// order. Exact plus exact is exact; a bounded term widens the sum to the
 /// sum of the intervals; a measured term makes it measured.
-pub(crate) fn sum_operators<'o>(blocks: impl IntoIterator<Item = &'o [OperatorCost]>) -> Vec<OperatorCost> {
+pub(crate) fn sum_operators<'o>(
+    blocks: impl IntoIterator<Item = &'o [OperatorCost]>,
+) -> Vec<OperatorCost> {
     let mut out: Vec<OperatorCost> = Vec::new();
     for block in blocks {
         if out.is_empty() {
@@ -506,7 +507,7 @@ pub(crate) fn plan_reports(
                 then.push(q.operators);
             }
         }
-        let n = plan.nodes.len() as u32;
+        let n = u32::try_from(plan.nodes.len()).unwrap_or(u32::MAX);
         out.push(PlanReport {
             plan: hash,
             runs: runs.len() as u64,

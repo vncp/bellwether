@@ -236,22 +236,21 @@ On the synthetic ledger at the medium size: one replay of one run under one cand
 
 ## 14. Operators priced exactly (ADR 026)
 
-The loss covers the relational subset a lake pipeline actually uses, not lookups alone. Each row says what the price needs and how exact it is.
+The loss covers the relational subset a lake pipeline actually uses, not lookups alone. Relational replay (WP15) prices a consumer's plan, a typed DAG (`ConsumerPlan`), node by node from the index and footer statistics. Each row says what the price is and how exact it is; the README's table ("Pricing a whole query") is the same one.
 
-| Operator | Needs | Exactness |
+| Operator | Bytes | Output rows |
 |---|---|---|
-| Projection of columns | per-column chunk bytes from footers (`ColumnStats.bytes`) | exact |
-| Equality, `IN` | exact or bloom key | exact (bloom: bounded by its false-positive rate) |
-| Range | min/max statistics; exact under a range key | bounded; exact with a range key |
-| `latest`, `asof` | temporal key | exact |
-| Semi-join of a key set against a dataset | exact key on the dataset | exact |
-| Inner or left join of two datasets | exact keys on both join columns; counts for output cardinality | exact row groups; exact cardinality with counts, else bounded |
-| Window partition prefilter | exact key on the partition columns | exact |
-| Aggregation input | projection and the filters above | exact |
-| Shuffle bytes | rows per key (counts) and average row width per column | bounded |
-| CPU and wall time | an attached executor | measured |
+| `scan`, `project` | projected columns' compressed chunk bytes over the planned row groups (a text chunk whole): exact | footer row counts: exact |
+| `filter` with `in` or a semi-join, `semi_join`, `window` with keys | the row groups the serving exact, bloom, or temporal key plans (a bloom's false positives are in the plan): exact | exact from a counted key on exactly those columns over a scan's rows; else bounded `[(key, row group) pairs present, rows of the planned row groups]` |
+| `filter` with `between` | the row groups a range key (else min/max) keeps: exact | bounded `[0, rows of those row groups]` |
+| `latest`, `as_of` | the winners' row groups through a temporal key: exact | bounded `[keys with a version, counted rows of the winners' row groups]` |
+| `join` (inner, left), a semi-join keyed by another node | per side the row groups holding a common key, from a merge of both indexes' sorted key blocks: exact | Σ count_L × count_R (left: plus unmatched left rows): exact with counts on both sides over scans' rows selected only by whole keys on the join columns, else bounded; a side with no exact or temporal key on its join columns is refused |
+| `aggregate` | its input's: exact | groups: exact from an exact or temporal key on the grouping columns over a scan's rows, else bounded `[min(1, low), high]` |
+| `exchange` | compressed-equivalent bytes moved (rows × average compressed row width): bounded with respect to that quantity, not network or memory bytes | unchanged |
+| any node over a SQL table | measured, naming the model | measured |
+| CPU and wall time | not priced: an attached executor measures them | |
 
-Counts are per-key, per-row-group row counts stored beside the bitmap when a key spec asks for them (storage version 2). They cost index space and buy exact join cardinalities, exact layout pricing, and exact shuffle bounds. The optimizer's backward pass (§4.1) is unchanged: one exact replay per counterfactual, whatever the operator.
+Counts are per-key, per-row-group row counts stored beside the bitmap when a key spec asks for them (storage version 2). They cost index space and buy exact join cardinalities and exact filter rows. A shared node (a diamond, a self-join) is evaluated once per run and its scans read once with the union of their consumers' row groups; each consumer prices its rows from its own selection. Layout pricing and plan-node counterfactuals were cut from WP15 (ADR 032, amended 2026-10-27); the backward pass (§4.1) over key specs is unchanged.
 
 ## 15. Generic use through Scorer and Verifier
 

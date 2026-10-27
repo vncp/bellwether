@@ -1149,7 +1149,7 @@ impl Engine {
         // borrows them; a name not bound is refused before any is read.
         let plan = req
             .plan
-            .as_ref()
+            .as_deref()
             .map(crate::plans::read_plan)
             .transpose()?;
         let mut plans: Vec<bellwether_types::ConsumerPlan> = plan.iter().cloned().collect();
@@ -3153,6 +3153,7 @@ impl Engine {
     /// as an engine Proposal citing the Evidence and scored by a Replay of
     /// every run through its plan. The recommendation rule is
     /// [`Engine::why`]'s, on the runs' read bytes.
+    #[allow(clippy::too_many_lines)]
     fn replay_plan_candidates(
         &self,
         report: &mut WhyReport,

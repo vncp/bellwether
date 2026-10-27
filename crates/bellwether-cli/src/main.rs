@@ -242,7 +242,7 @@ struct WhyArgs {
     #[arg(long, value_name = "COL[=VALUE]", conflicts_with = "lookback")]
     tombstone: Option<String>,
     /// The instant for `asof` pricing (with `--latest-by`), or of a
-    /// consumer plan's as_of nodes (with `--plan`): RFC 3339, a date
+    /// consumer plan's `as_of` nodes (with `--plan`): RFC 3339, a date
     /// (YYYY-MM-DD), or an integer in the version column's unit.
     #[arg(long, value_name = "INSTANT")]
     at: Option<String>,
@@ -345,7 +345,7 @@ struct WhyArgs {
     /// each candidate key drawn from the columns its filters, joins,
     /// windows, and aggregates name, beside an operator table. The datasets
     /// it scans besides this folder are bound with --dataset NAME=ROOT;
-    /// --at gives its as_of nodes their instant.
+    /// --at gives its `as_of` nodes their instant.
     #[arg(long, value_name = "FILE", requires = "from")]
     plan: Option<PathBuf>,
 }
@@ -629,6 +629,14 @@ struct ProposeArgs {
     /// returns the same rows by the key columns).
     #[arg(long, value_name = "TEXT")]
     invariant: Option<String>,
+    /// With --before: the current shape as a consumer plan, a JSON file of
+    /// a typed plan DAG (as `why --plan` reads), so the rewrite is replayed
+    /// and `fix` takes it to an attest-only receipt (with --after-plan).
+    #[arg(long, value_name = "FILE", requires_all = ["before", "after_plan"])]
+    before_plan: Option<PathBuf>,
+    /// With --before-plan: the target shape as a consumer plan.
+    #[arg(long, value_name = "FILE", requires = "before_plan")]
+    after_plan: Option<PathBuf>,
     /// Propose a rewrite of queries in the engine the folder is a twin of:
     /// BEFORE=AFTER, two files of one query each (repeat for several pairs,
     /// scored and verified as one set). Cite the evidence `why --twin-of`
@@ -771,7 +779,7 @@ impl From<Error> for Failure {
                 field:
                     "lookback" | "latest_by" | "signing_key" | "trusted_keys" | "public_key" | "out"
                     | "name" | "valid_from" | "revoked_at" | "index" | "root" | "scratch" | "items"
-                    | "columns" | "text" | "join" | "functions",
+                    | "columns" | "text" | "join" | "functions" | "plan" | "datasets",
                 ..
             } => Self::Usage(match hint(&e) {
                 Some(h) => format!("{e}; {h}"),
@@ -867,6 +875,8 @@ fn hint(e: &Error) -> Option<String> {
                 "columns" => "--columns",
                 "text" => "--contains, --has, or --prefix",
                 "functions" => "--fn",
+                "plan" => "--plan (a consumer plan's JSON) or --before-plan and --after-plan",
+                "datasets" => "--dataset NAME=ROOT",
                 "join" => {
                     "the right side the join key names (--join <right>.<column>[,<column>...], or \
                      the right side of a join: key spec): a folder beside the data root, one \
@@ -1206,8 +1216,16 @@ fn propose(g: &Global, out: &Out, a: &ProposeArgs) -> Result<Outcome, Failure> {
                 pairs: Vec::new(),
                 key: Vec::new(),
                 keys: None,
-                before_plan: None,
-                after_plan: None,
+                before_plan: a
+                    .before_plan
+                    .as_deref()
+                    .map(bellwether::read_plan)
+                    .transpose()?,
+                after_plan: a
+                    .after_plan
+                    .as_deref()
+                    .map(bellwether::read_plan)
+                    .transpose()?,
             },
         })
     } else if !a.rewrite.is_empty() {

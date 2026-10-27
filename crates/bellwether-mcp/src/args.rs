@@ -199,7 +199,10 @@ impl EngineArgs {
                         .into(),
                 ));
             }
-            if datasets.insert(name.to_string(), root.to_string()).is_some() {
+            if datasets
+                .insert(name.to_string(), root.to_string())
+                .is_some()
+            {
                 return Err(OptionsError::Usage(format!(
                     "--dataset binds {name:?} twice; bind each name once"
                 )));

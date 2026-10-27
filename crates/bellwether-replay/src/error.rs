@@ -170,7 +170,9 @@ impl From<ReplayError> for Error {
             ReplayError::RewriteNotScorable
             | ReplayError::ProposalMismatch { .. }
             | ReplayError::NotAProposal(_) => Error::LedgerRule(msg),
-            ReplayError::SpecServesNoRun { .. } => Error::KeySpec(msg),
+            ReplayError::SpecServesNoRun { .. } | ReplayError::JoinNotIndexed { .. } => {
+                Error::KeySpec(msg)
+            }
             ReplayError::BenchMismatch { .. } | ReplayError::UnprobeableFilter { .. } => {
                 Error::Source(msg)
             }
@@ -179,7 +181,6 @@ impl From<ReplayError> for Error {
                 field: "plan",
                 reason: msg,
             },
-            ReplayError::JoinNotIndexed { .. } => Error::KeySpec(msg),
         }
     }
 }

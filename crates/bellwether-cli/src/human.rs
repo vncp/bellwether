@@ -469,7 +469,7 @@ fn lookup_label(lookup: &LookupKind) -> String {
         }
         LookupKind::Latest => "latest".to_string(),
         LookupKind::Plan { plans } => format!(
-            "through consumer plan {}",
+            "consumer plan {}",
             plans
                 .iter()
                 .map(ToString::to_string)
@@ -1058,6 +1058,7 @@ fn exactness(q: &bellwether::types::Quantity) -> &'static str {
 /// planned read bytes and output rows summed over runs, each with its
 /// exactness, under the current configuration and the recommended key;
 /// then the read occurrences and the shared nodes.
+#[allow(clippy::too_many_lines)]
 fn plan_table(s: &mut String, p: &bellwether::PlanReport, recommended: Option<String>) {
     let _ = writeln!(
         s,
@@ -1074,7 +1075,10 @@ fn plan_table(s: &mut String, p: &bellwether::PlanReport, recommended: Option<St
                     .model
                     .as_ref()
                     .map_or_else(String::new, |m| format!(", {m}"));
-                format!("{} = {} at sequence {}{measured}", d.name, d.root, d.sequence)
+                format!(
+                    "{} = {} at sequence {}{measured}",
+                    d.name, d.root, d.sequence
+                )
             })
             .collect::<Vec<_>>()
             .join("; ")
@@ -1117,7 +1121,9 @@ fn plan_table(s: &mut String, p: &bellwether::PlanReport, recommended: Option<St
             .unwrap_or(0)
     };
     let w: Vec<usize> = (0..6).map(width).collect();
-    for (row, node) in std::iter::once((&head, None)).chain(cells.iter().zip(p.consumers.iter().map(Some))) {
+    for (row, node) in
+        std::iter::once((&head, None)).chain(cells.iter().zip(p.consumers.iter().map(Some)))
+    {
         let note = match node {
             Some(0) => "  root",
             Some(1) | None => "",

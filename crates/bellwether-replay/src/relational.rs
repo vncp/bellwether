@@ -61,7 +61,7 @@
 //!   it once. It is not wall time and not what an engine reads (an engine
 //!   may prune more or read more, which an adapter measures). For an
 //!   `exchange` it is compressed-equivalent bytes moved (below).
-//! - **rows_out** is the node's output cardinality. Per-key counts give
+//! - **`rows_out`** is the node's output cardinality. Per-key counts give
 //!   exact numbers only where the relation they count is proved: a scan's
 //!   rows filtered by whole keys (`in`, a semi-join, a window prefilter)
 //!   on exactly the counted columns. After a range filter, a `latest` or
@@ -202,7 +202,7 @@ fn predicate_nodes(p: &Predicate, out: &mut Vec<u32>) {
 /// A node's children: its inputs, then the nodes whose output keys it.
 #[must_use]
 pub fn children(node: &PlanNode) -> Vec<u32> {
-    let keyed = |k: &Option<&KeysFrom>| match k {
+    let keyed = |k: Option<&KeysFrom>| match k {
         Some(KeysFrom::Node { node, .. }) => Some(*node),
         _ => None,
     };
@@ -219,10 +219,10 @@ pub fn children(node: &PlanNode) -> Vec<u32> {
         | PlanNode::Exchange { input, .. }
         | PlanNode::Project { input, .. } => vec![*input],
         PlanNode::SemiJoin { input, keys, .. } => {
-            std::iter::once(*input).chain(keyed(&Some(keys))).collect()
+            std::iter::once(*input).chain(keyed(Some(keys))).collect()
         }
         PlanNode::Window { input, keys, .. } => std::iter::once(*input)
-            .chain(keyed(&keys.as_ref()))
+            .chain(keyed(keys.as_ref()))
             .collect(),
         PlanNode::Join { left, right, .. } => vec![*left, *right],
     }
@@ -375,6 +375,8 @@ fn check_predicate(node: u32, p: &Predicate) -> ReplayResult<()> {
 /// several), every node read by the root, and well-formed literals.
 /// Returns the nodes in post order (inputs before the nodes they feed),
 /// each once.
+// Node indices fit in u32: the node count is checked first.
+#[allow(clippy::too_many_lines, clippy::cast_possible_truncation)]
 pub fn check_shape(plan: &ConsumerPlan) -> ReplayResult<Vec<u32>> {
     if plan.version > PLAN_VERSION {
         return Err(Error::UnsupportedVersion {
@@ -469,7 +471,7 @@ pub fn check_shape(plan: &ConsumerPlan) -> ReplayResult<Vec<u32>> {
             }
             PlanNode::Exchange { by, .. } => check_columns(i, "the exchange", by, true)?,
             PlanNode::Project { columns, .. } => {
-                check_columns(i, "the projection", columns, false)?
+                check_columns(i, "the projection", columns, false)?;
             }
         }
     }
@@ -687,10 +689,11 @@ impl CheckedPlan {
                     Probe::Versions(ts),
                 ) => same_set(columns, cols) && ts_column == ts,
                 (
-                    KeySpec::Exact { columns, .. } | KeySpec::Temporal { columns, .. },
+                    KeySpec::Exact { columns, .. }
+                    | KeySpec::Temporal { columns, .. }
+                    | KeySpec::Bloom { columns, .. },
                     Probe::Keys,
-                )
-                | (KeySpec::Bloom { columns, .. }, Probe::Keys) => same_set(columns, cols),
+                ) => same_set(columns, cols),
                 _ => false,
             })
     }
@@ -908,6 +911,8 @@ impl<'a> Replayer<'a> {
     }
 
     /// Checks `plan` against the datasets it scans (module docs).
+    // Node indices fit in u32: `check_shape` checks the node count.
+    #[allow(clippy::too_many_lines, clippy::cast_possible_truncation)]
     pub fn check_plan(&self, plan: &ConsumerPlan) -> ReplayResult<CheckedPlan> {
         let order = check_shape(plan)?;
         let n = plan.nodes.len();
@@ -1197,7 +1202,7 @@ impl<'a> Replayer<'a> {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments, clippy::unused_self)]
     fn check_keyed(
         &self,
         plan: &ConsumerPlan,
@@ -1264,6 +1269,39 @@ impl<'a> Replayer<'a> {
         keys: &RunKeys,
         asof: Option<i64>,
     ) -> ReplayResult<PricedPlan> {
+        Ok(self
+            .run_pricer(checked, specs, run_id, keys, asof, false)?
+            .0)
+    }
+
+    /// The lookups `checked` makes on `main` for one run under `specs`
+    /// (every other dataset under its current specs), in pricing order:
+    /// what `fix` verifies a key proposal over a consumer-plan workload on
+    /// (each lookup's keys and the row groups the plan read them from, never
+    /// the run's keys as such). Takes the same arguments as
+    /// [`Replayer::price_checked`] and prices the plan once.
+    pub fn plan_lookups(
+        &self,
+        checked: &CheckedPlan,
+        specs: &[KeySpec],
+        run_id: &str,
+        keys: &RunKeys,
+        asof: Option<i64>,
+    ) -> ReplayResult<Vec<PlanLookup>> {
+        Ok(self.run_pricer(checked, specs, run_id, keys, asof, true)?.1)
+    }
+
+    /// Prices `checked` for one run, recording its lookups on `main` when
+    /// `record` is set.
+    fn run_pricer(
+        &self,
+        checked: &CheckedPlan,
+        specs: &[KeySpec],
+        run_id: &str,
+        keys: &RunKeys,
+        asof: Option<i64>,
+        record: bool,
+    ) -> ReplayResult<(PricedPlan, Vec<PlanLookup>)> {
         if checked.asof && asof.is_none() {
             return Err(invalid(
                 None,
@@ -1296,8 +1334,11 @@ impl<'a> Replayer<'a> {
             asof,
             unserved: false,
             remaining: checked.consumers.clone(),
+            node: 0,
+            lookups: record.then(Vec::new),
         };
-        p.price(run_id)
+        let priced = p.price(run_id)?;
+        Ok((priced, p.lookups.unwrap_or_default()))
     }
 
     /// The catalog digests of the datasets `checked` scans besides `main`,
@@ -1311,6 +1352,63 @@ impl<'a> Replayer<'a> {
             .filter_map(|d| self.datasets.get(d))
             .map(|r| r.catalog().digest())
             .collect()
+    }
+}
+
+/// One lookup a consumer plan makes on `main` through an index
+/// ([`Replayer::plan_lookups`]): the node, what it looks up, and the row
+/// groups the configuration planned for it (before any narrowing by the
+/// node's input), which is what the plan reads them from.
+#[derive(Clone, Debug)]
+pub enum PlanLookup {
+    /// Whole keys on `keys.columns()` (an `in` or semi-join filter, a
+    /// semi-join, a window prefilter, or a join side restricted to keys a
+    /// run or literal supplies), planned as `query`: `locate`, or `latest`
+    /// or `asof` for a `latest` or `as_of` node.
+    Keys {
+        /// The node that looks them up.
+        node: u32,
+        /// The keys, on `main`'s columns.
+        keys: RunKeys,
+        /// How they were planned.
+        query: RunQuery,
+        /// The row-group ids planned for them.
+        planned: RoaringBitmap,
+    },
+    /// `column` in `[lo, hi]` through a range key.
+    Range {
+        /// The `between` filter node.
+        node: u32,
+        /// The range key's column.
+        column: String,
+        /// The lower bound, canonical encoding.
+        lo: Vec<u8>,
+        /// The upper bound, canonical encoding.
+        hi: Vec<u8>,
+        /// The row-group ids the range key planned.
+        planned: RoaringBitmap,
+    },
+    /// A join (or a semi-join keyed by another node's output) whose keys
+    /// on `columns` no run or literal key restricts: the plan merges every
+    /// key `main`'s index holds on them with the other side's, so the keys
+    /// it looks up are the whole key space, not a workload's.
+    AllKeys {
+        /// The join node.
+        node: u32,
+        /// `main`'s join columns, in its key's order.
+        columns: Vec<String>,
+    },
+}
+
+impl PlanLookup {
+    /// The node that makes the lookup.
+    #[must_use]
+    pub fn node(&self) -> u32 {
+        match self {
+            Self::Keys { node, .. } | Self::Range { node, .. } | Self::AllKeys { node, .. } => {
+                *node
+            }
+        }
     }
 }
 
@@ -1503,6 +1601,11 @@ struct Pricer<'p, 'a> {
     /// Per node: the reads of it not yet priced; its output is moved to
     /// the last, cloned for the others (a shared node, module docs).
     remaining: Vec<u32>,
+    /// The node being priced.
+    node: u32,
+    /// The lookups on `main`, when recording them
+    /// ([`Replayer::plan_lookups`]).
+    lookups: Option<Vec<PlanLookup>>,
 }
 
 fn same_set(a: &[String], b: &[String]) -> bool {
@@ -1517,6 +1620,16 @@ fn keyed_columns(spec: &KeySpec) -> Option<&[String]> {
 }
 
 impl<'p, 'a> Pricer<'p, 'a> {
+    /// Records the lookup `make` builds when recording and `d` is `main`.
+    fn record(&mut self, d: &str, make: impl FnOnce(u32) -> PlanLookup) {
+        if d == MAIN_DATASET {
+            let node = self.node;
+            if let Some(l) = self.lookups.as_mut() {
+                l.push(make(node));
+            }
+        }
+    }
+
     fn replayer(&self, d: &str) -> ReplayResult<&'p Replayer<'a>> {
         self.main
             .dataset(d)
@@ -1611,13 +1724,11 @@ impl<'p, 'a> Pricer<'p, 'a> {
     }
 
     fn model_of(&self, rel: &Rel) -> Option<String> {
-        rel.sides()
-            .filter_map(|s| {
-                self.main
-                    .dataset(&s.dataset)
-                    .and_then(|r| r.measured.clone())
-            })
-            .next()
+        rel.sides().find_map(|s| {
+            self.main
+                .dataset(&s.dataset)
+                .and_then(|r| r.measured.clone())
+        })
     }
 
     fn quantity(iv: Iv, model: Option<&String>) -> Quantity {
@@ -1709,12 +1820,7 @@ impl<'p, 'a> Pricer<'p, 'a> {
 
     /// Every stored key of `keys` (projected onto `spec`'s columns) with its
     /// row groups and per-row-group counts, folded across segments.
-    fn stored(
-        &self,
-        d: &str,
-        spec: &KeySpec,
-        keys: &RunKeys,
-    ) -> ReplayResult<(Vec<usize>, BTreeMap<Vec<u8>, Folded>)> {
+    fn stored(&self, d: &str, spec: &KeySpec, keys: &RunKeys) -> ReplayResult<StoredKeys> {
         let cols = keyed_columns(spec).unwrap_or(&[]);
         let positions = keys
             .positions(cols)
@@ -1769,7 +1875,14 @@ impl<'p, 'a> Pricer<'p, 'a> {
             r.verified_plan(planner, self.specs(&d), &keys, &RunQuery::Locate)?
         };
         self.unserved |= unserved;
-        let planned = &side.rgs & &r.catalog().ids_of(&plan);
+        let ids = r.catalog().ids_of(&plan);
+        self.record(&d, |node| PlanLookup::Keys {
+            node,
+            keys: keys.clone(),
+            query: RunQuery::Locate,
+            planned: ids.clone(),
+        });
+        let planned = &side.rgs & &ids;
         let in_rgs = self.rows_of(&d, &planned)?;
         let lower = if base {
             self.pairs(&d, &keys, &planned)?
@@ -1822,6 +1935,13 @@ impl<'p, 'a> Pricer<'p, 'a> {
             for r in segs.readers() {
                 planned |= r.lookup_range(lo, hi)?;
             }
+            self.record(&d, |node| PlanLookup::Range {
+                node,
+                column: column.to_string(),
+                lo: lo.to_vec(),
+                hi: hi.to_vec(),
+                planned: planned.clone(),
+            });
             &side.rgs & &planned
         } else {
             let c = self.replayer(&d)?.catalog();
@@ -1897,7 +2017,14 @@ impl<'p, 'a> Pricer<'p, 'a> {
             r.verified_plan(planner, self.specs(&d), &keys, &query)?
         };
         self.unserved |= unserved;
-        let planned = &side.rgs & &r.catalog().ids_of(&plan);
+        let ids = r.catalog().ids_of(&plan);
+        self.record(&d, |node| PlanLookup::Keys {
+            node,
+            keys: keys.clone(),
+            query: query.clone(),
+            planned: ids.clone(),
+        });
+        let planned = &side.rgs & &ids;
         // Lower: a key with a live version (at or before the instant)
         // returns at least one row; one per run tuple, so the two
         // encodings of a float zero count once.
@@ -1939,8 +2066,9 @@ impl<'p, 'a> Pricer<'p, 'a> {
 
     /// The keys two sides share on their join columns (`lcols[i]` pairs
     /// with `rcols[i]`), by a merge of both sides' exact or temporal keys.
+    #[allow(clippy::too_many_lines)]
     fn merge(
-        &self,
+        &mut self,
         node: u32,
         (lname, left, lcols): (&'static str, &Side, &[String]),
         (rname, right, rcols): (&'static str, &Side, &[String]),
@@ -2054,6 +2182,8 @@ impl<'p, 'a> Pricer<'p, 'a> {
             (None, Some(r)) => Some(r.all_probes(&r.positions(&rorder).unwrap_or_default())),
             (None, None) => None,
         };
+        // What each side of `main` looked up, recorded after the merge.
+        let mut looked: Vec<Looked> = Vec::new();
         if let Some(probes) = restrict {
             let mut lmap: BTreeMap<Vec<u8>, Folded> = BTreeMap::new();
             let mut rmap: BTreeMap<Vec<u8>, Folded> = BTreeMap::new();
@@ -2072,6 +2202,22 @@ impl<'p, 'a> Pricer<'p, 'a> {
                     visit(k, lf, rf);
                 }
             }
+            if self.lookups.is_some() {
+                let planned = |map: &BTreeMap<Vec<u8>, Folded>| {
+                    map.values()
+                        .fold(RoaringBitmap::new(), |a, f| a | &f.bitmap)
+                };
+                looked.push((
+                    left.dataset.clone(),
+                    lorder.clone(),
+                    Some((probes.clone(), planned(&lmap))),
+                ));
+                looked.push((
+                    right.dataset.clone(),
+                    rorder.clone(),
+                    Some((probes, planned(&rmap))),
+                ));
+            }
         } else {
             let mut ls = MergedKeys::new(lsegs.readers())?;
             let mut rs = MergedKeys::new(rsegs.readers())?;
@@ -2087,6 +2233,39 @@ impl<'p, 'a> Pricer<'p, 'a> {
                     }
                 }
             }
+            looked.push((left.dataset.clone(), lorder.clone(), None));
+            looked.push((right.dataset.clone(), rorder.clone(), None));
+        }
+        // The lookups on `main`: the probed keys with the row groups its
+        // key planned for them, or, unrestricted, its whole key space.
+        for (d, columns, probed) in looked {
+            if d != MAIN_DATASET || self.lookups.is_none() {
+                continue;
+            }
+            let lookup = match probed {
+                Some((probes, planned)) => {
+                    let schema = self.replayer(&d)?.schema();
+                    let types = columns
+                        .iter()
+                        .map(|c| {
+                            let f = schema
+                                .field_with_name(c)
+                                .map_err(|_| invalid(Some(node), format!("{c:?} is not in {d}")))?;
+                            ColumnType::of(f.data_type()).map_err(ReplayError::from)
+                        })
+                        .collect::<ReplayResult<Vec<_>>>()?;
+                    let keys =
+                        RunKeys::from_tuples(&columns, &types, probes.iter().map(Vec::as_slice))?.0;
+                    PlanLookup::Keys {
+                        node,
+                        keys,
+                        query: RunQuery::Locate,
+                        planned,
+                    }
+                }
+                None => PlanLookup::AllKeys { node, columns },
+            };
+            self.record(&d, |_| lookup);
         }
         Ok(m)
     }
@@ -2108,6 +2287,7 @@ impl<'p, 'a> Pricer<'p, 'a> {
         rel.ok_or_else(|| invalid(Some(v), format!("node {i} was not priced before it")))
     }
 
+    #[allow(clippy::too_many_lines)]
     fn price(&mut self, run_id: &str) -> ReplayResult<PricedPlan> {
         let plan = &self.checked.plan;
         let n = plan.nodes.len();
@@ -2116,6 +2296,7 @@ impl<'p, 'a> Pricer<'p, 'a> {
         let mut shared = Vec::new();
         let order = self.checked.order.clone();
         for v in order {
+            self.node = v;
             let node = &plan.nodes[v as usize];
             let mut moved: Option<Iv> = None;
             let rel = match node {
@@ -2302,7 +2483,7 @@ impl<'p, 'a> Pricer<'p, 'a> {
         input: u32,
         rel: Rel,
         p: &Predicate,
-        rels: &mut Vec<Option<Rel>>,
+        rels: &mut [Option<Rel>],
     ) -> ReplayResult<Rel> {
         match p {
             Predicate::And { all } => {
@@ -2348,7 +2529,7 @@ impl<'p, 'a> Pricer<'p, 'a> {
         rel: Rel,
         columns: &[String],
         keys: &KeysFrom,
-        rels: &mut Vec<Option<Rel>>,
+        rels: &mut [Option<Rel>],
     ) -> ReplayResult<Rel> {
         let Some(side) = rel.side.clone() else {
             // Rows derived from several scans: no index holds them.
@@ -2479,6 +2660,7 @@ impl<'p, 'a> Pricer<'p, 'a> {
     /// other side's read to the row groups holding a key of those rows,
     /// its own read stays as priced below, and the rows are bounded by the
     /// derived rows (never counted from the index).
+    #[allow(clippy::many_single_char_names)]
     fn join(
         &mut self,
         v: u32,
@@ -2696,6 +2878,15 @@ impl<'p, 'a> Pricer<'p, 'a> {
         Ok(Iv::new(sat(lo), sat(hi)))
     }
 }
+
+/// The positions of a spec's columns among a key set's, and each stored
+/// key of the set with what the index holds for it.
+type StoredKeys = (Vec<usize>, BTreeMap<Vec<u8>, Folded>);
+
+/// A lookup a join made on one side: its dataset, its key columns, and the
+/// probed keys with the row groups the index holds them in (`None`: every
+/// key the index holds).
+type Looked = (String, Vec<String>, Option<(Vec<Vec<u8>>, RoaringBitmap)>);
 
 /// One stored key's row groups, per-row-group counts, and versions,
 /// folded across the segments that hold it.

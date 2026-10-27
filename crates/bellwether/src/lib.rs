@@ -86,6 +86,9 @@ pub use ledger_views::{
     Finding, FindingsResult, ReceiptEntry, ReceiptsResult, RuleScore, ScorecardResult, UNATTRIBUTED,
 };
 pub use lookback::{split_window, window_reversed, Lookback};
+pub use plans::{
+    read_plan, PlanDataset, PlanRead, PlanReport, SharedEstimate, SHARED_ESTIMATE_MODEL,
+};
 pub use propose::engine_rewrite;
 pub use receipt::signature_summary;
 pub use reconcile::{ReconcileProblem, ReconcileRequest, ReconcileResult};
@@ -107,7 +110,6 @@ pub use twin::{
     EngineWorkload, GateFit, TwinCandidate, TwinColumns, TwinReport, CARDINALITY_RATIO,
     LOW_CARDINALITY_ROWS, MEMBERSHIP_GATE, NARROW_PERCENT, SELECTIVE_FILES_PERCENT,
 };
-pub use plans::{PlanDataset, PlanRead, PlanReport, SharedEstimate, SHARED_ESTIMATE_MODEL};
 pub use why::{
     AggregateQuery, Candidate, CandidateOrigin, Culprit, CulpritReason, Dataset, DiagnosisReads,
     LookupMode, ProfileEvidence, Recommendation, TextMatch, TimeWindow, WhyReport, WhyRequest,

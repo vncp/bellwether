@@ -13,8 +13,8 @@ use arrow::array::{ArrayRef, RecordBatch, StringArray, UInt64Array};
 use arrow::datatypes::{DataType, Field, Schema};
 use bellwether_ledger::{Ledger, RecordKind};
 use bellwether_replay::{
-    report, write_replay, CostDelta, KeyInput, MemoryKeySets, PlanSource, ReplayError, Replayer,
-    Scored, SpecAlternative, WorkloadRecorder,
+    report, write_replay, Alternative, CostDelta, KeyInput, MemoryKeySets, PlanSource, ReplayError,
+    Replayer, Scored, WorkloadRecorder,
 };
 use bellwether_source::ParquetSource;
 use bellwether_store::{ObjectStoreBackend, Snapshot};
@@ -759,7 +759,7 @@ fn attribution_hooks_return_exact_counterfactual_deltas() {
     let c_none = replayer.replay_specs(&[], &workload, &keys).unwrap();
 
     let d = replayer
-        .replace_spec(&nodes, 1, &SpecAlternative::Ablate, &workload, &keys)
+        .replace_node(&nodes, 1, &Alternative::Ablate, &workload, &keys)
         .unwrap();
     for (i, x) in d.iter().enumerate() {
         assert_eq!(x.base, c_both[i]);
@@ -776,10 +776,10 @@ fn attribution_hooks_return_exact_counterfactual_deltas() {
         bounds: None,
     };
     let d = replayer
-        .replace_spec(
+        .replace_node(
             &nodes,
             0,
-            &SpecAlternative::Replace(bloom.clone()),
+            &Alternative::Replace(bloom.clone()),
             &workload,
             &keys,
         )
@@ -794,10 +794,10 @@ fn attribution_hooks_return_exact_counterfactual_deltas() {
 
     // I_uv = c(a_uv) − c(a_u) − c(a_v) + c(a), with both nodes ablated.
     let inter = replayer
-        .spec_interaction(
+        .interaction(
             &nodes,
-            (0, &SpecAlternative::Ablate),
-            (1, &SpecAlternative::Ablate),
+            (0, &Alternative::Ablate),
+            (1, &Alternative::Ablate),
             &workload,
             &keys,
         )
@@ -820,10 +820,10 @@ fn attribution_hooks_return_exact_counterfactual_deltas() {
         assert_eq!(x.interaction, want, "{}", x.run_id);
     }
     assert!(replayer
-        .spec_interaction(
+        .interaction(
             &nodes,
-            (0, &SpecAlternative::Ablate),
-            (0, &SpecAlternative::Ablate),
+            (0, &Alternative::Ablate),
+            (0, &Alternative::Ablate),
             &workload,
             &keys
         )

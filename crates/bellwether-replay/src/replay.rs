@@ -670,8 +670,8 @@ impl<'a> Replayer<'a> {
         keys: &dyn KeySetSource,
         query: Option<&RunQuery>,
     ) -> Result<PricedRuns> {
-        let planned = workload.runs().iter().filter(|r| r.plan.is_some()).count();
-        if planned != 0 && planned != workload.runs().len() {
+        let with_plans = workload.runs().iter().filter(|r| r.plan.is_some()).count();
+        if with_plans != 0 && with_plans != workload.runs().len() {
             return Err(Error::InvalidArgument {
                 field: "workload",
                 reason: "the workload mixes runs priced through a consumer plan with plain \

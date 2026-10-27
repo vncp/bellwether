@@ -60,10 +60,7 @@ pub mod slo;
 pub mod transient;
 pub mod workload;
 
-pub use attribution::{
-    apply as apply_alternative, apply_all as apply_alternatives, Alternative, CostDelta, RunDelta,
-    RunInteraction, SpecAlternative,
-};
+pub use attribution::{Alternative, CostDelta, RunDelta, RunInteraction};
 pub use baseline::{Baseline, BaselinePlanner};
 pub use catalog::{Catalog, CatalogRowGroup};
 pub use error::{ReplayError, ReplayResult};
@@ -76,8 +73,8 @@ pub use plan::{
     text_residual, Lookup, PlanSource, RangeRead, SegmentBytes, SegmentPlanner, SpecSegments,
 };
 pub use relational::{
-    check_shape, children, op_name, CheckedPlan, PricedPlan, ScanRead, SharedOutput, MAIN_DATASET,
-    PLAN_VERSION,
+    check_shape, children, op_name, CheckedPlan, PlanLookup, PricedPlan, ScanRead, SharedOutput,
+    MAIN_DATASET, PLAN_VERSION,
 };
 pub use replay::{proposed_specs, write_replay, PricedRuns, Replayer, Scored, DEFAULT_CACHE_BYTES};
 pub use report::{

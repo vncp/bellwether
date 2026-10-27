@@ -1107,7 +1107,7 @@ fn verify_and_outcome_human(s: &mut String, r: &FixResult) {
                     "layout proposals are applied by evolve, which has not landed".into()
                 }
                 Refusal::NoReplay { .. } => {
-                    "the rewrite verified, but a receipt cites a replay and rewrites have none yet (contract v3 backlog #2)".into()
+                    "the rewrite verified, but a receipt cites a replay, and this rewrite states its plans only in prose, so it has none; propose it again with --before-plan and --after-plan (typed plan DAGs, as why --plan reads) to have it priced and attested".into()
                 }
                 Refusal::AttestOnly {
                     target,

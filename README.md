@@ -102,6 +102,7 @@ An agent (or a person) may **observe** and **propose**. Only the engine may **sc
 - [Highlights](#highlights)
 - [Index kinds](#index-kinds)
 - [How `fix` proves a change](#how-fix-proves-a-change)
+- [Pricing a whole query](#pricing-a-whole-query)
 - [Questions over time](#questions-over-time)
 - [For a coding agent](#for-a-coding-agent)
 - [How it compares](#how-it-compares)
@@ -230,6 +231,25 @@ In order, every time: **score** the proposal by exact replay, **verify** that th
   </picture>
 </p>
 <p align="center"><em><code>bellwether report</code> after that fix, its receipt section drawn below · same corpus and build</em></p>
+
+## Pricing a whole query
+
+A lookup is one step of a job; the rest is joins, windows, and aggregates. `why --plan plan.json` prices the whole query: the plan is a typed DAG (`{"version": 1, "nodes": [...], "root": N}` with `scan`, `filter`, `semi_join`, `join`, `latest`, `as_of`, `window`, `aggregate`, `exchange`, `project` nodes; never SQL, so the price does not depend on a dialect or on which rewrites a planner applied). Each `--from` run's keys feed the plan's run-keyed nodes; the datasets it scans besides the folder are bound by name (`--dataset repos=./repos`), never named by the plan or a tool argument. `why` prices every run through the plan under the current configuration and under each key the plan's filters, joins, windows, and aggregates could use, and prints an operator table beside the funnel. A node may feed several nodes (a diamond, a self-join): it is evaluated once per run, each scan is read once with the union of what its consumers need, and each consumer prices its rows from its own selection. A rewrite proposed with `--before-plan` and `--after-plan` is priced the same way, its actual outputs are reconciled, and `fix` writes an attest-only receipt.
+
+Every node has bytes and output rows, each `exact`, `bounded` (an interval that holds the true value), or `measured` (naming the model):
+
+| Operator | Bytes | Output rows |
+|---|---|---|
+| `scan`, `project` | projected columns' compressed chunk bytes over the planned row groups (a text chunk whole): **exact** | footer row counts: **exact** |
+| `filter` with `in` or a semi-join, `semi_join`, `window` with keys (whole keys, from the run or literal) | the row groups the serving exact, bloom, or temporal key plans (a bloom's false positives are in the plan): **exact** | **exact** from a counted key on exactly those columns over a scan's rows; else **bounded** `[(key, row group) pairs present, rows of the planned row groups]` |
+| `filter` with `between` | the row groups a range key (else the footers' min/max) keeps: **exact** | **bounded** `[0, rows of those row groups]` |
+| `latest`, `as_of` | the winners' row groups through a temporal key: **exact** | **bounded** `[keys with a version, counted rows of the winners' row groups]`: duplicates at a winning timestamp are not stored per (key, timestamp) |
+| `join` (inner, left), and a semi-join keyed by another node | per side the row groups holding a common key (a left join every left row group); the common keys merged from both indexes' sorted key blocks: **exact** | Σ count_L × count_R (left: plus unmatched left rows), **exact** when both sides carry counts and both are a scan's rows selected only by whole keys on the join columns; else **bounded**. A side without an exact or temporal key on its join columns is refused (`JoinNotIndexed`), never priced as a scan |
+| `aggregate` | its input's: **exact** | groups: **exact** from an exact or temporal key on the grouping columns over a scan's rows (not a float grouping); else **bounded** `[min(1, low), high]` |
+| `exchange` | compressed-equivalent bytes moved, rows × average compressed row width of the planned row groups: **bounded** with respect to that quantity, which is not network or memory bytes | unchanged |
+| any node over a SQL table | **measured**, naming the model (ADR 027) | **measured** |
+
+What stays measured, never priced: CPU and wall time (an attached engine adapter measures them); any node over a SQL table; shuffle bytes beyond their compressed-equivalent bound, and memory for a shared node's buffered output; an engine's own extra pruning or extra reads (the adapters report both); row counts at a winning timestamp with duplicates.
 
 ## Questions over time
 
@@ -463,12 +483,13 @@ Pre-alpha. The architecture and on-disk format are fixed and documented; the cra
 - [ ] **M7** a SQL table reconciles against a folder of files with a certificate; plans execute inside DataFusion and DuckDB without a sidecar step; receipts gate pull requests
 - [ ] **M8** rules transfer across datasets and the exact-versus-estimated ablation is measured; receipts are signed (signing landed with [#10](https://github.com/vncp/bellwether/pull/10))
 
+Landed toward **M6**: relational replay (WP15), the loss over the relational operators: `why --plan` prices a query's plan DAG node by node, and a rewrite with typed before and after plans is priced, reconciled, and attested ([Pricing a whole query](#pricing-a-whole-query)).
+
 Built beyond the milestones: the time-series keys (partition values from paths, ordered plans, `--at-manifest` pinned lookups, per-key time bounds, bitemporal as-of, the `market` corpus), `report` as one HTML file from the ledger, the ledger views (`bellwether ledger findings|receipts|scorecard`), and signed receipts and certificates (`bellwether keys`, `fix --signing-key`, `receipt show --require-signature`).
 
 Not built, or not yet measured:
 
 - **SQL tables as a source.** In review ([#11](https://github.com/vncp/bellwether/pull/11)).
-- **Relational replay.** Joins, windows and aggregation input are recorded predicates that the verifier refuses; WP15 prices and plans them.
 - **`advise` and `evolve`.** Designed in stages ([`docs/evolve.md`](docs/evolve.md), ADRs 021 to 025, 031, 032); no code yet.
 - **Engine adapters, CI receipts, a multi-machine build.** Planned (WP16, WP17, WP22). Today a plan is a list of files and row groups your engine reads, on one machine.
 - **Performance.** Latency is measured only where the Results say so; planning beat DuckDB alone on 2 of 14 questions. WP22 measures the rest in release builds.

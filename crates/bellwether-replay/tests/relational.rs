@@ -21,6 +21,7 @@
 #![allow(
     clippy::unwrap_used,
     missing_docs,
+    clippy::many_single_char_names,
     clippy::too_many_lines,
     clippy::cast_possible_truncation,
     clippy::cast_possible_wrap,
@@ -40,8 +41,8 @@ use bellwether_build::{BuildOptions, Builder};
 use bellwether_core::encoding::{encode_value, Value};
 use bellwether_ledger::Ledger;
 use bellwether_replay::{
-    apply_alternative, check_shape, load_plan, store_plan, write_replay, Alternative, KeyInput,
-    MemoryKeySets, ReplayError, Replayer, RunKeys, RunQuery, WorkloadRecorder,
+    check_shape, load_plan, store_plan, write_replay, KeyInput, MemoryKeySets, ReplayError,
+    Replayer, RunKeys, RunQuery, WorkloadRecorder,
 };
 use bellwether_source::ParquetSource;
 use bellwether_store::{ObjectStoreBackend, Snapshot};
@@ -111,7 +112,7 @@ fn write_corpus(events: &Path, repos: &Path) {
             d.push(if g.below(30) == 0 {
                 None
             } else {
-                Some(g.below(100_000) as i128 - 20_000)
+                Some(i128::from(g.below(100_000)) - 20_000)
             });
             x.push((f * n + i) as i64);
         }
@@ -151,7 +152,7 @@ fn write_corpus(events: &Path, repos: &Path) {
             } else {
                 base + v as i64 * 7
             });
-            rd.push(g.below(1_000_000) as i128);
+            rd.push(i128::from(g.below(1_000_000)));
         }
     }
     let half = rk.len() / 2;
@@ -404,9 +405,7 @@ impl Oracle<'_> {
                             .is_some_and(|k| set.contains(&k))
                     })
                 }
-                PlanNode::Window { input: i, .. } | PlanNode::Exchange { input: i, .. } => {
-                    input(i)
-                }
+                PlanNode::Window { input: i, .. } | PlanNode::Exchange { input: i, .. } => input(i),
                 PlanNode::Project { input: i, columns } => {
                     let mut i = input(i);
                     i.cols = columns
@@ -788,7 +787,10 @@ fn check(
     let (mut bytes, mut rgs) = (0u64, 0u64);
     for read in &priced.reads {
         assert!(seen.insert(read.node), "scan {} read twice", read.node);
-        assert!(matches!(plan.nodes[read.node as usize], PlanNode::Scan { .. }));
+        assert!(matches!(
+            plan.nodes[read.node as usize],
+            PlanNode::Scan { .. }
+        ));
         let d = if Oracle::dataset_of(plan, read.node) == "main" {
             main
         } else {
@@ -864,7 +866,7 @@ fn random_plans_are_exact_or_bounded_against_the_oracle() {
     // Exact and bounded claims both occur, on joins and elsewhere.
     let (mut exact_joins, mut bounded_nodes) = (0, 0);
     for case in 0..160 {
-        let keys: BTreeSet<i64> = (0..1 + g.below(25)).map(|_| g.below(140) as i64).collect();
+        let keys: BTreeSet<i64> = (0..=g.below(25)).map(|_| g.below(140) as i64).collect();
         let plan = random_plan(&mut g);
         let specs = &configs[(case as usize) % configs.len()];
         let asof = g.below(25) as i64;
@@ -923,7 +925,7 @@ fn random_dags_share_reads_and_hold_the_oracle() {
     let mut g = Rng(0x00da_0015);
     let (mut priced, mut refused, mut shared) = (0, 0, 0);
     for case in 0..180 {
-        let keys: BTreeSet<i64> = (0..1 + g.below(25)).map(|_| g.below(140) as i64).collect();
+        let keys: BTreeSet<i64> = (0..=g.below(25)).map(|_| g.below(140) as i64).collect();
         let plan = random_dag(&mut g);
         let specs = &configs[(case as usize) % configs.len()];
         let asof = g.below(25) as i64;
@@ -953,9 +955,7 @@ fn step(g: &mut Rng, input: u32) -> PlanNode {
             input,
             predicate: Predicate::In {
                 columns: cols(&["k"]),
-                values: (0..1 + g.below(8))
-                    .map(|_| int(g.below(120) as i64))
-                    .collect(),
+                values: (0..=g.below(8)).map(|_| int(g.below(120) as i64)).collect(),
             },
         },
         2 => {
@@ -1127,9 +1127,7 @@ fn random_plan(g: &mut Rng) -> ConsumerPlan {
                 input: top,
                 predicate: Predicate::In {
                     columns: cols(&["k"]),
-                    values: (0..1 + g.below(6))
-                        .map(|_| int(g.below(120) as i64))
-                        .collect(),
+                    values: (0..=g.below(6)).map(|_| int(g.below(120) as i64)).collect(),
                 },
             },
             2 if g.below(2) == 0 => {
@@ -1145,13 +1143,13 @@ fn random_plan(g: &mut Rng) -> ConsumerPlan {
             }
             2 => {
                 // A decimal range at the column's scale (2).
-                let lo = g.below(60_000) as i128 - 20_000;
+                let lo = i128::from(g.below(60_000)) - 20_000;
                 PlanNode::Filter {
                     input: top,
                     predicate: Predicate::Between {
                         column: "d2".into(),
                         lo: dec(lo, 2),
-                        hi: dec(lo + g.below(20_000) as i128, 2),
+                        hi: dec(lo + i128::from(g.below(20_000)), 2),
                     },
                 }
             }
@@ -1204,30 +1202,27 @@ fn random_plan(g: &mut Rng) -> ConsumerPlan {
         });
         top = nodes.len() as u32 - 1;
     }
-    match g.below(3) {
-        0 => {
-            let by = if have_g && g.below(2) == 0 { "g" } else { "k" };
-            nodes.push(PlanNode::Aggregate {
-                input: top,
-                group_by: if g.below(5) == 0 {
-                    Vec::new()
-                } else {
-                    cols(&[by])
+    if g.below(3) == 0 {
+        let by = if have_g && g.below(2) == 0 { "g" } else { "k" };
+        nodes.push(PlanNode::Aggregate {
+            input: top,
+            group_by: if g.below(5) == 0 {
+                Vec::new()
+            } else {
+                cols(&[by])
+            },
+            measures: vec![
+                Measure {
+                    function: AggregateFn::Count,
+                    column: None,
                 },
-                measures: vec![
-                    Measure {
-                        function: AggregateFn::Count,
-                        column: None,
-                    },
-                    Measure {
-                        function: AggregateFn::Sum,
-                        column: Some("d2".into()),
-                    },
-                ],
-            });
-            top = nodes.len() as u32 - 1;
-        }
-        _ => {}
+                Measure {
+                    function: AggregateFn::Sum,
+                    column: Some("d2".into()),
+                },
+            ],
+        });
+        top = nodes.len() as u32 - 1;
     }
     ConsumerPlan {
         version: 1,
@@ -1275,7 +1270,7 @@ fn keys_some() -> BTreeSet<i64> {
 }
 
 /// An inner join of two scans' rows selected by whole keys, both counted,
-/// is exact: Σ count_L × count_R over the common keys. With counts on one
+/// is exact: Σ `count_L` × `count_R` over the common keys. With counts on one
 /// side only it is bounded (deliberate break: price it Exact).
 #[test]
 fn join_cardinality_is_exact_only_with_counts_on_both_sides() {
@@ -2096,103 +2091,6 @@ fn plan_workloads_record_score_and_load() {
     ));
 }
 
-/// Counterfactuals over plan nodes: ablating the semi-join below a join
-/// gives the delta to the unfiltered plan, and the interaction of two
-/// ablations is the inclusion-exclusion of four exact replays.
-#[test]
-fn plan_node_counterfactuals_are_exact_replays() {
-    let w = world();
-    let estore = Arc::new(ObjectStoreBackend::memory().unwrap());
-    Builder::new(Arc::clone(&estore), "idx")
-        .build(
-            &w.events,
-            &[exact("k", true)],
-            &BuildOptions {
-                schema: Some(events_schema()),
-                ..BuildOptions::default()
-            },
-        )
-        .unwrap();
-    let esnap = Snapshot::open(Arc::clone(&estore), "idx").unwrap();
-    let rsnap = Snapshot::open(Arc::clone(&w.rstore), "idx").unwrap();
-    let r = Replayer::for_snapshot(&w.esrc, &esnap)
-        .unwrap()
-        .with_datasets(BTreeMap::from([(
-            "repos".to_string(),
-            Replayer::for_snapshot(&w.rsrc, &rsnap).unwrap(),
-        )]))
-        .unwrap();
-    let keys = MemoryKeySets::new();
-    let a: BTreeSet<i64> = [31, 40].into_iter().collect();
-    let b: BTreeSet<i64> = [2, 90].into_iter().collect();
-    let workload = record(&r, &keys, &[("a", &a), ("b", &b)], None);
-    let p = join_plan(true, true); // 0 scan, 1 semi, 2 scan, 3 semi, 4 join
-    let d = r
-        .replace_node(&p, 1, &Alternative::Ablate, &workload, &keys)
-        .unwrap();
-    let without = apply_alternative(&p, 1, &Alternative::Ablate).unwrap();
-    assert_eq!(without.nodes.len(), 4);
-    let cf = r.replay_plan(&without, &workload, &keys).unwrap();
-    for (x, c) in d.iter().zip(&cf) {
-        assert_eq!(&x.counterfactual, c);
-        assert!(
-            x.delta.bytes <= 0,
-            "removing the semi-join never reads less"
-        );
-    }
-    let inter = r
-        .interaction(
-            &p,
-            (1, &Alternative::Ablate),
-            (3, &Alternative::Ablate),
-            &workload,
-            &keys,
-        )
-        .unwrap();
-    let base = r.replay_plan(&p, &workload, &keys).unwrap();
-    let u = r
-        .replay_plan(
-            &apply_alternative(&p, 1, &Alternative::Ablate).unwrap(),
-            &workload,
-            &keys,
-        )
-        .unwrap();
-    let v = r
-        .replay_plan(
-            &apply_alternative(&p, 3, &Alternative::Ablate).unwrap(),
-            &workload,
-            &keys,
-        )
-        .unwrap();
-    let uv = r
-        .replay_plan(&join_plan(false, false), &workload, &keys)
-        .unwrap();
-    for (i, x) in inter.iter().enumerate() {
-        let want = i128::from(uv[i].bytes) - i128::from(u[i].bytes) - i128::from(v[i].bytes)
-            + i128::from(base[i].bytes);
-        assert_eq!(x.interaction.bytes, want);
-    }
-    // A scan cannot be ablated; a replacement node is priced.
-    assert!(r
-        .replace_node(&p, 0, &Alternative::Ablate, &workload, &keys)
-        .is_err());
-    let replaced = r
-        .replace_node(
-            &p,
-            4,
-            &Alternative::Replace(PlanNode::Join {
-                left: 1,
-                right: 3,
-                on: vec![("k".into(), "k".into())],
-                kind: JoinKind::Left,
-            }),
-            &workload,
-            &keys,
-        )
-        .unwrap();
-    assert_eq!(replaced.len(), 2);
-}
-
 // ------------------------------------------------------- shared nodes (DAG)
 
 /// The row groups of `d` holding a row whose `k` is in `keys`, from the
@@ -2208,7 +2106,11 @@ fn rgs_with(d: &Decoded, keys: &BTreeSet<i64>) -> BTreeSet<u32> {
 /// The footers' compressed bytes of `columns` over `rgs`.
 fn chunk_bytes(d: &Decoded, rgs: &BTreeSet<u32>, columns: &[&str]) -> u64 {
     rgs.iter()
-        .flat_map(|rg| columns.iter().map(move |c| d.chunk[&(*rg, (*c).to_string())]))
+        .flat_map(|rg| {
+            columns
+                .iter()
+                .map(move |c| d.chunk[&(*rg, (*c).to_string())])
+        })
         .sum()
 }
 
@@ -2272,7 +2174,10 @@ fn a_diamond_reads_its_shared_scan_once_and_two_scans_twice() {
     let all = ["k", "t", "g", "d2", "x"];
     let want = chunk_bytes(&main, &rgs, &all);
     assert_eq!(one.reads.len(), 1);
-    assert_eq!(one.reads[0].row_groups, rgs.iter().copied().collect::<Vec<_>>());
+    assert_eq!(
+        one.reads[0].row_groups,
+        rgs.iter().copied().collect::<Vec<_>>()
+    );
     assert_eq!(one.cost.bytes, want);
     assert_eq!(one.cost.row_groups, rgs.len() as u64);
     assert_eq!(two.reads.len(), 2);
@@ -2286,7 +2191,7 @@ fn a_diamond_reads_its_shared_scan_once_and_two_scans_twice() {
     // model estimate.
     assert_eq!(one.shared.len(), 1);
     assert_eq!((one.shared[0].node, one.shared[0].consumers), (0, 2));
-    assert!(two.shared.is_empty());
+    assert_eq!(two.shared, [] as [bellwether_replay::SharedOutput; 0]);
 }
 
 /// A self-join of one node (`join(n, n)`) reads its scan once, and its
@@ -2305,7 +2210,10 @@ fn a_self_join_of_one_node_is_one_read_with_squared_counts() {
         got.cost.bytes,
         chunk_bytes(&main, &rgs, &["k", "t", "g", "d2", "x"])
     );
-    assert_eq!(root_rows(&got), &Quantity::exact(self_join_rows(&main, &run)));
+    assert_eq!(
+        root_rows(&got),
+        &Quantity::exact(self_join_rows(&main, &run))
+    );
     assert_eq!(got.shared[0].node, 1);
     assert_eq!(got.shared[0].consumers, 2);
     // Without counts the same join is bounded, and still read once.
