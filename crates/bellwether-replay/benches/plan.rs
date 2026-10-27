@@ -77,6 +77,9 @@ fn write_day(dir: &std::path::Path, day: i64) {
     w.close().unwrap();
 }
 
+/// The first `n` symbols: consecutive, so each day's file holds them in
+/// the fewest row groups (one for 10 or 300, five of eight for 3,000), and
+/// every plan prunes.
 fn keys(n: usize) -> bellwether_replay::RunKeys {
     let key_schema = Arc::new(Schema::new(vec![Field::new(
         "symbol",
@@ -84,7 +87,7 @@ fn keys(n: usize) -> bellwether_replay::RunKeys {
         false,
     )]));
     let mut b = RunKeysBuilder::new(&["symbol".to_string()], &key_schema).unwrap();
-    let picked: Vec<String> = (0..n).map(|i| symbol(i * SYMBOLS / n)).collect();
+    let picked: Vec<String> = (0..n).map(symbol).collect();
     b.push_batch(
         &RecordBatch::try_new(
             key_schema,

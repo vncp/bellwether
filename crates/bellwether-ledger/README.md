@@ -30,6 +30,7 @@ The name is `Record::hash()`, which is BLAKE3 over `serde_json::to_vec(&record)`
 | `sign(&Hash, &SigningKey, signed_at) -> SignaturePath` | Writes the detached signature object with `put_if_absent`. See "Signatures". |
 | `signatures(&Hash) -> Vec<SignatureStatus>` | Every signature object beside a record, each verified on its own: `Valid { key_id, public_key, signed_at }` or `Invalid { key_id, reason }`. Never a panic on a corrupt object. Writes nothing. |
 | `verify_against(&Hash, &TrustedKeys) -> Verdict` | `signatures` folded against a reader's trust set. Writes nothing. |
+| `signature_index() -> SignatureIndex`, `signatures_in(&Hash, &SignatureIndex)`, `explain_in(&Hash, Option<&TrustedKeys>, &SignatureIndex)` | One listing of `ledger/`: every signature object's path by the record it signs, and `signatures` and `explain` reading it instead of listing per record. A command over many records (`ledger receipts`) lists once, and `explain` lists once per call. A signature written after the listing is not in it (WP22b; `ledger receipts` over a 10,000-file ledger has a measured budget). |
 
 `put`, `put_receipt`, and `sign` are the only write paths. There is no delete.
 

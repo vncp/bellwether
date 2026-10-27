@@ -1,7 +1,8 @@
 //! ADR 018 measured on the operating system's books, not the meter's:
 //! the physical memory of a `reconcile` process over row groups 100,000
 //! rows wide stays within its stated bound, the budget plus one decoded
-//! batch plus a fixed allowance over the same binary's own baseline.
+//! batch plus a fixed allowance over the same binary's own baseline (the
+//! same reconcile over one row group of 1,000 rows).
 //!
 //! Until row groups were decoded in batches, a row group was decoded whole,
 //! and the allocator kept the freed row-group-sized buffers dirty: this
@@ -24,7 +25,7 @@ use serde_json::Value;
 
 const MIB: u64 = 1024 * 1024;
 
-/// What the bound allows beyond the binary's own baseline, the budget, and
+/// What the bound allows beyond the baseline reconcile, the budget, and
 /// the decoded batch: the footers and fingerprints of one file, the
 /// partition key hashing buffers, and allocator slack.
 const FIXED: u64 = 24 * MIB;
@@ -90,31 +91,40 @@ fn reconcile(data: &Path, index: &Path, budget: &str) -> (u64, Value) {
     (peak, v["outcome"]["memory"].clone())
 }
 
-#[test]
-fn reconcile_physical_memory_stays_within_the_budget_plus_one_batch() {
-    let dir = tempfile::tempdir().unwrap();
-    let corpus = dir.path().join("corpus");
-    let (_, out) = measured(&[
+/// A generated ledger of one file of `groups` row groups of `rows` rows.
+fn generate(out: &Path, groups: &str, rows: &str, entities: &str) -> std::path::PathBuf {
+    let (_, stdout) = measured(&[
         "bench",
         "generate",
         "--out",
-        path(&corpus),
+        path(out),
         "--days",
         "1",
         "--files",
         "1",
         "--row-groups-per-file",
-        "4",
+        groups,
         "--rows-per-row-group",
-        "100000",
+        rows,
         "--entities",
-        "50000",
+        entities,
     ]);
-    assert!(out.contains("wrote corpus"), "{out}");
-    let data = corpus.join("data");
-    let (baseline, _) = measured(&["--version"]);
+    assert!(stdout.contains("wrote corpus"), "{stdout}");
+    out.join("data")
+}
+
+#[test]
+fn reconcile_physical_memory_stays_within_the_budget_plus_one_batch() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = generate(&dir.path().join("corpus"), "4", "100000", "50000");
+    // The baseline is the same reconcile over one row group of 1,000 rows:
+    // the process, its threads, and the code it pages in, which Linux's
+    // resident set counts and macOS's footprint does not, so what is left
+    // is what grows with the data.
+    let small = generate(&dir.path().join("small"), "1", "1000", "500");
 
     for (budget, multi_pass) in [("4M", true), ("64M", false)] {
+        let (baseline, _) = reconcile(&small, &dir.path().join(format!("small-{budget}")), budget);
         let index = dir.path().join(format!("idx-{budget}"));
         let (peak, memory) = reconcile(&data, &index, budget);
         let field = |k: &str| memory[k].as_u64().unwrap();

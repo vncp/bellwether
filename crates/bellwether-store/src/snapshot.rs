@@ -154,8 +154,6 @@ pub struct Snapshot<S: StoreExt + ?Sized> {
     version: StoreVersion,
     pinned_sequence: Option<u64>,
     content_hash: Hash,
-    /// The pinned manifest's bytes as stored.
-    manifest_bytes: Bytes,
     /// Each referenced segment's size, from the manifest.
     sizes: Arc<HashMap<Hash, u64>>,
     /// This snapshot's (and its clones') windows in [`WINDOWS`].
@@ -177,19 +175,9 @@ impl<S: StoreExt + ?Sized> Snapshot<S> {
     /// is no manifest yet, or with [`Error::UnsupportedVersion`] if it is
     /// newer than this build.
     pub fn open(store: Arc<S>, root: &str) -> Result<Self> {
-        Self::try_open(store, root)?
-            .ok_or_else(|| Error::Store(format!("no manifest under {root:?}")))
-    }
-
-    /// [`Self::open`], or `None` when there is no manifest yet: one read of
-    /// the manifest, so the bytes, the content hash, and the parsed
-    /// manifest are one commit's.
-    pub fn try_open(store: Arc<S>, root: &str) -> Result<Option<Self>> {
-        Ok(
-            read_manifest_raw(&*store, root)?.map(|(manifest, version, bytes)| {
-                Self::pinned(store, root, manifest, version, None, bytes)
-            }),
-        )
+        let (manifest, version, bytes) = read_manifest_raw(&*store, root)?
+            .ok_or_else(|| Error::Store(format!("no manifest under {root:?}")))?;
+        Ok(Self::pinned(store, root, manifest, version, None, &bytes))
     }
 
     fn pinned(
@@ -198,7 +186,7 @@ impl<S: StoreExt + ?Sized> Snapshot<S> {
         manifest: Manifest,
         version: StoreVersion,
         pinned_sequence: Option<u64>,
-        bytes: Bytes,
+        bytes: &[u8],
     ) -> Self {
         let sizes = manifest.segments.iter().map(|s| (s.id, s.bytes)).collect();
         Self {
@@ -207,8 +195,7 @@ impl<S: StoreExt + ?Sized> Snapshot<S> {
             manifest: Arc::new(manifest),
             version,
             pinned_sequence,
-            content_hash: Hash::of(&bytes),
-            manifest_bytes: bytes,
+            content_hash: Hash::of(bytes),
             sizes: Arc::new(sizes),
             windows: Arc::new(WindowOwner(NEXT_OWNER.fetch_add(1, Ordering::Relaxed))),
         }
@@ -241,7 +228,7 @@ impl<S: StoreExt + ?Sized> Snapshot<S> {
                 manifest,
                 version,
                 Some(sequence),
-                bytes,
+                &bytes,
             )));
         }
         if let Some((current, version, bytes)) = read_manifest_raw(&*store, root)? {
@@ -252,7 +239,7 @@ impl<S: StoreExt + ?Sized> Snapshot<S> {
                     current,
                     version,
                     Some(sequence),
-                    bytes,
+                    &bytes,
                 )));
             }
         }
@@ -304,13 +291,6 @@ impl<S: StoreExt + ?Sized> Snapshot<S> {
     #[must_use]
     pub fn content_hash(&self) -> Hash {
         self.content_hash
-    }
-
-    /// The pinned manifest's bytes as stored, whose BLAKE3 is
-    /// [`Self::content_hash`].
-    #[must_use]
-    pub fn manifest_bytes(&self) -> &Bytes {
-        &self.manifest_bytes
     }
 
     /// The index root this snapshot reads.
