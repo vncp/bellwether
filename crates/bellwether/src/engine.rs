@@ -15,8 +15,8 @@ use bellwether_source::{
 };
 use bellwether_source_sql::{is_sql_root, SqlOptions, SqlSource, SqlUrl, TableRun};
 use bellwether_store::{
-    manifest_history_path, manifest_path, now_rfc3339, parse_rfc3339, retained_sequences,
-    rfc3339_millis, Cache, Manifest, ObjectStoreBackend, Snapshot, StoreExt,
+    manifest_path, now_rfc3339, parse_rfc3339, retained_sequences, rfc3339_millis, Cache, Manifest,
+    ObjectStoreBackend, Snapshot, StoreExt,
 };
 use bellwether_types::{Error, FileFingerprint, Hash, KeySpec, Record, Result, Source};
 use bytes::Bytes;
@@ -30,10 +30,6 @@ pub const ISSUE_TRACKER: &str = "https://github.com/vncp/bellwether/issues";
 /// Name of the default index directory inside the data root. Discovery
 /// skips names that start with `.`, so the index is never read as data.
 pub const DEFAULT_INDEX_DIR: &str = ".bellwether";
-
-/// How many times a manifest pin is retried when a commit lands between
-/// reading the manifest's bytes and pinning its snapshot.
-const PIN_ATTEMPTS: usize = 8;
 
 /// The kind of files under the data root.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -684,10 +680,9 @@ impl Engine {
 
     /// Pins the current manifest with its content hash, or `None` if the
     /// folder is not indexed. The bytes hashed and the snapshot pinned are
-    /// the same commit (sequence and nonce agree), retried a few times if a
-    /// commit lands in between. With [`EngineOptions::at_manifest`], pins
-    /// that committed sequence instead, or refuses with
-    /// [`Error::NotRetained`].
+    /// one read of the manifest, so one commit. With
+    /// [`EngineOptions::at_manifest`], pins that committed sequence
+    /// instead, or refuses with [`Error::NotRetained`].
     pub(crate) fn pin(&self) -> Result<Option<Pinned>> {
         let Some(store) = self.existing_store()? else {
             if let Some(seq) = self.options.at_manifest {
@@ -702,74 +697,40 @@ impl Engine {
         if let Some(seq) = self.options.at_manifest {
             return self.pin_at(store, seq).map(Some);
         }
-        for _ in 0..PIN_ATTEMPTS {
-            let Some((bytes, _)) = store.get_opt(&manifest_path(""))? else {
-                return Ok(None);
-            };
-            let read = Manifest::from_slice(&bytes)?;
-            let snapshot = Snapshot::open(Arc::clone(store), "")?;
-            let pinned = snapshot.manifest();
-            if read.sequence == pinned.sequence && read.commit_nonce == pinned.commit_nonce {
-                let age = commit_age(pinned, self.now_nanos()?)?;
-                let planner = Planner::from_snapshot(snapshot.clone())?;
-                return Ok(Some(Pinned {
-                    snapshot,
-                    planner,
-                    hash: Hash::of(&bytes),
-                    bytes,
-                    age,
-                }));
-            }
-        }
-        Err(Error::VersionConflict {
-            expected: "a manifest stable while it is pinned".into(),
-            found: format!("{PIN_ATTEMPTS} commits in a row; retry when the writers settle"),
-        })
+        let Some(snapshot) = Snapshot::try_open(Arc::clone(store), "")? else {
+            return Ok(None);
+        };
+        let age = commit_age(snapshot.manifest(), self.now_nanos()?)?;
+        let planner = Planner::from_snapshot(snapshot.clone())?;
+        Ok(Some(Pinned {
+            hash: snapshot.content_hash(),
+            bytes: snapshot.manifest_bytes().clone(),
+            snapshot,
+            planner,
+            age,
+        }))
     }
 
     /// Pins the committed manifest at `seq` from the store's history
-    /// (`manifests/<sequence>.json`), whose bytes are those the commit wrote,
-    /// so its content hash is the one an unpinned lookup at that sequence
-    /// cited.
+    /// (`manifests/<sequence>.json`, or `manifest.json` while that is the
+    /// sequence and its history copy is not written yet), whose bytes are
+    /// those the commit wrote, so its content hash is the one an unpinned
+    /// lookup at that sequence cited.
     fn pin_at(&self, store: &Arc<ObjectStoreBackend>, seq: u64) -> Result<Pinned> {
-        let refuse = || -> Result<Error> {
-            Ok(Error::NotRetained {
+        let Some(snapshot) = Snapshot::open_at(Arc::clone(store), "", seq)? else {
+            return Err(Error::NotRetained {
                 index: self.index.clone(),
                 requested: seq,
                 retained: retained_sequences(&**store, "")?,
-            })
-        };
-        let Some(snapshot) = Snapshot::open_at(Arc::clone(store), "", seq)? else {
-            return Err(refuse()?);
-        };
-        let bytes = match store.get_opt(&manifest_history_path("", seq))? {
-            Some((b, _)) => b,
-            // Not backfilled yet: the current manifest is that sequence.
-            None => match store.get_opt(&manifest_path(""))? {
-                Some((b, _)) => b,
-                None => return Err(refuse()?),
-            },
-        };
-        let read = Manifest::from_slice(&bytes)?;
-        let pinned = snapshot.manifest();
-        if read.sequence != pinned.sequence || read.commit_nonce != pinned.commit_nonce {
-            // The current manifest moved on between the two reads, and the
-            // history object is not written yet: ask again.
-            return Err(Error::VersionConflict {
-                expected: format!("manifest sequence {seq}"),
-                found: format!(
-                    "sequence {}; retry, the commit's history copy is being written",
-                    read.sequence
-                ),
             });
-        }
-        let age = commit_age(pinned, self.now_nanos()?)?;
+        };
+        let age = commit_age(snapshot.manifest(), self.now_nanos()?)?;
         let planner = Planner::from_snapshot(snapshot.clone())?;
         Ok(Pinned {
+            hash: snapshot.content_hash(),
+            bytes: snapshot.manifest_bytes().clone(),
             snapshot,
             planner,
-            hash: Hash::of(&bytes),
-            bytes,
             age,
         })
     }

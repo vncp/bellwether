@@ -1500,7 +1500,7 @@ impl<S: StoreExt + ?Sized> Planner<S> {
     ) -> Result<SegmentReader<SegmentBytes<'_, S>>> {
         let bytes = match src {
             SegSource::Committed { id, size } if !whole => {
-                SegmentBytes::ranged(&self.snapshot, *id, *size)
+                SegmentBytes::committed(&self.snapshot, *id, *size)?
             }
             SegSource::Committed { id, .. } => {
                 SegmentBytes::Memory(self.snapshot.read_segment(id)?)
@@ -1992,12 +1992,20 @@ impl<S: StoreExt + ?Sized> Planner<S> {
                 (Selection::Lookbacks(hits), acc)
             }
         };
-        let others: Vec<(&SpecSegments, Serve)> = serving
-            .iter()
-            .filter(|(s, _)| !std::ptr::eq(*s, t))
-            .map(|(s, h)| (*s, h.clone()))
-            .collect();
-        self.intersect(&mut acc, &others, keys, &spans, None)?;
+        // When the temporal spec keys the whole lookup tuple, its versions
+        // are rows of the key itself, so every row group they keep holds the
+        // key, and every other serving spec's row groups for the key contain
+        // them (invariant 1): intersecting with those changes nothing, so
+        // their segments are not read. A temporal spec on part of the tuple
+        // keeps the versions of that part, which the others narrow.
+        if positions.len() < columns.len() {
+            let others: Vec<(&SpecSegments, Serve)> = serving
+                .iter()
+                .filter(|(s, _)| !std::ptr::eq(*s, t))
+                .map(|(s, h)| (*s, h.clone()))
+                .collect();
+            self.intersect(&mut acc, &others, keys, &spans, None)?;
+        }
         let selected = acc
             .into_iter()
             .flatten()
@@ -2533,8 +2541,37 @@ impl<S: StoreExt + ?Sized> Planner<S> {
                 });
             }
         };
+        // A serving spec that a narrowing below reads again with the same
+        // projection (a temporal spec on the window's time column, its
+        // chains; an exact spec with bounds, its bounds) is not intersected
+        // here: per key, what the narrowing keeps is a subset of that
+        // spec's own row groups for the key, so intersecting with them too
+        // changes nothing, and each of its segments is read once.
+        let positions_of = |def: &SidecarDef| -> Option<Vec<usize>> {
+            def.columns
+                .iter()
+                .map(|c| columns.iter().position(|x| x == c))
+                .collect()
+        };
+        let narrowed_again = |s: &SpecSegments, how: &Serve| -> bool {
+            let Serve::Project(positions) = how else {
+                return false;
+            };
+            match &s.spec {
+                KeySpec::Temporal { ts_column: tc, .. } if tc == ts_column => true,
+                _ => sidecars.iter().any(|(def, src)| {
+                    matches!(src, TimedSource::Spec(spec) if spec.identity() == s.spec.identity())
+                        && positions_of(def).as_ref() == Some(positions)
+                }),
+            }
+        };
+        let intersected: Vec<(&SpecSegments, Serve)> = serving
+            .iter()
+            .filter(|(s, how)| !narrowed_again(s, how))
+            .map(|(s, how)| (*s, how.clone()))
+            .collect();
         let mut acc: Vec<Option<RoaringBitmap>> = vec![None; keys.len()];
-        self.intersect(&mut acc, &serving, &keys, &spans, None)?;
+        self.intersect(&mut acc, &intersected, &keys, &spans, None)?;
         if let Some(w) = &window {
             narrow(&mut acc, w);
         }

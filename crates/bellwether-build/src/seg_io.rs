@@ -2,9 +2,11 @@
 //!
 //! Lookups read keyed segments by range through the pinned [`Snapshot`], so
 //! a lookup holds one block index and the blocks it touches, not whole
-//! segments (ADR 018). Segments that every probe must scan end to end (bloom
-//! and range layouts) and transient segments are held in memory, one segment
-//! at a time for bloom.
+//! segments (ADR 018). A keyed segment of at most [`WHOLE_SEGMENT_BYTES`]
+//! is read in one ranged request instead, and held whole while it is open.
+//! Segments that every probe must scan end to end (bloom and range layouts)
+//! and transient segments are held in memory, one segment at a time for
+//! bloom.
 
 use std::borrow::Cow;
 use std::cell::RefCell;
@@ -30,10 +32,19 @@ pub(crate) enum SegmentBytes<'a, S: StoreExt + ?Sized> {
         /// reader (ADR 018).
         last: RefCell<Option<(u64, Bytes)>>,
     },
-    /// Whole segment bytes: a verified read of a committed segment, or a
+    /// Whole segment bytes: a verified read of a committed segment, a
+    /// committed segment of at most [`WHOLE_SEGMENT_BYTES`] read by one
+    /// range (its regions checked as ranged reads check them), or a
     /// transient segment built in memory.
     Memory(Bytes),
 }
+
+/// A committed keyed segment at most this large is read in one request when
+/// a plan opens it, and held whole while it is open: one store request
+/// instead of one per window, and value reads borrow its bytes instead of
+/// copying them. A planner worker holds one segment open at a time, so
+/// this is its bound (ADR 018).
+pub(crate) const WHOLE_SEGMENT_BYTES: u64 = 1 << 20;
 
 impl<'a, S: StoreExt + ?Sized> SegmentBytes<'a, S> {
     /// Ranged reads of segment `id` (of `size` bytes) pinned by `snapshot`.
@@ -44,6 +55,23 @@ impl<'a, S: StoreExt + ?Sized> SegmentBytes<'a, S> {
             size,
             last: RefCell::new(None),
         }
+    }
+
+    /// Segment `id` (of `size` bytes) pinned by `snapshot`: read whole in
+    /// one ranged request when it is at most [`WHOLE_SEGMENT_BYTES`], else
+    /// [`Self::ranged`].
+    pub(crate) fn committed(snapshot: &'a Snapshot<S>, id: Hash, size: u64) -> Result<Self> {
+        if size > WHOLE_SEGMENT_BYTES {
+            return Ok(Self::ranged(snapshot, id, size));
+        }
+        let bytes = snapshot.read_segment_range(&id, 0..size)?;
+        if bytes.len() as u64 != size {
+            return Err(Error::Store(format!(
+                "segment {id}: asked for its {size} bytes, got {}",
+                bytes.len()
+            )));
+        }
+        Ok(Self::Memory(bytes))
     }
 }
 

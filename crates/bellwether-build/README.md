@@ -95,7 +95,7 @@ A lookup on an expression (a key column named by an expression over dataset colu
 
 **Intersection.**
 
-- Bitmaps are intersected per key tuple across serving specs, then unioned.
+- Bitmaps are intersected per key tuple across serving specs, then unioned. A spec is skipped where intersecting with it cannot change the answer, so its segments are not read for nothing: in a window, a spec that a narrowing reads again with the same projection (a temporal spec on the window's time column, an exact spec with bounds), since what the narrowing keeps is a subset of that spec's own row groups; in `latest` and `asof`, every other spec when the temporal spec keys the whole lookup tuple, since its winners are rows of the key itself and every spec's row groups for the key contain them (invariant 1). The plans are byte-identical either way (WP22b, checked over every lookup of the measured document).
 - No spec means a raw scan of every live row group.
 - No key means no row group and an empty `In`, never a full scan, with or without specs.
 - A probe containing a null matches nothing (ADR 014). It is dropped before any lookup (point, prefix or projection) and from the residual.
@@ -195,10 +195,11 @@ An `expr` key's build reads the expression's input columns and derives its virtu
   - Bound: `threads × (one row group's key columns + specs × max(cap, one row group))`.
   - `tests/memory.rs` holds weak references to every column a worker is handed and checks that at most one batch per worker is alive at any read, and exactly one with one worker. It also checks that only key columns are read, and that every segment respects the cap.
 - **Plan.** A plan holds:
-  - the block indexes of the keyed segments it probes (ranged reads through the snapshot);
+  - the block indexes of the keyed segments it probes (ranged reads through the snapshot), or, for a keyed segment of at most 1 MiB (`seg_io::WHOLE_SEGMENT_BYTES`), the segment itself, read in one request;
   - the blocks it touches;
   - one whole bloom or range segment at a time (they are scanned per probe);
   - the bitmaps and version hits for the keys asked.
+  - A spec's segments are read on the rayon pool, each worker one segment at a time, so these hold per worker.
 - **Compaction.** Holds a group's inputs and its output, so about twice `max_output_bytes`.
 - **Resident bytes per key (contract v3, entry 32).** The caps count accounted key bytes, not resident memory. A release build measured an open segment writer over `UInt64` keys at **320 resident bytes per key**, against 9 bytes accounted: 35.5 times. Over 9-byte keys, the layout map measured 84 resident bytes per key, against 73 accounted: 1.15 times. For narrow keys, then, the resident memory of `specs × cap` is about 36 times the cap. The figures come from `bellwether-replay`'s `tests/resident.rs` and are listed in [the measured document](../../docs/measured/2026-10-26-performance.md). Charging that overhead to the caps is a WP22b candidate.
 

@@ -1383,7 +1383,7 @@ def top_frames(profile, syms, n=10):
                                  for k, v in ranked(wall_inclusive)]}
 
 
-def section_profiles(p, mkt10, ledger):
+def section_profiles(p, mkt10, ledger, mdef=None):
     samply = shutil.which("samply")
     if not samply:
         say("skipping profiles: samply is not on PATH (cargo install samply)")
@@ -1392,6 +1392,12 @@ def section_profiles(p, mkt10, ledger):
     os.makedirs(outdir, exist_ok=True)
     bw = p.a.bin
     jobs = []
+    if mdef:
+        # The plan floor: the fixed cost of one small lookup process (start,
+        # manifest, staleness check, the durable Evidence write).
+        ensure_index(p, mdef)
+        jobs.append(("plan-floor-market-default-10", 200, [bw, "latest", mdef.data, "--keys",
+                     key_file(p, mdef, 10), "--index", mdef.idx, "--quiet"], None))
     if mkt10:
         ensure_index(p, mkt10)
         at = mid_hour(mkt10.span)
@@ -1541,7 +1547,7 @@ def main():
 
     # Corpora only for the sections that read them.
     want = lambda *names: bool(sections & set(names))  # noqa: E731
-    mdef = market_dataset(p, "market-default", []) if want("lookups", "build") else None
+    mdef = market_dataset(p, "market-default", []) if want("lookups", "build", "profiles") else None
     mkt10 = None if a.ci or not want("lookups", "build", "profiles") else market_dataset(
         p, "market-10x", ["--symbols", "3000", "--days", "30", "--prints-per-symbol-per-day", "12"])
     gh = None if a.ci or not want("lookups") else gh_dataset(p)
@@ -1556,7 +1562,7 @@ def main():
         ("build", lambda: section_build(p, [d for d in (replay_small if a.ci else ledger, mdef, mkt10) if d])),
         ("reconcile", lambda: section_reconcile(p, replay_small if a.ci else ledger)),
         ("latency", lambda: section_latency(p, replay_small, ledger)),
-        ("profiles", lambda: section_profiles(p, mkt10, ledger)),
+        ("profiles", lambda: section_profiles(p, mkt10, ledger, mdef)),
         ("ledger", lambda: section_ledger(p)),
     ]
     for name, run in runs:
