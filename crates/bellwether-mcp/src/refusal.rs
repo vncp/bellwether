@@ -248,12 +248,13 @@ impl RefusalCode {
                  `fields.command` to build the sketch (no receipt)"
             }
             Self::NoWorkload => {
-                "pass `keys` (a Parquet key file), a recorded `workload` hash, or `text` lookups \
-                 (score.why) for a key, or the rewrite outputs for a rewrite"
+                "pass `keys` (a Parquet key file), `key_values` (inline key tuples with \
+                 `key_columns`), a recorded `workload` hash, or `text` lookups (score.why) for a \
+                 key, or the rewrite outputs for a rewrite"
             }
             Self::StaleIndex => {
-                "ask the human to run `bellwether index` on the data folder, then call the tool \
-                 again"
+                "call `apply.refresh`, or ask the human to run `bellwether index` on the data \
+                 folder, then call the tool again"
             }
             Self::NotIndexed => {
                 "ask the human to index the data folder with a key spec (`bellwether index`), \
@@ -318,8 +319,9 @@ impl RefusalCode {
                  twice"
             }
             Self::StaleJoin => {
-                "ask the human to run `bellwether index` on the data folder (the left dataset), \
-                 which rebuilds the join key's pair index, then call the tool again"
+                "call `apply.refresh`, or ask the human to run `bellwether index` on the data \
+                 folder (the left dataset), which rebuilds the join key's pair index, then call \
+                 the tool again"
             }
             Self::JoinNotServed => {
                 "use only the join key on the right side `fields.served` names; when it is null, \
@@ -378,7 +380,7 @@ fn hash_field(kind: HashKind) -> (&'static str, &'static str) {
         HashKind::Workload => (
             "workload",
             "pass in `workload` the `workload.hash` score.why returned, or call score.why with \
-             `keys` to record one",
+             `keys` or `key_values` to record one",
         ),
     }
 }

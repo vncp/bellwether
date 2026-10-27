@@ -11,9 +11,13 @@ fail if the two differ.
 
 1. **Observe.** Call `observe.why` with no keys. Read `evidence.hash` in the
    result: the profile Evidence, with fanout per column and lints. If you have
-   the keys the slow query looked up (a Parquet file), call `score.why` with
-   `keys`: the engine replays them under every candidate key and returns the
-   funnel, the culprit, the recommended key, and `workload.hash`. When the
+   the keys the slow query looked up (a Parquet file in `keys`, or literal
+   key tuples in `key_values` with `key_columns`, which `observe.locate`,
+   `observe.asof`, `observe.count`, `observe.aggregate`, and `score.why`
+   encode at the dataset's key column types and store in the cache without a
+   file on disk), call `score.why` with `keys` or `key_values`: the engine
+   replays them under every candidate key and returns the funnel, the
+   culprit, the recommended key, and `workload.hash`. When the
    server was started with `--twin-of` (the folder is the lake copy, the
    *twin*, of tables a query engine stores), call `score.record` with a
    `keys_query` in the engine's language to record the keys as a workload,
@@ -25,10 +29,10 @@ fail if the two differ.
    slow query is more than a lookup (a join, a window, an aggregate), pass
    its plan as a typed plan DAG in `plan` (a JSON file path; the datasets
    it scans besides the folder are the ones the human bound with
-   `--dataset NAME=ROOT` when starting the server, named in `datasets`):
-   each run is priced through the plan, and `plans` holds per node its
-   bytes and rows, each `exact`, `bounded` (an interval holding the truth),
-   or `measured`.
+   `--dataset NAME=ROOT` when starting the server, named in `datasets`, and
+   `at` gives the instant of its `as_of` nodes): each run is priced through
+   the plan, and `plans` holds per node its bytes and rows, each `exact`,
+   `bounded` (an interval holding the truth), or `measured`.
 2. **Read the evidence.** Quote the lint (`rule`, columns, message) and the
    fanout that explain the read. Every number is an exact sum of footer
    statistics; none is an estimate, except those labelled `approximate`:
@@ -44,7 +48,8 @@ fail if the two differ.
    scored and verified as one set, and the proposal must cite the twin
    Evidence; for a rewrite of lake queries, `shape.before_plan` and
    `shape.after_plan` hold the two shapes as typed plan DAGs, which the
-   engine prices), citing the evidence hash in
+   engine prices, verifies with `score.verify` against their `rewrite`
+   outputs, and attests with `apply.receipt`), citing the evidence hash in
    `evidence` and your own name in `by`. Pass `dry_run: true` first if you
    want to see the Proposal without writing it. A proposal has no score
    field; anything that looks like one is rejected by the schema.
@@ -88,10 +93,10 @@ already holds.
 
 | Tier | Tool | Writes |
 |---|---|---|
-| observe | `observe.why` (no keys), `observe.cardinality`, `observe.overlap`, `observe.profile`, `observe.locate`, `observe.asof`, `observe.text`, `observe.semijoin`, `observe.join_overlap`, `observe.join_verify` | Evidence and cache entries only |
-| score (engine-scored) | `score.why` (with keys, a workload, or `text` lookups), `score.verify`, `score.record` (keys from the query engine, with `--twin-of`) | engine Proposals, Replays, plan Evidence, Certificates; `score.record` a workload in the cache |
+| observe | `observe.why` (no keys), `observe.cardinality`, `observe.overlap`, `observe.profile`, `observe.locate` (`keys` or `key_values`; optional `emit`: `"datafusion" \| "duckdb" \| "spark"`), `observe.count` (`keys` or `key_values`), `observe.aggregate` (`keys` or `key_values`), `observe.asof` (`keys` or `key_values`; optional `emit`: `"datafusion" \| "duckdb" \| "spark"`), `observe.text`, `observe.semijoin`, `observe.join_overlap`, `observe.join_verify` | Evidence and cache entries only |
+| score (engine-scored) | `score.why` (with `keys`, `key_values`, a `workload`, or `text` lookups; optional `plan`, `datasets`, `at`), `score.verify`, `score.record` (keys from the query engine, with `--twin-of`) | engine Proposals, Replays, plan Evidence, Certificates; `score.record` a workload in the cache |
 | propose | `propose.key`, `propose.layout`, `propose.rewrite` | one Proposal, or nothing with `dry_run` |
-| apply | `apply.receipt` | Replay, the index commit, Receipt; nothing with `dry_run` or on a refusal, unless another commit lands during the apply (`concurrent_commit`: the key is built, the receipt withheld) |
+| apply | `apply.receipt`, `apply.refresh` (rebuilds stale index specs and stale join keys on the server's data folder in one manifest commit, charged to the session budget) | `apply.receipt`: Replay, the index commit, Receipt; `apply.refresh`: the index commit; nothing with `dry_run` or on a refusal, unless another commit lands during the apply (`concurrent_commit`: the key is built, the receipt withheld) |
 | jobs | `jobs.start`, `jobs.status`, `jobs.result` | whatever the started tool writes |
 
 ## Signatures in `chains[]`
@@ -136,8 +141,8 @@ line. No refusal is prose only.
 | `attest_only` | The proposal verified and its target is a table (`sql://`): the engine applies nothing to a table and writes no receipt. For a key, `fields.run` lists the `CREATE INDEX` per table the engine wrote, for a human to run; for a rewrite, `fields.proposed_rewrite` is your own proposed text, which the engine never ran, for the human to review. Report the certificate and those fields to the human. The same gain gate as over files applies first (`nothing_to_gain`). |
 | `reserved_proposer` | The name in `by` is reserved for the engine. Pass your own name. |
 | `sketch_not_proposable` | The key in `spec` (or `sidecars`) declares a sketch (`sketch:a`), which is approximate and never planned with, so no replay can price it and it has no certificate or receipt. `fields` has `declaration`, `sketch`, `root`, and `command` (the `bellwether index` command that builds it, shell-quoted, with this server's source flags; null when no command line spells them). Propose a key spec to reach a receipt, or ask the human to run `fields.command`. Per-key time bounds (`exact:a@ts`) and bitemporal keys (`temporal2:id@valid,known`) are key specs and propose like any other. |
-| `no_workload` | Scoring needs input that was not given: `keys`, a recorded `workload`, or `text` lookups for `score.why`, `workload` for a key proposal, `rewrite` outputs for a rewrite; `fields.field` names it. |
-| `stale_index` | Files landed, changed, or vanished since the index was built; `fields` lists them. Ask the human to run `bellwether index`. |
+| `no_workload` | Scoring needs input that was not given: `keys`, `key_values`, a recorded `workload`, or `text` lookups for `score.why`, `workload` for a key proposal, `rewrite` outputs for a rewrite; `fields.field` names it. |
+| `stale_index` | Files landed, changed, or vanished since the index was built; `fields` lists them. Call `apply.refresh`, or ask the human to run `bellwether index`. |
 | `not_indexed` | The lookup needs an index the folder does not have (none at all, or no complete key spec of the kind it plans with, in `fields.needs`). Ask the human to index the folder. |
 | `not_retained` | The lookup was pinned with `at_manifest` to a sequence the index does not retain (never committed, or pruned by garbage collection); `fields.oldest` and `fields.current` bound the sequences you may pass (both null when the folder is not indexed). Pass one of them, or omit `at_manifest`. |
 | `wrong_kind` | The hash is a record of another kind than the tool takes; `fields.field` names the argument. Pass the hash the earlier step printed. |
@@ -163,7 +168,7 @@ line. No refusal is prose only.
 | `caller_supplied_cost` | The arguments carried a score, cost, measurement, replay, prediction, verdict, or certificate field (`fields.field`). The engine measures, verifies, and attests on its own; remove the field and call again. |
 | `measurement_refused` | A query engine's log entry for one run cannot stand as its measurement; `fields.reason` says why: `cache_served` (the query text turned a cache on), `statistics_missing`, `not_the_query_submitted` or `ambiguous_log_entry` (another client ran under the run's tag), `tag_mismatch`, or `result_rows_differ` (the rows the run returned are not the rows it exported). Nothing was recorded. For `cache_served`, propose the rewrite again without those settings. |
 | `measurement_changed` | `apply.receipt` measured a rewrite of engine queries again, in the state certified, and a query's rows read, bytes read, or result rows disagree with the certified replay's (`fields.pair`, `fields.side`, `fields.certified`, `fields.measured`). Nothing was written. Do not apply; verify the proposal again. |
-| `stale_join` | A join key's pair index (B3) is stale: the data folder's row groups changed (`fields.side` is `left`) or the right dataset committed again (`right`) since it was built; `fields.spec`, `fields.pinned`, `fields.current`. Nothing was planned. Ask the human to run `bellwether index` on the data folder, which rebuilds it, then call the tool again. |
+| `stale_join` | A join key's pair index (B3) is stale: the data folder's row groups changed (`fields.side` is `left`) or the right dataset committed again (`right`) since it was built; `fields.spec`, `fields.pinned`, `fields.current`. Nothing was planned. Call `apply.refresh`, or ask the human to run `bellwether index`. |
 | `join_not_served` | A join key (B3) names a right dataset this server does not serve: the server reads only the right side the human gave with `--join` (`fields.served`, `<right>.<columns>`; null when it was started without `--join`). Refused by `propose.key`, `score.verify`, `apply.receipt`, and `score.why` before any folder is read, so the refusal is the same whether a folder of the name asked exists, is indexed, or not. Use the join key on `fields.served`, or ask the human to restart the server with `--join <right>.<columns>`. |
 
 ## What you may never do

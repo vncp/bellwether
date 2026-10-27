@@ -140,6 +140,7 @@ fn make_world(signing: bool) -> World {
             json!({"shape": {"before": "b", "after": "a", "invariant": "i"}, "evidence": [ev], "by": "p"}),
         );
         valid.insert("apply.receipt", json!({"certificate": ev, "wait": true}));
+        valid.insert("apply.refresh", json!({"dry_run": true, "wait": true}));
         valid.insert(
             "score.why",
             json!({"keys": k, "max_candidates": 1, "wait": true}),
@@ -203,7 +204,7 @@ fn arb_json() -> impl Strategy<Value = Value> {
     })
 }
 
-const TOOLS: [&str; 16] = [
+const TOOLS: [&str; 17] = [
     "observe.why",
     "observe.cardinality",
     "observe.overlap",
@@ -217,6 +218,7 @@ const TOOLS: [&str; 16] = [
     "propose.layout",
     "propose.rewrite",
     "apply.receipt",
+    "apply.refresh",
     "jobs.start",
     "jobs.status",
     "jobs.result",
@@ -278,7 +280,9 @@ fn allowed(tool: &str, kinds: &[String], other: &[String], signing: bool) -> Res
         "observe.why" | "observe.profile" | "observe.locate" | "observe.asof" => {
             only(&["evidence"]) && cache_only
         }
-        "apply.receipt" | "jobs.status" | "jobs.result" => kinds.is_empty() && other.is_empty(),
+        "apply.receipt" | "apply.refresh" | "jobs.status" | "jobs.result" => {
+            kinds.is_empty() && other.is_empty()
+        }
         "score.record" => kinds.is_empty() && cache_only,
         "score.why" | "score.verify" | "jobs.start" => {
             only(&["evidence", "proposal", "replay", "certificate"]) && cache_only

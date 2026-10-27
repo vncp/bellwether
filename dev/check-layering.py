@@ -24,7 +24,7 @@ ALLOWED = {
     "bellwether-replay": {"bellwether-types", "bellwether-core", "bellwether-source", "bellwether-store", "bellwether-ledger", "bellwether-build"},
     "bellwether-verify": {"bellwether-types", "bellwether-core", "bellwether-source", "bellwether-store", "bellwether-ledger", "bellwether-build"},
     "bellwether-evolve": {"bellwether-types", "bellwether-core", "bellwether-source", "bellwether-store", "bellwether-ledger", "bellwether-build", "bellwether-profile", "bellwether-replay", "bellwether-verify"},
-    "bellwether": {"bellwether-types", "bellwether-core", "bellwether-source", "bellwether-store", "bellwether-ledger", "bellwether-build", "bellwether-profile", "bellwether-replay", "bellwether-verify", "bellwether-evolve", "bellwether-source-sql", "bellwether-source-engine"},  # the facade: the one code path the CLI and MCP share (ADR 010)
+    "bellwether": {"bellwether-types", "bellwether-core", "bellwether-source", "bellwether-store", "bellwether-ledger", "bellwether-build", "bellwether-profile", "bellwether-replay", "bellwether-verify", "bellwether-evolve", "bellwether-source-sql", "bellwether-source-engine", "bellwether-adapters"},  # the facade: the one code path the CLI and MCP share (ADR 010)
     "bellwether-cli": {"bellwether", "bellwether-types", "bellwether-bench", "bellwether-mcp", "bellwether-adapters"},  # formatting and argument parsing only; `bench` and `mcp` subcommands delegate; `--emit` hands the plan to an adapter (WP16)
     "bellwether-mcp": {"bellwether", "bellwether-types"},  # tool envelopes over the facade; no engine logic
 }

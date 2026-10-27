@@ -183,6 +183,74 @@ impl Engine {
         })
     }
 
+    /// Checks what `index(&[])` (`apply.refresh`) would refresh without
+    /// writing anything: folder changes (`folder_changes`), incomplete
+    /// declared specs and sidecars, and declared join-key freshness
+    /// (`join_verify`). Refused with [`Error::NotIndexed`] when the folder
+    /// has no index yet.
+    pub fn refresh_dry_run(&self) -> Result<crate::results::RefreshDryRunResult> {
+        guard(|| {
+            self.require_folder("refresh")?;
+            self.require_current("refresh")?;
+            let pinned = self.pin_required("refresh")?;
+            let (untracked, changed, missing) =
+                folder_changes(self.root(), &pinned, self.format(), &self.excluded())?.paths();
+            let m = pinned.manifest();
+            let incomplete_specs: Vec<KeySpec> = pinned
+                .planner
+                .declared_specs()
+                .iter()
+                .filter(|s| {
+                    !matches!(s, KeySpec::Join { .. }) && pinned.planner.completeness(s).is_none()
+                })
+                .cloned()
+                .collect();
+            let incomplete_sidecars: Vec<String> = pinned
+                .planner
+                .declared_sidecars()
+                .iter()
+                .filter(|d| pinned.planner.sidecar_completeness(d).is_none())
+                .map(bellwether_core::sidecar::SidecarDef::name)
+                .chain(
+                    bellwether_build::declared_sketches(m)
+                        .iter()
+                        .filter(|s| bellwether_build::sketch_completeness(m, s).is_none())
+                        .map(bellwether_types::SketchSpec::name),
+                )
+                .collect();
+            let has_join = pinned
+                .planner
+                .declared_specs()
+                .iter()
+                .any(|s| matches!(s, KeySpec::Join { .. }));
+            let joins = if has_join {
+                self.join_verify(None)?.joins
+            } else {
+                Vec::new()
+            };
+            let would_refresh = !untracked.is_empty()
+                || !changed.is_empty()
+                || !missing.is_empty()
+                || !incomplete_specs.is_empty()
+                || !incomplete_sidecars.is_empty()
+                || joins
+                    .iter()
+                    .any(|j| !matches!(j.state, crate::join::JoinFreshness::Fresh { .. }));
+            Ok(crate::results::RefreshDryRunResult {
+                root: self.root().to_string(),
+                sequence: pinned.sequence(),
+                untracked,
+                changed,
+                missing,
+                incomplete_specs,
+                incomplete_sidecars,
+                joins,
+                would_refresh,
+            })
+        })
+        .map_err(|e| root_hint(self.root(), schema_hint(e)))
+    }
+
     /// Plans a lookup of the keys in `keys` with every declared key spec
     /// complete at the current manifest sequence, and writes the plan as an
     /// Evidence of kind `plan`. The plan includes every row group holding a
@@ -467,6 +535,7 @@ impl Engine {
             column_bytes_from_footers: 0,
             evidence,
             live: None,
+            emitted: None,
         })
     }
 
@@ -722,6 +791,7 @@ impl Engine {
             column_bytes_from_footers,
             evidence,
             live,
+            emitted: None,
         })
     }
 

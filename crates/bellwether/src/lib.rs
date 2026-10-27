@@ -70,7 +70,9 @@ pub use bellwether_types as types;
 pub use bellwether_verify::{
     ExactTotal, GroupTotal, KeyRepr, Mismatch, Reconciliation, TotalColumn,
 };
-pub use emit::{EmitInputs, EmitPartitions};
+pub use emit::{
+    EmitEngine, EmitInputs, EmitPartitions, EmitRequest, EmitResidual, EmittedArtifact,
+};
 pub use engine::{
     schema_from_json, ConnectFn, Engine, EngineConnector, EngineOptions, FolderStatus,
     SourceFormat, DEFAULT_INDEX_DIR, ISSUE_TRACKER,
@@ -103,9 +105,9 @@ pub use receipt::signature_summary;
 pub use reconcile::{ReconcileProblem, ReconcileRequest, ReconcileResult};
 pub use results::{
     ChainLink, Cost, CountResult, IndexResult, LinkStatus, LivePlan, LookbackWindow, LookupKind,
-    NotSigned, PlanResult, ProposeRefusal, ProposeResult, ReceiptResult, ReportResult,
-    SidecarFolded, SidecarState, SpecState, TextRebuilt, TombstoneDropped, TombstoneRows,
-    TombstoneUnused, Written,
+    NotSigned, PlanResult, ProposeRefusal, ProposeResult, ReceiptResult, RefreshDryRunResult,
+    ReportResult, SidecarFolded, SidecarState, SpecState, TextRebuilt, TombstoneDropped,
+    TombstoneRows, TombstoneUnused, Written,
 };
 pub use signing::{
     generate_key, load_signing_key, load_trusted_keys, parse_trusted_keys, public_path,

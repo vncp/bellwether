@@ -229,3 +229,178 @@ fn the_binary_takes_the_shared_engine_and_budget_flags() {
     let err = String::from_utf8(out.stderr).unwrap();
     assert!(err.starts_with("bellwether-mcp: "), "{err}");
 }
+
+#[test]
+fn inline_key_values_emit_and_apply_refresh_work_over_stdio() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    common::scattered_corpus(&data, 3, 4, 25, 400);
+    let keys = dir.path().join("k.parquet");
+    write_keys(&keys, "id", &[5, 77, 123]);
+    let root = data.to_str().unwrap();
+    let k = keys.to_str().unwrap();
+
+    let srv = server(&data);
+    srv.engine()
+        .index(&[
+            bellwether::spec::parse("exact:id,counts").unwrap(),
+            bellwether::spec::parse("temporal:id@ts").unwrap(),
+            bellwether::spec::parse("agg:id@batch{sum,count}").unwrap(),
+        ])
+        .unwrap();
+
+    let mut c = Client::spawn(EXE, &["--clock", CLOCK, root]);
+    c.initialize();
+
+    // (a) observe.locate with inline key_values + emit: "duckdb"
+    let located_inline = c.call(
+        "observe.locate",
+        json!({
+            "key_columns": ["id"],
+            "key_values": [[5], [77], [123]],
+            "emit": "duckdb"
+        }),
+    );
+    assert_eq!(located_inline["isError"], false, "{located_inline}");
+    let inline_v: Value = serde_json::from_str(text(&located_inline)).unwrap();
+    let file_located = ok(&srv, "observe.locate", json!({"keys": k}));
+    let file_v = json(&file_located);
+    assert_eq!(inline_v["key_set"], file_v["key_set"]);
+    assert_eq!(inline_v["planned"], file_v["planned"]);
+    assert_eq!(inline_v["emitted"]["engine"], "duckdb");
+    assert_eq!(inline_v["emitted"]["residual"], "full");
+    assert_eq!(inline_v["emitted"]["ordered"], false);
+    let sql = inline_v["emitted"]["text"].as_str().unwrap();
+    assert!(sql.contains("read_parquet") && sql.contains("123"), "{sql}");
+
+    // observe.asof with key_values + emit: "datafusion", and observe.count / observe.aggregate with key_values.
+    let asof_inline = c.call(
+        "observe.asof",
+        json!({
+            "key_columns": ["id"],
+            "key_values": [[5], [77]],
+            "at": "1970-01-01T00:01:00Z",
+            "emit": "datafusion"
+        }),
+    );
+    assert_eq!(asof_inline["isError"], false, "{asof_inline}");
+    let asof_v: Value = serde_json::from_str(text(&asof_inline)).unwrap();
+    assert_eq!(asof_v["emitted"]["engine"], "datafusion");
+
+    let count_inline = c.call(
+        "observe.count",
+        json!({
+            "key_columns": ["id"],
+            "key_values": [[5], [77], [123]]
+        }),
+    );
+    assert_eq!(count_inline["isError"], false, "{count_inline}");
+    let count_v: Value = serde_json::from_str(text(&count_inline)).unwrap();
+    assert_eq!(count_v["keys"], 3);
+
+    let agg_inline = c.call(
+        "observe.aggregate",
+        json!({
+            "key_columns": ["id"],
+            "key_values": [[5], [77]],
+            "value": "batch"
+        }),
+    );
+    assert_eq!(agg_inline["isError"], false, "{agg_inline}");
+    let agg_v: Value = serde_json::from_str(text(&agg_inline)).unwrap();
+    assert_eq!(agg_v["keys"], 2);
+    // Contradictory or incomplete key_values inputs are refused with invalid_argument.
+    for (bad_args, want_field) in [
+        (
+            json!({"keys": k, "key_columns": ["id"], "key_values": [[5]]}),
+            "key_values",
+        ),
+        (
+            json!({"key_columns": ["id"], "key_values": []}),
+            "key_values",
+        ),
+        (json!({"key_values": [[5]]}), "key_columns"),
+    ] {
+        let r = c.call("observe.locate", bad_args.clone());
+        assert_eq!(r["isError"], true, "{bad_args}");
+        assert_eq!(
+            r["structuredContent"]["refusal"]["code"], "invalid_argument",
+            "{bad_args}: {r}"
+        );
+        assert_eq!(
+            r["structuredContent"]["refusal"]["fields"]["field"], want_field,
+            "{bad_args}: {r}"
+        );
+    }
+
+    // (b) score.why with inline key_values produces the same workload hash and funnel as keys file.
+    let why_inline = c.call(
+        "score.why",
+        json!({
+            "key_columns": ["id"],
+            "key_values": [[5], [77], [123]],
+            "wait": true
+        }),
+    );
+    assert_eq!(why_inline["isError"], false, "{why_inline}");
+    let why_inline_v: Value = serde_json::from_str(text(&why_inline)).unwrap();
+    let why_file = ok(&srv, "score.why", json!({"keys": k, "wait": true}));
+    let why_file_v = json(&why_file);
+    assert_eq!(
+        why_inline_v["workload"]["hash"],
+        why_file_v["workload"]["hash"]
+    );
+    assert_eq!(why_inline_v["current"], why_file_v["current"]);
+
+    // (c) apply.refresh healing a stale_index so a subsequent observe.locate succeeds.
+    common::write_file(
+        &data.join("part-999.parquet"),
+        &[vec![(5, 1, Some(1_000_000), "late".into())]],
+    );
+    let stale = c.call(
+        "observe.locate",
+        json!({"key_columns": ["id"], "key_values": [[5]]}),
+    );
+    assert_eq!(stale["isError"], true, "{stale}");
+    assert_eq!(
+        stale["structuredContent"]["refusal"]["code"], "stale_index",
+        "{stale}"
+    );
+    assert!(
+        stale["structuredContent"]["refusal"]["next"]
+            .as_str()
+            .unwrap()
+            .contains("apply.refresh"),
+        "{stale}"
+    );
+
+    let dry = c.call("apply.refresh", json!({"dry_run": true}));
+    assert_eq!(dry["isError"], false, "{dry}");
+    let dry_v: Value = serde_json::from_str(text(&dry)).unwrap();
+    assert_eq!(dry_v["would_refresh"], true, "{dry_v}");
+    assert_eq!(dry_v["untracked"].as_array().unwrap().len(), 1, "{dry_v}");
+
+    // Still stale after dry_run.
+    let still_stale = c.call(
+        "observe.locate",
+        json!({"key_columns": ["id"], "key_values": [[5]]}),
+    );
+    assert_eq!(still_stale["isError"], true);
+
+    let refreshed = c.call("apply.refresh", json!({"wait": true}));
+    assert_eq!(refreshed["isError"], false, "{refreshed}");
+    let ref_v: Value = serde_json::from_str(text(&refreshed)).unwrap();
+    assert_eq!(ref_v["committed"], 2, "{ref_v}");
+    assert_eq!(ref_v["files_new"], 1, "{ref_v}");
+
+    let healed = c.call(
+        "observe.locate",
+        json!({"key_columns": ["id"], "key_values": [[5]]}),
+    );
+    assert_eq!(healed["isError"], false, "{healed}");
+    let healed_v: Value = serde_json::from_str(text(&healed)).unwrap();
+    assert_eq!(healed_v["sequence"], 2);
+
+    let (status, _, _) = c.close();
+    assert!(status.success());
+}

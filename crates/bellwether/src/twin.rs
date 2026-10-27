@@ -695,6 +695,7 @@ impl Engine {
                     let kf = crate::keys::KeyFile {
                         path: f.clone(),
                         columns: columns.map(<[String]>::to_vec),
+                        key_values: None,
                     };
                     batches.push(kf.read()?);
                 }

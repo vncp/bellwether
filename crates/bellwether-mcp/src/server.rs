@@ -21,10 +21,11 @@ use crate::envelope::{cites_of, Chain, Envelope, Status};
 use crate::jobs::{job_id, Job, JobInfo, JobState, Jobs};
 use crate::refusal::{self, Refusal, RefusalCode};
 use crate::tools::{
-    self, ApplyReceipt, JobRef, JobsStart, KeyArg, Membership, ObserveAggregate, ObserveAsof,
-    ObserveCardinality, ObserveCount, ObserveJoinOverlap, ObserveJoinVerify, ObserveLocate,
-    ObserveOverlap, ObserveSemijoin, ObserveText, ObserveWhy, ProposeKey, ProposeLayout,
-    ProposeRewrite, ScoreRecord, ScoreVerify, ScoreWhy, Tier,
+    self, ApplyReceipt, ApplyRefresh, EmitEngine, EmitResidual, JobRef, JobsStart, KeyArg,
+    Membership, ObserveAggregate, ObserveAsof, ObserveCardinality, ObserveCount,
+    ObserveJoinOverlap, ObserveJoinVerify, ObserveLocate, ObserveOverlap, ObserveSemijoin,
+    ObserveText, ObserveWhy, ProposeKey, ProposeLayout, ProposeRewrite, ScoreRecord, ScoreVerify,
+    ScoreWhy, Tier,
 };
 
 /// How the server is configured at startup. Nothing is read from the
@@ -378,12 +379,15 @@ impl Server {
             },
             "observe.locate" => {
                 let a = parse!(ObserveLocate);
+                let keys = match resolve_keys(a.keys, a.key_columns, a.key_values) {
+                    Ok(k) => k,
+                    Err(err) => return failed(&err),
+                };
                 let pinned = match self.lookup_engine(a.at_manifest) {
                     Ok(p) => p,
                     Err(err) => return failed(&err),
                 };
                 let engine = pinned.as_ref().unwrap_or(e);
-                let keys = key_file(a.keys, a.key_columns);
                 let result = match (&a.columns, a.contains) {
                     (Some(_), Some(_)) => Err(bellwether::types::Error::InvalidArgument {
                         field: "columns",
@@ -396,50 +400,59 @@ impl Server {
                     (Some(columns), None) => engine.locate_columns(&keys, None, columns),
                     (None, None) => engine.locate(&keys),
                 };
-                match result {
+                match result
+                    .and_then(|r| with_emit(engine, r, a.emit, a.ordered, a.residual, a.relocate))
+                {
                     Ok(r) => done(&r, None),
                     Err(err) => failed(&err),
                 }
             }
             "observe.count" => {
                 let a = parse!(ObserveCount);
+                let keys = match resolve_keys(a.keys, a.key_columns, a.key_values) {
+                    Ok(k) => k,
+                    Err(err) => return failed(&err),
+                };
                 let pinned = match self.lookup_engine(a.at_manifest) {
                     Ok(p) => p,
                     Err(err) => return failed(&err),
                 };
-                match pinned
-                    .as_ref()
-                    .unwrap_or(e)
-                    .count(&key_file(a.keys, a.key_columns))
-                {
+                match pinned.as_ref().unwrap_or(e).count(&keys) {
                     Ok(r) => done(&r, None),
                     Err(err) => failed(&err),
                 }
             }
             "observe.aggregate" => {
                 let a = parse!(ObserveAggregate);
+                let keys = match resolve_keys(a.keys, a.key_columns, a.key_values) {
+                    Ok(k) => k,
+                    Err(err) => return failed(&err),
+                };
                 let pinned = match self.lookup_engine(a.at_manifest) {
                     Ok(p) => p,
                     Err(err) => return failed(&err),
                 };
                 let functions = a.functions.unwrap_or_else(tools::default_functions);
-                match pinned.as_ref().unwrap_or(e).aggregate(
-                    &key_file(a.keys, a.key_columns),
-                    &a.value,
-                    &functions,
-                ) {
+                match pinned
+                    .as_ref()
+                    .unwrap_or(e)
+                    .aggregate(&keys, &a.value, &functions)
+                {
                     Ok(r) => done(&r, None),
                     Err(err) => failed(&err),
                 }
             }
             "observe.asof" => {
                 let a = parse!(ObserveAsof);
+                let keys = match resolve_keys(a.keys, a.key_columns, a.key_values) {
+                    Ok(k) => k,
+                    Err(err) => return failed(&err),
+                };
                 let pinned = match self.lookup_engine(a.at_manifest) {
                     Ok(p) => p,
                     Err(err) => return failed(&err),
                 };
                 let engine = pinned.as_ref().unwrap_or(e);
-                let keys = key_file(a.keys, a.key_columns);
                 let clocks = match (&a.valid_by, &a.known_by) {
                     (Some(v), Some(k)) => Ok(Some((v.as_str(), k.as_str()))),
                     (None, None) => Ok(None),
@@ -482,7 +495,9 @@ impl Server {
                             .into(),
                     }),
                 };
-                match r {
+                match r
+                    .and_then(|r| with_emit(engine, r, a.emit, a.ordered, a.residual, a.relocate))
+                {
                     Ok(r) => done(&r, None),
                     Err(err) => failed(&err),
                 }
@@ -529,14 +544,25 @@ impl Server {
             }
             "score.why" => {
                 let a = parse!(ScoreWhy);
-                if a.keys.is_none() && a.workload.is_none() && a.text.is_empty() {
+                if a.keys.is_none()
+                    && a.key_values.is_none()
+                    && a.workload.is_none()
+                    && a.text.is_empty()
+                {
                     return Done::Failed(Refusal::new(
                         RefusalCode::NoWorkload,
-                        "score.why replays a workload (keys, workload, or text lookups); without \
-                         one, call observe.why",
+                        "score.why replays a workload (keys, key_values, workload, or text \
+                         lookups); without one, call observe.why",
                         json!({}),
                     ));
                 }
+                let keys = match (a.keys.is_some(), a.key_values.is_some()) {
+                    (false, false) => None,
+                    _ => match resolve_keys(a.keys, a.key_columns.clone(), a.key_values) {
+                        Ok(k) => Some(k),
+                        Err(err) => return failed(&err),
+                    },
+                };
                 let tombstone = match a
                     .tombstone
                     .as_deref()
@@ -553,7 +579,7 @@ impl Server {
                         .into_iter()
                         .map(|k| key_file(k, a.key_columns.clone()))
                         .collect(),
-                    keys: a.keys.map(|k| key_file(k, a.key_columns)),
+                    keys,
                     bench_workload: None,
                     workload: a.workload,
                     mode: match (a.contains, a.join) {
@@ -710,6 +736,20 @@ impl Server {
                         certificate: Some(a.certificate),
                         ..FixRequest::default()
                     }))
+                }
+            }
+            "apply.refresh" => {
+                let a = parse!(ApplyRefresh);
+                if a.dry_run {
+                    match e.refresh_dry_run() {
+                        Ok(r) => done(&r, None),
+                        Err(err) => failed(&err),
+                    }
+                } else {
+                    match e.index(&[]) {
+                        Ok(r) => done(&r, None),
+                        Err(err) => failed(&err),
+                    }
                 }
             }
             other => Done::Failed(Refusal::new(
@@ -1009,7 +1049,7 @@ fn runs_as_job(tool: &str, args: &Value) -> bool {
     let flag = |k: &str| args.get(k).and_then(Value::as_bool).unwrap_or(false);
     match tool {
         "score.why" | "score.verify" | "score.record" => !flag("wait"),
-        "apply.receipt" => !flag("wait") && !flag("dry_run"),
+        "apply.receipt" | "apply.refresh" => !flag("wait") && !flag("dry_run"),
         _ => false,
     }
 }
@@ -1028,6 +1068,110 @@ fn key_file(path: String, columns: Option<Vec<String>>) -> KeyFile {
         Some(c) => f.with_columns(c),
         None => f,
     }
+}
+
+fn resolve_keys(
+    path: Option<String>,
+    columns: Option<Vec<String>>,
+    key_values: Option<Vec<Vec<Value>>>,
+) -> bellwether::types::Result<KeyFile> {
+    match (path, key_values) {
+        (Some(_), Some(_)) => Err(Error::InvalidArgument {
+            field: "key_values",
+            reason: "give `keys` (a Parquet key file) or `key_values` (inline key tuples), not \
+                     both"
+                .into(),
+        }),
+        (None, None) => Err(Error::InvalidArgument {
+            field: "keys",
+            reason: "give `keys` (a Parquet key file) or `key_values` (inline key tuples with \
+                     `key_columns`)"
+                .into(),
+        }),
+        (Some(p), None) => Ok(key_file(p, columns)),
+        (None, Some(rows)) => {
+            if rows.is_empty() {
+                return Err(Error::InvalidArgument {
+                    field: "key_values",
+                    reason: "`key_values` is empty; pass at least one key tuple".into(),
+                });
+            }
+            let Some(cols) = columns.filter(|c| !c.is_empty()) else {
+                return Err(Error::InvalidArgument {
+                    field: "key_columns",
+                    reason: "`key_values` requires `key_columns` naming the key column(s) in \
+                             tuple order"
+                        .into(),
+                });
+            };
+            for (r, row) in rows.iter().enumerate() {
+                if row.len() != cols.len() {
+                    return Err(Error::InvalidArgument {
+                        field: "key_values",
+                        reason: format!(
+                            "`key_values` row {r} has {} value(s), but `key_columns` names {} \
+                             column(s) ({})",
+                            row.len(),
+                            cols.len(),
+                            cols.join(", ")
+                        ),
+                    });
+                }
+            }
+            Ok(KeyFile::from_values(cols, rows))
+        }
+    }
+}
+
+fn with_emit(
+    engine: &Engine,
+    mut result: bellwether::PlanResult,
+    emit: Option<EmitEngine>,
+    ordered: bool,
+    residual: Option<EmitResidual>,
+    relocate: Option<[String; 2]>,
+) -> bellwether::types::Result<bellwether::PlanResult> {
+    let Some(target) = emit else {
+        if ordered {
+            return Err(Error::InvalidArgument {
+                field: "ordered",
+                reason: "`ordered` applies to an emitted artifact; pass `emit` (`datafusion`, \
+                         `duckdb`, or `spark`) with it, or omit `ordered`"
+                    .into(),
+            });
+        }
+        if residual.is_some() {
+            return Err(Error::InvalidArgument {
+                field: "residual",
+                reason: "`residual` applies to an emitted artifact; pass `emit` (`datafusion`, \
+                         `duckdb`, or `spark`) with it, or omit `residual`"
+                    .into(),
+            });
+        }
+        if relocate.is_some() {
+            return Err(Error::InvalidArgument {
+                field: "relocate",
+                reason: "`relocate` applies to an emitted artifact; pass `emit` (`datafusion`, \
+                         `duckdb`, or `spark`) with it, or omit `relocate`"
+                    .into(),
+            });
+        }
+        return Ok(result);
+    };
+    let emitted = engine.emit_plan_result(
+        &result,
+        &bellwether::EmitRequest {
+            engine: target.into(),
+            keys_file: None,
+            residual: residual.unwrap_or_default().into(),
+            ordered,
+            footer_hint: false,
+            engine_pruning: false,
+            relocate,
+        },
+    )?;
+    result.emitted = Some(emitted);
+    Ok(result)
 }
 
 fn propose(
