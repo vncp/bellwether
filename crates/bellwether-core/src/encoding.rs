@@ -303,11 +303,25 @@ fn int_range(declared: &DataType) -> Option<(i128, i128)> {
     })
 }
 
+/// `10^0 ..= 10^76`, every power of ten an `i256` holds (`10^77` overflows),
+/// built once instead of computed per value.
+static POW10: std::sync::LazyLock<[i256; 77]> = std::sync::LazyLock::new(|| {
+    let ten = i256::from_i128(10);
+    let mut t = [i256::ONE; 77];
+    for i in 1..t.len() {
+        t[i] = t[i - 1].wrapping_mul(ten);
+    }
+    t
+});
+
+/// `10^exp`, or `None` past `10^76`: what `i256::checked_pow` gives.
+fn pow10(exp: u32) -> Option<i256> {
+    POW10.get(usize::try_from(exp).ok()?).copied()
+}
+
 fn rescale(value: i256, scale: i8, declared: &DataType, p: u8, s: i8) -> Result<i256> {
     let diff = i32::from(s) - i32::from(scale);
-    let ten = i256::from_i128(10);
-    let factor = ten
-        .checked_pow(diff.unsigned_abs())
+    let factor = pow10(diff.unsigned_abs())
         .ok_or_else(|| unrepresentable(format!("decimal at scale {scale}"), declared))?;
     let v = if diff >= 0 {
         value.checked_mul(factor)
@@ -317,9 +331,8 @@ fn rescale(value: i256, scale: i8, declared: &DataType, p: u8, s: i8) -> Result<
         None
     }
     .ok_or_else(|| unrepresentable(format!("decimal {value} at scale {scale}"), declared))?;
-    let bound = ten
-        .checked_pow(u32::from(p))
-        .ok_or_else(|| unrepresentable("decimal precision", declared))?;
+    let bound =
+        pow10(u32::from(p)).ok_or_else(|| unrepresentable("decimal precision", declared))?;
     let neg_bound = bound
         .checked_neg()
         .ok_or_else(|| unrepresentable("decimal precision", declared))?;
@@ -494,12 +507,15 @@ fn put_i64(out: &mut Vec<u8>, v: i64) {
 fn put_escaped(out: &mut Vec<u8>, t: u8, bytes: &[u8]) {
     out.reserve(bytes.len() + 3);
     out.push(t);
-    for &b in bytes {
-        out.push(b);
-        if b == 0 {
-            out.push(0xFF);
-        }
+    // Copies the runs between zero bytes whole; each zero is followed by
+    // its 0xFF escape.
+    let mut rest = bytes;
+    while let Some(i) = rest.iter().position(|&b| b == 0) {
+        out.extend_from_slice(&rest[..=i]);
+        out.push(0xFF);
+        rest = &rest[i + 1..];
     }
+    out.extend_from_slice(rest);
     out.extend_from_slice(&[0x00, 0x00]);
 }
 
@@ -1081,6 +1097,48 @@ mod tests {
 
     fn enc_as(v: Value<'_>, d: &DataType) -> Result<Vec<u8>> {
         encode_tuple_as(&[v], std::slice::from_ref(d))
+    }
+
+    /// The table gives what `checked_pow` computes, overflow included.
+    #[test]
+    fn pow10_is_checked_pow() {
+        let ten = i256::from_i128(10);
+        for exp in 0..=100 {
+            assert_eq!(pow10(exp), ten.checked_pow(exp), "10^{exp}");
+        }
+        assert_eq!(pow10(u32::MAX), None);
+    }
+
+    /// Escaping copies runs whole: the same bytes as escaping byte by byte,
+    /// for zeros at the start, the end, in runs, and none at all.
+    #[test]
+    fn escaping_matches_byte_by_byte() {
+        fn by_byte(t: u8, bytes: &[u8]) -> Vec<u8> {
+            let mut out = vec![t];
+            for &b in bytes {
+                out.push(b);
+                if b == 0 {
+                    out.push(0xFF);
+                }
+            }
+            out.extend_from_slice(&[0x00, 0x00]);
+            out
+        }
+        let cases: [&[u8]; 8] = [
+            b"",
+            b"abc",
+            b"\0",
+            b"\0\0\0",
+            b"\0ab",
+            b"ab\0",
+            b"a\0b\0\0c\xff\0",
+            b"\xff\xfe\0\x01",
+        ];
+        for bytes in cases {
+            let mut out = vec![0x42];
+            put_escaped(&mut out, tag::UTF8, bytes);
+            assert_eq!(out[1..], by_byte(tag::UTF8, bytes)[..], "{bytes:?}");
+        }
     }
 
     #[test]
