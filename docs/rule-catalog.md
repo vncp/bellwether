@@ -34,6 +34,10 @@ semi-join runs.
 runs, or a reconcile that just ran, rather than footer statistics; `why`
 raises the first into the same `profile` Evidence and `reconcile` returns
 the second in its `lints`.
+`R-tombstone-1` (2026-10-26, tombstones) reads the recorded workload's
+`latest`, `asof`, and bitemporal runs that filter on a boolean or state
+column after choosing each key's newest version; `why` raises it into the
+same `profile` Evidence.
 
 ## How to read an entry
 
@@ -663,3 +667,50 @@ kind (`docs/adding-an-index-kind.md`: no kind without its detector).
 - **Confidence rubric**: high: the runs (or the reconcile) are recorded and
   the specs are the manifest's; nothing is sampled. Advice only: it changes
   no plan.
+
+### R-tombstone-1
+
+Added 2026-10-26 with tombstones (B8), the detector that recommends the
+kind (`docs/adding-an-index-kind.md`: no kind without its detector).
+
+- **id**: `R-tombstone-1`
+- **Detector**: from the recorded workload. Some run takes each key's
+  newest version, `latest`, `asof`, or a bitemporal as-of, and then keeps
+  only rows that are not retractions, a filter on a boolean or state column
+  (`arg_max(ts, *) by key` followed by `where not void`, or `where status
+  <> 'VOID'`; recorded by `why --from <keys.parquet> --latest-by <ts> [--at
+  <t>] --tombstone <column>[=<value>]`, or `--valid-by <v> --known-by <k>`
+  for a bitemporal one, or found in a recorded workload), and no key spec
+  complete at the current manifest is a temporal (or bitemporal) key on the
+  run's columns and time columns declaring exactly that tombstone. One lint
+  per (columns, time columns, tombstone)
+  (`bellwether_profile::lints::latest_then_filter`, raised by `why` into the
+  same `profile` Evidence, which then cites the workload it was read from).
+  A temporal key without the tombstone, with another tombstone, or on other
+  time columns does not silence it.
+- **Estimator**: without the tombstone every run reads every row group
+  holding a key's newest version, also for keys whose newest row the filter
+  then drops. Bytes: `why --tombstone` replays the runs as `live` lookups
+  under the transient key with the tombstone and reports their exact row
+  groups and bytes; its `tombstone` column is the number of keys (over live
+  row groups) whose newest row is a tombstone, out of the keys with a
+  version, exact. Those keys' row groups are the ones the kind saves, so the
+  fraction says whether it pays: near zero, a live lookup reads what
+  `latest` reads and the residual alone does the work.
+- **Guidance template**: file `bellwether.toml` (or `bellwether index`),
+  step `key_specs`. Before: `latest on (<columns>), then where <filter>`.
+  After: `temporal:<columns>@<ts>,tombstone=<column>[=<value>]` (or
+  `temporal2:<columns>@<valid>,<known>,tombstone=...`); the manifest keeps
+  the temporal key unchanged and declares the tombstone as its sidecar
+  (`docs/format.md`, "Tombstones"). Invariant: `every row group holding a
+  live row at a key's newest time is still selected (invariant 1), and the
+  residual drops the tombstone rows`.
+- **Verification method**: `fix` compares, per key of the workload, the
+  newest rows chosen from every live row group holding the key, then kept by
+  the live filter, against the rows in the proposed plan's row groups after
+  the same residual (`Live` after `LatestPerKey`): a key whose newest row
+  is a tombstone must have no row on either side, and a row group the
+  tombstones pruned must hold no live newest row. One differing key fails
+  the certificate.
+- **Confidence rubric**: high: the runs are recorded and the specs are the
+  manifest's; nothing is sampled. Advice only: it changes no plan.

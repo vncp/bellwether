@@ -18,6 +18,9 @@ use bellwether_bench::report::write_report;
 use bellwether_bench::results::Results;
 use bellwether_bench::slo::{assert_slo, Mode};
 use bellwether_bench::text::{generate_text, TextParams, TextShape, TextSummary};
+use bellwether_bench::tombstone::{
+    generate_tombstone, TombstoneParams, TombstoneShape, TombstoneSummary,
+};
 use bellwether_bench::truth::write_ground_truth;
 use bellwether_bench::workload::{generate_workload, WorkloadParams};
 use clap::{Args, Subcommand, ValueEnum};
@@ -79,6 +82,57 @@ pub(crate) enum BenchCommand {
     /// skewed accounts with null amounts (10^7 rows by default), per-key sum
     /// runs of 10, 10^3, and 10^5 accounts, and exact per-run sums.
     Agg(AggArgs),
+    /// Write a corpus for tombstones on one shape: the ledger with voids
+    /// (`void`) or market trade prints with retractions (`status=CANCEL`),
+    /// rows in time order (2 x 10^6 by default), `latest`/`asof` runs of 10,
+    /// 10^3, and 10^5 keys, and exact per-run truth.
+    Tombstone(TombstoneArgs),
+}
+
+#[derive(Args)]
+pub(crate) struct TombstoneArgs {
+    /// Output directory (`data/` and `workload/`); must not hold a corpus.
+    #[arg(long)]
+    out: PathBuf,
+    /// The shape.
+    #[arg(long, value_enum)]
+    shape: TombstoneShapeArg,
+    /// RNG seed [default: 11].
+    #[arg(long)]
+    seed: Option<u64>,
+    /// Files [default: 20].
+    #[arg(long)]
+    files: Option<u32>,
+    /// Row groups per file [default: 10].
+    #[arg(long)]
+    row_groups_per_file: Option<u32>,
+    /// Rows per row group [default: 10000].
+    #[arg(long)]
+    rows_per_row_group: Option<u32>,
+    /// Distinct keys the rows draw from [default: 200000].
+    #[arg(long)]
+    keys: Option<u32>,
+    /// Fraction of rows that are retractions [default: 0.2 ledger, 0.05
+    /// market].
+    #[arg(long)]
+    retract_fraction: Option<f64>,
+    /// Fraction of rows whose `void` is null [default: 0.001 ledger, 0
+    /// market, whose `status` is never null].
+    #[arg(long)]
+    null_fraction: Option<f64>,
+    /// Keys per run, comma-separated [default: 10,1000,100000].
+    #[arg(long, value_delimiter = ',')]
+    runs: Option<Vec<u32>>,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+pub(crate) enum TombstoneShapeArg {
+    /// `order_id`, `ts`, `amount`, `void`: orders whose newest row may be a
+    /// void.
+    Ledger,
+    /// `trade_id`, `symbol`, `ts`, `price`, `size`, `status`: prints whose
+    /// newest may be a cancellation.
+    Market,
 }
 
 #[derive(Args)]
@@ -423,6 +477,9 @@ pub(crate) struct Wrote {
     /// Agg corpus summary (`agg` only).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub agg: Option<AggSummary>,
+    /// Tombstone corpus summary (`tombstone` only).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tombstone: Option<TombstoneSummary>,
 }
 
 fn bench_err(e: &bellwether_bench::BenchError) -> Error {
@@ -522,6 +579,7 @@ pub(crate) fn run(cmd: &BenchCommand) -> Result<Wrote, Error> {
         BenchCommand::Lists(a) => return lists(a),
         BenchCommand::Joins(a) => return joins(a),
         BenchCommand::Agg(a) => return agg(a),
+        BenchCommand::Tombstone(a) => return tombstone(a),
     };
     Ok(Wrote {
         what,
@@ -535,6 +593,7 @@ pub(crate) fn run(cmd: &BenchCommand) -> Result<Wrote, Error> {
         lists: None,
         joins: None,
         agg: None,
+        tombstone: None,
     })
 }
 
@@ -590,6 +649,69 @@ fn joins(a: &JoinsArgs) -> Result<Wrote, Error> {
         lists: None,
         joins: Some(truth.summary),
         agg: None,
+        tombstone: None,
+    })
+}
+
+/// `bench tombstone`: the shape's preset, each flag given overriding one.
+fn tombstone(a: &TombstoneArgs) -> Result<Wrote, Error> {
+    let mut params = TombstoneParams::preset(match a.shape {
+        TombstoneShapeArg::Ledger => TombstoneShape::Ledger,
+        TombstoneShapeArg::Market => TombstoneShape::Market,
+    });
+    if let Some(v) = a.seed {
+        params.seed = v;
+    }
+    if let Some(v) = a.files {
+        params.files = v;
+    }
+    if let Some(v) = a.row_groups_per_file {
+        params.row_groups_per_file = v;
+    }
+    if let Some(v) = a.rows_per_row_group {
+        params.rows_per_row_group = v;
+    }
+    if let Some(v) = a.keys {
+        params.keys = v;
+    }
+    if let Some(v) = a.retract_fraction {
+        params.retract_fraction = v;
+    }
+    if let Some(v) = a.null_fraction {
+        params.null_fraction = v;
+    }
+    if let Some(v) = &a.runs {
+        params.runs.clone_from(v);
+    }
+    let truth = generate_tombstone(&a.out, &params).map_err(|e| bench_err(&e))?;
+    let s = &truth.summary;
+    let where_summary = format!(
+        "{} ({} {} files, {} row groups, {} rows, {} retractions, {} keys of which {} have a \
+         retraction as their newest row, {} bytes)",
+        a.out.display(),
+        s.shape.as_str(),
+        s.files,
+        s.row_groups,
+        s.rows,
+        s.retractions,
+        s.keys_with_version,
+        s.newest_retracted,
+        s.bytes,
+    );
+    let truth_path = a.out.join("workload").join("truth.json");
+    Ok(Wrote {
+        what: "tombstone corpus",
+        path: where_summary,
+        blake3: file_hash(&truth_path)?,
+        failed: Vec::new(),
+        market: None,
+        read: None,
+        text: None,
+        expr: None,
+        lists: None,
+        joins: None,
+        agg: None,
+        tombstone: Some(truth.summary),
     })
 }
 
@@ -643,6 +765,7 @@ fn agg(a: &AggArgs) -> Result<Wrote, Error> {
         lists: None,
         joins: None,
         agg: Some(truth.summary),
+        tombstone: None,
     })
 }
 
@@ -697,6 +820,7 @@ fn lists(a: &ListsArgs) -> Result<Wrote, Error> {
         lists: Some(truth.summary),
         joins: None,
         agg: None,
+        tombstone: None,
     })
 }
 
@@ -742,6 +866,7 @@ fn text(a: &TextArgs) -> Result<Wrote, Error> {
         lists: None,
         joins: None,
         agg: None,
+        tombstone: None,
     })
 }
 
@@ -802,6 +927,7 @@ fn market(a: &MarketArgs) -> Result<Wrote, Error> {
         lists: None,
         joins: None,
         agg: None,
+        tombstone: None,
     })
 }
 
@@ -852,6 +978,7 @@ fn expr(a: &ExprArgs) -> Result<Wrote, Error> {
         lists: None,
         joins: None,
         agg: None,
+        tombstone: None,
     })
 }
 
@@ -898,5 +1025,6 @@ fn read(a: &ReadArgs) -> Result<Wrote, Error> {
         lists: None,
         joins: None,
         agg: None,
+        tombstone: None,
     })
 }

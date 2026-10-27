@@ -81,6 +81,10 @@ Values in rows outside the coverage (other workload keys, unsampled keys) are no
 
 **Checking a proposed agg key.** `check_agg_cells(source, schema, row_groups, spec, keys, stored)` reads every live row group one at a time and compares, for each workload key, the cell the rows make with the stored one: rows, nulls, sum, minimum, and maximum, a missing cell and a cell where the key has no row both counted as differences (`AggCellCheck { keys, cells, row_groups_read, differ, examples }`, each example an `AggCellDiff` naming the key, row group, and stored cell and the cell the rows make). `fix` passes it the cells replay's transient segments hold (written by the build's writer) as `CertificateContext.agg`; `certify` records it as `AggServed { side: "proposed", checked }` and passes only when no cell differs.
 
+### Live rows (tombstones, B8)
+
+A residual `Predicate::Live { column, tombstone }` compiles to the row test `RowTest::Live`: the column is not null and is not the tombstone value's canonical encoding (a null is not live, ADR 014 amendment). It runs after `LatestPerKey`, so a key whose newest row is a tombstone keeps no row. A point lookup through an index whose specs carry a tombstone plans through the specs without it (`IndexPlanner`), so a reconcile never reads the sidecar.
+
 ## The certificate
 
 | Field | Value |

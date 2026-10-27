@@ -74,6 +74,7 @@ pub mod results;
 pub mod slo;
 pub mod stats;
 pub mod text;
+pub mod tombstone;
 pub mod truth;
 pub mod workload;
 
