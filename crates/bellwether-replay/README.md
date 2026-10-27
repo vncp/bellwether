@@ -320,18 +320,18 @@ The build planner reads footers through its own source, which the test's countin
 
 `max_segment_key_bytes` and `max_index_bytes` cap **accounted** key bytes (the measures above), not resident memory.
 
-The per-key resident overhead (contract v3, entry 32) was measured in a release build by `tests/resident.rs` (`cargo test --release -p bellwether-replay --test resident -- --ignored`), over 1,048,576 keys, on 2026-10-26 ([the measured document](../../docs/measured/2026-10-26-performance.md)). These are the documented constants:
+The per-key resident overhead (contract v3, entry 32) was measured in a release build by `tests/resident.rs` (`cargo test --release -p bellwether-replay --test resident -- --ignored`), over 1,048,576 keys, on 2026-10-27 ([the measured document](../../docs/measured/2026-10-27-performance.md#resident-bytes-per-key)). These are the documented constants:
 
-- **Open writer: 320 bytes resident per key.** An open transient segment writer over `UInt64` keys accounts 9 bytes per key and holds 320, which is 35.5 times the accounted bytes. A key cap therefore bounds resident memory at about 36 times itself for narrow keys.
+- **Open writer: 1,001 bytes resident per key.** An open transient segment writer over `UInt64` keys accounts 9 bytes per key and holds 1,001, which is 111 times the accounted bytes. A key cap therefore bounds resident memory at about 111 times itself for narrow keys. The writer's keys are in a hash map sorted once when the segment finishes (WP22b), which made `why` on the small rung 27% faster and holds 379 bytes per key more than the ordered map before it (622 bytes; 320 on 2026-10-26).
 - **Layout map: 84 bytes resident per key.** The cluster-key map over 9-byte keys accounts 73 bytes per key (`CLUSTER_KEY_OVERHEAD` included) and holds 84, which is 1.15 times the accounted bytes.
 
 Earlier debug-build figures, for scale:
 
 - **Index cap, u64 keys.** An 8 MiB `max_index_bytes` cap admitted about 900,000 keys, and resident memory peaked near 284 MB, 33 times the cap.
 - **Default caps, u64 keys.** 2 million unique keys peaked near 397 MB for a 90 MB index.
-- **Rows cap.** For narrow keys, `max_segment_rows` (2^20 rows, roughly 300 MB resident) is the bound that takes effect.
+- **Rows cap.** For narrow keys, `max_segment_rows` (2^20 rows) is the bound that takes effect: about 1 GB resident for an open writer at the 2026-10-27 constant (the debug build above held roughly 300 MB).
 
-Charging the writer's measured overhead to the caps, shared with the build crate, is a WP22b candidate.
+Charging the writer's measured overhead to the caps, shared with the build crate, is not taken yet.
 
 ## Tests
 

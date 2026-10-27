@@ -25,7 +25,7 @@ One crate, one owner, one interface contract each. WP0 ships first and alone. Af
 | WP15 relational replay, WP16 engine adapters, WP17 CI receipts, WP18 transfer evaluation | planned 2026-10-24 (ADR 026) |
 | WP19 signed receipts | merged in wave A: detached ed25519 signatures beside receipts and certificates (ADR 029), no record or format version change; M8's signing half done |
 | WP21 time-series keys | merged: partition values from Hive-style paths, ordered plans, `--at-manifest` pinned lookups over a manifest history, per-key time bounds (`bounds` sidecar), bitemporal as-of (`temporal2` sidecar), the `market` bench corpus with measured funnels |
-| WP22 performance | next after WP21; measured in release builds |
+| WP22 performance | WP22a merged (#16, `docs/measured/2026-10-26-performance.md`); WP22b S1 (#37, `docs/measured/2026-10-27-performance.md`): lookup planning (one store round trip per value gone; plans beat a full scan on the 10× `market` corpus at 10 and 300 keys, not yet on folders a full scan reads in 4 to 5 ms), reconcile memory within its bound on the ledger rung, one ledger listing per command, and the budget check in CI (`perf.yml`, `bench perf-check`); fsync (H9) is the largest remaining candidate and needs a store-durability ADR; the multi-machine build (ADR 030) is parked as a work-in-progress commit on `wp22b-distributed` |
 | B2 sketch | phase 5: per item, per file HyperLogLog registers and optional MinHash signatures as a `sketch` sidecar in `schema.sidecars[]`, approximate and never read by a planner; `cardinality`, `overlap`, the `why` `sketch` column and `--sketches-only`, the low-cardinality-key detector `R-sketch-1`; benched on the ledger and `market` shapes over 10⁴ files |
 
 ## WP0 · first, alone
