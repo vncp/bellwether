@@ -26,7 +26,7 @@ FACTOR = 1.25
 # Which section of scripts/perf.py measured a metric, by id prefix.
 SECTION = {"lookup": "lookups", "process": "lookups", "build": "build", "reconcile": "reconcile",
            "replay": "latency", "observe": "latency", "mcp": "latency", "why": "latency",
-           "resident": "latency", "profile": "profiles"}
+           "resident": "latency", "profile": "profiles", "ledger": "ledger"}
 
 
 def section_of(mid, sections):

@@ -1034,22 +1034,24 @@ impl Drop for SqlSource {
     }
 }
 
-impl Source for SqlSource {
-    fn discover(&self, root: &str) -> Result<Vec<FileFingerprint>> {
-        self.check_root(root)?;
-        let mut inner = self.lock()?;
-        inner.dirty = true;
-        let d = self.discover_locked(&mut inner)?;
-        Ok(d.units.iter().map(|(_, m)| m.file.clone()).collect())
-    }
-
-    fn row_groups(&self, file: &FileFingerprint) -> Result<Vec<RowGroupMeta>> {
-        let mut inner = self.lock()?;
-        let d = self.discover_locked(&mut inner)?;
-        Ok(vec![self.unit(&d, file)?.1.clone()])
-    }
-
-    fn read_columns(&self, rg: &RowGroupMeta, columns: &[String]) -> Result<RecordBatch> {
+impl SqlSource {
+    /// Reads `columns` of one unit, handing the rows to `f` as the driver
+    /// returns them, in batches of at most `max_rows` rows (a driver's
+    /// larger batch is sliced, not copied), each with the requested
+    /// columns typed as the dataset schema says; no columns gives batches
+    /// of rows alone. Returns the batches' schema. The rows must add up to
+    /// the unit's identity: more stops the read at once, fewer fails once
+    /// the driver is done, so a caller that streams must discard what it
+    /// folded when this fails.
+    #[allow(clippy::too_many_lines)]
+    fn decode(
+        &self,
+        rg: &RowGroupMeta,
+        columns: &[String],
+        max_rows: usize,
+        f: &mut dyn FnMut(RecordBatch) -> Result<()>,
+    ) -> Result<SchemaRef> {
+        let max_rows = max_rows.max(1);
         let mut inner = self.lock()?;
         inner.dirty = true;
         let d = self.discover_locked(&mut inner)?;
@@ -1064,12 +1066,19 @@ impl Source for SqlSource {
         let rows = usize::try_from(meta.rows)
             .map_err(|_| Error::Source(format!("{}: too many rows", unit.path)))?;
         if columns.is_empty() {
-            return RecordBatch::try_new_with_options(
-                Arc::new(Schema::empty()),
-                Vec::new(),
-                &RecordBatchOptions::new().with_row_count(Some(rows)),
-            )
-            .map_err(|e| Error::Source(e.to_string()));
+            let schema = Arc::new(Schema::empty());
+            let mut left = rows;
+            while left > 0 {
+                let n = left.min(max_rows);
+                f(RecordBatch::try_new_with_options(
+                    Arc::clone(&schema),
+                    Vec::new(),
+                    &RecordBatchOptions::new().with_row_count(Some(n)),
+                )
+                .map_err(|e| Error::Source(e.to_string()))?)?;
+                left -= n;
+            }
+            return Ok(schema);
         }
         let (native, dataset) = self.schemas(&mut inner)?;
         let pick = |s: &Schema| -> Result<SchemaRef> {
@@ -1085,13 +1094,18 @@ impl Source for SqlSource {
             )))
         };
         let (nat, want) = (pick(&native)?, pick(&dataset)?);
+        let schema = Arc::new(Schema::new(
+            want.fields()
+                .iter()
+                .map(|f| Field::new(f.name(), f.data_type().clone(), true))
+                .collect::<Vec<_>>(),
+        ));
         let cols: Vec<String> = columns.iter().map(|c| self.dialect.ident(c)).collect();
         let mut sql = format!("SELECT {} FROM {}", cols.join(", "), unit.from);
         if let Some(w) = &unit.filter {
             let _ = write!(sql, " WHERE {w}");
         }
         let what = format!("reading {}", unit.path);
-        let mut parts = Vec::new();
         let mut got = 0usize;
         let mut over = false;
         let read = inner.driver.query(&sql, &nat, &mut |b| {
@@ -1101,7 +1115,23 @@ impl Source for SqlSource {
                 over = true;
                 return Err(Error::Other(String::new()));
             }
-            parts.push(conform(&b, &want, &what)?);
+            let b = conform(&b, &want, &what)?;
+            let b = RecordBatch::try_new_with_options(
+                Arc::clone(&schema),
+                b.columns().to_vec(),
+                &RecordBatchOptions::new().with_row_count(Some(b.num_rows())),
+            )
+            .map_err(|e| Error::Source(format!("{what}: {e}")))?;
+            let mut at = 0;
+            while at < b.num_rows() {
+                let n = (b.num_rows() - at).min(max_rows);
+                f(if n == b.num_rows() {
+                    b.clone()
+                } else {
+                    b.slice(at, n)
+                })?;
+                at += n;
+            }
             Ok(())
         });
         if !over {
@@ -1124,19 +1154,55 @@ impl Source for SqlSource {
                 Error::Source(message)
             });
         }
-        let schema = Arc::new(Schema::new(
-            want.fields()
-                .iter()
-                .map(|f| Field::new(f.name(), f.data_type().clone(), true))
-                .collect::<Vec<_>>(),
-        ));
-        if parts.len() == 1 {
-            let only = parts.remove(0);
-            return only
-                .with_schema(schema)
-                .map_err(|e| Error::Source(format!("{what}: {e}")));
+        Ok(schema)
+    }
+}
+
+impl Source for SqlSource {
+    fn discover(&self, root: &str) -> Result<Vec<FileFingerprint>> {
+        self.check_root(root)?;
+        let mut inner = self.lock()?;
+        inner.dirty = true;
+        let d = self.discover_locked(&mut inner)?;
+        Ok(d.units.iter().map(|(_, m)| m.file.clone()).collect())
+    }
+
+    fn row_groups(&self, file: &FileFingerprint) -> Result<Vec<RowGroupMeta>> {
+        let mut inner = self.lock()?;
+        let d = self.discover_locked(&mut inner)?;
+        Ok(vec![self.unit(&d, file)?.1.clone()])
+    }
+
+    fn read_columns(&self, rg: &RowGroupMeta, columns: &[String]) -> Result<RecordBatch> {
+        let mut parts = Vec::new();
+        let schema = self.decode(rg, columns, usize::MAX, &mut |b| {
+            parts.push(b);
+            Ok(())
+        })?;
+        if columns.is_empty() {
+            let rows = parts.iter().map(RecordBatch::num_rows).sum();
+            return RecordBatch::try_new_with_options(
+                schema,
+                Vec::new(),
+                &RecordBatchOptions::new().with_row_count(Some(rows)),
+            )
+            .map_err(|e| Error::Source(e.to_string()));
         }
-        concat_batches(&schema, &parts).map_err(|e| Error::Source(format!("{what}: {e}")))
+        if parts.len() == 1 {
+            return Ok(parts.remove(0));
+        }
+        concat_batches(&schema, &parts)
+            .map_err(|e| Error::Source(format!("reading {}: {e}", rg.file.path)))
+    }
+
+    fn read_column_batches(
+        &self,
+        rg: &RowGroupMeta,
+        columns: &[String],
+        max_rows: usize,
+        f: &mut dyn FnMut(RecordBatch) -> Result<()>,
+    ) -> Result<()> {
+        self.decode(rg, columns, max_rows, f).map(|_| ())
     }
 
     fn schema(&self, root: &str) -> Result<SchemaRef> {

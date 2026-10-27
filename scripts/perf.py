@@ -19,6 +19,8 @@ Sections (--sections, comma-separated; default all):
   latency    replay p50 run, why end to end, observe and MCP latency,
              resident bytes per key (contract v3 entry 32)
   profiles   samply over the five hot paths and the ledger build, top ten self-time frames
+  ledger     `ledger receipts` (with and without a trust file) and `ledger
+             scorecard` over a generated 10k-file ledger of 400 signed receipts
 
 Quantiles are nearest-rank (docs/benchmark.md): the value at zero-based
 index ceil(q * n) - 1 of the sorted samples.
@@ -544,6 +546,7 @@ SECTION_PREFIXES = {
     "reconcile": ("reconcile/",),
     "latency": ("replay/", "observe/", "mcp/", "why/", "resident/"),
     "profiles": ("profile/",),
+    "ledger": ("ledger/",),
 }
 
 
@@ -1009,6 +1012,95 @@ def section_reconcile(p, ledger):
         say(f"  smallest one-pass budget: {hi} MiB (bisection to 10%, probes {probes})")
 
 
+# ---------------------------------------------------------------- ledger
+
+LEDGER_RECEIPTS = 400
+LEDGER_FILES = 10_000
+LEDGER_REPS = 3
+
+
+def ledger_10k(p):
+    """A ledger of at least LEDGER_FILES files holding LEDGER_RECEIPTS
+    receipts, each with its certificate signed, the shape PR #10's review
+    timed (10,413 files, 401 receipts). Every record is written by the
+    binary: per receipt, a bloom key proposal at its own false-positive
+    rate and a `fix --signing-key` that scores, verifies, applies, and signs
+    it (about ten files each, signatures and store lock files included);
+    then key proposals by distinct proposers up to the file count. Kept
+    under <work>/ledger-10k and reused while ready.json is there."""
+    root = os.path.join(p.a.work, "ledger-10k")
+    ready = os.path.join(root, "ready.json")
+    if os.path.exists(ready):
+        return json.load(open(ready))
+    shutil.rmtree(root, ignore_errors=True)
+    os.makedirs(root)
+    corpus = os.path.join(root, "corpus")
+    gen = ["--days", "1", "--files", "2", "--row-groups-per-file", "4", "--rows-per-row-group", "500",
+           "--entities", "1000"]
+    sh([p.a.bin, "bench", "generate", "--out", corpus, *gen])
+    data = os.path.realpath(os.path.join(corpus, "data"))
+    src = ["--partitioning", "hive"]
+    keys = os.path.join(root, "keys.parquet")
+    duck(f"COPY (SELECT DISTINCT entity_id FROM read_parquet('{data}/*/*.parquet') ORDER BY entity_id "
+         f"LIMIT 20) TO '{keys}' (FORMAT PARQUET)")
+    why = json.loads(sh([p.a.bin, "why", data, *src, "--from", keys, "--json"])[1])
+    evidence, workload = why["evidence"]["hash"], why["workload"]["hash"]
+    key, trust = os.path.join(root, "signer"), os.path.join(root, "trust.toml")
+    sh([p.a.bin, "keys", "generate", "--out", key, "--name", "perf"])
+    sh([p.a.bin, "keys", "trust", "--file", trust, "--add", key + ".pub"])
+    say(f"ledger: writing {LEDGER_RECEIPTS} signed receipts")
+    for i in range(LEDGER_RECEIPTS):
+        spec = f"bloom:entity_id@{0.01 + i * 0.0005:.4f}"
+        out = sh([p.a.bin, "propose", data, *src, "--evidence", evidence, "--key", spec, "--json"])[1]
+        proposal = json.loads(out)["proposal"]["hash"]
+        out = sh([p.a.bin, "fix", data, *src, "--proposal", proposal, "--workload", workload,
+                  "--allow-no-gain", "--signing-key", key, "--json"])[1]
+        if '"receipt"' not in out:
+            sys.exit(f"ledger: fix of {spec} wrote no receipt: {out[:400]}")
+    ledger = os.path.join(data, ".bellwether", "ledger")
+
+    def files():
+        return sum(len(fs) for _, _, fs in os.walk(ledger))
+
+    say(f"ledger: {files()} files; padding with key proposals to {LEDGER_FILES}")
+    from concurrent.futures import ThreadPoolExecutor
+    n = 0
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        while files() < LEDGER_FILES:
+            batch = range(n, n + max(LEDGER_FILES - files(), 1))
+            list(pool.map(lambda j: sh([p.a.bin, "propose", data, *src, "--evidence", evidence, "--key",
+                                        "exact:entity_id", "--by", f"perf-pad-{j}", "-q"]), batch))
+            n = batch.stop
+    info = {"data": data, "trust": trust, "files": files(), "receipts": LEDGER_RECEIPTS,
+            "command": "scripts/perf.py ledger_10k: bellwether bench generate --out corpus " + " ".join(gen)
+            + f"; {LEDGER_RECEIPTS} x (propose --key bloom:entity_id@<fpr>, fix --allow-no-gain "
+            "--signing-key); propose --key exact:entity_id --by perf-pad-<n> to the file count"}
+    json.dump(info, open(ready, "w"))
+    return info
+
+
+def section_ledger(p):
+    """`ledger receipts` (without and with a trust file) and `ledger
+    scorecard` over the 10k-file ledger, warm."""
+    lg = ledger_10k(p)
+    p.context["ledger/ledger-10k"] = {k: lg[k] for k in ("files", "receipts", "command")}
+    for name, extra in (("receipts", []), ("receipts-trusted", ["--trusted-keys", lg["trust"]]),
+                        ("scorecard", [])):
+        verb = "scorecard" if name == "scorecard" else "receipts"
+        cmd = [p.a.bin, "ledger", verb, lg["data"], "--partitioning", "hive", *extra, "--json"]
+        _, out, _, _ = sh(cmd)
+        if verb == "receipts":
+            shown = out.count('"receipt":')
+            if shown < lg["receipts"]:
+                sys.exit(f"ledger {verb}: {shown} receipts shown, {lg['receipts']} written")
+        xs = [sh(cmd)[0] for _ in range(LEDGER_REPS)]
+        p.quantiles(f"ledger/ledger-10k/{name}/warm", xs, dataset="ledger-10k",
+                    query=f"ledger {verb}{' --trusted-keys' if extra else ''}", metric="ledger",
+                    cache="warm", files=lg["files"], receipts=lg["receipts"],
+                    command="bellwether " + " ".join(c if c != lg["data"] else "<ledger-10k>"
+                                                     for c in cmd[1:]).replace(lg["trust"], "trust.toml"))
+
+
 # ---------------------------------------------------------------- latency
 
 
@@ -1394,9 +1486,9 @@ def main():
     ap.add_argument("--realdata", default=os.environ.get("REALDATA_WORK", ""),
                     help="directory holding gh/, taxi/, and taxi_duck/ from scripts/realdata.sh")
     ap.add_argument("--showcase", help="also write the README chart rows here")
-    ap.add_argument("--sections", default="lookups,build,reconcile,latency,profiles")
+    ap.add_argument("--sections", default="lookups,build,reconcile,latency,profiles,ledger")
     ap.add_argument("--ci", action="store_true",
-                    help="small corpora only (replay-small, the quick corpus, market defaults); no profiles")
+                    help="small corpora only (replay-small, the quick corpus, market defaults); no profiles, no ledger")
     ap.add_argument("--merge", action="store_true",
                     help="keep the other sections' results in an existing <out>/perf.json")
     ap.add_argument("--max-load", type=float, default=3.0,
@@ -1433,7 +1525,7 @@ def main():
     os.makedirs(a.work, exist_ok=True)
     sections = set(a.sections.split(","))
     if a.ci:
-        sections -= {"profiles"}
+        sections -= {"profiles", "ledger"}
     unknown = sections - set(SECTION_PREFIXES)
     if unknown:
         sys.exit(f"unknown sections {sorted(unknown)}; choose from {sorted(SECTION_PREFIXES)}")
@@ -1442,14 +1534,17 @@ def main():
     say(f"machine: {p.env['machine']}\nbuild: {p.env['build']}, {p.env['rustc']}, commit "
         f"{p.env['commit']}{' (dirty)' if p.env['commit_dirty'] else ''}\ncold: {p.cache.label}")
 
-    mdef = market_dataset(p, "market-default", [])
-    mkt10 = None if a.ci else market_dataset(p, "market-10x", ["--symbols", "3000", "--days", "30",
-                                                               "--prints-per-symbol-per-day", "12"])
-    gh = None if a.ci else gh_dataset(p)
-    replay_small = ledger_dataset(p, "replay-small", ["--days", "4", "--files", "64",
-                                                      "--row-groups-per-file", "2", "--rows-per-row-group",
-                                                      "2000", "--entities", "640000", "--churn", "0.1"])
-    ledger = None if a.ci else ledger_dataset(p, "ledger-small", ["--rung", "small"])
+    # Corpora only for the sections that read them.
+    want = lambda *names: bool(sections & set(names))  # noqa: E731
+    mdef = market_dataset(p, "market-default", []) if want("lookups", "build") else None
+    mkt10 = None if a.ci or not want("lookups", "build", "profiles") else market_dataset(
+        p, "market-10x", ["--symbols", "3000", "--days", "30", "--prints-per-symbol-per-day", "12"])
+    gh = None if a.ci or not want("lookups") else gh_dataset(p)
+    replay_small = None if not (want("latency") or (a.ci and want("build", "reconcile"))) else ledger_dataset(
+        p, "replay-small", ["--days", "4", "--files", "64", "--row-groups-per-file", "2",
+                            "--rows-per-row-group", "2000", "--entities", "640000", "--churn", "0.1"])
+    ledger = None if a.ci or not want("build", "reconcile", "latency", "profiles") else ledger_dataset(
+        p, "ledger-small", ["--rung", "small"])
 
     runs = [
         ("lookups", lambda: section_lookups(p, [d for d in (mdef, mkt10, gh) if d])),
@@ -1457,6 +1552,7 @@ def main():
         ("reconcile", lambda: section_reconcile(p, replay_small if a.ci else ledger)),
         ("latency", lambda: section_latency(p, replay_small, ledger)),
         ("profiles", lambda: section_profiles(p, mkt10, ledger)),
+        ("ledger", lambda: section_ledger(p)),
     ]
     for name, run in runs:
         if name in sections:

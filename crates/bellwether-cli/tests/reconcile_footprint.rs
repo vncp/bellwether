@@ -3,14 +3,14 @@
 //! rows wide stays within its stated bound, the budget plus one decoded
 //! batch plus a fixed allowance over the same binary's own baseline.
 //!
-//! Before WP22b a row group was decoded whole, and the allocator kept the
-//! freed row-group-sized buffers dirty: this corpus peaked at 862 MB of
-//! physical footprint under a 4 MiB budget over 9 passes, with the meter
-//! at 0.3 MiB (`docs/measured/2026-10-26-performance.md`, finding 1, and
-//! its WP22b revision). The process is
-//! measured by `/usr/bin/time` (`-l` on macOS, the peak physical
-//! footprint; `-v` on Linux, the peak resident set), so allocator
-//! retention, which a counting allocator cannot see, counts.
+//! Until row groups were decoded in batches, a row group was decoded whole,
+//! and the allocator kept the freed row-group-sized buffers dirty: this
+//! corpus peaked at 862 MB of physical footprint under a 4 MiB budget over
+//! 9 passes, with the meter at 0.3 MiB (`docs/measured/2026-10-27-wp22b.md`,
+//! the matched before and after). The process is measured by
+//! `/usr/bin/time` (`-l` on macOS, the peak physical footprint; `-v` on
+//! Linux, the peak resident set), so allocator retention, which a counting
+//! allocator cannot see, counts.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 

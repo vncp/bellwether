@@ -930,7 +930,7 @@ fn store_text_in_planted_records_is_escaped_in_explain() {
     assert!(!json.contains("\\u001b"), "{json}");
 }
 
-/// A store that counts listings (WP22b: one listing per command).
+/// A store that counts its listings: a command lists the ledger once.
 #[derive(Default)]
 struct Listings {
     inner: MemStore,
@@ -999,7 +999,7 @@ fn explaining_lists_the_ledger_once_and_an_index_serves_every_receipt() {
     assert_eq!(lists(), 3);
     assert_eq!(index.of(&receipt).len(), 2);
     assert_eq!(index.of(&f.certificate).len(), 1);
-    assert!(index.of(&other).is_empty());
+    assert_eq!(index.of(&other), &[] as &[SignaturePath]);
     // Every read from the index is the read with its own listing.
     assert_eq!(counted.explain_in(&receipt, None, &index).unwrap(), plain);
     assert_eq!(
@@ -1018,7 +1018,7 @@ fn explaining_lists_the_ledger_once_and_an_index_serves_every_receipt() {
     // The index is a snapshot of one listing: a signature written after it
     // is read only by a new listing.
     ledger.sign(&other, &k1, T).unwrap();
-    assert!(counted.signatures_in(&other, &index).unwrap().is_empty());
+    assert_eq!(counted.signatures_in(&other, &index).unwrap(), vec![]);
     assert_eq!(counted.signatures(&other).unwrap().len(), 1);
     // An index keeps only signature objects, deduplicated per record.
     let path = SignaturePath {

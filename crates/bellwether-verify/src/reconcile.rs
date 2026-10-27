@@ -9,6 +9,17 @@
 //! of the pass every key is classified and the state is dropped. Every
 //! per-key decision depends only on that key's rows, and every total is an
 //! exact, order-independent sum, so the result does not depend on `P`.
+//!
+//! A pass may keep several residues `lo..hi` of `P`; every key still falls
+//! in exactly one pass. `P` comes from the sides' statistics. When it is
+//! above one, the first pass keeps residue 0 and also counts the distinct
+//! keys it reads in a distinct-count sketch (core's [`Hll`]) whose
+//! registers are charged to the budget; that approximate count only
+//! decides how many residues each later pass keeps. It never decides
+//! whether a row is kept, never enters a count, total, or digest, and is
+//! not reported. A pass it undersizes overflows the meter like any other,
+//! and the run restarts with one residue per pass (the schedule the
+//! statistics alone give), so the budget holds and the result is the same.
 
 use std::mem::size_of;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -16,7 +27,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use arrow::array::{Array, RecordBatch};
 use arrow::datatypes::{i256, DataType};
 use bellwether_core::encoding;
-use bellwether_core::hll::Hll;
+use bellwether_core::hll::{Hll, MIN_PRECISION};
 use bellwether_core::render::render_tuple;
 use bellwether_types::{
     format, AggServed, Coverage, Evidence, EvidenceBody, FileFingerprint, Hash, Provenance, Record,
@@ -346,9 +357,12 @@ struct Attempt {
     /// the first pass.
     null_keys: [u64; 2],
     peak_batch: u64,
-    /// The first pass's HyperLogLog count of every key it reads, while it runs
-    /// in a run of more than one partition.
+    /// The first pass's distinct-key count while it runs in a run of more
+    /// than one partition; it schedules the later passes and nothing else.
     distinct: Option<Hll>,
+    /// Whether the pass running (or the one that stopped the attempt)
+    /// holds more than one partition.
+    grouped: bool,
 }
 
 /// One pass's per-key state.
@@ -419,8 +433,8 @@ impl Reconciler {
         let prep = self.prepare([*left, *right])?;
         let (model, entries) = self.pass_model(&prep);
         let mut of = model.passes_for(entries);
-        // After an overflow the run restarts at twice the partitions, one
-        // per pass, as before the first pass counted the keys.
+        // Partitions are grouped by the first pass's distinct-key count
+        // until a pass overflows; after that, one partition per pass.
         let mut regroup = true;
         let mut memory = MemoryReport {
             budget_bytes: self.options.memory_budget,
@@ -439,6 +453,7 @@ impl Reconciler {
                 null_keys: [0, 0],
                 peak_batch: 0,
                 distinct: None,
+                grouped: false,
             };
             let result = attempt(&prep, regroup.then_some(&model), of, &mut a);
             memory.peak_state_bytes = memory.peak_state_bytes.max(a.meter.peak());
@@ -451,8 +466,17 @@ impl Reconciler {
                 Err(Abort::Error(e)) => return Err(e),
                 Err(Abort::Overflow) => {
                     memory.restarts += 1;
+                    // Every later attempt keeps one partition per pass. A
+                    // grouped pass that overflowed was undersized by the
+                    // distinct-key count while the first pass of `of`
+                    // partitions fit: run the same partitions, as the
+                    // statistics alone would have. A pass of one partition
+                    // that overflowed means the model's per-key bytes were
+                    // too low: twice the partitions.
                     regroup = false;
-                    of = of.saturating_mul(2);
+                    if !a.grouped {
+                        of = of.saturating_mul(2);
+                    }
                     if of > MAX_PASSES {
                         return Err(VerifyError::Budget(format!(
                             "the comparison state does not fit in {} bytes even at {MAX_PASSES} \
@@ -636,6 +660,7 @@ impl Reconciler {
             per_key_heap,
             sampled,
             workload,
+            distinct_precision: distinct_precision(self.options.memory_budget),
         };
         (model, entries)
     }
@@ -653,6 +678,9 @@ struct PassModel {
     sampled: Option<f64>,
     /// The workload's keys, which bound the keys a pass holds.
     workload: Option<u64>,
+    /// Precision of the first pass's distinct-key count
+    /// ([`distinct_precision`]); its registers are charged to that pass.
+    distinct_precision: u8,
 }
 
 impl PassModel {
@@ -677,29 +705,46 @@ impl PassModel {
         }
     }
 
-    /// Whether a pass expected to hold `n` keys fits. Hash partitions are
-    /// uneven: it allows 5% plus three standard deviations over the mean.
-    fn fits(&self, n: u64) -> bool {
+    /// Whether a pass expected to hold `n` keys fits in `room` bytes. Hash
+    /// partitions are uneven: it allows 5% plus three standard deviations
+    /// over the mean.
+    fn fits_in(&self, n: u64, room: u64) -> bool {
         #[allow(
             clippy::cast_precision_loss,
             clippy::cast_possible_truncation,
             clippy::cast_sign_loss
         )]
         let spread = 3 * (n as f64).sqrt().ceil() as u64;
-        self.need(n + n / 20 + spread) <= self.available
+        self.need(n + n / 20 + spread) <= room
     }
 
-    /// The fewest passes over `entries` keys whose every pass fits.
+    /// Whether a pass expected to hold `n` keys fits.
+    fn fits(&self, n: u64) -> bool {
+        self.fits_in(n, self.available)
+    }
+
+    /// The fewest passes over `entries` keys whose every pass fits; with
+    /// more than one, the first pass also holds the distinct-key count.
     fn passes_for(&self, entries: u64) -> u32 {
+        let first = self
+            .available
+            .saturating_sub(1u64 << self.distinct_precision);
         (1..=MAX_PASSES)
-            .find(|&p| self.fits(entries.div_ceil(u64::from(p))))
+            .find(|&p| {
+                let n = entries.div_ceil(u64::from(p));
+                if p == 1 {
+                    self.fits(n)
+                } else {
+                    self.fits_in(n, first)
+                }
+            })
             .unwrap_or(MAX_PASSES)
     }
 
     /// How many of the `of` partitions each later pass takes, from the
-    /// first pass's HyperLogLog count of every key: its estimate raised by three
-    /// relative standard errors (an underestimate costs a restart, never
-    /// the bound), capped by the workload's keys.
+    /// first pass's distinct-key count of every key ([`Hll`]): its estimate
+    /// raised by three relative standard errors (an underestimate costs a
+    /// restart, never the bound), capped by the workload's keys.
     fn partitions_per_pass(&self, count: &Hll, of: u32) -> u32 {
         let raise = 1.0 + 3.0 * Hll::relative_standard_error(count.precision());
         #[allow(
@@ -1211,17 +1256,27 @@ impl Part {
 }
 
 /// Precision of the distinct-key count the first pass of a multi-pass run
-/// keeps: 16 KiB of registers, a relative standard error of 0.81 %.
-const DISTINCT_PRECISION: u8 = 14;
+/// keeps: the largest whose registers take at most 1/64 of the budget,
+/// between [`MIN_PRECISION`] and 14 (16 KiB of registers, a relative
+/// standard error of 0.81 %). The registers are charged to the meter.
+fn distinct_precision(budget: u64) -> u8 {
+    let room = (budget / 64).max(1);
+    u8::try_from(room.ilog2())
+        .unwrap_or(u8::MAX)
+        .clamp(MIN_PRECISION, 14)
+}
 
 /// One complete run over key space cut into `of` partitions, and the
 /// passes it made. With a `model`, the first pass keeps partition 0 and
-/// counts the distinct keys of every row it reads (a 16 KiB HyperLogLog, outside the
-/// budget); the rest of the partitions are then grouped so each pass holds
-/// as many as the model says fit, from that count rather than from row
-/// counts (a key with many versions is one key). Without one, each pass
-/// keeps one partition. An underestimate makes a pass overflow, and the
-/// run restarts.
+/// counts the distinct keys of every row it reads in an [`Hll`] whose
+/// registers are charged to the meter for that pass; the rest of the
+/// partitions are then grouped so each pass holds as many as the model
+/// says fit, from that count rather than from row counts (a key with many
+/// versions is one key). Without one, each pass keeps one partition. The
+/// count only decides how partitions are grouped into passes: every row is
+/// still kept or skipped by its exact partition hash, and nothing in the
+/// outcome comes from the count. An underestimate makes a grouped pass
+/// overflow the meter, and the run restarts ([`Attempt::grouped`]).
 fn attempt(
     prep: &Prepared<'_>,
     model: Option<&PassModel>,
@@ -1233,14 +1288,18 @@ fn attempt(
         values: vec![None; prep.plan.totals.len()],
         ..Scratch::default()
     };
-    a.distinct = if of > 1 && model.is_some() {
-        Some(Hll::new(DISTINCT_PRECISION).map_err(VerifyError::from)?)
-    } else {
-        None
+    a.distinct = match model {
+        Some(m) if of > 1 => {
+            let count = Hll::new(m.distinct_precision).map_err(VerifyError::from)?;
+            a.meter.charge(count.bytes() as u64)?;
+            Some(count)
+        }
+        _ => None,
     };
     let mut part = Part { of, lo: 0, hi: 1 };
     let mut made = 0;
     while part.lo < of {
+        a.grouped = part.hi - part.lo > 1;
         let mut pass = PassState {
             keys: MeteredMap::new(),
             unsampled: MeteredMap::new(),
@@ -1256,7 +1315,10 @@ fn attempt(
         a.unsampled += unsampled;
         made += 1;
         let per = match (a.distinct.take(), model) {
-            (Some(count), Some(model)) => model.partitions_per_pass(&count, of),
+            (Some(count), Some(model)) => {
+                a.meter.release(count.bytes() as u64);
+                model.partitions_per_pass(&count, of)
+            }
             _ => 1,
         };
         part.lo = part.hi;

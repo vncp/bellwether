@@ -227,3 +227,98 @@ fn an_integer_key_range_in_statistics_bounds_the_pass_estimate() {
     let out = reconcile_with(l.path(), r.path(), spec, options(budget)).unwrap();
     assert!(out.memory.passes > 1, "{:?}", out.memory);
 }
+
+/// `n` string keys `width` bytes wide, each in `versions` rows (version
+/// `v` of key `i` is the value `i * versions + v`).
+fn versioned_keys(n: usize, width: usize, versions: usize) -> RecordBatch {
+    let mut keys = Vec::with_capacity(n * versions);
+    let mut vals = Vec::with_capacity(n * versions);
+    for v in 0..versions {
+        for i in 0..n {
+            keys.push(format!("{i:0>width$}"));
+            vals.push(i64::try_from(i * versions + v).unwrap());
+        }
+    }
+    RecordBatch::try_from_iter([
+        ("k", Arc::new(StringArray::from(keys)) as ArrayRef),
+        ("v", Arc::new(Int64Array::from(vals))),
+    ])
+    .unwrap()
+}
+
+#[test]
+fn a_distinct_key_count_groups_the_later_passes_and_changes_no_result() {
+    // 1,000 ids with 8 versions each, keyed by the note column (one string
+    // per id, so the statistics bound nothing but the 8,000 rows): the run
+    // plans several partitions from the rows, the first pass counts about
+    // 1,000 keys, and every other partition fits in one more pass. The
+    // count schedules passes only: every row is still read in each pass,
+    // and the result equals one pass's.
+    let (l, r) = dirs();
+    let rows = ledger(1_000, 8);
+    write(l.path(), "x.parquet", &rows, 1_000);
+    write(r.path(), "x.parquet", &rows, 1_000);
+    for spec in [
+        ReconcileSpec::new(["note"]),
+        ReconcileSpec::new(["note"]).latest_by("ts"),
+        ReconcileSpec::new(["note"]).coverage(CoverageRequest::Sampled {
+            fraction: 0.3,
+            seed: 9,
+        }),
+    ] {
+        let one = reconcile_with(l.path(), r.path(), spec.clone(), options(1 << 30)).unwrap();
+        assert_eq!(one.memory.passes, 1);
+        let budget = 700 * 1024;
+        let out = reconcile_with(l.path(), r.path(), spec.clone(), options(budget)).unwrap();
+        assert_eq!(
+            (out.memory.passes, out.memory.restarts),
+            (2, 0),
+            "{spec:?}: {:?}",
+            out.memory
+        );
+        assert!(out.memory.peak_state_bytes <= budget, "{:?}", out.memory);
+        assert_eq!(out.memory.rows_read, [2 * 8_000, 2 * 8_000]);
+        assert_eq!(strip(out), strip(one), "{spec:?}");
+    }
+}
+
+#[test]
+fn a_grouped_pass_the_count_undersizes_restarts_and_still_holds_the_bound() {
+    // 300-byte keys (the model assumes 32) in 16 versions each: the first
+    // pass, sized from the rows, holds 1/16 of what the model allows and
+    // fits; the passes grouped from the distinct-key count hold what the
+    // model allows of keys about twice as wide as it assumes and overflow
+    // the meter. The run restarts once with the same partitions, one per
+    // pass, never exceeds the budget, and gives the one-pass result, the
+    // same way every time.
+    let (l, r) = dirs();
+    let (n, versions) = (2_000, 16);
+    let rows = (n * versions) as u64;
+    write_batch(
+        l.path(),
+        "x.parquet",
+        &versioned_keys(n, 300, versions),
+        4_000,
+    );
+    write_batch(
+        r.path(),
+        "x.parquet",
+        &versioned_keys(n, 300, versions),
+        4_000,
+    );
+    let spec = ReconcileSpec::new(["k"]);
+    let one = reconcile_with(l.path(), r.path(), spec.clone(), options(1 << 30)).unwrap();
+    assert!(one.pass);
+    let budget = 512 * 1024;
+    let out = reconcile_with(l.path(), r.path(), spec.clone(), options(budget)).unwrap();
+    let m = &out.memory;
+    assert_eq!(m.restarts, 1, "{m:?}");
+    assert!(m.peak_state_bytes <= budget, "{m:?}");
+    // The attempt that overflowed read every row once (its first pass)
+    // and then some: the restart came from a grouped pass, not the first.
+    let passes = u64::from(m.passes);
+    assert!(m.rows_read[0] > (passes + 1) * rows, "{m:?}");
+    let again = reconcile_with(l.path(), r.path(), spec, options(budget)).unwrap();
+    assert_eq!(again.memory, out.memory, "the schedule is deterministic");
+    assert_eq!(strip(out), strip(one));
+}

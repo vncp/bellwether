@@ -314,9 +314,9 @@ impl Locator {
         };
         Ok(Self {
             by_id,
+            live,
             known,
             known_span,
-            live,
         })
     }
 
