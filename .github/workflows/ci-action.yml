@@ -55,6 +55,8 @@ jobs:
           path: ${{ env.REPO }}
           base: ${{ env.BASE }}
           head: ${{ env.PASS }}
+          # The test's own pull request body is not the fixture's.
+          pr-body: ''
 
       - name: the step summary holds the verdict
         env:
@@ -77,6 +79,7 @@ jobs:
           path: ${{ env.REPO }}
           base: ${{ env.BASE }}
           head: ${{ env.MISSING }}
+          pr-body: ''
 
       - name: the job fails with exit 1 and the verdict names the step
         env:
