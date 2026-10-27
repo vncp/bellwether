@@ -73,7 +73,7 @@ use roaring::RoaringBitmap;
 use crate::catalog::Catalog;
 use crate::keys::RunKeys;
 use crate::transient::TransientIndex;
-use crate::workload::{RunAggregate, RunQuery, RunWindow};
+use crate::workload::{RunAggregate, RunBitemporal, RunQuery, RunWindow};
 
 /// How a key spec serves a run's keys ([`servable`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -180,6 +180,7 @@ pub fn serves_query(spec: &KeySpec, run_columns: &[String], query: &RunQuery) ->
         RunQuery::ContainsAny | RunQuery::ContainsAll => {
             matches!(spec, KeySpec::List { column } if run_columns == std::slice::from_ref(column))
         }
+        RunQuery::Bitemporal(b) => serves_bitemporal(spec, run_columns, b),
         // A semi-join run (B3) is served by the join key on its pair, and
         // each side, without one, by the keys serving a locate there.
         RunQuery::SemiJoin(j) => matches!(
@@ -225,6 +226,16 @@ pub fn aggregate_specs(
     let agg = bellwether_build::serving_agg(specs, &agg_lookup_of(run_columns, Vec::new(), a))?;
     let counting = bellwether_build::counting_spec(specs, run_columns)?;
     Some((agg.clone(), counting.clone()))
+}
+
+/// Whether `spec` is a bitemporal key on `run`'s two clocks whose key
+/// columns the run names: the only spec that plans a bitemporal run.
+#[must_use]
+pub fn serves_bitemporal(spec: &KeySpec, run_columns: &[String], run: &RunBitemporal) -> bool {
+    matches!(spec, KeySpec::Bitemporal { columns, valid_column, known_column }
+        if *valid_column == run.valid_column
+            && *known_column == run.known_column
+            && columns.iter().all(|c| run_columns.contains(c)))
 }
 
 /// The timestamp column of the one temporal spec of `specs` whose columns
@@ -278,6 +289,12 @@ pub fn planned_time_column(
         | RunQuery::SemiJoin(_)
         | RunQuery::Aggregate(_) => Ok(None),
         RunQuery::Latest | RunQuery::Asof { .. } => serving_temporal_column(specs, run_columns),
+        // Planned on its valid clock when a bitemporal key on its clocks
+        // serves it; unplannable (every row group) otherwise.
+        RunQuery::Bitemporal(b) => Ok(specs
+            .iter()
+            .any(|s| serves_bitemporal(s, run_columns, b))
+            .then(|| b.valid_column.clone())),
         RunQuery::Lookback { asof: None, .. } => planner.lookback_column(specs, run_columns),
         RunQuery::Lookback { asof: Some(_), .. } => {
             match serving_temporal_column(specs, run_columns)? {
@@ -331,6 +348,79 @@ pub(crate) fn lookback_window(
         lo: at.saturating_sub(lookback).max(floor),
         hi: at,
     })
+}
+
+/// The window `[max(at − lookback, floor), at]`, with `at` and `lookback`
+/// in the unit of the column `recorded` (the column the run's instants were
+/// measured on), planned on `ts_column`: the converted window holds the
+/// `ts_column` value of every instant the recorded one covers, rounding
+/// outward ([`instant_span_as`]: a recorded value `v` covers the instants
+/// from the start of `v` to the end of `v`, so a coarse `hi` reaches the
+/// last fine value inside it). `None` when the two columns' units do not
+/// convert (an integer or time-of-day column on either side, unless both
+/// columns have the same type): the run has no window on `ts_column`.
+/// The one conversion replay prices with and verify compares rows by.
+pub(crate) fn converted_lookback_window(
+    schema: &Schema,
+    recorded: &str,
+    ts_column: String,
+    at: i64,
+    lookback: i64,
+) -> Result<Option<RunWindow>> {
+    let from = ts_type(schema, recorded)?;
+    let to = ts_type(schema, &ts_column)?;
+    let RunWindow { lo, hi, .. } = lookback_window(schema, recorded.to_string(), at, lookback)?;
+    if from == to {
+        return Ok(Some(RunWindow { ts_column, lo, hi }));
+    }
+    let (Some((lo, _)), Some((_, hi))) = (
+        instant_span_as(lo, &from, &to)?,
+        instant_span_as(hi, &from, &to)?,
+    ) else {
+        return Ok(None);
+    };
+    Ok(Some(RunWindow { ts_column, lo, hi }))
+}
+
+/// Nanoseconds per unit of an instant column's values: a timestamp's unit,
+/// a day for `Date32`, a millisecond for `Date64`. `None` for any other type
+/// (an integer or a time of day is not an instant).
+fn nanos_per_unit(dt: &DataType) -> Option<i128> {
+    use arrow::datatypes::TimeUnit;
+    Some(match dt {
+        DataType::Dictionary(_, v) => return nanos_per_unit(v),
+        DataType::Timestamp(TimeUnit::Second, _) => 1_000_000_000,
+        DataType::Timestamp(TimeUnit::Millisecond, _) | DataType::Date64 => 1_000_000,
+        DataType::Timestamp(TimeUnit::Microsecond, _) => 1_000,
+        DataType::Timestamp(TimeUnit::Nanosecond, _) => 1,
+        DataType::Date32 => 86_400 * 1_000_000_000,
+        _ => return None,
+    })
+}
+
+/// The `to` values of every instant the `from` value `value` covers, the
+/// first and the last: a value `v` in a unit of `f` nanoseconds covers the
+/// instants `[v·f, (v+1)·f − 1]`, which in a unit of `t` nanoseconds are
+/// `⌊v·f / t⌋` through `⌊((v+1)·f − 1) / t⌋` (floor division, so instants
+/// before 1970 round down too), each clamped to the values `to` holds.
+/// `None` when either type is not an instant ([`nanos_per_unit`]).
+fn instant_span_as(value: i64, from: &DataType, to: &DataType) -> Result<Option<(i64, i64)>> {
+    let (Some(f), Some(t)) = (nanos_per_unit(from), nanos_per_unit(to)) else {
+        return Ok(None);
+    };
+    let max: i128 = match to {
+        DataType::Date32 => i32::MAX.into(),
+        DataType::Dictionary(_, v) if **v == DataType::Date32 => i32::MAX.into(),
+        _ => i64::MAX.into(),
+    };
+    let min = i128::from(encoding::ts_min(to)?);
+    let v = i128::from(value);
+    let first = (v * f).div_euclid(t).clamp(min, max);
+    let last = ((v + 1) * f - 1).div_euclid(t).clamp(min, max);
+    let as_i64 = |x: i128| {
+        i64::try_from(x).map_err(|_| Error::Other(format!("instant {x} out of range for {to}")))
+    };
+    Ok(Some((as_i64(first)?, as_i64(last)?)))
 }
 
 /// `query` as a planner plans it under `specs`: an `asof` lookback run is
@@ -1136,6 +1226,7 @@ impl SegmentPlanner {
             | RunQuery::Lookback { asof: Some(_), .. }
             | RunQuery::ContainsAny
             | RunQuery::ContainsAll
+            | RunQuery::Bitemporal(_)
             | RunQuery::SemiJoin(_)
             | RunQuery::Aggregate(_) => {
                 return Err(Error::Other(format!(
@@ -1395,6 +1486,7 @@ impl PlanSource for SegmentPlanner {
         self.specs.iter().map(|s| s.spec.clone()).collect()
     }
 
+    #[allow(clippy::too_many_lines)]
     fn plan_query(&self, specs: &[KeySpec], keys: &RunKeys, query: &RunQuery) -> Result<ScanPlan> {
         check_key_types(self.catalog.schema(), keys)?;
         if let Some((column, op, values)) = text_run(keys, query)? {
@@ -1413,6 +1505,25 @@ impl PlanSource for SegmentPlanner {
             listed.push(self.listed(spec)?);
         }
         let query = planned_query(self.catalog.schema(), specs, keys.columns(), query)?;
+        if query.bitemporal().is_some() && !specs.is_empty() {
+            // Bitemporal versions are planned by the build planner over a
+            // committed index (its bitemporal segments); this planner plans
+            // over transient key segments only.
+            let spec = query.bitemporal().map(|b| {
+                format!(
+                    "temporal2:{}@{},{}",
+                    keys.columns().join(","),
+                    b.valid_column,
+                    b.known_column
+                )
+            });
+            return Err(Error::KeySpec(format!(
+                "a bitemporal run on {} is priced over an index of its bitemporal key: run \
+                 `bellwether index` on the data folder with --key {}, then price it again",
+                keys.columns().join(", "),
+                spec.unwrap_or_default()
+            )));
+        }
         if query.is_membership() {
             let all = matches!(*query, RunQuery::ContainsAll);
             return self.plan_membership(specs, &listed, keys, all);
@@ -1880,5 +1991,133 @@ mod tests {
         assert_eq!(servable(&list, &cols(&["a"])), None);
         assert!(serves_query(&list, &cols(&["a"]), &RunQuery::ContainsAny));
         assert!(!serves_query(&list, &cols(&["a"]), &RunQuery::Locate));
+    }
+
+    /// An `asof` lookback measured on a microsecond timestamp and planned
+    /// on a `Date32` column takes the days holding its instants, never the
+    /// microseconds read as days (which do not fit `Date32`).
+    #[test]
+    fn a_lookback_window_converts_to_the_planned_columns_unit() {
+        use arrow::datatypes::{Field, TimeUnit};
+        let schema = Schema::new(vec![
+            Field::new("ts", DataType::Timestamp(TimeUnit::Microsecond, None), true),
+            Field::new("day", DataType::Date32, true),
+            Field::new("ms", DataType::Timestamp(TimeUnit::Millisecond, None), true),
+            Field::new("v", DataType::Int64, true),
+        ]);
+        let us_per_day = 86_400_000_000_i64;
+        let at = 20_516 * us_per_day + 1;
+        let w = |to: &str| converted_lookback_window(&schema, "ts", to.into(), at, 2 * us_per_day);
+        let day = w("day").unwrap().unwrap();
+        assert_eq!((day.lo, day.hi), (20_514, 20_516));
+        let ms = w("ms").unwrap().unwrap();
+        assert_eq!((ms.lo, ms.hi), (20_514 * 86_400_000, 20_516 * 86_400_000));
+        let same = w("ts").unwrap().unwrap();
+        assert_eq!((same.lo, same.hi), (at - 2 * us_per_day, at));
+        // An integer column is no instant: no window, not a wrong one.
+        assert_eq!(w("v").unwrap(), None);
+        // A day back to microseconds covers the whole day: its first
+        // microsecond through its last, before the epoch too.
+        let back = converted_lookback_window(&schema, "day", "ts".into(), -1, 0)
+            .unwrap()
+            .unwrap();
+        assert_eq!((back.lo, back.hi), (-us_per_day, -1));
+        let day_to_us = converted_lookback_window(&schema, "day", "ts".into(), 20_516, 1)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (day_to_us.lo, day_to_us.hi),
+            (20_515 * us_per_day, 20_517 * us_per_day - 1)
+        );
+    }
+
+    /// A recorded lookback window converted to the planned column's unit
+    /// holds the planned-unit value of every instant the recorded window
+    /// covers (a recorded value `v` in a unit of `f` ns covers the instants
+    /// `[v·f, (v+1)·f)`), for every pair of instant units, against a
+    /// brute-force oracle (the PR #30 review's probe).
+    #[test]
+    fn a_converted_lookback_window_rounds_outward_for_every_unit_pair() {
+        use arrow::datatypes::{Field, TimeUnit};
+        let units: Vec<(&str, DataType, i128)> = vec![
+            (
+                "s",
+                DataType::Timestamp(TimeUnit::Second, None),
+                1_000_000_000,
+            ),
+            (
+                "ms",
+                DataType::Timestamp(TimeUnit::Millisecond, None),
+                1_000_000,
+            ),
+            (
+                "us",
+                DataType::Timestamp(TimeUnit::Microsecond, None),
+                1_000,
+            ),
+            ("ns", DataType::Timestamp(TimeUnit::Nanosecond, None), 1),
+            ("d32", DataType::Date32, 86_400_000_000_000),
+            ("d64", DataType::Date64, 1_000_000),
+        ];
+        let schema = Schema::new(
+            units
+                .iter()
+                .map(|(n, t, _)| Field::new(*n, t.clone(), true))
+                .collect::<Vec<_>>(),
+        );
+        let mut seed = 0x9e37_79b9_7f4a_7c15_u64;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let day_ns: i128 = 86_400_000_000_000;
+        let mut failures = Vec::new();
+        for (from, _, f) in &units {
+            for (to, _, t) in &units {
+                // Recorded instants within 60 days of 2026-01-01, and before
+                // the epoch, in `from` units.
+                for base_day in [20_454_i128, -400] {
+                    for _ in 0..200 {
+                        let at_ns = (base_day - 60) * day_ns + i128::from(next()) % (120 * day_ns);
+                        let at = i64::try_from(at_ns.div_euclid(*f)).unwrap();
+                        let lookback =
+                            i64::try_from((i128::from(next()) % (3 * day_ns)).div_euclid(*f))
+                                .unwrap();
+                        let w = converted_lookback_window(
+                            &schema,
+                            from,
+                            (*to).to_string(),
+                            at,
+                            lookback,
+                        )
+                        .unwrap()
+                        .unwrap();
+                        let (lo, hi) = (i128::from(at - lookback), i128::from(at));
+                        // The instants the recorded window covers, at its
+                        // ends and inside its last value.
+                        for x in [lo * f, (hi + 1) * f - 1, hi * f + f / 2] {
+                            let v = x.div_euclid(*t);
+                            if v < i128::from(w.lo) || v > i128::from(w.hi) {
+                                failures.push(format!(
+                                    "{from}->{to}: recorded [{lo}, {hi}] -> [{}, {}] misses \
+                                     instant {x} ns (value {v})",
+                                    w.lo, w.hi
+                                ));
+                            }
+                        }
+                        // And it reaches no further than those instants.
+                        assert_eq!(i128::from(w.lo), (lo * f).div_euclid(*t), "{from}->{to}");
+                        assert_eq!(
+                            i128::from(w.hi),
+                            ((hi + 1) * f - 1).div_euclid(*t),
+                            "{from}->{to}"
+                        );
+                    }
+                }
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
     }
 }

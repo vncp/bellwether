@@ -136,10 +136,13 @@ pub struct Counts {
     /// Keys with rows on the left only (`CertBody::missing_right`).
     pub missing_right: u64,
     /// Keys whose compared versions differ, plus keys that failed to
-    /// compare (`CertBody::mismatched`).
+    /// compare (counted again in `no_comparable_version`). The certificate
+    /// counts them apart: its `mismatched` is this less
+    /// `no_comparable_version`, and its `uncomparable` is
+    /// `no_comparable_version`.
     pub mismatched: u64,
     /// Of `mismatched`, the keys that failed to compare: no comparable
-    /// version on some side (contract-v3 #26 proposes a certificate field).
+    /// version on some side (the certificate's `uncomparable`).
     pub no_comparable_version: u64,
     /// Workload keys found on neither side; both sides agree they are
     /// absent.

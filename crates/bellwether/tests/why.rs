@@ -733,3 +733,88 @@ fn why_with_latest_by_prices_temporal_and_locate_and_equals_latest_and_asof_plan
         latest_why.candidates[0].locate.unwrap()
     );
 }
+
+/// A key proposal's `sidecars` are applied with its spec in one commit:
+/// `fix` of `exact:id` proposed with `bloom:id@0.01` beside it scores,
+/// verifies and applies both, so the index after the receipt holds both, and
+/// the same proposal then has nothing to apply.
+#[test]
+fn fix_applies_a_proposals_sidecars_with_its_spec() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    scattered_corpus(&data, 3, 4, 25, 1_000);
+    let e = open(&data);
+    let ids: Vec<i64> = [10, 110, 210].iter().map(|k| (k * 37) % 1_000).collect();
+    let hash = record_workload(&data, &[("a", "id", ids)]);
+    let r = e
+        .why(&WhyRequest {
+            workload: Some(hash),
+            max_candidates: 0,
+            ..WhyRequest::default()
+        })
+        .unwrap();
+    let exact = |c: &str| KeySpec::Exact {
+        columns: vec![c.into()],
+        counts: false,
+        bounds: None,
+    };
+    let bloom = KeySpec::Bloom {
+        columns: vec!["id".into()],
+        fpr: 0.01,
+        bounds: None,
+    };
+    let proposal = match e
+        .propose(
+            ProposalBody::Key {
+                spec: exact("id"),
+                sidecars: vec![bloom.clone()],
+            },
+            &[r.evidence.hash.unwrap()],
+            "agent",
+        )
+        .unwrap()
+    {
+        bellwether::ProposeResult::Written { proposal } => proposal.hash,
+        other => panic!("{other:?}"),
+    };
+    let fixed = e
+        .fix(&FixRequest {
+            proposal: Some(proposal),
+            workload: Some(hash),
+            ..FixRequest::default()
+        })
+        .unwrap();
+    assert!(
+        matches!(fixed.outcome, FixOutcome::Applied { .. }),
+        "{:?}",
+        fixed.outcome
+    );
+    let after = e
+        .why(&WhyRequest {
+            workload: Some(hash),
+            max_candidates: 0,
+            ..WhyRequest::default()
+        })
+        .unwrap();
+    let mut current = after.current_specs.clone();
+    current.sort_by_key(KeySpec::name);
+    assert_eq!(current, [bloom, exact("id")]);
+    // Applying the same proposal again commits nothing: both are complete.
+    let again = e
+        .fix(&FixRequest {
+            proposal: Some(proposal),
+            workload: Some(hash),
+            ..FixRequest::default()
+        })
+        .unwrap();
+    assert!(
+        matches!(
+            again.outcome,
+            FixOutcome::Refused {
+                refusal: bellwether::Refusal::NothingToApply { .. }
+            }
+        ),
+        "{:?}",
+        again.outcome
+    );
+}

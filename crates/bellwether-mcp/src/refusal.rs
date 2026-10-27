@@ -44,7 +44,7 @@ pub enum RefusalCode {
     /// The proposer name is reserved for the engine.
     ReservedProposer,
     /// The key declares a sidecar, which no proposal can carry yet.
-    SidecarNotProposable,
+    SketchNotProposable,
     /// Scoring needs keys, a workload, or rewrite outputs.
     NoWorkload,
     /// The folder changed since the index was built.
@@ -128,7 +128,7 @@ impl RefusalCode {
         Self::NoReplay,
         Self::AttestOnly,
         Self::ReservedProposer,
-        Self::SidecarNotProposable,
+        Self::SketchNotProposable,
         Self::NoWorkload,
         Self::StaleIndex,
         Self::NotIndexed,
@@ -174,7 +174,7 @@ impl RefusalCode {
             Self::NoReplay => "no_replay",
             Self::AttestOnly => "attest_only",
             Self::ReservedProposer => "reserved_proposer",
-            Self::SidecarNotProposable => "sidecar_not_proposable",
+            Self::SketchNotProposable => "sketch_not_proposable",
             Self::NoWorkload => "no_workload",
             Self::StaleIndex => "stale_index",
             Self::NotIndexed => "not_indexed",
@@ -240,9 +240,9 @@ impl RefusalCode {
                  the engine applies nothing to a table"
             }
             Self::ReservedProposer => "pass your own agent name in `by`",
-            Self::SidecarNotProposable => {
-                "propose a key spec (exact, bloom, range, or temporal) for a receipt, or ask the \
-                 human to run the index command in `fields.command` (no receipt)"
+            Self::SketchNotProposable => {
+                "propose a key spec for a receipt, or ask the human to run the index command in \
+                 `fields.command` to build the sketch (no receipt)"
             }
             Self::NoWorkload => {
                 "pass `keys` (a Parquet key file), a recorded `workload` hash, or `text` lookups \
@@ -543,12 +543,6 @@ pub fn from_error(e: &Error) -> Refusal {
             RefusalCode::UnsupportedVersion,
             json!({ "what": what, "found": found, "supported": supported }),
         ),
-        // A storage version 2 shape a later release adds: the same next
-        // step as a newer version (upgrade), with the shape named.
-        Error::UnsupportedShape { what, found } => (
-            RefusalCode::UnsupportedVersion,
-            json!({ "what": what, "found": found }),
-        ),
         Error::SegmentClaimed(h) => (RefusalCode::SegmentClaimed, json!({ "segment": h })),
         Error::VersionConflict { expected, found } => (
             RefusalCode::VersionConflict,
@@ -657,31 +651,21 @@ pub fn from_propose(r: &ProposeRefusal) -> Refusal {
             format!("the proposer name {name:?} is reserved for the engine's own candidates"),
             json!({ "name": name }),
         ),
-        ProposeRefusal::SidecarNotProposable {
+        ProposeRefusal::SketchNotProposable {
             declaration,
-            sidecar,
-            key,
+            sketch,
             root,
             command,
         } => {
             let mut r = Refusal::new(
-                RefusalCode::SidecarNotProposable,
-                if sidecar.starts_with("sketch:") {
-                    format!(
-                        "{declaration} declares the sketch {sidecar}, which is approximate and \
-                         never planned with, so no replay can price it and it has no \
-                         certificate or receipt"
-                    )
-                } else {
-                    format!(
-                        "{declaration} declares the sidecar {sidecar}, and a proposal can carry \
-                         only a key spec, so it has no replay, certificate, or receipt yet"
-                    )
-                },
+                RefusalCode::SketchNotProposable,
+                format!(
+                    "{declaration} declares the sketch {sketch}, which is approximate and never \
+                     planned with, so no replay can price it and it has no certificate or receipt"
+                ),
                 json!({
                     "declaration": declaration,
-                    "sidecar": sidecar,
-                    "key": key,
+                    "sketch": sketch,
                     "root": root,
                     "command": command,
                 }),
@@ -696,13 +680,7 @@ pub fn from_propose(r: &ProposeRefusal) -> Refusal {
                 "ask the human to index {root} with the declaration {declaration} ({how}; no \
                  receipt)"
             );
-            r.next = match key {
-                Some(k) => format!(
-                    "call propose.key with `spec` \"{k}\" (`fields.key`, the key alone) to reach \
-                     a receipt, or {build}"
-                ),
-                None => build,
-            };
+            r.next = build;
             r
         }
     }
@@ -718,6 +696,7 @@ pub fn from_fix(r: &FixRefusal, verification: Option<&Reconciliation>) -> Refusa
         FixRefusal::CertificateFailed {
             certificate,
             mismatched,
+            uncomparable,
             missing_left,
             missing_right,
             totals_differ,
@@ -735,15 +714,16 @@ pub fn from_fix(r: &FixRefusal, verification: Option<&Reconciliation>) -> Refusa
             let mut detail = json!({
                 "certificate": certificate,
                 "mismatched": mismatched,
+                "uncomparable": uncomparable,
                 "missing_left": missing_left,
                 "missing_right": missing_right,
                 "totals_differ": totals_differ,
                 "mismatches_sample": sample,
             });
             let mut message = format!(
-                "certificate {certificate} failed: {mismatched} mismatched, {missing_left} \
-                 missing on the left, {missing_right} missing on the right, {totals_differ} \
-                 group totals differ"
+                "certificate {certificate} failed: {mismatched} mismatched, {uncomparable} \
+                 uncomparable, {missing_left} missing on the left, {missing_right} missing on \
+                 the right, {totals_differ} group totals differ"
             );
             // A proposed agg key (B7) whose cells differ from the rows.
             if *agg_cells_differ > 0 {
@@ -760,6 +740,12 @@ pub fn from_fix(r: &FixRefusal, verification: Option<&Reconciliation>) -> Refusa
                 message.push_str(" agg cells differ from the rows they aggregate");
                 detail["agg_cells_differ"] = json!(agg_cells_differ);
                 detail["agg_cells_sample"] = Value::Array(cells);
+            }
+            if *uncomparable > 0 {
+                message = format!(
+                    "{message}. {}",
+                    bellwether::uncomparable_cause(*uncomparable)
+                );
             }
             Refusal::new(RefusalCode::CertificateFailed, message, detail)
         }
@@ -1018,13 +1004,6 @@ mod tests {
                 },
                 RefusalCode::MeasurementRefused,
             ),
-            (
-                Error::UnsupportedShape {
-                    what: "bitemporal key spec",
-                    found: "temporal2:id@valid,known".into(),
-                },
-                RefusalCode::UnsupportedVersion,
-            ),
         ];
         for (e, code) in &cases {
             let r = from_error(e);
@@ -1052,8 +1031,6 @@ mod tests {
         assert_eq!(f(18)["requested"], 1);
         assert_eq!(f(18)["oldest"], 3);
         assert_eq!(f(18)["current"], 5);
-        assert_eq!(f(20)["what"], "bitemporal key spec");
-        assert_eq!(f(20)["found"], "temporal2:id@valid,known");
         // Next lines name the MCP field to fix.
         assert!(from_error(&cases[10].0).next.contains("`certificate`"));
         assert!(from_error(&cases[11].0).next.contains("`workload`"));
@@ -1110,6 +1087,7 @@ mod tests {
                 FixRefusal::CertificateFailed {
                     certificate: h,
                     mismatched: 1,
+                    uncomparable: 5,
                     missing_left: 2,
                     missing_right: 3,
                     totals_differ: 4,

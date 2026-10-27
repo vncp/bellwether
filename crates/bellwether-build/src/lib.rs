@@ -55,8 +55,8 @@ pub use join::{
 pub use keys::encode_ts;
 pub use plan::{
     aggregate_answer, counting_spec, default_window_column, overlapping_counts, partition_columns,
-    serving_agg, AggAnswer, AggLookup, Aggregated, KeyAggregate, KeyCount, Lookup, PlanOrder,
-    Planner, TotalsVisitor, TransientSpec,
+    serving_agg, several_bitemporal_keys, AggAnswer, AggLookup, Aggregated, KeyAggregate, KeyCount,
+    Lookup, PlanOrder, Planner, TotalsVisitor, TransientSpec,
 };
-pub use target::declared_sketches;
+pub use target::{declared_sketches, TimedSource};
 pub use verify::Drift;

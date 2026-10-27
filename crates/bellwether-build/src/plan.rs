@@ -82,7 +82,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use arrow::array::{ArrayRef, RecordBatch};
 use arrow::datatypes::{DataType, SchemaRef};
 use bellwether_core::encoding::{self, tag, KeyColumns, Value};
-use bellwether_core::segment::ReadAt;
+use bellwether_core::segment::{Layout, ReadAt};
 use bellwether_core::sidecar::{
     bitemporal_winner, BitemporalHit, RgBounds, SidecarDef, SidecarKind, SidecarReader, Triple,
 };
@@ -92,7 +92,7 @@ use bellwether_core::SegmentReader;
 use bellwether_source::{
     fingerprint_with_policy, FingerprintPolicy, LocalFs, ParquetSource, Partitioning,
 };
-use bellwether_store::{Manifest, SegmentRef, Snapshot, StoreExt};
+use bellwether_store::{Manifest, Snapshot, StoreExt};
 use bellwether_types::{
     ColumnBytes, Error, Hash, KeySpec, Predicate, Quantity, Result, RowGroupId, ScanEntry,
     ScanPlan, Source, TextOp,
@@ -105,7 +105,7 @@ use crate::coverage::{completeness, segment_of, sidecar_completeness, Locator};
 use crate::keys::{encode_ts, project, split_checked, widen_zero_bounds, zero_variants};
 use crate::seg_io::SegmentBytes;
 use crate::sources::parquet_source;
-use crate::target::declared_sidecars;
+use crate::target::{bloom_bounds_def, declared_sidecars, TimedSource};
 
 mod agg;
 pub use agg::{
@@ -200,12 +200,17 @@ pub enum Lookup {
     },
     /// Per key, the newest row by valid time among rows known at or before
     /// `known` and valid at or before `valid` (ties on valid time broken by
-    /// the greater known time), through the one complete `temporal2`
-    /// sidecar serving `columns`. `None` leaves that clock unbounded.
+    /// the greater known time), through the one complete bitemporal key
+    /// (or pre-M5 `temporal2` sidecar) serving `columns`, on `clocks` when
+    /// given. `None` leaves that clock unbounded.
     Bitemporal {
         /// Lookup columns; they must include every key column of the
-        /// sidecar.
+        /// bitemporal key.
         columns: Vec<String>,
+        /// The `(valid, known)` clock columns of the bitemporal key to
+        /// plan through; `None` takes the one bitemporal key serving
+        /// `columns` and refuses when several do, naming them.
+        clocks: Option<(String, String)>,
         /// Canonical key tuples.
         keys: Vec<Vec<u8>>,
         /// Upper bound on valid time, in the valid column's unit.
@@ -280,17 +285,19 @@ pub struct KeyCount {
 /// The order of a plan's entries ([`Planner::plan_ordered`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PlanOrder {
-    /// Reading the entries in order, and each entry's row groups in
-    /// ascending index, visits the planned row groups in non-decreasing
-    /// order of `column`'s row-group minimum (as the range key on `column`
-    /// records it; row groups whose every value is null come last).
+    /// The planned row groups can be read in non-decreasing order of
+    /// `column`'s row-group minimum (as the range key on `column` records
+    /// it; row groups whose every value is null come last): the entries in
+    /// order, each entry's row groups ascending, or, when no order of whole
+    /// files is one (two files' row groups overlap in time, or a file's own
+    /// row groups run backwards), the `(entry, row group)` sequence in
+    /// `ScanPlan::order`, which interleaves files.
     Ordered {
         /// The timestamp or date column of the range key.
         column: String,
     },
-    /// No such order holds; `reason` says why. Entries are still in a
-    /// deterministic order: by each file's earliest row-group minimum when a
-    /// timestamp range key exists, else by path.
+    /// No range key gives an order; `reason` says why. Entries are still in
+    /// a deterministic order, by path, and `ScanPlan::order` is absent.
     Unspecified {
         /// Why, in a sentence.
         reason: String,
@@ -307,9 +314,14 @@ pub struct TransientSpec {
     pub spec: KeySpec,
     /// Segment bytes, as core's `EncodedSegment::bytes`.
     pub segments: Vec<Bytes>,
+    /// For a bloom with per-key bounds, its `bounds` segments' bytes
+    /// (core's `SegmentWriter::bloom_bounds_for_dataset`), covering the
+    /// same row groups; empty for every other spec.
+    pub bounds: Vec<Bytes>,
 }
 
 /// One segment of a spec taking part in a plan.
+#[derive(Clone)]
 enum SegSource {
     Committed { id: Hash, size: u64 },
     Transient(Bytes),
@@ -318,6 +330,8 @@ enum SegSource {
 struct SpecSegments {
     spec: KeySpec,
     sources: Vec<SegSource>,
+    /// A bloom with per-key bounds: its `bounds` segments.
+    bounds: Vec<SegSource>,
 }
 
 /// A key lookup's row groups, the rows of its keys and the spec that
@@ -337,14 +351,18 @@ fn serve(spec: &KeySpec, columns: &[String]) -> Option<Serve> {
     // expr key serves only a lookup on its expression (`plan_expr`), never
     // one that names its virtual column. A list key answers membership
     // lookups only (`plan_contains`), never a lookup on the list column's
-    // value as a whole. An agg key answers aggregate lookups only
-    // (`Planner::aggregate`). A join key (B3) answers semi-joins between two
-    // datasets only (`Planner::plan_semijoin`), never a lookup on one.
+    // value as a whole.
+    // A bitemporal key's bitmaps hold only the row groups of rows whose
+    // valid and known times are both set, so it serves bitemporal lookups
+    // only (`plan_bitemporal`). A join key (B3) answers semi-joins between
+    // two datasets only (`Planner::plan_semijoin`), never a lookup on one.
+    // An agg key answers aggregate lookups only (`Planner::aggregate`).
     if matches!(
         spec,
         KeySpec::Text { .. }
             | KeySpec::Expr { .. }
             | KeySpec::List { .. }
+            | KeySpec::Bitemporal { .. }
             | KeySpec::Join { .. }
             | KeySpec::Agg { .. }
     ) {
@@ -392,7 +410,7 @@ impl<S: StoreExt + ?Sized> Planner<S> {
     /// Plans against an already pinned snapshot.
     pub fn from_snapshot(snapshot: Snapshot<S>) -> Result<Self> {
         let m = snapshot.manifest();
-        let kind = SourceKind::parse(&m.source.kind)?;
+        let kind = SourceKind::of(&m.source)?;
         let policy = parse_policy(m.source.fingerprint_policy.as_deref())?;
         let schema = columns_to_schema(&m.schema.columns)?;
         let locator = Locator::new(&m.rowgroup_space)?;
@@ -451,41 +469,116 @@ impl<S: StoreExt + ?Sized> Planner<S> {
         self.footers.load(Ordering::Relaxed)
     }
 
-    /// The sidecars the manifest declares that this binary knows (per-key
-    /// time bounds, bitemporal versions).
+    /// The sidecars the manifest declares in `schema.sidecars` that this
+    /// binary knows: the per-key time bounds and bitemporal versions of an
+    /// index written before M5, which the next build with work folds into
+    /// key specs.
     #[must_use]
     pub fn declared_sidecars(&self) -> Vec<SidecarDef> {
         declared_sidecars(self.manifest())
     }
 
-    /// The sequence at which sidecar `def` became complete, or `None` (see
-    /// [`crate::sidecar_completeness`]).
+    /// The sequence at which per-key bounds or bitemporal versions `def`
+    /// became complete, or `None` (see [`crate::sidecar_completeness`]).
     #[must_use]
     pub fn sidecar_completeness(&self, def: &SidecarDef) -> Option<u64> {
         sidecar_completeness(self.manifest(), def)
     }
 
-    /// The complete sidecars that take part in planning `lookup`: for a
-    /// window, every complete `bounds` sidecar whose key columns the lookup
-    /// names and whose time column is the window's; for a bitemporal
-    /// lookup, every complete `temporal2` sidecar whose key columns the
-    /// lookup names (the plan refuses unless there is exactly one).
+    /// The per-key time bounds and bitemporal versions planning with
+    /// `specs` reads, each as the [`SidecarDef`] it serves as and with
+    /// where it is read: the exact specs with bounds and bitemporal specs
+    /// in `specs` (their own segments), the blooms with bounds in `specs`
+    /// (their `bounds` sidecar), each committed or transient, and the
+    /// complete sidecars of an index written before M5. A plan refuses a
+    /// spec of `specs` that is neither complete nor transient. Two sources
+    /// of one definition are listed once (the first: an exact spec before
+    /// a bloom).
     #[must_use]
-    pub fn sidecars_for(&self, lookup: &Lookup) -> Vec<SidecarDef> {
+    pub fn timed_sources(&self, specs: &[KeySpec]) -> Vec<(SidecarDef, TimedSource)> {
+        let mut out: Vec<(SidecarDef, TimedSource)> = Vec::new();
+        let mut push = |def: SidecarDef, src: TimedSource| {
+            if !out.iter().any(|(d, _)| *d == def) {
+                out.push((def, src));
+            }
+        };
+        for spec in specs {
+            let def = match spec {
+                KeySpec::Exact {
+                    columns,
+                    bounds: Some(ts),
+                    ..
+                } => SidecarDef {
+                    kind: SidecarKind::Bounds,
+                    columns: columns.clone(),
+                    time_columns: vec![ts.clone()],
+                },
+                KeySpec::Bitemporal {
+                    columns,
+                    valid_column,
+                    known_column,
+                } => SidecarDef {
+                    kind: SidecarKind::Bitemporal,
+                    columns: columns.clone(),
+                    time_columns: vec![valid_column.clone(), known_column.clone()],
+                },
+                _ => continue,
+            };
+            push(def, TimedSource::Spec(spec.clone()));
+        }
+        for spec in specs {
+            if let Some(def) = bloom_bounds_def(spec) {
+                push(def, TimedSource::BloomBounds(spec.clone()));
+            }
+        }
+        for def in self.declared_sidecars() {
+            if self.sidecar_completeness(&def).is_some() {
+                push(def, TimedSource::Legacy);
+            }
+        }
+        out
+    }
+
+    /// The per-key bounds and bitemporal versions ([`Self::timed_sources`]
+    /// of `specs`) that take part in planning `lookup`: for a window, every
+    /// one with bounds whose key columns the lookup names and whose time
+    /// column is the window's; for a bitemporal lookup, every bitemporal
+    /// one whose key columns the lookup names (the plan refuses unless
+    /// there is exactly one).
+    #[must_use]
+    pub fn sidecars_for(
+        &self,
+        specs: &[KeySpec],
+        lookup: &Lookup,
+    ) -> Vec<(SidecarDef, TimedSource)> {
         let (kind, columns, time) = match lookup {
             Lookup::Window {
                 columns, ts_column, ..
             } => (SidecarKind::Bounds, columns, Some(ts_column)),
+            Lookup::Bitemporal {
+                columns,
+                clocks: Some((valid, known)),
+                ..
+            } => {
+                return self
+                    .timed_sources(specs)
+                    .into_iter()
+                    .filter(|(d, _)| {
+                        d.kind == SidecarKind::Bitemporal
+                            && d.columns.iter().all(|c| columns.contains(c))
+                            && d.time_columns == [valid.clone(), known.clone()]
+                    })
+                    .collect()
+            }
             Lookup::Bitemporal { columns, .. } => (SidecarKind::Bitemporal, columns, None),
             _ => return Vec::new(),
         };
-        self.declared_sidecars()
+        self.timed_sources(specs)
             .into_iter()
-            .filter(|d| {
+            .filter(|(d, _)| {
                 d.kind == kind
                     && d.columns.iter().all(|c| columns.contains(c))
                     && time.is_none_or(|t| d.time_columns.first() == Some(t))
-                    && self.sidecar_completeness(d).is_some()
             })
             .collect()
     }
@@ -602,9 +695,11 @@ impl<S: StoreExt + ?Sized> Planner<S> {
     }
 
     /// Plans `lookup` with `specs` like [`Planner::plan`], then orders the
-    /// plan's entries by a timestamp range key's row-group minimum (see
-    /// [`PlanOrder`]). The row groups planned are exactly those of
-    /// [`Planner::plan`]; only the order of `entries` differs.
+    /// plan by a timestamp range key's row-group minimum (see
+    /// [`PlanOrder`]): its entries by each file's earliest row group, and,
+    /// when reading whole files in that order is not a time order,
+    /// `ScanPlan::order` with the interleaved `(entry, row group)` read
+    /// order. The row groups planned are exactly those of [`Planner::plan`].
     pub fn plan_ordered(
         &self,
         specs: &[KeySpec],
@@ -647,9 +742,9 @@ impl<S: StoreExt + ?Sized> Planner<S> {
                     Lookup::Between { column, .. } => Some(column.clone()),
                     Lookup::Window { ts_column, .. } => Some(ts_column.clone()),
                     Lookup::Bitemporal { .. } => self
-                        .sidecars_for(lookup)
+                        .sidecars_for(specs, lookup)
                         .first()
-                        .and_then(|d| d.time_columns.first())
+                        .and_then(|(d, _)| d.time_columns.first())
                         .cloned(),
                     Lookup::Latest { columns, .. } | Lookup::AsOf { columns, .. } => {
                         specs.iter().find_map(|s| match s {
@@ -688,8 +783,11 @@ impl<S: StoreExt + ?Sized> Planner<S> {
 
     /// Orders `plan.entries` by the earliest row-group minimum of the
     /// ordering column among each entry's row groups (row groups with no
-    /// minimum, every value null, sort last; ties by path), and says whether
-    /// that order is a total time order (see [`PlanOrder`]).
+    /// minimum, every value null, sort last; ties by path), and, when
+    /// reading the entries whole in that order is not a time order, fills
+    /// `plan.order` with every planned `(entry, row group)` in
+    /// non-decreasing minimum (ties by entry, then row group), which
+    /// interleaves files (see [`PlanOrder`]).
     fn order(&self, specs: &[KeySpec], lookup: &Lookup, plan: &mut ScanPlan) -> Result<PlanOrder> {
         let spec = match self.order_spec(specs, lookup) {
             Ok(s) => s,
@@ -748,36 +846,24 @@ impl<S: StoreExt + ?Sized> Planner<S> {
             let eb = b.iter().map(rank).min();
             ea.cmp(&eb).then_with(|| x.file.path.cmp(&y.file.path))
         });
-        let mut previous: Option<(Rank, &str)> = None;
-        let mut breach: Option<(String, String)> = None;
-        for (rg_mins, e) in &keyed {
-            for m in rg_mins {
-                let r = rank(m);
-                if let Some((p, path)) = &previous {
-                    if r < *p && breach.is_none() {
-                        breach = Some(((*path).to_string(), e.file.path.clone()));
-                    }
+        let whole_files = keyed
+            .iter()
+            .flat_map(|(rg_mins, _)| rg_mins.iter().map(rank))
+            .is_sorted();
+        if !whole_files {
+            let mut pairs: Vec<(Rank, u32, u32)> = Vec::new();
+            for (i, (rg_mins, e)) in keyed.iter().enumerate() {
+                let entry = u32::try_from(i)
+                    .map_err(|_| Error::Other("more than 2^32 planned files".into()))?;
+                for (m, rg) in rg_mins.iter().zip(e.row_groups.iter()) {
+                    pairs.push((rank(m), entry, rg));
                 }
-                previous = Some((r, e.file.path.as_str()));
             }
+            pairs.sort();
+            plan.order = Some(pairs.into_iter().map(|(_, e, rg)| (e, rg)).collect());
         }
         plan.entries = keyed.into_iter().map(|(_, e)| e).collect();
-        Ok(match breach {
-            None => PlanOrder::Ordered { column },
-            Some((a, b)) if a == b => PlanOrder::Unspecified {
-                reason: format!(
-                    "the row groups of {a} are not in {column} order, so no reading order of \
-                     whole files is a time order; entries are ordered by each file's earliest \
-                     row group"
-                ),
-            },
-            Some((a, b)) => PlanOrder::Unspecified {
-                reason: format!(
-                    "row groups of {a} and {b} overlap in {column}, so no reading order of whole \
-                     files is a time order; entries are ordered by each file's earliest row group"
-                ),
-            },
-        })
+        Ok(PlanOrder::Ordered { column })
     }
 
     /// Plans `lookup` with `specs`, where a spec equal to one in `extra`
@@ -844,17 +930,26 @@ impl<S: StoreExt + ?Sized> Planner<S> {
                 lo,
                 hi,
             } => {
-                let sidecars = self.sidecars_for(lookup);
+                let sidecars = self.sidecars_for(specs, lookup);
                 self.plan_window(&segs, &sidecars, columns, keys, ts_column, *lo, *hi)
             }
             Lookup::Bitemporal {
                 columns,
+                clocks,
                 keys,
                 valid,
                 known,
             } => {
-                let sidecars = self.sidecars_for(lookup);
-                self.plan_bitemporal(&sidecars, columns, keys, *valid, *known)
+                let sidecars = self.sidecars_for(specs, lookup);
+                self.plan_bitemporal(
+                    &segs,
+                    &sidecars,
+                    columns,
+                    clocks.as_ref(),
+                    keys,
+                    *valid,
+                    *known,
+                )
             }
             Lookup::Text { column, op, values } => self.plan_text(&segs, column, *op, values),
             Lookup::ContainsAny { column, values } => {
@@ -1106,9 +1201,12 @@ impl<S: StoreExt + ?Sized> Planner<S> {
             .collect();
         if !segs.is_empty() && serving.is_empty() {
             return Err(Error::KeySpec(format!(
-                "none of the key specs {:?} serves a membership lookup on {column}; only a list \
+                "none of the key specs ({}) serves a membership lookup on {column}; only a list \
                  key does: declare list:{column}, or plan with no key spec to read every row group",
-                segs.iter().map(|s| s.spec.name()).collect::<Vec<_>>()
+                segs.iter()
+                    .map(|s| s.spec.name())
+                    .collect::<Vec<_>>()
+                    .join(", ")
             )));
         }
         let selected = if groups.is_empty() || nothing {
@@ -1179,32 +1277,38 @@ impl<S: StoreExt + ?Sized> Planner<S> {
                     return Err(Error::KeySpec(format!("key spec {name} is listed twice")));
                 }
                 if let Some(t) = extra.iter().find(|t| &t.spec == spec) {
+                    let transient = |b: &[Bytes]| -> Vec<SegSource> {
+                        b.iter().cloned().map(SegSource::Transient).collect()
+                    };
                     return Ok(SpecSegments {
                         spec: spec.clone(),
-                        sources: t
-                            .segments
-                            .iter()
-                            .cloned()
-                            .map(SegSource::Transient)
-                            .collect(),
+                        sources: transient(&t.segments),
+                        bounds: transient(&t.bounds),
                     });
                 }
                 if self.completeness(spec).is_none() {
                     return Err(self.not_servable(spec));
                 }
                 let identity = spec.identity();
-                let sources = m
-                    .segments
-                    .iter()
-                    .filter(|s| segment_of(s, &identity))
-                    .map(|s| SegSource::Committed {
-                        id: s.id,
-                        size: s.bytes,
-                    })
-                    .collect();
+                let committed = |kind: Option<&str>| -> Vec<SegSource> {
+                    m.segments
+                        .iter()
+                        .filter(|s| segment_of(s, &identity, kind))
+                        .map(|s| SegSource::Committed {
+                            id: s.id,
+                            size: s.bytes,
+                        })
+                        .collect()
+                };
+                let bounds = if bloom_bounds_def(spec).is_some() {
+                    committed(Some(SidecarKind::Bounds.as_str()))
+                } else {
+                    Vec::new()
+                };
                 Ok(SpecSegments {
                     spec: spec.clone(),
-                    sources,
+                    sources: committed(None),
+                    bounds,
                 })
             })
             .collect()
@@ -1236,6 +1340,26 @@ impl<S: StoreExt + ?Sized> Planner<S> {
         src: &SegSource,
         whole: bool,
     ) -> Result<SegmentReader<SegmentBytes<'_, S>>> {
+        self.open_in_layout(spec, Layout::for_spec(spec), src, whole)
+    }
+
+    /// Opens one segment of a bloom's per-key bounds (the `keyed` layout
+    /// under the bloom spec), refusing anything else.
+    fn open_bloom_bounds(
+        &self,
+        spec: &KeySpec,
+        src: &SegSource,
+    ) -> Result<SegmentReader<SegmentBytes<'_, S>>> {
+        self.open_in_layout(spec, Layout::Keyed, src, false)
+    }
+
+    fn open_in_layout(
+        &self,
+        spec: &KeySpec,
+        layout: Layout,
+        src: &SegSource,
+        whole: bool,
+    ) -> Result<SegmentReader<SegmentBytes<'_, S>>> {
         let bytes = match src {
             SegSource::Committed { id, size } if !whole => SegmentBytes::Ranged {
                 snapshot: &self.snapshot,
@@ -1248,11 +1372,20 @@ impl<S: StoreExt + ?Sized> Planner<S> {
             SegSource::Transient(b) => SegmentBytes::Memory(b.clone()),
         };
         let reader = SegmentReader::open_for_dataset(bytes, &self.schema)?;
-        if reader.key_spec() != spec {
+        if reader.key_spec() != spec || reader.header().layout != layout {
+            let what = |l: Layout| {
+                if l == Layout::for_spec(spec) {
+                    "segments"
+                } else {
+                    "per-key bounds"
+                }
+            };
             return Err(Error::KeySpec(format!(
-                "a segment listed under {} indexes {}; the manifest lists it under another \
-                 spec, so restore the manifest from manifests/ or rebuild the spec",
+                "a segment listed among the {} of {} holds the {} of {}; the manifest lists it \
+                 under another spec, so restore the manifest from manifests/ or rebuild the spec",
+                what(layout),
                 spec.identity(),
+                what(reader.header().layout),
                 reader.key_spec().identity()
             )));
         }
@@ -1269,8 +1402,13 @@ impl<S: StoreExt + ?Sized> Planner<S> {
             .collect();
         if !segs.is_empty() && serving.is_empty() {
             return Err(Error::KeySpec(format!(
-                "none of the key specs {:?} serves a lookup on {columns:?}",
-                segs.iter().map(|s| s.spec.name()).collect::<Vec<_>>()
+                "none of the key specs ({}) serves a lookup on {}; declare exact:{} to serve it",
+                segs.iter()
+                    .map(|s| s.spec.name())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                columns.join(","),
+                columns.join(",")
             )));
         }
         Ok(serving)
@@ -1839,37 +1977,146 @@ impl<S: StoreExt + ?Sized> Planner<S> {
         Ok(selected)
     }
 
-    /// Opens one committed sidecar segment against the dataset schema,
-    /// refusing one that records another definition.
+    /// Opens one sidecar segment (a `bounds` or `temporal2` sidecar,
+    /// committed or transient) listed under `listed_under` against the
+    /// dataset schema, refusing one that records another definition than
+    /// `def`.
     fn open_sidecar(
         &self,
         def: &SidecarDef,
-        seg: &SegmentRef,
+        listed_under: &str,
+        seg: &SegSource,
     ) -> Result<SidecarReader<SegmentBytes<'_, S>>> {
-        let bytes = SegmentBytes::Ranged {
-            snapshot: &self.snapshot,
-            id: seg.id,
-            size: seg.bytes,
+        let bytes = match seg {
+            SegSource::Committed { id, size } => SegmentBytes::Ranged {
+                snapshot: &self.snapshot,
+                id: *id,
+                size: *size,
+            },
+            SegSource::Transient(b) => SegmentBytes::Memory(b.clone()),
         };
         let reader = SidecarReader::open_for_dataset(bytes, &self.schema)?;
         if reader.def() != def {
             return Err(Error::KeySpec(format!(
-                "a segment listed under {} records the sidecar {}",
-                def.name(),
+                "a segment listed under {listed_under} records the sidecar {}",
                 reader.def().name()
             )));
         }
         Ok(reader)
     }
 
-    /// The committed segments of sidecar `def`.
-    fn sidecar_segments<'m>(&'m self, def: &SidecarDef) -> Vec<&'m SegmentRef> {
+    /// The segments of a sidecar of an index written before M5: its kind,
+    /// listed under its name.
+    fn legacy_sources(&self, def: &SidecarDef) -> Vec<SegSource> {
         let name = def.name();
+        let kind = def.kind.as_str();
         self.manifest()
             .segments
             .iter()
-            .filter(|s| segment_of(s, &name))
+            .filter(|s| segment_of(s, &name, Some(kind)))
+            .map(|s| SegSource::Committed {
+                id: s.id,
+                size: s.bytes,
+            })
             .collect()
+    }
+
+    /// The segments of the spec `spec` among `segs`.
+    fn spec_segments<'a>(segs: &'a [SpecSegments], spec: &KeySpec) -> Result<&'a SpecSegments> {
+        segs.iter().find(|s| s.spec == *spec).ok_or_else(|| {
+            Error::Other(format!(
+                "{} is not among the planned specs",
+                spec.identity()
+            ))
+        })
+    }
+
+    /// Per probe in `probes`, its `[min, max]` per row group from `def` as
+    /// `src` holds it: an exact spec's value records or a bloom's `bounds`
+    /// segments (where a row group whose every row of the key has a null
+    /// time is the all-null sentinel and left out), or a `bounds` sidecar's
+    /// records (where it is absent).
+    fn read_bounds(
+        &self,
+        segs: &[SpecSegments],
+        def: &SidecarDef,
+        src: &TimedSource,
+        probes: &[Vec<u8>],
+    ) -> Result<BTreeMap<Vec<u8>, Vec<RgBounds>>> {
+        let mut out: BTreeMap<Vec<u8>, Vec<RgBounds>> = BTreeMap::new();
+        let (spec, sources, bloom) = match src {
+            TimedSource::Spec(spec) => (spec, &Self::spec_segments(segs, spec)?.sources, false),
+            TimedSource::BloomBounds(spec) => {
+                (spec, &Self::spec_segments(segs, spec)?.bounds, true)
+            }
+            TimedSource::Legacy => {
+                let name = def.name();
+                for seg in &self.legacy_sources(def) {
+                    let r = self.open_sidecar(def, &name, seg)?;
+                    for (key, bounds) in r.bounds(probes)? {
+                        out.entry(key).or_default().extend(bounds);
+                    }
+                }
+                return Ok(out);
+            }
+        };
+        for seg in sources {
+            let r = if bloom {
+                self.open_bloom_bounds(spec, seg)?
+            } else {
+                self.open_segment(spec, seg, false)?
+            };
+            let found = r.bounds(probes)?.ok_or_else(|| {
+                Error::Other(format!(
+                    "corrupt index: a segment of {} stores no per-key bounds",
+                    spec.identity()
+                ))
+            })?;
+            for (key, bounds) in found {
+                out.entry(key).or_default().extend(bounds);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Per probe in `probes`, its bitemporal versions from `def` as `src`
+    /// holds them: a bitemporal spec's value records, or a `temporal2`
+    /// sidecar's.
+    fn read_triples(
+        &self,
+        segs: &[SpecSegments],
+        def: &SidecarDef,
+        src: &TimedSource,
+        probes: &[Vec<u8>],
+    ) -> Result<BTreeMap<Vec<u8>, Vec<Triple>>> {
+        let mut out: BTreeMap<Vec<u8>, Vec<Triple>> = BTreeMap::new();
+        match src {
+            TimedSource::Spec(spec) => {
+                let t = Self::spec_segments(segs, spec)?;
+                for seg in &t.sources {
+                    let r = self.open_segment(&t.spec, seg, false)?;
+                    for (key, ts) in r.triples(probes)? {
+                        out.entry(key).or_default().extend(ts);
+                    }
+                }
+            }
+            TimedSource::Legacy => {
+                let name = def.name();
+                for seg in &self.legacy_sources(def) {
+                    let r = self.open_sidecar(def, &name, seg)?;
+                    for (key, ts) in r.triples(probes)? {
+                        out.entry(key).or_default().extend(ts);
+                    }
+                }
+            }
+            TimedSource::BloomBounds(spec) => {
+                return Err(Error::Other(format!(
+                    "{} holds per-key bounds, not bitemporal versions",
+                    spec.identity()
+                )))
+            }
+        }
+        Ok(out)
     }
 
     /// Keys in a time window (see [`Lookup::Window`]).
@@ -1877,7 +2124,7 @@ impl<S: StoreExt + ?Sized> Planner<S> {
     fn plan_window(
         &self,
         segs: &[SpecSegments],
-        sidecars: &[SidecarDef],
+        sidecars: &[(SidecarDef, TimedSource)],
         columns: &[String],
         keys: &[Vec<u8>],
         ts_column: &str,
@@ -1919,9 +2166,13 @@ impl<S: StoreExt + ?Sized> Planner<S> {
             && by_path.is_none()
         {
             return Err(Error::KeySpec(format!(
-                "none of the key specs {:?} serves a lookup on {columns:?} in a window of \
-                 {ts_column:?}; declare exact:{}@{ts_column} or a range spec on {ts_column}",
-                segs.iter().map(|s| s.spec.name()).collect::<Vec<_>>(),
+                "none of the key specs ({}) serves a lookup on {} in a window of {ts_column}; \
+                 declare exact:{}@{ts_column} or a range spec on {ts_column}",
+                segs.iter()
+                    .map(|s| s.spec.name())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                columns.join(","),
                 columns.join(",")
             )));
         }
@@ -1960,10 +2211,11 @@ impl<S: StoreExt + ?Sized> Planner<S> {
             let inside = self.chain_window(t, &variants, lo, hi)?;
             narrow_per_key(&mut acc, &variants, &inside);
         }
-        // Each bounds sidecar keeps, per key, exactly the row groups where
-        // that key's own non-null times reach into the window. A row group
-        // where the key has no non-null time holds no row of the window.
-        for def in sidecars {
+        // Each source of per-key bounds keeps, per key, exactly the row
+        // groups where that key's own non-null times reach into the window.
+        // A row group where the key has no non-null time holds no row of
+        // the window.
+        for (def, src) in sidecars {
             let positions: Vec<usize> = def
                 .columns
                 .iter()
@@ -1973,7 +2225,7 @@ impl<S: StoreExt + ?Sized> Planner<S> {
                     Error::Other(format!("{} does not serve {columns:?}", def.name()))
                 })?;
             let variants = key_variants(&keys, &spans, &positions);
-            let inside = self.bounds_window(def, &variants, lo, hi)?;
+            let inside = self.bounds_window(segs, def, src, &variants, lo, hi)?;
             narrow_per_key(&mut acc, &variants, &inside);
         }
         let selected = if segs.is_empty() && sidecars.is_empty() {
@@ -2016,24 +2268,24 @@ impl<S: StoreExt + ?Sized> Planner<S> {
         Ok(inside)
     }
 
-    /// Per probe of `variants`, the row groups where the bounds sidecar
-    /// `def` records the key's own time range overlapping `[lo, hi]`.
+    /// Per probe of `variants`, the row groups where the per-key bounds
+    /// `def` (read from `src`) record the key's own time range overlapping
+    /// `[lo, hi]`.
     fn bounds_window(
         &self,
+        segs: &[SpecSegments],
         def: &SidecarDef,
+        src: &TimedSource,
         variants: &[Vec<Vec<u8>>],
         lo: i64,
         hi: i64,
     ) -> Result<BTreeMap<Vec<u8>, RoaringBitmap>> {
         let probes = sorted_probes(variants);
         let mut inside: BTreeMap<Vec<u8>, RoaringBitmap> = BTreeMap::new();
-        for seg in self.sidecar_segments(def) {
-            let r = self.open_sidecar(def, seg)?;
-            for (key, bounds) in r.bounds(&probes)? {
-                let e = inside.entry(key).or_default();
-                for b in bounds.iter().filter(|b| b.overlaps(lo, hi)) {
-                    e.insert(b.rg.0);
-                }
+        for (key, bounds) in self.read_bounds(segs, def, src, &probes)? {
+            let e = inside.entry(key).or_default();
+            for b in bounds.iter().filter(|b| b.overlaps(lo, hi)) {
+                e.insert(b.rg.0);
             }
         }
         Ok(inside)
@@ -2114,25 +2366,24 @@ impl<S: StoreExt + ?Sized> Planner<S> {
             }
             (None, _) => {}
         }
-        let bounds: Vec<SidecarDef> = self
-            .declared_sidecars()
+        let bounds: Vec<(SidecarDef, TimedSource)> = self
+            .timed_sources(specs)
             .into_iter()
-            .filter(|d| {
-                d.kind == SidecarKind::Bounds
-                    && d.columns.iter().all(|c| columns.contains(c))
-                    && self.sidecar_completeness(d).is_some()
+            .filter(|(d, _)| {
+                d.kind == SidecarKind::Bounds && d.columns.iter().all(|c| columns.contains(c))
             })
             .collect();
-        match <[SidecarDef; 1]>::try_from(bounds) {
-            Ok([one]) => Ok(Some(Versioned::Bounds(one))),
+        match <[(SidecarDef, TimedSource); 1]>::try_from(bounds) {
+            Ok([(def, src)]) => Ok(Some(Versioned::Bounds(def, src))),
             Err(none) if none.is_empty() => Ok(None),
-            Err(many) => {
-                Err(Error::KeySpec(format!(
+            Err(many) => Err(Error::KeySpec(format!(
                 "several per-key bounds ({}) serve a lookback on {columns:?}, each with its own \
                  key and so its own windows; declare a temporal key on the key columns",
-                many.iter().map(SidecarDef::name).collect::<Vec<_>>().join(", ")
-            )))
-            }
+                many.iter()
+                    .map(|(d, _)| d.name())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ))),
         }
     }
 
@@ -2143,7 +2394,7 @@ impl<S: StoreExt + ?Sized> Planner<S> {
     pub fn lookback_column(&self, specs: &[KeySpec], columns: &[String]) -> Result<Option<String>> {
         Ok(self.lookback_source(specs, columns)?.map(|v| match v {
             Versioned::Temporal(ts) => ts,
-            Versioned::Bounds(def) => def.time_columns[0].clone(),
+            Versioned::Bounds(def, _) => def.time_columns[0].clone(),
         }))
     }
 
@@ -2153,14 +2404,12 @@ impl<S: StoreExt + ?Sized> Planner<S> {
     /// manifest's partition columns). `None` when no level has one.
     pub fn window_column(&self, specs: &[KeySpec], columns: &[String]) -> Result<Option<String>> {
         let bounded = self
-            .declared_sidecars()
+            .timed_sources(specs)
             .into_iter()
-            .filter(|d| {
-                d.kind == SidecarKind::Bounds
-                    && d.columns.iter().all(|c| columns.contains(c))
-                    && self.sidecar_completeness(d).is_some()
+            .filter(|(d, _)| {
+                d.kind == SidecarKind::Bounds && d.columns.iter().all(|c| columns.contains(c))
             })
-            .map(|d| d.time_columns[0].clone())
+            .map(|(d, _)| d.time_columns[0].clone())
             .collect();
         let m = self.manifest();
         let scheme = Partitioning::parse(m.source.partitioning.as_deref())?;
@@ -2191,8 +2440,8 @@ impl<S: StoreExt + ?Sized> Planner<S> {
             Some(Versioned::Temporal(_)) => {
                 self.plan_temporal(segs, columns, keys, Versions::Lookback(lookback))
             }
-            Some(Versioned::Bounds(def)) => {
-                self.plan_bounds_lookback(segs, &def, columns, keys, lookback)
+            Some(Versioned::Bounds(def, src)) => {
+                self.plan_bounds_lookback(segs, &def, &src, columns, keys, lookback)
             }
             None => Err(Error::KeySpec(format!(
                 "a lookback needs each key's newest time: declare a temporal key \
@@ -2211,6 +2460,7 @@ impl<S: StoreExt + ?Sized> Planner<S> {
         &self,
         segs: &[SpecSegments],
         def: &SidecarDef,
+        src: &TimedSource,
         columns: &[String],
         keys: &[Vec<u8>],
         lookback: i64,
@@ -2233,14 +2483,11 @@ impl<S: StoreExt + ?Sized> Planner<S> {
         let probes = sorted_probes(&variants);
         let live = self.locator.live();
         let mut ranges: BTreeMap<Vec<u8>, Vec<RgBounds>> = BTreeMap::new();
-        for seg in self.sidecar_segments(def) {
-            let r = self.open_sidecar(def, seg)?;
-            for (key, bounds) in r.bounds(&probes)? {
-                ranges
-                    .entry(key)
-                    .or_default()
-                    .extend(bounds.into_iter().filter(|b| live.contains(b.rg.0)));
-            }
+        for (key, bounds) in self.read_bounds(segs, def, src, &probes)? {
+            ranges
+                .entry(key)
+                .or_default()
+                .extend(bounds.into_iter().filter(|b| live.contains(b.rg.0)));
         }
         let hits: Vec<Option<LookbackHit>> = variants
             .iter()
@@ -2283,34 +2530,39 @@ impl<S: StoreExt + ?Sized> Planner<S> {
     }
 
     /// The bitemporal as-of (see [`Lookup::Bitemporal`]).
+    #[allow(clippy::too_many_arguments)]
     fn plan_bitemporal(
         &self,
-        sidecars: &[SidecarDef],
+        segs: &[SpecSegments],
+        sidecars: &[(SidecarDef, TimedSource)],
         columns: &[String],
+        clocks: Option<&(String, String)>,
         keys: &[Vec<u8>],
         valid: Option<i64>,
         known: Option<i64>,
     ) -> Result<ScanPlan> {
-        let def = match sidecars {
-            [one] => one,
+        let (def, src) = match sidecars {
+            [(def, src)] => (def, src),
             [] => {
-                return Err(Error::KeySpec(format!(
-                    "a bitemporal lookup needs a complete temporal2 sidecar on key columns the \
-                     lookup names ({}); declare temporal2:<key>@<valid>,<known> with \
-                     `bellwether index --key`",
-                    columns.join(", ")
-                )))
+                return Err(Error::KeySpec(match clocks {
+                    Some((v, k)) => format!(
+                        "no complete bitemporal key on key columns the lookup names ({}) has \
+                         the clocks {v} (valid) and {k} (known); declare \
+                         temporal2:<key>@{v},{k} with `bellwether index --key`, or pick the \
+                         clocks of a declared one",
+                        columns.join(", ")
+                    ),
+                    None => format!(
+                        "a bitemporal lookup needs a complete bitemporal key on key columns the \
+                         lookup names ({}); declare temporal2:<key>@<valid>,<known> with \
+                         `bellwether index --key`",
+                        columns.join(", ")
+                    ),
+                }))
             }
             many => {
-                return Err(Error::KeySpec(format!(
-                    "more than one temporal2 sidecar serves a lookup on {}: {}; look up with \
-                     exactly the key columns of one",
-                    columns.join(", "),
-                    many.iter()
-                        .map(SidecarDef::name)
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                )))
+                let defs: Vec<SidecarDef> = many.iter().map(|(d, _)| d.clone()).collect();
+                return Err(several_bitemporal_keys(columns, &defs));
             }
         };
         let types = self.column_types(columns)?;
@@ -2351,16 +2603,13 @@ impl<S: StoreExt + ?Sized> Planner<S> {
         // still bounds the residual; invariant 5).
         let live = self.locator.live();
         let mut triples: BTreeMap<Vec<u8>, Vec<Triple>> = BTreeMap::new();
-        for seg in self.sidecar_segments(def) {
-            let r = self.open_sidecar(def, seg)?;
-            for (key, ts) in r.triples(&probes)? {
-                let ids: RoaringBitmap = ts.iter().map(|t| t.rg.0).collect();
-                self.locator.check_known(&ids)?;
-                triples
-                    .entry(key)
-                    .or_default()
-                    .extend(ts.into_iter().filter(|t| live.contains(t.rg.0)));
-            }
+        for (key, ts) in self.read_triples(segs, def, src, &probes)? {
+            let ids: RoaringBitmap = ts.iter().map(|t| t.rg.0).collect();
+            self.locator.check_known(&ids)?;
+            triples
+                .entry(key)
+                .or_default()
+                .extend(ts.into_iter().filter(|t| live.contains(t.rg.0)));
         }
         let winners: Vec<Option<BitemporalHit>> = variants
             .iter()
@@ -2654,6 +2903,28 @@ struct Clock {
     bound: Option<i64>,
 }
 
+/// The refusal of a bitemporal lookup on `columns` that several
+/// bitemporal keys (`defs`, as their sidecar shapes) serve: it names each
+/// with the clock columns that pick it, since a key file names only key
+/// columns and two bitemporal keys on one key differ only in their clocks.
+#[must_use]
+pub fn several_bitemporal_keys(columns: &[String], defs: &[SidecarDef]) -> Error {
+    let named: Vec<String> = defs
+        .iter()
+        .map(|d| match d.time_columns.as_slice() {
+            [v, k] => format!("{} (--valid-by {v} --known-by {k})", d.name()),
+            _ => d.name(),
+        })
+        .collect();
+    Error::KeySpec(format!(
+        "several bitemporal keys serve a lookup on ({}): {}; pick one by its clock columns with \
+         --valid-by <valid-time column> --known-by <known-time column> (MCP: valid_by, \
+         known_by)",
+        columns.join(", "),
+        named.join(", ")
+    ))
+}
+
 /// The residual of a bitemporal lookup (`docs/format.md`, "Sidecar
 /// kinds"): `In` over keys with a winner, both clocks bounded, then
 /// `NotOlderThan` on valid and on known per key, then `LatestPerKey`.
@@ -2859,8 +3130,9 @@ impl Versions {
 enum Versioned {
     /// The temporal spec on this timestamp column: its version chains.
     Temporal(String),
-    /// This `bounds` sidecar: each key's own time range per row group.
-    Bounds(SidecarDef),
+    /// These per-key bounds, read from this source: each key's own time
+    /// range per row group.
+    Bounds(SidecarDef, TimedSource),
 }
 
 /// Per key, what a temporal lookup selected: its winning version, or its

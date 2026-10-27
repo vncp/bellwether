@@ -508,7 +508,7 @@ impl AggCell {
     /// [max]` (`docs/format.md`, "Agg keys"). `sum` is present exactly when
     /// the spec stores sums; `min` and `max` exactly when the spec stores
     /// them and some value is not null.
-    pub(crate) fn encode(&self, functions: &[AggregateFn], out: &mut Vec<u8>) -> Result<()> {
+    pub(crate) fn encode(&self, shape: CellShape, out: &mut Vec<u8>) -> Result<()> {
         if self.rows == 0 || self.nulls > self.rows {
             return Err(Error::Other(
                 "an agg cell holds at least one row and at most that many nulls".into(),
@@ -516,7 +516,7 @@ impl AggCell {
         }
         put_leb128(out, self.rows);
         put_leb128(out, self.nulls);
-        if functions.contains(&AggregateFn::Sum) {
+        if shape.sum {
             match self.sum {
                 Some(AggSum::Int(v)) => {
                     out.put_u8(SUM_INT);
@@ -531,8 +531,11 @@ impl AggCell {
             }
         }
         let valued = self.values() > 0;
-        for (f, v) in [(AggregateFn::Min, &self.min), (AggregateFn::Max, &self.max)] {
-            if functions.contains(&f) && valued {
+        for (f, stored, v) in [
+            (AggregateFn::Min, shape.min, &self.min),
+            (AggregateFn::Max, shape.max, &self.max),
+        ] {
+            if stored && valued {
                 let b = v.as_ref().ok_or_else(|| {
                     Error::Other(format!("an agg cell with values lacks its {}", f.as_str()))
                 })?;
@@ -542,9 +545,28 @@ impl AggCell {
         Ok(())
     }
 
-    /// Reads one cell written by [`AggCell::encode`] for `functions`.
+    /// Reads `n` cells written by [`AggCell::encode`] for `shape`, one per
+    /// row group of a value record's bitmap; `None` without a shape (not an
+    /// agg key's record). Allocates as cells are read, never `n` up front
+    /// (`n` comes from the bytes).
+    pub(crate) fn decode_n(
+        c: &mut Cursor<'_>,
+        n: usize,
+        shape: Option<CellShape>,
+    ) -> Result<Option<Vec<Self>>> {
+        let Some(shape) = shape else {
+            return Ok(None);
+        };
+        let mut v = Vec::new();
+        for _ in 0..n {
+            v.push(Self::decode(c, shape)?);
+        }
+        Ok(Some(v))
+    }
+
+    /// Reads one cell written by [`AggCell::encode`] for `shape`.
     /// Anything malformed is refused as corruption.
-    pub(crate) fn decode(c: &mut Cursor<'_>, functions: &[AggregateFn]) -> Result<Self> {
+    pub(crate) fn decode(c: &mut Cursor<'_>, shape: CellShape) -> Result<Self> {
         let rows = c.leb128()?;
         let nulls = c.leb128()?;
         if rows == 0 || nulls > rows {
@@ -552,7 +574,7 @@ impl AggCell {
                 "an agg cell holds no rows, or more nulls than rows",
             ));
         }
-        let sum = if functions.contains(&AggregateFn::Sum) {
+        let sum = if shape.sum {
             Some(match c.u8()? {
                 SUM_INT => {
                     let b: [u8; 16] = c.take(16)?.try_into().map_err(|_| corrupt("agg sum"))?;
@@ -572,8 +594,8 @@ impl AggCell {
             None
         };
         let valued = rows > nulls;
-        let mut read = |f: AggregateFn| -> Result<Option<Vec<u8>>> {
-            if functions.contains(&f) && valued {
+        let mut read = |stored: bool| -> Result<Option<Vec<u8>>> {
+            if stored && valued {
                 let b = c.bytes()?;
                 if b.is_empty() {
                     return Err(corrupt("an empty agg minimum or maximum"));
@@ -583,8 +605,8 @@ impl AggCell {
                 Ok(None)
             }
         };
-        let min = read(AggregateFn::Min)?;
-        let max = read(AggregateFn::Max)?;
+        let min = read(shape.min)?;
+        let max = read(shape.max)?;
         if let (Some(a), Some(b)) = (&min, &max) {
             if a > b {
                 return Err(corrupt("an agg minimum above its maximum"));
@@ -597,6 +619,31 @@ impl AggCell {
             min,
             max,
         })
+    }
+}
+
+/// What an agg key's cells hold after `rows | nulls`: a sum, a minimum, a
+/// maximum, each exactly when the spec stores that function (`count` is
+/// `rows - nulls`, always present). Part of [`crate::segment::ValueShape`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CellShape {
+    /// The cell holds a sum.
+    pub sum: bool,
+    /// The cell holds a minimum when some value is not null.
+    pub min: bool,
+    /// The cell holds a maximum when some value is not null.
+    pub max: bool,
+}
+
+impl CellShape {
+    /// The cell shape of an agg key storing `functions`.
+    #[must_use]
+    pub fn of(functions: &[AggregateFn]) -> Self {
+        Self {
+            sum: functions.contains(&AggregateFn::Sum),
+            min: functions.contains(&AggregateFn::Min),
+            max: functions.contains(&AggregateFn::Max),
+        }
     }
 }
 

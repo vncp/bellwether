@@ -321,21 +321,17 @@ fn a_lookback_is_per_key_through_chains_or_bounds() {
     let days = corpus(&s);
     let all = rows(&days);
     let store = memory_store();
-    let bounds = bellwether_core::sidecar::SidecarDef {
-        kind: bellwether_core::sidecar::SidecarKind::Bounds,
-        columns: cols(&["symbol"]),
-        time_columns: cols(&["ts"]),
-    };
-    let specs = [temporal(&["symbol"], "ts"), exact(&["symbol"])];
+    // `exact:symbol@ts`: the exact spec carries per-key bounds.
+    let specs = [
+        temporal(&["symbol"], "ts"),
+        bellwether_types::KeySpec::Exact {
+            columns: cols(&["symbol"]),
+            counts: false,
+            bounds: Some("ts".into()),
+        },
+    ];
     builder(&store)
-        .build(
-            &s.root_str(),
-            &specs,
-            &BuildOptions {
-                sidecars: vec![bounds],
-                ..opts(TEMPLATE)
-            },
-        )
+        .build(&s.root_str(), &specs, &opts(TEMPLATE))
         .unwrap();
     let p = planner(&store);
     let symbol = cols(&["symbol"]);

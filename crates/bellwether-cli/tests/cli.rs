@@ -158,8 +158,8 @@ fn a_panic_prints_one_line_naming_the_tracker_and_exits_4() {
     );
 }
 
-/// Files that store one decimal column at different scales need the dataset
-/// schema: the refusal names --schema, and --schema makes it work.
+/// Files that store one decimal column at different scales: a new index
+/// infers the widest decimal across them (M5), and --schema still works.
 #[test]
 fn schema_flag_supplies_the_dataset_schema() {
     use std::sync::Arc;
@@ -193,9 +193,8 @@ fn schema_flag_supplies_the_dataset_schema() {
         .args(["index", path(&data), "--key", "exact:amount"])
         .output()
         .unwrap();
-    assert_eq!(out.status.code(), Some(4));
-    let err = String::from_utf8(out.stderr).unwrap();
-    assert!(err.contains("--schema"), "{err}");
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    std::fs::remove_dir_all(data.join(".bellwether")).ok();
     let schema = dir.path().join("schema.json");
     std::fs::write(
         &schema,
@@ -257,5 +256,73 @@ fn chunk_size_on_a_parquet_folder_is_a_usage_error_for_every_verb() {
     assert!(
         !index_dir(&data).exists(),
         "a refused option wrote an index"
+    );
+}
+
+/// Two folders whose inferred decimal scales differ cannot be compared
+/// value by value: `reconcile` refuses with the step a command-line user
+/// can take, `--schema <file>`, never a Rust API, and following it compares.
+#[test]
+fn reconcile_across_decimal_scales_names_the_schema_flag() {
+    use std::sync::Arc;
+
+    use arrow::array::{ArrayRef, Decimal128Array, Int64Array, RecordBatch};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use parquet::arrow::ArrowWriter;
+
+    let dir = tempfile::tempdir().unwrap();
+    let side = |name: &str, value: i128, scale: i8| {
+        let data = dir.path().join(name);
+        std::fs::create_dir_all(&data).unwrap();
+        let precision = 10 + u8::try_from(scale).unwrap();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("amount", DataType::Decimal128(precision, scale), true),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from(vec![1])) as ArrayRef,
+                Arc::new(
+                    Decimal128Array::from(vec![Some(value)])
+                        .with_precision_and_scale(precision, scale)
+                        .unwrap(),
+                ),
+            ],
+        )
+        .unwrap();
+        let file = std::fs::File::create(data.join("a.parquet")).unwrap();
+        let mut w = ArrowWriter::try_new(file, schema, None).unwrap();
+        w.write(&batch).unwrap();
+        w.close().unwrap();
+        data
+    };
+    let (l, r) = (side("left", 150, 2), side("right", 15_000, 4));
+    let out = common::bw()
+        .args(["reconcile", path(&l), path(&r), "--key", "id"])
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_ne!(out.status.code(), Some(0), "{err}");
+    assert!(err.contains("--schema <file>"), "{err}");
+    assert!(!err.contains("with_schema"), "{err}");
+    let schema = dir.path().join("schema.json");
+    std::fs::write(
+        &schema,
+        r#"[{"name": "id", "type": "Int64", "nullable": false},
+            {"name": "amount", "type": "Decimal128(14, 4)", "nullable": true}]"#,
+    )
+    .unwrap();
+    run(
+        &[
+            "--schema",
+            path(&schema),
+            "reconcile",
+            path(&l),
+            path(&r),
+            "--key",
+            "id",
+        ],
+        0,
     );
 }

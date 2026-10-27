@@ -13,7 +13,7 @@ use bellwether_core::encoding::{encode_tuple_as, Value};
 use bellwether_ledger::{rfc3339::is_rfc3339, Ledger, RecordKind};
 use bellwether_source::ParquetSource;
 use bellwether_store::ObjectStoreBackend;
-use bellwether_types::{format, Coverage, Hash, Record, Source};
+use bellwether_types::{format, Coverage, Hash, Predicate, Record, Source, TotalSpec};
 use bellwether_verify::{
     record, AgedInput, CertificateContext, CoverageRequest, ManifestAnchor, Options, ReconcileSpec,
     Reconciler, Side, VerifyError, WorkloadKeys,
@@ -130,6 +130,15 @@ fn a_passing_certificate_fills_every_field_and_reaches_the_ledger() {
     );
     assert_eq!(c.body.ignored_columns, ["note"]);
     assert_eq!(c.body.totals_delta.len(), 0);
+    // every total column summed, passing or not; a decimal sums as stored
+    assert_eq!(
+        c.body.totals,
+        [TotalSpec {
+            column: "amount".into(),
+            quantize: None,
+        }]
+    );
+    assert_eq!(c.body.row_filter, None);
     assert_eq!(
         c.provenance.inputs,
         [
@@ -209,7 +218,7 @@ fn a_failing_certificate_records_counts_and_totals_and_is_stored() {
 }
 
 #[test]
-fn a_key_that_failed_to_compare_fails_the_certificate_and_counts_as_mismatched() {
+fn a_key_that_failed_to_compare_fails_the_certificate_as_uncomparable() {
     let (l, r) = dirs();
     let mut a = common::r(1, 0, 1, "a");
     a.ts = None;
@@ -231,9 +240,12 @@ fn a_key_that_failed_to_compare_fails_the_certificate_and_counts_as_mismatched()
     assert!(!certified.certificate.pass);
     assert_eq!(certified.outcome.counts.no_comparable_version, 1);
     assert_eq!(certified.outcome.counts.mismatched, 1);
-    // Counted in `mismatched` on the record (contract-v3 #26).
+    // On the record it is `uncomparable`, never `mismatched` (M5, ADR 028;
+    // contract-v3 #26), with its example.
     let b = &certified.certificate.body;
-    assert_eq!((b.missing_left, b.missing_right, b.mismatched), (0, 0, 1));
+    assert_eq!((b.missing_left, b.missing_right, b.mismatched), (0, 0, 0));
+    assert_eq!(b.uncomparable, 1);
+    assert_eq!(b.examples.len(), 1, "{b:?}");
     // The ledger stores a failing certificate (rule 9 binds only a pass).
     let ledger = Ledger::new(Arc::new(ObjectStoreBackend::memory().unwrap()));
     record(&ledger, &certified).unwrap();
@@ -328,4 +340,50 @@ fn a_workload_certificate_cites_the_workload_and_its_age() {
     assert!(c.provenance.inputs.contains(&workload));
     assert!(c.provenance.oldest_input_age >= Duration::from_secs(3_600));
     assert!(c.pass);
+}
+
+/// A certificate over a filtered comparison (an `asof`, lookback or window
+/// workload) names the row filter it applied (contract v3), so a reader
+/// knows which rows the pass covers.
+#[test]
+fn a_filtered_certificate_records_its_row_filter() {
+    let (l, r) = dirs();
+    write(l.path(), "x.parquet", &ledger(10, 2), 4);
+    write(r.path(), "x.parquet", &ledger(10, 2), 4);
+    let (ls, rs) = (ParquetSource::new(), ParquetSource::new());
+    let (lr, rr) = (root(l.path()), root(r.path()));
+    let mut lo = Vec::new();
+    let mut hi = Vec::new();
+    for (v, out) in [(0, &mut lo), (1_500, &mut hi)] {
+        bellwether_core::encoding::encode_value_as(
+            &Value::Timestamp {
+                value: v,
+                unit: arrow::datatypes::TimeUnit::Microsecond,
+            },
+            &common::ts_type(),
+            out,
+        )
+        .unwrap();
+    }
+    let filter = vec![Predicate::Between {
+        column: "ts".into(),
+        lo,
+        hi,
+    }];
+    let spec = ReconcileSpec::new(["id"]).rows_where(filter.clone());
+    let c = Reconciler::new(spec, Options::default())
+        .unwrap()
+        .certify(
+            &Side::new(&ls, &lr),
+            &Side::new(&rs, &rr),
+            &CertificateContext {
+                manifest: Some(anchor(4, Duration::from_secs(1))),
+                ..CertificateContext::default()
+            },
+        )
+        .unwrap()
+        .certificate;
+    assert!(c.pass);
+    assert_eq!(c.body.row_filter, Some(filter));
+    assert_eq!(c.body.totals, []);
 }

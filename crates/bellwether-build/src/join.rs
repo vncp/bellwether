@@ -222,7 +222,7 @@ fn pair_segments<'m>(m: &'m Manifest, spec: &KeySpec) -> Vec<&'m SegmentRef> {
     let identity = spec.identity();
     m.segments
         .iter()
-        .filter(|s| segment_of(s, &identity))
+        .filter(|s| segment_of(s, &identity, None))
         .collect()
 }
 
@@ -260,7 +260,7 @@ fn open_side<'a, S: StoreExt + ?Sized>(
     let identity = spec.identity();
     m.segments
         .iter()
-        .filter(|s| segment_of(s, &identity))
+        .filter(|s| segment_of(s, &identity, None))
         .map(|s| {
             let r = SegmentReader::open_for_dataset(
                 SegmentBytes::Ranged {

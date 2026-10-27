@@ -427,10 +427,10 @@ fn where_min_max_keeps_extra_row_groups_the_key_is_recommended_and_applied() {
     assert!(!out.contains("1 receipts") && !out.contains(" 1 profile evidence records"));
 }
 
-/// Item 3: a bitemporal `asof` that the temporal2 sidecar alone plans names
-/// the sidecar on the specs line, never "raw scan".
+/// Item 3: a bitemporal `asof` that the bitemporal key alone plans names
+/// that key on the specs line, never "raw scan".
 #[test]
-fn a_lookup_planned_by_a_sidecar_alone_names_it() {
+fn a_lookup_planned_by_a_bitemporal_key_alone_names_it() {
     let dir = tempfile::tempdir().unwrap();
     let data = dir.path().join("data");
     corpus(&data, 2, 4, 20, 10);
@@ -451,11 +451,23 @@ fn a_lookup_planned_by_a_sidecar_alone_names_it() {
         0,
     );
     assert!(!human.contains("raw scan"), "{human}");
-    assert!(
-        human.contains("specs: none; planned by the sidecar temporal2:id@ts,batch"),
-        "{human}"
-    );
+    assert!(human.contains("specs: temporal2:id@ts,batch\n"), "{human}");
     assert!(human.contains(": 1 key on (id)"), "{human}");
+    // A plain locate is not served by the bitemporal key: the refusal names
+    // the specs and columns as text, never Debug, and the key to declare.
+    let out = common::bw()
+        .args(["locate", path(&data), "--keys", path(&kf)])
+        .output()
+        .unwrap();
+    let err = String::from_utf8(out.stderr).unwrap();
+    assert_ne!(out.status.code(), Some(0), "{err}");
+    assert!(
+        err.contains(
+            "none of the key specs (temporal2:id) serves a lookup on id; declare exact:id"
+        ),
+        "{err}"
+    );
+    assert!(!err.contains("[\"") && !err.contains("[["), "{err}");
 }
 
 /// A CSV folder of `(id, ts)` rows and a `--schema` file declaring `ts` a
@@ -577,4 +589,56 @@ fn a_csv_schema_time_zone_gets_the_same_answer_from_why_and_index() {
         assert_eq!(why.status.code(), Some(0));
         assert_eq!(index.status.code(), Some(0));
     }
+}
+
+/// The `fix` header names every spec a key proposal applies, not only the
+/// first: `propose --key exact:id --key bloom:id@0.01` is one commit of two
+/// specs.
+#[test]
+fn the_fix_header_names_every_spec_of_the_proposal() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    common::scattered(&data, 2, 4, 25, 101);
+    let kf = dir.path().join("k.parquet");
+    keys(&kf, "id", &[3, 50]);
+    let d = path(&data);
+    let why: serde_json::Value =
+        serde_json::from_str(&run(&["why", d, "--from", path(&kf), "--json"], 0)).unwrap();
+    let (ev, workload) = (
+        why["evidence"]["hash"].as_str().unwrap(),
+        why["workload"]["hash"].as_str().unwrap(),
+    );
+    let proposed: serde_json::Value = serde_json::from_str(&run(
+        &[
+            "propose",
+            d,
+            "--evidence",
+            ev,
+            "--key",
+            "exact:id",
+            "--key",
+            "bloom:id@0.01",
+            "--json",
+        ],
+        0,
+    ))
+    .unwrap();
+    let proposal = proposed["proposal"]["hash"].as_str().unwrap();
+    let human = run(
+        &[
+            "fix",
+            d,
+            "--proposal",
+            proposal,
+            "--workload",
+            workload,
+            "--verify-only",
+        ],
+        0,
+    );
+    let header = human.lines().next().unwrap();
+    assert!(
+        header.contains(": keys exact:id and bloom:id@0.01, applied in one commit, against"),
+        "{human}"
+    );
 }

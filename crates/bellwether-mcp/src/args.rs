@@ -61,9 +61,10 @@ pub struct EngineArgs {
     #[arg(long, global = true, value_name = "BYTES")]
     pub chunk_size: Option<u64>,
     /// The dataset schema as a JSON file (a list of {"name", "type",
-    /// "nullable"} with Arrow type spellings), instead of inferring it from
-    /// the first file; needed when files differ in decimal scale or time
-    /// unit.
+    /// "nullable"} with Arrow type spellings), instead of inferring it (from
+    /// the first file in sorted order, each decimal column widened to the
+    /// widest precision and scale any file stores); needed when files
+    /// differ in time unit, or to read two folders under one type.
     #[arg(long, global = true, value_name = "FILE")]
     pub schema: Option<PathBuf>,
     /// Which bytes a file fingerprint hashes when a new index is built:

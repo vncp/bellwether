@@ -1,0 +1,97 @@
+{
+  "commit_nonce": 15038248747729167795,
+  "committed_at": "2026-10-26T21:34:46.802Z",
+  "created_at": "2026-10-26T21:34:46.802Z",
+  "deleting": [],
+  "key_spec_completeness": {
+    "exact:id,counts": 1
+  },
+  "rowgroup_space": {
+    "files": [
+      {
+        "chunk_size": 67108864,
+        "chunks": [
+          {
+            "end": 93,
+            "start": 0
+          }
+        ],
+        "fingerprint": {
+          "etag": "2026-10-25T00:00:00.000000000Z",
+          "path": "/private/tmp/bellwether-format-v0.1/text/trades.csv",
+          "size": 93,
+          "tail_blake3": "f5bbb3db8475d009cbc8d88f30f45fa8ef0d7d4806f2faac88a5ab54cf19ef49"
+        },
+        "rowgroup_bytes": [
+          93
+        ],
+        "rowgroup_ids": [
+          0
+        ],
+        "rowgroup_rows": [
+          7
+        ]
+      }
+    ],
+    "next_id": 1,
+    "tombstones": []
+  },
+  "schema": {
+    "columns": [
+      {
+        "data_type": {
+          "type": "int64"
+        },
+        "name": "id",
+        "nullable": true
+      },
+      {
+        "data_type": {
+          "type": "utf8"
+        },
+        "name": "symbol",
+        "nullable": true
+      },
+      {
+        "data_type": {
+          "type": "float64"
+        },
+        "name": "amount",
+        "nullable": true
+      }
+    ],
+    "key_specs": [
+      {
+        "columns": [
+          "id"
+        ],
+        "counts": true,
+        "kind": "exact"
+      }
+    ]
+  },
+  "segment_tombstones": [],
+  "segments": [
+    {
+      "bytes": 596,
+      "id": "14efb7885f8c8f622f27c55164264e8e1b764fff419a41746b2372a7d35cc059",
+      "key_spec": "exact:id,counts",
+      "rowgroup_range": {
+        "end": 1,
+        "start": 0
+      }
+    }
+  ],
+  "sequence": 1,
+  "source": {
+    "dialect": {
+      "delimiter": 44,
+      "header": true,
+      "quote": 34
+    },
+    "fingerprint_policy": "tail64k",
+    "kind": "csv",
+    "root": "/private/tmp/bellwether-format-v0.1/text"
+  },
+  "storage_version": 2
+}

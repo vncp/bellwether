@@ -13,8 +13,9 @@ use arrow::array::{
     TimestampMicrosecondArray, TimestampMillisecondArray,
 };
 use arrow::datatypes::{DataType, TimeUnit};
-use bellwether_verify::{row_hash, Mismatch, ReconcileSpec};
-use common::{dirs, reconcile, write_batch};
+use bellwether_source::ParquetSource;
+use bellwether_verify::{row_hash, Mismatch, Options, ReconcileSpec, Reconciler, Side};
+use common::{dirs, root, write_batch};
 use xxhash_rust::xxh3::xxh3_128;
 
 /// The golden row's hash, pinned. If this changes, every certificate ever
@@ -22,7 +23,7 @@ use xxhash_rust::xxh3::xxh3_128;
 const GOLDEN: u128 = 0x0016_a08f_6b47_314e_7456_6e88_24a9_3834;
 
 fn anchor_row() -> RecordBatch {
-    // Dataset types come from this first file: Decimal128(18, 2), µs.
+    // The dataset types, declared from this file: Decimal128(18, 2), µs.
     RecordBatch::try_from_iter([
         ("id", Arc::new(Int64Array::from(vec![1])) as ArrayRef),
         (
@@ -101,7 +102,16 @@ fn the_reconciler_hashes_rows_exactly_as_format_md_states() {
     write_batch(l.path(), "a.parquet", &anchor_row(), 4);
     write_batch(l.path(), "b.parquet", &golden_row(), 4);
     write_batch(r.path(), "a.parquet", &anchor_row(), 4);
-    let out = reconcile(l.path(), r.path(), ReconcileSpec::new(["id"])).unwrap();
+    // Inferred, a folder takes its widest decimal (M5); the golden row's
+    // rescale to scale 2 is the point, so the dataset schema is declared.
+    let schema = anchor_row().schema();
+    let ls = ParquetSource::new().with_schema(Arc::clone(&schema));
+    let rs = ParquetSource::new().with_schema(schema);
+    let (lr, rr) = (root(l.path()), root(r.path()));
+    let out = Reconciler::new(ReconcileSpec::new(["id"]), Options::default())
+        .unwrap()
+        .run(&Side::new(&ls, &lr), &Side::new(&rs, &rr))
+        .unwrap();
     assert_eq!(out.hashed_columns, ["id", "amount", "name", "ts", "flag"]);
     let [Mismatch::MissingOnRight { key, left }] = out.mismatches.as_slice() else {
         panic!("{:?}", out.mismatches);

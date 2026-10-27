@@ -9,7 +9,7 @@
 //! ```text
 //! preamble   magic "BWSEGMNT" | storage_version u32 | encoding_version u32 | header_len u32
 //! header     JSON {storage_version, encoding_version, key_spec, codec, layout, bloom_hash,
-//!                  key_types?, ts_type?, ..unknown}
+//!                  key_types?, ts_type?, time_types?, ..unknown}
 //! body       layout-specific blocks (below)
 //! index      entries u64 | has_rg u8 | rg_min u32 | rg_max u32 | block_count u32 | entry*
 //! footer     index_offset u64 | index_len u64 | checksum u64 | magic "BWSEGMNT"
@@ -41,8 +41,9 @@
 //!
 //! A segment written from a dataset schema ([`SegmentWriter::for_dataset`])
 //! records the dataset type of each key column (`key_types`) and, for
-//! temporal specs, of the timestamp column with its unit (`ts_type`), in the
-//! core-owned [`ColumnType`] spelling. Keys encoded under different types
+//! temporal specs, of the timestamp column with its unit (`ts_type`), and,
+//! for an exact spec with per-key bounds or a bitemporal spec, of its time
+//! columns (`time_types`), in the core-owned [`ColumnType`] spelling. Keys encoded under different types
 //! would split silently, so segments whose recorded types differ never merge
 //! or fold together, and [`SegmentReader::open_for_dataset`] refuses a
 //! segment whose recorded types differ from the dataset's. Merge writes its
@@ -58,18 +59,42 @@
 //! | body_off u64 | body_len u32 | body_checksum u64 | n u32`. A value record
 //! is `bitmap_len u32 | bitmap`, a roaring bitmap over global `RowGroupId`;
 //! then, for a spec with `counts`, one shortest-form LEB128 row count per
-//! set bit in ascending row-group order; then, for temporal segments, the
+//! set bit in ascending row-group order; then, for an exact spec with
+//! per-key bounds (storage version 2), one `min i64 | max i64` per set bit,
+//! the bounds column's range over the key's rows there, or the all-null
+//! sentinel `min = i64::MAX, max = i64::MIN` ([`ALL_NULL_BOUNDS`]) where
+//! every such row has a null time; then, for temporal segments, the
 //! version chain (see [`crate::temporal::VersionChain::write_to`]). The
 //! bitmap is always in roaring's no-run serialized form (cookie
 //! `3a 30 00 00`), fills its bytes exactly, and is never empty; a reader
 //! refuses anything else. (Version 1: no checksums, and an exact value
 //! record is the bare bitmap.)
 //!
+//! **Bitemporal** (`temporal2`, storage version 2). As keyed, and the value
+//! record is `bitmap_len u32 | bitmap | count u32 | count x (valid i64 |
+//! known i64 | rg u32)`: the key's distinct versions over rows where neither
+//! time is null, strictly ascending, and the bitmap is exactly their row
+//! groups (the storage version 1 `temporal2` sidecar record, behind a
+//! bitmap). A key with no such row is not stored.
+//!
+//! **Agg** (B7, storage version 2). As keyed, and the value record ends
+//! with one aggregate cell per set bit, in ascending row-group order
+//! ([`crate::agg::AggCell`]): `rows LEB128 | nulls LEB128 | [sum] | [min] |
+//! [max]`, as the spec's functions ask (`docs/format.md`, "Agg keys").
+//!
 //! **Bloom per row group** (bloom). One SBBF per row group over that row
 //! group's distinct keys, sized from the spec's `fpr`; structure and sizing
 //! are those of a Parquet embedded filter. Index entry: `rg u32 | off u64 |
 //! len u32 | ndv u64 | checksum u64`. A row group may have more than one entry (merge keeps
 //! filters of different sizes); a lookup unions over them.
+//!
+//! **A bloom's bounds** (`bloom:a@0.01@ts`, storage version 2). A bloom has
+//! no per-key record, so its per-key bounds are a second segment of the
+//! bloom ([`SegmentWriter::bloom_bounds_for_dataset`]): its header names the
+//! bloom spec with layout `keyed` ([`Layout::admits`]), and its value
+//! records are `bitmap | bounds`, the exact spec's bounds record without
+//! counts, checksummed like every keyed record. The manifest lists it with
+//! `kind: "bounds"` under the bloom's identity.
 //!
 //! **Min/max** (range). One `(min, max)` per row group, sorted by
 //! `(min, max, rg)`, in blocks of `rg u32 | min | max` entries. Index entry:
@@ -105,8 +130,10 @@ mod reader;
 mod writer;
 
 pub use format::{
-    checksum, footer_len, spec_types, types, ColumnType, FileRange, Layout, ReadAt, RecordedUnit,
-    SegmentHeader, CODEC_NONE, FOOTER_LEN, FOOTER_LEN_V2, MAGIC, PREAMBLE_LEN,
+    bloom_bounds_column, checksum, footer_len, record_time_columns, record_time_types, spec_types,
+    time_columns, time_types, types, ColumnType, FileRange, Layout, ReadAt, RecordedUnit,
+    SegmentHeader, ValueShape, ALL_NULL_BOUNDS, CODEC_NONE, FOOTER_LEN, FOOTER_LEN_V2, MAGIC,
+    PREAMBLE_LEN,
 };
 pub use reader::SegmentReader;
 pub use writer::{

@@ -26,8 +26,9 @@ use arrow::array::{
     TimestampSecondArray, UInt64Array,
 };
 use arrow::datatypes::{i256, DataType, Int32Type, TimeUnit};
-use bellwether_verify::{row_hash, Mismatch, ReconcileSpec};
-use common::{dirs, reconcile, write_batch};
+use bellwether_source::ParquetSource;
+use bellwether_verify::{row_hash, Mismatch, Options, ReconcileSpec, Reconciler, Side};
+use common::{dirs, reconcile, root, write_batch};
 use xxhash_rust::xxh3::xxh3_128;
 
 fn dict(values: &[&str]) -> ArrayRef {
@@ -160,7 +161,16 @@ fn reconciler_hash(f: f64) -> String {
     write_batch(l.path(), "a.parquet", &anchor(), 4);
     write_batch(l.path(), "b.parquet", &probe(f), 4);
     write_batch(r.path(), "a.parquet", &anchor(), 4);
-    let out = reconcile(l.path(), r.path(), ReconcileSpec::new(["id"])).unwrap();
+    // Inferred, a folder takes its widest decimal (M5): the dataset types
+    // under test are the anchor's, so they are declared.
+    let schema = anchor().schema();
+    let ls = ParquetSource::new().with_schema(Arc::clone(&schema));
+    let rs = ParquetSource::new().with_schema(schema);
+    let (lr, rr) = (root(l.path()), root(r.path()));
+    let out = Reconciler::new(ReconcileSpec::new(["id"]), Options::default())
+        .unwrap()
+        .run(&Side::new(&ls, &lr), &Side::new(&rs, &rr))
+        .unwrap();
     assert_eq!(
         out.hashed_columns,
         ["id", "çé", "d256", "day", "f", "u", "b", "dict", "t"]

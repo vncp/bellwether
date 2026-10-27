@@ -259,10 +259,14 @@ fn live_only(value: KeyValue, live: &RoaringBitmap) -> Option<KeyValue> {
             .collect::<Vec<u64>>()
     });
     let bitmap = &value.bitmap & live;
+    // A join pairs row-group sets (and counts): an exact key's per-key
+    // bounds are not part of a join value.
     (!bitmap.is_empty()).then_some(KeyValue {
         bitmap,
         chain: value.chain,
         counts,
+        bounds: None,
+        triples: Vec::new(),
         agg: None,
     })
 }
@@ -486,6 +490,8 @@ pub fn build_pair<RL: ReadAt, RR: ReadAt>(
                                 bitmap: v.bitmap.clone(),
                                 chain: v.chain.clone(),
                                 counts: None,
+                                bounds: None,
+                                triples: Vec::new(),
                                 agg: None,
                             };
                             out.push_join(lk, &bare(lv), &bare(rv))?;
@@ -533,6 +539,8 @@ fn read_side(c: &mut Cursor<'_>, counts: bool) -> Result<KeyValue> {
         bitmap,
         chain: crate::temporal::VersionChain::default(),
         counts,
+        bounds: None,
+        triples: Vec::new(),
         agg: None,
     })
 }

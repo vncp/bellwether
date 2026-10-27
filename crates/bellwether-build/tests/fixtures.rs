@@ -75,18 +75,23 @@ fn multi_rg_exact_range_bloom_composite_and_prefix() {
     assert_eq!(r.files_listed, 1);
     let m = b.manifest().unwrap().unwrap();
     assert_eq!(m.sequence, 1);
-    let cols: Vec<(&str, &str)> = m
+    // Storage version 2 spells each type as the segment format's
+    // `ColumnType` JSON.
+    let cols: Vec<(&str, String)> = m
         .schema
         .columns
         .iter()
-        .map(|c| (c.name.as_str(), c.data_type.as_str()))
+        .map(|c| (c.name.as_str(), c.data_type.to_string()))
         .collect();
     assert_eq!(
         cols,
         vec![
-            ("id", "Int64"),
-            ("name", "Utf8"),
-            ("amount", "Decimal128(10, 2)")
+            ("id", r#"{"type":"int64"}"#.to_string()),
+            ("name", r#"{"type":"utf8"}"#.to_string()),
+            (
+                "amount",
+                r#"{"precision":10,"scale":2,"type":"decimal128"}"#.to_string()
+            )
         ]
     );
     assert_eq!(m.source.kind, "parquet");

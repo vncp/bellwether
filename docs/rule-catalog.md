@@ -48,8 +48,9 @@ Every entry uses the same fields.
   is labeled as an estimate.
 - **Guidance template**: what the finding tells an agent. File, step, before
   shape, after shape, invariant. The last three map to `RewriteShape`
-  (`before`, `after`, `invariant`). File and step have no typed field today;
-  they go in `Lint.message` as text.
+  (`before`, `after`, `invariant`), and the profiler fills them into
+  `Lint.fix` for every finding that has a rewrite (storage version 2, M5).
+  File and step have no typed field; they go in `Lint.message` as text.
 - **Verification method**: one of four.
   - *Static algebraic identity*: the rewrite is correct by a known identity
     on the plan, independent of data.

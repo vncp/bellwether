@@ -254,6 +254,7 @@ fn committed_and_transient_segments_plan_identically_through_wp4_and_this_crate(
                     | RunQuery::Text(_)
                     | RunQuery::ContainsAny
                     | RunQuery::ContainsAll
+                    | RunQuery::Bitemporal(_)
                     | RunQuery::SemiJoin(_)
                     | RunQuery::Aggregate(_) => unreachable!(),
                 };

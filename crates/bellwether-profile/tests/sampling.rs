@@ -72,6 +72,10 @@ fn sampled_fanout_is_within_the_stated_error() {
     .unwrap();
     let e = single(&exact);
     assert!(!e.fanout.sampled);
+    assert_eq!(
+        (e.fanout.sample_size, e.fanout.quantile_error),
+        (None, None)
+    );
     assert_eq!(e.fanout.distinct, rgs.len() as u64);
     let q = |v: &[u64]| {
         [
@@ -101,6 +105,9 @@ fn sampled_fanout_is_within_the_stated_error() {
         assert!(f.sampled);
         assert_eq!(s.sample.distinct_source, DistinctSource::Hll);
         assert!(s.sample.retained <= tracked as u64);
+        // contract v3: a sampled entry names its sample size and rank error
+        assert_eq!(f.sample_size, Some(s.sample.retained));
+        assert!(f.quantile_error.is_some_and(|q| q > 0.0), "{f:?}");
         let truth = rgs.len() as f64;
         let err = (f.distinct as f64 - truth).abs() / truth;
         assert!(

@@ -9,11 +9,13 @@ use std::sync::Arc;
 use arrow::array::{
     ArrayRef, Decimal128Array, Decimal256Array, Int64Array, RecordBatch, StringArray,
 };
-use arrow::datatypes::i256;
+use arrow::datatypes::{i256, DataType, Field, Schema};
+use bellwether_source::ParquetSource;
 use bellwether_verify::{
-    CoverageRequest, ExactTotal, Mismatch, ReconcileSpec, Reconciliation, TotalValue, VerifyError,
+    CoverageRequest, ExactTotal, Mismatch, Options, ReconcileSpec, Reconciler, Reconciliation,
+    Side, TotalValue, VerifyError,
 };
-use common::{batch_at, dirs, ledger, r, reconcile, write, write_batch};
+use common::{batch_at, dirs, ledger, r, reconcile, root, write, write_batch};
 
 fn dec_batch(ids: &[i64], unscaled: &[i128], precision: u8, scale: i8) -> RecordBatch {
     RecordBatch::try_from_iter([
@@ -68,21 +70,40 @@ fn files_at_different_scales_give_equal_totals() {
 #[test]
 fn a_value_unrepresentable_at_the_dataset_scale_is_an_error_not_a_pass() {
     let (l, rt) = dirs();
-    // Dataset scale 2 (first file); the second file holds 1.235 at scale 3.
+    // The first file is at scale 2; the second holds 1.235 at scale 3.
     write_batch(l.path(), "a.parquet", &dec_batch(&[1], &[150], 18, 2), 4);
     write_batch(l.path(), "b.parquet", &dec_batch(&[2], &[1235], 18, 3), 4);
     // The right side holds the very same files, so a comparison that rounded
     // or skipped the value would pass.
     write_batch(rt.path(), "a.parquet", &dec_batch(&[1], &[150], 18, 2), 4);
     write_batch(rt.path(), "b.parquet", &dec_batch(&[2], &[1235], 18, 3), 4);
-    for spec in [
-        ReconcileSpec::new(["id"]),
-        ReconcileSpec::new(["id"]).totals(["amount"]),
-        ReconcileSpec::new(["id"])
-            .ignore(["amount"])
-            .totals(["amount"]),
-    ] {
-        let err = reconcile(l.path(), rt.path(), spec).unwrap_err();
+    let specs = || {
+        [
+            ReconcileSpec::new(["id"]),
+            ReconcileSpec::new(["id"]).totals(["amount"]),
+            ReconcileSpec::new(["id"])
+                .ignore(["amount"])
+                .totals(["amount"]),
+        ]
+    };
+    // Inferred, the dataset takes the widest decimal across the files
+    // (M5, ADR 028): scale 3 holds every value, and the sides agree.
+    for spec in specs() {
+        assert!(reconcile(l.path(), rt.path(), spec).unwrap().pass);
+    }
+    // A dataset schema declared at scale 2 cannot hold 1.235: an error.
+    let at_2 = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, true),
+        Field::new("amount", DataType::Decimal128(18, 2), true),
+    ]));
+    let ls = ParquetSource::new().with_schema(Arc::clone(&at_2));
+    let rs = ParquetSource::new().with_schema(at_2);
+    let (lr, rr) = (root(l.path()), root(rt.path()));
+    for spec in specs() {
+        let err = Reconciler::new(spec, Options::default())
+            .unwrap()
+            .run(&Side::new(&ls, &lr), &Side::new(&rs, &rr))
+            .unwrap_err();
         let VerifyError::Unrepresentable { column, file, .. } = &err else {
             panic!("{err}");
         };

@@ -19,7 +19,7 @@ use bellwether_core::encoding;
 use bellwether_core::render::render_tuple;
 use bellwether_types::{
     format, AggServed, Coverage, Evidence, EvidenceBody, FileFingerprint, Hash, Provenance, Record,
-    RowGroupMeta, ScanPlan, Source,
+    RowGroupMeta, ScanPlan, Source, TotalSpec,
 };
 use xxhash_rust::xxh3::{xxh3_128, xxh3_64_with_seed};
 
@@ -255,6 +255,9 @@ pub(crate) struct Execution {
     pub manifests: [Option<u64>; 2],
     /// `plan` Evidence of the planned sides.
     pub evidence: Vec<Evidence>,
+    /// The total columns and their quantization, in spec order
+    /// (`CertBody::totals`).
+    pub totals: Vec<TotalSpec>,
 }
 
 /// Why a pass stopped early.
@@ -710,6 +713,15 @@ impl Reconciler {
             inputs,
             manifests,
             evidence,
+            totals: self
+                .spec
+                .total_columns
+                .iter()
+                .map(|t| TotalSpec {
+                    column: t.column.clone(),
+                    quantize: t.quantize,
+                })
+                .collect(),
         })
     }
 

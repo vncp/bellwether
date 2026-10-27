@@ -640,8 +640,8 @@ fn side_types(
         if lc != rc {
             return Err(VerifyError::Schema(format!(
                 "column {name:?} is {lt} on the left and {rt} on the right, which do not share a \
-                 canonical encoding; build one side's source with the other's dataset schema \
-                 (with_schema) to cast it"
+                 canonical encoding; read both sides under one dataset schema giving it a type \
+                 both convert to exactly"
             )));
         }
         types[0].push(lt.clone());

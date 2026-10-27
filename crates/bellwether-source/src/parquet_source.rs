@@ -736,7 +736,7 @@ impl<S: Storage> Source for ParquetSource<S> {
             .find(|p| has_extension(p, PARQUET_EXTENSION))
             .ok_or_else(|| Error::Source(format!("{root}: no .parquet files")))?;
         let fp = fingerprint_with_policy(&self.storage, &first, self.policy)?;
-        let file_schema = self.footer(&fp)?.schema().clone();
+        let file_schema = self.widest_decimals(root, self.footer(&fp)?.schema())?;
         if self.partition_root.is_none() {
             return Ok(file_schema);
         }
@@ -761,6 +761,75 @@ impl<S: Storage> Source for ParquetSource<S> {
         Ok(Arc::new(Schema::new_with_metadata(
             fields,
             file_schema.metadata().clone(),
+        )))
+    }
+}
+
+impl<S: Storage> ParquetSource<S> {
+    /// `first`, the first file's schema, with every decimal column widened
+    /// to the widest precision and scale any file under `root` stores it
+    /// at (contract v3 #33): the largest scale, and the most integer digits
+    /// (precision minus scale) beside it, so every file's values convert
+    /// exactly whatever the files' order. A `Decimal128` wider than 38
+    /// digits becomes a `Decimal256`; one wider than 76 is refused. Opens
+    /// every file's footer only when the first file has a decimal column.
+    fn widest_decimals(&self, root: &str, first: &SchemaRef) -> Result<SchemaRef> {
+        let decimal = |dt: &DataType| match dt {
+            DataType::Decimal128(p, s) | DataType::Decimal256(p, s) => Some((*p, *s)),
+            _ => None,
+        };
+        let mut widest: BTreeMap<&str, (i16, i8)> = first
+            .fields()
+            .iter()
+            .filter_map(|f| {
+                decimal(f.data_type())
+                    .map(|(p, s)| (f.name().as_str(), (i16::from(p) - i16::from(s), s)))
+            })
+            .collect();
+        if widest.is_empty() {
+            return Ok(SchemaRef::clone(first));
+        }
+        for path in self.storage.list(root)? {
+            if !has_extension(&path, PARQUET_EXTENSION) {
+                continue;
+            }
+            let fp = fingerprint_with_policy(&self.storage, &path, self.policy)?;
+            let footer = self.footer(&fp)?;
+            for f in footer.schema().fields() {
+                if let (Some(w), Some((p, s))) =
+                    (widest.get_mut(f.name().as_str()), decimal(f.data_type()))
+                {
+                    *w = (w.0.max(i16::from(p) - i16::from(s)), w.1.max(s));
+                }
+            }
+        }
+        let fields = first
+            .fields()
+            .iter()
+            .map(|f| {
+                let Some(&(digits, scale)) = widest.get(f.name().as_str()) else {
+                    return Ok(f.as_ref().clone());
+                };
+                let precision = digits + i16::from(scale);
+                let dt = match (f.data_type(), u8::try_from(precision)) {
+                    (DataType::Decimal128(..), Ok(p)) if p <= 38 => DataType::Decimal128(p, scale),
+                    (_, Ok(p)) if p <= 76 => DataType::Decimal256(p, scale),
+                    _ => {
+                        return Err(Error::Source(format!(
+                            "{root}: column {:?} needs {precision} decimal digits to hold every \
+                             file's values exactly (the widest scale, {scale}, beside the most \
+                             integer digits, {digits}), more than a decimal holds (76); give the \
+                             dataset schema explicitly",
+                            f.name()
+                        )))
+                    }
+                };
+                Ok(f.as_ref().clone().with_data_type(dt))
+            })
+            .collect::<Result<Vec<Field>>>()?;
+        Ok(Arc::new(Schema::new_with_metadata(
+            fields,
+            first.metadata().clone(),
         )))
     }
 }

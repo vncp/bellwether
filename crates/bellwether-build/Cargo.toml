@@ -18,6 +18,7 @@ arrow = { workspace = true }
 bytes = { workspace = true }
 rayon = { workspace = true }
 roaring = { workspace = true }
+serde_json = { workspace = true }
 
 [dev-dependencies]
 arrow = { workspace = true, features = ["csv", "json"] }

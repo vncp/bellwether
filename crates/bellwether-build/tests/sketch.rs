@@ -22,7 +22,7 @@ use std::sync::Arc;
 use arrow::array::{Int64Array, RecordBatch, StringArray, TimestampMicrosecondArray};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use bellwether_build::{declared_sketches, sketch_completeness, BuildOptions, Lookup};
-use bellwether_core::sidecar::{SidecarDef, SidecarKind};
+use bellwether_core::sidecar::SidecarKind;
 use bellwether_core::sketch::{item_types, FileSketcher, ItemSketch, SketchReader};
 use bellwether_store::{segment_path, Manifest, StoreExt};
 use bellwether_types::{KeySpec, SketchSpec, Store};
@@ -73,10 +73,9 @@ fn write_file(path: &Path, base: i64, rows: i64, rows_per_rg: usize) {
     write_parquet(path, &batch, rows_per_rg);
 }
 
-fn opts(sketches: Vec<SketchSpec>, sidecars: Vec<SidecarDef>) -> BuildOptions {
+fn opts(sketches: Vec<SketchSpec>) -> BuildOptions {
     BuildOptions {
         sketches,
-        sidecars,
         max_segment_row_groups: 3,
         ..parquet_opts(&schema())
     }
@@ -149,7 +148,7 @@ fn stored_sketches_equal_the_decoded_files_and_complete_like_a_sidecar() {
         &b,
         &s.root_str(),
         &[exact(&["id"])],
-        &opts(vec![spec.clone()], Vec::new()),
+        &opts(vec![spec.clone()]),
     );
     let m = Manifest::from_slice(&manifest_bytes(&store)).unwrap();
     assert_eq!(declared_sketches(&m), vec![spec.clone()]);
@@ -178,7 +177,7 @@ fn new_and_changed_files_are_sketched_and_retired_entries_are_not_used() {
     let store = memory_store();
     let b = builder(&store);
     let spec = sketch(&[&["id"], &["batch"]], 10, None);
-    let o = opts(vec![spec.clone()], Vec::new());
+    let o = opts(vec![spec.clone()]);
     build_ok(&b, &s.root_str(), &[exact(&["id"])], &o);
     // A new file and a rewritten one.
     write_file(&s.root().join("c.parquet"), 300, 33, 16);
@@ -194,12 +193,7 @@ fn new_and_changed_files_are_sketched_and_retired_entries_are_not_used() {
     }
     // Same name, another precision: rebuilt over every live row group.
     let finer = sketch(&[&["id"], &["batch"]], 12, None);
-    let r = build_ok(
-        &b,
-        &s.root_str(),
-        &[],
-        &opts(vec![finer.clone()], Vec::new()),
-    );
+    let r = build_ok(&b, &s.root_str(), &[], &opts(vec![finer.clone()]));
     assert!(
         r.specs_rebuilt.contains(&finer.name()),
         "{:?}",
@@ -222,7 +216,7 @@ fn a_sketch_on_a_missing_column_is_refused_and_nothing_is_committed() {
         .build(
             &s.root_str(),
             &[exact(&["id"])],
-            &opts(vec![sketch(&[&["nope"]], 14, None)], Vec::new()),
+            &opts(vec![sketch(&[&["nope"]], 14, None)]),
         )
         .unwrap_err();
     assert!(e.to_string().contains("nope"), "{e}");
@@ -310,43 +304,37 @@ fn no_planner_path_reads_a_sketch() {
     for i in 0..5i64 {
         write_file(&s.root().join(format!("f{i}.parquet")), i * 100, 80, 16);
     }
+    // `exact:id@ts`: per-key bounds for the window lookup.
     let specs = [
-        exact(&["id"]),
+        KeySpec::Exact {
+            columns: cols(&["id"]),
+            counts: false,
+            bounds: Some("ts".into()),
+        },
         bloom(&["batch"]),
         range("ts"),
         temporal(&["id"], "ts"),
     ];
-    let bounds = SidecarDef {
-        kind: SidecarKind::Bounds,
-        columns: cols(&["id"]),
-        time_columns: cols(&["ts"]),
-    };
     let plain = memory_store();
-    build_ok(
-        &builder(&plain),
-        &s.root_str(),
-        &specs,
-        &opts(Vec::new(), vec![bounds.clone()]),
-    );
+    build_ok(&builder(&plain), &s.root_str(), &specs, &opts(Vec::new()));
     let sketched = memory_store();
     let spec = sketch(&[&["id"], &["batch"], &["id", "ts"]], 12, Some(8));
     build_ok(
         &builder(&sketched),
         &s.root_str(),
         &specs,
-        &opts(vec![spec.clone()], vec![bounds]),
+        &opts(vec![spec.clone()]),
     );
     let (pp, ps) = (planner(&plain), planner(&sketched));
-    assert!(ps
-        .declared_sidecars()
-        .iter()
-        .all(|d| d.kind == SidecarKind::Bounds));
+    let timed = ps.timed_sources(&specs);
+    assert_ne!(timed.len(), 0);
+    assert!(timed.iter().all(|(d, _)| d.kind == SidecarKind::Bounds));
     let lk = lookups(&pp);
     for (sp, lookup) in &lk {
         assert!(ps
-            .sidecars_for(lookup)
+            .sidecars_for(sp, lookup)
             .iter()
-            .all(|d| !d.name().starts_with("sketch")));
+            .all(|(d, _)| !d.name().starts_with("sketch")));
         let a = pp.plan(sp, lookup).unwrap();
         let b = ps.plan(sp, lookup).unwrap();
         assert_eq!(a.entries, b.entries, "{lookup:?}");

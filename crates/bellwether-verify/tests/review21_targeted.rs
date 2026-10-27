@@ -177,9 +177,31 @@ fn dec(ids: &[i64], unscaled: &[i128], scale: i8) -> RecordBatch {
     .unwrap()
 }
 
+/// Reconciles with both sides read at the dataset schema `(id, amount
+/// Decimal128(18, 2))`, declared: inferred, a folder takes its widest
+/// decimal (M5), so a scale-2 dataset over a scale-3 file is declared.
+fn reconcile_at_scale_2(
+    left: &std::path::Path,
+    right: &std::path::Path,
+    spec: ReconcileSpec,
+) -> bellwether_verify::Result<bellwether_verify::Reconciliation> {
+    let schema = Arc::new(arrow::datatypes::Schema::new(vec![
+        arrow::datatypes::Field::new("id", arrow::datatypes::DataType::Int64, true),
+        arrow::datatypes::Field::new(
+            "amount",
+            arrow::datatypes::DataType::Decimal128(18, 2),
+            true,
+        ),
+    ]));
+    let ls = ParquetSource::new().with_schema(Arc::clone(&schema));
+    let rs = ParquetSource::new().with_schema(schema);
+    let (lr, rr) = (root(left), root(right));
+    Reconciler::new(spec, Options::default())?.run(&Side::new(&ls, &lr), &Side::new(&rs, &rr))
+}
+
 #[test]
 fn guard_a_difference_beyond_the_dataset_scale_is_an_error_and_a_rescaled_equal_passes() {
-    // Dataset scale 2 (from a.parquet). b.parquet holds 1.234 on the left and
+    // Dataset scale 2 (declared). b.parquet holds 1.234 on the left and
     // 1.235 on the right at scale 3: both differ only beyond scale 2.
     let (l, rt) = dirs();
     write_batch(l.path(), "a.parquet", &dec(&[1], &[100], 2), 4);
@@ -193,15 +215,20 @@ fn guard_a_difference_beyond_the_dataset_scale_is_an_error_and_a_rescaled_equal_
             .ignore(["amount"])
             .totals(["amount"]),
     ] {
-        let err = reconcile(l.path(), rt.path(), spec).unwrap_err();
+        let err = reconcile_at_scale_2(l.path(), rt.path(), spec).unwrap_err();
         assert!(matches!(err, VerifyError::Unrepresentable { .. }), "{err}");
     }
+    // Inferred, both sides take scale 3 (the widest, M5): the difference
+    // is visible, a mismatch, never an error or a rounding pass.
+    let out = reconcile(l.path(), rt.path(), ReconcileSpec::new(["id"])).unwrap();
+    assert!(!out.pass);
+    assert_eq!(out.counts.mismatched, 1, "{out:#?}");
     // 1.230 at scale 3 equals 1.23 at scale 2: equal after rescaling.
     let (l2, r2) = dirs();
     write_batch(l2.path(), "a.parquet", &dec(&[1], &[100], 2), 4);
     write_batch(l2.path(), "b.parquet", &dec(&[2], &[1230], 3), 4);
     write_batch(r2.path(), "a.parquet", &dec(&[1, 2], &[100, 123], 2), 4);
-    let out = reconcile(
+    let out = reconcile_at_scale_2(
         l2.path(),
         r2.path(),
         ReconcileSpec::new(["id"]).totals(["amount"]),
@@ -214,7 +241,7 @@ fn guard_a_difference_beyond_the_dataset_scale_is_an_error_and_a_rescaled_equal_
     write_batch(l3.path(), "b.parquet", &dec(&[2], &[1231], 3), 4);
     write_batch(r3.path(), "a.parquet", &dec(&[1, 2], &[100, 123], 2), 4);
     assert!(matches!(
-        reconcile(l3.path(), r3.path(), ReconcileSpec::new(["id"])),
+        reconcile_at_scale_2(l3.path(), r3.path(), ReconcileSpec::new(["id"])),
         Err(VerifyError::Unrepresentable { .. })
     ));
 }
@@ -367,14 +394,17 @@ fn guard_refusals_are_typed_and_nothing_is_written() {
         ),
         Err(VerifyError::Overflow { .. })
     ));
-    // An unrepresentable decimal.
+    // Two sides whose inferred decimals differ in scale (the left's widest
+    // is scale 3, the right's scale 2; M5) share no canonical encoding: a
+    // schema refusal saying to read both under one dataset schema (the
+    // facade adds the command-line step, `--schema <file>`).
     let (l4, r4) = dirs();
     write_batch(l4.path(), "a.parquet", &dec(&[1], &[100], 2), 4);
     write_batch(l4.path(), "b.parquet", &dec(&[2], &[1235], 3), 4);
     write_batch(r4.path(), "a.parquet", &dec(&[1], &[100], 2), 4);
     assert!(matches!(
         certify(l4.path(), r4.path(), ReconcileSpec::new(["id"])),
-        Err(VerifyError::Unrepresentable { .. })
+        Err(VerifyError::Schema(m)) if m.contains("one dataset schema")
     ));
     // StaticProof.
     assert!(matches!(
@@ -416,10 +446,10 @@ fn guard_a_null_workload_key_is_refused_before_any_read() {
 // ---------------------------------------------------------------------------
 
 /// Settled: a key whose every version has a null timestamp counts in
-/// `mismatched` on the certificate (contract-v3 row 26), never a pass:false
-/// certificate with every count zero.
+/// `uncomparable` on the certificate (M5, ADR 028; contract-v3 row 26), not
+/// in `mismatched`, never a pass:false certificate with every count zero.
 #[test]
-fn finding_a_key_with_no_comparable_version_counts_in_mismatched() {
+fn finding_a_key_with_no_comparable_version_counts_as_uncomparable() {
     let (l, rt) = dirs();
     let mut a = r(1, 0, 1, "a");
     a.ts = None;
@@ -434,7 +464,8 @@ fn finding_a_key_with_no_comparable_version_counts_in_mismatched() {
         .certificate;
     assert!(!c.pass);
     assert_eq!(
-        c.body.mismatched, 1,
+        (c.body.mismatched, c.body.uncomparable),
+        (0, 1),
         "pass=false with body {:?}: a reader sees no difference",
         c.body
     );
@@ -458,7 +489,7 @@ fn finding_a_null_version_key_present_on_one_side_only_is_counted() {
     assert!(!c.pass);
     let b = &c.body;
     assert!(
-        b.missing_left + b.missing_right + b.mismatched >= 1,
+        b.missing_left + b.missing_right + b.mismatched + b.uncomparable >= 1,
         "pass=false with all-zero body {b:?}"
     );
 }

@@ -197,7 +197,9 @@ pub struct ObserveAggregate {
     pub at_manifest: Option<u64>,
 }
 
-/// `observe.asof`: the version of each key current at an instant.
+/// `observe.asof`: the version of each key current at an instant, or, with
+/// `valid` and/or `known` instead of `at`, the bitemporal as-of through a
+/// `temporal2` key (`asof --valid --known`).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ObserveAsof {
@@ -207,8 +209,25 @@ pub struct ObserveAsof {
     #[serde(default)]
     pub key_columns: Option<Vec<String>>,
     /// The instant: RFC 3339, a date (YYYY-MM-DD), or an integer in the
-    /// timestamp column's unit.
-    pub at: String,
+    /// timestamp column's unit. Give `at`, or `valid` and/or `known`.
+    #[serde(default)]
+    pub at: Option<String>,
+    /// Bitemporal: the valid-time instant, in the same forms as `at`
+    /// (needs a `temporal2` key); absent: unbounded.
+    #[serde(default)]
+    pub valid: Option<String>,
+    /// Bitemporal: the known-time instant; rows learned later are ignored.
+    /// Absent: unbounded.
+    #[serde(default)]
+    pub known: Option<String>,
+    /// Bitemporal: the valid-time column of the bitemporal key to plan
+    /// through (with `known_by`), when several serve the key columns.
+    /// Absent: the one that serves them.
+    #[serde(default)]
+    pub valid_by: Option<String>,
+    /// Bitemporal: the known-time column of that key (with `valid_by`).
+    #[serde(default)]
+    pub known_by: Option<String>,
     /// Plan against the committed manifest at this sequence (a plan's
     /// `sequence`) instead of the current one, so a lookup repeated over a
     /// grown folder reads exactly what it read then: files indexed since are
@@ -346,6 +365,25 @@ pub struct ScoreWhy {
     /// none.
     #[serde(default)]
     pub text: Vec<TextLookup>,
+    /// Price `keys` under a bitemporal lookup (`why --valid-by`; `asof
+    /// --valid --known`): the valid-time column. Needs `known_by`; the floor
+    /// candidate is `temporal2:<key columns>@<valid_by>,<known_by>`. A
+    /// bitemporal run is priced over an index.
+    #[serde(default)]
+    pub valid_by: Option<String>,
+    /// The known-time column of a bitemporal lookup (`why --known-by`; with
+    /// `valid_by`).
+    #[serde(default)]
+    pub known_by: Option<String>,
+    /// The valid-time bound of a bitemporal lookup (`why --valid`):
+    /// RFC 3339, a date, or an integer in `valid_by`'s unit; default:
+    /// unbounded.
+    #[serde(default)]
+    pub valid: Option<String>,
+    /// The known-time bound of a bitemporal lookup (`why --known`), in
+    /// `known_by`'s unit likewise; default: unbounded.
+    #[serde(default)]
+    pub known: Option<String>,
 }
 
 /// What an aggregate lookup computes per key.
@@ -419,6 +457,10 @@ pub struct ScoreVerify {
 pub struct ProposeKey {
     /// The key.
     pub spec: KeyArg,
+    /// Further keys applied in the same commit as `spec` (the proposal's
+    /// `sidecars`), each in either form; every name distinct.
+    #[serde(default)]
+    pub sidecars: Vec<KeyArg>,
     /// Evidence hashes the proposal cites; at least one.
     pub evidence: Vec<Hash>,
     /// Who proposes: your agent name. `engine` is reserved.
@@ -433,10 +475,10 @@ pub struct ProposeKey {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(untagged)]
 pub enum KeyArg {
-    /// The short form: exact:a,b, bloom:a@0.01, range:ts, or temporal:id@ts.
-    /// A sidecar declaration (temporal2:id@valid,known, or exact:a@ts with
-    /// its per-key time bounds) is refused with `sidecar_not_proposable`:
-    /// a proposal carries a key spec only.
+    /// The short form: exact:a,b, exact:a@ts (per-key time bounds),
+    /// bloom:a@0.01, range:ts, temporal:id@ts, temporal2:id@valid,known, or
+    /// any other `index --key` spelling. A sketch (sketch:a) is refused with
+    /// `sketch_not_proposable`: it is approximate and never planned with.
     Short(String),
     /// The key spec's JSON form.
     Spec(KeySpec),
@@ -596,9 +638,10 @@ pub fn catalog() -> Vec<ToolDef> {
             "observe.asof",
             Tier::Observe,
             true,
-            "Plan the version of each key current at an instant, against the current manifest \
-             or a committed one (at_manifest). Writes the plan Evidence and the key set to the \
-             cache only.",
+            "Plan the version of each key current at an instant (at), or its bitemporal version \
+             valid at valid as known at known (a temporal2 key), against the current manifest or \
+             a committed one (at_manifest). Writes the plan Evidence and the key set to the cache \
+             only.",
         ),
         def::<ObserveText>(
             "observe.text",
@@ -639,9 +682,10 @@ pub fn catalog() -> Vec<ToolDef> {
             Tier::Score,
             false,
             "Engine-scored why: replay the keys (or a recorded workload) under the current \
-             configuration and every candidate key; returns the funnel, the culprit, the \
-             recommended key, and workload.hash. Writes engine Proposals and Replays. Charged \
-             to the session budget. Returns a job id unless wait is true.",
+             configuration and every candidate key, as point lookups or, with valid_by and \
+             known_by, bitemporal ones; returns the funnel, the culprit, the recommended key, and \
+             workload.hash. Writes engine Proposals and Replays. Charged to the session budget. \
+             Returns a job id unless wait is true.",
         ),
         def::<ScoreVerify>(
             "score.verify",

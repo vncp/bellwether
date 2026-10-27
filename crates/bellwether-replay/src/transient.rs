@@ -53,6 +53,7 @@ use bellwether_core::encoding::{self, KeyColumns};
 use bellwether_core::segment::{
     validate_spec, ColumnType, SegmentReader, SegmentWriter, WriterOptions,
 };
+use bellwether_core::sidecar::{self, SidecarDef, SidecarKind};
 use bellwether_types::{Error, Hash, KeySpec, Result, RowGroupId, Source};
 use bytes::Bytes;
 use roaring::RoaringBitmap;
@@ -120,6 +121,9 @@ pub struct TransientIndex {
     manifest_version: String,
     catalog_digest: Hash,
     segments: Arc<SpecSegments>,
+    /// For a bloom with per-key bounds, its `bounds` segments, one per key
+    /// segment, over the same row groups.
+    bounds: Vec<Bytes>,
     /// First and last row group each segment's writer processed.
     ranges: Vec<(RowGroupId, RowGroupId)>,
     stats: BuildStats,
@@ -136,13 +140,68 @@ pub(crate) fn spec_types(
     bellwether_core::segment::spec_types(spec, schema)
 }
 
+/// The per-key times a spec's segments carry, as the sidecar definition
+/// they serve: a bitemporal spec's versions (its layout's records are the
+/// `temporal2` sidecar's), a bloom with bounds' `bounds` segments. `None`
+/// otherwise.
+pub(crate) fn timed_def(spec: &KeySpec) -> Option<SidecarDef> {
+    match spec {
+        KeySpec::Bitemporal {
+            columns,
+            valid_column,
+            known_column,
+        } => Some(SidecarDef {
+            kind: SidecarKind::Bitemporal,
+            columns: columns.clone(),
+            time_columns: vec![valid_column.clone(), known_column.clone()],
+        }),
+        KeySpec::Bloom {
+            columns,
+            bounds: Some(ts),
+            ..
+        } => Some(SidecarDef {
+            kind: SidecarKind::Bounds,
+            columns: columns.clone(),
+            time_columns: vec![ts.clone()],
+        }),
+        _ => None,
+    }
+}
+
 /// Measures one row group's keys for `spec` (module docs): `(keys, bytes)`.
+/// `time` is the dataset types of the spec's time columns (core's
+/// `segment::time_types`; a bloom with bounds: its bounds column's).
+#[allow(clippy::too_many_lines)] // one arm per kind, as the build's measure
 pub(crate) fn measure(
     spec: &KeySpec,
     keys: &[DataType],
     ts: Option<&DataType>,
+    time: &[DataType],
     batch: &RecordBatch,
 ) -> Result<(u64, u64)> {
+    // A bitemporal spec's records are the `temporal2` sidecar's; a bloom
+    // with bounds adds its `bounds` segment's (`bitmap | bounds` per key,
+    // a key and 16 bytes per row group holding it) to its filter's.
+    let bounds_bytes = match timed_def(spec) {
+        Some(def) if def.kind == SidecarKind::Bitemporal => {
+            return sidecar::measure(&def, keys, time, batch);
+        }
+        Some(_) => {
+            measure(
+                &KeySpec::Exact {
+                    columns: spec.columns().to_vec(),
+                    counts: false,
+                    bounds: bellwether_core::segment::bloom_bounds_column(spec).map(str::to_string),
+                },
+                keys,
+                None,
+                time,
+                batch,
+            )?
+            .1
+        }
+        None => 0,
+    };
     let column = |name: &str| -> Result<ArrayRef> {
         batch
             .column_by_name(name)
@@ -233,11 +292,17 @@ pub(crate) fn measure(
             bytes += match spec.physical() {
                 KeySpec::Bloom { .. } => 8,
                 KeySpec::Temporal { .. } => key_len + 8,
-                _ => key_len + cell,
+                // a `[min, max]` per row group holding the key
+                KeySpec::Exact {
+                    bounds: Some(_), ..
+                } => key_len + 16,
+                // one aggregate cell per row group holding the key
+                KeySpec::Agg { .. } => key_len + cell,
+                _ => key_len,
             };
         }
     }
-    Ok((seen.len() as u64, bytes))
+    Ok((seen.len() as u64, bytes + bounds_bytes))
 }
 
 impl TransientIndex {
@@ -246,6 +311,7 @@ impl TransientIndex {
     /// the catalog carries (module docs for the memory bound). A row group
     /// whose read returns a different row count than its statistics is an
     /// error.
+    #[allow(clippy::too_many_lines)]
     pub fn build(
         source: &dyn Source,
         catalog: &Catalog,
@@ -258,12 +324,27 @@ impl TransientIndex {
         }
         let schema = catalog.schema();
         let (key_types, ts_type) = spec_types(spec, schema)?;
+        let bounds_def = timed_def(spec).filter(|d| d.kind == SidecarKind::Bounds);
+        let time_types = match &bounds_def {
+            Some(def) => def.time_types(schema)?,
+            None => bellwether_core::segment::time_types(spec, schema)?,
+        };
         // An expr key reads its expression's input columns and derives the
-        // virtual column one row group at a time (ADR 018).
+        // virtual column one row group at a time (ADR 018). A temporal key
+        // reads its timestamp, an exact key with bounds its time column, a
+        // bitemporal key its two clocks, a bloom with bounds its bounds
+        // column.
         let mut columns: Vec<String> = bellwether_core::expr::input_columns(spec)?;
+        let mut times = bellwether_core::segment::time_columns(spec);
         if let KeySpec::Temporal { ts_column, .. } = spec {
-            if !columns.contains(ts_column) {
-                columns.push(ts_column.clone());
+            times.push(ts_column.clone());
+        }
+        if let Some(def) = &bounds_def {
+            times.extend(def.time_columns.iter().cloned());
+        }
+        for c in times {
+            if !columns.contains(&c) {
+                columns.push(c);
             }
         }
         let opts = WriterOptions::default();
@@ -276,9 +357,19 @@ impl TransientIndex {
                 ..BuildStats::default()
             },
             readers: Vec::new(),
+            bounds: Vec::new(),
             ranges: Vec::new(),
         };
         let mut writer = SegmentWriter::for_dataset(spec.clone(), schema, opts.clone())?;
+        let new_bounds = || -> Result<Option<SegmentWriter>> {
+            bounds_def
+                .as_ref()
+                .map(|_| {
+                    SegmentWriter::bloom_bounds_for_dataset(spec.clone(), schema, opts.clone())
+                })
+                .transpose()
+        };
+        let mut bounds_writer = new_bounds()?;
         let (mut open_rows, mut open_bytes) = (0u64, 0u64);
         // First and last row group the open writer processed.
         let mut open: Option<(RowGroupId, RowGroupId)> = None;
@@ -292,7 +383,7 @@ impl TransientIndex {
                     rg.meta.file.path, rg.meta.index_in_file, rg.meta.rows
                 )));
             }
-            let (_, bytes) = measure(spec, &key_types, ts_type.as_ref(), &batch)?;
+            let (_, bytes) = measure(spec, &key_types, ts_type.as_ref(), &time_types, &batch)?;
             let cut = open_rows > 0
                 && (open_rows + rows > limits.max_segment_rows
                     || open_bytes + bytes > limits.max_segment_key_bytes);
@@ -301,7 +392,8 @@ impl TransientIndex {
                     &mut writer,
                     SegmentWriter::for_dataset(spec.clone(), schema, opts.clone())?,
                 );
-                build.finish(full, range, open_rows, open_bytes)?;
+                let full_bounds = std::mem::replace(&mut bounds_writer, new_bounds()?);
+                build.finish(full, full_bounds, range, open_rows, open_bytes)?;
                 open = None;
                 open_rows = 0;
                 open_bytes = 0;
@@ -320,6 +412,9 @@ impl TransientIndex {
                 )));
             }
             writer.add_batch(rg.id, &batch)?;
+            if let Some(w) = &mut bounds_writer {
+                w.add_batch(rg.id, &batch)?;
+            }
             open = Some((open.map_or(rg.id, |(first, _)| first), rg.id));
             open_rows += rows;
             open_bytes += bytes;
@@ -334,11 +429,12 @@ impl TransientIndex {
         // The open writer is finished whenever it processed a row group,
         // even one that gave it no keys.
         if let Some(range) = open {
-            build.finish(writer, range, open_rows, open_bytes)?;
+            build.finish(writer, bounds_writer, range, open_rows, open_bytes)?;
         }
         let Build {
             stats,
             readers,
+            bounds,
             ranges,
             ..
         } = build;
@@ -346,6 +442,7 @@ impl TransientIndex {
             manifest_version: catalog.manifest_version().to_string(),
             catalog_digest: catalog.digest(),
             segments: Arc::new(SpecSegments::new(spec.clone(), readers)?),
+            bounds,
             ranges,
             stats,
         })
@@ -444,6 +541,15 @@ impl TransientIndex {
             .collect()
     }
 
+    /// For a bloom with per-key bounds, the raw bytes of its `bounds`
+    /// segments (one per key segment, over the same row groups),
+    /// as the build crate's `Planner::plan_with_transient` takes them; empty
+    /// for every other spec.
+    #[must_use]
+    pub fn bounds_bytes(&self) -> &[Bytes] {
+        &self.bounds
+    }
+
     /// For an exact or temporal spec: each probe key's row groups, unioned
     /// across segments. Keys absent from the index are absent from the map.
     pub fn get(
@@ -468,16 +574,19 @@ struct Build<'a> {
     limits: &'a TransientLimits,
     stats: BuildStats,
     readers: Vec<SegmentReader<SegmentBytes>>,
+    bounds: Vec<Bytes>,
     ranges: Vec<(RowGroupId, RowGroupId)>,
 }
 
 impl Build<'_> {
-    /// Finishes one writer that processed the row groups `range` (first and
-    /// last), took `rows` rows and `key_bytes` accounted key bytes,
+    /// Finishes one writer (and the `bounds` segment writer beside it, for
+    /// a bloom with bounds) that processed the row groups `range` (first
+    /// and last), took `rows` rows and `key_bytes` accounted key bytes,
     /// enforcing the index byte cap before keeping the segment.
     fn finish(
         &mut self,
         mut writer: SegmentWriter,
+        bounds: Option<SegmentWriter>,
         range: (RowGroupId, RowGroupId),
         rows: u64,
         key_bytes: u64,
@@ -485,7 +594,14 @@ impl Build<'_> {
         // The segment records the row groups it processed, keys or not, so
         // it claims coverage of exactly them and two key-less segments over
         // different row groups never share bytes (docs/format.md).
-        writer.set_rowgroup_range(range.0..RowGroupId(range.1 .0 + 1))?;
+        let processed = range.0..RowGroupId(range.1 .0 + 1);
+        if let Some(mut w) = bounds {
+            w.set_rowgroup_range(processed.clone())?;
+            let seg = w.finish()?;
+            self.stats.bytes += seg.bytes.len() as u64;
+            self.bounds.push(Bytes::from(seg.bytes));
+        }
+        writer.set_rowgroup_range(processed)?;
         let seg = writer.finish()?;
         if seg.rowgroup_range != Some(range) {
             return Err(Error::Other(format!(

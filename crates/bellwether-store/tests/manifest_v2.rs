@@ -93,71 +93,79 @@ fn misaligned_arrays_and_newer_versions_are_refused() {
 
 /// A manifest edit.
 type Edit = Box<dyn FnOnce(&mut serde_json::Value)>;
+/// A shape: what it is, the edit that writes it, and what reading it shows.
+type Shape<'a> = (&'a str, Edit, &'a dyn Fn(&Manifest));
 
-/// The shapes the next storage version 2 release writes (ADR 028: the
-/// record shapes are final in this release, the bytes of storage version 2
-/// from the next) are refused by name with `UnsupportedShape`, which says
-/// to upgrade: never a serde error, never "a newer storage version" (the
-/// version is the same).
+/// The storage version 2 shapes the first storage version 2 release
+/// refused by name (ADR 028: a column's `data_type` as a type map, a
+/// `source.dialect`, a key spec with per-key `bounds`, a bitemporal key
+/// spec) are read by this one, the M5 release, and survive a rewrite.
 #[test]
-fn later_storage_version_2_shapes_are_refused_by_name() {
-    let shapes: Vec<(&str, &str, Edit)> = vec![
+fn the_shapes_the_first_storage_version_2_release_refused_now_read() {
+    let shapes: Vec<Shape<'_>> = vec![
         (
-            "manifest column data_type",
-            "of column \"symbol\" (a type map)",
+            "a column data_type in ColumnType spelling",
             Box::new(|v| {
                 v["schema"]["columns"][0]["data_type"] = serde_json::json!({"type": "utf8"});
             }),
+            &|m| {
+                assert_eq!(
+                    m.schema.columns[0].data_type.to_string(),
+                    r#"{"type":"utf8"}"#
+                );
+            },
         ),
         (
-            "manifest column data_type",
-            "of column \"day\" (a type map)",
+            "a column data_type in Arrow spelling",
             Box::new(|v| {
-                v["schema"]["columns"][1]["data_type"] = serde_json::json!({"arrow": "Date32"});
+                v["schema"]["columns"][1]["data_type"] = serde_json::json!({"arrow": "List(Utf8)"});
             }),
+            &|m| {
+                assert_eq!(
+                    m.schema.columns[1].data_type.to_string(),
+                    r#"{"arrow":"List(Utf8)"}"#
+                );
+            },
         ),
         (
-            "manifest source",
-            "dialect",
+            "a source dialect",
             Box::new(|v| {
                 v["source"]["dialect"] =
-                    serde_json::json!({"delimiter": ";", "header": true, "quote": "\""});
+                    serde_json::json!({"delimiter": 59, "header": true, "quote": 34});
             }),
+            &|m| {
+                let d = m.source.dialect.as_ref().unwrap();
+                assert_eq!((d.delimiter, d.header, d.quote), (b';', true, b'"'));
+            },
         ),
         (
-            "key spec with per-key bounds",
-            "exact:symbol@ts,counts",
+            "a key spec with per-key bounds",
             Box::new(|v| {
                 v["schema"]["key_specs"][0]["bounds"] = "ts".into();
             }),
+            &|m| assert_eq!(m.schema.key_specs[0].identity(), "exact:symbol@ts,counts"),
         ),
         (
-            "bitemporal key spec",
-            "temporal2:symbol@valid,known",
+            "a bitemporal key spec",
             Box::new(|v| {
                 v["schema"]["key_specs"].as_array_mut().unwrap().push(
                     serde_json::json!({"kind": "bitemporal", "columns": ["symbol"],
                         "valid_column": "valid", "known_column": "known"}),
                 );
             }),
+            &|m| {
+                assert_eq!(
+                    m.schema.key_specs.last().unwrap().identity(),
+                    "temporal2:symbol@valid,known"
+                );
+            },
         ),
     ];
-    for (what, found, edit) in shapes {
-        let err = edited(edit).unwrap_err();
-        let text = err.to_string();
-        match &err {
-            Error::UnsupportedShape { what: w, found: f } => {
-                assert_eq!((*w, f.as_str()), (what, found), "{text}");
-            }
-            other => panic!("{what}: expected UnsupportedShape, got {other:?}"),
-        }
-        assert!(
-            text.contains(
-                "storage version 2 segment/manifest shape not supported by this binary; upgrade"
-            ) && !text.contains("newer storage version")
-                && !text.contains("serde"),
-            "{text}"
-        );
+    for (what, edit, check) in shapes {
+        let m = edited(edit).unwrap_or_else(|e| panic!("{what}: {e}"));
+        check(&m);
+        let again = Manifest::from_slice(&m.to_vec().unwrap()).unwrap();
+        assert_eq!(again, m, "{what}: rewrite");
     }
 }
 

@@ -1,6 +1,6 @@
-# On-disk format, storage version 2
+# On-disk format, storage version 2 (frozen)
 
-Versioned from the first commit. `bellwether-types::format::STORAGE_VERSION` (2) is written into the manifest and every segment header. A binary that reads a newer version refuses with `Error::UnsupportedVersion` and never downgrades in place (ADR 017). This binary writes storage version 2 and reads version 1 ("Reading storage version 1"). ADR 028 freezes the format in two steps: this release makes the record version 3 shapes final, and the next release freezes the bytes of storage version 2, at M5. Until then a storage version 2 shape that only the next release writes is refused by name with `Error::UnsupportedShape` ("Segments, storage version 2", "Not frozen yet"). `fixtures/format-v1/` (built by the last version 1 binary) and `fixtures/format-v0.1/` (built by this one, pre-M5) are read in CI by every later binary, and every plan and record hash they pin must replay identically (`crates/bellwether-cli/tests/format_compat.rs`).
+Versioned from the first commit. `bellwether-types::format::STORAGE_VERSION` (2) is written into the manifest and into the header of every `BWSEGMNT` segment, a bloom's `bounds` segment included. Two other segment layouts carry their own layout version, 1, in their preamble and header: a `sketch` segment (`BWSKETCH`, "Sketch segments") and a `bounds` or `temporal2` sidecar of an index written before M5 (`BWSIDECR`, "Sidecar kinds"), which no build writes since M5. A binary that reads a newer version refuses with `Error::UnsupportedVersion` and never downgrades in place (ADR 017). This binary writes storage version 2 and reads version 1 ("Reading storage version 1"). **Storage version 2 and record version 3 are frozen (M5, ADR 028):** a later change to the bytes of a segment, a manifest or a record is a new version with a new fixture directory, never an edit. The freeze came in two steps: the first storage version 2 release made the record version 3 shapes final, and the second froze the bytes, folding per-key time bounds into the exact value record and bitemporal versions into a `bitemporal` layout, and spelling a manifest column's `data_type` and a text source's `dialect` ("Segments, storage version 2", "Manifest, storage version 2"). `fixtures/format-v1/` (built by the last version 1 binary), `fixtures/format-v0.1-pre/` (built by the first storage version 2 release, before M5) and `fixtures/format-v0.1/` (built at M5, the frozen bytes) are read in CI by every later binary, and every plan and record hash they pin must replay identically (`crates/bellwether-cli/tests/format_compat.rs`).
 
 ```
 <index-root>/
@@ -8,12 +8,17 @@ Versioned from the first commit. `bellwether-types::format::STORAGE_VERSION` (2)
   manifest.json                  storage_version, sequence (monotonic, +1 per commit; ADR 020),
                                  created_at (first creation, preserved), committed_at (this commit),
                                  commit_nonce (random u64 per commit attempt; detects an applied write reported as 412),
-                                 source{kind, root, fingerprint_policy?, partitioning?}
+                                 source{kind, root, fingerprint_policy?, partitioning?, dialect?}
                                            (partitioning: "hive" when name=value directories are columns,
                                             "template:<pattern>" when a path template's placeholders are; see
-                                            "Partition columns"; absent for none)
+                                            "Partition columns"; absent for none. dialect: a CSV source's
+                                            {delimiter u8, header, quote u8}; see "Manifest, storage version 2")
                                  schema{columns[{name, data_type, nullable}], key_specs[],
-                                        sidecars?[{kind, columns[], time_columns[]}]}   (see "Sidecar kinds")
+                                        sidecars?[{kind, columns[], time_columns[], params?}]}
+                                           (data_type: core's ColumnType JSON, or {"arrow": "<display>"};
+                                            sidecars: kinds no planner reads, such as "sketch"; a manifest
+                                            written before M5 also declares "bounds" and "temporal2" there,
+                                            which the next build with work folds into key specs; see "Sidecar kinds")
                                  rowgroup_space{next_id, files[{fingerprint, rowgroup_ids[], rowgroup_rows[], rowgroup_bytes[],
                                                 column_bytes?[], chunk_size?, chunks?[{start,end}]}],
                                                 tombstones[{since, rowgroup_ids[]}]}   (retired row-group ids, ADR 013)
@@ -25,8 +30,10 @@ Versioned from the first commit. `bellwether-types::format::STORAGE_VERSION` (2)
                                            join? (a join key's segment only: {right_sequence, right_manifest, left_live}, what it pins; see "Join keys")}]
                                            (rowgroup_range = the row groups the segment's writer processed, including
                                             any that held no keys; the spec's coverage, and recorded in the segment too;
-                                            kind is absent for a key spec's segment, "bounds" or "temporal2" for a
-                                            sidecar's; see "Segment kinds" for kinds a reader does not know)
+                                            kind is absent for a key spec's segment, "bounds" for a bloom's per-key
+                                            bounds (key_spec = the bloom's identity) or a pre-M5 sidecar, "temporal2"
+                                            for a pre-M5 sidecar, "sketch" for a sketch; see "Segment kinds" for
+                                            kinds a reader does not know)
                                  segment_tombstones[{id, since}]   (unreferenced segments awaiting GC, ADR 013)
                                  deleting[{id, claimed_at, token, lease_ms}]
                                                                    (GC claims; a commit referencing a claimed id is refused;
@@ -42,18 +49,22 @@ Versioned from the first commit. `bellwether-types::format::STORAGE_VERSION` (2)
                                  decimal digits; written with put_if_absent only after the commit's CAS succeeded,
                                  and backfilled from manifest.json by the next commit if that write failed; never
                                  overwritten and never blocking a commit; see "Manifest history"
-  segments/<blake3>.seg          header{storage_version, encoding_version, key_spec, codec, bloom_hash}
+  segments/<blake3>.seg          header{storage_version, encoding_version, key_spec, codec, layout, bloom_hash}
                                  bloom_hash ∈ {"canonical", "parquet_plain"}; readers refuse any other value
                                  footer index_offset u64 | index_len u64 | checksum u64 | magic; every block,
                                            filter and value record a read touches has its own checksum
                                            (see "Segments, storage version 2")
                                  exact:    block index of sorted key blocks, one split-block bloom per block,
-                                           key → value record: bitmap_len u32 | bitmap | [counts]; bitmaps: roaring,
-                                           over global RowGroupId, always in the no-run serialized form
-                                           (cookie 3a 30 00 00), never empty; readers refuse any other cookie or an
-                                           empty keyed bitmap; counts (spec `counts`): one LEB128 row count per set bit
+                                           key → value record: bitmap_len u32 | bitmap | [counts] | [bounds];
+                                           bitmaps: roaring, over global RowGroupId, always in the no-run serialized
+                                           form (cookie 3a 30 00 00), never empty; readers refuse any other cookie or
+                                           an empty keyed bitmap; counts (spec `counts`): one LEB128 row count per set
+                                           bit; bounds (spec `bounds`, `exact:symbol@ts`): one min i64 | max i64 per
+                                           set bit, the key's time range there, or the all-null sentinel
+                                           (i64::MAX, i64::MIN) where its times are all null
                                  header also records each key column's dataset type (and the temporal ts type
-                                           and unit); segments with differing recorded types never merge
+                                           and unit, and the bounds or bitemporal time types); segments with
+                                           differing recorded types never merge
                                  index records the row-group range the writer processed (inclusive; a merge
                                            records the hull of its inputs'), so a segment whose row groups held
                                            no keys still records them and two segments over different row groups
@@ -64,8 +75,13 @@ Versioned from the first commit. `bellwether-types::format::STORAGE_VERSION` (2)
                                  range:    (min, max) canonical bytes per row group
                                  temporal: exact layout plus key → [(ts, rowgroup_id)] chain + max_ts after the
                                            counts; latest/asof return every row group at the winning ts (ties)
-                                 bounds, temporal2: sidecar segments, their own layout (magic "BWSIDECR"); see
-                                           "Sidecar kinds"
+                                 bitemporal (temporal2:id@valid,known): exact layout whose value record is
+                                           bitmap_len u32 | bitmap | count u32 | count x (valid i64 | known i64 | rg u32)
+                                 bounds:   a bloom's per-key bounds (bloom:id@0.01@ts): the keyed layout under the
+                                           bloom spec, value record bitmap_len u32 | bitmap | bounds, checksummed like
+                                           every keyed record, listed with kind "bounds" under the bloom's identity;
+                                           pre-M5 indexes also hold bounds and temporal2 sidecars in the version 1
+                                           sidecar layout (magic "BWSIDECR"); see "Sidecar kinds"
                                  sketch:   sidecar segment, its own layout (magic "BWSKETCH"); approximate, never
                                            read by a planner; see "Sketch segments"
                                  text:     the exact layout keyed by tokens, or with bloom=<fpr> the bloom layout
@@ -91,11 +107,11 @@ file fingerprint = (path, size, etag: Option<String> (object-store etag, else RF
 rowgroup id      = dense u32 assigned at first sighting of (fingerprint, index_in_file); never reused
 ```
 
-**Manifest column types (amendment, 2026-10-24).** `schema.columns[].data_type` is Arrow's `Display` form of the type, which is Arrow-version dependent (contract v3, entry 9). The dependency upgrade to Arrow 59 changed the form of time units: Arrow 53 wrote `Timestamp(Microsecond, Some("UTC"))`, `Timestamp(Second, None)`, `Time64(Nanosecond)` and `Duration(Millisecond)`; Arrow 59 writes `Timestamp(µs, "UTC")`, `Timestamp(s)`, `Time64(ns)` and `Duration(ms)`. Every other type an index can record is spelled the same. Types that carry child fields (lists and list views, structs, maps, unions, run-end encoding, and dictionaries of them) were never recordable, because Arrow 53 could not parse its own display form of them. Arrow 59 can. Since the second 2026-10-24 amendment (real-data defect 1) the manifest records them by that spelling like any other column, so a dataset with a nested column is indexed on its flat columns; only a key column needs a canonical encoding, and a nested key column is refused naming the column. A nested column whose child fields carry metadata, which Arrow's spelling drops, does not read back as the same type and is refused naming the column. An Arrow 53 binary cannot read a manifest that records a nested column. A reader accepts both forms: the build crate's manifest reader rewrites an old temporal spelling itself when Arrow does not accept it, and a test reads every Arrow 53 spelling and an index whose manifest carries them. The first commit by a newer binary rewrites the spelling to the current form; the types, the segments, and the row-group ids do not change.
+**Manifest column types (amendment, 2026-10-24).** In a storage version 1 manifest, and in a storage version 2 manifest written before M5, `schema.columns[].data_type` is Arrow's `Display` form of the type, which is Arrow-version dependent (contract v3, entry 9). From M5 a build writes it as core's `ColumnType` JSON (`{"type":"int64"}`, `{"type":"timestamp","unit":"microsecond","tz":"UTC"}`, `{"type":"decimal128","precision":10,"scale":2}`), or `{"arrow": "<display>"}` for a type without one (a nested or dictionary column), so a manifest no longer depends on an Arrow version's spelling; a reader accepts both forms, and the first commit with work by an M5 binary rewrites the string form. The rest of this paragraph describes the string form. The dependency upgrade to Arrow 59 changed the form of time units: Arrow 53 wrote `Timestamp(Microsecond, Some("UTC"))`, `Timestamp(Second, None)`, `Time64(Nanosecond)` and `Duration(Millisecond)`; Arrow 59 writes `Timestamp(µs, "UTC")`, `Timestamp(s)`, `Time64(ns)` and `Duration(ms)`. Every other type an index can record is spelled the same. Types that carry child fields (lists and list views, structs, maps, unions, run-end encoding, and dictionaries of them) were never recordable, because Arrow 53 could not parse its own display form of them. Arrow 59 can. Since the second 2026-10-24 amendment (real-data defect 1) the manifest records them by that spelling like any other column, so a dataset with a nested column is indexed on its flat columns; only a key column needs a canonical encoding, and a nested key column is refused naming the column. A nested column whose child fields carry metadata, which Arrow's spelling drops, does not read back as the same type and is refused naming the column. An Arrow 53 binary cannot read a manifest that records a nested column. A reader accepts both forms: the build crate's manifest reader rewrites an old temporal spelling itself when Arrow does not accept it, and a test reads every Arrow 53 spelling and an index whose manifest carries them. The first commit by a newer binary rewrites the spelling to the current form; the types, the segments, and the row-group ids do not change.
 
 ## Key specs
 
-`Exact{columns, counts?}`, `Bloom{columns, fpr}`, `Range{column}`, `Temporal{columns, ts_column, counts?}`, and (phase 5) `Expr{name, expr, over, conformance}` ([Expression keys](#expression-keys-expr-phase-5)), and (phase 5) `Text{column, tokenizer, bloom?}` (see "Text keys"), and (phase 5) `List{column}` (B4; see "List keys"), and (phase 5) `Join{dataset, columns, right, right_columns, counts?}` (B3; see "Join keys"), and (phase 5) `Agg{columns, value, functions}` (B7; see "Agg keys"). Composite is not a kind; every kind takes a column list and encodes it memcomparably (ADR 002). CSV and JSON lines sources define row groups as fixed byte-range chunks recorded in the manifest, so the rest of the system never knows the difference. `counts` (storage version 2) is serialized only when true, so a spec without it has the same JSON as in version 1; a version 1 manifest that carries it is refused.
+`Exact{columns, counts?, bounds?}`, `Bloom{columns, fpr, bounds?}`, `Range{column}`, `Temporal{columns, ts_column, counts?}`, `Bitemporal{columns, valid_column, known_column}` (storage version 2, M5; serialized with `"kind": "bitemporal"` and declared `temporal2:<columns>@<valid_column>,<known_column>`), and (phase 5) `Expr{name, expr, over, conformance}` ([Expression keys](#expression-keys-expr-phase-5)), and (phase 5) `Text{column, tokenizer, bloom?}` (see "Text keys"), and (phase 5) `List{column}` (B4; see "List keys"), and (phase 5) `Join{dataset, columns, right, right_columns, counts?}` (B3; see "Join keys"), and (phase 5) `Agg{columns, value, functions}` (B7; see "Agg keys"). Composite is not a kind; every kind takes a column list and encodes it memcomparably (ADR 002). CSV and JSON lines sources define row groups as fixed byte-range chunks recorded in the manifest, so the rest of the system never knows the difference. `counts` (storage version 2) is serialized only when true, so a spec without it has the same JSON as in version 1; a version 1 manifest that carries it is refused. `bounds` (a time column, storage version 2 at M5) is serialized only when set: on an exact spec its per-key, per-row-group time range is part of each value record; on a bloom spec, which has no per-key record, it is a `bounds` segment listed under the bloom. A bitemporal spec (`temporal2:id@valid,known`) holds every distinct `(valid, known, row group)` version per key in its own `bitemporal` layout. Key and time columns of one spec are all distinct. Before M5 both were sidecars declared in `schema.sidecars` ("Sidecar kinds").
 
 **Key-spec identity (storage version 2).** `KeySpec::identity()` is the canonical string of every field of a spec, and the key under which the manifest lists its segments (`segments[].key_spec`) and its completeness (`key_spec_completeness`):
 
@@ -107,6 +123,9 @@ rowgroup id      = dense u32 assigned at first sighting of (fingerprint, index_i
 | `Range{column: ts}` | `range:ts` |
 | `Temporal{columns: [id], ts_column: ts}` | `temporal:id@ts` |
 | `Temporal{columns: [id], ts_column: ts, counts: true}` | `temporal:id@ts,counts` |
+| `Exact{columns: [a], bounds: ts}` | `exact:a@ts` (with counts `exact:a@ts,counts`) |
+| `Bloom{columns: [a], fpr: 0.01, bounds: ts}` | `bloom:a@0.01@ts` |
+| `Bitemporal{columns: [id], valid_column: valid, known_column: known}` | `temporal2:id@valid,known` |
 | `Expr{name: sym, expr: json_get(payload,'$.symbol'), over: Exact{counts: true}}` | `expr:sym=json_get(payload,'$.symbol'):exact,counts` (bloom: `...:bloom@0.01`) |
 | `Text{column: body, tokenizer: words}` | `text:body,tokenizer=words` |
 | `Text{column: body, tokenizer: trigram, bloom: 0.01}` | `text:body,tokenizer=trigram,bloom=0.01` |
@@ -139,7 +158,7 @@ Bloom hash: xxhash64 over the canonical encoding, split-block filter per the Par
 
 ## Catalog digest
 
-The identity of the data a reader saw, cited by a `Replay` (its `inputs`) and by a `Certificate` (its provenance) so both name the same data the same way. One definition, `bellwether_source::catalog`, which is byte for byte the replay crate's `Catalog` digest (the replay crate's tests check the two on an unindexed folder and on a built index): BLAKE3 over the canonical JSON (`serde_json`, no whitespace) of
+The identity of the data a reader saw, cited by a `Replay` (its `inputs`) and by a `Certificate` (its provenance) so both name the same data the same way. One definition, `bellwether_source::catalog`, which the replay crate's `Catalog` also calls for its digest (since M5; its tests check it on an unindexed folder and on a built index): BLAKE3 over the canonical JSON (`serde_json`, no whitespace) of
 
 ```
 {"manifest_version":<string>,
@@ -286,7 +305,7 @@ A segment is one file, `segments/<blake3 of its bytes>.seg`, readable from this 
 segment             preamble | header | data | index | footer
 preamble            magic "BWSEGMNT" | storage_version u32 | encoding_version u32 | header_len u32
 header              header_len bytes of JSON: {storage_version, encoding_version, key_spec, codec, layout,
-                    bloom_hash, key_types?, ts_type?, value_type?, ..unknown fields, preserved}
+                    bloom_hash, key_types?, ts_type?, time_types?, value_type?, ..unknown fields, preserved}
 data                the layout's blocks, at the offsets the index gives
 index               entries u64 | has_rg u8 | rg_min u32 | rg_max u32 | block_count u32 |
                     block_count x index entry (of the layout)
@@ -294,13 +313,13 @@ footer              index_offset u64 | index_len u64 | checksum u64 | magic "BWS
                     (checksum over preamble ‖ header ‖ index)
 ```
 
-- **Header.** `storage_version` and `encoding_version` equal the preamble's. `codec` is `"none"`. `layout` follows from the key spec's kind: `keyed` (exact), `keyed_temporal` (temporal), `keyed_agg` (agg), `bloom_per_row_group` (bloom), `min_max` (range); any other pairing is refused. `bloom_hash` is `canonical`, or `parquet_plain` for a bloom segment holding a reused single-column Parquet filter (ADR 008). `key_types` (one per key column) and, for a temporal spec, `ts_type` are each key column's dataset type in core's `ColumnType` spelling, present together when the segment was written from a dataset schema. `value_type` is present exactly on an agg segment written from a dataset schema, beside `key_types`: the value column's dataset type, which the cells were encoded and summed at (a decimal's scale is not visible in the bytes); a reader whose dataset type differs refuses the segment on open.
+- **Header.** `storage_version` and `encoding_version` equal the preamble's. `codec` is `"none"`. `layout` follows from the key spec's kind: `keyed` (exact, with or without bounds), `keyed_temporal` (temporal), `bitemporal` (bitemporal), `keyed_agg` (agg), `bloom_per_row_group` (bloom), `min_max` (range), `keyed_join` (join, "Join keys"); the one other pairing is `keyed` under a bloom spec with bounds (`bloom:a@0.01@ts`), which is that bloom's `bounds` segment (listed with `kind: "bounds"`, see "Bounds" below); any other pairing is refused. `bloom_hash` is `canonical`, or `parquet_plain` for a bloom segment holding a reused single-column Parquet filter (ADR 008). `key_types` (one per key column) and, for a temporal spec, `ts_type` are each key column's dataset type in core's `ColumnType` spelling, present together when the segment was written from a dataset schema; with them, an exact spec with bounds (and a bloom's `bounds` segment) records its bounds column's type and a bitemporal spec its valid and known columns' types in `time_types`, in that order. A storage version 1 header whose spec has bounds or is bitemporal is refused. `value_type` is present exactly on an agg segment written from a dataset schema, beside `key_types`: the value column's dataset type, which the cells were encoded and summed at (a decimal's scale is not visible in the bytes); a reader whose dataset type differs refuses the segment on open.
 - **Index header.** `entries` counts keys (keyed layouts), range entries (`min_max`) or the sum of the filters' distinct-value estimates (`bloom_per_row_group`). `rg_min..=rg_max` is the row-group range the writer processed, inclusive (see the tree above); `has_rg` is 0, with both bounds 0, only for a segment that recorded no range.
 
 The layouts:
 
 ```
-keyed, keyed_temporal, keyed_agg (exact, temporal, agg specs)
+keyed, keyed_temporal, bitemporal, keyed_agg (exact, temporal, bitemporal, agg specs; keyed also for a bloom's bounds segment)
   block             value records | bloom | directory, in that order; at most 1024 keys or 64 KiB of
                     key bytes per block; keys strictly ascending across the segment
   index entry       first_key bytes | last_key bytes | bloom_off u64 | bloom_len u32 | bloom_checksum u64 |
@@ -308,13 +327,23 @@ keyed, keyed_temporal, keyed_agg (exact, temporal, agg specs)
   bloom             a split-block bloom filter (Parquet's layout) over the block's keys, hashed canonically
   directory (body)  n u32 | (n+1) key end offsets u32, the first 0 | key bytes |
                     n x (value_offset u64 | value_len u32 | value_checksum u64)
-  value record      bitmap_len u32 | bitmap | [counts] | [chain] | [cells]
+  value record      bitmap_len u32 | bitmap | [counts] | [bounds] | [chain] | [versions] | [cells]
   bitmap            roaring over global RowGroupId, in the no-run serialized form (cookie 3a 30 00 00),
                     never empty
   counts            spec has counts: one unsigned LEB128 u64 per set bit, in ascending row-group order
+  bounds            exact spec with bounds, or a bloom's bounds segment: one (min i64 | max i64) per set bit, in ascending row-group
+                    order: the bounds column's range over the key's rows in that row group, min <= max;
+                    or the all-null sentinel (min = i64::MAX, max = i64::MIN: ff ff ff ff ff ff ff 7f
+                    00 00 00 00 00 00 00 80) where every such row has a null time
   chain             temporal only: count u32 | has_max u8 | max_ts i64 | count x (ts i64 | rg u32);
                     the distinct (ts, row group) pairs of the key's non-null times, strictly ascending;
                     has_max = 1 and max_ts = the last ts when count > 0, else 0 and 0
+  versions          bitemporal only: count u32 | count x (valid i64 | known i64 | rg u32); the key's
+                    distinct versions over rows where neither time is null, strictly ascending by
+                    (valid, known, rg), count >= 1, and their row groups are exactly the bitmap's;
+                    valid is in the valid column's dataset unit and known in the known column's
+                    (each as bounds take theirs: a timestamp in its unit, a Date32 in days, a
+                    Date64 in milliseconds, an integer as stored), so the two clocks may differ
   cells             keyed_agg only: one cell per set bit, in ascending row-group order (see "Agg keys")
 
 bloom_per_row_group (bloom specs)
@@ -331,8 +360,10 @@ min_max (range specs)
 - **Checksums.** A reader checks the footer's checksum when it opens a segment, and the checksum of every filter, directory and value record before it decodes one. A mismatch is refused as a corrupt segment (`corrupt segment: …`, the corrupt-index class), never decoded into an answer. A lookup still holds the index, one block and the values of the keys asked (ADR 018).
 - **Counts** are present exactly when the header's `key_spec` has `counts: true`. Each is the number of rows in that row group whose key tuple is this key: at least 1, in its shortest LEB128 form (an over-long form or one past 64 bits is refused), and nothing may follow the last one (or the chain). Rows whose leading key column is null are not indexed and not counted; a trailing null element of a composite key is the `0x00` marker and counts under that tuple (ADR 014). A temporal count is the key's rows in the row group over all versions, including rows with a null time, which never win. `SegmentReader::counts(keys)` returns `None` for a segment without counts, never zero.
 - **Merge** sums the counts of a (key, row group) only when the inputs' row groups are disjoint, as the build's contiguous groups are, and refuses inputs that both count one key in one row group. Its output is written at this build's storage version. A read that finds two listed segments of one counted spec both counting one (key, row group) refuses the index as corrupt rather than summing them.
-- A segment header at storage version 1 that declares `counts` is refused.
-- **Not frozen yet (ADR 028).** Storage version 2's bytes are frozen by the next release, at M5; this one makes the record version 3 shapes final. Per-key time bounds (`exact:symbol@ts`) and bitemporal versions (`temporal2:id@valid,known`) are still the version 1 sidecar segments of "Sidecar kinds", declared in `schema.sidecars`. The next release folds them into the exact value record (`[counts] | [bounds]`) and a `bitemporal` layout, writes a manifest column's `data_type` in core's `ColumnType` spelling and a text source's `source.dialect`. This binary refuses each of those shapes by name, never misreading them and never calling them a newer storage version (the version is the same): a segment header with the `bitemporal` layout, a bitemporal key spec, a key spec with `bounds` or a header `bounds` field, and a manifest whose `data_type` is a map, which has a `source.dialect`, or which declares a key spec with `bounds` or of the bitemporal kind. The refusal is `Error::UnsupportedShape`: "`<shape> <where>`: storage version 2 segment/manifest shape not supported by this binary; upgrade bellwether to read this index" (exit 4; MCP `unsupported_version`).
+- A segment header at storage version 1 that declares `counts`, `bounds` or a bitemporal spec is refused.
+- **Bounds** are present exactly when the header's `key_spec` is an exact spec with `bounds`, or a bloom spec with `bounds` in the `keyed` layout. The latter is the bloom's `bounds` segment: a bloom has no per-key record, so its per-key bounds are a second segment of the bloom whose value records are `bitmap | bounds` (the exact spec's record without counts), checksummed like every keyed record. The manifest lists it with `kind: "bounds"` and the bloom's identity as `key_spec`, and the bloom is complete when its filters and its bounds both cover every live row group. Merge never merges a bloom's filters with its bounds. Times are `i64` in the bounds column's dataset unit (a timestamp in its unit, a `Date32` in days, a `Date64` in milliseconds), as temporal specs take them. A window lookup `(keys, [lo, hi])` keeps a row group for a key only when the key's own `[min, max]` there overlaps `[lo, hi]`; the sentinel overlaps no window (not even one ending at `i64::MAX`), because a row group where the key's times are all null holds no row of any window. `SegmentReader::bounds(keys)` returns the non-sentinel ranges and `None` for a segment without bounds; `SegmentReader::get` returns the stored record, sentinel included. A bounds record must be one pair per set bit, each `min <= max` or the sentinel; anything else is refused. **Merge** widens one (key, row group)'s bounds across inputs, `[min(a, c), max(b, d)]`, so the sentinel absorbs into any real range and stays only where every input's times are all null; it unites bitemporal versions and deduplicates them. Counts still refuse an overlapping (key, row group).
+- **Bitemporal.** The as-of answer for `(V, K)`, either optional, is per key the greatest `valid <= V` among versions with `known <= K`, then the greatest `known` at that valid time; every row group holding that pair is planned (ties are kept), and retired row groups never win. The residual is that of the version 1 `temporal2` sidecar ("Sidecar kinds"). A row whose valid or known time is null is not a version (ADR 014); a key with no version is not stored.
+- **Frozen (M5, ADR 028).** These are the bytes of storage version 2. The first storage version 2 release kept per-key bounds and bitemporal versions in the version 1 sidecar segments of "Sidecar kinds", declared in `schema.sidecars`, and refused the folded shapes by name (`Error::UnsupportedShape`, since removed); a binary of that release given an M5 index still refuses it with that error. This binary reads an index of that release as written ("Sidecar kinds": its sidecars plan as before) and folds them on its first build with work: each `bounds:<keys>@<ts>` sidecar becomes the bounds of the exact spec on those keys without bounds, else of the bloom spec on them without bounds, else a new `exact:<keys>@<ts>`; each `temporal2` sidecar becomes a bitemporal key spec; the folded specs are rebuilt in the folded layouts, the sidecar declarations and segments are dropped, and `bellwether index` lists each fold (`sidecars_folded`). A sidecar none of these fits is never discarded: a `temporal2` sidecar whose bitemporal spec name is taken by one on other clocks (`temporal2:sym@ts,known` beside `temporal2:sym@valid,known`), or a `bounds` sidecar whose exact spec already keeps bounds on another column (`bounds:sym@valid` beside `exact:sym@ts`), stays declared as a sidecar with its segments, is built like any target and still plans; `bellwether index` lists it (`kept_legacy`). A build with nothing to do writes nothing, and `bellwether index` names the folds it would make (`fold_pending`).
 
 ### Roaring bitmaps
 
@@ -448,6 +479,48 @@ A file whose arrays are present but do not align with its row groups or the sche
 
 **Size.** The arrays cost about 8 bytes of decimal text per (row group, column). An index over 10^5 row groups of 50 columns carries a manifest of about 40 MB; beyond that, externalized statistics are a storage version 3 question, not solved here.
 
+**Column types (M5).** `schema.columns[].data_type` is core's `ColumnType` JSON, the spelling a segment header records (`{"type":"utf8"}`, `{"type":"timestamp","unit":"microsecond","tz":"UTC"}`, `{"type":"decimal128","precision":10,"scale":2}`, `{"type":"date32"}`), or `{"arrow": "<Arrow display>"}` for a type `ColumnType` has no spelling for or whose spelling reads back as another type: a nested column (never a key) or a dictionary column (a segment header records a dictionary key column as its value type, since the encoding sees only decoded values). A reader also accepts the storage version 1 string (Arrow's display form; see "Manifest column types"), which a manifest written before M5 carries; a build with work writes the JSON form. A new index infers each column's type over every file; a decimal column of different scales takes the widest precision and scale.
+
+Every `ColumnType` spelling, one per variant (a timestamp's `tz` is absent without a zone, and is the zone string the dataset declares, an offset or an IANA name, otherwise); `crates/bellwether-core/tests/column_type_spellings.rs` checks that each Arrow type serializes to its row and reads back from it, and that this table lists exactly these:
+
+| Arrow type | `ColumnType` JSON |
+|---|---|
+| `Boolean` | `{"type":"boolean"}` |
+| `Int8` | `{"type":"int8"}` |
+| `Int16` | `{"type":"int16"}` |
+| `Int32` | `{"type":"int32"}` |
+| `Int64` | `{"type":"int64"}` |
+| `UInt8` | `{"type":"uint8"}` |
+| `UInt16` | `{"type":"uint16"}` |
+| `UInt32` | `{"type":"uint32"}` |
+| `UInt64` | `{"type":"uint64"}` |
+| `Float16` | `{"type":"float16"}` |
+| `Float32` | `{"type":"float32"}` |
+| `Float64` | `{"type":"float64"}` |
+| `Decimal128(10, 2)` | `{"type":"decimal128","precision":10,"scale":2}` |
+| `Decimal256(40, -2)` | `{"type":"decimal256","precision":40,"scale":-2}` |
+| `Utf8` | `{"type":"utf8"}` |
+| `LargeUtf8` | `{"type":"large_utf8"}` |
+| `Utf8View` | `{"type":"utf8_view"}` |
+| `Binary` | `{"type":"binary"}` |
+| `LargeBinary` | `{"type":"large_binary"}` |
+| `BinaryView` | `{"type":"binary_view"}` |
+| `FixedSizeBinary(16)` | `{"type":"fixed_size_binary","size":16}` |
+| `Date32` | `{"type":"date32"}` |
+| `Date64` | `{"type":"date64"}` |
+| `Time32(Second)` | `{"type":"time32","unit":"second"}` |
+| `Time32(Millisecond)` | `{"type":"time32","unit":"millisecond"}` |
+| `Time64(Microsecond)` | `{"type":"time64","unit":"microsecond"}` |
+| `Time64(Nanosecond)` | `{"type":"time64","unit":"nanosecond"}` |
+| `Timestamp(Second, None)` | `{"type":"timestamp","unit":"second"}` |
+| `Timestamp(Millisecond, "UTC")` | `{"type":"timestamp","unit":"millisecond","tz":"UTC"}` |
+| `Timestamp(Microsecond, "+01:00")` | `{"type":"timestamp","unit":"microsecond","tz":"+01:00"}` |
+| `Timestamp(Nanosecond, "America/New_York")` | `{"type":"timestamp","unit":"nanosecond","tz":"America/New_York"}` |
+
+The `{"arrow": …}` form is Arrow's display string, which depends on the Arrow version (the arrow-59 upgrade changed the time units'). `fixtures/format-v0.1/index-nested/` pins the spellings an Arrow 59 build writes, and every later binary must read them: `{"arrow": "List(Utf8, field: 'element')"}`, `{"arrow": "Struct(\"venue\": Utf8, \"lot\": Int32)"}`, `{"arrow": "Map(\"key_value\": non-null Struct(\"key\": non-null Utf8, \"value\": Int64), unsorted)"}` and `{"arrow": "Dictionary(Int32, Utf8)"}` (`crates/bellwether-cli/tests/format_compat.rs`).
+
+**Source dialect (M5).** A CSV source records its dialect as `source.dialect: {delimiter, header, quote}`, the delimiter and quote as byte values (`{"delimiter": 44, "header": true, "quote": 34}` for a comma, a header row and `"`), beside `source.kind: "csv"`. A storage version 1 manifest spelled a dialect other than comma-with-header inside `kind` (`csv;delimiter=<byte>;header=<bool>`), which is still read; a build with nothing else to do does not respell it. A dialect beside a kind that has none, or a quote other than `"`, is refused.
+
 The minimal version 2 manifest, in the canonical form `Manifest::to_vec` writes (sorted keys, two-space indent). `crates/bellwether-store/tests/manifest_v2.rs` reads it, writes it back byte for byte, checks that this section shows it exactly, and sweeps every byte of it:
 
 ```json
@@ -494,12 +567,16 @@ The minimal version 2 manifest, in the canonical form `Manifest::to_vec` writes 
   "schema": {
     "columns": [
       {
-        "data_type": "Utf8",
+        "data_type": {
+          "type": "utf8"
+        },
         "name": "symbol",
         "nullable": true
       },
       {
-        "data_type": "Date32",
+        "data_type": {
+          "type": "date32"
+        },
         "name": "day",
         "nullable": true
       }
@@ -547,11 +624,34 @@ The minimal version 2 manifest, in the canonical form `Manifest::to_vec` writes 
 | exact value `"AAPL"`, row groups {0, 2}, counts [3, 1] | `14 00 00 00 3a 30 00 00 01 00 00 00 00 00 01 00 10 00 00 00 00 00 02 00 03 01` |
 | exact value `"MSFT"`, row group {1}, counts [300] | `12 00 00 00 3a 30 00 00 01 00 00 00 00 00 00 00 10 00 00 00 01 00 ac 02` |
 
-The same test checks that every segment in `fixtures/format-v1/` and `fixtures/format-v0.1/` is named by the blake3 of its bytes.
+The same test checks that every segment in `fixtures/format-v1/`, `fixtures/format-v0.1-pre/` and `fixtures/format-v0.1/` is named by the blake3 of its bytes.
+
+## Folded layout conformance vectors
+
+`crates/bellwether-core/tests/folded_conformance.rs` writes three segments over `symbol` (row groups 0..4, no recorded types) and checks every row of this table byte for byte: it finds each value record exactly once in its segment, followed in the directory by its offset, length and checksum, and checks each segment's blake3.
+
+- `exact:symbol@ts,counts`: `"AAPL"` in row group 0 (three rows, times `1`, `86400000000` and null) and row group 2 (one row, null time, so the all-null sentinel); `"MSFT"` in row group 1 (two rows, times `-1` and `1`).
+- the `bounds` segment of `bloom:symbol@0.01@ts`: the same rows; its header is `{"storage_version":2,"encoding_version":1,"key_spec":{"kind":"bloom","columns":["symbol"],"fpr":0.01,"bounds":"ts"},"codec":"none","layout":"keyed","bloom_hash":"canonical"}` and its records are the exact spec's without counts.
+- `temporal2:symbol@valid,known`: `"AAPL"` versions `(1, 1)` in row group 0 and `(1, 86400000000)` in row group 2; `"MSFT"` version `(86400000000, 86400000000)` in row group 1.
+
+| Vector | Bytes |
+|---|---|
+| `"AAPL"` key | `06 41 41 50 4c 00 00` |
+| `exact:symbol@ts,counts` value `"AAPL"`: row groups {0, 2}, counts [3, 1], bounds [1, 86400000000] and the all-null sentinel | `14 00 00 00 3a 30 00 00 01 00 00 00 00 00 01 00 10 00 00 00 00 00 02 00 03 01 01 00 00 00 00 00 00 00 00 60 d7 1d 14 00 00 00 ff ff ff ff ff ff ff 7f 00 00 00 00 00 00 00 80` |
+| `exact:symbol@ts,counts` value `"MSFT"`: row group {1}, counts [2], bounds [-1, 1] | `12 00 00 00 3a 30 00 00 01 00 00 00 00 00 00 00 10 00 00 00 01 00 02 ff ff ff ff ff ff ff ff 01 00 00 00 00 00 00 00` |
+| `bloom:symbol@0.01@ts` bounds segment value `"AAPL"`: row groups {0, 2}, bounds [1, 86400000000] and the all-null sentinel | `14 00 00 00 3a 30 00 00 01 00 00 00 00 00 01 00 10 00 00 00 00 00 02 00 01 00 00 00 00 00 00 00 00 60 d7 1d 14 00 00 00 ff ff ff ff ff ff ff 7f 00 00 00 00 00 00 00 80` |
+| `bloom:symbol@0.01@ts` bounds segment value `"MSFT"`: row group {1}, bounds [-1, 1] | `12 00 00 00 3a 30 00 00 01 00 00 00 00 00 00 00 10 00 00 00 01 00 ff ff ff ff ff ff ff ff 01 00 00 00 00 00 00 00` |
+| `temporal2:symbol@valid,known` value `"AAPL"`: (1, 1, rg 0), (1, 86400000000, rg 2) | `14 00 00 00 3a 30 00 00 01 00 00 00 00 00 01 00 10 00 00 00 00 00 02 00 02 00 00 00 01 00 00 00 00 00 00 00 01 00 00 00 00 00 00 00 00 00 00 00 01 00 00 00 00 00 00 00 00 60 d7 1d 14 00 00 00 02 00 00 00` |
+| `temporal2:symbol@valid,known` value `"MSFT"`: (86400000000, 86400000000, rg 1) | `12 00 00 00 3a 30 00 00 01 00 00 00 00 00 00 00 10 00 00 00 01 00 01 00 00 00 00 60 d7 1d 14 00 00 00 00 60 d7 1d 14 00 00 00 01 00 00 00` |
+| `exact:symbol@ts,counts` segment blake3 | `74acef3b4710583ea99596f607094102ef917fbcdae93cf774ec3930c62f41bf` |
+| `bloom:symbol@0.01@ts` bounds segment blake3 | `083eb7d2da5c3589bb2a290b634e66346561d8e78fb6135a8906aa8b5b57a775` |
+| `temporal2:symbol@valid,known` segment blake3 | `0771c6c1083255732be1d9b1d870cd3c9f24063320be2e87f4d27cdc2d48df0a` |
+
+The same test also checks, over a Parquet file of seven row groups with null keys, null times, the extreme `i64` times and a key whose times are all null in one row group: that each value record the writer builds from the file's row groups equals one computed row by row from the file; that a window plan through the stored bounds is exactly the row groups whose per-key range overlaps the window, never one holding only the sentinel (a window ending at `i64::MAX` included), and so never misses a row in the window; that a build split in two merges back to the same bytes; that merge widens one row group's bounds across inputs, the sentinel absorbing into any real range; and that every byte value at every body position, and every truncation, of each folded layout (a bloom's `bounds` segment included) is refused or reads the clean value, never a panic. `crates/bellwether-cli/tests/bloom_bounds_corruption.rs` rewrites the value records of a built index's bloom `bounds` segment in place, keeping its file name, and checks that a window `locate` is refused as a corrupt index rather than planned.
 
 ## Reading storage version 1
 
-- **Segments.** A version 1 segment has the 24-byte footer without a checksum and no other checksums; an exact value record is the bare bitmap and a temporal one the length-prefixed bitmap and the chain. It never stores counts: `SegmentReader::counts` returns `None`, and its value bytes are never read as counts. Sidecar segments (`BWSIDECR`, "Sidecar kinds") are unchanged in version 2.
+- **Segments.** A version 1 segment has the 24-byte footer without a checksum and no other checksums; an exact value record is the bare bitmap and a temporal one the length-prefixed bitmap and the chain. It never stores counts: `SegmentReader::counts` returns `None`, and its value bytes are never read as counts. Sidecar segments (`BWSIDECR`, "Sidecar kinds") are unchanged in version 2; since M5 only an index written before M5 holds them.
 - **Manifests.** Keys are rewritten from names to identities on read ("Key-spec identity"). Without the arrays, a plan opens each planned file's footer, as version 1 did. `storage_version` stays 1 until a commit: `bellwether index` with nothing to do commits nothing and leaves the index at version 1, readable by a version 1 binary; the first build with work fills the arrays, commits at version 2 and says so (`manifest upgraded to storage version 2`). Every plan of the version 1 index pinned to its earlier sequences (`--at-manifest`) is unchanged by the upgrade. Its specs are read as they were declared, whatever their column names. Two of them that share an identity (two temporal specs whose time column holds an `@`) are read under `v1-shared-identity:<name>` keys, which no identity equals, so neither plans; every build refuses before reading or writing anything, naming both specs in their JSON form and the step that upgrades the index: re-declare the one whose key columns have no `,` or `@` under its name with another time column (`--key '{"kind":"temporal","columns":["id"],"ts_column":"ts"}'`; a spec declared under an existing name replaces it), or, when both key columns hold one, move the index folder aside and index again. A storage version 2 manifest with two such specs is refused as a corrupt index: no build commits one.
 
 ## Inference stability (2026-10-24)
@@ -572,7 +672,7 @@ An index built with `--partitioning hive` records `source.partitioning = "hive"`
 
 ## Plan order (2026-10-24)
 
-A plan's entries are one per file and name their row groups as a set, read in ascending index. When a complete range key on a timestamp or date column exists (several: the one on the lookup's own time column), lookups order entries by the smallest row-group minimum among each entry's planned row groups, as the range key's segments record it (no minimum, every value null: last; ties by path), and the result names the column (`ordered_by`) only when reading entries in order, each entry's row groups ascending, visits every planned row group in non-decreasing minimum. Otherwise the result says the order is unspecified and why (two files overlap in time, or a file's own row groups run out of time order). The planned row groups and bytes never depend on the order.
+A plan's entries are one per file and name their row groups as a set, read in ascending index. When a complete range key on a timestamp or date column exists (several: the one on the lookup's own time column), lookups order entries by the smallest row-group minimum among each entry's planned row groups, as the range key's segments record it (no minimum, every value null: last; ties by path), and the result names the column (`ordered_by`). When reading entries in order, each entry's row groups ascending, visits every planned row group in non-decreasing minimum, the plan has no `order`. Otherwise (two files overlap in time, or a file's own row groups run out of time order) the plan's `order` (M5) lists every planned `(entry, row group)` pair in non-decreasing minimum, interleaving files, so a reader that follows it reads in time order. Without a complete range key the result says the order is unspecified and why. The planned row groups and bytes never depend on the order.
 
 ## Manifest history (2026-10-24)
 
@@ -580,9 +680,11 @@ A plan's entries are one per file and name their row groups as a set, read in as
 
 ## Segment kinds (2026-10-24)
 
-`segments[].kind` names what a segment is: absent for a key spec's segment, or a sidecar kind (`bounds`, `temporal2`). A reader that finds a `kind` it does not know, in `segments[]` or in `schema.sidecars[]`, still opens the manifest; it never plans with, merges, or counts toward coverage a segment of that kind, a build keeps the segment and the declaration unchanged, and the unknown kinds are reported (`bellwether index` lists them). This is the rule that lets a later version add a sidecar kind without a storage version bump. A binary that predates the field keeps both as unknown fields; it never plans with a sidecar's segments, because their `key_spec` is the sidecar's name, which no key spec has, and a build by such a binary drops them as undeclared, after which the sidecar is incomplete until rebuilt.
+`segments[].kind` names what a segment is: absent for a key spec's segment, or a sidecar kind: `bounds` (a bloom's per-key bounds, a storage version 2 `keyed` segment listed under the bloom's identity, or a sidecar of an index written before M5), `temporal2` (a sidecar of an index written before M5), `sketch` ("Sketch segments"). A reader that finds a `kind` it does not know, in `segments[]` or in `schema.sidecars[]`, still opens the manifest; it never plans with, merges, or counts toward coverage a segment of that kind, a build keeps the segment and the declaration unchanged, and the unknown kinds are reported (`bellwether index` lists them). This is the rule that lets a later version add a sidecar kind without a storage version bump. A binary that predates the field keeps both as unknown fields; it never plans with a sidecar's segments, because their `key_spec` is the sidecar's name, which no key spec has, and a build by such a binary drops them as undeclared, after which the sidecar is incomplete until rebuilt.
 
 ## Sidecar kinds (storage version 1, additive sidecar kinds, 2026-10-24)
+
+**Since M5 no build declares a `bounds` or `temporal2` sidecar**: per-key bounds are part of an exact spec's value record or a bloom's `bounds` segment, and bitemporal versions are a key spec of their own ("Segments, storage version 2"). This section describes the sidecars an index written before M5 holds, which this binary reads and plans with as written until its first build with work folds them (a sidecar no key spec can take stays a sidecar, "Segments, storage version 2", Frozen), and their `BWSIDECR` layout. A bloom's `bounds` segment is not in this layout: it is a storage version 2 `keyed` segment with a checksum on every record.
 
 A sidecar is declared in `schema.sidecars[]` as `{kind, columns, time_columns}` and named `<kind>:<columns joined by ,>@<time columns joined by ,>`. Its segments are listed in `segments[]` with that `kind` and that name as `key_spec`, are complete under that name in `key_spec_completeness` exactly as a key spec is (their recorded ranges cover every live row group), and are built over the row groups they do not cover, like a key spec. An incomplete `bounds` sidecar is not used (the plan is a superset, never short); a bitemporal lookup without a complete `temporal2` sidecar is refused.
 
@@ -619,7 +721,9 @@ A block holds at most 1024 keys or 64 KiB of key bytes. Readers refuse a newer s
 
 ### Sidecar proposal vectors
 
-Record version 3 can already propose the specs the next storage version 2 release makes declarable (ADR 028): a key whose exact spec carries per-key `bounds`, a bitemporal key, and a key with specs applied beside it (`ProposalBody::Key.sidecars`). Their records are final now, whichever release builds them. `bellwether-types`' `sidecar_proposal_vectors_match_docs_format_md` writes these three proposals, checks that this block lists exactly their canonical JSON, one record per line, and reads each line back to the same record:
+**Recorded lookback runs (a limit of record version 3).** A workload run's `lookback` is a length in the unit of the column it was measured on, and the run does not record that column: replay takes it to be the column the current configuration plans the run on (`Replayer::planned_time_column`), and converts the window outward (the lower bound rounded down, the upper bound up) to a candidate's column when the candidate plans on another, in replay and in `fix`'s verify alike. A run whose current configuration plans it on no time column is measured on the candidate's column. Recording the column is a new field, so it waits for record version 4.
+
+Record version 3 proposes the specs storage version 2 declares since M5 (ADR 028): a key whose exact spec carries per-key `bounds`, a bitemporal key, and a key with specs applied beside it (`ProposalBody::Key.sidecars`). Their records were final from the first storage version 2 release, before M5 made them declarable. `bellwether-types`' `sidecar_proposal_vectors_match_docs_format_md` writes these three proposals, checks that this block lists exactly their canonical JSON, one record per line, and reads each line back to the same record:
 
 ```json
 {"record":"proposal","record_version":3,"evidence":["eda5d831cf40b9fa97713a4eb5eec65e322a1a05ab2c8dad5ce1f7907e10236c"],"proposed_by":"agent","created_at":"2026-10-25T00:00:00.000Z","body":{"kind":"key","spec":{"kind":"exact","columns":["symbol"],"bounds":"ts"}}}
@@ -627,7 +731,7 @@ Record version 3 can already propose the specs the next storage version 2 releas
 {"record":"proposal","record_version":3,"evidence":["eda5d831cf40b9fa97713a4eb5eec65e322a1a05ab2c8dad5ce1f7907e10236c"],"proposed_by":"agent","created_at":"2026-10-25T00:00:00.000Z","body":{"kind":"key","spec":{"kind":"exact","columns":["symbol"],"counts":true},"sidecars":[{"kind":"bloom","columns":["symbol"],"fpr":0.01,"bounds":"ts"}]}}
 ```
 
-A binary of this release that finds one of these specs in a manifest or a segment header refuses it with `Error::UnsupportedShape` (see "Segments, storage version 2").
+`fix` applies each of them since M5: the spec, and any specs beside it, are built, verified and receipted together. A binary of the first storage version 2 release refuses these specs in a manifest or a segment header with `Error::UnsupportedShape`.
 
 ## Sketch segments (storage version 1, additive sidecar kind, 2026-10-26)
 
