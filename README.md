@@ -105,7 +105,7 @@ An agent (or a person) may **observe** and **propose**. Only the engine may **sc
 - [Questions over time](#questions-over-time)
 - [For a coding agent](#for-a-coding-agent)
 - [How it compares](#how-it-compares)
-- [Planned: evolve](#planned-evolve)
+- [Planned: advise](#planned-advise)
 - [Architecture](#architecture)
 - [Run it](#run-it)
 - [Query engines as sources](#query-engines-as-sources)
@@ -320,9 +320,11 @@ What Bellwether deliberately is not:
 - **Not a table format.** It never rewrites your data or asks you to convert it.
 - **Not a database.** If your data fits in Postgres or SQL Server, use their indexes. Bellwether is for data that lives as files because it is too big, too shared, or owned by a pipeline.
 
-## Planned: evolve
+## Planned: advise
 
-Most LLM query optimizers score their own suggestions with an estimate and verify them by hope. Bellwether has the two things text-space optimizers like [GEPA](https://arxiv.org/abs/2507.19457) and [SkillOpt](https://github.com/microsoft/SkillOpt) need and most data systems lack: a loss you cannot game (exact replay) and a gate you cannot skip (reconciliation). `advise` and `evolve` (M6) are to be that loop applied to data pipelines: a search over query plans, physical designs, and whole pipelines, each candidate scored by exact replay, gated by reconciliation, and selected by Pareto across your recorded runs with held-out anchors. It ships in three stages, each useful alone and each opened by a measured trigger: `advise` first (deterministic, no language model: rule-driven enumeration, exact finite-difference descent on knobs, layout and materialization search, receipts for every admitted change); `evolve --llm` only if `advise` leaves anti-patterns that need a structural rewrite, with scoped proposers fed by counterfactual attribution, within a stated cost per accepted mutation; rulebook promotion last, each rule promoted only by temporally held-out replay. If `advise` already captures the frontier, stages two and three do not ship. It is a design, not yet code: [`docs/evolve.md`](docs/evolve.md), ADRs [021](docs/adr/021-reflective-workload-optimization.md) through [025](docs/adr/025-rulebook-validation.md), [031](docs/adr/031-scoped-proposers-and-a-frozen-outer-loop.md), and [032](docs/adr/032-staged-delivery-with-a-measured-trigger.md).
+Bellwether can price any key spec against your recorded runs exactly, by replay, and certify it by reconciliation. `advise` (M6) is to use that to choose for you: a set of key specs and the numeric knobs replay prices (bloom false-positive rate, key-count gates), searched against every recorded run, selected by Pareto across runs so the median batch cannot buy its gain from the p95 one, with index bytes and build time counted as cost and a receipt for every change it admits. No language model. It starts once planning is faster than a full scan (WP22b), because the loss is bytes read and today fewer bytes do not yet mean less time.
+
+A language-model search over pipeline rewrites (`evolve --llm`) and a learned rulebook are designed ([`docs/evolve.md`](docs/evolve.md), ADRs [021](docs/adr/021-reflective-workload-optimization.md) through [025](docs/adr/025-rulebook-validation.md) and [031](docs/adr/031-scoped-proposers-and-a-frozen-outer-loop.md)) but deferred ([ADR 032](docs/adr/032-staged-delivery-with-a-measured-trigger.md), amended 2026-10-27): the rewrites they target cross pipeline steps, no recorded multi-step pipeline exists to search, and a coding agent already proposes keys and rewrites over MCP while the engine scores, verifies, and applies them.
 
 ## Architecture
 
@@ -394,9 +396,8 @@ bellwether why ./orders/ --workload <workload hash> --twin-of "$ENGINE" --gate i
 bellwether propose ./orders/ --rewrite before.sql=after.sql --evidence <twin evidence> --by me
 bellwether fix ./orders/ --twin-of "$ENGINE" --proposal <proposal hash> --scratch ./orders/_scratch
 
-# Arriving later (M6, staged): advise first, with no language model; evolve only if advise leaves rewrites it cannot reach
-bellwether advise ./pipeline/ --workload runs/
-bellwether evolve ./pipeline/ --workload runs/ --llm --budget 50g
+# Arriving later (M6): advise chooses a key set and knobs against the recorded workload, with no language model
+bellwether advise ./orders/ --workload <workload hash>
 ```
 
 Every command takes `--json` and then prints its typed result as one JSON line, with each ledger record it wrote embedded with its hash: the same value the MCP server returns (ADR 010). Exit codes: 0 success, 1 a certificate failed or mismatches were found, 2 usage, 3 refused at the trust boundary, 4 engine error.
@@ -459,19 +460,18 @@ Pre-alpha. The architecture and on-disk format are fixed and documented; the cra
 - [x] **M3** receipts: `fix` writes one
 - [x] **M4** agent-first: the loop runs end to end from an MCP client
 - [x] **M5** the format frozen: storage version 2 (per-key counts, per-column bytes, per-key time bounds and bitemporal versions folded into key specs) and record version 3, with compatibility fixtures read byte for byte in CI (ADR 028); records moved to version 4 with tombstones, storage stays version 2
-- [ ] **M6** staged optimization against your recorded workload: `advise` first (no language model; enumeration, knob descent, layout and materialization search, with receipts), then `evolve --llm` only if `advise` leaves structural anti-patterns, then rulebook promotion; each stage a replayable run in the ledger; the loss covers the relational operators (projection, joins, windows, aggregation input) exactly
+- [ ] **M6** `advise` against your recorded workload: a key set and knobs chosen by exact replay, Pareto across runs, a receipt for every admitted change, no language model; the loss covers the relational operators (projection, joins, windows, aggregation input) exactly. `evolve --llm` and the rulebook are deferred (ADR 032, amended 2026-10-27)
 - [ ] **M7** a SQL table reconciles against a folder of files with a certificate; plans execute inside DataFusion and DuckDB without a sidecar step; receipts gate pull requests
-- [ ] **M8** rules transfer across datasets and the exact-versus-estimated ablation is measured; receipts are signed (signing landed with [#10](https://github.com/vncp/bellwether/pull/10))
+- [ ] **M8** receipts are signed (landed with [#10](https://github.com/vncp/bellwether/pull/10)); rule transfer and the exact-versus-estimated ablation are deferred with the rulebook
 
 Built beyond the milestones: the time-series keys (partition values from paths, ordered plans, `--at-manifest` pinned lookups, per-key time bounds, bitemporal as-of, the `market` corpus), `report` as one HTML file from the ledger, the ledger views (`bellwether ledger findings|receipts|scorecard`), and signed receipts and certificates (`bellwether keys`, `fix --signing-key`, `receipt show --require-signature`).
 
 Not built, or not yet measured:
 
-- **SQL tables as a source.** In review ([#11](https://github.com/vncp/bellwether/pull/11)).
-- **Relational replay.** Joins, windows and aggregation input are recorded predicates that the verifier refuses; WP15 prices and plans them.
-- **`advise` and `evolve`.** Designed in stages ([`docs/evolve.md`](docs/evolve.md), ADRs 021 to 025, 031, 032); no code yet.
-- **Engine adapters, CI receipts, a multi-machine build.** Planned (WP16, WP17, WP22). Today a plan is a list of files and row groups your engine reads, on one machine.
-- **Performance.** Latency is measured only where the Results say so; planning beat DuckDB alone on 2 of 14 questions. WP22 measures the rest in release builds.
+- **Relational replay.** In progress (WP15): joins, windows and aggregation input are recorded predicates that the verifier refuses until it lands.
+- **`advise`.** Designed and reduced ([`docs/evolve.md`](docs/evolve.md) §3.1, ADR 032); no code yet. `evolve --llm` and the rulebook are deferred.
+- **Engine adapters, CI receipts.** In progress (WP16) and planned (WP17). Today a plan is a list of files and row groups your engine reads. A multi-machine build is parked (WP22b); builds run on one machine.
+- **Performance.** Release-build measurements ([`docs/measured/2026-10-26-performance.md`](docs/measured/2026-10-26-performance.md)): plan plus read lost to both a full scan and DuckDB in all 42 lookups, though it read far fewer bytes, because planning makes one store round trip per indexed value. WP22b fixes that first.
 
 ## Docs
 

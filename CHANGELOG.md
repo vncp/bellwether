@@ -6,6 +6,8 @@ All notable changes are documented here. The format follows Keep a Changelog; ve
 
 ### Added
 
+- Scope decision (ADR 032 amendment, 2026-10-27): `advise` (WP13a) is reduced to workload-level key-set selection, exact knob descent, Pareto with anchors, and receipts, and starts after WP22b's lookup fix; layout and materialization search, edge and plan-node attribution, `evolve --llm` (WP13b), rulebook v2 (WP13c), and the transfer evaluation (WP18) are deferred until a recorded multi-step pipeline workload exists. WP15 no longer carries plan-node counterfactuals or layout pricing. README "Planned: evolve" becomes "Planned: advise"; M6 and M8 restated; `docs/evolve.md`, `docs/work-packages.md` (status as of 2026-10-27), and the `layout_not_applicable` wording in the CLI and facade docs follow.
+
 - Tombstone plan counters name their measured quantities: `keys_without_row_groups` and `key_row_group_pairs_pruned` count pruned candidates, not retracted winners or distinct row groups. Incomplete-sidecar diagnostics distinguish direct `index` repair from the optional verified `fix` workflow.
 
 - ADR 033 amendment (PR #24 review, round 2): ClickHouse runs the agent's text with `readonly=1`, so a `SETTINGS` clause (a cache turned on, or the logging of profile events and settings turned off) is refused by the engine; a log entry not fully logged (empty `ProfileEvents`, or `Settings` without the request's `readonly=1`) is refused (`statistics_missing`). Kusto takes an export's result rows from its own `.export` response (`NumRecords`, the same run); `Exported` gains `rows`.
