@@ -105,6 +105,13 @@ pub enum AdapterError {
     /// The plan itself is malformed.
     #[error("the plan is malformed: {0}; emit the plan bellwether printed, unchanged")]
     Plan(String),
+    /// A DataFusion scan description that does not load: not the JSON
+    /// `--emit datafusion` printed, or edited since.
+    #[error(
+        "the DataFusion scan description cannot be loaded: {0}; run the description `--emit \
+         datafusion` printed, unchanged, or emit it again"
+    )]
+    Description(String),
     /// Execution in DataFusion failed (`datafusion` feature).
     #[error("DataFusion could not run the plan: {0}")]
     Execution(String),

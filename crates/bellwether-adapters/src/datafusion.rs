@@ -7,7 +7,10 @@
 //! read it, DataFusion's statistics, page-index, and bloom-filter pruning
 //! off unless [`crate::EmitOptions::engine_pruning`], and the residual as
 //! typed stages. Its JSON form is what `--emit datafusion` prints; it is
-//! always built.
+//! always built. The JSON carries the plan, the dataset schema, and the
+//! options it was built from, and [`from_json`] loads it back: it rebuilds
+//! the scan from those inputs and refuses a description that differs from
+//! the rebuilt one, so a description edited after emission never runs.
 //!
 //! With the `datafusion` feature, [`ScanConfig::file_scan_config`] builds
 //! the executable `FileScanConfig` (DataFusion 55), [`logical_plan`] the
@@ -24,8 +27,9 @@
 
 use std::path::PathBuf;
 
+use arrow::datatypes::DataType;
 use bellwether_types::ScanPlan;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value as Json;
 
 use crate::layout::layout;
@@ -95,6 +99,30 @@ pub struct ParquetOptions {
     pub pushdown_filters: bool,
 }
 
+/// One dataset column in a scan description: its name and its Arrow type
+/// as Arrow spells it (`DataType`'s `Display`, which `FromStr` reads back
+/// exactly).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SourceColumn {
+    /// The column's name.
+    pub name: String,
+    /// Its dataset type.
+    #[serde(rename = "type")]
+    pub data_type: String,
+}
+
+/// What a scan was built from: the plan, the dataset schema, and the
+/// options. [`from_json`] rebuilds the scan from these.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Source {
+    /// The plan, exactly as the lookup emitted it.
+    pub plan: ScanPlan,
+    /// The dataset schema it was planned against.
+    pub schema: Vec<SourceColumn>,
+    /// The options it was translated with.
+    pub options: EmitOptions,
+}
+
 /// The plan as DataFusion runs it (see the module docs). Serializes to the
 /// JSON `--emit datafusion` prints.
 #[derive(Clone, Debug, Serialize)]
@@ -126,6 +154,8 @@ pub struct ScanConfig {
     pub keys_file: Option<PathBuf>,
     /// Whether rows come back in the plan's read order.
     pub ordered: bool,
+    /// The plan, schema, and options the scan was built from.
+    pub source: Source,
     #[serde(skip)]
     pub(crate) compiled: Residual,
     #[serde(skip)]
@@ -152,6 +182,61 @@ impl ScanConfig {
     }
 }
 
+/// Loads a scan description `--emit datafusion` printed: rebuilds the scan
+/// from the plan, schema, and options it carries ([`scan_config`], which
+/// checks the keys file and, with the footer hint, each planned file's size
+/// and footer again) and refuses it unless the rebuilt description is the
+/// given one, field for field. What runs is what was printed.
+pub fn from_json(text: &str) -> Result<ScanConfig> {
+    let bad = |m: String| AdapterError::Description(m);
+    let doc: Json =
+        serde_json::from_str(text).map_err(|e| bad(format!("it is not JSON ({e})")))?;
+    match doc.get("format").and_then(Json::as_str) {
+        Some(FORMAT) => {}
+        Some(other) => return Err(bad(format!("its format is {other:?}, not {FORMAT:?}"))),
+        None => return Err(bad(format!("it has no format field (expected {FORMAT:?})"))),
+    }
+    let source = doc
+        .get("source")
+        .ok_or_else(|| bad("it has no source field (the plan it was built from)".into()))?;
+    let source: Source = serde_json::from_value(source.clone())
+        .map_err(|e| bad(format!("its source does not parse ({e})")))?;
+    let schema = source
+        .schema
+        .iter()
+        .map(|c| {
+            c.data_type
+                .parse::<DataType>()
+                .map(|dt| ColumnDef::new(&c.name, dt))
+                .map_err(|e| {
+                    bad(format!(
+                        "column {:?} has type {:?}, which Arrow does not read ({e})",
+                        c.name, c.data_type
+                    ))
+                })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let rebuilt = scan_config(&source.plan, &schema, &source.options)?;
+    let again = serde_json::to_value(&rebuilt)
+        .map_err(|e| bad(format!("the rebuilt scan does not serialize ({e})")))?;
+    if again != doc {
+        let field = match (&again, &doc) {
+            (Json::Object(a), Json::Object(d)) => a
+                .iter()
+                .find(|(k, v)| d.get(*k) != Some(*v))
+                .map(|(k, _)| k.clone())
+                .or_else(|| d.keys().find(|k| !a.contains_key(*k)).cloned())
+                .unwrap_or_default(),
+            _ => String::new(),
+        };
+        return Err(bad(format!(
+            "its {field:?} field differs from the scan its own plan, schema, and options build \
+             (it was edited after it was emitted)"
+        )));
+    }
+    Ok(rebuilt)
+}
+
 /// The plan as a DataFusion scan (see the module docs).
 pub fn scan_config(plan: &ScanPlan, schema: &[ColumnDef], opts: &EmitOptions) -> Result<ScanConfig> {
     let compiled = compile(plan.residual.as_ref(), schema, opts.residual, E)?;
@@ -165,6 +250,26 @@ pub fn scan_config(plan: &ScanPlan, schema: &[ColumnDef], opts: &EmitOptions) ->
                 next: "rename the column".into(),
             });
         }
+    }
+    let mut source_schema = Vec::with_capacity(schema.len());
+    for c in schema {
+        let spelled = c.data_type.to_string();
+        if spelled.parse::<DataType>().ok().as_ref() != Some(&c.data_type) {
+            return Err(AdapterError::Unsupported {
+                engine: E,
+                what: format!("column {:?} of type {spelled}", c.name),
+                reason: "has no exact text form in Arrow, so the scan description could not be \
+                         loaded back"
+                    .into(),
+                next: "emit for DuckDB, or build the scan in process with \
+                       datafusion::scan_config"
+                    .into(),
+            });
+        }
+        source_schema.push(SourceColumn {
+            name: c.name.clone(),
+            data_type: spelled,
+        });
     }
     let keys_file = match &opts.keys_file {
         Some(p) => {
@@ -258,6 +363,11 @@ pub fn scan_config(plan: &ScanPlan, schema: &[ColumnDef], opts: &EmitOptions) ->
         residual: compiled.to_json(),
         keys_file,
         ordered: opts.ordered,
+        source: Source {
+            plan: plan.clone(),
+            schema: source_schema,
+            options: opts.clone(),
+        },
         compiled,
         schema: schema.to_vec(),
     })

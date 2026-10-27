@@ -156,8 +156,10 @@ impl Relocate {
     }
 }
 
-/// How an adapter translates a plan.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+/// How an adapter translates a plan. Serialized into a DataFusion scan
+/// description (its `source.options`), so [`datafusion::from_json`] builds
+/// the same scan.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EmitOptions {
     /// A Parquet file of the queried keys, whose columns are the residual's
     /// `In` columns at their dataset types: the engine semi-joins against

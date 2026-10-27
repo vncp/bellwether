@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use bellwether::types::{Error, EvidenceBody, Record, ScanPlan};
 use bellwether::{Engine, PlanResult};
 use bellwether_adapters::{
-    ColumnDef, EmitOptions, Partitions, ResidualMode, RowOffsets,
+    ColumnDef, EmitOptions, Partitions, Relocate, ResidualMode, RowOffsets,
 };
 use clap::Args;
 
@@ -81,6 +81,12 @@ pub(crate) struct EmitArgs {
     /// plan's bytes, not exactly them).
     #[arg(long, requires = "emit")]
     pub engine_pruning: bool,
+    /// With --emit: the engine reads every planned file whose path starts
+    /// with FROM at TO followed by the rest of the path (the folder served
+    /// over HTTP, or mounted elsewhere). The plan is unchanged; only where
+    /// the engine reads it.
+    #[arg(long, num_args = 2, value_names = ["FROM", "TO"], requires = "emit")]
+    pub relocate: Option<Vec<String>>,
 }
 
 /// The plan a lookup's result carries.
@@ -141,15 +147,34 @@ pub(crate) fn with_emit(
         )));
     }
     let keys_file = if args.keys_file_in_query {
-        Some(keys.map(Path::to_path_buf).ok_or_else(|| {
+        let path = keys.ok_or_else(|| {
             Failure::Usage(
                 "--keys-file-in-query puts the --keys file in the query; this lookup has no \
                  key file (a text lookup), so drop the flag"
                     .into(),
             )
+        })?;
+        // Absolute, so the artifact runs from any directory.
+        Some(std::fs::canonicalize(path).map_err(|e| {
+            Failure::Usage(format!(
+                "--keys-file-in-query: cannot resolve {} ({e}); give a readable --keys file",
+                path.display()
+            ))
         })?)
     } else {
         None
+    };
+    let relocate = match args.relocate.as_deref() {
+        None => None,
+        Some([from, to]) => Some(Relocate {
+            from: from.clone(),
+            to: to.clone(),
+        }),
+        Some(_) => {
+            return Err(Failure::Usage(
+                "--relocate takes two values, FROM and TO".into(),
+            ))
+        }
     };
     let plan = plan_of(result)?;
     let inputs = engine.emit_inputs(plan)?;
@@ -177,7 +202,7 @@ pub(crate) fn with_emit(
             files: p.files,
         }),
         ordered: args.ordered,
-        relocate: None,
+        relocate,
     };
     let adapter = bellwether_adapters::adapter(target.name()).ok_or_else(|| {
         Failure::Usage(format!("no adapter for {}", target.name()))

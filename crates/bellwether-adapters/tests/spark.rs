@@ -163,7 +163,7 @@ fn every_lookup_shape_returns_the_reference_rows_reading_only_planned_files() {
 }
 
 #[test]
-fn ordered_output_and_a_nan_key_outside_the_statistics() {
+fn ordered_output_nan_keys_a_20k_keys_file_and_a_denied_planned_file() {
     let Some(py) = python() else { return };
     let tmp = tempfile::tempdir().unwrap();
     let c = common::corpus(&tmp.path().join("data"));

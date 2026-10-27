@@ -39,7 +39,9 @@ fn opts(c: &common::Corpus) -> EmitOptions {
 
 /// Runs `plan` in a fresh session reading through a counting store that
 /// coalesces a vectored read's ranges closer than `gap` bytes; returns the
-/// rows, what storage served, and what DataFusion asked for.
+/// rows, what storage served, and what DataFusion asked for. What runs is
+/// the description as `--emit datafusion` prints it, loaded back with
+/// `from_json`.
 fn run_with(
     rt: &tokio::runtime::Runtime,
     plan: &bellwether_types::ScanPlan,
@@ -47,7 +49,8 @@ fn run_with(
     spans: &BTreeMap<String, FileSpans>,
     gap: u64,
 ) -> (Vec<arrow::array::RecordBatch>, Realized, Realized) {
-    let cfg = datafusion::scan_config(plan, &common::dataset(), o).unwrap();
+    let printed = datafusion::scan_config(plan, &common::dataset(), o).unwrap().to_json().unwrap();
+    let cfg = datafusion::from_json(&printed).unwrap();
     let ctx = SessionContext::new();
     let store = Arc::new(CountingStore::with_coalescing(Arc::new(LocalFileSystem::new()), gap));
     datafusion::register(&ctx, &cfg, store.clone()).unwrap();
@@ -256,25 +259,38 @@ fn a_keys_file_semi_join_returns_the_same_rows_for_100k_keys() {
 }
 
 #[test]
-fn residual_modes_are_labeled_and_supersets() {
+fn partial_residual_modes_return_exactly_their_rows_and_say_so() {
     let rt = rt();
     let tmp = tempfile::tempdir().unwrap();
     let c = common::corpus(tmp.path());
     let spans = spans(&c);
-    let plan = common::latest(&c, "id", "ts", &common::ids(&[1, 2, 3]), None, true);
+    let keys = common::ids(&[1, 2, 3]);
+    let plan = common::latest(&c, "id", "ts", &keys, None, true);
     let columns = common::all_columns();
     let full = common::expected(&c, &plan, &columns);
+    let planned_rows = common::planned_rows(&c, &plan);
     for mode in [ResidualMode::KeysOnly, ResidualMode::None] {
         let o = EmitOptions {
             residual: mode,
             ..opts(&c)
         };
         let cfg = datafusion::scan_config(&plan, &common::dataset(), &o).unwrap();
-        assert!(cfg.to_json().unwrap().contains(mode.as_str()));
-        let (b, _) = run(&rt, &plan, &o, &spans);
+        // The description says which part of the residual it applies.
+        assert_eq!(cfg.residual["mode"], mode.as_str());
+        let (b, realized) = run(&rt, &plan, &o, &spans);
+        // Keys only: every row of a queried key in the planned row groups
+        // (no ranking, no live test); none: every row of them.
+        let mut want: Vec<Vec<String>> = planned_rows
+            .iter()
+            .filter(|r| mode == ResidualMode::None || r.get("id").is_some_and(|k| keys.contains(k)))
+            .map(|r| r.render(&columns))
+            .collect();
+        want.sort();
         let got = common::rendered(&b, &columns);
-        assert!(full.iter().all(|r| got.contains(r)), "{mode:?}");
-        assert!(got.len() > full.len(), "{mode:?}");
+        common::assert_rows(&got, &want, mode.as_str());
+        assert!(full.iter().all(|r| got.contains(r)), "{mode:?}: not a superset of the full answer");
+        assert!(got.len() > full.len(), "{mode:?}: the case must tell the modes apart");
+        assert_eq!(realized.data(), plan.bytes, "{mode:?}: the same row groups are read");
     }
 }
 

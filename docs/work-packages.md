@@ -22,7 +22,8 @@ One crate, one owner, one interface contract each. WP0 ships first and alone. Af
 | WP13a advise | after M3; no language model (ADR 032) |
 | WP13b evolve, WP13c rulebook v2 | each opens only when its measured trigger in `docs/evolve.md` §3 is met |
 | WP14 storage version 2 and record version 3 (ADR 028) | both pull requests done, **M5 declared**: the first brought per-key counts (`exact:col,counts`, `count`), checksummed segments, manifest row-group and column bytes (plans open no footer), identity keys and every record version 3 shape; the second filled the remaining record fields, folded the sidecars (`exact:col@ts` bounds in the value record, a `bitemporal` layout, both proposable and fixable), spelled column types and the CSV dialect in the manifest, and froze the bytes. Fixtures: `fixtures/format-v1/`, `fixtures/format-v0.1-pre/` (pre-M5), `fixtures/format-v0.1/` (M5) |
-| WP15 relational replay, WP16 engine adapters, WP17 CI receipts, WP18 transfer evaluation | planned 2026-10-24 (ADR 026) |
+| WP15 relational replay, WP17 CI receipts, WP18 transfer evaluation | planned 2026-10-24 (ADR 026) |
+| WP16 engine adapters | merged: `bellwether-adapters`, plans executed inside engines through `locate`, `latest`, `asof --emit`: DataFusion 55 with row-group access plans (data bytes equal the plan's at the storage boundary), one DuckDB statement over the planned files (row groups not pinnable; bytes measured), a Spark manifest and shim (planned files only); the residual decoded at the dataset types and run in the plan's order, or refused by name |
 | WP19 signed receipts | merged in wave A: detached ed25519 signatures beside receipts and certificates (ADR 029), no record or format version change; M8's signing half done |
 | WP21 time-series keys | merged: partition values from Hive-style paths, ordered plans, `--at-manifest` pinned lookups over a manifest history, per-key time bounds (`bounds` sidecar), bitemporal as-of (`temporal2` sidecar), the `market` bench corpus with measured funnels |
 | WP22 performance | next after WP21; measured in release builds |
@@ -112,7 +113,7 @@ Gaps the Phase 2 crates found in the contract and the docs, with interim behavio
 
 ## Deferred, with reasons
 
-- Engine adapters (DataFusion `ParquetAccessPlan`, DuckDB, Polars, Spark shim): `ScanPlan` is designed for them; they wait until the plan type is stable.
+- Further engine adapters (Polars): DataFusion, DuckDB, and Spark shipped in WP16 (`crates/bellwether-adapters`); Polars until a user asks.
 - CI integration (PR lint action): the lint exists in WP5; wiring it to a forge is separate.
 - SQL sources: scheduled as WP20 (ADR 027) now that the `Source` trait has survived two real sources.
 - Delta and Iceberg manifest-aware discovery: for now, folders of Parquet.
