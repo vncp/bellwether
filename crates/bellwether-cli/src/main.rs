@@ -9,6 +9,7 @@
 #![forbid(unsafe_code)]
 
 mod bench;
+mod emit_cmds;
 mod human;
 mod join_cmds;
 mod keys_cmds;
@@ -241,9 +242,10 @@ struct WhyArgs {
     /// keys whose newest row is a tombstone.
     #[arg(long, value_name = "COL[=VALUE]", conflicts_with = "lookback")]
     tombstone: Option<String>,
-    /// The instant for `asof` pricing (with `--latest-by`): RFC 3339, a date
-    /// (YYYY-MM-DD), or an integer in the timestamp column's unit.
-    #[arg(long, value_name = "INSTANT", requires = "latest_by")]
+    /// The instant for `asof` pricing (with `--latest-by`), or of a
+    /// consumer plan's `as_of` nodes (with `--plan`): RFC 3339, a date
+    /// (YYYY-MM-DD), or an integer in the version column's unit.
+    #[arg(long, value_name = "INSTANT")]
     at: Option<String>,
     /// Price every version in a window instead of one per key: the
     /// versions in [at − N, at] (asof) or [newest − N, newest] (latest). A
@@ -338,6 +340,15 @@ struct WhyArgs {
         requires = "value"
     )]
     functions: Vec<String>,
+    /// A consumer plan (relational replay): a JSON file of a typed plan
+    /// DAG ({"version": 1, "nodes": [...], "root": N}), read only. Each
+    /// --from run is priced through it under the current configuration and
+    /// each candidate key drawn from the columns its filters, joins,
+    /// windows, and aggregates name, beside an operator table. The datasets
+    /// it scans besides this folder are bound with --dataset NAME=ROOT;
+    /// --at gives its `as_of` nodes their instant.
+    #[arg(long, value_name = "FILE", requires = "from")]
+    plan: Option<PathBuf>,
 }
 
 /// `--gate NAME:N`.
@@ -495,6 +506,8 @@ struct LocateArgs {
     /// values in --keys, as --any.
     #[arg(long, conflicts_with_all = ["from", "to", "window", "ts", "columns", "contains", "has", "prefix"])]
     all: bool,
+    #[command(flatten)]
+    emit: emit_cmds::EmitArgs,
 }
 
 #[derive(Args)]
@@ -547,6 +560,8 @@ struct LatestArgs {
     /// tombstone answers no row.
     #[arg(long, conflicts_with = "lookback")]
     live: bool,
+    #[command(flatten)]
+    emit: emit_cmds::EmitArgs,
 }
 
 #[derive(Args)]
@@ -587,6 +602,8 @@ struct AsofArgs {
     /// newest row then is a tombstone answers no row.
     #[arg(long, conflicts_with_all = ["lookback", "ts"])]
     live: bool,
+    #[command(flatten)]
+    emit: emit_cmds::EmitArgs,
 }
 
 #[derive(Args)]
@@ -619,6 +636,14 @@ struct ProposeArgs {
     /// returns the same rows by the key columns).
     #[arg(long, value_name = "TEXT")]
     invariant: Option<String>,
+    /// With --before: the current shape as a consumer plan, a JSON file of
+    /// a typed plan DAG (as `why --plan` reads), so the rewrite is replayed
+    /// and `fix` takes it to an attest-only receipt (with --after-plan).
+    #[arg(long, value_name = "FILE", requires_all = ["before", "after_plan"])]
+    before_plan: Option<PathBuf>,
+    /// With --before-plan: the target shape as a consumer plan.
+    #[arg(long, value_name = "FILE", requires = "before_plan")]
+    after_plan: Option<PathBuf>,
     /// Propose a rewrite of queries in the engine the folder is a twin of:
     /// BEFORE=AFTER, two files of one query each (repeat for several pairs,
     /// scored and verified as one set). Cite the evidence `why --twin-of`
@@ -761,7 +786,7 @@ impl From<Error> for Failure {
                 field:
                     "lookback" | "latest_by" | "signing_key" | "trusted_keys" | "public_key" | "out"
                     | "name" | "valid_from" | "revoked_at" | "index" | "root" | "scratch" | "items"
-                    | "columns" | "text" | "join" | "functions",
+                    | "columns" | "text" | "join" | "functions" | "plan" | "datasets",
                 ..
             } => Self::Usage(match hint(&e) {
                 Some(h) => format!("{e}; {h}"),
@@ -857,6 +882,8 @@ fn hint(e: &Error) -> Option<String> {
                 "columns" => "--columns",
                 "text" => "--contains, --has, or --prefix",
                 "functions" => "--fn",
+                "plan" => "--plan (a consumer plan's JSON) or --before-plan and --after-plan",
+                "datasets" => "--dataset NAME=ROOT",
                 "join" => {
                     "the right side the join key names (--join <right>.<column>[,<column>...], or \
                      the right side of a join: key spec): a folder beside the data root, one \
@@ -1014,32 +1041,36 @@ fn run(cli: &Cli, out: &Out) -> Result<Outcome, Failure> {
         }
         Command::Latest(a) => {
             check_lookback(a.lookback.as_deref())?;
-            lookup(g, out, &a.lookup, |e, keys| match (&a.known, &a.lookback) {
-                (Some(known), _) => e.asof_bitemporal(
-                    keys,
-                    None,
-                    Some(known),
-                    a.valid_by.as_deref().zip(a.known_by.as_deref()),
-                    a.live,
-                ),
-                (None, Some(n)) => e.latest_lookback(keys, n),
-                (None, None) if a.live => e.latest_live(keys),
-                (None, None) => e.latest(keys),
+            lookup(g, out, &a.lookup, &a.emit, |e, keys| {
+                match (&a.known, &a.lookback) {
+                    (Some(known), _) => e.asof_bitemporal(
+                        keys,
+                        None,
+                        Some(known),
+                        a.valid_by.as_deref().zip(a.known_by.as_deref()),
+                        a.live,
+                    ),
+                    (None, Some(n)) => e.latest_lookback(keys, n),
+                    (None, None) if a.live => e.latest_live(keys),
+                    (None, None) => e.latest(keys),
+                }
             })
         }
         Command::Asof(a) => {
             check_lookback(a.lookback.as_deref())?;
-            lookup(g, out, &a.lookup, |e, keys| match (&a.at, &a.lookback) {
-                (Some(at), Some(n)) => e.asof_lookback(keys, at, n, a.ts.as_deref()),
-                (Some(at), None) if a.live => e.asof_live(keys, at),
-                (Some(at), None) => e.asof(keys, at),
-                (None, _) => e.asof_bitemporal(
-                    keys,
-                    a.valid.as_deref(),
-                    a.known.as_deref(),
-                    a.valid_by.as_deref().zip(a.known_by.as_deref()),
-                    a.live,
-                ),
+            lookup(g, out, &a.lookup, &a.emit, |e, keys| {
+                match (&a.at, &a.lookback) {
+                    (Some(at), Some(n)) => e.asof_lookback(keys, at, n, a.ts.as_deref()),
+                    (Some(at), None) if a.live => e.asof_live(keys, at),
+                    (Some(at), None) => e.asof(keys, at),
+                    (None, _) => e.asof_bitemporal(
+                        keys,
+                        a.valid.as_deref(),
+                        a.known.as_deref(),
+                        a.valid_by.as_deref().zip(a.known_by.as_deref()),
+                        a.live,
+                    ),
+                }
             })
         }
         Command::Propose(a) => propose(g, out, a),
@@ -1158,16 +1189,19 @@ fn mcp(g: &Global, a: &McpArgs) -> Result<Outcome, Failure> {
 }
 
 /// A plan lookup (`locate`, `latest`, `asof`): the engine, pinned to
-/// `--at-manifest` when given, and the key file, handed to `plan`.
+/// `--at-manifest` when given, and the key file, handed to `plan`; with
+/// `--emit`, the plan translated for an engine after the plan line.
 fn lookup(
     g: &Global,
     out: &Out,
     args: &LookupArgs,
+    emit: &emit_cmds::EmitArgs,
     plan: impl FnOnce(&Engine, &KeyFile) -> Result<bellwether::PlanResult, Error>,
 ) -> Result<Outcome, Failure> {
     let engine = engine_at(g, &args.root.root, args.at_manifest)?;
     let result = plan(&engine, &key_file(&args.keys, args.key.as_ref()))?;
-    done(&result, human::plan(&result, out), EXIT_OK)
+    let outcome = done(&result, human::plan(&result, out), EXIT_OK)?;
+    emit_cmds::with_emit(&engine, &result, Some(&args.keys), emit, outcome)
 }
 
 fn propose(g: &Global, out: &Out, a: &ProposeArgs) -> Result<Outcome, Failure> {
@@ -1199,8 +1233,16 @@ fn propose(g: &Global, out: &Out, a: &ProposeArgs) -> Result<Outcome, Failure> {
                 pairs: Vec::new(),
                 key: Vec::new(),
                 keys: None,
-                before_plan: None,
-                after_plan: None,
+                before_plan: a
+                    .before_plan
+                    .as_deref()
+                    .map(bellwether::read_plan)
+                    .transpose()?,
+                after_plan: a
+                    .after_plan
+                    .as_deref()
+                    .map(bellwether::read_plan)
+                    .transpose()?,
             },
         })
     } else if !a.rewrite.is_empty() {
@@ -1295,13 +1337,15 @@ fn locate(g: &Global, out: &Out, a: &LocateArgs) -> Result<Outcome, Failure> {
     let engine = engine_at(g, &a.root.root, a.at_manifest)?;
     if let Some(query) = text_query(a.contains.as_deref(), a.has.as_deref(), a.prefix.as_deref())? {
         let result = engine.locate_text(&query)?;
-        return done(&result, human::plan(&result, out), EXIT_OK);
+        let outcome = done(&result, human::plan(&result, out), EXIT_OK)?;
+        return emit_cmds::with_emit(&engine, &result, None, &a.emit, outcome);
     }
     let Some(keys) = &a.keys else {
         return Err(Failure::Usage(
             "say what to locate: --keys <file> or --contains, --has, or --prefix COL=TEXT".into(),
         ));
     };
+    let key_path = keys.clone();
     let keys = key_file(keys, a.key.as_ref());
     let result = match (window, &a.columns) {
         (w, Some(columns)) => {
@@ -1311,7 +1355,8 @@ fn locate(g: &Global, out: &Out, a: &LocateArgs) -> Result<Outcome, Failure> {
         (None, None) if a.any || a.all => engine.locate_contains(&keys, a.all)?,
         (None, None) => engine.locate(&keys)?,
     };
-    done(&result, human::plan(&result, out), EXIT_OK)
+    let outcome = done(&result, human::plan(&result, out), EXIT_OK)?;
+    emit_cmds::with_emit(&engine, &result, Some(&key_path), &a.emit, outcome)
 }
 
 /// The text lookup `--contains`, `--has`, or `--prefix` gives (at most one;
@@ -1477,6 +1522,9 @@ fn why(g: &Global, out: &Out, a: &WhyArgs) -> Result<Outcome, Failure> {
                 })
             })
             .transpose()?,
+        plan: a.plan.clone(),
+        // Every dataset the plan names, each bound with --dataset.
+        datasets: Vec::new(),
     };
     // Text lookups take none of the lookup-mode flags; the facade refuses
     // them first, with that cause.

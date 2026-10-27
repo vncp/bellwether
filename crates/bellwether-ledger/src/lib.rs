@@ -351,6 +351,77 @@ fn check_exactness(r: &Replay) -> Result<()> {
             }
         }
     }
+    check_operators(r, &check)
+}
+
+/// A replay priced through consumer plans (relational replay, WP15) lists
+/// per run a block of per-node costs for the current configuration, then
+/// one for the proposed, each block's nodes `0..n` in order. Every node's
+/// quantities are well formed like a run's, and a run whose block reads a
+/// measured dataset (a node measured by a model) is measured itself: a
+/// cost over a measured dataset is never exact (rule 7b).
+fn check_operators(r: &Replay, check: &dyn Fn(&str, &Exactness) -> Result<()>) -> Result<()> {
+    if r.operators.is_empty() {
+        return Ok(());
+    }
+    let mut blocks: Vec<&[bellwether_types::OperatorCost]> = Vec::new();
+    let mut start = 0usize;
+    for (i, op) in r.operators.iter().enumerate() {
+        let at = u32::try_from(i - start).unwrap_or(u32::MAX);
+        if op.node == 0 && i > start {
+            blocks.push(&r.operators[start..i]);
+            start = i;
+        } else if op.node != at {
+            return Err(rule(format!(
+                "replay operator {i} is node {} where node {at} of its plan belongs; each \
+                 block lists a plan's nodes 0..n in order",
+                op.node
+            )));
+        }
+    }
+    blocks.push(&r.operators[start..]);
+    let runs = r.current.len().max(r.proposed.len());
+    if r.current.len() != r.proposed.len() || blocks.len() != 2 * runs {
+        return Err(rule(format!(
+            "replay lists {} block(s) of per-node costs for {} current and {} proposed run(s); \
+             a replay priced through plans lists one block per run per configuration, current \
+             then proposed",
+            blocks.len(),
+            r.current.len(),
+            r.proposed.len()
+        )));
+    }
+    for (b, block) in blocks.iter().enumerate() {
+        let cost = if b % 2 == 0 {
+            &r.current[b / 2]
+        } else {
+            &r.proposed[b / 2]
+        };
+        for op in *block {
+            for (what, q) in [("bytes", &op.bytes), ("rows", &op.rows_out)] {
+                let name = format!("run {} node {} {what}", cost.run_id, op.node);
+                check(&name, &q.exactness)?;
+                if let Exactness::Bounded { high, .. } = q.exactness {
+                    if q.value != high {
+                        return Err(rule(format!(
+                            "replay {name} records {} for an interval ending at {high}; a \
+                             bounded quantity records its upper bound",
+                            q.value
+                        )));
+                    }
+                }
+                if let Exactness::Measured { model } = &q.exactness {
+                    if !matches!(cost.exactness, Exactness::Measured { .. }) {
+                        return Err(rule(format!(
+                            "replay {name} is measured by {model}, but the run's cost is {}; a \
+                             cost that reads a measured dataset is measured (rule 7b)",
+                            exactness_name(&cost.exactness)
+                        )));
+                    }
+                }
+            }
+        }
+    }
     Ok(())
 }
 

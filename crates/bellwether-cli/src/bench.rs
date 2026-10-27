@@ -14,6 +14,7 @@ use bellwether_bench::market::{
     generate_market, parse_ymd, MarketParams, MarketRung, MarketSummary,
 };
 use bellwether_bench::perf::{all_cells, plan_cells, read_row_groups, ReadReport};
+use bellwether_bench::relational::{generate_relational, RelationalParams, RelationalSummary};
 use bellwether_bench::report::write_report;
 use bellwether_bench::results::Results;
 use bellwether_bench::slo::{assert_slo, Mode};
@@ -93,6 +94,11 @@ pub(crate) enum BenchCommand {
     /// budgeted metric missing from the results; one nightly run past a
     /// budget is reported, not failed.
     PerfCheck(PerfCheckArgs),
+    /// Write the two-dataset corpus relational replay is priced on: an
+    /// event log (`events`, keyed by `repo_id`, in time order) beside the
+    /// repositories (`repos`, one row each plus restated rows), key files of
+    /// 10, 100, and 1,000 repositories, and the consumer plans over them.
+    Relational(RelationalArgs),
 }
 
 #[derive(Args)]
@@ -121,6 +127,26 @@ pub(crate) struct PerfCheckArgs {
     /// summary).
     #[arg(long, value_name = "FILE")]
     summary: Option<PathBuf>,
+}
+
+#[derive(Args)]
+pub(crate) struct RelationalArgs {
+    /// Output directory (`events/`, `repos/`, `workload/`, `plans/`); must
+    /// not hold a corpus.
+    #[arg(long)]
+    out: PathBuf,
+    /// RNG seed [default: 15].
+    #[arg(long)]
+    seed: Option<u64>,
+    /// Repositories [default: 2000].
+    #[arg(long)]
+    repos: Option<u64>,
+    /// Events [default: 200000].
+    #[arg(long)]
+    events: Option<u64>,
+    /// Rows per row group of `events` [default: 4000].
+    #[arg(long)]
+    rows_per_row_group: Option<u32>,
 }
 
 #[derive(Args)]
@@ -514,6 +540,9 @@ pub(crate) struct Wrote {
     /// Tombstone corpus summary (`tombstone` only).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tombstone: Option<TombstoneSummary>,
+    /// Relational corpus summary (`relational` only).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub relational: Option<RelationalSummary>,
 }
 
 fn bench_err(e: &bellwether_bench::BenchError) -> Error {
@@ -621,6 +650,7 @@ pub(crate) fn run(cmd: &BenchCommand) -> Result<Wrote, Error> {
                 "perf-check reports through bench::perf_check".into(),
             ))
         }
+        BenchCommand::Relational(a) => return relational(a),
     };
     Ok(Wrote {
         what,
@@ -635,6 +665,56 @@ pub(crate) fn run(cmd: &BenchCommand) -> Result<Wrote, Error> {
         joins: None,
         agg: None,
         tombstone: None,
+        relational: None,
+    })
+}
+
+/// `bench relational`: the small preset, each flag given overriding one.
+fn relational(a: &RelationalArgs) -> Result<Wrote, Error> {
+    let mut params = RelationalParams::small();
+    if let Some(v) = a.seed {
+        params.seed = v;
+    }
+    if let Some(v) = a.repos {
+        params.repos = v;
+    }
+    if let Some(v) = a.events {
+        params.events = v;
+    }
+    if let Some(v) = a.rows_per_row_group {
+        params.event_rows_per_row_group = v;
+    }
+    let s = generate_relational(&a.out, &params).map_err(|e| bench_err(&e))?;
+    let where_summary = format!(
+        "{} (events: {} files, {} row groups, {} rows, {} with no repo_id; repos: {} files, {} \
+         row groups, {} rows, {} repositories restated; {} key files, {} plans)",
+        a.out.display(),
+        s.events.files,
+        s.events.row_groups,
+        s.events.rows,
+        s.null_events,
+        s.repos.files,
+        s.repos.row_groups,
+        s.repos.rows,
+        s.restated,
+        s.key_files.len(),
+        s.plans.len(),
+    );
+    let summary_path = a.out.join("workload").join("relational.json");
+    Ok(Wrote {
+        what: "relational corpus",
+        path: where_summary,
+        blake3: file_hash(&summary_path)?,
+        failed: Vec::new(),
+        market: None,
+        read: None,
+        text: None,
+        expr: None,
+        lists: None,
+        joins: None,
+        agg: None,
+        tombstone: None,
+        relational: Some(s),
     })
 }
 
@@ -691,6 +771,7 @@ fn joins(a: &JoinsArgs) -> Result<Wrote, Error> {
         joins: Some(truth.summary),
         agg: None,
         tombstone: None,
+        relational: None,
     })
 }
 
@@ -753,6 +834,7 @@ fn tombstone(a: &TombstoneArgs) -> Result<Wrote, Error> {
         joins: None,
         agg: None,
         tombstone: Some(truth.summary),
+        relational: None,
     })
 }
 
@@ -807,6 +889,7 @@ fn agg(a: &AggArgs) -> Result<Wrote, Error> {
         joins: None,
         agg: Some(truth.summary),
         tombstone: None,
+        relational: None,
     })
 }
 
@@ -862,6 +945,7 @@ fn lists(a: &ListsArgs) -> Result<Wrote, Error> {
         joins: None,
         agg: None,
         tombstone: None,
+        relational: None,
     })
 }
 
@@ -908,6 +992,7 @@ fn text(a: &TextArgs) -> Result<Wrote, Error> {
         joins: None,
         agg: None,
         tombstone: None,
+        relational: None,
     })
 }
 
@@ -969,6 +1054,7 @@ fn market(a: &MarketArgs) -> Result<Wrote, Error> {
         joins: None,
         agg: None,
         tombstone: None,
+        relational: None,
     })
 }
 
@@ -1020,6 +1106,7 @@ fn expr(a: &ExprArgs) -> Result<Wrote, Error> {
         joins: None,
         agg: None,
         tombstone: None,
+        relational: None,
     })
 }
 
@@ -1115,5 +1202,6 @@ fn read(a: &ReadArgs) -> Result<Wrote, Error> {
         joins: None,
         agg: None,
         tombstone: None,
+        relational: None,
     })
 }

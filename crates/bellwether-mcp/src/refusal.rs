@@ -36,7 +36,8 @@ pub enum RefusalCode {
     NothingToGain,
     /// Layout proposals cannot be applied in this release.
     LayoutNotApplicable,
-    /// A rewrite cannot be attested yet.
+    /// A rewrite whose shape states its plans only in prose cannot be
+    /// attested: it has no replay.
     NoReplay,
     /// The proposal verified and targets a table: the engine applies
     /// nothing to a table; a human runs what `fields.run` lists.
@@ -232,7 +233,9 @@ impl RefusalCode {
                 "layout proposals cannot be applied in this release; propose a key or a rewrite"
             }
             Self::NoReplay => {
-                "rewrites cannot be attested yet; report the passing certificate to the human"
+                "this rewrite states its plans only in prose; propose it again with \
+                 shape.before_plan and shape.after_plan, or report the passing certificate to \
+                 the human"
             }
             Self::AttestOnly => {
                 "report the passing certificate to the human with `fields.run` (statements the engine \

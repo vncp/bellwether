@@ -113,6 +113,14 @@ pub struct EngineArgs {
     /// runs are byte-reproducible (testing and audits).
     #[arg(long, global = true, value_name = "RFC3339", hide = true)]
     pub clock: Option<String>,
+    /// A dataset a consumer plan may scan besides the data root,
+    /// NAME=ROOT (a folder, read through its own index, or a table);
+    /// repeat for several. Plans name datasets by NAME only: `why --plan`,
+    /// `fix` on a rewrite with plans, and an MCP server's `score.why`
+    /// read no root a plan or a tool argument names. `main` is the data
+    /// root's own name.
+    #[arg(long = "dataset", global = true, value_name = "NAME=ROOT")]
+    pub datasets: Vec<String>,
 }
 
 /// Why [`EngineArgs::options`] failed.
@@ -170,6 +178,36 @@ impl EngineArgs {
                 Some(bellwether::schema_from_json(&text).map_err(OptionsError::Engine)?)
             }
         };
+        let mut datasets = std::collections::BTreeMap::new();
+        for d in &self.datasets {
+            let (name, root) = d.split_once('=').ok_or_else(|| {
+                OptionsError::Usage(format!(
+                    "--dataset {d:?} binds no root; write --dataset NAME=ROOT, for example \
+                     --dataset repos=./repos"
+                ))
+            })?;
+            let (name, root) = (name.trim(), root.trim());
+            if name.is_empty() || root.is_empty() {
+                return Err(OptionsError::Usage(format!(
+                    "--dataset {d:?} needs both a name and a root; write --dataset NAME=ROOT"
+                )));
+            }
+            if name == "main" {
+                return Err(OptionsError::Usage(
+                    "--dataset main=...: `main` is the data root's own name in a plan; bind the \
+                     other datasets under other names"
+                        .into(),
+                ));
+            }
+            if datasets
+                .insert(name.to_string(), root.to_string())
+                .is_some()
+            {
+                return Err(OptionsError::Usage(format!(
+                    "--dataset binds {name:?} twice; bind each name once"
+                )));
+            }
+        }
         Ok(EngineOptions {
             index: self.index.clone(),
             format,
@@ -206,6 +244,9 @@ impl EngineArgs {
             // narrows it to its `--join` (`Server::new`).
             join_scope: bellwether::JoinScope::Any,
             engine_adapter: None,
+            // Datasets a consumer plan may scan (WP15): bound here, by the
+            // human who starts the command or the server.
+            datasets,
         })
     }
 

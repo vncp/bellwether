@@ -468,6 +468,14 @@ fn lookup_label(lookup: &LookupKind) -> String {
             format!("aggregate {}({value}) per key", functions.join(", "))
         }
         LookupKind::Latest => "latest".to_string(),
+        LookupKind::Plan { plans } => format!(
+            "consumer plan {}",
+            plans
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
         LookupKind::SemiJoin {
             right,
             right_columns,
@@ -1026,6 +1034,142 @@ fn no_index_serves(r: &bellwether::WhyReport) -> String {
     }
 }
 
+/// A quantity as the operator table shows it: the value when exact, its
+/// interval when bounded, the value and its model when measured.
+fn quantity(q: &bellwether::types::Quantity) -> String {
+    use bellwether::types::Exactness;
+    match &q.exactness {
+        Exactness::Exact => num(q.value),
+        Exactness::Bounded { low, high } => format!("[{}, {}]", num(*low), num(*high)),
+        Exactness::Measured { .. } => format!("~{}", num(q.value)),
+    }
+}
+
+fn exactness(q: &bellwether::types::Quantity) -> &'static str {
+    use bellwether::types::Exactness;
+    match &q.exactness {
+        Exactness::Exact => "exact",
+        Exactness::Bounded { .. } => "bounded",
+        Exactness::Measured { .. } => "measured",
+    }
+}
+
+/// One consumer plan's operator table (relational replay): per node its
+/// planned read bytes and output rows summed over runs, each with its
+/// exactness, under the current configuration and the recommended key;
+/// then the read occurrences and the shared nodes.
+#[allow(clippy::too_many_lines)]
+fn plan_table(s: &mut String, p: &bellwether::PlanReport, recommended: Option<String>) {
+    let _ = writeln!(
+        s,
+        "operators of plan {} over {} ({}): bytes are planned reads of the projected columns \
+         (an exchange's, compressed-equivalent bytes moved), not wall time or what an engine \
+         reads; each node is evaluated once per run (logical reuse, no claim an engine buffers \
+         or reuses it), and a scan several paths read is read once",
+        p.plan,
+        count(p.runs, "run", "runs"),
+        p.datasets
+            .iter()
+            .map(|d| {
+                let measured = d
+                    .model
+                    .as_ref()
+                    .map_or_else(String::new, |m| format!(", {m}"));
+                format!(
+                    "{} = {} at sequence {}{measured}",
+                    d.name, d.root, d.sequence
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("; ")
+    );
+    let cells: Vec<[String; 6]> = p
+        .current
+        .iter()
+        .map(|o| {
+            let then = p
+                .recommended
+                .as_ref()
+                .and_then(|r| r.get(o.node as usize))
+                .map_or_else(String::new, |r| {
+                    format!("{} B, {} rows", quantity(&r.bytes), quantity(&r.rows_out))
+                });
+            [
+                o.node.to_string(),
+                o.op.clone(),
+                format!("{} B", quantity(&o.bytes)),
+                quantity(&o.rows_out),
+                format!("{}/{}", exactness(&o.bytes), exactness(&o.rows_out)),
+                then,
+            ]
+        })
+        .collect();
+    let head = [
+        "node".to_string(),
+        "op".to_string(),
+        "bytes".to_string(),
+        "rows".to_string(),
+        "bytes/rows".to_string(),
+        recommended.map_or_else(String::new, |l| format!("with {l}")),
+    ];
+    let width = |i: usize| {
+        cells
+            .iter()
+            .chain(std::iter::once(&head))
+            .map(|c| c[i].chars().count())
+            .max()
+            .unwrap_or(0)
+    };
+    let w: Vec<usize> = (0..6).map(width).collect();
+    for (row, node) in
+        std::iter::once((&head, None)).chain(cells.iter().zip(p.consumers.iter().map(Some)))
+    {
+        let note = match node {
+            Some(0) => "  root",
+            Some(1) | None => "",
+            Some(_) => "  shared",
+        };
+        let line = format!(
+            "  {:>w0$}  {:<w1$}  {:>w2$}  {:>w3$}  {:<w4$}  {}{note}",
+            row[0],
+            row[1],
+            row[2],
+            row[3],
+            row[4],
+            row[5],
+            w0 = w[0],
+            w1 = w[1],
+            w2 = w[2],
+            w3 = w[3],
+            w4 = w[4],
+        );
+        let _ = writeln!(s, "{}", line.trim_end());
+    }
+    for r in &p.reads {
+        let _ = writeln!(
+            s,
+            "  read occurrence: node {} scans {}: {}, {} bytes ({}) over the runs",
+            r.node,
+            r.dataset,
+            count(r.row_groups, "row group", "row groups"),
+            num(r.bytes),
+            size(r.bytes)
+        );
+    }
+    for x in &p.shared {
+        let _ = writeln!(
+            s,
+            "  shared node {} feeds {} nodes, evaluated once: its output is estimated at [{}, {}] \
+             bytes over the runs ({})",
+            x.node,
+            x.consumers,
+            num(x.low),
+            num(x.high),
+            x.model
+        );
+    }
+}
+
 // One linear screen: state, funnel, culprit, recommendation, fanout, lints,
 // records.
 #[allow(clippy::too_many_lines)]
@@ -1119,7 +1263,8 @@ pub(crate) fn why(r: &bellwether::WhyReport, out: &Out, fix_command: &str) -> St
             Some(
                 k @ (LookupKind::TextRuns { .. }
                 | LookupKind::Bitemporal { .. }
-                | LookupKind::SemiJoin { .. }),
+                | LookupKind::SemiJoin { .. }
+                | LookupKind::Plan { .. }),
             ) => lookup_label(k),
             // `why` prices locate (in a window or not), latest, asof,
             // bitemporal, text lookups, or semi-joins.
@@ -1360,6 +1505,15 @@ pub(crate) fn why(r: &bellwether::WhyReport, out: &Out, fix_command: &str) -> St
                 (CandidateOrigin::Profile, _, _) => {
                     notes.push("profile candidate".to_string());
                 }
+                (CandidateOrigin::Plan, spec, _) => notes.push(match spec {
+                    KeySpec::Range { .. } => {
+                        "a range key on a column the plan's between filter names".to_string()
+                    }
+                    KeySpec::Temporal { .. } => {
+                        "a temporal key on a latest or as_of node's keys and version".to_string()
+                    }
+                    _ => "an exact key on columns the plan's nodes probe by whole keys".to_string(),
+                }),
             }
             if let (Some(_), Some(loc)) = (&kind_label, c.locate) {
                 notes.push(format!(
@@ -1402,6 +1556,9 @@ pub(crate) fn why(r: &bellwether::WhyReport, out: &Out, fix_command: &str) -> St
         }
         for line in legends {
             let _ = writeln!(s, "{line}");
+        }
+        for p in &r.plans {
+            plan_table(&mut s, p, r.recommended.as_ref().map(|x| label(&x.spec)));
         }
     } else {
         let _ = writeln!(
@@ -1507,6 +1664,47 @@ pub(crate) fn why(r: &bellwether::WhyReport, out: &Out, fix_command: &str) -> St
                 row_groups,
                 values,
             } => list_layout(*least_row_groups, *row_groups, values),
+            CulpritReason::PlanShape {
+                scan,
+                keys_at,
+                above,
+                least_row_groups,
+                row_groups,
+                keys_row_groups,
+                keys_span,
+                ..
+            } => {
+                let reads = format!(
+                    "every candidate reads at least {} of the {} the plan spans, though the runs' \
+                     keys sit in {} of the {}",
+                    num(*least_row_groups),
+                    count(*row_groups, "row group", "row groups"),
+                    num(*keys_row_groups),
+                    count(*keys_span, "row group", "row groups")
+                );
+                match (keys_at, above) {
+                    (Some(k), Some(a)) => format!(
+                        "the plan's shape, not the layout or a missing index: node {} ({}) \
+                         applies the runs' keys above node {} ({}), whose output no index \
+                         narrows, so scan node {scan} reads everything it plans; {reads}; apply \
+                         the keys below node {} so a key prunes the scan",
+                        k.node, k.op, a.node, a.op, a.node
+                    ),
+                    (Some(k), None) => format!(
+                        "the plan's shape, not the layout or a missing index: node {} ({}) \
+                         applies the runs' keys but not to the rows of scan node {scan}, so that \
+                         scan reads everything it plans; {reads}; apply the keys on the scan's \
+                         own rows so a key prunes it",
+                        k.node, k.op
+                    ),
+                    (None, _) => format!(
+                        "the plan's shape, not the layout or a missing index: no node applies the \
+                         runs' keys (keys: {{\"from\": \"run\"}}), so scan node {scan} reads \
+                         everything it plans; {reads}; filter the scan's rows by the runs' keys \
+                         so a key prunes it"
+                    ),
+                }
+            }
             CulpritReason::ServingSpec { spec } => format!("the serving key {}", label(spec)),
             CulpritReason::AggAnswered { spec } => format!(
                 "none: the index answers the aggregates from {} beside its counted key; nothing \

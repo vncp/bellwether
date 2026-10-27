@@ -204,6 +204,83 @@ impl RunKeys {
         })
     }
 
+    /// A key set from canonical key tuples over `columns`, at `key_types`
+    /// (a consumer plan's literal keys, relational replay WP15): each tuple
+    /// must be a well-formed canonical tuple of exactly one element per
+    /// column; a tuple holding a null matches nothing (ADR 014) and is
+    /// dropped and counted; the rest are sorted and deduplicated. Returns
+    /// the key set and the null tuples dropped.
+    pub fn from_tuples<'t>(
+        columns: &[String],
+        key_types: &[ColumnType],
+        tuples: impl IntoIterator<Item = &'t [u8]>,
+    ) -> Result<(Self, u64)> {
+        if columns.is_empty() || columns.len() != key_types.len() {
+            return Err(Error::KeySpec(format!(
+                "{} key column(s) with {} type(s)",
+                columns.len(),
+                key_types.len()
+            )));
+        }
+        check_distinct_columns(columns)?;
+        let width = columns.len();
+        let mut nulls = 0u64;
+        let mut all: Vec<(Vec<u8>, Vec<usize>)> = Vec::new();
+        for t in tuples {
+            let ranges = encoding::tuple_elements(t).ok_or_else(|| {
+                Error::KeySpec(format!(
+                    "a key tuple ({} bytes) is not a well-formed canonical tuple",
+                    t.len()
+                ))
+            })?;
+            if ranges.len() != width {
+                return Err(Error::KeySpec(format!(
+                    "a key tuple holds {} element(s) and the keys name {width} column(s) ({})",
+                    ranges.len(),
+                    columns.join(", ")
+                )));
+            }
+            if encoding::tuple_has_null(t) != Some(false) {
+                nulls += 1;
+                continue;
+            }
+            all.push((t.to_vec(), ranges.iter().map(|r| r.end).collect()));
+        }
+        all.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        all.dedup_by(|a, b| a.0 == b.0);
+        let mut data = Vec::with_capacity(all.iter().map(|(t, _)| t.len()).sum());
+        let mut ends = Vec::with_capacity(all.len() * width);
+        for (t, e) in all {
+            let base = data.len();
+            data.extend_from_slice(&t);
+            ends.extend(e.into_iter().map(|x| base + x));
+        }
+        Ok((
+            Self {
+                columns: columns.to_vec(),
+                key_types: key_types.to_vec(),
+                data,
+                ends,
+            },
+            nulls,
+        ))
+    }
+
+    /// The tuples of this key set that `other` (over the same columns, in
+    /// the same order) also holds.
+    pub fn intersect(&self, other: &Self) -> Result<Self> {
+        if self.columns != other.columns {
+            return Err(Error::KeySpec(format!(
+                "keys over ({}) cannot be intersected with keys over ({})",
+                self.columns.join(", "),
+                other.columns.join(", ")
+            )));
+        }
+        let theirs: std::collections::BTreeSet<&[u8]> = other.tuples().collect();
+        let kept: Vec<&[u8]> = self.tuples().filter(|t| theirs.contains(t)).collect();
+        Ok(Self::from_tuples(&self.columns, &self.key_types, kept)?.0)
+    }
+
     /// The cache payload (module docs). Deterministic: equal key sets give
     /// equal bytes.
     pub fn to_payload(&self) -> Result<Vec<u8>> {

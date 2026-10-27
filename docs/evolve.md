@@ -2,6 +2,8 @@
 
 Design document for `bellwether-evolve` (WP13a `advise`, WP13b `evolve`, WP13c rulebook v2; milestone M6). Governing decisions: ADR 021 (the loop), ADR 022 (what "gradient" means here), ADR 023 (joint and whole-pipeline optimization), ADR 024 (counterfactual attribution), ADR 025 (rulebook validation), ADR 031 (scoped proposers and a frozen outer loop), ADR 032 (staged delivery with a measured trigger).
 
+**Scope as of 2026-10-27 (ADR 032 amendment).** Only a reduced stage 1 is scheduled: workload-level key-set selection, exact knob descent, Pareto with anchors, and receipts (§3.1). Layout and materialization search, edge and plan-node attribution, stage 2 (`evolve --llm`), and stage 3 (rulebook v2) are deferred until a recorded multi-step pipeline workload exists and reduced `advise` leaves a structural anti-pattern on it. The rest of this document is the design for that case.
+
 ## 1. The problem, stated precisely
 
 A data pipeline is a DAG of steps. Each step has a logical plan (a DAG of operators), reads from a physical design (which indexes and layouts exist), and runs many times with different inputs (a trigger batch of keys, a date window). Engineers tune three things: the plan (operator order, join strategy, projection), the physical design (keys, layouts, knobs), and the step boundaries (what is materialized, what is pushed upstream). Today they tune by hand, scoring with estimates and verifying by hope.
@@ -85,6 +87,8 @@ Keep evolve. It is the one place in this field where the optimizer has an exact 
 | 3 · rulebook v2 | Rules as predicated templates with counters, temporal holdout, caps, staleness that must be re-earned | Distillation only | A rule learned on one workload reproduces a gain on a held-out template under replay |
 
 **Kill criterion for stages 2 and 3.** If stage 1 captures the frontier on the real workloads you have (frontier within 5% of stage 2's on bytes read at p50 and p95), stop. An exact what-if advisor with receipts is already a product; the language-model search is the part that must prove it adds rewrites enumeration cannot reach.
+
+**Reduced stage 1 (2026-10-27, ADR 032 amendment).** The stage-1 row above now ships without layout and materialization search: `advise` chooses a set of key specs and the numeric knobs replay prices, against every recorded run, with Pareto, anchors, and receipts. It starts after WP22b's lookup fix (plan time under full-scan time), because the loss is bytes read and on 2026-10-26 fewer bytes did not yet mean less time. Stages 2 and 3 are not scheduled; the trigger and kill criterion above apply when they are reopened.
 
 **The stage-2 budget.** Cost per accepted mutation is replays plus model calls charged to one budget (§11, item 2). Its bound is the owner's decision and is deliberately unset here; it must be written into this section and recorded as a ledger row before WP13b's first search, as ADR 019 requires of every threshold an evaluation is judged by. WP13b's done-when cannot be met until it is.
 
@@ -236,22 +240,21 @@ On the synthetic ledger at the medium size: one replay of one run under one cand
 
 ## 14. Operators priced exactly (ADR 026)
 
-The loss covers the relational subset a lake pipeline actually uses, not lookups alone. Each row says what the price needs and how exact it is.
+The loss covers the relational subset a lake pipeline actually uses, not lookups alone. Relational replay (WP15) prices a consumer's plan, a typed DAG (`ConsumerPlan`), node by node from the index and footer statistics. Each row says what the price is and how exact it is; the README's table ("Pricing a whole query") is the same one.
 
-| Operator | Needs | Exactness |
+| Operator | Bytes | Output rows |
 |---|---|---|
-| Projection of columns | per-column chunk bytes from footers (`ColumnStats.bytes`) | exact |
-| Equality, `IN` | exact or bloom key | exact (bloom: bounded by its false-positive rate) |
-| Range | min/max statistics; exact under a range key | bounded; exact with a range key |
-| `latest`, `asof` | temporal key | exact |
-| Semi-join of a key set against a dataset | exact key on the dataset | exact |
-| Inner or left join of two datasets | exact keys on both join columns; counts for output cardinality | exact row groups; exact cardinality with counts, else bounded |
-| Window partition prefilter | exact key on the partition columns | exact |
-| Aggregation input | projection and the filters above | exact |
-| Shuffle bytes | rows per key (counts) and average row width per column | bounded |
-| CPU and wall time | an attached executor | measured |
+| `scan`, `project` | projected columns' compressed chunk bytes over the planned row groups (a text chunk whole): exact | footer row counts: exact |
+| `filter` with `in` or a semi-join, `semi_join`, `window` with keys | the row groups the serving exact, bloom, or temporal key plans (a bloom's false positives are in the plan): exact | exact from a counted key on exactly those columns over a scan's rows; else bounded `[(key, row group) pairs present, rows of the planned row groups]` |
+| `filter` with `between` | the row groups a range key (else min/max) keeps: exact | bounded `[0, rows of those row groups]` |
+| `latest`, `as_of` | the winners' row groups through a temporal key: exact | bounded `[keys with a version, counted rows of the winners' row groups]` |
+| `join` (inner, left), a semi-join keyed by another node | per side the row groups holding a common key, from a merge of both indexes' sorted key blocks: exact | Σ count_L × count_R (left: plus unmatched left rows): exact with counts on both sides over scans' rows selected only by whole keys on the join columns, else bounded; a side with no exact or temporal key on its join columns is refused |
+| `aggregate` | its input's: exact | groups: exact from an exact or temporal key on the grouping columns over a scan's rows, else bounded `[min(1, low), high]` |
+| `exchange` | compressed-equivalent bytes moved (rows × average compressed row width): bounded with respect to that quantity, not network or memory bytes | unchanged |
+| any node over a SQL table | measured, naming the model | measured |
+| CPU and wall time | not priced: an attached executor measures them | |
 
-Counts are per-key, per-row-group row counts stored beside the bitmap when a key spec asks for them (storage version 2). They cost index space and buy exact join cardinalities, exact layout pricing, and exact shuffle bounds. The optimizer's backward pass (§4.1) is unchanged: one exact replay per counterfactual, whatever the operator.
+Counts are per-key, per-row-group row counts stored beside the bitmap when a key spec asks for them (storage version 2). They cost index space and buy exact join cardinalities and exact filter rows. A shared node (a diamond, a self-join) is evaluated once per run and its scans read once with the union of their consumers' row groups; each consumer prices its rows from its own selection. Layout pricing and plan-node counterfactuals were cut from WP15 (ADR 032, amended 2026-10-27); the backward pass (§4.1) over key specs is unchanged.
 
 ## 15. Generic use through Scorer and Verifier
 

@@ -15,11 +15,14 @@ pub enum ReplayError {
     /// A failure from the engine crates (store, source, ledger, core).
     #[error(transparent)]
     Engine(#[from] Error),
-    /// A `Rewrite` proposal has no replay: its read set depends on the
-    /// rewritten plan, which a `RewriteShape` states in prose.
+    /// A `Rewrite` proposal whose shape carries no typed plans has no
+    /// replay: its read set depends on the rewritten plan, which the shape
+    /// then states only in prose. A shape with `before_plan` and
+    /// `after_plan` is replayed (relational replay, WP15).
     #[error(
-        "this crate has no replay for a Rewrite proposal: its read set depends on the rewritten \
-         plan, which a RewriteShape states in prose (contract v3 backlog #2)"
+        "this rewrite has no replay: its shape states the rewritten plan only in prose; give the \
+         rewrite a before_plan and an after_plan (typed consumer plans, docs/evolve.md section \
+         14) so the engine can price both"
     )]
     RewriteNotScorable,
     /// A proposed key spec serves none of the workload's runs, so scoring it
@@ -87,6 +90,62 @@ pub enum ReplayError {
         /// Why it cannot be probed.
         why: String,
     },
+    /// A consumer plan is malformed or does not fit its datasets: another
+    /// version, an input out of range, a cycle, a node feeding two nodes, a
+    /// node the root does not read, a dataset not bound, a column not in
+    /// its input, an ambiguous column, or join or key columns whose
+    /// encodings do not compare. Refused before anything is priced.
+    #[error("consumer plan{}: {reason}", node.map(|n| format!(" node {n}")).unwrap_or_default())]
+    InvalidPlan {
+        /// The node at fault, when one is.
+        node: Option<u32>,
+        /// What is wrong, and what to do.
+        reason: String,
+    },
+    /// A two-sided join (or a semi-join keyed by another node's output)
+    /// whose side has no complete exact or temporal key on exactly its
+    /// join columns, or is no single dataset's rows: the common keys are an
+    /// intersection of two indexes, so without one the node is refused,
+    /// never priced as a scan.
+    #[error("{}", join_not_indexed(*node, side, dataset, columns, derived.as_deref()))]
+    JoinNotIndexed {
+        /// The join node.
+        node: u32,
+        /// `left`, `right`, or `keys` (a semi-join's key source).
+        side: &'static str,
+        /// The dataset of that side (`node <n>` for derived rows).
+        dataset: String,
+        /// That side's join columns.
+        columns: Vec<String>,
+        /// Why no index can hold that side's rows, when it is rows derived
+        /// from several scans; `None` when the dataset only lacks the key.
+        derived: Option<String>,
+    },
+}
+
+fn join_not_indexed(
+    node: u32,
+    side: &str,
+    dataset: &str,
+    columns: &[String],
+    derived: Option<&str>,
+) -> String {
+    match derived {
+        Some(why) => format!(
+            "consumer plan node {node} joins on its {side} side ({dataset}: {}), and {why}; join \
+             on columns that all come from one scan, or split the join into one per scan",
+            columns.join(", ")
+        ),
+        None => format!(
+            "consumer plan node {node} joins on its {side} side {dataset}({}), and {dataset} has \
+             no complete exact or temporal key on exactly those columns, so the common keys \
+             cannot be read from two indexes and the join is not priced as a scan; declare \
+             `exact:{}` (add `,counts` for an exact output cardinality) on {dataset} and index \
+             it, or price a configuration that has it",
+            columns.join(", "),
+            columns.join(",")
+        ),
+    }
 }
 
 /// Result alias for operations that return [`ReplayError`].
@@ -111,11 +170,17 @@ impl From<ReplayError> for Error {
             ReplayError::RewriteNotScorable
             | ReplayError::ProposalMismatch { .. }
             | ReplayError::NotAProposal(_) => Error::LedgerRule(msg),
-            ReplayError::SpecServesNoRun { .. } => Error::KeySpec(msg),
+            ReplayError::SpecServesNoRun { .. } | ReplayError::JoinNotIndexed { .. } => {
+                Error::KeySpec(msg)
+            }
             ReplayError::BenchMismatch { .. } | ReplayError::UnprobeableFilter { .. } => {
                 Error::Source(msg)
             }
             ReplayError::ClusterKeysExceeded { .. } => Error::Other(msg),
+            ReplayError::InvalidPlan { .. } => Error::InvalidArgument {
+                field: "plan",
+                reason: msg,
+            },
         }
     }
 }

@@ -896,7 +896,10 @@ fn bellwether_mcp_takes_the_shared_engine_and_budget_flags() {
         assert!(help.contains(&long), "{long} missing from:\n{help}");
         flags += 1;
     }
-    assert_eq!(flags, 13);
+    // The engine flags (index, format, chunk-size, schema,
+    // fingerprint-policy, partitioning, path-template, twin-of, scratch,
+    // keep, dataset) and the 3 budgets.
+    assert_eq!(flags, 14);
 }
 
 /// `bellwether mcp <root>` is the same server: a handshake and one tool

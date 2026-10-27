@@ -1086,6 +1086,405 @@ pub fn prefix_bound(prefix: &[u8]) -> (Vec<u8>, Option<Vec<u8>>) {
     (lower, None)
 }
 
+/// An owned typed value decoded from a canonical encoding by [`decode`]:
+/// the value at the dataset type it was encoded under, with the dataset's
+/// decimal scale and time unit, so a consumer never re-interprets a key by
+/// its own cast. [`Scalar::as_value`] borrows it back as a [`Value`] for
+/// [`encode_value_as`], which reproduces the bytes exactly.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Scalar {
+    /// Boolean.
+    Boolean(bool),
+    /// A signed integer, in range for the dataset's width.
+    Int(i64),
+    /// An unsigned integer, in range for the dataset's width.
+    UInt(u64),
+    /// A float, exactly representable at the dataset's width; NaN is the
+    /// canonical NaN, and the sign of a zero is kept.
+    Float(f64),
+    /// A Decimal128 unscaled `value` at the dataset's `scale`.
+    Decimal128 {
+        /// Unscaled value.
+        value: i128,
+        /// The dataset scale.
+        scale: i8,
+    },
+    /// A Decimal256 unscaled `value` at the dataset's `scale`.
+    Decimal256 {
+        /// Unscaled value.
+        value: i256,
+        /// The dataset scale.
+        scale: i8,
+    },
+    /// A UTF-8 string.
+    Utf8(String),
+    /// Raw bytes.
+    Binary(Vec<u8>),
+    /// Days since the epoch.
+    Date32(i32),
+    /// Milliseconds since the epoch.
+    Date64(i64),
+    /// Time of day in the dataset's `unit`.
+    Time {
+        /// Value in `unit`.
+        value: i64,
+        /// The dataset unit.
+        unit: TimeUnit,
+    },
+    /// A UTC instant in the dataset's `unit`.
+    Timestamp {
+        /// Value in `unit`.
+        value: i64,
+        /// The dataset unit.
+        unit: TimeUnit,
+    },
+}
+
+impl Scalar {
+    /// The value as a borrowed [`Value`], for [`encode_value_as`].
+    #[must_use]
+    pub fn as_value(&self) -> Value<'_> {
+        match self {
+            Self::Boolean(b) => Value::Boolean(*b),
+            Self::Int(i) => Value::Int(*i),
+            Self::UInt(u) => Value::UInt(*u),
+            Self::Float(f) => Value::Float(*f),
+            Self::Decimal128 { value, scale } => Value::Decimal128 {
+                value: *value,
+                scale: *scale,
+            },
+            Self::Decimal256 { value, scale } => Value::Decimal256 {
+                value: *value,
+                scale: *scale,
+            },
+            Self::Utf8(s) => Value::Utf8(s),
+            Self::Binary(b) => Value::Binary(b),
+            Self::Date32(d) => Value::Date32(*d),
+            Self::Date64(d) => Value::Date64(*d),
+            Self::Time { value, unit } => Value::Time {
+                value: *value,
+                unit: *unit,
+            },
+            Self::Timestamp { value, unit } => Value::Timestamp {
+                value: *value,
+                unit: *unit,
+            },
+        }
+    }
+
+    /// The owned form of `v`.
+    #[must_use]
+    pub fn from_value(v: &Value<'_>) -> Self {
+        match *v {
+            Value::Boolean(b) => Self::Boolean(b),
+            Value::Int(i) => Self::Int(i),
+            Value::UInt(u) => Self::UInt(u),
+            Value::Float(f) => Self::Float(f),
+            Value::Decimal128 { value, scale } => Self::Decimal128 { value, scale },
+            Value::Decimal256 { value, scale } => Self::Decimal256 { value, scale },
+            Value::Utf8(s) => Self::Utf8(s.to_string()),
+            Value::Binary(b) => Self::Binary(b.to_vec()),
+            Value::Date32(d) => Self::Date32(d),
+            Value::Date64(d) => Self::Date64(d),
+            Value::Time { value, unit } => Self::Time { value, unit },
+            Value::Timestamp { value, unit } => Self::Timestamp { value, unit },
+        }
+    }
+}
+
+fn bad_encoding(dt: &crate::segment::ColumnType, why: impl std::fmt::Display) -> Error {
+    Error::Other(format!(
+        "canonical bytes do not decode as dataset type {}: {why}",
+        dt.data_type()
+    ))
+}
+
+fn read_u64(bytes: &[u8], at: usize) -> Option<u64> {
+    Some(u64::from_be_bytes(bytes.get(at..at + 8)?.try_into().ok()?))
+}
+
+fn read_flipped_i64(bytes: &[u8], at: usize) -> Option<i64> {
+    #[allow(clippy::cast_possible_wrap)] // the encoding's sign flip
+    read_u64(bytes, at).map(|u| (u ^ (1 << 63)) as i64)
+}
+
+/// Reads the escaped payload of a string or binary element starting at
+/// `at` (just after its tag): the bytes and the element's payload length
+/// including the `0x00 0x00` terminator.
+fn read_escaped(bytes: &[u8], at: usize) -> Option<(Vec<u8>, usize)> {
+    let mut out = Vec::new();
+    let mut j = at;
+    loop {
+        match *bytes.get(j)? {
+            0x00 => match *bytes.get(j + 1)? {
+                0x00 => return Some((out, j + 2 - at)),
+                0xFF => {
+                    out.push(0x00);
+                    j += 2;
+                }
+                _ => return None,
+            },
+            b => {
+                out.push(b);
+                j += 1;
+            }
+        }
+    }
+}
+
+fn recorded_unit(u: crate::segment::RecordedUnit) -> TimeUnit {
+    use crate::segment::RecordedUnit as R;
+    match u {
+        R::Second => TimeUnit::Second,
+        R::Millisecond => TimeUnit::Millisecond,
+        R::Microsecond => TimeUnit::Microsecond,
+        R::Nanosecond => TimeUnit::Nanosecond,
+    }
+}
+
+/// Decodes one element of a canonical encoding starting at `bytes[at]`
+/// under the dataset type `dt`: the value and the element's length. The
+/// tag, the decimal width, and the temporal kind and unit must be exactly
+/// the ones `dt` encodes under, and the value must be in range for `dt`
+/// (an integer for its width, a float exactly representable at its width,
+/// a decimal within its precision, a `FixedSizeBinary` of its size), so
+/// every accepted element re-encodes to the same bytes. A null marker is
+/// refused here; [`decode_tuple`] reads it as a null.
+#[allow(clippy::too_many_lines)]
+fn decode_at(bytes: &[u8], at: usize, dt: &crate::segment::ColumnType) -> Result<(Scalar, usize)> {
+    use crate::segment::ColumnType as T;
+    let head = *bytes
+        .get(at)
+        .ok_or_else(|| bad_encoding(dt, "no bytes left for the element"))?;
+    let short = || bad_encoding(dt, "the element is truncated");
+    let want_tag = |t: u8| {
+        if head == t {
+            Ok(())
+        } else if head == tag::NULL {
+            Err(bad_encoding(dt, "the element is the null marker"))
+        } else {
+            Err(bad_encoding(
+                dt,
+                format!("tag 0x{head:02x} where 0x{t:02x} was expected"),
+            ))
+        }
+    };
+    let temporal = |kind: u8, unit: u8| -> Result<i64> {
+        want_tag(tag::TEMPORAL)?;
+        let (k, u) = (
+            *bytes.get(at + 1).ok_or_else(short)?,
+            *bytes.get(at + 2).ok_or_else(short)?,
+        );
+        if (k, u) != (kind, unit) {
+            return Err(bad_encoding(
+                dt,
+                format!(
+                    "temporal kind 0x{k:02x} unit 0x{u:02x} where 0x{kind:02x} 0x{unit:02x} was \
+                     expected (another unit is another dataset type)"
+                ),
+            ));
+        }
+        read_flipped_i64(bytes, at + 3).ok_or_else(short)
+    };
+    let out_of_range =
+        |what: String| bad_encoding(dt, format!("{what} is out of range for the dataset type"));
+    Ok(match dt {
+        T::Boolean => {
+            want_tag(tag::BOOLEAN)?;
+            match *bytes.get(at + 1).ok_or_else(short)? {
+                0 => (Scalar::Boolean(false), 2),
+                1 => (Scalar::Boolean(true), 2),
+                b => return Err(bad_encoding(dt, format!("boolean byte 0x{b:02x}"))),
+            }
+        }
+        T::Int8 | T::Int16 | T::Int32 | T::Int64 => {
+            want_tag(tag::INT)?;
+            let v = read_flipped_i64(bytes, at + 1).ok_or_else(short)?;
+            let (lo, hi) = int_range(&dt.data_type()).unwrap_or((i128::MIN, i128::MAX));
+            if i128::from(v) < lo || i128::from(v) > hi {
+                return Err(out_of_range(v.to_string()));
+            }
+            (Scalar::Int(v), 9)
+        }
+        T::UInt8 | T::UInt16 | T::UInt32 | T::UInt64 => {
+            want_tag(tag::UINT)?;
+            let v = read_u64(bytes, at + 1).ok_or_else(short)?;
+            let (_, hi) = int_range(&dt.data_type()).unwrap_or((0, i128::MAX));
+            if i128::from(v) > hi {
+                return Err(out_of_range(v.to_string()));
+            }
+            (Scalar::UInt(v), 9)
+        }
+        T::Float16 | T::Float32 | T::Float64 => {
+            want_tag(tag::FLOAT)?;
+            let bits = read_u64(bytes, at + 1).ok_or_else(short)?;
+            let raw = if bits >> 63 == 1 {
+                bits ^ (1 << 63)
+            } else {
+                !bits
+            };
+            let f = f64::from_bits(raw);
+            if f.is_nan() && raw != 0x7FF8_0000_0000_0000 {
+                return Err(bad_encoding(dt, "a NaN other than the canonical NaN"));
+            }
+            // The encoder admits only values exact at the dataset width.
+            let mut probe = Vec::with_capacity(9);
+            encode_value_as(&Value::Float(f), &dt.data_type(), &mut probe)
+                .map_err(|_| out_of_range(format!("{f:?}")))?;
+            (Scalar::Float(f), 9)
+        }
+        T::Decimal128 { precision, scale } | T::Decimal256 { precision, scale } => {
+            want_tag(tag::DECIMAL)?;
+            let width = *bytes.get(at + 1).ok_or_else(short)?;
+            let wide = matches!(dt, T::Decimal256 { .. });
+            let expected = if wide {
+                width::DECIMAL256
+            } else {
+                width::DECIMAL128
+            };
+            if width != expected {
+                return Err(bad_encoding(
+                    dt,
+                    format!("decimal width 0x{width:02x} where 0x{expected:02x} was expected"),
+                ));
+            }
+            let bound = i256::from_i128(10)
+                .checked_pow(u32::from(*precision))
+                .ok_or_else(|| bad_encoding(dt, "the precision has no bound"))?;
+            if wide {
+                let mut raw: [u8; 32] = bytes
+                    .get(at + 2..at + 34)
+                    .ok_or_else(short)?
+                    .try_into()
+                    .map_err(|_| short())?;
+                raw[0] ^= 0x80;
+                let v = i256::from_be_bytes(raw);
+                if v >= bound || v <= bound.wrapping_neg() {
+                    return Err(out_of_range(format!("decimal {v}")));
+                }
+                (
+                    Scalar::Decimal256 {
+                        value: v,
+                        scale: *scale,
+                    },
+                    34,
+                )
+            } else {
+                let mut raw: [u8; 16] = bytes
+                    .get(at + 2..at + 18)
+                    .ok_or_else(short)?
+                    .try_into()
+                    .map_err(|_| short())?;
+                raw[0] ^= 0x80;
+                let v = i128::from_be_bytes(raw);
+                let w = i256::from_i128(v);
+                if w >= bound || w <= bound.wrapping_neg() {
+                    return Err(out_of_range(format!("decimal {v}")));
+                }
+                (
+                    Scalar::Decimal128 {
+                        value: v,
+                        scale: *scale,
+                    },
+                    18,
+                )
+            }
+        }
+        T::Utf8 | T::LargeUtf8 | T::Utf8View => {
+            want_tag(tag::UTF8)?;
+            let (raw, len) = read_escaped(bytes, at + 1)
+                .ok_or_else(|| bad_encoding(dt, "the string is not terminated"))?;
+            let s = String::from_utf8(raw)
+                .map_err(|_| bad_encoding(dt, "the string is not valid UTF-8"))?;
+            (Scalar::Utf8(s), len + 1)
+        }
+        T::Binary | T::LargeBinary | T::BinaryView | T::FixedSizeBinary { .. } => {
+            want_tag(tag::BINARY)?;
+            let (raw, len) = read_escaped(bytes, at + 1)
+                .ok_or_else(|| bad_encoding(dt, "the binary value is not terminated"))?;
+            if let T::FixedSizeBinary { size } = dt {
+                if usize::try_from(*size).ok() != Some(raw.len()) {
+                    return Err(bad_encoding(
+                        dt,
+                        format!("a {}-byte value for a {size}-byte type", raw.len()),
+                    ));
+                }
+            }
+            (Scalar::Binary(raw), len + 1)
+        }
+        T::Date32 => {
+            let v = temporal(temporal_kind::DATE32, time_unit::DAY)?;
+            let d = i32::try_from(v).map_err(|_| out_of_range(format!("date {v}")))?;
+            (Scalar::Date32(d), 11)
+        }
+        T::Date64 => (
+            Scalar::Date64(temporal(temporal_kind::DATE64, time_unit::MILLISECOND)?),
+            11,
+        ),
+        T::Time32 { unit } | T::Time64 { unit } => {
+            let u = recorded_unit(*unit);
+            let v = temporal(temporal_kind::TIME, unit_tag(u))?;
+            if matches!(dt, T::Time32 { .. }) && i32::try_from(v).is_err() {
+                return Err(out_of_range(format!("time {v}")));
+            }
+            (Scalar::Time { value: v, unit: u }, 11)
+        }
+        T::Timestamp { unit, .. } => {
+            let u = recorded_unit(*unit);
+            let v = temporal(temporal_kind::TIMESTAMP, unit_tag(u))?;
+            (Scalar::Timestamp { value: v, unit: u }, 11)
+        }
+    })
+}
+
+/// Decodes the canonical encoding (ADR 016) of one value of the dataset
+/// type `dt` into a typed [`Scalar`] at that type: decimals at the dataset
+/// scale, times and timestamps in the dataset unit. The bytes must be
+/// exactly one element that [`encode_value_as`] could have written under
+/// `dt`, so `encode_value_as(&decode(b, dt)?.as_value(), &dt.data_type())`
+/// gives `b` back; anything else (another tag, width, kind or unit, a
+/// value out of the type's range, trailing bytes, the null marker) is an
+/// error naming why, never a guess.
+pub fn decode(bytes: &[u8], dt: &crate::segment::ColumnType) -> Result<Scalar> {
+    let (v, len) = decode_at(bytes, 0, dt)?;
+    if len != bytes.len() {
+        return Err(bad_encoding(
+            dt,
+            format!("{} bytes follow the element", bytes.len() - len),
+        ));
+    }
+    Ok(v)
+}
+
+/// Decodes a canonical composite tuple of `types` (one element per type,
+/// in order), each element as [`decode`] does; a `0x00` null marker is
+/// `None` (ADR 014). The bytes must hold exactly that many elements.
+pub fn decode_tuple(
+    bytes: &[u8],
+    types: &[crate::segment::ColumnType],
+) -> Result<Vec<Option<Scalar>>> {
+    let mut out = Vec::with_capacity(types.len());
+    let mut at = 0usize;
+    for dt in types {
+        if bytes.get(at) == Some(&tag::NULL) {
+            out.push(None);
+            at += 1;
+            continue;
+        }
+        let (v, len) = decode_at(bytes, at, dt)?;
+        out.push(Some(v));
+        at += len;
+    }
+    if at != bytes.len() {
+        return Err(Error::Other(format!(
+            "a canonical tuple of {} elements has {} bytes left over",
+            types.len(),
+            bytes.len() - at
+        )));
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {

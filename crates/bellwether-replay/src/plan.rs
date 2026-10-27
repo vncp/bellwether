@@ -541,6 +541,14 @@ pub trait PlanSource: Send + Sync {
     /// so it is complete by construction.
     fn with_transient(&self, transient: &[Arc<TransientIndex>])
         -> Result<Box<dyn PlanSource + '_>>;
+
+    /// The segments of `spec` this source plans with, when it holds them
+    /// in this crate's form ([`SegmentPlanner`]); `None`, the default,
+    /// otherwise (the build crate's planner reads its own). Relational
+    /// replay streams their key blocks (WP15).
+    fn spec_segments(&self, _spec: &KeySpec) -> Option<Arc<SpecSegments>> {
+        None
+    }
 }
 
 /// The build planner's lookup of an aggregate run.
@@ -1822,6 +1830,10 @@ impl PlanSource for SegmentPlanner {
             p.add_shared(t.segments())?;
         }
         Ok(Box::new(p))
+    }
+
+    fn spec_segments(&self, spec: &KeySpec) -> Option<Arc<SpecSegments>> {
+        self.find(spec).cloned()
     }
 }
 
