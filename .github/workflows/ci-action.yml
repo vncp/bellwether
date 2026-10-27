@@ -3,7 +3,9 @@ name: ci-action
 # The composite Action in action/ (WP17), run against a fixture repository
 # built in a temporary directory: a head whose changed step carries a
 # signed receipt passes, and a head missing one fails the job with exit 1.
-# The comment script is tested against a stand-in for the GitHub API.
+# The comment script is tested against a stand-in for the GitHub API, and
+# the release-download and checksum verification path in install.sh against
+# a stand-in for `gh release download`.
 
 on:
   push:
@@ -36,6 +38,9 @@ jobs:
 
       - name: the comment is updated in place, never posted twice
         run: action/tests/comment-updates-in-place.sh
+
+      - name: release download verifies checksums.txt and refuses tampered or malformed archives
+        run: action/tests/install-checksum.sh
 
       - name: build the fixture repository
         env:

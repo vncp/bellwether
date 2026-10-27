@@ -1,0 +1,195 @@
+name: release
+
+# Builds `bellwether` (crates/bellwether-cli) in --release --locked for the
+# three targets action/install.sh supports, packs each binary at the archive
+# root as bellwether-<tag>-<target>.tar.gz, writes checksums.txt, verifies
+# action/install.sh against a local stand-in for `gh`, uploads the archives
+# and checksums.txt as workflow artifacts, and on a `v*` tag push publishes
+# them to the GitHub Release.
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to name the archives after (dry run when dispatched)"
+        required: false
+        default: v0.1.0-dry-run
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: build (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-24.04-arm
+          - target: aarch64-apple-darwin
+            os: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
+
+      - name: resolve tag
+        id: tag
+        shell: bash
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          if [[ "${{ github.ref }}" == refs/tags/v* ]]; then
+            tag="$REF_NAME"
+          elif [ -n "$INPUT_TAG" ]; then
+            tag="$INPUT_TAG"
+          else
+            tag="v0.1.0-dry-run"
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+      - name: build bellwether (--release --locked)
+        run: cargo build -p bellwether-cli --bin bellwether --release --locked --target ${{ matrix.target }}
+
+      - name: package bellwether-${{ steps.tag.outputs.tag }}-${{ matrix.target }}.tar.gz
+        shell: bash
+        env:
+          TAG: ${{ steps.tag.outputs.tag }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          dist="$RUNNER_TEMP/dist"
+          mkdir -p "$dist"
+          cp "target/$TARGET/release/bellwether" "$dist/bellwether"
+          chmod +x "$dist/bellwether"
+          "$dist/bellwether" --version
+          COPYFILE_DISABLE=1 tar -C "$dist" -czf "$dist/bellwether-$TAG-$TARGET.tar.gz" bellwether
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.target }}
+          path: ${{ runner.temp }}/dist/bellwether-${{ steps.tag.outputs.tag }}-${{ matrix.target }}.tar.gz
+          if-no-files-found: error
+
+  finalize:
+    name: checksums · verify install.sh · publish
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: resolve tag
+        id: tag
+        shell: bash
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          if [[ "${{ github.ref }}" == refs/tags/v* ]]; then
+            tag="$REF_NAME"
+          elif [ -n "$INPUT_TAG" ]; then
+            tag="$INPUT_TAG"
+          else
+            tag="v0.1.0-dry-run"
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+      - name: download built archives
+        uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          path: ${{ runner.temp }}/release
+          merge-multiple: true
+
+      - name: compute checksums.txt
+        shell: bash
+        env:
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          cd "$RUNNER_TEMP/release"
+          for target in x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu aarch64-apple-darwin; do
+            test -f "bellwether-$TAG-$target.tar.gz"
+          done
+          sha256sum "bellwether-$TAG-"*.tar.gz > checksums.txt
+          cat checksums.txt
+
+      - name: verify action/install.sh against the built Linux archive and checksums.txt
+        shell: bash
+        env:
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          work="$RUNNER_TEMP/verify-install"
+          mkdir -p "$work/mock-bin" "$work/runner-temp"
+          cat > "$work/mock-bin/gh" <<'EOF'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          [ "$1" = release ] && [ "$2" = download ] || { echo "mock gh: unexpected $*" >&2; exit 2; }
+          tag=$3
+          shift 3
+          dir=""
+          patterns=()
+          while [ $# -gt 0 ]; do
+            case "$1" in
+              --repo) shift 2 ;;
+              --pattern) patterns+=("$2"); shift 2 ;;
+              --dir) dir=$2; shift 2 ;;
+              --clobber) shift ;;
+              *) echo "mock gh: unexpected arg $1" >&2; exit 2 ;;
+            esac
+          done
+          [ "$tag" = "$EXPECTED_TAG" ] || { echo "mock gh: unexpected tag $tag" >&2; exit 2; }
+          for p in "${patterns[@]}"; do
+            cp "$RELEASE_DIR/$p" "$dir/$p"
+          done
+          EOF
+          chmod +x "$work/mock-bin/gh"
+          PATH="$work/mock-bin:$PATH" \
+            RELEASE_DIR="$RUNNER_TEMP/release" \
+            EXPECTED_TAG="$TAG" \
+            RUNNER_TEMP="$work/runner-temp" \
+            GITHUB_PATH="$work/github-path" \
+            BELLWETHER_VERSION="$TAG" \
+            BELLWETHER_RELEASES="${{ github.repository }}" \
+            action/install.sh
+          grep -qxF "$work/runner-temp/bellwether-bin" "$work/github-path"
+          "$work/runner-temp/bellwether-bin/bellwether" --version
+
+      - name: upload release archives and checksums.txt as workflow artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: bellwether-${{ steps.tag.outputs.tag }}
+          path: |
+            ${{ runner.temp }}/release/bellwether-${{ steps.tag.outputs.tag }}-*.tar.gz
+            ${{ runner.temp }}/release/checksums.txt
+          if-no-files-found: error
+
+      - name: publish to GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          cd "$RUNNER_TEMP/release"
+          if ! gh release view "$TAG" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            gh release create "$TAG" --repo "${{ github.repository }}" --title "$TAG" --generate-notes
+          fi
+          gh release upload "$TAG" --repo "${{ github.repository }}" --clobber \
+            "bellwether-$TAG-"*.tar.gz checksums.txt
