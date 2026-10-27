@@ -52,7 +52,7 @@ flowchart LR
 | `bellwether-source` | `Source` for Parquet (real row groups) and CSV/JSON lines (byte-range chunks); fingerprints | — |
 | `bellwether-source-sql` | `Source` over SQL tables (ADR 027): partitions or key ranges as units with an identity, statistics as bounds from one aggregate per unit, ADBC/SQLite/ODBC reads as Arrow, snapshot discipline, measured costs | — |
 | `bellwether-store` | `Store` over `object_store`; conditional PUT per backend; manifest commit protocol; cache | 4 |
-| `bellwether-build` | discover → fingerprint → assign ids → parallel segments → one manifest commit; incremental; compaction | — |
+| `bellwether-build` | discover → fingerprint → assign ids → parallel segments → one manifest commit; incremental; compaction; the multi-machine build (ADR 030: a content-addressed work plan in the index store, workers that upload segments and never touch a manifest, one commit of the union) | — |
 | `bellwether-profile` | fanout, sortedness, range gaps, lints, candidate composites | 6 |
 | `bellwether-replay` | workload recorder; exact cost of current and hypothetical key specs per recorded run | 3 |
 | `bellwether-verify` | reconcile two sources by key with latest-by, row hash, decimal totals; coverage statement | — |

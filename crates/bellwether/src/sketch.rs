@@ -383,15 +383,28 @@ impl Engine {
     }
 
     /// Drops the segments of each sketch in `sketches` the index declares
-    /// but cannot read (a segment missing from the store, damaged, or not a
-    /// sketch of the declared spec), so the build that follows sketches
-    /// every live row group again. Returns their labels. Reads each
-    /// re-declared sketch's segments; never a data file.
+    /// but cannot read ([`Engine::unreadable_sketches`]), so the build that
+    /// follows sketches every live row group again. Returns their labels.
     pub(crate) fn reset_unreadable_sketches<S: StoreExt + ?Sized>(
         &self,
         builder: &Builder<S>,
         sketches: &[SketchSpec],
     ) -> Result<Vec<String>> {
+        let mut out = Vec::new();
+        for s in self.unreadable_sketches(sketches)? {
+            if builder.reset_sketch(&s)?.is_some() {
+                out.push(s.label());
+            }
+        }
+        Ok(out)
+    }
+
+    /// The sketches in `sketches` with a segment the index lists but cannot
+    /// read (missing from the store, damaged, or not a sketch of the
+    /// declared spec). Reads each re-declared sketch's segments; never a
+    /// data file. A multi-machine plan rebuilds them whole instead of
+    /// resetting them in a commit of their own (ADR 030).
+    pub(crate) fn unreadable_sketches(&self, sketches: &[SketchSpec]) -> Result<Vec<SketchSpec>> {
         let mut out = Vec::new();
         if sketches.is_empty() {
             return Ok(out);
@@ -411,8 +424,8 @@ impl Engine {
                     });
                     !matches!(check, Ok(true))
                 });
-            if unreadable && builder.reset_sketch(s)?.is_some() {
-                out.push(s.label());
+            if unreadable {
+                out.push(s.clone());
             }
         }
         Ok(out)

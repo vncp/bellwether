@@ -49,10 +49,29 @@ impl Engine {
         guard(|| self.index_inner(declared)).map_err(|e| root_hint(self.root(), schema_hint(e)))
     }
 
-    #[allow(clippy::too_many_lines)]
     fn index_inner(&self, declared: &[Declaration]) -> Result<IndexResult> {
-        self.require_folder("index")?;
-        self.require_current("index")?;
+        let (specs, joins, options) = self.index_request("index", declared)?;
+        let builder = Builder::new(Arc::clone(self.store()?), "");
+        let sketches_rebuilt = self.reset_unreadable_sketches(&builder, &options.sketches)?;
+        let report = builder.build(self.root(), &specs, &options)?;
+        // A join key that cannot be rebuilt once the build committed is
+        // reported beside that commit (`JoinFreshness::NotRebuilt`), never
+        // in place of it.
+        let joins = self.refresh_joins(&joins, report.sequence.is_some())?;
+        self.index_result(report, joins, sketches_rebuilt)
+    }
+
+    /// The checked request of an `index` (and of a multi-machine plan of
+    /// one, `verb`): the row-built key specs, the join keys (B3, built
+    /// whole after the commit), and the build options with the declared
+    /// sketches.
+    pub(crate) fn index_request(
+        &self,
+        verb: &'static str,
+        declared: &[Declaration],
+    ) -> Result<(Vec<KeySpec>, Vec<KeySpec>, bellwether_build::BuildOptions)> {
+        self.require_folder(verb)?;
+        self.require_current(verb)?;
         if declared.is_empty() && self.manifest()?.is_none() {
             return Err(Error::KeySpec(
                 "a new index needs at least one key spec; pass --key exact:<column> (or \
@@ -80,13 +99,19 @@ impl Engine {
         }
         let mut options = self.build_options();
         options.sketches = declared.iter().filter_map(|d| d.sketch.clone()).collect();
-        let builder = Builder::new(Arc::clone(self.store()?), "");
-        let sketches_rebuilt = self.reset_unreadable_sketches(&builder, &options.sketches)?;
-        let report = builder.build(self.root(), &specs, &options)?;
-        // A join key that cannot be rebuilt once the build committed is
-        // reported beside that commit (`JoinFreshness::NotRebuilt`), never
-        // in place of it.
-        let joins = self.refresh_joins(&joins, report.sequence.is_some())?;
+        Ok((specs, joins, options))
+    }
+
+    /// The result of an `index` that built (or, multi-machine, committed)
+    /// `report`, refreshed `joins`, and rebuilt `sketches_rebuilt`: the
+    /// current manifest's specs and sidecars with their completeness.
+    #[allow(clippy::too_many_lines)]
+    pub(crate) fn index_result(
+        &self,
+        report: bellwether_build::BuildReport,
+        joins: Vec<crate::join::JoinKeyState>,
+        sketches_rebuilt: Vec<String>,
+    ) -> Result<IndexResult> {
         let pinned = self.pin_required("index")?;
         let m = pinned.manifest();
         Ok(IndexResult {

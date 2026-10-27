@@ -399,19 +399,52 @@ impl From<ModeArg> for bellwether::LookupMode {
 }
 
 #[derive(Args)]
+#[command(group(clap::ArgGroup::new("split").multiple(false).args(["items", "item_row_groups"])))]
 struct IndexArgs {
-    #[command(flatten)]
-    root: RootArg,
+    /// The folder of data files (not with --worker or --commit, which read
+    /// it from the work plan).
+    #[arg(required_unless_present_any = ["worker", "commit"], conflicts_with_all = ["worker", "commit"])]
+    root: Option<String>,
     /// A key spec: exact:a,b  temporal:id@ts  bloom:a@0.01  range:ts; with
     /// per-key row counts exact:a,b,counts or temporal:id@ts,counts; with
     /// per-key time bounds exact:a@ts or bloom:a@0.01@ts; or a bitemporal
     /// key temporal2:id@valid,known. Repeat for several.
-    #[arg(long = "key", value_name = "SPEC")]
+    #[arg(long = "key", value_name = "SPEC", conflicts_with_all = ["worker", "commit"])]
     keys: Vec<String>,
     /// Worker threads for the build [default: the available parallelism].
     /// The segments written do not depend on it.
     #[arg(long, value_name = "N", value_parser = clap::value_parser!(u32).range(1..))]
     threads: Option<u32>,
+    /// Multi-machine build (ADR 030): plan this build for workers instead
+    /// of running it. Writes the work plan and its items to the index store
+    /// under work/<run id>/ and the plan to DIR/plan.json; commits nothing.
+    #[arg(long, value_name = "DIR", conflicts_with_all = ["worker", "commit"])]
+    plan_work: Option<PathBuf>,
+    /// With --plan-work: at most N work items, balanced by row groups.
+    #[arg(long, value_name = "N", requires = "plan_work", value_parser = clap::value_parser!(u32).range(1..))]
+    items: Option<u32>,
+    /// With --plan-work: work items of at most M row groups each [default:
+    /// 1024].
+    #[arg(long, value_name = "M", requires = "plan_work", value_parser = clap::value_parser!(u64).range(1..))]
+    item_row_groups: Option<u64>,
+    /// Run one item of a work plan (the plan.json --plan-work wrote) on
+    /// this machine: writes and uploads its segments and its done file,
+    /// never a manifest. The data root must be mounted at the plan's path;
+    /// --index overrides the index location the plan records.
+    #[arg(
+        long,
+        value_name = "PLAN",
+        requires = "item",
+        conflicts_with = "commit"
+    )]
+    worker: Option<PathBuf>,
+    /// With --worker: the item to run.
+    #[arg(long, value_name = "N", requires = "worker")]
+    item: Option<u32>,
+    /// Commit a work plan whose items are all done: checks every done file
+    /// and segment, then commits once.
+    #[arg(long, value_name = "PLAN")]
+    commit: Option<PathBuf>,
 }
 
 #[derive(Args)]
@@ -963,10 +996,24 @@ pub(crate) fn key_file(path: &std::path::Path, key: Option<&Vec<String>>) -> Key
     }
 }
 
-/// `index`: the declared specs, built with `--threads` workers when given.
-/// The build committed and a join key could not be rebuilt (B3): the
-/// commit is reported, and the run exits 1 (a check failed).
+/// `index`: the declared specs, built with `--threads` workers when given;
+/// or the multi-machine build (ADR 030): `--plan-work`, `--worker`,
+/// `--commit`. The build committed and a join key could not be rebuilt
+/// (B3): the commit is reported, and the run exits 1 (a check failed).
 fn index(g: &Global, out: &Out, a: &IndexArgs) -> Result<Outcome, Failure> {
+    let threads = a.threads.map(|n| n as usize);
+    if let Some(plan) = &a.worker {
+        let index = plan_index_only(g, "--worker")?;
+        let item = a.item.unwrap_or_default();
+        let r = bellwether::work_item(plan, item, index.as_deref(), threads)?;
+        return done(&r, human::work_item(&r, out), EXIT_OK);
+    }
+    if let Some(plan) = &a.commit {
+        let index = plan_index_only(g, "--commit")?;
+        let r = bellwether::commit_work(plan, index.as_deref(), threads)?;
+        let code = join_code(&r.index);
+        return done(&r, human::work_commit(&r, out), code);
+    }
     let declared = a
         .keys
         .iter()
@@ -974,20 +1021,54 @@ fn index(g: &Global, out: &Out, a: &IndexArgs) -> Result<Outcome, Failure> {
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| Failure::Usage(e.to_string()))?;
     let options = EngineOptions {
-        threads: a.threads.map(|n| n as usize),
+        threads,
         ..engine_options(g)?
     };
-    let r = Engine::open(&a.root.root, options)?.index_declared(&declared)?;
-    let code = if r
-        .joins
+    let root = a.root.as_deref().unwrap_or_default();
+    if let Some(dir) = &a.plan_work {
+        let split = match (a.items, a.item_row_groups) {
+            (Some(n), _) => bellwether::ItemSplit::Items(n),
+            (None, Some(m)) => bellwether::ItemSplit::RowGroups(m),
+            (None, None) => bellwether::ItemSplit::default(),
+        };
+        let r = Engine::open(root, options)?.plan_work(&declared, split, dir)?;
+        return done(&r, human::work_plan(&r, out), EXIT_OK);
+    }
+    let r = Engine::open(root, options)?.index_declared(&declared)?;
+    let code = join_code(&r);
+    done(&r, human::index(&r, out), code)
+}
+
+/// Exit 1 when the build committed and a join key could not be rebuilt.
+fn join_code(r: &bellwether::IndexResult) -> u8 {
+    if r.joins
         .iter()
         .any(|j| j.state == bellwether::JoinFreshness::NotRebuilt)
     {
         EXIT_FAILED
     } else {
         EXIT_OK
+    }
+}
+
+/// The `--index` of a `--worker` or `--commit` run, refusing every other
+/// engine flag: the work plan fixes how the data is read.
+fn plan_index_only(g: &Global, verb: &str) -> Result<Option<String>, Failure> {
+    let o = engine_options(g)?;
+    let fixed = EngineOptions {
+        index: o.index.clone(),
+        source_flags: o.source_flags.clone(),
+        signing_key: o.signing_key.clone(),
+        trusted_keys: o.trusted_keys.clone(),
+        ..EngineOptions::default()
     };
-    done(&r, human::index(&r, out), code)
+    if o != fixed {
+        return Err(Failure::Usage(format!(
+            "{verb} reads the format, schema, fingerprint policy, and partitioning from the work \
+             plan; pass only --index (and --threads)"
+        )));
+    }
+    Ok(o.index)
 }
 
 #[allow(clippy::too_many_lines)]

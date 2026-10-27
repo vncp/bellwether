@@ -118,6 +118,6 @@ Gaps the Phase 2 crates found in the contract and the docs, with interim behavio
 - Delta and Iceberg manifest-aware discovery: for now, folders of Parquet.
 - Learned components (churn-predicted layout, learned bloom oracle): research track; needs M3 data.
 - Learned or adaptive index structures: an approximate number must never reach a planner path (invariant 1); sketches (B2) are the only approximate structure and they never prune.
-- Distributed build: segments are already independent; a coordinator is a later convenience.
+- Distributed build: no longer deferred; built in WP22b (ADR 030: `index --plan-work`, `--worker`, `--commit`, coordinated through the index store only).
 - Further query engine adapters (BigQuery, Snowflake, Postgres, Redshift) beyond ClickHouse and Kusto: until a user asks. The `MeasuredEngine` trait documentation and the one-file sketches in `crates/bellwether-source-engine/README.md` are the deliverable.
 - Geo kinds: no workload asks for one; an `expr` key over a cell id (B6) plus `exact` covers the point case when one appears.

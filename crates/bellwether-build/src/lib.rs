@@ -18,11 +18,18 @@
 //! - [`Planner`] turns key specs and a [`Lookup`] into a
 //!   [`bellwether_types::ScanPlan`] with exact bytes and a residual
 //!   predicate, against one pinned manifest version.
+//! - [`Builder::plan_work`], [`Builder::work_item`], and
+//!   [`Builder::commit_work`] are the multi-machine build (ADR 030): a
+//!   content-addressed work plan in the index store, workers that write
+//!   and upload segments without touching a manifest, and one commit of
+//!   the union through the same commit closure ([`work`]).
 //!
 //! Memory (ADR 018): a build worker holds one row group's key columns and
 //! one capped open segment per spec it builds (see [`BuildOptions`]); a
 //! plan holds block indexes, the blocks it touches, one whole bloom or range
-//! segment at a time, and the bitmaps for the keys asked.
+//! segment at a time, and the bitmaps for the keys asked. A multi-machine
+//! commit holds the done files' segment lists and reads one listed segment
+//! per thread at a time.
 
 #![forbid(unsafe_code)]
 #![cfg_attr(test, allow(clippy::unwrap_used))]
@@ -39,6 +46,7 @@ mod segments;
 mod sources;
 mod target;
 mod verify;
+pub mod work;
 
 pub use bellwether_core::join::PairCaps;
 pub use build::{BuildReport, Builder, TextTablesReplaced, TombstoneRows, MAX_KEY_SPECS};

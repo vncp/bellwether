@@ -184,6 +184,33 @@ A build keeps a tombstone declaration whose tombstone is unchanged byte for byte
 
 `Lookup::Latest`/`Asof`/bitemporal lookups carry `live: Option<Tombstone>`. `Planner::plan_ordered_live` plans the key's winners as before (invariant 5) and, with a complete sidecar declaring exactly the lookup's tombstone, prunes them by `bellwether_core::tombstone::prune`, returning a `LiveOutcome` (the sidecar that pruned, keys whose newest row is a tombstone, row groups pruned); the residual is the temporal one followed by `Predicate::Live`, and `In` lists only keys left with a version. `Planner::usable_specs()` reports a spec with an incomplete sidecar as its plain spec: a live lookup then plans unpruned (a superset), its residual still exact, and the facade names `bellwether index <root>`.
 
+## Multi-machine build (ADR 030)
+
+Workers write segments; one committer commits once; they coordinate through the index store only (no service, no lock, no manifest field, no changed byte).
+
+| Item | Purpose |
+|---|---|
+| `Builder::plan_work(root, specs, options, &WorkOptions)` | Everything `build` does before it reads a row group (discover, fingerprint, validate the saved row-group space, assign ids, decide each target's work, cut the build's items), then writes `work/<run id>/items/<n>.json` and `work/<run id>/plan.json`. Commits nothing; nothing to do writes nothing. The run id is the plan's BLAKE3. `ItemSplit::Items(n)` or `RowGroups(m)` (default 1024) groups consecutive build items; the split never changes a segment. |
+| `Builder::work_item(plan, n, threads)` | Runs item `n` through the build's own worker path (same caps, same memory bound, processed ranges), uploads its segments content-addressed, fingerprints every file it read after reading it, and writes `work/<run id>/done/<n>.json` with a checksum. Reads and writes no manifest. A rerun uploads the same bytes and keeps an equal done file (`DoneWrite::Unchanged`). |
+| `Builder::commit_work(plan, threads, commit, max_restarts)` | Requires every done file, checks each (checksum, exact spelling, run, item, files read against the plan's fingerprints, segments tiling exactly its build items' row groups per target, no segment twice), reads every listed segment back (present, BLAKE3 = id, size, header target and range), and runs the build's commit closure once with the union, in the single-machine order. |
+| `WorkRefusal` | Every refusal a caller acts on: `NotDone { items }`, `Drift { item, path }`, `BadDone { item }`, `Segment { item }` (missing or damaged), `Claimed { item }`, `Stale { what, committed }`, `NotPublished`, `NoDataRoot`. Nothing is committed on any of them. |
+
+The committed manifest equals a single-machine build's of the same work over the same base, apart from the fields every commit stamps from the clock or a random source, and every plan over it is the same (`tests/distributed.rs`, with workers as separate processes against a `file://` store).
+
+**Fault model.**
+
+- *A lost worker* is a missing done file: `NotDone` names the item; rerun it on any machine.
+- *A worker over other data* (a stale copy, a file changed since the plan) refuses itself with `Drift`, naming the item and the file, and writes no done file; the committer refuses a done file whose fingerprints differ from the plan's. Rerun where the copy matches; if the data changed for good, plan again.
+- *A crashed worker* leaves uploaded, unreferenced segments, which garbage collection tombstones as orphans and deletes after retention. The plan is reusable; a rerun uploads the same bytes.
+- *A lost committer* leaves orphans and a reusable plan: commit again. If its commit had landed, the next commit is `Stale { committed: true }`.
+- *Two committers* of one plan are serialized by the manifest's conditional PUT; the second rebases onto the first's manifest and sees `Stale { committed: true }`.
+- *Another build* committed between plan and commit: `Stale` when it changed the row-group space, schema, or source (the plan's ids may collide, ADR 013), exactly the single-machine restart rule; also `Stale` when the manifest already covers, for a kept target, a live row group the plan indexes (the plan committed and then compacted). Compaction and garbage collection otherwise are rebased onto. The plan's uploaded segments become orphans.
+- *Garbage collection* of uploaded segments (a commit later than the retention window): a claim is retried with the build's backoff, `max_restarts` times, then `Claimed`; a deleted segment is `Segment`, naming the item whose rerun re-uploads it.
+- *Damage or forgery* of a plan, item, or done file is refused before use (run id = path, item hashes in the plan, done checksums, exact spelling, tiling, segment content and headers). This catches damage, cross-wired files, other runs' files, and hand edits; it is no defense against a holder of store write credentials, who could rewrite the manifest itself.
+- *Version skew*: another engine version or other Unicode tables refuse the plan.
+
+Memory: a worker is a build worker (below). The commit holds the done files' segment lists and reads one whole listed segment per thread at a time (each at most the segment caps). The `work/` folder is never read by readers or garbage collection; after a commit it is an audit trail the operator may delete.
+
 ## Memory (ADR 018)
 
 An `expr` key's build reads the expression's input columns and derives its virtual column one row group at a time, never more; JSON documents are scanned without building a tree.
@@ -226,6 +253,7 @@ Ground truth never goes through the code under test:
 | `tests/verify.rs` | Changed and missing files; `tail64k` vs `full` |
 | `tests/nulls.rs` | All-null row groups covered for every kind; null probes match nothing; key-less segments over different row groups never collide, across items, caps and builds; empty key lists plan nothing; `encode_keys` skips a null in any column |
 | `tests/restarts.rs` | Restart when the winner changes or only retires row-group ids, and when it changes the schema; refusal when a rebase leaves a declared spec incomplete |
+| `tests/distributed.rs` | ADR 030: plan, workers as separate processes against a `file://` store, one commit; manifest equal to a single-machine build's (base and new index, any split) and every lookup plan equal; worker rerun changes nothing; missing done files named; drifted file names the item; damaged, re-spelled, cross-item, drift-forged, segment-dropping and byte-count-forged done files and a damaged segment refused, then repaired by a rerun; a concurrent build makes the plan stale and a fresh plan commits; two committers serialized, the second stale; a kept spec filled twice refused even after compaction; GC deletion and a live GC claim; a crashed worker; plan and item byte flips; nothing to do writes nothing; workers write no manifest |
 | `tests/damaged_manifests.rs` | A lowered `next_id` is refused before ids are assigned; a segment dropped after a rewrite is caught by re-deriving coverage by subset |
 | `tests/id_ledger.rs` | Every id maps to one (fingerprint, index) across rewrites, vanishings, reappearances and renames; a build listing one spec keeps the others; typed probe paths rescale or refuse |
 | `tests/invariant1_by_value.rs` | Invariant 1 against an oracle comparing decoded values (SQL equality) over two decimal scales, two time units, nulls, signed zero, NaN, and CSV/JSONL chunks |

@@ -70,7 +70,7 @@ impl SourceFormat {
         }
     }
 
-    fn from_kind(kind: SourceKind) -> Self {
+    pub(crate) fn from_kind(kind: SourceKind) -> Self {
         match kind {
             SourceKind::Parquet => Self::Parquet,
             SourceKind::Csv {

@@ -174,6 +174,52 @@ enum Attempt {
     Restart { claimed: bool },
 }
 
+/// What one build attempt decides before it reads a row group: the
+/// resolved configuration, the declared targets, the files and their ids,
+/// the work per target, and the work items. A single-machine build writes
+/// the items' segments itself; a multi-machine build (ADR 030,
+/// [`crate::work`]) writes them into a work plan for workers.
+pub(crate) enum Prep {
+    /// Nothing to commit: the report says so.
+    Noop(Box<BuildReport>),
+    /// Work to do.
+    Work(Box<Prepared>),
+}
+
+/// See [`Prep::Work`].
+pub(crate) struct Prepared {
+    pub(crate) base: Option<Manifest>,
+    /// BLAKE3 of the base manifest's bytes as stored.
+    pub(crate) base_hash: Option<bellwether_types::Hash>,
+    pub(crate) cfg: Config,
+    pub(crate) declared: Vec<KeySpec>,
+    pub(crate) sidecars: Vec<SidecarDef>,
+    pub(crate) sketches: Vec<SketchSpec>,
+    pub(crate) specs: Vec<SpecPlan>,
+    pub(crate) sources: DataSource,
+    pub(crate) files: FilePlan,
+    pub(crate) work: WorkPlan,
+    /// The report so far: files, ids, specs rebuilt, folds.
+    pub(crate) report: BuildReport,
+    pub(crate) items: Vec<segments::Item>,
+}
+
+impl Prepared {
+    /// The schema this build commits and the tombstones it stops declaring.
+    pub(crate) fn schema_info(&self) -> (SchemaInfo, Vec<crate::target::TombstoneDropped>) {
+        let (tombstones, dropped) = tombstone_decls(self.base.as_ref(), &self.declared);
+        let schema = schema_info(
+            self.base.as_ref(),
+            &self.cfg,
+            &self.declared,
+            &self.sidecars,
+            &self.sketches,
+            &tombstones,
+        );
+        (schema, dropped)
+    }
+}
+
 impl<S: StoreExt + ?Sized> Builder<S> {
     /// A builder for the index under `index_root` in `store`.
     pub fn new(store: Arc<S>, index_root: impl Into<String>) -> Self {
@@ -399,9 +445,23 @@ impl<S: StoreExt + ?Sized> Builder<S> {
         }
     }
 
+    /// Discovers, fingerprints, assigns ids, and decides the work of one
+    /// build attempt over the manifest current now, writing nothing.
+    /// `forced` names targets rebuilt from scratch whatever their coverage
+    /// (a multi-machine plan's damaged sketches; empty for a build).
     #[allow(clippy::too_many_lines)]
-    fn attempt(&self, root: &str, key_specs: &[KeySpec], opts: &BuildOptions) -> Result<Attempt> {
-        let base = read_manifest(&*self.store, &self.index_root)?.map(|(m, _)| m);
+    pub(crate) fn prepare(
+        &self,
+        root: &str,
+        key_specs: &[KeySpec],
+        opts: &BuildOptions,
+        forced: &BTreeSet<String>,
+    ) -> Result<Prep> {
+        let raw = self
+            .store
+            .get_opt(&bellwether_store::manifest_path(&self.index_root))?;
+        let base_hash = raw.as_ref().map(|(b, _)| bellwether_types::Hash::of(b));
+        let base = raw.map(|(b, _)| Manifest::from_slice(&b)).transpose()?;
         if let Some(m) = &base {
             // Fresh ids come from `next_id`: a damaged space (an id assigned
             // twice, live and retired at once, or at or above `next_id`)
@@ -451,7 +511,7 @@ impl<S: StoreExt + ?Sized> Builder<S> {
         )?;
         let live = live_ids(&files.space)?;
         let stale = stale_text_specs(&*self.store, &self.index_root, base.as_ref())?;
-        let mut work = plan_work(base.as_ref(), &specs, &cfg, &live, &stale);
+        let mut work = plan_work(base.as_ref(), &specs, &cfg, &live, &stale, forced);
         // A join key declared, redefined, or removed changes the schema
         // even when no row group needs indexing.
         let joins_unchanged = base.as_ref().is_some_and(|m| {
@@ -470,7 +530,7 @@ impl<S: StoreExt + ?Sized> Builder<S> {
                 report.sidecars_fold_pending = fold.folded;
                 report.sidecars_kept = fold.kept.iter().map(SidecarDef::name).collect();
             }
-            return Ok(Attempt::Done(Box::new(report)));
+            return Ok(Prep::Noop(Box::new(report)));
         }
         // A build with work folds the sidecars of an index written before
         // M5 into key specs, which it rebuilds (they are new identities);
@@ -487,57 +547,73 @@ impl<S: StoreExt + ?Sized> Builder<S> {
             sidecars = fold.kept;
             sidecars_folded = fold.folded;
             specs = plan_specs(&row_specs(&declared), &sidecars, &sketches, &cfg.schema)?;
-            work = plan_work(base.as_ref(), &specs, &cfg, &live, &stale);
+            work = plan_work(base.as_ref(), &specs, &cfg, &live, &stale, forced);
         }
         let mut report = files.report(&work);
         report.sidecars_folded = sidecars_folded;
         report.sidecars_kept = sidecars_kept;
         let items = segments::items(&files.rows, &work.needed, opts.max_segment_row_groups)?;
+        Ok(Prep::Work(Box::new(Prepared {
+            base,
+            base_hash,
+            cfg,
+            declared,
+            sidecars,
+            sketches,
+            specs,
+            sources,
+            files,
+            work,
+            report,
+            items,
+        })))
+    }
+
+    fn attempt(&self, root: &str, key_specs: &[KeySpec], opts: &BuildOptions) -> Result<Attempt> {
+        let p = match self.prepare(root, key_specs, opts, &BTreeSet::new())? {
+            Prep::Noop(report) => return Ok(Attempt::Done(report)),
+            Prep::Work(p) => p,
+        };
+        let mut report = p.report.clone();
         let ctx = Ctx {
             store: &*self.store,
             index_root: &self.index_root,
-            sources: &sources,
-            schema: &cfg.schema,
-            files: &files.rows,
-            specs: &specs,
+            sources: &p.sources,
+            schema: &p.cfg.schema,
+            files: &p.files.rows,
+            specs: &p.specs,
             max_keys: opts.max_segment_keys,
             max_bytes: opts.max_segment_bytes,
-            observer,
+            observer: opts.observer.as_deref(),
             held: AtomicU64::new(0),
             peak_held: AtomicU64::new(0),
             peak_keys: AtomicU64::new(0),
         };
-        let written = segments::write_all(&ctx, &items, opts.thread_count())?;
+        let written = segments::write_all(&ctx, &p.items, opts.thread_count())?;
         report.row_groups_read = written.row_groups_read;
         report.files_listed = written.files_listed;
         report.segments_written = written.segments.len() as u64;
         report.peak_row_groups_held = ctx.peak_held.load(Ordering::SeqCst);
         report.peak_segment_keys = ctx.peak_keys.load(Ordering::SeqCst);
         report.tombstone_rows = written.tombstone_rows;
-        let (tombstones, dropped) = tombstone_decls(base.as_ref(), &declared);
+        let (schema, dropped) = p.schema_info();
         report.tombstones_dropped = dropped;
+        let base = p.base.as_ref();
         let delta = Delta {
-            planned_space: base
-                .as_ref()
-                .map(|m| m.rowgroup_space.clone())
-                .unwrap_or_default(),
-            planned_schema: base.as_ref().map(|m| m.schema.clone()).unwrap_or_default(),
-            planned_source: base.as_ref().map(|m| m.source.clone()).unwrap_or_default(),
-            source: cfg.source_info.clone(),
-            schema: schema_info(
-                base.as_ref(),
-                &cfg,
-                &declared,
-                &sidecars,
-                &sketches,
-                &tombstones,
-            ),
-            space: files.space.clone(),
-            keep: &work.keep,
-            replaced: &work.replaced,
+            planned: Planned::Exact {
+                space: base.map(|m| m.rowgroup_space.clone()).unwrap_or_default(),
+                schema: base.map(|m| m.schema.clone()).unwrap_or_default(),
+                source: base.map(|m| m.source.clone()).unwrap_or_default(),
+            },
+            source: p.cfg.source_info.clone(),
+            schema,
+            space: p.files.space.clone(),
+            keep: &p.work.keep,
+            replaced: &p.work.replaced,
             added: &written.segments,
+            fresh_outputs: None,
         };
-        let restart = Cell::new(false);
+        let restart = Cell::new(None);
         let committed = commit_with(
             &*self.store,
             &self.index_root,
@@ -549,20 +625,19 @@ impl<S: StoreExt + ?Sized> Builder<S> {
             Ok(c) => {
                 report.sequence = Some(c.sequence);
                 report.upgraded_from = base
-                    .as_ref()
                     .map(|m| m.storage_version)
                     .filter(|&v| v < STORAGE_VERSION);
                 report.segments = written.segments;
                 Ok(Attempt::Done(Box::new(report)))
             }
-            Err(_) if restart.get() => Ok(Attempt::Restart { claimed: false }),
+            Err(_) if restart.get().is_some() => Ok(Attempt::Restart { claimed: false }),
             Err(Error::SegmentClaimed(_)) => Ok(Attempt::Restart { claimed: true }),
             Err(e) => Err(e),
         }
     }
 }
 
-fn canonical_root(root: &str) -> Result<String> {
+pub(crate) fn canonical_root(root: &str) -> Result<String> {
     let path = std::fs::canonicalize(root).map_err(|e| Error::Source(format!("{root}: {e}")))?;
     path.to_str()
         .map(str::to_string)
@@ -574,18 +649,18 @@ fn canonical_root(root: &str) -> Result<String> {
 // ---------------------------------------------------------------------------
 
 /// The resolved configuration of one build attempt.
-struct Config {
-    kind: SourceKind,
-    policy: FingerprintPolicy,
-    partitioning: Partitioning,
+pub(crate) struct Config {
+    pub(crate) kind: SourceKind,
+    pub(crate) policy: FingerprintPolicy,
+    pub(crate) partitioning: Partitioning,
     /// Chunk size for text files seen for the first time; `None` for
     /// Parquet.
     new_chunk_size: NewChunkSize,
     /// The dataset schema, in the form the manifest records.
-    schema: SchemaRef,
+    pub(crate) schema: SchemaRef,
     /// The schema the base manifest records, if any.
     base_schema: Option<SchemaRef>,
-    source_info: SourceInfo,
+    pub(crate) source_info: SourceInfo,
     columns: Vec<ColumnDef>,
 }
 
@@ -953,7 +1028,7 @@ fn declared_sketch_specs(
 /// then sketches.
 // One arm per kind of target (key spec, expr key, sidecar, sketch).
 #[allow(clippy::too_many_lines)]
-fn plan_specs(
+pub(crate) fn plan_specs(
     specs: &[KeySpec],
     sidecars: &[SidecarDef],
     sketches: &[SketchSpec],
@@ -1228,9 +1303,9 @@ struct FileCounts {
 }
 
 /// The tracked files and row-group space after this build.
-struct FilePlan {
-    rows: Vec<FileRow>,
-    space: RowGroupSpace,
+pub(crate) struct FilePlan {
+    pub(crate) rows: Vec<FileRow>,
+    pub(crate) space: RowGroupSpace,
     counts: FileCounts,
 }
 
@@ -1402,7 +1477,7 @@ fn plan_files(
 
 /// A tracked file entry as the workers read it. Text entries must record a
 /// chunk size and one chunk per id; Parquet entries must record neither.
-fn file_row(f: &FileEntry, kind: SourceKind) -> Result<FileRow> {
+pub(crate) fn file_row(f: &FileEntry, kind: SourceKind) -> Result<FileRow> {
     let path = &f.fingerprint.path;
     let chunks = match (kind.text_format().is_some(), f.chunk_size, &f.chunks) {
         (true, Some(_), Some(chunks)) if chunks.len() == f.rowgroup_ids.len() => {
@@ -1433,13 +1508,13 @@ fn file_row(f: &FileEntry, kind: SourceKind) -> Result<FileRow> {
 // ---------------------------------------------------------------------------
 
 /// Which row groups each declared spec must index in this build.
-struct WorkPlan {
+pub(crate) struct WorkPlan {
     /// Per declared spec, in declaration order.
-    needed: Vec<RoaringBitmap>,
+    pub(crate) needed: Vec<RoaringBitmap>,
     /// Specs rebuilt from scratch: all their base segments are dropped.
-    replaced: BTreeSet<String>,
+    pub(crate) replaced: BTreeSet<String>,
     /// Specs whose base segments are kept.
-    keep: BTreeSet<String>,
+    pub(crate) keep: BTreeSet<String>,
     /// Base specs no longer declared.
     removed: Vec<String>,
     /// Counted specs rebuilt because two of their base segments cover one
@@ -1577,12 +1652,17 @@ impl<S: StoreExt + ?Sized> bellwether_core::segment::ReadAt for HeaderBytes<'_, 
     }
 }
 
+/// Which row groups each declared target needs. `forced` targets are
+/// rebuilt from scratch, like a redefined one (a multi-machine plan's
+/// damaged sketches, which a single-machine build resets in a commit of
+/// their own first).
 fn plan_work(
     base: Option<&Manifest>,
     specs: &[SpecPlan],
     cfg: &Config,
     live: &RoaringBitmap,
     stale: &BTreeMap<String, bellwether_core::text::UnicodeTables>,
+    forced: &BTreeSet<String>,
 ) -> WorkPlan {
     let mut work = WorkPlan {
         needed: Vec::with_capacity(specs.len()),
@@ -1609,7 +1689,7 @@ fn plan_work(
         }
         // A text key built under other Unicode tables is rebuilt whole.
         let recorded = stale.get(&p.name);
-        let replaced = replaced || recorded.is_some();
+        let replaced = replaced || recorded.is_some() || forced.contains(&p.name);
         if let Some(t) = recorded {
             work.stale.push(TextTablesReplaced {
                 spec: p.name.clone(),
@@ -1701,42 +1781,166 @@ fn same_columns(recorded: &[ColumnDef], now: &[ColumnDef]) -> Result<bool> {
 // The commit
 // ---------------------------------------------------------------------------
 
+/// The base a build planned against, as [`Delta::apply`] compares it with
+/// the manifest current at commit time.
+#[allow(clippy::large_enum_variant)] // one per build attempt, never in bulk
+pub(crate) enum Planned {
+    /// The base's row-group space, schema, and source themselves (a
+    /// single-machine build, which holds them).
+    Exact {
+        space: RowGroupSpace,
+        schema: SchemaInfo,
+        source: SourceInfo,
+    },
+    /// Their digests (a multi-machine plan, which records them:
+    /// [`crate::work`]).
+    Digest(BaseDigest),
+}
+
+/// BLAKE3 digests of a manifest's row-group space, schema, and source, as
+/// `serde_json` serializes them: equal parts have equal digests.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct BaseDigest {
+    pub(crate) space: bellwether_types::Hash,
+    pub(crate) schema: bellwether_types::Hash,
+    pub(crate) source: bellwether_types::Hash,
+}
+
+impl BaseDigest {
+    /// The digests of `m`'s parts.
+    pub(crate) fn of(m: &Manifest) -> Result<Self> {
+        Ok(Self {
+            space: bellwether_types::Hash::of(&serde_json::to_vec(&m.rowgroup_space)?),
+            schema: bellwether_types::Hash::of(&serde_json::to_vec(&m.schema)?),
+            source: bellwether_types::Hash::of(&serde_json::to_vec(&m.source)?),
+        })
+    }
+}
+
+/// Why [`Delta::apply`] refused the manifest current at commit time.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Stale {
+    /// Another commit changed the row-group space.
+    Space,
+    /// Another commit changed the schema.
+    Schema,
+    /// Another commit changed the source.
+    Source,
+    /// A segment this commit adds is live already: this work was committed
+    /// (multi-machine commits only).
+    AlreadyCommitted,
+    /// Another commit covered row groups this commit indexes for a kept
+    /// target (multi-machine commits only).
+    Covered,
+}
+
+impl Stale {
+    /// What changed, in words.
+    pub(crate) fn what(self) -> &'static str {
+        match self {
+            Self::Space => "the row-group space changed since",
+            Self::Schema => "the schema changed since",
+            Self::Source => "the source changed since",
+            Self::AlreadyCommitted => "its segments are already committed",
+            Self::Covered => "another commit indexed row groups it indexes since",
+        }
+    }
+}
+
 /// The change one build publishes, applied to whatever manifest is current
 /// at commit time.
-struct Delta<'a> {
-    planned_space: RowGroupSpace,
-    planned_schema: SchemaInfo,
-    planned_source: SourceInfo,
-    source: SourceInfo,
-    schema: SchemaInfo,
-    space: RowGroupSpace,
-    keep: &'a BTreeSet<String>,
-    replaced: &'a BTreeSet<String>,
-    added: &'a [SegmentRef],
+pub(crate) struct Delta<'a> {
+    pub(crate) planned: Planned,
+    pub(crate) source: SourceInfo,
+    pub(crate) schema: SchemaInfo,
+    pub(crate) space: RowGroupSpace,
+    pub(crate) keep: &'a BTreeSet<String>,
+    pub(crate) replaced: &'a BTreeSet<String>,
+    pub(crate) added: &'a [SegmentRef],
+    /// For a multi-machine commit (ADR 030), the base's segment ids its
+    /// outputs may equal (those of the targets it rebuilds): a manifest
+    /// that references any other segment in `added`, or covers, for a
+    /// kept target, a live row group `added` covers, is refused, since
+    /// another committer of the same plan committed it and a rebase would
+    /// commit it twice. `None` for a single-machine build.
+    pub(crate) fresh_outputs: Option<&'a BTreeSet<bellwether_types::Hash>>,
 }
 
 impl Delta<'_> {
     /// The manifest to commit on top of `m`, or a conflict that restarts the
-    /// build (`restart` set) when `m` changed the row-group space, the
+    /// build (`stale` set) when `m` changed the row-group space, the
     /// schema, or the source since the build planned: the segments'
     /// bitmaps hold the ids this build assigned, so they cannot be rebased
     /// onto another assignment (ADR 013, ADR 015).
-    fn apply(&self, m: &Manifest, restart: &Cell<bool>) -> Result<Manifest> {
-        let conflict = |what: &str| {
-            restart.set(true);
+    pub(crate) fn apply(&self, m: &Manifest, stale: &Cell<Option<Stale>>) -> Result<Manifest> {
+        let conflict = |why: Stale| {
+            stale.set(Some(why));
             Error::VersionConflict {
-                expected: format!("the manifest this build planned against ({what} changed since)"),
+                expected: format!("the manifest this build planned against ({})", why.what()),
                 found: format!("sequence {}", m.sequence),
             }
         };
-        if m.rowgroup_space != self.planned_space {
-            return Err(conflict("the row-group space"));
+        // A multi-machine commit whose segments are live already was
+        // committed (by another committer, or by one whose answer was
+        // lost): said first, since that commit also changed the base.
+        if let Some(base_ids) = self.fresh_outputs {
+            if self
+                .added
+                .iter()
+                .any(|a| m.references(&a.id) && !base_ids.contains(&a.id))
+            {
+                return Err(conflict(Stale::AlreadyCommitted));
+            }
         }
-        if m.schema != self.planned_schema {
-            return Err(conflict("the schema"));
+        match &self.planned {
+            Planned::Exact {
+                space,
+                schema,
+                source,
+            } => {
+                if m.rowgroup_space != *space {
+                    return Err(conflict(Stale::Space));
+                }
+                if m.schema != *schema {
+                    return Err(conflict(Stale::Schema));
+                }
+                if m.source != *source {
+                    return Err(conflict(Stale::Source));
+                }
+            }
+            Planned::Digest(d) => {
+                let now = BaseDigest::of(m)?;
+                if now.space != d.space {
+                    return Err(conflict(Stale::Space));
+                }
+                if now.schema != d.schema {
+                    return Err(conflict(Stale::Schema));
+                }
+                if now.source != d.source {
+                    return Err(conflict(Stale::Source));
+                }
+            }
         }
-        if m.source != self.planned_source {
-            return Err(conflict("the source"));
+        if self.fresh_outputs.is_some() {
+            let live = live_ids(&self.space)?;
+            let mut ours: BTreeMap<(&str, Option<&str>), RoaringBitmap> = BTreeMap::new();
+            for a in self.added {
+                let (start, end) = (a.rowgroup_range.start.0, a.rowgroup_range.end.0);
+                if start < end {
+                    ours.entry((a.key_spec.as_str(), a.kind.as_deref()))
+                        .or_default()
+                        .insert_range(start..end);
+                }
+            }
+            for ((name, kind), ids) in &ours {
+                if self.keep.contains(*name) {
+                    let mut theirs = covered(m, name, *kind);
+                    theirs &= &live;
+                    if !theirs.is_disjoint(ids) {
+                        return Err(conflict(Stale::Covered));
+                    }
+                }
+            }
         }
         let mut next = m.clone();
         next.source = self.source.clone();

@@ -2435,3 +2435,167 @@ pub(crate) fn join_verify(r: &bellwether::JoinVerifyResult, out: &Out) -> String
     }
     s
 }
+
+/// `index --plan-work`: the plan, its items, and the commands that run it.
+pub(crate) fn work_plan(r: &bellwether::WorkPlanResult, out: &Out) -> String {
+    let mut s = String::new();
+    let (Some(run), Some(plan)) = (&r.run, &r.plan) else {
+        let _ = writeln!(
+            s,
+            "{}",
+            heading(
+                out,
+                &format!(
+                    "index {}: nothing to do; manifest sequence {} is current, so no work plan \
+                     was written",
+                    r.root, r.base_sequence
+                )
+            )
+        );
+        return s;
+    };
+    let _ = writeln!(
+        s,
+        "{}",
+        heading(
+            out,
+            &format!(
+                "index {}: work plan {} over manifest sequence {} (nothing committed)",
+                r.root,
+                &run.to_hex()[..12],
+                r.base_sequence
+            )
+        )
+    );
+    let _ = writeln!(
+        s,
+        "  files: {} new, {} changed, {} removed, {} unchanged; {} assigned, {} retired",
+        num(r.files_new),
+        num(r.files_changed),
+        num(r.files_removed),
+        num(r.files_unchanged),
+        count(r.row_groups_assigned, "row-group id", "row-group ids"),
+        num(r.row_groups_retired)
+    );
+    if !r.specs_rebuilt.is_empty() {
+        let _ = writeln!(
+            s,
+            "  rebuilt over every row group: {}",
+            r.specs_rebuilt.join(", ")
+        );
+    }
+    if !r.sketches_rebuilt.is_empty() {
+        let _ = writeln!(
+            s,
+            "  rebuilt {} from every row group: its segments were missing from the store or \
+             damaged",
+            r.sketches_rebuilt.join(", ")
+        );
+    }
+    let _ = writeln!(
+        s,
+        "  {} reading {}; plan written to {plan} and to {} in the index store",
+        count(r.items.len() as u64, "work item", "work items"),
+        count(r.row_groups, "row group", "row groups"),
+        r.store_path.as_deref().unwrap_or("?")
+    );
+    let _ = writeln!(
+        s,
+        "\n  {:>6} {:>12} {:>8} {:>8}",
+        "item", "row groups", "units", "files"
+    );
+    for i in &r.items {
+        let _ = writeln!(
+            s,
+            "  {:>6} {:>12} {:>8} {:>8}",
+            i.item,
+            num(i.row_groups),
+            num(u64::from(i.units)),
+            num(u64::from(i.files))
+        );
+    }
+    let last = r.items.len().saturating_sub(1);
+    let _ = writeln!(
+        s,
+        "\n  next: on each machine that mounts {} at that path and reaches the index store, run\n    \
+         bellwether index --worker {plan} --item N\n  for N in 0..={last} (any \
+         order, any number of machines; rerunning an item is safe), then here\n    \
+         bellwether index --commit {plan}\n  (--index overrides the index location the plan records: {})",
+        r.root,
+        r.index
+    );
+    s
+}
+
+/// `index --worker`: what one item uploaded.
+pub(crate) fn work_item(r: &bellwether::WorkItemResult, out: &Out) -> String {
+    let mut s = String::new();
+    let written = match r.written.as_str() {
+        "unchanged" => "an equal done file was already there (a rerun) and is kept",
+        "replaced" => "a done file with other contents was replaced",
+        _ => "done file written",
+    };
+    let _ = writeln!(
+        s,
+        "{}",
+        heading(
+            out,
+            &format!(
+                "work plan {} item {}: {} uploaded ({}), no manifest read or written",
+                &r.run.to_hex()[..12],
+                r.item,
+                count(r.segments, "segment", "segments"),
+                size(r.bytes)
+            )
+        )
+    );
+    let _ = writeln!(
+        s,
+        "  {} read from {}, each fingerprinted after reading; {} held at most at once; {} ms",
+        count(r.row_groups_read, "row group", "row groups"),
+        count(r.files, "file", "files"),
+        count(r.peak_row_groups_held, "row group", "row groups"),
+        num(r.elapsed_ms)
+    );
+    let _ = writeln!(s, "  {written}: {}", r.done);
+    s
+}
+
+/// `index --commit`: the commit, per-item times, then what `index` prints.
+pub(crate) fn work_commit(r: &bellwether::WorkCommitResult, out: &Out) -> String {
+    let mut s = String::new();
+    let _ = writeln!(
+        s,
+        "{}",
+        heading(
+            out,
+            &format!(
+                "work plan {}: {} committed once, planned at manifest sequence {}; checks and \
+                 commit took {} ms",
+                &r.run.to_hex()[..12],
+                count(r.items.len() as u64, "item", "items"),
+                r.base_sequence,
+                num(r.elapsed_ms)
+            )
+        )
+    );
+    let _ = writeln!(
+        s,
+        "  {:>6} {:>12} {:>10} {:>8} {:>10}",
+        "item", "row groups", "segments", "threads", "worker ms"
+    );
+    for t in &r.items {
+        let _ = writeln!(
+            s,
+            "  {:>6} {:>12} {:>10} {:>8} {:>10}",
+            t.item,
+            num(t.row_groups_read),
+            num(t.segments),
+            t.threads,
+            num(t.elapsed_ms)
+        );
+    }
+    s.push('\n');
+    s.push_str(&index(&r.index, out));
+    s
+}

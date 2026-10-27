@@ -41,7 +41,7 @@ Files (Parquet, CSV, or JSON lines) partitioned by date, each file holding rows 
 | Pipeline optimizer | Search over plans, keys, layouts, and multi-step pipelines with the exact cost as the loss and reconciliation as the gate | `bellwether evolve` | planned (WP13) |
 | Engine adapters | Plans executed inside DataFusion and DuckDB with no sidecar step | planned (WP16) |
 | Measured performance | Lookup p50 and p95, build throughput and its core-scaling curve, reconcile rows per second, in release builds | measured (WP22a, [2026-10-26](measured/2026-10-26-performance.md)); wins planned (WP22b) |
-| Multi-machine build | N workers writing segments, one committer, for lakes a single machine cannot index in time | planned (WP22) |
+| Multi-machine build | N workers writing segments, one committer, for lakes a single machine cannot index in time | `bellwether index ./data --key … --plan-work plan/`, then `index --worker plan/plan.json --item N` on each machine, then `index --commit plan/plan.json` | merged (WP22b, ADR 030); same-host process proxy measured, multi-host not yet |
 | SQL table as a side | Reconcile a warehouse table against files, with measured costs | planned (WP20) |
 | Agent interface | The same engine as MCP tools with job handles, typed refusals, dry runs, budgets | building (WP12) |
 | Is this column a key (sketches) | How many distinct symbols, timestamps, or `(symbol, ts)` pairs a vendor file set has, rows per value, and which files repeat a `(symbol, ts)`, approximately and without reading the files; never used to plan | `bellwether index ./data --key sketch:symbol,ts,symbol+ts`, then `bellwether sketch cardinality ./data` (or `--transient` before building); `why --sketches-only` | building (B2) |
@@ -60,7 +60,7 @@ Files (Parquet, CSV, or JSON lines) partitioned by date, each file holding rows 
 
 - The index skips; it does not compute. Derived signals (gaps, streaks, moving averages) are a scan over the pruned row groups or a materialized dataset. The optimizer, when built, can propose that materialization.
 - Costs are exact for bytes over files. Latency is measured, and only in release builds that are still to come.
-- One machine today. Indexing terabytes is a scheduling problem until the multi-machine build lands; pilot on a slice first.
+- Indexing terabytes is a scheduling problem: the multi-machine build (ADR 030) splits it over machines that mount the data at one path and reach the index store, coordinated through the store only. Pilot on a slice first.
 - The on-disk format freezes at M5; an index built before that may need one rebuild.
 - Nested columns can be present but not used as keys; flatten first.
 - Lookbacks count calendar time. "The last 252 trading sessions" needs the session calendar outside Bellwether: pass the calendar date of the 252nd session back as the window start (`--window START..T`).

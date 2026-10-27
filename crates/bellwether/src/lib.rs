@@ -50,8 +50,10 @@ pub mod spec;
 mod text;
 mod twin;
 mod why;
+mod work;
 
 pub use agg::{AggValue, AggregateGroup, AggregateResult};
+pub use bellwether_build::work::ItemSplit;
 pub use bellwether_ledger::{
     printable, InvalidReason, InvalidSignature, OutsideWindow, PublicKey, RecordKind,
     SignatureStatus, SignedBy, SigningKey, TrustError, TrustedKey, TrustedKeys, Verdict,
@@ -111,4 +113,8 @@ pub use why::{
     LookupMode, ProfileEvidence, Recommendation, TextMatch, TimeWindow, WhyReport, WhyRequest,
     WorkloadInfo, DEFAULT_MAX_CANDIDATES, ENGINE_PROPOSER, LAYOUT_BOUND_FRACTION,
     RESERVED_PROPOSERS,
+};
+pub use work::{
+    commit_work, work_item, WorkCommitResult, WorkItemPlan, WorkItemResult, WorkItemTiming,
+    WorkPlanResult, PLAN_FILE,
 };

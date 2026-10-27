@@ -470,7 +470,7 @@ Not built, or not yet measured:
 - **SQL tables as a source.** In review ([#11](https://github.com/vncp/bellwether/pull/11)).
 - **Relational replay.** Joins, windows and aggregation input are recorded predicates that the verifier refuses; WP15 prices and plans them.
 - **`advise` and `evolve`.** Designed in stages ([`docs/evolve.md`](docs/evolve.md), ADRs 021 to 025, 031, 032); no code yet.
-- **Engine adapters, CI receipts, a multi-machine build.** Planned (WP16, WP17, WP22). Today a plan is a list of files and row groups your engine reads, on one machine.
+- **Engine adapters, CI receipts.** Planned (WP16, WP17). Today a plan is a list of files and row groups your engine reads. The multi-machine build (`index --plan-work`, `--worker`, `--commit`, ADR 030) is built; it is measured only as several processes on one host, not across hosts.
 - **Performance.** Latency is measured only where the Results say so; planning beat DuckDB alone on 2 of 14 questions. WP22 measures the rest in release builds.
 
 ## Docs
