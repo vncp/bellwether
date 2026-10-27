@@ -304,6 +304,17 @@ fn a_tombstone_key_goes_from_why_to_receipt_to_live_lookups_on_both_sides() {
         0,
     );
     assert_eq!(verified["outcome"]["kind"], "verified", "{verified}");
+    // The certificate compared each key's newest rows kept by the live
+    // filter: the run's rows, not every newest row.
+    let filter = &verified["certificate"]["record"]["body"]["row_filter"];
+    let live_test = filter
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|f| f["all"].as_array().cloned().unwrap_or_default())
+        .find(|p| p["op"] == "live")
+        .unwrap_or_else(|| panic!("no live test in the certificate's row filter: {filter}"));
+    assert_eq!(live_test["column"], "void", "{filter}");
     let cert = h(&verified, "/certificate/hash");
     let (m, applied) = mcp(
         &srv,
