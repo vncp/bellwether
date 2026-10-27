@@ -16,8 +16,10 @@ Sections (--sections, comma-separated; default all):
   lookups    plan and end-to-end p50/p95 against a full scan and DuckDB
   build      row groups per second at --threads 1, 2, 4, 8, all
   reconcile  rows per second per side at four memory budgets, passes, peaks
-  latency    replay p50 run, why end to end, observe and MCP latency,
-             resident bytes per key (contract v3 entry 32)
+  latency    replay p50 run, observe and MCP latency, resident bytes per key
+             (contract v3 entry 32): release test builds, run under cargo
+  why        `why` end to end on the small rung's pre-registered workload,
+             cold and warm (the CLI only, so it runs without a target dir)
   profiles   samply over the five hot paths and the ledger build, top ten self-time frames
   ledger     `ledger receipts` (with and without a trust file) and `ledger
              scorecard` over a generated 10k-file ledger of 400 signed receipts
@@ -545,7 +547,8 @@ SECTION_PREFIXES = {
     "lookups": ("lookup/", "process/", "dataset/", "keys/", "skipped"),
     "build": ("build/",),
     "reconcile": ("reconcile/",),
-    "latency": ("replay/", "observe/", "mcp/", "why/", "resident/"),
+    "latency": ("replay/", "observe/", "mcp/", "resident/"),
+    "why": ("why/",),
     "profiles": ("profile/",),
     "ledger": ("ledger/",),
 }
@@ -1112,7 +1115,7 @@ def cargo_test(p, args, env):
     return out + err
 
 
-def section_latency(p, replay_small, ledger):
+def section_latency(p, replay_small):
     if replay_small:
         corpus = replay_small.root
         say("latency: replay p50 run (bellwether-replay tests/latency.rs)")
@@ -1152,23 +1155,6 @@ def section_latency(p, replay_small, ledger):
         p.quantiles("observe/cli-why-no-workload/warm", xs, dataset="replay-small",
                     query="why (no workload)", metric="observe", cache="warm", slo_ms=100,
                     command="bellwether " + " ".join(cmd[1:]))
-    if ledger:
-        say("latency: why end to end on the pre-registered workload (small rung)")
-        idx = os.path.join(p.a.work, "why-idx")
-        cmd = [p.a.bin, "why", ledger.data, "--bench-workload", ledger.root, "--index", idx, "--json"]
-        printable = "bellwether " + " ".join(cmd[1:])
-        cold, warm = [], []
-        shutil.rmtree(idx, ignore_errors=True)
-        for _ in range(p.a.why_reps):
-            shutil.rmtree(os.path.join(idx, "cache"), ignore_errors=True)
-            p.cache.drop()
-            cold.append(sh(cmd)[0])
-        for _ in range(p.a.why_reps):
-            warm.append(sh(cmd)[0])
-        for cache, xs in (("cold", cold), ("warm", warm)):
-            p.quantiles(f"why/{ledger.name}/preregistered/{cache}", xs, dataset=ledger.name,
-                        query="why --bench-workload (200 runs)", metric="end-to-end", cache=cache,
-                        command=printable)
     say("latency: resident bytes per key (bellwether-replay tests/resident.rs)")
     for test in ("open_writer_resident_bytes_per_key", "layout_map_resident_bytes_per_key"):
         cmd = ["cargo", "test", "--release", "-p", "bellwether-replay", "--test", "resident", "--",
@@ -1180,6 +1166,28 @@ def section_latency(p, replay_small, ledger):
                  metric="resident bytes per key", query=v["case"], keys=v["keys"],
                  command=" ".join(cmd))
         p.context[f"resident/{v['case']}"] = v
+
+
+def section_why(p, ledger):
+    if not ledger:
+        say("why: no small rung (--ci); nothing to measure")
+        return
+    say("why: end to end on the pre-registered workload (small rung)")
+    idx = os.path.join(p.a.work, "why-idx")
+    cmd = [p.a.bin, "why", ledger.data, "--bench-workload", ledger.root, "--index", idx, "--json"]
+    printable = "bellwether " + " ".join(cmd[1:])
+    cold, warm = [], []
+    shutil.rmtree(idx, ignore_errors=True)
+    for _ in range(p.a.why_reps):
+        shutil.rmtree(os.path.join(idx, "cache"), ignore_errors=True)
+        p.cache.drop()
+        cold.append(sh(cmd)[0])
+    for _ in range(p.a.why_reps):
+        warm.append(sh(cmd)[0])
+    for cache, xs in (("cold", cold), ("warm", warm)):
+        p.quantiles(f"why/{ledger.name}/preregistered/{cache}", xs, dataset=ledger.name,
+                    query="why --bench-workload (200 runs)", metric="end-to-end", cache=cache,
+                    command=printable)
 
 
 # --------------------------------------------------------------- profiles
@@ -1493,7 +1501,7 @@ def main():
     ap.add_argument("--realdata", default=os.environ.get("REALDATA_WORK", ""),
                     help="directory holding gh/, taxi/, and taxi_duck/ from scripts/realdata.sh")
     ap.add_argument("--showcase", help="also write the README chart rows here")
-    ap.add_argument("--sections", default="lookups,build,reconcile,latency,profiles,ledger")
+    ap.add_argument("--sections", default="lookups,build,reconcile,latency,why,profiles,ledger")
     ap.add_argument("--ci", action="store_true",
                     help="small corpora only (replay-small, the quick corpus, market defaults, the 10k-file "
                          "ledger); no profiles")
@@ -1554,14 +1562,15 @@ def main():
     replay_small = None if not (want("latency") or (a.ci and want("build", "reconcile"))) else ledger_dataset(
         p, "replay-small", ["--days", "4", "--files", "64", "--row-groups-per-file", "2",
                             "--rows-per-row-group", "2000", "--entities", "640000", "--churn", "0.1"])
-    ledger = None if a.ci or not want("build", "reconcile", "latency", "profiles") else ledger_dataset(
+    ledger = None if a.ci or not want("build", "reconcile", "why", "profiles") else ledger_dataset(
         p, "ledger-small", ["--rung", "small"])
 
     runs = [
         ("lookups", lambda: section_lookups(p, [d for d in (mdef, mkt10, gh) if d])),
         ("build", lambda: section_build(p, [d for d in (replay_small if a.ci else ledger, mdef, mkt10) if d])),
         ("reconcile", lambda: section_reconcile(p, replay_small if a.ci else ledger)),
-        ("latency", lambda: section_latency(p, replay_small, ledger)),
+        ("latency", lambda: section_latency(p, replay_small)),
+        ("why", lambda: section_why(p, ledger)),
         ("profiles", lambda: section_profiles(p, mkt10, ledger, mdef)),
         ("ledger", lambda: section_ledger(p)),
     ]

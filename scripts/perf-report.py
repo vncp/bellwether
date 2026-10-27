@@ -347,7 +347,8 @@ def main():
         if a.section == "compare-lookups":
             print(compare_lookups(before, d))
         else:
-            print(compare_metrics(before, d, ("build/", "reconcile/", "replay/", "ledger/", "latency/")))
+            print(compare_metrics(before, d, ("build/", "reconcile/", "replay/", "observe/", "mcp/", "why/",
+                                              "resident/", "ledger/")))
         return
     for s in ("runs", "lookups", "build", "reconcile", "latency", "expected", "profiles"):
         if a.section in ("all", s):
