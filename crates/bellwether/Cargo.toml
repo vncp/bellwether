@@ -27,6 +27,8 @@ bellwether-profile = { path = "../bellwether-profile" }
 bellwether-replay = { path = "../bellwether-replay" }
 # `reconcile`, and `fix`'s verify stage.
 bellwether-verify = { path = "../bellwether-verify" }
+# Workload-level physical design advisor (WP13a, M6).
+bellwether-evolve = { path = "../bellwether-evolve" }
 # Tables as sources (`sql://` roots, ADR 027): reconcile, why, and fix
 # (verify, then an attest-only refusal) over a table.
 bellwether-source-sql = { path = "../bellwether-source-sql" }

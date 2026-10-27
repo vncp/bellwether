@@ -2,7 +2,7 @@
 
 Design document for `bellwether-evolve` (WP13a `advise`, WP13b `evolve`, WP13c rulebook v2; milestone M6). Governing decisions: ADR 021 (the loop), ADR 022 (what "gradient" means here), ADR 023 (joint and whole-pipeline optimization), ADR 024 (counterfactual attribution), ADR 025 (rulebook validation), ADR 031 (scoped proposers and a frozen outer loop), ADR 032 (staged delivery with a measured trigger).
 
-**Scope as of 2026-10-27 (ADR 032 amendment).** Only a reduced stage 1 is scheduled: workload-level key-set selection, exact knob descent, Pareto with anchors, and receipts (§3.1). Layout and materialization search, edge and plan-node attribution, stage 2 (`evolve --llm`), and stage 3 (rulebook v2) are deferred until a recorded multi-step pipeline workload exists and reduced `advise` leaves a structural anti-pattern on it. The rest of this document is the design for that case.
+**Scope as of 2026-10-27 (ADR 032 amendment; WP13a / M6 shipped).** Reduced stage 1 (`crates/bellwether-evolve`, `Engine::advise`, `bellwether advise`, MCP `score.advise`) is built: workload-level key-set selection with subsumption, exact knob descent (bloom FPR grid and key-count gates), Pareto frontier with NSGA-II crowding distance and knee-point selection, preserve-and-extend anchor admission with $\delta$, and receipts (`--apply`, §3.1). Layout and materialization search, edge and plan-node attribution, stage 2 (`evolve --llm`), and stage 3 (rulebook v2) are deferred until a recorded multi-step pipeline workload exists and reduced `advise` leaves a structural anti-pattern on it. The rest of this document is the design for that case.
 
 ## 1. The problem, stated precisely
 

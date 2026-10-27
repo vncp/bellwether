@@ -74,6 +74,10 @@ enum Command {
     /// Profile the folder and, with keys, replay them under every candidate
     /// key: the funnel, the culprit column, and the recommended key.
     Why(WhyArgs),
+    /// Workload-level physical design advisor (milestone M6): rule-driven key
+    /// enumeration, subsumption, exact bloom FPR and gate descent, Pareto
+    /// frontier with anchors and δ, and (with --apply) verified receipts.
+    Advise(AdviseArgs),
     /// Build or update the index for one or more key specs.
     Index(IndexArgs),
     /// Plan which files and row groups hold the keys (in a time window with
@@ -355,6 +359,44 @@ struct WhyArgs {
     /// --at gives its `as_of` nodes their instant.
     #[arg(long, value_name = "FILE", requires = "from")]
     plan: Option<PathBuf>,
+}
+#[derive(Args)]
+struct AdviseArgs {
+    #[command(flatten)]
+    root: RootArg,
+    /// A recorded workload hash (repeat for several workloads).
+    #[arg(long = "workload", value_name = "HASH")]
+    workloads: Vec<String>,
+    /// A Parquet file of keys to record as a workload (repeat for several runs).
+    #[arg(long, value_name = "FILE")]
+    from: Vec<PathBuf>,
+    /// Key columns to take from --from, comma-separated [default: all].
+    #[arg(long, value_name = "COLS", requires = "from", value_delimiter = ',')]
+    key: Option<Vec<String>>,
+    /// Optimize across all recorded workloads in the index's cache when neither
+    /// --workload nor --from is given.
+    #[arg(long)]
+    all_workloads: bool,
+    /// Maximum number of key specs in a joint configuration D.
+    #[arg(long, value_name = "N", default_value_t = bellwether::DEFAULT_MAX_KEYS)]
+    max_keys: usize,
+    /// Optional cap on index segment bytes (bytes, or K/M/G/T binary units).
+    #[arg(long, value_name = "BYTES", value_parser = verify_cmds::parse_bytes)]
+    max_index_bytes: Option<u64>,
+    /// Preserve-and-extend per-run regression allowance δ on anchor runs (ADR 021).
+    #[arg(long, value_name = "F", default_value_t = bellwether::DEFAULT_DELTA)]
+    delta: f64,
+    /// Verify and apply the recommended frontier configuration through the
+    /// engine's verify + apply path and emit a Receipt per applied key spec.
+    #[arg(long)]
+    apply: bool,
+    /// Sign the Receipt and Certificate written by --apply with this ed25519
+    /// seed file (`bellwether keys generate`).
+    #[arg(long, value_name = "FILE", env = "BELLWETHER_SIGNING_KEY")]
+    signing_key: Option<PathBuf>,
+    /// Optional key-count gate NAME:N (repeat for several, e.g. broadcast:10000, in:100000).
+    #[arg(long = "gate", value_name = "NAME:N", value_parser = parse_gate)]
+    gates: Vec<bellwether::types::Gate>,
 }
 
 /// `--gate NAME:N`.
@@ -792,7 +834,8 @@ impl From<Error> for Failure {
                 field:
                     "lookback" | "latest_by" | "signing_key" | "trusted_keys" | "public_key" | "out"
                     | "name" | "valid_from" | "revoked_at" | "index" | "root" | "scratch" | "items"
-                    | "columns" | "text" | "join" | "functions" | "plan" | "datasets",
+                    | "columns" | "text" | "join" | "functions" | "plan" | "datasets" | "max_keys"
+                    | "delta" | "max_index_bytes",
                 ..
             } => Self::Usage(match hint(&e) {
                 Some(h) => format!("{e}; {h}"),
@@ -808,6 +851,7 @@ impl From<Error> for Failure {
 /// The next step for a typed engine error, in this CLI's flags and
 /// commands. The facade's message says what happened in words that name no
 /// surface; the MCP server adds its own next step in its field names.
+#[allow(clippy::too_many_lines)]
 fn hint(e: &Error) -> Option<String> {
     let hash_arg = |k: &HashKind| match k {
         HashKind::Evidence => {
@@ -890,6 +934,9 @@ fn hint(e: &Error) -> Option<String> {
                 "functions" => "--fn",
                 "plan" => "--plan (a consumer plan's JSON) or --before-plan and --after-plan",
                 "datasets" => "--dataset NAME=ROOT",
+                "max_keys" => "--max-keys",
+                "delta" => "--delta",
+                "max_index_bytes" => "--max-index-bytes",
                 "join" => {
                     "the right side the join key names (--join <right>.<column>[,<column>...], or \
                      the right side of a join: key spec): a folder beside the data root, one \
@@ -1028,6 +1075,7 @@ fn run(cli: &Cli, out: &Out) -> Result<Outcome, Failure> {
     let g = &cli.global;
     match &cli.command {
         Command::Why(a) => why(g, out, a),
+        Command::Advise(a) => advise(g, out, a),
         Command::Index(a) => index(g, out, a),
         Command::Locate(a) => locate(g, out, a),
         Command::Count(a) => {
@@ -1576,4 +1624,50 @@ fn why(g: &Global, out: &Out, a: &WhyArgs) -> Result<Outcome, Failure> {
         format!("bellwether fix {}", r.root)
     };
     done(&r, human::why(&r, out, &fix_command), EXIT_OK)
+}
+
+fn advise(g: &Global, out: &Out, a: &AdviseArgs) -> Result<Outcome, Failure> {
+    let workloads = a
+        .workloads
+        .iter()
+        .map(|w| hash(w, "workload"))
+        .collect::<Result<Vec<_>, _>>()?;
+    let from = a
+        .from
+        .iter()
+        .map(|p| key_file(p, a.key.as_ref()))
+        .collect::<Vec<_>>();
+    let key = crate::keys_cmds::signing_key(g, &a.root.root, a.signing_key.as_deref())?;
+    let e = engine_keyed(g, &a.root.root, key, None)?;
+    let req = bellwether::AdviseRequest {
+        workloads,
+        from,
+        all_workloads: a.all_workloads || (a.workloads.is_empty() && a.from.is_empty()),
+        max_keys: a.max_keys,
+        max_index_bytes: a.max_index_bytes,
+        delta: a.delta,
+        apply: a.apply,
+        gates: a.gates.clone(),
+    };
+    let r = e.advise(&req)?;
+    let code = if a.apply
+        && r.applied.iter().any(|f| {
+            matches!(
+                f.outcome,
+                bellwether::FixOutcome::Refused {
+                    refusal: bellwether::Refusal::CertificateFailed { .. }
+                }
+            )
+        }) {
+        EXIT_FAILED
+    } else if a.apply
+        && r.applied
+            .iter()
+            .any(|f| matches!(f.outcome, bellwether::FixOutcome::Refused { .. }))
+    {
+        EXIT_REFUSED
+    } else {
+        EXIT_OK
+    };
+    done(&r, human::advise(&r, out), code)
 }
