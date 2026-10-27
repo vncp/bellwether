@@ -247,7 +247,8 @@ impl Report {
             Verdict::Blip => 1,
             Verdict::Pass => 2,
         });
-        let num = |v: Option<f64>, unit: &str| v.map_or_else(|| "-".into(), |v| format!("{v:.3} {unit}"));
+        let num =
+            |v: Option<f64>, unit: &str| v.map_or_else(|| "-".into(), |v| format!("{v:.3} {unit}"));
         for r in rows {
             let _ = writeln!(
                 s,

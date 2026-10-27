@@ -82,7 +82,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use arrow::array::{ArrayRef, RecordBatch};
 use arrow::datatypes::{DataType, SchemaRef};
 use bellwether_core::encoding::{self, tag, KeyColumns, Value};
-use bellwether_core::segment::{Layout, ReadAt};
+use bellwether_core::segment::Layout;
 use bellwether_core::sidecar::{
     bitemporal_winner, BitemporalHit, RgBounds, SidecarDef, SidecarKind, SidecarReader, Triple,
 };
@@ -1604,7 +1604,7 @@ impl<S: StoreExt + ?Sized> Planner<S> {
                 }
                 match rows {
                     Some(total) => self.counted_per_key(seg, &all, &owners, n, total)?,
-                    None => self.fold_segments(
+                    None => Self::fold_segments(
                         &seg.sources,
                         || vec![RoaringBitmap::new(); n],
                         |out, src| {
@@ -1620,7 +1620,7 @@ impl<S: StoreExt + ?Sized> Planner<S> {
                     )?,
                 }
             }
-            (true, Serve::Prefix) => self.fold_segments(
+            (true, Serve::Prefix) => Self::fold_segments(
                 &seg.sources,
                 || vec![RoaringBitmap::new(); n],
                 |out, src| {
@@ -1713,14 +1713,8 @@ impl<S: StoreExt + ?Sized> Planner<S> {
     /// combines them and must not depend on their order (a union), so the
     /// result is the sequential one. On any error the sources are walked
     /// again in order, so the error returned is the first in source order,
-    /// as a sequential walk reports it (WP22b).
-    fn fold_segments<A, I, P, M>(
-        &self,
-        sources: &[SegSource],
-        init: I,
-        per: P,
-        merge: M,
-    ) -> Result<A>
+    /// as a sequential walk reports it.
+    fn fold_segments<A, I, P, M>(sources: &[SegSource], init: I, per: P, merge: M) -> Result<A>
     where
         A: Send,
         I: Fn() -> A + Sync + Send,
@@ -2120,12 +2114,7 @@ impl<S: StoreExt + ?Sized> Planner<S> {
     ) -> Result<Vec<Option<VersionHit>>> {
         let probes = sorted_probes(variants);
         let hits = self.temporal_hits(t, &probes, asof)?;
-        let hit = |v: &Vec<u8>| {
-            probes
-                .binary_search(v)
-                .ok()
-                .and_then(|i| hits[i].as_ref())
-        };
+        let hit = |v: &Vec<u8>| probes.binary_search(v).ok().and_then(|i| hits[i].as_ref());
         Ok(variants
             .iter()
             .map(|vs| {
@@ -2157,7 +2146,7 @@ impl<S: StoreExt + ?Sized> Planner<S> {
         let probes = sorted_probes(variants);
         // Every version of each probe across the spec's segments: the
         // segments' chains merged (a merge is order-free).
-        let chains = self.fold_segments(
+        let chains = Self::fold_segments(
             &t.sources,
             || vec![None; probes.len()],
             |acc: &mut Vec<Option<VersionChain>>, src| {
@@ -2216,7 +2205,7 @@ impl<S: StoreExt + ?Sized> Planner<S> {
             Some(acc) => acc.combine(&hit),
             None => *slot = Some(hit),
         };
-        let mut out = self.fold_segments(
+        let mut out = Self::fold_segments(
             &t.sources,
             || vec![None; probes.len()],
             |acc: &mut Vec<Option<VersionHit>>, src| {
@@ -2612,7 +2601,7 @@ impl<S: StoreExt + ?Sized> Planner<S> {
         hi: i64,
     ) -> Result<BTreeMap<Vec<u8>, RoaringBitmap>> {
         let probes = sorted_probes(variants);
-        let found = self.fold_segments(
+        let found = Self::fold_segments(
             &t.sources,
             || vec![None; probes.len()],
             |found: &mut Vec<Option<RoaringBitmap>>, src| {
@@ -2651,7 +2640,9 @@ impl<S: StoreExt + ?Sized> Planner<S> {
     ) -> Result<BTreeMap<Vec<u8>, RoaringBitmap>> {
         let probes = sorted_probes(variants);
         let sources = match src {
-            TimedSource::Spec(spec) => Some((spec, &Self::spec_segments(segs, spec)?.sources, false)),
+            TimedSource::Spec(spec) => {
+                Some((spec, &Self::spec_segments(segs, spec)?.sources, false))
+            }
             TimedSource::BloomBounds(spec) => {
                 Some((spec, &Self::spec_segments(segs, spec)?.bounds, true))
             }
@@ -2669,7 +2660,7 @@ impl<S: StoreExt + ?Sized> Planner<S> {
         };
         // The per-key bounds a key spec holds, read segment by segment on
         // the rayon pool: the bounds overlapping `[lo, hi]` of each probe.
-        let found = self.fold_segments(
+        let found = Self::fold_segments(
             sources,
             || vec![None; probes.len()],
             |found: &mut Vec<Option<RoaringBitmap>>, seg| {

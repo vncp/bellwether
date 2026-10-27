@@ -78,7 +78,7 @@ impl<S: StoreExt + ?Sized> Cache<S> {
 
     /// Stores a payload named by its own hash (`input_hash` is its blake3:
     /// a key set) unless that entry is already stored whole, so a repeated
-    /// lookup with the same keys writes and fsyncs nothing (WP22b). The
+    /// lookup with the same keys writes and fsyncs nothing. The
     /// entry keeps its first `created_at`; use it only for payloads whose
     /// age no reader uses. A missing, torn, or unparsable entry is written
     /// afresh by [`Self::put_cached`]. Refuses a payload that is not named
@@ -195,8 +195,6 @@ mod tests {
         assert!(cache.get_cached(&key).unwrap().is_none());
         cache.put_cached_once(&key, payload.clone()).unwrap();
         assert_eq!(cache.get_cached(&key).unwrap().unwrap().0, payload);
-        assert!(cache
-            .put_cached_once(&Hash::of(b"other"), payload)
-            .is_err());
+        assert!(cache.put_cached_once(&Hash::of(b"other"), payload).is_err());
     }
 }

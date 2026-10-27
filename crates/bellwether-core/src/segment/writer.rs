@@ -935,7 +935,7 @@ impl KeyAcc {
 
 /// The keyed accumulators: a hash map (one hash and one probe per row,
 /// where an ordered map compares keys at every level), sorted once by key
-/// when the segment is finished (WP22b). The hasher has a fixed seed; the
+/// when the segment is finished. The hasher has a fixed seed; the
 /// segment's bytes depend only on the sorted keys.
 type KeyedAcc = HashMap<Vec<u8>, KeyAcc, Xxh3DefaultBuilder>;
 

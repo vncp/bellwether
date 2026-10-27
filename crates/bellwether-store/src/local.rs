@@ -212,7 +212,7 @@ fn current_token(target: &Path) -> Result<Option<StoreVersion>> {
 /// Reads `target` whole on the calling thread: `None` when it is absent (or
 /// a directory, as `object_store`'s local `get` answers). The local
 /// backend's reads skip `object_store`'s blocking-pool round trip, which
-/// cost more than the read itself on the plan path (WP22b).
+/// cost more than the read itself on the plan path.
 pub(crate) fn read_whole(target: &Path) -> Result<Option<bytes::Bytes>> {
     match std::fs::read(target) {
         Ok(b) => Ok(Some(bytes::Bytes::from(b))),
@@ -251,7 +251,7 @@ pub(crate) fn read_range(
         );
         match read {
             Ok(0) => {
-                let size = file.metadata().map(|m| m.len()).unwrap_or(0);
+                let size = file.metadata().map_or(0, |m| m.len());
                 return Err(Error::Store(format!(
                     "read {}: asked for bytes {}..{}, the file holds {size}",
                     target.display(),

@@ -191,11 +191,6 @@ impl<'a> BlockView<'a> {
         (u64_at(b), u32_at(&b[8..], 0) as usize, sum)
     }
 
-    fn find(&self, key: &[u8]) -> Result<Option<usize>> {
-        let i = self.lower_bound(key)?;
-        Ok((i < self.n && self.key(i)? == key).then_some(i))
-    }
-
     fn lower_bound(&self, key: &[u8]) -> Result<usize> {
         self.lower_bound_from(key, 0)
     }

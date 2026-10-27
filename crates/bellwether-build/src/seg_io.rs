@@ -26,7 +26,7 @@ pub(crate) enum SegmentBytes<'a, S: StoreExt + ?Sized> {
         size: u64,
         /// The window of the last read: its index and bytes. Probes walk a
         /// segment in key order, so most reads land in the window before
-        /// and skip the snapshot's shared cache (WP22b). One window per open
+        /// and skip the snapshot's shared cache. One window per open
         /// reader (ADR 018).
         last: RefCell<Option<(u64, Bytes)>>,
     },

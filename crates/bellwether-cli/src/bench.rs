@@ -530,7 +530,9 @@ fn file_hash(path: &Path) -> Result<Option<Hash>, Error> {
     }
 }
 
-/// Runs one benchmark subcommand. Returns what it wrote.
+/// Runs one benchmark subcommand. Returns what it wrote. One arm per
+/// subcommand, so its length grows with them.
+#[allow(clippy::too_many_lines)]
 pub(crate) fn run(cmd: &BenchCommand) -> Result<Wrote, Error> {
     let (what, path, failed, market) = match cmd {
         BenchCommand::Generate(a) => {
