@@ -36,13 +36,13 @@ inputs:
     description: Check out the pull request's head with full history into `path` first.
     default: 'true'
   base:
-    description: The base commit [default: the pull request's].
+    description: "The base commit (default: the pull request's)."
     default: ${{ github.event.pull_request.base.sha }}
   head:
-    description: The head commit [default: the pull request's].
+    description: "The head commit (default: the pull request's)."
     default: ${{ github.event.pull_request.head.sha }}
   build-profile:
-    description: With `version: build`, the cargo profile (`release` or `debug`).
+    description: "With `version: build`, the cargo profile (`release` or `debug`)."
     default: release
   token:
     description: The token that downloads the release and posts the comment.
@@ -50,10 +50,10 @@ inputs:
 
 outputs:
   outcome:
-    description: pass, fail, advisory, or nothing_to_check (empty when the gate could not run).
+    description: "pass, fail, advisory, or nothing_to_check (empty when the gate could not run)."
     value: ${{ steps.gate.outputs.outcome }}
   exit-code:
-    description: 0 pass, advisory, or nothing to check; 1 a step failed; 2 usage or configuration; 4 the ledger could not be read.
+    description: "0 pass, advisory, or nothing to check; 1 a step failed; 2 usage or configuration; 4 the ledger could not be read."
     value: ${{ steps.gate.outputs.exit-code }}
   comment-file:
     description: The comment's markdown, exactly as posted and as written to the step summary.

@@ -14,7 +14,7 @@ if [ "$BELLWETHER_VERSION" = build ]; then
     debug) profile=(--debug) ;;
     *) echo "::error::build-profile must be release or debug, not $BELLWETHER_BUILD_PROFILE"; exit 2 ;;
   esac
-  cargo install --locked "${profile[@]}" --path "$GITHUB_ACTION_PATH/../crates/bellwether-cli" \
+  cargo install --locked ${profile[@]+"${profile[@]}"} --path "$GITHUB_ACTION_PATH/../crates/bellwether-cli" \
     --root "$RUNNER_TEMP/bellwether-install"
   cp "$RUNNER_TEMP/bellwether-install/bin/bellwether" "$bin/"
 else
