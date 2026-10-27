@@ -3299,15 +3299,17 @@ fn tombstone_column(
         thousands(n.keys)
     );
     if let (Some(m), Some(t)) = (index.stats().tombstone_marks, spec.tombstone()) {
-        value.push_str(&format!(
+        use std::fmt::Write as _;
+        let _ = write!(
+            value,
             "; of {} timed rows, {} are tombstones and {} have a null {}",
             thousands(m.rows),
             thousands(m.tombstones),
             thousands(m.nulls),
             t.column
-        ));
+        );
         if let Some(w) = m.suspect(t) {
-            value.push_str(&format!("; warning: {w}"));
+            let _ = write!(value, "; warning: {w}");
         }
     }
     Ok(Some(bellwether_types::KindColumn {
