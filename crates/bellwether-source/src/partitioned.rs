@@ -133,6 +133,50 @@ impl<S: Source> Partitioned<S> {
             ))
         })
     }
+
+    /// `batch` (the stored columns) with every column of `columns` in
+    /// order, each partition column repeated from its path value.
+    fn with_values(
+        &self,
+        batch: &RecordBatch,
+        columns: &[String],
+        values: &[PartitionValue],
+        rg: &RowGroupMeta,
+    ) -> Result<RecordBatch> {
+        let rows = batch.num_rows();
+        let mut fields = Vec::with_capacity(columns.len());
+        let mut arrays: Vec<ArrayRef> = Vec::with_capacity(columns.len());
+        for c in columns {
+            if let Some(p) = values.iter().find(|p| &p.name == c) {
+                let target = self.type_of(c)?;
+                let one = typed_value(c, p.value.as_deref(), &target)?;
+                fields.push(Field::new(c.clone(), target, true));
+                arrays.push(repeat(&one, rows)?);
+            } else {
+                let i = batch
+                    .schema()
+                    .index_of(c)
+                    .map_err(|_| Error::KeySpec(format!("column {c:?} not in decoded batch")))?;
+                fields.push(batch.schema().field(i).clone());
+                arrays.push(Arc::clone(batch.column(i)));
+            }
+        }
+        RecordBatch::try_new_with_options(
+            Arc::new(Schema::new(fields)),
+            arrays,
+            &arrow::array::RecordBatchOptions::new().with_row_count(Some(rows)),
+        )
+        .map_err(|e| Error::Source(format!("{}: {e}", rg.file.path)))
+    }
+}
+
+/// The columns of `columns` a file stores: every one its path does not give.
+fn stored(columns: &[String], values: &[PartitionValue]) -> Vec<String> {
+    columns
+        .iter()
+        .filter(|c| !values.iter().any(|p| &p.name == *c))
+        .cloned()
+        .collect()
 }
 
 impl<S: Source> Source for Partitioned<S> {
@@ -197,36 +241,25 @@ impl<S: Source> Source for Partitioned<S> {
         if values.is_empty() {
             return self.inner.read_columns(rg, columns);
         }
-        let stored: Vec<String> = columns
-            .iter()
-            .filter(|c| !values.iter().any(|p| &p.name == *c))
-            .cloned()
-            .collect();
-        let batch = self.inner.read_columns(rg, &stored)?;
-        let rows = batch.num_rows();
-        let mut fields = Vec::with_capacity(columns.len());
-        let mut arrays: Vec<ArrayRef> = Vec::with_capacity(columns.len());
-        for c in columns {
-            if let Some(p) = values.iter().find(|p| &p.name == c) {
-                let target = self.type_of(c)?;
-                let one = typed_value(c, p.value.as_deref(), &target)?;
-                fields.push(Field::new(c.clone(), target, true));
-                arrays.push(repeat(&one, rows)?);
-            } else {
-                let i = batch
-                    .schema()
-                    .index_of(c)
-                    .map_err(|_| Error::KeySpec(format!("column {c:?} not in decoded batch")))?;
-                fields.push(batch.schema().field(i).clone());
-                arrays.push(Arc::clone(batch.column(i)));
-            }
+        let batch = self.inner.read_columns(rg, &stored(columns, &values))?;
+        self.with_values(&batch, columns, &values, rg)
+    }
+
+    fn read_column_batches(
+        &self,
+        rg: &RowGroupMeta,
+        columns: &[String],
+        max_rows: usize,
+        f: &mut dyn FnMut(RecordBatch) -> Result<()>,
+    ) -> Result<()> {
+        let values = self.values(&rg.file.path)?;
+        if values.is_empty() {
+            return self.inner.read_column_batches(rg, columns, max_rows, f);
         }
-        RecordBatch::try_new_with_options(
-            Arc::new(Schema::new(fields)),
-            arrays,
-            &arrow::array::RecordBatchOptions::new().with_row_count(Some(rows)),
-        )
-        .map_err(|e| Error::Source(format!("{}: {e}", rg.file.path)))
+        self.inner
+            .read_column_batches(rg, &stored(columns, &values), max_rows, &mut |batch| {
+                f(self.with_values(&batch, columns, &values, rg)?)
+            })
     }
 
     fn schema(&self, root: &str) -> Result<SchemaRef> {

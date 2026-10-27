@@ -19,7 +19,7 @@ use bellwether_ledger::{
     record_path, signature_message, InvalidReason, Ledger, LinkStatus, RecordKind, SignaturePath,
     SignatureStatus, SigningKey, TrustError, TrustedKey, TrustedKeys, Verdict, SIGNATURE_DOMAIN,
 };
-use bellwether_types::{Error, Hash, Receipt, Record, Store};
+use bellwether_types::{Error, Hash, Receipt, Record, Store, StoreVersion};
 use common::{assert_rule, certificate, valid_chain, Fixture, MemStore, AFTER, BEFORE};
 use ed25519_dalek::Signer as _;
 use serde::Serialize;
@@ -928,4 +928,108 @@ fn store_text_in_planted_records_is_escaped_in_explain() {
     let chain = ledger.explain(&receipt).unwrap();
     let json = serde_json::to_string(&chain).unwrap();
     assert!(!json.contains("\\u001b"), "{json}");
+}
+
+/// A store that counts listings (WP22b: one listing per command).
+#[derive(Default)]
+struct Listings {
+    inner: MemStore,
+    lists: std::sync::atomic::AtomicUsize,
+}
+
+impl Store for Listings {
+    fn get(&self, path: &str) -> bellwether_types::Result<(bytes::Bytes, StoreVersion)> {
+        self.inner.get(path)
+    }
+    fn put_if_absent(
+        &self,
+        path: &str,
+        body: bytes::Bytes,
+    ) -> bellwether_types::Result<StoreVersion> {
+        self.inner.put_if_absent(path, body)
+    }
+    fn put_if_version(
+        &self,
+        path: &str,
+        body: bytes::Bytes,
+        expected: &StoreVersion,
+    ) -> bellwether_types::Result<StoreVersion> {
+        self.inner.put_if_version(path, body, expected)
+    }
+    fn put_content_addressed(
+        &self,
+        path: &str,
+        body: bytes::Bytes,
+    ) -> bellwether_types::Result<()> {
+        self.inner.put_content_addressed(path, body)
+    }
+    fn list(&self, prefix: &str) -> bellwether_types::Result<Vec<String>> {
+        self.lists.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.inner.list(prefix)
+    }
+    fn delete(&self, path: &str) -> bellwether_types::Result<()> {
+        self.inner.delete(path)
+    }
+}
+
+#[test]
+fn explaining_lists_the_ledger_once_and_an_index_serves_every_receipt() {
+    // WP22b: `explain` listed the whole ledger once per signed link (twice
+    // per receipt), and `ledger receipts` once more per receipt; a command
+    // now lists once and reads every signature from that listing.
+    let store = Listings::default();
+    let ledger = Ledger::new(&store.inner);
+    let f = valid_chain(&ledger);
+    let receipt = ledger.put_receipt(&f.receipt, AFTER).unwrap();
+    let other = second_receipt(&store.inner, &f);
+    let (k1, k2) = (key(1), key(2));
+    for (h, k) in [(&receipt, &k1), (&receipt, &k2), (&f.certificate, &k1)] {
+        ledger.sign(h, k, T).unwrap();
+    }
+    let t = trusting(&[(&k1, "ci")]);
+    let counted = Ledger::new(&store);
+    let lists = || store.lists.load(std::sync::atomic::Ordering::SeqCst);
+
+    let plain = counted.explain(&receipt).unwrap();
+    assert_eq!(lists(), 1, "explain lists once");
+    let verified = counted.explain_verified(&receipt, &t).unwrap();
+    assert_eq!(lists(), 2, "explain_verified lists once");
+
+    let index = counted.signature_index().unwrap();
+    assert_eq!(lists(), 3);
+    assert_eq!(index.of(&receipt).len(), 2);
+    assert_eq!(index.of(&f.certificate).len(), 1);
+    assert!(index.of(&other).is_empty());
+    // Every read from the index is the read with its own listing.
+    assert_eq!(counted.explain_in(&receipt, None, &index).unwrap(), plain);
+    assert_eq!(
+        counted.explain_in(&receipt, Some(&t), &index).unwrap(),
+        verified
+    );
+    for h in [receipt, f.certificate, other] {
+        assert_eq!(
+            counted.signatures_in(&h, &index).unwrap(),
+            ledger.signatures(&h).unwrap()
+        );
+    }
+    counted.explain_in(&other, Some(&t), &index).unwrap();
+    assert_eq!(lists(), 3, "reads through an index list nothing");
+
+    // The index is a snapshot of one listing: a signature written after it
+    // is read only by a new listing.
+    ledger.sign(&other, &k1, T).unwrap();
+    assert!(counted.signatures_in(&other, &index).unwrap().is_empty());
+    assert_eq!(counted.signatures(&other).unwrap().len(), 1);
+    // An index keeps only signature objects, deduplicated per record.
+    let path = SignaturePath {
+        record: other,
+        key_id: k1.key_id(),
+    }
+    .path();
+    let again = bellwether_ledger::SignatureIndex::from_paths([
+        path.as_str(),
+        path.as_str(),
+        "ledger/not-a-signature.json",
+    ]);
+    assert_eq!(again.of(&other).len(), 1);
 }

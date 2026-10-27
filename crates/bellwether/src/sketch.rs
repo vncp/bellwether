@@ -680,6 +680,21 @@ impl Source for CountingSource<'_> {
         Ok(batch)
     }
 
+    fn read_column_batches(
+        &self,
+        rg: &RowGroupMeta,
+        columns: &[String],
+        max_rows: usize,
+        f: &mut dyn FnMut(arrow::array::RecordBatch) -> Result<()>,
+    ) -> Result<()> {
+        self.inner.read_column_batches(rg, columns, max_rows, f)?;
+        self.row_groups.fetch_add(1, Ordering::SeqCst);
+        if let Ok(mut f) = self.files.lock() {
+            f.insert(rg.file.path.clone());
+        }
+        Ok(())
+    }
+
     fn schema(&self, root: &str) -> Result<SchemaRef> {
         self.inner.schema(root)
     }

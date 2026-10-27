@@ -3,7 +3,9 @@
 //! and the signatures beside the receipt and its certificate (ADR 029),
 //! folded into verdicts when the engine has trusted keys.
 
-use bellwether_ledger::{printable, LinkStatus as LedgerStatus, RecordKind, Verdict};
+use bellwether_ledger::{
+    printable, LinkStatus as LedgerStatus, RecordKind, SignatureIndex, Verdict,
+};
 use bellwether_types::{Error, EvidenceBody, Hash, HashKind, Record, Result};
 
 use crate::engine::{guard, Engine};
@@ -14,23 +16,26 @@ impl Engine {
     /// proposal, and evidence. A bad link is flagged, never an error; only a
     /// store failure or a hash that is not a receipt fails. Writes nothing.
     pub fn receipt(&self, hash: &Hash) -> Result<ReceiptResult> {
-        guard(|| self.receipt_inner(hash))
+        guard(|| {
+            let index = self.ledger()?.signature_index()?;
+            self.receipt_in(hash, &index)
+        })
     }
 
-    fn receipt_inner(&self, hash: &Hash) -> Result<ReceiptResult> {
+    /// [`Engine::receipt`] with the signatures of `index`, one listing of
+    /// the ledger shared by every receipt a command shows.
+    pub(crate) fn receipt_in(&self, hash: &Hash, index: &SignatureIndex) -> Result<ReceiptResult> {
         let ledger = self.ledger()?;
-        let chain = match &self.options().trusted_keys {
-            Some(t) => ledger.explain_verified(hash, t),
-            None => ledger.explain(hash),
-        }
-        .map_err(|e| match e {
-            Error::NotFound(h) if h == *hash => Error::RecordNotFound {
-                kind: HashKind::Receipt,
-                hash: h,
-                place: format!("the ledger at {}", self.index_location()),
-            },
-            other => other,
-        })?;
+        let chain = ledger
+            .explain_in(hash, self.options().trusted_keys.as_ref(), index)
+            .map_err(|e| match e {
+                Error::NotFound(h) if h == *hash => Error::RecordNotFound {
+                    kind: HashKind::Receipt,
+                    hash: h,
+                    place: format!("the ledger at {}", self.index_location()),
+                },
+                other => other,
+            })?;
         let mut links = Vec::with_capacity(chain.links.len());
         let mut records = Vec::new();
         for l in &chain.links {

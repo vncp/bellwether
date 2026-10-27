@@ -1065,6 +1065,16 @@ impl Source for SnapshotFiles {
         self.inner.read_columns(rg, columns)
     }
 
+    fn read_column_batches(
+        &self,
+        rg: &bellwether_types::RowGroupMeta,
+        columns: &[String],
+        max_rows: usize,
+        f: &mut dyn FnMut(arrow::array::RecordBatch) -> Result<()>,
+    ) -> Result<()> {
+        self.inner.read_column_batches(rg, columns, max_rows, f)
+    }
+
     fn schema(&self, root: &str) -> Result<SchemaRef> {
         self.inner.schema(root)
     }
@@ -1264,6 +1274,16 @@ impl Source for TableSource {
         columns: &[String],
     ) -> Result<arrow::array::RecordBatch> {
         self.0.read_columns(rg, columns)
+    }
+
+    fn read_column_batches(
+        &self,
+        rg: &bellwether_types::RowGroupMeta,
+        columns: &[String],
+        max_rows: usize,
+        f: &mut dyn FnMut(arrow::array::RecordBatch) -> Result<()>,
+    ) -> Result<()> {
+        self.0.read_column_batches(rg, columns, max_rows, f)
     }
 
     fn schema(&self, root: &str) -> Result<SchemaRef> {

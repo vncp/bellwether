@@ -16,6 +16,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use arrow::array::{Array, RecordBatch};
 use arrow::datatypes::{i256, DataType};
 use bellwether_core::encoding;
+use bellwether_core::hll::Hll;
 use bellwether_core::render::render_tuple;
 use bellwether_types::{
     format, AggServed, Coverage, Evidence, EvidenceBody, FileFingerprint, Hash, Provenance, Record,
@@ -46,6 +47,11 @@ pub const PARTITION_SEED: u64 = 0x6265_6c6c_7765_7468;
 /// binary) when choosing the pass count. A wrong guess costs a restart,
 /// never the bound.
 const ASSUMED_VARLEN_KEY_BYTES: u64 = 32;
+
+/// Rows decoded at a time from one row group. Memory outside the budget is
+/// one batch of at most this many rows, not one row group, so it does not
+/// grow with the width of the sources' row groups (ADR 018).
+pub const READ_BATCH_ROWS: usize = 8_192;
 
 const SIDE_NAMES: [&str; 2] = ["left", "right"];
 
@@ -340,6 +346,9 @@ struct Attempt {
     /// the first pass.
     null_keys: [u64; 2],
     peak_batch: u64,
+    /// The first pass's HyperLogLog count of every key it reads, while it runs
+    /// in a run of more than one partition.
+    distinct: Option<Hll>,
 }
 
 /// One pass's per-key state.
@@ -408,7 +417,11 @@ impl Reconciler {
     pub(crate) fn execute(&self, left: &Side<'_>, right: &Side<'_>) -> Result<Execution> {
         let started = Instant::now();
         let prep = self.prepare([*left, *right])?;
-        let mut passes = self.estimate_passes(&prep);
+        let (model, entries) = self.pass_model(&prep);
+        let mut of = model.passes_for(entries);
+        // After an overflow the run restarts at twice the partitions, one
+        // per pass, as before the first pass counted the keys.
+        let mut regroup = true;
         let mut memory = MemoryReport {
             budget_bytes: self.options.memory_budget,
             ..MemoryReport::default()
@@ -425,20 +438,22 @@ impl Reconciler {
                 rows_read: [0, 0],
                 null_keys: [0, 0],
                 peak_batch: 0,
+                distinct: None,
             };
-            let result = attempt(&prep, passes, &mut a);
+            let result = attempt(&prep, regroup.then_some(&model), of, &mut a);
             memory.peak_state_bytes = memory.peak_state_bytes.max(a.meter.peak());
             memory.peak_batch_bytes = memory.peak_batch_bytes.max(a.peak_batch);
             for (total, read) in memory.rows_read.iter_mut().zip(a.rows_read) {
                 *total += read;
             }
             match result {
-                Ok(()) => break a,
+                Ok(made) => break (a, made),
                 Err(Abort::Error(e)) => return Err(e),
                 Err(Abort::Overflow) => {
                     memory.restarts += 1;
-                    passes = passes.saturating_mul(2);
-                    if passes > MAX_PASSES {
+                    regroup = false;
+                    of = of.saturating_mul(2);
+                    if of > MAX_PASSES {
                         return Err(VerifyError::Budget(format!(
                             "the comparison state does not fit in {} bytes even at {MAX_PASSES} \
                              passes; raise the memory budget (`--memory-budget` on the CLI, \
@@ -449,7 +464,8 @@ impl Reconciler {
                 }
             }
         };
-        memory.passes = passes;
+        let (attempt, made) = attempt;
+        memory.passes = made;
         self.finish(prep, attempt, memory, started)
     }
 
@@ -565,21 +581,24 @@ impl Reconciler {
         })
     }
 
-    /// The pass count the statistics call for: the worst-case accounted
-    /// state of the keys a pass may hold, over the budget left after a
-    /// reserve for the group totals and examples.
-    fn estimate_passes(&self, prep: &Prepared<'_>) -> u32 {
-        // Distinct keys per pass: at most the rows of the larger side when
-        // the sides share their keys (if they do not, a pass overflows and
-        // the run restarts), at most the integer key's value range, and at
-        // most the workload's keys.
+    /// The meter's model of one pass, and the distinct keys the statistics
+    /// bound: at most the rows of the larger side when the sides share
+    /// their keys (if they do not, a pass overflows and the run restarts),
+    /// at most the integer key's value range, and at most the workload's
+    /// keys. The pass count to start with is [`PassModel::passes_for`]
+    /// those keys; the first pass then counts the keys themselves
+    /// ([`attempt`]).
+    fn pass_model(&self, prep: &Prepared<'_>) -> (PassModel, u64) {
         let rows = prep.reports[0].rows.max(prep.reports[1].rows);
         let mut entries = prep.key_bound.map_or(rows, |b| rows.min(b));
-        if let Scope::Workload {
-            keys, expr: None, ..
-        } = &prep.scope
-        {
-            entries = entries.min(keys.len() as u64);
+        let workload = match &prep.scope {
+            Scope::Workload {
+                keys, expr: None, ..
+            } => Some(keys.len() as u64),
+            _ => None,
+        };
+        if let Some(w) = workload {
+            entries = entries.min(w);
         }
         let key_len: u64 = prep.plan.key_types(0).iter().map(encoded_width).sum();
         let key_heap = heap(usize::try_from(key_len).unwrap_or(usize::MAX));
@@ -592,8 +611,6 @@ impl Reconciler {
             };
             per_key_heap += 2 * c.heap_bytes();
         }
-        let slot = size_of::<(Box<[u8]>, KeyState)>();
-        let set_slot = size_of::<(Box<[u8]>, ())>();
         let sampled = match prep.scope {
             Scope::Sampled { requested, .. } => Some(requested),
             _ => None,
@@ -611,45 +628,97 @@ impl Reconciler {
         if !prep.plan.totals.is_empty() {
             reserve += self.options.memory_budget / 16;
         }
-        let available = self.options.memory_budget.saturating_sub(reserve).max(1);
-        // The meter's own model of one pass holding `n` keys: the table's
-        // growth (largest resize or final size) plus the keys' heap.
-        let need = |n: u64| -> u64 {
-            match sampled {
-                None => table_peak(n, slot) + n * per_key_heap,
-                Some(f) => {
-                    #[allow(
-                        clippy::cast_precision_loss,
-                        clippy::cast_possible_truncation,
-                        clippy::cast_sign_loss
-                    )]
-                    let kept = (n as f64 * f).ceil() as u64;
-                    let rest = n.saturating_sub(kept);
-                    table_peak(kept, slot)
-                        + kept * per_key_heap
-                        + table_peak(rest, set_slot)
-                        + rest * key_heap
-                }
-            }
+        let model = PassModel {
+            available: self.options.memory_budget.saturating_sub(reserve).max(1),
+            slot: size_of::<(Box<[u8]>, KeyState)>(),
+            set_slot: size_of::<(Box<[u8]>, ())>(),
+            key_heap,
+            per_key_heap,
+            sampled,
+            workload,
         };
-        for passes in 1..=MAX_PASSES {
-            let n = entries.div_ceil(u64::from(passes));
-            // Hash partitions are uneven: allow 5% plus three standard
-            // deviations over the mean.
-            #[allow(
-                clippy::cast_precision_loss,
-                clippy::cast_possible_truncation,
-                clippy::cast_sign_loss
-            )]
-            let spread = 3 * (n as f64).sqrt().ceil() as u64;
-            let n = n + n / 20 + spread;
-            if need(n) <= available {
-                return passes;
+        (model, entries)
+    }
+}
+
+/// The meter's own model of one pass: whether the keys it holds fit the
+/// budget left after the run-long reserve.
+struct PassModel {
+    available: u64,
+    slot: usize,
+    set_slot: usize,
+    key_heap: u64,
+    per_key_heap: u64,
+    /// The sampled fraction, for a sampled scope.
+    sampled: Option<f64>,
+    /// The workload's keys, which bound the keys a pass holds.
+    workload: Option<u64>,
+}
+
+impl PassModel {
+    /// Accounted bytes of one pass holding `n` keys: the table's growth
+    /// (largest resize or final size) plus the keys' heap.
+    fn need(&self, n: u64) -> u64 {
+        match self.sampled {
+            None => table_peak(n, self.slot) + n * self.per_key_heap,
+            Some(f) => {
+                #[allow(
+                    clippy::cast_precision_loss,
+                    clippy::cast_possible_truncation,
+                    clippy::cast_sign_loss
+                )]
+                let kept = (n as f64 * f).ceil() as u64;
+                let rest = n.saturating_sub(kept);
+                table_peak(kept, self.slot)
+                    + kept * self.per_key_heap
+                    + table_peak(rest, self.set_slot)
+                    + rest * self.key_heap
             }
         }
-        MAX_PASSES
     }
 
+    /// Whether a pass expected to hold `n` keys fits. Hash partitions are
+    /// uneven: it allows 5% plus three standard deviations over the mean.
+    fn fits(&self, n: u64) -> bool {
+        #[allow(
+            clippy::cast_precision_loss,
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss
+        )]
+        let spread = 3 * (n as f64).sqrt().ceil() as u64;
+        self.need(n + n / 20 + spread) <= self.available
+    }
+
+    /// The fewest passes over `entries` keys whose every pass fits.
+    fn passes_for(&self, entries: u64) -> u32 {
+        (1..=MAX_PASSES)
+            .find(|&p| self.fits(entries.div_ceil(u64::from(p))))
+            .unwrap_or(MAX_PASSES)
+    }
+
+    /// How many of the `of` partitions each later pass takes, from the
+    /// first pass's HyperLogLog count of every key: its estimate raised by three
+    /// relative standard errors (an underestimate costs a restart, never
+    /// the bound), capped by the workload's keys.
+    fn partitions_per_pass(&self, count: &Hll, of: u32) -> u32 {
+        let raise = 1.0 + 3.0 * Hll::relative_standard_error(count.precision());
+        #[allow(
+            clippy::cast_precision_loss,
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss
+        )]
+        let mut keys = (count.estimate() * raise).ceil() as u64;
+        if let Some(w) = self.workload {
+            keys = keys.min(w);
+        }
+        (1..of)
+            .rev()
+            .find(|&k| self.fits((keys * u64::from(k)).div_ceil(u64::from(of))))
+            .unwrap_or(1)
+    }
+}
+
+impl Reconciler {
     /// Totals, examples, coverage, and the outcome.
     fn finish(
         &self,
@@ -1113,18 +1182,70 @@ fn encoded_width(t: &DataType) -> u64 {
     }
 }
 
-/// One complete run at `passes` passes.
-fn attempt(prep: &Prepared<'_>, passes: u32, a: &mut Attempt) -> std::result::Result<(), Abort> {
+/// The slice of key space one pass keeps: the keys whose partition hash
+/// (`xxh3_64(key, PARTITION_SEED)`) modulo `of` lies in `lo..hi`. Every
+/// key falls in exactly one pass's slice, so the passes of a run may take
+/// one residue or several each without changing any result.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Part {
+    of: u32,
+    lo: u32,
+    hi: u32,
+}
+
+impl Part {
+    /// The first pass of a run (it alone counts null keys).
+    fn first(self) -> bool {
+        self.lo == 0
+    }
+
+    /// Whether the slice is the whole key space (no hashing needed).
+    fn whole(self) -> bool {
+        self.of <= 1
+    }
+
+    fn keeps(self, hash: u64) -> bool {
+        let r = hash % u64::from(self.of);
+        u64::from(self.lo) <= r && r < u64::from(self.hi)
+    }
+}
+
+/// Precision of the distinct-key count the first pass of a multi-pass run
+/// keeps: 16 KiB of registers, a relative standard error of 0.81 %.
+const DISTINCT_PRECISION: u8 = 14;
+
+/// One complete run over key space cut into `of` partitions, and the
+/// passes it made. With a `model`, the first pass keeps partition 0 and
+/// counts the distinct keys of every row it reads (a 16 KiB HyperLogLog, outside the
+/// budget); the rest of the partitions are then grouped so each pass holds
+/// as many as the model says fit, from that count rather than from row
+/// counts (a key with many versions is one key). Without one, each pass
+/// keeps one partition. An underestimate makes a pass overflow, and the
+/// run restarts.
+fn attempt(
+    prep: &Prepared<'_>,
+    model: Option<&PassModel>,
+    of: u32,
+    a: &mut Attempt,
+) -> std::result::Result<u32, Abort> {
+    let of = of.max(1);
     let mut scratch = Scratch {
         values: vec![None; prep.plan.totals.len()],
         ..Scratch::default()
     };
-    for p in 0..passes {
+    a.distinct = if of > 1 && model.is_some() {
+        Some(Hll::new(DISTINCT_PRECISION).map_err(VerifyError::from)?)
+    } else {
+        None
+    };
+    let mut part = Part { of, lo: 0, hi: 1 };
+    let mut made = 0;
+    while part.lo < of {
         let mut pass = PassState {
             keys: MeteredMap::new(),
             unsampled: MeteredMap::new(),
         };
-        let outcome = run_pass(prep, passes, p, &mut pass, a, &mut scratch);
+        let outcome = run_pass(prep, part, &mut pass, a, &mut scratch);
         let seen = pass.keys.len() as u64;
         let unsampled = pass.unsampled.len() as u64;
         let classified = outcome.and_then(|()| classify(prep, &pass.keys, a));
@@ -1133,20 +1254,27 @@ fn attempt(prep: &Prepared<'_>, passes: u32, a: &mut Attempt) -> std::result::Re
         classified?;
         a.seen += seen;
         a.unsampled += unsampled;
+        made += 1;
+        let per = match (a.distinct.take(), model) {
+            (Some(count), Some(model)) => model.partitions_per_pass(&count, of),
+            _ => 1,
+        };
+        part.lo = part.hi;
+        part.hi = part.hi.saturating_add(per).min(of);
     }
-    Ok(())
+    Ok(made)
 }
 
-/// Folds the per-key rows and totals of an `agg` key (B7) into partition
-/// `p` as if its side's rows had been read: each key's `n` rows add `n` to
-/// its rows and compared rows and `n` copies of its one row hash (every
+/// Folds the per-key rows and totals of an `agg` key (B7) in the slice
+/// `part` as if its side's rows had been read: each key's `n` rows add `n`
+/// to its rows and compared rows and `n` copies of its one row hash (every
 /// hashed column is a key column, so every row of the key hashes alike),
 /// and its sum and rows to its group's totals.
 fn fold_agg_side(
     prep: &Prepared<'_>,
     s: usize,
     agg: &AggSide<'_>,
-    (passes, p): (u32, u32),
+    part: Part,
     pass: &mut PassState,
     a: &mut Attempt,
 ) -> std::result::Result<(), Abort> {
@@ -1154,9 +1282,14 @@ fn fold_agg_side(
     let mut stop: Option<Abort> = None;
     let mut row = Vec::new();
     let visited = agg.totals.visit(&mut |key, rows, sum| {
-        if passes > 1 && xxh3_64_with_seed(key, PARTITION_SEED) % u64::from(passes) != u64::from(p)
-        {
-            return Ok(());
+        if !part.whole() {
+            let h = xxh3_64_with_seed(key, PARTITION_SEED);
+            if let Some(d) = a.distinct.as_mut() {
+                d.insert(h);
+            }
+            if !part.keeps(h) {
+                return Ok(());
+            }
         }
         let outcome = (|| -> std::result::Result<(), Abort> {
             if !prep.scope.includes(key) {
@@ -1443,18 +1576,17 @@ fn agg_side<'s>(
     }))
 }
 
-/// Reads every row group of both sides once, keeping partition `p`.
+/// Reads every row group of both sides once, keeping the slice `part`.
 fn run_pass(
     prep: &Prepared<'_>,
-    passes: u32,
-    p: u32,
+    part: Part,
     pass: &mut PassState,
     a: &mut Attempt,
     scratch: &mut Scratch,
 ) -> std::result::Result<(), Abort> {
     for s in 0..2 {
         if let Some(agg) = &prep.agg[s] {
-            fold_agg_side(prep, s, agg, (passes, p), pass, a)?;
+            fold_agg_side(prep, s, agg, part, pass, a)?;
             continue;
         }
         let source = prep.sides[s].source;
@@ -1462,7 +1594,7 @@ fn run_pass(
             ReadSet::Scan(files) => {
                 for fp in files {
                     for rg in source.row_groups(fp)? {
-                        read_row_group(prep, s, &rg, (passes, p), pass, a, scratch)?;
+                        read_row_group(prep, s, &rg, part, pass, a, scratch)?;
                     }
                 }
             }
@@ -1476,7 +1608,7 @@ fn run_pass(
                                 fp.path
                             ))
                         })?;
-                        read_row_group(prep, s, rg, (passes, p), pass, a, scratch)?;
+                        read_row_group(prep, s, rg, part, pass, a, scratch)?;
                     }
                 }
             }
@@ -1485,21 +1617,61 @@ fn run_pass(
     Ok(())
 }
 
-/// Reads one row group's projected columns and folds the rows of partition
-/// `p` into the pass state.
-#[allow(clippy::too_many_lines)]
+/// Reads one row group's projected columns, at most [`READ_BATCH_ROWS`]
+/// rows at a time, and folds the rows of the slice `part` into the pass
+/// state.
 fn read_row_group(
     prep: &Prepared<'_>,
     s: usize,
     rg: &RowGroupMeta,
-    (passes, p): (u32, u32),
+    part: Part,
+    pass: &mut PassState,
+    a: &mut Attempt,
+    scratch: &mut Scratch,
+) -> std::result::Result<(), Abort> {
+    let mut rows = 0u64;
+    // The fold's own stop (an overflow or a per-row error) is kept here and
+    // the decode is stopped with a placeholder the source passes back.
+    let mut stopped: Option<Abort> = None;
+    let read = prep.sides[s].source.read_column_batches(
+        rg,
+        &prep.plan.projection,
+        READ_BATCH_ROWS,
+        &mut |batch| {
+            rows += batch.num_rows() as u64;
+            check_batch(&batch, rg, &prep.plan.projection, s, rows)
+                .map_err(Abort::Error)
+                .and_then(|()| fold_batch(prep, s, rg, &batch, part, pass, a, scratch))
+                .map_err(|abort| {
+                    stopped = Some(abort);
+                    bellwether_types::Error::Other("reconcile stopped".into())
+                })
+        },
+    );
+    if let Some(abort) = stopped {
+        return Err(abort);
+    }
+    read?;
+    if rows != rg.rows {
+        return Err(Abort::Error(rows_differ(rg, s, rows)));
+    }
+    Ok(())
+}
+
+/// Folds the rows of the slice `part` in one decoded batch of a row group
+/// into the pass state.
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
+fn fold_batch(
+    prep: &Prepared<'_>,
+    s: usize,
+    rg: &RowGroupMeta,
+    batch: &RecordBatch,
+    part: Part,
     pass: &mut PassState,
     a: &mut Attempt,
     scratch: &mut Scratch,
 ) -> std::result::Result<(), Abort> {
     let plan = &prep.plan;
-    let batch = prep.sides[s].source.read_columns(rg, &plan.projection)?;
-    check_batch(&batch, rg, &plan.projection, s)?;
     a.rows_read[s] += batch.num_rows() as u64;
     a.peak_batch = a.peak_batch.max(batch.get_array_memory_size() as u64);
     let cols: Vec<&dyn Array> = batch.columns().iter().map(AsRef::as_ref).collect();
@@ -1531,12 +1703,17 @@ fn read_row_group(
         }
         // A null leading key column is the lone marker first (ADR 014):
         // counted once, in the first pass.
-        if p == 0 && key.first() == Some(&encoding::tag::NULL) {
+        if part.first() && key.first() == Some(&encoding::tag::NULL) {
             a.null_keys[s] += 1;
         }
-        if passes > 1 && xxh3_64_with_seed(key, PARTITION_SEED) % u64::from(passes) != u64::from(p)
-        {
-            continue;
+        if !part.whole() {
+            let h = xxh3_64_with_seed(key, PARTITION_SEED);
+            if let Some(d) = a.distinct.as_mut() {
+                d.insert(h);
+            }
+            if !part.keeps(h) {
+                continue;
+            }
         }
         let in_scope = match &prep.scope {
             Scope::Workload {
@@ -2059,12 +2236,15 @@ fn key_label(key: &[u8], plan: &Plan, side: usize) -> String {
     format!("({})", parts.join(", "))
 }
 
-/// The batch must be the requested columns of the whole row group.
+/// The batch must be the requested columns of the row group, and the rows
+/// read so far (`upto`, this batch included) within its row count; the
+/// caller checks the total once the row group is read.
 fn check_batch(
     batch: &RecordBatch,
     rg: &RowGroupMeta,
     projection: &[String],
     s: usize,
+    upto: u64,
 ) -> Result<()> {
     let names: Vec<&String> = batch
         .schema_ref()
@@ -2078,17 +2258,18 @@ fn check_batch(
             SIDE_NAMES[s], rg.file.path, rg.index_in_file
         )));
     }
-    if batch.num_rows() as u64 != rg.rows {
-        return Err(VerifyError::SourceContract(format!(
-            "{} side, {} row group {}: statistics say {} rows, the read returned {}",
-            SIDE_NAMES[s],
-            rg.file.path,
-            rg.index_in_file,
-            rg.rows,
-            batch.num_rows()
-        )));
+    if upto > rg.rows {
+        return Err(rows_differ(rg, s, upto));
     }
     Ok(())
+}
+
+/// A source returned other than the row count its statistics give.
+fn rows_differ(rg: &RowGroupMeta, s: usize, read: u64) -> VerifyError {
+    VerifyError::SourceContract(format!(
+        "{} side, {} row group {}: statistics say {} rows, the read returned {read}",
+        SIDE_NAMES[s], rg.file.path, rg.index_in_file, rg.rows
+    ))
 }
 
 /// What a side's statistics say about its read set.

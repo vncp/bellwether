@@ -11,7 +11,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
-use bellwether_ledger::{parse_record_path, Ledger, LEDGER_PREFIX};
+use bellwether_ledger::{parse_record_path, Ledger, SignatureIndex, LEDGER_PREFIX};
 use bellwether_types::Store as _;
 use bellwether_types::{
     Certificate, Error, Evidence, EvidenceBody, Hash, KeySpec, Proposal, ProposalBody, Receipt,
@@ -114,6 +114,8 @@ struct Records {
     certificates: Vec<(Hash, Certificate)>,
     receipts: Vec<(Hash, Receipt)>,
     unreadable: Vec<Hash>,
+    /// The signature objects in the same listing.
+    signatures: SignatureIndex,
 }
 
 impl Engine {
@@ -174,7 +176,7 @@ impl Engine {
             });
             let mut receipts = Vec::with_capacity(all.receipts.len());
             for (hash, receipt) in all.receipts {
-                let shown = self.receipt(&hash)?;
+                let shown = self.receipt_in(&hash, &all.signatures)?;
                 receipts.push(ReceiptEntry {
                     receipt: Written {
                         hash,
@@ -248,11 +250,12 @@ impl Engine {
             return Ok(out);
         };
         let ledger = Ledger::new(Arc::clone(store));
-        let mut hashes: Vec<Hash> = store
-            .list(LEDGER_PREFIX)?
-            .iter()
-            .filter_map(|p| parse_record_path(p))
-            .collect();
+        // One listing serves every record and every signature a command
+        // reads (WP22b: `ledger receipts` listed the ledger twice per
+        // receipt).
+        let listed = store.list(LEDGER_PREFIX)?;
+        out.signatures = SignatureIndex::from_paths(listed.iter().map(String::as_str));
+        let mut hashes: Vec<Hash> = listed.iter().filter_map(|p| parse_record_path(p)).collect();
         hashes.sort();
         for h in hashes {
             match ledger.get(&h) {

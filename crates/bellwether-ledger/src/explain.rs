@@ -10,7 +10,7 @@ use bellwether_types::{
 };
 use serde::Serialize;
 
-use crate::{printable, Ledger, RecordKind, SignatureStatus, TrustedKeys, Verdict};
+use crate::{printable, Ledger, RecordKind, SignatureIndex, SignatureStatus, TrustedKeys, Verdict};
 
 /// Hex characters of the hash shown per line in the text rendering.
 const HASH_PREFIX: usize = 12;
@@ -93,14 +93,19 @@ impl Link {
         }
     }
 
-    /// Attaches the record's signatures, and its verdict when a trust set
-    /// is given.
-    fn signed<S>(mut self, ledger: &Ledger<S>, trusted: Option<&TrustedKeys>) -> Result<Self>
+    /// Attaches the record's signatures listed in `index`, and its verdict
+    /// when a trust set is given.
+    fn signed<S>(
+        mut self,
+        ledger: &Ledger<S>,
+        trusted: Option<&TrustedKeys>,
+        index: &SignatureIndex,
+    ) -> Result<Self>
     where
         S: Deref,
         S::Target: Store,
     {
-        let statuses = ledger.signatures(&self.hash)?;
+        let statuses = ledger.signatures_in(&self.hash, index)?;
         self.verdict = trusted.map(|t| Verdict::of(&statuses, t));
         self.signatures = Some(statuses);
         Ok(self)
@@ -217,6 +222,7 @@ pub(crate) fn explain<S>(
     ledger: &Ledger<S>,
     receipt_hash: &Hash,
     trusted: Option<&TrustedKeys>,
+    index: &SignatureIndex,
 ) -> Result<Chain>
 where
     S: Deref,
@@ -258,10 +264,10 @@ where
         Err(flagged) => flagged,
     });
     links.push(match cert {
-        Ok(c) => certificate_link(receipt.certificate, &c).signed(ledger, trusted)?,
+        Ok(c) => certificate_link(receipt.certificate, &c).signed(ledger, trusted, index)?,
         Err(flagged) => flagged,
     });
-    links.push(receipt_link(*receipt_hash, &receipt).signed(ledger, trusted)?);
+    links.push(receipt_link(*receipt_hash, &receipt).signed(ledger, trusted, index)?);
     Ok(Chain {
         receipt: *receipt_hash,
         links,

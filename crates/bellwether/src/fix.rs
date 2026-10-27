@@ -2965,6 +2965,19 @@ impl Source for PlannedSource<'_> {
         )))
     }
 
+    fn read_column_batches(
+        &self,
+        rg: &RowGroupMeta,
+        columns: &[String],
+        max_rows: usize,
+        f: &mut dyn FnMut(RecordBatch) -> Result<()>,
+    ) -> Result<()> {
+        if self.selection(&rg.file)?.contains(rg.index_in_file) {
+            return self.inner.read_column_batches(rg, columns, max_rows, f);
+        }
+        f(self.read_columns(rg, columns)?)
+    }
+
     fn schema(&self, root: &str) -> Result<SchemaRef> {
         self.inner.schema(root)
     }

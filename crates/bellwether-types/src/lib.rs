@@ -623,6 +623,24 @@ pub trait Source: Send + Sync {
         rg: &RowGroupMeta,
         columns: &[String],
     ) -> Result<arrow::array::RecordBatch>;
+    /// Reads only `columns` from one row group as consecutive batches in
+    /// row order, handing each to `f` before decoding the next, so at most
+    /// one batch is alive. A source that can decode part of a row group
+    /// keeps each batch to at most `max_rows` rows, which bounds a caller's
+    /// memory by `max_rows` instead of by the row group's width (ADR 018).
+    /// The batches' rows add up to the row group's rows. The default reads
+    /// the whole row group with [`Source::read_columns`] and hands it over
+    /// as one batch, for sources whose row groups are already small.
+    fn read_column_batches(
+        &self,
+        rg: &RowGroupMeta,
+        columns: &[String],
+        max_rows: usize,
+        f: &mut dyn FnMut(arrow::array::RecordBatch) -> Result<()>,
+    ) -> Result<()> {
+        let _ = max_rows;
+        f(self.read_columns(rg, columns)?)
+    }
     /// The Arrow schema of the dataset as the source infers it.
     fn schema(&self, root: &str) -> Result<arrow::datatypes::SchemaRef>;
 }

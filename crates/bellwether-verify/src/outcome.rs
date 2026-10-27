@@ -256,8 +256,10 @@ pub struct MemoryReport {
     pub restarts: u32,
     /// Peak accounted comparison state, in bytes; never above the budget.
     pub peak_state_bytes: u64,
-    /// Largest decoded row group of projected columns, in bytes (Arrow's
-    /// `get_array_memory_size`); outside the budget, one at a time.
+    /// Largest decoded batch of projected columns (at most
+    /// [`crate::READ_BATCH_ROWS`] rows of one row group from a source that
+    /// decodes part of a row group, otherwise one row group), in bytes
+    /// (Arrow's `get_array_memory_size`); outside the budget, one at a time.
     pub peak_batch_bytes: u64,
     /// Rows read per side over every pass of every attempt.
     pub rows_read: [u64; 2],

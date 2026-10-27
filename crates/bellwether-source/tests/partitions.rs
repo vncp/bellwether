@@ -337,6 +337,56 @@ fn a_null_partition_value_is_a_null() {
 }
 
 #[test]
+fn read_column_batches_streams_a_row_group_in_bounded_batches_equal_to_one_read() {
+    // WP22b: a reconcile decodes at most `max_rows` rows of a row group at
+    // a time. The batches are the row group's rows in order, with virtual
+    // columns synthesized per batch, and concatenate to `read_columns`.
+    let dir = tempfile::tempdir().unwrap();
+    let root = canonical_root(&dir);
+    let path = Path::new(&root).join("day=2026-01-02/part-0.parquet");
+    write_file(&path, 2, 7, 0);
+    let source = ParquetSource::new().with_partitioning(root.clone(), Partitioning::Hive);
+    let fp = source.discover(&root).unwrap().remove(0);
+    let rgs = source.row_groups(&fp).unwrap();
+    for columns in [
+        vec!["price".to_string(), "day".into(), "ts".into()],
+        vec!["day".into()],
+        vec!["ts".into(), "price".into()],
+    ] {
+        for rg in &rgs {
+            let whole = source.read_columns(rg, &columns).unwrap();
+            for max_rows in [1usize, 3, 7, 100] {
+                let mut sizes = Vec::new();
+                let mut parts = Vec::new();
+                source
+                    .read_column_batches(rg, &columns, max_rows, &mut |b| {
+                        sizes.push(b.num_rows());
+                        parts.push(b);
+                        Ok(())
+                    })
+                    .unwrap();
+                assert!(
+                    sizes.iter().all(|&n| n <= max_rows),
+                    "{sizes:?} over {max_rows}"
+                );
+                assert_eq!(sizes.iter().sum::<usize>(), 7, "{sizes:?}");
+                let joined = arrow::compute::concat_batches(&whole.schema(), &parts).unwrap();
+                assert_eq!(joined, whole, "{columns:?} at {max_rows} rows a batch");
+            }
+        }
+    }
+    // A stop from the caller ends the read with the caller's error.
+    let mut seen = 0;
+    let err = source
+        .read_column_batches(&rgs[0], &["price".into()], 2, &mut |_| {
+            seen += 1;
+            Err(bellwether_types::Error::Other("stop".into()))
+        })
+        .unwrap_err();
+    assert_eq!((seen, err.to_string().contains("stop")), (1, true));
+}
+
+#[test]
 fn a_column_is_typed_by_every_value_under_the_root_not_the_first_file() {
     // `symbol=123` sorts before `symbol=ABC`; typing by the first file
     // would make the column Int64 and refuse (or mis-encode) the second.
