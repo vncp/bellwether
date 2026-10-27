@@ -375,6 +375,14 @@ pub enum LookupKind {
         /// `has_prefix`), sorted.
         operators: Vec<TextOp>,
     },
+    /// A workload's consumer-plan runs (relational replay, WP15): each run
+    /// priced through its plan, its keys feeding the plan's run-keyed
+    /// nodes and an asof run's instant its `as_of` nodes.
+    Plan {
+        /// The plans the runs name, by BLAKE3 of their canonical JSON, in
+        /// run order.
+        plans: Vec<Hash>,
+    },
     // --- phase 5 kinds ---
     /// Rows whose list column holds at least one of the values
     /// (`contains_any`: `array_contains`, `has_any`, `exists(unnest)`).

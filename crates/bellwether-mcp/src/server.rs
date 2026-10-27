@@ -571,7 +571,7 @@ impl Server {
                         (None, false) => None,
                     },
                     latest_by: a.latest_by,
-                    at: None,
+                    at: a.at,
                     lookback: None,
                     valid_by: a.valid_by,
                     known_by: a.known_by,
@@ -598,6 +598,8 @@ impl Server {
                         value: g.value,
                         functions: g.functions.unwrap_or_else(tools::default_functions),
                     }),
+                    plan: a.plan.map(std::path::PathBuf::from),
+                    datasets: a.datasets,
                 };
                 match e.why(&request) {
                     Ok(r) => done(&r, None),

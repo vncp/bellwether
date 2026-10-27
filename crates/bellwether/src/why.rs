@@ -305,6 +305,22 @@ pub struct WhyRequest {
     /// mode is then `aggregate`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub aggregate: Option<AggregateQuery>,
+    /// A consumer plan (relational replay, WP15): a JSON file of a
+    /// [`bellwether_types::ConsumerPlan`], read only. Each run of the key
+    /// file is recorded as a run of the plan (its keys feed the plan's
+    /// `KeysFrom::Run` nodes, `at` its `as_of` nodes) and priced through
+    /// it under the current configuration and each candidate key drawn
+    /// from the columns the plan's filters, joins, windows, and aggregates
+    /// name; the report adds the plan's operator table. Needs `keys`; takes
+    /// no lookup option but `at`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan: Option<PathBuf>,
+    /// The datasets the plan scans besides the data root, by the names the
+    /// operator bound (`--dataset NAME=ROOT`, or the MCP server's
+    /// `--dataset`): a name, never a root. Empty: every dataset the plan
+    /// names, each of which must be bound.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub datasets: Vec<String>,
 }
 
 /// What an aggregate lookup computes per key (B7): `functions` of `value`.
@@ -350,6 +366,8 @@ impl Default for WhyRequest {
             join: None,
             tombstone: None,
             aggregate: None,
+            plan: None,
+            datasets: Vec::new(),
         }
     }
 }
@@ -407,6 +425,9 @@ impl WhyRequest {
     /// [`WhyRequest::lookup_mode`] before the tombstone's checks.
     #[allow(clippy::too_many_lines)] // one refusal per contradictory flag pair
     fn lookup_mode_untombstoned(&self) -> std::result::Result<LookupMode, String> {
+        if self.plan.is_some() {
+            return self.plan_mode();
+        }
         if let Some(l) = &self.lookback {
             Lookback::parse(l).map_err(|e| e.to_string())?;
         }
@@ -437,7 +458,8 @@ impl WhyRequest {
             return match inferred {
                 LookupMode::Asof if self.latest_by.is_none() => Err(
                     "--at requires --latest-by <timestamp column>; pass --latest-by <column> --at \
-                     <instant>"
+                     <instant> (or price a consumer plan's as_of nodes with --plan <plan.json> \
+                     --at <instant>)"
                         .into(),
                 ),
                 LookupMode::Locate if self.lookback.is_some() => Err(
@@ -534,6 +556,44 @@ impl WhyRequest {
             ),
             m => Ok(m),
         }
+    }
+
+    /// [`WhyRequest::lookup_mode`] of a request with a consumer plan: the
+    /// plan's nodes say how its rows are read, so no lookup option but
+    /// `at` (the instant of its `as_of` nodes) applies; `asof` with `at`,
+    /// else `locate`.
+    fn plan_mode(&self) -> std::result::Result<LookupMode, String> {
+        let bitemporal = self.valid_by.is_some()
+            || self.known_by.is_some()
+            || self.valid.is_some()
+            || self.known.is_some();
+        let other = [
+            ("--latest-by", self.latest_by.is_some()),
+            ("--lookback", self.lookback.is_some()),
+            ("--valid-by, --known-by, --valid, or --known", bitemporal),
+            ("--window", self.window.is_some()),
+            ("--ts", self.ts_column.is_some()),
+            ("--join", self.join.is_some()),
+            ("--tombstone", self.tombstone.is_some()),
+            ("--value", self.aggregate.is_some()),
+            (
+                "--mode",
+                self.mode
+                    .is_some_and(|m| !matches!(m, LookupMode::Locate | LookupMode::Asof)),
+            ),
+        ];
+        if let Some((flag, _)) = other.iter().find(|(_, given)| *given) {
+            return Err(format!(
+                "{flag} shapes a lookup of its own, and a consumer plan's nodes say how its rows \
+                 are read (its latest and as_of nodes name their version columns; --at gives the \
+                 as_of nodes their instant); drop {flag} with --plan"
+            ));
+        }
+        Ok(if self.at.is_some() {
+            LookupMode::Asof
+        } else {
+            LookupMode::Locate
+        })
     }
 
     /// [`WhyRequest::lookup_mode`] of a bitemporal request: both clocks,
@@ -655,6 +715,11 @@ pub enum CandidateOrigin {
     Window,
     /// A column or composite the profile measured that serves the workload.
     Profile,
+    /// A key a node of the workload's consumer plan prices with on the
+    /// data root (relational replay): exact on columns the plan probes by
+    /// whole keys, temporal on a `latest`/`as_of` node's, range on a
+    /// `between` column.
+    Plan,
 }
 
 /// One candidate key, replayed over the workload.
@@ -929,6 +994,13 @@ pub struct WhyReport {
     /// rebuilds it. Absent (omitted in JSON) otherwise.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sketch_unavailable: Option<String>,
+    /// With a workload of consumer-plan runs (`--plan`, relational replay):
+    /// per plan, the operator table beside the funnel (each node's bytes,
+    /// rows, and exactness under the current configuration and the
+    /// recommended key), its read occurrences, and its shared nodes. Omitted
+    /// otherwise.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub plans: Vec<crate::plans::PlanReport>,
 }
 
 fn exact_default() -> bool {
@@ -1072,10 +1144,38 @@ impl Engine {
         // A semi-join (B3) is priced on both datasets: the right one's
         // replayer and the candidate join key's transient pair index.
         let why_pair = self.why_pair(req, pinned.as_ref())?;
+        // A consumer plan (WP15) scans the datasets its operator bound,
+        // each through its own index, opened before the replayer that
+        // borrows them; a name not bound is refused before any is read.
+        let plan = req
+            .plan
+            .as_ref()
+            .map(crate::plans::read_plan)
+            .transpose()?;
+        let mut plans: Vec<bellwether_types::ConsumerPlan> = plan.iter().cloned().collect();
+        if let Some(h) = &req.workload {
+            let cache = self.cache()?;
+            let w = crate::fix::load_workload(self, &cache, h)?;
+            plans.extend(
+                crate::plans::workload_plans(&w, &cache)?
+                    .into_iter()
+                    .map(|(_, p)| p),
+            );
+        }
+        let plan_datasets = self.datasets_for(&req.datasets, &plans)?;
         let replayer = crate::fix::replayer(self, source, pinned.as_ref())?;
         let replayer = match &why_pair {
             Some(p) => replayer.with_pair(p.input()?),
             None => replayer,
+        };
+        let replayer = plan_datasets.attach(replayer)?;
+        // Checked against every dataset before anything is written.
+        let plan_query = match &plan {
+            Some(p) => Some((
+                p,
+                crate::plans::plan_query(&replayer, p, req.at.as_deref())?,
+            )),
+            None => None,
         };
         let resolved_temporal = resolve_temporal(req, replayer.schema())?;
         let catalog = replayer.catalog();
@@ -1120,6 +1220,7 @@ impl Engine {
                 &replayer,
                 &cache,
                 resolved_temporal.take(),
+                plan_query.as_ref().map(|(p, q)| (*p, q)),
             )?;
             if let Some(of) = &mut twin_of {
                 let p = twin::pass(source, replayer.catalog(), &w, &cache, &req.gates)?;
@@ -1241,6 +1342,7 @@ impl Engine {
             reads: DiagnosisReads::default(),
             from_sketches: false,
             sketch_unavailable,
+            plans: Vec::new(),
         };
         let workload = if has_workload {
             let cache = self.cache()?;
@@ -1252,6 +1354,7 @@ impl Engine {
                     &replayer,
                     &cache,
                     resolved_temporal,
+                    plan_query.as_ref().map(|(p, q)| (*p, q)),
                 )?,
             };
             self.replay_candidates(
@@ -1262,6 +1365,18 @@ impl Engine {
                 req,
                 temporal.as_ref(),
             )?;
+            // A workload of plan runs: each plan's operator table beside
+            // the funnel, under the current configuration and the
+            // recommended key.
+            if workload.runs().iter().any(|r| r.plan.is_some()) {
+                report.plans = crate::plans::plan_reports(
+                    &replayer,
+                    &workload,
+                    &cache,
+                    &plan_datasets.describe(self)?,
+                    report.recommended.as_ref().map(|r| &r.spec),
+                )?;
+            }
             let spread = queried_spread(&replayer, &workload, &cache)?;
             Some((workload, spread))
         } else {
@@ -1431,6 +1546,7 @@ impl Engine {
             },
             from_sketches: true,
             sketch_unavailable: None,
+            plans: Vec::new(),
         })
     }
 
@@ -1906,6 +2022,7 @@ impl Engine {
         if matches!(mode, LookupMode::Latest | LookupMode::Asof)
             && req.keys.is_none()
             && req.workload.is_none()
+            && req.plan.is_none()
         {
             return Err(Error::KeySpec(
                 "--latest-by prices a workload's keys under latest or asof lookups; pass --from \
@@ -1919,6 +2036,32 @@ impl Engine {
                  pass --from <keys.parquet> (or --workload <hash>)"
                     .into(),
             ));
+        }
+        if req.plan.is_some() && (given[1] || given[2] || given[3]) {
+            return Err(Error::InvalidArgument {
+                field: "plan",
+                reason: "a consumer plan is priced over the runs of a key file (--from); a \
+                         recorded workload names its plans in its runs, so price it without \
+                         --plan, and bench workloads and text lookups are not plan runs"
+                    .into(),
+            });
+        }
+        if req.plan.is_some() && !given[0] {
+            return Err(Error::InvalidArgument {
+                field: "plan",
+                reason: "--plan prices the plan once per run, and a run is the keys it looked \
+                         up: give them with --from <keys.parquet> (they feed the plan's run-keyed \
+                         nodes)"
+                    .into(),
+            });
+        }
+        if !req.datasets.is_empty() && req.plan.is_none() && !given[2] {
+            return Err(Error::InvalidArgument {
+                field: "datasets",
+                reason: "datasets name what a consumer plan scans; give the plan (--plan) or a \
+                         workload of plan runs (--workload)"
+                    .into(),
+            });
         }
         Ok(given.iter().any(|g| *g))
     }
@@ -2074,9 +2217,29 @@ impl Engine {
         replayer: &Replayer<'_>,
         cache: &Cache<ObjectStoreBackend>,
         resolved: Option<ResolvedTemporal>,
+        plan: Option<(&bellwether_types::ConsumerPlan, &RunQuery)>,
     ) -> Result<(Workload, Option<ResolvedTemporal>)> {
+        if let (Some((plan, query)), Some(first)) = (plan, &req.keys) {
+            // Each key file is one run of the plan (`plan_mode` took every
+            // other lookup option away).
+            let mut recorder =
+                WorkloadRecorder::new(cache, std::sync::Arc::clone(replayer.schema()))
+                    .with_plan(plan)?;
+            for (i, k) in std::iter::once(first).chain(&req.more_keys).enumerate() {
+                let id = if i == 0 {
+                    "keys".to_string()
+                } else {
+                    format!("keys-{}", i + 1)
+                };
+                let batch = k.read()?;
+                recorder.record_query(&id, KeyInput::Batch(&batch), query.clone(), None)?;
+            }
+            return Ok((recorder.finish()?, None));
+        }
         if let Some(h) = &req.workload {
             let w = crate::fix::load_workload(self, cache, h)?;
+            // A plan run's lookup is its plan's: nothing temporal to infer.
+            let planned = w.runs().iter().any(|r| r.plan.is_some());
             let temporal = match resolved {
                 Some(t) => {
                     // The runs are priced as recorded: a `--latest-by` (or
@@ -2156,6 +2319,7 @@ impl Engine {
                     }
                     None
                 }
+                None if planned => None,
                 None => infer_workload_temporal(&w, replayer.current_specs())?,
             };
             return Ok((w, temporal));
@@ -2319,6 +2483,9 @@ impl Engine {
                 self.index_location()
             ))
         })?;
+        if workload.runs().iter().any(|r| r.plan.is_some()) {
+            return self.replay_plan_candidates(report, replayer, workload, cache, evidence);
+        }
         let run_columns: Vec<Vec<String>> = {
             let set: BTreeSet<Vec<String>> =
                 workload.runs().iter().map(|r| r.columns.clone()).collect();
@@ -2962,6 +3129,130 @@ impl Engine {
                 replay: c.replay.hash,
                 lookup: lookup_kind,
                 lookback,
+                current,
+                proposed: c.proposed,
+            });
+        Ok(())
+    }
+}
+
+impl Engine {
+    /// [`Engine::replay_candidates`] for a workload of consumer-plan runs
+    /// (relational replay, WP15): the candidates are the keys a node of a
+    /// plan prices with on the data root (exact on columns probed by whole
+    /// keys, temporal on a `latest`/`as_of` node's keys and version column,
+    /// range on a `between` column), minus current specs; each is written
+    /// as an engine Proposal citing the Evidence and scored by a Replay of
+    /// every run through its plan. The recommendation rule is
+    /// [`Engine::why`]'s, on the runs' read bytes.
+    fn replay_plan_candidates(
+        &self,
+        report: &mut WhyReport,
+        replayer: &Replayer<'_>,
+        workload: &Workload,
+        cache: &Cache<ObjectStoreBackend>,
+        evidence: Hash,
+    ) -> Result<()> {
+        if workload.runs().iter().any(|r| r.plan.is_none()) {
+            return Err(Error::KeySpec(format!(
+                "workload {} mixes runs priced through a consumer plan with plain lookups; record \
+                 each as its own workload",
+                workload.hash()
+            )));
+        }
+        let plans = crate::plans::workload_plans(workload, cache)?;
+        let current_names: BTreeSet<String> = report.current_specs.iter().map(label).collect();
+        let mut chosen: Vec<KeySpec> = Vec::new();
+        for (_, p) in &plans {
+            let checked = replayer.check_plan(p).map_err(Error::from)?;
+            for s in checked.candidate_specs() {
+                let l = label(&s);
+                if !current_names.contains(&l) && !chosen.iter().any(|c| label(c) == l) {
+                    chosen.push(s);
+                }
+            }
+        }
+        let queries: Vec<RunQuery> = workload
+            .runs()
+            .iter()
+            .map(RecordedRun::query)
+            .collect::<Result<_>>()?;
+        let kinds: BTreeSet<&str> = queries.iter().map(RunQuery::kind_str).collect();
+        let columns: BTreeSet<Vec<String>> =
+            workload.runs().iter().map(|r| r.columns.clone()).collect();
+        let lookup = LookupKind::Plan {
+            plans: plans.iter().map(|(h, _)| *h).collect(),
+        };
+        report.workload = Some(WorkloadInfo {
+            hash: workload.hash(),
+            runs: workload.runs().len() as u64,
+            query_kind: kinds.into_iter().collect::<Vec<_>>().join(","),
+            lookup: Some(lookup.clone()),
+            lookback: None,
+            columns: columns.into_iter().collect(),
+            keys_p50_p95_max: workload.keys_p50_p95_max(),
+            null_tuples: workload.runs().iter().map(|r| r.null_tuples).sum(),
+            windows: Vec::new(),
+        });
+        let ledger = self.ledger()?;
+        for spec in chosen {
+            let proposal = self.put(Record::Proposal(Proposal {
+                record_version: format::RECORD_VERSION,
+                evidence: vec![evidence],
+                proposed_by: ENGINE_PROPOSER.to_string(),
+                created_at: self.now(),
+                body: ProposalBody::Key {
+                    spec: spec.clone(),
+                    sidecars: Vec::new(),
+                },
+            }))?;
+            // Over a table every cost is measured and not recorded (ADR
+            // 027), as for any workload.
+            let (replay_hash, scored) = if self.is_table() {
+                crate::fix::measured_score(self, replayer, &proposal.hash, workload, cache)?
+            } else {
+                replayer
+                    .record(&ledger, &proposal.hash, workload, cache, &self.now())
+                    .map_err(Error::from)?
+            };
+            report.candidates.push(Candidate {
+                spec,
+                origin: CandidateOrigin::Plan,
+                proposed: total(&scored.replay.proposed),
+                locate: None,
+                proposal,
+                replay: Written {
+                    hash: replay_hash,
+                    record: Record::Replay(scored.replay),
+                },
+                kind_column: None,
+                not_recommended: None,
+            });
+        }
+        let current = match report.candidates.first() {
+            Some(Candidate {
+                replay:
+                    Written {
+                        record: Record::Replay(r),
+                        ..
+                    },
+                ..
+            }) => total(&r.current),
+            _ => total(&replayer.replay_current(workload, cache)?),
+        };
+        report.current = Some(current);
+        report.recommended = report
+            .candidates
+            .iter()
+            .enumerate()
+            .min_by_key(|(i, c)| (c.proposed.bytes, c.spec.columns().len(), *i))
+            .filter(|(_, c)| c.proposed.bytes < current.bytes)
+            .map(|(_, c)| Recommendation {
+                spec: c.spec.clone(),
+                proposal: c.proposal.hash,
+                replay: c.replay.hash,
+                lookup: lookup.clone(),
+                lookback: None,
                 current,
                 proposed: c.proposed,
             });

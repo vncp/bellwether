@@ -10,9 +10,13 @@
 //! (SQL semantics: a null key matches nothing, a null version never wins,
 //! a null group is one group), and reads each column chunk's compressed
 //! size from the footers. Every `Exact` quantity the replay states must
-//! equal the oracle's; every `Bounded` interval must contain it; the bytes
-//! read must cover every row group holding a row the plan needs (no false
-//! negatives), and equal them where the plan's selection is by whole keys.
+//! equal the oracle's; every `Bounded` interval must contain it; each read
+//! occurrence's bytes must equal the footers' chunk sizes over its row
+//! groups; and evaluating the plan over only the row groups the replay
+//! plans to read must give the answer of evaluating it over every row (no
+//! false negatives, including a `latest`'s and a `window`'s whole groups).
+//! Plans are DAGs: diamonds, self-joins, subplans two nodes read, and two
+//! scans of one dataset, checked against costs derived from the rows.
 
 #![allow(
     clippy::unwrap_used,
@@ -288,24 +292,53 @@ fn value(a: &ArrayRef, r: usize) -> Val {
     panic!("unexpected type {}", a.data_type());
 }
 
-/// One output tuple: per scan node, a row of its dataset.
-type Tuple = BTreeMap<u32, usize>;
+/// One output tuple: per slot (a scan reached by one path; a self-join has
+/// two slots of one scan), the row of its dataset, or `NONE` (the null
+/// side of a left join's unmatched row).
+type Tuple = Vec<usize>;
 
-/// What the oracle derives for one node: its output tuples, its output
-/// columns (name, scan, dataset column), the tuples it needs (an
-/// aggregate's input; any other node's output), and its row count.
+const NONE: usize = usize::MAX;
+
+/// What the oracle derives for one node: the scan node of each slot, its
+/// output tuples, its output columns (name, slot, dataset column), its row
+/// count, and, for an aggregate, its groups with their counts and sums.
 #[derive(Clone)]
 struct Truth {
+    slots: Vec<u32>,
     out: Vec<Tuple>,
-    cols: Vec<(String, u32, String)>,
-    needs: Vec<Tuple>,
+    cols: Vec<(String, usize, String)>,
     rows: u64,
+    groups: Option<Vec<(Vec<Val>, u64, i128)>>,
 }
 
+impl Truth {
+    fn rows(slots: Vec<u32>, out: Vec<Tuple>, cols: Vec<(String, usize, String)>) -> Self {
+        Self {
+            rows: out.len() as u64,
+            slots,
+            out,
+            cols,
+            groups: None,
+        }
+    }
+
+    /// What the node returns, comparable across two evaluations: its
+    /// groups, or its tuples sorted.
+    fn result(&self) -> (Option<Vec<(Vec<Val>, u64, i128)>>, Vec<Tuple>) {
+        let mut out = self.out.clone();
+        out.sort();
+        (self.groups.clone(), out)
+    }
+}
+
+/// Evaluates a plan on the decoded rows (SQL semantics), each scan reading
+/// every row, or only the rows of the row groups `allowed` gives it (the
+/// replay's planned reads: evaluating there must give the same answer).
 struct Oracle<'d> {
     data: BTreeMap<&'static str, &'d Decoded>,
     keys: BTreeSet<i64>,
     asof: i64,
+    allowed: Option<BTreeMap<u32, BTreeSet<u32>>>,
 }
 
 impl Oracle<'_> {
@@ -316,77 +349,89 @@ impl Oracle<'_> {
         }
     }
 
-    fn get<'a>(
-        &'a self,
-        plan: &ConsumerPlan,
-        t: &Tuple,
-        cols: &[(String, u32, String)],
-        name: &str,
-    ) -> &'a Val {
-        let (_, scan, col) = cols.iter().find(|(n, _, _)| n == name).unwrap();
-        let row = t[scan];
-        &self.data[Self::dataset_of(plan, *scan)].rows[row].1[col]
+    fn get<'a>(&'a self, plan: &ConsumerPlan, i: &Truth, t: &Tuple, name: &str) -> &'a Val {
+        let (_, slot, col) = i.cols.iter().find(|(n, _, _)| n == name).unwrap();
+        match t[*slot] {
+            NONE => &Val::Null,
+            row => &self.data[Self::dataset_of(plan, i.slots[*slot])].rows[row].1[col],
+        }
+    }
+
+    fn key_of(&self, plan: &ConsumerPlan, i: &Truth, t: &Tuple, name: &str) -> Option<i64> {
+        self.get(plan, i, t, name).key()
     }
 
     fn run(&self, plan: &ConsumerPlan, order: &[u32]) -> Vec<Truth> {
         let mut out: Vec<Option<Truth>> = vec![None; plan.nodes.len()];
         for &v in order {
+            let input = |i: &u32| out[*i as usize].clone().unwrap();
             let t = match &plan.nodes[v as usize] {
                 PlanNode::Scan { dataset, columns } => {
                     let d = if dataset == "main" { "main" } else { "repos" };
                     let tuples: Vec<Tuple> = (0..self.data[d].rows.len())
-                        .map(|i| BTreeMap::from([(v, i)]))
+                        .filter(|i| {
+                            self.allowed.as_ref().is_none_or(|a| {
+                                a.get(&v)
+                                    .is_some_and(|rgs| rgs.contains(&self.data[d].rows[*i].0))
+                            })
+                        })
+                        .map(|i| vec![i])
                         .collect();
-                    Truth {
-                        rows: tuples.len() as u64,
-                        needs: tuples.clone(),
-                        out: tuples,
-                        cols: columns.iter().map(|c| (c.clone(), v, c.clone())).collect(),
-                    }
+                    let cols = columns.iter().map(|c| (c.clone(), 0, c.clone())).collect();
+                    Truth::rows(vec![v], tuples, cols)
                 }
                 PlanNode::SemiJoin {
-                    input,
+                    input: i,
                     columns,
-                    keys: KeysFrom::Run,
+                    keys,
                 } => {
-                    let i = out[*input as usize].clone().unwrap();
-                    self.keep(plan, i, |o, t, c| {
-                        o.get(plan, t, c, &columns[0])
-                            .key()
-                            .is_some_and(|k| o.keys.contains(&k))
+                    let set = self.key_set(plan, keys, &out);
+                    let i = input(i);
+                    self.keep(i, |o, i, t| {
+                        o.key_of(plan, i, t, &columns[0])
+                            .is_some_and(|k| set.contains(&k))
                     })
                 }
                 PlanNode::Window {
-                    input,
+                    input: i,
                     partition_by,
-                    keys: Some(KeysFrom::Run),
+                    keys: Some(keys),
                 } => {
-                    let i = out[*input as usize].clone().unwrap();
-                    self.keep(plan, i, |o, t, c| {
-                        o.get(plan, t, c, &partition_by[0])
-                            .key()
-                            .is_some_and(|k| o.keys.contains(&k))
+                    let set = self.key_set(plan, keys, &out);
+                    let i = input(i);
+                    self.keep(i, |o, i, t| {
+                        o.key_of(plan, i, t, &partition_by[0])
+                            .is_some_and(|k| set.contains(&k))
                     })
                 }
-                PlanNode::Window { input, .. } | PlanNode::Exchange { input, .. } => {
-                    out[*input as usize].clone().unwrap()
+                PlanNode::Window { input: i, .. } | PlanNode::Exchange { input: i, .. } => {
+                    input(i)
                 }
-                PlanNode::Project { input, columns } => {
-                    let mut i = out[*input as usize].clone().unwrap();
+                PlanNode::Project { input: i, columns } => {
+                    let mut i = input(i);
                     i.cols = columns
                         .iter()
                         .map(|c| i.cols.iter().find(|(n, _, _)| n == c).unwrap().clone())
                         .collect();
                     i
                 }
-                PlanNode::Filter { input, predicate } => {
-                    let i = out[*input as usize].clone().unwrap();
+                PlanNode::Filter {
+                    input: i,
+                    predicate,
+                } => {
+                    let i = input(i);
                     match predicate {
                         Predicate::In { columns, values } => {
                             let set: BTreeSet<i64> = values.iter().map(|b| decode_int(b)).collect();
-                            self.keep(plan, i, |o, t, c| {
-                                o.get(plan, t, c, &columns[0])
-                                    .key()
+                            self.keep(i, |o, i, t| {
+                                o.key_of(plan, i, t, &columns[0])
+                                    .is_some_and(|k| set.contains(&k))
+                            })
+                        }
+                        Predicate::SemiJoin { columns, keys_from } => {
+                            let set = self.key_set(plan, keys_from, &out);
+                            self.keep(i, |o, i, t| {
+                                o.key_of(plan, i, t, &columns[0])
                                     .is_some_and(|k| set.contains(&k))
                             })
                         }
@@ -394,8 +439,8 @@ impl Oracle<'_> {
                             // Canonical encodings are memcomparable: the
                             // row's value, encoded at its type, between the
                             // bounds' bytes.
-                            self.keep(plan, i, |o, t, c| {
-                                let enc = match o.get(plan, t, c, column) {
+                            self.keep(i, |o, i, t| {
+                                let enc = match o.get(plan, i, t, column) {
                                     Val::I(v) => int(*v),
                                     Val::D(v) => dec(*v, 2),
                                     _ => return false,
@@ -406,29 +451,38 @@ impl Oracle<'_> {
                         p => panic!("oracle does not evaluate {p:?}"),
                     }
                 }
-                PlanNode::Latest { input, columns, ts } | PlanNode::AsOf { input, columns, ts } => {
+                PlanNode::Latest {
+                    input: i,
+                    columns,
+                    ts,
+                }
+                | PlanNode::AsOf {
+                    input: i,
+                    columns,
+                    ts,
+                } => {
                     let asof = matches!(plan.nodes[v as usize], PlanNode::AsOf { .. })
                         .then_some(self.asof);
-                    let i = out[*input as usize].clone().unwrap();
+                    let i = input(i);
                     let mut best: BTreeMap<Vec<Val>, i64> = BTreeMap::new();
                     for t in &i.out {
                         let key: Vec<Val> = columns
                             .iter()
-                            .map(|c| self.get(plan, t, &i.cols, c).clone())
+                            .map(|c| self.get(plan, &i, t, c).clone())
                             .collect();
-                        if let Some(at) = self.get(plan, t, &i.cols, ts).key() {
+                        if let Some(at) = self.key_of(plan, &i, t, ts) {
                             if asof.is_none_or(|a| at <= a) {
                                 let e = best.entry(key).or_insert(at);
                                 *e = (*e).max(at);
                             }
                         }
                     }
-                    self.keep(plan, i, |o, t, c| {
+                    self.keep(i, |o, i, t| {
                         let key: Vec<Val> = columns
                             .iter()
-                            .map(|x| o.get(plan, t, c, x).clone())
+                            .map(|x| o.get(plan, i, t, x).clone())
                             .collect();
-                        let at = o.get(plan, t, c, ts).key();
+                        let at = o.key_of(plan, i, t, ts);
                         at.is_some() && best.get(&key).copied() == at
                     })
                 }
@@ -438,74 +492,91 @@ impl Oracle<'_> {
                     on,
                     kind,
                 } => {
-                    let (l, r) = (
-                        out[*left as usize].clone().unwrap(),
-                        out[*right as usize].clone().unwrap(),
-                    );
+                    let (l, r) = (input(left), input(right));
                     let mut by: BTreeMap<i64, Vec<&Tuple>> = BTreeMap::new();
                     for t in &r.out {
-                        if let Some(k) = self.get(plan, t, &r.cols, &on[0].1).key() {
+                        if let Some(k) = self.key_of(plan, &r, t, &on[0].1) {
                             by.entry(k).or_default().push(t);
                         }
                     }
                     let mut tuples = Vec::new();
                     for t in &l.out {
-                        let matches = self
-                            .get(plan, t, &l.cols, &on[0].0)
-                            .key()
-                            .and_then(|k| by.get(&k));
+                        let matches = self.key_of(plan, &l, t, &on[0].0).and_then(|k| by.get(&k));
                         match (matches, kind) {
                             (Some(ms), _) => {
                                 for m in ms {
                                     let mut j = t.clone();
-                                    j.extend(m.iter().map(|(a, b)| (*a, *b)));
+                                    j.extend(m.iter().copied());
                                     tuples.push(j);
                                 }
                             }
-                            (None, JoinKind::Left) => tuples.push(t.clone()),
+                            (None, JoinKind::Left) => {
+                                let mut j = t.clone();
+                                j.extend(std::iter::repeat_n(NONE, r.slots.len()));
+                                tuples.push(j);
+                            }
                             (None, JoinKind::Inner) => {}
                         }
                     }
+                    let shift = l.slots.len();
                     let mut cols = l.cols.clone();
-                    for c in r.cols {
-                        if !on.iter().any(|(a, b)| a == b && *b == c.0) {
-                            cols.push(c);
+                    for (n, s, c) in r.cols {
+                        if !on.iter().any(|(a, b)| a == b && *b == n) {
+                            cols.push((n, s + shift, c));
                         }
                     }
-                    Truth {
-                        rows: tuples.len() as u64,
-                        needs: tuples.clone(),
-                        out: tuples,
-                        cols,
-                    }
+                    let mut slots = l.slots.clone();
+                    slots.extend(&r.slots);
+                    Truth::rows(slots, tuples, cols)
                 }
                 PlanNode::Aggregate {
-                    input, group_by, ..
+                    input: i,
+                    group_by,
+                    measures,
                 } => {
-                    let i = out[*input as usize].clone().unwrap();
-                    let groups: BTreeSet<Vec<Val>> = i
-                        .out
-                        .iter()
-                        .map(|t| {
-                            group_by
-                                .iter()
-                                .map(|c| self.get(plan, t, &i.cols, c).clone())
-                                .collect()
+                    let i = input(i);
+                    let sum_of = measures.iter().find_map(|m| m.column.clone());
+                    let mut groups: BTreeMap<Vec<Val>, (u64, i128, Tuple)> = BTreeMap::new();
+                    for t in &i.out {
+                        let key: Vec<Val> = group_by
+                            .iter()
+                            .map(|c| self.get(plan, &i, t, c).clone())
+                            .collect();
+                        let e = groups.entry(key).or_insert_with(|| (0, 0, t.clone()));
+                        e.0 += 1;
+                        e.2 = e.2.clone().min(t.clone());
+                        match sum_of.as_ref().map(|c| self.get(plan, &i, t, c)) {
+                            Some(Val::D(d)) => e.1 += d,
+                            Some(Val::I(x)) => e.1 += i128::from(*x),
+                            _ => {}
+                        }
+                    }
+                    // One output row per group: its least input tuple (so
+                    // a node above reads the group's columns) and, in a
+                    // slot of no scan, its count (so a partial group shows).
+                    let out: Vec<Tuple> = groups
+                        .values()
+                        .map(|(n, _, t)| {
+                            let mut t = t.clone();
+                            t.push(*n as usize);
+                            t
                         })
                         .collect();
-                    let rows = if group_by.is_empty() {
-                        1
-                    } else {
-                        groups.len() as u64
-                    };
+                    let mut slots = i.slots.clone();
+                    slots.push(u32::MAX);
+                    if group_by.is_empty() && groups.is_empty() {
+                        groups.insert(Vec::new(), (0, 0, Vec::new()));
+                    }
+                    let cols = group_by
+                        .iter()
+                        .map(|c| i.cols.iter().find(|(n, _, _)| n == c).unwrap().clone())
+                        .collect();
                     Truth {
-                        out: Vec::new(),
-                        needs: i.out.clone(),
-                        cols: group_by
-                            .iter()
-                            .map(|c| i.cols.iter().find(|(n, _, _)| n == c).unwrap().clone())
-                            .collect(),
-                        rows,
+                        rows: groups.len() as u64,
+                        slots,
+                        out,
+                        cols,
+                        groups: Some(groups.into_iter().map(|(k, (n, s, _))| (k, n, s)).collect()),
                     }
                 }
                 n => panic!("oracle does not evaluate {n:?}"),
@@ -515,25 +586,30 @@ impl Oracle<'_> {
         out.into_iter().map(Option::unwrap).collect()
     }
 
-    fn keep(
+    /// The non-null keys `from` names: the run's, literal ones, or another
+    /// node's output column.
+    fn key_set(
         &self,
         plan: &ConsumerPlan,
-        i: Truth,
-        f: impl Fn(&Self, &Tuple, &[(String, u32, String)]) -> bool,
-    ) -> Truth {
-        let _ = plan;
-        let out: Vec<Tuple> = i
-            .out
-            .iter()
-            .filter(|t| f(self, t, &i.cols))
-            .cloned()
-            .collect();
-        Truth {
-            rows: out.len() as u64,
-            needs: out.clone(),
-            out,
-            cols: i.cols,
+        from: &KeysFrom,
+        out: &[Option<Truth>],
+    ) -> BTreeSet<i64> {
+        match from {
+            KeysFrom::Run => self.keys.clone(),
+            KeysFrom::Values { values } => values.iter().map(|b| decode_int(b)).collect(),
+            KeysFrom::Node { node, columns } => {
+                let src = out[*node as usize].as_ref().unwrap();
+                src.out
+                    .iter()
+                    .filter_map(|t| self.key_of(plan, src, t, &columns[0]))
+                    .collect()
+            }
         }
+    }
+
+    fn keep(&self, i: Truth, f: impl Fn(&Self, &Truth, &Tuple) -> bool) -> Truth {
+        let out: Vec<Tuple> = i.out.iter().filter(|t| f(self, &i, t)).cloned().collect();
+        Truth::rows(i.slots, out, i.cols)
     }
 }
 
@@ -681,10 +757,11 @@ fn check(
     let rk = run_keys(r, keys);
     let priced = r.price_plan(plan, specs, "run", &rk, Some(asof))?;
     let order = check_shape(plan).unwrap();
-    let oracle = Oracle {
+    let mut oracle = Oracle {
         data: BTreeMap::from([("main", main), ("repos", repos)]),
         keys: keys.clone(),
         asof,
+        allowed: None,
     };
     let truth = oracle.run(plan, &order);
     for op in &priced.operators {
@@ -702,39 +779,57 @@ fn check(
             assert_eq!(op.bytes.exactness, Exactness::Exact, "node {}", op.node);
         }
     }
-    // No false negatives: the run reads every row group holding a row the
-    // root needs, at the projection the plan checked.
-    let checked = r.check_plan(plan).unwrap();
     let root = &truth[plan.root as usize];
-    let mut minimal = 0u64;
-    let mut cells: BTreeSet<(u32, u32)> = BTreeSet::new();
-    for t in &root.needs {
-        for (scan, row) in t {
-            let d = if Oracle::dataset_of(plan, *scan) == "main" {
-                main
-            } else {
-                repos
-            };
-            cells.insert((*scan, d.rows[*row].0));
-        }
-    }
-    for (scan, rg) in &cells {
-        let d = if Oracle::dataset_of(plan, *scan) == "main" {
+    assert!(holds(priced.cost.rows.as_ref().unwrap(), root.rows));
+    // Every read occurrence is one scan node, once; its bytes are the
+    // footers' compressed chunk sizes of the projection over its row
+    // groups (an independent sum), and the run's cost is their sum.
+    let checked = r.check_plan(plan).unwrap();
+    let mut seen = BTreeSet::new();
+    let (mut bytes, mut rgs) = (0u64, 0u64);
+    for read in &priced.reads {
+        assert!(seen.insert(read.node), "scan {} read twice", read.node);
+        assert!(matches!(plan.nodes[read.node as usize], PlanNode::Scan { .. }));
+        let d = if Oracle::dataset_of(plan, read.node) == "main" {
             main
         } else {
             repos
         };
-        for c in checked.projection(*scan).unwrap() {
-            minimal += d.chunk[&(*rg, c.clone())];
-        }
+        let want: u64 = read
+            .row_groups
+            .iter()
+            .flat_map(|rg| {
+                checked
+                    .projection(read.node)
+                    .unwrap()
+                    .iter()
+                    .map(move |c| d.chunk[&(*rg, c.clone())])
+            })
+            .sum();
+        assert_eq!(read.bytes, want, "scan {} bytes\nplan {plan:?}", read.node);
+        bytes += want;
+        rgs += read.row_groups.len() as u64;
     }
-    assert!(
-        priced.cost.bytes >= minimal,
-        "the run reads {} bytes, below the {minimal} its needed rows sit in\nplan {plan:?}",
-        priced.cost.bytes
+    assert_eq!(priced.cost.bytes, bytes);
+    assert_eq!(priced.cost.row_groups, rgs);
+    // No false negatives: evaluating the plan over only the row groups it
+    // plans to read gives the answer of evaluating it over every row (a
+    // latest's stale version, a window's partial partition, a join's
+    // missing match would all change it).
+    oracle.allowed = Some(
+        priced
+            .reads
+            .iter()
+            .map(|r| (r.node, r.row_groups.iter().copied().collect()))
+            .collect(),
     );
-    assert!(priced.cost.row_groups >= cells.len() as u64);
-    assert!(holds(priced.cost.rows.as_ref().unwrap(), root.rows));
+    let restricted = oracle.run(plan, &order);
+    assert!(
+        restricted[plan.root as usize].result() == root.result(),
+        "the planned reads do not reproduce the plan's answer under {specs:?} with keys \
+         {keys:?}\nplan {plan:?}\nreads {:?}",
+        priced.reads
+    );
     Ok(priced)
 }
 
@@ -805,6 +900,218 @@ fn random_plans_are_exact_or_bounded_against_the_oracle() {
         exact_joins > 0 && bounded_nodes > 0,
         "{exact_joins} exact joins, {bounded_nodes} bounded nodes"
     );
+}
+
+/// The property over DAGs: random diamonds, self-joins of one node,
+/// subplans two nodes read, two scans of one dataset, joins of a join's
+/// or an aggregate's output, with groups (`latest`, `window`) below the
+/// narrowing. Each shared scan is read once, its reads reproduce the
+/// plan's answer, and every quantity holds the oracle's.
+#[test]
+fn random_dags_share_reads_and_hold_the_oracle() {
+    let w = world();
+    let r = w.replayer();
+    let main = decode(&r);
+    let repos = decode(r.dataset("repos").unwrap());
+    let configs: Vec<Vec<KeySpec>> = vec![
+        vec![exact("k", true)],
+        vec![exact("k", false)],
+        vec![temporal("k", "t", true)],
+        vec![exact("k", true), KeySpec::Range { column: "t".into() }],
+        vec![temporal("k", "t", false), exact("g", true)],
+        vec![],
+    ];
+    let mut g = Rng(0x00da_0015);
+    let (mut priced, mut refused, mut shared) = (0, 0, 0);
+    for case in 0..180 {
+        let keys: BTreeSet<i64> = (0..1 + g.below(25)).map(|_| g.below(140) as i64).collect();
+        let plan = random_dag(&mut g);
+        let specs = &configs[(case as usize) % configs.len()];
+        let asof = g.below(25) as i64;
+        match check(&r, &main, &repos, &plan, specs, &keys, asof) {
+            Ok(p) => {
+                priced += 1;
+                shared += usize::from(!p.shared.is_empty());
+                for s in &p.shared {
+                    assert!(s.consumers >= 2 && s.estimate.0 <= s.estimate.1);
+                }
+            }
+            Err(ReplayError::JoinNotIndexed { .. }) => refused += 1,
+            Err(e) => panic!("case {case}: {e}\nplan {plan:?}"),
+        }
+    }
+    assert!(
+        priced > 100 && shared > 60 && refused > 0,
+        "{priced} priced ({shared} with a shared node), {refused} refused"
+    );
+}
+
+/// One random step over `input`'s rows of `events`, keeping the columns.
+fn step(g: &mut Rng, input: u32) -> PlanNode {
+    match g.below(7) {
+        0 => semi(input),
+        1 => PlanNode::Filter {
+            input,
+            predicate: Predicate::In {
+                columns: cols(&["k"]),
+                values: (0..1 + g.below(8))
+                    .map(|_| int(g.below(120) as i64))
+                    .collect(),
+            },
+        },
+        2 => {
+            let lo = g.below(10) as i64;
+            PlanNode::Filter {
+                input,
+                predicate: Predicate::Between {
+                    column: "t".into(),
+                    lo: int(lo),
+                    hi: int(lo + g.below(5) as i64),
+                },
+            }
+        }
+        3 => PlanNode::Latest {
+            input,
+            columns: cols(&["k"]),
+            ts: "t".into(),
+        },
+        4 => PlanNode::Window {
+            input,
+            partition_by: cols(&[if g.below(2) == 0 { "k" } else { "g" }]),
+            keys: None,
+        },
+        5 => PlanNode::Window {
+            input,
+            partition_by: cols(&["k"]),
+            keys: Some(KeysFrom::Run),
+        },
+        _ => PlanNode::Exchange {
+            input,
+            by: cols(&["k"]),
+        },
+    }
+}
+
+/// Pushes up to `n` random steps over `from`; returns the top node.
+fn chain(g: &mut Rng, nodes: &mut Vec<PlanNode>, from: u32, n: u64) -> u32 {
+    let mut top = from;
+    for _ in 0..g.below(n + 1) {
+        nodes.push(step(g, top));
+        top = nodes.len() as u32 - 1;
+    }
+    top
+}
+
+fn join(left: u32, right: u32, kind: JoinKind) -> PlanNode {
+    PlanNode::Join {
+        left,
+        right,
+        on: vec![("k".into(), "k".into())],
+        kind,
+    }
+}
+
+fn kind(g: &mut Rng) -> JoinKind {
+    if g.below(3) == 0 {
+        JoinKind::Left
+    } else {
+        JoinKind::Inner
+    }
+}
+
+fn count_by_k(input: u32) -> PlanNode {
+    PlanNode::Aggregate {
+        input,
+        group_by: cols(&["k"]),
+        measures: vec![Measure {
+            function: AggregateFn::Count,
+            column: None,
+        }],
+    }
+}
+
+/// A random DAG: a diamond over one scan, a self-join of one node, a
+/// subplan read by a semi-join's keys and a join, two scans of one
+/// dataset, or a join over a join's or an aggregate's output.
+fn random_dag(g: &mut Rng) -> ConsumerPlan {
+    let mut nodes = vec![scan_events()];
+    let top = match g.below(6) {
+        0 => {
+            // Diamond: two branches over the one scan, joined.
+            let a = chain(g, &mut nodes, 0, 2);
+            let b = chain(g, &mut nodes, 0, 2);
+            let k = kind(g);
+            nodes.push(join(a, b, k));
+            nodes.len() as u32 - 1
+        }
+        1 => {
+            // A self-join of one node.
+            let a = chain(g, &mut nodes, 0, 2);
+            let k = kind(g);
+            nodes.push(join(a, a, k));
+            nodes.len() as u32 - 1
+        }
+        2 => {
+            // A subplan read twice: its keys narrow repos, and it joins
+            // the narrowed repos.
+            let f = chain(g, &mut nodes, 0, 2);
+            nodes.push(scan_repos());
+            let rs = nodes.len() as u32 - 1;
+            nodes.push(PlanNode::SemiJoin {
+                input: rs,
+                columns: cols(&["k"]),
+                keys: KeysFrom::Node {
+                    node: f,
+                    columns: cols(&["k"]),
+                },
+            });
+            let sj = nodes.len() as u32 - 1;
+            let k = kind(g);
+            nodes.push(join(f, sj, k));
+            nodes.len() as u32 - 1
+        }
+        3 => {
+            // Two scans of one dataset: two read occurrences.
+            let a = chain(g, &mut nodes, 0, 2);
+            nodes.push(scan_events());
+            let s2 = nodes.len() as u32 - 1;
+            let b = chain(g, &mut nodes, s2, 2);
+            let k = kind(g);
+            nodes.push(join(a, b, k));
+            nodes.len() as u32 - 1
+        }
+        4 => {
+            // A join of a join's output with a second scan of repos.
+            let a = chain(g, &mut nodes, 0, 2);
+            nodes.push(scan_repos());
+            let rs = nodes.len() as u32 - 1;
+            let k = kind(g);
+            nodes.push(join(a, rs, k));
+            let j = nodes.len() as u32 - 1;
+            nodes.push(PlanNode::Scan {
+                dataset: "repos".into(),
+                columns: cols(&["k"]),
+            });
+            let r2 = nodes.len() as u32 - 1;
+            let k = kind(g);
+            nodes.push(join(j, r2, k));
+            nodes.len() as u32 - 1
+        }
+        _ => {
+            // An aggregate's output joined back to its own input.
+            let a = chain(g, &mut nodes, 0, 2);
+            nodes.push(count_by_k(a));
+            let agg = nodes.len() as u32 - 1;
+            let k = kind(g);
+            nodes.push(join(agg, a, k));
+            nodes.len() as u32 - 1
+        }
+    };
+    ConsumerPlan {
+        version: 1,
+        nodes,
+        root: top,
+    }
 }
 
 /// A plan of up to four steps over `events`, possibly joined with `repos`
@@ -1290,20 +1597,43 @@ fn malformed_plans_are_refused_by_node() {
         },
         "cycle",
     );
-    // A shared input.
-    refused(
-        plan(vec![
-            scan_events(),
-            semi(0),
-            PlanNode::Join {
-                left: 0,
-                right: 1,
-                on: vec![("k".into(), "k".into())],
-                kind: JoinKind::Inner,
-            },
-        ]),
-        "feeds two nodes",
+    // A derived side's join columns from two scans: no one index holds
+    // their tuples.
+    let two_scans = plan(vec![
+        scan_events(),
+        scan_repos(),
+        PlanNode::Join {
+            left: 0,
+            right: 1,
+            on: vec![("k".into(), "k".into())],
+            kind: JoinKind::Inner,
+        },
+        PlanNode::Scan {
+            dataset: "main".into(),
+            columns: cols(&["k", "t"]),
+        },
+        PlanNode::Join {
+            left: 2,
+            right: 3,
+            on: vec![("k".into(), "k".into()), ("ts".into(), "t".into())],
+            kind: JoinKind::Inner,
+        },
+    ]);
+    let e = r
+        .price_plan(&two_scans, &[exact("k", true)], "run", &rk, None)
+        .unwrap_err();
+    assert!(
+        matches!(
+            e,
+            ReplayError::JoinNotIndexed {
+                side: "left",
+                derived: Some(_),
+                ..
+            }
+        ),
+        "{e}"
     );
+    assert!(e.to_string().contains("more than one scan"), "{e}");
     refused(
         ConsumerPlan {
             version: 1,
@@ -1386,7 +1716,9 @@ fn malformed_plans_are_refused_by_node() {
         ]),
         "records no instant",
     );
-    // A join of a join's output is not priced as a scan.
+    // A join of a join's output is matched through the scan its join
+    // column comes from: refused without a key there, never priced as a
+    // scan; with one, priced and bounded, never exact.
     let nested = plan(vec![
         scan_events(),
         scan_repos(),
@@ -1404,13 +1736,19 @@ fn malformed_plans_are_refused_by_node() {
             kind: JoinKind::Inner,
         },
     ]);
+    let e = r
+        .price_plan(&nested, &[exact("g", true)], "run", &rk, None)
+        .unwrap_err();
+    assert!(
+        matches!(&e, ReplayError::JoinNotIndexed { side: "left", dataset, derived: None, .. } if dataset == "main"),
+        "{e}"
+    );
+    let priced = r
+        .price_plan(&nested, &[exact("k", true)], "run", &rk, None)
+        .unwrap();
     assert!(matches!(
-        r.price_plan(&nested, &[exact("k", true)], "run", &rk, None),
-        Err(ReplayError::JoinNotIndexed {
-            side: "left",
-            derived: Some(_),
-            ..
-        })
+        priced.operators[4].rows_out.exactness,
+        Exactness::Bounded { low: 0, .. }
     ));
 }
 
@@ -1854,4 +2192,301 @@ fn plan_node_counterfactuals_are_exact_replays() {
         )
         .unwrap();
     assert_eq!(replaced.len(), 2);
+}
+
+// ------------------------------------------------------- shared nodes (DAG)
+
+/// The row groups of `d` holding a row whose `k` is in `keys`, from the
+/// decoded rows.
+fn rgs_with(d: &Decoded, keys: &BTreeSet<i64>) -> BTreeSet<u32> {
+    d.rows
+        .iter()
+        .filter(|(_, row)| row["k"].key().is_some_and(|k| keys.contains(&k)))
+        .map(|(rg, _)| *rg)
+        .collect()
+}
+
+/// The footers' compressed bytes of `columns` over `rgs`.
+fn chunk_bytes(d: &Decoded, rgs: &BTreeSet<u32>, columns: &[&str]) -> u64 {
+    rgs.iter()
+        .flat_map(|rg| columns.iter().map(move |c| d.chunk[&(*rg, (*c).to_string())]))
+        .sum()
+}
+
+/// The keys of `d` present among `keys`.
+fn present(d: &Decoded, keys: &BTreeSet<i64>) -> BTreeSet<i64> {
+    d.rows
+        .iter()
+        .filter_map(|(_, row)| row["k"].key())
+        .filter(|k| keys.contains(k))
+        .collect()
+}
+
+/// Σ over `keys` of count(k)² in `d`: an inner self-join's rows.
+fn self_join_rows(d: &Decoded, keys: &BTreeSet<i64>) -> u64 {
+    let mut n: BTreeMap<i64, u64> = BTreeMap::new();
+    for (_, row) in &d.rows {
+        if let Some(k) = row["k"].key().filter(|k| keys.contains(k)) {
+            *n.entry(k).or_default() += 1;
+        }
+    }
+    n.values().map(|c| c * c).sum()
+}
+
+/// A diamond over one scan (two whole-key branches joined) reads the scan
+/// once, with the union of the branches' row groups; the same plan over
+/// two scans of the dataset reads it twice. Rows are the oracle's, exact
+/// in both: each branch keeps its own selection. The costs are checked
+/// against row groups and chunk sizes derived from the decoded rows.
+#[test]
+fn a_diamond_reads_its_shared_scan_once_and_two_scans_twice() {
+    let w = world();
+    let r = w.replayer();
+    let (main, repos) = (decode(&r), decode(r.dataset("repos").unwrap()));
+    let run: BTreeSet<i64> = [2, 3, 31, 33, 40, 55].into_iter().collect();
+    let lit: BTreeSet<i64> = [3, 33, 40, 77, 119].into_iter().collect();
+    let in_lit = |input: u32| PlanNode::Filter {
+        input,
+        predicate: Predicate::In {
+            columns: cols(&["k"]),
+            values: lit.iter().map(|k| int(*k)).collect(),
+        },
+    };
+    let diamond = plan(vec![
+        scan_events(),
+        semi(0),
+        in_lit(0),
+        join(1, 2, JoinKind::Inner),
+    ]);
+    let twice = plan(vec![
+        scan_events(),
+        semi(0),
+        scan_events(),
+        in_lit(2),
+        join(1, 3, JoinKind::Inner),
+    ]);
+    let specs = [exact("k", true)];
+    let one = check(&r, &main, &repos, &diamond, &specs, &run, 0).unwrap();
+    let two = check(&r, &main, &repos, &twice, &specs, &run, 0).unwrap();
+    let common: BTreeSet<i64> = run.intersection(&lit).copied().collect();
+    let rgs = rgs_with(&main, &common);
+    let all = ["k", "t", "g", "d2", "x"];
+    let want = chunk_bytes(&main, &rgs, &all);
+    assert_eq!(one.reads.len(), 1);
+    assert_eq!(one.reads[0].row_groups, rgs.iter().copied().collect::<Vec<_>>());
+    assert_eq!(one.cost.bytes, want);
+    assert_eq!(one.cost.row_groups, rgs.len() as u64);
+    assert_eq!(two.reads.len(), 2);
+    assert_eq!(two.cost.bytes, 2 * want);
+    assert_eq!(two.cost.row_groups, 2 * rgs.len() as u64);
+    let rows = self_join_rows(&main, &common);
+    for p in [&one, &two] {
+        assert_eq!(root_rows(p), &Quantity::exact(rows));
+    }
+    // The scan of the diamond feeds two nodes: logical reuse, with its
+    // model estimate.
+    assert_eq!(one.shared.len(), 1);
+    assert_eq!((one.shared[0].node, one.shared[0].consumers), (0, 2));
+    assert!(two.shared.is_empty());
+}
+
+/// A self-join of one node (`join(n, n)`) reads its scan once, and its
+/// rows are Σ count(k)² over the run's keys, exact from counts.
+#[test]
+fn a_self_join_of_one_node_is_one_read_with_squared_counts() {
+    let w = world();
+    let r = w.replayer();
+    let (main, repos) = (decode(&r), decode(r.dataset("repos").unwrap()));
+    let run = keys_some();
+    let p = plan(vec![scan_events(), semi(0), join(1, 1, JoinKind::Inner)]);
+    let got = check(&r, &main, &repos, &p, &[exact("k", true)], &run, 0).unwrap();
+    let rgs = rgs_with(&main, &present(&main, &run));
+    assert_eq!(got.reads.len(), 1);
+    assert_eq!(
+        got.cost.bytes,
+        chunk_bytes(&main, &rgs, &["k", "t", "g", "d2", "x"])
+    );
+    assert_eq!(root_rows(&got), &Quantity::exact(self_join_rows(&main, &run)));
+    assert_eq!(got.shared[0].node, 1);
+    assert_eq!(got.shared[0].consumers, 2);
+    // Without counts the same join is bounded, and still read once.
+    let bounded = check(&r, &main, &repos, &p, &[exact("k", false)], &run, 0).unwrap();
+    assert!(matches!(
+        root_rows(&bounded).exactness,
+        Exactness::Bounded { .. }
+    ));
+    assert_eq!(bounded.cost.bytes, got.cost.bytes);
+}
+
+/// A subplan two nodes read (its keys narrow `repos`, and it joins the
+/// narrowed `repos`) is one read of `events` over the row groups holding a
+/// common key, and `repos` reads the row groups holding one.
+#[test]
+fn a_subplan_read_by_two_nodes_is_priced_once() {
+    let w = world();
+    let r = w.replayer();
+    let (main, repos) = (decode(&r), decode(r.dataset("repos").unwrap()));
+    let run = keys_some();
+    let p = plan(vec![
+        scan_events(),
+        semi(0),
+        scan_repos(),
+        PlanNode::SemiJoin {
+            input: 2,
+            columns: cols(&["k"]),
+            keys: KeysFrom::Node {
+                node: 1,
+                columns: cols(&["k"]),
+            },
+        },
+        join(1, 3, JoinKind::Inner),
+    ]);
+    let got = check(&r, &main, &repos, &p, &[exact("k", true)], &run, 0).unwrap();
+    let common: BTreeSet<i64> = present(&main, &run)
+        .intersection(&present(&repos, &run))
+        .copied()
+        .collect();
+    let ergs = rgs_with(&main, &common);
+    let rrgs = rgs_with(&repos, &common);
+    assert_eq!(
+        got.reads
+            .iter()
+            .map(|r| (r.node, r.row_groups.len()))
+            .collect::<Vec<_>>(),
+        vec![(0, ergs.len()), (2, rrgs.len())]
+    );
+    assert_eq!(
+        got.cost.bytes,
+        chunk_bytes(&main, &ergs, &["k", "t", "g", "d2", "x"])
+            + chunk_bytes(&repos, &rrgs, &["k", "ts", "d4"])
+    );
+    // The semi-join of two scans' whole-key rows is exact.
+    assert_eq!(got.operators[3].rows_out.exactness, Exactness::Exact);
+    assert_eq!(
+        got.shared
+            .iter()
+            .map(|s| (s.node, s.consumers))
+            .collect::<Vec<_>>(),
+        vec![(1, 2)]
+    );
+}
+
+/// A node above a `latest` (no temporal key) or a `window` narrows the
+/// read only by whole groups: a range on the version after `latest` reads
+/// every row group (reading fewer would promote a stale version), and an
+/// `in` on `k` after a window over `g` reads every row group (it would cut
+/// a partition short). Without the group below, the same filters narrow.
+#[test]
+fn narrowing_above_a_group_keeps_its_groups_whole() {
+    let w = world();
+    let r = w.replayer();
+    let (main, repos) = (decode(&r), decode(r.dataset("repos").unwrap()));
+    let run = keys_some();
+    let range = |input: u32| PlanNode::Filter {
+        input,
+        predicate: Predicate::Between {
+            column: "x".into(),
+            lo: int(120),
+            hi: int(260),
+        },
+    };
+    let latest = |input: u32| PlanNode::Latest {
+        input,
+        columns: cols(&["k"]),
+        ts: "t".into(),
+    };
+    let total = main.rg_rows.len() as u64;
+    let specs = [exact("k", true)];
+    let after = check(
+        &r,
+        &main,
+        &repos,
+        &plan(vec![scan_events(), latest(0), range(1)]),
+        &specs,
+        &run,
+        0,
+    )
+    .unwrap();
+    assert_eq!(after.cost.row_groups, total);
+    let before = check(
+        &r,
+        &main,
+        &repos,
+        &plan(vec![scan_events(), range(0), latest(1)]),
+        &specs,
+        &run,
+        0,
+    )
+    .unwrap();
+    assert_eq!(before.cost.row_groups, 4);
+    let window = PlanNode::Window {
+        input: 0,
+        partition_by: cols(&["g"]),
+        keys: None,
+    };
+    let cut = check(
+        &r,
+        &main,
+        &repos,
+        &plan(vec![scan_events(), window, semi(1)]),
+        &specs,
+        &run,
+        0,
+    )
+    .unwrap();
+    assert_eq!(cut.cost.row_groups, total);
+    // A window over `k` keeps whole partitions under an `in` on `k`.
+    let by_k = PlanNode::Window {
+        input: 0,
+        partition_by: cols(&["k"]),
+        keys: None,
+    };
+    let whole = check(
+        &r,
+        &main,
+        &repos,
+        &plan(vec![scan_events(), by_k, semi(1)]),
+        &specs,
+        &run,
+        0,
+    )
+    .unwrap();
+    assert_eq!(
+        whole.cost.row_groups,
+        rgs_with(&main, &present(&main, &run)).len() as u64
+    );
+}
+
+/// A join over an aggregate's output is matched through the aggregate's
+/// scan: priced, bounded (the index counts scan rows, not groups), and its
+/// reads reproduce the answer.
+#[test]
+fn a_join_over_an_aggregate_is_bounded_never_exact() {
+    let w = world();
+    let r = w.replayer();
+    let (main, repos) = (decode(&r), decode(r.dataset("repos").unwrap()));
+    let run = keys_some();
+    let p = plan(vec![
+        scan_events(),
+        semi(0),
+        count_by_k(1),
+        scan_repos(),
+        join(2, 3, JoinKind::Inner),
+    ]);
+    let got = check(&r, &main, &repos, &p, &[exact("k", true)], &run, 0).unwrap();
+    assert!(matches!(
+        root_rows(&got).exactness,
+        Exactness::Bounded { low: 0, .. }
+    ));
+    // repos reads only the row groups of keys the aggregate's scan holds
+    // in the row groups it read (a superset of the groups' keys).
+    let ergs = rgs_with(&main, &run);
+    let held: BTreeSet<i64> = main
+        .rows
+        .iter()
+        .filter(|(rg, _)| ergs.contains(rg))
+        .filter_map(|(_, row)| row["k"].key())
+        .collect();
+    let rrgs = rgs_with(&repos, &held);
+    assert_eq!(got.reads[1].row_groups.len(), rrgs.len());
 }

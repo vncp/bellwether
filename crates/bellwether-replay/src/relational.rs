@@ -8,14 +8,43 @@
 //! is a replayer attached by name ([`Replayer::with_datasets`]). A plan is
 //! checked before anything is priced ([`check_shape`], then
 //! [`Replayer::check_plan`]): version 1; the root and every input in range;
-//! acyclic; a tree (every node feeds exactly one node, the root none; a
-//! node whose output keys a semi-join counts as feeding it), so no read is
-//! counted for two consumers; every node read by the root; every dataset
-//! bound; every column an output of the node's input, by one name; key,
-//! join, range, and time columns of a scalar type; join and key columns
-//! whose canonical encodings compare (core's `join::check_same_domain`);
-//! literal key tuples well formed. A refusal is a typed
-//! [`ReplayError::InvalidPlan`] naming the node.
+//! acyclic; every node read by the root; every dataset bound; every column
+//! an output of the node's input, by one name; key, join, range, and time
+//! columns of a scalar type; join and key columns whose canonical encodings
+//! compare (core's `join::check_same_domain`); literal key tuples well
+//! formed. A refusal is a typed [`ReplayError::InvalidPlan`] naming the
+//! node.
+//!
+//! # Shared nodes: the plan is a DAG
+//!
+//! A node may feed several nodes (a diamond, a self-join `join(n, n)`, a
+//! subplan two branches read, a node whose output keys a semi-join beside
+//! another consumer). The convention is **logical reuse**: every node is
+//! evaluated once per run, and its output is what each consumer reads.
+//! It is a statement about the plan, not a claim that an engine buffers or
+//! reuses anything; an engine that recomputes a shared subplan reads more,
+//! which an adapter measures.
+//!
+//! - **Read occurrences.** Each `scan` node is one read occurrence, priced
+//!   once: its columns are the union of the columns every path above it
+//!   references, and its row groups the union of the row groups every
+//!   consumer path plans from it. Two `scan` nodes of one dataset are two
+//!   read occurrences, each priced (a self-join over two scans reads the
+//!   dataset twice, as the plan says).
+//! - **Selections stay per path.** The union is for reads only. Each
+//!   consumer prices its rows from the shared node's own output and its own
+//!   narrowing (its keys, its range, its join's common keys), so a sibling
+//!   branch's row groups never widen another branch's rows or a join's
+//!   multiplicities.
+//! - **Bytes per node** are the reads of the node's own sub-DAG, each read
+//!   occurrence below it once with the union of the row groups its paths
+//!   within that sub-DAG plan.
+//! - **Buffering is not priced.** Holding a shared node's output for its
+//!   consumers is memory, not storage I/O, and stays unknown until
+//!   measured. [`PricedPlan::shared`] lists each shared node with its
+//!   consumers and a compressed-equivalent **model estimate** of its output
+//!   (`rows_out` × the average compressed row width of the planned row
+//!   groups), labelled so: it bounds neither runtime memory nor RSS.
 //!
 //! # Quantities
 //!
@@ -28,11 +57,10 @@
 //! - **bytes** is logical planned I/O: the compressed bytes of the columns
 //!   the plan needs (the union of the columns every node above a scan
 //!   references, and the root's outputs; a text chunk is read whole) over
-//!   the row groups the plan reads at that node, every scan below it
-//!   summed. It is not wall time and not what an engine reads (an engine
+//!   the row groups the plan reads at that node, each read occurrence below
+//!   it once. It is not wall time and not what an engine reads (an engine
 //!   may prune more or read more, which an adapter measures). For an
-//!   `exchange` it is the bytes moved: the rows moved times the compressed
-//!   width of a row over the planned row groups, a bounded quantity.
+//!   `exchange` it is compressed-equivalent bytes moved (below).
 //! - **rows_out** is the node's output cardinality. Per-key counts give
 //!   exact numbers only where the relation they count is proved: a scan's
 //!   rows filtered by whole keys (`in`, a semi-join, a window prefilter)
@@ -77,13 +105,33 @@
 //!   whole keys on the join columns; a left join adds the unmatched left
 //!   rows. Otherwise the interval is bounded by the common keys (when both
 //!   sides are proved) and the product of the sides' rows.
+//! - A join side (or a semi-join's key source) that is rows derived from
+//!   several scans, a join's or an aggregate's output, is matched through
+//!   the one scan its join columns come from, which needs the key as
+//!   above (columns from two scans are refused). That scan's keys in the
+//!   row groups read below hold every key the derived rows carry, so they
+//!   narrow the other side's read soundly; the derived side's own read
+//!   stays as priced below, and the rows are `[0, derived × other]` (a
+//!   left join `[left low, left high + matched]`): never exact, since the
+//!   index counts scan rows, not derived ones.
 //! - `aggregate`: reads its input; rows the number of groups: exact from an
 //!   exact or temporal key on the grouping columns over a scan's rows (its
 //!   distinct keys in the planned row groups, plus the null group the
 //!   footers' null counts prove), else `[min(1, low), high]`; one row with
 //!   no grouping columns.
-//! - `exchange`: rows unchanged; bytes moved bounded as above.
+//! - `exchange`: rows unchanged; bytes are compressed-equivalent bytes
+//!   moved: the rows (an interval) times the average compressed row width
+//!   over the planned row groups. `Bounded` holds with respect to that
+//!   definition; the width models the in-memory width, which no statistic
+//!   gives, so it is not a bound on network or memory bytes.
 //! - `project`: rows and reads unchanged (projection is pushed into scans).
+//!
+//! A node above narrows a scan's read (drops row groups from it) only
+//! where the rows it drops cannot change a result below: after a `latest`
+//! or `as_of` (proved by a temporal key or not), only by whole keys on its
+//! key columns; after a `window`, only by whole partitions; otherwise
+//! freely. A selection that may not narrow the read still bounds the rows
+//! by the row groups it plans.
 //!
 //! # Memory (ADR 018)
 //!
@@ -323,9 +371,10 @@ fn check_predicate(node: u32, p: &Predicate) -> ReplayResult<()> {
 }
 
 /// Checks a plan's shape without its datasets (module docs): version 1,
-/// the root and every input in range, acyclic, a tree read by the root,
-/// and well-formed literals. Returns the nodes in post order (inputs before
-/// the nodes they feed).
+/// the root and every input in range, acyclic (a DAG: a node may feed
+/// several), every node read by the root, and well-formed literals.
+/// Returns the nodes in post order (inputs before the nodes they feed),
+/// each once.
 pub fn check_shape(plan: &ConsumerPlan) -> ReplayResult<Vec<u32>> {
     if plan.version > PLAN_VERSION {
         return Err(Error::UnsupportedVersion {
@@ -394,12 +443,8 @@ pub fn check_shape(plan: &ConsumerPlan) -> ReplayResult<Vec<u32>> {
                         "the join pairs no columns; a cross join is not priced",
                     ));
                 }
-                if left == right {
-                    return Err(invalid(
-                        Some(i),
-                        "the join reads one node on both sides; give each side its own scan",
-                    ));
-                }
+                // `left == right` is a self-join of one node's output: a
+                // shared node (module docs), priced once.
                 let l: Vec<String> = on.iter().map(|(a, _)| a.clone()).collect();
                 let r: Vec<String> = on.iter().map(|(_, b)| b.clone()).collect();
                 check_columns(i, "the join's left side", &l, false)?;
@@ -450,14 +495,9 @@ pub fn check_shape(plan: &ConsumerPlan) -> ReplayResult<Vec<u32>> {
                         format!("reads node {c}, which reads node {v}: the plan has a cycle"),
                     ))
                 }
-                _ => {
-                    return Err(invalid(
-                        Some(c),
-                        "feeds two nodes; a plan is priced as a tree, so a shared input would \
-                         be read once or twice depending on the engine: give each consumer its \
-                         own scan",
-                    ))
-                }
+                // Done already: a node several nodes read (a DAG; module
+                // docs), ordered once.
+                _ => {}
             }
         } else {
             state[v as usize] = 2;
@@ -500,6 +540,8 @@ pub struct CheckedPlan {
     run_keyed: bool,
     /// Whether a node is an `as_of`.
     asof: bool,
+    /// Per node: how many times nodes read it (0 for the root).
+    consumers: Vec<u32>,
 }
 
 impl CheckedPlan {
@@ -533,6 +575,13 @@ impl CheckedPlan {
     #[must_use]
     pub fn uses_asof(&self) -> bool {
         self.asof
+    }
+
+    /// How many times nodes read `node`: 2 or more for a shared node
+    /// (module docs), 0 for the root.
+    #[must_use]
+    pub fn consumers(&self, node: u32) -> u32 {
+        self.consumers.get(node as usize).copied().unwrap_or(0)
     }
 
     /// The `main` dataset columns `names` resolve to among `input`'s
@@ -657,6 +706,67 @@ impl CheckedPlan {
         for (c, p) in self.main_probes() {
             if matches!(p, Probe::Keys) && !out.iter().any(|o| same_set(o, &c)) {
                 out.push(c);
+            }
+        }
+        out
+    }
+
+    /// The keys a node of this plan could price with on `main`, each once,
+    /// in plan order (`why --plan`'s candidates, drawn from the columns the
+    /// plan's filters, joins, windows, and aggregates name): an exact key
+    /// on each column set probed by whole keys, a temporal key on each
+    /// `latest`/`as_of` key set and version column, a range key on each
+    /// `between` column.
+    #[must_use]
+    pub fn candidate_specs(&self) -> Vec<KeySpec> {
+        let mut out: Vec<KeySpec> = Vec::new();
+        for (columns, p) in self.main_probes() {
+            let spec = match p {
+                Probe::Keys => KeySpec::Exact {
+                    columns,
+                    counts: false,
+                    bounds: None,
+                },
+                Probe::Versions(ts_column) => KeySpec::Temporal {
+                    columns,
+                    ts_column,
+                    counts: false,
+                    tombstone: None,
+                },
+                Probe::Range => KeySpec::Range {
+                    column: columns.concat(),
+                },
+            };
+            if !out.iter().any(|o| o.identity() == spec.identity()) {
+                out.push(spec);
+            }
+        }
+        out
+    }
+
+    /// The version columns of the plan's `as_of` nodes, as `(dataset,
+    /// column)`, each once: the run's instant is in their unit.
+    #[must_use]
+    pub fn asof_columns(&self) -> Vec<(String, String)> {
+        let mut out = Vec::new();
+        for node in &self.plan.nodes {
+            if let PlanNode::AsOf { input, ts, .. } = node {
+                let col = self
+                    .outputs
+                    .get(*input as usize)
+                    .and_then(|cols| cols.iter().find(|c| &c.name == ts));
+                if let Some(c) = col {
+                    let d = self
+                        .datasets
+                        .get(c.scan as usize)
+                        .cloned()
+                        .flatten()
+                        .unwrap_or_default();
+                    let pair = (d, c.column.clone());
+                    if !out.contains(&pair) {
+                        out.push(pair);
+                    }
+                }
             }
         }
         out
@@ -808,6 +918,12 @@ impl<'a> Replayer<'a> {
         let mut refs: Vec<(u32, String)> = Vec::new();
         let mut run_keyed = false;
         let mut asof = false;
+        let mut consumers = vec![0u32; n];
+        for &v in &order {
+            for c in children(&plan.nodes[v as usize]) {
+                consumers[c as usize] += 1;
+            }
+        }
         for &v in &order {
             let node = &plan.nodes[v as usize];
             let input_of = |i: u32| outputs[i as usize].clone();
@@ -1027,6 +1143,7 @@ impl<'a> Replayer<'a> {
             projection,
             run_keyed,
             asof,
+            consumers,
         })
     }
 
@@ -1180,6 +1297,7 @@ impl<'a> Replayer<'a> {
             run_keys: keys,
             asof,
             unserved: false,
+            remaining: checked.consumers.clone(),
         };
         p.price(run_id)
     }
@@ -1201,16 +1319,51 @@ impl<'a> Replayer<'a> {
 /// One run priced through a plan.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PricedPlan {
-    /// The run's cost: the root's read bytes, every scan's row groups and
-    /// files, and the root's rows.
+    /// The run's cost: the root's read bytes, every read occurrence's row
+    /// groups and files, and the root's rows.
     pub cost: RunCost,
     /// Each node's cost, in plan order.
     pub operators: Vec<OperatorCost>,
+    /// Every read occurrence the root's cost sums (one per `scan` node,
+    /// module docs), in node order.
+    pub reads: Vec<ScanRead>,
+    /// Every node more than one node reads, in node order (module docs).
+    pub shared: Vec<SharedOutput>,
     /// The model a measured dataset's costs come from, when one was read.
     pub model: Option<String>,
     /// Whether a key selection no spec served was priced under the
     /// statistics baseline.
     pub unserved: bool,
+}
+
+/// One read occurrence of a run: a `scan` node, read once with the union
+/// of the row groups every consumer path plans from it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ScanRead {
+    /// The scan node.
+    pub node: u32,
+    /// Its dataset (`main` for the data root and its aliases).
+    pub dataset: String,
+    /// The live row-group ids it reads, ascending.
+    pub row_groups: Vec<u32>,
+    /// The projected compressed bytes of those row groups.
+    pub bytes: u64,
+}
+
+/// A node several nodes read: evaluated once (logical reuse, module docs),
+/// its output read by each consumer.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SharedOutput {
+    /// The node.
+    pub node: u32,
+    /// How many times nodes read it (a self-join reads it twice).
+    pub consumers: u32,
+    /// A compressed-equivalent **model estimate** of its output, `[low,
+    /// high]` bytes: `rows_out` (its interval) × the average compressed
+    /// row width of the planned row groups of every read below it. A
+    /// model, not a statistic: it bounds neither runtime memory nor RSS,
+    /// which stay unknown until measured.
+    pub estimate: (u64, u64),
 }
 
 /// An interval `[lo, hi]` that holds the truth.
@@ -1254,6 +1407,33 @@ struct Side {
     rgs: RoaringBitmap,
     rows: Iv,
     sel: Sel,
+    /// Column sets a node below computed over whole groups of (a `latest`
+    /// or `as_of` over its keys, a `window` over its partitions): a node
+    /// above may drop row groups from the read only by whole keys on
+    /// exactly each of these, or it would cut a group short (a stale
+    /// version promoted, a window over part of its partition).
+    groups: Vec<Vec<String>>,
+}
+
+impl Side {
+    /// Whether a selection on `columns` (whole keys; `None` for a range or
+    /// any other) may drop row groups from this side's read.
+    fn narrowable(&self, columns: Option<&[String]>) -> bool {
+        self.groups
+            .iter()
+            .all(|g| columns.is_some_and(|c| same_set(g, c)))
+    }
+
+    /// `planned` as this side's read: kept when narrowable by `columns`,
+    /// else the read stays the input's (rows are still priced from
+    /// `planned`).
+    fn read(&self, columns: Option<&[String]>, planned: RoaringBitmap) -> RoaringBitmap {
+        if self.narrowable(columns) {
+            planned
+        } else {
+            self.rgs.clone()
+        }
+    }
 }
 
 /// A node's output: one scan's rows (which an index can still narrow), or
@@ -1285,6 +1465,17 @@ impl Rel {
     fn into_reads(self) -> Vec<Side> {
         self.side.into_iter().chain(self.reads).collect()
     }
+    /// Every read occurrence below: per scan node its dataset and the
+    /// union of the row groups every path to it reads (module docs).
+    fn occurrences(&self) -> BTreeMap<u32, (&str, RoaringBitmap)> {
+        let mut out: BTreeMap<u32, (&str, RoaringBitmap)> = BTreeMap::new();
+        for s in self.sides() {
+            out.entry(s.scan)
+                .or_insert_with(|| (s.dataset.as_str(), RoaringBitmap::new()))
+                .1 |= &s.rgs;
+        }
+        out
+    }
 }
 
 /// What a merge of two sides' keys on their join columns found.
@@ -1311,6 +1502,9 @@ struct Pricer<'p, 'a> {
     run_keys: &'p RunKeys,
     asof: Option<i64>,
     unserved: bool,
+    /// Per node: the reads of it not yet priced; its output is moved to
+    /// the last, cloned for the others (a shared node, module docs).
+    remaining: Vec<u32>,
 }
 
 fn same_set(a: &[String], b: &[String]) -> bool {
@@ -1356,16 +1550,17 @@ impl<'p, 'a> Pricer<'p, 'a> {
         Ok(n)
     }
 
-    /// The projected compressed bytes of `side`'s planned row groups.
-    fn side_bytes(&self, side: &Side) -> ReplayResult<u64> {
-        let r = self.replayer(&side.dataset)?;
+    /// The projected compressed bytes of read occurrence `scan` (of
+    /// dataset `d`) over row groups `rgs`.
+    fn read_bytes(&self, scan: u32, d: &str, rgs: &RoaringBitmap) -> ReplayResult<u64> {
+        let r = self.replayer(d)?;
         let c = r.catalog();
-        let projection = self.checked.projection(side.scan).unwrap_or(&[]);
+        let projection = self.checked.projection(scan).unwrap_or(&[]);
         let mut total = 0u64;
-        for id in &side.rgs {
-            let rg = c.get(id).ok_or_else(|| {
-                Error::Other(format!("row group {id} is not live in {}", side.dataset))
-            })?;
+        for id in rgs {
+            let rg = c
+                .get(id)
+                .ok_or_else(|| Error::Other(format!("row group {id} is not live in {d}")))?;
             // A text chunk is read whole, whatever columns are wanted.
             if rg.meta.byte_range.is_some() {
                 total = total.saturating_add(rg.meta.bytes);
@@ -1398,10 +1593,9 @@ impl<'p, 'a> Pricer<'p, 'a> {
         Ok(total)
     }
 
-    fn side_files(&self, side: &Side) -> ReplayResult<u64> {
-        let c = self.replayer(&side.dataset)?.catalog();
-        let files: BTreeSet<usize> = side
-            .rgs
+    fn read_files(&self, d: &str, rgs: &RoaringBitmap) -> ReplayResult<u64> {
+        let c = self.replayer(d)?.catalog();
+        let files: BTreeSet<usize> = rgs
             .iter()
             .filter_map(|id| c.get(id))
             .map(|r| r.file)
@@ -1409,10 +1603,11 @@ impl<'p, 'a> Pricer<'p, 'a> {
         Ok(files.len() as u64)
     }
 
+    /// The reads below `rel`: each read occurrence once (module docs).
     fn rel_bytes(&self, rel: &Rel) -> ReplayResult<u64> {
         let mut t = 0u64;
-        for s in rel.sides() {
-            t = t.saturating_add(self.side_bytes(s)?);
+        for (scan, (d, rgs)) in rel.occurrences() {
+            t = t.saturating_add(self.read_bytes(scan, d, &rgs)?);
         }
         Ok(t)
     }
@@ -1576,13 +1771,19 @@ impl<'p, 'a> Pricer<'p, 'a> {
             r.verified_plan(planner, self.specs(&d), &keys, &RunQuery::Locate)?
         };
         self.unserved |= unserved;
-        let rgs = &side.rgs & &r.catalog().ids_of(&plan);
-        let in_rgs = self.rows_of(&d, &rgs)?;
+        let planned = &side.rgs & &r.catalog().ids_of(&plan);
+        let in_rgs = self.rows_of(&d, &planned)?;
+        let lower = if base {
+            self.pairs(&d, &keys, &planned)?
+        } else {
+            0
+        };
+        let rgs = side.read(Some(keys.columns()), planned);
         if base {
             // The relation is exactly the dataset's rows of `keys`.
             let rows = match &plan.rows {
                 Some(q) if q.exactness.is_exact() => Iv::exact(q.value),
-                _ => Iv::new(self.pairs(&d, &keys, &rgs)?, in_rgs),
+                _ => Iv::new(lower, in_rgs),
             };
             return Ok(Side {
                 rows,
@@ -1617,7 +1818,7 @@ impl<'p, 'a> Pricer<'p, 'a> {
             .iter()
             .find(|s| matches!(s, KeySpec::Range { column: c } if c == column))
             .cloned();
-        let rgs = if let Some(spec) = range {
+        let planned: RoaringBitmap = if let Some(spec) = range {
             let segs = self.replayer(&d)?.segments_of(&spec)?;
             let mut planned = RoaringBitmap::new();
             for r in segs.readers() {
@@ -1642,7 +1843,9 @@ impl<'p, 'a> Pricer<'p, 'a> {
                 })
                 .collect()
         };
-        let hi_rows = side.rows.hi.min(self.rows_of(&d, &rgs)?);
+        // Rows in range lie in the planned row groups, read or not.
+        let hi_rows = side.rows.hi.min(self.rows_of(&d, &planned)?);
+        let rgs = side.read(None, planned);
         Ok(Side {
             rows: Iv::new(0, hi_rows),
             rgs,
@@ -1673,12 +1876,16 @@ impl<'p, 'a> Pricer<'p, 'a> {
                     if same_set(c, columns) && ts_column == ts)
             })
             .cloned();
+        let mut groups = side.groups.clone();
+        groups.push(columns.to_vec());
         let (Some(keys), Some(spec)) = (keys, temporal) else {
             // No temporal key proves the winners of exactly these rows:
-            // the node reads its input.
+            // the node reads its input, and a node above may narrow that
+            // read only by whole keys on these columns.
             return Ok(Side {
                 rows: Iv::new(0, side.rows.hi),
                 sel: Sel::Other,
+                groups,
                 ..side
             });
         };
@@ -1692,7 +1899,7 @@ impl<'p, 'a> Pricer<'p, 'a> {
             r.verified_plan(planner, self.specs(&d), &keys, &query)?
         };
         self.unserved |= unserved;
-        let rgs = &side.rgs & &r.catalog().ids_of(&plan);
+        let planned = &side.rgs & &r.catalog().ids_of(&plan);
         // Lower: a key with a live version (at or before the instant)
         // returns at least one row; one per run tuple, so the two
         // encodings of a float zero count once.
@@ -1709,14 +1916,15 @@ impl<'p, 'a> Pricer<'p, 'a> {
             });
             lower += u64::from(has);
         }
-        let mut upper = side.rows.hi.min(self.rows_of(&d, &rgs)?);
-        if let Some(n) = self.counted(&d, &keys, &rgs)? {
+        let mut upper = side.rows.hi.min(self.rows_of(&d, &planned)?);
+        if let Some(n) = self.counted(&d, &keys, &planned)? {
             upper = upper.min(n);
         }
         Ok(Side {
             rows: Iv::new(lower, upper),
-            rgs,
+            rgs: side.read(Some(columns), planned),
             sel: Sel::Other,
+            groups,
             ..side
         })
     }
@@ -1885,19 +2093,32 @@ impl<'p, 'a> Pricer<'p, 'a> {
         Ok(m)
     }
 
+    /// Node `i`'s output as node `v` reads it: moved to its last reader,
+    /// cloned for the others (a shared node is priced once; module docs).
+    fn input(&mut self, rels: &mut [Option<Rel>], v: u32, i: u32) -> ReplayResult<Rel> {
+        let left = self
+            .remaining
+            .get_mut(i as usize)
+            .ok_or_else(|| invalid(Some(v), format!("reads node {i}, which is not a node")))?;
+        *left = left.saturating_sub(1);
+        let slot = &mut rels[i as usize];
+        let rel = if *left == 0 {
+            slot.take()
+        } else {
+            slot.clone()
+        };
+        rel.ok_or_else(|| invalid(Some(v), format!("node {i} was not priced before it")))
+    }
+
     fn price(&mut self, run_id: &str) -> ReplayResult<PricedPlan> {
         let plan = &self.checked.plan;
         let n = plan.nodes.len();
         let mut rels: Vec<Option<Rel>> = vec![None; n];
         let mut ops: Vec<Option<OperatorCost>> = vec![None; n];
+        let mut shared = Vec::new();
         let order = self.checked.order.clone();
         for v in order {
             let node = &plan.nodes[v as usize];
-            let take = |rels: &mut Vec<Option<Rel>>, i: u32| {
-                rels[i as usize].take().ok_or_else(|| {
-                    invalid(Some(v), format!("node {i} was priced for another node"))
-                })
-            };
             let mut moved: Option<Iv> = None;
             let rel = match node {
                 PlanNode::Scan { dataset, .. } => {
@@ -1909,10 +2130,11 @@ impl<'p, 'a> Pricer<'p, 'a> {
                         rows: Iv::exact(r.catalog().rows_total()),
                         rgs,
                         sel: Sel::All,
+                        groups: Vec::new(),
                     })
                 }
                 PlanNode::Filter { input, predicate } => {
-                    let rel = take(&mut rels, *input)?;
+                    let rel = self.input(&mut rels, v, *input)?;
                     self.filter(v, *input, rel, predicate, &mut rels)?
                 }
                 PlanNode::SemiJoin {
@@ -1920,7 +2142,7 @@ impl<'p, 'a> Pricer<'p, 'a> {
                     columns,
                     keys,
                 } => {
-                    let rel = take(&mut rels, *input)?;
+                    let rel = self.input(&mut rels, v, *input)?;
                     self.keyed(v, *input, rel, columns, keys, &mut rels)?
                 }
                 PlanNode::Window {
@@ -1928,14 +2150,24 @@ impl<'p, 'a> Pricer<'p, 'a> {
                     partition_by,
                     keys,
                 } => {
-                    let rel = take(&mut rels, *input)?;
-                    match keys {
+                    let rel = self.input(&mut rels, v, *input)?;
+                    let rel = match keys {
                         None => rel,
                         Some(k) => self.keyed(v, *input, rel, partition_by, k, &mut rels)?,
+                    };
+                    // A window computes over whole partitions: a node
+                    // above narrows its read only by whole partitions.
+                    let cols = self.dataset_columns(v, *input, partition_by)?;
+                    match rel.side.clone() {
+                        Some(mut side) => {
+                            side.groups.push(cols);
+                            rel.with_side(side)
+                        }
+                        None => rel,
                     }
                 }
                 PlanNode::Latest { input, columns, ts } | PlanNode::AsOf { input, columns, ts } => {
-                    let rel = take(&mut rels, *input)?;
+                    let rel = self.input(&mut rels, v, *input)?;
                     let asof = if matches!(node, PlanNode::AsOf { .. }) {
                         self.asof
                     } else {
@@ -1960,22 +2192,22 @@ impl<'p, 'a> Pricer<'p, 'a> {
                     on,
                     kind,
                 } => {
-                    let l = take(&mut rels, *left)?;
-                    let r = take(&mut rels, *right)?;
+                    let l = self.input(&mut rels, v, *left)?;
+                    let r = self.input(&mut rels, v, *right)?;
                     self.join(v, (*left, l), (*right, r), on, *kind)?
                 }
                 PlanNode::Aggregate {
                     input, group_by, ..
                 } => {
-                    let rel = take(&mut rels, *input)?;
+                    let rel = self.input(&mut rels, v, *input)?;
                     self.aggregate(v, *input, rel, group_by)?
                 }
                 PlanNode::Exchange { input, .. } => {
-                    let rel = take(&mut rels, *input)?;
+                    let rel = self.input(&mut rels, v, *input)?;
                     moved = Some(self.moved(&rel)?);
                     rel
                 }
-                PlanNode::Project { input, .. } => take(&mut rels, *input)?,
+                PlanNode::Project { input, .. } => self.input(&mut rels, v, *input)?,
             };
             let model = self.model_of(&rel);
             let bytes = match moved {
@@ -1988,6 +2220,15 @@ impl<'p, 'a> Pricer<'p, 'a> {
                 bytes: Self::quantity(bytes, model.as_ref()),
                 rows_out: Self::quantity(rel.rows, model.as_ref()),
             });
+            let consumers = self.checked.consumers(v);
+            if consumers > 1 {
+                let est = self.moved(&rel)?;
+                shared.push(SharedOutput {
+                    node: v,
+                    consumers,
+                    estimate: (est.lo, est.hi),
+                });
+            }
             rels[v as usize] = Some(rel);
         }
         let root = rels[plan.root as usize]
@@ -1996,11 +2237,21 @@ impl<'p, 'a> Pricer<'p, 'a> {
         let model = self.model_of(&root);
         let mut files = 0u64;
         let mut row_groups = 0u64;
-        for s in root.sides() {
-            files += self.side_files(s)?;
-            row_groups += s.rgs.len();
+        let mut bytes = 0u64;
+        let mut reads = Vec::new();
+        for (scan, (d, rgs)) in root.occurrences() {
+            let b = self.read_bytes(scan, d, &rgs)?;
+            files += self.read_files(d, &rgs)?;
+            row_groups += rgs.len();
+            bytes = bytes.saturating_add(b);
+            reads.push(ScanRead {
+                node: scan,
+                dataset: d.to_string(),
+                row_groups: rgs.iter().collect(),
+                bytes: b,
+            });
         }
-        let bytes = self.rel_bytes(&root)?;
+        shared.sort_by_key(|s: &SharedOutput| s.node);
         let exactness = match &model {
             Some(m) => Exactness::Measured { model: m.clone() },
             None => Exactness::Exact,
@@ -2022,6 +2273,8 @@ impl<'p, 'a> Pricer<'p, 'a> {
                 measured: None,
             },
             operators,
+            reads,
+            shared,
             model,
             unserved: self.unserved,
         })
@@ -2097,9 +2350,7 @@ impl<'p, 'a> Pricer<'p, 'a> {
         let Some(side) = rel.side.clone() else {
             // Rows derived from several scans: no index holds them.
             if let KeysFrom::Node { node, .. } = keys {
-                let src = rels[*node as usize].take().ok_or_else(|| {
-                    invalid(Some(v), "its key source was priced for another node")
-                })?;
+                let src = self.input(rels, v, *node)?;
                 let mut reads = rel.reads;
                 reads.extend(src.into_reads());
                 return Ok(Rel {
@@ -2126,21 +2377,13 @@ impl<'p, 'a> Pricer<'p, 'a> {
         else {
             return Err(invalid(Some(v), "keys without a source"));
         };
-        let src = rels[*node as usize]
-            .take()
-            .ok_or_else(|| invalid(Some(v), "its key source was priced for another node"))?;
-        let Some(rside) = src.side.clone() else {
-            return Err(ReplayError::JoinNotIndexed {
-                node: v,
-                side: "keys",
-                dataset: format!("node {node}"),
-                columns: from.clone(),
-                derived: Some(
-                    "the keys come from rows derived from several scans (a join or an \
-                     aggregate below), which no index holds"
-                        .into(),
-                ),
-            });
+        let src = self.input(rels, v, *node)?;
+        // Keys from rows derived from several scans: matched through the
+        // scan their columns come from, which bounds them.
+        let sderived = src.side.is_none();
+        let rside = match &src.side {
+            Some(s) => s.clone(),
+            None => self.proxy(v, "keys", *node, &src, from)?,
         };
         let rcols = self.dataset_columns(v, *node, from)?;
         let m = self.merge(v, ("left", &side, &cols), ("keys", &rside, &rcols))?;
@@ -2155,14 +2398,18 @@ impl<'p, 'a> Pricer<'p, 'a> {
             (false, _) => Iv::new(0, hi),
         };
         let mut reads = rel.reads;
-        reads.push(Side {
-            rgs: m.rrgs.clone(),
-            ..rside
-        });
-        reads.extend(src.reads);
+        if sderived {
+            reads.extend(src.into_reads());
+        } else {
+            reads.push(Side {
+                rgs: rside.read(Some(&rcols), m.rrgs.clone()),
+                ..rside
+            });
+            reads.extend(src.reads);
+        }
         Ok(Rel {
             side: Some(Side {
-                rgs: m.lrgs,
+                rgs: side.read(Some(&cols), m.lrgs),
                 rows,
                 sel: Sel::Other,
                 ..side
@@ -2172,6 +2419,63 @@ impl<'p, 'a> Pricer<'p, 'a> {
         })
     }
 
+    /// The scan rows a derived input's (a join's, an aggregate's) column
+    /// `names` take their values from: every read below `rel` of the one
+    /// scan those columns resolve to, its row groups unioned, with no
+    /// proof about which of its rows the derived rows hold. Every value the
+    /// derived rows carry on those columns is a value of those rows, so its
+    /// keys bound the derived keys from above; never its rows (a join
+    /// below multiplies them).
+    fn proxy(
+        &self,
+        v: u32,
+        which: &'static str,
+        input: u32,
+        rel: &Rel,
+        names: &[String],
+    ) -> ReplayResult<Side> {
+        let cols: Vec<Col> = names
+            .iter()
+            .map(|n| self.column_of(v, input, n))
+            .collect::<ReplayResult<_>>()?;
+        let scan = cols.first().map(|c| c.scan);
+        let refused = || ReplayError::JoinNotIndexed {
+            node: v,
+            side: which,
+            dataset: format!("node {input}"),
+            columns: names.to_vec(),
+            derived: Some(
+                "those columns come from more than one scan below a join or an aggregate, so no \
+                 one index holds their tuples"
+                    .into(),
+            ),
+        };
+        let Some(scan) = scan.filter(|s| cols.iter().all(|c| c.scan == *s)) else {
+            return Err(refused());
+        };
+        let mut out: Option<Side> = None;
+        for s in rel.sides().filter(|s| s.scan == scan) {
+            match &mut out {
+                Some(o) => o.rgs |= &s.rgs,
+                None => {
+                    out = Some(Side {
+                        rows: Iv::new(0, rel.rows.hi),
+                        sel: Sel::Other,
+                        groups: Vec::new(),
+                        ..s.clone()
+                    });
+                }
+            }
+        }
+        out.ok_or_else(refused)
+    }
+
+    /// A two-sided join (module docs). A side that is rows derived from
+    /// several scans (a join or an aggregate below) is matched through the
+    /// scan its join columns come from ([`Pricer::proxy`]): it narrows the
+    /// other side's read to the row groups holding a key of those rows,
+    /// its own read stays as priced below, and the rows are bounded by the
+    /// derived rows (never counted from the index).
     fn join(
         &mut self,
         v: u32,
@@ -2182,38 +2486,41 @@ impl<'p, 'a> Pricer<'p, 'a> {
     ) -> ReplayResult<Rel> {
         let lnames: Vec<String> = on.iter().map(|(a, _)| a.clone()).collect();
         let rnames: Vec<String> = on.iter().map(|(_, b)| b.clone()).collect();
-        let derived = |which: &'static str, i: u32, names: &[String]| ReplayError::JoinNotIndexed {
-            node: v,
-            side: which,
-            dataset: format!("node {i}"),
-            columns: names.to_vec(),
-            derived: Some(
-                "that side is rows derived from several scans (a join or an aggregate below), \
-                 which no index holds"
-                    .into(),
-            ),
+        let (lderived, rderived) = (l.side.is_none(), r.side.is_none());
+        let ls = match &l.side {
+            Some(s) => s.clone(),
+            None => self.proxy(v, "left", li, &l, &lnames)?,
         };
-        let Some(ls) = l.side.clone() else {
-            return Err(derived("left", li, &lnames));
-        };
-        let Some(rs) = r.side.clone() else {
-            return Err(derived("right", ri, &rnames));
+        let rs = match &r.side {
+            Some(s) => s.clone(),
+            None => self.proxy(v, "right", ri, &r, &rnames)?,
         };
         let lcols = self.dataset_columns(v, li, &lnames)?;
         let rcols = self.dataset_columns(v, ri, &rnames)?;
         let m = self.merge(v, ("left", &ls, &lcols), ("right", &rs, &rcols))?;
         let pure = m.lpure && m.rpure;
-        let side_hi = |s: &Side, rgs: &RoaringBitmap, sum: Option<u64>| -> ReplayResult<u64> {
+        // Rows of a side that can meet the other: a scan's rows are
+        // bounded by the row groups and counts of the common keys; derived
+        // rows only by their own interval.
+        let side_hi = |s: &Side,
+                       rel: &Rel,
+                       derived: bool,
+                       rgs: &RoaringBitmap,
+                       sum: Option<u64>|
+         -> ReplayResult<u64> {
+            if derived {
+                return Ok(rel.rows.hi);
+            }
             let mut hi = s.rows.hi.min(self.rows_of(&s.dataset, rgs)?);
             if let Some(x) = sum {
                 hi = hi.min(x);
             }
             Ok(hi)
         };
-        let nl = side_hi(&ls, &m.lrgs, m.lsum)?;
-        let nr = side_hi(&rs, &m.rrgs, m.rsum)?;
+        let nl = side_hi(&ls, &l, lderived, &m.lrgs, m.lsum)?;
+        let nr = side_hi(&rs, &r, rderived, &m.rrgs, m.rsum)?;
         let mut inner_hi = sat(u128::from(nl) * u128::from(nr));
-        if let Some(p) = m.prod {
+        if let (Some(p), false, false) = (m.prod, lderived, rderived) {
             inner_hi = inner_hi.min(sat(p));
         }
         let inner = match (pure, m.prod) {
@@ -2224,29 +2531,36 @@ impl<'p, 'a> Pricer<'p, 'a> {
             }
             (false, _) => Iv::new(0, inner_hi),
         };
-        let (rows, left_read) = match kind {
-            JoinKind::Inner => (
-                inner,
-                Side {
-                    rgs: m.lrgs.clone(),
-                    ..ls
-                },
-            ),
-            JoinKind::Left => {
-                // Every left row is output, matched or not: the left side
-                // reads all its row groups.
-                let rows = match (pure, m.prod, m.lsum, ls.rows.lo == ls.rows.hi) {
-                    (true, Some(p), Some(s), true) => {
-                        Iv::exact(sat(p).saturating_add(ls.rows.hi.saturating_sub(s)))
-                    }
-                    _ => Iv::new(ls.rows.lo, inner.hi.saturating_add(ls.rows.hi)),
-                };
-                (rows, ls)
-            }
+        let rows = match kind {
+            JoinKind::Inner => inner,
+            // Every left row is output at least once, matched or not.
+            JoinKind::Left => match (pure, m.prod, m.lsum, l.rows.lo == l.rows.hi) {
+                (true, Some(p), Some(s), true) => {
+                    Iv::exact(sat(p).saturating_add(l.rows.hi.saturating_sub(s)))
+                }
+                _ => Iv::new(l.rows.lo, inner.hi.saturating_add(l.rows.hi)),
+            },
         };
-        let mut reads = vec![left_read, Side { rgs: m.rrgs, ..rs }];
-        reads.extend(l.reads);
-        reads.extend(r.reads);
+        let mut reads = Vec::new();
+        if lderived {
+            reads.extend(l.into_reads());
+        } else {
+            // A left join outputs every left row: its left side reads all
+            // its row groups.
+            let rgs = match kind {
+                JoinKind::Inner => ls.read(Some(&lcols), m.lrgs.clone()),
+                JoinKind::Left => ls.rgs.clone(),
+            };
+            reads.push(Side { rgs, ..ls });
+            reads.extend(l.reads);
+        }
+        if rderived {
+            reads.extend(r.into_reads());
+        } else {
+            let rgs = rs.read(Some(&rcols), m.rrgs);
+            reads.push(Side { rgs, ..rs });
+            reads.extend(r.reads);
+        }
         Ok(Rel {
             side: None,
             reads,
@@ -2358,13 +2672,17 @@ impl<'p, 'a> Pricer<'p, 'a> {
         }
     }
 
-    /// The compressed bytes `rel`'s rows move in an exchange: its rows
-    /// times the compressed width of a row over each side's planned row
-    /// groups, rounded outward.
+    /// The compressed-equivalent bytes of `rel`'s rows: its rows times the
+    /// average compressed width of a row over each side's planned row
+    /// groups, rounded outward. A side reached by two paths (a self-join)
+    /// carries its columns twice in an output row, so it counts per path.
+    /// Bounded with respect to that definition (the rows are an interval
+    /// that holds the truth); the width is a model of the in-memory width,
+    /// which no statistic gives.
     fn moved(&self, rel: &Rel) -> ReplayResult<Iv> {
         let (mut lo, mut hi) = (0u128, 0u128);
         for s in rel.sides() {
-            let bytes = u128::from(self.side_bytes(s)?);
+            let bytes = u128::from(self.read_bytes(s.scan, &s.dataset, &s.rgs)?);
             let rows = u128::from(self.rows_of(&s.dataset, &s.rgs)?);
             if rows == 0 {
                 continue;

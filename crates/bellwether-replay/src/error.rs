@@ -132,8 +132,8 @@ fn join_not_indexed(
 ) -> String {
     match derived {
         Some(why) => format!(
-            "consumer plan node {node} joins on its {side} side ({dataset}: {}), and {why}; \
-             join the scans' rows first and aggregate after, or price the two steps as two plans",
+            "consumer plan node {node} joins on its {side} side ({dataset}: {}), and {why}; join \
+             on columns that all come from one scan, or split the join into one per scan",
             columns.join(", ")
         ),
         None => format!(

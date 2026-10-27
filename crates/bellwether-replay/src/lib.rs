@@ -75,7 +75,10 @@ pub use plan::{
     run_cost, servable, serves_bitemporal, serves_query, serves_window, serving_temporal_column,
     text_residual, Lookup, PlanSource, RangeRead, SegmentBytes, SegmentPlanner, SpecSegments,
 };
-pub use relational::{check_shape, op_name, CheckedPlan, PricedPlan, MAIN_DATASET, PLAN_VERSION};
+pub use relational::{
+    check_shape, children, op_name, CheckedPlan, PricedPlan, ScanRead, SharedOutput, MAIN_DATASET,
+    PLAN_VERSION,
+};
 pub use replay::{proposed_specs, write_replay, PricedRuns, Replayer, Scored, DEFAULT_CACHE_BYTES};
 pub use report::{
     nearest_rank, p50_p95_max, report, CostQuantiles, Report, RunRow, TemplateSummary,

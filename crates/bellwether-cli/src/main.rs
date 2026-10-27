@@ -241,9 +241,10 @@ struct WhyArgs {
     /// keys whose newest row is a tombstone.
     #[arg(long, value_name = "COL[=VALUE]", conflicts_with = "lookback")]
     tombstone: Option<String>,
-    /// The instant for `asof` pricing (with `--latest-by`): RFC 3339, a date
-    /// (YYYY-MM-DD), or an integer in the timestamp column's unit.
-    #[arg(long, value_name = "INSTANT", requires = "latest_by")]
+    /// The instant for `asof` pricing (with `--latest-by`), or of a
+    /// consumer plan's as_of nodes (with `--plan`): RFC 3339, a date
+    /// (YYYY-MM-DD), or an integer in the version column's unit.
+    #[arg(long, value_name = "INSTANT")]
     at: Option<String>,
     /// Price every version in a window instead of one per key: the
     /// versions in [at − N, at] (asof) or [newest − N, newest] (latest). A
@@ -338,6 +339,15 @@ struct WhyArgs {
         requires = "value"
     )]
     functions: Vec<String>,
+    /// A consumer plan (relational replay): a JSON file of a typed plan
+    /// DAG ({"version": 1, "nodes": [...], "root": N}), read only. Each
+    /// --from run is priced through it under the current configuration and
+    /// each candidate key drawn from the columns its filters, joins,
+    /// windows, and aggregates name, beside an operator table. The datasets
+    /// it scans besides this folder are bound with --dataset NAME=ROOT;
+    /// --at gives its as_of nodes their instant.
+    #[arg(long, value_name = "FILE", requires = "from")]
+    plan: Option<PathBuf>,
 }
 
 /// `--gate NAME:N`.
@@ -1474,6 +1484,9 @@ fn why(g: &Global, out: &Out, a: &WhyArgs) -> Result<Outcome, Failure> {
                 })
             })
             .transpose()?,
+        plan: a.plan.clone(),
+        // Every dataset the plan names, each bound with --dataset.
+        datasets: Vec::new(),
     };
     // Text lookups take none of the lookup-mode flags; the facade refuses
     // them first, with that cause.

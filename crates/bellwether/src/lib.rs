@@ -39,6 +39,7 @@ mod join;
 mod keys;
 mod ledger_views;
 mod lookback;
+mod plans;
 mod propose;
 mod receipt;
 mod reconcile;
@@ -106,6 +107,7 @@ pub use twin::{
     EngineWorkload, GateFit, TwinCandidate, TwinColumns, TwinReport, CARDINALITY_RATIO,
     LOW_CARDINALITY_ROWS, MEMBERSHIP_GATE, NARROW_PERCENT, SELECTIVE_FILES_PERCENT,
 };
+pub use plans::{PlanDataset, PlanRead, PlanReport, SharedEstimate, SHARED_ESTIMATE_MODEL};
 pub use why::{
     AggregateQuery, Candidate, CandidateOrigin, Culprit, CulpritReason, Dataset, DiagnosisReads,
     LookupMode, ProfileEvidence, Recommendation, TextMatch, TimeWindow, WhyReport, WhyRequest,

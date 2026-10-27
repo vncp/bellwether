@@ -602,10 +602,15 @@ impl Engine {
                 let source = self.source(pinned.as_ref())?;
                 // A join key is priced and verified on both datasets.
                 let pair = self.pair_of(pinned.as_ref(), spec)?;
-                let replayer =
-                    with_pair(replayer(self, &*source, pinned.as_ref())?, pair.as_ref())?;
                 let cache = self.cache()?;
                 let workload = load_workload(self, &cache, &workload_hash)?;
+                // Plan runs (WP15) read the datasets their plans scan.
+                check_plan_key(&specs, &workload)?;
+                let datasets = self.workload_datasets(&workload, &cache)?;
+                let replayer = datasets.attach(with_pair(
+                    replayer(self, &*source, pinned.as_ref())?,
+                    pair.as_ref(),
+                )?)?;
                 // 1. Score.
                 let mut replay_hash = None;
                 if self.is_table() {
@@ -738,10 +743,16 @@ impl Engine {
                     before,
                     pinned.as_ref().map(anchor).as_ref(),
                 ),
+            ProposalBody::Rewrite { shape }
+                if shape.before_plan.is_some() && shape.after_plan.is_some() =>
+            {
+                self.fix_plan_rewrite(result, hash, &proposal, shape, req, pinned.as_ref())
+            }
             ProposalBody::Rewrite { shape } => {
                 result.score = Some(Score::NotScorable {
-                    reason: "the replay crate defines no replay for rewrite proposals (contract \
-                             v3 backlog #2)"
+                    reason: "a rewrite described in words has no replay: give its before and \
+                             after shapes as consumer plans (shape.before_plan and \
+                             shape.after_plan) for relational replay to price them"
                         .into(),
                 });
                 result.invariant = Some(shape.invariant.clone());
@@ -895,6 +906,20 @@ impl Engine {
                 }
                 result.outcome = refused(self.attest_only(cert_hash, body)?);
             }
+            ProposalBody::Rewrite { shape }
+                if shape.before_plan.is_some() && shape.after_plan.is_some() =>
+            {
+                return self.apply_plan_rewrite(
+                    result,
+                    cert_hash,
+                    &proposal_hash,
+                    &proposal,
+                    shape,
+                    before,
+                    dry_run,
+                    allow_no_gain,
+                );
+            }
             ProposalBody::Rewrite { shape } => {
                 result.invariant = Some(shape.invariant.clone());
                 result.outcome = refused(Refusal::NoReplay {
@@ -955,10 +980,13 @@ impl Engine {
                     },
                     None => None,
                 };
-                let replayer =
-                    with_pair(replayer(self, &*source, pinned.as_ref())?, pair.as_ref())?;
                 let cache = self.cache()?;
                 let workload = load_workload(self, &cache, workload)?;
+                let datasets = self.workload_datasets(&workload, &cache)?;
+                let replayer = datasets.attach(with_pair(
+                    replayer(self, &*source, pinned.as_ref())?,
+                    pair.as_ref(),
+                )?)?;
                 let (replay, current_cost, proposed_cost) =
                     self.score(&replayer, &proposal_hash, &workload, &cache)?;
                 let replay_hash = replay.hash;
@@ -1656,8 +1684,12 @@ impl Engine {
             [spec] => self.pair_of(pinned.as_ref(), spec)?,
             _ => None,
         };
-        let replayer = with_pair(replayer(self, &*source, pinned.as_ref())?, pair.as_ref())?;
         let cache = self.cache()?;
+        let datasets = self.workload_datasets(workload, &cache)?;
+        let replayer = datasets.attach(with_pair(
+            replayer(self, &*source, pinned.as_ref())?,
+            pair.as_ref(),
+        )?)?;
         let (replay, _, _) = self.score(&replayer, proposal, workload, &cache)?;
         Ok(Some(Box::new(replay)))
     }
@@ -1824,6 +1856,337 @@ impl Engine {
             });
         }
         Ok(out)
+    }
+}
+
+/// A key proposal over a workload of consumer-plan runs (WP15) is verified
+/// as any key is, by looking each run's keys up through the configuration
+/// the apply commits and reconciling against a full scan; a spec that does
+/// not look up the runs' own key columns would go unexercised by that
+/// check, so it is refused rather than certified unchecked.
+fn check_plan_key(specs: &[KeySpec], workload: &Workload) -> Result<()> {
+    let Some(run) = workload.runs().iter().find(|r| r.plan.is_some()) else {
+        return Ok(());
+    };
+    for s in specs {
+        if !matches!(
+            bellwether_replay::servable(s, &run.columns),
+            Some(bellwether_replay::Lookup::Point { .. })
+        ) {
+            return Err(Error::InvalidArgument {
+                field: "workload",
+                reason: format!(
+                    "{} is priced through the workload's consumer plans, and fix verifies a key \
+                     by looking the runs' keys ({}) up through it, which {} does not serve, so \
+                     the certificate would not exercise it; record a workload whose runs look \
+                     up its columns (bellwether why --from <keys on {}> --plan <plan.json>) and \
+                     fix the key on that",
+                    crate::spec::label(s),
+                    run.columns.join(", "),
+                    crate::spec::label(s),
+                    s.columns().join(",")
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// A rewrite whose shape carries a before and an after consumer plan
+/// (relational replay, WP15).
+impl Engine {
+    /// The workload a plan rewrite is priced over: the request's, else the
+    /// shape's key sample.
+    fn rewrite_workload(
+        &self,
+        given: Option<Hash>,
+        shape: &bellwether_types::RewriteShape,
+        cache: &Cache<ObjectStoreBackend>,
+    ) -> Result<Workload> {
+        let h = given.or(shape.keys).ok_or(Error::NoWorkload {
+            proposal: "rewrite",
+            field: "workload",
+            needs: "a recorded workload whose runs' keys feed its plans (why --from <keys> --plan \
+                    <plan.json> records one), given with the request or as the shape's keys",
+        })?;
+        load_workload(self, cache, &h)
+    }
+
+    /// Scores a plan rewrite now: per run, the before plan as current and
+    /// the after plan as proposed, under the current configuration of
+    /// every dataset they scan (each bound by its operator). Over a table
+    /// the replay is measured and not recorded (ADR 027); otherwise it is
+    /// written, measured (naming the model) only when a plan reads a table.
+    fn score_plan_rewrite(
+        &self,
+        proposal: &Hash,
+        shape: &bellwether_types::RewriteShape,
+        workload: &Workload,
+        cache: &Cache<ObjectStoreBackend>,
+        pinned: Option<&Pinned>,
+    ) -> Result<(Written, Score)> {
+        let plans: Vec<bellwether_types::ConsumerPlan> = shape
+            .before_plan
+            .iter()
+            .chain(&shape.after_plan)
+            .cloned()
+            .collect();
+        let datasets = self.datasets_for(&[], &plans)?;
+        let source = self.source(pinned)?;
+        let replayer = datasets.attach(replayer(self, &*source, pinned)?)?;
+        let (written, model) = if self.is_table() {
+            let (h, scored) = measured_score(self, &replayer, proposal, workload, cache)?;
+            (
+                Written {
+                    hash: h,
+                    record: Record::Replay(scored.replay),
+                },
+                Some(MEASURED_AGGREGATES.to_string()),
+            )
+        } else {
+            let (w, _, _) = self.score(&replayer, proposal, workload, cache)?;
+            let model = match &w.record {
+                Record::Replay(r) => r.model.clone(),
+                _ => None,
+            };
+            (w, model)
+        };
+        let Record::Replay(r) = &written.record else {
+            return Err(Error::Other("a replay scored is not a replay".into()));
+        };
+        let (current, proposed) = (total(&r.current), total(&r.proposed));
+        let score = match model {
+            Some(model) => Score::Measured {
+                replay: Box::new(written.clone()),
+                current,
+                proposed,
+                model,
+            },
+            None => Score::Replayed {
+                replay: Box::new(written.clone()),
+                current,
+                proposed,
+            },
+        };
+        Ok((written, score))
+    }
+
+    /// `fix --proposal` for a plan rewrite: the workload, the score, the
+    /// gain gate, then the reconcile of the actual before and after
+    /// outputs (a certificate of the outputs, never of the plans), the
+    /// trust gate, and an attest-only receipt: the engine runs no query, so
+    /// it applies nothing; a human deploys the after shape.
+    fn fix_plan_rewrite(
+        &self,
+        mut result: FixResult,
+        hash: &Hash,
+        proposal: &Proposal,
+        shape: &bellwether_types::RewriteShape,
+        req: &FixRequest,
+        pinned: Option<&Pinned>,
+    ) -> Result<FixResult> {
+        result.invariant = Some(shape.invariant.clone());
+        let outputs = req.rewrite.as_ref().ok_or(Error::NoWorkload {
+            proposal: "rewrite",
+            field: "rewrite",
+            needs: "the outputs before and after it",
+        })?;
+        let cache = self.cache()?;
+        let workload = self.rewrite_workload(req.workload, shape, &cache)?;
+        // 1. Score, and the gain gate (not on a verify-only run, which
+        // applies nothing; applying its certificate scores and gates).
+        let (replay, score) = self.score_plan_rewrite(hash, shape, &workload, &cache, pinned)?;
+        let (current, proposed) = match &score {
+            Score::Replayed {
+                current, proposed, ..
+            }
+            | Score::Measured {
+                current, proposed, ..
+            } => (*current, *proposed),
+            Score::NotScorable { .. } => (Cost::default(), Cost::default()),
+        };
+        result.score = Some(score);
+        if let Some(r) = no_gain(
+            &replay.hash,
+            &current,
+            &proposed,
+            req.allow_no_gain || req.verify_only,
+        ) {
+            result.outcome = refused(r);
+            return Ok(result);
+        }
+        // 2. Verify: the actual outputs.
+        let (cert, verification) = self.verify_rewrite(hash, outputs, pinned)?;
+        result.verification = Some(verification);
+        let certificate = cert_of(&cert)?.clone();
+        result.certificate = Some(cert.clone());
+        if let Some(r) = failed(&cert.hash, &certificate) {
+            result.outcome = refused(r);
+            return Ok(result);
+        }
+        if req.verify_only {
+            result.signatures = self.sign_written(&[(cert.hash, RecordKind::Certificate)], None)?;
+            return Ok(result);
+        }
+        if self.is_table() {
+            result.outcome = refused(self.attest_only(&cert.hash, &proposal.body)?);
+            return Ok(result);
+        }
+        // 3 and 4, behind the trust-boundary gate.
+        match self.gate(&cert.hash, &certificate, false)? {
+            Err(r) => result.outcome = refused(r),
+            Ok(before) => {
+                (result.outcome, result.signatures) =
+                    self.attest_plan_rewrite(proposal, hash, shape, &replay, &cert.hash, true, before)?;
+            }
+        }
+        Ok(result)
+    }
+
+    /// `fix --certificate` for a plan rewrite: the certificate reconciled
+    /// the outputs earlier; the replay is recomputed now over the shape's
+    /// key sample and gated, then the attest-only receipt. A dry run writes
+    /// nothing (no replay is scored).
+    #[allow(clippy::too_many_arguments)]
+    fn apply_plan_rewrite(
+        &self,
+        mut result: FixResult,
+        cert_hash: &Hash,
+        proposal_hash: &Hash,
+        proposal: &Proposal,
+        shape: &bellwether_types::RewriteShape,
+        before: u64,
+        dry_run: bool,
+        allow_no_gain: bool,
+    ) -> Result<FixResult> {
+        result.invariant = Some(shape.invariant.clone());
+        let cache = self.cache()?;
+        let workload = self.rewrite_workload(None, shape, &cache)?;
+        if dry_run {
+            // What the real apply opens: every dataset bound and each plan
+            // valid against it.
+            let plans: Vec<bellwether_types::ConsumerPlan> = shape
+                .before_plan
+                .iter()
+                .chain(&shape.after_plan)
+                .cloned()
+                .collect();
+            let datasets = self.datasets_for(&[], &plans)?;
+            let pinned = self.pin()?;
+            let source = self.source(pinned.as_ref())?;
+            let replayer = datasets.attach(replayer(self, &*source, pinned.as_ref())?)?;
+            for p in &plans {
+                replayer.check_plan(p).map_err(Error::from)?;
+            }
+            result.outcome = FixOutcome::WouldApply {
+                sequence: before,
+                expected: before,
+            };
+            return Ok(result);
+        }
+        let pinned = self.pin()?;
+        let (replay, score) =
+            self.score_plan_rewrite(proposal_hash, shape, &workload, &cache, pinned.as_ref())?;
+        let (current, proposed) = match &score {
+            Score::Replayed {
+                current, proposed, ..
+            }
+            | Score::Measured {
+                current, proposed, ..
+            } => (*current, *proposed),
+            Score::NotScorable { .. } => (Cost::default(), Cost::default()),
+        };
+        result.score = Some(score);
+        if let Some(r) = no_gain(&replay.hash, &current, &proposed, allow_no_gain) {
+            result.outcome = refused(r);
+            return Ok(result);
+        }
+        (result.outcome, result.signatures) = self.attest_plan_rewrite(
+            proposal,
+            proposal_hash,
+            shape,
+            &replay,
+            cert_hash,
+            false,
+            before,
+        )?;
+        Ok(result)
+    }
+
+    /// The attest-only receipt of a plan rewrite, after one last check that
+    /// every dataset its replay read is the data now (the data root's and
+    /// each bound dataset's catalog digest among the replay's inputs): a
+    /// dataset that changed between the score and the attest would make the
+    /// receipt cite another data's numbers, so it is refused
+    /// ([`Refusal::DataChanged`]) with nothing written.
+    #[allow(clippy::too_many_arguments)]
+    fn attest_plan_rewrite(
+        &self,
+        proposal: &Proposal,
+        proposal_hash: &Hash,
+        shape: &bellwether_types::RewriteShape,
+        replay: &Written,
+        cert: &Hash,
+        certificate_written: bool,
+        manifest: u64,
+    ) -> Result<(FixOutcome, Vec<SignatureWritten>)> {
+        #[cfg(test)]
+        test_seam::before_apply(self);
+        let Record::Replay(r) = &replay.record else {
+            return Err(Error::Other("a replay written is not a replay".into()));
+        };
+        let plans: Vec<bellwether_types::ConsumerPlan> = shape
+            .before_plan
+            .iter()
+            .chain(&shape.after_plan)
+            .cloned()
+            .collect();
+        let datasets = self.datasets_for(&[], &plans)?;
+        let pinned = self.pin()?;
+        let source = self.source(pinned.as_ref())?;
+        let main = replayer(self, &*source, pinned.as_ref())?.catalog().digest();
+        for now in std::iter::once(main).chain(datasets.digests()?) {
+            if !r.inputs.contains(&now) {
+                return Ok((
+                    refused(Refusal::DataChanged {
+                        certificate: *cert,
+                        certified: None,
+                        current: now,
+                    }),
+                    Vec::new(),
+                ));
+            }
+        }
+        let receipt = Receipt {
+            record_version: format::RECORD_VERSION,
+            evidence: proposal.evidence.clone(),
+            proposal: *proposal_hash,
+            replay: replay.hash,
+            certificate: *cert,
+            manifest_before: manifest.to_string(),
+            manifest_after: manifest.to_string(),
+            created_at: self.now(),
+            attest_only: true,
+            prediction: r.prediction.clone(),
+        };
+        let now = self.manifest()?.map_or(0, |m| m.sequence);
+        let hash = self.ledger()?.put_receipt(&receipt, &now.to_string())?;
+        let mut signed = vec![(hash, RecordKind::Receipt)];
+        if certificate_written {
+            signed.push((*cert, RecordKind::Certificate));
+        }
+        let signatures = self.sign_written(&signed, None)?;
+        Ok((
+            FixOutcome::Attested {
+                receipt: Box::new(Written {
+                    hash,
+                    record: Record::Receipt(receipt),
+                }),
+                target: self.root().to_string(),
+                deploy: Vec::new(),
+            },
+            signatures,
+        ))
     }
 }
 
