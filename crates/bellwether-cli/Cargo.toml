@@ -19,6 +19,10 @@ doc = false
 [features]
 # SQL Server tables through ODBC (links the system ODBC driver manager).
 odbc = ["bellwether/odbc"]
+# The DataFusion adapter's executable form, for the `--emit datafusion`
+# end-to-end tests that run the emitted scan (tests/emit.rs); the binary
+# prints the scan description and runs nothing either way.
+datafusion = ["bellwether-adapters/datafusion"]
 
 [dependencies]
 bellwether = { path = "../bellwether" }
@@ -26,6 +30,8 @@ bellwether = { path = "../bellwether" }
 bellwether-bench = { path = "../bellwether-bench" }
 # The `mcp` subcommand only: `bellwether mcp` is `bellwether-mcp`.
 bellwether-mcp = { path = "../bellwether-mcp" }
+# `--emit`: the plan translated for a query engine (WP16).
+bellwether-adapters = { path = "../bellwether-adapters" }
 # `env`: BELLWETHER_SIGNING_KEY and BELLWETHER_TRUSTED_KEYS (paths only).
 clap = { version = "4", features = ["derive", "env"] }
 serde = { workspace = true }
@@ -38,6 +44,8 @@ assert_cmd = "2"
 tempfile = { workspace = true }
 arrow = { workspace = true }
 parquet = { workspace = true, features = ["arrow"] }
+# Runs the emitted DataFusion scan in tests/emit.rs (feature `datafusion`).
+tokio = { workspace = true }
 
 [lints]
 workspace = true

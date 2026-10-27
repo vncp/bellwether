@@ -61,6 +61,19 @@ jobs:
           echo "BELLWETHER_DUCKDB_DRIVER=$RUNNER_TEMP/libduckdb/libduckdb.so" >> "$GITHUB_ENV"
       - name: install the ODBC driver manager (the `odbc` feature of bellwether-source-sql links it)
         run: sudo apt-get update && sudo apt-get install -y unixodbc-dev
+      # The engine adapters (bellwether-adapters, `--emit`) run their
+      # artifacts in real engines. Installed outside PATH and named only in
+      # the step that requires it, so no other test changes behavior. Spark
+      # runs in its own job (`spark`, below).
+      - name: install the DuckDB CLI v2.0.0 (the adapters run emitted SQL in it)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/duckdb-cli" && cd "$RUNNER_TEMP/duckdb-cli"
+          gh release download v2.0.0 --repo duckdb/duckdb --pattern 'duckdb-cli-linux-amd64.tar.gz'
+          echo 'c6507206baf7793c6013dbd82368469a45f20dc0e17a6f92f204602f652ed2bc  duckdb-cli-linux-amd64.tar.gz' | sha256sum -c -
+          tar -xzf duckdb-cli-linux-amd64.tar.gz
+          ./duckdb -no-agent --version
       - name: fmt
         run: cargo fmt --all -- --check
       # clippy and test both pass --workspace --all-features, so cargo
@@ -80,9 +93,58 @@ jobs:
           # this reuses its build instead of recompiling four crates.
           cargo test --workspace --all-features --test clickhouse -- --nocapture 2>&1 | tee clickhouse.log
           ! grep -q 'SKIPPED:' clickhouse.log
+      - name: the engine adapters ran in DataFusion and DuckDB (not skipped)
+        shell: bash
+        env:
+          BELLWETHER_DUCKDB: ${{ runner.temp }}/duckdb-cli/duckdb
+          BELLWETHER_REQUIRE_DATAFUSION: "1"
+          BELLWETHER_REQUIRE_DUCKDB: "1"
+        run: |
+          # The same feature set as the test step: its build is reused.
+          # With the REQUIRE variables a missing engine fails the run, and
+          # the grep catches any skip that slipped through. The Spark tests
+          # are the `spark` job's.
+          set -o pipefail
+          cargo test --workspace --all-features --test datafusion --test duckdb --test emit -- --nocapture --skip spark 2>&1 | tee adapters.log
+          ! grep -q 'SKIPPED:' adapters.log
       - name: disk left after the build
         if: always()
         run: df -h / && du -sh target
+
+  spark:
+    name: Spark shim (PySpark 4.2.0, Java 17)
+    runs-on: ubuntu-latest
+    env:
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/free-runner-disk
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: install Java 17 (Spark's runtime)
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - name: install PySpark 4.2.0 and pytest in a venv
+        run: |
+          python3 -m venv "$RUNNER_TEMP/spark-venv"
+          "$RUNNER_TEMP/spark-venv/bin/pip" install --quiet pyspark==4.2.0 pytest==9.1.1
+          "$RUNNER_TEMP/spark-venv/bin/python" -c 'import pyspark; print(pyspark.__version__)'
+      - name: the Spark shim and `--emit spark` ran in a local Spark session (not skipped)
+        shell: bash
+        env:
+          BELLWETHER_SPARK_PYTHON: ${{ runner.temp }}/spark-venv/bin/python
+          BELLWETHER_REQUIRE_SPARK: "1"
+        run: |
+          set -o pipefail
+          cargo test -p bellwether-adapters --test spark -- --nocapture 2>&1 | tee spark.log
+          cargo test -p bellwether-cli --test emit -- --nocapture spark 2>&1 | tee -a spark.log
+          grep -q 'test spark_runs_every_emitted_manifest_opening_only_the_planned_files ... ok' spark.log
+          ! grep -q 'SKIPPED:' spark.log
 
   format-compat:
     name: persisted format v0.1 fixture
