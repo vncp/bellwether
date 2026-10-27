@@ -38,7 +38,13 @@ pub mod format {
     /// `docs/contract-v3.md` lists every field it added). `Replay.unserved`
     /// (2026-10-26) is an additive label field under ADR 017's 2026-10-26
     /// amendment: an older reader drops it without misreading any other field.
-    pub const RECORD_VERSION: u32 = 3;
+    /// 4 (2026-10-26, B8 tombstones): a temporal or bitemporal
+    /// [`KeySpec`](crate::KeySpec) may carry a `tombstone` and a
+    /// [`Predicate`](crate::Predicate) may be `live`. A version 3 reader that
+    /// dropped the tombstone would read another key or another row filter,
+    /// so every record written now is version 4, which a version 3 reader
+    /// refuses before parsing it; version 1–3 records are read unchanged.
+    pub const RECORD_VERSION: u32 = 4;
     /// Version of the canonical byte encoding (ADR 016).
     pub const ENCODING_VERSION: u32 = 1;
 }
@@ -3053,6 +3059,12 @@ mod tests {
 mod schema_feature {
     use super::*;
 
+    /// Record version 3, frozen at M5 (ADR 028). The goldens of version 3
+    /// build their records at this literal, not at
+    /// [`format::RECORD_VERSION`]: a version 3 record's bytes stay the bytes
+    /// M5 wrote whatever version this build writes.
+    const V3: u32 = 3;
+
     /// One record of every kind, touching every field with custom serde
     /// (`Hash`, the row-group bitmap, the nanosecond age) and every tagged
     /// enum.
@@ -3069,7 +3081,7 @@ mod schema_feature {
         rgs.insert(70_000);
         vec![
             Record::Evidence(Evidence {
-                record_version: format::RECORD_VERSION,
+                record_version: V3,
                 provenance: provenance.clone(),
                 body: EvidenceBody::Plan {
                     plan: ScanPlan {
@@ -3099,7 +3111,7 @@ mod schema_feature {
                 },
             }),
             Record::Proposal(Proposal {
-                record_version: format::RECORD_VERSION,
+                record_version: V3,
                 evidence: vec![Hash::of(b"e")],
                 proposed_by: "agent".into(),
                 created_at: "2026-10-24T00:00:00.000Z".into(),
@@ -3118,7 +3130,7 @@ mod schema_feature {
             }),
             Record::Replay(Replay {
                 prediction: None,
-                record_version: format::RECORD_VERSION,
+                record_version: V3,
                 proposal: Hash::of(b"p"),
                 manifest_version: "3".into(),
                 workload: Hash::of(b"w"),
@@ -3142,7 +3154,7 @@ mod schema_feature {
                 operators: Vec::new(),
             }),
             Record::Certificate(Certificate {
-                record_version: format::RECORD_VERSION,
+                record_version: V3,
                 proposal: Some(Hash::of(b"p")),
                 coverage: Coverage::Sampled {
                     keys: 7,
@@ -3166,7 +3178,7 @@ mod schema_feature {
             Record::Receipt(Receipt {
                 attest_only: false,
                 prediction: None,
-                record_version: format::RECORD_VERSION,
+                record_version: V3,
                 evidence: vec![Hash::of(b"e")],
                 proposal: Hash::of(b"p"),
                 replay: Hash::of(b"r"),
@@ -3178,11 +3190,12 @@ mod schema_feature {
         ]
     }
 
-    /// The canonical bytes of every record kind at this record version,
+    /// The canonical bytes of every record kind at record version 3,
     /// pinned (the drift test). A field added, renamed or newly written, or
-    /// a derive that changed serialization, changes this hash; the fix is a
-    /// `RECORD_VERSION` bump with a fixture, never an edit of the golden
-    /// alone.
+    /// a derive that changed serialization, changes this hash; a version 3
+    /// record must keep its bytes (ADR 028), so the fix is never an edit of
+    /// the golden: a new shape is a new record version with its own golden
+    /// (`every_record_version_4_field_is_pinned`) and fixture.
     #[test]
     fn record_bytes_are_the_same_with_and_without_the_schema_feature() {
         let mut all = Vec::new();
@@ -3191,10 +3204,11 @@ mod schema_feature {
             all.push(b'\n');
         }
         assert_eq!(
-            (format::RECORD_VERSION, Hash::of(&all).to_hex().as_str()),
+            (V3, Hash::of(&all).to_hex().as_str()),
             GOLDEN,
-            "record bytes moved: bump RECORD_VERSION, add fixtures/format-<next>/ and read it in \
-             crates/bellwether-cli/tests/format_compat.rs, then pin the new golden"
+            "record version 3 bytes moved: a version 3 record must read and serialize as M5 \
+             wrote it; a new shape is a new RECORD_VERSION with a fixtures/format-<next>/ read \
+             in crates/bellwether-cli/tests/format_compat.rs and its own golden"
         );
     }
 
@@ -3331,7 +3345,7 @@ mod schema_feature {
         };
         vec![
             Record::Evidence(Evidence {
-                record_version: format::RECORD_VERSION,
+                record_version: V3,
                 provenance: provenance.clone(),
                 body: EvidenceBody::Plan {
                     plan: ScanPlan {
@@ -3373,7 +3387,7 @@ mod schema_feature {
                 },
             }),
             Record::Evidence(Evidence {
-                record_version: format::RECORD_VERSION,
+                record_version: V3,
                 provenance: provenance.clone(),
                 body: EvidenceBody::Profile {
                     root: "/data".into(),
@@ -3401,7 +3415,7 @@ mod schema_feature {
                 },
             }),
             Record::Proposal(Proposal {
-                record_version: format::RECORD_VERSION,
+                record_version: V3,
                 evidence: vec![Hash::of(b"e")],
                 proposed_by: "agent".into(),
                 created_at: "2026-10-25T00:00:00.000Z".into(),
@@ -3433,14 +3447,14 @@ mod schema_feature {
                 },
             }),
             Record::Proposal(Proposal {
-                record_version: format::RECORD_VERSION,
+                record_version: V3,
                 evidence: vec![Hash::of(b"e")],
                 proposed_by: "agent".into(),
                 created_at: "2026-10-25T00:00:00.000Z".into(),
                 body: ProposalBody::Rewrite { shape },
             }),
             Record::Replay(Replay {
-                record_version: format::RECORD_VERSION,
+                record_version: V3,
                 proposal: Hash::of(b"p"),
                 manifest_version: "3".into(),
                 workload: Hash::of(b"w"),
@@ -3463,7 +3477,7 @@ mod schema_feature {
                 created_at: "2026-10-25T00:00:00.000Z".into(),
             }),
             Record::Certificate(Certificate {
-                record_version: format::RECORD_VERSION,
+                record_version: V3,
                 proposal: Some(Hash::of(b"p")),
                 coverage: Coverage::Full,
                 pass: false,
@@ -3564,11 +3578,11 @@ mod schema_feature {
             assert!(text.contains(field), "{field} is not serialized");
         }
         assert_eq!(
-            (format::RECORD_VERSION, Hash::of(&all).to_hex().as_str()),
+            (V3, Hash::of(&all).to_hex().as_str()),
             GOLDEN_V3,
-            "record version 3 bytes moved: bump RECORD_VERSION, add fixtures/format-<next>/ \
-             and read it in crates/bellwether-cli/tests/format_compat.rs, then pin the new \
-             golden\n{text}"
+            "record version 3 bytes moved: a version 3 record must read and serialize as M5 \
+             wrote it; a new shape is a new RECORD_VERSION with a fixtures/format-<next>/ read \
+             in crates/bellwether-cli/tests/format_compat.rs and its own golden\n{text}"
         );
     }
 
@@ -3576,6 +3590,253 @@ mod schema_feature {
     const GOLDEN_V3: (u32, &str) = (
         3,
         "3a0b4e5617d7f91bbb26c399b27351355681eb6f56118212cb30a5e6b6376c14",
+    );
+
+    /// Every shape record version 4 added (B8 tombstones), each set to a
+    /// value that is not its default so it is serialized, in one record of
+    /// every kind at version 4: a temporal key proposed with a boolean
+    /// tombstone and a bitemporal one with a value tombstone, a rewrite whose
+    /// plan filters `live`, a plan whose residual ends in `live`, a replay
+    /// of a tombstone configuration, a certificate whose row filter is
+    /// `live`, and a receipt. The third golden.
+    #[allow(clippy::too_many_lines)]
+    fn every_v4_field() -> Vec<Record> {
+        let cols = |c: &[&str]| c.iter().map(|s| (*s).to_string()).collect::<Vec<_>>();
+        let void = Tombstone {
+            column: "void".into(),
+            value: None,
+        };
+        let cancel = Tombstone {
+            column: "status".into(),
+            value: Some("CANCEL".into()),
+        };
+        // Encoded values (ADR 016 encodings are opaque bytes to this crate):
+        // a boolean `true`, as the planner writes it, and a string value.
+        let live_void = Predicate::Live {
+            column: "void".into(),
+            tombstone: vec![0x01, 0x01],
+        };
+        let live_cancel = Predicate::Live {
+            column: "status".into(),
+            tombstone: b"\x01CANCEL".to_vec(),
+        };
+        let provenance = Provenance {
+            inputs: vec![Hash::of(b"input")],
+            oldest_input_age: Duration::from_nanos(11),
+            manifest_version: Some("2".into()),
+            created_at: "2026-10-26T00:00:00.000Z".into(),
+        };
+        let mut rgs = RoaringBitmap::new();
+        rgs.insert(2);
+        let not_older = Predicate::NotOlderThan {
+            columns: cols(&["id"]),
+            ts_column: "ts".into(),
+            bounds: vec![(
+                vec![0x01, 0x80, 0, 0, 0, 0, 0, 0, 0x07],
+                vec![0x01, 0x80, 0, 0, 0, 0, 0, 0, 0x05],
+            )],
+        };
+        let latest = Predicate::LatestPerKey {
+            columns: cols(&["id"]),
+            ts_column: "ts".into(),
+        };
+        let cost = RunCost {
+            measured: None,
+            run_id: "live".into(),
+            keys: 1,
+            files: 1,
+            row_groups: 1,
+            bytes: 7,
+            exact: true,
+            exactness: Exactness::Exact,
+            rows: None,
+        };
+        vec![
+            Record::Evidence(Evidence {
+                record_version: format::RECORD_VERSION,
+                provenance: provenance.clone(),
+                body: EvidenceBody::Plan {
+                    plan: ScanPlan {
+                        manifest_version: "2".into(),
+                        entries: vec![ScanEntry {
+                            file: FileFingerprint {
+                                path: "a.parquet".into(),
+                                size: 10,
+                                etag: None,
+                                tail_blake3: Hash::of(b"t"),
+                            },
+                            row_groups: rgs,
+                            bytes: 7,
+                            columns: None,
+                        }],
+                        residual: Some(Predicate::And {
+                            all: vec![
+                                Predicate::In {
+                                    columns: cols(&["id"]),
+                                    values: vec![vec![0x01, 0x80, 0, 0, 0, 0, 0, 0, 0x07]],
+                                },
+                                not_older.clone(),
+                                latest.clone(),
+                                live_void.clone(),
+                            ],
+                        }),
+                        bytes: 7,
+                        row_groups_total: 3,
+                        row_groups_selected: 1,
+                        projected_bytes: None,
+                        order: None,
+                        rows: None,
+                    },
+                },
+            }),
+            Record::Proposal(Proposal {
+                record_version: format::RECORD_VERSION,
+                evidence: vec![Hash::of(b"e")],
+                proposed_by: "agent".into(),
+                created_at: "2026-10-26T00:00:00.000Z".into(),
+                body: ProposalBody::Key {
+                    spec: KeySpec::Temporal {
+                        columns: cols(&["id"]),
+                        ts_column: "ts".into(),
+                        counts: false,
+                        tombstone: Some(void),
+                    },
+                    sidecars: vec![KeySpec::Bitemporal {
+                        columns: cols(&["id"]),
+                        valid_column: "valid".into(),
+                        known_column: "known".into(),
+                        tombstone: Some(cancel),
+                    }],
+                },
+            }),
+            Record::Proposal(Proposal {
+                record_version: format::RECORD_VERSION,
+                evidence: vec![Hash::of(b"e")],
+                proposed_by: "agent".into(),
+                created_at: "2026-10-26T00:00:00.000Z".into(),
+                body: ProposalBody::Rewrite {
+                    shape: RewriteShape {
+                        pairs: Vec::new(),
+                        key: Vec::new(),
+                        keys: None,
+                        before: "b".into(),
+                        after: "a".into(),
+                        invariant: "i".into(),
+                        before_plan: Some(ConsumerPlan {
+                            version: 1,
+                            nodes: vec![
+                                PlanNode::Scan {
+                                    dataset: "orders".into(),
+                                    columns: cols(&["id", "ts", "status"]),
+                                },
+                                PlanNode::Latest {
+                                    input: 0,
+                                    columns: cols(&["id"]),
+                                    ts: "ts".into(),
+                                },
+                                PlanNode::Filter {
+                                    input: 1,
+                                    predicate: live_cancel.clone(),
+                                },
+                            ],
+                            root: 2,
+                        }),
+                        after_plan: None,
+                    },
+                },
+            }),
+            Record::Replay(Replay {
+                prediction: None,
+                record_version: format::RECORD_VERSION,
+                proposal: Hash::of(b"p"),
+                manifest_version: "2".into(),
+                workload: Hash::of(b"w"),
+                inputs: vec![Hash::of(b"c")],
+                current: vec![RunCost {
+                    bytes: 9,
+                    ..cost.clone()
+                }],
+                proposed: vec![cost],
+                model: None,
+                unserved: None,
+                created_at: "2026-10-26T00:00:00.000Z".into(),
+                configuration: vec!["temporal:id@ts,tombstone=void".into()],
+                operators: Vec::new(),
+            }),
+            Record::Certificate(Certificate {
+                record_version: format::RECORD_VERSION,
+                proposal: Some(Hash::of(b"p")),
+                coverage: Coverage::Full,
+                pass: true,
+                body: CertBody {
+                    missing_right: 0,
+                    missing_left: 0,
+                    mismatched: 0,
+                    ignored_columns: vec![],
+                    totals_delta: vec![],
+                    examples: Vec::new(),
+                    uncomparable: 0,
+                    totals: Vec::new(),
+                    row_filter: Some(vec![not_older, latest, live_void]),
+                    agg: Vec::new(),
+                },
+                provenance,
+            }),
+            Record::Receipt(Receipt {
+                attest_only: false,
+                prediction: None,
+                record_version: format::RECORD_VERSION,
+                evidence: vec![Hash::of(b"e")],
+                proposal: Hash::of(b"p"),
+                replay: Hash::of(b"r"),
+                certificate: Hash::of(b"c"),
+                manifest_before: "2".into(),
+                manifest_after: "3".into(),
+                created_at: "2026-10-26T00:00:00.000Z".into(),
+            }),
+        ]
+    }
+
+    /// Every record version 4 shape, serialized at version 4: each appears
+    /// in the bytes, every record reads back, and the bytes are pinned with
+    /// the version (a shape renamed, dropped, or retyped moves the hash; the
+    /// fix is a `RECORD_VERSION` bump with a fixture, never an edit of the
+    /// golden alone). Version 4 is what this build writes.
+    #[test]
+    fn every_record_version_4_field_is_pinned() {
+        let mut all = Vec::new();
+        for r in every_v4_field() {
+            let line = serde_json::to_vec(&r).unwrap();
+            let back: Record = serde_json::from_slice(&line).unwrap();
+            assert_eq!(back, r, "round trip");
+            all.extend(line);
+            all.push(b'\n');
+        }
+        let text = String::from_utf8(all.clone()).unwrap();
+        for field in [
+            "\"record_version\":4",
+            "\"tombstone\":{\"column\":\"void\"}",
+            "\"tombstone\":{\"column\":\"status\",\"value\":\"CANCEL\"}",
+            "\"op\":\"live\"",
+            "\"row_filter\"",
+            "temporal:id@ts,tombstone=void",
+        ] {
+            assert!(text.contains(field), "{field} is not serialized:\n{text}");
+        }
+        assert!(!text.contains("\"record_version\":3"), "{text}");
+        assert_eq!(
+            (format::RECORD_VERSION, Hash::of(&all).to_hex().as_str()),
+            GOLDEN_V4,
+            "record version 4 bytes moved: bump RECORD_VERSION, add fixtures/format-<next>/ \
+             and read it in crates/bellwether-cli/tests/format_compat.rs, then pin the new \
+             golden\n{text}"
+        );
+    }
+
+    /// The record version and the hash of `every_v4_field()`'s bytes at it.
+    const GOLDEN_V4: (u32, &str) = (
+        4,
+        "39492426860d6356004fe8068cb7b84ebfd38e56ccb80243fee06c7037e62b20",
     );
 
     /// The sidecar proposals of record version 3 (`docs/format.md`, "Sidecar
@@ -3587,7 +3848,7 @@ mod schema_feature {
     fn sidecar_proposal_vectors_match_docs_format_md() {
         let proposal = |spec: KeySpec, sidecars: Vec<KeySpec>| {
             Record::Proposal(Proposal {
-                record_version: format::RECORD_VERSION,
+                record_version: V3,
                 evidence: vec![Hash::of(b"profile")],
                 proposed_by: "agent".into(),
                 created_at: "2026-10-25T00:00:00.000Z".into(),

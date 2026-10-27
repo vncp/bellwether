@@ -415,7 +415,7 @@ python3 scripts/render_figures.py --check     # README figures match their defin
 python3 scripts/render_terminal.py --check    # README captures match their committed text
 ```
 
-CI also asserts the latency budgets in release builds (the bench SLOs, replay's p50-run budget, and `observe.why` under 100 ms in process and over stdio) and checks that every persisted format fixture still reads byte for byte, the M5 one included (`fixtures/format-v1/`, `fixtures/format-v0.1-pre/`, `fixtures/format-v0.1/`). The README's captures come from [`scripts/readme-captures.sh`](scripts/readme-captures.sh): it generates its data with `bellwether bench`, runs every command shown in a pseudo-terminal, stores the text beside each image, and redraws them.
+CI also asserts the latency budgets in release builds (the bench SLOs, replay's p50-run budget, and `observe.why` under 100 ms in process and over stdio) and checks that every persisted format fixture still reads byte for byte, the M5 one included (`fixtures/format-v1/`, `fixtures/format-v0.1-pre/`, `fixtures/format-v0.1/`, and `fixtures/format-v4/`). Storage and records are versioned apart: indexes are storage version 2, frozen at M5 and unchanged since (tombstones are an additive sidecar the M5 binary keeps and plans beside); ledger records are version 4 since tombstones, whose key specs and live filters a version 3 reader would misread, so the M5 binary refuses a version 4 record before reading it and writes nothing (ADR 028). The README's captures come from [`scripts/readme-captures.sh`](scripts/readme-captures.sh): it generates its data with `bellwether bench`, runs every command shown in a pseudo-terminal, stores the text beside each image, and redraws them.
 
 ## Tables as sources
 
@@ -458,7 +458,7 @@ Pre-alpha. The architecture and on-disk format are fixed and documented; the cra
 - [x] **M2** the index: `index`, `locate`, `latest`, `asof`
 - [x] **M3** receipts: `fix` writes one
 - [x] **M4** agent-first: the loop runs end to end from an MCP client
-- [x] **M5** the format frozen: storage version 2 (per-key counts, per-column bytes, per-key time bounds and bitemporal versions folded into key specs) and record version 3, with compatibility fixtures read byte for byte in CI (ADR 028)
+- [x] **M5** the format frozen: storage version 2 (per-key counts, per-column bytes, per-key time bounds and bitemporal versions folded into key specs) and record version 3, with compatibility fixtures read byte for byte in CI (ADR 028); records moved to version 4 with tombstones, storage stays version 2
 - [ ] **M6** staged optimization against your recorded workload: `advise` first (no language model; enumeration, knob descent, layout and materialization search, with receipts), then `evolve --llm` only if `advise` leaves structural anti-patterns, then rulebook promotion; each stage a replayable run in the ledger; the loss covers the relational operators (projection, joins, windows, aggregation input) exactly
 - [ ] **M7** a SQL table reconciles against a folder of files with a certificate; plans execute inside DataFusion and DuckDB without a sidecar step; receipts gate pull requests
 - [ ] **M8** rules transfer across datasets and the exact-versus-estimated ablation is measured; receipts are signed (signing landed with [#10](https://github.com/vncp/bellwether/pull/10))

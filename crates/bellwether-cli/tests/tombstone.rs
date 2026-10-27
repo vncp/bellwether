@@ -329,6 +329,32 @@ fn a_tombstone_key_goes_from_why_to_receipt_to_live_lookups_on_both_sides() {
         .find(|p| p["op"] == "live")
         .unwrap_or_else(|| panic!("no live test in the certificate's row filter: {filter}"));
     assert_eq!(live_test["column"], "void", "{filter}");
+    // The human line of a live `latest` run: the newest version, then the
+    // live rows, and no instant or lookback (it has neither; PR #33 review
+    // item 4).
+    let text = human(
+        &[
+            "fix",
+            d,
+            "--proposal",
+            &proposal,
+            "--workload",
+            &workload,
+            "--verify-only",
+        ],
+        0,
+    );
+    assert!(
+        text.contains(
+            "each key's newest version by ts, found in the data, then its live rows only (void \
+             not null and not the tombstone value)"
+        ),
+        "{text}"
+    );
+    assert!(
+        !text.contains("lookback") && !text.contains("instant"),
+        "{text}"
+    );
     let cert = h(&verified, "/certificate/hash");
     let (m, applied) = mcp(
         &srv,

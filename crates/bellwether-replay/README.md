@@ -276,7 +276,7 @@ They also differ in store paths and hash seeds. Each child builds the index from
 - they equal an in-process run with a third limit
 - with the catalog digest masked, they hash to a checked-in golden value. The digest is masked because it names this run's temporary paths and mtimes.
 
-The golden value was last refreshed for contract v2.1 (`RECORD_VERSION` 2 and `inputs`).
+The golden value was last refreshed for record version 4 (B8: the record's `record_version` and its proposal's hash move, nothing else); before that, for contract v2.1 (`RECORD_VERSION` 2 and `inputs`).
 
 ## Memory (ADR 018)
 

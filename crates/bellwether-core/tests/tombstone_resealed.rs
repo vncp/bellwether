@@ -4,7 +4,15 @@
 //!   recomputed are refused by the entry rules (live after newest, a flag
 //!   contradicting the times, unknown flag bits, a live time without its
 //!   flag), never used to prune: the every-byte sweep cannot reach those
-//!   rules, since the checksums refuse first (PR #33 review, mutant M5);
+//!   rules, since the checksums refuse first (PR #33 review, mutant M5).
+//!   A reader holds the rules twice: `Liveness::read` checks each entry,
+//!   and `KeyValue::decode` checks the decoded value, entries included,
+//!   before it is used. Dropping either one alone leaves this test
+//!   passing, since the other refuses the same entries with the same
+//!   message (M5 is equivalent here); dropping the one in `Liveness::read`
+//!   fails core's `entries_round_trip_and_inconsistent_ones_are_refused`,
+//!   and dropping both makes this test fail, accepting the three entries
+//!   only those checks refuse (live after newest, and the flag both ways);
 //! - two segments holding one key in one row group are refused by merge,
 //!   never unioned (`docs/format.md`, "Tombstones"; mutant M14).
 #![allow(clippy::unwrap_used, missing_docs, clippy::cast_possible_truncation)]

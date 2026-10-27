@@ -27,11 +27,13 @@
 //!
 //! Updating the golden value is a deliberate act: it means the record a
 //! given input produces has changed, and the PR that changes it says why.
-//! It was last updated for contract v2.1 (`RECORD_VERSION` 2, `inputs`),
-//! together with recorded runs gaining a query kind and the column-set
-//! template (both part of the workload hash). It was computed with parquet
-//! 53.4.1, whose writer fixes the row-group byte sizes; the arrow/parquet
-//! upgrade is expected to change it.
+//! It was last updated for record version 4 (B8), which moves the record's
+//! `record_version` and its proposal's hash and nothing else. Before that,
+//! for contract v2.1 (`RECORD_VERSION` 2, `inputs`), together with recorded
+//! runs gaining a query kind and the column-set template (both part of the
+//! workload hash). It was computed with parquet 53.4.1, whose writer fixes
+//! the row-group byte sizes; the arrow/parquet upgrade is expected to
+//! change it.
 
 #![allow(clippy::unwrap_used, missing_docs)]
 
@@ -59,7 +61,11 @@ const CHILD_CORPUS: &str = "BELLWETHER_REPLAY_DETERMINISM_CORPUS";
 /// Re-pinned 2026-10-26 for M5 (ADR 028): replay fills `configuration`
 /// (the current specs' identities, here `range:entity_id` and
 /// `exact:batch_id`); every cost is unchanged.
-const GOLDEN: &str = "cc01571a670250d62ffd8aaa85b500b46d78bc73d9216017303dcc9033a74525";
+/// Re-pinned 2026-10-26 for record version 4 (B8, ADR 028): the Replay and
+/// the Proposal it cites are written at version 4, so `record_version` and
+/// `proposal` (the proposal's hash) move; the change is the version
+/// constant alone, so every cost and every other field is unchanged.
+const GOLDEN: &str = "da2ee890e8699fc1a7992c7d2c94c24b0f107cde1df2edf3e2f10df3781d383c";
 
 fn cols(c: &[&str]) -> Vec<String> {
     c.iter().map(|s| (*s).to_string()).collect()

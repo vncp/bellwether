@@ -6,8 +6,9 @@
 //!   which declares the temporal key unchanged and the tombstone as a
 //!   `tombstone` sidecar;
 //! - has the old binary plan `latest` and `asof` through it: the same
-//!   output and Evidence, byte for byte, as this build's lookups without
-//!   `--live` (this build's `specs` also names the key's tombstone);
+//!   output and plan Evidence as this build's lookups without `--live`,
+//!   but for the record version (this build writes 4, the old binary 3,
+//!   so the hashes differ) and this build's `specs` naming the tombstone;
 //! - appends a file and has the old binary `index` the folder (a rewrite of
 //!   the manifest): the key spec, the sidecar's declaration, and its
 //!   segments are all kept; the sidecar is then incomplete;
@@ -17,12 +18,18 @@
 //!   live newest rows' row groups again.
 //!
 //! A second test holds ADR 028's rule for the tombstone declaration's
-//! unknown fields and for records: a field the old binary does not know on
-//! the declaration survives the old binary's rewrite and this build's; and
-//! the records a live workload writes (a key spec with a tombstone in a
-//! Proposal, `Predicate::Live`, `RecordedRun.tombstone`) are read by the old
-//! binary fail-closed: skipped as records it cannot read, its receipt view
-//! flags the chain, and its `fix` on them refuses and writes nothing.
+//! unknown fields and the record version 4 boundary: a field the old
+//! binary does not know on the declaration survives the old binary's
+//! rewrite and this build's; and the live chain this build writes (a
+//! workload of live runs, a Proposal whose key spec carries a tombstone, a
+//! Replay, a Certificate whose row filter ends in `live`, plan Evidence, a
+//! Receipt), every record at version 4, is refused by the old binary
+//! before it parses one: its ledger views list every record as one it
+//! cannot read; `fix --proposal` (with and without `--verify-only`), `fix
+//! --certificate` and `receipt show` exit 4 naming record version 4; the
+//! live workload is refused by `why --workload` and by `fix` of the old
+//! binary's own proposal; and none of them writes a ledger record, a
+//! manifest, or a segment.
 //!
 //! Without `BELLWETHER_OLD_BIN` it prints `SKIPPED:` and passes: no old
 //! binary is built in CI. Build one with `git worktree add /tmp/old e1bd168
@@ -32,13 +39,15 @@
 
 mod common;
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::process::Command;
 use std::sync::Arc;
 
 use arrow::array::{ArrayRef, BooleanArray, Int64Array, RecordBatch};
 use arrow::datatypes::{DataType, Field, Schema};
+use bellwether::types::format::RECORD_VERSION;
+use bellwether::types::{Hash, Record};
 use common::{index_dir, keys, path, run};
 use parquet::arrow::ArrowWriter;
 use parquet::file::properties::WriterProperties;
@@ -159,14 +168,28 @@ fn old(bin: &str, args: &[&str]) -> String {
 }
 
 /// The old binary's lookup and this build's (without `--live`) agree: the
-/// same JSON, Evidence (and so plan) byte for byte, except that this build
-/// lists the declared spec with its tombstone, which the old binary does
-/// not know; without it the lists are equal.
+/// same JSON and plan Evidence byte for byte, except that this build lists
+/// the declared spec with its tombstone, which the old binary does not know
+/// (without it the lists are equal), and writes the Evidence at record
+/// version 4 where the old binary writes 3 (so their hashes differ; each is
+/// the hash of its own record).
 fn same_plan(bin: &str, args: &[&str]) {
-    let o: Value = serde_json::from_str(&old(bin, args)).unwrap();
+    let mut o: Value = serde_json::from_str(&old(bin, args)).unwrap();
     let mut n: Value = serde_json::from_str(&new(args)).unwrap();
     for s in n["specs"].as_array_mut().unwrap() {
         s.as_object_mut().unwrap().remove("tombstone");
+    }
+    for (v, version) in [(&mut o, 3), (&mut n, RECORD_VERSION)] {
+        let ev = &mut v["evidence"];
+        let record: Record = serde_json::from_value(ev["record"].clone()).unwrap();
+        assert_eq!(record.record_version(), version, "{args:?}");
+        assert_eq!(
+            ev["hash"].as_str().unwrap(),
+            Hash::of_record(&record).unwrap().to_hex(),
+            "{args:?}"
+        );
+        ev["record"]["record_version"] = Value::Null;
+        ev["hash"] = Value::Null;
     }
     assert_eq!(o, n, "{args:?}: the old binary planned differently");
 }
@@ -286,24 +309,54 @@ fn old_any(bin: &str, args: &[&str]) -> (Option<i32>, String, String) {
     )
 }
 
-fn ledger_files(data: &Path) -> BTreeSet<String> {
-    let mut out = BTreeSet::new();
+/// Every file under the index but its cache (ledger records, manifests,
+/// segments), with the hash of its bytes.
+fn index_files(data: &Path) -> BTreeMap<String, String> {
+    let mut out = BTreeMap::new();
     let mut stack = vec![index_dir(data)];
     while let Some(d) = stack.pop() {
         for e in std::fs::read_dir(&d).unwrap() {
             let p = e.unwrap().path();
             if p.is_dir() {
-                stack.push(p);
+                if p.file_name().is_some_and(|n| n != "cache") {
+                    stack.push(p);
+                }
             } else {
-                out.insert(p.display().to_string());
+                let bytes = std::fs::read(&p).unwrap();
+                out.insert(p.display().to_string(), Hash::of(&bytes).to_hex());
             }
         }
     }
     out
 }
 
+/// Every ledger record: (hash, kind, record version), read by this build.
+fn ledger_records(data: &Path) -> Vec<(String, String, u32)> {
+    let mut out = Vec::new();
+    for e in std::fs::read_dir(index_dir(data).join("ledger")).unwrap() {
+        let p = e.unwrap().path();
+        let Some(name) = p
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .strip_suffix(".rec")
+        else {
+            continue;
+        };
+        let record: Record = serde_json::from_slice(&std::fs::read(&p).unwrap()).unwrap();
+        let kind = serde_json::to_value(&record).unwrap()["record"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        out.push((name.to_string(), kind, record.record_version()));
+    }
+    out.sort();
+    out
+}
+
 #[test]
-fn the_m5_binary_keeps_unknown_fields_and_reads_live_records_fail_closed() {
+fn the_m5_binary_keeps_unknown_fields_and_refuses_record_version_4() {
     let Ok(bin) = std::env::var("BELLWETHER_OLD_BIN") else {
         eprintln!("SKIPPED: BELLWETHER_OLD_BIN is not set (an e1bd168 bellwether binary)");
         return;
@@ -340,8 +393,15 @@ fn the_m5_binary_keeps_unknown_fields_and_reads_live_records_fail_closed() {
     new(&["index", d]);
     assert_eq!(sidecar(&manifest(&data)).0, decl, "this build dropped it");
 
-    // Live records, end to end with this build: a workload of live runs, a
-    // proposal of the key with its tombstone, a certificate, a receipt.
+    // The live chain, end to end with this build, on a folder indexed by
+    // `exact:id` only: a workload of live runs and its profile Evidence, a
+    // proposal of the key with its tombstone, a replay and a certificate
+    // (`--verify-only`), then the receipt (`fix --certificate`, the apply
+    // tier).
+    let data = dir.path().join("live");
+    lake(&data, 0..2);
+    let d = path(&data);
+    new(&["index", d, "--key", "exact:id"]);
     let why: Value = serde_json::from_str(&new(&[
         "why",
         d,
@@ -367,27 +427,106 @@ fn the_m5_binary_keeps_unknown_fields_and_reads_live_records_fail_closed() {
     ]))
     .unwrap();
     let proposal = proposed["proposal"]["hash"].as_str().unwrap().to_string();
-    let before = ledger_files(&data);
-    // The old binary's ledger views skip what it cannot read and say so.
-    let views: Vec<String> = ["findings", "receipts", "scorecard"]
-        .iter()
-        .map(|v| {
-            let (code, out, err) = old_any(&bin, &["ledger", v, d]);
-            assert_eq!(code, Some(0), "ledger {v}: {out}{err}");
-            format!("ledger {v}:\n{out}{err}")
-        })
-        .collect();
-    assert!(
-        views.iter().any(|v| v.contains("cannot read")),
-        "the old binary did not say it skipped the live records: {views:#?}"
+    let verified: Value = serde_json::from_str(&new(&[
+        "fix",
+        d,
+        "--proposal",
+        &proposal,
+        "--workload",
+        &workload,
+        "--verify-only",
+    ]))
+    .unwrap();
+    assert_eq!(verified["outcome"]["kind"], "verified", "{verified}");
+    let certificate = verified["certificate"]["hash"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let filter = &verified["certificate"]["record"]["body"]["row_filter"];
+    assert_eq!(
+        filter[0]["all"].as_array().unwrap().last().unwrap()["op"],
+        "live",
+        "{filter}"
     );
-    // Its `why --workload` on the live workload refuses, writing nothing.
-    let (code, out, err) = old_any(&bin, &["why", d, "--workload", &workload]);
-    assert_ne!(code, Some(0), "the old binary read a live workload: {out}");
-    assert!(err.contains("canonical form"), "{err}");
-    // Its `fix` on the proposal of a key with a tombstone refuses too.
-    let (code, out, err) = old_any(
+    // The old binary's own records: profile Evidence (and whatever else its
+    // `why` writes) and a key proposal without a tombstone, all at version
+    // 3, to be fixed against the live workload below.
+    let written_new: BTreeSet<String> = ledger_records(&data).into_iter().map(|r| r.0).collect();
+    let old_why: Value = serde_json::from_str(&old(&bin, &["why", d, "--from", k])).unwrap();
+    let old_ev = old_why["evidence"]["hash"].as_str().unwrap().to_string();
+    let old_proposed: Value = serde_json::from_str(&old(
         &bin,
+        &[
+            "propose",
+            d,
+            "--evidence",
+            &old_ev,
+            "--by",
+            "agent",
+            "--key",
+            "exact:id",
+        ],
+    ))
+    .unwrap();
+    let old_proposal = old_proposed["proposal"]["hash"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let old_records: BTreeSet<String> = ledger_records(&data)
+        .into_iter()
+        .map(|r| r.0)
+        .filter(|h| !written_new.contains(h))
+        .collect();
+    assert!(old_records.contains(&old_ev) && old_records.contains(&old_proposal));
+    let applied: Value =
+        serde_json::from_str(&new(&["fix", d, "--certificate", &certificate])).unwrap();
+    assert_eq!(applied["outcome"]["kind"], "applied", "{applied}");
+    let receipt = applied["outcome"]["receipt"]["hash"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // Every record this build wrote is at version 4, and they hold every
+    // kind; the old binary's are at 3.
+    let records = ledger_records(&data);
+    let mut kinds = BTreeSet::new();
+    for (h, kind, version) in &records {
+        let want = if old_records.contains(h) { 3 } else { 4 };
+        assert_eq!(*version, want, "{kind} {h}");
+        if want == 4 {
+            kinds.insert(kind.as_str());
+        }
+    }
+    assert_eq!(
+        kinds,
+        ["certificate", "evidence", "proposal", "receipt", "replay"].into()
+    );
+
+    let before = index_files(&data);
+    // The old binary's ledger views list every version 4 record as one it
+    // cannot read, and no other.
+    for v in ["findings", "receipts", "scorecard"] {
+        let (code, out, err) = old_any(&bin, &["ledger", v, d]);
+        assert_eq!(code, Some(0), "ledger {v}: {out}{err}");
+        let skipped = out
+            .lines()
+            .find_map(|l| l.split_once("records this build cannot read, skipped:"))
+            .unwrap_or_else(|| panic!("ledger {v} skipped nothing:\n{out}"));
+        let n = records.iter().filter(|r| r.2 == 4).count();
+        assert_eq!(skipped.0.trim(), n.to_string(), "ledger {v}:\n{out}");
+        for (h, kind, version) in &records {
+            assert_eq!(
+                skipped.1.contains(&h[..12]),
+                *version == 4,
+                "ledger {v}, {kind} {h}:\n{out}"
+            );
+        }
+    }
+    assert_eq!(index_files(&data), before, "a ledger view wrote");
+    // Reading a version 4 record by its hash: refused before it is parsed
+    // (exit 4, the record version named), writing nothing.
+    let refusals: [&[&str]; 4] = [
         &[
             "fix",
             d,
@@ -397,12 +536,42 @@ fn the_m5_binary_keeps_unknown_fields_and_reads_live_records_fail_closed() {
             &workload,
             "--verify-only",
         ],
-    );
-    assert_ne!(
-        code,
-        Some(0),
-        "the old binary verified a live proposal: {out}"
-    );
-    assert!(!err.is_empty(), "{out}");
-    assert_eq!(ledger_files(&data), before, "the old binary wrote a record");
+        &["fix", d, "--proposal", &proposal, "--workload", &workload],
+        &["fix", d, "--certificate", &certificate],
+        &["receipt", "show", d, &receipt],
+    ];
+    for args in refusals {
+        let (code, out, err) = old_any(&bin, args);
+        assert_eq!(code, Some(4), "{args:?}: {out}{err}");
+        assert!(
+            err.contains("unsupported record version 4; this build supports up to 3"),
+            "{args:?}: {err}"
+        );
+        assert_eq!(index_files(&data), before, "{args:?} wrote");
+    }
+    // The live workload is refused wherever the old binary loads it: its
+    // `why --workload`, and `fix` of its own proposal on it.
+    let workload_refusals: [&[&str]; 2] = [
+        &["why", d, "--workload", &workload],
+        &[
+            "fix",
+            d,
+            "--proposal",
+            &old_proposal,
+            "--workload",
+            &workload,
+            "--verify-only",
+        ],
+    ];
+    for args in workload_refusals {
+        let (code, out, err) = old_any(&bin, args);
+        assert_ne!(code, Some(0), "{args:?} read a live workload: {out}");
+        assert!(
+            err.contains(&format!(
+                "workload {workload} is not stored in canonical form"
+            )),
+            "{args:?}: {err}"
+        );
+        assert_eq!(index_files(&data), before, "{args:?} wrote");
+    }
 }

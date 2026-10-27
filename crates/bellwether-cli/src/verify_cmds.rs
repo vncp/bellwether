@@ -378,10 +378,19 @@ fn rows_asked(filter: &[Predicate]) -> String {
                              the bounds among those known by then, at the greatest {known}), \
                              found in the data"
                         ),
-                        [ts, ..] => format!(
-                            "each key's newest version by {ts} at or before the instant, found \
-                             in the data"
-                        ),
+                        // An asof run bounds the time by its instant
+                        // (`Between`); a latest run has no instant.
+                        [ts, ..]
+                            if all.iter().any(
+                                |q| matches!(q, Predicate::Between { column, .. } if column == ts),
+                            ) =>
+                        {
+                            format!(
+                                "each key's newest version by {ts} at or before the instant, \
+                                 found in the data"
+                            )
+                        }
+                        [ts, ..] => format!("each key's newest version by {ts}, found in the data"),
                         [] => "each key's newest version".to_string(),
                     };
                     let phrase = format!(

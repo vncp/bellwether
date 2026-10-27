@@ -265,11 +265,12 @@ fn all_exact(costs: &[RunCost]) -> bool {
 /// priced as the files' own min/max statistics read them.
 const UNSERVED_PARQUET_STATS: &str = "parquet_stats";
 
-/// Record version 3: every cost's `exact` agrees with its `exactness`
-/// (`exact` is true exactly when `exactness` is `Exact`), a measured cost
-/// is measured by a named model, a bounded cost's interval is ordered, and
-/// so is every `rows` quantity's. A version 2 replay has no `exactness`
-/// (it reads as `Exact`), so only version 3 replays are held to it.
+/// Record version 3 and later: every cost's `exact` agrees with its
+/// `exactness` (`exact` is true exactly when `exactness` is `Exact`), a
+/// measured cost is measured by a named model, a bounded cost's interval is
+/// ordered, and so is every `rows` quantity's. A version 2 replay has no
+/// `exactness` (it reads as `Exact`), so only version 3 and later replays
+/// are held to it.
 fn check_exactness(r: &Replay) -> Result<()> {
     if r.record_version < 3 {
         return Ok(());
@@ -292,7 +293,7 @@ fn check_exactness(r: &Replay) -> Result<()> {
         if c.exact != c.exactness.is_exact() {
             return Err(rule(format!(
                 "replay run {} says exact={} but its exactness is {}; exact is true exactly \
-                 when exactness is exact (record version 3)",
+                 when exactness is exact (from record version 3)",
                 c.run_id,
                 c.exact,
                 exactness_name(&c.exactness)

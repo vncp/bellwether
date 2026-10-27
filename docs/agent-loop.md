@@ -48,7 +48,7 @@ Details that matter when reading or producing these records:
 - `created_at` is RFC 3339 UTC with millisecond precision
   (`2026-10-24T21:03:02.069Z`), written by the facade's one clock for every
   record kind.
-- `record_version` is `2`, from `bellwether_types::format::RECORD_VERSION` (contract v2.1; version-1 records remain readable).
+- `record_version` is the writing build's `bellwether_types::format::RECORD_VERSION`: 4 since tombstones (B8, ADR 028), whose key specs and live filters a version 3 reader would misread, so it refuses a version 4 record. The shapes below show 2 (contract v2.1), as written then; every earlier version remains readable, its bytes unchanged.
 
 The blocks below are shapes, not parseable JSON: angle-bracket placeholders
 stand in for values.

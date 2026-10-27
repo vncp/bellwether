@@ -289,7 +289,7 @@ fn a_key_proposal_is_scored_and_written_through_the_ledger() {
     assert_eq!(written.manifest_version, "1");
     assert_eq!(written.workload, workload.hash());
     assert_eq!(written.created_at, AT);
-    assert_eq!(written.record_version, 3);
+    assert_eq!(written.record_version, RECORD_VERSION);
     assert_eq!(written.inputs, vec![replayer.catalog().digest()]);
     assert_eq!(written.model, None, "a key proposal names no model");
     assert_eq!(
