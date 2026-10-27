@@ -35,6 +35,7 @@ mod emit;
 mod engine;
 mod engine_fix;
 mod fix;
+mod gate;
 mod index;
 mod join;
 mod keys;
@@ -79,6 +80,12 @@ pub use fix::{
     uncomparable_cause, DataState, FixOutcome, FixRequest, FixResult, Refusal, RewriteOutputs,
     Score, SignatureWritten,
 };
+pub use gate::{
+    CertificateFacts, ChangeKind, CheckOutcome, FunnelRow, GateCheck, GateFailure, GateMode,
+    GateOutcome, GateReport, GateRequest, GateRequirements, GateStep, GateVerdict, GivenReceipt,
+    ReceiptFacts, ReceiptProblem, ReceiptSource, ReplayTotals, StepEvidence, StepRecommendation,
+    StepReport,
+};
 pub use join::{
     JoinFreshness, JoinKeyState, JoinOverlapResult, JoinRows, JoinScope, JoinVerifyResult,
     SemiJoinResult, SemiJoinStep,
@@ -101,8 +108,9 @@ pub use results::{
     TombstoneUnused, Written,
 };
 pub use signing::{
-    generate_key, load_signing_key, load_trusted_keys, public_path, read_public_key,
-    refuse_inside_index, trust_key, GeneratedKey, PublicKeyFile, TrustEntry, TrustResult,
+    generate_key, load_signing_key, load_trusted_keys, parse_trusted_keys, public_path,
+    read_public_key, refuse_inside_index, trust_key, GeneratedKey, PublicKeyFile, TrustEntry,
+    TrustResult,
 };
 pub use sketch::{
     CardinalityRequest, CardinalityResult, ItemCardinality, OverlapResult, SketchSource,

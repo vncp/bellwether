@@ -310,6 +310,12 @@ fn parse_trust_file(path: &Path) -> Result<(String, TrustFile)> {
             ),
         )
     })?;
+    let file = parse_trust_text(&text, &shown.to_string())?;
+    Ok((text, file))
+}
+
+/// A trust file's text, parsed; `shown` names it in errors.
+fn parse_trust_text(text: &str, shown: &str) -> Result<TrustFile> {
     let shape = |detail: String| {
         bad(
             "trusted_keys",
@@ -324,15 +330,13 @@ fn parse_trust_file(path: &Path) -> Result<(String, TrustFile)> {
     // datetime (`valid_from = 2026-01-01T00:00:00Z`) as the RFC 3339 text
     // it spells, so quoted and unquoted times are both accepted.
     let table: toml::Table =
-        toml::from_str(&text).map_err(|e| shape(e.to_string().trim().to_string()))?;
-    let file: TrustFile = toml::Value::Table(table)
+        toml::from_str(text).map_err(|e| shape(e.to_string().trim().to_string()))?;
+    toml::Value::Table(table)
         .try_into()
-        .map_err(|e: toml::de::Error| shape(e.to_string().trim().to_string()))?;
-    Ok((text, file))
+        .map_err(|e: toml::de::Error| shape(e.to_string().trim().to_string()))
 }
 
-fn trusted_from(path: &Path, file: &TrustFile) -> Result<TrustedKeys> {
-    let shown = path.display();
+fn trusted_from(shown: &str, file: &TrustFile) -> Result<TrustedKeys> {
     let mut keys = TrustedKeys::new();
     for (i, e) in file.key.iter().enumerate() {
         let at = format!("the trust file {shown}, key {} ({:?})", i + 1, e.name);
@@ -400,7 +404,14 @@ fn trust_error_in_file(at: &str, err: &TrustError) -> String {
 /// the file and the entry.
 pub fn load_trusted_keys(path: &Path) -> Result<TrustedKeys> {
     let (_, file) = parse_trust_file(path)?;
-    trusted_from(path, &file)
+    trusted_from(&path.display().to_string(), &file)
+}
+
+/// Parses a trust file's text, as [`load_trusted_keys`] reads a file:
+/// `shown` names it in errors (`bellwether ci` reads the trust file from
+/// the base commit, never from disk).
+pub fn parse_trusted_keys(text: &str, shown: &str) -> Result<TrustedKeys> {
+    trusted_from(shown, &parse_trust_text(text, shown)?)
 }
 
 /// Appends the key in `public` (a `.pub` file) to the trust file `file`,
@@ -440,7 +451,7 @@ pub fn trust_key(
     } else {
         (String::new(), TrustFile::default())
     };
-    let mut keys = trusted_from(file, &existing)?;
+    let mut keys = trusted_from(&file.display().to_string(), &existing)?;
     if keys.get(&entry.key_id).is_some() {
         return Err(bad(
             "trusted_keys",

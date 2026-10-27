@@ -104,6 +104,7 @@ An agent (or a person) may **observe** and **propose**. Only the engine may **sc
 - [How `fix` proves a change](#how-fix-proves-a-change)
 - [Pricing a whole query](#pricing-a-whole-query)
 - [Questions over time](#questions-over-time)
+- [Gate a pull request](#gate-a-pull-request)
 - [For a coding agent](#for-a-coding-agent)
 - [How it compares](#how-it-compares)
 - [Planned: advise](#planned-advise)
@@ -287,6 +288,41 @@ Measured on the synthetic `market` corpus (`bellwether bench market --rung small
 | row groups holding a matching print (ground truth) | 213 | |
 
 All twelve bitemporal lookups in the same workload planned exactly the row groups of the ground-truth winners; a valid-time-only temporal key differed on all twelve, because those queries were drawn around restatements and late prints.
+
+## Gate a pull request
+
+A pipeline step that changes needs a receipt, and the gate is the receipt hash. Declare the steps in `.bellwether/ci.toml` (the [CLI README](crates/bellwether-cli/README.md) has every key); the gate always reads it from the pull request's **base**, so a pull request cannot change its own gate. The author runs `bellwether fix` and commits the receipt hash to `.bellwether/receipts/<step>`, or adds a line `Bellwether-Receipt(<step>): <hash>` to the pull request body. `bellwether ci` checks each changed step's receipt from the ledger's own records (the chain, the certificate's rules re-run, the workload it covered, the data's digest now, the signatures) and exits 1 when one does not stand.
+
+```yaml
+name: receipts
+on: pull_request
+permissions:
+  contents: read
+  pull-requests: write
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: vncp/bellwether/action@v0.1.0   # pinned by tag
+        with:
+          version: v0.1.0     # that release's binary, checked against its checksums.txt
+        env:                  # read-only credentials for the ledger's store
+          AWS_ACCESS_KEY_ID: ${{ secrets.LEDGER_READ_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.LEDGER_READ_SECRET }}
+```
+
+The comment, posted once and updated in place on every push (a fork's pull request, whose token is read-only, gets it in the job summary instead), here from the test fixture after a file was added to the rewrite step's output folder (the repository's path shortened to `/repo`):
+
+> ### ❌ 1 of 2 steps failed the receipt gate
+>
+> | step | receipt | certificate | bytes before → after | manifest before → after | signature | verdict |
+> |---|---|---|---|---|---|---|
+> | `positions` | `3671431bd950` | pass, workload 2065a7a4ac27, 5 keys | 434.5 kB → 57.6 kB (realized 57.6 kB) | 0 → 1 | valid: ci | ✅ pass |
+> | `repo_counts` | `94d8c58e666e` | pass, every key | 119.0 kB → 15.6 kB | 1 (attest only) | valid: ci | ❌ data_changed: the certificate is about data with catalog digest 6419288f0dce, and /repo/lake/out-after has digest 7380845f42a3 now; the data changed since the receipt; run `bellwether fix` again on the data as it is |
+>
+> <sub>bellwether 0.1.0 · gate `require` · ledger `/repo/lake/events/.bellwether` · base `5bb3a3acfb0676a43e3c65304180ab6a0b8fe4ab` · head `8a738b274126451b85557df7cca3bb9bbb51cc4b` · `bellwether ci --base 5bb3a3acfb0676a43e3c65304180ab6a0b8fe4ab --head HEAD --pr-body body.md --comment-out sample-fail.md`</sub>
+
+Minimal credentials: read on the index location the configuration names (S3 `s3:GetObject` and `s3:ListBucket` on its prefix; Azure `Storage Blob Data Reader`; GCS `roles/storage.objectViewer`), plus read on the data the steps' roots name, mounted at the path `fix` saw it (the data digest names files by their full path). Write on `ledger/` and `cache/` only with `gate = "advise"` and `[ci] why = true`, where `why` records the funnel for a step without a receipt. Nothing from the pull request runs: the threat model's [CI row](docs/threat-model.md) lists the rules.
 
 ## For a coding agent
 
@@ -493,7 +529,7 @@ Built beyond the milestones: the time-series keys (partition values from paths, 
 Not built, or not yet measured:
 
 - **`advise`.** Designed and reduced ([`docs/evolve.md`](docs/evolve.md) §3.1, ADR 032); no code yet. `evolve --llm` and the rulebook are deferred.
-- **CI receipts.** Planned (WP17). A multi-machine build is parked (WP22b); builds run on one machine.
+- **Multi-machine build.** Parked (WP22b); builds run on one machine.
 - **Performance.** Release-build measurements ([`docs/measured/2026-10-26-performance.md`](docs/measured/2026-10-26-performance.md), then [`2026-10-27-performance.md`](docs/measured/2026-10-27-performance.md)). WP22a found plan plus read lost to both a full scan and DuckDB in all 42 lookups, though it read far fewer bytes, because planning made one store round trip per indexed value. WP22b fixed that first: plan plus read now beats the full scan in 11 of 42 lookups and DuckDB in 3, and planning beats the full scan on the 10× `market` corpus at 10 and 300 keys. On folders a full scan reads in 4 to 5 ms it does not: a plan's fixed cost is about 13.5 ms, half of it the durable write of its evidence.
 
 ## Docs
