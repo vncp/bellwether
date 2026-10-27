@@ -242,6 +242,18 @@ fn a_tombstone_key_goes_from_why_to_receipt_to_live_lookups_on_both_sides() {
             .starts_with(&format!("{n_retracted} of 20 (")),
         "{column}"
     );
+    // the rows behind it, against the lake (PR #33 review item 8)
+    let value = column["value"].as_str().unwrap();
+    assert!(
+        value.contains(&format!(
+            "; of {} timed rows, {} are tombstones and {} have a null void",
+            rows.len(),
+            rows.iter().filter(|r| r.4 == Some(true)).count(),
+            rows.iter().filter(|r| r.4.is_none()).count()
+        )),
+        "{value}"
+    );
+    assert!(!value.contains("warning"), "{value}");
     let lints = why["profile"]["lints"].as_array().unwrap();
     let lint = lints
         .iter()
@@ -377,6 +389,25 @@ fn a_tombstone_key_goes_from_why_to_receipt_to_live_lookups_on_both_sides() {
         "{text}"
     );
     assert!(text.contains("pruned by tombstone:id@ts"), "{text}");
+    // the line states what was measured (PR #33 review item 5)
+    assert!(
+        text.contains(&format!(
+            "tombstones: {} of {} with a version answered with no row group read (no live row \
+             at their newest time); {} (key, row group) pair",
+            latest["live"]["keys_retracted"],
+            if latest["live"]["keys_with_version"] == 1 {
+                "1 key".to_string()
+            } else {
+                format!("{} keys", latest["live"]["keys_with_version"])
+            },
+            latest["live"]["row_groups_pruned"]
+        )),
+        "{text}"
+    );
+    assert!(
+        !text.contains("have a tombstone as their newest row"),
+        "{text}"
+    );
 
     // asof --live = observe.asof with live, at several instants
     for at in ["0", "100", "200", "359", "1000"] {
@@ -551,6 +582,55 @@ fn an_incomplete_tombstone_sidecar_is_stated_and_fixed_by_index() {
         text.contains("tombstones: not used for pruning;") && text.contains("bellwether index"),
         "{text}"
     );
+    // `why` names the declared tombstone and the true cause, an incomplete
+    // sidecar that `bellwether index` completes; R-tombstone-1 stays quiet
+    // (the tombstone is declared), PR #33 review item 3.
+    let report = human(
+        &[
+            "why",
+            d,
+            "--from",
+            k,
+            "--latest-by",
+            "ts",
+            "--tombstone",
+            "void",
+        ],
+        0,
+    );
+    let head = report.lines().next().unwrap();
+    assert!(
+        head.contains("temporal:id@ts,tombstone=void (tombstone sidecar incomplete)"),
+        "{report}"
+    );
+    assert!(
+        report.contains(&format!(
+            "`bellwether index {}` completes it",
+            path(&std::fs::canonicalize(&data).unwrap())
+        )),
+        "{report}"
+    );
+    assert!(!report.contains("R-tombstone-1"), "{report}");
+    let why: Value = serde_json::from_str(&cli(
+        &[
+            "why",
+            d,
+            "--from",
+            k,
+            "--latest-by",
+            "ts",
+            "--tombstone",
+            "void",
+        ],
+        0,
+    ))
+    .unwrap();
+    assert_eq!(
+        why["tombstones_incomplete"],
+        json!([{"kind": "temporal", "columns": ["id"], "ts_column": "ts",
+                "tombstone": {"column": "void"}}]),
+        "{why}"
+    );
     // bellwether index completes it: pruned again.
     cli(&["index", d], 0);
     let asof = cli(&["asof", d, "--keys", k, "--at", "1000", "--live"], 0);
@@ -674,6 +754,28 @@ fn an_asof_live_certificate_compares_the_newest_rows_at_or_before_the_instant() 
         .unwrap_or_else(|| panic!("no between in {filter}"));
     assert_eq!(i64_tail(&between["hi"]), at, "{filter}");
     assert!(tests.iter().any(|p| p["op"] == "live"), "{filter}");
+    // The human line says what was compared, newest version first, then
+    // the live rows (PR #33 review item 4).
+    let text = human(
+        &[
+            "fix",
+            d,
+            "--proposal",
+            &proposal,
+            "--workload",
+            &workload,
+            "--verify-only",
+        ],
+        0,
+    );
+    assert!(
+        text.contains(
+            "each key's newest version by ts at or before the instant, found in the data, then \
+             its live rows only (void not null and not the tombstone value)"
+        ),
+        "{text}"
+    );
+    assert!(!text.contains("lookback"), "{text}");
 }
 
 /// `asof --live --ts` is a usage error, never a silently ignored flag, and
@@ -706,4 +808,73 @@ fn live_with_ts_is_a_usage_error_and_index_counts_tombstone_rows() {
         .output()
         .unwrap();
     assert_eq!(out.status.code(), Some(2), "{out:?}");
+}
+
+/// A tombstone column null in every row marks no row live: `why` says so in
+/// the candidate's column and never recommends the key (PR #33 review item
+/// 8: it recommended `tombstone=void` as "reads 0 bytes").
+#[test]
+fn why_never_recommends_a_tombstone_whose_column_is_all_null() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    std::fs::create_dir_all(&data).unwrap();
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("ts", DataType::Int64, true),
+        Field::new("void", DataType::Boolean, true),
+    ]));
+    for f in 0..2i64 {
+        let file = std::fs::File::create(data.join(format!("part-{f}.parquet"))).unwrap();
+        let mut w = ArrowWriter::try_new(file, Arc::clone(&schema), None).unwrap();
+        let ks: Vec<i64> = (f * 40..f * 40 + 40).collect();
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from(
+                    ks.iter().map(|k| k % 10).collect::<Vec<_>>(),
+                )) as ArrayRef,
+                Arc::new(Int64Array::from(ks.clone())),
+                Arc::new(BooleanArray::from(vec![None::<bool>; ks.len()])),
+            ],
+        )
+        .unwrap();
+        w.write(&batch).unwrap();
+        w.close().unwrap();
+    }
+    let kf = dir.path().join("k.parquet");
+    keys(&kf, "id", &[1, 2, 3]);
+    let (d, k) = (path(&data), path(&kf));
+    cli(&["index", d, "--key", "exact:id"], 0);
+    let args = [
+        "why",
+        d,
+        "--from",
+        k,
+        "--latest-by",
+        "ts",
+        "--tombstone",
+        "void",
+    ];
+    let why: Value = serde_json::from_str(&cli(&args, 0)).unwrap();
+    let candidate = why["candidates"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["spec"]["tombstone"].is_object())
+        .unwrap_or_else(|| panic!("no tombstone candidate: {why}"));
+    let reason = candidate["not_recommended"].as_str().unwrap();
+    assert!(
+        reason.contains("every row read has a null void"),
+        "{reason}"
+    );
+    let value = candidate["kind_column"]["value"].as_str().unwrap();
+    assert!(
+        value.contains("of 80 timed rows, 0 are tombstones and 80 have a null void; warning:"),
+        "{value}"
+    );
+    assert!(
+        why["recommended"]["spec"]["tombstone"].is_null(),
+        "{}",
+        why["recommended"]
+    );
 }

@@ -684,6 +684,11 @@ pub struct Candidate {
     /// when its kind contributes one; absent (omitted in JSON) otherwise.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kind_column: Option<bellwether_types::KindColumn>,
+    /// Why this candidate is never recommended although it may read
+    /// fewer bytes: a tombstone (B8) whose column is null in every row read
+    /// marks no row live. Absent (omitted in JSON) otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub not_recommended: Option<String>,
 }
 
 /// The candidate that reads the least under the requested lookup kind
@@ -2831,6 +2836,18 @@ impl Engine {
                     },
                 },
             };
+            // A tombstone (B8) whose column is null in every row read marks
+            // no row live: the key would read nothing and answer nothing,
+            // so it is never recommended, and the report says why.
+            let not_recommended = match spec.tombstone() {
+                Some(t) => replayer
+                    .transient(&spec)?
+                    .stats()
+                    .tombstone_marks
+                    .filter(|m| m.rows > 0 && m.nulls == m.rows)
+                    .and_then(|m| m.suspect(t)),
+                None => None,
+            };
             report.candidates.push(Candidate {
                 spec,
                 origin,
@@ -2842,6 +2859,7 @@ impl Engine {
                     record: Record::Replay(scored.replay),
                 },
                 kind_column,
+                not_recommended,
             });
         }
         let current = match report.candidates.first() {
@@ -2935,6 +2953,7 @@ impl Engine {
             .candidates
             .iter()
             .enumerate()
+            .filter(|(_, c)| c.not_recommended.is_none())
             .min_by_key(|(i, c)| (c.proposed.bytes, c.spec.columns().len(), *i))
             .filter(|(_, c)| c.proposed.bytes < current.bytes)
             .map(|(_, c)| Recommendation {
@@ -3271,14 +3290,30 @@ fn tombstone_column(
     }
     #[allow(clippy::cast_precision_loss)]
     let pct = 100.0 * n.newest_is_tombstone as f64 / n.keys as f64;
+    // The rows behind it: tombstones, and rows with a null tombstone
+    // column (not live, and not tombstones), with a warning when they make
+    // the tombstone suspect (no row holds its value, or every row is null).
+    let mut value = format!(
+        "{} of {} ({pct:.1}%)",
+        thousands(n.newest_is_tombstone),
+        thousands(n.keys)
+    );
+    if let (Some(m), Some(t)) = (index.stats().tombstone_marks, spec.tombstone()) {
+        value.push_str(&format!(
+            "; of {} timed rows, {} are tombstones and {} have a null {}",
+            thousands(m.rows),
+            thousands(m.tombstones),
+            thousands(m.nulls),
+            t.column
+        ));
+        if let Some(w) = m.suspect(t) {
+            value.push_str(&format!("; warning: {w}"));
+        }
+    }
     Ok(Some(bellwether_types::KindColumn {
         kind: "tombstone".into(),
-        label: "keys whose newest row is a tombstone".into(),
-        value: format!(
-            "{} of {} ({pct:.1}%)",
-            thousands(n.newest_is_tombstone),
-            thousands(n.keys)
-        ),
+        label: "keys with no live row at their newest time (a tombstone or a null there)".into(),
+        value,
         exactness: bellwether_types::Exactness::Exact,
     }))
 }

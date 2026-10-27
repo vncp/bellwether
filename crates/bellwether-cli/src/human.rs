@@ -1594,6 +1594,16 @@ pub(crate) fn why(r: &bellwether::WhyReport, out: &Out, fix_command: &str) -> St
                      current key serves"
                 );
             }
+            None if r.candidates.iter().any(|c| c.not_recommended.is_some()) => {
+                for c in r.candidates.iter().filter(|c| c.not_recommended.is_some()) {
+                    let _ = writeln!(
+                        s,
+                        "recommended{for_kind}: none; {} is not recommended: {}",
+                        label(&c.spec),
+                        c.not_recommended.as_deref().unwrap_or_default()
+                    );
+                }
+            }
             None => {
                 let _ = writeln!(
                     s,

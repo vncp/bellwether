@@ -16,6 +16,14 @@
 //!   `bellwether index` completes the sidecar and the plan is exactly the
 //!   live newest rows' row groups again.
 //!
+//! A second test holds ADR 028's rule for the tombstone declaration's
+//! unknown fields and for records: a field the old binary does not know on
+//! the declaration survives the old binary's rewrite and this build's; and
+//! the records a live workload writes (a key spec with a tombstone in a
+//! Proposal, `Predicate::Live`, `RecordedRun.tombstone`) are read by the old
+//! binary fail-closed: skipped as records it cannot read, its receipt view
+//! flags the chain, and its `fix` on them refuses and writes nothing.
+//!
 //! Without `BELLWETHER_OLD_BIN` it prints `SKIPPED:` and passes: no old
 //! binary is built in CI. Build one with `git worktree add /tmp/old e1bd168
 //! && cargo build -p bellwether-cli` there.
@@ -263,4 +271,138 @@ fn the_m5_binary_opens_plans_and_keeps_a_tombstone_index() {
     assert_eq!(plan_row_groups(&live, &data), truth(&rows, &ids, None));
     // And the old binary still opens and plans the completed index.
     same_plan(&bin, &["latest", d, "--keys", k]);
+}
+
+/// The old binary's run, whatever its exit: (code, stdout, stderr), human.
+fn old_any(bin: &str, args: &[&str]) -> (Option<i32>, String, String) {
+    let out = Command::new(bin)
+        .args([&["--clock", CLOCK], args].concat())
+        .output()
+        .unwrap();
+    (
+        out.status.code(),
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
+}
+
+fn ledger_files(data: &Path) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    let mut stack = vec![index_dir(data)];
+    while let Some(d) = stack.pop() {
+        for e in std::fs::read_dir(&d).unwrap() {
+            let p = e.unwrap().path();
+            if p.is_dir() {
+                stack.push(p);
+            } else {
+                out.insert(p.display().to_string());
+            }
+        }
+    }
+    out
+}
+
+#[test]
+fn the_m5_binary_keeps_unknown_fields_and_reads_live_records_fail_closed() {
+    let Ok(bin) = std::env::var("BELLWETHER_OLD_BIN") else {
+        eprintln!("SKIPPED: BELLWETHER_OLD_BIN is not set (an e1bd168 bellwether binary)");
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    lake(&data, 0..2);
+    let ids: Vec<i64> = (0..20).collect();
+    let kf = dir.path().join("k.parquet");
+    keys(&kf, "id", &ids);
+    let (d, k) = (path(&data), path(&kf));
+
+    // The declaration's unknown field survives the old binary's rewrite and
+    // this build's.
+    new(&["index", d, "--key", "temporal:id@ts,tombstone=void"]);
+    let mpath = index_dir(&data).join("manifest.json");
+    let mut m: Value = serde_json::from_slice(&std::fs::read(&mpath).unwrap()).unwrap();
+    for s in m["schema"]["sidecars"].as_array_mut().unwrap() {
+        if s["kind"] == "tombstone" {
+            s["future_field"] = serde_json::json!({"x": 1});
+        }
+    }
+    std::fs::write(&mpath, serde_json::to_vec_pretty(&m).unwrap()).unwrap();
+    let (decl, _) = sidecar(&manifest(&data));
+    assert_eq!(decl[0]["future_field"], serde_json::json!({"x": 1}));
+    lake(&data, 2..3);
+    old(&bin, &["index", d]);
+    assert_eq!(
+        sidecar(&manifest(&data)).0,
+        decl,
+        "the old binary dropped it"
+    );
+    lake(&data, 3..4);
+    new(&["index", d]);
+    assert_eq!(sidecar(&manifest(&data)).0, decl, "this build dropped it");
+
+    // Live records, end to end with this build: a workload of live runs, a
+    // proposal of the key with its tombstone, a certificate, a receipt.
+    let why: Value = serde_json::from_str(&new(&[
+        "why",
+        d,
+        "--from",
+        k,
+        "--latest-by",
+        "ts",
+        "--tombstone",
+        "void",
+    ]))
+    .unwrap();
+    let ev = why["evidence"]["hash"].as_str().unwrap().to_string();
+    let workload = why["workload"]["hash"].as_str().unwrap().to_string();
+    let proposed: Value = serde_json::from_str(&new(&[
+        "propose",
+        d,
+        "--evidence",
+        &ev,
+        "--by",
+        "agent",
+        "--key",
+        "temporal:id@ts,tombstone=void",
+    ]))
+    .unwrap();
+    let proposal = proposed["proposal"]["hash"].as_str().unwrap().to_string();
+    let before = ledger_files(&data);
+    // The old binary's ledger views skip what it cannot read and say so.
+    let views: Vec<String> = ["findings", "receipts", "scorecard"]
+        .iter()
+        .map(|v| {
+            let (code, out, err) = old_any(&bin, &["ledger", v, d]);
+            assert_eq!(code, Some(0), "ledger {v}: {out}{err}");
+            format!("ledger {v}:\n{out}{err}")
+        })
+        .collect();
+    assert!(
+        views.iter().any(|v| v.contains("cannot read")),
+        "the old binary did not say it skipped the live records: {views:#?}"
+    );
+    // Its `why --workload` on the live workload refuses, writing nothing.
+    let (code, out, err) = old_any(&bin, &["why", d, "--workload", &workload]);
+    assert_ne!(code, Some(0), "the old binary read a live workload: {out}");
+    assert!(err.contains("canonical form"), "{err}");
+    // Its `fix` on the proposal of a key with a tombstone refuses too.
+    let (code, out, err) = old_any(
+        &bin,
+        &[
+            "fix",
+            d,
+            "--proposal",
+            &proposal,
+            "--workload",
+            &workload,
+            "--verify-only",
+        ],
+    );
+    assert_ne!(
+        code,
+        Some(0),
+        "the old binary verified a live proposal: {out}"
+    );
+    assert!(!err.is_empty(), "{out}");
+    assert_eq!(ledger_files(&data), before, "the old binary wrote a record");
 }

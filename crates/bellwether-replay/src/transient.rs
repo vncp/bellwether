@@ -113,6 +113,10 @@ pub struct BuildStats {
     /// Rows whose key is not indexed because its leading column is null
     /// (ADR 014); for an `expr` key, rows whose expression is null.
     pub null_rows: u64,
+    /// For a spec with a tombstone (B8): what its tombstone column holds
+    /// over the timed rows read (tombstones, nulls; core's
+    /// `tombstone::Marks`). `None` for any other spec.
+    pub tombstone_marks: Option<bellwether_core::tombstone::Marks>,
 }
 
 /// A hypothetical spec's segments over every live row group of one catalog.
@@ -671,6 +675,12 @@ impl Build<'_> {
         // different row groups never share bytes (docs/format.md).
         let processed = range.0..RowGroupId(range.1 .0 + 1);
         if let Some(mut w) = side {
+            if let Some(m) = w.tombstone_marks() {
+                self.stats
+                    .tombstone_marks
+                    .get_or_insert_with(Default::default)
+                    .add(m);
+            }
             w.set_rowgroup_range(processed.clone())?;
             let seg = w.finish()?;
             self.stats.bytes += seg.bytes.len() as u64;

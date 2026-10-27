@@ -707,7 +707,8 @@ pub fn catalog() -> Vec<ToolDef> {
             false,
             "Engine-scored why: replay the keys (or a recorded workload) under the current \
              configuration and every candidate key, as point lookups or, with valid_by and \
-             known_by, bitemporal ones; returns the funnel, the culprit, the recommended key, and \
+             known_by, bitemporal ones, or with latest_by, latest ones (with tombstone, only their live \
+             rows); returns the funnel, the culprit, the recommended key, and \
              workload.hash. Writes engine Proposals and Replays. Charged to the session budget. \
              Returns a job id unless wait is true.",
         ),

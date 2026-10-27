@@ -55,7 +55,7 @@ List keys (B4): `observe.locate` takes `contains: "any" | "all"` (= `locate --an
 
 Agg keys (B7): `observe.aggregate` (= `bellwether aggregate`; `functions` default `sum`, `count`) and `score.why` with `aggregate: {value, functions}` (= `why --value V --fn ...`); each tool's text is the CLI's `--json` line, and a refusal for a missing agg key names both specs to declare (`crates/bellwether-cli/tests/agg.rs`).
 
-Tombstones (B8): `observe.asof` takes `live: true` (= `latest --live` without `at`, `asof --at T --live` with it, and the bitemporal form) and `score.why` takes `tombstone: "<column>[=<value>]"` (= `why --tombstone`); each tool's text is the CLI's `--json` line, and a live lookup through a key declaring no tombstone is refused naming the spec to declare (`crates/bellwether-cli/tests/tombstone.rs`).
+Tombstones (B8): `observe.asof` takes `live: true` (= `latest --live` without `at`, `asof --at T --live` with it, and the bitemporal form) and `score.why` takes `tombstone: "<column>[=<value>]"` (= `why --tombstone`) with `latest_by` (= `why --latest-by`, the temporal form R-tombstone-1 names) or `valid_by`/`known_by`; each tool's text is the CLI's `--json` line, and a live lookup through a key declaring no tombstone is refused naming the spec to declare (`crates/bellwether-cli/tests/tombstone.rs`).
 
 ## Resources and the prompt
 
