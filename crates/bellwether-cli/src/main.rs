@@ -1021,32 +1021,36 @@ fn run(cli: &Cli, out: &Out) -> Result<Outcome, Failure> {
         }
         Command::Latest(a) => {
             check_lookback(a.lookback.as_deref())?;
-            lookup(g, out, &a.lookup, &a.emit, |e, keys| match (&a.known, &a.lookback) {
-                (Some(known), _) => e.asof_bitemporal(
-                    keys,
-                    None,
-                    Some(known),
-                    a.valid_by.as_deref().zip(a.known_by.as_deref()),
-                    a.live,
-                ),
-                (None, Some(n)) => e.latest_lookback(keys, n),
-                (None, None) if a.live => e.latest_live(keys),
-                (None, None) => e.latest(keys),
+            lookup(g, out, &a.lookup, &a.emit, |e, keys| {
+                match (&a.known, &a.lookback) {
+                    (Some(known), _) => e.asof_bitemporal(
+                        keys,
+                        None,
+                        Some(known),
+                        a.valid_by.as_deref().zip(a.known_by.as_deref()),
+                        a.live,
+                    ),
+                    (None, Some(n)) => e.latest_lookback(keys, n),
+                    (None, None) if a.live => e.latest_live(keys),
+                    (None, None) => e.latest(keys),
+                }
             })
         }
         Command::Asof(a) => {
             check_lookback(a.lookback.as_deref())?;
-            lookup(g, out, &a.lookup, &a.emit, |e, keys| match (&a.at, &a.lookback) {
-                (Some(at), Some(n)) => e.asof_lookback(keys, at, n, a.ts.as_deref()),
-                (Some(at), None) if a.live => e.asof_live(keys, at),
-                (Some(at), None) => e.asof(keys, at),
-                (None, _) => e.asof_bitemporal(
-                    keys,
-                    a.valid.as_deref(),
-                    a.known.as_deref(),
-                    a.valid_by.as_deref().zip(a.known_by.as_deref()),
-                    a.live,
-                ),
+            lookup(g, out, &a.lookup, &a.emit, |e, keys| {
+                match (&a.at, &a.lookback) {
+                    (Some(at), Some(n)) => e.asof_lookback(keys, at, n, a.ts.as_deref()),
+                    (Some(at), None) if a.live => e.asof_live(keys, at),
+                    (Some(at), None) => e.asof(keys, at),
+                    (None, _) => e.asof_bitemporal(
+                        keys,
+                        a.valid.as_deref(),
+                        a.known.as_deref(),
+                        a.valid_by.as_deref().zip(a.known_by.as_deref()),
+                        a.live,
+                    ),
+                }
             })
         }
         Command::Propose(a) => propose(g, out, a),

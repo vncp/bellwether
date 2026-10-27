@@ -79,12 +79,23 @@ fn spark_type(dt: &DataType) -> Result<String> {
                 spark_type(kv[0].data_type())?,
                 spark_type(kv[1].data_type())?
             ),
-            other => return Err(unsupported(format!("a map of {other}"), "has no Spark type")),
+            other => {
+                return Err(unsupported(
+                    format!("a map of {other}"),
+                    "has no Spark type",
+                ))
+            }
         },
         DataType::Struct(fields) => {
             let parts = fields
                 .iter()
-                .map(|f| Ok(format!("{}:{}", backtick(f.name()), spark_type(f.data_type())?)))
+                .map(|f| {
+                    Ok(format!(
+                        "{}:{}",
+                        backtick(f.name()),
+                        spark_type(f.data_type())?
+                    ))
+                })
                 .collect::<Result<Vec<_>>>()?;
             format!("struct<{}>", parts.join(","))
         }
@@ -138,18 +149,33 @@ fn check(residual: &Residual) -> Result<()> {
                 })
             }
             Stage::Filter(Cond::In { columns, raw, .. }) if !complete_zero_classes(raw.iter()) => {
-                return Err(zero_refusal(E, &format!("the In key list on {}", columns.join(", "))));
+                return Err(zero_refusal(
+                    E,
+                    &format!("the In key list on {}", columns.join(", ")),
+                ));
             }
-            Stage::Filter(Cond::ContainsAny { column, raw, .. }) if !complete_zero_classes(raw.iter()) => {
-                return Err(zero_refusal(E, &format!("the ContainsAny values on list column {column:?}")));
+            Stage::Filter(Cond::ContainsAny { column, raw, .. })
+                if !complete_zero_classes(raw.iter()) =>
+            {
+                return Err(zero_refusal(
+                    E,
+                    &format!("the ContainsAny values on list column {column:?}"),
+                ));
             }
             Stage::Filter(Cond::ContainsAll { column, raw, .. })
                 if raw.iter().any(|g| !complete_zero_classes(g.iter())) =>
             {
-                return Err(zero_refusal(E, &format!("the ContainsAll values on list column {column:?}")));
+                return Err(zero_refusal(
+                    E,
+                    &format!("the ContainsAll values on list column {column:?}"),
+                ));
             }
             Stage::Filter(Cond::Between {
-                column, lo, hi, data_type, ..
+                column,
+                lo,
+                hi,
+                data_type,
+                ..
             }) if is_float(data_type)
                 && [lo, hi]
                     .iter()
@@ -157,17 +183,26 @@ fn check(residual: &Residual) -> Result<()> {
             {
                 return Err(AdapterError::Unsupported {
                     engine: E,
-                    what: format!("the Between range on float column {column:?}, bounded by a zero or NaN"),
+                    what: format!(
+                        "the Between range on float column {column:?}, bounded by a zero or NaN"
+                    ),
                     reason: "orders -0.0 before +0.0 and NaN last in the plan, which Spark's \
                              comparison does not"
                         .into(),
-                    next: "emit for DataFusion, which orders floats as the plan's canonical bytes do".into(),
+                    next:
+                        "emit for DataFusion, which orders floats as the plan's canonical bytes do"
+                            .into(),
                 });
             }
-            Stage::Filter(Cond::Live { column, tombstone, .. })
-                if matches!(tombstone, Scalar::Float(f) if *f == 0.0) =>
-            {
-                return Err(zero_refusal(E, &format!("the Live tombstone on column {column:?}")));
+            Stage::Filter(Cond::Live {
+                column,
+                tombstone: Scalar::Float(f),
+                ..
+            }) if *f == 0.0 => {
+                return Err(zero_refusal(
+                    E,
+                    &format!("the Live tombstone on column {column:?}"),
+                ));
             }
             _ => {}
         }
@@ -188,7 +223,11 @@ fn residual_json(residual: &Residual) -> Result<Json> {
             ..
         } = s
         {
-            let kept = keys::sql_bounds(bounds, E, &format!("the NotOlderThan bounds on {}", columns.join(", ")))?;
+            let kept = keys::sql_bounds(
+                bounds,
+                E,
+                &format!("the NotOlderThan bounds on {}", columns.join(", ")),
+            )?;
             out["stages"][i]["bounds"] = Json::Array(
                 kept.iter()
                     .map(|b| {
@@ -205,6 +244,7 @@ fn residual_json(residual: &Residual) -> Result<Json> {
 }
 
 /// The plan as the Spark shim's manifest (see the module docs).
+#[allow(clippy::too_many_lines)] // one linear pass: files, row ranges, residual, schema
 pub fn manifest(plan: &ScanPlan, schema: &[ColumnDef], opts: &EmitOptions) -> Result<Json> {
     let residual = compile(plan.residual.as_ref(), schema, opts.residual, E)?;
     check(&residual)?;
@@ -252,7 +292,12 @@ pub fn manifest(plan: &ScanPlan, schema: &[ColumnDef], opts: &EmitOptions) -> Re
                 .iter()
                 .zip(&f.partition_values)
                 .map(|(c, v)| {
-                    let dt = value_type(crate::residual::column_type(schema, c, "a partition column")?).clone();
+                    let dt = value_type(crate::residual::column_type(
+                        schema,
+                        c,
+                        "a partition column",
+                    )?)
+                    .clone();
                     let s = partition_scalar(c, v.as_deref(), &dt)?;
                     Ok((c.clone(), s.map_or(Json::Null, |s| scalar_json(&s, &dt))))
                 })
@@ -278,7 +323,9 @@ pub fn manifest(plan: &ScanPlan, schema: &[ColumnDef], opts: &EmitOptions) -> Re
                 })
                 .collect()
         } else {
-            (0..lay.files.len()).map(|fi| json!({ "file": fi })).collect()
+            (0..lay.files.len())
+                .map(|fi| json!({ "file": fi }))
+                .collect()
         }
     } else {
         Vec::new()

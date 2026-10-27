@@ -6,7 +6,12 @@
 //! footer counted apart, nothing else read.
 
 #![cfg(feature = "datafusion")]
-#![allow(clippy::unwrap_used, clippy::expect_used)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::doc_markdown,
+    clippy::single_range_in_vec_init
+)]
 
 mod common;
 
@@ -49,10 +54,16 @@ fn run_with(
     spans: &BTreeMap<String, FileSpans>,
     gap: u64,
 ) -> (Vec<arrow::array::RecordBatch>, Realized, Realized) {
-    let printed = datafusion::scan_config(plan, &common::dataset(), o).unwrap().to_json().unwrap();
+    let printed = datafusion::scan_config(plan, &common::dataset(), o)
+        .unwrap()
+        .to_json()
+        .unwrap();
     let cfg = datafusion::from_json(&printed).unwrap();
     let ctx = SessionContext::new();
-    let store = Arc::new(CountingStore::with_coalescing(Arc::new(LocalFileSystem::new()), gap));
+    let store = Arc::new(CountingStore::with_coalescing(
+        Arc::new(LocalFileSystem::new()),
+        gap,
+    ));
     datafusion::register(&ctx, &cfg, store.clone()).unwrap();
     let batches = rt.block_on(async {
         datafusion::execute(&cfg, &ctx)
@@ -110,17 +121,34 @@ fn every_lookup_shape_returns_the_reference_rows_and_reads_exactly_the_plan() {
             case.name,
         );
         // The headline: data bytes are the plan's, at the storage boundary.
-        assert_eq!(realized.data(), case.plan.bytes, "{}: {realized:#?}", case.name);
+        assert_eq!(
+            realized.data(),
+            case.plan.bytes,
+            "{}: {realized:#?}",
+            case.name
+        );
         assert_eq!(realized.touched(), planned(&case.plan), "{}", case.name);
-        assert_eq!(realized.other(), 0, "{}: page index or bloom bytes read", case.name);
+        assert_eq!(
+            realized.other(),
+            0,
+            "{}: page index or bloom bytes read",
+            case.name
+        );
         for e in &case.plan.entries {
             let fb = &realized.files[&e.file.path];
             assert_eq!(fb.data, e.bytes, "{} {}", case.name, e.file.path);
             // One exact footer read per file: the size hint is the footer.
-            assert_eq!(fb.footer, spans[&e.file.path].footer_len, "{} {}", case.name, e.file.path);
+            assert_eq!(
+                fb.footer, spans[&e.file.path].footer_len,
+                "{} {}",
+                case.name, e.file.path
+            );
         }
         assert!(
-            realized.files.keys().all(|p| case.plan.entries.iter().any(|e| &e.file.path == p)),
+            realized
+                .files
+                .keys()
+                .all(|p| case.plan.entries.iter().any(|e| &e.file.path == p)),
             "{}: an unplanned file was read",
             case.name
         );
@@ -156,7 +184,11 @@ fn engine_pruning_reads_at_most_the_plan() {
             case.name,
         );
         assert!(realized.data() <= case.plan.bytes, "{}", case.name);
-        assert!(realized.touched().is_subset(&planned(&case.plan)), "{}", case.name);
+        assert!(
+            realized.touched().is_subset(&planned(&case.plan)),
+            "{}",
+            case.name
+        );
     }
 }
 
@@ -187,12 +219,23 @@ fn an_ordered_plan_returns_rows_in_its_read_order() {
     let c = common::corpus(tmp.path());
     let spans = spans(&c);
     for interleave in [false, true] {
-        let mut plan = common::latest(&c, "id", "ts", &common::ids(&[1, 2, 3, 4, 5, 6]), None, false);
+        let mut plan = common::latest(
+            &c,
+            "id",
+            "ts",
+            &common::ids(&[1, 2, 3, 4, 5, 6]),
+            None,
+            false,
+        );
         let pairs: Vec<(u32, u32)> = plan
             .entries
             .iter()
             .enumerate()
-            .flat_map(|(i, e)| e.row_groups.iter().map(move |rg| (u32::try_from(i).unwrap(), rg)))
+            .flat_map(|(i, e)| {
+                e.row_groups
+                    .iter()
+                    .map(move |rg| (u32::try_from(i).unwrap(), rg))
+            })
             .collect();
         let read: Vec<(u32, u32)> = if interleave {
             let mut o: Vec<(u32, u32)> = pairs.iter().rev().copied().collect();
@@ -210,10 +253,17 @@ fn an_ordered_plan_returns_rows_in_its_read_order() {
         assert_eq!(realized.data(), plan.bytes);
         // The returned rows, in order, are the reference's rows sorted by
         // read position then row number.
-        let kept = common::apply(plan.residual.as_ref().unwrap(), common::planned_rows(&c, &plan));
+        let kept = common::apply(
+            plan.residual.as_ref().unwrap(),
+            common::planned_rows(&c, &plan),
+        );
         let pos = |r: &common::Row| {
             let path = &c.files[r.file].path;
-            let e = plan.entries.iter().position(|e| &e.file.path == path).unwrap();
+            let e = plan
+                .entries
+                .iter()
+                .position(|e| &e.file.path == path)
+                .unwrap();
             read.iter()
                 .position(|&(pe, rg)| pe as usize == e && rg == r.rg)
                 .unwrap()
@@ -224,7 +274,9 @@ fn an_ordered_plan_returns_rows_in_its_read_order() {
         let want: Vec<Vec<String>> = want.iter().map(|r| r.render(&columns)).collect();
         let got: Vec<Vec<String>> = batches
             .iter()
-            .flat_map(|b| (0..b.num_rows()).map(|i| common::rendered(&[b.slice(i, 1)], &columns).remove(0)))
+            .flat_map(|b| {
+                (0..b.num_rows()).map(|i| common::rendered(&[b.slice(i, 1)], &columns).remove(0))
+            })
             .collect();
         assert_eq!(got, want, "interleave {interleave}");
     }
@@ -247,8 +299,14 @@ fn a_keys_file_semi_join_returns_the_same_rows_for_100k_keys() {
         ..opts(&c)
     };
     let (batches, realized) = run(&rt, &plan, &o, &spans);
-    assert_eq!(common::rendered(&batches, &columns), common::expected(&c, &plan, &columns));
-    assert_eq!(common::rendered(&inline.0, &columns), common::expected(&c, &plan, &columns));
+    assert_eq!(
+        common::rendered(&batches, &columns),
+        common::expected(&c, &plan, &columns)
+    );
+    assert_eq!(
+        common::rendered(&inline.0, &columns),
+        common::expected(&c, &plan, &columns)
+    );
     assert_eq!(realized.data(), plan.bytes);
     // A keys file that is not the plan's key set is refused.
     common::keys_file(&kf, &keys[1..]);
@@ -288,9 +346,19 @@ fn partial_residual_modes_return_exactly_their_rows_and_say_so() {
         want.sort();
         let got = common::rendered(&b, &columns);
         common::assert_rows(&got, &want, mode.as_str());
-        assert!(full.iter().all(|r| got.contains(r)), "{mode:?}: not a superset of the full answer");
-        assert!(got.len() > full.len(), "{mode:?}: the case must tell the modes apart");
-        assert_eq!(realized.data(), plan.bytes, "{mode:?}: the same row groups are read");
+        assert!(
+            full.iter().all(|r| got.contains(r)),
+            "{mode:?}: not a superset of the full answer"
+        );
+        assert!(
+            got.len() > full.len(),
+            "{mode:?}: the case must tell the modes apart"
+        );
+        assert_eq!(
+            realized.data(),
+            plan.bytes,
+            "{mode:?}: the same row groups are read"
+        );
     }
 }
 
@@ -308,8 +376,13 @@ fn a_coalescing_store_counts_gap_bytes_apart_from_the_requested_data() {
     let loc = Path::from(f.path.trim_start_matches('/'));
     for (g, fetches) in [(0, vec![0..10, 110..120]), (gap, vec![0..120])] {
         let store = CountingStore::with_coalescing(Arc::new(LocalFileSystem::new()), g);
-        let got = rt.block_on(store.get_ranges(&loc, &[0..10, 110..120])).unwrap();
-        assert_eq!(got.iter().map(bytes::Bytes::len).collect::<Vec<_>>(), vec![10, 10]);
+        let got = rt
+            .block_on(store.get_ranges(&loc, &[0..10, 110..120]))
+            .unwrap();
+        assert_eq!(
+            got.iter().map(bytes::Bytes::len).collect::<Vec<_>>(),
+            vec![10, 10]
+        );
         // Fetches run concurrently; compare them in offset order.
         let ranges = |v: Vec<bellwether_adapters::measure::Fetch>| {
             let mut r: Vec<_> = v.into_iter().map(|x| x.range).collect();
@@ -332,7 +405,11 @@ fn a_coalescing_store_counts_gap_bytes_apart_from_the_requested_data() {
         assert_eq!(exact.footer(), exact_requests.footer(), "{}", case.name);
         let fetched = |r: &Realized| r.files.values().map(|f| f.fetched).sum::<u64>();
         assert!(fetched(&served) >= fetched(&requested), "{}", case.name);
-        assert!(served.touched().is_superset(&planned(&case.plan)), "{}", case.name);
+        assert!(
+            served.touched().is_superset(&planned(&case.plan)),
+            "{}",
+            case.name
+        );
         eprintln!(
             "{:<52} planned {:>7}  requested data {:>7}  served data {:>7}  coalesced extra {:>7}",
             case.name,
@@ -353,9 +430,18 @@ fn a_nan_key_outside_the_statistics_returns_its_row() {
         .plan
         .entries
         .iter()
-        .map(|e| (e.file.path.clone(), FileSpans::of_local(&e.file.path).unwrap()))
+        .map(|e| {
+            (
+                e.file.path.clone(),
+                FileSpans::of_local(&e.file.path).unwrap(),
+            )
+        })
         .collect();
-    for (plan, pruning) in [(&nan.plan, false), (&nan.composite, false), (&nan.plan, true)] {
+    for (plan, pruning) in [
+        (&nan.plan, false),
+        (&nan.composite, false),
+        (&nan.plan, true),
+    ] {
         let o = EmitOptions {
             row_offsets: Some(nan.offsets.clone()),
             engine_pruning: pruning,
@@ -366,7 +452,12 @@ fn a_nan_key_outside_the_statistics_returns_its_row() {
         let store = Arc::new(CountingStore::new(Arc::new(LocalFileSystem::new())));
         datafusion::register(&ctx, &cfg, store.clone()).unwrap();
         let batches = rt.block_on(async {
-            datafusion::execute(&cfg, &ctx).await.unwrap().try_collect::<Vec<_>>().await.unwrap()
+            datafusion::execute(&cfg, &ctx)
+                .await
+                .unwrap()
+                .try_collect::<Vec<_>>()
+                .await
+                .unwrap()
         });
         let got = common::rendered(&batches, &["id".into(), "f".into()]);
         common::assert_rows(&got, &nan.want, &format!("pruning {pruning}"));

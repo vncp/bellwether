@@ -188,6 +188,7 @@ pub struct EmitOptions {
 
 /// What an adapter produces.
 #[derive(Debug)]
+#[allow(clippy::large_enum_variant)] // one per emit, returned by value and printed
 pub enum Artifact {
     /// DataFusion: the scan description, executable with the `datafusion`
     /// feature.

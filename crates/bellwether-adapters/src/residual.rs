@@ -184,7 +184,9 @@ impl Residual {
                     columns, ts_column, ..
                 }
                 | Stage::LatestPerKey { columns, ts_column } => {
-                    columns.iter().for_each(|c| push(c));
+                    for c in columns {
+                        push(c);
+                    }
                     push(ts_column);
                 }
             }
@@ -459,7 +461,9 @@ pub fn compile(
                     data_type: dt,
                 })
             }
-            Predicate::SemiJoin { .. } | Predicate::Join { .. } | Predicate::WindowPartition { .. } => {
+            Predicate::SemiJoin { .. }
+            | Predicate::Join { .. }
+            | Predicate::WindowPartition { .. } => {
                 return Err(AdapterError::Unsupported {
                     engine,
                     what: "a relational residual (SemiJoin, Join, WindowPartition)".into(),
@@ -487,11 +491,12 @@ pub fn compile(
 /// and whether it is a map.
 fn list_element(schema: &[ColumnDef], column: &str, what: &str) -> Result<(DataType, bool)> {
     let dt = value_type(column_type(schema, column, what)?);
-    let element = bellwether_core::list::element_type(dt).ok_or_else(|| AdapterError::Canonical {
-        column: column.to_string(),
-        what: what.to_string(),
-        reason: format!("a membership test needs a list or map column, not {dt}"),
-    })?;
+    let element =
+        bellwether_core::list::element_type(dt).ok_or_else(|| AdapterError::Canonical {
+            column: column.to_string(),
+            what: what.to_string(),
+            reason: format!("a membership test needs a list or map column, not {dt}"),
+        })?;
     Ok((
         value_type(element).clone(),
         matches!(dt, DataType::Map(_, _)),
@@ -536,9 +541,10 @@ pub fn scalar_json(s: &Scalar, dt: &DataType) -> Json {
         DataType::Float64 => "float64",
         DataType::Decimal128(_, _) | DataType::Decimal256(_, _) => "decimal",
         DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => "utf8",
-        DataType::FixedSizeBinary(_) | DataType::Binary | DataType::LargeBinary | DataType::BinaryView => {
-            "binary"
-        }
+        DataType::FixedSizeBinary(_)
+        | DataType::Binary
+        | DataType::LargeBinary
+        | DataType::BinaryView => "binary",
         DataType::Date32 => "date32",
         DataType::Date64 => "date64",
         DataType::Time32(_) | DataType::Time64(_) => "time",
@@ -651,7 +657,9 @@ fn cond_json(c: &Cond) -> Json {
             column,
             data_type,
             tombstone,
-        } => json!({ "op": "live", "column": column, "tombstone": scalar_json(tombstone, data_type) }),
+        } => {
+            json!({ "op": "live", "column": column, "tombstone": scalar_json(tombstone, data_type) })
+        }
     }
 }
 

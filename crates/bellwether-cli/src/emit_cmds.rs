@@ -4,13 +4,15 @@
 //! executed: the artifact is text for the user's engine (threat model, "no
 //! surface executes a query string").
 
+// Doc comments here are clap's help text, where backticks would print.
+#![allow(clippy::doc_markdown)]
+
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
 use bellwether::types::{Error, EvidenceBody, Record, ScanPlan};
 use bellwether::{Engine, PlanResult};
-use bellwether_adapters::{
-    ColumnDef, EmitOptions, Partitions, Relocate, ResidualMode, RowOffsets,
-};
+use bellwether_adapters::{ColumnDef, EmitOptions, Partitions, Relocate, ResidualMode, RowOffsets};
 use clap::Args;
 
 use crate::{Failure, Outcome};
@@ -50,6 +52,7 @@ pub(crate) enum ResidualArg {
 
 /// The `--emit` flags.
 #[derive(Args, Debug, Default)]
+#[allow(clippy::struct_excessive_bools)] // independent CLI flags
 pub(crate) struct EmitArgs {
     /// Translate the plan for a query engine and print the artifact after
     /// the plan line: datafusion (JSON), duckdb (SQL), or spark (JSON for
@@ -91,17 +94,14 @@ pub(crate) struct EmitArgs {
 
 /// The plan a lookup's result carries.
 fn plan_of(result: &PlanResult) -> Result<&ScanPlan, Failure> {
-    match &result.evidence.record {
-        Record::Evidence(e) => match &e.body {
-            EvidenceBody::Plan { plan } => Ok(plan),
-            _ => Err(Failure::Engine(Error::Other(
-                "the lookup's evidence holds no plan".into(),
-            ))),
-        },
-        _ => Err(Failure::Engine(Error::Other(
-            "the lookup's record is not an evidence".into(),
-        ))),
+    if let Record::Evidence(e) = &result.evidence.record {
+        if let EvidenceBody::Plan { plan } = &e.body {
+            return Ok(plan);
+        }
     }
+    Err(Failure::Engine(Error::Other(
+        "the lookup's result holds no plan evidence".into(),
+    )))
 }
 
 fn adapter_failure(e: bellwether_adapters::AdapterError) -> Failure {
@@ -119,6 +119,7 @@ fn adapter_failure(e: bellwether_adapters::AdapterError) -> Failure {
 /// Appends the artifact `args` asks for to a lookup's outcome: printed
 /// after the plan line (human or `--json`), or written to `--out` with a
 /// line saying where.
+#[allow(clippy::too_many_lines)] // the flag checks, then one emit
 pub(crate) fn with_emit(
     engine: &Engine,
     result: &PlanResult,
@@ -204,34 +205,31 @@ pub(crate) fn with_emit(
         ordered: args.ordered,
         relocate,
     };
-    let adapter = bellwether_adapters::adapter(target.name()).ok_or_else(|| {
-        Failure::Usage(format!("no adapter for {}", target.name()))
-    })?;
+    let adapter = bellwether_adapters::adapter(target.name())
+        .ok_or_else(|| Failure::Usage(format!("no adapter for {}", target.name())))?;
     let text = adapter
         .emit(plan, &schema, &opts)
         .and_then(|a| a.to_text())
         .map_err(adapter_failure)?;
     let Outcome::Done(mut json, mut human, code) = outcome;
-    match &args.out {
-        Some(path) => {
-            std::fs::write(path, format!("{text}\n")).map_err(|e| {
-                Failure::Usage(format!(
-                    "--out: cannot write {} ({e}); give a writable path",
-                    path.display()
-                ))
-            })?;
-            human.push_str(&format!(
-                "wrote the {} artifact to {} (nothing was executed)\n",
-                target.name(),
+    if let Some(path) = &args.out {
+        std::fs::write(path, format!("{text}\n")).map_err(|e| {
+            Failure::Usage(format!(
+                "--out: cannot write {} ({e}); give a writable path",
                 path.display()
-            ));
-        }
-        None => {
-            json.push_str(&text);
-            json.push('\n');
-            human.push_str(&text);
-            human.push('\n');
-        }
+            ))
+        })?;
+        let _ = writeln!(
+            human,
+            "wrote the {} artifact to {} (nothing was executed)",
+            target.name(),
+            path.display()
+        );
+    } else {
+        json.push_str(&text);
+        json.push('\n');
+        human.push_str(&text);
+        human.push('\n');
     }
     Ok(Outcome::Done(json, human, code))
 }

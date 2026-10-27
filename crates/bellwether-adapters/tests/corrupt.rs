@@ -8,7 +8,12 @@
 //! flipped bytes; and a DataFusion scan description edited after it was
 //! printed does not load.
 
-#![allow(clippy::unwrap_used, clippy::expect_used)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::doc_markdown,
+    clippy::type_complexity
+)]
 
 mod common;
 
@@ -30,7 +35,10 @@ fn opts(c: &common::Corpus) -> EmitOptions {
 
 fn each(plan: &ScanPlan, o: &EmitOptions, check: impl Fn(&str, Result<(), AdapterError>)) {
     for e in ENGINES {
-        let r = adapter(e).unwrap().emit(plan, &common::dataset(), o).map(|_| ());
+        let r = adapter(e)
+            .unwrap()
+            .emit(plan, &common::dataset(), o)
+            .map(|_| ());
         check(e, r);
     }
 }
@@ -42,7 +50,10 @@ fn an_unknown_file_is_refused_by_name() {
     let mut plan = common::locate(&c, &["id"], &common::ids(&[1]));
     plan.entries[0].file.path = format!("{}/nowhere.parquet", c.root.display());
     each(&plan, &opts(&c), |e, r| {
-        assert!(matches!(r, Err(AdapterError::UnknownFile { .. })), "{e}: {r:?}");
+        assert!(
+            matches!(r, Err(AdapterError::UnknownFile { .. })),
+            "{e}: {r:?}"
+        );
     });
     // With the footer hint, a file whose size is not the fingerprint's.
     let mut plan = common::locate(&c, &["id"], &common::ids(&[1]));
@@ -51,7 +62,9 @@ fn an_unknown_file_is_refused_by_name() {
         footer_hint: true,
         ..opts(&c)
     };
-    let r = adapter("datafusion").unwrap().emit(&plan, &common::dataset(), &o);
+    let r = adapter("datafusion")
+        .unwrap()
+        .emit(&plan, &common::dataset(), &o);
     let msg = format!("{r:?}");
     assert!(matches!(r, Err(AdapterError::UnknownFile { .. })), "{msg}");
     assert!(msg.contains("changed since it was planned"), "{msg}");
@@ -65,7 +78,10 @@ fn an_out_of_range_row_group_is_refused() {
     plan.entries[0].row_groups.insert(99);
     each(&plan, &opts(&c), |e, r| {
         assert!(
-            matches!(r, Err(AdapterError::RowGroupOutOfRange { row_group: 99, .. })),
+            matches!(
+                r,
+                Err(AdapterError::RowGroupOutOfRange { row_group: 99, .. })
+            ),
             "{e}: {r:?}"
         );
     });
@@ -75,8 +91,13 @@ fn an_out_of_range_row_group_is_refused() {
         footer_hint: true,
         ..opts(&c)
     };
-    let r = adapter("datafusion").unwrap().emit(&plan, &common::dataset(), &o);
-    assert!(matches!(r, Err(AdapterError::RowGroupOutOfRange { .. })), "{r:?}");
+    let r = adapter("datafusion")
+        .unwrap()
+        .emit(&plan, &common::dataset(), &o);
+    assert!(
+        matches!(r, Err(AdapterError::RowGroupOutOfRange { .. })),
+        "{r:?}"
+    );
 }
 
 #[test]
@@ -124,7 +145,10 @@ fn canonical_bytes_at_the_wrong_width_are_refused() {
             }),
         );
         each(&plan, &opts(&c), |e, r| {
-            assert!(matches!(r, Err(AdapterError::Canonical { .. })), "{e} {col}: {r:?}");
+            assert!(
+                matches!(r, Err(AdapterError::Canonical { .. })),
+                "{e} {col}: {r:?}"
+            );
         });
     }
 }
@@ -150,7 +174,10 @@ fn without_row_counts_a_strict_subset_is_refused_not_widened() {
         ..opts(&c)
     };
     each(&plan, &o, |e, r| {
-        assert!(matches!(r, Err(AdapterError::RowOffsetsNeeded { .. })), "{e}: {r:?}");
+        assert!(
+            matches!(r, Err(AdapterError::RowOffsetsNeeded { .. })),
+            "{e}: {r:?}"
+        );
     });
 }
 
@@ -187,7 +214,10 @@ fn a_flipped_residual_byte_is_refused_iff_it_does_not_decode_and_otherwise_reenc
             continue;
         };
         let Some(v) = values.first() else { continue };
-        let types: Vec<DataType> = columns.iter().map(|c| value_type(&common::dt(c)).clone()).collect();
+        let types: Vec<DataType> = columns
+            .iter()
+            .map(|c| value_type(&common::dt(c)).clone())
+            .collect();
         let with = |bytes: Vec<u8>| {
             let mut plan = case.plan.clone();
             plan.residual = Some(Predicate::In {
@@ -202,7 +232,9 @@ fn a_flipped_residual_byte_is_refused_iff_it_does_not_decode_and_otherwise_reenc
             .iter()
             .map(|e| {
                 matches!(
-                    adapter(e).unwrap().emit(&with(v.clone()), &common::dataset(), &opts(&c)),
+                    adapter(e)
+                        .unwrap()
+                        .emit(&with(v.clone()), &common::dataset(), &opts(&c)),
                     Err(AdapterError::Unsupported { .. })
                 )
             })
@@ -214,16 +246,30 @@ fn a_flipped_residual_byte_is_refused_iff_it_does_not_decode_and_otherwise_reenc
                 let plan = with(bad.clone());
                 let tuple = decoded(&bad, &types);
                 if let Some(t) = &tuple {
-                    assert_eq!(reencoded(t, &types), bad, "{} byte {i}: decode is not exact", case.name);
+                    assert_eq!(
+                        reencoded(t, &types),
+                        bad,
+                        "{} byte {i}: decode is not exact",
+                        case.name
+                    );
                 }
-                let nan = tuple.iter().flatten().flatten().any(|s| matches!(s, Scalar::Float(f) if f.is_nan()));
+                let nan = tuple
+                    .iter()
+                    .flatten()
+                    .flatten()
+                    .any(|s| matches!(s, Scalar::Float(f) if f.is_nan()));
                 for (e, refused_before) in ENGINES.iter().zip(&baseline) {
-                    let r = adapter(e).unwrap().emit(&plan, &common::dataset(), &opts(&c));
+                    let r = adapter(e)
+                        .unwrap()
+                        .emit(&plan, &common::dataset(), &opts(&c));
                     let at = format!("{e} {} byte {i} ^{flip:02x}", case.name);
                     match (&tuple, r) {
                         (None, Err(AdapterError::Canonical { .. })) => {}
-                        (None, other) => panic!("{at}: bytes that do not decode were not refused: {other:?}"),
-                        (Some(_), Err(AdapterError::Unsupported { .. })) if *refused_before || (*e == "duckdb" && nan) => {}
+                        (None, other) => {
+                            panic!("{at}: bytes that do not decode were not refused: {other:?}")
+                        }
+                        (Some(_), Err(AdapterError::Unsupported { .. }))
+                            if *refused_before || (*e == "duckdb" && nan) => {}
                         (Some(t), Ok(_)) if *e == "datafusion" => {
                             // The literal the scan carries is the decoded
                             // value, typed (a tuple with a null matches
@@ -239,13 +285,22 @@ fn a_flipped_residual_byte_is_refused_iff_it_does_not_decode_and_otherwise_reenc
                                 Vec::new()
                             } else {
                                 vec![Json::Array(
-                                    t.iter().zip(&types).map(|(s, dt)| scalar_json(s.as_ref().unwrap(), dt)).collect(),
+                                    t.iter()
+                                        .zip(&types)
+                                        .map(|(s, dt)| scalar_json(s.as_ref().unwrap(), dt))
+                                        .collect(),
                                 )]
                             };
-                            assert_eq!(printed["residual"]["stages"][0]["rows"], Json::Array(want), "{at}");
+                            assert_eq!(
+                                printed["residual"]["stages"][0]["rows"],
+                                Json::Array(want),
+                                "{at}"
+                            );
                         }
                         (Some(_), Ok(_)) => {}
-                        (Some(_), other) => panic!("{at}: a value that decodes was refused: {other:?}"),
+                        (Some(_), other) => {
+                            panic!("{at}: a value that decodes was refused: {other:?}")
+                        }
                     }
                 }
                 checked += 1;
@@ -276,9 +331,13 @@ fn an_edited_datafusion_description_does_not_load() {
     }
     assert!(loaded >= 20, "{loaded}");
     let plan = common::locate(&c, &["id"], &common::ids(&[1, 2]));
-    let printed: Json =
-        serde_json::from_str(&datafusion::scan_config(&plan, &common::dataset(), &o).unwrap().to_json().unwrap())
-            .unwrap();
+    let printed: Json = serde_json::from_str(
+        &datafusion::scan_config(&plan, &common::dataset(), &o)
+            .unwrap()
+            .to_json()
+            .unwrap(),
+    )
+    .unwrap();
     let skip = printed["files"][0]["access"]
         .as_array()
         .unwrap()
@@ -289,12 +348,30 @@ fn an_edited_datafusion_description_does_not_load() {
     // in the description's order; the options edit changes the Parquet
     // options the rebuilt scan prints).
     let edits: Vec<(&str, Box<dyn Fn(&mut Json)>)> = vec![
-        ("files", Box::new(move |d: &mut Json| d["files"][0]["access"][skip] = "scan".into())),
-        ("parquet", Box::new(|d: &mut Json| d["parquet"]["pruning"] = true.into())),
-        ("projection", Box::new(|d: &mut Json| d["projection"] = serde_json::json!(["id"]))),
-        ("residual", Box::new(|d: &mut Json| d["residual"]["stages"][0]["rows"][0][0]["value"] = "3".into())),
-        ("parquet", Box::new(|d: &mut Json| d["source"]["options"]["engine_pruning"] = true.into())),
-        ("format", Box::new(|d: &mut Json| d["format"] = "bellwether.datafusion/0".into())),
+        (
+            "files",
+            Box::new(move |d: &mut Json| d["files"][0]["access"][skip] = "scan".into()),
+        ),
+        (
+            "parquet",
+            Box::new(|d: &mut Json| d["parquet"]["pruning"] = true.into()),
+        ),
+        (
+            "projection",
+            Box::new(|d: &mut Json| d["projection"] = serde_json::json!(["id"])),
+        ),
+        (
+            "residual",
+            Box::new(|d: &mut Json| d["residual"]["stages"][0]["rows"][0][0]["value"] = "3".into()),
+        ),
+        (
+            "parquet",
+            Box::new(|d: &mut Json| d["source"]["options"]["engine_pruning"] = true.into()),
+        ),
+        (
+            "format",
+            Box::new(|d: &mut Json| d["format"] = "bellwether.datafusion/0".into()),
+        ),
     ];
     for (field, edit) in edits {
         let mut d = printed.clone();
@@ -302,7 +379,10 @@ fn an_edited_datafusion_description_does_not_load() {
         match datafusion::from_json(&serde_json::to_string(&d).unwrap()) {
             Err(e @ AdapterError::Description(_)) => {
                 let msg = e.to_string();
-                assert!(msg.contains(&format!("{field:?}")) || field == "format", "{field}: {msg}");
+                assert!(
+                    msg.contains(&format!("{field:?}")) || field == "format",
+                    "{field}: {msg}"
+                );
                 assert!(msg.contains("emit it again"), "{field}: {msg}");
             }
             other => panic!("{field}: an edited description loaded or failed untyped: {other:?}"),
@@ -311,11 +391,19 @@ fn an_edited_datafusion_description_does_not_load() {
     // A schema edited so the plan's key bytes no longer decode at the
     // column's type: refused by the adapter's own check, typed.
     let mut d = printed.clone();
-    let id = d["source"]["schema"].as_array().unwrap().iter().position(|c| c["name"] == "id").unwrap();
+    let id = d["source"]["schema"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .position(|c| c["name"] == "id")
+        .unwrap();
     d["source"]["schema"][id]["type"] = "Utf8".into();
     let r = datafusion::from_json(&serde_json::to_string(&d).unwrap());
     assert!(matches!(r, Err(AdapterError::Canonical { .. })), "{r:?}");
-    assert!(matches!(datafusion::from_json("{"), Err(AdapterError::Description(_))));
+    assert!(matches!(
+        datafusion::from_json("{"),
+        Err(AdapterError::Description(_))
+    ));
 }
 
 #[test]

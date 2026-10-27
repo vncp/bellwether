@@ -4,7 +4,12 @@
 //! `HEAD` sends no body and is not recorded. Paths outside the root are
 //! refused with 404.
 
-#![allow(dead_code, clippy::unwrap_used, clippy::expect_used)]
+#![allow(
+    dead_code,
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::format_push_string
+)]
 
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::net::{TcpListener, TcpStream};
@@ -164,7 +169,10 @@ fn serve(conn: TcpStream, root: &Path, log: &Mutex<Vec<Fetch>>) -> std::io::Resu
             if method == "HEAD" { size } else { end - start }
         );
         if status.starts_with("206") {
-            head.push_str(&format!("Content-Range: bytes {start}-{}/{size}\r\n", end - 1));
+            head.push_str(&format!(
+                "Content-Range: bytes {start}-{}/{size}\r\n",
+                end - 1
+            ));
         }
         head.push_str("\r\n");
         conn.write_all(head.as_bytes())?;

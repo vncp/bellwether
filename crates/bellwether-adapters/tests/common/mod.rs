@@ -11,7 +11,18 @@
 //! the reference evaluator's: the residual applied over the planned row
 //! groups' rows, over canonical bytes.
 
-#![allow(dead_code, clippy::unwrap_used, clippy::expect_used, clippy::too_many_lines)]
+#![allow(
+    dead_code,
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::too_many_lines,
+    clippy::cast_sign_loss,
+    clippy::doc_markdown,
+    clippy::float_cmp,
+    clippy::format_collect,
+    clippy::many_single_char_names,
+    clippy::struct_field_names
+)]
 
 pub mod range_server;
 
@@ -54,7 +65,11 @@ pub fn file_schema() -> SchemaRef {
             DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
             true,
         ),
-        Field::new("ts_ms", DataType::Timestamp(TimeUnit::Millisecond, None), true),
+        Field::new(
+            "ts_ms",
+            DataType::Timestamp(TimeUnit::Millisecond, None),
+            true,
+        ),
         Field::new("day", DataType::Date32, true),
         Field::new("u", DataType::UInt32, true),
         Field::new("void", DataType::Boolean, true),
@@ -240,19 +255,23 @@ fn batch(fi: usize, rg: usize) -> RecordBatch {
     .with_timezone("UTC");
     let ts_ms = TimestampMillisecondArray::from(
         (0..n)
-            .map(|r| (g(r) % 13 != 5).then(|| 1_700_000_000_000 + i64::try_from(g(r) % 4).unwrap() * 997))
+            .map(|r| {
+                (g(r) % 13 != 5).then(|| 1_700_000_000_000 + i64::try_from(g(r) % 4).unwrap() * 997)
+            })
             .collect::<Vec<_>>(),
     );
     let day: Date32Array = (0..n)
         .map(|r| Some(19_700 + i32::try_from(g(r) % 6).unwrap()))
         .collect();
-    let u: UInt32Array = (0..n).map(|r| Some(u32::try_from(g(r) % 9).unwrap() * 1000)).collect();
+    let u: UInt32Array = (0..n)
+        .map(|r| Some(u32::try_from(g(r) % 9).unwrap() * 1000))
+        .collect();
     let void: BooleanArray = (0..n)
         .map(|r| (g(r) % 19 != 2).then(|| g(r) % 4 == 0))
         .collect();
-    let bin = BinaryArray::from_iter((0..n).map(|r| {
-        (g(r) % 5 != 1).then(|| vec![0u8, u8::try_from(g(r) % 7).unwrap(), 0xff])
-    }));
+    let bin = BinaryArray::from_iter(
+        (0..n).map(|r| (g(r) % 5 != 1).then(|| vec![0u8, u8::try_from(g(r) % 7).unwrap(), 0xff])),
+    );
     let body: StringArray = (0..n)
         .map(|r| (g(r) % 9 != 4).then(|| BODIES[g(r) % BODIES.len()]))
         .collect();
@@ -312,7 +331,8 @@ pub fn corpus(dir: &Path) -> Corpus {
         let props = WriterProperties::builder()
             .set_max_row_group_row_count(Some(RG_ROWS))
             .build();
-        let mut w = ArrowWriter::try_new(File::create(&path).unwrap(), file_schema(), Some(props)).unwrap();
+        let mut w =
+            ArrowWriter::try_new(File::create(&path).unwrap(), file_schema(), Some(props)).unwrap();
         for rg in 0..RGS {
             w.write(&batch(fi, rg)).unwrap();
             w.flush().unwrap();
@@ -321,7 +341,11 @@ pub fn corpus(dir: &Path) -> Corpus {
         let path_s = path.canonicalize().unwrap().display().to_string();
         let reader = ParquetRecordBatchReaderBuilder::try_new(File::open(&path).unwrap()).unwrap();
         let md = reader.metadata().clone();
-        let rg_rows: Vec<u64> = md.row_groups().iter().map(|g| g.num_rows() as u64).collect();
+        let rg_rows: Vec<u64> = md
+            .row_groups()
+            .iter()
+            .map(|g| g.num_rows() as u64)
+            .collect();
         let rg_bytes: Vec<u64> = md
             .row_groups()
             .iter()
@@ -331,7 +355,13 @@ pub fn corpus(dir: &Path) -> Corpus {
         for (rg, n) in rg_rows.iter().enumerate() {
             let b = batch(fi, rg);
             assert_eq!(b.num_rows() as u64, *n);
-            rows.extend(decode_rows(&b, fi, u32::try_from(rg).unwrap(), row_no, *region));
+            rows.extend(decode_rows(
+                &b,
+                fi,
+                u32::try_from(rg).unwrap(),
+                row_no,
+                *region,
+            ));
             row_no += n;
         }
         files.push(CorpusFile {
@@ -354,11 +384,13 @@ fn decode_rows(b: &RecordBatch, fi: usize, rg: u32, first: u64, region: Option<&
     let arrow_schema = bellwether_adapters::residual::arrow_schema(&schema);
     let typed = bellwether_core::expr::Typed::parse(EXPR, &arrow_schema).unwrap();
     let exprs = typed
-        .encode_rows(&RecordBatch::try_new(
-            Arc::new(Schema::new(vec![Field::new("sym", DataType::Utf8, true)])),
-            vec![Arc::clone(b.column_by_name("sym").unwrap())],
+        .encode_rows(
+            &RecordBatch::try_new(
+                Arc::new(Schema::new(vec![Field::new("sym", DataType::Utf8, true)])),
+                vec![Arc::clone(b.column_by_name("sym").unwrap())],
+            )
+            .unwrap(),
         )
-        .unwrap())
         .unwrap();
     let tags = bellwether_core::list::ListElements::new(b.column_by_name("tags").unwrap()).unwrap();
     let enc = tags.encoder(&DataType::Utf8).unwrap();
@@ -419,7 +451,11 @@ pub fn enc(v: Value<'_>, dt: &DataType) -> Vec<u8> {
 
 /// The dataset type of a column.
 pub fn dt(c: &str) -> DataType {
-    dataset().into_iter().find(|x| x.name == c).unwrap().data_type
+    dataset()
+        .into_iter()
+        .find(|x| x.name == c)
+        .unwrap()
+        .data_type
 }
 
 /// Both encodings of a float zero, or the value alone.
@@ -474,7 +510,11 @@ pub fn plan(c: &Corpus, rgs: &BTreeSet<(usize, u32)>, residual: Option<Predicate
 
 /// Every `(file, row group)` holding a row `pred` holds for.
 pub fn holding(c: &Corpus, pred: impl Fn(&Row) -> bool) -> BTreeSet<(usize, u32)> {
-    c.rows.iter().filter(|r| pred(r)).map(|r| (r.file, r.rg)).collect()
+    c.rows
+        .iter()
+        .filter(|r| pred(r))
+        .map(|r| (r.file, r.rg))
+        .collect()
 }
 
 /// The rows of the plan's row groups.
@@ -493,7 +533,11 @@ pub fn planned_rows(c: &Corpus, plan: &ScanPlan) -> Vec<Row> {
             e.row_groups.iter().map(move |rg| (fi, rg))
         })
         .collect();
-    c.rows.iter().filter(|r| rgs.contains(&(r.file, r.rg))).cloned().collect()
+    c.rows
+        .iter()
+        .filter(|r| rgs.contains(&(r.file, r.rg)))
+        .cloned()
+        .collect()
 }
 
 /// The reference evaluator over canonical bytes, with SQL's nulls: a null
@@ -518,10 +562,12 @@ pub fn apply(pred: &Predicate, rows: Vec<Row>) -> Vec<Row> {
         } => {
             let bounds: BTreeMap<&Vec<u8>, &Vec<u8>> = bounds.iter().map(|(k, t)| (k, t)).collect();
             rows.into_iter()
-                .filter(|r| match r.tuple(columns).and_then(|k| bounds.get(&k).copied()) {
-                    None => true,
-                    Some(b) => r.get(ts_column).is_some_and(|t| t >= b),
-                })
+                .filter(
+                    |r| match r.tuple(columns).and_then(|k| bounds.get(&k).copied()) {
+                        None => true,
+                        Some(b) => r.get(ts_column).is_some_and(|t| t >= b),
+                    },
+                )
                 .collect()
         }
         Predicate::LatestPerKey { columns, ts_column } => {
@@ -550,9 +596,11 @@ pub fn apply(pred: &Predicate, rows: Vec<Row>) -> Vec<Row> {
             assert_eq!(column, "body");
             rows.into_iter()
                 .filter(|r| {
-                    r.body
-                        .as_deref()
-                        .is_some_and(|v| values.iter().any(|a| bellwether_core::text::matches(*operator, a, v)))
+                    r.body.as_deref().is_some_and(|v| {
+                        values
+                            .iter()
+                            .any(|a| bellwether_core::text::matches(*operator, a, v))
+                    })
                 })
                 .collect()
         }
@@ -572,7 +620,9 @@ pub fn apply(pred: &Predicate, rows: Vec<Row>) -> Vec<Row> {
             .into_iter()
             .filter(|r| {
                 r.tags.as_ref().is_some_and(|l| {
-                    values.iter().all(|g| l.iter().flatten().any(|e| g.contains(e)))
+                    values
+                        .iter()
+                        .all(|g| l.iter().flatten().any(|e| g.contains(e)))
                 })
             })
             .collect(),
@@ -673,7 +723,12 @@ pub fn partitions(c: &Corpus) -> Partitions {
 
 /// The corpus's row counts.
 pub fn row_offsets(c: &Corpus) -> RowOffsets {
-    RowOffsets(c.files.iter().map(|f| (f.path.clone(), f.rg_rows.clone())).collect())
+    RowOffsets(
+        c.files
+            .iter()
+            .map(|f| (f.path.clone(), f.rg_rows.clone()))
+            .collect(),
+    )
 }
 
 /// The canonical tuples of `columns` over every row, nulls dropped.
@@ -702,14 +757,23 @@ pub fn locate(c: &Corpus, columns: &[&str], keys: &[Vec<u8>]) -> ScanPlan {
 /// `at`) over every row, the row groups holding a row at it (every tie),
 /// `In` over keys with a version, `Between` for asof, `NotOlderThan`,
 /// `LatestPerKey`, then `Live` on `void` when `live`.
-pub fn latest(c: &Corpus, key: &str, ts: &str, keys: &[Vec<u8>], at: Option<&Vec<u8>>, live: bool) -> ScanPlan {
+pub fn latest(
+    c: &Corpus,
+    key: &str,
+    ts: &str,
+    keys: &[Vec<u8>],
+    at: Option<&Vec<u8>>,
+    live: bool,
+) -> ScanPlan {
     let cols = vec![key.to_string()];
     // As the planner: a queried key's winner is over all its variants
     // (both signs of a float zero), and every variant gets its bound.
     let class = |k: &Vec<u8>| zero_variants(k).pop().unwrap();
     let mut newest: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
     for r in &c.rows {
-        let (Some(k), Some(t)) = (r.tuple(&cols), r.get(ts)) else { continue };
+        let (Some(k), Some(t)) = (r.tuple(&cols), r.get(ts)) else {
+            continue;
+        };
         if !keys.contains(&k) || at.is_some_and(|a| t > a) {
             continue;
         }
@@ -760,9 +824,11 @@ pub fn latest(c: &Corpus, key: &str, ts: &str, keys: &[Vec<u8>], at: Option<&Vec
 pub fn text(c: &Corpus, op: TextOp, args: &[&str]) -> ScanPlan {
     let values: Vec<String> = args.iter().map(|s| (*s).to_string()).collect();
     let rgs = holding(c, |r| {
-        r.body
-            .as_deref()
-            .is_some_and(|v| values.iter().any(|a| bellwether_core::text::matches(op, a, v)))
+        r.body.as_deref().is_some_and(|v| {
+            values
+                .iter()
+                .any(|a| bellwether_core::text::matches(op, a, v))
+        })
     });
     plan(
         c,
@@ -805,13 +871,18 @@ pub fn read_parquet(path: &Path) -> Vec<RecordBatch> {
 
 /// Canonical Int64 keys.
 pub fn ids(keys: &[i64]) -> Vec<Vec<u8>> {
-    keys.iter().map(|k| enc(Value::Int(*k), &DataType::Int64)).collect()
+    keys.iter()
+        .map(|k| enc(Value::Int(*k), &DataType::Int64))
+        .collect()
 }
 
 /// `KeyColumns` over a batch's `columns` at the dataset types, for tests
 /// that encode engine-side keys.
 pub fn key_columns(b: &RecordBatch, columns: &[&str]) -> KeyColumns {
-    let arrays: Vec<ArrayRef> = columns.iter().map(|c| Arc::clone(b.column_by_name(c).unwrap())).collect();
+    let arrays: Vec<ArrayRef> = columns
+        .iter()
+        .map(|c| Arc::clone(b.column_by_name(c).unwrap()))
+        .collect();
     let types: Vec<DataType> = columns.iter().map(|c| dt(c)).collect();
     KeyColumns::new(&arrays, &types).unwrap()
 }
@@ -828,8 +899,13 @@ pub fn duckdb() -> Result<String, String> {
         .output()
     {
         Ok(o) if o.status.success() => Ok(bin),
-        Ok(o) => Err(format!("`{bin} -no-agent --version` failed: {}", String::from_utf8_lossy(&o.stderr))),
-        Err(e) => Err(format!("no `{bin}` CLI ({e}); install DuckDB or set BELLWETHER_DUCKDB")),
+        Ok(o) => Err(format!(
+            "`{bin} -no-agent --version` failed: {}",
+            String::from_utf8_lossy(&o.stderr)
+        )),
+        Err(e) => Err(format!(
+            "no `{bin}` CLI ({e}); install DuckDB or set BELLWETHER_DUCKDB"
+        )),
     }
 }
 
@@ -846,7 +922,10 @@ pub fn require_duckdb() -> Option<String> {
 /// Prints `SKIPPED: <why>` and returns `None`, or fails when `require`
 /// is set in the environment.
 pub fn skip_or_fail<T>(require: &str, why: &str) -> Option<T> {
-    assert!(std::env::var_os(require).is_none(), "{require} is set: {why}");
+    assert!(
+        std::env::var_os(require).is_none(),
+        "{require} is set: {why}"
+    );
     eprintln!("SKIPPED: {why}");
     None
 }
@@ -873,7 +952,10 @@ pub fn duckdb_run(bin: &str, script: &str) -> Result<String, String> {
     let out = child.wait_with_output().map_err(|e| e.to_string())?;
     let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
     if !out.status.success() || !stderr.is_empty() {
-        return Err(format!("duckdb exited {} with stderr {stderr:?}", out.status));
+        return Err(format!(
+            "duckdb exited {} with stderr {stderr:?}",
+            out.status
+        ));
     }
     Ok(String::from_utf8_lossy(&out.stdout).to_string())
 }
@@ -915,7 +997,9 @@ pub fn bitemporal(c: &Corpus, keys: &[Vec<u8>], valid: &Vec<u8>, known: &Vec<u8>
             *e = (v.clone(), kn.clone());
         }
     }
-    let rgs = holding(c, |r| r.tuple(&cols).is_some_and(|k| winners.contains_key(&k)));
+    let rgs = holding(c, |r| {
+        r.tuple(&cols).is_some_and(|k| winners.contains_key(&k))
+    });
     let (lo_v, lo_k) = (
         winners.values().map(|w| w.0.clone()).min(),
         winners.values().map(|w| w.1.clone()).min(),
@@ -939,12 +1023,18 @@ pub fn bitemporal(c: &Corpus, keys: &[Vec<u8>], valid: &Vec<u8>, known: &Vec<u8>
     all.push(Predicate::NotOlderThan {
         columns: cols.clone(),
         ts_column: "ts".into(),
-        bounds: winners.iter().map(|(k, w)| (k.clone(), w.0.clone())).collect(),
+        bounds: winners
+            .iter()
+            .map(|(k, w)| (k.clone(), w.0.clone()))
+            .collect(),
     });
     all.push(Predicate::NotOlderThan {
         columns: cols.clone(),
         ts_column: "ts_ms".into(),
-        bounds: winners.iter().map(|(k, w)| (k.clone(), w.1.clone())).collect(),
+        bounds: winners
+            .iter()
+            .map(|(k, w)| (k.clone(), w.1.clone()))
+            .collect(),
     });
     all.push(Predicate::LatestPerKey {
         columns: cols,
@@ -972,37 +1062,206 @@ pub struct Case {
 pub fn cases(c: &Corpus) -> Vec<Case> {
     let s = |v: &str| enc(Value::Utf8(v), &DataType::Utf8);
     let f = |v: f64| enc(Value::Float(v), &DataType::Float64);
-    let d = |v: i128, sc: i8, t: &DataType| enc(Value::Decimal128 { value: v, scale: sc }, t);
-    let ts = |us: i64| enc(Value::Timestamp { value: us, unit: TimeUnit::Microsecond }, &dt("ts"));
-    let ms = |m: i64| enc(Value::Timestamp { value: m, unit: TimeUnit::Millisecond }, &dt("ts_ms"));
+    let d = |v: i128, sc: i8, t: &DataType| {
+        enc(
+            Value::Decimal128 {
+                value: v,
+                scale: sc,
+            },
+            t,
+        )
+    };
+    let ts = |us: i64| {
+        enc(
+            Value::Timestamp {
+                value: us,
+                unit: TimeUnit::Microsecond,
+            },
+            &dt("ts"),
+        )
+    };
+    let ms = |m: i64| {
+        enc(
+            Value::Timestamp {
+                value: m,
+                unit: TimeUnit::Millisecond,
+            },
+            &dt("ts_ms"),
+        )
+    };
     let base = 1_704_067_200_000_000i64;
     let mut out = vec![
-        Case { name: "locate int64", plan: locate(c, &["id"], &ids(&[0, 5, 22, 999])), sql_exact: true, spark: true },
-        Case { name: "locate float zeros and NaN", plan: locate(c, &["f"], &[f(-0.0), f(0.0), f(f64::NAN), f(1.5)]), sql_exact: false, spark: true },
-        Case { name: "locate float zeros", plan: locate(c, &["f"], &[f(-0.0), f(0.0), f(1.5)]), sql_exact: true, spark: true },
-        Case { name: "locate decimal scale 2", plan: locate(c, &["d2"], &[d(-575, 2, &dt("d2")), d(-7, 0, &dt("d2"))]), sql_exact: true, spark: true },
-        Case { name: "locate decimal scale 4", plan: locate(c, &["d4"], &[d(-61_725, 4, &dt("d4")), d(0, 0, &dt("d4"))]), sql_exact: true, spark: true },
-        Case { name: "locate timestamp us utc", plan: locate(c, &["ts"], &[ts(base), ts(base + 3_000_003)]), sql_exact: true, spark: true },
-        Case { name: "locate timestamp ms naive", plan: locate(c, &["ts_ms"], &[ms(1_700_000_000_997)]), sql_exact: true, spark: true },
-        Case { name: "locate strings quoted unicode", plan: locate(c, &["sym"], &[s("o'k"), s("Straße"), s("\"q\"")]), sql_exact: true, spark: true },
-        Case { name: "locate binary", plan: locate(c, &["bin"], &[enc(Value::Binary(&[0, 3, 0xff]), &DataType::Binary)]), sql_exact: true, spark: true },
-        Case { name: "locate uint32", plan: locate(c, &["u"], &[enc(Value::UInt(4000), &DataType::UInt32)]), sql_exact: true, spark: true },
-        Case { name: "locate date", plan: locate(c, &["day"], &[enc(Value::Date32(19_702), &DataType::Date32)]), sql_exact: true, spark: true },
-        Case { name: "locate partition column (hive null matches nothing)", plan: locate(c, &["region"], &[s("us")]), sql_exact: true, spark: true },
-        Case { name: "locate nothing found", plan: locate(c, &["id"], &ids(&[12_345])), sql_exact: true, spark: true },
-        Case { name: "latest with ties and null timestamps", plan: latest(c, "id", "ts", &ids(&[1, 2, 3, 4, 5, 6, 7]), None, false), sql_exact: true, spark: true },
-        Case { name: "asof", plan: latest(c, "id", "ts", &ids(&[1, 2, 3, 8, 9]), Some(&ts(base + 2_000_002)), false), sql_exact: true, spark: true },
-        Case { name: "latest live (latest then live)", plan: latest(c, "id", "ts", &ids(&(0..23).collect::<Vec<_>>()), None, true), sql_exact: true, spark: true },
-        Case { name: "latest on a float key keeps zero signs apart", plan: latest(c, "f", "ts", &[f(-0.0), f(0.0), f(f64::NAN)], None, false), sql_exact: false, spark: true },
-        Case { name: "latest on float zeros", plan: latest(c, "f", "ts", &[f(-0.0), f(0.0), f(-2.25)], None, false), sql_exact: true, spark: true },
-        Case { name: "bitemporal", plan: bitemporal(c, &ids(&[1, 4, 9, 16]), &ts(base + 3_000_003), &ms(1_700_000_001_994)), sql_exact: true, spark: true },
-        Case { name: "text has token (full case folding)", plan: text(c, TextOp::HasToken, &["strasse"]), sql_exact: false, spark: false },
-        Case { name: "text contains", plan: text(c, TextOp::Contains, &["GUIDANCE r"]), sql_exact: false, spark: false },
+        Case {
+            name: "locate int64",
+            plan: locate(c, &["id"], &ids(&[0, 5, 22, 999])),
+            sql_exact: true,
+            spark: true,
+        },
+        Case {
+            name: "locate float zeros and NaN",
+            plan: locate(c, &["f"], &[f(-0.0), f(0.0), f(f64::NAN), f(1.5)]),
+            sql_exact: false,
+            spark: true,
+        },
+        Case {
+            name: "locate float zeros",
+            plan: locate(c, &["f"], &[f(-0.0), f(0.0), f(1.5)]),
+            sql_exact: true,
+            spark: true,
+        },
+        Case {
+            name: "locate decimal scale 2",
+            plan: locate(c, &["d2"], &[d(-575, 2, &dt("d2")), d(-7, 0, &dt("d2"))]),
+            sql_exact: true,
+            spark: true,
+        },
+        Case {
+            name: "locate decimal scale 4",
+            plan: locate(c, &["d4"], &[d(-61_725, 4, &dt("d4")), d(0, 0, &dt("d4"))]),
+            sql_exact: true,
+            spark: true,
+        },
+        Case {
+            name: "locate timestamp us utc",
+            plan: locate(c, &["ts"], &[ts(base), ts(base + 3_000_003)]),
+            sql_exact: true,
+            spark: true,
+        },
+        Case {
+            name: "locate timestamp ms naive",
+            plan: locate(c, &["ts_ms"], &[ms(1_700_000_000_997)]),
+            sql_exact: true,
+            spark: true,
+        },
+        Case {
+            name: "locate strings quoted unicode",
+            plan: locate(c, &["sym"], &[s("o'k"), s("Straße"), s("\"q\"")]),
+            sql_exact: true,
+            spark: true,
+        },
+        Case {
+            name: "locate binary",
+            plan: locate(
+                c,
+                &["bin"],
+                &[enc(Value::Binary(&[0, 3, 0xff]), &DataType::Binary)],
+            ),
+            sql_exact: true,
+            spark: true,
+        },
+        Case {
+            name: "locate uint32",
+            plan: locate(c, &["u"], &[enc(Value::UInt(4000), &DataType::UInt32)]),
+            sql_exact: true,
+            spark: true,
+        },
+        Case {
+            name: "locate date",
+            plan: locate(
+                c,
+                &["day"],
+                &[enc(Value::Date32(19_702), &DataType::Date32)],
+            ),
+            sql_exact: true,
+            spark: true,
+        },
+        Case {
+            name: "locate partition column (hive null matches nothing)",
+            plan: locate(c, &["region"], &[s("us")]),
+            sql_exact: true,
+            spark: true,
+        },
+        Case {
+            name: "locate nothing found",
+            plan: locate(c, &["id"], &ids(&[12_345])),
+            sql_exact: true,
+            spark: true,
+        },
+        Case {
+            name: "latest with ties and null timestamps",
+            plan: latest(c, "id", "ts", &ids(&[1, 2, 3, 4, 5, 6, 7]), None, false),
+            sql_exact: true,
+            spark: true,
+        },
+        Case {
+            name: "asof",
+            plan: latest(
+                c,
+                "id",
+                "ts",
+                &ids(&[1, 2, 3, 8, 9]),
+                Some(&ts(base + 2_000_002)),
+                false,
+            ),
+            sql_exact: true,
+            spark: true,
+        },
+        Case {
+            name: "latest live (latest then live)",
+            plan: latest(
+                c,
+                "id",
+                "ts",
+                &ids(&(0..23).collect::<Vec<_>>()),
+                None,
+                true,
+            ),
+            sql_exact: true,
+            spark: true,
+        },
+        Case {
+            name: "latest on a float key keeps zero signs apart",
+            plan: latest(c, "f", "ts", &[f(-0.0), f(0.0), f(f64::NAN)], None, false),
+            sql_exact: false,
+            spark: true,
+        },
+        Case {
+            name: "latest on float zeros",
+            plan: latest(c, "f", "ts", &[f(-0.0), f(0.0), f(-2.25)], None, false),
+            sql_exact: true,
+            spark: true,
+        },
+        Case {
+            name: "bitemporal",
+            plan: bitemporal(
+                c,
+                &ids(&[1, 4, 9, 16]),
+                &ts(base + 3_000_003),
+                &ms(1_700_000_001_994),
+            ),
+            sql_exact: true,
+            spark: true,
+        },
+        Case {
+            name: "text has token (full case folding)",
+            plan: text(c, TextOp::HasToken, &["strasse"]),
+            sql_exact: false,
+            spark: false,
+        },
+        Case {
+            name: "text contains",
+            plan: text(c, TextOp::Contains, &["GUIDANCE r"]),
+            sql_exact: false,
+            spark: false,
+        },
     ];
     // Composite prefix: (sym, id) keyed, looked up by sym alone.
-    out.push(Case { name: "composite prefix", plan: locate(c, &["sym"], &[s("AAPL")]), sql_exact: true, spark: true });
-    let pairs: Vec<Vec<u8>> = tuples(c, &["sym".into(), "id".into()]).into_iter().step_by(5).collect();
-    out.push(Case { name: "composite key", plan: locate(c, &["sym", "id"], &pairs), sql_exact: true, spark: true });
+    out.push(Case {
+        name: "composite prefix",
+        plan: locate(c, &["sym"], &[s("AAPL")]),
+        sql_exact: true,
+        spark: true,
+    });
+    let pairs: Vec<Vec<u8>> = tuples(c, &["sym".into(), "id".into()])
+        .into_iter()
+        .step_by(5)
+        .collect();
+    out.push(Case {
+        name: "composite key",
+        plan: locate(c, &["sym", "id"], &pairs),
+        sql_exact: true,
+        spark: true,
+    });
     // A window: keys whose rows lie in [lo, hi] on ts.
     let mut w = locate(c, &["id"], &ids(&[3, 6, 9]));
     if let Some(Predicate::In { columns, values }) = w.residual.take() {
@@ -1012,54 +1271,117 @@ pub fn cases(c: &Corpus) -> Vec<Case> {
             r.tuple(&columns).is_some_and(|k| set.contains(&k))
                 && r.get("ts").is_some_and(|t| *t >= lo && *t <= hi)
         });
-        w = plan(c, &rgs, Some(Predicate::And { all: vec![Predicate::In { columns, values }, Predicate::Between { column: "ts".into(), lo, hi }] }));
+        w = plan(
+            c,
+            &rgs,
+            Some(Predicate::And {
+                all: vec![
+                    Predicate::In { columns, values },
+                    Predicate::Between {
+                        column: "ts".into(),
+                        lo,
+                        hi,
+                    },
+                ],
+            }),
+        );
     }
-    out.push(Case { name: "window", plan: w, sql_exact: true, spark: true });
+    out.push(Case {
+        name: "window",
+        plan: w,
+        sql_exact: true,
+        spark: true,
+    });
     // A lookback: In then a per-key lower bound, no ranking.
     let mut lb = latest(c, "id", "ts", &ids(&[2, 4, 6]), None, false);
     if let Some(Predicate::And { all }) = lb.residual.take() {
         let keep: Vec<Predicate> = all
             .into_iter()
             .filter_map(|p| match p {
-                Predicate::NotOlderThan { columns, ts_column, bounds } => Some(Predicate::NotOlderThan {
+                Predicate::NotOlderThan {
                     columns,
                     ts_column,
-                    bounds: bounds.into_iter().map(|(k, _)| (k, ts(base + 1_000_001))).collect(),
+                    bounds,
+                } => Some(Predicate::NotOlderThan {
+                    columns,
+                    ts_column,
+                    bounds: bounds
+                        .into_iter()
+                        .map(|(k, _)| (k, ts(base + 1_000_001)))
+                        .collect(),
                 }),
                 p @ Predicate::In { .. } => Some(p),
                 _ => None,
             })
             .collect();
         let set: BTreeSet<Vec<u8>> = ids(&[2, 4, 6]).into_iter().collect();
-        let rgs = holding(c, |r| r.tuple(&["id".into()]).is_some_and(|k| set.contains(&k)));
+        let rgs = holding(c, |r| {
+            r.tuple(&["id".into()]).is_some_and(|k| set.contains(&k))
+        });
         lb = plan(c, &rgs, Some(Predicate::And { all: keep }));
     }
-    out.push(Case { name: "lookback (per-key lower bound)", plan: lb, sql_exact: true, spark: true });
+    out.push(Case {
+        name: "lookback (per-key lower bound)",
+        plan: lb,
+        sql_exact: true,
+        spark: true,
+    });
     // Expression.
     let ev = vec![s("aapl"), s("straße"), s("été")];
     let set: BTreeSet<Vec<u8>> = ev.iter().cloned().collect();
     let rgs = holding(c, |r| r.expr.as_ref().is_some_and(|v| set.contains(v)));
     out.push(Case {
         name: "expression in",
-        plan: plan(c, &rgs, Some(Predicate::ExprIn { expr: EXPR.into(), values: ev })),
+        plan: plan(
+            c,
+            &rgs,
+            Some(Predicate::ExprIn {
+                expr: EXPR.into(),
+                values: ev,
+            }),
+        ),
         sql_exact: false,
         spark: false,
     });
     // List membership.
     let any = vec![s("t1"), s("t6")];
     let set: BTreeSet<Vec<u8>> = any.iter().cloned().collect();
-    let rgs = holding(c, |r| r.tags.as_ref().is_some_and(|l| l.iter().flatten().any(|e| set.contains(e))));
+    let rgs = holding(c, |r| {
+        r.tags
+            .as_ref()
+            .is_some_and(|l| l.iter().flatten().any(|e| set.contains(e)))
+    });
     out.push(Case {
         name: "list contains any",
-        plan: plan(c, &rgs, Some(Predicate::ContainsAny { column: "tags".into(), values: any })),
+        plan: plan(
+            c,
+            &rgs,
+            Some(Predicate::ContainsAny {
+                column: "tags".into(),
+                values: any,
+            }),
+        ),
         sql_exact: true,
         spark: true,
     });
     let groups = vec![vec![s("t2")], vec![s("t3")]];
-    let rgs = holding(c, |r| r.tags.as_ref().is_some_and(|l| groups.iter().all(|g| l.iter().flatten().any(|e| g.contains(e)))));
+    let rgs = holding(c, |r| {
+        r.tags.as_ref().is_some_and(|l| {
+            groups
+                .iter()
+                .all(|g| l.iter().flatten().any(|e| g.contains(e)))
+        })
+    });
     out.push(Case {
         name: "list contains all",
-        plan: plan(c, &rgs, Some(Predicate::ContainsAll { column: "tags".into(), values: groups })),
+        plan: plan(
+            c,
+            &rgs,
+            Some(Predicate::ContainsAll {
+                column: "tags".into(),
+                values: groups,
+            }),
+        ),
         sql_exact: true,
         spark: true,
     });
@@ -1098,12 +1420,17 @@ pub fn nan_case(dir: &Path) -> NanCase {
     let id: Vec<i64> = (0..48).collect();
     let b = RecordBatch::try_new(
         Arc::clone(&schema),
-        vec![Arc::new(Int64Array::from(id.clone())), Arc::new(Float64Array::from(f.clone()))],
+        vec![
+            Arc::new(Int64Array::from(id.clone())),
+            Arc::new(Float64Array::from(f.clone())),
+        ],
     )
     .unwrap();
     std::fs::create_dir_all(dir).unwrap();
     let path = dir.join("nan.parquet");
-    let props = WriterProperties::builder().set_max_row_group_row_count(Some(16)).build();
+    let props = WriterProperties::builder()
+        .set_max_row_group_row_count(Some(16))
+        .build();
     let mut w = ArrowWriter::try_new(File::create(&path).unwrap(), schema, Some(props)).unwrap();
     w.write(&b).unwrap();
     let md = w.close().unwrap();
@@ -1149,15 +1476,24 @@ pub fn nan_case(dir: &Path) -> NanCase {
     });
     let composite = with(Predicate::In {
         columns: vec!["f".into(), "id".into()],
-        values: hits.iter().map(|(i, v)| [fenc(*v), ienc(*i)].concat()).collect(),
+        values: hits
+            .iter()
+            .map(|(i, v)| [fenc(*v), ienc(*i)].concat())
+            .collect(),
     });
-    let mut want: Vec<Vec<String>> = hits.iter().map(|(i, v)| vec![hex(&ienc(*i)), hex(&fenc(*v))]).collect();
+    let mut want: Vec<Vec<String>> = hits
+        .iter()
+        .map(|(i, v)| vec![hex(&ienc(*i)), hex(&fenc(*v))])
+        .collect();
     want.sort();
     NanCase {
         plan,
         composite,
         want,
-        schema: vec![ColumnDef::new("id", DataType::Int64), ColumnDef::new("f", DataType::Float64)],
+        schema: vec![
+            ColumnDef::new("id", DataType::Int64),
+            ColumnDef::new("f", DataType::Float64),
+        ],
         offsets: RowOffsets([(path_s, vec![16, 16, 16])].into_iter().collect()),
     }
 }

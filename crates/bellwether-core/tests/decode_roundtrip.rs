@@ -39,8 +39,13 @@ fn typed_value() -> impl Strategy<Value = (DataType, Value<'static>)> {
         any::<u64>().prop_map(|v| (DataType::UInt64, Value::UInt(v))),
         any::<f32>().prop_map(|v| (DataType::Float32, Value::Float(v.into()))),
         any::<f64>().prop_map(|v| (DataType::Float64, Value::Float(v))),
-        prop_oneof![Just(0.0f64), Just(-0.0), Just(f64::NAN), Just(f64::INFINITY)]
-            .prop_map(|v| (DataType::Float64, Value::Float(v))),
+        prop_oneof![
+            Just(0.0f64),
+            Just(-0.0),
+            Just(f64::NAN),
+            Just(f64::INFINITY)
+        ]
+        .prop_map(|v| (DataType::Float64, Value::Float(v))),
         // A decimal given at another scale is rescaled to the dataset's.
         (-10i128.pow(15)..10i128.pow(15), 0i8..4).prop_map(|(v, s)| (
             DataType::Decimal128(38, 6),
@@ -171,7 +176,10 @@ fn bytes_of_another_type_width_or_unit_are_refused() {
     );
     let e = decode(&b, &ColumnType::of(&us).unwrap()).unwrap_err();
     assert!(e.to_string().contains("another unit"), "{e}");
-    let d128 = enc(&Value::Decimal128 { value: 1, scale: 0 }, &DataType::Decimal128(5, 0));
+    let d128 = enc(
+        &Value::Decimal128 { value: 1, scale: 0 },
+        &DataType::Decimal128(5, 0),
+    );
     assert!(decode(&d128, &ColumnType::of(&DataType::Decimal256(5, 0)).unwrap()).is_err());
     // An Int64 encoding of a value out of an Int8 dataset's range.
     let big = enc(&Value::Int(300), &DataType::Int64);
@@ -180,7 +188,13 @@ fn bytes_of_another_type_width_or_unit_are_refused() {
     let f = enc(&Value::Float(0.1), &DataType::Float64);
     assert!(decode(&f, &ColumnType::of(&DataType::Float32).unwrap()).is_err());
     // A decimal beyond its precision.
-    let wide = enc(&Value::Decimal128 { value: 10_000, scale: 0 }, &DataType::Decimal128(10, 0));
+    let wide = enc(
+        &Value::Decimal128 {
+            value: 10_000,
+            scale: 0,
+        },
+        &DataType::Decimal128(10, 0),
+    );
     assert!(decode(&wide, &ColumnType::of(&DataType::Decimal128(4, 0)).unwrap()).is_err());
     // The null marker is not a value; a tuple reads it as a null.
     assert!(decode(&[0x00], &ColumnType::of(&DataType::Int64).unwrap()).is_err());

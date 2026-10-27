@@ -48,15 +48,15 @@ fn exec_err(e: impl fmt::Display) -> AdapterError {
 }
 
 /// The object store URL and the in-store path of a scan location.
-fn split_location(location: &str) -> Result<(String, String)> {
+fn split_location(location: &str) -> (String, String) {
     if let Some((scheme, rest)) = location.split_once("://") {
         if scheme == "file" {
-            return Ok(("file://".into(), rest.to_string()));
+            return ("file://".into(), rest.to_string());
         }
         let (authority, path) = rest.split_once('/').unwrap_or((rest, ""));
-        return Ok((format!("{scheme}://{authority}"), path.to_string()));
+        return (format!("{scheme}://{authority}"), path.to_string());
     }
-    Ok(("file://".into(), location.to_string()))
+    ("file://".into(), location.to_string())
 }
 
 impl ScanConfig {
@@ -64,7 +64,7 @@ impl ScanConfig {
     pub fn object_store_url(&self) -> Result<ObjectStoreUrl> {
         let mut url: Option<String> = None;
         for f in &self.files {
-            let (u, _) = split_location(&f.location)?;
+            let (u, _) = split_location(&f.location);
             match &url {
                 Some(prev) if *prev != u => {
                     return Err(AdapterError::Unsupported {
@@ -97,7 +97,11 @@ impl ScanConfig {
         }
         let mut virtuals: Vec<FieldRef> = Vec::new();
         if self.ordered {
-            parts.push(Arc::new(Field::new(POSITION_COLUMN, DataType::UInt32, false)));
+            parts.push(Arc::new(Field::new(
+                POSITION_COLUMN,
+                DataType::UInt32,
+                false,
+            )));
             virtuals.push(Arc::new(
                 Field::new(ROW_COLUMN, DataType::Int64, true)
                     .with_extension_type(parquet::arrow::RowNumber),
@@ -125,13 +129,20 @@ impl ScanConfig {
         let types = self
             .table_partition_cols
             .iter()
-            .map(|c| column_type(&self.schema, c, "a partition column").map(|t| value_type(t).clone()))
+            .map(|c| {
+                column_type(&self.schema, c, "a partition column").map(|t| value_type(t).clone())
+            })
             .collect::<Result<Vec<_>>>()?;
         let mut partitioned = Vec::with_capacity(self.files.len());
         for f in &self.files {
-            let (_, path) = split_location(&f.location)?;
+            let (_, path) = split_location(&f.location);
             let mut values = Vec::with_capacity(types.len() + 1);
-            for ((c, v), t) in self.table_partition_cols.iter().zip(&f.partition_values).zip(&types) {
+            for ((c, v), t) in self
+                .table_partition_cols
+                .iter()
+                .zip(&f.partition_values)
+                .zip(&types)
+            {
                 values.push(match partition_scalar(c, v.as_deref(), t)? {
                     Some(s) => scalar_value(&s, t)?,
                     None => ScalarValue::try_from(t).map_err(exec_err)?,
@@ -183,19 +194,15 @@ pub(crate) fn scalar_value(s: &Scalar, dt: &DataType) -> Result<ScalarValue> {
         (Scalar::UInt(v), DataType::UInt16) => ScalarValue::UInt16(Some(*v as u16)),
         (Scalar::UInt(v), DataType::UInt32) => ScalarValue::UInt32(Some(*v as u32)),
         (Scalar::UInt(v), DataType::UInt64) => ScalarValue::UInt64(Some(*v)),
-        (Scalar::Float(f), DataType::Float16) => {
-            ScalarValue::Float16(Some(udf::F16::from_f64(*f)))
-        }
+        (Scalar::Float(f), DataType::Float16) => ScalarValue::Float16(Some(udf::F16::from_f64(*f))),
         (Scalar::Float(f), DataType::Float32) => ScalarValue::Float32(Some(*f as f32)),
         (Scalar::Float(f), DataType::Float64) => ScalarValue::Float64(Some(*f)),
         (Scalar::Decimal128 { value, .. }, DataType::Decimal128(p, s)) => {
             ScalarValue::Decimal128(Some(*value), *p, *s)
         }
-        (Scalar::Decimal128 { value, .. }, DataType::Decimal256(p, s)) => ScalarValue::Decimal256(
-            Some(arrow::datatypes::i256::from_i128(*value)),
-            *p,
-            *s,
-        ),
+        (Scalar::Decimal128 { value, .. }, DataType::Decimal256(p, s)) => {
+            ScalarValue::Decimal256(Some(arrow::datatypes::i256::from_i128(*value)), *p, *s)
+        }
         (Scalar::Decimal256 { value, .. }, DataType::Decimal256(p, s)) => {
             ScalarValue::Decimal256(Some(*value), *p, *s)
         }
@@ -358,14 +365,20 @@ fn key_expr(e: Expr, dt: &DataType) -> Expr {
 /// A literal compared against [`key_expr`] of a `dt` column.
 fn key_lit(s: &Scalar, dt: &DataType) -> Result<Expr> {
     match s {
-        Scalar::Float(f) if is_float(dt) => Ok(lit(ScalarValue::UInt64(Some(udf::float_order(*f))))),
+        Scalar::Float(f) if is_float(dt) => {
+            Ok(lit(ScalarValue::UInt64(Some(udf::float_order(*f)))))
+        }
         _ => scalar_value(s, dt).map(lit),
     }
 }
 
 /// Registers `store` as the object store the scan reads through (a
 /// [`super::CountingStore`] to measure a run).
-pub fn register(ctx: &SessionContext, config: &ScanConfig, store: Arc<dyn ObjectStore>) -> Result<()> {
+pub fn register(
+    ctx: &SessionContext,
+    config: &ScanConfig,
+    store: Arc<dyn ObjectStore>,
+) -> Result<()> {
     let url = config.object_store_url()?;
     ctx.register_object_store(url.as_ref(), store);
     Ok(())
@@ -386,7 +399,8 @@ pub async fn logical_plan(config: &ScanConfig, ctx: &SessionContext) -> Result<L
         b.project(columns.iter().map(|c| scan_col(c)).collect::<Vec<_>>())
             .map_err(exec_err)
     };
-    let mut b = LogicalPlanBuilder::scan(SCAN, provider_as_source(provider), None).map_err(exec_err)?;
+    let mut b =
+        LogicalPlanBuilder::scan(SCAN, provider_as_source(provider), None).map_err(exec_err)?;
     let dataset = &config.schema;
     for (n, stage) in config.compiled.stages.iter().enumerate() {
         b = match stage {
@@ -411,35 +425,35 @@ pub async fn logical_plan(config: &ScanConfig, ctx: &SessionContext) -> Result<L
                             .map_err(exec_err)?
                     } else {
                         let alias = format!("bw_k{n}");
-                        let right = match &config.keys_file {
-                            Some(path) => {
-                                let p = path.display().to_string();
-                                ctx.read_parquet(p, ParquetReadOptions::default())
-                                    .await
-                                    .map_err(exec_err)?
-                                    .into_unoptimized_plan()
-                            }
-                            None => {
-                                let values = rows
-                                    .iter()
-                                    .map(|r| {
-                                        r.iter()
-                                            .zip(types)
-                                            .map(|(s, t)| scalar_value(s, t).map(lit))
-                                            .collect::<Result<Vec<_>>>()
-                                    })
-                                    .collect::<Result<Vec<_>>>()?;
-                                let v = LogicalPlanBuilder::values(values).map_err(exec_err)?;
-                                let names: Vec<Expr> = keys
-                                    .iter()
-                                    .enumerate()
-                                    .map(|(i, k)| {
-                                        Expr::Column(Column::from_name(format!("column{}", i + 1)))
-                                            .alias(k)
-                                    })
-                                    .collect();
-                                v.project(names).map_err(exec_err)?.build().map_err(exec_err)?
-                            }
+                        let right = if let Some(path) = &config.keys_file {
+                            let p = path.display().to_string();
+                            ctx.read_parquet(p, ParquetReadOptions::default())
+                                .await
+                                .map_err(exec_err)?
+                                .into_unoptimized_plan()
+                        } else {
+                            let values = rows
+                                .iter()
+                                .map(|r| {
+                                    r.iter()
+                                        .zip(types)
+                                        .map(|(s, t)| scalar_value(s, t).map(lit))
+                                        .collect::<Result<Vec<_>>>()
+                                })
+                                .collect::<Result<Vec<_>>>()?;
+                            let v = LogicalPlanBuilder::values(values).map_err(exec_err)?;
+                            let names: Vec<Expr> = keys
+                                .iter()
+                                .enumerate()
+                                .map(|(i, k)| {
+                                    Expr::Column(Column::from_name(format!("column{}", i + 1)))
+                                        .alias(k)
+                                })
+                                .collect();
+                            v.project(names)
+                                .map_err(exec_err)?
+                                .build()
+                                .map_err(exec_err)?
                         };
                         let right = LogicalPlanBuilder::new(right)
                             .alias(alias.as_str())
@@ -456,7 +470,10 @@ pub async fn logical_plan(config: &ScanConfig, ctx: &SessionContext) -> Result<L
                             .zip(types)
                             .map(|(k, t)| {
                                 key_expr(
-                                    Expr::Column(Column::new(Some(TableReference::bare(alias.as_str())), k)),
+                                    Expr::Column(Column::new(
+                                        Some(TableReference::bare(alias.as_str())),
+                                        k,
+                                    )),
                                     t,
                                 )
                             })
@@ -473,10 +490,10 @@ pub async fn logical_plan(config: &ScanConfig, ctx: &SessionContext) -> Result<L
                     lo,
                     hi,
                 } => b
-                    .filter(key_expr(scan_col(column), data_type).between(
-                        key_lit(lo, data_type)?,
-                        key_lit(hi, data_type)?,
-                    ))
+                    .filter(
+                        key_expr(scan_col(column), data_type)
+                            .between(key_lit(lo, data_type)?, key_lit(hi, data_type)?),
+                    )
                     .map_err(exec_err)?,
                 Cond::Text {
                     column,
@@ -488,10 +505,7 @@ pub async fn logical_plan(config: &ScanConfig, ctx: &SessionContext) -> Result<L
                     b.filter(f.call(vec![scan_col(column)])).map_err(exec_err)?
                 }
                 Cond::ExprIn {
-                    expr,
-                    inputs,
-                    raw,
-                    ..
+                    expr, inputs, raw, ..
                 } => {
                     let arrow_schema = crate::residual::arrow_schema(dataset);
                     let typed = bellwether_core::expr::Typed::parse(expr, &arrow_schema)
@@ -501,7 +515,7 @@ pub async fn logical_plan(config: &ScanConfig, ctx: &SessionContext) -> Result<L
                         .map(|c| column_type(dataset, c, "ExprIn").map(|t| (c.clone(), t.clone())))
                         .collect::<Result<Vec<_>>>()?;
                     let set: HashSet<Vec<u8>> = raw.iter().cloned().collect();
-                    let f = udf::expr_in(&format!("bellwether_expr_{n}"), typed, ins, set);
+                    let f = udf::expr_in(&format!("bellwether_expr_{n}"), typed, &ins, set);
                     b.filter(f.call(inputs.iter().map(|c| scan_col(c)).collect()))
                         .map_err(exec_err)?
                 }
@@ -513,7 +527,12 @@ pub async fn logical_plan(config: &ScanConfig, ctx: &SessionContext) -> Result<L
                 } => {
                     let dt = column_type(dataset, column, "ContainsAny")?;
                     let set: HashSet<Vec<u8>> = raw.iter().cloned().collect();
-                    let f = udf::contains(&format!("bellwether_contains_{n}"), dt, element.clone(), vec![set]);
+                    let f = udf::contains(
+                        &format!("bellwether_contains_{n}"),
+                        dt,
+                        element.clone(),
+                        vec![set],
+                    );
                     b.filter(f.call(vec![scan_col(column)])).map_err(exec_err)?
                 }
                 Cond::ContainsAll {
@@ -527,7 +546,12 @@ pub async fn logical_plan(config: &ScanConfig, ctx: &SessionContext) -> Result<L
                         .iter()
                         .map(|g| g.iter().cloned().collect::<HashSet<_>>())
                         .collect();
-                    let f = udf::contains(&format!("bellwether_contains_{n}"), dt, element.clone(), groups);
+                    let f = udf::contains(
+                        &format!("bellwether_contains_{n}"),
+                        dt,
+                        element.clone(),
+                        groups,
+                    );
                     b.filter(f.call(vec![scan_col(column)])).map_err(exec_err)?
                 }
                 Cond::Live {
@@ -560,7 +584,9 @@ pub async fn logical_plan(config: &ScanConfig, ctx: &SessionContext) -> Result<L
                             .iter()
                             .zip(types)
                             .map(|(k, t)| {
-                                let k = k.as_ref().ok_or_else(|| AdapterError::Plan("null key".into()))?;
+                                let k = k
+                                    .as_ref()
+                                    .ok_or_else(|| AdapterError::Plan("null key".into()))?;
                                 scalar_value(k, t).map(lit)
                             })
                             .collect::<Result<Vec<_>>>()?;
@@ -575,10 +601,13 @@ pub async fn logical_plan(config: &ScanConfig, ctx: &SessionContext) -> Result<L
                     let mut names: Vec<Expr> = keys
                         .iter()
                         .enumerate()
-                        .map(|(i, k)| Expr::Column(Column::from_name(format!("column{}", i + 1))).alias(k))
+                        .map(|(i, k)| {
+                            Expr::Column(Column::from_name(format!("column{}", i + 1))).alias(k)
+                        })
                         .collect();
                     names.push(
-                        Expr::Column(Column::from_name(format!("column{}", keys.len() + 1))).alias(BOUND),
+                        Expr::Column(Column::from_name(format!("column{}", keys.len() + 1)))
+                            .alias(BOUND),
                     );
                     let right = LogicalPlanBuilder::values(rows)
                         .map_err(exec_err)?
@@ -588,7 +617,9 @@ pub async fn logical_plan(config: &ScanConfig, ctx: &SessionContext) -> Result<L
                         .map_err(exec_err)?
                         .build()
                         .map_err(exec_err)?;
-                    let rcol = |c: &str| Expr::Column(Column::new(Some(TableReference::bare(alias.as_str())), c));
+                    let rcol = |c: &str| {
+                        Expr::Column(Column::new(Some(TableReference::bare(alias.as_str())), c))
+                    };
                     let lk = keys
                         .iter()
                         .zip(types)
@@ -622,12 +653,17 @@ pub async fn logical_plan(config: &ScanConfig, ctx: &SessionContext) -> Result<L
                 }
                 let partition = keys
                     .iter()
-                    .map(|k| column_type(dataset, k, "LatestPerKey").map(|t| key_expr(scan_col(k), t)))
+                    .map(|k| {
+                        column_type(dataset, k, "LatestPerKey").map(|t| key_expr(scan_col(k), t))
+                    })
                     .collect::<Result<Vec<_>>>()?;
                 let rank = datafusion::functions_window::expr_fn::rank()
                     .partition_by(partition)
                     .order_by(vec![SortExpr::new(
-                        key_expr(scan_col(ts_column), column_type(dataset, ts_column, "LatestPerKey")?),
+                        key_expr(
+                            scan_col(ts_column),
+                            column_type(dataset, ts_column, "LatestPerKey")?,
+                        ),
                         false,
                         true,
                     )])
@@ -653,15 +689,24 @@ pub async fn logical_plan(config: &ScanConfig, ctx: &SessionContext) -> Result<L
             ])
             .map_err(exec_err)?;
     }
-    b.project(config.projection.iter().map(|c| scan_col(c)).collect::<Vec<_>>())
-        .map_err(exec_err)?
-        .build()
-        .map_err(exec_err)
+    b.project(
+        config
+            .projection
+            .iter()
+            .map(|c| scan_col(c))
+            .collect::<Vec<_>>(),
+    )
+    .map_err(exec_err)?
+    .build()
+    .map_err(exec_err)
 }
 
 /// Runs the scan and its residual in `ctx` (register a
 /// [`super::CountingStore`] with [`register`] first to measure it).
-pub async fn execute(config: &ScanConfig, ctx: &SessionContext) -> Result<SendableRecordBatchStream> {
+pub async fn execute(
+    config: &ScanConfig,
+    ctx: &SessionContext,
+) -> Result<SendableRecordBatchStream> {
     let plan = logical_plan(config, ctx).await?;
     ctx.execute_logical_plan(plan)
         .await

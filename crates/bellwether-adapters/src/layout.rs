@@ -21,15 +21,19 @@ pub(crate) fn partition_scalar(
     dt: &arrow::datatypes::DataType,
 ) -> Result<Option<bellwether_core::encoding::Scalar>> {
     let Some(v) = value else { return Ok(None) };
-    let bad = |reason: String| AdapterError::Plan(format!(
-        "partition value {column}={v} is not a {dt} ({reason})"
-    ));
-    let strings: arrow::array::ArrayRef = std::sync::Arc::new(arrow::array::StringArray::from(vec![v]));
+    let bad = |reason: String| {
+        AdapterError::Plan(format!(
+            "partition value {column}={v} is not a {dt} ({reason})"
+        ))
+    };
+    let strings: arrow::array::ArrayRef =
+        std::sync::Arc::new(arrow::array::StringArray::from(vec![v]));
     let opts = arrow::compute::CastOptions {
         safe: false,
         format_options: arrow::util::display::FormatOptions::default(),
     };
-    let typed = arrow::compute::cast_with_options(&strings, dt, &opts).map_err(|e| bad(e.to_string()))?;
+    let typed =
+        arrow::compute::cast_with_options(&strings, dt, &opts).map_err(|e| bad(e.to_string()))?;
     let value = bellwether_core::encoding::value_at(typed.as_ref(), 0)
         .map_err(|e| bad(e.to_string()))?
         .ok_or_else(|| bad("it casts to null".into()))?;
@@ -157,10 +161,7 @@ fn read_footer(path: &str, size: u64) -> Result<(u64, Vec<u64>)> {
         path: path.to_string(),
         why: format!("cannot be opened ({e})"),
     })?;
-    let actual = f
-        .metadata()
-        .map_err(|e| footer(e.to_string()))?
-        .len();
+    let actual = f.metadata().map_err(|e| footer(e.to_string()))?.len();
     if actual != size {
         return Err(AdapterError::UnknownFile {
             path: path.to_string(),
@@ -171,14 +172,18 @@ fn read_footer(path: &str, size: u64) -> Result<(u64, Vec<u64>)> {
         });
     }
     if size < 12 {
-        return Err(footer(format!("{size} bytes is too short for a Parquet file")));
+        return Err(footer(format!(
+            "{size} bytes is too short for a Parquet file"
+        )));
     }
     let mut trailer = [0u8; 8];
     f.seek(SeekFrom::Start(size - 8))
         .and_then(|_| f.read_exact(&mut trailer))
         .map_err(|e| footer(e.to_string()))?;
     if &trailer[4..] != PAR1 {
-        return Err(footer("the file does not end in the Parquet magic PAR1".into()));
+        return Err(footer(
+            "the file does not end in the Parquet magic PAR1".into(),
+        ));
     }
     let len = u64::from(u32::from_le_bytes([
         trailer[0], trailer[1], trailer[2], trailer[3],
@@ -206,11 +211,7 @@ fn read_footer(path: &str, size: u64) -> Result<(u64, Vec<u64>)> {
 /// pair, projected column, and partition value against the adapter's
 /// inputs.
 #[allow(clippy::too_many_lines)]
-pub fn layout(
-    plan: &ScanPlan,
-    schema: &[ColumnDef],
-    opts: &EmitOptions,
-) -> Result<Layout> {
+pub fn layout(plan: &ScanPlan, schema: &[ColumnDef], opts: &EmitOptions) -> Result<Layout> {
     let mut seen = BTreeSet::new();
     let partition_columns = opts
         .partitions
@@ -268,10 +269,13 @@ pub fn layout(
         }
         let partition_values = match &opts.partitions {
             Some(p) => {
-                let v = p.files.get(&path).ok_or_else(|| AdapterError::UnknownFile {
-                    path: path.clone(),
-                    why: "has no partition values among those given".into(),
-                })?;
+                let v = p
+                    .files
+                    .get(&path)
+                    .ok_or_else(|| AdapterError::UnknownFile {
+                        path: path.clone(),
+                        why: "has no partition values among those given".into(),
+                    })?;
                 if v.len() != p.columns.len() {
                     return Err(AdapterError::Plan(format!(
                         "{path} has {} partition values for {} partition columns",
@@ -374,13 +378,14 @@ pub fn layout(
     })
 }
 
-/// The row restriction each file needs for `engine`: `None` for a file
-/// read whole, else the `[first, last]` row ranges of its planned row
-/// groups. A strict subset without row counts is refused.
-pub fn row_restrictions(
-    layout: &Layout,
-    engine: &'static str,
-) -> Result<BTreeMap<usize, Option<Vec<(u64, u64)>>>> {
+/// Per file (by its index in [`Layout::files`]): `None` for a file read
+/// whole, else the inclusive `[first, last]` row ranges of its planned row
+/// groups.
+pub type RowRestrictions = BTreeMap<usize, Option<Vec<(u64, u64)>>>;
+
+/// The row restriction each file needs for `engine`. A strict subset
+/// without row counts is refused.
+pub fn row_restrictions(layout: &Layout, engine: &'static str) -> Result<RowRestrictions> {
     let mut out = BTreeMap::new();
     for (i, f) in layout.files.iter().enumerate() {
         let r = match f.whole() {

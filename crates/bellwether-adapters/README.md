@@ -91,6 +91,22 @@ bellwether locate|latest|asof <root> --keys K ... --emit datafusion|duckdb|spark
 
 The artifact is printed after the plan line (human or `--json`), or written to `--out`. Nothing is executed by the CLI: the artifact is text for the user's engine (threat model: no surface executes a query string). `--ordered` is refused, with the plan's own reason, when the plan has no read order; `--footer-hint` and `--engine-pruning` are refused for DuckDB and Spark; `--keys-file-in-query` is refused for a text lookup, which has no key file.
 
+`--keys-file-in-query` with `latest` or `asof` takes a file of the keys that have a version: those lookups list only such keys, and a file holding another key is refused with that reason.
+
+## Measured: planned versus realized bytes
+
+Release build, 2026-10-27, Apple M3 Pro (12 cores, 36 GiB), macOS 26.4, local SSD; DuckDB CLI v2.0.0 through `httpfs` at the test's HTTP range server. `cargo test --release -p bellwether-cli --features datafusion --test emit -- --ignored --nocapture measured`: a bench corpus (10 files × 8 row groups × 20,000 rows, 256-byte payload, 200,000 entities), indexed by the CLI; each lookup emitted by the CLI, run as written, its rows equal to the oracle's, and every byte classified at the storage boundary against the files' own layouts. *Data* is column-chunk bytes; footers are counted apart; *other* is page indexes, bloom filters, and bytes between requested ranges.
+
+| Lookup | Rows | Planned row groups / bytes | DataFusion data (asked = served) | DataFusion row groups touched | DataFusion other | DuckDB data | DuckDB row groups touched | DuckDB other |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| `locate`, 10 keys | 208 | 56 / 313,912,797 | 313,912,797 | 56 | 0 | 313,912,797 | 56 | 973,889 |
+| `locate`, 100 keys | 2,032 | 80 / 448,447,926 | 448,447,926 | 80 | 0 | 448,447,926 | 80 | 1,391,270 |
+| `locate`, 1,000 keys | 19,872 | 80 / 448,447,926 | 448,447,926 | 80 | 0 | 448,447,926 | 80 | 1,391,270 |
+| `latest`, 100 keys | 100 | 10 / 56,056,124 | 56,056,124 | 10 | 0 | 448,447,926 (8.0×) | 80 | 1,391,270 |
+| `asof`, 100 keys | 66 | 12 / 67,267,426 | 67,267,426 | 12 | 0 | 319,545,895 (4.8×) | 64 | 1,113,012 |
+
+DataFusion's data bytes equal the plan's in every run, also behind a store that coalesces ranges up to 1 MiB apart (identical figures; what it asked for stays the plan's). DuckDB reads every planned row group. For `locate` it read exactly the plan's data. For `latest` and `asof` it read row groups the plan skipped: those plans drop the row groups holding only a key's older versions, which the key's own statistics cannot rule out, and DuckDB did not skip them on the `file_row_number` restriction. Rows are exact either way. Spark has no byte figure: only that it opened no unplanned file. Footers: 52,430 to 74,900 bytes per run (one per planned file).
+
 ## Tests
 
 | Test | What it proves |
@@ -102,4 +118,4 @@ The artifact is printed after the plan line (human or `--json`), or written to `
 | `tests/corrupt.rs` | typed refusals for plans that do not belong to their inputs; every flipped byte of a residual value refused exactly when it does not decode, and otherwise translated as the value it re-encodes to; an edited DataFusion description refused |
 | `bellwether-cli/tests/emit.rs` | the CLI end to end: a bench corpus indexed, `locate`, `latest`, `asof`, `--live`, `--keys-file-in-query`, `--columns`, `--residual keys-only`, `--ordered`, `--footer-hint`, and `--relocate` emitted for each engine, each artifact as written executed, and its rows and exact `amount` total equal to the bench oracle's (`harness::oracle`) and to a scan of every corpus row |
 
-Without an engine a test prints `SKIPPED:` and the reason; with `BELLWETHER_REQUIRE_DATAFUSION`, `BELLWETHER_REQUIRE_DUCKDB`, or `BELLWETHER_REQUIRE_SPARK` set it fails instead. CI installs the DuckDB CLI v2.0.0 (pinned by checksum), Java 17, and PySpark 4.2.0, sets all three, and fails if any `SKIPPED:` is printed. `BELLWETHER_DUCKDB` and `BELLWETHER_SPARK_PYTHON` name the binaries.
+Without an engine a test prints `SKIPPED:` and the reason; with `BELLWETHER_REQUIRE_DATAFUSION`, `BELLWETHER_REQUIRE_DUCKDB`, or `BELLWETHER_REQUIRE_SPARK` set it fails instead. In CI the `check` job installs the DuckDB CLI v2.0.0 (pinned by checksum) and requires DataFusion and DuckDB; the `spark` job installs Java 17 and PySpark 4.2.0 and requires Spark; both fail if any `SKIPPED:` is printed. `BELLWETHER_DUCKDB` and `BELLWETHER_SPARK_PYTHON` name the binaries.

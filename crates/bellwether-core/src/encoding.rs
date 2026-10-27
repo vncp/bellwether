@@ -1443,7 +1443,10 @@ pub fn decode(bytes: &[u8], dt: &crate::segment::ColumnType) -> Result<Scalar> {
 /// Decodes a canonical composite tuple of `types` (one element per type,
 /// in order), each element as [`decode`] does; a `0x00` null marker is
 /// `None` (ADR 014). The bytes must hold exactly that many elements.
-pub fn decode_tuple(bytes: &[u8], types: &[crate::segment::ColumnType]) -> Result<Vec<Option<Scalar>>> {
+pub fn decode_tuple(
+    bytes: &[u8],
+    types: &[crate::segment::ColumnType],
+) -> Result<Vec<Option<Scalar>>> {
     let mut out = Vec::with_capacity(types.len());
     let mut at = 0usize;
     for dt in types {

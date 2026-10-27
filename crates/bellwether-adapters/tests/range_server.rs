@@ -4,7 +4,7 @@
 //! classification splits fetched bytes into footer, data, and other bytes
 //! against the file's own layout.
 
-#![allow(clippy::unwrap_used, clippy::expect_used)]
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::doc_markdown)]
 
 mod common;
 
@@ -49,15 +49,24 @@ fn served_ranges_are_exact_and_recorded() {
     let bytes = std::fs::read(&f.path).unwrap();
     let r = request(
         &server.base,
-        &format!("GET {} HTTP/1.1\r\nHost: x\r\nRange: bytes=4-19\r\n\r\n", f.path),
+        &format!(
+            "GET {} HTTP/1.1\r\nHost: x\r\nRange: bytes=4-19\r\n\r\n",
+            f.path
+        ),
     );
     assert!(r.starts_with(b"HTTP/1.1 206"));
     assert_eq!(body(&r), &bytes[4..20]);
-    let r = request(&server.base, &format!("HEAD {} HTTP/1.1\r\nHost: x\r\n\r\n", f.path));
-    assert!(body(&r).is_empty());
     let r = request(
         &server.base,
-        &format!("GET {} HTTP/1.1\r\nHost: x\r\nRange: bytes=-8\r\n\r\n", f.path),
+        &format!("HEAD {} HTTP/1.1\r\nHost: x\r\n\r\n", f.path),
+    );
+    assert_eq!(body(&r), b"");
+    let r = request(
+        &server.base,
+        &format!(
+            "GET {} HTTP/1.1\r\nHost: x\r\nRange: bytes=-8\r\n\r\n",
+            f.path
+        ),
     );
     assert_eq!(body(&r), &bytes[bytes.len() - 8..]);
     let fetches = server.fetches();
@@ -77,7 +86,12 @@ fn classification_splits_footer_data_and_other_bytes() {
     let spans = FileSpans::of_local(&f.path).unwrap();
     let layouts: BTreeMap<String, FileSpans> = [(f.path.clone(), spans.clone())].into();
     // Row group 1 exactly, the footer exactly, and the 4-byte magic.
-    let rg1: Vec<_> = spans.chunks.iter().filter(|(rg, _)| *rg == 1).map(|(_, s)| s.clone()).collect();
+    let rg1: Vec<_> = spans
+        .chunks
+        .iter()
+        .filter(|(rg, _)| *rg == 1)
+        .map(|(_, s)| s.clone())
+        .collect();
     let mut fetches: Vec<bellwether_adapters::measure::Fetch> = rg1
         .iter()
         .map(|r| bellwether_adapters::measure::Fetch {

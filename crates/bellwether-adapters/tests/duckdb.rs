@@ -5,7 +5,7 @@
 //! unplanned row groups of the planned files. Skipped, with the reason,
 //! without a `duckdb` CLI (or, for the bytes, without `httpfs`).
 
-#![allow(clippy::unwrap_used, clippy::expect_used)]
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::doc_markdown)]
 
 mod common;
 
@@ -25,7 +25,9 @@ fn opts(c: &common::Corpus) -> EmitOptions {
 
 #[test]
 fn every_lookup_shape_returns_the_reference_rows() {
-    let Some(bin) = common::require_duckdb() else { return };
+    let Some(bin) = common::require_duckdb() else {
+        return;
+    };
     let tmp = tempfile::tempdir().unwrap();
     let c = common::corpus(tmp.path());
     let schema = common::dataset();
@@ -35,7 +37,11 @@ fn every_lookup_shape_returns_the_reference_rows() {
         let sql = duckdb::sql(&case.plan, &schema, &opts(&c));
         if !case.sql_exact {
             match sql {
-                Err(e @ AdapterError::Unsupported { engine: "duckdb", .. }) => {
+                Err(
+                    e @ AdapterError::Unsupported {
+                        engine: "duckdb", ..
+                    },
+                ) => {
                     let msg = e.to_string();
                     assert!(msg.contains("emit for DataFusion"), "{}: {msg}", case.name);
                 }
@@ -54,7 +60,9 @@ fn every_lookup_shape_returns_the_reference_rows() {
 
 #[test]
 fn ordered_output_follows_the_read_order() {
-    let Some(bin) = common::require_duckdb() else { return };
+    let Some(bin) = common::require_duckdb() else {
+        return;
+    };
     let tmp = tempfile::tempdir().unwrap();
     let c = common::corpus(tmp.path());
     let mut plan = common::locate(&c, &["id"], &common::ids(&[1, 2, 3, 4, 5]));
@@ -63,7 +71,11 @@ fn ordered_output_follows_the_read_order() {
         .entries
         .iter()
         .enumerate()
-        .flat_map(|(i, e)| e.row_groups.iter().map(move |rg| (u32::try_from(i).unwrap(), rg)))
+        .flat_map(|(i, e)| {
+            e.row_groups
+                .iter()
+                .map(move |rg| (u32::try_from(i).unwrap(), rg))
+        })
         .collect();
     let mut order: Vec<(u32, u32)> = pairs.iter().rev().copied().collect();
     order.rotate_left(1);
@@ -94,7 +106,11 @@ fn ordered_output_follows_the_read_order() {
     for (e, rg) in order {
         let path = &plan.entries[e as usize].file.path;
         let fi = c.files.iter().position(|f| &f.path == path).unwrap();
-        let mut rows: Vec<&common::Row> = c.rows.iter().filter(|r| r.file == fi && r.rg == rg).collect();
+        let mut rows: Vec<&common::Row> = c
+            .rows
+            .iter()
+            .filter(|r| r.file == fi && r.rg == rg)
+            .collect();
         rows.sort_by_key(|r| r.row);
         for r in rows {
             if let Some(v) = r.get("id") {
@@ -110,7 +126,9 @@ fn ordered_output_follows_the_read_order() {
 
 #[test]
 fn bytes_read_are_measured_at_a_range_server() {
-    let Some(bin) = common::require_duckdb() else { return };
+    let Some(bin) = common::require_duckdb() else {
+        return;
+    };
     let tmp = tempfile::tempdir().unwrap();
     let c = common::corpus(tmp.path());
     if let Err(e) = common::duckdb_run(&bin, "INSTALL httpfs; LOAD httpfs;") {
@@ -171,11 +189,19 @@ fn bytes_read_are_measured_at_a_range_server() {
                     .sum::<u64>()
             })
             .sum();
-        let planned_files: BTreeSet<&str> =
-            case.plan.entries.iter().map(|e| e.file.path.as_str()).collect();
+        let planned_files: BTreeSet<&str> = case
+            .plan
+            .entries
+            .iter()
+            .map(|e| e.file.path.as_str())
+            .collect();
         for (p, fb) in &realized.files {
             if !planned_files.contains(p.as_str()) {
-                assert_eq!(fb.data, 0, "{}: DuckDB read data of an unplanned file {p}", case.name);
+                assert_eq!(
+                    fb.data, 0,
+                    "{}: DuckDB read data of an unplanned file {p}",
+                    case.name
+                );
             }
         }
         let data = realized.data();
@@ -197,7 +223,10 @@ fn bytes_read_are_measured_at_a_range_server() {
             touched.len()
         ));
     }
-    eprintln!("DuckDB at the range server (data = column-chunk bytes served):\n{}", table.join("\n"));
+    eprintln!(
+        "DuckDB at the range server (data = column-chunk bytes served):\n{}",
+        table.join("\n")
+    );
 }
 
 #[test]
@@ -214,8 +243,20 @@ fn a_nan_key_is_refused_by_name_not_run_loosely() {
     for plan in [&nan.plan, &nan.composite] {
         let err = duckdb::sql(plan, &nan.schema, &o).unwrap_err();
         let msg = err.to_string();
-        assert!(matches!(err, AdapterError::Unsupported { engine: "duckdb", .. }), "{msg}");
-        assert!(msg.contains("In key list") && msg.contains("NaN") && msg.contains("\"f\""), "{msg}");
+        assert!(
+            matches!(
+                err,
+                AdapterError::Unsupported {
+                    engine: "duckdb",
+                    ..
+                }
+            ),
+            "{msg}"
+        );
+        assert!(
+            msg.contains("In key list") && msg.contains("NaN") && msg.contains("\"f\""),
+            "{msg}"
+        );
         assert!(msg.contains("emit for DataFusion"), "{msg}");
     }
 }

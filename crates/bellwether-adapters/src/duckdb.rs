@@ -80,7 +80,13 @@ fn column_type_name(dt: &DataType) -> Result<String> {
         DataType::Struct(fields) => {
             let parts = fields
                 .iter()
-                .map(|f| Ok(format!("{} {}", ident(f.name(), E)?, column_type_name(f.data_type())?)))
+                .map(|f| {
+                    Ok(format!(
+                        "{} {}",
+                        ident(f.name(), E)?,
+                        column_type_name(f.data_type())?
+                    ))
+                })
                 .collect::<Result<Vec<_>>>()?;
             format!("STRUCT({})", parts.join(", "))
         }
@@ -128,6 +134,7 @@ fn partition_keys(columns: &[String], schema: &[ColumnDef]) -> Result<Vec<String
 
 /// A row test as a SQL boolean over the stage's input (`None` when the
 /// test needs a relation instead: a long or composite `In`).
+#[allow(clippy::too_many_lines)] // one arm per residual condition
 fn cond_sql(c: &Cond) -> Result<Option<String>> {
     Ok(Some(match c {
         Cond::In {
@@ -144,7 +151,12 @@ fn cond_sql(c: &Cond) -> Result<Option<String>> {
                 .iter()
                 .zip(types)
                 .enumerate()
-                .find(|(i, (_, t))| is_float(t) && rows.iter().any(|r| matches!(r[*i], Scalar::Float(f) if f.is_nan())))
+                .find(|(i, (_, t))| {
+                    is_float(t)
+                        && rows
+                            .iter()
+                            .any(|r| matches!(r[*i], Scalar::Float(f) if f.is_nan()))
+                })
                 .map(|(_, (c, _))| c)
             {
                 return Err(AdapterError::Unsupported {
@@ -181,11 +193,15 @@ fn cond_sql(c: &Cond) -> Result<Option<String>> {
             if zero_or_nan(lo) || zero_or_nan(hi) {
                 return Err(AdapterError::Unsupported {
                     engine: E,
-                    what: format!("the Between range on float column {column:?}, bounded by a zero or NaN"),
+                    what: format!(
+                        "the Between range on float column {column:?}, bounded by a zero or NaN"
+                    ),
                     reason: "orders -0.0 before +0.0 and NaN last in the plan, which SQL \
                              comparison does not"
                         .into(),
-                    next: "emit for DataFusion, which orders floats as the plan's canonical bytes do".into(),
+                    next:
+                        "emit for DataFusion, which orders floats as the plan's canonical bytes do"
+                            .into(),
                 });
             }
             format!(
@@ -227,7 +243,10 @@ fn cond_sql(c: &Cond) -> Result<Option<String>> {
             raw,
         } => {
             if !complete_zero_classes(raw.iter()) {
-                return Err(zero_refusal(E, &format!("the ContainsAny values on list column {column:?}")));
+                return Err(zero_refusal(
+                    E,
+                    &format!("the ContainsAny values on list column {column:?}"),
+                ));
             }
             if values.is_empty() {
                 return Ok(Some("FALSE".into()));
@@ -251,7 +270,10 @@ fn cond_sql(c: &Cond) -> Result<Option<String>> {
         } => {
             for g in raw {
                 if !complete_zero_classes(g.iter()) {
-                    return Err(zero_refusal(E, &format!("the ContainsAll values on list column {column:?}")));
+                    return Err(zero_refusal(
+                        E,
+                        &format!("the ContainsAll values on list column {column:?}"),
+                    ));
                 }
             }
             let list = list_expr(column, *map)?;
@@ -271,7 +293,10 @@ fn cond_sql(c: &Cond) -> Result<Option<String>> {
             tombstone,
         } => {
             if matches!(tombstone, Scalar::Float(f) if *f == 0.0) {
-                return Err(zero_refusal(E, &format!("the Live tombstone on column {column:?}")));
+                return Err(zero_refusal(
+                    E,
+                    &format!("the Live tombstone on column {column:?}"),
+                ));
             }
             let q = ident(column, E)?;
             format!(
@@ -344,7 +369,11 @@ pub fn sql(plan: &ScanPlan, schema: &[ColumnDef], opts: &EmitOptions) -> Result<
             .iter()
             .map(|c| {
                 let dt = crate::residual::column_type(schema, c, "the output")?;
-                Ok(format!("CAST(NULL AS {}) AS {}", column_type_name(dt)?, ident(c, E)?))
+                Ok(format!(
+                    "CAST(NULL AS {}) AS {}",
+                    column_type_name(dt)?,
+                    ident(c, E)?
+                ))
             })
             .collect::<Result<Vec<_>>>()?;
         let _ = write!(out, "SELECT {} WHERE FALSE", cols.join(", "));
@@ -362,12 +391,20 @@ pub fn sql(plan: &ScanPlan, schema: &[ColumnDef], opts: &EmitOptions) -> Result<
         let types = lay
             .partition_columns
             .iter()
-            .map(|c| crate::residual::column_type(schema, c, "a partition column").map(|t| value_type(t).clone()))
+            .map(|c| {
+                crate::residual::column_type(schema, c, "a partition column")
+                    .map(|t| value_type(t).clone())
+            })
             .collect::<Result<Vec<_>>>()?;
         let mut rows = Vec::with_capacity(lay.files.len());
         for f in &lay.files {
             let mut cells = vec![string(&f.location)];
-            for ((c, v), t) in lay.partition_columns.iter().zip(&f.partition_values).zip(&types) {
+            for ((c, v), t) in lay
+                .partition_columns
+                .iter()
+                .zip(&f.partition_values)
+                .zip(&types)
+            {
                 let s = partition_scalar(c, v.as_deref(), t)?;
                 cells.push(literal_or_null(s.as_ref(), t)?);
             }
@@ -423,7 +460,10 @@ pub fn sql(plan: &ScanPlan, schema: &[ColumnDef], opts: &EmitOptions) -> Result<
                     .collect::<Vec<_>>()
                     .join(" OR ")
             };
-            wheres.push(format!("(t.filename <> {} OR {ranges})", string(&f.location)));
+            wheres.push(format!(
+                "(t.filename <> {} OR {ranges})",
+                string(&f.location)
+            ));
         }
     }
     if !wheres.is_empty() {
@@ -436,9 +476,13 @@ pub fn sql(plan: &ScanPlan, schema: &[ColumnDef], opts: &EmitOptions) -> Result<
     for (n, stage) in residual.stages.iter().enumerate() {
         let me = format!("bw_s{}", n + 1);
         let body = match stage {
+            // The keys file, once checked, always replaces the one key
+            // list, however short (cond_sql still runs for its refusals).
             Stage::Filter(c) => match cond_sql(c)? {
-                Some(test) => format!("SELECT * FROM {prev} WHERE {test}"),
-                None => {
+                Some(test) if keys_file.is_none() || !matches!(c, Cond::In { .. }) => {
+                    format!("SELECT * FROM {prev} WHERE {test}")
+                }
+                _ => {
                     let Cond::In {
                         columns,
                         types,
@@ -448,8 +492,8 @@ pub fn sql(plan: &ScanPlan, schema: &[ColumnDef], opts: &EmitOptions) -> Result<
                     else {
                         unreachable!("only In needs a relation")
                     };
-                    let keys_rel = match &keys_file {
-                        Some((path, _)) => format!(
+                    let keys_rel = if let Some((path, _)) = &keys_file {
+                        format!(
                             "(SELECT {} FROM read_parquet({}))",
                             columns
                                 .iter()
@@ -457,22 +501,22 @@ pub fn sql(plan: &ScanPlan, schema: &[ColumnDef], opts: &EmitOptions) -> Result<
                                 .collect::<Result<Vec<_>>>()?
                                 .join(", "),
                             string(&path.display().to_string())
-                        ),
-                        None => {
-                            let kname = format!("bw_k{}", n + 1);
-                            let names = columns
-                                .iter()
-                                .map(|c| ident(c, E))
-                                .collect::<Result<Vec<_>>>()?;
-                            let vals = values_rows(rows.iter().map(|r| {
+                        )
+                    } else {
+                        let kname = format!("bw_k{}", n + 1);
+                        let names = columns
+                            .iter()
+                            .map(|c| ident(c, E))
+                            .collect::<Result<Vec<_>>>()?;
+                        let vals =
+                            values_rows(rows.iter().map(|r| {
                                 r.iter().map(Some).zip(types.iter()).collect::<Vec<_>>()
                             }))?;
-                            ctes.push(format!(
-                                "{kname} AS (SELECT * FROM (VALUES {vals}) AS v({}))",
-                                names.join(", ")
-                            ));
-                            kname
-                        }
+                        ctes.push(format!(
+                            "{kname} AS (SELECT * FROM (VALUES {vals}) AS v({}))",
+                            names.join(", ")
+                        ));
+                        kname
                     };
                     let on = columns
                         .iter()
@@ -556,7 +600,12 @@ pub fn sql(plan: &ScanPlan, schema: &[ColumnDef], opts: &EmitOptions) -> Result<
         .iter()
         .map(|c| ident(c, E))
         .collect::<Result<Vec<_>>>()?;
-    let _ = write!(out, "WITH {}\nSELECT {} FROM {prev}", ctes.join(",\n"), output.join(", "));
+    let _ = write!(
+        out,
+        "WITH {}\nSELECT {} FROM {prev}",
+        ctes.join(",\n"),
+        output.join(", ")
+    );
     if opts.ordered {
         let mut cases = Vec::new();
         if lay.interleaved {

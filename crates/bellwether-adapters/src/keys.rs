@@ -73,7 +73,9 @@ pub(crate) fn complete_zero_classes<'a>(raw: impl IntoIterator<Item = &'a Vec<u8
         if tuple_has_null(k) != Some(false) {
             continue;
         }
-        let e = classes.entry(sql_class(k)).or_insert_with(|| (zeros(k), BTreeSet::new()));
+        let e = classes
+            .entry(sql_class(k))
+            .or_insert_with(|| (zeros(k), BTreeSet::new()));
         e.1.insert(k);
     }
     classes
@@ -131,8 +133,11 @@ pub(crate) fn sql_bounds<'a>(
     Ok(by_class.into_values().collect())
 }
 
-/// The residual's one `In` stage: its columns, types, and canonical rows.
-fn the_in(residual: &Residual, path: &str) -> Result<(Vec<String>, Vec<DataType>, Vec<Vec<u8>>)> {
+/// An `In` list: its columns, their dataset types, and the canonical rows.
+type KeyList = (Vec<String>, Vec<DataType>, Vec<Vec<u8>>);
+
+/// The residual's one `In` stage.
+fn the_in(residual: &Residual, path: &str) -> Result<KeyList> {
     let ins: Vec<&Cond> = residual
         .stages
         .iter()
@@ -164,7 +169,11 @@ fn the_in(residual: &Residual, path: &str) -> Result<(Vec<String>, Vec<DataType>
 /// Checks that the Parquet file at `path` holds exactly the residual's `In`
 /// keys under `equality`, with each key column at its dataset type, and
 /// returns the key columns the engine joins on.
-pub(crate) fn check(path: &Path, residual: &Residual, equality: KeyEquality) -> Result<Vec<String>> {
+pub(crate) fn check(
+    path: &Path,
+    residual: &Residual,
+    equality: KeyEquality,
+) -> Result<Vec<String>> {
     let shown = path.display().to_string();
     let bad = |reason: String| AdapterError::KeysFile {
         path: shown.clone(),
@@ -212,7 +221,9 @@ pub(crate) fn check(path: &Path, residual: &Residual, equality: KeyEquality) -> 
         let keys = KeyColumns::new(&arrays, &types).map_err(|e| bad(e.to_string()))?;
         let mut buf = Vec::new();
         for row in 0..keys.len() {
-            if keys.encode_into(row, &mut buf).map_err(|e| bad(e.to_string()))?
+            if keys
+                .encode_into(row, &mut buf)
+                .map_err(|e| bad(e.to_string()))?
                 && tuple_has_null(&buf) == Some(false)
             {
                 got.insert(match equality {

@@ -6,14 +6,24 @@
 //! feature; DuckDB through its CLI when one is installed), must return
 //! exactly the reference's rows.
 
-#![allow(clippy::unwrap_used, clippy::expect_used)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::cast_sign_loss,
+    clippy::default_trait_access,
+    clippy::doc_markdown,
+    clippy::format_collect,
+    clippy::many_single_char_names
+)]
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 use std::path::Path;
 use std::sync::Arc;
 
-use arrow::array::{BooleanArray, Float64Array, Int64Array, RecordBatch, TimestampMicrosecondArray};
+use arrow::array::{
+    BooleanArray, Float64Array, Int64Array, RecordBatch, TimestampMicrosecondArray,
+};
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use bellwether_adapters::{ColumnDef, EmitOptions, RowOffsets};
 use bellwether_core::encoding::{encode_nullable_as, encode_value_as, Value};
@@ -62,7 +72,8 @@ fn shape() -> impl Strategy<Value = Shape> {
         proptest::collection::vec(0i64..10, 0..5).prop_map(Shape::In),
         proptest::collection::vec(0usize..FLOATS.len(), 1..3).prop_map(Shape::FloatIn),
         (0i64..4, 0i64..4).prop_map(|(a, b)| Shape::Between(a.min(b), a.max(b))),
-        (proptest::collection::vec(0i64..10, 1..6), any::<bool>()).prop_map(|(k, l)| Shape::Latest(k, l)),
+        (proptest::collection::vec(0i64..10, 1..6), any::<bool>())
+            .prop_map(|(k, l)| Shape::Latest(k, l)),
         proptest::collection::vec(0usize..FLOATS.len(), 1..4).prop_map(Shape::FloatLatest),
         proptest::collection::vec((0i64..10, 0i64..4), 0..5).prop_map(Shape::Bounds),
     ]
@@ -72,7 +83,10 @@ fn schema() -> Vec<ColumnDef> {
     vec![
         ColumnDef::new("k", DataType::Int64),
         ColumnDef::new("f", DataType::Float64),
-        ColumnDef::new("ts", DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()))),
+        ColumnDef::new(
+            "ts",
+            DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+        ),
         ColumnDef::new("void", DataType::Boolean),
     ]
 }
@@ -83,7 +97,9 @@ fn arrow(t: &Table) -> RecordBatch {
         s,
         vec![
             Arc::new(Int64Array::from(t.k.clone())),
-            Arc::new(Float64Array::from(t.f.iter().map(|i| i.map(|i| FLOATS[i])).collect::<Vec<_>>())),
+            Arc::new(Float64Array::from(
+                t.f.iter().map(|i| i.map(|i| FLOATS[i])).collect::<Vec<_>>(),
+            )),
             Arc::new(TimestampMicrosecondArray::from(t.ts.clone()).with_timezone("UTC")),
             Arc::new(BooleanArray::from(t.void.clone())),
         ],
@@ -118,12 +134,19 @@ fn zeros(i: usize) -> Vec<Vec<u8>> {
 fn setup(dir: &Path, t: &Table, residual: Predicate) -> (ScanPlan, Vec<common::Row>, RowOffsets) {
     let path = dir.join("t.parquet");
     let b = arrow(t);
-    let props = WriterProperties::builder().set_max_row_group_row_count(Some(16)).build();
-    let mut w = ArrowWriter::try_new(File::create(&path).unwrap(), b.schema(), Some(props)).unwrap();
+    let props = WriterProperties::builder()
+        .set_max_row_group_row_count(Some(16))
+        .build();
+    let mut w =
+        ArrowWriter::try_new(File::create(&path).unwrap(), b.schema(), Some(props)).unwrap();
     w.write(&b).unwrap();
     let md = w.close().unwrap();
     let path_s = path.canonicalize().unwrap().display().to_string();
-    let rg_rows: Vec<u64> = md.row_groups().iter().map(|g| g.num_rows() as u64).collect();
+    let rg_rows: Vec<u64> = md
+        .row_groups()
+        .iter()
+        .map(|g| g.num_rows() as u64)
+        .collect();
     let rg_bytes: Vec<u64> = md
         .row_groups()
         .iter()
@@ -198,7 +221,10 @@ fn residual(t: &Table, shape: &Shape) -> Predicate {
             k.clone()
         }
     };
-    let latest = |cols: &Vec<String>, keys: BTreeSet<Vec<u8>>, key_of: &dyn Fn(usize) -> Option<Vec<u8>>, live: bool| {
+    let latest = |cols: &Vec<String>,
+                  keys: BTreeSet<Vec<u8>>,
+                  key_of: &dyn Fn(usize) -> Option<Vec<u8>>,
+                  live: bool| {
         let mut newest: BTreeMap<Vec<u8>, i64> = BTreeMap::new();
         for r in 0..t.k.len() {
             if let (Some(k), Some(ts)) = (key_of(r), t.ts[r]) {
@@ -220,7 +246,10 @@ fn residual(t: &Table, shape: &Shape) -> Predicate {
             Predicate::NotOlderThan {
                 columns: cols.clone(),
                 ts_column: "ts".into(),
-                bounds: listed.iter().map(|(k, v)| (k.clone(), ts_enc(*v))).collect(),
+                bounds: listed
+                    .iter()
+                    .map(|(k, v)| (k.clone(), ts_enc(*v)))
+                    .collect(),
             },
             Predicate::LatestPerKey {
                 columns: cols.clone(),
@@ -319,7 +348,10 @@ fn rendered(batches: &[RecordBatch]) -> Vec<Vec<String>> {
 fn datafusion_agrees_with_the_reference_on_random_rows() {
     use bellwether_adapters::datafusion;
     use futures::TryStreamExt;
-    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
     let mut runner = TestRunner::new(Config::with_cases(256));
     runner
         .run(&(table(), shape()), |(t, s)| {
@@ -332,7 +364,12 @@ fn datafusion_agrees_with_the_reference_on_random_rows() {
             let cfg = datafusion::scan_config(&plan, &schema(), &o).unwrap();
             let ctx = datafusion::engine::prelude::SessionContext::new();
             let got = rt.block_on(async {
-                datafusion::execute(&cfg, &ctx).await.unwrap().try_collect::<Vec<_>>().await.unwrap()
+                datafusion::execute(&cfg, &ctx)
+                    .await
+                    .unwrap()
+                    .try_collect::<Vec<_>>()
+                    .await
+                    .unwrap()
             });
             prop_assert_eq!(rendered(&got), expected(&plan, rows), "{:?}", s);
             Ok(())
@@ -342,7 +379,9 @@ fn datafusion_agrees_with_the_reference_on_random_rows() {
 
 #[test]
 fn duckdb_agrees_with_the_reference_on_random_rows() {
-    let Some(bin) = common::require_duckdb() else { return };
+    let Some(bin) = common::require_duckdb() else {
+        return;
+    };
     // A DuckDB process per case: fewer cases than in process.
     let mut runner = TestRunner::new(Config::with_cases(48));
     runner
@@ -367,7 +406,11 @@ fn duckdb_agrees_with_the_reference_on_random_rows() {
                     sql
                 }
                 Err(bellwether_adapters::AdapterError::Unsupported { what, .. }) if lists_nan => {
-                    prop_assert!(what.contains("NaN") && what.contains("In key list"), "{}", what);
+                    prop_assert!(
+                        what.contains("NaN") && what.contains("In key list"),
+                        "{}",
+                        what
+                    );
                     return Ok(());
                 }
                 Err(e) => return Err(TestCaseError::fail(format!("{s:?}: {e}"))),
@@ -388,17 +431,40 @@ fn every_variant_compiles_to_typed_literals() {
         ColumnDef::new("t", DataType::Timestamp(TimeUnit::Millisecond, None)),
         ColumnDef::new("f", DataType::Float32),
     ];
-    let d = enc(Value::Decimal128 { value: 125, scale: 2 }, &s[0].data_type);
-    let t = enc(Value::Timestamp { value: 7, unit: TimeUnit::Millisecond }, &s[1].data_type);
+    let d = enc(
+        Value::Decimal128 {
+            value: 125,
+            scale: 2,
+        },
+        &s[0].data_type,
+    );
+    let t = enc(
+        Value::Timestamp {
+            value: 7,
+            unit: TimeUnit::Millisecond,
+        },
+        &s[1].data_type,
+    );
     let f = enc(Value::Float(-0.0), &s[2].data_type);
     let p = Predicate::And {
         all: vec![
-            Predicate::In { columns: vec!["d".into()], values: vec![d] },
-            Predicate::Between { column: "t".into(), lo: t.clone(), hi: t },
-            Predicate::In { columns: vec!["f".into()], values: vec![f] },
+            Predicate::In {
+                columns: vec!["d".into()],
+                values: vec![d],
+            },
+            Predicate::Between {
+                column: "t".into(),
+                lo: t.clone(),
+                hi: t,
+            },
+            Predicate::In {
+                columns: vec!["f".into()],
+                values: vec![f],
+            },
         ],
     };
-    let r = bellwether_adapters::residual::compile(Some(&p), &s, Default::default(), "test").unwrap();
+    let r =
+        bellwether_adapters::residual::compile(Some(&p), &s, Default::default(), "test").unwrap();
     let j = r.to_json().to_string();
     assert!(j.contains(r#""unscaled":"12500""#), "{j}");
     assert!(j.contains(r#""scale":4"#), "{j}");

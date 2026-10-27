@@ -88,7 +88,10 @@ pub(crate) fn canonical_order(dt: &DataType) -> ScalarUDF {
 /// `column` (a string column of type `dt`) matches one of `args` under
 /// `op`, both sides case-folded.
 pub(crate) fn text(name: &str, dt: &DataType, op: TextOp, args: &[String]) -> ScalarUDF {
-    let folded: Vec<String> = args.iter().map(|a| bellwether_core::text::fold(a)).collect();
+    let folded: Vec<String> = args
+        .iter()
+        .map(|a| bellwether_core::text::fold(a))
+        .collect();
     create_udf(
         name,
         vec![dt.clone()],
@@ -116,7 +119,7 @@ pub(crate) fn text(name: &str, dt: &DataType, op: TextOp, args: &[String]) -> Sc
 pub(crate) fn expr_in(
     name: &str,
     typed: Typed,
-    inputs: Vec<(String, DataType)>,
+    inputs: &[(String, DataType)],
     values: HashSet<Vec<u8>>,
 ) -> ScalarUDF {
     let schema = Arc::new(Schema::new(

@@ -43,14 +43,14 @@ mod exec;
 #[cfg(feature = "datafusion")]
 mod udf;
 
-#[cfg(feature = "datafusion")]
-pub use counting::CountingStore;
-#[cfg(feature = "datafusion")]
-pub use exec::{execute, logical_plan, register};
 /// The DataFusion crate the executable scan is built with (feature
 /// `datafusion`), for callers that run it.
 #[cfg(feature = "datafusion")]
 pub use ::datafusion as engine;
+#[cfg(feature = "datafusion")]
+pub use counting::CountingStore;
+#[cfg(feature = "datafusion")]
+pub use exec::{execute, logical_plan, register};
 
 const E: &str = "datafusion";
 
@@ -88,6 +88,7 @@ pub struct ScanFile {
 
 /// The Parquet options of the scan.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[allow(clippy::struct_excessive_bools)] // DataFusion's own four independent switches, by name
 pub struct ParquetOptions {
     /// Row-group statistics pruning.
     pub pruning: bool,
@@ -189,8 +190,7 @@ impl ScanConfig {
 /// given one, field for field. What runs is what was printed.
 pub fn from_json(text: &str) -> Result<ScanConfig> {
     let bad = |m: String| AdapterError::Description(m);
-    let doc: Json =
-        serde_json::from_str(text).map_err(|e| bad(format!("it is not JSON ({e})")))?;
+    let doc: Json = serde_json::from_str(text).map_err(|e| bad(format!("it is not JSON ({e})")))?;
     match doc.get("format").and_then(Json::as_str) {
         Some(FORMAT) => {}
         Some(other) => return Err(bad(format!("its format is {other:?}, not {FORMAT:?}"))),
@@ -238,7 +238,12 @@ pub fn from_json(text: &str) -> Result<ScanConfig> {
 }
 
 /// The plan as a DataFusion scan (see the module docs).
-pub fn scan_config(plan: &ScanPlan, schema: &[ColumnDef], opts: &EmitOptions) -> Result<ScanConfig> {
+#[allow(clippy::too_many_lines)] // one linear pass: files, access plans, residual, labels
+pub fn scan_config(
+    plan: &ScanPlan,
+    schema: &[ColumnDef],
+    opts: &EmitOptions,
+) -> Result<ScanConfig> {
     let compiled = compile(plan.residual.as_ref(), schema, opts.residual, E)?;
     let lay = layout(plan, schema, opts)?;
     for c in schema {
@@ -279,11 +284,13 @@ pub fn scan_config(plan: &ScanPlan, schema: &[ColumnDef], opts: &EmitOptions) ->
         None => None,
     };
     let access = |f: &crate::layout::PlannedFile, only: Option<u32>| -> Result<Vec<&'static str>> {
-        let n = f.row_group_count().ok_or_else(|| AdapterError::RowOffsetsNeeded {
-            engine: E,
-            path: f.path.clone(),
-            why: "to give the file a row-group access plan, which names every row group",
-        })?;
+        let n = f
+            .row_group_count()
+            .ok_or_else(|| AdapterError::RowOffsetsNeeded {
+                engine: E,
+                path: f.path.clone(),
+                why: "to give the file a row-group access plan, which names every row group",
+            })?;
         Ok((0..n)
             .map(|i| {
                 let i = u32::try_from(i).unwrap_or(u32::MAX);
@@ -321,9 +328,7 @@ pub fn scan_config(plan: &ScanPlan, schema: &[ColumnDef], opts: &EmitOptions) ->
         }
     } else {
         for (pos, f) in lay.files.iter().enumerate() {
-            let position = opts
-                .ordered
-                .then(|| u32::try_from(pos).unwrap_or(u32::MAX));
+            let position = opts.ordered.then(|| u32::try_from(pos).unwrap_or(u32::MAX));
             files.push(scan_file(f, None, position)?);
         }
     }

@@ -13,7 +13,7 @@
 //! else `python3`. Without one the tests print `SKIPPED:` and the reason;
 //! with `BELLWETHER_REQUIRE_SPARK` set they fail instead.
 
-#![allow(clippy::unwrap_used, clippy::expect_used)]
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::too_many_lines)]
 
 mod common;
 
@@ -112,7 +112,14 @@ fn written(out: &Path) -> Vec<RecordBatch> {
     parts.iter().flat_map(|p| common::read_parquet(p)).collect()
 }
 
-fn manifest_job(dir: &Path, name: &str, plan: &ScanPlan, schema: &[ColumnDef], o: &EmitOptions, all_files: &[String]) -> Job {
+fn manifest_job(
+    dir: &Path,
+    name: &str,
+    plan: &ScanPlan,
+    schema: &[ColumnDef],
+    o: &EmitOptions,
+    all_files: &[String],
+) -> Job {
     let n = name.replace(|c: char| !c.is_ascii_alphanumeric(), "_");
     let m = spark::manifest(plan, schema, o).unwrap_or_else(|e| panic!("{name}: {e}"));
     let manifest = dir.join(format!("{n}.json"));
@@ -122,7 +129,11 @@ fn manifest_job(dir: &Path, name: &str, plan: &ScanPlan, schema: &[ColumnDef], o
         name: name.to_string(),
         manifest,
         out: dir.join(format!("{n}.out")),
-        deny: all_files.iter().filter(|p| !planned.contains(p.as_str())).cloned().collect(),
+        deny: all_files
+            .iter()
+            .filter(|p| !planned.contains(p.as_str()))
+            .cloned()
+            .collect(),
     }
 }
 
@@ -141,7 +152,11 @@ fn every_lookup_shape_returns_the_reference_rows_reading_only_planned_files() {
     for case in common::cases(&c) {
         if !case.spark {
             match spark::manifest(&case.plan, &schema, &opts(&c)) {
-                Err(e @ AdapterError::Unsupported { engine: "spark", .. }) => {
+                Err(
+                    e @ AdapterError::Unsupported {
+                        engine: "spark", ..
+                    },
+                ) => {
                     let msg = e.to_string();
                     assert!(msg.contains("emit for DataFusion"), "{}: {msg}", case.name);
                 }
@@ -149,15 +164,31 @@ fn every_lookup_shape_returns_the_reference_rows_reading_only_planned_files() {
             }
             continue;
         }
-        jobs.push(manifest_job(&work, case.name, &case.plan, &schema, &opts(&c), &files));
+        jobs.push(manifest_job(
+            &work,
+            case.name,
+            &case.plan,
+            &schema,
+            &opts(&c),
+            &files,
+        ));
         want.push(common::expected(&c, &case.plan, &columns));
     }
     let results = run(&py, &work, &jobs);
     for ((job, outcome), want) in jobs.iter().zip(&results).zip(&want) {
         // A run that opened an unplanned (denied) file fails: no error
         // means Spark read the planned files only.
-        assert!(outcome.error.is_none(), "{}: {}", job.name, outcome.error.as_deref().unwrap_or(""));
-        common::assert_rows(&common::rendered(&written(&job.out), &columns), want, &job.name);
+        assert!(
+            outcome.error.is_none(),
+            "{}: {}",
+            job.name,
+            outcome.error.as_deref().unwrap_or("")
+        );
+        common::assert_rows(
+            &common::rendered(&written(&job.out), &columns),
+            want,
+            &job.name,
+        );
     }
     assert!(jobs.len() >= 20, "{}", jobs.len());
 }
@@ -176,7 +207,11 @@ fn ordered_output_nan_keys_a_20k_keys_file_and_a_denied_planned_file() {
         .entries
         .iter()
         .enumerate()
-        .flat_map(|(i, e)| e.row_groups.iter().map(move |rg| (u32::try_from(i).unwrap(), rg)))
+        .flat_map(|(i, e)| {
+            e.row_groups
+                .iter()
+                .map(move |rg| (u32::try_from(i).unwrap(), rg))
+        })
         .collect();
     let mut order: Vec<(u32, u32)> = pairs.iter().rev().copied().collect();
     order.rotate_left(1);
@@ -194,10 +229,24 @@ fn ordered_output_nan_keys_a_20k_keys_file_and_a_denied_planned_file() {
         ..EmitOptions::default()
     };
     let inline = manifest_job(&work, "nan", &nan.plan, &nan.schema, &nan_opts, &[]);
-    let composite = manifest_job(&work, "nan composite", &nan.composite, &nan.schema, &nan_opts, &[]);
+    let composite = manifest_job(
+        &work,
+        "nan composite",
+        &nan.composite,
+        &nan.schema,
+        &nan_opts,
+        &[],
+    );
     // The control for the unreadable-file check: denying a planned file
     // fails the run, so a run that passes opened no denied file.
-    let mut control = manifest_job(&work, "control", &plan, &common::dataset(), &opts(&c), &files);
+    let mut control = manifest_job(
+        &work,
+        "control",
+        &plan,
+        &common::dataset(),
+        &opts(&c),
+        &files,
+    );
     control.deny.push(plan.entries[0].file.path.clone());
     // The key list as a keys file (a semi-join against it): 20k keys.
     let keys: Vec<i64> = (-10_000..10_000).collect();
@@ -208,7 +257,14 @@ fn ordered_output_nan_keys_a_20k_keys_file_and_a_denied_planned_file() {
         keys_file: Some(kf),
         ..opts(&c)
     };
-    let keyed = manifest_job(&work, "keys file", &kplan, &common::dataset(), &kopts, &files);
+    let keyed = manifest_job(
+        &work,
+        "keys file",
+        &kplan,
+        &common::dataset(),
+        &kopts,
+        &files,
+    );
     let results = run(&py, &work, &[ordered, inline, composite, control, keyed]);
     for r in [&results[0], &results[1], &results[2], &results[4]] {
         assert!(r.error.is_none(), "{:?}", r.error);
@@ -219,9 +275,15 @@ fn ordered_output_nan_keys_a_20k_keys_file_and_a_denied_planned_file() {
         &common::expected(&c, &kplan, &columns),
         "keys file",
     );
-    let denied = results[3].error.as_deref().expect("reading a denied planned file must fail");
+    let denied = results[3]
+        .error
+        .as_deref()
+        .expect("reading a denied planned file must fail");
     // Spark reports the unreadable file by name (as not existing).
-    assert!(denied.contains(plan.entries[0].file.path.as_str()), "{denied}");
+    assert!(
+        denied.contains(plan.entries[0].file.path.as_str()),
+        "{denied}"
+    );
     // Ordered: the rows in read position, then row number.
     let got: Vec<i64> = written(&work.join("ordered.out"))
         .iter()
@@ -241,7 +303,11 @@ fn ordered_output_nan_keys_a_20k_keys_file_and_a_denied_planned_file() {
     for (e, rg) in order {
         let path = &plan.entries[e as usize].file.path;
         let fi = c.files.iter().position(|f| &f.path == path).unwrap();
-        let mut rows: Vec<&common::Row> = c.rows.iter().filter(|r| r.file == fi && r.rg == rg).collect();
+        let mut rows: Vec<&common::Row> = c
+            .rows
+            .iter()
+            .filter(|r| r.file == fi && r.rg == rg)
+            .collect();
         rows.sort_by_key(|r| r.row);
         for r in rows {
             if let Some(v) = r.get("id") {
@@ -282,5 +348,11 @@ fn the_shim_pytest_passes() {
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     );
-    eprintln!("{}", String::from_utf8_lossy(&out.stdout).lines().last().unwrap_or(""));
+    eprintln!(
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .last()
+            .unwrap_or("")
+    );
 }

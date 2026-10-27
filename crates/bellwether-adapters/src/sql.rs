@@ -2,6 +2,8 @@
 //! literals written from integers, so no value or name from a plan or a
 //! schema is ever interpolated raw.
 
+use std::fmt::Write as _;
+
 use arrow::datatypes::{DataType, TimeUnit};
 use bellwether_core::encoding::Scalar;
 
@@ -93,7 +95,7 @@ pub(crate) fn time_text(value: i64, unit: TimeUnit) -> String {
     let (h, mi, s) = (secs / 3600, (secs / 60) % 60, secs % 60);
     let mut out = format!("{h:02}:{mi:02}:{s:02}");
     if digits(unit) > 0 {
-        out.push_str(&format!(".{frac:0width$}", width = digits(unit)));
+        let _ = write!(out, ".{frac:0width$}", width = digits(unit));
     }
     out
 }
@@ -137,7 +139,9 @@ pub(crate) fn duckdb_type(dt: &DataType) -> Result<String> {
                 ));
             }
             if *s < 0 {
-                return Err(unsupported("has a negative scale, which DuckDB has no type for"));
+                return Err(unsupported(
+                    "has a negative scale, which DuckDB has no type for",
+                ));
             }
             format!("DECIMAL({p},{s})")
         }
@@ -191,7 +195,7 @@ pub(crate) fn duckdb_literal(s: &Scalar, dt: &DataType) -> Result<String> {
         Scalar::Binary(b) => {
             let mut text = String::with_capacity(b.len() * 4);
             for byte in b {
-                text.push_str(&format!("\\x{byte:02X}"));
+                let _ = write!(text, "\\x{byte:02X}");
             }
             format!("CAST('{text}' AS BLOB)")
         }
@@ -219,6 +223,7 @@ pub(crate) fn duckdb_literal(s: &Scalar, dt: &DataType) -> Result<String> {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 
