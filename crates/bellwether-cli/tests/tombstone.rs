@@ -469,7 +469,7 @@ fn a_live_lookup_through_a_key_without_a_tombstone_names_the_spec_to_declare() {
         .unwrap();
     let err = String::from_utf8_lossy(&out.stderr);
     assert_ne!(out.status.code(), Some(0), "{err}");
-    assert!(err.contains("key or time column"), "{err}");
+    assert!(err.contains("is a time column of the key"), "{err}");
 }
 
 /// Condition (c): the tombstone segments over an appended file are missing,
@@ -560,4 +560,150 @@ fn an_incomplete_tombstone_sidecar_is_stated_and_fixed_by_index() {
         plan_row_groups(&asof, &data),
         truth(&rows, &ids, Some(1000))
     );
+}
+
+/// The last 8 bytes of a canonical encoding (ADR 016) of an i64, as the
+/// value: big-endian with the sign bit flipped.
+fn i64_tail(v: &Value) -> i64 {
+    let b: Vec<u8> = v
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|x| u8::try_from(x.as_u64().unwrap()).unwrap())
+        .collect();
+    let tail: [u8; 8] = b[b.len() - 8..].try_into().unwrap();
+    i64::from_be_bytes((u64::from_be_bytes(tail) ^ (1 << 63)).to_be_bytes())
+}
+
+/// The certificate of an `asof` live run compares each key's newest
+/// version at or before the instant, then its live rows: its row filter's
+/// `NotOlderThan` bounds are, per key with a version at or before the
+/// instant, that newest time, against the decoded rows, and its `Between`
+/// ends at the instant (PR #33 review, mutant M10: a certificate whose
+/// newest versions ignore the instant compares no row of a key retracted
+/// after it, and passes a plan missing its live winner).
+#[test]
+fn an_asof_live_certificate_compares_the_newest_rows_at_or_before_the_instant() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    let rows = lake(&data, 0..2);
+    let ids: Vec<i64> = (0..20).collect();
+    let kf = dir.path().join("k.parquet");
+    keys(&kf, "id", &ids);
+    let (d, k) = (path(&data), path(&kf));
+    cli(&["index", d, "--key", "exact:id"], 0);
+    let at = 150i64;
+    let why = cli(
+        &[
+            "why",
+            d,
+            "--from",
+            k,
+            "--latest-by",
+            "ts",
+            "--at",
+            &at.to_string(),
+            "--tombstone",
+            "void",
+        ],
+        0,
+    );
+    let why: Value = serde_json::from_str(&why).unwrap();
+    let (ev, workload) = (h(&why, "/evidence/hash"), h(&why, "/workload/hash"));
+    let proposed = cli(
+        &[
+            "propose",
+            d,
+            "--evidence",
+            &ev,
+            "--by",
+            "agent",
+            "--key",
+            "temporal:id@ts,tombstone=void",
+        ],
+        0,
+    );
+    let proposed: Value = serde_json::from_str(&proposed).unwrap();
+    let proposal = h(&proposed, "/proposal/hash");
+    let verified = cli(
+        &[
+            "fix",
+            d,
+            "--proposal",
+            &proposal,
+            "--workload",
+            &workload,
+            "--verify-only",
+        ],
+        0,
+    );
+    let verified: Value = serde_json::from_str(&verified).unwrap();
+    assert_eq!(verified["outcome"]["kind"], "verified", "{verified}");
+    let filter = &verified["certificate"]["record"]["body"]["row_filter"];
+    let tests: Vec<Value> = filter
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|f| f["all"].as_array().cloned().unwrap_or_default())
+        .collect();
+    let bounds = tests
+        .iter()
+        .find(|p| p["op"] == "not_older_than")
+        .unwrap_or_else(|| panic!("no not_older_than in {filter}"));
+    let got: std::collections::BTreeMap<i64, i64> = bounds["bounds"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|b| (i64_tail(&b[0]), i64_tail(&b[1])))
+        .collect();
+    let mut want = std::collections::BTreeMap::new();
+    for id in &ids {
+        if let Some(n) = rows
+            .iter()
+            .filter(|r| r.2 == *id && r.3 <= at)
+            .map(|r| r.3)
+            .max()
+        {
+            want.insert(*id, n);
+        }
+    }
+    assert_eq!(got, want, "{filter}");
+    let between = tests
+        .iter()
+        .find(|p| p["op"] == "between")
+        .unwrap_or_else(|| panic!("no between in {filter}"));
+    assert_eq!(i64_tail(&between["hi"]), at, "{filter}");
+    assert!(tests.iter().any(|p| p["op"] == "live"), "{filter}");
+}
+
+/// `asof --live --ts` is a usage error, never a silently ignored flag, and
+/// `index` states what the rows it read hold for the tombstone (PR #33
+/// review, items 7 and 8).
+#[test]
+fn live_with_ts_is_a_usage_error_and_index_counts_tombstone_rows() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    let rows = lake(&data, 0..1);
+    let kf = dir.path().join("k.parquet");
+    keys(&kf, "id", &[1, 2]);
+    let (d, k) = (path(&data), path(&kf));
+    let out = human(&["index", d, "--key", "temporal:id@ts,tombstone=void"], 0);
+    let tombstones = rows.iter().filter(|r| r.4 == Some(true)).count();
+    let nulls = rows.iter().filter(|r| r.4.is_none()).count();
+    assert!(
+        out.contains(&format!(
+            "tombstone:id@ts (tombstone=void): of the {} timed rows this build read, {tombstones} \
+             are tombstones and {nulls} have a null void",
+            rows.len()
+        )),
+        "{out}"
+    );
+    assert!(!out.contains("warning:"), "{out}");
+    let out = common::bw()
+        .args([
+            "asof", d, "--keys", k, "--at", "5", "--live", "--ts", "nope",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2), "{out:?}");
 }

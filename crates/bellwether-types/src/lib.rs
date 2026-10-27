@@ -940,22 +940,51 @@ impl Tombstone {
         }
         Ok(())
     }
+
     /// The spelling in a spec: `tombstone=col` or `tombstone=col=value`.
     #[must_use]
     pub fn spelling(&self) -> String {
+        format!("tombstone={}", self.argument())
+    }
+
+    /// The spelling as an argument of its own (`why --tombstone`, MCP
+    /// `tombstone`): `col` or `col=value`.
+    #[must_use]
+    pub fn argument(&self) -> String {
         match &self.value {
-            Some(v) => format!("tombstone={}={v}", self.column),
-            None => format!("tombstone={}", self.column),
+            Some(v) => format!("{}={v}", self.column),
+            None => self.column.clone(),
         }
     }
 
-    /// The predicate a reader keeps live rows with, in SQL: `not col` (or
-    /// `col <> 'value'`), which keeps no null.
+    /// Whether `other` marks the same rows as tombstones: the same column
+    /// and value, where the boolean form (`void`) is the value form
+    /// `void=true` (the boolean form needs a boolean column, on which the
+    /// two are one test).
     #[must_use]
-    pub fn live_sql(&self) -> String {
-        match &self.value {
-            Some(v) => format!("{} <> '{}'", self.column, v.replace('\'', "''")),
-            None => format!("not {}", self.column),
+    pub fn same_test(&self, other: &Tombstone) -> bool {
+        let value = |t: &Tombstone| t.value.clone().filter(|v| v != "true");
+        self.column == other.column && value(self) == value(other)
+    }
+
+    /// The predicate a reader keeps live rows with, in SQL, for a tombstone
+    /// column of dataset type `dt`: `not col` for a boolean column marked
+    /// by `true` (`col` when `false` marks a tombstone), `col <> 3` for an
+    /// integer column, `col <> 'VOID'` for any other. Each keeps no null.
+    #[must_use]
+    pub fn live_sql(&self, dt: &arrow::datatypes::DataType) -> String {
+        use arrow::datatypes::DataType;
+        let value_type = match dt {
+            DataType::Dictionary(_, v) => v.as_ref(),
+            other => other,
+        };
+        match (self.value.as_deref(), value_type) {
+            (None | Some("true"), DataType::Boolean) | (None, _) => {
+                format!("not {}", self.column)
+            }
+            (Some("false"), DataType::Boolean) => self.column.clone(),
+            (Some(v), t) if t.is_integer() => format!("{} <> {v}", self.column),
+            (Some(v), _) => format!("{} <> '{}'", self.column, v.replace('\'', "''")),
         }
     }
 }

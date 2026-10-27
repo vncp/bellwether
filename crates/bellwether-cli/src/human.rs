@@ -280,6 +280,52 @@ fn text_rebuilt(s: &mut String, rebuilt: &[bellwether::TextRebuilt]) {
     }
 }
 
+/// What `index` read and did with tombstones (B8): per tombstone sidecar
+/// it wrote, the rows that are tombstones and the rows with a null
+/// tombstone column, with a warning when those say the tombstone is
+/// suspect; each tombstone it stopped declaring; and each declaration it
+/// keeps without using.
+fn tombstone_states(s: &mut String, r: &IndexResult) {
+    for t in &r.tombstone_rows {
+        let _ = writeln!(
+            s,
+            "\n  {} ({}): of the {} timed rows this build read, {} are tombstones and {} have a \
+             null {} (not live, and not tombstones)",
+            t.sidecar,
+            t.tombstone.spelling(),
+            num(t.rows),
+            num(t.tombstones),
+            num(t.nulls),
+            t.tombstone.column
+        );
+        if let Some(w) = &t.warning {
+            let _ = writeln!(s, "  warning: {w}");
+        }
+    }
+    for d in &r.tombstones_dropped {
+        let _ = match &d.now {
+            Some(now) => writeln!(
+                s,
+                "\n  dropped {} ({}): this build declares {now} in its place, so its segments \
+                 were dropped",
+                d.sidecar, d.tombstone
+            ),
+            None => writeln!(
+                s,
+                "\n  dropped {} ({}): its key is no longer declared, so its segments were dropped",
+                d.sidecar, d.tombstone
+            ),
+        };
+    }
+    for u in &r.tombstones_unused {
+        let _ = writeln!(
+            s,
+            "\n  {} is kept unchanged and never planned with: {}",
+            u.sidecar, u.reason
+        );
+    }
+}
+
 /// What `index` did with the sidecars of an index written before M5: the
 /// folds it made, the sidecars it kept, or (nothing to do) the folds its
 /// next build with work makes.
@@ -397,6 +443,7 @@ pub(crate) fn index(r: &IndexResult, out: &Out) -> String {
     }
     text_rebuilt(&mut s, &r.text_rebuilt);
     join_states(&mut s, &r.joins);
+    tombstone_states(&mut s, r);
     if !r.unknown_segment_kinds.is_empty() {
         let _ = writeln!(
             s,
@@ -805,17 +852,22 @@ fn live_lines(s: &mut String, r: &PlanResult) {
     );
     match (&l.pruned_by, &l.unpruned) {
         (Some(by), _) => {
+            // What the planner measured: keys whose every winning row group
+            // the stored liveness pruned (no row group read for them), and
+            // (key, winning row group) pairs pruned; not a count of keys
+            // whose newest row is a tombstone (an asof between a row
+            // group's newest live time and its newest time keeps it).
             let _ = writeln!(
                 s,
-                "  tombstones: {} of {} with a version have a tombstone as their newest row \
-                 and are not read; {} {} pruned by {by}",
+                "  tombstones: {} of {} with a version answered with no row group read (no \
+                 live row at their newest time); {} (key, row group) {} pruned by {by}",
                 num(l.keys_retracted),
                 count(l.keys_with_version, "key", "keys"),
-                count(l.row_groups_pruned, "row group", "row groups"),
+                num(l.row_groups_pruned),
                 if l.row_groups_pruned == 1 {
-                    "was"
+                    "pair"
                 } else {
-                    "were"
+                    "pairs"
                 }
             );
         }
@@ -987,7 +1039,22 @@ pub(crate) fn why(r: &bellwether::WhyReport, out: &Out, fix_command: &str) -> St
     let state = if r.sequence == 0 {
         "not indexed".to_string()
     } else {
-        let specs: Vec<String> = r.current_specs.iter().map(label).collect();
+        // A key whose tombstone is declared but whose tombstone sidecar is
+        // incomplete (B8) is shown as declared, with what it lacks.
+        let specs: Vec<String> = r
+            .current_specs
+            .iter()
+            .map(|c| {
+                match r
+                    .tombstones_incomplete
+                    .iter()
+                    .find(|t| t.without_tombstone() == *c)
+                {
+                    Some(t) => format!("{} (tombstone sidecar incomplete)", label(t)),
+                    None => label(c),
+                }
+            })
+            .collect();
         format!(
             "manifest sequence {}, current keys: {}",
             r.sequence,
@@ -999,6 +1066,17 @@ pub(crate) fn why(r: &bellwether::WhyReport, out: &Out, fix_command: &str) -> St
         )
     };
     let _ = writeln!(s, "{}", heading(out, &format!("why {}: {state}", r.root)));
+    for t in &r.tombstones_incomplete {
+        let _ = writeln!(
+            s,
+            "  {} declares its tombstone, and its tombstone sidecar does not cover the row \
+             groups added since it was built (by a binary without tombstones, or an index run \
+             that has not finished), so live lookups through it prune nothing; `bellwether \
+             index {}` completes it (no proposal is needed)",
+            label(t),
+            r.root
+        );
+    }
     if let Some(t) = &r.twin {
         twin_header(&mut s, t);
     }

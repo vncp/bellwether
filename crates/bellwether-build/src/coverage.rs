@@ -229,6 +229,17 @@ pub(crate) fn completeness_map(
         };
         out.insert(name, seq);
     }
+    // A tombstone declaration this binary does not use (B8) keeps its
+    // entry, as it keeps its declaration and segments, while those still
+    // cover every live row group.
+    for name in crate::target::kept_tombstone_names(next) {
+        if let Some(&recorded) = base.key_spec_completeness.get(&name) {
+            let kind = Some(bellwether_core::tombstone::TOMBSTONE_KIND);
+            if live_next.is_subset(&covered(next, &name, kind)) {
+                out.insert(name, recorded);
+            }
+        }
+    }
     // A join key (B3) becomes complete only by its own commit
     // (`Builder::refresh_join`); a later commit keeps its entry only while
     // the left's live row groups are exactly the set its pair was built

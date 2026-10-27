@@ -27,7 +27,8 @@
     clippy::cast_possible_truncation,
     clippy::too_many_lines,
     clippy::similar_names,
-    clippy::many_single_char_names
+    clippy::many_single_char_names,
+    clippy::assert_is_empty
 )]
 
 mod common;
@@ -636,7 +637,7 @@ fn a_tombstone_that_cannot_mark_a_row_is_refused_when_declared() {
                 column: "ts".into(),
                 value: Some("1".into()),
             },
-            "key or time column",
+            "is a time column of the key",
         ),
     ] {
         let spec = KeySpec::Temporal {
@@ -656,4 +657,254 @@ fn a_tombstone_that_cannot_mark_a_row_is_refused_when_declared() {
         assert!(err.contains(want), "{err}");
     }
     assert!(b.manifest().unwrap().is_none(), "nothing committed");
+}
+
+/// A field `m`'s tombstone declaration does not know is kept, and so is the
+/// declaration and its segments, when its tombstone is unchanged (ADR 017):
+/// across a rewrite that indexes a new file, the declaration comes back
+/// byte for byte, `future_field` included (PR #33 review, ruling 1).
+#[test]
+fn an_unchanged_tombstone_declaration_is_kept_with_its_unknown_fields() {
+    let s = Scratch::new();
+    corpus(&s, &[0]);
+    let spec = temporal_spec(None);
+    let store = memory_store();
+    let b = builder(&store);
+    let opts = parquet_opts(&schema());
+    build_ok(&b, &s.root_str(), std::slice::from_ref(&spec), &opts);
+    commit(&*store, "idx", &StagedSegments::new(), |cur| {
+        let mut next = cur.clone();
+        for d in &mut next.schema.sidecars {
+            if d.kind == "tombstone" {
+                d.extra
+                    .insert("future_field".into(), serde_json::json!({"x": 1}));
+            }
+        }
+        Ok(next)
+    })
+    .unwrap();
+    let before: Vec<_> = b.manifest().unwrap().unwrap().schema.sidecars;
+    corpus(&s, &[1]);
+    let r = build_ok(&b, &s.root_str(), std::slice::from_ref(&spec), &opts);
+    assert!(
+        r.tombstones_dropped.is_empty(),
+        "{:?}",
+        r.tombstones_dropped
+    );
+    let m = b.manifest().unwrap().unwrap();
+    assert_eq!(
+        m.schema.sidecars, before,
+        "the declaration is kept as it was"
+    );
+    assert!(completeness(&m, &spec).is_some(), "and still used");
+    // The plain spec given (as `index --key temporal:id@ts` gives it) keeps
+    // the declaration too.
+    corpus(&s, &[2]);
+    build_ok(&b, &s.root_str(), &[spec.without_tombstone()], &opts);
+    let m = b.manifest().unwrap().unwrap();
+    assert_eq!(m.schema.sidecars, before);
+    assert!(completeness(&m, &spec).is_some());
+}
+
+/// The tombstone declarations this build cannot use (PR #33 review,
+/// ruling 1) are kept with their segments, listed by name with why, and
+/// never planned with: one with a param this build does not read
+/// (`params.also`), and one whose key a binary without tombstones
+/// redefined (`temporal:id@ts2`). A build over them commits them unchanged;
+/// only `remove_spec` with a tombstone under that name removes one, and a
+/// build declaring a tombstone under its name replaces it, saying so.
+#[test]
+fn a_tombstone_declaration_this_build_cannot_use_is_kept_listed_and_never_planned_with() {
+    let s = Scratch::new();
+    corpus(&s, &[0]);
+    let spec = temporal_spec(None);
+    let plain = spec.without_tombstone();
+    let store = memory_store();
+    let b = builder(&store);
+    let opts = parquet_opts(&schema());
+    build_ok(&b, &s.root_str(), std::slice::from_ref(&spec), &opts);
+    // (a) a param this build does not read
+    commit(&*store, "idx", &StagedSegments::new(), |cur| {
+        let mut next = cur.clone();
+        for d in &mut next.schema.sidecars {
+            if d.kind == "tombstone" {
+                d.params.insert("also".into(), "x".into());
+            }
+        }
+        Ok(next)
+    })
+    .unwrap();
+    let m = b.manifest().unwrap().unwrap();
+    let unused = bellwether_build::unused_tombstones(&m);
+    assert_eq!(unused.len(), 1);
+    assert_eq!(unused[0].sidecar, "tombstone:id@ts");
+    assert!(unused[0].reason.contains("also"), "{}", unused[0].reason);
+    assert_eq!(
+        bellwether_build::declared_key_specs(&m),
+        vec![plain.clone()]
+    );
+    let decls = m.schema.sidecars.clone();
+    let tomb_segs: Vec<_> = m
+        .segments
+        .iter()
+        .filter(|sg| sg.kind.as_deref() == Some("tombstone"))
+        .cloned()
+        .collect();
+    assert!(!tomb_segs.is_empty());
+    // A build with nothing to do commits nothing; one with work keeps the
+    // declaration and its segments unchanged.
+    let r = b
+        .build(&s.root_str(), std::slice::from_ref(&plain), &opts)
+        .unwrap();
+    assert_eq!(r.sequence, None, "nothing to do over a kept declaration");
+    corpus(&s, &[1]);
+    let r = build_ok(&b, &s.root_str(), std::slice::from_ref(&plain), &opts);
+    assert!(r.sequence.is_some());
+    assert!(r.tombstones_dropped.is_empty());
+    let m = b.manifest().unwrap().unwrap();
+    assert_eq!(m.schema.sidecars, decls, "kept unchanged");
+    for sg in &tomb_segs {
+        assert!(m.segments.contains(sg), "its segments are kept");
+    }
+    let p = planner(&store);
+    assert_eq!(
+        p.usable_specs().0,
+        vec![plain.clone()],
+        "never planned with"
+    );
+    // A build declaring a tombstone under its name replaces it and says so.
+    let r = build_ok(&b, &s.root_str(), std::slice::from_ref(&spec), &opts);
+    assert_eq!(r.tombstones_dropped.len(), 1, "{:?}", r.tombstones_dropped);
+    assert_eq!(r.tombstones_dropped[0].sidecar, "tombstone:id@ts");
+    assert_eq!(r.tombstones_dropped[0].now, Some(spec.identity()));
+    let m = b.manifest().unwrap().unwrap();
+    assert!(bellwether_build::unused_tombstones(&m).is_empty());
+    assert!(completeness(&m, &spec).is_some());
+
+    // (b) a binary without tombstones redefines the key: the declaration
+    // (an unknown kind to it) stays, orphaned.
+    commit(&*store, "idx", &StagedSegments::new(), |cur| {
+        let mut next = cur.clone();
+        next.schema.key_specs = vec![KeySpec::Temporal {
+            columns: cols(&["id"]),
+            ts_column: "valid".into(),
+            counts: false,
+            tombstone: None,
+        }];
+        next.segments.retain(|sg| sg.kind.is_some());
+        next.key_spec_completeness
+            .retain(|k, _| k.starts_with("tombstone"));
+        Ok(next)
+    })
+    .unwrap();
+    let m = b.manifest().unwrap().unwrap();
+    let unused = bellwether_build::unused_tombstones(&m);
+    assert_eq!(unused.len(), 1);
+    assert!(
+        unused[0].reason.contains("temporal:id@valid"),
+        "{}",
+        unused[0].reason
+    );
+    let decls = m.schema.sidecars.clone();
+    corpus(&s, &[2]);
+    let r = build_ok(&b, &s.root_str(), &[], &opts);
+    assert!(r.tombstones_dropped.is_empty());
+    let m = b.manifest().unwrap().unwrap();
+    assert_eq!(m.schema.sidecars, decls, "the orphan is kept");
+    assert!(m
+        .segments
+        .iter()
+        .any(|sg| sg.kind.as_deref() == Some("tombstone")));
+    // Only remove_spec with a tombstone under its name removes it.
+    assert!(b.remove_spec(&spec).unwrap().is_some());
+    let m = b.manifest().unwrap().unwrap();
+    assert!(m.schema.sidecars.iter().all(|d| d.kind != "tombstone"));
+    assert!(m
+        .segments
+        .iter()
+        .all(|sg| sg.kind.as_deref() != Some("tombstone")));
+    assert_eq!(
+        b.remove_spec(&spec).unwrap(),
+        None,
+        "nothing left to remove"
+    );
+}
+
+/// This build redefining a key with a tombstone under its name (`index
+/// --key temporal:id@valid` over `temporal:id@ts,tombstone=void`) drops the
+/// tombstone and says so (PR #33 review, item 8).
+#[test]
+fn redefining_a_key_states_that_its_tombstone_is_dropped() {
+    let s = Scratch::new();
+    corpus(&s, &[0]);
+    let spec = temporal_spec(None);
+    let store = memory_store();
+    let b = builder(&store);
+    let opts = parquet_opts(&schema());
+    build_ok(&b, &s.root_str(), std::slice::from_ref(&spec), &opts);
+    let redefined = KeySpec::Temporal {
+        columns: cols(&["id"]),
+        ts_column: "valid".into(),
+        counts: false,
+        tombstone: None,
+    };
+    let r = build_ok(&b, &s.root_str(), std::slice::from_ref(&redefined), &opts);
+    assert_eq!(r.tombstones_dropped.len(), 1, "{:?}", r.tombstones_dropped);
+    let d = &r.tombstones_dropped[0];
+    assert_eq!(d.sidecar, "tombstone:id@ts");
+    assert_eq!(d.tombstone, "tombstone=void");
+    assert_eq!(d.now, Some(redefined.identity()));
+    let m = b.manifest().unwrap().unwrap();
+    assert!(m.schema.sidecars.iter().all(|d| d.kind != "tombstone"));
+}
+
+/// A build reports, per tombstone sidecar it wrote, its timed rows, the
+/// tombstones among them and the rows with a null tombstone column, against
+/// the decoded rows; and warns when no row holds the value, or every row is
+/// null (PR #33 review, item 8).
+#[test]
+fn a_build_counts_tombstone_and_null_rows_and_warns_when_suspect() {
+    let s = Scratch::new();
+    corpus(&s, &[0, 1]);
+    let rows = all_rows(&s, &[0, 1]);
+    let timed: Vec<&Row> = rows
+        .iter()
+        .filter(|r| r.get("id").is_some() && r.get("ts").is_some())
+        .collect();
+    let t = enc(&Value::Boolean(true), &DataType::Boolean);
+    let store = memory_store();
+    let b = builder(&store);
+    let opts = parquet_opts(&schema());
+    let r = build_ok(&b, &s.root_str(), &[temporal_spec(None)], &opts);
+    assert_eq!(r.tombstone_rows.len(), 1);
+    let m = &r.tombstone_rows[0].marks;
+    assert_eq!(m.rows, timed.len() as u64);
+    assert_eq!(
+        m.tombstones,
+        timed.iter().filter(|r| r.get("void") == Some(&t)).count() as u64
+    );
+    assert_eq!(
+        m.nulls,
+        timed.iter().filter(|r| r.get("void").is_none()).count() as u64
+    );
+    assert!(m.tombstones > 0 && m.nulls > 0);
+    assert_eq!(m.suspect(&tomb(None)), None);
+    // A value that never occurs is suspect.
+    let store = memory_store();
+    let b = builder(&store);
+    let r = build_ok(&b, &s.root_str(), &[temporal_spec(Some("ZZZ"))], &opts);
+    let m = r.tombstone_rows[0].marks;
+    assert_eq!(m.tombstones, 0);
+    let w = m.suspect(&tomb(Some("ZZZ"))).unwrap();
+    assert!(w.contains("no row read has status = ZZZ"), "{w}");
+    // Every row null is suspect.
+    let all_null = bellwether_core::tombstone::Marks {
+        rows: 3,
+        tombstones: 0,
+        nulls: 3,
+    };
+    assert!(all_null
+        .suspect(&tomb(None))
+        .unwrap()
+        .contains("every row read has a null void"));
 }

@@ -392,10 +392,18 @@ pub struct ScoreWhy {
     /// `known_by`'s unit likewise; default: unbounded.
     #[serde(default)]
     pub known: Option<String>,
-    /// With a bitemporal lookup (B8; `why --tombstone`): the runs keep only
-    /// live rows, `<column>` (a boolean column whose true marks a
-    /// retracted row) or `<column>=<value>`; the floor candidate is
-    /// `temporal2:<key columns>@<valid_by>,<known_by>,tombstone=<column>`.
+    /// Price `keys` as `latest` lookups (`why --latest-by`): each key's
+    /// newest version by this time column, the floor candidate
+    /// `temporal:<key columns>@<latest_by>` (with `tombstone`, the live
+    /// rows of it, through `temporal:<key columns>@<latest_by>,tombstone=
+    /// <column>`). Takes no `valid_by` or `known_by`.
+    #[serde(default)]
+    pub latest_by: Option<String>,
+    /// With `latest_by` or a bitemporal lookup (B8; `why --tombstone`): the
+    /// runs keep only live rows, `<column>` (a boolean column whose true
+    /// marks a retracted row) or `<column>=<value>`; the floor candidate is
+    /// `temporal:<key columns>@<latest_by>,tombstone=<column>` (or
+    /// `temporal2:<key columns>@<valid_by>,<known_by>,tombstone=<column>`).
     /// Default: none (every row of the newest version).
     #[serde(default)]
     pub tombstone: Option<String>,

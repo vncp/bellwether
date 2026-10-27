@@ -30,8 +30,9 @@ use crate::segments::{self, Ctx, FileRow, SpecPlan};
 use crate::sources::{infer_schema, DataSource};
 use crate::target::{
     bloom_bounds_def, decl_of, declared_key_specs, declared_sidecars, declared_sketches,
-    declared_targets, fold_legacy, known_decl, sketch_columns, sketch_decl, tombstone_decl,
-    tombstone_name, tombstone_of, unknown_kind, Target, SKETCH_KIND,
+    declared_targets, fold_legacy, kept_tombstone_names, kept_tombstone_segment, known_decl,
+    sketch_columns, sketch_decl, tombstone_decls, tombstone_name, unknown_kind, Target,
+    SKETCH_KIND,
 };
 use bellwether_core::tombstone::TOMBSTONE_KIND;
 
@@ -122,6 +123,17 @@ pub struct BuildReport {
     /// On a build with nothing to do over an index written before M5: the
     /// folds its next build with work will make (as `sidecars_folded`).
     pub sidecars_fold_pending: Vec<(String, String)>,
+    /// Tombstones (B8) this build stopped declaring: a temporal or
+    /// bitemporal key with a tombstone redefined under its name (`index
+    /// --key temporal:id@ts2` over `temporal:id@ts,tombstone=void`) or
+    /// removed (`remove_unlisted`), or declared with another tombstone, and
+    /// a declaration this binary could not use whose name a declared
+    /// tombstone took. Their segments were dropped.
+    pub tombstones_dropped: Vec<crate::target::TombstoneDropped>,
+    /// Per tombstone sidecar (B8) this build wrote segments for, what the
+    /// rows it read hold ([`TombstoneRows`]): over the row groups this
+    /// build read, not the whole dataset.
+    pub tombstone_rows: Vec<TombstoneRows>,
     /// Restarts after a conflicting concurrent commit.
     pub restarts: u32,
     /// Most row groups held by workers at once (at most the thread count).
@@ -142,6 +154,19 @@ pub struct TextTablesReplaced {
     pub recorded: bellwether_core::text::UnicodeTables,
     /// This binary's tables, which the rebuilt segments record.
     pub current: bellwether_core::text::UnicodeTables,
+}
+
+/// What the rows one build read hold for one tombstone sidecar (B8,
+/// [`BuildReport::tombstone_rows`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TombstoneRows {
+    /// The sidecar (`tombstone:id@ts`).
+    pub sidecar: String,
+    /// The tombstone it declares.
+    pub tombstone: bellwether_types::Tombstone,
+    /// Its timed rows among the row groups read, and of those the
+    /// tombstones and the ones whose tombstone column is null.
+    pub marks: bellwether_core::tombstone::Marks,
 }
 
 enum Attempt {
@@ -189,10 +214,16 @@ impl<S: StoreExt + ?Sized> Builder<S> {
     /// collector. Returns the committed sequence, or `None` if the index
     /// does not declare `spec`. A different spec declared under the same
     /// name ([`KeySpec::name`] omits `ts_column` and `fpr`) is an error,
-    /// never removed in its place. A temporal or bitemporal spec given
-    /// with the tombstone it is declared with (B8) removes that tombstone
-    /// only (its sidecar declaration, segments and completeness), keeping
-    /// the spec; given without it, the spec goes with its tombstone.
+    /// never removed in its place.
+    ///
+    /// A temporal or bitemporal spec with a tombstone (B8) removes only the
+    /// tombstone declaration under its name (`tombstone:id@ts`), with its
+    /// segments and completeness, keeping the key: the one the key is
+    /// declared with when it is this tombstone (another is an error), or
+    /// else a declaration this binary does not use
+    /// ([`crate::unused_tombstones`]: params it cannot read, or a key the
+    /// index no longer declares), which no build removes. Given without a
+    /// tombstone, the spec goes with the tombstone it is declared with.
     pub fn remove_spec(&self, spec: &KeySpec) -> Result<Option<u64>> {
         let name = spec.name();
         let absent = Cell::new(false);
@@ -203,12 +234,45 @@ impl<S: StoreExt + ?Sized> Builder<S> {
             CommitOptions::default(),
             |m| {
                 let declared = declared_key_specs(m);
+                let mut next = m.clone();
+                let drop_tombstone = |next: &mut Manifest, tomb: &str| {
+                    next.schema
+                        .sidecars
+                        .retain(|s| !(s.kind == TOMBSTONE_KIND && s.name() == tomb));
+                    next.segments.retain(|s| {
+                        !(s.kind.as_deref() == Some(TOMBSTONE_KIND) && s.key_spec == tomb)
+                    });
+                    next.key_spec_completeness.remove(tomb);
+                };
+                if spec.tombstone().is_some() {
+                    let tomb = tombstone_name(spec);
+                    let used = declared
+                        .iter()
+                        .find(|s| s.tombstone().is_some() && tombstone_name(s) == tomb);
+                    match used {
+                        Some(d) if d != spec => {
+                            return Err(Error::KeySpec(format!(
+                                "the index declares {} under the name {tomb}, not {}",
+                                d.identity(),
+                                spec.identity()
+                            )))
+                        }
+                        Some(_) => {}
+                        None if kept_tombstone_names(m).contains(&tomb) => {}
+                        None => {
+                            absent.set(true);
+                            return Err(Error::KeySpec(format!("{tomb} is not declared")));
+                        }
+                    }
+                    drop_tombstone(&mut next, &tomb);
+                    return Ok(next);
+                }
                 let d = match declared.iter().find(|s| s.name() == name) {
                     None => {
                         absent.set(true);
                         return Err(Error::KeySpec(format!("key spec {name} is not declared")));
                     }
-                    Some(d) if d != spec && d.without_tombstone() != *spec => {
+                    Some(d) if d.without_tombstone() != *spec => {
                         return Err(Error::KeySpec(format!(
                             "the index declares {} under the name {name}, not {}",
                             d.identity(),
@@ -217,26 +281,15 @@ impl<S: StoreExt + ?Sized> Builder<S> {
                     }
                     Some(d) => d.clone(),
                 };
-                let mut next = m.clone();
                 if d.tombstone().is_some() {
-                    let tomb = tombstone_name(&d);
-                    next.schema.sidecars.retain(|s| {
-                        !(s.kind == TOMBSTONE_KIND
-                            && tombstone_of(s, &m.schema.key_specs).as_ref() == Some(&d))
-                    });
-                    next.segments.retain(|s| {
-                        !(s.kind.as_deref() == Some(TOMBSTONE_KIND) && s.key_spec == tomb)
-                    });
-                    next.key_spec_completeness.remove(&tomb);
+                    drop_tombstone(&mut next, &tombstone_name(&d));
                 }
-                if spec.tombstone().is_none() {
-                    // Segments and completeness are keyed by the declared
-                    // spec's identity (storage version 2).
-                    let identity = spec.identity();
-                    next.schema.key_specs.retain(|s| s.name() != name);
-                    next.segments.retain(|s| s.key_spec != identity);
-                    next.key_spec_completeness.remove(&identity);
-                }
+                // Segments and completeness are keyed by the declared
+                // spec's identity (storage version 2).
+                let identity = spec.identity();
+                next.schema.key_specs.retain(|s| s.name() != name);
+                next.segments.retain(|s| s.key_spec != identity);
+                next.key_spec_completeness.remove(&identity);
                 Ok(next)
             },
         );
@@ -460,6 +513,9 @@ impl<S: StoreExt + ?Sized> Builder<S> {
         report.segments_written = written.segments.len() as u64;
         report.peak_row_groups_held = ctx.peak_held.load(Ordering::SeqCst);
         report.peak_segment_keys = ctx.peak_keys.load(Ordering::SeqCst);
+        report.tombstone_rows = written.tombstone_rows;
+        let (tombstones, dropped) = tombstone_decls(base.as_ref(), &declared);
+        report.tombstones_dropped = dropped;
         let delta = Delta {
             planned_space: base
                 .as_ref()
@@ -468,7 +524,14 @@ impl<S: StoreExt + ?Sized> Builder<S> {
             planned_schema: base.as_ref().map(|m| m.schema.clone()).unwrap_or_default(),
             planned_source: base.as_ref().map(|m| m.source.clone()).unwrap_or_default(),
             source: cfg.source_info.clone(),
-            schema: schema_info(base.as_ref(), &cfg, &declared, &sidecars, &sketches),
+            schema: schema_info(
+                base.as_ref(),
+                &cfg,
+                &declared,
+                &sidecars,
+                &sketches,
+                &tombstones,
+            ),
             space: files.space.clone(),
             keep: &work.keep,
             replaced: &work.replaced,
@@ -806,16 +869,19 @@ fn shared_identity(root: &str, base: Option<&Manifest>, a: &KeySpec, b: &KeySpec
 }
 
 /// The schema this build commits: the dataset columns, the declared key
-/// specs (each without its tombstone), sidecars, sketches, and tombstones
-/// (B8, a `tombstone` sidecar per spec with one), the base's declarations
-/// of sidecar kinds this binary does not know (kept unchanged, as their
-/// segments are), and the base's unknown fields.
+/// specs (each without its tombstone), sidecars, sketches, and `tombstones`
+/// (B8, [`tombstone_decls`]: a `tombstone` sidecar per spec with one, the
+/// base's unchanged where its tombstone is, and the base's declarations
+/// this binary does not use), the base's declarations of sidecar kinds
+/// this binary does not know (kept unchanged, as their segments are), and
+/// the base's unknown fields.
 fn schema_info(
     base: Option<&Manifest>,
     cfg: &Config,
     declared: &[KeySpec],
     sidecars: &[SidecarDef],
     sketches: &[SketchSpec],
+    tombstones: &[bellwether_store::SidecarDecl],
 ) -> SchemaInfo {
     SchemaInfo {
         columns: cfg.columns.clone(),
@@ -824,12 +890,7 @@ fn schema_info(
             .iter()
             .map(decl_of)
             .chain(sketches.iter().map(sketch_decl))
-            .chain(
-                declared
-                    .iter()
-                    .filter(|s| s.tombstone().is_some())
-                    .map(tombstone_decl),
-            )
+            .chain(tombstones.iter().cloned())
             .chain(
                 base.iter()
                     .flat_map(|m| m.schema.sidecars.iter().filter(|d| !known_decl(d)).cloned()),
@@ -1592,6 +1653,7 @@ fn is_noop(
         return Ok(false);
     };
     let declared: Vec<Target> = specs.iter().map(|p| p.target.clone()).collect();
+    let kept_tombstones = kept_tombstone_names(m);
     let unchanged = files.counts.new == 0
         && files.counts.changed == 0
         && files.counts.removed == 0
@@ -1603,6 +1665,7 @@ fn is_noop(
         && declared_targets(m) == declared
         && m.segments.iter().all(|s| {
             unknown_kind(s)
+                || kept_tombstone_segment(s, &kept_tombstones)
                 || work.keep.contains(&s.key_spec)
                 || joins_of(&m.schema.key_specs).contains(&s.key_spec)
         });
@@ -1680,11 +1743,16 @@ impl Delta<'_> {
         next.schema = self.schema.clone();
         next.rowgroup_space = self.space.clone();
         // Segments of kinds this binary does not know are kept unchanged,
-        // and so is a declared join key's pair segment (its completeness
-        // then says whether it still covers the left's row groups).
+        // and so are those of a tombstone declaration it does not use (B8),
+        // and a declared join key's pair segment (its completeness then
+        // says whether it still covers the left's row groups).
         let joins = joins_of(&self.schema.key_specs);
+        let kept = kept_tombstone_names(&next);
         next.segments.retain(|s| {
-            unknown_kind(s) || self.keep.contains(&s.key_spec) || joins.contains(&s.key_spec)
+            unknown_kind(s)
+                || kept_tombstone_segment(s, &kept)
+                || self.keep.contains(&s.key_spec)
+                || joins.contains(&s.key_spec)
         });
         for seg in self.added {
             next.add_segment(seg.clone());

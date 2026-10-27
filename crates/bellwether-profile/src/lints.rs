@@ -1241,6 +1241,9 @@ pub struct TombstoneUse {
     /// The filter: the boolean column whose true marks a retracted row, or
     /// the state column and the value that does.
     pub tombstone: Tombstone,
+    /// The live test in SQL at the column's dataset type
+    /// (`Tombstone::live_sql`: `not void`, `code <> 3`, `status <> 'VOID'`).
+    pub filter: String,
     /// Runs on this tuple, time columns and filter.
     pub runs: u64,
 }
@@ -1248,19 +1251,22 @@ pub struct TombstoneUse {
 /// `R-tombstone-1` (B8): a recorded workload takes each key's newest
 /// version (`latest`, `asof`, or a bitemporal as-of) and then filters on a
 /// boolean or state column (`where not void`, `where status <> 'VOID'`),
-/// and none of `complete` (the key specs complete at the current manifest)
-/// is a temporal or bitemporal key on those columns and times declaring
-/// that tombstone, so each run reads every row group holding a key's
-/// newest version, also for keys whose newest row the filter then drops.
-/// Fires once per (columns, times, filter), high confidence (the runs are
-/// recorded and the specs are the manifest's). Does not fire without such
-/// runs, or when a complete key with exactly that tombstone serves them.
+/// and none of `declared` is a temporal or bitemporal key on those columns
+/// and times declaring that tombstone, so each run reads every row group
+/// holding a key's newest version, also for keys whose newest row the
+/// filter then drops. `declared` is the key specs complete at the current
+/// manifest and the keys whose tombstone is declared but whose tombstone
+/// sidecar is not complete yet: for those the step is an index build, not
+/// a new key, and `why` says so. Fires once per (columns, times, filter),
+/// high confidence (the runs are recorded and the specs are the
+/// manifest's). Does not fire without such runs, or when a declared key
+/// with exactly that tombstone serves them.
 #[must_use]
-pub fn latest_then_filter(uses: &[TombstoneUse], complete: &[KeySpec]) -> Vec<Lint> {
+pub fn latest_then_filter(uses: &[TombstoneUse], declared: &[KeySpec]) -> Vec<Lint> {
     uses.iter()
         .filter(|u| u.runs > 0)
         .filter(|u| {
-            !complete.iter().any(|s| {
+            !declared.iter().any(|s| {
                 let times_match = match s {
                     KeySpec::Temporal { ts_column, .. } => u.times == [ts_column.clone()],
                     KeySpec::Bitemporal {
@@ -1271,30 +1277,31 @@ pub fn latest_then_filter(uses: &[TombstoneUse], complete: &[KeySpec]) -> Vec<Li
                     _ => false,
                 };
                 times_match
-                    && s.tombstone() == Some(&u.tombstone)
+                    && s.tombstone().is_some_and(|t| t.same_test(&u.tombstone))
                     && s.columns().iter().all(|c| u.columns.contains(c))
             })
         })
         .map(|u| {
             let cols = u.columns.join(",");
-            let (key, flags) = match u.times.as_slice() {
+            let (key, flags, fields) = match u.times.as_slice() {
                 [valid, known] => (
                     format!(
                         "temporal2:{cols}@{valid},{known},{}",
                         u.tombstone.spelling()
                     ),
                     format!("--valid-by {valid} --known-by {known}"),
+                    format!("valid_by {valid:?}, known_by {known:?}"),
                 ),
                 times => {
                     let ts = times.first().map_or("<ts>", String::as_str);
                     (
                         format!("temporal:{cols}@{ts},{}", u.tombstone.spelling()),
                         format!("--latest-by {ts}"),
+                        format!("latest_by {ts:?}"),
                     )
                 }
             };
-            let arg = u.tombstone.spelling();
-            let arg = arg.trim_start_matches("tombstone=");
+            let arg = u.tombstone.argument();
             Lint {
                 rule: LATEST_THEN_FILTER.into(),
                 columns: u.columns.clone(),
@@ -1306,14 +1313,13 @@ pub fn latest_then_filter(uses: &[TombstoneUse], complete: &[KeySpec]) -> Vec<Li
                      then drops. A key with a tombstone, {key}, stores per key and row group \
                      the newest time of a live row, so those row groups are never read; price \
                      it with `bellwether why <root> --from <keys.parquet> {flags} --tombstone \
-                     {arg}`.",
-                    u.runs,
-                    u.tombstone.live_sql(),
+                     {arg}` (MCP: score.why with {fields}, tombstone {arg:?}).",
+                    u.runs, u.filter,
                 ),
                 confidence: HIGH,
                 site: None,
                 fix: rewrite(
-                    format!("latest on ({cols}), then where {}", u.tombstone.live_sql()),
+                    format!("latest on ({cols}), then where {}", u.filter),
                     key,
                     "every row group holding a live row at a key's newest time is still \
                      selected (invariant 1), and the residual drops the tombstone rows",
@@ -1637,13 +1643,20 @@ mod tests {
     }
 
     fn tombstone_use(value: Option<&str>, times: &[&str], runs: u64) -> TombstoneUse {
+        let tombstone = Tombstone {
+            column: if value.is_some() { "status" } else { "void" }.into(),
+            value: value.map(str::to_string),
+        };
+        let dt = if value.is_some() {
+            arrow::datatypes::DataType::Utf8
+        } else {
+            arrow::datatypes::DataType::Boolean
+        };
         TombstoneUse {
             columns: vec!["order_id".into()],
             times: times.iter().map(|t| (*t).to_string()).collect(),
-            tombstone: Tombstone {
-                column: if value.is_some() { "status" } else { "void" }.into(),
-                value: value.map(str::to_string),
-            },
+            filter: tombstone.live_sql(&dt),
+            tombstone,
             runs,
         }
     }
@@ -1715,6 +1728,27 @@ mod tests {
             .message
             .contains("temporal2:order_id@valid,known,tombstone=void"));
         assert!(bi[0].message.contains("--valid-by valid --known-by known"));
+        // the MCP spelling of the same pricing (score.why's fields)
+        assert!(
+            lints_mcp(
+                &state[0].message,
+                "latest_by \"ts\", tombstone \"status=VOID\""
+            ),
+            "{}",
+            state[0].message
+        );
+        assert!(
+            lints_mcp(
+                &bi[0].message,
+                "valid_by \"valid\", known_by \"known\", tombstone \"void\""
+            ),
+            "{}",
+            bi[0].message
+        );
+    }
+
+    fn lints_mcp(message: &str, fields: &str) -> bool {
+        message.contains(&format!("(MCP: score.why with {fields})"))
     }
 
     /// It does not fire when a complete key on the runs' columns and time
@@ -1742,6 +1776,27 @@ mod tests {
             latest_then_filter(&[tombstone_use(None, &["valid", "known"], 3)], &[bi]).is_empty()
         );
         assert!(latest_then_filter(&[tombstone_use(None, &["ts"], 0)], &[]).is_empty());
+        // `void` and `void=true` mark the same rows of a boolean column: a
+        // key declaring either serves runs filtering on the other.
+        let spelled = Tombstone {
+            column: "void".into(),
+            value: Some("true".into()),
+        };
+        assert!(latest_then_filter(
+            &[tombstone_use(None, &["ts"], 2)],
+            &[temporal(Some(spelled.clone()))]
+        )
+        .is_empty());
+        let mut by_value = tombstone_use(None, &["ts"], 2);
+        by_value.tombstone = spelled;
+        assert!(latest_then_filter(
+            &[by_value],
+            &[temporal(Some(Tombstone {
+                column: "void".into(),
+                value: None,
+            }))]
+        )
+        .is_empty());
         assert!(latest_then_filter(&[], &[]).is_empty());
     }
 

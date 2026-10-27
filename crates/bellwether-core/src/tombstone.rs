@@ -224,12 +224,36 @@ pub fn clocks(spec: &KeySpec) -> u8 {
     }
 }
 
+/// How a refusal spells a tombstone it suggests: as a key spec writes it
+/// (`tombstone=status=VOID`, `index --key`, `propose`), or as an argument
+/// of its own (`status=VOID`: `why --tombstone`, MCP `tombstone`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Spelling {
+    /// `tombstone=<column>[=<value>]`.
+    Spec,
+    /// `<column>[=<value>]`.
+    Argument,
+}
+
+impl Spelling {
+    fn of(self, column: &str, value: Option<&str>) -> String {
+        let arg = match value {
+            Some(v) => format!("{column}={v}"),
+            None => column.to_string(),
+        };
+        match self {
+            Self::Spec => format!("tombstone={arg}"),
+            Self::Argument => arg,
+        }
+    }
+}
+
 /// The dataset type of `spec`'s tombstone column in `schema`, after the
 /// rules a tombstone meets: a temporal or bitemporal spec; a column of the
 /// dataset that is not a key or time column of the spec; with no value, a
 /// boolean column; with a value, a boolean, integer, or string column (or a
-/// dictionary of one) the value converts to exactly. Each refusal says what
-/// to declare instead.
+/// dictionary of one) the value converts to exactly. Each refusal names the
+/// spec and says what to declare instead.
 pub fn column_type(spec: &KeySpec, schema: &Schema) -> Result<DataType> {
     let Some(t) = spec.tombstone() else {
         return Err(Error::KeySpec(format!(
@@ -237,48 +261,62 @@ pub fn column_type(spec: &KeySpec, schema: &Schema) -> Result<DataType> {
             spec.identity()
         )));
     };
-    let mut times: Vec<&String> = Vec::new();
-    match spec {
-        KeySpec::Temporal { ts_column, .. } => times.push(ts_column),
+    let times: Vec<&String> = match spec {
+        KeySpec::Temporal { ts_column, .. } => vec![ts_column],
         KeySpec::Bitemporal {
             valid_column,
             known_column,
             ..
-        } => {
-            times.push(valid_column);
-            times.push(known_column);
-        }
+        } => vec![valid_column, known_column],
         _ => {
             return Err(Error::KeySpec(format!(
                 "a tombstone is a parameter of a temporal or temporal2 key, and {} is neither",
                 spec.name()
             )))
         }
-    }
-    if spec.columns().contains(&t.column) || times.contains(&&t.column) {
+    };
+    tombstone_type(t, spec.columns(), &times, schema, Spelling::Spec).map_err(|e| match e {
+        Error::KeySpec(m) => Error::KeySpec(format!("{}: {m}", spec.identity())),
+        other => other,
+    })
+}
+
+/// [`column_type`]'s rules for the tombstone `t` of a key on `columns` and
+/// `times`, its refusals spelling suggestions as `spelling` says and naming
+/// no spec: the dataset type of the tombstone column.
+pub fn tombstone_type(
+    t: &Tombstone,
+    columns: &[String],
+    times: &[&String],
+    schema: &Schema,
+    spelling: Spelling,
+) -> Result<DataType> {
+    if columns.contains(&t.column) || times.contains(&&t.column) {
+        let what = if columns.contains(&t.column) {
+            "a key column"
+        } else {
+            "a time column"
+        };
         return Err(Error::KeySpec(format!(
-            "{}: the tombstone column {:?} is a key or time column of the key; name the column \
-             that marks a row as retracted (a boolean, or a status column with \
-             tombstone=<column>=<value>)",
-            spec.identity(),
-            t.column
+            "the tombstone column {:?} is {what} of the key; name the column that marks a row \
+             as retracted (a boolean column, {}, or a status column with the value that marks \
+             one, {})",
+            t.column,
+            spelling.of("<column>", None),
+            spelling.of("<column>", Some("<value>"))
         )));
     }
     let dt = schema
         .field_with_name(&t.column)
         .map_err(|_| {
             Error::KeySpec(format!(
-                "{}: the tombstone {}",
-                spec.identity(),
+                "the tombstone {}",
                 encoding::not_in_schema(schema, &t.column)
             ))
         })?
         .data_type()
         .clone();
-    tombstone_bytes(t, &dt).map_err(|e| match e {
-        Error::KeySpec(m) => Error::KeySpec(format!("{}: {m}", spec.identity())),
-        other => other,
-    })?;
+    tombstone_bytes_as(t, &dt, spelling)?;
     Ok(dt)
 }
 
@@ -287,17 +325,43 @@ pub fn column_type(spec: &KeySpec, schema: &Schema) -> Result<DataType> {
 /// written value converted to `dt` exactly (refused when it does not
 /// convert, or when `dt` is not a boolean, integer, or string type).
 pub fn tombstone_bytes(t: &Tombstone, dt: &DataType) -> Result<Vec<u8>> {
+    tombstone_bytes_as(t, dt, Spelling::Spec)
+}
+
+/// Whether a tombstone column of type `dt` (a dictionary's value type) can
+/// hold a tombstone value: a boolean, integer, or string type.
+fn markable(dt: &DataType) -> bool {
+    matches!(
+        dt,
+        DataType::Boolean | DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View
+    ) || dt.is_integer()
+}
+
+/// [`tombstone_bytes`], its refusals spelling suggestions as `spelling`
+/// says. Every suggestion is one the rules accept: a column whose type
+/// cannot mark a tombstone is refused naming the types that can, never
+/// with a form it would refuse next.
+pub fn tombstone_bytes_as(t: &Tombstone, dt: &DataType, spelling: Spelling) -> Result<Vec<u8>> {
     let value_type = match dt {
         DataType::Dictionary(_, v) => v.as_ref(),
         other => other,
     };
+    let c = &t.column;
+    if !markable(value_type) {
+        return Err(Error::KeySpec(format!(
+            "{}: {c} is {dt}, and a tombstone column is a boolean, integer, or string column; \
+             name a column of one of those types that marks a row as retracted",
+            spelling.of(c, t.value.as_deref())
+        )));
+    }
     let mut out = Vec::new();
     let Some(v) = t.value.as_deref() else {
         if *value_type != DataType::Boolean {
             return Err(Error::KeySpec(format!(
-                "tombstone={} needs a boolean column, and {} is {dt}; name the value that marks a \
-                 tombstone with tombstone={}=<value>",
-                t.column, t.column, t.column
+                "{} needs a boolean column, and {c} is {dt}; name the value that marks a \
+                 tombstone, {}",
+                spelling.of(c, None),
+                spelling.of(c, Some("<value>"))
             )));
         }
         encoding::encode_value_as(&Value::Boolean(true), dt, &mut out)?;
@@ -305,8 +369,8 @@ pub fn tombstone_bytes(t: &Tombstone, dt: &DataType) -> Result<Vec<u8>> {
     };
     let refuse = |why: String| {
         Error::KeySpec(format!(
-            "tombstone={}={v}: {why}; write a value of the column's type",
-            t.column
+            "{}: {why}; write a value of the column's type",
+            spelling.of(c, Some(v))
         ))
     };
     let value = match value_type {
@@ -315,36 +379,28 @@ pub fn tombstone_bytes(t: &Tombstone, dt: &DataType) -> Result<Vec<u8>> {
             "false" => Value::Boolean(false),
             _ => {
                 return Err(refuse(format!(
-                    "{} is boolean, so the value is true or false",
-                    t.column
+                    "{c} is boolean, so the value is true or false"
                 )))
             }
         },
-        DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64 => {
-            Value::Int(v.parse().map_err(|_| {
-                refuse(format!("{} is {dt}, and {v:?} is not an integer", t.column))
-            })?)
-        }
+        DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64 => Value::Int(
+            v.parse()
+                .map_err(|_| refuse(format!("{c} is {dt}, and {v:?} is not an integer")))?,
+        ),
         DataType::UInt8 | DataType::UInt16 | DataType::UInt32 | DataType::UInt64 => {
             Value::UInt(v.parse().map_err(|_| {
-                refuse(format!(
-                    "{} is {dt}, and {v:?} is not an unsigned integer",
-                    t.column
-                ))
+                refuse(format!("{c} is {dt}, and {v:?} is not an unsigned integer"))
             })?)
         }
-        DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => Value::Utf8(v),
-        _ => {
-            return Err(Error::KeySpec(format!(
-                "the tombstone column {} is {dt}; a tombstone column is a boolean \
-                 (tombstone={}), or an integer or string column with the value that marks a \
-                 tombstone (tombstone={}=<value>)",
-                t.column, t.column, t.column
-            )))
-        }
+        _ => Value::Utf8(v),
     };
-    encoding::encode_value_as(&value, dt, &mut out)
-        .map_err(|e| refuse(format!("it does not convert to {dt} ({e})")))?;
+    encoding::encode_value_as(&value, dt, &mut out).map_err(|e| {
+        refuse(if value_type.is_integer() {
+            format!("{c} is {dt}, and {v} is outside its range")
+        } else {
+            format!("it does not convert to {dt} ({e})")
+        })
+    })?;
     Ok(out)
 }
 
@@ -393,11 +449,97 @@ impl Matcher {
     /// live: not null, and not the tombstone value once converted to the
     /// dataset type. `buf` is scratch space.
     pub fn is_live(&self, array: &dyn Array, row: usize, buf: &mut Vec<u8>) -> Result<bool> {
+        Ok(self.mark(array, row, buf)? == Mark::Live)
+    }
+
+    /// What row `row` of `array` (the tombstone column of a batch) is: a
+    /// null, the tombstone value once converted to the dataset type, or
+    /// live. `buf` is scratch space.
+    pub fn mark(&self, array: &dyn Array, row: usize, buf: &mut Vec<u8>) -> Result<Mark> {
         buf.clear();
         Ok(
-            encoding::encode_array_value_as(array, row, &self.declared, buf)?
-                && buf.as_slice() != self.tombstone.as_slice(),
+            if !encoding::encode_array_value_as(array, row, &self.declared, buf)? {
+                Mark::Null
+            } else if buf.as_slice() == self.tombstone.as_slice() {
+                Mark::Tombstone
+            } else {
+                Mark::Live
+            },
         )
+    }
+}
+
+/// What one row's tombstone column holds ([`Matcher::mark`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Mark {
+    /// Not null and not the tombstone value.
+    Live,
+    /// The tombstone value.
+    Tombstone,
+    /// Null: not live (ADR 014), and not a tombstone either.
+    Null,
+}
+
+/// What a tombstone column holds over the timed rows one writer read (a
+/// row whose time or leading key column is null is no version, so not
+/// counted): how many, and of those how many are tombstones and how many
+/// have a null tombstone column. Neither is stored in a segment; a build
+/// and `why` report them for the rows they read.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Marks {
+    /// Timed rows read.
+    pub rows: u64,
+    /// Of those, rows holding the tombstone value.
+    pub tombstones: u64,
+    /// Of those, rows whose tombstone column is null.
+    pub nulls: u64,
+}
+
+impl Marks {
+    /// Counts one row.
+    pub fn count(&mut self, mark: Mark) {
+        self.rows += 1;
+        match mark {
+            Mark::Live => {}
+            Mark::Tombstone => self.tombstones += 1,
+            Mark::Null => self.nulls += 1,
+        }
+    }
+
+    /// Adds another writer's counts.
+    pub fn add(&mut self, other: Marks) {
+        self.rows += other.rows;
+        self.tombstones += other.tombstones;
+        self.nulls += other.nulls;
+    }
+
+    /// Why the counts make the tombstone suspect, when they do: every row
+    /// read has a null tombstone column (no row is live, so every live
+    /// lookup answers nothing), or no row read holds the tombstone value
+    /// (the column or value may be misnamed, and a live lookup prunes
+    /// nothing). `None` with no rows read.
+    #[must_use]
+    pub fn suspect(&self, t: &Tombstone) -> Option<String> {
+        if self.rows == 0 {
+            return None;
+        }
+        let value = t.value.as_deref().unwrap_or("true");
+        if self.nulls == self.rows {
+            return Some(format!(
+                "every row read has a null {}, so no row is live and every live lookup answers \
+                 no row; check that {} is the column that marks a retraction",
+                t.column, t.column
+            ));
+        }
+        if self.tombstones == 0 {
+            return Some(format!(
+                "no row read has {} = {value}, so tombstones prune nothing; check the column and \
+                 the value ({})",
+                t.column,
+                t.spelling()
+            ));
+        }
+        None
     }
 }
 

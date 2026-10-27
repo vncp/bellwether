@@ -386,17 +386,19 @@ impl WhyRequest {
             LookupMode::Latest | LookupMode::Asof | LookupMode::Bitemporal
         ) {
             return Err(format!(
-                "--tombstone {} keeps only the live rows of each key's newest version, so it \
-                 prices a latest or asof lookup; pass --latest-by <timestamp column> (and --at \
-                 <instant> for asof), or --valid-by and --known-by for a bitemporal one",
-                t.spelling()
+                "the tombstone {} keeps only the live rows of each key's newest version, so it \
+                 prices a latest or asof lookup: name the time column that orders versions \
+                 (--latest-by <column>, and --at <instant> for asof; MCP score.why: \
+                 latest_by), or both clocks of a bitemporal one (--valid-by and --known-by; \
+                 MCP: valid_by and known_by)",
+                t.argument()
             ));
         }
         if self.lookback.is_some() {
             return Err(format!(
-                "--tombstone {} keeps only the live rows of each key's newest version, and \
+                "the tombstone {} keeps only the live rows of each key's newest version, and \
                  --lookback reads every version in a window; pass one of them",
-                t.spelling()
+                t.argument()
             ));
         }
         Ok(mode)
@@ -813,6 +815,14 @@ pub struct WhyReport {
     pub sequence: u64,
     /// The current configuration: declared specs complete at `sequence`.
     pub current_specs: Vec<KeySpec>,
+    /// Declared keys with a tombstone (B8) whose own segments are complete
+    /// and whose tombstone sidecar is not (a binary without tombstones
+    /// appended files): in `current_specs` without their tombstone, so live
+    /// lookups through them prune nothing until `bellwether index` on the
+    /// data folder completes the sidecar; no proposal is needed. Omitted in
+    /// JSON when none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tombstones_incomplete: Vec<KeySpec>,
     /// The workload replayed, if any.
     pub workload: Option<WorkloadInfo>,
     /// The `profile` Evidence.
@@ -1050,6 +1060,10 @@ impl Engine {
         let source: &dyn bellwether_types::Source = &counting;
         let sequence = pinned.as_ref().map_or(0, Pinned::sequence);
         let current_specs = pinned.as_ref().map(|p| p.specs().0).unwrap_or_default();
+        let tombstones_incomplete = pinned
+            .as_ref()
+            .map(|p| tombstones_incomplete(p, &current_specs))
+            .unwrap_or_default();
         // A semi-join (B3) is priced on both datasets: the right one's
         // replayer and the candidate join key's transient pair index.
         let why_pair = self.why_pair(req, pinned.as_ref())?;
@@ -1145,11 +1159,21 @@ impl Engine {
             Some((w, _)) if !join_lints.is_empty() && text_input.is_none() => Some(w.hash()),
             _ => None,
         };
-        // The latest-then-filter detector (B8) likewise.
+        // The latest-then-filter detector (B8) likewise. A tombstone that
+        // is declared but whose sidecar is incomplete is declared: the step
+        // is `bellwether index`, which the report states, never a new key.
         let tombstone_lints = match &recorded {
             Some((w, temporal)) => bellwether_profile::lints::latest_then_filter(
-                &tombstone_uses(w, temporal.as_ref().map(|t| t.ts_column.as_str())),
-                &current_specs,
+                &tombstone_uses(
+                    w,
+                    temporal.as_ref().map(|t| t.ts_column.as_str()),
+                    replayer.schema(),
+                ),
+                &current_specs
+                    .iter()
+                    .chain(&tombstones_incomplete)
+                    .cloned()
+                    .collect::<Vec<_>>(),
             ),
             None => Vec::new(),
         };
@@ -1189,6 +1213,7 @@ impl Engine {
             root: self.root().to_string(),
             sequence,
             current_specs: current_specs.clone(),
+            tombstones_incomplete,
             workload: None,
             evidence,
             profile,
@@ -1374,6 +1399,7 @@ impl Engine {
         Ok(WhyReport {
             root: self.root().to_string(),
             sequence: p.sequence(),
+            tombstones_incomplete: tombstones_incomplete(p, &current_specs),
             current_specs,
             workload: None,
             evidence,
@@ -3055,18 +3081,41 @@ fn semijoin_uses(
         .collect())
 }
 
+/// The declared keys with a tombstone (B8) whose own segments are complete
+/// (`usable` holds them without the tombstone) and whose tombstone sidecar
+/// is not ([`WhyReport::tombstones_incomplete`]).
+fn tombstones_incomplete(p: &Pinned, usable: &[KeySpec]) -> Vec<KeySpec> {
+    p.planner
+        .declared_specs()
+        .into_iter()
+        .filter(|s| {
+            s.tombstone().is_some()
+                && !usable.contains(s)
+                && usable.contains(&s.without_tombstone())
+        })
+        .collect()
+}
+
 /// The runs of `w` that keep only live rows (B8), per key columns, time
 /// columns and tombstone, for `R-tombstone-1`: a `latest`/`asof` run's time
 /// column is the temporal lookup's (`ts_column`: `--latest-by`'s, or the
 /// current temporal key's), a bitemporal run's its two clocks. A live run
-/// with no known time column raises nothing.
+/// with no known time column raises nothing. Each filter is spelled in SQL
+/// at its column's type in `schema`, and on a boolean column `void=true`
+/// counts as `void` (one test).
 fn tombstone_uses(
     w: &Workload,
     ts_column: Option<&str>,
+    schema: &Schema,
 ) -> Vec<bellwether_profile::lints::TombstoneUse> {
+    let dt = |t: &Tombstone| {
+        schema
+            .field_with_name(&t.column)
+            .map_or(arrow::datatypes::DataType::Null, |f| f.data_type().clone())
+    };
     let mut by: BTreeMap<(Vec<String>, Vec<String>, Tombstone), u64> = BTreeMap::new();
     for r in w.runs() {
-        let (times, t) = match r.query() {
+        let (times, mut t) = match r.query() {
             Ok(RunQuery::Live(l)) => match ts_column {
                 Some(ts) => (vec![ts.to_string()], l.tombstone),
                 None => continue,
@@ -3079,6 +3128,9 @@ fn tombstone_uses(
             })) => (vec![valid_column, known_column], t),
             _ => continue,
         };
+        if dt(&t) == arrow::datatypes::DataType::Boolean && t.value.as_deref() == Some("true") {
+            t.value = None;
+        }
         *by.entry((r.columns.clone(), times, t)).or_default() += 1;
     }
     by.into_iter()
@@ -3086,6 +3138,7 @@ fn tombstone_uses(
             |((columns, times, tombstone), runs)| bellwether_profile::lints::TombstoneUse {
                 columns,
                 times,
+                filter: tombstone.live_sql(&dt(&tombstone)),
                 tombstone,
                 runs,
             },
@@ -3734,35 +3787,21 @@ fn resolve_temporal(req: &WhyRequest, schema: &Schema) -> Result<Option<Resolved
             })
         }
     };
+    // `WhyRequest::lookup_mode` refuses a tombstone with a lookback.
     let query = match (&lookback, &req.tombstone) {
-        (None, None) => query,
-        (Some(l), None) => RunQuery::Lookback {
+        (Some(l), _) => RunQuery::Lookback {
             asof: query.asof_ts(),
             lookback: l.length,
         },
         // A tombstone (B8): only live rows of each key's newest version.
         (None, Some(t)) => {
-            check_tombstone(
-                t,
-                &KeySpec::Temporal {
-                    columns: Vec::new(),
-                    ts_column: ts_column.to_string(),
-                    counts: false,
-                    tombstone: None,
-                },
-                schema,
-            )?;
+            check_tombstone(t, &[&ts_column.to_string()], schema)?;
             RunQuery::Live(RunLive {
                 asof: query.asof_ts(),
                 tombstone: t.clone(),
             })
         }
-        (Some(_), Some(_)) => {
-            return Err(Error::KeySpec(
-                "--tombstone keeps only the live rows of each key's newest version, and a                  --lookback reads every version in a window; pass one of them"
-                    .into(),
-            ))
-        }
+        (None, None) => query,
     };
     // With --ts, the run is the window `asof --at --lookback --ts` plans,
     // recorded as a window run (`Engine::windowed`), not a temporal lookup.
@@ -3807,20 +3846,20 @@ fn time_column_type(
     Ok(ty.clone())
 }
 
-/// Refuses a `--tombstone` (B8) whose column the dataset does not have, or
-/// whose type or value cannot mark a tombstone, on the temporal or
-/// bitemporal key `plain` (its time columns; no key columns yet), with
-/// what to pass instead (`bellwether_core::tombstone::column_type`).
-fn check_tombstone(t: &Tombstone, plain: &KeySpec, schema: &Schema) -> Result<()> {
-    let spec = plain
-        .with_tombstone(t.clone())
-        .ok_or_else(|| Error::KeySpec("--tombstone needs a temporal lookup".into()))?;
-    bellwether_core::tombstone::column_type(&spec, schema)
-        .map(|_| ())
-        .map_err(|e| match e {
-            Error::KeySpec(m) => Error::KeySpec(format!("--tombstone {}: {m}", t.spelling())),
-            other => other,
-        })
+/// Refuses a tombstone (B8; `why --tombstone`, MCP `tombstone`) whose
+/// column the dataset does not have, is one of the lookup's time columns
+/// `times`, or whose type or value cannot mark a tombstone, with what to
+/// pass instead, spelled as the argument is (`status=<value>`;
+/// `bellwether_core::tombstone::tombstone_type`).
+fn check_tombstone(t: &Tombstone, times: &[&String], schema: &Schema) -> Result<()> {
+    bellwether_core::tombstone::tombstone_type(
+        t,
+        &[],
+        times,
+        schema,
+        bellwether_core::tombstone::Spelling::Argument,
+    )
+    .map(|_| ())
 }
 
 /// A bitemporal request (`valid_by`, `known_by`, and the optional `valid`
@@ -3851,12 +3890,7 @@ fn resolve_bitemporal(req: &WhyRequest, schema: &Schema) -> Result<ResolvedTempo
     if let Some(t) = &req.tombstone {
         check_tombstone(
             t,
-            &KeySpec::Bitemporal {
-                columns: Vec::new(),
-                valid_column: valid_column.to_string(),
-                known_column: known_column.to_string(),
-                tombstone: None,
-            },
+            &[&valid_column.to_string(), &known_column.to_string()],
             schema,
         )?;
     }

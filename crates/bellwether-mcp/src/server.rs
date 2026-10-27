@@ -570,7 +570,7 @@ impl Server {
                         (None, true) => Some(bellwether::LookupMode::SemiJoin),
                         (None, false) => None,
                     },
-                    latest_by: None,
+                    latest_by: a.latest_by,
                     at: None,
                     lookback: None,
                     valid_by: a.valid_by,

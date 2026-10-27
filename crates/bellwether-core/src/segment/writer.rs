@@ -1000,6 +1000,8 @@ pub struct SegmentWriter {
     bloom_hash: Option<BloomHash>,
     /// Row groups the writer processed, inclusive, if the caller said.
     processed: Option<(u32, u32)>,
+    /// A tombstone segment's (B8) counts of the batches' timed rows.
+    marks: crate::tombstone::Marks,
 }
 
 /// Validates a key spec for indexing: the rules every spec meets, declared
@@ -1055,14 +1057,24 @@ pub fn validate_spec(spec: &KeySpec) -> Result<()> {
             KeySpec::Temporal { ts_column, .. } => Some(ts_column),
             _ => None,
         };
-        if t.column.is_empty()
-            || spec.columns().contains(&t.column)
-            || times.contains(&t.column)
-            || ts == Some(&t.column)
-        {
+        if t.column.is_empty() {
             return Err(Error::KeySpec(format!(
-                "{}: the tombstone column {:?} is empty or is a key or time column of the key; \
-                 name the column that marks a row as retracted",
+                "{}: the tombstone names no column; write tombstone=<column> for a boolean \
+                 column whose true marks a retracted row, or tombstone=<column>=<value>",
+                spec.identity()
+            )));
+        }
+        let what = if spec.columns().contains(&t.column) {
+            Some("a key column")
+        } else if times.contains(&t.column) || ts == Some(&t.column) {
+            Some("a time column")
+        } else {
+            None
+        };
+        if let Some(what) = what {
+            return Err(Error::KeySpec(format!(
+                "{}: the tombstone column {:?} is {what} of the key; name the column that marks \
+                 a row as retracted",
                 spec.identity(),
                 t.column
             )));
@@ -1132,6 +1144,7 @@ impl SegmentWriter {
             dataset: None,
             bloom_hash: None,
             processed: None,
+            marks: crate::tombstone::Marks::default(),
         })
     }
 
@@ -1763,6 +1776,7 @@ impl SegmentWriter {
         let mut staged: Vec<(Vec<u8>, crate::tombstone::Clock, bool)> =
             Vec::with_capacity(batch.num_rows());
         let (mut buf, mut scratch) = (Vec::new(), Vec::new());
+        let mut counted = crate::tombstone::Marks::default();
         'rows: for row in 0..batch.num_rows() {
             if !keys.encode_into(row, &mut buf)? {
                 continue;
@@ -1774,12 +1788,18 @@ impl SegmentWriter {
                     None => continue 'rows,
                 }
             }
-            let live = matcher.is_live(marks.as_ref(), row, &mut scratch)?;
-            staged.push((buf.clone(), (t[0], t[1]), live));
+            let mark = matcher.mark(marks.as_ref(), row, &mut scratch)?;
+            counted.count(mark);
+            staged.push((
+                buf.clone(),
+                (t[0], t[1]),
+                mark == crate::tombstone::Mark::Live,
+            ));
         }
         for (key, time, live) in &staged {
             self.insert_liveness(key, rg, *time, *live)?;
         }
+        self.marks.add(counted);
         Ok(())
     }
 
@@ -1814,6 +1834,15 @@ impl SegmentWriter {
             .and_modify(|a| a.push(time, live))
             .or_insert_with(|| crate::tombstone::LiveAcc::new(time, live));
         Ok(())
+    }
+
+    /// For a tombstone segment (B8), what the tombstone column holds over
+    /// the timed rows of the batches added so far
+    /// ([`crate::tombstone::Marks`]); `None` for any other segment, and for
+    /// one filled by [`SegmentWriter::insert_liveness`] alone.
+    #[must_use]
+    pub fn tombstone_marks(&self) -> Option<crate::tombstone::Marks> {
+        (self.layout == Layout::KeyedTombstone && self.dataset.is_some()).then_some(self.marks)
     }
 
     /// Writes the segment.

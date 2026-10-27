@@ -585,7 +585,7 @@ struct AsofArgs {
     /// without its tombstone rows, by the tombstone its temporal or
     /// temporal2 key declares (temporal:id@ts,tombstone=void); a key whose
     /// newest row then is a tombstone answers no row.
-    #[arg(long, conflicts_with = "lookback")]
+    #[arg(long, conflicts_with_all = ["lookback", "ts"])]
     live: bool,
 }
 

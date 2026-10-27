@@ -91,7 +91,8 @@ pub use reconcile::{ReconcileProblem, ReconcileRequest, ReconcileResult};
 pub use results::{
     ChainLink, Cost, CountResult, IndexResult, LinkStatus, LivePlan, LookbackWindow, LookupKind,
     NotSigned, PlanResult, ProposeRefusal, ProposeResult, ReceiptResult, ReportResult,
-    SidecarFolded, SidecarState, SpecState, TextRebuilt, Written,
+    SidecarFolded, SidecarState, SpecState, TextRebuilt, TombstoneDropped, TombstoneRows,
+    TombstoneUnused, Written,
 };
 pub use signing::{
     generate_key, load_signing_key, load_trusted_keys, public_path, read_public_key,

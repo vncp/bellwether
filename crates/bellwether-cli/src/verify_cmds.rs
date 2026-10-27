@@ -312,7 +312,9 @@ fn coverage(c: &Coverage) -> String {
 }
 
 /// What a row filter keeps, in words: one phrase per kind of test.
+#[allow(clippy::too_many_lines)] // one phrase per kind of test
 fn rows_asked(filter: &[Predicate]) -> String {
+    #[allow(clippy::too_many_lines)] // one phrase per kind of test
     fn walk(p: &Predicate, out: &mut Vec<String>) {
         let phrase = match p {
             Predicate::Between { column, .. } => format!("{column} within the lookup's bounds"),
@@ -353,8 +355,6 @@ fn rows_asked(filter: &[Predicate]) -> String {
                 format!("live rows only: {column} not null and not the tombstone value")
             }
             Predicate::And { all } => {
-                // A bitemporal run's winners: a per-key bound on each of
-                // its two clocks, read from the data, not a lookback.
                 let clocks: Vec<&str> = all
                     .iter()
                     .filter_map(|q| match q {
@@ -362,6 +362,39 @@ fn rows_asked(filter: &[Predicate]) -> String {
                         _ => None,
                     })
                     .collect();
+                // A live run (B8): each key's newest version first, then
+                // its live rows, in that order (never the newest live row).
+                let live = all.iter().find_map(|q| match q {
+                    Predicate::Live { column, .. } => Some(column.as_str()),
+                    _ => None,
+                });
+                if let Some(column) = live {
+                    for q in all.iter().filter(|q| matches!(q, Predicate::In { .. })) {
+                        walk(q, out);
+                    }
+                    let newest = match clocks.as_slice() {
+                        [valid, known] => format!(
+                            "each key's as-of version (the rows at its greatest {valid} within \
+                             the bounds among those known by then, at the greatest {known}), \
+                             found in the data"
+                        ),
+                        [ts, ..] => format!(
+                            "each key's newest version by {ts} at or before the instant, found \
+                             in the data"
+                        ),
+                        [] => "each key's newest version".to_string(),
+                    };
+                    let phrase = format!(
+                        "{newest}, then its live rows only ({column} not null and not the \
+                         tombstone value)"
+                    );
+                    if !out.contains(&phrase) {
+                        out.push(phrase);
+                    }
+                    return;
+                }
+                // A bitemporal run's winners: a per-key bound on each of
+                // its two clocks, read from the data, not a lookback.
                 if let [valid, known] = clocks.as_slice() {
                     for q in all
                         .iter()

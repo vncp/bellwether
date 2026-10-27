@@ -19,7 +19,7 @@ use crate::keys::KeyFile;
 use crate::lookback::Lookback;
 use crate::results::{
     Cost, CountResult, IndexResult, LivePlan, LookupKind, PlanResult, SidecarFolded, SidecarState,
-    SpecState, TextRebuilt,
+    SpecState, TextRebuilt, TombstoneDropped, TombstoneRows, TombstoneUnused,
 };
 use crate::spec::Declaration;
 use crate::text::TextQuery;
@@ -159,6 +159,27 @@ impl Engine {
                 })
                 .collect(),
             joins,
+            tombstones_unused: bellwether_build::unused_tombstones(m)
+                .into_iter()
+                .map(|u| TombstoneUnused {
+                    sidecar: u.sidecar,
+                    reason: u.reason,
+                })
+                .collect(),
+            tombstones_dropped: report
+                .tombstones_dropped
+                .into_iter()
+                .map(|d| TombstoneDropped {
+                    sidecar: d.sidecar,
+                    tombstone: d.tombstone,
+                    now: d.now,
+                })
+                .collect(),
+            tombstone_rows: report
+                .tombstone_rows
+                .into_iter()
+                .map(|t| TombstoneRows::of(t.sidecar, t.tombstone, t.marks))
+                .collect(),
         })
     }
 
@@ -1483,7 +1504,10 @@ fn temporal_ts(spec: &KeySpec) -> &str {
 /// are complete), and the tombstone still comes from the declaration, so
 /// the residual drops tombstone rows and [`live_plan`] says nothing was
 /// pruned by them. A key declared without a tombstone is
-/// [`Error::NotIndexed`], naming the spec to declare.
+/// [`Error::NotIndexed`], naming the spec to declare; when the index holds
+/// a tombstone declaration on the key's columns this build does not use
+/// (`bellwether_build::unused_tombstones`), the refusal names it, says
+/// why, and gives the `index` command that declares one it uses.
 fn declared_tombstone(
     root: &str,
     verb: &'static str,
@@ -1500,15 +1524,47 @@ fn declared_tombstone(
                 .then(|| s.tombstone().cloned())
                 .flatten()
         });
-    declared.ok_or_else(|| Error::NotIndexed {
-        root: root.to_string(),
-        operation: if verb == "latest" {
-            "a live latest"
+    if let Some(t) = declared {
+        return Ok(t);
+    }
+    let operation = if verb == "latest" {
+        "a live latest"
+    } else {
+        "a live asof"
+    };
+    let unused = bellwether_build::unused_tombstones(pinned.manifest());
+    let Some(u) = unused.iter().find(|u| u.columns == plain.columns()) else {
+        return Err(Error::NotIndexed {
+            root: root.to_string(),
+            operation,
+            needs: Some(format!("{},tombstone=<column>", plain.identity())),
+        });
+    };
+    let spelling = u
+        .tombstone
+        .as_ref()
+        .map_or_else(|| "tombstone=<column>".to_string(), Tombstone::spelling);
+    let replaces = u
+        .tombstone
+        .as_ref()
+        .and_then(|t| plain.with_tombstone(t.clone()))
+        .is_some_and(|s| bellwether_build::tombstone_name(&s) == u.sidecar);
+    Err(Error::KeySpec(format!(
+        "the index declares the tombstone {}, which this build does not use: {}; so {operation} \
+         through {} has no tombstone to keep live rows by, and nothing was planned. Declare a \
+         tombstone on {}: `bellwether index {} --key '{},{spelling}'`{}",
+        u.sidecar,
+        u.reason,
+        plain.identity(),
+        plain.identity(),
+        crate::spec::shell_quote(root),
+        plain.identity(),
+        if replaces {
+            ", which replaces that declaration"
         } else {
-            "a live asof"
-        },
-        needs: Some(format!("{},tombstone=<column>", plain.identity())),
-    })
+            ""
+        }
+    )))
 }
 
 /// The tombstone of a `live` lookup (B8), if it is one.
@@ -1536,7 +1592,13 @@ fn live_plan(root: &str, pinned: &Pinned, tombstone: Tombstone, o: LiveOutcome) 
         )
     });
     LivePlan {
-        filter: tombstone.live_sql(),
+        filter: tombstone.live_sql(
+            &pinned
+                .planner
+                .schema()
+                .field_with_name(&tombstone.column)
+                .map_or(DataType::Null, |f| f.data_type().clone()),
+        ),
         tombstone,
         pruned_by: o.pruned_by,
         unpruned,

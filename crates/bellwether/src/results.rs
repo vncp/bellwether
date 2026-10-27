@@ -159,6 +159,90 @@ pub struct IndexResult {
     /// (`refreshed`). Absent (omitted in JSON) when none is declared.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub joins: Vec<crate::join::JoinKeyState>,
+    /// Tombstone declarations (B8) the index holds that this binary does
+    /// not use: params it cannot read (a newer binary's), or a key the index
+    /// no longer declares (a binary without tombstones redefined it). Kept
+    /// unchanged with their segments, never planned with. Absent (omitted
+    /// in JSON) when none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tombstones_unused: Vec<TombstoneUnused>,
+    /// Tombstones (B8) this build stopped declaring, and what it declares
+    /// in their place: a key redefined or declared with another tombstone.
+    /// Absent (omitted in JSON) when none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tombstones_dropped: Vec<TombstoneDropped>,
+    /// Per tombstone sidecar (B8) this build wrote, what the rows it read
+    /// hold: tombstones, and rows whose tombstone column is null (neither
+    /// live nor a tombstone), with a warning when the counts make the
+    /// tombstone suspect. Over the row groups this build read only. Absent
+    /// (omitted in JSON) when none was written.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tombstone_rows: Vec<TombstoneRows>,
+}
+
+/// A tombstone declaration (B8) this binary does not use
+/// ([`IndexResult::tombstones_unused`]).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TombstoneUnused {
+    /// Its name (`tombstone:id@ts`).
+    pub sidecar: String,
+    /// Why this binary does not use it.
+    pub reason: String,
+}
+
+/// A tombstone (B8) a build stopped declaring
+/// ([`IndexResult::tombstones_dropped`]).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TombstoneDropped {
+    /// Its declaration's name (`tombstone:id@ts`).
+    pub sidecar: String,
+    /// What it declared (`tombstone=void`), or why this binary could not
+    /// use it.
+    pub tombstone: String,
+    /// The spec declared in its place, when one is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub now: Option<String>,
+}
+
+/// What one build's rows hold for a tombstone sidecar (B8,
+/// [`IndexResult::tombstone_rows`]).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TombstoneRows {
+    /// The sidecar (`tombstone:id@ts`).
+    pub sidecar: String,
+    /// The tombstone it declares.
+    pub tombstone: Tombstone,
+    /// Timed rows read (a row with a null time or leading key column is no
+    /// version).
+    pub rows: u64,
+    /// Of those, rows holding the tombstone value.
+    pub tombstones: u64,
+    /// Of those, rows whose tombstone column is null: not live, and not
+    /// tombstones.
+    pub nulls: u64,
+    /// Why the counts make the tombstone suspect (no row holds its value,
+    /// or every row has a null tombstone column), when they do.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub warning: Option<String>,
+}
+
+impl TombstoneRows {
+    /// The counts `marks` of the tombstone `tombstone` under `sidecar`, with
+    /// the warning they call for.
+    pub(crate) fn of(
+        sidecar: String,
+        tombstone: Tombstone,
+        marks: bellwether_core::tombstone::Marks,
+    ) -> Self {
+        Self {
+            warning: marks.suspect(&tombstone),
+            sidecar,
+            tombstone,
+            rows: marks.rows,
+            tombstones: marks.tombstones,
+            nulls: marks.nulls,
+        }
+    }
 }
 
 /// A text key `index` rebuilt because its segments recorded other Unicode

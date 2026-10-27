@@ -41,7 +41,7 @@ mod target;
 mod verify;
 
 pub use bellwether_core::join::PairCaps;
-pub use build::{BuildReport, Builder, TextTablesReplaced, MAX_KEY_SPECS};
+pub use build::{BuildReport, Builder, TextTablesReplaced, TombstoneRows, MAX_KEY_SPECS};
 pub use compact::CompactReport;
 pub use config::{
     BuildObserver, BuildOptions, CompactOptions, SourceKind, DEFAULT_MAX_RESTARTS,
@@ -60,5 +60,8 @@ pub use plan::{
     serving_agg, several_bitemporal_keys, AggAnswer, AggLookup, Aggregated, KeyAggregate, KeyCount,
     LiveOutcome, Lookup, PlanOrder, Planner, TotalsVisitor, TransientSpec,
 };
-pub use target::{declared_key_specs, declared_sketches, tombstone_name, TimedSource};
+pub use target::{
+    declared_key_specs, declared_sketches, tombstone_name, unused_tombstones, TimedSource,
+    TombstoneDropped, UnusedTombstone,
+};
 pub use verify::Drift;
