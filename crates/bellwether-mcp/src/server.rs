@@ -453,6 +453,7 @@ impl Server {
                 let bitemporal = a.valid.is_some() || a.known.is_some();
                 let r = match (&a.at, bitemporal, clocks) {
                     (_, _, Err(err)) => Err(err),
+                    (Some(at), false, Ok(None)) if a.live => engine.asof_live(&keys, at),
                     (Some(at), false, Ok(None)) => engine.asof(&keys, at),
                     (Some(_), false, Ok(Some(_))) => Err(Error::InvalidArgument {
                         field: "valid_by",
@@ -466,6 +467,7 @@ impl Server {
                         a.valid.as_deref(),
                         a.known.as_deref(),
                         clocks,
+                        a.live,
                     ),
                     (Some(_), true, _) => Err(Error::InvalidArgument {
                         field: "at",
@@ -535,7 +537,17 @@ impl Server {
                         json!({}),
                     ));
                 }
+                let tombstone = match a
+                    .tombstone
+                    .as_deref()
+                    .map(bellwether::spec::parse_tombstone)
+                {
+                    Some(Err(err)) => return failed(&err),
+                    Some(Ok(t)) => Some(t),
+                    None => None,
+                };
                 let request = WhyRequest {
+                    tombstone,
                     more_keys: a
                         .more_keys
                         .into_iter()
@@ -558,7 +570,7 @@ impl Server {
                         (None, true) => Some(bellwether::LookupMode::SemiJoin),
                         (None, false) => None,
                     },
-                    latest_by: None,
+                    latest_by: a.latest_by,
                     at: None,
                     lookback: None,
                     valid_by: a.valid_by,

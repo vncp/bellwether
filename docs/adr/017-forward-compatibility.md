@@ -31,3 +31,15 @@ A ledger record may gain an optional **label field** without a `RECORD_VERSION` 
 A field that would change how an existing field is read still requires a `RECORD_VERSION` bump, as `inputs` and `model` did in contract v2.1.
 
 The first such field is `Replay.unserved` (`"parquet_stats"` or absent): it says that runs no key spec serves were priced as the files' own min/max statistics read them, while `current` and `proposed` remain exact byte sums of the row groups each plan reads. An older build reading such a Replay sees the same costs and lacks only the label. The record-version bump to 3 and the frozen record shapes arrive with storage version 2 (PR #23), which carries `unserved` unchanged.
+
+## Amendment 2026-10-26 (B8): a parameter whose absence means something else is a version bump
+
+The label-field rule above does not cover a field an older reader would misread by dropping it. B8's tombstone is one: a `KeySpec::Temporal` or `KeySpec::Bitemporal` with a `tombstone`, `Predicate::Live`, and `RecordedRun.tombstone` each change what the record or run means (another key, another row filter, another query). Dropped, the record still parses and reads as something else: the M5 binary (e1bd168) read a Proposal of `temporal:id@ts,tombstone=void` as `temporal:id@ts` and passed `fix --verify-only` on it.
+
+So each side follows its own rule:
+
+- **Storage** keeps `STORAGE_VERSION` 2: the manifest never holds the parameter in `key_specs` (the store refuses a key spec that carries one). The tombstone is an additive sidecar kind (ADR 028), which an older binary preserves, never plans with, and never misreads.
+- **Records** bump `RECORD_VERSION` to 4 (ADR 028, "Records after the freeze"). A version 3 reader refuses a version 4 record with `Error::UnsupportedVersion` before parsing it, whatever the record holds, so it never sees a record with the parameter dropped. Records of versions 1 to 3 are read unchanged and never rewritten.
+- **Workloads** are not ledger records and carry no record version; their stored bytes must be the canonical JSON of the manifest a reader parses, so a reader that would drop `tombstone` refuses the workload ("not stored in canonical form").
+
+Every rule is held against the M5 binary by `crates/bellwether-cli/tests/tombstone_old_binary.rs`.

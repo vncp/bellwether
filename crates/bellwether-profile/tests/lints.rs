@@ -291,6 +291,7 @@ fn count_before_scan_is_silenced_by_every_spec_the_planner_counts_with() {
         &[(Some("count"), vec![1, 2]), (Some("locate"), vec![1, 2])],
     );
     let temporal = |counts| KeySpec::Temporal {
+        tombstone: None,
         columns: vec!["entity_id".into()],
         ts_column: "version_ts".into(),
         counts,

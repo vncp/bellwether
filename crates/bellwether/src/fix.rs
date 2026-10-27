@@ -2436,6 +2436,18 @@ fn rows_asked(
             // greatest known time within the bound.
             (RunQuery::Bitemporal(b), _) => {
                 tests = bitemporal_winners(source, catalog, run, b)?;
+                // With a tombstone (B8): then only the live rows of the
+                // winning version.
+                if let Some(t) = &b.tombstone {
+                    tests.push(live_test(schema, t)?);
+                }
+            }
+            // A live run (B8): each key's newest version at or before the
+            // instant, from the data, then only its live rows. A key whose
+            // newest row is a tombstone keeps no row on either side.
+            (RunQuery::Live(l), Some(c)) => {
+                tests = newest_versions(source, catalog, run, c, l.asof)?;
+                tests.push(live_test(schema, &l.tombstone)?);
             }
             _ => {
                 filter.push(Predicate::And { all: tests });
@@ -2674,6 +2686,111 @@ fn bitemporal_winners(
     tests.push(per_key(&b.valid_column, valid_type, |w| w.0)?);
     tests.push(per_key(&b.known_column, known_type, |w| w.1)?);
     Ok(tests)
+}
+
+/// Each key's newest version on `ts_column` at or before `asof` (all times
+/// for `None`), from every live row group of `source`: `In` over the keys
+/// with a non-null time there, `Between` up to `asof`, and `NotOlderThan`
+/// at each key's newest time, which keep exactly the rows at it (a live
+/// run, B8). Memory: one time per looked-up key (ADR 018).
+fn newest_versions(
+    source: &dyn Source,
+    catalog: &Catalog,
+    run: &AskedRun,
+    ts_column: &str,
+    asof: Option<i64>,
+) -> Result<Vec<Predicate>> {
+    let columns = run.keys.columns().to_vec();
+    let all: Vec<usize> = (0..columns.len()).collect();
+    let wanted: std::collections::HashSet<Vec<u8>> =
+        run.keys.all_probes(&all).into_iter().collect();
+    let schema = catalog.schema();
+    let mut read = columns.clone();
+    read.push(ts_column.to_string());
+    let types: Vec<arrow::datatypes::DataType> = read
+        .iter()
+        .map(|c| {
+            schema
+                .field_with_name(c)
+                .map(|f| f.data_type().clone())
+                .map_err(|_| Error::KeySpec(format!("column {c:?} is not in the dataset")))
+        })
+        .collect::<Result<_>>()?;
+    let n = columns.len();
+    let mut newest: BTreeMap<Vec<u8>, i64> = BTreeMap::new();
+    let mut key = Vec::new();
+    for rg in catalog.row_groups() {
+        let batch = source.read_columns(&rg.meta, &read)?;
+        'rows: for row in 0..batch.num_rows() {
+            key.clear();
+            for (i, t) in types[..n].iter().enumerate() {
+                if !bellwether_core::encoding::encode_array_value_as(
+                    batch.column(i).as_ref(),
+                    row,
+                    t,
+                    &mut key,
+                )? {
+                    continue 'rows;
+                }
+            }
+            if !wanted.contains(&key) {
+                continue;
+            }
+            let Some(ts) =
+                bellwether_core::encoding::ts_value_as(batch.column(n).as_ref(), row, &types[n])?
+            else {
+                continue;
+            };
+            if asof.is_some_and(|at| ts > at) {
+                continue;
+            }
+            let e = newest.entry(key.clone()).or_insert(ts);
+            *e = (*e).max(ts);
+        }
+    }
+    let t = &types[n];
+    let mut tests = vec![Predicate::In {
+        columns: columns.clone(),
+        values: newest.keys().cloned().collect(),
+    }];
+    if let Some(at) = asof {
+        tests.push(Predicate::Between {
+            column: ts_column.to_string(),
+            lo: encode_ts(bellwether_core::encoding::ts_min(t)?, t)?,
+            hi: encode_ts(at, t)?,
+        });
+    }
+    tests.push(Predicate::NotOlderThan {
+        columns,
+        ts_column: ts_column.to_string(),
+        bounds: newest
+            .iter()
+            .map(|(k, w)| Ok((k.clone(), encode_ts(*w, t)?)))
+            .collect::<Result<Vec<_>>>()?,
+    });
+    Ok(tests)
+}
+
+/// The row test of a tombstone (B8): its column not null and not the
+/// tombstone value, encoded at the column's dataset type.
+fn live_test(
+    schema: &arrow::datatypes::Schema,
+    t: &bellwether_types::Tombstone,
+) -> Result<Predicate> {
+    let dt = schema
+        .field_with_name(&t.column)
+        .map_err(|_| {
+            Error::KeySpec(format!(
+                "the tombstone column {:?} is not in the dataset",
+                t.column
+            ))
+        })?
+        .data_type()
+        .clone();
+    Ok(Predicate::Live {
+        column: t.column.clone(),
+        tombstone: bellwether_core::tombstone::tombstone_bytes(t, &dt)?,
+    })
 }
 
 pub(crate) fn load_workload(

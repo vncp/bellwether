@@ -62,6 +62,7 @@ use bellwether_core::encoding;
 use bellwether_core::segment::{ColumnType, ReadAt, SegmentReader};
 use bellwether_core::temporal::{self, LookbackHit, VersionChain, VersionHit};
 use bellwether_core::text;
+use bellwether_core::tombstone;
 use bellwether_source::Partitioning;
 use bellwether_store::{Snapshot, StoreExt};
 use bellwether_types::{
@@ -171,7 +172,10 @@ pub fn serves_query(spec: &KeySpec, run_columns: &[String], query: &RunQuery) ->
         RunQuery::Window(w) => {
             servable(spec, run_columns).is_some() || serves_window(spec, &w.ts_column)
         }
-        RunQuery::Latest | RunQuery::Asof { .. } | RunQuery::Lookback { .. } => match spec {
+        RunQuery::Latest
+        | RunQuery::Asof { .. }
+        | RunQuery::Lookback { .. }
+        | RunQuery::Live(_) => match spec {
             KeySpec::Temporal { .. } => {
                 matches!(servable(spec, run_columns), Some(Lookup::Point { .. }))
             }
@@ -232,7 +236,7 @@ pub fn aggregate_specs(
 /// columns the run names: the only spec that plans a bitemporal run.
 #[must_use]
 pub fn serves_bitemporal(spec: &KeySpec, run_columns: &[String], run: &RunBitemporal) -> bool {
-    matches!(spec, KeySpec::Bitemporal { columns, valid_column, known_column }
+    matches!(spec, KeySpec::Bitemporal { columns, valid_column, known_column, .. }
         if *valid_column == run.valid_column
             && *known_column == run.known_column
             && columns.iter().all(|c| run_columns.contains(c)))
@@ -288,7 +292,9 @@ pub fn planned_time_column(
         | RunQuery::ContainsAll
         | RunQuery::SemiJoin(_)
         | RunQuery::Aggregate(_) => Ok(None),
-        RunQuery::Latest | RunQuery::Asof { .. } => serving_temporal_column(specs, run_columns),
+        RunQuery::Latest | RunQuery::Asof { .. } | RunQuery::Live(_) => {
+            serving_temporal_column(specs, run_columns)
+        }
         // Planned on its valid clock when a bitemporal key on its clocks
         // serves it; unplannable (every row group) otherwise.
         RunQuery::Bitemporal(b) => Ok(specs
@@ -719,21 +725,58 @@ impl<S: StoreExt + ?Sized + Send + Sync> RangeRead for SnapshotSegment<S> {
 pub struct SpecSegments {
     spec: KeySpec,
     readers: Vec<SegmentReader<SegmentBytes>>,
+    /// For a spec with a tombstone (B8), its tombstone segments.
+    tombstones: Vec<SegmentReader<SegmentBytes>>,
 }
 
 impl SpecSegments {
     /// The segments of `spec`. Each must index exactly `spec`.
     pub fn new(spec: KeySpec, readers: Vec<SegmentReader<SegmentBytes>>) -> Result<Self> {
+        Self::with_tombstones(spec, readers, Vec::new())
+    }
+
+    /// The segments of `spec` and, for a spec with a tombstone (B8), its
+    /// tombstone segments. Each of `readers` must index the spec without
+    /// its tombstone (its own segments), and each of `tombstones` the spec
+    /// with it, in the `keyed_tombstone` layout; a spec with a tombstone
+    /// needs its tombstone segments.
+    pub fn with_tombstones(
+        spec: KeySpec,
+        readers: Vec<SegmentReader<SegmentBytes>>,
+        tombstones: Vec<SegmentReader<SegmentBytes>>,
+    ) -> Result<Self> {
+        let own = spec.without_tombstone();
         for r in &readers {
-            if r.key_spec() != &spec {
+            if r.key_spec() != &own {
                 return Err(Error::KeySpec(format!(
                     "a segment indexes {}, not {}",
                     r.key_spec().identity(),
-                    spec.identity()
+                    own.identity()
                 )));
             }
         }
-        Ok(Self { spec, readers })
+        if spec.tombstone().is_some() && !readers.is_empty() && tombstones.is_empty() {
+            return Err(Error::KeySpec(format!(
+                "{} has segments and no tombstone segments",
+                spec.identity()
+            )));
+        }
+        for r in &tombstones {
+            if r.key_spec() != &spec
+                || r.header().layout != bellwether_core::segment::Layout::KeyedTombstone
+            {
+                return Err(Error::KeySpec(format!(
+                    "a segment listed as a tombstone segment of {} indexes {}",
+                    spec.identity(),
+                    r.key_spec().identity()
+                )));
+            }
+        }
+        Ok(Self {
+            spec,
+            readers,
+            tombstones,
+        })
     }
 
     /// The key spec.
@@ -746,6 +789,13 @@ impl SpecSegments {
     #[must_use]
     pub fn readers(&self) -> &[SegmentReader<SegmentBytes>] {
         &self.readers
+    }
+
+    /// The tombstone segment readers (B8); empty for a spec without a
+    /// tombstone.
+    #[must_use]
+    pub fn tombstone_readers(&self) -> &[SegmentReader<SegmentBytes>] {
+        &self.tombstones
     }
 
     /// Row groups that may hold any of `probes` (point probes or prefixes),
@@ -830,12 +880,13 @@ impl SegmentPlanner {
         }
         let live = catalog.all_ids();
         let mut planner = Self::new(catalog);
-        for (i, spec) in manifest.schema.key_specs.iter().enumerate() {
+        // Each temporal or bitemporal spec with the tombstone its sidecar
+        // declares (B8); the manifest's `key_specs` hold them without it.
+        let declared = bellwether_build::declared_key_specs(manifest);
+        for (i, full) in declared.iter().enumerate() {
+            let spec = &full.without_tombstone();
             let name = spec.name();
-            if manifest.schema.key_specs[..i]
-                .iter()
-                .any(|s| s.name() == name)
-            {
+            if declared[..i].iter().any(|s| s.name() == name) {
                 return Err(Error::KeySpec(format!(
                     "two declared key specs share the name {name}; their segments cannot be told \
                      apart"
@@ -890,7 +941,32 @@ impl SegmentPlanner {
                 }));
                 readers.push(SegmentReader::open_for_dataset(bytes, &schema)?);
             }
-            planner.add(SpecSegments::new(spec.clone(), readers)?)?;
+            // A complete tombstone sidecar plans with the spec; an
+            // incomplete one is left out, and the spec plans without it (as
+            // `bellwether_build::Planner::usable_specs` has it).
+            if full.tombstone().is_some()
+                && bellwether_build::tombstone_completeness(manifest, full).is_some()
+            {
+                let sidecar = bellwether_build::tombstone_name(full);
+                let mut tombstones = Vec::new();
+                for r in manifest.segments.iter().filter(|s| {
+                    s.kind.as_deref() == Some(tombstone::TOMBSTONE_KIND) && s.key_spec == sidecar
+                }) {
+                    let bytes = SegmentBytes::Ranged(Arc::new(SnapshotSegment {
+                        snapshot: snapshot.clone(),
+                        id: r.id,
+                        len: r.bytes,
+                    }));
+                    tombstones.push(SegmentReader::open_for_dataset(bytes, &schema)?);
+                }
+                planner.add(SpecSegments::with_tombstones(
+                    full.clone(),
+                    readers,
+                    tombstones,
+                )?)?;
+            } else {
+                planner.add(SpecSegments::new(spec.clone(), readers)?)?;
+            }
         }
         Ok(planner)
     }
@@ -1165,6 +1241,7 @@ impl SegmentPlanner {
     /// ones, invariant 5) or every live version in the key's own lookback
     /// window, per-key intersection with any other serving specs, and the
     /// `NotOlderThan` / `LatestPerKey` residual, or the lookback's.
+    #[allow(clippy::too_many_lines)] // latest, asof, live, and lookback in one walk
     fn plan_temporal(
         &self,
         serving: &[(&SpecSegments, Lookup)],
@@ -1211,12 +1288,39 @@ impl SegmentPlanner {
                     .collect();
                 (Selection::Lookbacks(hits), acc)
             }
-            RunQuery::Latest | RunQuery::Asof { .. } => {
-                let winners = self.winners(&t.readers, &variants, asof)?;
-                let acc: Vec<Option<RoaringBitmap>> = winners
+            RunQuery::Latest | RunQuery::Asof { .. } | RunQuery::Live(_) => {
+                let mut winners = self.winners(&t.readers, &variants, asof)?;
+                let mut acc: Vec<Option<RoaringBitmap>> = winners
                     .iter()
                     .map(|w| Some(w.as_ref().map(|h| h.row_groups.clone()).unwrap_or_default()))
                     .collect();
+                // With a tombstone (B8), the build planner's rule: a spec
+                // declared with exactly the run's tombstone prunes each key's
+                // winning row groups by its stored liveness; a key whose
+                // every winning row group goes answers no row.
+                if let (RunQuery::Live(l), Some(spec_t)) = (query, t.spec.tombstone()) {
+                    if *spec_t == l.tombstone {
+                        let mut probes: Vec<Vec<u8>> = variants
+                            .iter()
+                            .zip(&winners)
+                            .filter(|(_, w)| w.is_some())
+                            .flat_map(|(vs, _)| vs.iter().cloned())
+                            .collect();
+                        probes.sort_unstable();
+                        probes.dedup();
+                        let entries = tombstone::liveness(&t.tombstones, &probes)?;
+                        for ((vs, w), a) in variants.iter().zip(&mut winners).zip(&mut acc) {
+                            let Some(h) = w.as_ref() else { continue };
+                            let maps: Vec<&tombstone::KeyLiveness> =
+                                vs.iter().filter_map(|v| entries.get(v)).collect();
+                            let kept = tombstone::prune(&h.row_groups, (h.ts, 0), &maps)?;
+                            if kept.is_empty() {
+                                *w = None;
+                            }
+                            *a = Some(kept);
+                        }
+                    }
+                }
                 (Selection::Winners(winners), acc)
             }
             RunQuery::Locate
@@ -1263,6 +1367,28 @@ impl SegmentPlanner {
             Selection::Lookbacks(hits) => {
                 lookback_residual(&t.spec, ts_column, &ts_type, keys, &variants, hits)?
             }
+        };
+        let residual = match query {
+            RunQuery::Live(l) => {
+                let full = t
+                    .spec
+                    .without_tombstone()
+                    .with_tombstone(l.tombstone.clone())
+                    .ok_or_else(|| Error::KeySpec("a live run needs a temporal key".into()))?;
+                let dt = tombstone::column_type(&full, self.catalog.schema())?;
+                let live = Predicate::Live {
+                    column: l.tombstone.column.clone(),
+                    tombstone: tombstone::tombstone_bytes(&l.tombstone, &dt)?,
+                };
+                match residual {
+                    Predicate::And { mut all } => {
+                        all.push(live);
+                        Predicate::And { all }
+                    }
+                    r => Predicate::And { all: vec![r, live] },
+                }
+            }
+            _ => residual,
         };
         let mut plan = self.catalog.plan_for(&selected)?;
         plan.residual = Some(residual);
@@ -1511,10 +1637,13 @@ impl PlanSource for SegmentPlanner {
             // over transient key segments only.
             let spec = query.bitemporal().map(|b| {
                 format!(
-                    "temporal2:{}@{},{}",
+                    "temporal2:{}@{},{}{}",
                     keys.columns().join(","),
                     b.valid_column,
-                    b.known_column
+                    b.known_column,
+                    b.tombstone
+                        .as_ref()
+                        .map_or_else(String::new, |t| format!(",{}", t.spelling()))
                 )
             });
             return Err(Error::KeySpec(format!(
@@ -1967,6 +2096,7 @@ mod tests {
             columns: cols(&["a", "b"]),
             ts_column: "t".into(),
             counts: false,
+            tombstone: None,
         };
         assert_eq!(servable(&temporal, &cols(&["a"])), Some(Lookup::Prefix));
         // Neither: a leading column missing, or a bloom spec asked a prefix.

@@ -228,6 +228,14 @@ pub struct ObserveAsof {
     /// Bitemporal: the known-time column of that key (with `valid_by`).
     #[serde(default)]
     pub known_by: Option<String>,
+    /// Keep only live rows (B8; the CLI's `--live`): each key's newest
+    /// version at the instant, without its tombstone rows, through the
+    /// tombstone the serving temporal or temporal2 key declares
+    /// (`temporal:id@ts,tombstone=void`). A key whose newest row is a
+    /// tombstone answers no row. Default `false`: every row of the newest
+    /// version.
+    #[serde(default)]
+    pub live: bool,
     /// Plan against the committed manifest at this sequence (a plan's
     /// `sequence`) instead of the current one, so a lookup repeated over a
     /// grown folder reads exactly what it read then: files indexed since are
@@ -384,6 +392,21 @@ pub struct ScoreWhy {
     /// `known_by`'s unit likewise; default: unbounded.
     #[serde(default)]
     pub known: Option<String>,
+    /// Price `keys` as `latest` lookups (`why --latest-by`): each key's
+    /// newest version by this time column, the floor candidate
+    /// `temporal:<key columns>@<latest_by>` (with `tombstone`, the live
+    /// rows of it, through `temporal:<key columns>@<latest_by>,tombstone=
+    /// <column>`). Takes no `valid_by` or `known_by`.
+    #[serde(default)]
+    pub latest_by: Option<String>,
+    /// With `latest_by` or a bitemporal lookup (B8; `why --tombstone`): the
+    /// runs keep only live rows, `<column>` (a boolean column whose true
+    /// marks a retracted row) or `<column>=<value>`; the floor candidate is
+    /// `temporal:<key columns>@<latest_by>,tombstone=<column>` (or
+    /// `temporal2:<key columns>@<valid_by>,<known_by>,tombstone=<column>`).
+    /// Default: none (every row of the newest version).
+    #[serde(default)]
+    pub tombstone: Option<String>,
 }
 
 /// What an aggregate lookup computes per key.
@@ -640,7 +663,8 @@ pub fn catalog() -> Vec<ToolDef> {
             true,
             "Plan the version of each key current at an instant (at), or its bitemporal version \
              valid at valid as known at known (a temporal2 key), against the current manifest or \
-             a committed one (at_manifest). Writes the plan Evidence and the key set to the cache \
+             a committed one (at_manifest); with live, only its rows that are not tombstones (the \
+             key's declared tombstone). Writes the plan Evidence and the key set to the cache \
              only.",
         ),
         def::<ObserveText>(
@@ -683,7 +707,8 @@ pub fn catalog() -> Vec<ToolDef> {
             false,
             "Engine-scored why: replay the keys (or a recorded workload) under the current \
              configuration and every candidate key, as point lookups or, with valid_by and \
-             known_by, bitemporal ones; returns the funnel, the culprit, the recommended key, and \
+             known_by, bitemporal ones, or with latest_by, latest ones (with tombstone, only their live \
+             rows); returns the funnel, the culprit, the recommended key, and \
              workload.hash. Writes engine Proposals and Replays. Charged to the session budget. \
              Returns a job id unless wait is true.",
         ),

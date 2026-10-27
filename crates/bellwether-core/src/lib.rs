@@ -24,6 +24,9 @@
 //!   `overlap_stats`.
 //! - [`agg`]: agg keys (B7), per-key, per-row-group aggregates of one value
 //!   column, and the rule that decides which row groups they answer.
+//! - [`tombstone`]: tombstones on temporal and bitemporal keys (B8): the
+//!   `keyed_tombstone` liveness entries, the row test, and the pruning
+//!   rule of `latest`/`asof` with `live`.
 //!
 //! Invariants owned here: 1 (no false negatives in pruning,
 //! `tests/no_false_negatives.rs`) and 5 (stale-version rejection,
@@ -50,6 +53,7 @@ pub mod sidecar;
 pub mod sketch;
 pub mod temporal;
 pub mod text;
+pub mod tombstone;
 
 pub use merge::{count_live_keys, merge};
 pub use segment::{EncodedSegment, SegmentReader, SegmentWriter, WriterOptions};

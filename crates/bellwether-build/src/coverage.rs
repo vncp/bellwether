@@ -23,7 +23,8 @@ use bellwether_store::{Manifest, RowGroupSpace, SegmentRef};
 use bellwether_types::{Error, KeySpec, Result, RowGroupId, SketchSpec};
 
 use crate::target::{
-    declared_sketches, declared_targets, targets_of, timed_sources, Target, TimedSource,
+    declared_key_specs, declared_sketches, declared_targets, targets_of, timed_sources, Target,
+    TimedSource,
 };
 use roaring::RoaringBitmap;
 
@@ -107,6 +108,15 @@ fn all_complete(manifest: &Manifest, targets: &[Target], name: &str, live: &Roar
 /// make a partial spec look complete.
 #[must_use]
 pub fn completeness(manifest: &Manifest, spec: &KeySpec) -> Option<u64> {
+    // A spec with a tombstone (B8) is complete when the spec without it and
+    // its tombstone sidecar both are: at the later of their sequences.
+    if spec.tombstone().is_some() {
+        if !declared_key_specs(manifest).contains(spec) {
+            return None;
+        }
+        let plain = completeness(manifest, &spec.without_tombstone())?;
+        return tombstone_completeness(manifest, spec).map(|t| t.max(plain));
+    }
     if !manifest.schema.key_specs.contains(spec) {
         return None;
     }
@@ -118,6 +128,19 @@ pub fn completeness(manifest: &Manifest, spec: &KeySpec) -> Option<u64> {
         }
     }
     Some(seq)
+}
+
+/// The sequence at which the tombstone sidecar of `spec` (a temporal or
+/// bitemporal spec with a tombstone, B8) became complete in `manifest`, or
+/// `None`: declared with exactly this tombstone, recorded, and covering
+/// every live row group. Independent of the spec's own segments, which
+/// plan without it.
+#[must_use]
+pub fn tombstone_completeness(manifest: &Manifest, spec: &KeySpec) -> Option<u64> {
+    if spec.tombstone().is_none() || !declared_key_specs(manifest).contains(spec) {
+        return None;
+    }
+    recorded_and_covered(manifest, &[Target::Tombstone(spec.clone())])
 }
 
 /// Whether the join key named `name` has segments in `manifest` and every
@@ -205,6 +228,17 @@ pub(crate) fn completeness_map(
             _ => base.sequence + 1,
         };
         out.insert(name, seq);
+    }
+    // A tombstone declaration this binary does not use (B8) keeps its
+    // entry, as it keeps its declaration and segments, while those still
+    // cover every live row group.
+    for name in crate::target::kept_tombstone_names(next) {
+        if let Some(&recorded) = base.key_spec_completeness.get(&name) {
+            let kind = Some(bellwether_core::tombstone::TOMBSTONE_KIND);
+            if live_next.is_subset(&covered(next, &name, kind)) {
+                out.insert(name, recorded);
+            }
+        }
     }
     // A join key (B3) becomes complete only by its own commit
     // (`Builder::refresh_join`); a later commit keeps its entry only while
@@ -463,6 +497,7 @@ mod tests {
             columns: vec!["id".into()],
             ts_column: "ts".into(),
             counts: false,
+            tombstone: None,
         };
         m.schema.key_specs = vec![temporal.clone()];
         m.key_spec_completeness.insert("temporal:id@ts".into(), 3);
@@ -471,6 +506,7 @@ mod tests {
             columns: vec!["id".into()],
             ts_column: "updated_at".into(),
             counts: false,
+            tombstone: None,
         };
         assert_eq!(temporal.name(), other_ts.name());
         assert_eq!(completeness(&m, &temporal), Some(3));

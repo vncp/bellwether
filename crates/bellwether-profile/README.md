@@ -122,6 +122,10 @@ How the thresholds and choices were made:
 
 `lints::grouped_aggregates(uses, complete)` fires once per (columns, value) that recorded aggregate runs ask when no complete agg key beside a counted key answers them, high confidence, naming the declarations (the counted key first when missing, with the `--allow-no-gain` its own fix needs) and that `why` prices them. `lints::reconcile_rescans(rescans)` fires once per reconcile side read to compare per-key rows and a decimal total whose index has no complete agg key on exactly the key storing the sum, naming the side's root and the declaration. Both read what the caller ran (the workload's runs, the reconcile), so neither is part of `lints::run`: `why` adds the first to its `profile` Evidence and `reconcile` returns the second in its `lints`.
 
+### `R-tombstone-1` (tombstones, B8)
+
+`lints::latest_then_filter(uses, complete)` fires once per (columns, time columns, tombstone) that recorded `latest`, `asof`, or bitemporal runs filter after choosing each key's newest version (`where not void`, `where status <> 'VOID'`), when no complete temporal or bitemporal key on those columns and times declares exactly that tombstone, high confidence, naming the key (`temporal:<cols>@<ts>,tombstone=...`) and the `why --tombstone` command that prices it. `why` calls it with the runs it records and adds its lints to the same `profile` Evidence, citing the workload. It is not part of `lints::run`.
+
 ## Workload summary
 
 `workload_keys` holds the nearest-rank p50, p95, and max of distinct keys per recorded run. The only recorded-workload format that exists today is the benchmark's (`bellwether-bench-workload/1`), and nothing in its `workload.json` is trusted:

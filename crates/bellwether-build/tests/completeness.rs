@@ -218,6 +218,7 @@ fn a_definition_change_under_the_same_name_rebuilds_the_spec() {
         columns: cols(&["id"]),
         ts_column: "id".into(),
         counts: false,
+        tombstone: None,
     };
     assert_eq!(by_ts.name(), by_grp.name());
     build_ok(&b, &s.root_str(), std::slice::from_ref(&by_ts), &opts);
@@ -363,6 +364,7 @@ fn remove_spec_removes_exactly_the_declared_spec() {
         columns: cols(&["id"]),
         ts_column: "grp".into(),
         counts: false,
+        tombstone: None,
     };
     assert!(b.remove_spec(&other).is_err());
     assert_eq!(

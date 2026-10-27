@@ -460,6 +460,7 @@ fn counted_temporal() -> (Vec<u8>, Counted) {
         columns: vec!["symbol".into()],
         ts_column: "ts".into(),
         counts: true,
+        tombstone: None,
     };
     let (aapl, msft) = (utf8("AAPL"), utf8("MSFT"));
     let mut w = SegmentWriter::new(spec, WriterOptions::default()).unwrap();

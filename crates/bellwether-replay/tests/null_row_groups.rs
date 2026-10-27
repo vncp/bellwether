@@ -90,6 +90,7 @@ fn all_null_row_groups_are_covered_never_selected_and_split_invariant() {
                 columns: cols(&["entity_id"]),
                 ts_column: "version_ts".into(),
                 counts: false,
+                tombstone: None,
             },
             true,
         ),

@@ -157,6 +157,10 @@ A run recorded with `RunQuery::ContainsAny` or `ContainsAll` (`query_kind` `cont
 
 A run recorded with `RunQuery::Aggregate(RunAggregate { value, functions })` (`query_kind` `aggregate`; `RecordedRun.aggregate`, omitted for every other run so existing workload hashes are unchanged) asks `fn(value) group by key where key in (...)`. Recording refuses a value column that is a key column or cannot be aggregated. Both planners price it through `PlanSource::plan_aggregate`, the build planner's `aggregate` rules over a built or transient agg key (transient cells are written by the build's writer, sized by the same cell estimate): the run costs the row groups the counts do not prove answered, or, when no agg key serves it, a plain locate of its keys. Scoring an agg proposal without `exact:<key>,counts` complete is refused, naming the propose step. Tests (`tests/agg.rs`): predicted equals planned on both planners over a built and a transient agg key, against `Planner::aggregate` and an oracle over the decoded rows, including a finer lookup over a coarser agg key; the locate fallback; the refusals.
 
+### Live runs (B8)
+
+A `latest` or `asof` run (or a bitemporal one) recorded with a tombstone (`RecordedRun.tombstone`, `RunBitemporal.tombstone`; omitted otherwise, so existing workload hashes are unchanged) is `RunQuery::Live(RunLive { asof, tombstone })`: `arg_max(ts, *) by key` then `where not <tombstone>`. Both planners plan it through a temporal (or bitemporal) key on the run's columns, pruned by its tombstone sidecar exactly when the key declares that tombstone (the build planner's `plan_ordered_live`); the transient index builds the sidecar's segments too, and `TransientIndex::newest_tombstones` gives `why`'s `tombstone` column. `tests/tombstone.rs` checks predicted equals planned, with and without the sidecar, temporal and bitemporal.
+
 ## Configurations
 
 `Replayer` pins one manifest version. It is built three ways:
@@ -272,7 +276,7 @@ They also differ in store paths and hash seeds. Each child builds the index from
 - they equal an in-process run with a third limit
 - with the catalog digest masked, they hash to a checked-in golden value. The digest is masked because it names this run's temporary paths and mtimes.
 
-The golden value was last refreshed for contract v2.1 (`RECORD_VERSION` 2 and `inputs`).
+The golden value was last refreshed for record version 4 (B8: the record's `record_version` and its proposal's hash move, nothing else); before that, for contract v2.1 (`RECORD_VERSION` 2 and `inputs`).
 
 ## Memory (ADR 018)
 

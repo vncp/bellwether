@@ -1,0 +1,280 @@
+{
+ "certificate": "c2ba4aaaf796bdf166c1ae8a77b0d25e33ad595defa40e1edd4cd10aed9e4919",
+ "clock": "2026-10-25T00:00:00Z",
+ "corpus": "live",
+ "lookups": [
+  {
+   "args": [
+    "latest",
+    "/private/tmp/bellwether-format-v4/data",
+    "--keys",
+    "<corpus>/live/keys.parquet",
+    "--live"
+   ],
+   "json": [
+    "{\"lookup\":{\"kind\":\"latest\"},\"columns\":[\"id\"],\"keys\":7,\"null_tuples\":0,\"key_set\":\"6331deffc1ff18c18682d0333f21ef4193e8894513085a4aa9e369baa15cd70c\",\"sequence\":2,\"specs\":[{\"kind\":\"exact\",\"columns\":[\"id\"]},{\"kind\":\"bitemporal\",\"columns\":[\"id\"],\"valid_column\":\"valid\",\"known_column\":\"known\",\"tombstone\":{\"column\":\"status\",\"value\":\"CANCEL\"}},{\"kind\":\"temporal\",\"columns\":[\"id\"],\"ts_column\":\"ts\",\"tombstone\":{\"column\":\"void\"}}],\"excluded_incomplete\":[],\"sidecars\":[],\"path_values\":null,\"files_total\":3,\"row_groups_total\":6,\"planned\":{\"files\":2,\"row_groups\":2,\"bytes\":1149},\"ordered_by\":null,\"unordered_reason\":\"no complete range key on a timestamp or date column; declare one (for example range:ts) to get plans in time order\",\"evidence\":{\"hash\":\"5a1952776ad3db0ee305c683029826fcf9aa3a37105eefcb652e0e9e35825c98\",\"record\":{\"record\":\"evidence\",\"record_version\":4,\"provenance\":{\"inputs\":[\"8792390a3d089eab2862dd50ca9b2d9db744e223530f68da679b57db2aa39d4d\",\"6331deffc1ff18c18682d0333f21ef4193e8894513085a4aa9e369baa15cd70c\"],\"oldest_input_age\":0,\"manifest_version\":\"2\",\"created_at\":\"2026-10-25T00:00:00.000Z\"},\"body\":{\"kind\":\"plan\",\"plan\":{\"manifest_version\":\"2\",\"entries\":[{\"file\":{\"path\":\"/private/tmp/bellwether-format-v4/data/part-0.parquet\",\"size\":3057,\"etag\":\"2026-10-25T00:00:00.000000000Z\",\"tail_blake3\":\"983a6b8e7498bf557928784b936202ace7f5da51bb4d36176921a6e49bc17be4\"},\"row_groups\":[1],\"bytes\":565},{\"file\":{\"path\":\"/private/tmp/bellwether-format-v4/data/part-2.parquet\",\"size\":3075,\"etag\":\"2026-10-25T00:00:00.000000000Z\",\"tail_blake3\":\"3db0b3c52ae6e46abaa8d8a8ef1b6c6abc045d43aab8548f5971f9f50401118a\"},\"row_groups\":[1],\"bytes\":584}],\"residual\":{\"op\":\"and\",\"all\":[{\"op\":\"in\",\"columns\":[\"id\"],\"values\":[[2,128,0,0,0,0,0,0,1],[2,128,0,0,0,0,0,0,2],[2,128,0,0,0,0,0,0,3]]},{\"op\":\"not_older_than\",\"columns\":[\"id\"],\"ts_column\":\"ts\",\"bounds\":[[[2,128,0,0,0,0,0,0,1],[8,4,3,128,6,71,72,95,40,241,0]],[[2,128,0,0,0,0,0,0,2],[8,4,3,128,6,71,72,141,166,204,0]],[[2,128,0,0,0,0,0,0,3],[8,4,3,128,6,71,72,145,58,83,0]]]},{\"op\":\"latest_per_key\",\"columns\":[\"id\"],\"ts_column\":\"ts\"},{\"op\":\"live\",\"column\":\"void\",\"tombstone\":[1,1]}]},\"bytes\":1149,\"row_groups_total\":6,\"row_groups_selected\":2}}}},\"live\":{\"tombstone\":{\"column\":\"void\"},\"filter\":\"not void\",\"pruned_by\":\"tombstone:id@ts\",\"keys_with_version\":6,\"keys_without_row_groups\":3,\"key_row_group_pairs_pruned\":3}}"
+   ]
+  },
+  {
+   "args": [
+    "latest",
+    "/private/tmp/bellwether-format-v4/data",
+    "--keys",
+    "<corpus>/live/keys.parquet"
+   ],
+   "json": [
+    "{\"lookup\":{\"kind\":\"latest\"},\"columns\":[\"id\"],\"keys\":7,\"null_tuples\":0,\"key_set\":\"6331deffc1ff18c18682d0333f21ef4193e8894513085a4aa9e369baa15cd70c\",\"sequence\":2,\"specs\":[{\"kind\":\"exact\",\"columns\":[\"id\"]},{\"kind\":\"bitemporal\",\"columns\":[\"id\"],\"valid_column\":\"valid\",\"known_column\":\"known\",\"tombstone\":{\"column\":\"status\",\"value\":\"CANCEL\"}},{\"kind\":\"temporal\",\"columns\":[\"id\"],\"ts_column\":\"ts\",\"tombstone\":{\"column\":\"void\"}}],\"excluded_incomplete\":[],\"sidecars\":[],\"path_values\":null,\"files_total\":3,\"row_groups_total\":6,\"planned\":{\"files\":2,\"row_groups\":3,\"bytes\":1728},\"ordered_by\":null,\"unordered_reason\":\"no complete range key on a timestamp or date column; declare one (for example range:ts) to get plans in time order\",\"evidence\":{\"hash\":\"0ac90e7042c175659be3b924e18999644376ef8e6e678b3a5e177085c0f1877f\",\"record\":{\"record\":\"evidence\",\"record_version\":4,\"provenance\":{\"inputs\":[\"8792390a3d089eab2862dd50ca9b2d9db744e223530f68da679b57db2aa39d4d\",\"6331deffc1ff18c18682d0333f21ef4193e8894513085a4aa9e369baa15cd70c\"],\"oldest_input_age\":0,\"manifest_version\":\"2\",\"created_at\":\"2026-10-25T00:00:00.000Z\"},\"body\":{\"kind\":\"plan\",\"plan\":{\"manifest_version\":\"2\",\"entries\":[{\"file\":{\"path\":\"/private/tmp/bellwether-format-v4/data/part-0.parquet\",\"size\":3057,\"etag\":\"2026-10-25T00:00:00.000000000Z\",\"tail_blake3\":\"983a6b8e7498bf557928784b936202ace7f5da51bb4d36176921a6e49bc17be4\"},\"row_groups\":[1],\"bytes\":565},{\"file\":{\"path\":\"/private/tmp/bellwether-format-v4/data/part-2.parquet\",\"size\":3075,\"etag\":\"2026-10-25T00:00:00.000000000Z\",\"tail_blake3\":\"3db0b3c52ae6e46abaa8d8a8ef1b6c6abc045d43aab8548f5971f9f50401118a\"},\"row_groups\":[0,1],\"bytes\":1163}],\"residual\":{\"op\":\"and\",\"all\":[{\"op\":\"in\",\"columns\":[\"id\"],\"values\":[[2,128,0,0,0,0,0,0,0],[2,128,0,0,0,0,0,0,1],[2,128,0,0,0,0,0,0,2],[2,128,0,0,0,0,0,0,3],[2,128,0,0,0,0,0,0,4],[2,128,0,0,0,0,0,0,5]]},{\"op\":\"not_older_than\",\"columns\":[\"id\"],\"ts_column\":\"ts\",\"bounds\":[[[2,128,0,0,0,0,0,0,0],[8,4,3,128,6,71,72,134,127,190,0]],[[2,128,0,0,0,0,0,0,1],[8,4,3,128,6,71,72,95,40,241,0]],[[2,128,0,0,0,0,0,0,2],[8,4,3,128,6,71,72,141,166,204,0]],[[2,128,0,0,0,0,0,0,3],[8,4,3,128,6,71,72,145,58,83,0]],[[2,128,0,0,0,0,0,0,4],[8,4,3,128,6,71,72,148,205,218,0]],[[2,128,0,0,0,0,0,0,5],[8,4,3,128,6,71,72,152,97,97,0]]]},{\"op\":\"latest_per_key\",\"columns\":[\"id\"],\"ts_column\":\"ts\"}]},\"bytes\":1728,\"row_groups_total\":6,\"row_groups_selected\":3}}}}}"
+   ]
+  },
+  {
+   "args": [
+    "asof",
+    "/private/tmp/bellwether-format-v4/data",
+    "--keys",
+    "<corpus>/live/keys.parquet",
+    "--at",
+    "2026-01-01T00:16:30Z",
+    "--live"
+   ],
+   "json": [
+    "{\"lookup\":{\"kind\":\"asof\",\"at\":\"2026-01-01T00:16:30Z\",\"ts\":1767226590000000,\"ts_column\":\"ts\"},\"columns\":[\"id\"],\"keys\":7,\"null_tuples\":0,\"key_set\":\"6331deffc1ff18c18682d0333f21ef4193e8894513085a4aa9e369baa15cd70c\",\"sequence\":2,\"specs\":[{\"kind\":\"exact\",\"columns\":[\"id\"]},{\"kind\":\"bitemporal\",\"columns\":[\"id\"],\"valid_column\":\"valid\",\"known_column\":\"known\",\"tombstone\":{\"column\":\"status\",\"value\":\"CANCEL\"}},{\"kind\":\"temporal\",\"columns\":[\"id\"],\"ts_column\":\"ts\",\"tombstone\":{\"column\":\"void\"}}],\"excluded_incomplete\":[],\"sidecars\":[],\"path_values\":null,\"files_total\":3,\"row_groups_total\":6,\"planned\":{\"files\":3,\"row_groups\":4,\"bytes\":2304},\"ordered_by\":null,\"unordered_reason\":\"no complete range key on a timestamp or date column; declare one (for example range:ts) to get plans in time order\",\"evidence\":{\"hash\":\"65d3cddb09c188b308c66b841ae3bddfbedca4982c40bc9157227004216e7d0b\",\"record\":{\"record\":\"evidence\",\"record_version\":4,\"provenance\":{\"inputs\":[\"8792390a3d089eab2862dd50ca9b2d9db744e223530f68da679b57db2aa39d4d\",\"6331deffc1ff18c18682d0333f21ef4193e8894513085a4aa9e369baa15cd70c\"],\"oldest_input_age\":0,\"manifest_version\":\"2\",\"created_at\":\"2026-10-25T00:00:00.000Z\"},\"body\":{\"kind\":\"plan\",\"plan\":{\"manifest_version\":\"2\",\"entries\":[{\"file\":{\"path\":\"/private/tmp/bellwether-format-v4/data/part-0.parquet\",\"size\":3057,\"etag\":\"2026-10-25T00:00:00.000000000Z\",\"tail_blake3\":\"983a6b8e7498bf557928784b936202ace7f5da51bb4d36176921a6e49bc17be4\"},\"row_groups\":[1],\"bytes\":565},{\"file\":{\"path\":\"/private/tmp/bellwether-format-v4/data/part-1.parquet\",\"size\":3072,\"etag\":\"2026-10-25T00:00:00.000000000Z\",\"tail_blake3\":\"11341b500330af7aad5ab31e67693de9d2e5afa4e4e006847f67e87fa55c29ea\"},\"row_groups\":[0,1],\"bytes\":1160},{\"file\":{\"path\":\"/private/tmp/bellwether-format-v4/data/part-2.parquet\",\"size\":3075,\"etag\":\"2026-10-25T00:00:00.000000000Z\",\"tail_blake3\":\"3db0b3c52ae6e46abaa8d8a8ef1b6c6abc045d43aab8548f5971f9f50401118a\"},\"row_groups\":[0],\"bytes\":579}],\"residual\":{\"op\":\"and\",\"all\":[{\"op\":\"in\",\"columns\":[\"id\"],\"values\":[[2,128,0,0,0,0,0,0,0],[2,128,0,0,0,0,0,0,1],[2,128,0,0,0,0,0,0,2],[2,128,0,0,0,0,0,0,3],[2,128,0,0,0,0,0,0,4],[2,128,0,0,0,0,0,0,5]]},{\"op\":\"between\",\"column\":\"ts\",\"lo\":[8,4,3,128,6,71,72,95,40,241,0],\"hi\":[8,4,3,128,6,71,72,129,34,115,128]},{\"op\":\"not_older_than\",\"columns\":[\"id\"],\"ts_column\":\"ts\",\"bounds\":[[[2,128,0,0,0,0,0,0,0],[8,4,3,128,6,71,72,113,10,148,0]],[[2,128,0,0,0,0,0,0,1],[8,4,3,128,6,71,72,95,40,241,0]],[[2,128,0,0,0,0,0,0,2],[8,4,3,128,6,71,72,120,49,162,0]],[[2,128,0,0,0,0,0,0,3],[8,4,3,128,6,71,72,123,197,41,0]],[[2,128,0,0,0,0,0,0,4],[8,4,3,128,6,71,72,127,88,176,0]],[[2,128,0,0,0,0,0,0,5],[8,4,3,128,6,71,72,109,119,13,0]]]},{\"op\":\"latest_per_key\",\"columns\":[\"id\"],\"ts_column\":\"ts\"},{\"op\":\"live\",\"column\":\"void\",\"tombstone\":[1,1]}]},\"bytes\":2304,\"row_groups_total\":6,\"row_groups_selected\":4}}}},\"live\":{\"tombstone\":{\"column\":\"void\"},\"filter\":\"not void\",\"pruned_by\":\"tombstone:id@ts\",\"keys_with_version\":6,\"keys_without_row_groups\":0,\"key_row_group_pairs_pruned\":0}}"
+   ]
+  },
+  {
+   "args": [
+    "asof",
+    "/private/tmp/bellwether-format-v4/data",
+    "--keys",
+    "<corpus>/live/keys.parquet",
+    "--at",
+    "2026-01-01T00:16:30Z"
+   ],
+   "json": [
+    "{\"lookup\":{\"kind\":\"asof\",\"at\":\"2026-01-01T00:16:30Z\",\"ts\":1767226590000000,\"ts_column\":\"ts\"},\"columns\":[\"id\"],\"keys\":7,\"null_tuples\":0,\"key_set\":\"6331deffc1ff18c18682d0333f21ef4193e8894513085a4aa9e369baa15cd70c\",\"sequence\":2,\"specs\":[{\"kind\":\"exact\",\"columns\":[\"id\"]},{\"kind\":\"bitemporal\",\"columns\":[\"id\"],\"valid_column\":\"valid\",\"known_column\":\"known\",\"tombstone\":{\"column\":\"status\",\"value\":\"CANCEL\"}},{\"kind\":\"temporal\",\"columns\":[\"id\"],\"ts_column\":\"ts\",\"tombstone\":{\"column\":\"void\"}}],\"excluded_incomplete\":[],\"sidecars\":[],\"path_values\":null,\"files_total\":3,\"row_groups_total\":6,\"planned\":{\"files\":3,\"row_groups\":4,\"bytes\":2304},\"ordered_by\":null,\"unordered_reason\":\"no complete range key on a timestamp or date column; declare one (for example range:ts) to get plans in time order\",\"evidence\":{\"hash\":\"6cb393bada29252fe19301287ae7fe0d53a0d39141bcb6d66f52213e09d9ecbd\",\"record\":{\"record\":\"evidence\",\"record_version\":4,\"provenance\":{\"inputs\":[\"8792390a3d089eab2862dd50ca9b2d9db744e223530f68da679b57db2aa39d4d\",\"6331deffc1ff18c18682d0333f21ef4193e8894513085a4aa9e369baa15cd70c\"],\"oldest_input_age\":0,\"manifest_version\":\"2\",\"created_at\":\"2026-10-25T00:00:00.000Z\"},\"body\":{\"kind\":\"plan\",\"plan\":{\"manifest_version\":\"2\",\"entries\":[{\"file\":{\"path\":\"/private/tmp/bellwether-format-v4/data/part-0.parquet\",\"size\":3057,\"etag\":\"2026-10-25T00:00:00.000000000Z\",\"tail_blake3\":\"983a6b8e7498bf557928784b936202ace7f5da51bb4d36176921a6e49bc17be4\"},\"row_groups\":[1],\"bytes\":565},{\"file\":{\"path\":\"/private/tmp/bellwether-format-v4/data/part-1.parquet\",\"size\":3072,\"etag\":\"2026-10-25T00:00:00.000000000Z\",\"tail_blake3\":\"11341b500330af7aad5ab31e67693de9d2e5afa4e4e006847f67e87fa55c29ea\"},\"row_groups\":[0,1],\"bytes\":1160},{\"file\":{\"path\":\"/private/tmp/bellwether-format-v4/data/part-2.parquet\",\"size\":3075,\"etag\":\"2026-10-25T00:00:00.000000000Z\",\"tail_blake3\":\"3db0b3c52ae6e46abaa8d8a8ef1b6c6abc045d43aab8548f5971f9f50401118a\"},\"row_groups\":[0],\"bytes\":579}],\"residual\":{\"op\":\"and\",\"all\":[{\"op\":\"in\",\"columns\":[\"id\"],\"values\":[[2,128,0,0,0,0,0,0,0],[2,128,0,0,0,0,0,0,1],[2,128,0,0,0,0,0,0,2],[2,128,0,0,0,0,0,0,3],[2,128,0,0,0,0,0,0,4],[2,128,0,0,0,0,0,0,5]]},{\"op\":\"between\",\"column\":\"ts\",\"lo\":[8,4,3,128,6,71,72,95,40,241,0],\"hi\":[8,4,3,128,6,71,72,129,34,115,128]},{\"op\":\"not_older_than\",\"columns\":[\"id\"],\"ts_column\":\"ts\",\"bounds\":[[[2,128,0,0,0,0,0,0,0],[8,4,3,128,6,71,72,113,10,148,0]],[[2,128,0,0,0,0,0,0,1],[8,4,3,128,6,71,72,95,40,241,0]],[[2,128,0,0,0,0,0,0,2],[8,4,3,128,6,71,72,120,49,162,0]],[[2,128,0,0,0,0,0,0,3],[8,4,3,128,6,71,72,123,197,41,0]],[[2,128,0,0,0,0,0,0,4],[8,4,3,128,6,71,72,127,88,176,0]],[[2,128,0,0,0,0,0,0,5],[8,4,3,128,6,71,72,109,119,13,0]]]},{\"op\":\"latest_per_key\",\"columns\":[\"id\"],\"ts_column\":\"ts\"}]},\"bytes\":2304,\"row_groups_total\":6,\"row_groups_selected\":4}}}}}"
+   ]
+  },
+  {
+   "args": [
+    "asof",
+    "/private/tmp/bellwether-format-v4/data",
+    "--keys",
+    "<corpus>/live/keys.parquet",
+    "--valid",
+    "2026-01-02T00:00:00Z",
+    "--known",
+    "2026-01-01T03:00:00Z",
+    "--live"
+   ],
+   "json": [
+    "{\"lookup\":{\"kind\":\"bitemporal\",\"valid\":\"2026-01-02T00:00:00Z\",\"known\":\"2026-01-01T03:00:00Z\",\"valid_ts\":1767312000000000,\"known_ts\":1767236400000000,\"valid_column\":\"valid\",\"known_column\":\"known\"},\"columns\":[\"id\"],\"keys\":7,\"null_tuples\":0,\"key_set\":\"6331deffc1ff18c18682d0333f21ef4193e8894513085a4aa9e369baa15cd70c\",\"sequence\":2,\"specs\":[{\"kind\":\"exact\",\"columns\":[\"id\"]},{\"kind\":\"bitemporal\",\"columns\":[\"id\"],\"valid_column\":\"valid\",\"known_column\":\"known\",\"tombstone\":{\"column\":\"status\",\"value\":\"CANCEL\"}},{\"kind\":\"temporal\",\"columns\":[\"id\"],\"ts_column\":\"ts\",\"tombstone\":{\"column\":\"void\"}}],\"excluded_incomplete\":[],\"sidecars\":[],\"path_values\":null,\"files_total\":3,\"row_groups_total\":6,\"planned\":{\"files\":1,\"row_groups\":1,\"bytes\":584},\"ordered_by\":null,\"unordered_reason\":\"no complete range key on a timestamp or date column; declare one (for example range:ts) to get plans in time order\",\"evidence\":{\"hash\":\"a95705c78aa6ff19c6f7b75dc7fec082527d02e3412150f1f108bce83193889f\",\"record\":{\"record\":\"evidence\",\"record_version\":4,\"provenance\":{\"inputs\":[\"8792390a3d089eab2862dd50ca9b2d9db744e223530f68da679b57db2aa39d4d\",\"6331deffc1ff18c18682d0333f21ef4193e8894513085a4aa9e369baa15cd70c\"],\"oldest_input_age\":0,\"manifest_version\":\"2\",\"created_at\":\"2026-10-25T00:00:00.000Z\"},\"body\":{\"kind\":\"plan\",\"plan\":{\"manifest_version\":\"2\",\"entries\":[{\"file\":{\"path\":\"/private/tmp/bellwether-format-v4/data/part-2.parquet\",\"size\":3075,\"etag\":\"2026-10-25T00:00:00.000000000Z\",\"tail_blake3\":\"3db0b3c52ae6e46abaa8d8a8ef1b6c6abc045d43aab8548f5971f9f50401118a\"},\"row_groups\":[1],\"bytes\":584}],\"residual\":{\"op\":\"and\",\"all\":[{\"op\":\"in\",\"columns\":[\"id\"],\"values\":[[2,128,0,0,0,0,0,0,2],[2,128,0,0,0,0,0,0,3]]},{\"op\":\"between\",\"column\":\"valid\",\"lo\":[8,4,3,128,6,71,92,99,247,160,0],\"hi\":[8,4,3,128,6,71,92,99,247,160,0]},{\"op\":\"between\",\"column\":\"known\",\"lo\":[8,4,3,128,6,71,72,145,58,83,0],\"hi\":[8,4,3,128,6,71,74,201,219,44,0]},{\"op\":\"not_older_than\",\"columns\":[\"id\"],\"ts_column\":\"valid\",\"bounds\":[[[2,128,0,0,0,0,0,0,2],[8,4,3,128,6,71,92,99,247,160,0]],[[2,128,0,0,0,0,0,0,3],[8,4,3,128,6,71,92,99,247,160,0]]]},{\"op\":\"not_older_than\",\"columns\":[\"id\"],\"ts_column\":\"known\",\"bounds\":[[[2,128,0,0,0,0,0,0,2],[8,4,3,128,6,71,74,58,206,20,0]],[[2,128,0,0,0,0,0,0,3],[8,4,3,128,6,71,72,145,58,83,0]]]},{\"op\":\"latest_per_key\",\"columns\":[\"id\"],\"ts_column\":\"valid\"},{\"op\":\"live\",\"column\":\"status\",\"tombstone\":[6,67,65,78,67,69,76,0,0]}]},\"bytes\":584,\"row_groups_total\":6,\"row_groups_selected\":1}}}},\"live\":{\"tombstone\":{\"column\":\"status\",\"value\":\"CANCEL\"},\"filter\":\"status <> 'CANCEL'\",\"pruned_by\":\"tombstone:id@valid,known\",\"keys_with_version\":6,\"keys_without_row_groups\":4,\"key_row_group_pairs_pruned\":4}}"
+   ]
+  },
+  {
+   "args": [
+    "latest",
+    "/private/tmp/bellwether-format-v4/data",
+    "--keys",
+    "<corpus>/live/keys.parquet",
+    "--known",
+    "2026-01-01T02:00:00Z",
+    "--live"
+   ],
+   "json": [
+    "{\"lookup\":{\"kind\":\"bitemporal\",\"valid\":null,\"known\":\"2026-01-01T02:00:00Z\",\"valid_ts\":null,\"known_ts\":1767232800000000,\"valid_column\":\"valid\",\"known_column\":\"known\"},\"columns\":[\"id\"],\"keys\":7,\"null_tuples\":0,\"key_set\":\"6331deffc1ff18c18682d0333f21ef4193e8894513085a4aa9e369baa15cd70c\",\"sequence\":2,\"specs\":[{\"kind\":\"exact\",\"columns\":[\"id\"]},{\"kind\":\"bitemporal\",\"columns\":[\"id\"],\"valid_column\":\"valid\",\"known_column\":\"known\",\"tombstone\":{\"column\":\"status\",\"value\":\"CANCEL\"}},{\"kind\":\"temporal\",\"columns\":[\"id\"],\"ts_column\":\"ts\",\"tombstone\":{\"column\":\"void\"}}],\"excluded_incomplete\":[],\"sidecars\":[],\"path_values\":null,\"files_total\":3,\"row_groups_total\":6,\"planned\":{\"files\":1,\"row_groups\":1,\"bytes\":584},\"ordered_by\":null,\"unordered_reason\":\"no complete range key on a timestamp or date column; declare one (for example range:ts) to get plans in time order\",\"evidence\":{\"hash\":\"fc47381c1d574951441772f7760ba7ade391786b8f4d698633cdc6c767ef62b3\",\"record\":{\"record\":\"evidence\",\"record_version\":4,\"provenance\":{\"inputs\":[\"8792390a3d089eab2862dd50ca9b2d9db744e223530f68da679b57db2aa39d4d\",\"6331deffc1ff18c18682d0333f21ef4193e8894513085a4aa9e369baa15cd70c\"],\"oldest_input_age\":0,\"manifest_version\":\"2\",\"created_at\":\"2026-10-25T00:00:00.000Z\"},\"body\":{\"kind\":\"plan\",\"plan\":{\"manifest_version\":\"2\",\"entries\":[{\"file\":{\"path\":\"/private/tmp/bellwether-format-v4/data/part-2.parquet\",\"size\":3075,\"etag\":\"2026-10-25T00:00:00.000000000Z\",\"tail_blake3\":\"3db0b3c52ae6e46abaa8d8a8ef1b6c6abc045d43aab8548f5971f9f50401118a\"},\"row_groups\":[1],\"bytes\":584}],\"residual\":{\"op\":\"and\",\"all\":[{\"op\":\"in\",\"columns\":[\"id\"],\"values\":[[2,128,0,0,0,0,0,0,3]]},{\"op\":\"between\",\"column\":\"valid\",\"lo\":[8,4,3,128,6,71,92,99,247,160,0],\"hi\":[8,4,3,128,6,71,92,99,247,160,0]},{\"op\":\"between\",\"column\":\"known\",\"lo\":[8,4,3,128,6,71,72,145,58,83,0],\"hi\":[8,4,3,128,6,71,73,243,71,136,0]},{\"op\":\"not_older_than\",\"columns\":[\"id\"],\"ts_column\":\"valid\",\"bounds\":[[[2,128,0,0,0,0,0,0,3],[8,4,3,128,6,71,92,99,247,160,0]]]},{\"op\":\"not_older_than\",\"columns\":[\"id\"],\"ts_column\":\"known\",\"bounds\":[[[2,128,0,0,0,0,0,0,3],[8,4,3,128,6,71,72,145,58,83,0]]]},{\"op\":\"latest_per_key\",\"columns\":[\"id\"],\"ts_column\":\"valid\"},{\"op\":\"live\",\"column\":\"status\",\"tombstone\":[6,67,65,78,67,69,76,0,0]}]},\"bytes\":584,\"row_groups_total\":6,\"row_groups_selected\":1}}}},\"live\":{\"tombstone\":{\"column\":\"status\",\"value\":\"CANCEL\"},\"filter\":\"status <> 'CANCEL'\",\"pruned_by\":\"tombstone:id@valid,known\",\"keys_with_version\":4,\"keys_without_row_groups\":3,\"key_row_group_pairs_pruned\":3}}"
+   ]
+  },
+  {
+   "args": [
+    "locate",
+    "/private/tmp/bellwether-format-v4/data",
+    "--keys",
+    "<corpus>/live/keys.parquet"
+   ],
+   "json": [
+    "{\"lookup\":{\"kind\":\"locate\"},\"columns\":[\"id\"],\"keys\":7,\"null_tuples\":0,\"key_set\":\"6331deffc1ff18c18682d0333f21ef4193e8894513085a4aa9e369baa15cd70c\",\"sequence\":2,\"specs\":[{\"kind\":\"exact\",\"columns\":[\"id\"]},{\"kind\":\"bitemporal\",\"columns\":[\"id\"],\"valid_column\":\"valid\",\"known_column\":\"known\",\"tombstone\":{\"column\":\"status\",\"value\":\"CANCEL\"}},{\"kind\":\"temporal\",\"columns\":[\"id\"],\"ts_column\":\"ts\",\"tombstone\":{\"column\":\"void\"}}],\"excluded_incomplete\":[],\"sidecars\":[],\"path_values\":null,\"files_total\":3,\"row_groups_total\":6,\"planned\":{\"files\":3,\"row_groups\":6,\"bytes\":3470},\"ordered_by\":null,\"unordered_reason\":\"no complete range key on a timestamp or date column; declare one (for example range:ts) to get plans in time order\",\"evidence\":{\"hash\":\"1df3f088724386e5c14a37e103d8e361cbd3779da77f7089c6f605836c8bb9d8\",\"record\":{\"record\":\"evidence\",\"record_version\":4,\"provenance\":{\"inputs\":[\"8792390a3d089eab2862dd50ca9b2d9db744e223530f68da679b57db2aa39d4d\",\"6331deffc1ff18c18682d0333f21ef4193e8894513085a4aa9e369baa15cd70c\"],\"oldest_input_age\":0,\"manifest_version\":\"2\",\"created_at\":\"2026-10-25T00:00:00.000Z\"},\"body\":{\"kind\":\"plan\",\"plan\":{\"manifest_version\":\"2\",\"entries\":[{\"file\":{\"path\":\"/private/tmp/bellwether-format-v4/data/part-0.parquet\",\"size\":3057,\"etag\":\"2026-10-25T00:00:00.000000000Z\",\"tail_blake3\":\"983a6b8e7498bf557928784b936202ace7f5da51bb4d36176921a6e49bc17be4\"},\"row_groups\":[0,1],\"bytes\":1147},{\"file\":{\"path\":\"/private/tmp/bellwether-format-v4/data/part-1.parquet\",\"size\":3072,\"etag\":\"2026-10-25T00:00:00.000000000Z\",\"tail_blake3\":\"11341b500330af7aad5ab31e67693de9d2e5afa4e4e006847f67e87fa55c29ea\"},\"row_groups\":[0,1],\"bytes\":1160},{\"file\":{\"path\":\"/private/tmp/bellwether-format-v4/data/part-2.parquet\",\"size\":3075,\"etag\":\"2026-10-25T00:00:00.000000000Z\",\"tail_blake3\":\"3db0b3c52ae6e46abaa8d8a8ef1b6c6abc045d43aab8548f5971f9f50401118a\"},\"row_groups\":[0,1],\"bytes\":1163}],\"residual\":{\"op\":\"in\",\"columns\":[\"id\"],\"values\":[[2,128,0,0,0,0,0,0,0],[2,128,0,0,0,0,0,0,1],[2,128,0,0,0,0,0,0,2],[2,128,0,0,0,0,0,0,3],[2,128,0,0,0,0,0,0,4],[2,128,0,0,0,0,0,0,5],[2,128,0,0,0,0,0,0,6]]},\"bytes\":3470,\"row_groups_total\":6,\"row_groups_selected\":6}}}}}"
+   ]
+  }
+ ],
+ "proposal": "a8ec0db8332d4984593a9fc935b68d8d402faff266d921d7b77a12e3c79523c6",
+ "receipt": "aa0b8dfcea44f7e72d8cce4495297890f67d6f7e5f6d381dc2c4ec336837716f",
+ "receipt_text": "receipt aa0b8dfcea44: every link present\n  f71042e9a60c  evidence     2026-10-25T00:00:00.000Z  body=profile  root=/private/tmp/bellwether-format-v4/data  fanout=3  lints=2  inputs=4  age=0s  manifest=1\n  a8ec0db8332d  proposal     2026-10-25T00:00:00.000Z  key=temporal:id@ts,tombstone=void  by=fixture\n  b5e3a2ae1a50  replay       2026-10-25T00:00:00.000Z  runs=1  bytes_current=3470  bytes_proposed=1149  manifest=1  unserved=parquet_stats\n  c2ba4aaaf796  certificate  2026-10-25T00:00:00.000Z  coverage=workload(7 keys)  pass=true  mismatched=0\n  aa0b8dfcea44  receipt      2026-10-25T00:00:00.000Z  manifest=1->2\nsignatures\n  unsigned: no signature beside the receipt or its certificate (`bellwether fix --signing-key <file>` signs what it writes)\n",
+ "records": [
+  "0ac90e7042c175659be3b924e18999644376ef8e6e678b3a5e177085c0f1877f",
+  "13a72a3fc42a6917cdc5d782cc4a7d6977d7aaf40d3179c5117f082d3ce27ed3",
+  "1df3f088724386e5c14a37e103d8e361cbd3779da77f7089c6f605836c8bb9d8",
+  "5a1952776ad3db0ee305c683029826fcf9aa3a37105eefcb652e0e9e35825c98",
+  "65d3cddb09c188b308c66b841ae3bddfbedca4982c40bc9157227004216e7d0b",
+  "6cb393bada29252fe19301287ae7fe0d53a0d39141bcb6d66f52213e09d9ecbd",
+  "813132716e064ddcda68b24ef09f41ee6a1d58677b54df138acb02c7e55fee5c",
+  "a8ec0db8332d4984593a9fc935b68d8d402faff266d921d7b77a12e3c79523c6",
+  "a95705c78aa6ff19c6f7b75dc7fec082527d02e3412150f1f108bce83193889f",
+  "aa0b8dfcea44f7e72d8cce4495297890f67d6f7e5f6d381dc2c4ec336837716f",
+  "b5e3a2ae1a50215ad844d542ea8ed803db267c09b43a7eab939fe6ce1abd64c0",
+  "c2ba4aaaf796bdf166c1ae8a77b0d25e33ad595defa40e1edd4cd10aed9e4919",
+  "cbf1f672d3a3cf2da334eb724b5e7b2f172c612e2a4bec9b193a83c77221de89",
+  "d15a5a4860a080476f9b8e58552580cfc92d4bb80b41672d71d44eb6bbde4e21",
+  "dbfa46064b80ad1430289ab30e64a7fb42548620755e3f95f4f2762f8f12b71c",
+  "f5633b571764ad85ac013584d94a2b83601114751cfbf1862b2b72b55e709a5a",
+  "f71042e9a60c46769a17da7b9c1063895d170a4f5fb59e8a48f1f1e4738aa695",
+  "fc47381c1d574951441772f7760ba7ade391786b8f4d698633cdc6c767ef62b3"
+ ],
+ "root": "/private/tmp/bellwether-format-v4",
+ "steps": [
+  {
+   "args": [
+    "index",
+    "/private/tmp/bellwether-format-v4/data",
+    "--key",
+    "exact:id",
+    "--key",
+    "temporal2:id@valid,known,tombstone=status=CANCEL"
+   ],
+   "exit": 0
+  },
+  {
+   "args": [
+    "--json",
+    "why",
+    "/private/tmp/bellwether-format-v4/data",
+    "--from",
+    "<corpus>/live/keys.parquet",
+    "--latest-by",
+    "ts",
+    "--tombstone",
+    "void"
+   ],
+   "exit": 0
+  },
+  {
+   "args": [
+    "--json",
+    "propose",
+    "/private/tmp/bellwether-format-v4/data",
+    "--key",
+    "temporal:id@ts,tombstone=void",
+    "--by",
+    "fixture",
+    "--evidence",
+    "f71042e9a60c46769a17da7b9c1063895d170a4f5fb59e8a48f1f1e4738aa695"
+   ],
+   "exit": 0
+  },
+  {
+   "args": [
+    "--json",
+    "fix",
+    "/private/tmp/bellwether-format-v4/data",
+    "--proposal",
+    "a8ec0db8332d4984593a9fc935b68d8d402faff266d921d7b77a12e3c79523c6",
+    "--workload",
+    "15dcd45bbab7b5660b386ae697b3e63987b937689db7f855be069aee8eca637c",
+    "--verify-only"
+   ],
+   "exit": 0
+  },
+  {
+   "args": [
+    "--json",
+    "fix",
+    "/private/tmp/bellwether-format-v4/data",
+    "--certificate",
+    "c2ba4aaaf796bdf166c1ae8a77b0d25e33ad595defa40e1edd4cd10aed9e4919"
+   ],
+   "exit": 0
+  },
+  {
+   "args": [
+    "--json",
+    "latest",
+    "/private/tmp/bellwether-format-v4/data",
+    "--keys",
+    "<corpus>/live/keys.parquet",
+    "--live"
+   ],
+   "exit": 0
+  },
+  {
+   "args": [
+    "--json",
+    "latest",
+    "/private/tmp/bellwether-format-v4/data",
+    "--keys",
+    "<corpus>/live/keys.parquet"
+   ],
+   "exit": 0
+  },
+  {
+   "args": [
+    "--json",
+    "asof",
+    "/private/tmp/bellwether-format-v4/data",
+    "--keys",
+    "<corpus>/live/keys.parquet",
+    "--at",
+    "2026-01-01T00:16:30Z",
+    "--live"
+   ],
+   "exit": 0
+  },
+  {
+   "args": [
+    "--json",
+    "asof",
+    "/private/tmp/bellwether-format-v4/data",
+    "--keys",
+    "<corpus>/live/keys.parquet",
+    "--at",
+    "2026-01-01T00:16:30Z"
+   ],
+   "exit": 0
+  },
+  {
+   "args": [
+    "--json",
+    "asof",
+    "/private/tmp/bellwether-format-v4/data",
+    "--keys",
+    "<corpus>/live/keys.parquet",
+    "--valid",
+    "2026-01-02T00:00:00Z",
+    "--known",
+    "2026-01-01T03:00:00Z",
+    "--live"
+   ],
+   "exit": 0
+  },
+  {
+   "args": [
+    "--json",
+    "latest",
+    "/private/tmp/bellwether-format-v4/data",
+    "--keys",
+    "<corpus>/live/keys.parquet",
+    "--known",
+    "2026-01-01T02:00:00Z",
+    "--live"
+   ],
+   "exit": 0
+  },
+  {
+   "args": [
+    "--json",
+    "locate",
+    "/private/tmp/bellwether-format-v4/data",
+    "--keys",
+    "<corpus>/live/keys.parquet"
+   ],
+   "exit": 0
+  },
+  {
+   "args": [
+    "receipt",
+    "show",
+    "/private/tmp/bellwether-format-v4/data",
+    "aa0b8dfcea44f7e72d8cce4495297890f67d6f7e5f6d381dc2c4ec336837716f"
+   ],
+   "exit": 0
+  }
+ ],
+ "workload": "15dcd45bbab7b5660b386ae697b3e63987b937689db7f855be069aee8eca637c"
+}

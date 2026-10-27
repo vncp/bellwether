@@ -169,6 +169,9 @@ pub(crate) enum RowTest {
         col: usize,
         groups: Vec<HashSet<Vec<u8>>>,
     },
+    /// The value at `col` is not null and is not `tombstone` (B8,
+    /// `Live`): a live row.
+    Live { col: usize, tombstone: Vec<u8> },
 }
 
 impl RowTest {
@@ -231,8 +234,9 @@ impl RowTest {
             | Predicate::WindowPartition { .. } => {
                 return Err(VerifyError::InvalidSpec(
                     "a row filter holds only the residual of a lookup (in, between, \
-                     not-older-than, latest-per-key, contains-any, contains-all); a semi-join, join, or window partition \
-                     is priced by replay and cannot filter the rows a reconciliation compares"
+                     not-older-than, latest-per-key, contains-any, contains-all, live); a \
+                     semi-join, join, or window partition is priced by replay and cannot filter \
+                     the rows a reconciliation compares"
                         .into(),
                 ))
             }
@@ -255,6 +259,10 @@ impl RowTest {
             Predicate::ContainsAll { column, values } => Self::ContainsAll {
                 col: index(column),
                 groups: values.iter().map(|g| g.iter().cloned().collect()).collect(),
+            },
+            Predicate::Live { column, tombstone } => Self::Live {
+                col: index(column),
+                tombstone: tombstone.clone(),
             },
         })
     }
@@ -330,6 +338,14 @@ impl RowTest {
                     .iter()
                     .all(|g| elements.iter().any(|e| g.contains(e)))
             }
+            Self::Live { col, tombstone } => {
+                buf.clear();
+                let present = encoding::encode_array_value_as(cols[*col], row, &types[*col], buf)?;
+                bellwether_core::tombstone::is_live_value(
+                    present.then_some(buf.as_slice()),
+                    tombstone,
+                )
+            }
         })
     }
 }
@@ -356,7 +372,8 @@ fn predicate_columns(p: &Predicate, out: &mut Vec<String>) {
         Predicate::Between { column, .. }
         | Predicate::Text { column, .. }
         | Predicate::ContainsAny { column, .. }
-        | Predicate::ContainsAll { column, .. } => {
+        | Predicate::ContainsAll { column, .. }
+        | Predicate::Live { column, .. } => {
             out.push(column.clone());
         }
         Predicate::NotOlderThan {

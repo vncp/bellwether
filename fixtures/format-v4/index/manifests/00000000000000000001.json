@@ -1,0 +1,241 @@
+{
+  "commit_nonce": 13901390382119427445,
+  "committed_at": "2026-10-27T03:07:29.911Z",
+  "created_at": "2026-10-27T03:07:29.911Z",
+  "deleting": [],
+  "key_spec_completeness": {
+    "exact:id": 1,
+    "temporal2:id@valid,known": 1,
+    "tombstone:id@valid,known": 1
+  },
+  "rowgroup_space": {
+    "files": [
+      {
+        "column_bytes": [
+          115,
+          121,
+          98,
+          122,
+          44,
+          82,
+          110,
+          121,
+          98,
+          122,
+          44,
+          70
+        ],
+        "fingerprint": {
+          "etag": "2026-10-25T00:00:00.000000000Z",
+          "path": "/private/tmp/bellwether-format-v4/data/part-0.parquet",
+          "size": 3057,
+          "tail_blake3": "983a6b8e7498bf557928784b936202ace7f5da51bb4d36176921a6e49bc17be4"
+        },
+        "rowgroup_bytes": [
+          582,
+          565
+        ],
+        "rowgroup_ids": [
+          0,
+          1
+        ],
+        "rowgroup_rows": [
+          4,
+          4
+        ]
+      },
+      {
+        "column_bytes": [
+          117,
+          121,
+          98,
+          122,
+          44,
+          82,
+          115,
+          115,
+          98,
+          122,
+          44,
+          82
+        ],
+        "fingerprint": {
+          "etag": "2026-10-25T00:00:00.000000000Z",
+          "path": "/private/tmp/bellwether-format-v4/data/part-1.parquet",
+          "size": 3072,
+          "tail_blake3": "11341b500330af7aad5ab31e67693de9d2e5afa4e4e006847f67e87fa55c29ea"
+        },
+        "rowgroup_bytes": [
+          584,
+          576
+        ],
+        "rowgroup_ids": [
+          2,
+          3
+        ],
+        "rowgroup_rows": [
+          4,
+          4
+        ]
+      },
+      {
+        "column_bytes": [
+          112,
+          121,
+          98,
+          122,
+          44,
+          82,
+          117,
+          121,
+          98,
+          122,
+          44,
+          82
+        ],
+        "fingerprint": {
+          "etag": "2026-10-25T00:00:00.000000000Z",
+          "path": "/private/tmp/bellwether-format-v4/data/part-2.parquet",
+          "size": 3075,
+          "tail_blake3": "3db0b3c52ae6e46abaa8d8a8ef1b6c6abc045d43aab8548f5971f9f50401118a"
+        },
+        "rowgroup_bytes": [
+          579,
+          584
+        ],
+        "rowgroup_ids": [
+          4,
+          5
+        ],
+        "rowgroup_rows": [
+          4,
+          4
+        ]
+      }
+    ],
+    "next_id": 6,
+    "tombstones": []
+  },
+  "schema": {
+    "columns": [
+      {
+        "data_type": {
+          "type": "int64"
+        },
+        "name": "id",
+        "nullable": true
+      },
+      {
+        "data_type": {
+          "type": "timestamp",
+          "tz": "UTC",
+          "unit": "microsecond"
+        },
+        "name": "ts",
+        "nullable": true
+      },
+      {
+        "data_type": {
+          "type": "timestamp",
+          "tz": "UTC",
+          "unit": "microsecond"
+        },
+        "name": "valid",
+        "nullable": true
+      },
+      {
+        "data_type": {
+          "type": "timestamp",
+          "tz": "UTC",
+          "unit": "microsecond"
+        },
+        "name": "known",
+        "nullable": true
+      },
+      {
+        "data_type": {
+          "type": "boolean"
+        },
+        "name": "void",
+        "nullable": true
+      },
+      {
+        "data_type": {
+          "type": "utf8"
+        },
+        "name": "status",
+        "nullable": true
+      }
+    ],
+    "key_specs": [
+      {
+        "columns": [
+          "id"
+        ],
+        "kind": "exact"
+      },
+      {
+        "columns": [
+          "id"
+        ],
+        "kind": "bitemporal",
+        "known_column": "known",
+        "valid_column": "valid"
+      }
+    ],
+    "sidecars": [
+      {
+        "columns": [
+          "id"
+        ],
+        "kind": "tombstone",
+        "params": {
+          "column": "status",
+          "value": "CANCEL"
+        },
+        "time_columns": [
+          "valid",
+          "known"
+        ]
+      }
+    ]
+  },
+  "segment_tombstones": [],
+  "segments": [
+    {
+      "bytes": 722,
+      "id": "cd48588f687a3db054905e4608520e6e559779d836cfbfad0baefe57e8a318c1",
+      "key_spec": "exact:id",
+      "rowgroup_range": {
+        "end": 6,
+        "start": 0
+      }
+    },
+    {
+      "bytes": 1383,
+      "id": "f027099866c69c25d8cf2d3dafe8da17917495e4f133f780860e9ec90474e166",
+      "key_spec": "temporal2:id@valid,known",
+      "rowgroup_range": {
+        "end": 6,
+        "start": 0
+      }
+    },
+    {
+      "bytes": 1745,
+      "id": "5d7f8788311c712d30807aa2946ed940f765b866c382853638c10ea9bbd1df5a",
+      "key_spec": "tombstone:id@valid,known",
+      "kind": "tombstone",
+      "rowgroup_range": {
+        "end": 6,
+        "start": 0
+      }
+    }
+  ],
+  "sequence": 1,
+  "source": {
+    "fingerprint_policy": "tail64k",
+    "kind": "parquet",
+    "root": "/private/tmp/bellwether-format-v4/data"
+  },
+  "storage_version": 2
+}

@@ -77,6 +77,7 @@ fn temporal() -> KeySpec {
         columns: vec!["id".into()],
         ts_column: "ts".into(),
         counts: false,
+        tombstone: None,
     }
 }
 
@@ -107,10 +108,12 @@ fn answer(
     let key = p.encode_tuple(&cols(&["id"]), &[Value::Int(id)]).unwrap();
     let lookup = match asof {
         None => Lookup::Latest {
+            live: None,
             columns: cols(&["id"]),
             keys: vec![key],
         },
         Some(ts) => Lookup::AsOf {
+            live: None,
             columns: cols(&["id"]),
             keys: vec![key],
             ts,
@@ -305,6 +308,7 @@ fn a_retired_zero_variant_does_not_bound_the_other_zero() {
         columns: vec!["k".into()],
         ts_column: "ts".into(),
         counts: false,
+        tombstone: None,
     };
     let o = BuildOptions {
         schema: Some(Arc::clone(&fschema)),
@@ -328,6 +332,7 @@ fn a_retired_zero_variant_does_not_bound_the_other_zero() {
             .plan(
                 std::slice::from_ref(&t),
                 &Lookup::Latest {
+                    live: None,
                     columns: cols(&["k"]),
                     keys: vec![key],
                 },
@@ -389,6 +394,7 @@ fn invariant5_asof_winner_in_a_pruned_row_group_bounds_older_rows() {
         .plan(
             &specs,
             &Lookup::AsOf {
+                live: None,
                 columns: cols(&["id", "region"]),
                 keys,
                 ts: 25,

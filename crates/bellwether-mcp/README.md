@@ -55,6 +55,8 @@ List keys (B4): `observe.locate` takes `contains: "any" | "all"` (= `locate --an
 
 Agg keys (B7): `observe.aggregate` (= `bellwether aggregate`; `functions` default `sum`, `count`) and `score.why` with `aggregate: {value, functions}` (= `why --value V --fn ...`); each tool's text is the CLI's `--json` line, and a refusal for a missing agg key names both specs to declare (`crates/bellwether-cli/tests/agg.rs`).
 
+Tombstones (B8): `observe.asof` takes `live: true` (= `asof --at T --live` with `at`, and the bitemporal form `asof --valid/--known --live` with `valid` and/or `known`; `at` or one of those is required, as for every as-of) and `score.why` takes `tombstone: "<column>[=<value>]"` (= `why --tombstone`) with `latest_by` (= `why --latest-by`, the temporal form R-tombstone-1 names) or `valid_by`/`known_by`; each tool's text is the CLI's `--json` line, and a live lookup through a key declaring no tombstone is refused naming the spec to declare (`crates/bellwether-cli/tests/tombstone.rs`). No tool serves `latest` (with or without `live`); an as-of at an instant at or after every key's newest time returns the same rows.
+
 ## Resources and the prompt
 
 `bellwether://findings` (the newest profile Evidence per root with its lints), `bellwether://receipts` (every receipt with its chain status), and `bellwether://scorecard` (per rule id: proposals, certificates passed and failed, receipts), each the facade's ledger view, byte for byte `bellwether ledger findings|receipts|scorecard --json`. One prompt, `diagnose_slow_query`, which is `AGENTS.md` (and the symptom the human described, when given).

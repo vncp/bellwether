@@ -114,6 +114,7 @@ mod coverage_and_null_probes {
                 columns: vec!["a".into()],
                 ts_column: "c".into(),
                 counts: false,
+                tombstone: None,
             },
         ];
         let r = b.build(&s.root_str(), &specs, &opts()).unwrap();
@@ -375,6 +376,7 @@ mod keyless_segments {
                 columns: vec!["k".into()],
                 ts_column: "t".into(),
                 counts: false,
+                tombstone: None,
             },
         ];
         let mut report = Vec::new();

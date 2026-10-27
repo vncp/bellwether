@@ -95,7 +95,7 @@ use bellwether_source::{
 use bellwether_store::{Manifest, Snapshot, StoreExt};
 use bellwether_types::{
     ColumnBytes, Error, Hash, KeySpec, Predicate, Quantity, Result, RowGroupId, ScanEntry,
-    ScanPlan, Source, TextOp,
+    ScanPlan, Source, TextOp, Tombstone,
 };
 use bytes::Bytes;
 use roaring::RoaringBitmap;
@@ -105,7 +105,10 @@ use crate::coverage::{completeness, segment_of, sidecar_completeness, Locator};
 use crate::keys::{encode_ts, project, split_checked, widen_zero_bounds, zero_variants};
 use crate::seg_io::SegmentBytes;
 use crate::sources::parquet_source;
-use crate::target::{bloom_bounds_def, declared_sidecars, TimedSource};
+use crate::target::{
+    bloom_bounds_def, declared_key_specs, declared_sidecars, tombstone_name, TimedSource,
+};
+use bellwether_core::tombstone::{self as tomb, TOMBSTONE_KIND};
 
 mod agg;
 pub use agg::{
@@ -133,6 +136,13 @@ pub enum Lookup {
         columns: Vec<String>,
         /// Canonical key tuples.
         keys: Vec<Vec<u8>>,
+        /// With a tombstone (B8), only live rows answer: per key, the rows
+        /// at its newest time that are not tombstones (none when the newest
+        /// row is one). The residual ends with [`Predicate::Live`]; a
+        /// complete tombstone sidecar of the serving spec with exactly this
+        /// tombstone also prunes the row groups holding no live row at the
+        /// winning time ([`Planner::plan_ordered_live`]).
+        live: Option<Tombstone>,
     },
     /// The version of each key current at `ts`.
     AsOf {
@@ -143,6 +153,8 @@ pub enum Lookup {
         /// The instant, in the timestamp column's dataset unit (days for
         /// `Date32`, the integer itself for an integer column).
         ts: i64,
+        /// Only live rows answer, as [`Lookup::Latest`]'s `live`.
+        live: Option<Tombstone>,
     },
     /// Every version of each key in its own lookback window `[newest −
     /// lookback, newest]`, `newest` being the key's newest live version
@@ -217,6 +229,8 @@ pub enum Lookup {
         valid: Option<i64>,
         /// Upper bound on known time, in the known column's unit.
         known: Option<i64>,
+        /// Only live rows answer, as [`Lookup::Latest`]'s `live`.
+        live: Option<Tombstone>,
     },
     // --- phase 5 kinds ---
     /// Rows whose string `column` matches one of `values` under `op`, both
@@ -310,7 +324,7 @@ pub enum PlanOrder {
 /// segments cover every live row group of the pinned manifest.
 #[derive(Clone, Debug)]
 pub struct TransientSpec {
-    /// The spec.
+    /// The spec (with its tombstone, for a spec that has one).
     pub spec: KeySpec,
     /// Segment bytes, as core's `EncodedSegment::bytes`.
     pub segments: Vec<Bytes>,
@@ -318,6 +332,30 @@ pub struct TransientSpec {
     /// (core's `SegmentWriter::bloom_bounds_for_dataset`), covering the
     /// same row groups; empty for every other spec.
     pub bounds: Vec<Bytes>,
+    /// For a temporal or bitemporal spec with a tombstone (B8), its
+    /// tombstone segments' bytes (`keyed_tombstone`), covering the same row
+    /// groups; empty for every other spec.
+    pub tombstones: Vec<Bytes>,
+}
+
+/// What a `live` lookup's tombstones did ([`Planner::plan_ordered_live`]).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct LiveOutcome {
+    /// The tombstone sidecar whose stored liveness pruned the plan
+    /// (`tombstone:<keys>@<times>`), or `None` when the plan was not pruned
+    /// by tombstones (no complete sidecar of the serving spec with the
+    /// lookup's tombstone): the residual alone drops tombstone rows.
+    pub pruned_by: Option<String>,
+    /// Queried keys with a version at the lookup's instant (before the
+    /// tombstone rule).
+    pub keys_with_version: u64,
+    /// Queried keys for which sidecar pruning kept no winning row group.
+    /// Not the number of retracted keys: the residual may remove all
+    /// winners even when a row group remains. Zero without pruning.
+    pub keys_without_row_groups: u64,
+    /// Winning (key, row group) pairs removed before the union across keys.
+    /// A row group removed for one key may remain for another.
+    pub key_row_group_pairs_pruned: u64,
 }
 
 /// One segment of a spec taking part in a plan.
@@ -328,10 +366,15 @@ enum SegSource {
 }
 
 struct SpecSegments {
+    /// The spec, always without its tombstone (its own segments are the
+    /// spec's without it).
     spec: KeySpec,
     sources: Vec<SegSource>,
     /// A bloom with per-key bounds: its `bounds` segments.
     bounds: Vec<SegSource>,
+    /// A spec declared and complete with a tombstone (B8): the spec with
+    /// it, and its tombstone segments.
+    tombstone: Option<(KeySpec, Vec<SegSource>)>,
 }
 
 /// A key lookup's row groups, the rows of its keys and the spec that
@@ -447,10 +490,41 @@ impl<S: StoreExt + ?Sized> Planner<S> {
         &self.schema
     }
 
-    /// The declared key specs.
+    /// The declared key specs, each temporal or bitemporal spec with the
+    /// tombstone its sidecar declares (B8; the manifest's `key_specs` hold
+    /// them without it).
     #[must_use]
-    pub fn declared_specs(&self) -> &[KeySpec] {
-        &self.manifest().schema.key_specs
+    pub fn declared_specs(&self) -> Vec<KeySpec> {
+        declared_key_specs(self.manifest())
+    }
+
+    /// The declared specs a plan can use at the pinned sequence, and those
+    /// it cannot (ADR 012): a complete spec as declared; a spec with a
+    /// tombstone (B8) whose own segments are complete but whose tombstone
+    /// sidecar is not, without its tombstone (it plans as before, and a
+    /// `live` lookup through it is not pruned by tombstones, which the
+    /// facade says); every other spec in the second list.
+    #[must_use]
+    pub fn usable_specs(&self) -> (Vec<KeySpec>, Vec<KeySpec>) {
+        let (mut usable, mut excluded) = (Vec::new(), Vec::new());
+        for s in self.declared_specs() {
+            if self.completeness(&s).is_some() {
+                usable.push(s);
+            } else if s.tombstone().is_some() && self.completeness(&s.without_tombstone()).is_some()
+            {
+                usable.push(s.without_tombstone());
+            } else {
+                excluded.push(s);
+            }
+        }
+        (usable, excluded)
+    }
+
+    /// The sequence at which the tombstone sidecar of `spec` became
+    /// complete, or `None` (see [`crate::tombstone_completeness`]).
+    #[must_use]
+    pub fn tombstone_completeness(&self, spec: &KeySpec) -> Option<u64> {
+        crate::coverage::tombstone_completeness(self.manifest(), spec)
     }
 
     /// The sequence at which `spec` became complete, or `None` (see
@@ -517,6 +591,7 @@ impl<S: StoreExt + ?Sized> Planner<S> {
                     columns,
                     valid_column,
                     known_column,
+                    ..
                 } => SidecarDef {
                     kind: SidecarKind::Bitemporal,
                     columns: columns.clone(),
@@ -524,7 +599,9 @@ impl<S: StoreExt + ?Sized> Planner<S> {
                 },
                 _ => continue,
             };
-            push(def, TimedSource::Spec(spec.clone()));
+            // A bitemporal spec with a tombstone (B8) reads its versions
+            // from its own segments, the spec's without it.
+            push(def, TimedSource::Spec(spec.without_tombstone()));
         }
         for spec in specs {
             if let Some(def) = bloom_bounds_def(spec) {
@@ -875,6 +952,32 @@ impl<S: StoreExt + ?Sized> Planner<S> {
         lookup: &Lookup,
         extra: &[TransientSpec],
     ) -> Result<ScanPlan> {
+        self.plan_inner(specs, lookup, extra, &mut LiveOutcome::default())
+    }
+
+    /// Plans a lookup with `live` (B8) like [`Planner::plan_ordered`], and
+    /// says what its tombstones did ([`LiveOutcome`]).
+    pub fn plan_ordered_live(
+        &self,
+        specs: &[KeySpec],
+        lookup: &Lookup,
+    ) -> Result<(ScanPlan, PlanOrder, LiveOutcome)> {
+        let mut outcome = LiveOutcome::default();
+        let mut plan = self.plan_inner(specs, lookup, &[], &mut outcome)?;
+        let order = self.order(specs, lookup, &mut plan)?;
+        Ok((plan, order, outcome))
+    }
+
+    /// [`Planner::plan_with_transient`], recording a `live` lookup's
+    /// tombstone outcome in `outcome`.
+    #[allow(clippy::too_many_lines)] // one arm per lookup kind
+    fn plan_inner(
+        &self,
+        specs: &[KeySpec],
+        lookup: &Lookup,
+        extra: &[TransientSpec],
+        outcome: &mut LiveOutcome,
+    ) -> Result<ScanPlan> {
         let segs = self.resolve(specs, extra)?;
         let lookup_columns: &[String] = match lookup {
             Lookup::Keys { columns, .. }
@@ -911,12 +1014,31 @@ impl<S: StoreExt + ?Sized> Planner<S> {
         }
         match lookup {
             Lookup::Keys { columns, keys } => self.plan_keys(&segs, columns, keys),
-            Lookup::Latest { columns, keys } => {
-                self.plan_temporal(&segs, columns, keys, Versions::Latest)
-            }
-            Lookup::AsOf { columns, keys, ts } => {
-                self.plan_temporal(&segs, columns, keys, Versions::Asof(*ts))
-            }
+            Lookup::Latest {
+                columns,
+                keys,
+                live,
+            } => self.plan_temporal(
+                &segs,
+                columns,
+                keys,
+                Versions::Latest,
+                live.as_ref(),
+                outcome,
+            ),
+            Lookup::AsOf {
+                columns,
+                keys,
+                ts,
+                live,
+            } => self.plan_temporal(
+                &segs,
+                columns,
+                keys,
+                Versions::Asof(*ts),
+                live.as_ref(),
+                outcome,
+            ),
             Lookup::Lookback {
                 columns,
                 keys,
@@ -939,6 +1061,7 @@ impl<S: StoreExt + ?Sized> Planner<S> {
                 keys,
                 valid,
                 known,
+                live,
             } => {
                 let sidecars = self.sidecars_for(specs, lookup);
                 self.plan_bitemporal(
@@ -947,8 +1070,9 @@ impl<S: StoreExt + ?Sized> Planner<S> {
                     columns,
                     clocks.as_ref(),
                     keys,
-                    *valid,
-                    *known,
+                    (*valid, *known),
+                    live.as_ref(),
+                    outcome,
                 )
             }
             Lookup::Text { column, op, values } => self.plan_text(&segs, column, *op, values),
@@ -1276,39 +1400,53 @@ impl<S: StoreExt + ?Sized> Planner<S> {
                 if !names.insert(name.clone()) {
                     return Err(Error::KeySpec(format!("key spec {name} is listed twice")));
                 }
+                // A spec with a tombstone (B8) plans with its own segments,
+                // which are the spec's without it, and its tombstone
+                // segments beside them.
+                let plain = spec.without_tombstone();
                 if let Some(t) = extra.iter().find(|t| &t.spec == spec) {
                     let transient = |b: &[Bytes]| -> Vec<SegSource> {
                         b.iter().cloned().map(SegSource::Transient).collect()
                     };
                     return Ok(SpecSegments {
-                        spec: spec.clone(),
+                        spec: plain,
                         sources: transient(&t.segments),
                         bounds: transient(&t.bounds),
+                        tombstone: spec
+                            .tombstone()
+                            .map(|_| (spec.clone(), transient(&t.tombstones))),
                     });
                 }
                 if self.completeness(spec).is_none() {
                     return Err(self.not_servable(spec));
                 }
-                let identity = spec.identity();
-                let committed = |kind: Option<&str>| -> Vec<SegSource> {
+                let committed = |name: &str, kind: Option<&str>| -> Vec<SegSource> {
                     m.segments
                         .iter()
-                        .filter(|s| segment_of(s, &identity, kind))
+                        .filter(|s| segment_of(s, name, kind))
                         .map(|s| SegSource::Committed {
                             id: s.id,
                             size: s.bytes,
                         })
                         .collect()
                 };
+                let identity = plain.identity();
                 let bounds = if bloom_bounds_def(spec).is_some() {
-                    committed(Some(SidecarKind::Bounds.as_str()))
+                    committed(&identity, Some(SidecarKind::Bounds.as_str()))
                 } else {
                     Vec::new()
                 };
+                let tombstone = spec.tombstone().map(|_| {
+                    (
+                        spec.clone(),
+                        committed(&tombstone_name(spec), Some(TOMBSTONE_KIND)),
+                    )
+                });
                 Ok(SpecSegments {
-                    spec: spec.clone(),
-                    sources: committed(None),
+                    sources: committed(&identity, None),
+                    spec: plain,
                     bounds,
+                    tombstone,
                 })
             })
             .collect()
@@ -1319,7 +1457,7 @@ impl<S: StoreExt + ?Sized> Planner<S> {
         let seq = self.sequence();
         match self.declared_specs().iter().find(|s| s.name() == name) {
             None => Error::KeySpec(format!("key spec {name} is not declared in this index")),
-            Some(d) if d != spec => Error::KeySpec(format!(
+            Some(d) if d != spec && d.without_tombstone() != *spec => Error::KeySpec(format!(
                 "the index declares {} under the name {name}, not {}",
                 d.identity(),
                 spec.identity()
@@ -1693,12 +1831,15 @@ impl<S: StoreExt + ?Sized> Planner<S> {
         })
     }
 
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     fn plan_temporal(
         &self,
         segs: &[SpecSegments],
         columns: &[String],
         keys: &[Vec<u8>],
         versions: Versions,
+        live: Option<&Tombstone>,
+        outcome: &mut LiveOutcome,
     ) -> Result<ScanPlan> {
         let types = self.column_types(columns)?;
         let (keys, spans) = non_null_probes(keys, &types)?;
@@ -1731,6 +1872,9 @@ impl<S: StoreExt + ?Sized> Planner<S> {
             .column_types(std::slice::from_ref(ts_column))?
             .remove(0)
             .1;
+        // The residual's tombstone test (B8), checked before anything is
+        // read: the column and value must fit the spec and the dataset.
+        let live_test = live.map(|lt| self.live_residual(&t.spec, lt)).transpose()?;
         // Every variant of each key's projection onto the temporal spec.
         let variants: Vec<Vec<Vec<u8>>> = keys
             .iter()
@@ -1744,11 +1888,28 @@ impl<S: StoreExt + ?Sized> Planner<S> {
             .collect::<Result<Vec<_>>>()?;
         let (selection, mut acc) = match versions {
             Versions::Latest | Versions::Asof(_) => {
-                let winners = self.winners(&readers, &variants, versions.asof())?;
-                let acc: Vec<Option<RoaringBitmap>> = winners
+                let mut winners = self.winners(&readers, &variants, versions.asof())?;
+                let mut acc: Vec<Option<RoaringBitmap>> = winners
                     .iter()
                     .map(|w| Some(w.as_ref().map(|h| h.row_groups.clone()).unwrap_or_default()))
                     .collect();
+                if let Some(lt) = live {
+                    let hits: Vec<Option<(tomb::Clock, RoaringBitmap)>> = winners
+                        .iter()
+                        .map(|w| w.as_ref().map(|h| ((h.ts, 0), h.row_groups.clone())))
+                        .collect();
+                    let kept = self.prune_live(t, lt, &variants, &hits, outcome)?;
+                    if let Some(kept) = kept {
+                        for ((w, a), k) in winners.iter_mut().zip(&mut acc).zip(kept) {
+                            if let Some(k) = k {
+                                if k.is_empty() {
+                                    *w = None;
+                                }
+                                *a = Some(k);
+                            }
+                        }
+                    }
+                }
                 (Selection::Winners(winners), acc)
             }
             Versions::Lookback(lookback) => {
@@ -1788,7 +1949,84 @@ impl<S: StoreExt + ?Sized> Planner<S> {
                 hits,
             )?,
         };
-        self.finish(&selected, residual)
+        self.finish(&selected, with_live(residual, live_test))
+    }
+
+    /// The residual test of a `live` lookup through `spec` (B8):
+    /// [`Predicate::Live`] on the tombstone column, its value encoded at the
+    /// column's dataset type; refused, naming what to fix, when the column
+    /// or value does not fit (`bellwether_core::tombstone::column_type`).
+    fn live_residual(&self, spec: &KeySpec, lt: &Tombstone) -> Result<Predicate> {
+        let full = spec
+            .without_tombstone()
+            .with_tombstone(lt.clone())
+            .ok_or_else(|| {
+                Error::KeySpec(format!(
+                    "a live lookup goes through a temporal or temporal2 key, and {} is neither",
+                    spec.name()
+                ))
+            })?;
+        let dt = tomb::column_type(&full, &self.schema)?;
+        Ok(Predicate::Live {
+            column: lt.column.clone(),
+            tombstone: tomb::tombstone_bytes(lt, &dt)?,
+        })
+    }
+
+    /// Prunes each key's winning row groups (`hits`: its winning time and
+    /// row groups, `None` without a version) by the stored liveness of
+    /// `seg`'s tombstone segments, when `seg` is declared and complete with
+    /// exactly the lookup's tombstone `lt`; `None` otherwise (the plan is
+    /// not pruned, and the residual alone drops tombstone rows). Records
+    /// what it did in `outcome`.
+    fn prune_live(
+        &self,
+        seg: &SpecSegments,
+        lt: &Tombstone,
+        variants: &[Vec<Vec<u8>>],
+        hits: &[Option<(tomb::Clock, RoaringBitmap)>],
+        outcome: &mut LiveOutcome,
+    ) -> Result<Option<Vec<Option<RoaringBitmap>>>> {
+        outcome.keys_with_version = hits.iter().filter(|h| h.is_some()).count() as u64;
+        let Some((full, sources)) = seg
+            .tombstone
+            .as_ref()
+            .filter(|(full, _)| full.tombstone() == Some(lt))
+        else {
+            return Ok(None);
+        };
+        let readers = sources
+            .iter()
+            .map(|src| self.open_in_layout(full, Layout::KeyedTombstone, src, false))
+            .collect::<Result<Vec<_>>>()?;
+        let probes: Vec<Vec<u8>> = {
+            let mut p: Vec<Vec<u8>> = variants
+                .iter()
+                .zip(hits)
+                .filter(|(_, h)| h.is_some())
+                .flat_map(|(vs, _)| vs.iter().cloned())
+                .collect();
+            p.sort_unstable();
+            p.dedup();
+            p
+        };
+        let entries = tomb::liveness(&readers, &probes)?;
+        let mut out = Vec::with_capacity(hits.len());
+        for (vs, h) in variants.iter().zip(hits) {
+            let Some((winner, rgs)) = h else {
+                out.push(None);
+                continue;
+            };
+            let maps: Vec<&tomb::KeyLiveness> = vs.iter().filter_map(|v| entries.get(v)).collect();
+            let kept = tomb::prune(rgs, *winner, &maps)?;
+            outcome.key_row_group_pairs_pruned += rgs.len() - kept.len();
+            if kept.is_empty() {
+                outcome.keys_without_row_groups += 1;
+            }
+            out.push(Some(kept));
+        }
+        outcome.pruned_by = Some(tombstone_name(full));
+        Ok(Some(out))
     }
 
     /// Each key's index-wide winning version (latest, or at `asof`): every
@@ -2437,9 +2675,14 @@ impl<S: StoreExt + ?Sized> Planner<S> {
             )));
         }
         match self.lookback_source(specs, columns)? {
-            Some(Versioned::Temporal(_)) => {
-                self.plan_temporal(segs, columns, keys, Versions::Lookback(lookback))
-            }
+            Some(Versioned::Temporal(_)) => self.plan_temporal(
+                segs,
+                columns,
+                keys,
+                Versions::Lookback(lookback),
+                None,
+                &mut LiveOutcome::default(),
+            ),
             Some(Versioned::Bounds(def, src)) => {
                 self.plan_bounds_lookback(segs, &def, &src, columns, keys, lookback)
             }
@@ -2530,7 +2773,7 @@ impl<S: StoreExt + ?Sized> Planner<S> {
     }
 
     /// The bitemporal as-of (see [`Lookup::Bitemporal`]).
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     fn plan_bitemporal(
         &self,
         segs: &[SpecSegments],
@@ -2538,8 +2781,9 @@ impl<S: StoreExt + ?Sized> Planner<S> {
         columns: &[String],
         clocks: Option<&(String, String)>,
         keys: &[Vec<u8>],
-        valid: Option<i64>,
-        known: Option<i64>,
+        (valid, known): (Option<i64>, Option<i64>),
+        live_t: Option<&Tombstone>,
+        outcome: &mut LiveOutcome,
     ) -> Result<ScanPlan> {
         let (def, src) = match sidecars {
             [(def, src)] => (def, src),
@@ -2611,7 +2855,7 @@ impl<S: StoreExt + ?Sized> Planner<S> {
                 .or_default()
                 .extend(ts.into_iter().filter(|t| live.contains(t.rg.0)));
         }
-        let winners: Vec<Option<BitemporalHit>> = variants
+        let mut winners: Vec<Option<BitemporalHit>> = variants
             .iter()
             .map(|vs| {
                 bitemporal_winner(
@@ -2621,6 +2865,41 @@ impl<S: StoreExt + ?Sized> Planner<S> {
                 )
             })
             .collect();
+        // With a tombstone (B8): the residual's test, and, when the
+        // bitemporal key is complete with exactly this tombstone, each
+        // key's winning row groups pruned by their stored liveness.
+        let live_test = match live_t {
+            Some(lt) => {
+                let spec = KeySpec::Bitemporal {
+                    columns: def.columns.clone(),
+                    valid_column: valid_col.clone(),
+                    known_column: known_col.clone(),
+                    tombstone: None,
+                };
+                let hits: Vec<Option<(tomb::Clock, RoaringBitmap)>> = winners
+                    .iter()
+                    .map(|w| {
+                        w.as_ref()
+                            .map(|h| ((h.valid, h.known), h.row_groups.clone()))
+                    })
+                    .collect();
+                let kept = if let Some(seg) = segs.iter().find(|s| s.spec == spec) {
+                    self.prune_live(seg, lt, &variants, &hits, outcome)?
+                } else {
+                    outcome.keys_with_version = hits.iter().filter(|h| h.is_some()).count() as u64;
+                    None
+                };
+                for (w, k) in winners.iter_mut().zip(kept.into_iter().flatten()) {
+                    match (w.as_mut(), k) {
+                        (Some(_), Some(k)) if k.is_empty() => *w = None,
+                        (Some(h), Some(k)) => h.row_groups = k,
+                        _ => {}
+                    }
+                }
+                Some(self.live_residual(&spec, lt)?)
+            }
+            None => None,
+        };
         let selected = winners
             .iter()
             .flatten()
@@ -2642,7 +2921,7 @@ impl<S: StoreExt + ?Sized> Planner<S> {
                 bound: known,
             },
         )?;
-        self.finish(&selected, residual)
+        self.finish(&selected, with_live(residual, live_test))
     }
 
     /// A text lookup (see [`Lookup::Text`]): per value, each serving text
@@ -3188,6 +3467,20 @@ fn lookback_residual(
             },
         ],
     })
+}
+
+/// `residual` with a `live` lookup's tombstone test (B8) appended: applied
+/// after `LatestPerKey`, so the newest rows are chosen first and the
+/// tombstones among them dropped.
+fn with_live(residual: Predicate, live: Option<Predicate>) -> Predicate {
+    match (residual, live) {
+        (Predicate::And { mut all }, Some(l)) => {
+            all.push(l);
+            Predicate::And { all }
+        }
+        (r, Some(l)) => Predicate::And { all: vec![r, l] },
+        (r, None) => r,
+    }
 }
 
 /// The residual of a latest or asof lookup (see the module docs).

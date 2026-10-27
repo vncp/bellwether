@@ -319,6 +319,7 @@ fn specs() -> Vec<KeySpec> {
         e(&["id", "name"]),
         e(&["name", "id"]),
         KeySpec::Temporal {
+            tombstone: None,
             columns: vec!["id".into()],
             ts_column: "ts".into(),
             counts: false,
@@ -633,10 +634,12 @@ fn check_temporal(
     let key = p.encode_tuple(&cols(&["id"]), &[Value::Int(id)]).unwrap();
     let lookup = match asof_us {
         None => Lookup::Latest {
+            live: None,
             columns: cols(&["id"]),
             keys: vec![key],
         },
         Some(ts) => Lookup::AsOf {
+            live: None,
             columns: cols(&["id"]),
             keys: vec![key],
             ts,

@@ -51,6 +51,7 @@ fn spec() -> KeySpec {
         columns: cols(&["id"]),
         valid_column: "valid".into(),
         known_column: "known".into(),
+        tombstone: None,
     }
 }
 
@@ -202,6 +203,7 @@ fn the_newest_valid_version_known_by_k_wins_for_every_v_and_k() {
                     .plan(
                         &specs(),
                         &Lookup::Bitemporal {
+                            live: None,
                             columns: cols(&["id"]),
                             clocks: None,
                             keys: keys.to_vec(),
@@ -273,6 +275,7 @@ fn a_rewritten_file_s_versions_no_longer_win() {
         .plan(
             &specs(),
             &Lookup::Bitemporal {
+                live: None,
                 columns: cols(&["id"]),
                 clocks: None,
                 keys: keys.clone(),
@@ -303,6 +306,7 @@ fn a_rewritten_file_s_versions_no_longer_win() {
         .plan(
             &[],
             &Lookup::Bitemporal {
+                live: None,
                 columns: cols(&["id"]),
                 clocks: None,
                 keys: vec![enc_i64(1)],

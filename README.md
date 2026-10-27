@@ -207,6 +207,7 @@ Reproduce everything above, downloads included, with [`scripts/showcase.sh`](scr
 | `list` | array membership: `array_contains`, `has_any`, `has_all`, `exists(unnest)` over a `List`, `LargeList`, or a map's keys | `index --key list:col` | `locate --keys values.parquet --any\|--all`; priced by `why --mode contains-any\|contains-all` |
 | `join` | semi-join, anti-join, `in (subquery)`, `exists` between two datasets on one column pair; drive side and whether the keyset fits a membership list | `index <left> --key join:left.col=right.col` (both datasets need `exact:<col>`; the right is the folder beside the left) | `join semijoin --join right.col --keys keys.parquet` (two steps, each the row groups of keys both hold), `join overlap` (exact \|L∩R\|, \|L∖R\|, \|R∖L\|), `join verify`; priced by `why --mode semijoin --join right.col`, proposed and receipted by `fix` |
 | `agg` | `sum/count/min/max(value) ... where key in (...) group by key`; the per-key totals a reconciliation compares | `index --key exact:key,counts --key 'agg:key@value{sum,count,min,max}'` (always beside the counted key) | `aggregate --keys K --value V --fn sum,count` from the index, no data file opened (exact for integers and decimals; float sums labelled measured); `reconcile --key K --totals V --ignore V,...` (every other column ignored, the total too: it is then compared through its exact sum only) folds a side from it and the certificate says so, and otherwise says why the side was read; priced by `why --value V --fn ...` ([funnels](docs/measured/2026-10-26-agg.md)) |
+| `tombstone` | `arg_max(ts, *) by key` followed by `where not retracted`: each key's newest row as of `t`, dropped when it is a retraction (cancellations, voids, restatements, delistings; the guard against look-ahead in a backtest) | `index --key temporal:key@ts,tombstone=void` (a boolean column) or `tombstone=status=CANCEL` (a state column and value); also on `temporal2` | `latest --live`, `asof --at T --live` (MCP `observe.asof` with `live`): each key's newest row, dropped when it is a tombstone, the same answer as `asof` plus the filter, reading no row group for a key whose newest row is a tombstone; priced by `why --latest-by ts --tombstone void` (the fraction of keys whose newest row is a tombstone), proposed and receipted by `fix` ([funnels](docs/measured/2026-10-26-tombstone.md)) |
 
 ## How `fix` proves a change
 
@@ -302,7 +303,7 @@ The trust boundary at the wire: a proposal has no score field, so the input sche
 |---|---|---|---|---|---|
 | Runs | one process | inside the query engine | inside the Hudi writer and engine | inside ClickHouse | inside the database |
 | Granularity | row group | file (min/max) | file group or record | granule | row |
-| Key kinds | exact, bloom, range, temporal, sketch (approximate, never plans), expr, text, list, join (dataset pairs), agg | min/max statistics | bloom, record-level, column stats | minmax, set, bloom variants | B-tree |
+| Key kinds | exact, bloom, range, temporal, sketch (approximate, never plans), expr, text, list, join (dataset pairs), agg, tombstone (live latest/as-of) | min/max statistics | bloom, record-level, column stats | minmax, set, bloom variants | B-tree |
 | Composite keys | native, prefix seek | Z-order or clustering columns | record key | multi-column expressions | yes |
 | Latest / as-of | native over plain files | table time travel | incremental and point-in-time queries | no | via `ROW_NUMBER` scan |
 | Tells you which key to index | measured fanout + exact replay | no | no | no | estimated (what-if API) |
@@ -414,7 +415,7 @@ python3 scripts/render_figures.py --check     # README figures match their defin
 python3 scripts/render_terminal.py --check    # README captures match their committed text
 ```
 
-CI also asserts the latency budgets in release builds (the bench SLOs, replay's p50-run budget, and `observe.why` under 100 ms in process and over stdio) and checks that every persisted format fixture still reads byte for byte, the M5 one included (`fixtures/format-v1/`, `fixtures/format-v0.1-pre/`, `fixtures/format-v0.1/`). The README's captures come from [`scripts/readme-captures.sh`](scripts/readme-captures.sh): it generates its data with `bellwether bench`, runs every command shown in a pseudo-terminal, stores the text beside each image, and redraws them.
+CI also asserts the latency budgets in release builds (the bench SLOs, replay's p50-run budget, and `observe.why` under 100 ms in process and over stdio) and checks that every persisted format fixture still reads byte for byte, the M5 one included (`fixtures/format-v1/`, `fixtures/format-v0.1-pre/`, `fixtures/format-v0.1/`, and `fixtures/format-v4/`). Storage and records are versioned apart: indexes are storage version 2, frozen at M5 and unchanged since (tombstones are an additive sidecar the M5 binary keeps and plans beside); ledger records are version 4 since tombstones, whose key specs and live filters a version 3 reader would misread, so the M5 binary refuses a version 4 record before reading it and writes nothing (ADR 028). The README's captures come from [`scripts/readme-captures.sh`](scripts/readme-captures.sh): it generates its data with `bellwether bench`, runs every command shown in a pseudo-terminal, stores the text beside each image, and redraws them.
 
 ## Tables as sources
 
@@ -457,7 +458,7 @@ Pre-alpha. The architecture and on-disk format are fixed and documented; the cra
 - [x] **M2** the index: `index`, `locate`, `latest`, `asof`
 - [x] **M3** receipts: `fix` writes one
 - [x] **M4** agent-first: the loop runs end to end from an MCP client
-- [x] **M5** the format frozen: storage version 2 (per-key counts, per-column bytes, per-key time bounds and bitemporal versions folded into key specs) and record version 3, with compatibility fixtures read byte for byte in CI (ADR 028)
+- [x] **M5** the format frozen: storage version 2 (per-key counts, per-column bytes, per-key time bounds and bitemporal versions folded into key specs) and record version 3, with compatibility fixtures read byte for byte in CI (ADR 028); records moved to version 4 with tombstones, storage stays version 2
 - [ ] **M6** staged optimization against your recorded workload: `advise` first (no language model; enumeration, knob descent, layout and materialization search, with receipts), then `evolve --llm` only if `advise` leaves structural anti-patterns, then rulebook promotion; each stage a replayable run in the ledger; the loss covers the relational operators (projection, joins, windows, aggregation input) exactly
 - [ ] **M7** a SQL table reconciles against a folder of files with a certificate; plans execute inside DataFusion and DuckDB without a sidecar step; receipts gate pull requests
 - [ ] **M8** rules transfer across datasets and the exact-versus-estimated ablation is measured; receipts are signed (signing landed with [#10](https://github.com/vncp/bellwether/pull/10))

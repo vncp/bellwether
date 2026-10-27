@@ -373,7 +373,7 @@ fn a_pre_m5_index_whose_sidecars_cannot_all_fold_keeps_them_and_plans_the_same()
             ),
         ] {
             let got = planned(
-                &e.asof_bitemporal(&a, Some(&v_at), Some(&k_at), Some((vc, kc)))
+                &e.asof_bitemporal(&a, Some(&v_at), Some(&k_at), Some((vc, kc)), false)
                     .unwrap(),
             );
             assert_eq!(
@@ -385,7 +385,7 @@ fn a_pre_m5_index_whose_sidecars_cannot_all_fold_keeps_them_and_plans_the_same()
         // Two bitemporal sources on sym: a lookup naming no clocks is
         // refused, naming both and the clocks that pick each.
         let err = e
-            .asof_bitemporal(&a, Some(&v_at), Some(&k_at), None)
+            .asof_bitemporal(&a, Some(&v_at), Some(&k_at), None, false)
             .unwrap_err()
             .to_string();
         for want in [

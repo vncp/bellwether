@@ -46,6 +46,7 @@ fn specs() -> Vec<KeySpec> {
             column: "version_ts".into(),
         },
         KeySpec::Temporal {
+            tombstone: None,
             columns: cols(&["status", "entity_id"]),
             ts_column: "version_ts".into(),
             counts: false,
@@ -219,6 +220,7 @@ fn replaying_the_current_index_reads_no_columns_and_a_candidate_reads_only_its_k
         columns: cols(&["entity_id"]),
         ts_column: "version_ts".into(),
         counts: false,
+        tombstone: None,
     };
     replayer
         .replay_specs(std::slice::from_ref(&candidate), &workload, &keys)
@@ -287,7 +289,7 @@ fn a_key_proposal_is_scored_and_written_through_the_ledger() {
     assert_eq!(written.manifest_version, "1");
     assert_eq!(written.workload, workload.hash());
     assert_eq!(written.created_at, AT);
-    assert_eq!(written.record_version, 3);
+    assert_eq!(written.record_version, RECORD_VERSION);
     assert_eq!(written.inputs, vec![replayer.catalog().digest()]);
     assert_eq!(written.model, None, "a key proposal names no model");
     assert_eq!(

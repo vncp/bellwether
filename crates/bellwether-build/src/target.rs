@@ -30,18 +30,29 @@
 //! `kind` is unknown is never planned with, merged, or counted toward
 //! coverage; a build keeps it unchanged, and so does a declaration of an
 //! unknown kind; both are reported (`Manifest::unknown_segment_kinds`).
+//!
+//! A `tombstone` declaration (B8) this binary cannot use is held to the
+//! same rule ([`unused_tombstones`]): one whose `params` it cannot read, or
+//! whose temporal or bitemporal key the index no longer declares on its
+//! key and time columns (a binary without tombstones redefined the key),
+//! is kept unchanged with its segments, listed by name, and never planned
+//! with. Only `Builder::remove_spec` on a spec with a tombstone under that
+//! name removes it, and a build that declares a tombstone under its name
+//! replaces it and says so (`BuildReport::tombstones_dropped`).
 
 use std::collections::BTreeMap;
 
 use bellwether_core::sidecar::{SidecarDef, SidecarKind};
+use bellwether_core::tombstone::TOMBSTONE_KIND;
 use bellwether_store::{Extra, Manifest, SegmentRef, SidecarDecl, KNOWN_SEGMENT_KINDS};
-use bellwether_types::{KeySpec, SketchSpec, SKETCH_DEFAULT_PRECISION};
+use bellwether_types::{KeySpec, SketchSpec, Tombstone, SKETCH_DEFAULT_PRECISION};
 
 /// A key spec or a sidecar: one thing a build indexes, with its own
 /// segments and completeness.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Target {
-    /// A key spec (`segments[].kind` absent).
+    /// A key spec (`segments[].kind` absent). Never one with a tombstone:
+    /// the spec without it ([`targets_of`]).
     Key(KeySpec),
     /// The `bounds` segments of a bloom spec with per-key bounds
     /// (`segments[].kind` = `bounds`, `key_spec` = the bloom's identity).
@@ -51,6 +62,10 @@ pub(crate) enum Target {
     Sidecar(SidecarDef),
     /// A sketch (`segments[].kind` = `sketch`). Never planned with.
     Sketch(SketchSpec),
+    /// The tombstone sidecar (B8) of a temporal or bitemporal spec with a
+    /// tombstone, the spec held whole (`segments[].kind` = `tombstone`,
+    /// `key_spec` = [`tombstone_name`]).
+    Tombstone(KeySpec),
 }
 
 impl Target {
@@ -61,6 +76,7 @@ impl Target {
             Self::Key(k) | Self::BloomBounds(k) => k.identity(),
             Self::Sidecar(d) => d.name(),
             Self::Sketch(s) => s.name(),
+            Self::Tombstone(k) => tombstone_name(k),
         }
     }
 
@@ -73,6 +89,7 @@ impl Target {
             Self::BloomBounds(k) => format!("bounds:{}", k.name()),
             Self::Sidecar(d) => d.name(),
             Self::Sketch(s) => s.name(),
+            Self::Tombstone(k) => format!("{TOMBSTONE_KIND}:{}", k.name()),
         }
     }
 
@@ -83,6 +100,7 @@ impl Target {
             Self::BloomBounds(_) => Some(SidecarKind::Bounds.as_str()),
             Self::Sidecar(d) => Some(d.kind.as_str()),
             Self::Sketch(_) => Some(SKETCH_KIND),
+            Self::Tombstone(_) => Some(TOMBSTONE_KIND),
         }
     }
 
@@ -90,7 +108,7 @@ impl Target {
     /// temporal timestamp or the sidecar's time columns; for an `expr` key,
     /// the dataset columns its expression reads (the virtual column's type
     /// follows from theirs); for an `agg` key, its key columns and its
-    /// value column.
+    /// value column; for a tombstone, also the tombstone column.
     pub(crate) fn typed_columns(&self) -> Vec<String> {
         match self {
             Self::Key(KeySpec::Temporal {
@@ -113,6 +131,11 @@ impl Target {
                 .unwrap_or_default(),
             Self::Sidecar(d) => d.columns.iter().chain(&d.time_columns).cloned().collect(),
             Self::Sketch(s) => sketch_columns(s),
+            Self::Tombstone(k) => {
+                let mut c = Self::Key(k.without_tombstone()).typed_columns();
+                c.extend(k.tombstone().map(|t| t.column.clone()));
+                c
+            }
         }
     }
 }
@@ -135,14 +158,347 @@ pub(crate) fn bloom_bounds_def(spec: &KeySpec) -> Option<SidecarDef> {
     }
 }
 
-/// The targets a key spec's segments are: the spec, and, for a bloom with
-/// per-key bounds, its `bounds` segments.
+/// The targets a key spec's segments are: the spec (without its tombstone),
+/// for a bloom with per-key bounds its `bounds` segments, and for a spec
+/// with a tombstone its tombstone sidecar.
 pub(crate) fn targets_of(spec: &KeySpec) -> Vec<Target> {
-    let mut out = vec![Target::Key(spec.clone())];
+    let mut out = vec![Target::Key(spec.without_tombstone())];
     if bloom_bounds_def(spec).is_some() {
         out.push(Target::BloomBounds(spec.clone()));
     }
+    if spec.tombstone().is_some() {
+        out.push(Target::Tombstone(spec.clone()));
+    }
     out
+}
+
+/// The time columns of a temporal (`[ts]`) or bitemporal (`[valid,
+/// known]`) spec; empty for any other.
+fn clock_columns(spec: &KeySpec) -> Vec<String> {
+    match spec {
+        KeySpec::Temporal { ts_column, .. } => vec![ts_column.clone()],
+        KeySpec::Bitemporal {
+            valid_column,
+            known_column,
+            ..
+        } => vec![valid_column.clone(), known_column.clone()],
+        _ => Vec::new(),
+    }
+}
+
+/// The name a tombstone sidecar is declared, listed, and complete under:
+/// `tombstone:<key columns>@<time columns>` (`tombstone:id@ts`,
+/// `tombstone:id@valid,known`), the shape of every sidecar's name
+/// (`SidecarDecl::name`). One per key spec: a key's slot holds one temporal
+/// and one bitemporal spec, whose names differ by their time columns.
+#[must_use]
+pub fn tombstone_name(spec: &KeySpec) -> String {
+    tombstone_decl(spec).name()
+}
+
+/// The manifest declaration of `spec`'s tombstone sidecar: the key
+/// columns, the time columns, and `params` `column` and, for the value
+/// form, `value`.
+pub(crate) fn tombstone_decl(spec: &KeySpec) -> SidecarDecl {
+    let mut params = BTreeMap::new();
+    if let Some(t) = spec.tombstone() {
+        params.insert("column".to_string(), t.column.clone());
+        if let Some(v) = &t.value {
+            params.insert("value".to_string(), v.clone());
+        }
+    }
+    SidecarDecl {
+        kind: TOMBSTONE_KIND.to_string(),
+        columns: spec.columns().to_vec(),
+        time_columns: clock_columns(spec),
+        params,
+        extra: Extra::new(),
+    }
+}
+
+/// The tombstone a declaration names, when it is a well-formed tombstone
+/// declaration (`params` exactly `column` and an optional `value`).
+fn tombstone_param(decl: &SidecarDecl) -> Option<Tombstone> {
+    if decl.kind != TOMBSTONE_KIND || decl.params.keys().any(|k| k != "column" && k != "value") {
+        return None;
+    }
+    Some(Tombstone {
+        column: decl.params.get("column")?.clone(),
+        value: decl.params.get("value").cloned(),
+    })
+}
+
+/// The spec with a tombstone a declaration names: the temporal or
+/// bitemporal spec of `specs` on its key and time columns, with the
+/// tombstone. `None` for a declaration of another kind, a malformed one,
+/// or one whose spec `specs` does not hold.
+pub(crate) fn tombstone_of(decl: &SidecarDecl, specs: &[KeySpec]) -> Option<KeySpec> {
+    let t = tombstone_param(decl)?;
+    specs
+        .iter()
+        .find(|s| {
+            matches!(s, KeySpec::Temporal { .. } | KeySpec::Bitemporal { .. })
+                && s.tombstone().is_none()
+                && s.columns() == decl.columns.as_slice()
+                && clock_columns(s) == decl.time_columns
+        })
+        .and_then(|s| s.with_tombstone(t))
+}
+
+/// A `tombstone` declaration (B8) the index holds that this binary does
+/// not use: kept unchanged with its segments, never planned with
+/// ([`unused_tombstones`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UnusedTombstone {
+    /// Its name (`tombstone:id@ts`).
+    pub sidecar: String,
+    /// Why this binary does not use it.
+    pub reason: String,
+    /// Its key columns.
+    pub columns: Vec<String>,
+    /// The tombstone its `params` name (`column`, and `value` when given),
+    /// when it names a column; read even when other params are not.
+    pub tombstone: Option<Tombstone>,
+}
+
+/// The specs `m` declares with the tombstone each one's declaration names,
+/// each with the index of that declaration in `schema.sidecars`: the first
+/// usable declaration per spec.
+fn usable_tombstones(m: &Manifest) -> Vec<(usize, KeySpec)> {
+    m.schema
+        .key_specs
+        .iter()
+        .filter_map(|s| {
+            m.schema
+                .sidecars
+                .iter()
+                .enumerate()
+                .find_map(|(i, d)| tombstone_of(d, std::slice::from_ref(s)).map(|t| (i, t)))
+        })
+        .collect()
+}
+
+/// The key specs `m` declares, each temporal or bitemporal spec with the
+/// tombstone its `tombstone` sidecar declares (B8): the specs as declared,
+/// where `schema.key_specs` holds each without its tombstone. A
+/// declaration this binary cannot use ([`unused_tombstones`]) adds none.
+#[must_use]
+pub fn declared_key_specs(m: &Manifest) -> Vec<KeySpec> {
+    let usable = usable_tombstones(m);
+    m.schema
+        .key_specs
+        .iter()
+        .map(|s| {
+            usable
+                .iter()
+                .find(|(_, t)| t.without_tombstone() == *s)
+                .map_or_else(|| s.clone(), |(_, t)| t.clone())
+        })
+        .collect()
+}
+
+/// Every `tombstone` declaration of `m` this binary does not use, in
+/// declaration order, with why: its `params` are not the ones it reads
+/// (`column` and an optional `value`), or the index declares no temporal
+/// or bitemporal key on its key and time columns (a binary without
+/// tombstones redefined or removed the key), or another declaration under
+/// its name is the one used. A build keeps each unchanged with its
+/// segments; no planner reads it.
+#[must_use]
+pub fn unused_tombstones(m: &Manifest) -> Vec<UnusedTombstone> {
+    let used: Vec<usize> = usable_tombstones(m).into_iter().map(|(i, _)| i).collect();
+    m.schema
+        .sidecars
+        .iter()
+        .enumerate()
+        .filter(|(i, d)| d.kind == TOMBSTONE_KIND && !used.contains(i))
+        .map(|(_, d)| UnusedTombstone {
+            sidecar: d.name(),
+            reason: unused_reason(d, &m.schema.key_specs),
+            columns: d.columns.clone(),
+            tombstone: d.params.get("column").map(|c| Tombstone {
+                column: c.clone(),
+                value: d.params.get("value").cloned(),
+            }),
+        })
+        .collect()
+}
+
+/// Why a `tombstone` declaration is not used ([`unused_tombstones`]).
+fn unused_reason(d: &SidecarDecl, specs: &[KeySpec]) -> String {
+    let unread: Vec<&str> = d
+        .params
+        .keys()
+        .map(String::as_str)
+        .filter(|k| *k != "column" && *k != "value")
+        .collect();
+    if !unread.is_empty() {
+        return format!(
+            "it has params this build does not read ({}; this build reads column and value), \
+             written by a newer binary",
+            unread.join(", ")
+        );
+    }
+    let Some(column) = d.params.get("column") else {
+        return "it names no tombstone column (params.column)".into();
+    };
+    let mut t = format!("tombstone={column}");
+    if let Some(v) = d.params.get("value") {
+        t.push('=');
+        t.push_str(v);
+    }
+    let on_columns: Vec<&KeySpec> = specs
+        .iter()
+        .filter(|s| {
+            matches!(s, KeySpec::Temporal { .. } | KeySpec::Bitemporal { .. })
+                && s.columns() == d.columns.as_slice()
+        })
+        .collect();
+    if let Some(s) = on_columns
+        .iter()
+        .find(|s| clock_columns(s) == d.time_columns)
+    {
+        // The declaration reads, and the key is declared: only a first
+        // declaration under the same name takes its place.
+        return format!(
+            "another tombstone declaration under that name is the one {} uses",
+            s.identity()
+        );
+    }
+    let was = format!("@{}", d.time_columns.join(","));
+    match on_columns.as_slice() {
+        [] => format!(
+            "it declares {t} for a key on ({}) with time columns {was}, and the index declares \
+             no temporal or temporal2 key on ({})",
+            d.columns.join(", "),
+            d.columns.join(", ")
+        ),
+        now => format!(
+            "it declares {t} for a key on ({}) with time columns {was}, and the index now \
+             declares {} on those key columns",
+            d.columns.join(", "),
+            now.iter()
+                .map(|s| s.identity())
+                .collect::<Vec<_>>()
+                .join(" and ")
+        ),
+    }
+}
+
+/// The names of `m`'s unused tombstone declarations ([`unused_tombstones`])
+/// no used declaration shares: the ones whose segments a build keeps
+/// unchanged.
+pub(crate) fn kept_tombstone_names(m: &Manifest) -> std::collections::BTreeSet<String> {
+    let used: std::collections::BTreeSet<String> = usable_tombstones(m)
+        .iter()
+        .map(|(_, t)| tombstone_name(t))
+        .collect();
+    unused_tombstones(m)
+        .into_iter()
+        .map(|u| u.sidecar)
+        .filter(|n| !used.contains(n))
+        .collect()
+}
+
+/// Whether `seg` is a segment of an unused tombstone declaration a build
+/// keeps unchanged (`kept`, [`kept_tombstone_names`]).
+pub(crate) fn kept_tombstone_segment(
+    seg: &SegmentRef,
+    kept: &std::collections::BTreeSet<String>,
+) -> bool {
+    seg.kind.as_deref() == Some(TOMBSTONE_KIND) && kept.contains(&seg.key_spec)
+}
+
+/// A tombstone (B8) a build stopped declaring, which it says
+/// (`BuildReport::tombstones_dropped`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TombstoneDropped {
+    /// The declaration's name (`tombstone:id@ts`).
+    pub sidecar: String,
+    /// What it declared (`tombstone=void`), or, for a declaration this
+    /// binary could not read, why ([`UnusedTombstone::reason`]).
+    pub tombstone: String,
+    /// The spec the build declares in its place: under the key's name (a
+    /// redefinition, `temporal:id@ts2`), or with a tombstone under the
+    /// same declaration name (`temporal:id@ts,tombstone=status=VOID`);
+    /// `None` when the key was removed (`remove_unlisted`).
+    pub now: Option<String>,
+}
+
+/// The `tombstone` declarations a build over `base` declaring `declared`
+/// commits, and the ones it drops:
+///
+/// - per declared spec with a tombstone, the base's declaration of exactly
+///   that tombstone on that key, unchanged (its unknown fields kept, ADR
+///   017), or else a new one ([`tombstone_decl`]);
+/// - every base declaration this binary does not use
+///   ([`unused_tombstones`]) under a name no declared spec takes, unchanged;
+///
+/// Dropped: a base tombstone whose spec is redefined or removed, or
+/// declared with another tombstone, and an unused declaration whose name a
+/// declared tombstone takes.
+pub(crate) fn tombstone_decls(
+    base: Option<&Manifest>,
+    declared: &[KeySpec],
+) -> (Vec<SidecarDecl>, Vec<TombstoneDropped>) {
+    let base_decls: &[SidecarDecl] = base.map_or(&[], |m| m.schema.sidecars.as_slice());
+    let mut decls: Vec<SidecarDecl> = Vec::new();
+    for spec in declared.iter().filter(|s| s.tombstone().is_some()) {
+        let plain = spec.without_tombstone();
+        let kept = base_decls
+            .iter()
+            .find(|d| tombstone_of(d, std::slice::from_ref(&plain)).as_ref() == Some(spec));
+        decls.push(kept.cloned().unwrap_or_else(|| tombstone_decl(spec)));
+    }
+    let taken: Vec<String> = decls.iter().map(SidecarDecl::name).collect();
+    let mut dropped = Vec::new();
+    if let Some(m) = base {
+        for (_, was) in usable_tombstones(m) {
+            if declared.contains(&was) {
+                continue;
+            }
+            let name = tombstone_name(&was);
+            let now = declared
+                .iter()
+                .find(|s| s.name() == was.name())
+                .or_else(|| {
+                    declared
+                        .iter()
+                        .find(|s| s.tombstone().is_some() && tombstone_name(s) == name)
+                })
+                .map(KeySpec::identity);
+            dropped.push(TombstoneDropped {
+                sidecar: name,
+                tombstone: was.tombstone().map(Tombstone::spelling).unwrap_or_default(),
+                now,
+            });
+        }
+        let unused = unused_tombstones(m);
+        let kept = kept_tombstone_names(m);
+        for d in base_decls.iter().filter(|d| d.kind == TOMBSTONE_KIND) {
+            let name = d.name();
+            if !kept.contains(&name) || decls.contains(d) {
+                continue;
+            }
+            if taken.contains(&name) {
+                dropped.push(TombstoneDropped {
+                    tombstone: unused
+                        .iter()
+                        .find(|u| u.sidecar == name)
+                        .map(|u| u.reason.clone())
+                        .unwrap_or_default(),
+                    now: declared
+                        .iter()
+                        .find(|s| s.tombstone().is_some() && tombstone_name(s) == name)
+                        .map(KeySpec::identity),
+                    sidecar: name,
+                });
+            } else {
+                decls.push(d.clone());
+            }
+        }
+    }
+    (decls, dropped)
 }
 
 /// Where a planner reads per-key time bounds or bitemporal versions
@@ -188,6 +544,7 @@ pub(crate) fn timed_sources(m: &Manifest) -> Vec<(SidecarDef, TimedSource)> {
                 columns,
                 valid_column,
                 known_column,
+                ..
             } => SidecarDef {
                 kind: SidecarKind::Bitemporal,
                 columns: columns.clone(),
@@ -251,9 +608,10 @@ pub(crate) fn fold_legacy(specs: &[KeySpec], sidecars: &[SidecarDef]) -> Fold {
                         columns: def.columns.clone(),
                         valid_column: valid.clone(),
                         known_column: known.clone(),
+                        tombstone: None,
                     };
                     match out.specs.iter().find(|s| s.name() == spec.name()) {
-                        Some(s) if *s == spec => Some(spec.identity()),
+                        Some(s) if s.without_tombstone() == spec => Some(spec.identity()),
                         Some(_) => None,
                         None => {
                             out.specs.push(spec.clone());
@@ -401,10 +759,12 @@ pub fn declared_sketches(m: &Manifest) -> Vec<SketchSpec> {
     m.schema.sidecars.iter().filter_map(sketch_of).collect()
 }
 
-/// Whether this binary uses `decl` (a known sidecar or a sketch); others are
-/// kept unchanged.
+/// Whether a build writes `decl` again itself (a known sidecar, a sketch,
+/// or a tombstone, B8); others are kept unchanged. Tombstone declarations
+/// are written by [`tombstone_decls`], which keeps the base's unchanged
+/// when their tombstone is, and keeps the ones this binary does not use.
 pub(crate) fn known_decl(decl: &SidecarDecl) -> bool {
-    def_of(decl).is_some() || sketch_of(decl).is_some()
+    def_of(decl).is_some() || sketch_of(decl).is_some() || decl.kind == TOMBSTONE_KIND
 }
 
 /// The sidecar a declaration names, or `None` for a kind this binary does
@@ -429,8 +789,7 @@ pub(crate) fn declared_sidecars(m: &Manifest) -> Vec<SidecarDef> {
 /// its segment and its completeness while the left's row groups stay
 /// covered ([`declared_joins`]).
 pub(crate) fn declared_targets(m: &Manifest) -> Vec<Target> {
-    m.schema
-        .key_specs
+    declared_key_specs(m)
         .iter()
         .filter(|s| !matches!(s, KeySpec::Join { .. }))
         .flat_map(targets_of)

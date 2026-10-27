@@ -2,20 +2,31 @@
 //! indexes and ledgers earlier binaries wrote, and answers exactly what they
 //! answered.
 //!
+//! Each fixture's persisted records (its ledger) are checked byte for byte
+//! under their hashes, at the record version its binary wrote. A pinned
+//! lookup's line carries the plan Evidence this binary writes now, a new
+//! record at this build's record version (4): its `record_version` and so
+//! its hash are all a pinned line may differ by, and only for a fixture
+//! written at an older version (`same_line`).
+//!
 //! - `fixtures/format-v1/` (storage version 1, record version 2): every
 //!   pinned command's `--json` line is the pinned one byte for byte, except
-//!   what this binary must change: the plan Evidence it writes is record
-//!   version 3 (so its hash), and the manifest it cites is the restored one
-//!   (its bytes hold the restore root). The receipt chain reads as it did,
-//!   byte for byte.
+//!   what this binary must change: the plan Evidence it writes (above), and
+//!   the manifest it cites is the restored one (its bytes hold the restore
+//!   root). The receipt chain reads as it did, byte for byte.
 //! - `fixtures/format-v0.1-pre/` (storage version 2 before M5, record
 //!   version 3, per-key counts, time bounds and bitemporal versions in
 //!   version 1 sidecars): every pinned line byte for byte, `count` and
 //!   `locate --columns` included.
-//! - `fixtures/format-v0.1/` (storage version 2 as frozen at M5): the same,
-//!   over the folded layouts (`exact:id@ts,counts`, a bitemporal key spec, a
-//!   bloom with its bounds segment, a proposal with bounds applied by
-//!   `fix`), `ColumnType` spellings, and a CSV index with `source.dialect`.
+//! - `fixtures/format-v0.1/` (storage version 2 and record version 3 as
+//!   frozen at M5): the same, over the folded layouts
+//!   (`exact:id@ts,counts`, a bitemporal key spec, a bloom with its bounds
+//!   segment, a proposal with bounds applied by `fix`), `ColumnType`
+//!   spellings, and a CSV index with `source.dialect`.
+//! - `fixtures/format-v4/` (storage version 2, record version 4, B8
+//!   tombstones): a live chain, `why --tombstone` → `propose` of a key with
+//!   a tombstone → `fix --verify-only` → `fix --certificate` → receipt, and
+//!   `--live` lookups, every pinned line byte for byte.
 //! - Upgrade on commit: a v1 copy with nothing to do stays at version 1; with
 //!   one new file it commits at version 2, says so, records per-row-group
 //!   rows and bytes and per-column bytes equal to the files' footers, and
@@ -49,9 +60,10 @@ use parquet::file::reader::{FileReader, SerializedFileReader};
 use serde_json::Value;
 
 // A version constant that moves needs a new fixture directory written by
-// the new binary, and a test here that reads it.
+// the new binary, and a test here that reads it: record version 4 is
+// `fixtures/format-v4/`.
 const _: () = assert!(
-    STORAGE_VERSION == 2 && RECORD_VERSION == 3 && ENCODING_VERSION == 1,
+    STORAGE_VERSION == 2 && RECORD_VERSION == 4 && ENCODING_VERSION == 1,
     "a format version moved: add fixtures/format-<next>/ and read it in format_compat.rs"
 );
 
@@ -121,8 +133,17 @@ impl Restored {
             .unwrap()
             .to_string();
         let data = Path::new(&root).join("data");
-        copy_tree(&corpus().join("data"), &data, true);
-        copy_tree(&corpus().join("extra"), &data, true);
+        // The corpus folder the fixture indexes: `format-corpus/` itself
+        // (its `data/` and `extra/`), or the folder `corpus` names
+        // (`live/` for the record version 4 fixture).
+        let source = expected
+            .get("corpus")
+            .and_then(Value::as_str)
+            .map_or_else(corpus, |c| corpus().join(c));
+        copy_tree(&source.join("data"), &data, true);
+        if source.join("extra").is_dir() {
+            copy_tree(&source.join("extra"), &data, true);
+        }
         let index = data.join(".bellwether");
         copy_tree(&dir.join("index"), &index, false);
         let mut indexes = vec![index];
@@ -221,22 +242,38 @@ fn ok(r: &Restored, args: &[String]) -> String {
 }
 
 /// `want` (a pinned line, substituted) against `got`, byte for byte. A plan
-/// line carries the Evidence this binary wrote: its hash must be the hash of
-/// its record, and stands in for the pinned one; `upgrade` maps a record
-/// version 2 Evidence to the version 3 this binary writes.
-fn same_line(want: &str, got: &str, upgrade: bool, what: &str) {
+/// line carries the Evidence this binary wrote just now, a new record and
+/// not one of the fixture's: it is written at this build's record version,
+/// so its `record_version` and with it its hash are all that may differ
+/// from the pinned line. The pinned Evidence must be at `from` (the record
+/// version the fixture's binary wrote), the new one at [`RECORD_VERSION`]
+/// with its hash the hash of its record; every other byte is the pinned
+/// one. The fixture's persisted records are never mapped: `chain` checks
+/// them byte for byte.
+fn same_line(want: &str, got: &str, from: u32, what: &str) {
     let mut want = want.to_string();
     let got_v: Value = serde_json::from_str(got).unwrap();
     if let Some(ev) = got_v.get("evidence") {
         let record: Record = serde_json::from_value(ev["record"].clone()).unwrap();
+        assert_eq!(
+            record.record_version(),
+            RECORD_VERSION,
+            "{what}: new evidence"
+        );
         let hash = Hash::of_record(&record).unwrap().to_hex();
         assert_eq!(ev["hash"].as_str().unwrap(), hash, "{what}: evidence hash");
         let want_v: Value = serde_json::from_str(&want).unwrap();
+        assert_eq!(
+            want_v["evidence"]["record"]["record_version"], from,
+            "{what}: the pinned evidence's record version"
+        );
         let old = want_v["evidence"]["hash"].as_str().unwrap().to_string();
         want = want.replace(&old, &hash);
-        if upgrade {
+        if from != RECORD_VERSION {
+            let pinned = format!(r#""record":"evidence","record_version":{from},"#);
+            assert_eq!(want.matches(&pinned).count(), 1, "{what}: {want}");
             want = want.replace(
-                r#""record":"evidence","record_version":2,"#,
+                &pinned,
                 &format!(r#""record":"evidence","record_version":{RECORD_VERSION},"#),
             );
         }
@@ -247,8 +284,9 @@ fn same_line(want: &str, got: &str, upgrade: bool, what: &str) {
     );
 }
 
-/// Every pinned lookup, replayed and compared; returns how many.
-fn pinned_lookups(r: &Restored, upgrade: bool, extra: &[&str]) -> usize {
+/// Every pinned lookup, replayed and compared (the pinned plan Evidence at
+/// record version `from`); returns how many.
+fn pinned_lookups(r: &Restored, from: u32, extra: &[&str]) -> usize {
     let lookups = r.expected["lookups"].as_array().unwrap();
     for l in lookups {
         let mut args = vec!["--json".to_string()];
@@ -267,7 +305,7 @@ fn pinned_lookups(r: &Restored, upgrade: bool, extra: &[&str]) -> usize {
         let got: Vec<&str> = got.lines().collect();
         assert_eq!(got.len(), want.len(), "{args:?}");
         for (w, g) in want.iter().zip(got) {
-            same_line(w, g, upgrade, &args.join(" "));
+            same_line(w, g, from, &args.join(" "));
         }
     }
     lookups.len()
@@ -275,9 +313,10 @@ fn pinned_lookups(r: &Restored, upgrade: bool, extra: &[&str]) -> usize {
 
 /// The receipt chain: `receipt show` prints the pinned text, every ledger
 /// record is named by its hash and parses, and the pinned records are all
-/// there: exactly them when `exact` (before any command that records
-/// evidence), among later ones otherwise.
-fn chain(r: &Restored, exact: bool) {
+/// there, each at record version `from` (the fixture's): exactly them when
+/// `exact` (before any command that records evidence), among later ones
+/// otherwise, every later one written at this build's [`RECORD_VERSION`].
+fn chain(r: &Restored, exact: bool, from: u32) {
     let receipt = r.expected["receipt"].as_str().unwrap();
     let text = ok(
         r,
@@ -297,14 +336,14 @@ fn chain(r: &Restored, exact: bool) {
     );
     assert!(text.contains("every link present"), "{text}");
     let ledger = r.data.join(".bellwether/ledger");
-    let mut names: Vec<String> = Vec::new();
+    let mut names: Vec<(String, u32)> = Vec::new();
     for e in std::fs::read_dir(&ledger).unwrap() {
         let p = e.unwrap().path();
         let bytes = std::fs::read(&p).unwrap();
         let name = p.file_stem().unwrap().to_str().unwrap().to_string();
         assert_eq!(Hash::of(&bytes).to_hex(), name, "{}", p.display());
-        let _: Record = serde_json::from_slice(&bytes).unwrap();
-        names.push(name);
+        let record: Record = serde_json::from_slice(&bytes).unwrap();
+        names.push((name, record.record_version()));
     }
     names.sort();
     let want: Vec<String> = r.expected["records"]
@@ -313,17 +352,24 @@ fn chain(r: &Restored, exact: bool) {
         .iter()
         .map(|v| v.as_str().unwrap().to_string())
         .collect();
-    if exact {
-        assert_eq!(names, want);
-    } else {
-        for w in &want {
-            assert!(names.contains(w), "pinned record {w} is gone");
-        }
+    for (name, version) in &names {
+        let pinned = want.contains(name);
+        assert!(pinned || !exact, "record {name} is not pinned");
+        let at = if pinned { from } else { RECORD_VERSION };
+        assert_eq!(*version, at, "record {name} (pinned: {pinned})");
     }
-    for key in ["proposal", "receipt", "failing_certificate"] {
-        let h = r.expected[key].as_str().unwrap();
+    for w in &want {
         assert!(
-            names.iter().any(|n| n == h),
+            names.iter().any(|(n, _)| n == w),
+            "pinned record {w} is gone"
+        );
+    }
+    for key in ["proposal", "receipt", "failing_certificate", "certificate"] {
+        let Some(h) = r.expected.get(key).and_then(Value::as_str) else {
+            continue;
+        };
+        assert!(
+            names.iter().any(|(n, _)| n == h),
             "{key} {h} is not in the ledger"
         );
     }
@@ -333,9 +379,9 @@ fn chain(r: &Restored, exact: bool) {
 fn the_storage_version_1_fixture_reads_as_it_was_written() {
     let r = Restored::new("format-v1");
     assert_eq!(r.manifest()["storage_version"], 1);
-    chain(&r, true);
-    assert_eq!(pinned_lookups(&r, true, &[]), 9);
-    chain(&r, false);
+    chain(&r, true, 2);
+    assert_eq!(pinned_lookups(&r, 2, &[]), 9);
+    chain(&r, false, 2);
     // Reading changed nothing: still version 1.
     assert_eq!(r.manifest()["storage_version"], 1);
 }
@@ -343,16 +389,21 @@ fn the_storage_version_1_fixture_reads_as_it_was_written() {
 /// A storage version 2 fixture: every file carries the row-group arrays,
 /// the ledger chain reads as pinned, and every pinned lookup (`lookups` of
 /// them, `counts` of which are `count`s) replays byte for byte.
-fn storage_version_2(fixture: &str, lookups: usize, counts: usize) -> Restored {
+fn storage_version_2(
+    fixture: &str,
+    record_version: u32,
+    lookups: usize,
+    counts: usize,
+) -> Restored {
     let r = Restored::new(fixture);
     let m = r.manifest();
     assert_eq!(m["storage_version"], 2);
     for f in m["rowgroup_space"]["files"].as_array().unwrap() {
         assert!(f.get("rowgroup_bytes").is_some(), "{f}");
     }
-    chain(&r, true);
-    assert_eq!(pinned_lookups(&r, false, &[]), lookups);
-    chain(&r, false);
+    chain(&r, true, record_version);
+    assert_eq!(pinned_lookups(&r, record_version, &[]), lookups);
+    chain(&r, false, record_version);
     let pinned: Vec<String> = r.expected["lookups"]
         .as_array()
         .unwrap()
@@ -374,7 +425,7 @@ fn storage_version_2(fixture: &str, lookups: usize, counts: usize) -> Restored {
 
 #[test]
 fn the_pre_m5_storage_version_2_fixture_reads_byte_for_byte() {
-    let r = storage_version_2("format-v0.1-pre", 12, 2);
+    let r = storage_version_2("format-v0.1-pre", 3, 12, 2);
     // Its time bounds and bitemporal versions are storage version 1
     // sidecars, read as they were written.
     let m = r.manifest();
@@ -393,7 +444,7 @@ fn the_pre_m5_storage_version_2_fixture_reads_byte_for_byte() {
 /// them otherwise must still read these).
 #[test]
 fn the_m5_fixture_reads_byte_for_byte() {
-    let r = storage_version_2("format-v0.1", 15, 3);
+    let r = storage_version_2("format-v0.1", 3, 15, 3);
     let m = r.manifest();
     assert!(m["schema"].get("sidecars").is_none(), "{}", m["schema"]);
     for c in m["schema"]["columns"].as_array().unwrap() {
@@ -445,6 +496,78 @@ fn the_m5_fixture_reads_byte_for_byte() {
     );
 }
 
+/// The record version 4 fixture (storage version 2 unchanged): an index of
+/// `format-corpus/live/` with a tombstone on a bitemporal key, and a live
+/// chain in its ledger, every record at version 4. `why --latest-by ts
+/// --tombstone void` recorded a workload of live runs, `propose` a key spec
+/// with a tombstone, `fix --verify-only` a certificate whose row filter
+/// ends in `live`, `fix --certificate` the receipt. Every pinned lookup
+/// (`--live` and not, temporal and bitemporal) replays byte for byte; the
+/// manifest holds the key specs without their tombstones and each tombstone
+/// as a sidecar.
+#[test]
+fn the_record_version_4_fixture_reads_byte_for_byte() {
+    let r = storage_version_2("format-v4", 4, 7, 0);
+    let m = r.manifest();
+    let identities: Vec<&str> = m["key_spec_completeness"]
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(
+        identities,
+        [
+            "exact:id",
+            "temporal2:id@valid,known",
+            "temporal:id@ts",
+            "tombstone:id@ts",
+            "tombstone:id@valid,known"
+        ]
+    );
+    assert_eq!(
+        m["schema"]["sidecars"],
+        serde_json::json!([
+            {"columns": ["id"], "kind": "tombstone", "params": {"column": "status", "value": "CANCEL"}, "time_columns": ["valid", "known"]},
+            {"columns": ["id"], "kind": "tombstone", "params": {"column": "void"}, "time_columns": ["ts"]},
+        ])
+    );
+    // The record version 4 shapes are in the chain's records.
+    let record = |key: &str| -> Value {
+        let h = r.expected[key].as_str().unwrap();
+        serde_json::from_slice(
+            &std::fs::read(r.data.join(".bellwether/ledger").join(format!("{h}.rec"))).unwrap(),
+        )
+        .unwrap()
+    };
+    assert_eq!(
+        record("proposal")["body"]["spec"],
+        serde_json::json!({"kind": "temporal", "columns": ["id"], "ts_column": "ts", "tombstone": {"column": "void"}})
+    );
+    let filter = record("certificate")["body"]["row_filter"].clone();
+    assert_eq!(
+        filter[0]["all"].as_array().unwrap().last().unwrap()["op"],
+        "live",
+        "{filter}"
+    );
+    // So is the workload's run.
+    let w = r.expected["workload"].as_str().unwrap();
+    let workload: Value = serde_json::from_slice(
+        &std::fs::read(r.data.join(format!(".bellwether/cache/{w}.bin"))).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        workload["runs"][0]["tombstone"],
+        serde_json::json!({"column": "void"})
+    );
+    // Each `--live` lookup's plan Evidence ends its residual with `live`.
+    for l in r.expected["lookups"].as_array().unwrap() {
+        let live = l["args"].as_array().unwrap().iter().any(|a| a == "--live");
+        let pinned = l["json"][0].as_str().unwrap();
+        assert_eq!(pinned.contains(r#""op":"live""#), live, "{pinned}");
+    }
+}
+
 /// Per-row-group rows and bytes and per-column bytes of every tracked file,
 /// from the file's footer with the `parquet` crate (the oracle), in the
 /// manifest's column order (0 for a column not in the file: a partition
@@ -475,7 +598,7 @@ fn u64s(v: &Value) -> Vec<u64> {
 #[test]
 fn a_storage_version_1_copy_upgrades_on_its_next_commit() {
     let r = Restored::new("format-v1");
-    chain(&r, true);
+    chain(&r, true, 2);
     let index = ["index".to_string(), path(&r.data).to_string()];
     let manifest_bytes = || std::fs::read(r.data.join(".bellwether/manifest.json")).unwrap();
 
@@ -547,8 +670,8 @@ fn a_storage_version_1_copy_upgrades_on_its_next_commit() {
 
     // Every v1 plan, pinned to the v1 sequence it was answered at, is the
     // pinned plan.
-    assert_eq!(pinned_lookups(&r, true, &["--at-manifest", "3"]), 9);
-    chain(&r, false);
+    assert_eq!(pinned_lookups(&r, 2, &["--at-manifest", "3"]), 9);
+    chain(&r, false, 2);
 }
 
 /// The pre-M5 fixture's first build with work (here a new key spec, so the
@@ -627,8 +750,8 @@ fn a_pre_m5_copy_folds_its_sidecars_on_its_next_commit() {
         let want = r.sub(l["json"][0].as_str().unwrap());
         assert_eq!(planned(&got), planned(&want), "{args:?}");
     }
-    assert_eq!(pinned_lookups(&r, false, &["--at-manifest", "3"]), 12);
-    chain(&r, false);
+    assert_eq!(pinned_lookups(&r, 3, &["--at-manifest", "3"]), 12);
+    chain(&r, false, 3);
 }
 
 /// The `index` human output over a pre-M5 index says what the fold does:

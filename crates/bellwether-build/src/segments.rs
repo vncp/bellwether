@@ -20,6 +20,7 @@ use arrow::datatypes::{DataType, Schema};
 use bellwether_core::encoding::{self, KeyColumns};
 use bellwether_core::sidecar::{self, SidecarWriter};
 use bellwether_core::sketch::{self as sketch_seg, SketchWriter};
+use bellwether_core::tombstone::Marks;
 use bellwether_core::{SegmentWriter, WriterOptions};
 use bellwether_store::{segment_path, Extra, RowGroupRange, SegmentRef, StoreExt};
 use bellwether_types::{Error, FileFingerprint, KeySpec, Result, RowGroupId, RowGroupMeta};
@@ -176,6 +177,8 @@ pub(crate) struct Written {
     pub(crate) segments: Vec<SegmentRef>,
     pub(crate) row_groups_read: u64,
     pub(crate) files_listed: u64,
+    /// Per tombstone sidecar written (B8), what its rows hold.
+    pub(crate) tombstone_rows: Vec<crate::build::TombstoneRows>,
 }
 
 /// Runs every item on a pool of `threads` workers. Each finished segment is
@@ -200,7 +203,30 @@ pub(crate) fn write_all<S: StoreExt + ?Sized>(
         written.segments.extend(out.segments);
         written.row_groups_read += out.row_groups_read;
         written.files_listed += out.files_listed;
+        for (plan, marks) in out.marks {
+            let Some(tombstone) = (match &plan.target {
+                Target::Tombstone(spec) => spec.tombstone(),
+                _ => None,
+            }) else {
+                continue;
+            };
+            match written
+                .tombstone_rows
+                .iter_mut()
+                .find(|t| t.sidecar == plan.name)
+            {
+                Some(t) => t.marks.add(marks),
+                None => written.tombstone_rows.push(crate::build::TombstoneRows {
+                    sidecar: plan.name.clone(),
+                    tombstone: tombstone.clone(),
+                    marks,
+                }),
+            }
+        }
     }
+    written
+        .tombstone_rows
+        .sort_by(|a, b| a.sidecar.cmp(&b.sidecar));
     written.segments.sort_by(|a, b| {
         (&a.key_spec, a.rowgroup_range.start).cmp(&(&b.key_spec, b.rowgroup_range.start))
     });
@@ -259,13 +285,15 @@ fn list_file<S: StoreExt + ?Sized>(ctx: &Ctx<'_, S>, fi: usize) -> Result<Curren
 }
 
 #[derive(Default)]
-struct ItemOut {
+struct ItemOut<'a> {
     segments: Vec<SegmentRef>,
     row_groups_read: u64,
     files_listed: u64,
+    /// Per tombstone sidecar (B8), its writers' counts.
+    marks: Vec<(&'a SpecPlan, Marks)>,
 }
 
-fn process_item<S: StoreExt + ?Sized>(ctx: &Ctx<'_, S>, item: &Item) -> Result<ItemOut> {
+fn process_item<'a, S: StoreExt + ?Sized>(ctx: &'a Ctx<'_, S>, item: &Item) -> Result<ItemOut<'a>> {
     let specs: Vec<&SpecPlan> = ctx
         .specs
         .iter()
@@ -313,12 +341,18 @@ fn process_item<S: StoreExt + ?Sized>(ctx: &Ctx<'_, S>, item: &Item) -> Result<I
         }
     }
     for w in writers {
-        out.segments.extend(w.finish(ctx)?);
+        let plan = w.plan;
+        let (segments, marks) = w.finish(ctx)?;
+        out.segments.extend(segments);
+        if let Some(m) = marks {
+            out.marks.push((plan, m));
+        }
     }
     Ok(out)
 }
 
 /// An open segment writer: a key spec's, a sidecar's, or a sketch's.
+#[allow(clippy::large_enum_variant)] // one per open segment, never in bulk
 enum AnyWriter {
     Key(SegmentWriter),
     Sidecar(SidecarWriter),
@@ -334,6 +368,8 @@ struct SpecWriter<'a> {
     keys: u64,
     bytes: u64,
     done: Vec<SegmentRef>,
+    /// A tombstone sidecar's (B8) counts over its finished writers.
+    marks: Option<Marks>,
 }
 
 impl<'a> SpecWriter<'a> {
@@ -346,6 +382,7 @@ impl<'a> SpecWriter<'a> {
             keys: 0,
             bytes: 0,
             done: Vec::new(),
+            marks: None,
         }
     }
 
@@ -395,11 +432,15 @@ impl<'a> SpecWriter<'a> {
                 self.keys = 0;
                 self.bytes = 0;
                 slot.insert(match &self.plan.target {
-                    Target::Key(spec) => AnyWriter::Key(SegmentWriter::for_dataset(
-                        spec.clone(),
-                        ctx.schema,
-                        WriterOptions::default(),
-                    )?),
+                    // A spec with its tombstone names the `keyed_tombstone`
+                    // layout (core's `Layout::for_spec`).
+                    Target::Key(spec) | Target::Tombstone(spec) => {
+                        AnyWriter::Key(SegmentWriter::for_dataset(
+                            spec.clone(),
+                            ctx.schema,
+                            WriterOptions::default(),
+                        )?)
+                    }
                     Target::Sidecar(def) => {
                         AnyWriter::Sidecar(SidecarWriter::for_dataset(def.clone(), ctx.schema)?)
                     }
@@ -441,6 +482,9 @@ impl<'a> SpecWriter<'a> {
         let range = RowGroupId(self.start)..RowGroupId(self.end);
         let (id, body) = match writer {
             AnyWriter::Key(mut w) => {
+                if let Some(m) = w.tombstone_marks() {
+                    self.marks.get_or_insert_with(Marks::default).add(m);
+                }
                 w.set_rowgroup_range(range)?;
                 let seg = w.finish()?;
                 (seg.id, seg.bytes)
@@ -471,9 +515,14 @@ impl<'a> SpecWriter<'a> {
         Ok(())
     }
 
-    fn finish<S: StoreExt + ?Sized>(mut self, ctx: &Ctx<'_, S>) -> Result<Vec<SegmentRef>> {
+    /// Flushes the open segment: every segment written, and for a tombstone
+    /// sidecar (B8) what its rows hold.
+    fn finish<S: StoreExt + ?Sized>(
+        mut self,
+        ctx: &Ctx<'_, S>,
+    ) -> Result<(Vec<SegmentRef>, Option<Marks>)> {
         self.flush(ctx)?;
-        Ok(self.done)
+        Ok((self.done, self.marks))
     }
 }
 
@@ -510,11 +559,36 @@ pub(crate) fn measure(plan: &SpecPlan, batch: &RecordBatch) -> Result<(u64, u64)
             &bounds_records
         }
         Target::Sketch(spec) => return Ok((1, sketch_seg::max_entry_bytes(spec))),
+        // A tombstone sidecar (B8): one liveness entry per distinct key of
+        // the row group, its key bytes plus 17 (33 with two clocks).
+        Target::Tombstone(spec) => {
+            let cols = spec
+                .columns()
+                .iter()
+                .map(|c| {
+                    batch
+                        .column_by_name(c)
+                        .cloned()
+                        .ok_or_else(|| Error::KeySpec(format!("column {c} not in batch")))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let keys = KeyColumns::new(&cols, &plan.key_types)?;
+            let per = 16 * u64::from(bellwether_core::tombstone::clocks(spec)) + 1;
+            let (mut seen, mut bytes, mut buf) = (HashSet::new(), 0u64, Vec::new());
+            for row in 0..batch.num_rows() {
+                if keys.encode_into(row, &mut buf)? && !seen.contains(buf.as_slice()) {
+                    bytes += buf.len() as u64 + per;
+                    seen.insert(buf.clone());
+                }
+            }
+            return Ok((seen.len() as u64, bytes));
+        }
     };
     if let KeySpec::Bitemporal {
         columns,
         valid_column,
         known_column,
+        ..
     } = spec
     {
         // The bitemporal layout's records are the temporal2 sidecar's.
@@ -790,6 +864,7 @@ mod tests {
                 columns: vec!["id".into()],
                 ts_column: "ts".into(),
                 counts: false,
+                tombstone: None,
             },
             &schema,
         );

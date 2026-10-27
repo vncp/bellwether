@@ -44,11 +44,13 @@ fn a_changed_fpr_or_ts_column_is_a_miss() {
         columns: cols(&["k_i64"]),
         ts_column: "ts".into(),
         counts: false,
+        tombstone: None,
     };
     let t2 = KeySpec::Temporal {
         columns: cols(&["k_i64"]),
         ts_column: "k_u32".into(),
         counts: false,
+        tombstone: None,
     };
     assert_eq!(t1.name(), t2.name());
     let a = r.transient(&t1).unwrap();

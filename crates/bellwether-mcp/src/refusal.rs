@@ -441,6 +441,18 @@ fn typed_next(e: &Error) -> Option<String> {
                  call the tool again"
             ))
         }
+        // A tombstone (B8) priced without the time column ordering versions.
+        Error::KeySpec(m) if m.contains("MCP score.why: latest_by") => Some(
+            "pass `latest_by` (the time column that orders versions) with `tombstone`, or \
+             `valid_by` and `known_by` for a bitemporal lookup, then call score.why again"
+                .into(),
+        ),
+        // A spec refusal whose step is an index build names the command.
+        Error::KeySpec(m) if m.contains("`bellwether index ") => Some(
+            "ask the human to run the `bellwether index` command the message gives, then call \
+             the tool again"
+                .into(),
+        ),
         Error::InvalidArgument { field, .. } => Some(format!(
             "fix `{field}` as the message says, then call the tool again (with `wait: true` if \
              the arguments themselves are unchanged)"

@@ -171,6 +171,7 @@ fn the_fold_refuses_segments_of_other_specs_or_recorded_types() {
         columns: vec!["id".into(), "tag".into()],
         ts_column: "updated_at".into(),
         counts: false,
+        tombstone: None,
     };
     let mixed = [one(common::temporal()), one(other)];
     assert!(temporal::latest(&mixed, &[&k]).is_err());

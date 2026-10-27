@@ -85,6 +85,11 @@ pub enum Layout {
     /// As `Keyed`, and each key's value also carries its distinct
     /// `(valid, known, row group)` triples. Bitemporal (`temporal2`).
     Bitemporal,
+    /// As `Keyed`, each key's value one liveness entry per row group
+    /// holding a timed row of the key: the newest time there, the newest
+    /// time of a live row, and whether the newest row is a tombstone. The
+    /// `tombstone` sidecar of a temporal or bitemporal key (B8).
+    KeyedTombstone,
     /// As `Keyed`, and each key's value also carries one aggregate cell per
     /// row group holding it (`crate::agg`). Agg (B7).
     KeyedAgg,
@@ -102,6 +107,14 @@ impl Layout {
             KeySpec::Exact { .. } | KeySpec::Text { bloom: None, .. } | KeySpec::List { .. } => {
                 Self::Keyed
             }
+            // A spec with a tombstone names its tombstone segments; its own
+            // segments are written under the spec without it.
+            KeySpec::Temporal {
+                tombstone: Some(_), ..
+            }
+            | KeySpec::Bitemporal {
+                tombstone: Some(_), ..
+            } => Self::KeyedTombstone,
             KeySpec::Temporal { .. } => Self::KeyedTemporal,
             KeySpec::Bloom { .. } | KeySpec::Text { bloom: Some(_), .. } => Self::BloomPerRowGroup,
             KeySpec::Range { .. } => Self::MinMax,
@@ -121,12 +134,16 @@ impl Layout {
     }
 
     /// Whether the layout stores keys with value records (`keyed`,
-    /// `keyed_temporal`, `bitemporal`, `keyed_agg`).
+    /// `keyed_temporal`, `bitemporal`, `keyed_agg`, `keyed_tombstone`).
     #[must_use]
     pub fn is_keyed(self) -> bool {
         matches!(
             self,
-            Self::Keyed | Self::KeyedTemporal | Self::Bitemporal | Self::KeyedAgg
+            Self::Keyed
+                | Self::KeyedTemporal
+                | Self::Bitemporal
+                | Self::KeyedAgg
+                | Self::KeyedTombstone
         )
     }
 }
@@ -146,6 +163,9 @@ pub struct ValueShape {
     pub chain: bool,
     /// The `(valid, known, row group)` triples (bitemporal).
     pub triples: bool,
+    /// The clocks of a tombstone segment's liveness entries (B8): 1 for a
+    /// temporal key's, 2 for a bitemporal key's; 0 for every other segment.
+    pub clocks: u8,
     /// One aggregate cell per row group of the bitmap, holding what the agg
     /// key's functions need (agg, B7).
     pub agg: Option<crate::agg::CellShape>,
@@ -153,12 +173,23 @@ pub struct ValueShape {
 
 impl ValueShape {
     /// The value record shape of `spec`'s segments in `layout`: a bloom's
-    /// `bounds` segment (`keyed`) holds `bitmap | bounds`.
+    /// `bounds` segment (`keyed`) holds `bitmap | bounds`, a tombstone
+    /// segment `bitmap | liveness` (never counts).
     #[must_use]
     pub fn of(spec: &KeySpec, layout: Layout) -> Self {
         if layout == Layout::Keyed && bloom_bounds_column(spec).is_some() {
             return Self {
                 bounds: true,
+                ..Self::default()
+            };
+        }
+        if layout == Layout::KeyedTombstone {
+            return Self {
+                clocks: if matches!(spec, KeySpec::Bitemporal { .. }) {
+                    2
+                } else {
+                    1
+                },
                 ..Self::default()
             };
         }
@@ -173,6 +204,7 @@ impl ValueShape {
             ),
             chain: layout == Layout::KeyedTemporal,
             triples: layout == Layout::Bitemporal,
+            clocks: 0,
             agg: (layout == Layout::KeyedAgg)
                 .then(|| crate::agg::CellShape::of(crate::agg::functions(spec))),
         }
@@ -637,6 +669,12 @@ pub struct SegmentHeader {
     /// `key_types` records the left's; present together with `key_types`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub right_key_types: Option<Vec<ColumnType>>,
+    /// For a tombstone segment (B8, `keyed_tombstone`) only: the tombstone
+    /// column's dataset type, recorded together with `key_types`, so a
+    /// segment whose column changed type is refused, never compared with
+    /// a value encoded under another type.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tombstone_type: Option<ColumnType>,
     /// For an agg key (and only an agg key) written from a dataset schema:
     /// the value column's dataset type, which its cells were encoded and
     /// summed at (a decimal's scale is not visible in the bytes). Recorded
@@ -673,6 +711,7 @@ impl SegmentHeader {
             right_sequence: None,
             right_manifest: None,
             right_key_types: None,
+            tombstone_type: None,
             value_type: None,
             extra: serde_json::Map::new(),
         }
@@ -845,6 +884,24 @@ impl SegmentHeader {
             return Err(corrupt(
                 "left_sequence, left_live, right_sequence, right_manifest or right_key_types on a \
                  segment that is not a join key",
+            ));
+        }
+        // A tombstone segment records its column's type exactly when it
+        // records key types; no other segment records one.
+        if self.layout == Layout::KeyedTombstone {
+            if self.storage_version < 2 {
+                return Err(corrupt(
+                    "a tombstone segment is a storage version 2 kind; version 1 has none",
+                ));
+            }
+            if self.tombstone_type.is_some() != self.key_types.is_some() {
+                return Err(corrupt(
+                    "tombstone_type is recorded exactly when key_types is",
+                ));
+            }
+        } else if self.tombstone_type.is_some() {
+            return Err(corrupt(
+                "tombstone_type on a segment that is not a tombstone segment",
             ));
         }
         // An expr key's header carries its expression and conformance

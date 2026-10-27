@@ -1,0 +1,1 @@
+{"format":"bellwether-replay-workload/1","encoding_version":1,"runs":[{"run_id":"keys","template":"columns(id)","query_kind":"latest","columns":["id"],"key_types":[{"type":"int64"}],"keys":7,"null_tuples":0,"key_set":"6331deffc1ff18c18682d0333f21ef4193e8894513085a4aa9e369baa15cd70c","tombstone":{"column":"void"}}]}

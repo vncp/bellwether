@@ -37,6 +37,10 @@
 //! - [`agg`] writes the ledger corpus for agg keys (B7): decimal amounts at
 //!   scale 6 over skewed accounts with null amounts, per-key sum runs of 10,
 //!   10^3, and 10^5 accounts, and exact per-run sums (`scripts/agg-funnels.py`).
+//! - [`tombstone`] writes the corpora for tombstones (B8) in both shapes
+//!   (the ledger with voids, market prints with retractions): rows in time
+//!   order, `latest`/`asof` runs of 10, 10^3, and 10^5 keys, and exact
+//!   per-run truth (`scripts/tombstone-funnels.py`).
 
 #![forbid(unsafe_code)]
 // Benchmark arithmetic converts freely between counts, sizes, and floating
@@ -74,6 +78,7 @@ pub mod results;
 pub mod slo;
 pub mod stats;
 pub mod text;
+pub mod tombstone;
 pub mod truth;
 pub mod workload;
 

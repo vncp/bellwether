@@ -113,6 +113,10 @@ pub struct BuildStats {
     /// Rows whose key is not indexed because its leading column is null
     /// (ADR 014); for an `expr` key, rows whose expression is null.
     pub null_rows: u64,
+    /// For a spec with a tombstone (B8): what its tombstone column holds
+    /// over the timed rows read (tombstones, nulls; core's
+    /// `tombstone::Marks`). `None` for any other spec.
+    pub tombstone_marks: Option<bellwether_core::tombstone::Marks>,
 }
 
 /// A hypothetical spec's segments over every live row group of one catalog.
@@ -124,6 +128,9 @@ pub struct TransientIndex {
     /// For a bloom with per-key bounds, its `bounds` segments, one per key
     /// segment, over the same row groups.
     bounds: Vec<Bytes>,
+    /// For a spec with a tombstone (B8), its tombstone segments, one per key
+    /// segment, over the same row groups.
+    tombstones: Vec<Bytes>,
     /// First and last row group each segment's writer processed.
     ranges: Vec<(RowGroupId, RowGroupId)>,
     stats: BuildStats,
@@ -150,6 +157,7 @@ pub(crate) fn timed_def(spec: &KeySpec) -> Option<SidecarDef> {
             columns,
             valid_column,
             known_column,
+            ..
         } => Some(SidecarDef {
             kind: SidecarKind::Bitemporal,
             columns: columns.clone(),
@@ -181,7 +189,32 @@ pub(crate) fn measure(
 ) -> Result<(u64, u64)> {
     // A bitemporal spec's records are the `temporal2` sidecar's; a bloom
     // with bounds adds its `bounds` segment's (`bitmap | bounds` per key,
-    // a key and 16 bytes per row group holding it) to its filter's.
+    // a key and 16 bytes per row group holding it) to its filter's; a spec
+    // with a tombstone (B8) adds its tombstone segment's (a key and 17
+    // bytes, 33 with two clocks, per distinct key of the row group).
+    if spec.tombstone().is_some() {
+        let (k, own) = measure(&spec.without_tombstone(), keys, ts, time, batch)?;
+        let cols = spec
+            .columns()
+            .iter()
+            .map(|c| {
+                batch
+                    .column_by_name(c)
+                    .cloned()
+                    .ok_or_else(|| Error::KeySpec(format!("column {c} not in batch")))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let kc = KeyColumns::new(&cols, keys)?;
+        let per = 16 * u64::from(bellwether_core::tombstone::clocks(spec)) + 1;
+        let (mut seen, mut extra, mut buf) = (HashSet::new(), 0u64, Vec::new());
+        for row in 0..batch.num_rows() {
+            if kc.encode_into(row, &mut buf)? && !seen.contains(buf.as_slice()) {
+                extra += buf.len() as u64 + per;
+                seen.insert(buf.clone());
+            }
+        }
+        return Ok((k, own + extra));
+    }
     let bounds_bytes = match timed_def(spec) {
         Some(def) if def.kind == SidecarKind::Bitemporal => {
             return sidecar::measure(&def, keys, time, batch);
@@ -342,6 +375,9 @@ impl TransientIndex {
         if let Some(def) = &bounds_def {
             times.extend(def.time_columns.iter().cloned());
         }
+        if let Some(t) = spec.tombstone() {
+            times.push(t.column.clone());
+        }
         for c in times {
             if !columns.contains(&c) {
                 columns.push(c);
@@ -358,16 +394,22 @@ impl TransientIndex {
             },
             readers: Vec::new(),
             bounds: Vec::new(),
+            tombstones: Vec::new(),
             ranges: Vec::new(),
         };
-        let mut writer = SegmentWriter::for_dataset(spec.clone(), schema, opts.clone())?;
+        // A spec with a tombstone (B8) writes its own segments as the spec
+        // without it, and its tombstone segments beside them.
+        let own = spec.without_tombstone();
+        let mut writer = SegmentWriter::for_dataset(own.clone(), schema, opts.clone())?;
         let new_bounds = || -> Result<Option<SegmentWriter>> {
-            bounds_def
-                .as_ref()
-                .map(|_| {
-                    SegmentWriter::bloom_bounds_for_dataset(spec.clone(), schema, opts.clone())
-                })
-                .transpose()
+            if bounds_def.is_some() {
+                return SegmentWriter::bloom_bounds_for_dataset(spec.clone(), schema, opts.clone())
+                    .map(Some);
+            }
+            if spec.tombstone().is_some() {
+                return SegmentWriter::for_dataset(spec.clone(), schema, opts.clone()).map(Some);
+            }
+            Ok(None)
         };
         let mut bounds_writer = new_bounds()?;
         let (mut open_rows, mut open_bytes) = (0u64, 0u64);
@@ -390,7 +432,7 @@ impl TransientIndex {
             if let (true, Some(range)) = (cut, open) {
                 let full = std::mem::replace(
                     &mut writer,
-                    SegmentWriter::for_dataset(spec.clone(), schema, opts.clone())?,
+                    SegmentWriter::for_dataset(own.clone(), schema, opts.clone())?,
                 );
                 let full_bounds = std::mem::replace(&mut bounds_writer, new_bounds()?);
                 build.finish(full, full_bounds, range, open_rows, open_bytes)?;
@@ -435,14 +477,24 @@ impl TransientIndex {
             stats,
             readers,
             bounds,
+            tombstones,
             ranges,
             ..
         } = build;
+        let tombstone_readers = tombstones
+            .iter()
+            .map(|b| SegmentReader::open_for_dataset(SegmentBytes::Memory(b.clone()), schema))
+            .collect::<Result<Vec<_>>>()?;
         Ok(Self {
             manifest_version: catalog.manifest_version().to_string(),
             catalog_digest: catalog.digest(),
-            segments: Arc::new(SpecSegments::new(spec.clone(), readers)?),
+            segments: Arc::new(SpecSegments::with_tombstones(
+                spec.clone(),
+                readers,
+                tombstone_readers,
+            )?),
             bounds,
+            tombstones,
             ranges,
             stats,
         })
@@ -550,6 +602,31 @@ impl TransientIndex {
         &self.bounds
     }
 
+    /// For a temporal or bitemporal spec with a tombstone (B8), the raw
+    /// bytes of its tombstone segments (one per key segment, over the same
+    /// row groups), as the build crate's `Planner::plan_with_transient`
+    /// takes them; empty for every other spec.
+    #[must_use]
+    pub fn tombstone_bytes(&self) -> &[Bytes] {
+        &self.tombstones
+    }
+
+    /// For a spec with a tombstone (B8): how many keys have a newest row
+    /// that is a tombstone, over every row group this index covers (core's
+    /// `tombstone::newest_tombstones`). Exact. `None` for any other spec.
+    pub fn newest_tombstones(
+        &self,
+    ) -> Result<Option<bellwether_core::tombstone::NewestTombstones>> {
+        if self.spec().tombstone().is_none() {
+            return Ok(None);
+        }
+        bellwether_core::tombstone::newest_tombstones(
+            self.segments.tombstone_readers(),
+            &self.covered(),
+        )
+        .map(Some)
+    }
+
     /// For an exact or temporal spec: each probe key's row groups, unioned
     /// across segments. Keys absent from the index are absent from the map.
     pub fn get(
@@ -575,18 +652,20 @@ struct Build<'a> {
     stats: BuildStats,
     readers: Vec<SegmentReader<SegmentBytes>>,
     bounds: Vec<Bytes>,
+    tombstones: Vec<Bytes>,
     ranges: Vec<(RowGroupId, RowGroupId)>,
 }
 
 impl Build<'_> {
-    /// Finishes one writer (and the `bounds` segment writer beside it, for
-    /// a bloom with bounds) that processed the row groups `range` (first
-    /// and last), took `rows` rows and `key_bytes` accounted key bytes,
-    /// enforcing the index byte cap before keeping the segment.
+    /// Finishes one writer (and the segment writer beside it: a bloom with
+    /// bounds' `bounds` segment, or a spec with a tombstone's tombstone
+    /// segment, B8) that processed the row groups `range` (first and last),
+    /// took `rows` rows and `key_bytes` accounted key bytes, enforcing the
+    /// index byte cap before keeping the segment.
     fn finish(
         &mut self,
         mut writer: SegmentWriter,
-        bounds: Option<SegmentWriter>,
+        side: Option<SegmentWriter>,
         range: (RowGroupId, RowGroupId),
         rows: u64,
         key_bytes: u64,
@@ -595,11 +674,21 @@ impl Build<'_> {
         // it claims coverage of exactly them and two key-less segments over
         // different row groups never share bytes (docs/format.md).
         let processed = range.0..RowGroupId(range.1 .0 + 1);
-        if let Some(mut w) = bounds {
+        if let Some(mut w) = side {
+            if let Some(m) = w.tombstone_marks() {
+                self.stats
+                    .tombstone_marks
+                    .get_or_insert_with(Default::default)
+                    .add(m);
+            }
             w.set_rowgroup_range(processed.clone())?;
             let seg = w.finish()?;
             self.stats.bytes += seg.bytes.len() as u64;
-            self.bounds.push(Bytes::from(seg.bytes));
+            if self.spec.tombstone().is_some() {
+                self.tombstones.push(Bytes::from(seg.bytes));
+            } else {
+                self.bounds.push(Bytes::from(seg.bytes));
+            }
         }
         writer.set_rowgroup_range(processed)?;
         let seg = writer.finish()?;

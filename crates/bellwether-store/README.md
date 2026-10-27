@@ -111,6 +111,10 @@ These `object_store` errors map to `Error::VersionConflict`:
 
 `agg` is a key-spec kind (`key_spec_fields`: `kind`, `columns`, `value`, `functions`), admitted by storage version 2: declared in `schema.key_specs`, its segments ordinary key-spec segments named by the identity `agg:<columns>@<value>{<functions>}`. A build that predates the kind refuses such a manifest with the typed unknown-kind error, never by dropping the declaration on a rewrite.
 
+### Tombstones (B8)
+
+A tombstone is not a key-spec field in a manifest: `schema.key_specs` holds the temporal or bitemporal spec without it, and a key spec carrying `tombstone` is refused. It is declared in `schema.sidecars[]` as `{kind: "tombstone", columns, time_columns, params: {column, value?}}`, its segments listed with `kind: "tombstone"` (`KNOWN_SEGMENT_KINDS`). That is ADR 028's additive sidecar kind: a binary that predates it (M5, e1bd168, included) opens the manifest, keeps the declaration and the segments on every rewrite, and never counts them toward coverage (`crates/bellwether-cli/tests/tombstone_old_binary.rs` runs that binary).
+
 ## Commit protocol
 
 ```rust

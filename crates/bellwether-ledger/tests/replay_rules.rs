@@ -205,7 +205,10 @@ fn a_layout_proposal_replay_needs_a_model_and_exact_current_costs() {
     match ledger.get(&h).unwrap() {
         Record::Replay(back) => {
             assert_eq!(back, r, "inputs and model round-trip exactly");
-            assert_eq!(back.record_version, 3);
+            assert_eq!(
+                back.record_version,
+                bellwether_types::format::RECORD_VERSION
+            );
         }
         other => panic!("expected a replay, got {other:?}"),
     }

@@ -175,6 +175,18 @@ Tests (`tests/list.rs`): round trip, the pinned conformance vectors, nulls and e
 
 Tests (`tests/agg.rs`): round trip, the pinned conformance segment (`docs/format.md`), decimal rescale and its refusal, both float zeros and the compensated sum, integer overflow, refusals, merge over disjoint row groups only, an every-byte corruption sweep, and a property test of the stored cells, the combined aggregates, and `unanswered`/`cover` against a brute-force oracle over the rows written.
 
+## Tombstones (B8, `temporal:<k>@<ts>,tombstone=<col>[=<value>]`; `docs/format.md`, "Tombstones")
+
+`tombstone` holds the sidecar of a temporal or bitemporal key with a tombstone: per key, per row group holding a timed row of it, one `Liveness` entry (`newest | live | flags`: the newest time there, the newest time of a live row, and whether the newest row is a tombstone) in the `keyed_tombstone` value record, after the bitmap; the header records the tombstone column's dataset type (`tombstone_type`), checked on open.
+
+- `tombstone::Matcher::for_spec(spec, schema)` / `is_live`: the row test, the tombstone value's canonical encoding at the column's dataset type (`tombstone_bytes`; a boolean column's `true`, or `=value` converted exactly). A null tombstone column is not live (ADR 014 amendment), so the row test equals the residual's `Predicate::Live`.
+- `SegmentWriter` builds the entries one row group at a time (a row with a null leading key column or a null time is no version); `merge` interleaves a key's entries over disjoint row groups only.
+- `tombstone::liveness(readers, keys)` reads each key's entries over the listed segments, refusing two segments that both hold one (key, row group) as a corrupt index.
+- `tombstone::prune(winners, liveness)`: the pruning rule. Of a key's winning row groups at its winning time `w` (invariant 5), keep those whose live time is at or after `w` (`Liveness::keeps`); never drops a row group holding a live row at `w` (invariant 1).
+- `tombstone::newest_tombstones(readers)`: over the whole dataset, the keys with a version and those whose newest row is a tombstone (`why`'s `tombstone` column), merging the segments' sorted keys one block per segment.
+
+Tests (`tests/tombstone.rs`): round trip, the pinned conformance vectors (`docs/format.md`, "Tombstone conformance vectors"), nulls (key, time, tombstone column), a state column against the boolean form, merge over disjoint row groups only, truncation and an every-byte corruption sweep, and a property test of the entries, the dataset-wide count, and the pruning rule against a brute-force oracle over random multi-segment layouts with ties.
+
 ## Lookup cost and memory bound (ADR 018)
 
 `SegmentReader::open` holds the header and the block index, which is two keys and five integers per block of up to 1024 keys. A keyed lookup of `k` keys:

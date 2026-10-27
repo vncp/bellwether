@@ -103,6 +103,7 @@ fn temporal() -> KeySpec {
         columns: vec!["id".into()],
         ts_column: "ts".into(),
         counts: false,
+        tombstone: None,
     }
 }
 
@@ -186,6 +187,7 @@ fn a_build_listing_one_spec_keeps_the_others() {
     let latest = p.plan(
         &[temporal()],
         &Lookup::Latest {
+            live: None,
             columns: cols(&["id"]),
             keys: vec![common::enc_i64(1)],
         },

@@ -1,0 +1,1 @@
+{"record":"proposal","record_version":4,"evidence":["f71042e9a60c46769a17da7b9c1063895d170a4f5fb59e8a48f1f1e4738aa695"],"proposed_by":"engine","created_at":"2026-10-25T00:00:00.000Z","body":{"kind":"key","spec":{"kind":"temporal","columns":["id"],"ts_column":"ts"}}}

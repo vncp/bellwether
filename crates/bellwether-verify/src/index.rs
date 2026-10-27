@@ -154,7 +154,14 @@ impl<S: StoreExt + ?Sized + Send + Sync> SidePlanner for IndexPlanner<S> {
         keys: &[Vec<u8>],
     ) -> bellwether_types::Result<ScanPlan> {
         self.planner.plan(
-            self.planner.declared_specs(),
+            // A point lookup reads no tombstone (B8): every spec plans as
+            // the spec without one.
+            &self
+                .planner
+                .declared_specs()
+                .iter()
+                .map(bellwether_types::KeySpec::without_tombstone)
+                .collect::<Vec<_>>(),
             &Lookup::Keys {
                 columns: columns.to_vec(),
                 keys: keys.to_vec(),
@@ -167,17 +174,17 @@ impl<S: StoreExt + ?Sized + Send + Sync> SidePlanner for IndexPlanner<S> {
         key_columns: &[String],
         value: &str,
     ) -> bellwether_types::Result<Option<Box<dyn AggTotals + '_>>> {
-        let spec = self.planner.declared_specs().iter().find(|s| {
+        let spec = self.planner.declared_specs().into_iter().find(|s| {
             matches!(s, KeySpec::Agg { columns, value: v, functions }
                 if columns.as_slice() == key_columns
                     && v == value
                     && functions.contains(&AggregateFn::Sum))
                 && self.planner.completeness(s).is_some()
         });
-        Ok(spec.map(|s| {
+        Ok(spec.map(|spec| {
             Box::new(IndexAggTotals {
                 planner: &self.planner,
-                spec: s.clone(),
+                spec,
             }) as Box<dyn AggTotals + '_>
         }))
     }

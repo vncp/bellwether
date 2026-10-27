@@ -15,7 +15,8 @@ use bytes::Bytes;
 use crate::build::Builder;
 use crate::config::{columns_to_schema, CompactOptions};
 use crate::coverage::{completeness_map, segment_of};
-use crate::target::declared_targets;
+use crate::target::{declared_key_specs, declared_targets, tombstone_name};
+use bellwether_core::tombstone::TOMBSTONE_KIND;
 
 /// What a compaction did.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -117,6 +118,21 @@ impl<S: StoreExt + ?Sized> Builder<S> {
             segs.sort_by_key(|s| (s.rowgroup_range.start, s.rowgroup_range.end, s.id));
             groups.extend(plan_groups(spec, &segs, options));
         }
+        // A tombstone sidecar's segments (B8) merge like a key spec's; their
+        // headers name the spec with its tombstone.
+        for spec in declared_key_specs(m)
+            .into_iter()
+            .filter(|s| s.tombstone().is_some())
+        {
+            let name = tombstone_name(&spec);
+            let mut segs: Vec<&SegmentRef> = m
+                .segments
+                .iter()
+                .filter(|s| segment_of(s, &name, Some(TOMBSTONE_KIND)))
+                .collect();
+            segs.sort_by_key(|s| (s.rowgroup_range.start, s.rowgroup_range.end, s.id));
+            groups.extend(plan_groups(&spec, &segs, options));
+        }
         let mut merged = Vec::with_capacity(groups.len());
         for g in &groups {
             let readers = g
@@ -158,10 +174,14 @@ impl<S: StoreExt + ?Sized> Builder<S> {
                 inputs: g.inputs.iter().map(|s| s.id).collect(),
                 output: SegmentRef {
                     id: out.id,
-                    key_spec: g.spec.identity(),
+                    key_spec: if g.spec.tombstone().is_some() {
+                        tombstone_name(&g.spec)
+                    } else {
+                        g.spec.identity()
+                    },
                     rowgroup_range: RowGroupRange::new(start, end),
                     bytes,
-                    kind: None,
+                    kind: g.spec.tombstone().map(|_| TOMBSTONE_KIND.to_string()),
                     join: None,
                     extra: Extra::new(),
                 },

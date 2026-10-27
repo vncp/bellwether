@@ -245,13 +245,11 @@ impl Pinned {
     }
 
     /// Declared specs complete at the pinned sequence, and those that are
-    /// not (ADR 012).
+    /// not (ADR 012). A spec with a tombstone (B8) whose own segments are
+    /// complete and whose tombstone sidecar is not is among the first,
+    /// without its tombstone ([`bellwether_build::Planner::usable_specs`]).
     pub fn specs(&self) -> (Vec<KeySpec>, Vec<KeySpec>) {
-        self.planner
-            .declared_specs()
-            .iter()
-            .cloned()
-            .partition(|s| self.planner.completeness(s).is_some())
+        self.planner.usable_specs()
     }
 
     pub fn policy(&self) -> Result<FingerprintPolicy> {

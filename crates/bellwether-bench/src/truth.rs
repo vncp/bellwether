@@ -817,6 +817,7 @@ fn lookback(
             columns: strings(&["entity_id"]),
             ts_column: "version_ts".into(),
             counts: false,
+            tombstone: None,
         }),
         fix_layout: None,
         versions: Some(VersionDetail {

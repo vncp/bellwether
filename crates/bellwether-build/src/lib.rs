@@ -41,13 +41,15 @@ mod target;
 mod verify;
 
 pub use bellwether_core::join::PairCaps;
-pub use build::{BuildReport, Builder, TextTablesReplaced, MAX_KEY_SPECS};
+pub use build::{BuildReport, Builder, TextTablesReplaced, TombstoneRows, MAX_KEY_SPECS};
 pub use compact::CompactReport;
 pub use config::{
     BuildObserver, BuildOptions, CompactOptions, SourceKind, DEFAULT_MAX_RESTARTS,
     DEFAULT_MAX_SEGMENT_BYTES, DEFAULT_MAX_SEGMENT_KEYS, DEFAULT_MAX_SEGMENT_ROW_GROUPS,
 };
-pub use coverage::{completeness, sidecar_completeness, sketch_completeness};
+pub use coverage::{
+    completeness, sidecar_completeness, sketch_completeness, tombstone_completeness,
+};
 pub use join::{
     join_side_spec, transient_pair, JoinRefresh, JoinState, PairBuild, RightManifest, SemiJoinPlan,
     DEFAULT_PAIR_CAPS,
@@ -56,7 +58,10 @@ pub use keys::encode_ts;
 pub use plan::{
     aggregate_answer, counting_spec, default_window_column, overlapping_counts, partition_columns,
     serving_agg, several_bitemporal_keys, AggAnswer, AggLookup, Aggregated, KeyAggregate, KeyCount,
-    Lookup, PlanOrder, Planner, TotalsVisitor, TransientSpec,
+    LiveOutcome, Lookup, PlanOrder, Planner, TotalsVisitor, TransientSpec,
 };
-pub use target::{declared_sketches, TimedSource};
+pub use target::{
+    declared_key_specs, declared_sketches, tombstone_name, unused_tombstones, TimedSource,
+    TombstoneDropped, UnusedTombstone,
+};
 pub use verify::Drift;

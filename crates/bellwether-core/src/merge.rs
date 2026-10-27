@@ -96,6 +96,7 @@ fn merged_header<R: ReadAt>(inputs: &[SegmentReader<R>]) -> Result<SegmentHeader
         if h.key_types != h0.key_types
             || h.ts_type != h0.ts_type
             || h.time_types != h0.time_types
+            || h.tombstone_type != h0.tombstone_type
             || h.value_type != h0.value_type
         {
             return Err(Error::KeySpec(format!(
@@ -122,6 +123,7 @@ fn merged_header<R: ReadAt>(inputs: &[SegmentReader<R>]) -> Result<SegmentHeader
     header.key_types.clone_from(&h0.key_types);
     header.ts_type.clone_from(&h0.ts_type);
     header.time_types.clone_from(&h0.time_types);
+    header.tombstone_type.clone_from(&h0.tombstone_type);
     header.value_type.clone_from(&h0.value_type);
     header.extra.clone_from(&h0.extra);
     Ok(header)
@@ -295,6 +297,7 @@ fn fold(value: &mut KeyValue, other: KeyValue, key: &[u8]) -> Result<()> {
         value.triples.sort_unstable();
         value.triples.dedup();
     }
+    value.liveness = fold_liveness(value, &other, key)?;
     let counts = match (value.counts.take(), other.counts) {
         (None, None) => None,
         (Some(a), Some(b)) => {
@@ -370,6 +373,37 @@ fn fold(value: &mut KeyValue, other: KeyValue, key: &[u8]) -> Result<()> {
     value.counts = counts;
     value.agg = agg;
     Ok(())
+}
+
+/// The liveness entries (B8) of `value` and `other`, a key's entries in
+/// two tombstone segments, interleaved by row group; two entries for one
+/// row group are refused (segments of one spec cover disjoint row groups).
+/// Takes `value`'s entries.
+fn fold_liveness(
+    value: &mut KeyValue,
+    other: &KeyValue,
+    key: &[u8],
+) -> Result<Option<Vec<crate::tombstone::Liveness>>> {
+    match (value.liveness.take(), &other.liveness) {
+        (None, None) => Ok(None),
+        (Some(a), Some(b)) => {
+            let mut per_rg: std::collections::BTreeMap<u32, crate::tombstone::Liveness> =
+                value.bitmap.iter().zip(a).collect();
+            for (rg, e) in other.bitmap.iter().zip(b.iter().copied()) {
+                if per_rg.insert(rg, e).is_some() {
+                    return Err(Error::Other(format!(
+                        "cannot merge tombstone segments that both hold key {} in row group \
+                         {rg}: segments of one spec cover disjoint row groups",
+                        hex(key)
+                    )));
+                }
+            }
+            Ok(Some(per_rg.into_values().collect()))
+        }
+        _ => Err(Error::Other(
+            "cannot merge a value with liveness entries with one without".into(),
+        )),
+    }
 }
 
 fn hex(b: &[u8]) -> String {
