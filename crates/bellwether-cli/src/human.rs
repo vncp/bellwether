@@ -1664,6 +1664,47 @@ pub(crate) fn why(r: &bellwether::WhyReport, out: &Out, fix_command: &str) -> St
                 row_groups,
                 values,
             } => list_layout(*least_row_groups, *row_groups, values),
+            CulpritReason::PlanShape {
+                scan,
+                keys_at,
+                above,
+                least_row_groups,
+                row_groups,
+                keys_row_groups,
+                keys_span,
+                ..
+            } => {
+                let reads = format!(
+                    "every candidate reads at least {} of the {} the plan spans, though the runs' \
+                     keys sit in {} of the {}",
+                    num(*least_row_groups),
+                    count(*row_groups, "row group", "row groups"),
+                    num(*keys_row_groups),
+                    count(*keys_span, "row group", "row groups")
+                );
+                match (keys_at, above) {
+                    (Some(k), Some(a)) => format!(
+                        "the plan's shape, not the layout or a missing index: node {} ({}) \
+                         applies the runs' keys above node {} ({}), whose output no index \
+                         narrows, so scan node {scan} reads everything it plans; {reads}; apply \
+                         the keys below node {} so a key prunes the scan",
+                        k.node, k.op, a.node, a.op, a.node
+                    ),
+                    (Some(k), None) => format!(
+                        "the plan's shape, not the layout or a missing index: node {} ({}) \
+                         applies the runs' keys but not to the rows of scan node {scan}, so that \
+                         scan reads everything it plans; {reads}; apply the keys on the scan's \
+                         own rows so a key prunes it",
+                        k.node, k.op
+                    ),
+                    (None, _) => format!(
+                        "the plan's shape, not the layout or a missing index: no node applies the \
+                         runs' keys (keys: {{\"from\": \"run\"}}), so scan node {scan} reads \
+                         everything it plans; {reads}; filter the scan's rows by the runs' keys \
+                         so a key prunes it"
+                    ),
+                }
+            }
             CulpritReason::ServingSpec { spec } => format!("the serving key {}", label(spec)),
             CulpritReason::AggAnswered { spec } => format!(
                 "none: the index answers the aggregates from {} beside its counted key; nothing \

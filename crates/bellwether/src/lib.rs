@@ -112,7 +112,7 @@ pub use twin::{
 };
 pub use why::{
     AggregateQuery, Candidate, CandidateOrigin, Culprit, CulpritReason, Dataset, DiagnosisReads,
-    LookupMode, ProfileEvidence, Recommendation, TextMatch, TimeWindow, WhyReport, WhyRequest,
-    WorkloadInfo, DEFAULT_MAX_CANDIDATES, ENGINE_PROPOSER, LAYOUT_BOUND_FRACTION,
+    LookupMode, PlanNodeName, ProfileEvidence, Recommendation, TextMatch, TimeWindow, WhyReport,
+    WhyRequest, WorkloadInfo, DEFAULT_MAX_CANDIDATES, ENGINE_PROPOSER, LAYOUT_BOUND_FRACTION,
     RESERVED_PROPOSERS,
 };

@@ -196,9 +196,9 @@ fn the_binary_takes_the_shared_engine_and_budget_flags() {
         flags += 1;
     }
     assert_eq!(
-        flags, 13,
+        flags, 14,
         "index, format, chunk-size, schema, fingerprint-policy, partitioning, path-template, \
-         twin-of, scratch, keep, 3 budgets"
+         twin-of, scratch, keep, dataset, 3 budgets"
     );
 
     let dir = tempfile::tempdir().unwrap();

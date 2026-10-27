@@ -18,9 +18,12 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
-use bellwether_replay::{load_plan, KeySetSource, Replayer, Workload, MAIN_DATASET};
+use bellwether_replay::{
+    children, load_plan, op_name, KeySetSource, Replayer, Workload, MAIN_DATASET,
+};
 use bellwether_types::{
-    ConsumerPlan, Error, Exactness, Hash, KeySpec, OperatorCost, PlanNode, Quantity, Result, Source,
+    ConsumerPlan, Error, Exactness, Hash, KeySpec, KeysFrom, OperatorCost, PlanNode, Predicate,
+    Quantity, Result, Source,
 };
 use serde::{Deserialize, Serialize};
 
@@ -145,6 +148,59 @@ pub(crate) fn workload_plans(
         .into_iter()
         .map(|h| Ok((h, load_plan(keys, &h)?)))
         .collect()
+}
+
+/// Where `plan` applies the run's keys: its first node (in plan order)
+/// keyed by them (`keys: {"from": "run"}`), and the node below it, on its
+/// input path toward a scan, whose output no index narrows (an
+/// `aggregate` or a `join`: [`bellwether_replay::relational`] narrows a
+/// scan's read only through nodes that keep the scan's rows). `(None,
+/// None)` when no node uses the run's keys.
+pub(crate) fn keys_applied(
+    plan: &ConsumerPlan,
+) -> (Option<crate::PlanNodeName>, Option<crate::PlanNodeName>) {
+    fn by_run(p: &Predicate) -> bool {
+        match p {
+            Predicate::SemiJoin {
+                keys_from: KeysFrom::Run,
+                ..
+            } => true,
+            Predicate::And { all } => all.iter().any(by_run),
+            _ => false,
+        }
+    }
+    let keyed = |n: &PlanNode| match n {
+        PlanNode::SemiJoin {
+            keys: KeysFrom::Run,
+            ..
+        }
+        | PlanNode::Window {
+            keys: Some(KeysFrom::Run),
+            ..
+        } => true,
+        PlanNode::Filter { predicate, .. } => by_run(predicate),
+        _ => false,
+    };
+    let name = |v: usize| crate::PlanNodeName {
+        node: u32::try_from(v).unwrap_or(u32::MAX),
+        op: op_name(&plan.nodes[v]).to_string(),
+    };
+    let Some(v) = plan.nodes.iter().position(keyed) else {
+        return (None, None);
+    };
+    // The input path: a node's first child is its input (a join's left).
+    let mut at = children(&plan.nodes[v]).first().copied();
+    while let Some(c) = at {
+        let node = &plan.nodes[c as usize];
+        match node {
+            PlanNode::Aggregate { .. } | PlanNode::Join { .. } => {
+                return (Some(name(v)), Some(name(c as usize)));
+            }
+            PlanNode::Scan { .. } => break,
+            _ => at = children(node).first().copied(),
+        }
+    }
+    (Some(name(v)), None)
 }
 
 /// Reads a plan file (read only): a consumer plan's JSON.

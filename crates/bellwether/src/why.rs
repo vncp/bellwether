@@ -828,6 +828,37 @@ pub enum CulpritReason {
         /// every run): files and row groups holding it, p50 / p95 / max.
         values: Fanout,
     },
+    /// A workload of consumer-plan runs (WP15) whose plan reads at least
+    /// [`LAYOUT_BOUND_FRACTION`] of the row groups the runs span under every
+    /// priced configuration, while the runs' own keys, located on the data
+    /// root through the floor (an exact key on the runs' columns), sit in
+    /// fewer than that fraction of its row groups: the plan's shape, not
+    /// the layout or a missing index, makes it read everything.
+    PlanShape {
+        /// The plan.
+        plan: Hash,
+        /// Its scan of the data root reading the most row groups.
+        scan: u32,
+        /// The first node applying the runs' keys (`keys: {"from": "run"}`);
+        /// `None` when no node does.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        keys_at: Option<PlanNodeName>,
+        /// The node between `keys_at` and the scan whose output no index
+        /// narrows (an `aggregate` or a `join`), when there is one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        above: Option<PlanNodeName>,
+        /// The fewest row groups any priced configuration reads through
+        /// the plan, summed over runs.
+        least_row_groups: u64,
+        /// The row groups the runs span through the plan: per run, the
+        /// live row groups of each scan's dataset.
+        row_groups: u64,
+        /// The row groups of the data root holding the runs' keys, summed
+        /// over runs.
+        keys_row_groups: u64,
+        /// Runs times the data root's indexed row groups.
+        keys_span: u64,
+    },
     /// A current key spec serves the workload; its columns bound what it
     /// prunes.
     ServingSpec {
@@ -850,6 +881,15 @@ pub enum CulpritReason {
         /// The agg key that answers.
         spec: KeySpec,
     },
+}
+
+/// A plan node named in a culprit: its index and operator.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlanNodeName {
+    /// The node's index in the plan.
+    pub node: u32,
+    /// Its operator (`semi_join`, `aggregate`, ...).
+    pub op: String,
 }
 
 /// One text match of a workload's runs on one column, and what serves it
@@ -1089,7 +1129,12 @@ impl Engine {
     /// The **culprit** is, in order: with a workload, the layout, when
     /// every priced configuration, the floor included, reads at least
     /// [`LAYOUT_BOUND_FRACTION`] of the row groups the runs span (it names
-    /// the lowest-fanout measured column); else the highest-confidence
+    /// the lowest-fanout measured column). For consumer-plan runs that
+    /// read at least that fraction through the plan under every priced
+    /// configuration, the runs' own keys located on the data root by the
+    /// floor decide: the layout when they too sit in at least that
+    /// fraction, else the plan's shape ([`CulpritReason::PlanShape`],
+    /// naming where the plan applies the keys). Else the highest-confidence
     /// `batch_stamp_key` or `low_selectivity_single_column` lint on a column
     /// the workload or a current spec uses (never for a semi-join workload,
     /// which a join key serves or none does); else, with a workload, its key
@@ -1378,11 +1423,25 @@ impl Engine {
                 )?;
             }
             let spread = queried_spread(&replayer, &workload, &cache)?;
-            Some((workload, spread))
+            // Plan runs: where their own keys sit on the data root, which
+            // the layout culprit judges instead of the plan's reads.
+            let own = if report.plans.is_empty() {
+                None
+            } else {
+                own_keys(
+                    &replayer,
+                    &workload,
+                    &cache,
+                    indexed_row_groups,
+                    &report.plans,
+                )?
+            };
+            Some((workload, spread, own))
         } else {
             None
         };
-        let (workload, spread) = workload.map_or((None, None), |(w, s)| (Some(w), s));
+        let (workload, spread, own) =
+            workload.map_or((None, None, None), |(w, s, o)| (Some(w), s, o));
         let text_runs = match &workload {
             Some(w) => is_text_workload(w)?,
             None => false,
@@ -1398,7 +1457,9 @@ impl Engine {
         report.culprit = match workload.as_ref() {
             Some(w) if text_runs => text_culprit(&report.current_specs, w)?,
             Some(w) => answered_aggregates(&report, w)
-                .or_else(|| layout_culprit(&report, w, indexed_row_groups, span, spread))
+                .or_else(|| {
+                    layout_culprit(&report, w, indexed_row_groups, span, spread, own.as_ref())
+                })
                 .or_else(|| culprit(&report.current_specs, &report.profile, Some(w))),
             None => culprit(&report.current_specs, &report.profile, None),
         };
@@ -3791,15 +3852,24 @@ fn answered_aggregates(r: &WhyReport, w: &Workload) -> Option<Culprit> {
 /// floor was priced (a candidate exact key on a run's own columns, or a
 /// current spec serving the first run) and every priced configuration reads
 /// at least [`LAYOUT_BOUND_FRACTION`] of the `span` row groups the runs
-/// span (`runs × indexed_row_groups`; for consumer-plan runs, per run every
-/// read occurrence's dataset's row groups, [`plan_span`]). A dataset of one
-/// row group never names the layout.
+/// span (`runs × indexed_row_groups`). A dataset of one row group never
+/// names the layout.
+///
+/// Consumer-plan runs are judged by where their own keys sit (`own`,
+/// [`own_keys`]), not by the plan's reads, which the plan's shape can make
+/// whole however the keys sit: `None` unless every priced configuration
+/// reads at least the fraction of the row groups the plan spans
+/// ([`plan_span`]); then the layout when the keys' own row groups are at
+/// least the fraction of theirs, else the plan's shape
+/// ([`CulpritReason::PlanShape`]). `None` when `own` was not measured.
+#[allow(clippy::too_many_lines)]
 fn layout_culprit(
     r: &WhyReport,
     w: &Workload,
     indexed_row_groups: u64,
     span: u64,
     spread: Option<Fanout>,
+    own: Option<&OwnKeys>,
 ) -> Option<Culprit> {
     // A text lookup (B5) that reads nearly every row group under every
     // text key is a term in nearly every row group, which the text key's
@@ -3832,27 +3902,53 @@ fn layout_culprit(
             servable(s, &columns).is_some()
         }
     };
-    // For consumer-plan runs the floor is a plan candidate serving the
-    // runs' own key columns.
-    let floor_priced = r.candidates.iter().any(|c| {
-        c.origin == CandidateOrigin::Workload
-            || (c.origin == CandidateOrigin::Plan && serves(&c.spec))
-    }) || r.current_specs.iter().any(serves);
-    let row_groups = span;
     // One row group has nothing to prune: no layout could do better.
-    if !floor_priced || indexed_row_groups < 2 {
+    if indexed_row_groups < 2 {
         return None;
     }
-    let least_row_groups = r
+    let least = r
         .candidates
         .iter()
         .map(|c| c.proposed.row_groups)
         .chain([current.row_groups])
         .min()?;
     #[allow(clippy::cast_precision_loss)]
-    if (least_row_groups as f64) < LAYOUT_BOUND_FRACTION * row_groups as f64 {
+    let bound = |least: u64, of: u64| (least as f64) >= LAYOUT_BOUND_FRACTION * of as f64;
+    if !bound(least, span) {
         return None;
     }
+    let (least_row_groups, row_groups) = if r.plans.is_empty() {
+        let floor_priced = r
+            .candidates
+            .iter()
+            .any(|c| c.origin == CandidateOrigin::Workload)
+            || r.current_specs.iter().any(serves);
+        if !floor_priced {
+            return None;
+        }
+        (least, span)
+    } else {
+        // The floor located the runs' own keys: it reads no more than any
+        // index could.
+        let own = own?;
+        if !bound(own.row_groups, own.span) {
+            return Some(Culprit {
+                columns,
+                fanout: None,
+                reason: CulpritReason::PlanShape {
+                    plan: own.plan,
+                    scan: own.scan,
+                    keys_at: own.keys_at.clone(),
+                    above: own.above.clone(),
+                    least_row_groups: least,
+                    row_groups: span,
+                    keys_row_groups: own.row_groups,
+                    keys_span: own.span,
+                },
+            });
+        }
+        (own.row_groups, own.span)
+    };
     // Membership runs: the cause is where the queried values sit, measured
     // from the list key itself, not any column's fanout.
     if let Some(values) = spread {
@@ -3912,6 +4008,82 @@ fn plan_span(replayer: &Replayer<'_>, plans: &[crate::plans::PlanReport]) -> u64
             p.runs.saturating_mul(per_run)
         })
         .sum()
+}
+
+/// Where consumer-plan runs' own keys sit on the data root, and where the
+/// plan applies them ([`own_keys`]).
+struct OwnKeys {
+    /// The data root's row groups holding each run's keys, summed over runs.
+    row_groups: u64,
+    /// Runs times the data root's indexed row groups.
+    span: u64,
+    /// The plan whose scan of the data root reads the most row groups.
+    plan: Hash,
+    /// That scan.
+    scan: u32,
+    /// The node applying the runs' keys ([`crate::plans::keys_applied`]).
+    keys_at: Option<PlanNodeName>,
+    /// The node above which it applies them, whose output no index
+    /// narrows.
+    above: Option<PlanNodeName>,
+}
+
+/// For consumer-plan runs, what the layout culprit judges instead of the
+/// plan's reads: each run's keys located on the data root through the
+/// floor (a transient exact key on the run's own columns: the row groups
+/// holding them, which no index reads fewer of), and, of the plan whose
+/// scan of the data root reads the most, where it applies the run's keys.
+/// `None` when a run's columns are not all data-root columns (its keys are
+/// another dataset's) or no plan scans the data root.
+fn own_keys(
+    replayer: &Replayer<'_>,
+    workload: &Workload,
+    cache: &Cache<ObjectStoreBackend>,
+    indexed_row_groups: u64,
+    plans: &[crate::plans::PlanReport],
+) -> Result<Option<OwnKeys>> {
+    let schema = replayer.schema();
+    let mut row_groups = 0u64;
+    for run in workload.runs() {
+        if run.columns.is_empty()
+            || run
+                .columns
+                .iter()
+                .any(|c| schema.field_with_name(c).is_err())
+        {
+            return Ok(None);
+        }
+        let floor = KeySpec::Exact {
+            columns: run.columns.clone(),
+            counts: false,
+            bounds: None,
+        };
+        let rk = workload.run_keys(cache, run)?;
+        let cost = replayer.cost_of_keys(&[floor], &run.run_id, &rk)?;
+        row_groups = row_groups.saturating_add(cost.row_groups);
+    }
+    let Some((report, read)) = plans
+        .iter()
+        .flat_map(|p| {
+            p.reads
+                .iter()
+                .filter(|r| r.dataset == bellwether_replay::MAIN_DATASET)
+                .map(move |r| (p, r))
+        })
+        .max_by_key(|(_, r)| r.row_groups)
+    else {
+        return Ok(None);
+    };
+    let plan = bellwether_replay::load_plan(cache, &report.plan)?;
+    let (keys_at, above) = crate::plans::keys_applied(&plan);
+    Ok(Some(OwnKeys {
+        row_groups,
+        span: indexed_row_groups.saturating_mul(workload.runs().len() as u64),
+        plan: report.plan,
+        scan: read.node,
+        keys_at,
+        above,
+    }))
 }
 
 /// The culprit rule documented on [`Engine::why`].

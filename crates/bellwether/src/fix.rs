@@ -1947,9 +1947,11 @@ impl Engine {
     /// Refused, each naming what to do: a proposed key a plan uses only on
     /// a join no run or literal key restricts (its lookups are the whole key
     /// space, not the workload's); a proposed key no plan looks anything up
-    /// through; lookups mixing whole keys with ranges, several key-column
-    /// sets, plain locates with `latest`/`as_of`, or version columns (one
-    /// certificate compares one kind).
+    /// through; lookups mixing whole keys with ranges, ranges on several
+    /// columns, several key-column sets, or plain locates with
+    /// `latest`/`as_of` (one certificate compares one kind). The versioned
+    /// lookups then share one version column: it is the serving temporal
+    /// key's for their one key-column set under one configuration.
     #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     fn verify_plan_key(
         &self,
@@ -2138,23 +2140,10 @@ impl Engine {
                 }
                 let mut keys: Vec<Vec<u8>> = Vec::new();
                 let mut asked: Vec<AskedRun> = Vec::with_capacity(keyed.len());
-                let mut version_column: Option<Option<String>> = None;
                 for (k, query, planned) in keyed {
                     select(&planned)?;
                     keys.extend(probe_set(&k, &key_columns));
                     let column = replayer.planned_time_column(specs, k.columns(), &query)?;
-                    if versioned {
-                        match &version_column {
-                            Some(c) if *c != column => {
-                                return Err(refuse(format!(
-                                    "the workload's plans rank versions through {named} on more \
-                                     than one column, and one certificate compares one version \
-                                     rule; propose the key for one version column at a time"
-                                )));
-                            }
-                            _ => version_column = Some(column.clone()),
-                        }
-                    }
                     asked.push(AskedRun {
                         keys: k,
                         query,

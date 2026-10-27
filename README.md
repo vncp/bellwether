@@ -251,6 +251,8 @@ Every node has bytes and output rows, each `exact`, `bounded` (an interval that 
 
 What stays measured, never priced: CPU and wall time (an attached engine adapter measures them); any node over a SQL table; shuffle bytes beyond their compressed-equivalent bound, and memory for a shared node's buffered output; an engine's own extra pruning or extra reads (the adapters report both); row counts at a winning timestamp with duplicates.
 
+The culprit of a plan that reads everything is judged by where the runs' own keys sit, not by what the plan reads. When the keys sit in few row groups but every candidate still reads nearly all of them through the plan, the cause is the plan's shape, and `why` names the node: for example, the semi-join on the run's keys sits above an aggregate, whose output no index narrows, so the keys should be applied below it. A filter-pushdown rewrite of that kind is proposed with `--before-plan` and `--after-plan` and attested by `fix`.
+
 ## Questions over time
 
 For folders of market data (partitioned by date, many symbols per file), five additions, built additive to storage version 1 and folded into the frozen storage version 2 at M5, where per-key time bounds and bitemporal versions are key specs that `why` prices and `fix` proposes, verifies and receipts ([format](docs/format.md), [capabilities and status](docs/time-series-capabilities.md)):
