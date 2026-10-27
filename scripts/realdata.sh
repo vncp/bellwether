@@ -322,6 +322,90 @@ once 3a-dec-count-index index taxi_dec --index idx-counts/taxi_dec --key exact:f
 run 3b-dec-count count taxi_dec --index idx-counts/taxi_dec --keys keys/taxi_fare.parquet
 count_check 3b-dec-count taxi_dec fare_amount keys/taxi_fare.parquet
 
+# ---- 3c. operators (relational replay, WP15) --------------------------------
+# Consumer plans over the GH events (main: gh, through idx-counts/gh, which
+# holds exact:repo_id,counts) and a repos table derived from them (one row
+# per repo_id with its first created_at, indexed with counts), each priced
+# by `why --plan` and checked against DuckDB over the rows and footers.
+say ""
+say "## 3c. operators: consumer plans priced by why --plan, against DuckDB"
+rm -rf ghrepos plans
+mkdir -p ghrepos plans
+duckdb -no-agent -c "COPY (SELECT repo_id, min(created_at) AS first_at FROM read_parquet('gh/*.parquet')
+  WHERE repo_id IS NOT NULL GROUP BY 1 ORDER BY 1) TO 'ghrepos/repos.parquet' (FORMAT PARQUET)" >/dev/null
+once 3c-repos-index index ghrepos --key exact:repo_id,counts
+semi='{"op": "semi_join", "input": 0, "columns": ["repo_id"], "keys": {"from": "run"}}'
+cat >plans/semi.json <<JSON
+{"version": 1, "root": 2, "nodes": [
+  {"op": "scan", "dataset": "main", "columns": ["repo_id", "type"]}, $semi,
+  {"op": "project", "input": 1, "columns": ["repo_id", "type"]}]}
+JSON
+cat >plans/join.json <<'JSON'
+{"version": 1, "root": 3, "nodes": [
+  {"op": "scan", "dataset": "main", "columns": ["repo_id", "type"]},
+  {"op": "scan", "dataset": "repos", "columns": ["repo_id", "first_at"]},
+  {"op": "join", "left": 0, "right": 1, "on": [["repo_id", "repo_id"]], "kind": "inner"},
+  {"op": "project", "input": 2, "columns": ["repo_id", "type", "first_at"]}]}
+JSON
+cat >plans/window.json <<'JSON'
+{"version": 1, "root": 2, "nodes": [
+  {"op": "scan", "dataset": "main", "columns": ["repo_id", "created_at"]},
+  {"op": "window", "input": 0, "partition_by": ["repo_id"], "keys": {"from": "run"}},
+  {"op": "project", "input": 1, "columns": ["repo_id", "created_at"]}]}
+JSON
+cat >plans/aggregate.json <<JSON
+{"version": 1, "root": 2, "nodes": [
+  {"op": "scan", "dataset": "main", "columns": ["repo_id"]}, $semi,
+  {"op": "aggregate", "input": 1, "group_by": ["repo_id"], "measures": [{"function": "count"}]}]}
+JSON
+# created_at in [03:00, 04:00) UTC, as canonical encodings (a timestamp in
+# microseconds: tag 0x08, kind 0x04, unit 0x03, the value big-endian with
+# its sign bit flipped).
+LO_US=$(duck "SELECT epoch_us(TIMESTAMPTZ '2024-01-01 03:00:00+00')")
+HI_US=$(duck "SELECT epoch_us(TIMESTAMPTZ '2024-01-01 03:59:59.999999+00')")
+enc_us() { perl -e 'print join(",", 8, 4, 3, unpack("C8", pack("Q>", $ARGV[0] ^ (1 << 63))))' "$1"; }
+cat >plans/range.json <<JSON
+{"version": 1, "root": 2, "nodes": [
+  {"op": "scan", "dataset": "main", "columns": ["repo_id", "created_at"]},
+  {"op": "filter", "input": 0, "predicate": {"op": "between", "column": "created_at",
+    "lo": [$(enc_us "$LO_US")], "hi": [$(enc_us "$HI_US")]}},
+  {"op": "project", "input": 1, "columns": ["repo_id", "created_at"]}]}
+JSON
+OPS="--index idx-counts/gh --dataset repos=$W/ghrepos"
+for p in semi join window aggregate range; do
+  # shellcheck disable=SC2086
+  run "3c-$p" $OPS why gh --from keys/gh_repo10.parquet --plan "plans/$p.json"
+done
+K10="SELECT repo_id FROM read_parquet('keys/gh_repo10.parquet')"
+GH="read_parquet('gh/*.parquet')"
+check "operators projection: scan bytes (repo_id, type) = parquet_metadata compressed sizes" \
+  "$(j 3c-semi '.plans[0].current[0].bytes.value')" \
+  "$(duck "SELECT sum(total_compressed_size) FROM parquet_metadata('gh/*.parquet') WHERE path_in_schema IN ('repo_id', 'type')")"
+check "operators semi-join, 10 keys: rows (exact) = DuckDB count(*)" \
+  "$(j 3c-semi '.plans[0].current[1] | "\(.rows_out.value) \(.rows_out.exactness.kind)"')" \
+  "$(duck "SELECT count(*) FROM $GH WHERE repo_id IN ($K10)") exact"
+oracle_pairs gh repo_id keys/gh_repo10.parquet locate >"$OUT/3c-oracle10"
+check "operators semi-join, 10 keys: row groups read = DuckDB row groups holding a key" \
+  "$(j 3c-semi '.plans[0].reads[0].row_groups')" "$(wc -l <"$OUT/3c-oracle10" | tr -d ' ')"
+check "operators join with repos (both counted): rows (exact) = DuckDB count(*) of the join" \
+  "$(j 3c-join '.plans[0].current[2] | "\(.rows_out.value) \(.rows_out.exactness.kind)"')" \
+  "$(duck "SELECT count(*) FROM $GH e JOIN read_parquet('ghrepos/repos.parquet') r USING (repo_id)") exact"
+check "operators window over 10 partitions: row groups read = DuckDB row groups holding a key" \
+  "$(j 3c-window '.plans[0].reads[0].row_groups')" "$(wc -l <"$OUT/3c-oracle10" | tr -d ' ')"
+check "operators window over 10 partitions: rows (exact) = DuckDB count(*) over (partition by repo_id) rows" \
+  "$(j 3c-window '.plans[0].current[1] | "\(.rows_out.value) \(.rows_out.exactness.kind)"')" \
+  "$(duck "SELECT count(*) FROM (SELECT count(*) OVER (PARTITION BY repo_id) FROM $GH WHERE repo_id IN ($K10))") exact"
+check "operators group by repo_id over 10 keys: groups (exact) = DuckDB groups" \
+  "$(j 3c-aggregate '.plans[0].current[2] | "\(.rows_out.value) \(.rows_out.exactness.kind)"')" \
+  "$(duck "SELECT count(*) FROM (SELECT repo_id FROM $GH WHERE repo_id IN ($K10) GROUP BY 1)") exact"
+check "operators created_at range: row groups read = row groups whose footer min/max overlap it (DuckDB)" \
+  "$(j 3c-range '.plans[0].reads[0].row_groups')" \
+  "$(duck "SELECT count(*) FROM parquet_metadata('gh/*.parquet') WHERE path_in_schema = 'created_at'
+    AND stats_min_value::TIMESTAMPTZ <= TIMESTAMPTZ '2024-01-01 03:59:59.999999+00'
+    AND stats_max_value::TIMESTAMPTZ >= TIMESTAMPTZ '2024-01-01 03:00:00+00'")"
+check "operators created_at range: rows in range (DuckDB) within the bounded interval" \
+  "$(j 3c-range '.plans[0].current[1].rows_out.exactness | "\(.kind)"')" bounded
+
 # ---- 4. fix ------------------------------------------------------------------
 say ""
 say "## 4. propose, fix, receipt, report"

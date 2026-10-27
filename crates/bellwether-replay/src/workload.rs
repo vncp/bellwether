@@ -475,6 +475,16 @@ pub struct RecordedRun {
     /// serialized, so other runs hash as before) otherwise.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub aggregate: Option<RunAggregate>,
+    /// For a run priced through a consumer plan (relational replay, WP15):
+    /// the BLAKE3 of the plan's canonical JSON, stored in the cache beside
+    /// the key sets ([`store_plan`]). The run's keys feed the plan's
+    /// `KeysFrom::Run` nodes and an `asof` run's instant its `AsOf` nodes.
+    /// Only a `locate` or `asof` run carries one. Absent (and not
+    /// serialized, so every other run hashes as before) otherwise; a build
+    /// without plans refuses a stored workload that holds one, because
+    /// re-serializing it drops the field and no longer matches its hash.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan: Option<Hash>,
 }
 
 impl RecordedRun {
@@ -482,6 +492,24 @@ impl RecordedRun {
     /// `asof`, `lookback`, and `window` disagree or name an unknown kind.
     #[allow(clippy::too_many_lines)] // one arm per query kind
     pub fn query(&self) -> Result<RunQuery> {
+        if self.plan.is_some()
+            && (!matches!(
+                self.query_kind.as_str(),
+                QUERY_KIND_LOCATE | QUERY_KIND_ASOF
+            ) || self.lookback.is_some()
+                || self.window.is_some()
+                || self.bitemporal.is_some()
+                || self.join.is_some()
+                || self.tombstone.is_some()
+                || self.aggregate.is_some())
+        {
+            return Err(Error::Other(format!(
+                "run {:?} is a {} run and names a consumer plan; a plan run is a locate run (its \
+                 keys feed the plan) or an asof run (its instant feeds the plan's asof nodes), \
+                 with no lookback, window, clocks, right dataset, tombstone, or aggregate",
+                self.run_id, self.query_kind
+            )));
+        }
         if self.query_kind == QUERY_KIND_BITEMPORAL {
             return match (&self.bitemporal, &self.window, self.asof, self.lookback) {
                 (Some(b), None, None, None)
@@ -917,6 +945,40 @@ fn check_content(bytes: &[u8], hash: &Hash, what: &str) -> Result<()> {
     }
 }
 
+/// The canonical JSON of a consumer plan: its bytes as `serde_json` writes
+/// the contract type (fields in declaration order, no whitespace), the
+/// bytes its hash names.
+pub fn plan_payload(plan: &bellwether_types::ConsumerPlan) -> Result<(Hash, Vec<u8>)> {
+    let bytes = serde_json::to_vec(plan)?;
+    Ok((Hash::of(&bytes), bytes))
+}
+
+/// Stores `plan`'s canonical JSON in `sink` under its BLAKE3 (relational
+/// replay, WP15), as key sets are stored, and returns the hash a run's
+/// [`RecordedRun::plan`] names it by.
+pub fn store_plan(sink: &dyn KeySetSink, plan: &bellwether_types::ConsumerPlan) -> Result<Hash> {
+    let (hash, bytes) = plan_payload(plan)?;
+    sink.put(&hash, Bytes::from(bytes))?;
+    Ok(hash)
+}
+
+/// Loads the consumer plan stored under `hash`: the bytes must hash to
+/// `hash` and be exactly the canonical JSON of a plan, so a plan with a
+/// field this build does not know is refused rather than read without it
+/// (ADR 017).
+pub fn load_plan(keys: &dyn KeySetSource, hash: &Hash) -> Result<bellwether_types::ConsumerPlan> {
+    let bytes = keys.get(hash)?;
+    check_content(&bytes, hash, "consumer plan")?;
+    let plan: bellwether_types::ConsumerPlan = serde_json::from_slice(&bytes)?;
+    if serde_json::to_vec(&plan)? != bytes.as_ref() {
+        return Err(Error::Other(format!(
+            "consumer plan {hash} is not stored in canonical form (a field or value this build \
+             does not read); use the build that recorded it"
+        )));
+    }
+    Ok(plan)
+}
+
 /// Where key sets and workload manifests are read from, by hash.
 pub trait KeySetSource {
     /// The bytes stored under `hash`; [`Error::NotFound`] if absent. Readers
@@ -1014,6 +1076,7 @@ pub struct WorkloadRecorder<'a> {
     schema: SchemaRef,
     runs: BTreeMap<String, RecordedRun>,
     window: Option<RunWindow>,
+    plan: Option<Hash>,
 }
 
 impl std::fmt::Debug for WorkloadRecorder<'_> {
@@ -1039,7 +1102,26 @@ impl<'a> WorkloadRecorder<'a> {
             schema,
             runs: BTreeMap::new(),
             window: None,
+            plan: None,
         }
+    }
+
+    /// This recorder, recording every run with the consumer plan `plan`
+    /// (relational replay, WP15): the plan is checked for its shape
+    /// ([`crate::relational::check_shape`]) and stored in the sink under
+    /// the BLAKE3 of its canonical JSON ([`store_plan`]) now, and every
+    /// run recorded after names it in [`RecordedRun::plan`]. Only `locate`
+    /// and `asof` runs can carry a plan.
+    pub fn with_plan(mut self, plan: &bellwether_types::ConsumerPlan) -> Result<Self> {
+        crate::relational::check_shape(plan).map_err(Error::from)?;
+        if self.window.is_some() {
+            return Err(Error::Other(
+                "a plan run is a locate or asof run; a recorder in a window records window runs"
+                    .into(),
+            ));
+        }
+        self.plan = Some(store_plan(self.sink, plan)?);
+        Ok(self)
     }
 
     /// This recorder, recording every `locate` run as a `window` run over
@@ -1117,6 +1199,12 @@ impl<'a> WorkloadRecorder<'a> {
         query: RunQuery,
         template: Option<&str>,
     ) -> Result<Prepared> {
+        if self.plan.is_some() && !matches!(query, RunQuery::Locate | RunQuery::Asof { .. }) {
+            return Err(Error::Other(format!(
+                "run {run_id:?}: a plan run is a locate run or an asof run, not {}",
+                query.kind_str()
+            )));
+        }
         let (built, null_tuples) = match keys {
             KeyInput::Batch(batch) => {
                 let columns = field_names(&batch.schema());
@@ -1205,6 +1293,7 @@ impl<'a> WorkloadRecorder<'a> {
                     _ => None,
                 },
                 aggregate: query.aggregate().cloned(),
+                plan: self.plan,
             },
             payload,
         })

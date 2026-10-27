@@ -55,7 +55,7 @@ pub mod temporal;
 pub mod text;
 pub mod tombstone;
 
-pub use merge::{count_live_keys, merge};
+pub use merge::{count_live_keys, merge, MergedKeys};
 pub use segment::{EncodedSegment, SegmentReader, SegmentWriter, WriterOptions};
 pub use sidecar::{
     bitemporal_winner, BitemporalHit, EncodedSidecar, RgBounds, SidecarDef, SidecarHeader,

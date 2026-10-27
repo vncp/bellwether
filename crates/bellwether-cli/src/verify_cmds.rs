@@ -1007,15 +1007,17 @@ fn verify_and_outcome_human(s: &mut String, r: &FixResult) {
             target,
             deploy,
         } => {
+            let what = match deploy.len() {
+                // A rewrite priced through consumer plans (WP15): the
+                // engine ran no query; the after shape is the proposal's.
+                0 => "after plan the proposal describes".to_string(),
+                1 => "rewritten query".to_string(),
+                _ => "rewritten queries".to_string(),
+            };
             let _ = writeln!(
                 s,
                 "  3 apply   attest-only: nothing applied in {target}; a human or a CI gate \
-                 deploys the rewritten {}",
-                if deploy.len() == 1 {
-                    "query"
-                } else {
-                    "queries"
-                }
+                 deploys the {what}"
             );
             let _ = writeln!(s, "  4 attest  receipt {} (attest-only)", receipt.hash);
             signed_line(s, r, "receipt");
@@ -1105,7 +1107,7 @@ fn verify_and_outcome_human(s: &mut String, r: &FixResult) {
                     "layout proposals cannot be applied in this release; propose a key or a rewrite".into()
                 }
                 Refusal::NoReplay { .. } => {
-                    "the rewrite verified, but a receipt cites a replay and rewrites have none yet (contract v3 backlog #2)".into()
+                    "the rewrite verified, but a receipt cites a replay, and this rewrite states its plans only in prose, so it has none; propose it again with --before-plan and --after-plan (typed plan DAGs, as why --plan reads) to have it priced and attested".into()
                 }
                 Refusal::AttestOnly {
                     target,

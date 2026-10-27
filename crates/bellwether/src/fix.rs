@@ -20,6 +20,14 @@
 //!
 //! A failing certificate writes no Receipt and returns a typed refusal
 //! naming the mismatch counts.
+//!
+//! Consumer plans (relational replay, WP15): a key proposal over a workload
+//! of plan runs is verified on what the plans look up through it (each
+//! lookup's keys, or range, and the row groups the plan read them from),
+//! never on the runs' keys as such. A Rewrite whose shape carries
+//! `before_plan` and `after_plan` is scored by pricing both plans, its
+//! actual outputs are reconciled, and it is attested (an attest-only
+//! receipt: the engine runs no query).
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -213,9 +221,9 @@ pub enum Refusal {
     },
     /// A Layout proposal: layout apply is deferred (ADR 032, amended 2026-10-27).
     LayoutNotApplicable,
-    /// A passing Rewrite cannot be attested yet: a receipt cites a Replay
-    /// and the replay crate defines none for rewrites (contract v3
-    /// backlog #2).
+    /// A passing Rewrite whose shape states its plans only in prose cannot
+    /// be attested: a receipt cites a Replay, and only a shape with
+    /// `before_plan` and `after_plan` has one (relational replay, WP15).
     NoReplay {
         /// The passing certificate.
         certificate: Hash,
@@ -602,10 +610,14 @@ impl Engine {
                 let source = self.source(pinned.as_ref())?;
                 // A join key is priced and verified on both datasets.
                 let pair = self.pair_of(pinned.as_ref(), spec)?;
-                let replayer =
-                    with_pair(replayer(self, &*source, pinned.as_ref())?, pair.as_ref())?;
                 let cache = self.cache()?;
                 let workload = load_workload(self, &cache, &workload_hash)?;
+                // Plan runs (WP15) read the datasets their plans scan.
+                let datasets = self.workload_datasets(&workload, &cache)?;
+                let replayer = datasets.attach(with_pair(
+                    replayer(self, &*source, pinned.as_ref())?,
+                    pair.as_ref(),
+                )?)?;
                 // 1. Score.
                 let mut replay_hash = None;
                 if self.is_table() {
@@ -738,10 +750,16 @@ impl Engine {
                     before,
                     pinned.as_ref().map(anchor).as_ref(),
                 ),
+            ProposalBody::Rewrite { shape }
+                if shape.before_plan.is_some() && shape.after_plan.is_some() =>
+            {
+                self.fix_plan_rewrite(result, hash, &proposal, shape, req, pinned.as_ref())
+            }
             ProposalBody::Rewrite { shape } => {
                 result.score = Some(Score::NotScorable {
-                    reason: "the replay crate defines no replay for rewrite proposals (contract \
-                             v3 backlog #2)"
+                    reason: "a rewrite described in words has no replay: give its before and \
+                             after shapes as consumer plans (shape.before_plan and \
+                             shape.after_plan) for relational replay to price them"
                         .into(),
                 });
                 result.invariant = Some(shape.invariant.clone());
@@ -895,6 +913,20 @@ impl Engine {
                 }
                 result.outcome = refused(self.attest_only(cert_hash, body)?);
             }
+            ProposalBody::Rewrite { shape }
+                if shape.before_plan.is_some() && shape.after_plan.is_some() =>
+            {
+                return self.apply_plan_rewrite(
+                    result,
+                    cert_hash,
+                    &proposal_hash,
+                    &proposal,
+                    shape,
+                    before,
+                    dry_run,
+                    allow_no_gain,
+                );
+            }
             ProposalBody::Rewrite { shape } => {
                 result.invariant = Some(shape.invariant.clone());
                 result.outcome = refused(Refusal::NoReplay {
@@ -955,10 +987,13 @@ impl Engine {
                     },
                     None => None,
                 };
-                let replayer =
-                    with_pair(replayer(self, &*source, pinned.as_ref())?, pair.as_ref())?;
                 let cache = self.cache()?;
                 let workload = load_workload(self, &cache, workload)?;
+                let datasets = self.workload_datasets(&workload, &cache)?;
+                let replayer = datasets.attach(with_pair(
+                    replayer(self, &*source, pinned.as_ref())?,
+                    pair.as_ref(),
+                )?)?;
                 let (replay, current_cost, proposed_cost) =
                     self.score(&replayer, &proposal_hash, &workload, &cache)?;
                 let replay_hash = replay.hash;
@@ -1056,6 +1091,12 @@ impl Engine {
             .fold(replayer.current_specs().to_vec(), |c, s| {
                 proposed_specs(&c, s)
             });
+        // Consumer-plan runs (WP15): verified on what the plans look up.
+        if workload.runs().iter().any(|r| r.plan.is_some()) {
+            return self.verify_plan_key(
+                proposal, proposed, &specs, replayer, source, workload, cache, pinned,
+            );
+        }
         let named = proposed
             .iter()
             .map(crate::spec::label)
@@ -1149,6 +1190,103 @@ impl Engine {
             .collect::<Result<Vec<_>>>()?;
         #[cfg(test)]
         test_seam::apply(&mut selected);
+        self.certify_planned(
+            proposal,
+            replayer,
+            source,
+            workload,
+            cache,
+            pinned,
+            selected,
+            agg,
+            |age| {
+                // A text workload (B5) names words and substrings, and a
+                // membership workload (B4) list elements, not keys: rows
+                // are compared keyed by every hashable column, and chosen
+                // by the runs' text matches or membership tests. A workload
+                // keyed on an expression (an expr key's runs) compares the
+                // rows whose expression value is one of its keys, each row
+                // identified by the expression's input columns.
+                let (key_columns, coverage, keys_of) = if text || membership {
+                    let hashable: Vec<String> = replayer
+                        .schema()
+                        .fields()
+                        .iter()
+                        .filter(|f| {
+                            bellwether_core::encoding::check_supported(f.data_type()).is_ok()
+                        })
+                        .map(|f| f.name().clone())
+                        .collect();
+                    if hashable.is_empty() {
+                        return Err(Error::Other(format!(
+                            "every column of {} is nested (a list, map, or struct), so verify \
+                             has no column to compare rows by and cannot certify {}; build it \
+                             without a receipt with `bellwether index {} --key {}`",
+                            self.root(),
+                            named,
+                            self.root(),
+                            named
+                        )));
+                    }
+                    (
+                        hashable,
+                        CoverageRequest::WorkloadRows {
+                            workload: workload.hash(),
+                            age,
+                        },
+                        None,
+                    )
+                } else {
+                    let keys_of = match columns.as_slice() {
+                        [c] if bellwether_core::expr::is_expression(c, replayer.schema()) => {
+                            Some(c.clone())
+                        }
+                        _ => None,
+                    };
+                    let key_columns = match &keys_of {
+                        Some(e) => bellwether_core::expr::Expr::parse(e)?.columns(),
+                        None => columns,
+                    };
+                    (
+                        key_columns,
+                        CoverageRequest::Workload(WorkloadKeys {
+                            workload: workload.hash(),
+                            age,
+                            keys,
+                        }),
+                        keys_of,
+                    )
+                };
+                let ignored = unhashable(replayer.schema(), &key_columns);
+                let mut rec_spec = ReconcileSpec::new(key_columns)
+                    .ignore(ignored)
+                    .coverage(coverage);
+                if let Some(e) = keys_of {
+                    rec_spec = rec_spec.keys_of(e);
+                }
+                rows_asked(source, replayer.catalog(), &asked, rec_spec)
+            },
+        )
+    }
+
+    /// Verify's reconcile for a key proposal: every row the workload asks
+    /// for (`reconcile`, given the workload's age, chooses and keys them)
+    /// in a full scan of `source`, against the rows in the `selected` row
+    /// groups the configuration the apply commits plans; the certificate
+    /// cites the plan evidence of `selected` and records `agg`.
+    #[allow(clippy::too_many_arguments)]
+    fn certify_planned(
+        &self,
+        proposal: &Hash,
+        replayer: &Replayer<'_>,
+        source: &dyn Source,
+        workload: &Workload,
+        cache: &Cache<ObjectStoreBackend>,
+        pinned: Option<&Pinned>,
+        selected: BTreeMap<String, (FileFingerprint, RoaringBitmap)>,
+        agg: Vec<AggServed>,
+        reconcile: impl FnOnce(Duration) -> Result<ReconcileSpec>,
+    ) -> Result<(Written, Written, Reconciliation)> {
         let union = union_plan(replayer, &selected)?;
         let plan_evidence = self.plan_evidence(replayer, workload, union)?;
         let planned = PlannedSource {
@@ -1163,68 +1301,7 @@ impl Engine {
             None => cache.get_cached(&workload.hash())?,
         };
         let workload_age = cached.map_or(Duration::ZERO, |(_, age)| age);
-        // A text workload (B5) names words and substrings, and a membership
-        // workload (B4) list elements, not keys: rows are compared keyed by
-        // every hashable column, and chosen by the runs' text matches or
-        // membership tests. A workload keyed on an expression (an expr
-        // key's runs) compares the rows whose expression value is one of its
-        // keys, each row identified by the expression's input columns.
-        let (key_columns, coverage, keys_of) = if text || membership {
-            let hashable: Vec<String> = replayer
-                .schema()
-                .fields()
-                .iter()
-                .filter(|f| bellwether_core::encoding::check_supported(f.data_type()).is_ok())
-                .map(|f| f.name().clone())
-                .collect();
-            if hashable.is_empty() {
-                return Err(Error::Other(format!(
-                    "every column of {} is nested (a list, map, or struct), so verify has no \
-                     column to compare rows by and cannot certify {}; build it without a \
-                     receipt with `bellwether index {} --key {}`",
-                    self.root(),
-                    named,
-                    self.root(),
-                    named
-                )));
-            }
-            (
-                hashable,
-                CoverageRequest::WorkloadRows {
-                    workload: workload.hash(),
-                    age: workload_age,
-                },
-                None,
-            )
-        } else {
-            let keys_of = match columns.as_slice() {
-                [c] if bellwether_core::expr::is_expression(c, replayer.schema()) => {
-                    Some(c.clone())
-                }
-                _ => None,
-            };
-            let key_columns = match &keys_of {
-                Some(e) => bellwether_core::expr::Expr::parse(e)?.columns(),
-                None => columns,
-            };
-            (
-                key_columns,
-                CoverageRequest::Workload(WorkloadKeys {
-                    workload: workload.hash(),
-                    age: workload_age,
-                    keys,
-                }),
-                keys_of,
-            )
-        };
-        let ignored = unhashable(replayer.schema(), &key_columns);
-        let mut rec_spec = ReconcileSpec::new(key_columns)
-            .ignore(ignored)
-            .coverage(coverage);
-        if let Some(e) = keys_of {
-            rec_spec = rec_spec.keys_of(e);
-        }
-        let rec_spec = rows_asked(source, replayer.catalog(), &asked, rec_spec)?;
+        let rec_spec = reconcile(workload_age)?;
         let ctx = CertificateContext {
             proposal: Some(*proposal),
             manifest: pinned.map(anchor),
@@ -1656,8 +1733,12 @@ impl Engine {
             [spec] => self.pair_of(pinned.as_ref(), spec)?,
             _ => None,
         };
-        let replayer = with_pair(replayer(self, &*source, pinned.as_ref())?, pair.as_ref())?;
         let cache = self.cache()?;
+        let datasets = self.workload_datasets(workload, &cache)?;
+        let replayer = datasets.attach(with_pair(
+            replayer(self, &*source, pinned.as_ref())?,
+            pair.as_ref(),
+        )?)?;
         let (replay, _, _) = self.score(&replayer, proposal, workload, &cache)?;
         Ok(Some(Box::new(replay)))
     }
@@ -1824,6 +1905,581 @@ impl Engine {
             });
         }
         Ok(out)
+    }
+}
+
+/// Whether `spec` is a keyed spec (exact, temporal, bloom) on exactly the
+/// column set `columns`, in any order: one a consumer plan's whole-key
+/// lookup on those columns plans with.
+fn keyed_on(spec: &KeySpec, columns: &[String]) -> bool {
+    matches!(
+        spec,
+        KeySpec::Exact { .. } | KeySpec::Temporal { .. } | KeySpec::Bloom { .. }
+    ) && spec.columns().len() == columns.len()
+        && spec.columns().iter().all(|c| columns.contains(c))
+}
+
+/// One lookup of a consumer plan verify compares: its keys, how they were
+/// planned, and the row-group ids the plan read them from.
+type KeyedLookup = (RunKeys, RunQuery, RoaringBitmap);
+
+/// The canonical probes of `keys` on `columns` (in that order), as a set.
+fn probe_set(keys: &RunKeys, columns: &[String]) -> std::collections::BTreeSet<Vec<u8>> {
+    keys.positions(columns)
+        .map(|p| keys.all_probes(&p).into_iter().collect())
+        .unwrap_or_default()
+}
+
+impl Engine {
+    /// Stage 2 for a key proposal over a workload of consumer-plan runs
+    /// (WP15). Verify compares what the plans look up through a proposed
+    /// key, never the runs' keys as such: per run, its plan is priced under
+    /// `specs` (the configuration the apply commits) recording each lookup
+    /// on `main` ([`Replayer::plan_lookups`]), and every lookup a proposed
+    /// key plans (its keys on the key's columns, or its range on a range
+    /// key's column) is compared, every row of it in a full scan against
+    /// the rows in the row groups the plan read it from. The keys come
+    /// from the workload and the plans (the run's keys relabelled, literal
+    /// keys, a join's keys restricted by them), never from the index under
+    /// test. A `latest` or `as_of` of the same keys supersedes their locate
+    /// within one run, since the plan reads only the versions then.
+    ///
+    /// Refused, each naming what to do: a proposed key a plan uses only on
+    /// a join no run or literal key restricts (its lookups are the whole key
+    /// space, not the workload's); a proposed key no plan looks anything up
+    /// through; lookups mixing whole keys with ranges, ranges on several
+    /// columns, several key-column sets, or plain locates with
+    /// `latest`/`as_of` (one certificate compares one kind). The versioned
+    /// lookups then share one version column: it is the serving temporal
+    /// key's for their one key-column set under one configuration.
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    fn verify_plan_key(
+        &self,
+        proposal: &Hash,
+        proposed: &[KeySpec],
+        specs: &[KeySpec],
+        replayer: &Replayer<'_>,
+        source: &dyn Source,
+        workload: &Workload,
+        cache: &Cache<ObjectStoreBackend>,
+        pinned: Option<&Pinned>,
+    ) -> Result<(Written, Written, Reconciliation)> {
+        use bellwether_replay::PlanLookup;
+        let named = proposed
+            .iter()
+            .map(crate::spec::label)
+            .collect::<Vec<_>>()
+            .join(" and ");
+        let without_receipt = format!(
+            "propose a key the plans look up by the workload's keys, or build {named} without a \
+             receipt with `bellwether index {} --key {}`",
+            self.root(),
+            proposed
+                .iter()
+                .map(crate::spec::label)
+                .collect::<Vec<_>>()
+                .join(" --key ")
+        );
+        let refuse = |reason: String| Error::InvalidArgument {
+            field: "workload",
+            reason,
+        };
+        let mut checked: BTreeMap<Hash, bellwether_replay::CheckedPlan> = BTreeMap::new();
+        let mut keyed: Vec<KeyedLookup> = Vec::new();
+        let mut ranges: Vec<(String, Vec<u8>, Vec<u8>, RoaringBitmap)> = Vec::new();
+        for run in workload.runs() {
+            let Some(h) = &run.plan else {
+                return Err(refuse(
+                    "the workload mixes runs priced through a consumer plan with plain lookups; \
+                     record each as its own workload"
+                        .into(),
+                ));
+            };
+            if !checked.contains_key(h) {
+                let plan = bellwether_replay::load_plan(cache, h)?;
+                checked.insert(*h, replayer.check_plan(&plan).map_err(Error::from)?);
+            }
+            let rk = workload.run_keys(cache, run)?;
+            let lookups = replayer
+                .plan_lookups(&checked[h], specs, &run.run_id, &rk, run.query()?.asof_ts())
+                .map_err(Error::from)?;
+            let mut run_keyed: Vec<KeyedLookup> = Vec::new();
+            for l in lookups {
+                match l {
+                    PlanLookup::Keys {
+                        keys,
+                        query,
+                        planned,
+                        ..
+                    } if proposed.iter().any(|s| keyed_on(s, keys.columns())) => {
+                        run_keyed.push((keys, query, planned));
+                    }
+                    PlanLookup::Range {
+                        column,
+                        lo,
+                        hi,
+                        planned,
+                        ..
+                    } if proposed
+                        .iter()
+                        .any(|s| matches!(s, KeySpec::Range { column: c } if *c == column)) =>
+                    {
+                        ranges.push((column, lo, hi, planned));
+                    }
+                    PlanLookup::AllKeys { node, columns }
+                        if proposed.iter().any(|s| keyed_on(s, &columns)) =>
+                    {
+                        return Err(refuse(format!(
+                            "plan {h} node {node} joins main on ({}) with no run or literal \
+                             keys restricting either side, so {named} would be looked up with \
+                             every key main holds, not the workload's, and fix verifies a key \
+                             on the keys its workload looks up; put a semi-join on the run's \
+                             keys (keys_from: run) below the join, or {without_receipt}",
+                            columns.join(", ")
+                        )));
+                    }
+                    _ => {}
+                }
+            }
+            // A locate whose keys a `latest` or `as_of` of this run then
+            // looks up: the plan reads only the versions of those keys.
+            // Compared on one column order.
+            let sorted = |k: &RunKeys| {
+                let mut cols = k.columns().to_vec();
+                cols.sort();
+                probe_set(k, &cols)
+            };
+            let versioned: Vec<std::collections::BTreeSet<Vec<u8>>> = run_keyed
+                .iter()
+                .filter(|(_, q, _)| !matches!(q, RunQuery::Locate))
+                .map(|(k, _, _)| sorted(k))
+                .collect();
+            run_keyed.retain(|(k, q, _)| {
+                !matches!(q, RunQuery::Locate) || !versioned.contains(&sorted(k))
+            });
+            keyed.extend(run_keyed);
+        }
+        let catalog = replayer.catalog();
+        let mut selected: BTreeMap<String, (FileFingerprint, RoaringBitmap)> = BTreeMap::new();
+        let mut select = |ids: &RoaringBitmap| -> Result<()> {
+            for e in catalog.plan_for(ids)?.entries {
+                selected
+                    .entry(e.file.path.clone())
+                    .or_insert_with(|| (e.file.clone(), RoaringBitmap::new()))
+                    .1 |= &e.row_groups;
+            }
+            Ok(())
+        };
+        match (keyed.is_empty(), ranges.is_empty()) {
+            (true, true) => Err(refuse(format!(
+                "the workload's plans look nothing up on main through {named} (it only counts an \
+                 aggregate's groups or bounds rows, which narrows no read), so fix has no lookup \
+                 to verify it on; {without_receipt}"
+            ))),
+            (false, false) => Err(refuse(format!(
+                "the workload's plans look {named} up both by whole keys and by ranges, and one \
+                 certificate compares one kind of lookup; propose the range key and the keyed \
+                 key separately"
+            ))),
+            (true, false) => {
+                let column = ranges[0].0.clone();
+                if ranges.iter().any(|r| r.0 != column) {
+                    return Err(refuse(format!(
+                        "the workload's plans look {named} up by ranges on several columns, and \
+                         one certificate compares one column; propose one range key at a time"
+                    )));
+                }
+                let mut filter = Vec::with_capacity(ranges.len());
+                for (column, lo, hi, planned) in ranges {
+                    select(&planned)?;
+                    filter.push(Predicate::Between { column, lo, hi });
+                }
+                #[cfg(test)]
+                test_seam::apply(&mut selected);
+                let key_columns = vec![column];
+                self.certify_planned(
+                    proposal,
+                    replayer,
+                    source,
+                    workload,
+                    cache,
+                    pinned,
+                    selected,
+                    Vec::new(),
+                    |age| {
+                        let ignored = unhashable(replayer.schema(), &key_columns);
+                        Ok(ReconcileSpec::new(key_columns)
+                            .ignore(ignored)
+                            .coverage(CoverageRequest::WorkloadRows {
+                                workload: workload.hash(),
+                                age,
+                            })
+                            .rows_where(filter))
+                    },
+                )
+            }
+            (false, true) => {
+                let key_columns = keyed[0].0.columns().to_vec();
+                if keyed.iter().any(|(k, _, _)| {
+                    k.positions(&key_columns).is_none() || k.columns().len() != key_columns.len()
+                }) {
+                    return Err(refuse(format!(
+                        "the workload's plans look {named} up on several key-column sets, and one \
+                         certificate compares one set; propose one key at a time"
+                    )));
+                }
+                let locate = keyed.iter().any(|(_, q, _)| matches!(q, RunQuery::Locate));
+                let versioned = keyed.iter().any(|(_, q, _)| !matches!(q, RunQuery::Locate));
+                if locate && versioned {
+                    return Err(refuse(format!(
+                        "the workload's plans look {named} up both for every row of some keys and \
+                         for only the newest version of others (latest or as_of), and one \
+                         certificate compares one version rule; record the plans' latest and \
+                         locate lookups as separate workloads, or {without_receipt}"
+                    )));
+                }
+                let mut keys: Vec<Vec<u8>> = Vec::new();
+                let mut asked: Vec<AskedRun> = Vec::with_capacity(keyed.len());
+                for (k, query, planned) in keyed {
+                    select(&planned)?;
+                    keys.extend(probe_set(&k, &key_columns));
+                    let column = replayer.planned_time_column(specs, k.columns(), &query)?;
+                    asked.push(AskedRun {
+                        keys: k,
+                        query,
+                        column,
+                        window: None,
+                        residual: None,
+                    });
+                }
+                keys.sort_unstable();
+                keys.dedup();
+                #[cfg(test)]
+                test_seam::apply(&mut selected);
+                self.certify_planned(
+                    proposal,
+                    replayer,
+                    source,
+                    workload,
+                    cache,
+                    pinned,
+                    selected,
+                    Vec::new(),
+                    |age| {
+                        let ignored = unhashable(replayer.schema(), &key_columns);
+                        let spec = ReconcileSpec::new(key_columns).ignore(ignored).coverage(
+                            CoverageRequest::Workload(WorkloadKeys {
+                                workload: workload.hash(),
+                                age,
+                                keys,
+                            }),
+                        );
+                        rows_asked(source, catalog, &asked, spec)
+                    },
+                )
+            }
+        }
+    }
+}
+
+/// A rewrite whose shape carries a before and an after consumer plan
+/// (relational replay, WP15).
+impl Engine {
+    /// The workload a plan rewrite is priced over: the request's, else the
+    /// shape's key sample.
+    fn rewrite_workload(
+        &self,
+        given: Option<Hash>,
+        shape: &bellwether_types::RewriteShape,
+        cache: &Cache<ObjectStoreBackend>,
+    ) -> Result<Workload> {
+        let h = given.or(shape.keys).ok_or(Error::NoWorkload {
+            proposal: "rewrite",
+            field: "workload",
+            needs: "a recorded workload whose runs' keys feed its plans (why --from <keys> --plan \
+                    <plan.json> records one), given with the request or as the shape's keys",
+        })?;
+        load_workload(self, cache, &h)
+    }
+
+    /// Scores a plan rewrite now: per run, the before plan as current and
+    /// the after plan as proposed, under the current configuration of
+    /// every dataset they scan (each bound by its operator). Over a table
+    /// the replay is measured and not recorded (ADR 027); otherwise it is
+    /// written, measured (naming the model) only when a plan reads a table.
+    fn score_plan_rewrite(
+        &self,
+        proposal: &Hash,
+        shape: &bellwether_types::RewriteShape,
+        workload: &Workload,
+        cache: &Cache<ObjectStoreBackend>,
+        pinned: Option<&Pinned>,
+    ) -> Result<(Written, Score)> {
+        let plans: Vec<bellwether_types::ConsumerPlan> = shape
+            .before_plan
+            .iter()
+            .chain(&shape.after_plan)
+            .cloned()
+            .collect();
+        let datasets = self.datasets_for(&[], &plans)?;
+        let source = self.source(pinned)?;
+        let replayer = datasets.attach(replayer(self, &*source, pinned)?)?;
+        let (written, model) = if self.is_table() {
+            let (h, scored) = measured_score(self, &replayer, proposal, workload, cache)?;
+            (
+                Written {
+                    hash: h,
+                    record: Record::Replay(scored.replay),
+                },
+                Some(MEASURED_AGGREGATES.to_string()),
+            )
+        } else {
+            let (w, _, _) = self.score(&replayer, proposal, workload, cache)?;
+            let model = match &w.record {
+                Record::Replay(r) => r.model.clone(),
+                _ => None,
+            };
+            (w, model)
+        };
+        let Record::Replay(r) = &written.record else {
+            return Err(Error::Other("a replay scored is not a replay".into()));
+        };
+        let (current, proposed) = (total(&r.current), total(&r.proposed));
+        let score = match model {
+            Some(model) => Score::Measured {
+                replay: Box::new(written.clone()),
+                current,
+                proposed,
+                model,
+            },
+            None => Score::Replayed {
+                replay: Box::new(written.clone()),
+                current,
+                proposed,
+            },
+        };
+        Ok((written, score))
+    }
+
+    /// `fix --proposal` for a plan rewrite: the workload, the score, the
+    /// gain gate, then the reconcile of the actual before and after
+    /// outputs (a certificate of the outputs, never of the plans), the
+    /// trust gate, and an attest-only receipt: the engine runs no query, so
+    /// it applies nothing; a human deploys the after shape.
+    fn fix_plan_rewrite(
+        &self,
+        mut result: FixResult,
+        hash: &Hash,
+        proposal: &Proposal,
+        shape: &bellwether_types::RewriteShape,
+        req: &FixRequest,
+        pinned: Option<&Pinned>,
+    ) -> Result<FixResult> {
+        result.invariant = Some(shape.invariant.clone());
+        let outputs = req.rewrite.as_ref().ok_or(Error::NoWorkload {
+            proposal: "rewrite",
+            field: "rewrite",
+            needs: "the outputs before and after it",
+        })?;
+        let cache = self.cache()?;
+        let workload = self.rewrite_workload(req.workload, shape, &cache)?;
+        // 1. Score, and the gain gate (not on a verify-only run, which
+        // applies nothing; applying its certificate scores and gates).
+        let (replay, score) = self.score_plan_rewrite(hash, shape, &workload, &cache, pinned)?;
+        let (current, proposed) = match &score {
+            Score::Replayed {
+                current, proposed, ..
+            }
+            | Score::Measured {
+                current, proposed, ..
+            } => (*current, *proposed),
+            Score::NotScorable { .. } => (Cost::default(), Cost::default()),
+        };
+        result.score = Some(score);
+        if let Some(r) = no_gain(
+            &replay.hash,
+            &current,
+            &proposed,
+            req.allow_no_gain || req.verify_only,
+        ) {
+            result.outcome = refused(r);
+            return Ok(result);
+        }
+        // 2. Verify: the actual outputs.
+        let (cert, verification) = self.verify_rewrite(hash, outputs, pinned)?;
+        result.verification = Some(verification);
+        let certificate = cert_of(&cert)?.clone();
+        result.certificate = Some(cert.clone());
+        if let Some(r) = failed(&cert.hash, &certificate) {
+            result.outcome = refused(r);
+            return Ok(result);
+        }
+        if req.verify_only {
+            result.signatures = self.sign_written(&[(cert.hash, RecordKind::Certificate)], None)?;
+            return Ok(result);
+        }
+        if self.is_table() {
+            result.outcome = refused(self.attest_only(&cert.hash, &proposal.body)?);
+            return Ok(result);
+        }
+        // 3 and 4, behind the trust-boundary gate.
+        match self.gate(&cert.hash, &certificate, false)? {
+            Err(r) => result.outcome = refused(r),
+            Ok(before) => {
+                (result.outcome, result.signatures) = self.attest_plan_rewrite(
+                    proposal, hash, shape, &replay, &cert.hash, true, before,
+                )?;
+            }
+        }
+        Ok(result)
+    }
+
+    /// `fix --certificate` for a plan rewrite: the certificate reconciled
+    /// the outputs earlier; the replay is recomputed now over the shape's
+    /// key sample and gated, then the attest-only receipt. A dry run writes
+    /// nothing (no replay is scored).
+    #[allow(clippy::too_many_arguments)]
+    fn apply_plan_rewrite(
+        &self,
+        mut result: FixResult,
+        cert_hash: &Hash,
+        proposal_hash: &Hash,
+        proposal: &Proposal,
+        shape: &bellwether_types::RewriteShape,
+        before: u64,
+        dry_run: bool,
+        allow_no_gain: bool,
+    ) -> Result<FixResult> {
+        result.invariant = Some(shape.invariant.clone());
+        let cache = self.cache()?;
+        let workload = self.rewrite_workload(None, shape, &cache)?;
+        if dry_run {
+            // What the real apply opens: every dataset bound and each plan
+            // valid against it.
+            let plans: Vec<bellwether_types::ConsumerPlan> = shape
+                .before_plan
+                .iter()
+                .chain(&shape.after_plan)
+                .cloned()
+                .collect();
+            let datasets = self.datasets_for(&[], &plans)?;
+            let pinned = self.pin()?;
+            let source = self.source(pinned.as_ref())?;
+            let replayer = datasets.attach(replayer(self, &*source, pinned.as_ref())?)?;
+            for p in &plans {
+                replayer.check_plan(p).map_err(Error::from)?;
+            }
+            result.outcome = FixOutcome::WouldApply {
+                sequence: before,
+                expected: before,
+            };
+            return Ok(result);
+        }
+        let pinned = self.pin()?;
+        let (replay, score) =
+            self.score_plan_rewrite(proposal_hash, shape, &workload, &cache, pinned.as_ref())?;
+        let (current, proposed) = match &score {
+            Score::Replayed {
+                current, proposed, ..
+            }
+            | Score::Measured {
+                current, proposed, ..
+            } => (*current, *proposed),
+            Score::NotScorable { .. } => (Cost::default(), Cost::default()),
+        };
+        result.score = Some(score);
+        if let Some(r) = no_gain(&replay.hash, &current, &proposed, allow_no_gain) {
+            result.outcome = refused(r);
+            return Ok(result);
+        }
+        (result.outcome, result.signatures) = self.attest_plan_rewrite(
+            proposal,
+            proposal_hash,
+            shape,
+            &replay,
+            cert_hash,
+            false,
+            before,
+        )?;
+        Ok(result)
+    }
+
+    /// The attest-only receipt of a plan rewrite, after one last check that
+    /// every dataset its replay read is the data now (the data root's and
+    /// each bound dataset's catalog digest among the replay's inputs): a
+    /// dataset that changed between the score and the attest would make the
+    /// receipt cite another data's numbers, so it is refused
+    /// ([`Refusal::DataChanged`]) with nothing written.
+    #[allow(clippy::too_many_arguments)]
+    fn attest_plan_rewrite(
+        &self,
+        proposal: &Proposal,
+        proposal_hash: &Hash,
+        shape: &bellwether_types::RewriteShape,
+        replay: &Written,
+        cert: &Hash,
+        certificate_written: bool,
+        manifest: u64,
+    ) -> Result<(FixOutcome, Vec<SignatureWritten>)> {
+        #[cfg(test)]
+        test_seam::before_apply(self);
+        let Record::Replay(r) = &replay.record else {
+            return Err(Error::Other("a replay written is not a replay".into()));
+        };
+        let plans: Vec<bellwether_types::ConsumerPlan> = shape
+            .before_plan
+            .iter()
+            .chain(&shape.after_plan)
+            .cloned()
+            .collect();
+        let datasets = self.datasets_for(&[], &plans)?;
+        let pinned = self.pin()?;
+        let source = self.source(pinned.as_ref())?;
+        let main = replayer(self, &*source, pinned.as_ref())?
+            .catalog()
+            .digest();
+        for now in std::iter::once(main).chain(datasets.digests()?) {
+            if !r.inputs.contains(&now) {
+                return Ok((
+                    refused(Refusal::DataChanged {
+                        certificate: *cert,
+                        certified: None,
+                        current: now,
+                    }),
+                    Vec::new(),
+                ));
+            }
+        }
+        let receipt = Receipt {
+            record_version: format::RECORD_VERSION,
+            evidence: proposal.evidence.clone(),
+            proposal: *proposal_hash,
+            replay: replay.hash,
+            certificate: *cert,
+            manifest_before: manifest.to_string(),
+            manifest_after: manifest.to_string(),
+            created_at: self.now(),
+            attest_only: true,
+            prediction: r.prediction.clone(),
+        };
+        let now = self.manifest()?.map_or(0, |m| m.sequence);
+        let hash = self.ledger()?.put_receipt(&receipt, &now.to_string())?;
+        let mut signed = vec![(hash, RecordKind::Receipt)];
+        if certificate_written {
+            signed.push((*cert, RecordKind::Certificate));
+        }
+        let signatures = self.sign_written(&signed, None)?;
+        Ok((
+            FixOutcome::Attested {
+                receipt: Box::new(Written {
+                    hash,
+                    record: Record::Receipt(receipt),
+                }),
+                target: self.root().to_string(),
+                deploy: Vec::new(),
+            },
+            signatures,
+        ))
     }
 }
 
@@ -2280,6 +2936,9 @@ pub(crate) fn replayer<'a>(
         crate::SourceFormat::Parquet if !engine.is_table() => {
             replayer.with_unserved(Baseline::ParquetStats)
         }
+        // A table's statistics are the engine's per-unit aggregates: a
+        // plan node reading it is measured, never exact (ADR 027).
+        _ if engine.is_table() => replayer.with_measured(MEASURED_AGGREGATES),
         _ => replayer,
     })
 }

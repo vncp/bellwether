@@ -52,6 +52,7 @@ pub mod join;
 pub mod keys;
 pub mod layout;
 pub mod plan;
+pub mod relational;
 pub mod replay;
 pub mod report;
 pub mod sketch;
@@ -71,7 +72,11 @@ pub use plan::{
     run_cost, servable, serves_bitemporal, serves_query, serves_window, serving_temporal_column,
     text_residual, Lookup, PlanSource, RangeRead, SegmentBytes, SegmentPlanner, SpecSegments,
 };
-pub use replay::{proposed_specs, write_replay, Replayer, Scored, DEFAULT_CACHE_BYTES};
+pub use relational::{
+    check_shape, children, op_name, CheckedPlan, PlanLookup, PricedPlan, ScanRead, SharedOutput,
+    MAIN_DATASET, PLAN_VERSION,
+};
+pub use replay::{proposed_specs, write_replay, PricedRuns, Replayer, Scored, DEFAULT_CACHE_BYTES};
 pub use report::{
     nearest_rank, p50_p95_max, report, CostQuantiles, Report, RunRow, TemplateSummary,
 };
@@ -81,9 +86,10 @@ pub use transient::{
     BuildStats, CacheStats, TransientCache, TransientIndex, TransientLimits, CLUSTER_KEY_OVERHEAD,
 };
 pub use workload::{
-    record_bench_workload, BenchWorkloadSummary, KeyInput, KeySetSink, KeySetSource, MemoryKeySets,
-    RecordedRun, RunAggregate, RunBitemporal, RunJoin, RunLive, RunQuery, RunWindow, Workload,
-    WorkloadFile, WorkloadManifest, WorkloadRecorder, BENCH_WORKLOAD_FORMAT, QUERY_KIND_AGGREGATE,
-    QUERY_KIND_ASOF, QUERY_KIND_BITEMPORAL, QUERY_KIND_COUNT, QUERY_KIND_LATEST, QUERY_KIND_LOCATE,
-    QUERY_KIND_SEMIJOIN, QUERY_KIND_WINDOW, WORKLOAD_FORMAT,
+    load_plan, plan_payload, record_bench_workload, store_plan, BenchWorkloadSummary, KeyInput,
+    KeySetSink, KeySetSource, MemoryKeySets, RecordedRun, RunAggregate, RunBitemporal, RunJoin,
+    RunLive, RunQuery, RunWindow, Workload, WorkloadFile, WorkloadManifest, WorkloadRecorder,
+    BENCH_WORKLOAD_FORMAT, QUERY_KIND_AGGREGATE, QUERY_KIND_ASOF, QUERY_KIND_BITEMPORAL,
+    QUERY_KIND_COUNT, QUERY_KIND_LATEST, QUERY_KIND_LOCATE, QUERY_KIND_SEMIJOIN, QUERY_KIND_WINDOW,
+    WORKLOAD_FORMAT,
 };

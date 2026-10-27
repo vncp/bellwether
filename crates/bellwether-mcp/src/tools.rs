@@ -407,6 +407,24 @@ pub struct ScoreWhy {
     /// Default: none (every row of the newest version).
     #[serde(default)]
     pub tombstone: Option<String>,
+    /// A consumer plan (relational replay; `why --plan`): a JSON file of a
+    /// typed plan DAG (read, never written). Each run of `keys` is priced
+    /// through it under the current configuration and each candidate key
+    /// drawn from the columns its filters, joins, windows, and aggregates
+    /// name; the result adds its operator table. Takes `keys` and no
+    /// lookup option but `at`.
+    #[serde(default)]
+    pub plan: Option<String>,
+    /// The datasets `plan` scans besides the data folder, by the names the
+    /// human bound when starting the server (`--dataset NAME=ROOT`): names
+    /// only, never a folder; default: every dataset the plan names.
+    #[serde(default)]
+    pub datasets: Vec<String>,
+    /// The instant of `plan`'s `as_of` nodes (`why --plan --at`), or with
+    /// `latest_by` the instant of an `asof` lookup: RFC 3339, a date, or an
+    /// integer in the version column's unit; default: none.
+    #[serde(default)]
+    pub at: Option<String>,
 }
 
 /// What an aggregate lookup computes per key.
