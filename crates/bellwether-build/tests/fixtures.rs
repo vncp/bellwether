@@ -453,7 +453,8 @@ fn timestamps_parquet_latest_and_asof() {
     );
     assert_eq!(plan.row_groups_selected, 0);
     // latest needs every temporal column in the lookup
-    let lookup = Lookup::Latest { live: None,
+    let lookup = Lookup::Latest {
+        live: None,
         columns: cols(&["id"]),
         keys: vec![enc(&Value::Int(1), &DataType::Int32)],
     };

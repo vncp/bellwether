@@ -796,12 +796,13 @@ impl SegmentPlanner {
         }
         let live = catalog.all_ids();
         let mut planner = Self::new(catalog);
-        for (i, spec) in manifest.schema.key_specs.iter().enumerate() {
+        // Each temporal or bitemporal spec with the tombstone its sidecar
+        // declares (B8); the manifest's `key_specs` hold them without it.
+        let declared = bellwether_build::declared_key_specs(manifest);
+        for (i, full) in declared.iter().enumerate() {
+            let spec = &full.without_tombstone();
             let name = spec.name();
-            if manifest.schema.key_specs[..i]
-                .iter()
-                .any(|s| s.name() == name)
-            {
+            if declared[..i].iter().any(|s| s.name() == name) {
                 return Err(Error::KeySpec(format!(
                     "two declared key specs share the name {name}; their segments cannot be told \
                      apart"
@@ -856,7 +857,32 @@ impl SegmentPlanner {
                 }));
                 readers.push(SegmentReader::open_for_dataset(bytes, &schema)?);
             }
-            planner.add(SpecSegments::new(spec.clone(), readers)?)?;
+            // A complete tombstone sidecar plans with the spec; an
+            // incomplete one is left out, and the spec plans without it (as
+            // `bellwether_build::Planner::usable_specs` has it).
+            if full.tombstone().is_some()
+                && bellwether_build::tombstone_completeness(manifest, full).is_some()
+            {
+                let sidecar = bellwether_build::tombstone_name(full);
+                let mut tombstones = Vec::new();
+                for r in manifest.segments.iter().filter(|s| {
+                    s.kind.as_deref() == Some(tombstone::TOMBSTONE_KIND) && s.key_spec == sidecar
+                }) {
+                    let bytes = SegmentBytes::Ranged(Arc::new(SnapshotSegment {
+                        snapshot: snapshot.clone(),
+                        id: r.id,
+                        len: r.bytes,
+                    }));
+                    tombstones.push(SegmentReader::open_for_dataset(bytes, &schema)?);
+                }
+                planner.add(SpecSegments::with_tombstones(
+                    full.clone(),
+                    readers,
+                    tombstones,
+                )?)?;
+            } else {
+                planner.add(SpecSegments::new(spec.clone(), readers)?)?;
+            }
         }
         Ok(planner)
     }
@@ -1525,10 +1551,13 @@ impl PlanSource for SegmentPlanner {
             // over transient key segments only.
             let spec = query.bitemporal().map(|b| {
                 format!(
-                    "temporal2:{}@{},{}",
+                    "temporal2:{}@{},{}{}",
                     keys.columns().join(","),
                     b.valid_column,
-                    b.known_column
+                    b.known_column,
+                    b.tombstone
+                        .as_ref()
+                        .map_or_else(String::new, |t| format!(",{}", t.spelling()))
                 )
             });
             return Err(Error::KeySpec(format!(

@@ -186,7 +186,8 @@ fn a_build_listing_one_spec_keeps_the_others() {
     let p = Planner::open(Arc::clone(&store), "idx").unwrap();
     let latest = p.plan(
         &[temporal()],
-        &Lookup::Latest { live: None,
+        &Lookup::Latest {
+            live: None,
             columns: cols(&["id"]),
             keys: vec![common::enc_i64(1)],
         },

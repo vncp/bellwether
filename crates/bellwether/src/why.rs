@@ -14,8 +14,8 @@ use bellwether_profile::lints::MembershipUse;
 use bellwether_profile::{ProfileOptions, ProfileReport};
 use bellwether_replay::{
     proposed_specs, record_bench_workload, servable, serves_query, Baseline, KeyInput, Lookup,
-    RecordedRun, Replayer, RunBitemporal, RunJoin, RunLive, RunQuery, RunWindow, Workload, WorkloadRecorder,
-    QUERY_KIND_LOCATE,
+    RecordedRun, Replayer, RunBitemporal, RunJoin, RunLive, RunQuery, RunWindow, Workload,
+    WorkloadRecorder, QUERY_KIND_LOCATE,
 };
 use bellwether_store::{Cache, ObjectStoreBackend, StoreExt};
 use bellwether_types::{
@@ -2402,7 +2402,8 @@ impl Engine {
             if !orderable || columns.contains(&ts_column) {
                 continue;
             }
-            let spec = KeySpec::Temporal { tombstone: None,
+            let spec = KeySpec::Temporal {
+                tombstone: None,
                 columns,
                 ts_column,
                 counts: false,
@@ -2547,12 +2548,10 @@ impl Engine {
                 // a temporal key with a tombstone: the fraction of keys
                 // whose newest row is a tombstone (B8)
                 KeySpec::Temporal {
-                    tombstone: Some(_),
-                    ..
+                    tombstone: Some(_), ..
                 }
                 | KeySpec::Bitemporal {
-                    tombstone: Some(_),
-                    ..
+                    tombstone: Some(_), ..
                 } => tombstone_column(replayer, &spec)?,
                 _ => match expr_column(replayer, &spec)? {
                     Some(c) => Some(c),

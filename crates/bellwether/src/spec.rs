@@ -203,6 +203,16 @@ fn strip_tombstone<'a>(s: &str, list: &'a str) -> Result<(&'a str, Option<Tombst
              tombstone=<column>=<value>",
         ));
     }
+    // The tombstone comes last: `,counts` after it is ambiguous (a column
+    // `void,counts`, or a value ending in it), so it is refused.
+    let last = value.as_deref().unwrap_or(column);
+    if column.contains([',', '@']) || last.ends_with(",counts") {
+        return Err(bad(
+            s,
+            "the tombstone comes last, after ,counts, and its column holds no ',' or '@'; write \
+             temporal:<keys>@<ts>,counts,tombstone=<column>",
+        ));
+    }
     Ok((
         head,
         Some(Tombstone {
@@ -622,7 +632,8 @@ mod tests {
         );
         assert_eq!(
             parse("temporal:id@ts,counts").unwrap(),
-            KeySpec::Temporal { tombstone: None,
+            KeySpec::Temporal {
+                tombstone: None,
                 columns: vec!["id".into()],
                 ts_column: "ts".into(),
                 counts: true,
@@ -633,6 +644,63 @@ mod tests {
         assert_eq!(d.key.as_ref().map(KeySpec::counts), Some(true));
         assert_eq!(declaration_label(&d), "exact:a@ts,counts");
         assert_eq!(parse_declaration(&declaration_label(&d)).unwrap(), d);
+    }
+
+    /// A tombstone (B8) is the last part of a temporal or temporal2 spec:
+    /// `tombstone=col` or `tombstone=col=value`, after `,counts`.
+    #[test]
+    fn tombstones_parse_last_and_read_back() {
+        for s in [
+            "temporal:id@ts,tombstone=void",
+            "temporal:id,v@ts,tombstone=status=VOID",
+            "temporal:id@ts,counts,tombstone=void",
+            "temporal:id@ts,tombstone=status=A,B=C",
+            "temporal2:id@valid,known,tombstone=void",
+            "temporal2:id@valid,known,tombstone=state=3",
+        ] {
+            let spec = parse(s).unwrap();
+            assert_eq!(label(&spec), s);
+            assert_eq!(parse(&label(&spec)).unwrap(), spec);
+            assert!(spec.tombstone().is_some(), "{s}");
+            assert_eq!(spec.without_tombstone().tombstone(), None);
+            assert_eq!(parse_declaration(s).unwrap().key, Some(spec));
+        }
+        assert_eq!(
+            parse("temporal:id@ts,counts,tombstone=status=VOID").unwrap(),
+            KeySpec::Temporal {
+                columns: vec!["id".into()],
+                ts_column: "ts".into(),
+                counts: true,
+                tombstone: Some(Tombstone {
+                    column: "status".into(),
+                    value: Some("VOID".into()),
+                }),
+            }
+        );
+        for s in [
+            "temporal:id@ts,tombstone=",
+            "temporal:id@ts,tombstone=status=",
+            "temporal:id@ts,tombstone=id",
+            "temporal:id@ts,tombstone=ts",
+            "temporal:id@ts,tombstone=void,counts",
+            "temporal:id@ts,tombstone=status=VOID,counts",
+            "temporal:id@ts,tombstone=a@b",
+            "temporal2:id@valid,known,tombstone=known",
+            "temporal2:id@valid,tombstone=void",
+        ] {
+            assert!(parse(s).is_err(), "{s} parsed");
+        }
+        assert_eq!(
+            parse_tombstone("status=VOID").unwrap(),
+            Tombstone {
+                column: "status".into(),
+                value: Some("VOID".into()),
+            }
+        );
+        assert_eq!(parse_tombstone("void").unwrap().value, None);
+        for bad in ["", "=x", "a=", "a,b", "a@b"] {
+            assert!(parse_tombstone(bad).is_err(), "{bad:?}");
+        }
     }
 
     #[test]
@@ -685,7 +753,8 @@ mod tests {
         );
         assert_eq!(
             parse("temporal2:id@valid,known").unwrap(),
-            KeySpec::Bitemporal { tombstone: None,
+            KeySpec::Bitemporal {
+                tombstone: None,
                 columns: vec!["id".into()],
                 valid_column: "valid".into(),
                 known_column: "known".into(),

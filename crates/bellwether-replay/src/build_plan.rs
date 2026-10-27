@@ -181,12 +181,11 @@ where
         self.sequence().to_string()
     }
 
+    /// The specs complete at the pinned sequence, as `Planner::usable_specs`
+    /// gives them: a spec with a tombstone (B8) whose tombstone sidecar is
+    /// not complete plans without it, as the facade's lookups do.
     fn specs(&self) -> Vec<KeySpec> {
-        self.declared_specs()
-            .iter()
-            .filter(|s| self.completeness(s).is_some())
-            .cloned()
-            .collect()
+        self.usable_specs().0
     }
 
     fn plan_query(&self, specs: &[KeySpec], keys: &RunKeys, query: &RunQuery) -> Result<ScanPlan> {

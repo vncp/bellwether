@@ -55,7 +55,13 @@ fn schema() -> SchemaRef {
 
 /// `(id, ts, void, valid, known)`; `status` is `VOID` where `void` is true,
 /// `OK` where false, null where null.
-type R = (Option<i64>, Option<i64>, Option<bool>, Option<i64>, Option<i64>);
+type R = (
+    Option<i64>,
+    Option<i64>,
+    Option<bool>,
+    Option<i64>,
+    Option<i64>,
+);
 
 fn write(s: &Scratch, name: &str, rows: &[R], per_rg: usize) {
     let batch = RecordBatch::try_new(
@@ -251,7 +257,9 @@ fn check(
             live,
         },
     };
-    let (plan, _, outcome) = p.plan_ordered_live(specs, &lookup(Some(t.clone()))).unwrap();
+    let (plan, _, outcome) = p
+        .plan_ordered_live(specs, &lookup(Some(t.clone())))
+        .unwrap();
     let plain = p.plan(specs, &lookup(None)).unwrap();
     let want = sorted(truth(rows, keys, asof));
     let what = format!("{} keys at {asof:?}", keys.len());
@@ -310,17 +318,11 @@ fn live_lookups_are_the_lookup_then_the_filter_on_decoded_files() {
                 pruned_somewhere |= outcome.row_groups_pruned > 0;
                 if asof.is_none() {
                     // keys retracted = keys with a version and no answer
-                    let with_version: BTreeSet<Vec<u8>> = latest_truth(
-                        &rows,
-                        &cols(&["id"]),
-                        &keys,
-                        &cols(&["id"]),
-                        "ts",
-                        None,
-                    )
-                    .iter()
-                    .map(|r| r.get("id").unwrap().clone())
-                    .collect();
+                    let with_version: BTreeSet<Vec<u8>> =
+                        latest_truth(&rows, &cols(&["id"]), &keys, &cols(&["id"]), "ts", None)
+                            .iter()
+                            .map(|r| r.get("id").unwrap().clone())
+                            .collect();
                     let answered: BTreeSet<Vec<u8>> = truth(&rows, &keys, None)
                         .iter()
                         .map(|r| r.get("id").unwrap().clone())
@@ -422,8 +424,9 @@ fn live_bitemporal_lookups_are_the_winner_then_the_filter() {
                     known,
                     live,
                 };
-                let (plan, _, outcome) =
-                    p.plan_ordered_live(&specs, &lookup(Some(tomb(None)))).unwrap();
+                let (plan, _, outcome) = p
+                    .plan_ordered_live(&specs, &lookup(Some(tomb(None))))
+                    .unwrap();
                 let plain = p.plan(&specs, &lookup(None)).unwrap();
                 let want = bitemporal_truth(&keys, valid, known);
                 let needed: BTreeSet<(String, u32)> =

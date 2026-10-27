@@ -650,11 +650,13 @@ pub fn check_latest(
     asof: Option<(i64, Vec<u8>)>,
 ) -> ScanPlan {
     let lookup = match &asof {
-        None => bellwether_build::Lookup::Latest { live: None,
+        None => bellwether_build::Lookup::Latest {
+            live: None,
             columns: columns.to_vec(),
             keys: keys.to_vec(),
         },
-        Some((ts, _)) => bellwether_build::Lookup::AsOf { live: None,
+        Some((ts, _)) => bellwether_build::Lookup::AsOf {
+            live: None,
             columns: columns.to_vec(),
             keys: keys.to_vec(),
             ts: *ts,

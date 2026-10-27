@@ -29,7 +29,8 @@ fn a_sketch_changes_no_replay_plan() {
             counts: false,
             bounds: None,
         },
-        KeySpec::Temporal { tombstone: None,
+        KeySpec::Temporal {
+            tombstone: None,
             columns: cols(&["entity_id"]),
             ts_column: "version_ts".into(),
             counts: false,

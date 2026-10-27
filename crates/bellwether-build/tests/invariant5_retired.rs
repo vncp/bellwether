@@ -107,11 +107,13 @@ fn answer(
 ) -> BTreeSet<(String, i64)> {
     let key = p.encode_tuple(&cols(&["id"]), &[Value::Int(id)]).unwrap();
     let lookup = match asof {
-        None => Lookup::Latest { live: None,
+        None => Lookup::Latest {
+            live: None,
             columns: cols(&["id"]),
             keys: vec![key],
         },
-        Some(ts) => Lookup::AsOf { live: None,
+        Some(ts) => Lookup::AsOf {
+            live: None,
             columns: cols(&["id"]),
             keys: vec![key],
             ts,
@@ -329,7 +331,8 @@ fn a_retired_zero_variant_does_not_bound_the_other_zero() {
         let plan = p
             .plan(
                 std::slice::from_ref(&t),
-                &Lookup::Latest { live: None,
+                &Lookup::Latest {
+                    live: None,
                     columns: cols(&["k"]),
                     keys: vec![key],
                 },
@@ -390,7 +393,8 @@ fn invariant5_asof_winner_in_a_pruned_row_group_bounds_older_rows() {
     let plan = p
         .plan(
             &specs,
-            &Lookup::AsOf { live: None,
+            &Lookup::AsOf {
+                live: None,
                 columns: cols(&["id", "region"]),
                 keys,
                 ts: 25,

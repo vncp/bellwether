@@ -115,8 +115,8 @@ fn probes() -> Vec<Vec<u8>> {
 
 /// One segment over the row groups `rgs` of `layout`.
 fn build(spec: &KeySpec, layout: &[Vec<Row>], rgs: std::ops::Range<usize>) -> Vec<u8> {
-    let mut w = SegmentWriter::for_dataset(spec.clone(), &schema(), WriterOptions::default())
-        .unwrap();
+    let mut w =
+        SegmentWriter::for_dataset(spec.clone(), &schema(), WriterOptions::default()).unwrap();
     w.set_rowgroup_range(RowGroupId(rgs.start as u32)..RowGroupId(rgs.end as u32))
         .unwrap();
     for rg in rgs {
@@ -323,9 +323,11 @@ fn nulls_follow_adr_014() {
     // only-tombstones C: its winning row group is pruned; resurrected A:
     // the later live row's row group stays, the earlier one is not a winner
     let c = &got[&key("C")];
-    assert!(tombstone::prune(&[0u32].into_iter().collect(), (3, 0), &[c])
-        .unwrap()
-        .is_empty());
+    assert!(
+        tombstone::prune(&[0u32].into_iter().collect(), (3, 0), &[c])
+            .unwrap()
+            .is_empty()
+    );
     let a = &got[&key("A")];
     assert_eq!(
         tombstone::prune(&[1u32].into_iter().collect(), (3, 0), &[a]).unwrap(),
@@ -371,7 +373,8 @@ fn bitemporal_entries_hold_both_clocks() {
     let mut w = SegmentWriter::new(spec, WriterOptions::default()).unwrap();
     let a = key("A");
     w.insert_liveness(&a, RowGroupId(0), (3, 10), true).unwrap();
-    w.insert_liveness(&a, RowGroupId(0), (3, 12), false).unwrap();
+    w.insert_liveness(&a, RowGroupId(0), (3, 12), false)
+        .unwrap();
     w.insert_liveness(&a, RowGroupId(1), (2, 20), true).unwrap();
     let r = open(&[w.finish().unwrap().bytes]);
     let got = tombstone::liveness(&r, &[a.clone()]).unwrap();
@@ -480,7 +483,8 @@ fn pinned_bitemporal() -> Vec<u8> {
     let mut w = SegmentWriter::new(spec, WriterOptions::default()).unwrap();
     let a = key("A");
     w.insert_liveness(&a, RowGroupId(0), (3, 10), true).unwrap();
-    w.insert_liveness(&a, RowGroupId(0), (3, 12), false).unwrap();
+    w.insert_liveness(&a, RowGroupId(0), (3, 12), false)
+        .unwrap();
     w.finish().unwrap().bytes
 }
 
@@ -507,10 +511,7 @@ fn tombstone_value_records_match_the_pinned_bytes() {
         "segment blake3"
     );
     for (bytes, records) in [
-        (
-            pinned_temporal(),
-            vec![("A", A_RECORD), ("B", B_RECORD)],
-        ),
+        (pinned_temporal(), vec![("A", A_RECORD), ("B", B_RECORD)]),
         (pinned_bitemporal(), vec![("A2", A_BITEMPORAL_RECORD)]),
     ] {
         for (what, hex) in records {
@@ -588,8 +589,8 @@ fn exercise(bytes: &[u8]) -> Result<(Entries, NewestTombstones), String> {
     let r = SegmentReader::open(bytes.to_vec()).map_err(|e| e.to_string())?;
     let readers = vec![r];
     let entries = tombstone::liveness(&readers, &probes()).map_err(|e| e.to_string())?;
-    let newest = tombstone::newest_tombstones(&readers, &(0..3).collect())
-        .map_err(|e| e.to_string())?;
+    let newest =
+        tombstone::newest_tombstones(&readers, &(0..3).collect()).map_err(|e| e.to_string())?;
     merge::merge(&readers, &WriterOptions::default()).map_err(|e| e.to_string())?;
     Ok((entries, newest))
 }

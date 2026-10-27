@@ -1104,10 +1104,7 @@ pub fn latest_then_filter(uses: &[TombstoneUse], complete: &[KeySpec]) -> Vec<Li
                 confidence: HIGH,
                 site: None,
                 fix: rewrite(
-                    format!(
-                        "latest on ({cols}), then where {}",
-                        u.tombstone.live_sql()
-                    ),
+                    format!("latest on ({cols}), then where {}", u.tombstone.live_sql()),
                     key,
                     "every row group holding a live row at a key's newest time is still \
                      selected (invariant 1), and the residual drops the tombstone rows",
@@ -1428,5 +1425,114 @@ mod tests {
         assert!(served.is_empty(), "{served:?}");
         assert!(list_membership(&[uses("tags", 0, 0)], &[]).is_empty());
         assert!(list_membership(&[], &[]).is_empty());
+    }
+
+    fn tombstone_use(value: Option<&str>, times: &[&str], runs: u64) -> TombstoneUse {
+        TombstoneUse {
+            columns: vec!["order_id".into()],
+            times: times.iter().map(|t| (*t).to_string()).collect(),
+            tombstone: Tombstone {
+                column: if value.is_some() { "status" } else { "void" }.into(),
+                value: value.map(str::to_string),
+            },
+            runs,
+        }
+    }
+
+    fn temporal(tombstone: Option<Tombstone>) -> KeySpec {
+        KeySpec::Temporal {
+            columns: vec!["order_id".into()],
+            ts_column: "ts".into(),
+            counts: false,
+            tombstone,
+        }
+    }
+
+    /// `R-tombstone-1` (B8) fires for `latest` runs followed by a filter on
+    /// a boolean or state column when no complete temporal key declares
+    /// that tombstone: none at all, one without a tombstone, one with
+    /// another tombstone, or one on other time columns. It names the key and
+    /// the `why` command that prices it.
+    #[test]
+    fn latest_then_filter_fires_without_a_key_declaring_the_tombstone() {
+        let other = Tombstone {
+            column: "cancelled".into(),
+            value: None,
+        };
+        let elsewhere = KeySpec::Temporal {
+            columns: vec!["order_id".into()],
+            ts_column: "booked".into(),
+            counts: false,
+            tombstone: Some(Tombstone {
+                column: "void".into(),
+                value: None,
+            }),
+        };
+        for complete in [
+            vec![],
+            vec![temporal(None)],
+            vec![temporal(Some(other))],
+            vec![elsewhere],
+        ] {
+            let lints = latest_then_filter(&[tombstone_use(None, &["ts"], 4)], &complete);
+            assert_eq!(lints.len(), 1, "{complete:?}");
+            let l = &lints[0];
+            assert_eq!(l.rule, LATEST_THEN_FILTER);
+            assert_eq!(l.columns, vec!["order_id".to_string()]);
+            assert!(l.message.starts_with("4 recorded run(s)"), "{}", l.message);
+            assert!(l.message.contains("where not void"), "{}", l.message);
+            assert!(
+                l.message.contains("temporal:order_id@ts,tombstone=void"),
+                "{}",
+                l.message
+            );
+            assert!(
+                l.message.contains("--latest-by ts --tombstone void"),
+                "{}",
+                l.message
+            );
+            let fix = l.fix.as_ref().unwrap();
+            assert_eq!(fix.after, "temporal:order_id@ts,tombstone=void");
+        }
+        // a state column, and a bitemporal run
+        let state = latest_then_filter(&[tombstone_use(Some("VOID"), &["ts"], 1)], &[]);
+        assert!(state[0].message.contains("status <> 'VOID'"));
+        assert!(state[0]
+            .message
+            .contains("temporal:order_id@ts,tombstone=status=VOID"));
+        assert!(state[0].message.contains("--tombstone status=VOID"));
+        let bi = latest_then_filter(&[tombstone_use(None, &["valid", "known"], 2)], &[]);
+        assert!(bi[0]
+            .message
+            .contains("temporal2:order_id@valid,known,tombstone=void"));
+        assert!(bi[0].message.contains("--valid-by valid --known-by known"));
+    }
+
+    /// It does not fire when a complete key on the runs' columns and time
+    /// declares exactly that tombstone (temporal or bitemporal), or without
+    /// such runs.
+    #[test]
+    #[allow(clippy::assert_is_empty)]
+    fn latest_then_filter_does_not_fire_with_the_tombstone_key_or_without_runs() {
+        let void = Tombstone {
+            column: "void".into(),
+            value: None,
+        };
+        let served = latest_then_filter(
+            &[tombstone_use(None, &["ts"], 3)],
+            &[temporal(Some(void.clone()))],
+        );
+        assert!(served.is_empty(), "{served:?}");
+        let bi = KeySpec::Bitemporal {
+            columns: vec!["order_id".into()],
+            valid_column: "valid".into(),
+            known_column: "known".into(),
+            tombstone: Some(void),
+        };
+        assert!(
+            latest_then_filter(&[tombstone_use(None, &["valid", "known"], 3)], &[bi]).is_empty()
+        );
+        assert!(latest_then_filter(&[tombstone_use(None, &["ts"], 0)], &[]).is_empty());
+        assert!(latest_then_filter(&[], &[]).is_empty());
     }
 }

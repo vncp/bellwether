@@ -45,7 +45,8 @@ fn specs() -> Vec<KeySpec> {
         KeySpec::Range {
             column: "version_ts".into(),
         },
-        KeySpec::Temporal { tombstone: None,
+        KeySpec::Temporal {
+            tombstone: None,
             columns: cols(&["status", "entity_id"]),
             ts_column: "version_ts".into(),
             counts: false,

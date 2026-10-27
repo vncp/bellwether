@@ -18,8 +18,8 @@ use crate::engine::{folder_changes, guard, root_hint, schema_hint, Engine, Folde
 use crate::keys::KeyFile;
 use crate::lookback::Lookback;
 use crate::results::{
-    Cost, CountResult, IndexResult, LivePlan, LookupKind, PlanResult, SidecarFolded, SidecarState, SpecState,
-    TextRebuilt,
+    Cost, CountResult, IndexResult, LivePlan, LookupKind, PlanResult, SidecarFolded, SidecarState,
+    SpecState, TextRebuilt,
 };
 use crate::spec::Declaration;
 use crate::text::TextQuery;
@@ -1559,9 +1559,7 @@ fn check_temporal_residual(plan: &ScanPlan, live: bool) -> Result<()> {
             let latest = all
                 .iter()
                 .position(|p| matches!(p, Predicate::LatestPerKey { .. }));
-            let tombstones = all
-                .iter()
-                .position(|p| matches!(p, Predicate::Live { .. }));
+            let tombstones = all.iter().position(|p| matches!(p, Predicate::Live { .. }));
             matches!((not_older, latest), (Some(a), Some(b)) if a < b)
                 && match (live, latest, tombstones) {
                     (false, _, None) => true,

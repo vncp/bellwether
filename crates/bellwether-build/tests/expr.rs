@@ -347,7 +347,8 @@ fn a_near_miss_is_refused_naming_the_expr_keys_never_guessed() {
     let e = planner
         .plan(
             &specs(),
-            &Lookup::Latest { live: None,
+            &Lookup::Latest {
+                live: None,
                 columns: vec![SYM.into()],
                 keys: vec![enc_str("ab3")],
             },

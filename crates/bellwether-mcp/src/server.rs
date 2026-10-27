@@ -521,7 +521,11 @@ impl Server {
                         json!({}),
                     ));
                 }
-                let tombstone = match a.tombstone.as_deref().map(bellwether::spec::parse_tombstone) {
+                let tombstone = match a
+                    .tombstone
+                    .as_deref()
+                    .map(bellwether::spec::parse_tombstone)
+                {
                     Some(Err(err)) => return failed(&err),
                     Some(Ok(t)) => Some(t),
                     None => None,

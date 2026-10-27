@@ -42,7 +42,8 @@ fn specs() -> Vec<KeySpec> {
             counts: false,
             bounds: None,
         },
-        KeySpec::Temporal { tombstone: None,
+        KeySpec::Temporal {
+            tombstone: None,
             columns: cols(&["entity_id"]),
             ts_column: "version_ts".into(),
             counts: false,
@@ -221,11 +222,13 @@ fn committed_and_transient_segments_plan_identically_through_wp4_and_this_crate(
             for run in t_workload.runs() {
                 let rk = t_workload.run_keys(&t_keys, run).unwrap();
                 let lookup = match &query {
-                    RunQuery::Latest => BuildLookup::Latest { live: None,
+                    RunQuery::Latest => BuildLookup::Latest {
+                        live: None,
                         columns: rk.columns().to_vec(),
                         keys: rk.tuples().map(<[u8]>::to_vec).collect(),
                     },
-                    RunQuery::Asof { ts } => BuildLookup::AsOf { live: None,
+                    RunQuery::Asof { ts } => BuildLookup::AsOf {
+                        live: None,
                         columns: rk.columns().to_vec(),
                         keys: rk.tuples().map(<[u8]>::to_vec).collect(),
                         ts: *ts,
