@@ -5,8 +5,8 @@ use std::time::{Duration, Instant};
 
 use bellwether_ledger::{Ledger, RecordKind};
 use bellwether_types::{
-    format, CertBody, Certificate, Evidence, Hash, MismatchExample, MismatchKind, Provenance,
-    Record, Store, MAX_MISMATCH_EXAMPLES,
+    format, AggServed, CertBody, Certificate, Evidence, Hash, MismatchExample, MismatchKind,
+    Provenance, Record, Store, MAX_MISMATCH_EXAMPLES,
 };
 
 use crate::error::{Result, VerifyError};
@@ -41,9 +41,11 @@ pub struct CertificateContext {
     /// The proposal verified, or `None` for a standalone reconcile. The
     /// ledger refuses a certificate whose proposal does not resolve.
     pub proposal: Option<Hash>,
-    /// The manifest to anchor to. When a side is indexed it must name that
-    /// side's sequence. Without one, and with no side indexed, the
-    /// certificate is anchored at manifest `"0"` (contract-v3 #29).
+    /// The manifest to anchor to: the left side's. When the left side is
+    /// indexed it must name that side's sequence, or, when both sides are
+    /// indexed, the right's (naming the side the certificate is for). Without
+    /// one, and with no side indexed, the certificate is anchored at
+    /// manifest `"0"` (contract-v3 #29).
     pub manifest: Option<ManifestAnchor>,
     /// Further inputs, cited in order after this crate's own.
     pub inputs: Vec<AgedInput>,
@@ -52,6 +54,11 @@ pub struct CertificateContext {
     /// run is added to an input's age. Two runs over the same inputs then
     /// make byte-identical certificates. `None` uses the system clock.
     pub clock: Option<String>,
+    /// Agg cells (B7) the caller checked against the decoded rows
+    /// ([`crate::check_agg_cells`]), each with [`AggServed::checked`] set:
+    /// appended to the reconciliation's and the certificate's `agg`; both
+    /// pass only when no checked cell differs.
+    pub agg: Vec<AggServed>,
 }
 
 /// A reconciliation with its certificate, ready to record.
@@ -122,7 +129,7 @@ pub(crate) fn build(
     now: Instant,
     created_at: String,
 ) -> Result<Certified> {
-    let sequence = manifest_version(&exec.manifests, ctx.manifest.as_ref())?;
+    let sequence = manifest_version(exec.manifests, ctx.manifest.as_ref())?;
     let mut inputs: Vec<Hash> = Vec::new();
     let mut oldest = Duration::ZERO;
     // Under a fixed clock "now" does not advance, so nothing elapses.
@@ -147,7 +154,13 @@ pub(crate) fn build(
     for i in &ctx.inputs {
         cite(i.hash, i.age, handed);
     }
-    let o = &exec.outcome;
+    let mut outcome = exec.outcome;
+    outcome.pass &= ctx
+        .agg
+        .iter()
+        .all(|a| a.checked.as_ref().is_none_or(|c| c.differ == 0));
+    outcome.agg.extend(ctx.agg.iter().cloned());
+    let o = &outcome;
     let totals_delta = o
         .mismatches
         .iter()
@@ -178,6 +191,7 @@ pub(crate) fn build(
             uncomparable: o.counts.no_comparable_version,
             totals: exec.totals.clone(),
             row_filter: o.row_filter.clone(),
+            agg: o.agg.clone(),
         },
         provenance: Provenance {
             inputs,
@@ -187,7 +201,7 @@ pub(crate) fn build(
         },
     };
     Ok(Certified {
-        outcome: exec.outcome,
+        outcome,
         certificate,
         evidence: exec.evidence,
     })
@@ -218,20 +232,25 @@ fn examples(mismatches: &[Mismatch]) -> Vec<MismatchExample> {
         .collect()
 }
 
-/// The manifest sequence the certificate names.
-fn manifest_version(indexed: &[u64], anchor: Option<&ManifestAnchor>) -> Result<u64> {
+/// The manifest sequence the certificate names. `indexed` holds each
+/// side's manifest sequence when it is indexed. The anchor is the left
+/// side's (the caller's folder): an indexed left must be at it. With the
+/// left unindexed the anchor stands; the right side's index, handed for its
+/// agg key (B7), is cited as an input and anchors nothing.
+fn manifest_version(indexed: [Option<u64>; 2], anchor: Option<&ManifestAnchor>) -> Result<u64> {
     match (anchor, indexed) {
-        (Some(a), []) => Ok(a.sequence),
-        (Some(a), seqs) if seqs.contains(&a.sequence) => Ok(a.sequence),
+        (Some(a), [None, _]) => Ok(a.sequence),
+        (Some(a), [Some(l), r]) if l == a.sequence || r == Some(a.sequence) => Ok(a.sequence),
         (Some(a), seqs) => Err(VerifyError::Manifest(format!(
-            "the context names manifest {} but the indexed sides are at {seqs:?}",
-            a.sequence
+            "the context names manifest {} but the indexed sides are at {:?}",
+            a.sequence,
+            seqs.iter().flatten().collect::<Vec<_>>()
         ))),
         // Neither side indexed: the never-committed manifest (#29).
-        (None, []) => Ok(0),
-        (None, [one]) => Ok(*one),
-        (None, [a, b]) if a == b => Ok(*a),
-        (None, seqs) => Err(two_indexes(seqs)),
+        (None, [None, None]) => Ok(0),
+        (None, [Some(one), None] | [None, Some(one)]) => Ok(one),
+        (None, [Some(a), Some(b)]) if a == b => Ok(a),
+        (None, [Some(a), Some(b)]) => Err(two_indexes(&[a, b])),
     }
 }
 
@@ -291,12 +310,25 @@ mod tests {
             hash: Hash::of(b"m"),
             age: Duration::ZERO,
         };
-        assert_eq!(manifest_version(&[], Some(&a(7))).unwrap(), 7);
-        assert_eq!(manifest_version(&[7], None).unwrap(), 7);
-        assert_eq!(manifest_version(&[7, 7], None).unwrap(), 7);
-        assert_eq!(manifest_version(&[3, 7], Some(&a(7))).unwrap(), 7);
-        assert_eq!(manifest_version(&[], None).unwrap(), 0);
-        assert!(manifest_version(&[3, 7], None).is_err());
-        assert!(manifest_version(&[3], Some(&a(7))).is_err());
+        assert_eq!(manifest_version([None, None], Some(&a(7))).unwrap(), 7);
+        assert_eq!(manifest_version([Some(7), None], None).unwrap(), 7);
+        assert_eq!(manifest_version([None, Some(7)], None).unwrap(), 7);
+        assert_eq!(manifest_version([Some(7), Some(7)], None).unwrap(), 7);
+        assert_eq!(
+            manifest_version([Some(7), Some(3)], Some(&a(7))).unwrap(),
+            7
+        );
+        // Two indexed sides at different manifests: the anchor names the
+        // one the certificate is for (`tests/planner.rs`).
+        assert_eq!(
+            manifest_version([Some(3), Some(7)], Some(&a(7))).unwrap(),
+            7
+        );
+        assert_eq!(manifest_version([None, None], None).unwrap(), 0);
+        assert!(manifest_version([Some(3), Some(7)], None).is_err());
+        assert!(manifest_version([Some(3), None], Some(&a(7))).is_err());
+        // An unindexed left side's anchor stands beside the right side's
+        // index (an agg key on the right only, B7).
+        assert_eq!(manifest_version([None, Some(3)], Some(&a(7))).unwrap(), 7);
     }
 }

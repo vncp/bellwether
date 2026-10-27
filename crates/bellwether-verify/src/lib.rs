@@ -37,27 +37,28 @@
 #![forbid(unsafe_code)]
 #![cfg_attr(test, allow(clippy::unwrap_used))]
 
+mod agg_check;
 mod certificate;
 mod error;
 mod index;
 mod outcome;
 mod planner;
 mod reconcile;
-mod render;
 mod rowhash;
 mod schema;
 mod spec;
 mod state;
 mod totals;
 
+pub use agg_check::check_agg_cells;
 pub use certificate::{record, AgedInput, CertificateContext, Certified, ManifestAnchor};
 pub use error::{Result, VerifyError};
 pub use index::IndexPlanner;
 pub use outcome::{
-    Counts, GroupRepr, GroupTotal, KeyRepr, MemoryReport, Mismatch, Reconciliation, SidePath,
-    SideReport, Sides, VersionDigest,
+    AggNotUsed, Counts, GroupRepr, GroupTotal, KeyRepr, MemoryReport, Mismatch, Reconciliation,
+    SidePath, SideReport, Sides, VersionDigest,
 };
-pub use planner::{ManifestIdentity, SidePlanner};
+pub use planner::{AggTotals, ManifestIdentity, SidePlanner};
 pub use reconcile::{Reconciler, Side, PARTITION_SEED};
 pub use rowhash::{push_hashed_column, row_hash};
 pub use spec::{

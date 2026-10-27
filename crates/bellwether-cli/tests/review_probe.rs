@@ -126,6 +126,7 @@ fn probe_adr010_cli_json_equals_in_process_facade() {
                 uncomparable: 0,
                 totals: Vec::new(),
                 row_filter: None,
+                agg: Vec::new(),
             },
             provenance: Provenance {
                 inputs: vec![Hash::of(b"fixture")],

@@ -993,41 +993,58 @@ pub fn tuple_has_null(key: &[u8]) -> Option<bool> {
     let mut i = 0usize;
     let mut has_null = false;
     while i < key.len() {
-        let len = match key[i] {
-            tag::NULL => {
-                has_null = true;
-                1
-            }
-            tag::BOOLEAN => 2,
-            tag::INT | tag::UINT | tag::FLOAT => 9,
-            tag::DECIMAL => match *key.get(i + 1)? {
-                width::DECIMAL128 => 2 + 16,
-                width::DECIMAL256 => 2 + 32,
-                _ => return None,
-            },
-            tag::UTF8 | tag::BINARY => {
-                let mut j = i + 1;
-                loop {
-                    if *key.get(j)? == 0x00 {
-                        match *key.get(j + 1)? {
-                            0x00 => break j + 2 - i,
-                            0xFF => j += 2,
-                            _ => return None,
-                        }
-                    } else {
-                        j += 1;
-                    }
-                }
-            }
-            tag::TEMPORAL => 11,
-            _ => return None,
-        };
-        if i + len > key.len() {
-            return None;
-        }
-        i += len;
+        has_null |= key[i] == tag::NULL;
+        i += element_len(key, i)?;
     }
     Some(has_null)
+}
+
+/// The byte range of each element of a canonical tuple, in order, found by
+/// walking its self-delimiting elements; `None` if the bytes are not a
+/// well-formed tuple of encoding version 1. A null element is the one-byte
+/// `0x00` marker.
+#[must_use]
+pub fn tuple_elements(key: &[u8]) -> Option<Vec<std::ops::Range<usize>>> {
+    let mut i = 0usize;
+    let mut out = Vec::new();
+    while i < key.len() {
+        let len = element_len(key, i)?;
+        out.push(i..i + len);
+        i += len;
+    }
+    Some(out)
+}
+
+/// The length of the element starting at `key[i]`, `None` if it is not a
+/// well-formed element that fits in `key`.
+fn element_len(key: &[u8], i: usize) -> Option<usize> {
+    let len = match *key.get(i)? {
+        tag::NULL => 1,
+        tag::BOOLEAN => 2,
+        tag::INT | tag::UINT | tag::FLOAT => 9,
+        tag::DECIMAL => match *key.get(i + 1)? {
+            width::DECIMAL128 => 2 + 16,
+            width::DECIMAL256 => 2 + 32,
+            _ => return None,
+        },
+        tag::UTF8 | tag::BINARY => {
+            let mut j = i + 1;
+            loop {
+                if *key.get(j)? == 0x00 {
+                    match *key.get(j + 1)? {
+                        0x00 => break j + 2 - i,
+                        0xFF => j += 2,
+                        _ => return None,
+                    }
+                } else {
+                    j += 1;
+                }
+            }
+        }
+        tag::TEMPORAL => 11,
+        _ => return None,
+    };
+    (i + len <= key.len()).then_some(len)
 }
 
 /// Bounds for a prefix seek: every encoded key `k` that starts with `prefix`

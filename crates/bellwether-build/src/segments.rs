@@ -491,8 +491,9 @@ impl<'a> SpecWriter<'a> {
 /// - a sidecar of an index written before M5: core's `sidecar::measure`
 ///   (distinct keys, and key bytes plus 20 per stored record);
 /// - a bloom's `bounds` segment: as an exact spec with bounds on its
-///   columns (its records are that spec's, without counts).
-#[allow(clippy::too_many_lines)]
+///   columns (its records are that spec's, without counts);
+/// - agg: as exact, plus one aggregate cell per key (its largest size).
+#[allow(clippy::too_many_lines)] // one arm per kind
 pub(crate) fn measure(plan: &SpecPlan, batch: &RecordBatch) -> Result<(u64, u64)> {
     let bounds_records;
     let spec = match &plan.target {
@@ -574,6 +575,28 @@ pub(crate) fn measure(plan: &SpecPlan, batch: &RecordBatch) -> Result<(u64, u64)
         }
         return Ok(longest.map_or((0, 0), |l| (1, 2 * l)));
     }
+    // An agg key adds one cell per key and row group: two LEB128 counts (at
+    // most 20 bytes), a 17-byte sum, and a minimum and maximum each at most
+    // the longest value encoding of the batch plus its 4-byte length.
+    let cell = match spec {
+        KeySpec::Agg { value, .. } => {
+            let arr = column(value)?;
+            let declared = batch
+                .schema()
+                .field_with_name(value)
+                .map(|f| f.data_type().clone())
+                .map_err(|_| Error::KeySpec(format!("column {value} not in batch")))?;
+            let mut longest = 0u64;
+            for row in 0..batch.num_rows() {
+                buf.clear();
+                if encoding::encode_array_value_as(arr.as_ref(), row, &declared, &mut buf)? {
+                    longest = longest.max(buf.len() as u64);
+                }
+            }
+            20 + 17 + 2 * (4 + longest)
+        }
+        _ => 0,
+    };
     let mut seen: HashSet<Vec<u8>> = HashSet::new();
     let mut bytes = 0u64;
     for row in 0..batch.num_rows() {
@@ -599,6 +622,8 @@ pub(crate) fn measure(plan: &SpecPlan, batch: &RecordBatch) -> Result<(u64, u64)
                 KeySpec::Exact {
                     bounds: Some(_), ..
                 } => key_len + 16,
+                // one aggregate cell per row group holding the key
+                KeySpec::Agg { .. } => key_len + cell,
                 _ => key_len,
             };
         }

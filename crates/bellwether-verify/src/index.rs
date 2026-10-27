@@ -4,11 +4,11 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use arrow::datatypes::SchemaRef;
-use bellwether_build::{Lookup, Planner};
+use bellwether_build::{Lookup, Planner, TotalsVisitor};
 use bellwether_store::{manifest_path, parse_rfc3339, Manifest, Snapshot, StoreExt};
-use bellwether_types::{Error, FileFingerprint, Hash, ScanPlan};
+use bellwether_types::{AggregateFn, Error, FileFingerprint, Hash, KeySpec, ScanPlan};
 
-use crate::planner::{ManifestIdentity, SidePlanner};
+use crate::planner::{AggTotals, ManifestIdentity, SidePlanner};
 
 /// How many times [`IndexPlanner::open`] re-reads when a commit lands
 /// between reading the manifest's bytes and pinning its snapshot.
@@ -160,5 +160,41 @@ impl<S: StoreExt + ?Sized + Send + Sync> SidePlanner for IndexPlanner<S> {
                 keys: keys.to_vec(),
             },
         )
+    }
+
+    fn agg_totals(
+        &self,
+        key_columns: &[String],
+        value: &str,
+    ) -> bellwether_types::Result<Option<Box<dyn AggTotals + '_>>> {
+        let spec = self.planner.declared_specs().iter().find(|s| {
+            matches!(s, KeySpec::Agg { columns, value: v, functions }
+                if columns.as_slice() == key_columns
+                    && v == value
+                    && functions.contains(&AggregateFn::Sum))
+                && self.planner.completeness(s).is_some()
+        });
+        Ok(spec.map(|s| {
+            Box::new(IndexAggTotals {
+                planner: &self.planner,
+                spec: s.clone(),
+            }) as Box<dyn AggTotals + '_>
+        }))
+    }
+}
+
+/// One complete agg key of an [`IndexPlanner`]'s index.
+struct IndexAggTotals<'p, S: StoreExt + ?Sized> {
+    planner: &'p Planner<S>,
+    spec: KeySpec,
+}
+
+impl<S: StoreExt + ?Sized> AggTotals for IndexAggTotals<'_, S> {
+    fn spec(&self) -> String {
+        self.spec.identity()
+    }
+
+    fn visit(&self, f: &mut TotalsVisitor<'_>) -> bellwether_types::Result<()> {
+        self.planner.agg_totals(&self.spec, f)
     }
 }

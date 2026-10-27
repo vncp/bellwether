@@ -118,6 +118,10 @@ How the thresholds and choices were made:
 
 `lints::list_membership(uses, complete)` fires once per list column that recorded runs look up by membership (`array_contains`, `has_any`, `exists(unnest)`) when no complete `list:<column>` serves it, high confidence, naming the key and the `why --mode` command that prices it. It reads the workload's runs, which the profile does not, so `why` calls it and adds its lints to the same `profile` Evidence, citing the key set or workload. It is not part of `lints::run`.
 
+### `R-agg-1` (agg keys, B7)
+
+`lints::grouped_aggregates(uses, complete)` fires once per (columns, value) that recorded aggregate runs ask when no complete agg key beside a counted key answers them, high confidence, naming the declarations (the counted key first when missing, with the `--allow-no-gain` its own fix needs) and that `why` prices them. `lints::reconcile_rescans(rescans)` fires once per reconcile side read to compare per-key rows and a decimal total whose index has no complete agg key on exactly the key storing the sum, naming the side's root and the declaration. Both read what the caller ran (the workload's runs, the reconcile), so neither is part of `lints::run`: `why` adds the first to its `profile` Evidence and `reconcile` returns the second in its `lints`.
+
 ## Workload summary
 
 `workload_keys` holds the nearest-rank p50, p95, and max of distinct keys per recorded run. The only recorded-workload format that exists today is the benchmark's (`bellwether-bench-workload/1`), and nothing in its `workload.json` is trusted:

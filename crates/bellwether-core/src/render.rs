@@ -15,12 +15,14 @@ use arrow::array::{
 };
 use arrow::datatypes::{i256, DataType, TimeUnit};
 use arrow::util::display::{ArrayFormatter, FormatOptions};
-use bellwether_core::encoding::tag;
+
+use crate::encoding::tag;
 
 /// Decodes a canonical tuple of `types` into one display string per element
 /// (`None` for a null marker). Returns `None` if the bytes do not decode as
 /// that tuple, which never happens for tuples this crate encoded.
-pub(crate) fn render_tuple(bytes: &[u8], types: &[DataType]) -> Option<Vec<Option<String>>> {
+#[must_use]
+pub fn render_tuple(bytes: &[u8], types: &[DataType]) -> Option<Vec<Option<String>>> {
     let mut out = Vec::with_capacity(types.len());
     let mut i = 0usize;
     for dt in types {
@@ -39,6 +41,34 @@ pub(crate) fn render_tuple(bytes: &[u8], types: &[DataType]) -> Option<Vec<Optio
         i += len;
     }
     (i == bytes.len()).then_some(out)
+}
+
+/// A canonical tuple of `types` as one line, `7, a`: each element as
+/// [`render_tuple`] displays it (`null` for a null marker), or the tuple's
+/// lowercase hex when it does not decode. For messages that name a key.
+#[must_use]
+pub fn key_label(bytes: &[u8], types: &[DataType]) -> String {
+    match render_tuple(bytes, types) {
+        Some(v) => v
+            .into_iter()
+            .map(|e| e.unwrap_or_else(|| "null".into()))
+            .collect::<Vec<_>>()
+            .join(", "),
+        None => bytes.iter().fold(String::new(), |mut s, b| {
+            use std::fmt::Write as _;
+            let _ = write!(s, "{b:02x}");
+            s
+        }),
+    }
+}
+
+/// `v` as Arrow displays a `Float64` (`0.0`, `-0.0`, `6.5`, `inf`, `NaN`):
+/// a float sum prints as the column's minimum and maximum do.
+#[must_use]
+pub fn render_f64(v: f64) -> String {
+    let array = Float64Array::from(vec![v]);
+    ArrayFormatter::try_new(&array, &FormatOptions::default())
+        .map_or_else(|_| format!("{v:?}"), |f| f.value(0).to_string())
 }
 
 fn be_u64(bytes: &[u8], at: usize) -> Option<u64> {
@@ -181,14 +211,14 @@ fn decode(bytes: &[u8], at: usize, dt: &DataType) -> Option<(ArrayRef, usize)> {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
-    use crate::rowhash::push_key;
     use arrow::array::Array;
 
     fn roundtrip(array: &dyn Array, dt: &DataType) -> Option<String> {
         let mut key = Vec::new();
-        push_key(&mut key, &[(array, dt)], 0).unwrap();
+        crate::encoding::encode_nullable_as(array, 0, dt, &mut key).unwrap();
         render_tuple(&key, std::slice::from_ref(dt))
             .unwrap()
             .pop()

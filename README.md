@@ -206,6 +206,7 @@ Reproduce everything above, downloads included, with [`scripts/showcase.sh`](scr
 | `text` | `contains`, `like '%x%'`, `has`, prefix match on a string column, case-insensitive | `index --key text:col,tokenizer=words` (whole words, prefixes; exact row groups) or `text:col,tokenizer=trigram` (substrings; candidates, residual mandatory) | `locate --contains/--has/--prefix COL=TEXT`; priced by `why --contains/--has/--prefix`, proposed and receipted by `fix` ([funnels](docs/measured/2026-10-26-text.md)) |
 | `list` | array membership: `array_contains`, `has_any`, `has_all`, `exists(unnest)` over a `List`, `LargeList`, or a map's keys | `index --key list:col` | `locate --keys values.parquet --any\|--all`; priced by `why --mode contains-any\|contains-all` |
 | `join` | semi-join, anti-join, `in (subquery)`, `exists` between two datasets on one column pair; drive side and whether the keyset fits a membership list | `index <left> --key join:left.col=right.col` (both datasets need `exact:<col>`; the right is the folder beside the left) | `join semijoin --join right.col --keys keys.parquet` (two steps, each the row groups of keys both hold), `join overlap` (exact \|L∩R\|, \|L∖R\|, \|R∖L\|), `join verify`; priced by `why --mode semijoin --join right.col`, proposed and receipted by `fix` |
+| `agg` | `sum/count/min/max(value) ... where key in (...) group by key`; the per-key totals a reconciliation compares | `index --key exact:key,counts --key 'agg:key@value{sum,count,min,max}'` (always beside the counted key) | `aggregate --keys K --value V --fn sum,count` from the index, no data file opened (exact for integers and decimals; float sums labelled measured); `reconcile --key K --totals V --ignore V,...` (every other column ignored, the total too: it is then compared through its exact sum only) folds a side from it and the certificate says so, and otherwise says why the side was read; priced by `why --value V --fn ...` ([funnels](docs/measured/2026-10-26-agg.md)) |
 
 ## How `fix` proves a change
 
@@ -301,7 +302,7 @@ The trust boundary at the wire: a proposal has no score field, so the input sche
 |---|---|---|---|---|---|
 | Runs | one process | inside the query engine | inside the Hudi writer and engine | inside ClickHouse | inside the database |
 | Granularity | row group | file (min/max) | file group or record | granule | row |
-| Key kinds | exact, bloom, range, temporal, sketch (approximate, never plans), expr, text, list, join (dataset pairs) | min/max statistics | bloom, record-level, column stats | minmax, set, bloom variants | B-tree |
+| Key kinds | exact, bloom, range, temporal, sketch (approximate, never plans), expr, text, list, join (dataset pairs), agg | min/max statistics | bloom, record-level, column stats | minmax, set, bloom variants | B-tree |
 | Composite keys | native, prefix seek | Z-order or clustering columns | record key | multi-column expressions | yes |
 | Latest / as-of | native over plain files | table time travel | incremental and point-in-time queries | no | via `ROW_NUMBER` scan |
 | Tells you which key to index | measured fanout + exact replay | no | no | no | estimated (what-if API) |

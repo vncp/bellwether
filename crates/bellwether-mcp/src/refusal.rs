@@ -419,6 +419,19 @@ fn typed_next(e: &Error) -> Option<String> {
                 ", then call the tool again"
             }
         )),
+        Error::NotIndexed {
+            root,
+            needs: Some(agg),
+            ..
+        } if agg.starts_with("agg:") => Some(format!(
+            "ask the human to index the data folder with `bellwether index {root} --key \
+             'exact:{},counts' --key '{agg}'` (an agg key is declared beside the counted key on \
+             its columns), then call the tool again",
+            agg.trim_start_matches("agg:")
+                .split('@')
+                .next()
+                .unwrap_or_default()
+        )),
         Error::NotIndexed { needs, .. } => {
             let spec = needs
                 .as_deref()
@@ -687,6 +700,7 @@ pub fn from_fix(r: &FixRefusal, verification: Option<&Reconciliation>) -> Refusa
             missing_left,
             missing_right,
             totals_differ,
+            agg_cells_differ,
         } => {
             let sample: Vec<Value> = verification
                 .map(|v| {
@@ -697,30 +711,43 @@ pub fn from_fix(r: &FixRefusal, verification: Option<&Reconciliation>) -> Refusa
                         .collect()
                 })
                 .unwrap_or_default();
+            let mut detail = json!({
+                "certificate": certificate,
+                "mismatched": mismatched,
+                "uncomparable": uncomparable,
+                "missing_left": missing_left,
+                "missing_right": missing_right,
+                "totals_differ": totals_differ,
+                "mismatches_sample": sample,
+            });
             let mut message = format!(
                 "certificate {certificate} failed: {mismatched} mismatched, {uncomparable} \
                  uncomparable, {missing_left} missing on the left, {missing_right} missing on \
                  the right, {totals_differ} group totals differ"
             );
+            // A proposed agg key (B7) whose cells differ from the rows.
+            if *agg_cells_differ > 0 {
+                let cells: Vec<Value> = verification
+                    .into_iter()
+                    .flat_map(|v| &v.agg)
+                    .filter_map(|a| a.checked.as_ref())
+                    .flat_map(|c| &c.examples)
+                    .take(MISMATCH_SAMPLE)
+                    .map(|d| serde_json::to_value(d).unwrap_or(Value::Null))
+                    .collect();
+                message.push_str(", ");
+                message.push_str(&agg_cells_differ.to_string());
+                message.push_str(" agg cells differ from the rows they aggregate");
+                detail["agg_cells_differ"] = json!(agg_cells_differ);
+                detail["agg_cells_sample"] = Value::Array(cells);
+            }
             if *uncomparable > 0 {
                 message = format!(
                     "{message}. {}",
                     bellwether::uncomparable_cause(*uncomparable)
                 );
             }
-            Refusal::new(
-                RefusalCode::CertificateFailed,
-                message,
-                json!({
-                    "certificate": certificate,
-                    "mismatched": mismatched,
-                    "uncomparable": uncomparable,
-                    "missing_left": missing_left,
-                    "missing_right": missing_right,
-                    "totals_differ": totals_differ,
-                    "mismatches_sample": sample,
-                }),
-            )
+            Refusal::new(RefusalCode::CertificateFailed, message, detail)
         }
         FixRefusal::StaleManifest {
             certificate,
@@ -1064,6 +1091,7 @@ mod tests {
                     missing_left: 2,
                     missing_right: 3,
                     totals_differ: 4,
+                    agg_cells_differ: 5,
                 },
                 RefusalCode::CertificateFailed,
             ),

@@ -25,15 +25,15 @@
 
 use std::sync::Arc;
 
-use bellwether_build::{Lookup, Planner, TransientSpec};
+use bellwether_build::{Aggregated, Lookup, Planner, TransientSpec};
 use bellwether_store::StoreExt;
-use bellwether_types::{Error, KeySpec, Result, ScanPlan, TextOp};
+use bellwether_types::{Error, KeySpec, Quantity, Result, ScanPlan, TextOp};
 use roaring::RoaringBitmap;
 
 use crate::keys::RunKeys;
-use crate::plan::{check_key_types, planned_query, text_run, PlanSource};
+use crate::plan::{agg_lookup, check_key_types, planned_query, text_run, PlanSource};
 use crate::transient::TransientIndex;
-use crate::workload::RunQuery;
+use crate::workload::{RunAggregate, RunQuery};
 
 /// The run's keys and query kind as the build planner's lookup: canonical
 /// tuples over the run's columns, at the dataset types. `query` is as
@@ -43,7 +43,8 @@ fn lookup(keys: &RunKeys, query: &RunQuery) -> Result<Lookup> {
     let columns = keys.columns().to_vec();
     let tuples: Vec<Vec<u8>> = keys.tuples().map(<[u8]>::to_vec).collect();
     Ok(match query {
-        RunQuery::Locate | RunQuery::Count => Lookup::Keys {
+        // An aggregate run no agg key answers is read as a locate.
+        RunQuery::Locate | RunQuery::Count | RunQuery::Aggregate(_) => Lookup::Keys {
             columns,
             keys: tuples,
         },
@@ -107,6 +108,20 @@ fn text_lookup(column: &str, op: TextOp, values: &[String]) -> Lookup {
         op,
         values: values.to_vec(),
     }
+}
+
+/// The plan of an aggregate answer as replay costs it: the residual row
+/// groups, `rows` the keys' exact rows.
+fn aggregate_plan(answer: Aggregated) -> Result<ScanPlan> {
+    let mut rows = 0u64;
+    for k in &answer.keys {
+        rows = rows
+            .checked_add(k.cover.rows)
+            .ok_or_else(|| Error::Other("row count overflows u64".into()))?;
+    }
+    let mut plan = answer.residual;
+    plan.rows = Some(Quantity::exact(rows));
+    Ok(plan)
 }
 
 /// Checks `transient` against `planner`'s pinned manifest (module docs) and
@@ -188,6 +203,20 @@ where
         Planner::plan(self, specs, &text_lookup(column, op, values))
     }
 
+    fn plan_aggregate(
+        &self,
+        specs: &[KeySpec],
+        keys: &RunKeys,
+        aggregate: &RunAggregate,
+    ) -> Result<ScanPlan> {
+        check_key_types(self.schema(), keys)?;
+        aggregate_plan(Planner::aggregate(
+            self,
+            specs,
+            &agg_lookup(keys, aggregate),
+        )?)
+    }
+
     fn lookback_column(&self, specs: &[KeySpec], run_columns: &[String]) -> Result<Option<String>> {
         Planner::lookback_column(self, specs, run_columns)
     }
@@ -248,6 +277,20 @@ where
     ) -> Result<ScanPlan> {
         self.planner
             .plan_with_transient(specs, &text_lookup(column, op, values), &self.extra)
+    }
+
+    fn plan_aggregate(
+        &self,
+        specs: &[KeySpec],
+        keys: &RunKeys,
+        aggregate: &RunAggregate,
+    ) -> Result<ScanPlan> {
+        check_key_types(self.planner.schema(), keys)?;
+        aggregate_plan(self.planner.aggregate_with_transient(
+            specs,
+            &agg_lookup(keys, aggregate),
+            &self.extra,
+        )?)
     }
 
     fn lookback_column(&self, specs: &[KeySpec], run_columns: &[String]) -> Result<Option<String>> {

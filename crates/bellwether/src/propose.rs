@@ -260,7 +260,7 @@ impl Engine {
                 self.complete_engine_rewrite(&ledger, evidence, shape)?;
             }
         }
-        self.check_body(&body)?;
+        self.check_body(&body, evidence)?;
         let proposal = Proposal {
             record_version: format::RECORD_VERSION,
             evidence: evidence.to_vec(),
@@ -284,7 +284,7 @@ impl Engine {
         })
     }
 
-    fn check_body(&self, body: &ProposalBody) -> Result<()> {
+    fn check_body(&self, body: &ProposalBody, evidence: &[Hash]) -> Result<()> {
         match body {
             ProposalBody::Key { spec, sidecars } => {
                 // A join key (B3) is built whole from both datasets in a
@@ -304,7 +304,7 @@ impl Engine {
                 // checks.
                 std::iter::once(spec)
                     .chain(sidecars)
-                    .try_for_each(|s| self.check_key(s))
+                    .try_for_each(|s| self.check_key(s, evidence))
             }
             ProposalBody::Layout { cluster_by } => {
                 if cluster_by.is_empty() {
@@ -323,8 +323,10 @@ impl Engine {
     /// A proposed key spec is valid (core's rules), names its columns
     /// uniquely when it is a new declaration, and its key and time columns
     /// are in the dataset with the types `index` accepts, so a proposal
-    /// `index` would refuse is refused now, not at `fix`.
-    fn check_key(&self, spec: &KeySpec) -> Result<()> {
+    /// `index` would refuse is refused now, not at `fix`. An agg key (B7)
+    /// also needs its value column to aggregate as declared and the key
+    /// counting rows on exactly its columns to be complete.
+    fn check_key(&self, spec: &KeySpec, evidence: &[Hash]) -> Result<()> {
         crate::spec::check(spec)?;
         if let KeySpec::Expr { .. } = spec {
             // The expression's input columns exist, it type-checks, and its
@@ -333,6 +335,22 @@ impl Engine {
             let schema = self.check_columns(&inputs.iter().collect::<Vec<_>>())?;
             bellwether_core::expr::typed_spec(spec, &schema)?;
             return Ok(());
+        }
+        if let KeySpec::Agg { value, .. } = spec {
+            // The value column exists and can be aggregated as declared, and
+            // the key counting rows on exactly the agg key's columns is
+            // complete: without it the agg key is never built (refused by
+            // name, not at `fix`).
+            let schema = self.check_columns(&[value])?;
+            bellwether_core::agg::value_type(spec, &schema)?;
+            let complete = self.pin()?.map(|p| p.specs().0).unwrap_or_default();
+            if bellwether_build::counting_spec(&complete, spec.columns()).is_none() {
+                return Err(Error::KeySpec(counted_key_first(
+                    spec,
+                    self.root(),
+                    evidence,
+                )));
+            }
         }
         // A spec the index does not declare yet is a new declaration: it
         // must name its columns uniquely.
@@ -504,4 +522,22 @@ pub fn engine_rewrite(
         before_plan: None,
         after_plan: None,
     }
+}
+
+/// The refusal for an agg key (B7) proposed before the key counting rows on
+/// exactly its columns is complete: the propose step that comes first.
+fn counted_key_first(spec: &KeySpec, root: &str, evidence: &[Hash]) -> String {
+    let cols = spec.columns().join(",");
+    let cites: String = evidence.iter().fold(String::new(), |mut s, h| {
+        let _ = write!(s, " --evidence {h}");
+        s
+    });
+    format!(
+        "{} needs the key counting rows on exactly ({cols}) complete beside it, whose counts \
+         prove which of its aggregates answer a lookup, and the index has none; propose it \
+         first with `bellwether propose {root}{cites} --key 'exact:{cols},counts'` and apply \
+         it with `bellwether fix` (with --allow-no-gain when it saves no bytes on its own: its \
+         counts are what let the agg key answer), then propose the agg key",
+        spec.identity()
+    )
 }

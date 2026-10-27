@@ -171,6 +171,7 @@ pub(crate) fn timed_def(spec: &KeySpec) -> Option<SidecarDef> {
 /// Measures one row group's keys for `spec` (module docs): `(keys, bytes)`.
 /// `time` is the dataset types of the spec's time columns (core's
 /// `segment::time_types`; a bloom with bounds: its bounds column's).
+#[allow(clippy::too_many_lines)] // one arm per kind, as the build's measure
 pub(crate) fn measure(
     spec: &KeySpec,
     keys: &[DataType],
@@ -248,6 +249,29 @@ pub(crate) fn measure(
         }
         return Ok(longest.map_or((0, 0), |l| (1, 2 * l)));
     }
+    // An agg key adds one cell per key and row group, sized as the build
+    // sizes it: two LEB128 counts (at most 20 bytes), a 17-byte sum, and a
+    // minimum and maximum each at most the longest value encoding of the
+    // batch plus its 4-byte length.
+    let cell = match spec {
+        KeySpec::Agg { value, .. } => {
+            let arr = column(value)?;
+            let declared = batch
+                .schema()
+                .field_with_name(value)
+                .map(|f| f.data_type().clone())
+                .map_err(|_| Error::KeySpec(format!("column {value} not in batch")))?;
+            let mut longest = 0u64;
+            for row in 0..batch.num_rows() {
+                buf.clear();
+                if encoding::encode_array_value_as(arr.as_ref(), row, &declared, &mut buf)? {
+                    longest = longest.max(buf.len() as u64);
+                }
+            }
+            20 + 17 + 2 * (4 + longest)
+        }
+        _ => 0,
+    };
     let mut seen: HashSet<Vec<u8>> = HashSet::new();
     let mut bytes = 0u64;
     for row in 0..batch.num_rows() {
@@ -272,6 +296,8 @@ pub(crate) fn measure(
                 KeySpec::Exact {
                     bounds: Some(_), ..
                 } => key_len + 16,
+                // one aggregate cell per row group holding the key
+                KeySpec::Agg { .. } => key_len + cell,
                 _ => key_len,
             };
         }

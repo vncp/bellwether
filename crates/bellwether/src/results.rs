@@ -176,7 +176,7 @@ pub struct TextRebuilt {
 }
 
 #[allow(clippy::trivially_copy_pass_by_ref)] // serde passes a reference
-fn is_zero(n: &u64) -> bool {
+pub(crate) fn is_zero(n: &u64) -> bool {
     *n == 0
 }
 
@@ -303,6 +303,14 @@ pub enum LookupKind {
     ContainsAll {
         /// The list column.
         column: String,
+    },
+    /// Per key, aggregates of one value column over the keys' rows (B7:
+    /// `sum/count/min/max(value) ... group by key`).
+    Aggregate {
+        /// The aggregated column.
+        value: String,
+        /// The functions, in the order sum, count, min, max.
+        functions: Vec<String>,
     },
 }
 

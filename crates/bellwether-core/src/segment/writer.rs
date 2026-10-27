@@ -15,6 +15,7 @@ use super::format::{
     record_time_types, spec_types, ColumnType, Layout, Put, SegmentHeader, ValueShape,
     ALL_NULL_BOUNDS, FOOTER_LEN_V2, MAGIC,
 };
+use crate::agg::AggCell;
 use crate::bloom::{BloomHash, CanonicalHash, FilterHash, Sbbf};
 use crate::encoding::{self, KeyColumns, NEG_ZERO_KEY, POS_ZERO_KEY};
 use crate::temporal::{VersionBuffer, VersionChain};
@@ -233,6 +234,9 @@ pub struct KeyValue {
     /// `(valid, known, row group)` triples, strictly ascending; `bitmap` is
     /// exactly their row groups. Empty for every other spec.
     pub triples: Vec<(i64, i64, u32)>,
+    /// For an agg key (B7): one aggregate cell per row group of `bitmap`,
+    /// in ascending row-group order. `None` for every other spec.
+    pub agg: Option<Vec<AggCell>>,
 }
 
 impl KeyValue {
@@ -267,9 +271,24 @@ impl KeyValue {
         )
     }
 
+    /// `(row group, cell)` for every row group holding the key, ascending;
+    /// `None` when the segment is not an agg key's.
+    #[must_use]
+    pub fn cells(&self) -> Option<Vec<(RowGroupId, &AggCell)>> {
+        let cells = self.agg.as_ref()?;
+        Some(
+            self.bitmap
+                .iter()
+                .zip(cells.iter())
+                .map(|(rg, c)| (RowGroupId(rg), c))
+                .collect(),
+        )
+    }
+
     /// Checks the parts the shape adds against the bitmap: one count and one
-    /// `[min, max]` (or the sentinel) per row group, and triples that are
-    /// strictly ascending and name exactly the bitmap's row groups.
+    /// `[min, max]` (or the sentinel) per row group, triples that are
+    /// strictly ascending and name exactly the bitmap's row groups, and one
+    /// aggregate cell per row group.
     fn check(&self, shape: ValueShape) -> Result<()> {
         let bad = |what: &str| Err(Error::Other(format!("corrupt segment: {what}")));
         let n = self.bitmap.len();
@@ -302,11 +321,21 @@ impl KeyValue {
         } else if !self.triples.is_empty() {
             return bad("bitemporal versions on a spec that is not bitemporal");
         }
+        match (&self.agg, shape.agg) {
+            (Some(cells), Some(_)) if cells.len() as u64 == n => {}
+            (None, None) => {}
+            _ => {
+                return bad(
+                    "an agg key's value carries one aggregate cell per row group holding the \
+                     key, and no other key's value carries any",
+                )
+            }
+        }
         Ok(())
     }
 
     /// The storage version 2 value record: `bitmap_len u32 | bitmap |
-    /// [counts] | [bounds] | [chain] | [triples]` (`docs/format.md`).
+    /// [counts] | [bounds] | [chain] | [triples] | [cells]` (`docs/format.md`).
     pub(crate) fn encode(&self, shape: ValueShape, out: &mut Vec<u8>) -> Result<()> {
         self.check(shape)?;
         let mut bm = Vec::with_capacity(self.bitmap.serialized_size());
@@ -332,6 +361,11 @@ impl KeyValue {
                 out.put_u32(rg);
             }
         }
+        if let (Some(cells), Some(cell_shape)) = (&self.agg, shape.agg) {
+            for c in cells {
+                c.encode(cell_shape, out)?;
+            }
+        }
         Ok(())
     }
 
@@ -346,7 +380,8 @@ impl KeyValue {
     /// max i64` per row group (min <= max, or the all-null sentinel), the
     /// chain, the bitemporal triples (`count u32 | count x (valid i64 |
     /// known i64 | rg u32)`, strictly ascending, exactly the bitmap's row
-    /// groups); nothing may follow. Anything else is corruption and is
+    /// groups), one aggregate cell per row group (an agg key); nothing may
+    /// follow. Anything else is corruption and is
     /// refused, never decoded into a wrong answer.
     pub(crate) fn decode(bytes: &[u8], shape: ValueShape, storage: u32) -> Result<Self> {
         let read_bm = |b: &[u8]| -> Result<RoaringBitmap> {
@@ -432,6 +467,7 @@ impl KeyValue {
                 triples.push((valid, known, c.u32()?));
             }
         }
+        let agg = AggCell::decode_n(&mut c, n, shape.agg)?;
         if !c.is_done() {
             return Err(Error::Other(
                 "corrupt segment: trailing bytes after a value record".into(),
@@ -443,6 +479,7 @@ impl KeyValue {
             counts,
             bounds,
             triples,
+            agg,
         };
         v.check(shape)?;
         Ok(v)
@@ -850,6 +887,8 @@ struct KeyAcc {
     triples: Vec<(i64, i64, u32)>,
     /// Length of `triples` after its last sort and dedup.
     compacted: usize,
+    /// Aggregates per row group holding the key, kept only for an agg key.
+    cells: BTreeMap<u32, AggCell>,
 }
 
 impl KeyAcc {
@@ -906,6 +945,8 @@ struct DatasetTypes {
     recorded_times: Vec<ColumnType>,
     /// The checked expression of an `expr` key.
     expr: Option<crate::expr::Typed>,
+    /// An agg key's value column: its dataset type and recorded form.
+    value: Option<(DataType, ColumnType)>,
 }
 
 /// Builds one segment for one key spec.
@@ -982,6 +1023,7 @@ pub fn validate_spec(spec: &KeySpec) -> Result<()> {
             )));
         }
     }
+    crate::agg::check_spec(spec)?;
     crate::join::check_spec(spec)?;
     crate::expr::check_spec(spec)
 }
@@ -1013,7 +1055,7 @@ impl SegmentWriter {
     fn in_layout(spec: KeySpec, layout: Layout, opts: WriterOptions) -> Result<Self> {
         validate_spec(&spec)?;
         let acc = match layout {
-            Layout::Keyed | Layout::KeyedTemporal | Layout::Bitemporal => {
+            Layout::Keyed | Layout::KeyedTemporal | Layout::Bitemporal | Layout::KeyedAgg => {
                 Acc::Keyed(BTreeMap::new())
             }
             Layout::KeyedJoin => {
@@ -1066,6 +1108,13 @@ impl SegmentWriter {
             KeySpec::Expr { .. } => Some(crate::expr::typed_spec(&self.spec, schema)?),
             _ => None,
         };
+        let value = match crate::agg::value_type(&self.spec, schema)? {
+            Some(dt) => {
+                let recorded = ColumnType::of(&dt)?;
+                Some((dt, recorded))
+            }
+            None => None,
+        };
         self.dataset = Some(DatasetTypes {
             keys,
             ts,
@@ -1074,6 +1123,7 @@ impl SegmentWriter {
             times,
             recorded_times,
             expr,
+            value,
         });
         Ok(self)
     }
@@ -1126,6 +1176,59 @@ impl SegmentWriter {
         Ok(())
     }
 
+    /// Records rows of an agg key (B7): each `(key, value)` is one row of
+    /// `key` in row group `rg`, `value` the canonical encoding of its value
+    /// at the dataset type, or `None` for a null value. All or nothing: the
+    /// touched cells are updated on copies, so on error (a value that
+    /// cannot be summed, a sum past 128 bits, refused naming the spec, the
+    /// key and the row group) nothing is recorded. Rows are added in the
+    /// order given, which a float sum depends on.
+    pub fn insert_values(
+        &mut self,
+        rg: RowGroupId,
+        rows: &[(Vec<u8>, Option<Vec<u8>>)],
+    ) -> Result<()> {
+        let KeySpec::Agg { functions, .. } = &self.spec else {
+            return Err(Error::KeySpec(
+                "insert_values on a spec that is not an agg key".into(),
+            ));
+        };
+        let Acc::Keyed(m) = &mut self.acc else {
+            return Err(Error::KeySpec("an agg key's accumulator is keyed".into()));
+        };
+        let mut staged: BTreeMap<&[u8], AggCell> = BTreeMap::new();
+        for (key, value) in rows {
+            if !staged.contains_key(key.as_slice()) {
+                let current = m
+                    .get(key)
+                    .and_then(|a| a.cells.get(&rg.0))
+                    .cloned()
+                    .unwrap_or_else(AggCell::empty);
+                staged.insert(key.as_slice(), current);
+            }
+            if let Some(cell) = staged.get_mut(key.as_slice()) {
+                cell.add_row(value.as_deref(), functions).map_err(|e| {
+                    if crate::agg::is_sum_overflow(&e) {
+                        let types = self.dataset.as_ref().map_or(&[][..], |d| &d.keys);
+                        crate::agg::sum_overflow(
+                            &self.spec,
+                            &crate::render::key_label(key, types),
+                            crate::agg::OverflowAt::RowGroup(rg.0),
+                        )
+                    } else {
+                        e
+                    }
+                })?;
+            }
+        }
+        for (key, cell) in staged {
+            let acc = key_acc(m, key)?;
+            acc.bitmap.insert(rg.0);
+            acc.cells.insert(rg.0, cell);
+        }
+        Ok(())
+    }
+
     /// Records that row group `rg` holds one row of `key`. For temporal
     /// specs use [`SegmentWriter::insert_version`]; calling this on one is
     /// an error. On error nothing is recorded.
@@ -1141,6 +1244,11 @@ impl SegmentWriter {
         if matches!(self.spec, KeySpec::Temporal { .. }) {
             return Err(Error::KeySpec(
                 "temporal segments need a timestamp; use insert_version".into(),
+            ));
+        }
+        if matches!(self.spec, KeySpec::Agg { .. }) {
+            return Err(Error::KeySpec(
+                "agg segments aggregate values; use insert_values".into(),
             ));
         }
         if self.shape().bounds || self.shape().triples {
@@ -1354,6 +1462,7 @@ impl SegmentWriter {
     /// For an `expr` key the batch holds the expression's input columns; the
     /// virtual column is derived from them here, for this batch only (or
     /// taken from the batch when it already holds a column of that name).
+    #[allow(clippy::too_many_lines)] // one arm per layout, all or nothing
     pub fn add_batch(&mut self, rg: RowGroupId, batch: &RecordBatch) -> Result<()> {
         let Some(dataset) = self.dataset.clone() else {
             return Err(Error::KeySpec(
@@ -1367,6 +1476,36 @@ impl SegmentWriter {
                 .cloned()
                 .ok_or_else(|| Error::KeySpec(format!("column {name} not in batch")))
         };
+        if let KeySpec::Agg { value, .. } = &self.spec {
+            // One row per indexed key tuple (ADR 014: a null leading key
+            // column is not aggregated), its value at the dataset type, in
+            // row order; every row converts before any is recorded.
+            let Some((declared, _)) = &dataset.value else {
+                return Err(Error::KeySpec(
+                    "an agg writer needs its value column's dataset type".into(),
+                ));
+            };
+            let cols = self
+                .spec
+                .columns()
+                .iter()
+                .map(|c| column(c))
+                .collect::<Result<Vec<_>>>()?;
+            let keys = KeyColumns::new(&cols, &dataset.keys)?;
+            let values = column(value)?;
+            encoding::check_convertible(values.data_type(), declared)?;
+            let mut staged = Vec::with_capacity(batch.num_rows());
+            let (mut kbuf, mut vbuf) = (Vec::new(), Vec::new());
+            for row in 0..batch.num_rows() {
+                if !keys.encode_into(row, &mut kbuf)? {
+                    continue;
+                }
+                let v = crate::agg::value_at(values.as_ref(), row, declared, &mut vbuf)?
+                    .then(|| vbuf.clone());
+                staged.push((kbuf.clone(), v));
+            }
+            return self.insert_values(rg, &staged);
+        }
         if let KeySpec::List { column: c } = &self.spec {
             // One key per distinct element: a null list, an empty list, and
             // a null element add nothing (ADR 014). Every element converts
@@ -1505,6 +1644,7 @@ impl SegmentWriter {
             header.key_types = Some(d.recorded_keys.clone());
             header.ts_type.clone_from(&d.recorded_ts);
             header.time_types = (!d.recorded_times.is_empty()).then(|| d.recorded_times.clone());
+            header.value_type = d.value.as_ref().map(|(_, r)| r.clone());
         }
         let shape = self.shape();
         match self.acc {
@@ -1525,6 +1665,7 @@ impl SegmentWriter {
                         counts: shape.counts.then(|| acc.rows.values().copied().collect()),
                         bounds,
                         triples: acc.triples,
+                        agg: shape.agg.map(|_| acc.cells.into_values().collect()),
                     };
                     e.push(&k, &v)?;
                 }

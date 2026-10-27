@@ -24,6 +24,13 @@ pub(crate) enum VerifyCommand {
     /// key, latest version, and exact decimal totals; writes a Certificate. The summary names the first 10
     /// mismatching keys (every one is in --json), prints the exact totals,
     /// and says how many passes the comparison made over each side.
+    ///
+    /// A side whose index holds agg:<key>@<total>{sum,count} (B7) is
+    /// answered from it, reading no row, when only per-key rows and that
+    /// one total are compared: every other column ignored, the total too
+    /// (--key account --totals amount --ignore amount,memo,...; an ignored
+    /// total is still compared, through its exact sum). Otherwise the
+    /// summary says why the side was read and what to pass.
     Reconcile(ReconcileArgs),
     /// Score, verify, apply, and attest a proposal (or apply a certificate);
     /// ends with a receipt hash, or a refusal.
@@ -443,7 +450,7 @@ fn totals_human(s: &mut String, o: &bellwether::Reconciliation) {
     }
 }
 
-#[allow(clippy::many_single_char_names)]
+#[allow(clippy::many_single_char_names, clippy::too_many_lines)] // one section per outcome part
 fn reconcile_human(r: &ReconcileResult, out: &Out) -> String {
     let mut s = String::new();
     let o = &r.outcome;
@@ -519,7 +526,43 @@ fn reconcile_human(r: &ReconcileResult, out: &Out) -> String {
             "  each pass reads both sides again; a larger --memory-budget makes fewer passes"
         );
     }
+    for a in o.agg.iter().filter(|a| a.checked.is_none()) {
+        let _ = writeln!(
+            s,
+            "  the {} side's per-key rows and totals came from its index's {}: {} aggregated, \
+             none read",
+            a.side,
+            a.specs.join(", "),
+            count(a.rows, "row", "rows")
+        );
+    }
+    // A side whose agg key could have answered and did not: why, and what
+    // makes it answer.
+    for n in &o.agg_not_used {
+        let _ = writeln!(
+            s,
+            "  the {} side was read, not answered from its index's {}: {}",
+            n.side,
+            n.spec,
+            n.causes.join("; ")
+        );
+        if let Some(next) = &n.next {
+            let _ = writeln!(s, "    next: {next}");
+        }
+    }
     tables_human(&mut s, &r.tables);
+    if !r.lints.is_empty() {
+        let _ = writeln!(s, "\n  lints:");
+        for l in &r.lints {
+            let _ = writeln!(
+                s,
+                "    {} [{}]\n      {}",
+                l.rule,
+                l.columns.join(", "),
+                l.message
+            );
+        }
+    }
     let _ = writeln!(s, "\ncertificate {}", r.certificate.hash);
     s
 }
@@ -845,6 +888,39 @@ fn verify_and_outcome_human(s: &mut String, r: &FixResult) {
             rows_asked(filter)
         );
     }
+    // A proposed agg key's cells (B7), checked against the rows.
+    if let Some(Record::Certificate(cert)) = r.certificate.as_ref().map(|c| &c.record) {
+        for a in &cert.body.agg {
+            let Some(c) = &a.checked else { continue };
+            let _ = writeln!(
+                s,
+                "            agg cells checked against the rows: {}: {} of {} ({}; {} read), \
+                 {} differ",
+                a.specs.join(", "),
+                count(c.cells, "cell", "cells"),
+                count(c.keys, "key", "keys"),
+                count(a.rows, "row", "rows"),
+                count(c.row_groups_read, "row group", "row groups"),
+                num(c.differ)
+            );
+            for d in c.examples.iter().take(5) {
+                let key: Vec<&str> = d
+                    .values
+                    .iter()
+                    .map(|v| v.as_deref().unwrap_or("null"))
+                    .collect();
+                let _ = writeln!(
+                    s,
+                    "              key ({}) row group {}: the index would store {}; the rows \
+                     make {}",
+                    key.join(", "),
+                    d.row_group,
+                    d.stored,
+                    d.rows
+                );
+            }
+        }
+    }
     // The invariant is checked by the certificate; without one (a refusal
     // before the verify stage), nothing was.
     if let (Some(inv), Some(_)) = (&r.invariant, &r.certificate) {
@@ -919,6 +995,17 @@ fn verify_and_outcome_human(s: &mut String, r: &FixResult) {
         }
         FixOutcome::Refused { refusal } => {
             let why = match refusal {
+                Refusal::CertificateFailed {
+                    mismatched,
+                    uncomparable,
+                    missing_left,
+                    missing_right,
+                    totals_differ,
+                    agg_cells_differ,
+                    ..
+                } if *agg_cells_differ > 0 => format!(
+                    "the certificate failed: {agg_cells_differ} agg cells of the proposed key differ from the rows they aggregate (above), so building it would store wrong aggregates ({mismatched} mismatched, {uncomparable} uncomparable, {missing_left} missing left, {missing_right} missing right, {totals_differ} totals differ); no receipt"
+                ),
                 Refusal::CertificateFailed {
                     mismatched,
                     uncomparable,

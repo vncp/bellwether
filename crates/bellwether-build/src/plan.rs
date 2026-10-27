@@ -107,6 +107,12 @@ use crate::seg_io::SegmentBytes;
 use crate::sources::parquet_source;
 use crate::target::{bloom_bounds_def, declared_sidecars, TimedSource};
 
+mod agg;
+pub use agg::{
+    answer as aggregate_answer, counting_spec, serving_agg, AggAnswer, AggLookup, Aggregated,
+    KeyAggregate, TotalsVisitor,
+};
+
 /// What to look up.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Lookup {
@@ -350,6 +356,7 @@ fn serve(spec: &KeySpec, columns: &[String]) -> Option<Serve> {
     // valid and known times are both set, so it serves bitemporal lookups
     // only (`plan_bitemporal`). A join key (B3) answers semi-joins between
     // two datasets only (`Planner::plan_semijoin`), never a lookup on one.
+    // An agg key answers aggregate lookups only (`Planner::aggregate`).
     if matches!(
         spec,
         KeySpec::Text { .. }
@@ -357,6 +364,7 @@ fn serve(spec: &KeySpec, columns: &[String]) -> Option<Serve> {
             | KeySpec::List { .. }
             | KeySpec::Bitemporal { .. }
             | KeySpec::Join { .. }
+            | KeySpec::Agg { .. }
     ) {
         return None;
     }

@@ -21,10 +21,10 @@ use crate::envelope::{cites_of, Chain, Envelope, Status};
 use crate::jobs::{job_id, Job, JobInfo, JobState, Jobs};
 use crate::refusal::{self, Refusal, RefusalCode};
 use crate::tools::{
-    self, ApplyReceipt, JobRef, JobsStart, KeyArg, Membership, ObserveAsof, ObserveCardinality,
-    ObserveCount, ObserveJoinOverlap, ObserveJoinVerify, ObserveLocate, ObserveOverlap,
-    ObserveSemijoin, ObserveText, ObserveWhy, ProposeKey, ProposeLayout, ProposeRewrite,
-    ScoreRecord, ScoreVerify, ScoreWhy, Tier,
+    self, ApplyReceipt, JobRef, JobsStart, KeyArg, Membership, ObserveAggregate, ObserveAsof,
+    ObserveCardinality, ObserveCount, ObserveJoinOverlap, ObserveJoinVerify, ObserveLocate,
+    ObserveOverlap, ObserveSemijoin, ObserveText, ObserveWhy, ProposeKey, ProposeLayout,
+    ProposeRewrite, ScoreRecord, ScoreVerify, ScoreWhy, Tier,
 };
 
 /// How the server is configured at startup. Nothing is read from the
@@ -416,6 +416,22 @@ impl Server {
                     Err(err) => failed(&err),
                 }
             }
+            "observe.aggregate" => {
+                let a = parse!(ObserveAggregate);
+                let pinned = match self.lookup_engine(a.at_manifest) {
+                    Ok(p) => p,
+                    Err(err) => return failed(&err),
+                };
+                let functions = a.functions.unwrap_or_else(tools::default_functions);
+                match pinned.as_ref().unwrap_or(e).aggregate(
+                    &key_file(a.keys, a.key_columns),
+                    &a.value,
+                    &functions,
+                ) {
+                    Ok(r) => done(&r, None),
+                    Err(err) => failed(&err),
+                }
+            }
             "observe.asof" => {
                 let a = parse!(ObserveAsof);
                 let pinned = match self.lookup_engine(a.at_manifest) {
@@ -566,6 +582,10 @@ impl Server {
                     } else {
                         None
                     },
+                    aggregate: a.aggregate.map(|g| bellwether::AggregateQuery {
+                        value: g.value,
+                        functions: g.functions.unwrap_or_else(tools::default_functions),
+                    }),
                 };
                 match e.why(&request) {
                     Ok(r) => done(&r, None),

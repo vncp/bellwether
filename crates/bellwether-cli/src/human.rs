@@ -7,8 +7,8 @@ use std::fmt::Write as _;
 use bellwether::spec::label;
 use bellwether::types::{EvidenceBody, Hash, Record, TextOp, Tokenizer};
 use bellwether::{
-    Cost, CountResult, IndexResult, LinkStatus, LookupKind, PlanResult, ProposeResult,
-    ReceiptResult, ReportResult,
+    AggValue, AggregateResult, Cost, CountResult, IndexResult, LinkStatus, LookupKind, PlanResult,
+    ProposeResult, ReceiptResult, ReportResult,
 };
 
 use crate::Out;
@@ -59,6 +59,146 @@ pub(crate) fn heading(out: &Out, s: &str) -> String {
     } else {
         s.to_string()
     }
+}
+
+/// The most keys `aggregate` lists in a terminal; `--json` lists every key.
+const AGGREGATE_ROWS_SHOWN: usize = 20;
+
+/// `aggregate`: per key its rows, count, nulls and the asked aggregates,
+/// then where they came from, whether any float sum is measured rather
+/// than exact, and the row groups still to read when the index answered
+/// only part, with the `index` command (on `root`) that answers it all.
+#[allow(clippy::too_many_lines)] // header, one row per key, then the residual
+pub(crate) fn aggregate_result(r: &AggregateResult, root: &str, out: &Out) -> String {
+    let mut s = String::new();
+    let _ = writeln!(
+        s,
+        "{}",
+        heading(
+            out,
+            &format!(
+                "aggregate: {} of {} by ({}) over {} at manifest sequence {}",
+                r.functions.join(", "),
+                r.value,
+                r.columns.join(", "),
+                count(r.keys, "key", "keys"),
+                r.sequence
+            )
+        )
+    );
+    // An empty string reads `""`, never a blank cell; a null reads `null`.
+    let cell = |v: Option<&str>| -> String {
+        match v {
+            None => "null".into(),
+            Some("") => "\"\"".into(),
+            Some(t) => t.to_string(),
+        }
+    };
+    let shown =
+        |v: &Option<AggValue>| -> Option<String> { v.as_ref().map(|v| cell(v.value.as_deref())) };
+    let mut header = format!(
+        "  {:<24} {:>12} {:>12} {:>8}",
+        "key", "rows", "count", "nulls"
+    );
+    let wants = |f: &str| r.functions.iter().any(|x| x == f);
+    for f in ["sum", "min", "max"] {
+        if wants(f) {
+            let _ = write!(header, " {f:>20}");
+        }
+    }
+    let _ = writeln!(s, "{}", header.trim_end());
+    for g in r.groups.iter().take(AGGREGATE_ROWS_SHOWN) {
+        let key: Vec<String> = g.key.iter().map(|v| cell(v.as_deref())).collect();
+        let mut line = format!(
+            "  {:<24} {:>12} {:>12} {:>8}",
+            key.join(", "),
+            num(g.rows),
+            num(g.count),
+            num(g.nulls)
+        );
+        for v in [&g.sum, &g.min, &g.max] {
+            if let Some(text) = shown(v) {
+                let _ = write!(line, " {text:>20}");
+            }
+        }
+        if g.residual_rows > 0 {
+            let _ = write!(
+                line,
+                "  partial: {} in {} to read",
+                count(g.residual_rows, "row", "rows"),
+                count(g.residual_row_groups, "row group", "row groups")
+            );
+        }
+        let _ = writeln!(s, "{}", line.trim_end());
+    }
+    if r.groups.len() > AGGREGATE_ROWS_SHOWN {
+        let _ = writeln!(
+            s,
+            "  ... and {} more; --json lists every key",
+            count(
+                (r.groups.len() - AGGREGATE_ROWS_SHOWN) as u64,
+                "key",
+                "keys"
+            )
+        );
+    }
+    if r.null_tuples > 0 {
+        let _ = writeln!(
+            s,
+            "  {} key rows held a null and match nothing (ADR 014)",
+            num(r.null_tuples)
+        );
+    }
+    let measured = r
+        .groups
+        .iter()
+        .filter_map(|g| g.sum.as_ref())
+        .find_map(|v| match &v.exactness {
+            bellwether::types::Exactness::Measured { model } => Some(model.clone()),
+            _ => None,
+        });
+    if let Some(model) = measured {
+        let _ = writeln!(
+            s,
+            "  sums of {} are float sums, measured by {model}, never exact; counts, minimums and \
+             maximums are exact",
+            r.value
+        );
+    }
+    if r.complete {
+        let _ = writeln!(
+            s,
+            "  from {} ({} rows of the keys in {} of {}), checked against the counts of {}; no \
+             data file was read",
+            r.answered_by,
+            num(r.rows),
+            count(r.row_groups, "row group", "row groups"),
+            num(r.row_groups_total),
+            r.counted_by
+        );
+    } else {
+        let _ = writeln!(
+            s,
+            "  partial: {} aggregates by fewer columns than ({}), and in {} ({} in {}) its \
+             aggregate also holds rows of other keys",
+            r.answered_by,
+            r.columns.join(", "),
+            count(r.residual_row_groups, "row group", "row groups"),
+            size(r.residual_bytes),
+            count(r.residual_files, "file", "files")
+        );
+        let _ = writeln!(
+            s,
+            "  the values above are exact over the other rows; read those row groups, keep the \
+             rows of these keys, and add them, or declare the agg key on ({}) to answer from the \
+             index alone: bellwether index {root} --key 'agg:{}@{}{{{}}}'",
+            r.columns.join(", "),
+            r.columns.join(","),
+            r.value,
+            r.functions.join(",")
+        );
+    }
+    s
 }
 
 /// The narrowest label column of the funnel.
@@ -276,6 +416,9 @@ fn lookup_label(lookup: &LookupKind) -> String {
         LookupKind::ContainsAny { column } => format!("locate rows whose {column} holds any value"),
         LookupKind::ContainsAll { column } => {
             format!("locate rows whose {column} holds every value")
+        }
+        LookupKind::Aggregate { value, functions } => {
+            format!("aggregate {}({value}) per key", functions.join(", "))
         }
         LookupKind::Latest => "latest".to_string(),
         LookupKind::SemiJoin {
@@ -1003,6 +1146,16 @@ pub(crate) fn why(r: &bellwether::WhyReport, out: &Out, fix_command: &str) -> St
         for c in &r.candidates {
             let mut notes = Vec::new();
             match (&c.origin, &c.spec, &kind_label) {
+                // Beside aggregate runs (B7), the key an agg key needs.
+                (CandidateOrigin::Workload, KeySpec::Exact { counts: true, .. }, _)
+                    if matches!(w.lookup, Some(LookupKind::Aggregate { .. })) =>
+                {
+                    notes.push(
+                        "the counted key an agg key needs beside it; on its own it reads what \
+                         the locate of the keys reads"
+                            .to_string(),
+                    );
+                }
                 // Priced for count runs, which it answers with no data file
                 // read: not the floor the plain exact key is.
                 (CandidateOrigin::Workload, KeySpec::Exact { counts: true, .. }, _) => {
@@ -1067,6 +1220,13 @@ pub(crate) fn why(r: &bellwether::WhyReport, out: &Out, fix_command: &str) -> St
                 (CandidateOrigin::Workload, KeySpec::Join { .. }, _) => {
                     notes.push(
                         "floor (semijoin): only row groups holding a key both datasets hold"
+                            .to_string(),
+                    );
+                }
+                (CandidateOrigin::Workload, KeySpec::Agg { .. }, _) => {
+                    notes.push(
+                        "answers the aggregates from the index: reads only the row groups its \
+                         counts do not prove answered"
                             .to_string(),
                     );
                 }
@@ -1235,6 +1395,11 @@ pub(crate) fn why(r: &bellwether::WhyReport, out: &Out, fix_command: &str) -> St
                 values,
             } => list_layout(*least_row_groups, *row_groups, values),
             CulpritReason::ServingSpec { spec } => format!("the serving key {}", label(spec)),
+            CulpritReason::AggAnswered { spec } => format!(
+                "none: the index answers the aggregates from {} beside its counted key; nothing \
+                 is read",
+                label(spec)
+            ),
             CulpritReason::Text { matches } => {
                 let parts: Vec<String> = matches
                     .iter()
@@ -1323,6 +1488,31 @@ pub(crate) fn why(r: &bellwether::WhyReport, out: &Out, fix_command: &str) -> St
                     "recommended{for_kind}: none; no candidate reads fewer bytes than the current configuration"
                 );
             }
+        }
+        // Aggregate runs (B7) on a folder without the counted key an agg
+        // key needs: that key comes first, and saves no bytes on its own.
+        let counted = r.candidates.iter().find(|c| {
+            c.origin == CandidateOrigin::Workload
+                && matches!(c.spec, KeySpec::Exact { counts: true, .. })
+        });
+        if let (Some(LookupKind::Aggregate { .. }), Some(c), true) = (
+            &w.lookup,
+            counted,
+            r.tables.is_empty()
+                && !r
+                    .candidates
+                    .iter()
+                    .any(|c| matches!(c.spec, KeySpec::Agg { .. })),
+        ) {
+            let _ = writeln!(
+                s,
+                "  first apply the counted key the agg key needs ({}); it saves no bytes on its \
+                 own, so allow that: {fix_command} --proposal {} --workload {} --allow-no-gain\n  \
+                 then run why again: it proposes the agg key",
+                label(&c.spec),
+                c.proposal.hash,
+                w.hash
+            );
         }
     }
     if let Some(t) = &r.twin {
