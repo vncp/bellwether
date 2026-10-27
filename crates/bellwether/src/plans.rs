@@ -20,7 +20,7 @@ use std::path::PathBuf;
 
 use bellwether_replay::{load_plan, KeySetSource, Replayer, Workload, MAIN_DATASET};
 use bellwether_types::{
-    ConsumerPlan, Error, Exactness, Hash, KeySpec, OperatorCost, PlanNode, ProposalBody, Quantity,
+    ConsumerPlan, Error, Exactness, Hash, KeySpec, OperatorCost, PlanNode, Quantity,
     Result, Source,
 };
 use serde::{Deserialize, Serialize};
@@ -146,30 +146,6 @@ pub(crate) fn workload_plans(
         .into_iter()
         .map(|h| Ok((h, load_plan(keys, &h)?)))
         .collect()
-}
-
-/// The plans a proposal and a workload price: a rewrite's two, else the
-/// workload's.
-pub(crate) fn proposal_plans(
-    body: &ProposalBody,
-    workload: Option<&Workload>,
-    keys: &dyn KeySetSource,
-) -> Result<Vec<ConsumerPlan>> {
-    if let ProposalBody::Rewrite { shape } = body {
-        return Ok(shape
-            .before_plan
-            .iter()
-            .chain(&shape.after_plan)
-            .cloned()
-            .collect());
-    }
-    match workload {
-        Some(w) => Ok(workload_plans(w, keys)?
-            .into_iter()
-            .map(|(_, p)| p)
-            .collect()),
-        None => Ok(Vec::new()),
-    }
 }
 
 /// Reads a plan file (read only): a consumer plan's JSON.

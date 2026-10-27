@@ -1387,10 +1387,18 @@ impl Engine {
             Some(w) => is_text_workload(w)?,
             None => false,
         };
+        // The row groups the runs span: per run the data root's, or for
+        // consumer-plan runs every read occurrence's dataset's, since their
+        // costs count the row groups of every dataset the plan scans.
+        let span = match workload.as_ref() {
+            Some(_) if !report.plans.is_empty() => plan_span(&replayer, &report.plans),
+            Some(w) => indexed_row_groups * w.runs().len() as u64,
+            None => 0,
+        };
         report.culprit = match workload.as_ref() {
             Some(w) if text_runs => text_culprit(&report.current_specs, w)?,
             Some(w) => answered_aggregates(&report, w)
-                .or_else(|| layout_culprit(&report, w, indexed_row_groups, spread))
+                .or_else(|| layout_culprit(&report, w, indexed_row_groups, span, spread))
                 .or_else(|| culprit(&report.current_specs, &report.profile, Some(w))),
             None => culprit(&report.current_specs, &report.profile, None),
         };
@@ -3781,12 +3789,15 @@ fn answered_aggregates(r: &WhyReport, w: &Workload) -> Option<Culprit> {
 /// lookups, and unless the
 /// floor was priced (a candidate exact key on a run's own columns, or a
 /// current spec serving the first run) and every priced configuration reads
-/// at least [`LAYOUT_BOUND_FRACTION`] of the `runs × indexed_row_groups` row
-/// groups the runs span. A dataset of one row group never names the layout.
+/// at least [`LAYOUT_BOUND_FRACTION`] of the `span` row groups the runs
+/// span (`runs × indexed_row_groups`; for consumer-plan runs, per run every
+/// read occurrence's dataset's row groups, [`plan_span`]). A dataset of one
+/// row group never names the layout.
 fn layout_culprit(
     r: &WhyReport,
     w: &Workload,
     indexed_row_groups: u64,
+    span: u64,
     spread: Option<Fanout>,
 ) -> Option<Culprit> {
     // A text lookup (B5) that reads nearly every row group under every
@@ -3820,12 +3831,13 @@ fn layout_culprit(
             servable(s, &columns).is_some()
         }
     };
-    let floor_priced = r
-        .candidates
-        .iter()
-        .any(|c| c.origin == CandidateOrigin::Workload)
-        || r.current_specs.iter().any(serves);
-    let row_groups = indexed_row_groups * w.runs().len() as u64;
+    // For consumer-plan runs the floor is a plan candidate serving the
+    // runs' own key columns.
+    let floor_priced = r.candidates.iter().any(|c| {
+        c.origin == CandidateOrigin::Workload
+            || (c.origin == CandidateOrigin::Plan && serves(&c.spec))
+    }) || r.current_specs.iter().any(serves);
+    let row_groups = span;
     // One row group has nothing to prune: no layout could do better.
     if !floor_priced || indexed_row_groups < 2 {
         return None;
@@ -3881,6 +3893,24 @@ fn layout_culprit(
             lowest_fanout,
         },
     })
+}
+
+/// The row groups consumer-plan runs span: per plan, its runs times the
+/// live row groups of each read occurrence's dataset (a dataset scanned by
+/// two `scan` nodes counts twice, as its two reads do).
+fn plan_span(replayer: &Replayer<'_>, plans: &[crate::plans::PlanReport]) -> u64 {
+    plans
+        .iter()
+        .map(|p| {
+            let per_run: u64 = p
+                .reads
+                .iter()
+                .filter_map(|r| replayer.dataset(&r.dataset))
+                .map(|d| d.catalog().all_ids().len())
+                .sum();
+            p.runs.saturating_mul(per_run)
+        })
+        .sum()
 }
 
 /// The culprit rule documented on [`Engine::why`].

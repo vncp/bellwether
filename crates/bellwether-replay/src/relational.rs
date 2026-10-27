@@ -434,9 +434,7 @@ pub fn check_shape(plan: &ConsumerPlan) -> ReplayResult<Vec<u32>> {
                 check_columns(i, "the semi-join", columns, false)?;
                 check_keys_from(i, "the semi-join", columns.len(), keys)?;
             }
-            PlanNode::Join {
-                on, left, right, ..
-            } => {
+            PlanNode::Join { on, .. } => {
                 if on.is_empty() {
                     return Err(invalid(
                         Some(i),
@@ -2121,12 +2119,17 @@ impl<'p, 'a> Pricer<'p, 'a> {
             let node = &plan.nodes[v as usize];
             let mut moved: Option<Iv> = None;
             let rel = match node {
-                PlanNode::Scan { dataset, .. } => {
-                    let r = self.replayer(dataset)?;
+                PlanNode::Scan { .. } => {
+                    // The checked name: an alias of the data root is `main`,
+                    // whose configuration and planner it prices under.
+                    let dataset = self.checked.datasets[v as usize]
+                        .clone()
+                        .ok_or_else(|| invalid(Some(v), "a scan with no dataset"))?;
+                    let r = self.replayer(&dataset)?;
                     let rgs = r.catalog().all_ids();
                     Rel::of(Side {
                         scan: v,
-                        dataset: dataset.clone(),
+                        dataset,
                         rows: Iv::exact(r.catalog().rows_total()),
                         rgs,
                         sel: Sel::All,

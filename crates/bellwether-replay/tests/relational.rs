@@ -579,7 +579,6 @@ impl Oracle<'_> {
                         groups: Some(groups.into_iter().map(|(k, (n, s, _))| (k, n, s)).collect()),
                     }
                 }
-                n => panic!("oracle does not evaluate {n:?}"),
             };
             out[v as usize] = Some(t);
         }
