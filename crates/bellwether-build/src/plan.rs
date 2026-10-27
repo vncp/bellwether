@@ -2541,35 +2541,7 @@ impl<S: StoreExt + ?Sized> Planner<S> {
                 });
             }
         };
-        // A serving spec that a narrowing below reads again with the same
-        // projection (a temporal spec on the window's time column, its
-        // chains; an exact spec with bounds, its bounds) is not intersected
-        // here: per key, what the narrowing keeps is a subset of that
-        // spec's own row groups for the key, so intersecting with them too
-        // changes nothing, and each of its segments is read once.
-        let positions_of = |def: &SidecarDef| -> Option<Vec<usize>> {
-            def.columns
-                .iter()
-                .map(|c| columns.iter().position(|x| x == c))
-                .collect()
-        };
-        let narrowed_again = |s: &SpecSegments, how: &Serve| -> bool {
-            let Serve::Project(positions) = how else {
-                return false;
-            };
-            match &s.spec {
-                KeySpec::Temporal { ts_column: tc, .. } if tc == ts_column => true,
-                _ => sidecars.iter().any(|(def, src)| {
-                    matches!(src, TimedSource::Spec(spec) if spec.identity() == s.spec.identity())
-                        && positions_of(def).as_ref() == Some(positions)
-                }),
-            }
-        };
-        let intersected: Vec<(&SpecSegments, Serve)> = serving
-            .iter()
-            .filter(|(s, how)| !narrowed_again(s, how))
-            .map(|(s, how)| (*s, how.clone()))
-            .collect();
+        let intersected = not_narrowed_again(&serving, sidecars, columns, ts_column);
         let mut acc: Vec<Option<RoaringBitmap>> = vec![None; keys.len()];
         self.intersect(&mut acc, &intersected, &keys, &spans, None)?;
         if let Some(w) = &window {
@@ -3527,6 +3499,43 @@ fn expanded<'a>(keys: impl Iterator<Item = &'a Vec<u8>>) -> Vec<Vec<u8>> {
     out.sort_unstable();
     out.dedup();
     out
+}
+
+/// The serving specs a window plan intersects: all but those a narrowing
+/// reads again with the same projection (a temporal spec on the window's
+/// time column, its chains; an exact spec with bounds, its bounds). Per
+/// key, what the narrowing keeps is a subset of that spec's own row groups
+/// for the key, so intersecting with them too changes nothing, and each of
+/// its segments is read once.
+fn not_narrowed_again<'s>(
+    serving: &[(&'s SpecSegments, Serve)],
+    sidecars: &[(SidecarDef, TimedSource)],
+    columns: &[String],
+    ts_column: &str,
+) -> Vec<(&'s SpecSegments, Serve)> {
+    let positions_of = |def: &SidecarDef| -> Option<Vec<usize>> {
+        def.columns
+            .iter()
+            .map(|c| columns.iter().position(|x| x == c))
+            .collect()
+    };
+    let narrowed_again = |s: &SpecSegments, how: &Serve| -> bool {
+        let Serve::Project(positions) = how else {
+            return false;
+        };
+        match &s.spec {
+            KeySpec::Temporal { ts_column: tc, .. } if tc == ts_column => true,
+            _ => sidecars.iter().any(|(def, src)| {
+                matches!(src, TimedSource::Spec(spec) if spec.identity() == s.spec.identity())
+                    && positions_of(def).as_ref() == Some(positions)
+            }),
+        }
+    };
+    serving
+        .iter()
+        .filter(|(s, how)| !narrowed_again(s, how))
+        .map(|(s, how)| (*s, how.clone()))
+        .collect()
 }
 
 /// Every zero variant of each key's projection onto `positions`.
