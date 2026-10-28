@@ -306,6 +306,7 @@ fn the_engine_loop_returns_the_cli_json_line_from_every_engine_tool() {
         },
         budget: bellwether_mcp::Budget::default(),
         join: None,
+        workspace: false,
     })
     .unwrap();
     let mcp = |tool: &str, args: Value| -> (String, Value) {

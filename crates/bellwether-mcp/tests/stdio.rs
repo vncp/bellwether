@@ -404,3 +404,130 @@ fn inline_key_values_emit_and_apply_refresh_work_over_stdio() {
     let (status, _, _) = c.close();
     assert!(status.success());
 }
+
+#[test]
+fn workspace_mode_serves_multiple_folders_and_refuses_escape() {
+    let dir = tempfile::tempdir().unwrap();
+    let outside = dir.path().join("outside");
+    common::scattered_corpus(&outside, 1, 1, 10, 20);
+    let ws = dir.path().join("workspace");
+    let orders = ws.join("orders");
+    let customers = ws.join("customers");
+    common::scattered_corpus(&orders, 2, 2, 20, 100);
+    common::scattered_corpus(&customers, 2, 2, 20, 100);
+    let orders_canon = std::fs::canonicalize(&orders).unwrap();
+    let customers_canon = std::fs::canonicalize(&customers).unwrap();
+
+    // 1. With --workspace, one MCP server session serves both `orders` and `customers`.
+    let mut c = Client::spawn(
+        EXE,
+        &["--clock", CLOCK, "--workspace", ws.to_str().unwrap()],
+    );
+    c.initialize();
+
+    let why_orders = c.call("observe.why", json!({"dataset": "orders"}));
+    assert_eq!(why_orders["isError"], false, "{why_orders}");
+    let why_orders_v: Value = serde_json::from_str(text(&why_orders)).unwrap();
+    assert_eq!(why_orders_v["root"], orders_canon.to_str().unwrap());
+    let ev_orders = why_orders_v["evidence"]["hash"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let prop_orders = c.call(
+        "propose.key",
+        json!({
+            "dataset": "orders",
+            "spec": "exact:id",
+            "evidence": [ev_orders],
+            "by": "agent"
+        }),
+    );
+    assert_eq!(prop_orders["isError"], false, "{prop_orders}");
+    assert_eq!(
+        serde_json::from_str::<Value>(text(&prop_orders)).unwrap()["outcome"],
+        "written"
+    );
+
+    let why_customers = c.call("observe.why", json!({"dataset": "customers"}));
+    assert_eq!(why_customers["isError"], false, "{why_customers}");
+    let why_customers_v: Value = serde_json::from_str(text(&why_customers)).unwrap();
+    assert_eq!(why_customers_v["root"], customers_canon.to_str().unwrap());
+    let ev_customers = why_customers_v["evidence"]["hash"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let prop_customers = c.call(
+        "propose.key",
+        json!({
+            "dataset": "customers",
+            "spec": "exact:id",
+            "evidence": [ev_customers],
+            "by": "agent"
+        }),
+    );
+    assert_eq!(prop_customers["isError"], false, "{prop_customers}");
+
+    // Also verify observe.plan_from_sql auto-binds sibling folders in workspace mode.
+    let sql_plan = c.call(
+        "observe.plan_from_sql",
+        json!({
+            "dataset": "orders",
+            "main_table": "orders",
+            "sql": "SELECT o.id, c.payload FROM orders o JOIN customers c ON o.id = c.id WHERE o.id IN (:keys)"
+        }),
+    );
+    assert_eq!(sql_plan["isError"], false, "{sql_plan}");
+    let sql_plan_v: Value = serde_json::from_str(text(&sql_plan)).unwrap();
+    assert_eq!(sql_plan_v["datasets"], json!(["main", "customers"]));
+
+    // 2. Passing "../outside", "/etc", empty, or a symlink escaping the workspace is refused.
+    #[cfg(unix)]
+    {
+        let link = ws.join("escape_link");
+        std::os::unix::fs::symlink(&outside, &link).unwrap();
+        let esc = c.call("observe.why", json!({"dataset": "escape_link"}));
+        assert_eq!(esc["isError"], true, "{esc}");
+        assert_eq!(
+            esc["structuredContent"]["refusal"]["code"],
+            "invalid_argument"
+        );
+        assert_eq!(
+            esc["structuredContent"]["refusal"]["fields"]["field"],
+            "dataset"
+        );
+    }
+
+    for bad in ["../outside", "/etc", "", "s3://bucket/orders"] {
+        let r = c.call("observe.why", json!({"dataset": bad}));
+        assert_eq!(r["isError"], true, "{bad}: {r}");
+        assert_eq!(
+            r["structuredContent"]["refusal"]["code"], "invalid_argument",
+            "{bad}: {r}"
+        );
+        assert_eq!(
+            r["structuredContent"]["refusal"]["fields"]["field"], "dataset",
+            "{bad}: {r}"
+        );
+    }
+
+    let (status, _, _) = c.close();
+    assert!(status.success());
+
+    // 3. Without --workspace, passing an unbound `dataset: "orders"` is refused.
+    let mut single = Client::spawn(EXE, &["--clock", CLOCK, orders.to_str().unwrap()]);
+    single.initialize();
+    let refused = single.call("observe.why", json!({"dataset": "customers"}));
+    assert_eq!(refused["isError"], true, "{refused}");
+    assert_eq!(
+        refused["structuredContent"]["refusal"]["code"],
+        "invalid_argument"
+    );
+    assert_eq!(
+        refused["structuredContent"]["refusal"]["fields"]["field"],
+        "dataset"
+    );
+    let (status, _, _) = single.close();
+    assert!(status.success());
+}

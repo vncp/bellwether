@@ -74,6 +74,7 @@ fn server(c: &Corpus) -> bellwether_mcp::Server {
         },
         budget: bellwether_mcp::Budget::default(),
         join: None,
+        workspace: false,
     })
     .unwrap()
 }
@@ -148,6 +149,7 @@ fn why_plan_is_byte_identical_over_cli_and_mcp_and_names_unbound_datasets() {
         },
         budget: bellwether_mcp::Budget::default(),
         join: None,
+        workspace: false,
     })
     .unwrap();
     let r = bare.call(

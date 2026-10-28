@@ -517,6 +517,7 @@ fn dry_runs_never_create_an_absent_index_location() {
             },
             budget: Budget::default(),
             join: None,
+            workspace: false,
         })
         .unwrap();
         let before = objects(g.dir.path());

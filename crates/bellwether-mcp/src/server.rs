@@ -24,8 +24,8 @@ use crate::tools::{
     self, ApplyReceipt, ApplyRefresh, EmitEngine, EmitResidual, JobRef, JobsStart, KeyArg,
     Membership, ObserveAggregate, ObserveAsof, ObserveCardinality, ObserveCount,
     ObserveJoinOverlap, ObserveJoinVerify, ObserveLocate, ObserveOverlap, ObservePlanFromSql,
-    ObserveSemijoin, ObserveText, ObserveWhy, ProposeKey, ProposeLayout, ProposeRewrite,
-    ScoreAdvise, ScoreRecord, ScoreVerify, ScoreWhy, Tier,
+    ObserveProfile, ObserveSemijoin, ObserveText, ObserveWhy, ProposeKey, ProposeLayout,
+    ProposeRewrite, ScoreAdvise, ScoreRecord, ScoreVerify, ScoreWhy, Tier,
 };
 
 /// How the server is configured at startup. Nothing is read from the
@@ -42,6 +42,12 @@ pub struct Config {
     /// `--join`): `<right>.<cols>` or `join:<left>.<cols>=<right>.<cols>`.
     /// `None`: those tools are refused.
     pub join: Option<String>,
+    /// Serve `root` as a sandboxed workspace directory holding multiple data
+    /// folders: a tool call's optional `dataset` argument may name a relative
+    /// folder under the canonicalized `root`, consumer plans and SQL plans
+    /// auto-bind sibling folders under the workspace, and semi-join keys may
+    /// join folders within the workspace.
+    pub workspace: bool,
 }
 
 /// One tool call's reply.
@@ -71,17 +77,19 @@ enum Done {
         text: String,
         value: Value,
         refusal: Option<Refusal>,
+        engine: Option<Box<Engine>>,
     },
     /// Refused before or by the facade with an error.
     Failed(Refusal),
 }
 
-fn done<T: Serialize>(r: &T, refusal: Option<Refusal>) -> Done {
+fn done<T: Serialize>(r: &T, refusal: Option<Refusal>, engine: Option<Engine>) -> Done {
     match (serde_json::to_string(r), serde_json::to_value(r)) {
         (Ok(text), Ok(value)) => Done::Result {
             text,
             value,
             refusal,
+            engine: engine.map(Box::new),
         },
         (Err(e), _) | (_, Err(e)) => Done::Failed(refusal::from_error(&Error::Serde(e))),
     }
@@ -97,7 +105,9 @@ struct Inner {
     /// a committed manifest (`at_manifest`).
     root: String,
     options: EngineOptions,
+    explicit_datasets: std::collections::BTreeSet<String>,
     join: Option<String>,
+    workspace: bool,
     budget: Meter,
     jobs: Mutex<Jobs>,
 }
@@ -146,20 +156,29 @@ impl Server {
     /// `EngineOptions::join_scope`): a join key a tool argument names with
     /// another right side is refused before any folder is read.
     pub fn new(config: &Config) -> bellwether::types::Result<Self> {
-        let options = EngineOptions {
-            join_scope: match &config.join {
-                Some(j) => bellwether::JoinScope::Only(join_side_of(j)?),
-                None => bellwether::JoinScope::Unserved,
+        let explicit_datasets: std::collections::BTreeSet<String> =
+            config.engine.datasets.keys().cloned().collect();
+        let mut options = EngineOptions {
+            join_scope: match (&config.join, config.workspace) {
+                (Some(j), _) => bellwether::JoinScope::Only(join_side_of(j)?),
+                (None, true) => bellwether::JoinScope::Any,
+                (None, false) => bellwether::JoinScope::Unserved,
             },
             ..config.engine.clone()
         };
-        let engine = Engine::open(&config.root, options.clone())?;
+        let mut engine = Engine::open(&config.root, options.clone())?;
+        if config.workspace {
+            discover_workspace_datasets(std::path::Path::new(engine.root()), &mut options.datasets);
+            engine = Engine::open(&config.root, options.clone())?;
+        }
         Ok(Self {
             inner: Arc::new(Inner {
                 engine,
                 root: config.root.clone(),
                 options,
+                explicit_datasets,
                 join: config.join.clone(),
+                workspace: config.workspace,
                 budget: Meter::new(config.budget),
                 jobs: Mutex::new(Jobs::new()),
             }),
@@ -172,23 +191,156 @@ impl Server {
         &self.inner.engine
     }
 
-    /// The engine a lookup plans with: the session's, or, with
-    /// `at_manifest`, one opened at that committed manifest sequence (its
-    /// lookups refuse a sequence the index does not retain).
-    fn lookup_engine(&self, at_manifest: Option<u64>) -> bellwether::types::Result<Option<Engine>> {
-        at_manifest
-            .map(|seq| {
-                Engine::open(
-                    &self.inner.root,
-                    EngineOptions {
-                        at_manifest: Some(seq),
-                        ..self.inner.options.clone()
-                    },
-                )
-            })
-            .transpose()
+    /// Resolves the engine for a tool call's optional `dataset` argument and
+    /// optional `at_manifest` sequence.
+    ///
+    /// Returns `Ok(None)` when both `dataset` and `at_manifest` are absent (or
+    /// `dataset` is `"main"` without `at_manifest`) and not in workspace mode,
+    /// so the caller can use `&self.inner.engine` without opening a new engine.
+    fn engine_for(
+        &self,
+        dataset: Option<&str>,
+        at_manifest: Option<u64>,
+    ) -> bellwether::types::Result<Option<Engine>> {
+        let Some(name) = dataset else {
+            if self.inner.workspace && !self.inner.engine.is_table() {
+                let mut opts = self.inner.options.clone();
+                opts.at_manifest = at_manifest;
+                let ws_root = std::path::Path::new(self.inner.engine.root());
+                discover_workspace_datasets(ws_root, &mut opts.datasets);
+                return Engine::open(&self.inner.root, opts).map(Some);
+            }
+            return at_manifest
+                .map(|seq| {
+                    Engine::open(
+                        &self.inner.root,
+                        EngineOptions {
+                            at_manifest: Some(seq),
+                            ..self.inner.options.clone()
+                        },
+                    )
+                })
+                .transpose();
+        };
+        if name == "main" {
+            return self.engine_for(None, at_manifest);
+        }
+        if self.inner.explicit_datasets.contains(name) {
+            if let Some(bound_root) = self.inner.options.datasets.get(name) {
+                let mut opts = self.inner.options.clone();
+                opts.at_manifest = at_manifest;
+                opts.index = None;
+                return Engine::open(bound_root, opts).map(Some);
+            }
+        }
+        if !self.inner.workspace {
+            return Err(Error::InvalidArgument {
+                field: "dataset",
+                reason: "the server is bound to one folder; start it with --workspace (or \
+                         --dataset <name>=<path>) to target another folder"
+                    .into(),
+            });
+        }
+        let resolved = self.resolve_workspace_dataset(name)?;
+        let mut opts = self.inner.options.clone();
+        opts.at_manifest = at_manifest;
+        opts.index = None;
+        let ws_root = std::path::Path::new(self.inner.engine.root());
+        discover_workspace_datasets(ws_root, &mut opts.datasets);
+        if let Some(file_name) = resolved.file_name().and_then(|f| f.to_str()) {
+            opts.datasets
+                .entry(file_name.to_string())
+                .or_insert_with(|| resolved.to_string_lossy().into_owned());
+        }
+        opts.datasets
+            .entry(name.trim().to_string())
+            .or_insert_with(|| resolved.to_string_lossy().into_owned());
+        Engine::open(&resolved.to_string_lossy(), opts).map(Some)
     }
 
+    /// Validates and resolves `name` as a relative directory inside the
+    /// canonicalized workspace root. Refuses empty names, URLs, absolute paths,
+    /// `..` traversal components, non-directories, and symlinks resolving
+    /// outside the workspace root.
+    fn resolve_workspace_dataset(
+        &self,
+        raw: &str,
+    ) -> bellwether::types::Result<std::path::PathBuf> {
+        let name = raw.trim();
+        if name.is_empty() {
+            return Err(Error::InvalidArgument {
+                field: "dataset",
+                reason: "`dataset` must not be empty; pass a relative folder name under the \
+                         workspace root (or omit `dataset` for the workspace root)"
+                    .into(),
+            });
+        }
+        if name.contains("://") {
+            return Err(Error::InvalidArgument {
+                field: "dataset",
+                reason: format!(
+                    "`dataset` {raw:?} is a URL; in `--workspace` mode `dataset` must be a \
+                     relative folder path inside the workspace"
+                ),
+            });
+        }
+        let rel = std::path::Path::new(name);
+        if rel.is_absolute() {
+            return Err(Error::InvalidArgument {
+                field: "dataset",
+                reason: format!(
+                    "`dataset` {raw:?} is an absolute path; pass a relative folder path inside \
+                     the workspace"
+                ),
+            });
+        }
+        for comp in rel.components() {
+            match comp {
+                std::path::Component::Normal(_) | std::path::Component::CurDir => {}
+                std::path::Component::ParentDir
+                | std::path::Component::RootDir
+                | std::path::Component::Prefix(_) => {
+                    return Err(Error::InvalidArgument {
+                        field: "dataset",
+                        reason: format!(
+                            "`dataset` {raw:?} escapes the workspace (`..` or root components \
+                             are not allowed); pass a relative folder path inside the workspace"
+                        ),
+                    });
+                }
+            }
+        }
+        let ws_root = std::path::Path::new(self.inner.engine.root());
+        let candidate = ws_root.join(rel);
+        let canonical = std::fs::canonicalize(&candidate).map_err(|e| Error::InvalidArgument {
+            field: "dataset",
+            reason: format!(
+                "cannot open dataset {raw:?} under workspace {} ({e}); pass an existing \
+                 directory inside the workspace",
+                ws_root.display()
+            ),
+        })?;
+        if !canonical.starts_with(ws_root) {
+            return Err(Error::InvalidArgument {
+                field: "dataset",
+                reason: format!(
+                    "`dataset` {raw:?} resolves outside the workspace root {}; symlinks and \
+                     paths outside the workspace are refused",
+                    ws_root.display()
+                ),
+            });
+        }
+        if !canonical.is_dir() {
+            return Err(Error::InvalidArgument {
+                field: "dataset",
+                reason: format!(
+                    "`dataset` {raw:?} is not a directory; pass a data folder inside the \
+                     workspace"
+                ),
+            });
+        }
+        Ok(canonical)
+    }
     /// The join key the operator started the server with (`--join`), or
     /// the refusal saying a semi-join tool needs one.
     fn join(&self) -> bellwether::types::Result<&str> {
@@ -298,12 +450,14 @@ impl Server {
                 text,
                 value,
                 refusal,
+                engine,
             } => {
                 reservation.settle(Some(&value), elapsed);
                 let (cites, receipts) = cites_of(&value);
+                let receipt_engine = engine.as_deref().unwrap_or(&self.inner.engine);
                 let chains = receipts
                     .iter()
-                    .filter_map(|h| self.inner.engine.receipt(h).ok())
+                    .filter_map(|h| receipt_engine.receipt(h).ok())
                     .map(|r| Chain::from(&r))
                     .collect();
                 let status = if refusal.is_some() {
@@ -335,7 +489,7 @@ impl Server {
     /// The one facade call behind each tool.
     #[allow(clippy::too_many_lines)]
     fn dispatch(&self, tool: &str, args: Value) -> Done {
-        let e = &self.inner.engine;
+        let default_engine = &self.inner.engine;
         macro_rules! parse {
             ($t:ty) => {
                 match serde_json::from_value::<$t>(args) {
@@ -344,50 +498,66 @@ impl Server {
                 }
             };
         }
+        macro_rules! resolve_engine {
+            ($ds:expr, $at:expr) => {
+                match self.engine_for($ds, $at) {
+                    Ok(opt) => opt,
+                    Err(err) => return failed(&err),
+                }
+            };
+        }
         match tool {
             "observe.why" => {
                 let a = parse!(ObserveWhy);
+                let target = resolve_engine!(a.dataset.as_deref(), None);
+                let e = target.as_ref().unwrap_or(default_engine);
                 match e.why(&WhyRequest {
                     columns: a.columns,
                     sketches_only: a.sketches_only,
                     ..WhyRequest::default()
                 }) {
-                    Ok(r) => done(&r, None),
+                    Ok(r) => done(&r, None, target),
                     Err(err) => failed(&err),
                 }
             }
             "observe.cardinality" => {
                 let a = parse!(ObserveCardinality);
+                let target = resolve_engine!(a.dataset.as_deref(), None);
+                let e = target.as_ref().unwrap_or(default_engine);
                 match e.cardinality(&bellwether::CardinalityRequest {
                     items: a.items,
                     transient: a.transient,
                 }) {
-                    Ok(r) => done(&r, None),
+                    Ok(r) => done(&r, None, target),
                     Err(err) => failed(&err),
                 }
             }
             "observe.overlap" => {
                 let a = parse!(ObserveOverlap);
+                let target = resolve_engine!(a.dataset.as_deref(), None);
+                let e = target.as_ref().unwrap_or(default_engine);
                 match e.overlap(&a.left, &a.right, None) {
-                    Ok(r) => done(&r, None),
+                    Ok(r) => done(&r, None, target),
                     Err(err) => failed(&err),
                 }
             }
-            "observe.profile" => match e.findings() {
-                Ok(r) => done(&r, None),
-                Err(err) => failed(&err),
-            },
+            "observe.profile" => {
+                let a = parse!(ObserveProfile);
+                let target = resolve_engine!(a.dataset.as_deref(), None);
+                let e = target.as_ref().unwrap_or(default_engine);
+                match e.findings() {
+                    Ok(r) => done(&r, None, target),
+                    Err(err) => failed(&err),
+                }
+            }
             "observe.locate" => {
                 let a = parse!(ObserveLocate);
                 let keys = match resolve_keys(a.keys, a.key_columns, a.key_values) {
                     Ok(k) => k,
                     Err(err) => return failed(&err),
                 };
-                let pinned = match self.lookup_engine(a.at_manifest) {
-                    Ok(p) => p,
-                    Err(err) => return failed(&err),
-                };
-                let engine = pinned.as_ref().unwrap_or(e);
+                let target = resolve_engine!(a.dataset.as_deref(), a.at_manifest);
+                let engine = target.as_ref().unwrap_or(default_engine);
                 let result = match (&a.columns, a.contains) {
                     (Some(_), Some(_)) => Err(bellwether::types::Error::InvalidArgument {
                         field: "columns",
@@ -403,7 +573,7 @@ impl Server {
                 match result
                     .and_then(|r| with_emit(engine, r, a.emit, a.ordered, a.residual, a.relocate))
                 {
-                    Ok(r) => done(&r, None),
+                    Ok(r) => done(&r, None, target),
                     Err(err) => failed(&err),
                 }
             }
@@ -413,12 +583,9 @@ impl Server {
                     Ok(k) => k,
                     Err(err) => return failed(&err),
                 };
-                let pinned = match self.lookup_engine(a.at_manifest) {
-                    Ok(p) => p,
-                    Err(err) => return failed(&err),
-                };
-                match pinned.as_ref().unwrap_or(e).count(&keys) {
-                    Ok(r) => done(&r, None),
+                let target = resolve_engine!(a.dataset.as_deref(), a.at_manifest);
+                match target.as_ref().unwrap_or(default_engine).count(&keys) {
+                    Ok(r) => done(&r, None, target),
                     Err(err) => failed(&err),
                 }
             }
@@ -428,17 +595,14 @@ impl Server {
                     Ok(k) => k,
                     Err(err) => return failed(&err),
                 };
-                let pinned = match self.lookup_engine(a.at_manifest) {
-                    Ok(p) => p,
-                    Err(err) => return failed(&err),
-                };
+                let target = resolve_engine!(a.dataset.as_deref(), a.at_manifest);
                 let functions = a.functions.unwrap_or_else(tools::default_functions);
-                match pinned
+                match target
                     .as_ref()
-                    .unwrap_or(e)
+                    .unwrap_or(default_engine)
                     .aggregate(&keys, &a.value, &functions)
                 {
-                    Ok(r) => done(&r, None),
+                    Ok(r) => done(&r, None, target),
                     Err(err) => failed(&err),
                 }
             }
@@ -448,11 +612,8 @@ impl Server {
                     Ok(k) => k,
                     Err(err) => return failed(&err),
                 };
-                let pinned = match self.lookup_engine(a.at_manifest) {
-                    Ok(p) => p,
-                    Err(err) => return failed(&err),
-                };
-                let engine = pinned.as_ref().unwrap_or(e);
+                let target = resolve_engine!(a.dataset.as_deref(), a.at_manifest);
+                let engine = target.as_ref().unwrap_or(default_engine);
                 let clocks = match (&a.valid_by, &a.known_by) {
                     (Some(v), Some(k)) => Ok(Some((v.as_str(), k.as_str()))),
                     (None, None) => Ok(None),
@@ -498,36 +659,44 @@ impl Server {
                 match r
                     .and_then(|r| with_emit(engine, r, a.emit, a.ordered, a.residual, a.relocate))
                 {
-                    Ok(r) => done(&r, None),
+                    Ok(r) => done(&r, None, target),
                     Err(err) => failed(&err),
                 }
             }
             "observe.semijoin" => {
                 let a = parse!(ObserveSemijoin);
+                let target = resolve_engine!(a.dataset.as_deref(), None);
+                let e = target.as_ref().unwrap_or(default_engine);
                 match self
                     .join()
                     .and_then(|j| e.semijoin(j, &key_file(a.keys, a.key_columns)))
                 {
-                    Ok(r) => done(&r, None),
+                    Ok(r) => done(&r, None, target),
                     Err(err) => failed(&err),
                 }
             }
             "observe.join_overlap" => {
-                let _ = parse!(ObserveJoinOverlap);
+                let a = parse!(ObserveJoinOverlap);
+                let target = resolve_engine!(a.dataset.as_deref(), None);
+                let e = target.as_ref().unwrap_or(default_engine);
                 match self.join().and_then(|j| e.join_overlap(j)) {
-                    Ok(r) => done(&r, None),
+                    Ok(r) => done(&r, None, target),
                     Err(err) => failed(&err),
                 }
             }
             "observe.join_verify" => {
-                let _ = parse!(ObserveJoinVerify);
+                let a = parse!(ObserveJoinVerify);
+                let target = resolve_engine!(a.dataset.as_deref(), None);
+                let e = target.as_ref().unwrap_or(default_engine);
                 match e.join_verify(self.inner.join.as_deref()) {
-                    Ok(r) => done(&r, None),
+                    Ok(r) => done(&r, None, target),
                     Err(err) => failed(&err),
                 }
             }
             "observe.plan_from_sql" => {
                 let a = parse!(ObservePlanFromSql);
+                let target = resolve_engine!(a.dataset.as_deref(), None);
+                let e = target.as_ref().unwrap_or(default_engine);
                 match e.plan_from_sql(&bellwether::PlanFromSqlRequest {
                     sql: a.sql,
                     main_table: a.main_table,
@@ -536,28 +705,31 @@ impl Server {
                     validate: true,
                     cache: true,
                 }) {
-                    Ok(r) => done(&r, None),
+                    Ok(r) => done(&r, None, target),
                     Err(err) => failed(&err),
                 }
             }
             "observe.text" => {
                 let a = parse!(ObserveText);
-                let pinned = match self.lookup_engine(a.at_manifest) {
-                    Ok(p) => p,
-                    Err(err) => return failed(&err),
-                };
+                let target = resolve_engine!(a.dataset.as_deref(), a.at_manifest);
                 let query = TextQuery {
                     column: a.column,
                     op: a.op,
                     value: a.value,
                 };
-                match pinned.as_ref().unwrap_or(e).locate_text(&query) {
-                    Ok(r) => done(&r, None),
+                match target
+                    .as_ref()
+                    .unwrap_or(default_engine)
+                    .locate_text(&query)
+                {
+                    Ok(r) => done(&r, None, target),
                     Err(err) => failed(&err),
                 }
             }
             "score.why" => {
                 let a = parse!(ScoreWhy);
+                let target = resolve_engine!(a.dataset.as_deref(), None);
+                let e = target.as_ref().unwrap_or(default_engine);
                 if a.keys.is_none()
                     && a.key_values.is_none()
                     && a.workload.is_none()
@@ -643,12 +815,14 @@ impl Server {
                     datasets: a.datasets,
                 };
                 match e.why(&request) {
-                    Ok(r) => done(&r, None),
+                    Ok(r) => done(&r, None, target),
                     Err(err) => failed(&err),
                 }
             }
             "score.verify" => {
                 let a = parse!(ScoreVerify);
+                let target = resolve_engine!(a.dataset.as_deref(), None);
+                let e = target.as_ref().unwrap_or(default_engine);
                 // A tool argument never names a database to connect to: a
                 // table is a data root the human gives at start (threat
                 // model).
@@ -688,10 +862,12 @@ impl Server {
                         group_by: c.group_by,
                     }),
                 };
-                fix_done(e.fix(&request))
+                fix_done(e.fix(&request), target)
             }
             "score.advise" => {
                 let a = parse!(ScoreAdvise);
+                let target = resolve_engine!(a.dataset.as_deref(), None);
+                let e = target.as_ref().unwrap_or(default_engine);
                 let mut workloads = a.workloads;
                 if let Some(w) = a.workload {
                     if !workloads.contains(&w) {
@@ -725,19 +901,23 @@ impl Server {
                     gates: a.gates,
                 };
                 match e.advise(&req) {
-                    Ok(r) => done(&r, None),
+                    Ok(r) => done(&r, None, target),
                     Err(err) => failed(&err),
                 }
             }
             "score.record" => {
                 let a = parse!(ScoreRecord);
+                let target = resolve_engine!(a.dataset.as_deref(), None);
+                let e = target.as_ref().unwrap_or(default_engine);
                 match e.record_from_engine(&a.keys_query, a.key_columns.as_deref()) {
-                    Ok(r) => done(&r, None),
+                    Ok(r) => done(&r, None, target),
                     Err(err) => failed(&err),
                 }
             }
             "propose.key" => {
                 let a = parse!(ProposeKey);
+                let target = resolve_engine!(a.dataset.as_deref(), None);
+                let e = target.as_ref().unwrap_or(default_engine);
                 // Each key is read as `index --key` reads it, so a sketch
                 // reaches the facade's typed refusal.
                 let mut declared = Vec::with_capacity(1 + a.sidecars.len());
@@ -753,16 +933,21 @@ impl Server {
                         },
                     });
                 }
-                propose_done(if a.dry_run {
-                    e.propose_key_dry_run(&declared, &a.evidence, &a.by)
-                } else {
-                    e.propose_key(&declared, &a.evidence, &a.by)
-                })
+                propose_done(
+                    if a.dry_run {
+                        e.propose_key_dry_run(&declared, &a.evidence, &a.by)
+                    } else {
+                        e.propose_key(&declared, &a.evidence, &a.by)
+                    },
+                    target,
+                )
             }
             "propose.layout" => {
                 let a = parse!(ProposeLayout);
+                let target = resolve_engine!(a.dataset.as_deref(), None);
                 propose(
-                    e,
+                    target,
+                    default_engine,
                     ProposalBody::Layout {
                         cluster_by: a.cluster_by,
                     },
@@ -773,8 +958,10 @@ impl Server {
             }
             "propose.rewrite" => {
                 let a = parse!(ProposeRewrite);
+                let target = resolve_engine!(a.dataset.as_deref(), None);
                 propose(
-                    e,
+                    target,
+                    default_engine,
                     ProposalBody::Rewrite { shape: a.shape },
                     &a.evidence,
                     &a.by,
@@ -783,25 +970,32 @@ impl Server {
             }
             "apply.receipt" => {
                 let a = parse!(ApplyReceipt);
+                let target = resolve_engine!(a.dataset.as_deref(), None);
+                let e = target.as_ref().unwrap_or(default_engine);
                 if a.dry_run {
-                    fix_done(e.apply_dry_run(&a.certificate))
+                    fix_done(e.apply_dry_run(&a.certificate), target)
                 } else {
-                    fix_done(e.fix(&FixRequest {
-                        certificate: Some(a.certificate),
-                        ..FixRequest::default()
-                    }))
+                    fix_done(
+                        e.fix(&FixRequest {
+                            certificate: Some(a.certificate),
+                            ..FixRequest::default()
+                        }),
+                        target,
+                    )
                 }
             }
             "apply.refresh" => {
                 let a = parse!(ApplyRefresh);
+                let target = resolve_engine!(a.dataset.as_deref(), None);
+                let e = target.as_ref().unwrap_or(default_engine);
                 if a.dry_run {
                     match e.refresh_dry_run() {
-                        Ok(r) => done(&r, None),
+                        Ok(r) => done(&r, None, target),
                         Err(err) => failed(&err),
                     }
                 } else {
                     match e.index(&[]) {
-                        Ok(r) => done(&r, None),
+                        Ok(r) => done(&r, None, target),
                         Err(err) => failed(&err),
                     }
                 }
@@ -848,11 +1042,11 @@ impl Server {
         // retrying as a refusal's `next` line says runs again rather than
         // returning the stale result. An unreadable state is `null`; the
         // tool's own call then reports why.
+        let target_ds = args.get("dataset").and_then(Value::as_str);
         let state = self
-            .inner
-            .engine
-            .state()
+            .engine_for(target_ds, None)
             .ok()
+            .and_then(|opt| opt.as_ref().unwrap_or(&self.inner.engine).state().ok())
             .and_then(|s| serde_json::to_value(s).ok())
             .unwrap_or(Value::Null);
         let id = job_id(tool, &json!({ "request": request, "state": state }));
@@ -1228,34 +1422,84 @@ fn with_emit(
     Ok(result)
 }
 
+fn discover_workspace_datasets(
+    ws_root: &std::path::Path,
+    datasets: &mut std::collections::BTreeMap<String, String>,
+) {
+    fn visit(
+        ws_root: &std::path::Path,
+        dir: &std::path::Path,
+        depth: usize,
+        datasets: &mut std::collections::BTreeMap<String, String>,
+    ) {
+        let Ok(rd) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in rd.flatten() {
+            let name_os = entry.file_name();
+            let Some(name) = name_os.to_str() else {
+                continue;
+            };
+            if name.starts_with('.') || name == "main" {
+                continue;
+            }
+            let path = entry.path();
+            let Ok(canonical) = std::fs::canonicalize(&path) else {
+                continue;
+            };
+            if !canonical.is_dir() || !canonical.starts_with(ws_root) {
+                continue;
+            }
+            let canon_str = canonical.to_string_lossy().into_owned();
+            datasets
+                .entry(name.to_string())
+                .or_insert_with(|| canon_str.clone());
+            if let Ok(rel) = path.strip_prefix(ws_root) {
+                if let Some(rel_str) = rel.to_str() {
+                    datasets.entry(rel_str.to_string()).or_insert(canon_str);
+                }
+            }
+            if depth < 2 {
+                visit(ws_root, &canonical, depth + 1, datasets);
+            }
+        }
+    }
+    visit(ws_root, ws_root, 0, datasets);
+}
+
 fn propose(
-    e: &Engine,
+    target: Option<Engine>,
+    default_engine: &Engine,
     body: ProposalBody,
     evidence: &[bellwether::types::Hash],
     by: &str,
     dry_run: bool,
 ) -> Done {
-    propose_done(if dry_run {
-        e.propose_dry_run(body, evidence, by)
-    } else {
-        e.propose(body, evidence, by)
-    })
+    let e = target.as_ref().unwrap_or(default_engine);
+    propose_done(
+        if dry_run {
+            e.propose_dry_run(body, evidence, by)
+        } else {
+            e.propose(body, evidence, by)
+        },
+        target,
+    )
 }
 
-fn propose_done(r: bellwether::types::Result<ProposeResult>) -> Done {
+fn propose_done(r: bellwether::types::Result<ProposeResult>, engine: Option<Engine>) -> Done {
     match r {
         Ok(r) => {
             let refusal = match &r {
                 ProposeResult::Refused { refusal } => Some(refusal::from_propose(refusal)),
                 ProposeResult::Written { .. } | ProposeResult::WouldWrite { .. } => None,
             };
-            done(&r, refusal)
+            done(&r, refusal, engine)
         }
         Err(err) => failed(&err),
     }
 }
 
-fn fix_done(r: bellwether::types::Result<FixResult>) -> Done {
+fn fix_done(r: bellwether::types::Result<FixResult>, engine: Option<Engine>) -> Done {
     match r {
         Ok(r) => {
             let refusal = match &r.outcome {
@@ -1267,7 +1511,7 @@ fn fix_done(r: bellwether::types::Result<FixResult>) -> Done {
                 | FixOutcome::Verified
                 | FixOutcome::WouldApply { .. } => None,
             };
-            done(&r, refusal)
+            done(&r, refusal, engine)
         }
         Err(err) => failed(&err),
     }

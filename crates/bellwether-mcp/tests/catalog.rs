@@ -125,7 +125,10 @@ fn schemas_are_closed_and_carry_no_dangerous_field() {
                 .keys()
                 .map(String::as_str)
                 .collect();
-            assert_eq!(top, BTreeSet::from(["certificate", "dry_run", "wait"]));
+            assert_eq!(
+                top,
+                BTreeSet::from(["certificate", "dataset", "dry_run", "wait"])
+            );
             assert_eq!(t.input["required"], serde_json::json!(["certificate"]));
         }
         if t.name == "apply.refresh" {
@@ -135,7 +138,7 @@ fn schemas_are_closed_and_carry_no_dangerous_field() {
                 .keys()
                 .map(String::as_str)
                 .collect();
-            assert_eq!(top, BTreeSet::from(["dry_run", "wait"]));
+            assert_eq!(top, BTreeSet::from(["dataset", "dry_run", "wait"]));
         }
         if t.name == "observe.why" {
             assert!(!props.contains("keys") && !props.contains("workload"));

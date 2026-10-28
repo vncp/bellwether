@@ -49,6 +49,7 @@ fn main() -> ExitCode {
         engine,
         budget: args.budget.into(),
         join: args.join.join,
+        workspace: args.join.workspace,
     };
     match serve_stdio(&config) {
         Ok(()) => ExitCode::SUCCESS,

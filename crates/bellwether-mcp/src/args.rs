@@ -354,6 +354,13 @@ pub struct JoinArgs {
     /// join:LEFT.COLS=RIGHT.COLS.
     #[arg(long, value_name = "RIGHT.COLS")]
     pub join: Option<String>,
+    /// Serve the root as a sandboxed workspace directory holding multiple data
+    /// folders: any tool call may pass `dataset` to target a child folder under
+    /// the workspace, consumer plans and SQL plans auto-bind sibling folders
+    /// under the workspace, and semi-join keys may join folders within the
+    /// workspace.
+    #[arg(long)]
+    pub workspace: bool,
 }
 
 /// The per-session budget flags.

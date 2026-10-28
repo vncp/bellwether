@@ -1,0 +1,19 @@
+{
+  "mcpServers": {
+    "bellwether": {
+      "command": "bellwether-mcp",
+      "args": [".", "--workspace"]
+    },
+    "bellwether-orders-twin": {
+      "command": "bellwether",
+      "args": [
+        "mcp",
+        "./data/orders",
+        "--twin-of",
+        "clickhouse://reader@ch.internal:8123/sales/orders?password=env:CH_PASSWORD",
+        "--scratch",
+        "./data/orders/_scratch"
+      ]
+    }
+  }
+}

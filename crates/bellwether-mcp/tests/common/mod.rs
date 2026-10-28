@@ -189,6 +189,7 @@ pub fn server_at(
         },
         budget,
         join: None,
+        workspace: false,
     })
     .unwrap()
 }

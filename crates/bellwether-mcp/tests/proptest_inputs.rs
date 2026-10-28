@@ -93,6 +93,7 @@ fn signing_server(data: &std::path::Path, dir: &std::path::Path, signing: bool) 
         engine,
         budget: bellwether_mcp::Budget::default(),
         join: None,
+        workspace: false,
     })
     .unwrap()
 }
