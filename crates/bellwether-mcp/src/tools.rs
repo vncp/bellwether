@@ -377,6 +377,25 @@ pub struct ObserveJoinOverlap {}
 #[serde(deny_unknown_fields)]
 pub struct ObserveJoinVerify {}
 
+/// `observe.plan_from_sql` (WP15b): parse a SQL `SELECT` query and translate
+/// it deterministically into a [`bellwether::types::ConsumerPlan`] DAG,
+/// validated against the server's bound datasets and stored in the cache.
+/// Never executes the SQL string.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ObservePlanFromSql {
+    /// One read-only SQL `SELECT` query (with optional `WITH` CTEs).
+    /// Parsed and translated into a `ConsumerPlan` DAG; never executed.
+    pub sql: String,
+    /// Table name in `sql` that maps to the `"main"` dataset; default:
+    /// inferred when the query scans a single table.
+    #[serde(default)]
+    pub main_table: Option<String>,
+    /// Translate latest-per-key (`QUALIFY row_number() ... = 1` or `arg_max`)
+    /// into `as_of` instead of `latest`.
+    #[serde(default)]
+    pub as_of: bool,
+}
 /// One text lookup (B5): rows whose string `column` matches `value` under
 /// `op` (`has_token`, `contains`, or `has_prefix`), both case-folded.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -881,6 +900,14 @@ pub fn catalog() -> Vec<ToolDef> {
             true,
             "Whether each join key of the folder (or the server's --join key) is fresh, or stale \
              on the left or right, with the command that rebuilds it. Writes nothing.",
+        ),
+        def::<ObservePlanFromSql>(
+            "observe.plan_from_sql",
+            Tier::Observe,
+            true,
+            "Parse a SQL SELECT query into a typed ConsumerPlan DAG (plan, hash, datasets, \
+             cached), validated against the bound datasets and stored in the cache. Never \
+             executes the SQL string; refuses unsupported SQL constructs by name.",
         ),
         def::<ScoreWhy>(
             "score.why",

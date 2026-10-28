@@ -2824,3 +2824,101 @@ pub(crate) fn advise(r: &bellwether::AdviseResult, out: &Out) -> String {
     }
     s
 }
+
+pub(crate) fn plan_from_sql(
+    r: &bellwether::PlanFromSqlResult,
+    written_to: Option<&std::path::Path>,
+    out: &Out,
+) -> String {
+    use bellwether::types::PlanNode;
+    let mut s = String::new();
+    let _ = writeln!(
+        s,
+        "{}",
+        heading(
+            out,
+            &format!(
+                "consumer plan {} ({} {}, root node {}, datasets: {}{})",
+                r.hash,
+                r.plan.nodes.len(),
+                if r.plan.nodes.len() == 1 {
+                    "node"
+                } else {
+                    "nodes"
+                },
+                r.plan.root,
+                r.datasets.join(", "),
+                if r.cached { ", cached" } else { "" },
+            )
+        )
+    );
+    for (i, n) in r.plan.nodes.iter().enumerate() {
+        let desc = match n {
+            PlanNode::Scan { dataset, columns } => {
+                format!("scan {dataset} ({})", columns.join(", "))
+            }
+            PlanNode::Filter { input, .. } => format!("filter <- node {input}"),
+            PlanNode::Latest { input, columns, ts } => {
+                format!("latest ({}) @ {ts} <- node {input}", columns.join(", "))
+            }
+            PlanNode::AsOf { input, columns, ts } => {
+                format!("as_of ({}) @ {ts} <- node {input}", columns.join(", "))
+            }
+            PlanNode::SemiJoin { input, columns, .. } => {
+                format!("semi_join ({}) <- node {input}", columns.join(", "))
+            }
+            PlanNode::Join {
+                left,
+                right,
+                on,
+                kind,
+            } => {
+                let pairs: Vec<String> = on.iter().map(|(a, b)| format!("{a}={b}")).collect();
+                let k = match kind {
+                    bellwether::types::JoinKind::Inner => "inner",
+                    bellwether::types::JoinKind::Left => "left",
+                };
+                format!(
+                    "join ({k}) on {} <- nodes {left}, {right}",
+                    pairs.join(", ")
+                )
+            }
+            PlanNode::Window {
+                input,
+                partition_by,
+                ..
+            } => {
+                format!("window ({}) <- node {input}", partition_by.join(", "))
+            }
+            PlanNode::Aggregate {
+                input,
+                group_by,
+                measures,
+            } => {
+                let ms: Vec<String> = measures
+                    .iter()
+                    .map(|m| match &m.column {
+                        Some(c) => format!("{}({c})", m.function.as_str()),
+                        None => format!("{}(*)", m.function.as_str()),
+                    })
+                    .collect();
+                format!(
+                    "aggregate by ({}) [{}] <- node {input}",
+                    group_by.join(", "),
+                    ms.join(", ")
+                )
+            }
+            PlanNode::Exchange { input, by } => {
+                format!("exchange by ({}) <- node {input}", by.join(", "))
+            }
+            PlanNode::Project { input, columns } => {
+                format!("project ({}) <- node {input}", columns.join(", "))
+            }
+        };
+        let _ = writeln!(s, "  [{i}] {desc}");
+    }
+    if let Some(p) = written_to {
+        let _ = writeln!(s, "  wrote {}", p.display());
+    }
+    s
+}

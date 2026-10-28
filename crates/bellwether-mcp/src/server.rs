@@ -23,9 +23,9 @@ use crate::refusal::{self, Refusal, RefusalCode};
 use crate::tools::{
     self, ApplyReceipt, ApplyRefresh, EmitEngine, EmitResidual, JobRef, JobsStart, KeyArg,
     Membership, ObserveAggregate, ObserveAsof, ObserveCardinality, ObserveCount,
-    ObserveJoinOverlap, ObserveJoinVerify, ObserveLocate, ObserveOverlap, ObserveSemijoin,
-    ObserveText, ObserveWhy, ProposeKey, ProposeLayout, ProposeRewrite, ScoreAdvise, ScoreRecord,
-    ScoreVerify, ScoreWhy, Tier,
+    ObserveJoinOverlap, ObserveJoinVerify, ObserveLocate, ObserveOverlap, ObservePlanFromSql,
+    ObserveSemijoin, ObserveText, ObserveWhy, ProposeKey, ProposeLayout, ProposeRewrite,
+    ScoreAdvise, ScoreRecord, ScoreVerify, ScoreWhy, Tier,
 };
 
 /// How the server is configured at startup. Nothing is read from the
@@ -526,6 +526,20 @@ impl Server {
                     Err(err) => failed(&err),
                 }
             }
+            "observe.plan_from_sql" => {
+                let a = parse!(ObservePlanFromSql);
+                match e.plan_from_sql(&bellwether::PlanFromSqlRequest {
+                    sql: a.sql,
+                    main_table: a.main_table,
+                    keys_from_run: false,
+                    as_of: a.as_of,
+                    validate: true,
+                    cache: true,
+                }) {
+                    Ok(r) => done(&r, None),
+                    Err(err) => failed(&err),
+                }
+            }
             "observe.text" => {
                 let a = parse!(ObserveText);
                 let pinned = match self.lookup_engine(a.at_manifest) {
@@ -625,6 +639,7 @@ impl Server {
                         functions: g.functions.unwrap_or_else(tools::default_functions),
                     }),
                     plan: a.plan.map(std::path::PathBuf::from),
+                    consumer_plan: None,
                     datasets: a.datasets,
                 };
                 match e.why(&request) {

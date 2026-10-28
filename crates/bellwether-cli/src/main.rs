@@ -154,6 +154,44 @@ enum Command {
         #[command(subcommand)]
         command: WorkloadCommand,
     },
+    /// Consumer plans (relational replay, WP15b): translate a SQL `SELECT`
+    /// query into a typed [`bellwether::types::ConsumerPlan`] DAG.
+    Plan {
+        #[command(subcommand)]
+        command: PlanCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum PlanCommand {
+    /// Parse a SQL `SELECT` query (a `.sql` file path or a query string) and
+    /// translate it deterministically into a `ConsumerPlan` DAG, validated
+    /// against the bound datasets and cached in the index. Never executes
+    /// the SQL string.
+    FromSql(PlanFromSqlArgs),
+}
+
+#[derive(Args)]
+struct PlanFromSqlArgs {
+    #[command(flatten)]
+    root: RootArg,
+    /// A `.sql` file path (if it exists on disk) or a SQL `SELECT` query string.
+    #[arg(long, value_name = "FILE_OR_QUERY")]
+    sql: String,
+    /// Table name in the SQL query that maps to the `"main"` dataset
+    /// [default: inferred when the query scans a single table].
+    #[arg(long, value_name = "NAME")]
+    main_table: Option<String>,
+    /// Map literal `IN (...)` or `=` key predicates to `KeysFrom::Run`.
+    #[arg(long)]
+    keys_from_run: bool,
+    /// Translate latest-per-key (`QUALIFY row_number() ... = 1` or `arg_max`)
+    /// into `as_of` instead of `latest`.
+    #[arg(long)]
+    as_of: bool,
+    /// Write the canonical `ConsumerPlan` JSON to this file.
+    #[arg(long, value_name = "FILE")]
+    out: Option<PathBuf>,
 }
 
 #[derive(Subcommand)]
@@ -163,7 +201,6 @@ enum WorkloadCommand {
     /// twin; prints the workload hash `why --workload` takes.
     Record(RecordArgs),
 }
-
 #[derive(Args)]
 struct RecordArgs {
     #[command(flatten)]
@@ -357,8 +394,27 @@ struct WhyArgs {
     /// windows, and aggregates name, beside an operator table. The datasets
     /// it scans besides this folder are bound with --dataset NAME=ROOT;
     /// --at gives its `as_of` nodes their instant.
-    #[arg(long, value_name = "FILE", requires = "from")]
+    #[arg(
+        long,
+        value_name = "FILE",
+        requires = "from",
+        conflicts_with = "sql_plan"
+    )]
     plan: Option<PathBuf>,
+    /// Translate a SQL `SELECT` query (a `.sql` file path or a SQL string)
+    /// into a consumer plan and price each `--from` run through it (shorthand
+    /// for `bellwether plan from-sql` followed by `why --plan`).
+    #[arg(
+        long,
+        value_name = "FILE_OR_QUERY",
+        requires = "from",
+        conflicts_with = "plan"
+    )]
+    sql_plan: Option<String>,
+    /// With --sql-plan: the table name in the SQL query that maps to `"main"`
+    /// [default: inferred when the query scans a single table].
+    #[arg(long, value_name = "NAME", requires = "sql_plan")]
+    main_table: Option<String>,
 }
 #[derive(Args)]
 struct AdviseArgs {
@@ -834,8 +890,8 @@ impl From<Error> for Failure {
                 field:
                     "lookback" | "latest_by" | "signing_key" | "trusted_keys" | "public_key" | "out"
                     | "name" | "valid_from" | "revoked_at" | "index" | "root" | "scratch" | "items"
-                    | "columns" | "text" | "join" | "functions" | "plan" | "datasets" | "max_keys"
-                    | "delta" | "max_index_bytes",
+                    | "columns" | "text" | "join" | "functions" | "plan" | "sql" | "datasets"
+                    | "max_keys" | "delta" | "max_index_bytes",
                 ..
             } => Self::Usage(match hint(&e) {
                 Some(h) => format!("{e}; {h}"),
@@ -933,6 +989,7 @@ fn hint(e: &Error) -> Option<String> {
                 "text" => "--contains, --has, or --prefix",
                 "functions" => "--fn",
                 "plan" => "--plan (a consumer plan's JSON) or --before-plan and --after-plan",
+                "sql" => "--sql or --sql-plan (a SQL SELECT query or .sql file)",
                 "datasets" => "--dataset NAME=ROOT",
                 "max_keys" => "--max-keys",
                 "delta" => "--delta",
@@ -1216,7 +1273,56 @@ fn run(cli: &Cli, out: &Out) -> Result<Outcome, Failure> {
                 .record_from_engine(&query, a.key.as_deref())?;
             done(&r, human::engine_workload(&r, out), EXIT_OK)
         }
+        Command::Plan {
+            command: PlanCommand::FromSql(a),
+        } => plan_from_sql_cmd(g, out, a),
     }
+}
+
+fn read_sql_arg(given: &str, flag: &str) -> Result<String, Failure> {
+    let p = std::path::Path::new(given);
+    if p.exists() {
+        return std::fs::read_to_string(p).map_err(|e| {
+            Failure::Usage(format!(
+                "{flag}: cannot read the SQL file {} ({e})",
+                p.display()
+            ))
+        });
+    }
+    let looks_like_file = std::path::Path::new(given.trim())
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("sql"))
+        && !given.contains(' ');
+    if looks_like_file {
+        return Err(Failure::Usage(format!(
+            "{flag}: cannot read the SQL file {given:?} (file not found); pass an existing .sql file or a SQL SELECT query"
+        )));
+    }
+    Ok(given.to_string())
+}
+
+fn plan_from_sql_cmd(g: &Global, out: &Out, a: &PlanFromSqlArgs) -> Result<Outcome, Failure> {
+    let sql = read_sql_arg(&a.sql, "--sql")?;
+    let e = engine(g, &a.root.root)?;
+    let r = e.plan_from_sql(&bellwether::PlanFromSqlRequest {
+        sql,
+        main_table: a.main_table.clone(),
+        keys_from_run: a.keys_from_run,
+        as_of: a.as_of,
+        validate: true,
+        cache: true,
+    })?;
+    if let Some(path) = &a.out {
+        let bytes = serde_json::to_vec_pretty(&r.plan).map_err(Error::from)?;
+        std::fs::write(path, bytes).map_err(|err| {
+            Failure::Usage(format!(
+                "--out: cannot write consumer plan to {} ({err})",
+                path.display()
+            ))
+        })?;
+    }
+    done(&r, human::plan_from_sql(&r, a.out.as_deref(), out), EXIT_OK)
 }
 
 /// `bellwether mcp`: the same server as `bellwether-mcp`, with the same
@@ -1524,6 +1630,24 @@ fn why(g: &Global, out: &Out, a: &WhyArgs) -> Result<Outcome, Failure> {
             ));
         }
     }
+    let e = engine_at(g, &a.root.root, a.at_manifest)?;
+    let consumer_plan = match &a.sql_plan {
+        Some(raw) => {
+            let sql = read_sql_arg(raw, "--sql-plan")?;
+            Some(
+                e.plan_from_sql(&bellwether::PlanFromSqlRequest {
+                    sql,
+                    main_table: a.main_table.clone(),
+                    keys_from_run: false,
+                    as_of: a.at.is_some(),
+                    validate: true,
+                    cache: true,
+                })?
+                .plan,
+            )
+        }
+        None => None,
+    };
     let request = bellwether::WhyRequest {
         keys: a.from.first().map(|p| key_file(p, a.key.as_ref())),
         more_keys: a
@@ -1578,6 +1702,7 @@ fn why(g: &Global, out: &Out, a: &WhyArgs) -> Result<Outcome, Failure> {
             })
             .transpose()?,
         plan: a.plan.clone(),
+        consumer_plan,
         // Every dataset the plan names, each bound with --dataset.
         datasets: Vec::new(),
     };
@@ -1612,7 +1737,6 @@ fn why(g: &Global, out: &Out, a: &WhyArgs) -> Result<Outcome, Failure> {
                 .into(),
         ));
     }
-    let e = engine_at(g, &a.root.root, a.at_manifest)?;
     let r = e.why(&request)?;
     let fix_command = if e.is_table() {
         format!(
