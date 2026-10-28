@@ -26,3 +26,13 @@ A segment file in `segments/` has no meaning until a committed `manifest.json` r
 - `StoreExt` gains `sync_segments(&self, root: &str) -> Result<()>` with a default no-op implementation; `ObjectStoreBackend` implements it for `BackendKind::Local` by calling `sync_dir` on `<root>/segments/` when that directory exists.
 - `commit_inner` calls `store.sync_segments(root)?` after `ensure_segments_present` and before the `put_if_absent` / `put_if_version` on `manifest.json`.
 - Cold lookup plans and `why` / `profile` runs that populate `cache/` perform zero `F_FULLFSYNC` calls for `cache/`, while keeping atomic staging + rename visibility and BLAKE3 verification on read.
+
+## Windows local stores
+
+Windows uses per-segment staging-file `sync_all` before rename. It does not
+defer segment data to `sync_segments`: `sync_dir` has no Windows directory
+flush implementation, so that barrier is a no-op there. Cache writes remain
+atomic and regenerable. Ledger and conditional writes retain their staging-file
+syncs. Native CI exercises writes, replacement, locking and reopen behavior;
+it does not establish power-loss durability of directory entries on Windows.
+Do not infer the Unix directory-sync guarantee from a passing Windows run.

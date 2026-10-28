@@ -502,9 +502,10 @@ mod tests {
                 let rel = e
                     .strip_prefix(dir.path())
                     .unwrap()
-                    .to_str()
-                    .unwrap()
-                    .to_string();
+                    .components()
+                    .map(|part| part.as_os_str().to_str().unwrap())
+                    .collect::<Vec<_>>()
+                    .join("/");
                 let b = ParquetRecordBatchReaderBuilder::try_new(File::open(&e).unwrap())
                     .unwrap()
                     .with_batch_size(1250)
