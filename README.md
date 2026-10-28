@@ -511,7 +511,7 @@ bellwether fix ./orders/ --twin-of "$ENGINE" --proposal <proposal> --scratch ./o
 
 Pre-alpha. The architecture and on-disk format are fixed and documented; the crates are being built against them, each landing by reviewed pull request. Milestones as [`docs/work-packages.md`](docs/work-packages.md) defines them:
 
-- [x] Contract crate, architecture, invariants, threat model, format, 32 decision records
+- [x] Contract crate, architecture, invariants, threat model, format, 34 decision records
 - [x] Engine foundations: canonical encoding, segments and blooms, Parquet and text sources, object-store manifest commits, the ledger; each crate reviewed against its invariants, with the reviewer's probes kept as regression tests
 - [x] **M1** `why` works with no index built: footers, the profile's fanout and lints as a recorded Evidence, and replay
 - [x] **M2** the index: `index`, `locate`, `latest`, `asof`
@@ -519,10 +519,10 @@ Pre-alpha. The architecture and on-disk format are fixed and documented; the cra
 - [x] **M4** agent-first: the loop runs end to end from an MCP client
 - [x] **M5** the format frozen: storage version 2 (per-key counts, per-column bytes, per-key time bounds and bitemporal versions folded into key specs) and record version 3, with compatibility fixtures read byte for byte in CI (ADR 028); records moved to version 4 with tombstones, storage stays version 2
 - [x] **M6** `advise` against your recorded workload: a key set and knobs chosen by exact replay, Pareto across runs, a receipt for every admitted change, no language model; the loss covers the relational operators (projection, joins, windows, aggregation input) exactly. `evolve --llm` and the rulebook are deferred (ADR 032, amended 2026-10-27)
-- [ ] **M7** a SQL table reconciles against a folder of files with a certificate; plans execute inside DataFusion and DuckDB without a sidecar step; receipts gate pull requests
-- [ ] **M8** receipts are signed (landed with [#10](https://github.com/vncp/bellwether/pull/10)); rule transfer and the exact-versus-estimated ablation are deferred with the rulebook
+- [x] **M7** a SQL table reconciles against a folder of files with a certificate; plans execute inside DataFusion, DuckDB, and Spark (`--emit`); receipts gate pull requests (`bellwether ci`, `action/action.yml`)
+- [x] **M8** receipts are signed (landed with [#10](https://github.com/vncp/bellwether/pull/10)); rule transfer and the exact-versus-estimated ablation are deferred with the rulebook
 
-Landed toward **M6**: relational replay (WP15), the loss over the relational operators: `why --plan` prices a query's plan DAG node by node, and a rewrite with typed before and after plans is priced, reconciled, and attested ([Pricing a whole query](#pricing-a-whole-query)).
+Landed in **M6**: relational replay (WP15) and SQL-to-plan translation (WP15b), the loss over the relational operators: `why --plan` (and `why --sql-plan` / `plan from-sql`) prices a query's plan DAG node by node, and a rewrite with typed before and after plans is priced, reconciled, and attested ([Pricing a whole query](#pricing-a-whole-query)); and `advise` (`bellwether advise`, MCP `score.advise`, WP13a) selects a Pareto frontier of key sets and knobs with verified receipts.
 
 Built beyond the milestones: the time-series keys (partition values from paths, ordered plans, `--at-manifest` pinned lookups, per-key time bounds, bitemporal as-of, the `market` corpus), `report` as one HTML file from the ledger, the ledger views (`bellwether ledger findings|receipts|scorecard`), and signed receipts and certificates (`bellwether keys`, `fix --signing-key`, `receipt show --require-signature`).
 
