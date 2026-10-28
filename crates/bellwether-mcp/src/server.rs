@@ -24,7 +24,7 @@ use crate::tools::{
     self, ApplyReceipt, JobRef, JobsStart, KeyArg, Membership, ObserveAggregate, ObserveAsof,
     ObserveCardinality, ObserveCount, ObserveJoinOverlap, ObserveJoinVerify, ObserveLocate,
     ObserveOverlap, ObserveSemijoin, ObserveText, ObserveWhy, ProposeKey, ProposeLayout,
-    ProposeRewrite, ScoreRecord, ScoreVerify, ScoreWhy, Tier,
+    ProposeRewrite, ScoreAdvise, ScoreRecord, ScoreVerify, ScoreWhy, Tier,
 };
 
 /// How the server is configured at startup. Nothing is read from the
@@ -649,6 +649,45 @@ impl Server {
                 };
                 fix_done(e.fix(&request))
             }
+            "score.advise" => {
+                let a = parse!(ScoreAdvise);
+                let mut workloads = a.workloads;
+                if let Some(w) = a.workload {
+                    if !workloads.contains(&w) {
+                        workloads.insert(0, w);
+                    }
+                }
+                let mut from = Vec::new();
+                if let Some(k) = a.keys {
+                    from.push(key_file(k, a.key_columns.clone()));
+                }
+                for k in a.more_keys {
+                    from.push(key_file(k, a.key_columns.clone()));
+                }
+                if workloads.is_empty() && from.is_empty() {
+                    return Done::Failed(Refusal::new(
+                        RefusalCode::NoWorkload,
+                        "score.advise needs a workload (`workload`, `workloads`, or `keys`)",
+                        json!({ "field": "workload" }),
+                    ));
+                }
+                let req = bellwether::AdviseRequest {
+                    workloads,
+                    from,
+                    all_workloads: false,
+                    max_keys: a
+                        .max_keys
+                        .map_or(bellwether::DEFAULT_MAX_KEYS, |n| n as usize),
+                    max_index_bytes: a.max_index_bytes,
+                    delta: a.delta.unwrap_or(bellwether::DEFAULT_DELTA),
+                    apply: false,
+                    gates: a.gates,
+                };
+                match e.advise(&req) {
+                    Ok(r) => done(&r, None),
+                    Err(err) => failed(&err),
+                }
+            }
             "score.record" => {
                 let a = parse!(ScoreRecord);
                 match e.record_from_engine(&a.keys_query, a.key_columns.as_deref()) {
@@ -1008,7 +1047,7 @@ fn strip_cost_fields(v: &mut Value, found: &mut Option<String>) {
 fn runs_as_job(tool: &str, args: &Value) -> bool {
     let flag = |k: &str| args.get(k).and_then(Value::as_bool).unwrap_or(false);
     match tool {
-        "score.why" | "score.verify" | "score.record" => !flag("wait"),
+        "score.why" | "score.verify" | "score.advise" | "score.record" => !flag("wait"),
         "apply.receipt" => !flag("wait") && !flag("dry_run"),
         _ => false,
     }

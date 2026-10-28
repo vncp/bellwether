@@ -89,7 +89,7 @@ already holds.
 | Tier | Tool | Writes |
 |---|---|---|
 | observe | `observe.why` (no keys), `observe.cardinality`, `observe.overlap`, `observe.profile`, `observe.locate`, `observe.asof`, `observe.text`, `observe.semijoin`, `observe.join_overlap`, `observe.join_verify` | Evidence and cache entries only |
-| score (engine-scored) | `score.why` (with keys, a workload, or `text` lookups), `score.verify`, `score.record` (keys from the query engine, with `--twin-of`) | engine Proposals, Replays, plan Evidence, Certificates; `score.record` a workload in the cache |
+| score (engine-scored) | `score.why` (with keys, a workload, or `text` lookups), `score.verify`, `score.advise` (workload-level Pareto frontier over key sets and knobs), `score.record` (keys from the query engine, with `--twin-of`) | engine Proposals, Replays, plan Evidence, Certificates; `score.record` a workload in the cache |
 | propose | `propose.key`, `propose.layout`, `propose.rewrite` | one Proposal, or nothing with `dry_run` |
 | apply | `apply.receipt` | Replay, the index commit, Receipt; nothing with `dry_run` or on a refusal, unless another commit lands during the apply (`concurrent_commit`: the key is built, the receipt withheld) |
 | jobs | `jobs.start`, `jobs.status`, `jobs.result` | whatever the started tool writes |

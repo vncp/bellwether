@@ -30,6 +30,7 @@
 #![forbid(unsafe_code)]
 #![deny(clippy::unwrap_used, clippy::expect_used)]
 
+mod advise;
 mod agg;
 mod emit;
 mod engine;
@@ -54,7 +55,14 @@ mod text;
 mod twin;
 mod why;
 
+pub use advise::{AdviseRecommendation, AdviseRequest, AdviseResult};
 pub use agg::{AggValue, AggregateGroup, AggregateResult};
+pub use bellwether_evolve::{
+    AnchorCheck, AnchorRegression, AnchorRun, BloomGridPoint, BloomSweep, CandidateEval,
+    DiscardReason, DiscardedCandidate, EnumeratedSpec, FrontierEntry, GateEvaluation, GateTier,
+    MaintenanceCost, Objectives, SpecMaintenance, SubsumptionKind, SubsumptionPair, WorkloadSlice,
+    BLOOM_FPR_GRID, DEFAULT_DELTA, DEFAULT_MAX_KEYS,
+};
 pub use bellwether_ledger::{
     printable, InvalidReason, InvalidSignature, OutsideWindow, PublicKey, RecordKind,
     SignatureStatus, SignedBy, SigningKey, TrustError, TrustedKey, TrustedKeys, Verdict,
