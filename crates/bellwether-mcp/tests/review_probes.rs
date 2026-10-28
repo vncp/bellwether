@@ -381,7 +381,7 @@ fn loop_refusals_are_typed_and_name_mcp_fields() {
         (
             "observe.profile extra field",
             "observe.profile",
-            json!({"score": 1}),
+            json!({"colour": "red"}),
             "invalid_input",
             None,
         ),
@@ -517,6 +517,7 @@ fn dry_runs_never_create_an_absent_index_location() {
             },
             budget: Budget::default(),
             join: None,
+            workspace: false,
         })
         .unwrap();
         let before = objects(g.dir.path());

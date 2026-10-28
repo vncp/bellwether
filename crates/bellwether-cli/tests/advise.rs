@@ -82,6 +82,7 @@ fn advise_cli_and_mcp_parity_and_apply_to_signed_receipt() {
         },
         budget: bellwether_mcp::Budget::default(),
         join: None,
+        workspace: false,
     })
     .unwrap();
     let reply = srv.call(

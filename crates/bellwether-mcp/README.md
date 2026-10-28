@@ -6,15 +6,17 @@ Dependencies, as `dev/check-layering.py` permits: `bellwether` (the facade; ever
 
 ## For a coding agent
 
-Add the server to the agent's MCP configuration (the `mcpServers` block most clients read), naming the folder it is bound to:
+Add the server to the agent's MCP configuration (see [`examples/mcp.json`](../../examples/mcp.json)):
 
 ```json
 "bellwether": {
-  "command": "bellwether", "args": ["mcp", "/path/to/folder"]
+  "command": "bellwether-mcp", "args": [".", "--workspace"]
 }
 ```
 
-Then ask the agent to run the prompt `diagnose_slow_query`. The prompt is [`AGENTS.md`](../../AGENTS.md) at the repository root, embedded at build time: the loop in order, every refusal code, and what the agent may never do.
+With `--workspace`, the server treats `<ROOT>` as a sandboxed workspace directory and every observe, score, propose, and apply tool accepts an optional `dataset` argument naming a relative data folder inside the workspace (path traversal `..`, absolute paths, URLs, and symlinks resolving outside the workspace root are refused with `invalid_argument` on `dataset`). Without `--workspace`, the server is bound to `<ROOT>` (and any `--dataset NAME=ROOT` bindings), and passing an unbound `dataset` is refused.
+
+Then ask the agent to run the prompt `diagnose_slow_query`. The prompt is [`AGENTS.md`](../../AGENTS.md) at the repository root, embedded at build time: the loop in order, every refusal code, and what the agent may never do. See also [`docs/agent-pipeline-skill.md`](../../docs/agent-pipeline-skill.md) for the 1-page pipeline-repository playbook.
 
 Flags: `--index <PATH|URL>` (default `<ROOT>/.bellwether`), `--format parquet|csv|jsonl`, `--chunk-size`, `--schema <file>`, `--fingerprint-policy`, `--partitioning none|hive` or `--path-template <PATTERN>`, and the session budget `--budget-replays N` (default 256), `--budget-rows N` (default 2,000,000,000), `--budget-seconds N` (default 3,600). `bellwether mcp` takes the same flags from the same definitions (`bellwether_mcp::args`), so the two open a folder the same way (an unindexed CSV or JSON lines folder falls back to `--schema`, `--chunk-size`, and `--fingerprint-policy`, and an unindexed partitioned folder to `--partitioning` or `--path-template`). Exit codes: 0 when the client disconnects; 2 usage (including a `--schema` file that cannot be read or a malformed `--path-template`); 4 the engine could not open the folder (before the handshake, nothing on stdout) or the transport failed.
 

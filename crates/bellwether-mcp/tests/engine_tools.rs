@@ -268,6 +268,7 @@ impl World {
             engine: self.options(),
             budget: bellwether_mcp::Budget::default(),
             join: None,
+            workspace: false,
         })
         .unwrap()
     }

@@ -326,16 +326,15 @@ Minimal credentials: read on the index location the configuration names (S3 `s3:
 
 ## For a coding agent
 
-Add the server to the agent's MCP configuration (the `mcpServers` block most clients read):
+Add the server to the agent's MCP configuration (see [`examples/mcp.json`](examples/mcp.json) for a drop-in `.mcp.json` serving a whole workspace with `--workspace` or a single folder with a warehouse twin):
 
 ```json
 "bellwether": {
-  "command": "bellwether", "args": ["mcp", "./orders/"]
+  "command": "bellwether-mcp", "args": [".", "--workspace"]
 }
 ```
 
-Then ask it to run the prompt `diagnose_slow_query`, which is [`AGENTS.md`](AGENTS.md): observe, read the evidence, propose, have the engine score and verify, apply, quote the receipt hash. Every result carries the record hashes it rests on; every refusal carries a stable code, the facts to act on, and one next step. Details: [`crates/bellwether-mcp`](crates/bellwether-mcp/README.md).
-
+Then ask it to run the prompt `diagnose_slow_query`, which is [`AGENTS.md`](AGENTS.md): observe, read the evidence, propose, have the engine score and verify, apply, quote the receipt hash. For an end-to-end operational playbook covering physical design + reader pinning (`emit`), SQL/pipeline step rewrites with the CI receipt gate, and self-healing stale indexes (`apply.refresh`), see [`docs/agent-pipeline-skill.md`](docs/agent-pipeline-skill.md). Every result carries the record hashes it rests on; every refusal carries a stable code, the facts to act on, and one next step. Details: [`crates/bellwether-mcp`](crates/bellwether-mcp/README.md).
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="docs/assets/readme/capture-mcp-dark.svg">
@@ -535,7 +534,7 @@ Not built, or not yet measured:
 
 ## Docs
 
-[Architecture](docs/architecture.md) · [glossary](docs/glossary.md) · [invariants and their tests](docs/invariants.md) · [threat model](docs/threat-model.md) · [on-disk format](docs/format.md) · [decision records](docs/adr/) · [agent loop](docs/agent-loop.md) · [rule catalog](docs/rule-catalog.md) · [time-series capabilities](docs/time-series-capabilities.md) · [adding an index kind](docs/adding-an-index-kind.md) · [benchmark methodology](docs/benchmark.md) · [evolve](docs/evolve.md) · [work packages](docs/work-packages.md) · [measured results](docs/measured/showcase.md)
+[Architecture](docs/architecture.md) · [glossary](docs/glossary.md) · [invariants and their tests](docs/invariants.md) · [threat model](docs/threat-model.md) · [on-disk format](docs/format.md) · [decision records](docs/adr/) · [agent loop](docs/agent-loop.md) · [pipeline agent skill](docs/agent-pipeline-skill.md) · [rule catalog](docs/rule-catalog.md) · [time-series capabilities](docs/time-series-capabilities.md) · [adding an index kind](docs/adding-an-index-kind.md) · [benchmark methodology](docs/benchmark.md) · [evolve](docs/evolve.md) · [work packages](docs/work-packages.md) · [measured results](docs/measured/showcase.md)
 
 ## Where it came from
 

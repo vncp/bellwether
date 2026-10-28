@@ -103,6 +103,7 @@ fn server(data: &Path, join: Option<&str>) -> bellwether_mcp::Server {
         },
         budget: bellwether_mcp::Budget::default(),
         join: join.map(str::to_string),
+        workspace: false,
     })
     .unwrap()
 }

@@ -50,6 +50,11 @@ pub struct ObserveWhy {
     /// sketch, and over files that changed since the index was built.
     #[serde(default)]
     pub sketches_only: bool,
+    /// Target dataset: a `--dataset NAME=ROOT` binding or, when the server runs
+    /// with `--workspace`, a relative folder under the workspace root; default:
+    /// the server's primary root.
+    #[serde(default)]
+    pub dataset: Option<String>,
 }
 
 /// `observe.cardinality`: approximate distinct counts from sketches.
@@ -64,6 +69,11 @@ pub struct ObserveCardinality {
     /// refusing with `not_indexed`; the result says how many were read.
     #[serde(default)]
     pub transient: bool,
+    /// Target dataset: a `--dataset NAME=ROOT` binding or, when the server runs
+    /// with `--workspace`, a relative folder under the workspace root; default:
+    /// the server's primary root.
+    #[serde(default)]
+    pub dataset: Option<String>,
 }
 
 /// `observe.overlap`: approximate Jaccard similarity of two sketched items.
@@ -74,6 +84,11 @@ pub struct ObserveOverlap {
     pub left: String,
     /// The right item, in the same data folder.
     pub right: String,
+    /// Target dataset: a `--dataset NAME=ROOT` binding or, when the server runs
+    /// with `--workspace`, a relative folder under the workspace root; default:
+    /// the server's primary root.
+    #[serde(default)]
+    pub dataset: Option<String>,
 }
 
 /// The comparison of a rewrite of engine queries' before and after
@@ -110,13 +125,24 @@ pub struct ScoreRecord {
     /// Run in this call instead of returning a job id.
     #[serde(default)]
     pub wait: bool,
+    /// Target dataset: a `--dataset NAME=ROOT` binding or, when the server runs
+    /// with `--workspace`, a relative folder under the workspace root; default:
+    /// the server's primary root.
+    #[serde(default)]
+    pub dataset: Option<String>,
 }
 
 /// `observe.profile`: the newest recorded profile Evidence per root, with
 /// its lints and the receipts citing it. Reads the ledger only.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
-pub struct ObserveProfile {}
+pub struct ObserveProfile {
+    /// Target dataset: a `--dataset NAME=ROOT` binding or, when the server runs
+    /// with `--workspace`, a relative folder under the workspace root; default:
+    /// the server's primary root.
+    #[serde(default)]
+    pub dataset: Option<String>,
+}
 
 /// The query engine an `emit` argument translates a plan for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -217,6 +243,11 @@ pub struct ObserveLocate {
     /// with `[0]` (`from`) at `[1]` (`to`) followed by the rest of the path.
     #[serde(default)]
     pub relocate: Option<[String; 2]>,
+    /// Target dataset: a `--dataset NAME=ROOT` binding or, when the server runs
+    /// with `--workspace`, a relative folder under the workspace root; default:
+    /// the server's primary root.
+    #[serde(default)]
+    pub dataset: Option<String>,
 }
 
 /// Which rows a list-membership lookup keeps.
@@ -250,6 +281,11 @@ pub struct ObserveCount {
     /// current one. Default: the current manifest.
     #[serde(default)]
     pub at_manifest: Option<u64>,
+    /// Target dataset: a `--dataset NAME=ROOT` binding or, when the server runs
+    /// with `--workspace`, a relative folder under the workspace root; default:
+    /// the server's primary root.
+    #[serde(default)]
+    pub dataset: Option<String>,
 }
 
 /// `observe.aggregate` (B7): per key, `sum`, `count`, `min`, `max` of one
@@ -280,6 +316,11 @@ pub struct ObserveAggregate {
     /// the current one. Default: the current manifest.
     #[serde(default)]
     pub at_manifest: Option<u64>,
+    /// Target dataset: a `--dataset NAME=ROOT` binding or, when the server runs
+    /// with `--workspace`, a relative folder under the workspace root; default:
+    /// the server's primary root.
+    #[serde(default)]
+    pub dataset: Option<String>,
 }
 
 /// `observe.asof`: the version of each key current at an instant, or, with
@@ -352,6 +393,11 @@ pub struct ObserveAsof {
     /// with `[0]` (`from`) at `[1]` (`to`) followed by the rest of the path.
     #[serde(default)]
     pub relocate: Option<[String; 2]>,
+    /// Target dataset: a `--dataset NAME=ROOT` binding or, when the server runs
+    /// with `--workspace`, a relative folder under the workspace root; default:
+    /// the server's primary root.
+    #[serde(default)]
+    pub dataset: Option<String>,
 }
 
 /// `observe.semijoin` (B3): `semijoin(keys)` through the join key the
@@ -365,17 +411,34 @@ pub struct ObserveSemijoin {
     /// Key columns to take from the file, in tuple order; default: all.
     #[serde(default)]
     pub key_columns: Option<Vec<String>>,
+    /// Target dataset: a `--dataset NAME=ROOT` binding or, when the server runs
+    /// with `--workspace`, a relative folder under the workspace root; default:
+    /// the server's primary root.
+    #[serde(default)]
+    pub dataset: Option<String>,
 }
 
 /// `observe.join_overlap` (B3): the key overlap of the server's join key.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
-pub struct ObserveJoinOverlap {}
+pub struct ObserveJoinOverlap {
+    /// Target dataset: a `--dataset NAME=ROOT` binding or, when the server runs
+    /// with `--workspace`, a relative folder under the workspace root; default:
+    /// the server's primary root.
+    #[serde(default)]
+    pub dataset: Option<String>,
+}
 
 /// `observe.join_verify` (B3): whether the folder's join keys are fresh.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
-pub struct ObserveJoinVerify {}
+pub struct ObserveJoinVerify {
+    /// Target dataset: a `--dataset NAME=ROOT` binding or, when the server runs
+    /// with `--workspace`, a relative folder under the workspace root; default:
+    /// the server's primary root.
+    #[serde(default)]
+    pub dataset: Option<String>,
+}
 
 /// `observe.plan_from_sql` (WP15b): parse a SQL `SELECT` query and translate
 /// it deterministically into a [`bellwether::types::ConsumerPlan`] DAG,
@@ -395,6 +458,11 @@ pub struct ObservePlanFromSql {
     /// into `as_of` instead of `latest`.
     #[serde(default)]
     pub as_of: bool,
+    /// Target dataset: a `--dataset NAME=ROOT` binding or, when the server runs
+    /// with `--workspace`, a relative folder under the workspace root; default:
+    /// the server's primary root.
+    #[serde(default)]
+    pub dataset: Option<String>,
 }
 /// One text lookup (B5): rows whose string `column` matches `value` under
 /// `op` (`has_token`, `contains`, or `has_prefix`), both case-folded.
@@ -438,6 +506,11 @@ pub struct ObserveText {
     /// `not_retained`.
     #[serde(default)]
     pub at_manifest: Option<u64>,
+    /// Target dataset: a `--dataset NAME=ROOT` binding or, when the server runs
+    /// with `--workspace`, a relative folder under the workspace root; default:
+    /// the server's primary root.
+    #[serde(default)]
+    pub dataset: Option<String>,
 }
 
 /// `score.why`: replay a workload under every candidate key. Writes engine
@@ -557,6 +630,11 @@ pub struct ScoreWhy {
     /// integer in the version column's unit; default: none.
     #[serde(default)]
     pub at: Option<String>,
+    /// Target dataset: a `--dataset NAME=ROOT` binding or, when the server runs
+    /// with `--workspace`, a relative folder under the workspace root; default:
+    /// the server's primary root.
+    #[serde(default)]
+    pub dataset: Option<String>,
 }
 
 /// What an aggregate lookup computes per key.
@@ -622,6 +700,11 @@ pub struct ScoreVerify {
     /// Run in this call instead of returning a job id.
     #[serde(default)]
     pub wait: bool,
+    /// Target dataset: a `--dataset NAME=ROOT` binding or, when the server runs
+    /// with `--workspace`, a relative folder under the workspace root; default:
+    /// the server's primary root.
+    #[serde(default)]
+    pub dataset: Option<String>,
 }
 
 /// `score.advise`: workload-level physical design advisor (milestone M6).
@@ -658,6 +741,11 @@ pub struct ScoreAdvise {
     /// Run in this call instead of returning a job id.
     #[serde(default)]
     pub wait: bool,
+    /// Target dataset: a `--dataset NAME=ROOT` binding or, when the server runs
+    /// with `--workspace`, a relative folder under the workspace root; default:
+    /// the server's primary root.
+    #[serde(default)]
+    pub dataset: Option<String>,
 }
 
 /// `propose.key`: propose an index key.
@@ -677,6 +765,11 @@ pub struct ProposeKey {
     /// Return what would be written, and write nothing.
     #[serde(default)]
     pub dry_run: bool,
+    /// Target dataset: a `--dataset NAME=ROOT` binding or, when the server runs
+    /// with `--workspace`, a relative folder under the workspace root; default:
+    /// the server's primary root.
+    #[serde(default)]
+    pub dataset: Option<String>,
 }
 
 /// The key `propose.key` proposes: the contract's `KeySpec` as JSON, or the
@@ -706,6 +799,11 @@ pub struct ProposeLayout {
     /// Return what would be written, and write nothing.
     #[serde(default)]
     pub dry_run: bool,
+    /// Target dataset: a `--dataset NAME=ROOT` binding or, when the server runs
+    /// with `--workspace`, a relative folder under the workspace root; default:
+    /// the server's primary root.
+    #[serde(default)]
+    pub dataset: Option<String>,
 }
 
 /// `propose.rewrite`: propose a rewrite, as data. A rewrite of engine
@@ -724,6 +822,11 @@ pub struct ProposeRewrite {
     /// Return what would be written, and write nothing.
     #[serde(default)]
     pub dry_run: bool,
+    /// Target dataset: a `--dataset NAME=ROOT` binding or, when the server runs
+    /// with `--workspace`, a relative folder under the workspace root; default:
+    /// the server's primary root.
+    #[serde(default)]
+    pub dataset: Option<String>,
 }
 
 /// `apply.receipt`: apply a certificate the engine wrote and attest it.
@@ -739,6 +842,11 @@ pub struct ApplyReceipt {
     /// Run in this call instead of returning a job id.
     #[serde(default)]
     pub wait: bool,
+    /// Target dataset: a `--dataset NAME=ROOT` binding or, when the server runs
+    /// with `--workspace`, a relative folder under the workspace root; default:
+    /// the server's primary root.
+    #[serde(default)]
+    pub dataset: Option<String>,
 }
 
 /// `apply.refresh`: rebuild stale index specs and stale join keys on the
@@ -753,6 +861,11 @@ pub struct ApplyRefresh {
     /// Run in this call instead of returning a job id.
     #[serde(default)]
     pub wait: bool,
+    /// Target dataset: a `--dataset NAME=ROOT` binding or, when the server runs
+    /// with `--workspace`, a relative folder under the workspace root; default:
+    /// the server's primary root.
+    #[serde(default)]
+    pub dataset: Option<String>,
 }
 
 /// `jobs.start`: run any tool as a job. The job id is the hash of the

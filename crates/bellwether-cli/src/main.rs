@@ -1340,6 +1340,7 @@ fn mcp(g: &Global, a: &McpArgs) -> Result<Outcome, Failure> {
         engine,
         budget: a.budget.into(),
         join: a.join.join.clone(),
+        workspace: a.join.workspace,
     };
     // stdout is the protocol channel: nothing else is printed there.
     match bellwether_mcp::serve_stdio(&config) {

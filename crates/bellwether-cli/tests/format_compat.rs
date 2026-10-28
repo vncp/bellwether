@@ -850,6 +850,7 @@ fn index_says_what_the_fold_does_and_two_bitemporal_sources_are_picked_by_their_
         },
         budget: bellwether_mcp::Budget::default(),
         join: None,
+        workspace: false,
     })
     .unwrap();
     let at = |flag: &str| {

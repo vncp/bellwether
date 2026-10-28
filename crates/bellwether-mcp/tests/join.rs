@@ -77,6 +77,7 @@ fn server(data: &Path, join: Option<&str>) -> Server {
         },
         budget: Budget::default(),
         join: join.map(str::to_string),
+        workspace: false,
     })
     .unwrap()
 }
