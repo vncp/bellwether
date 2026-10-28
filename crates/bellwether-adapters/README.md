@@ -26,7 +26,7 @@ pub enum Artifact {
 | `footer_hint` | DataFusion: read each planned file's footer trailer once, set `metadata_size_hint` to the footer's exact length, and check the plan's row groups against the footer |
 | `engine_pruning` | DataFusion: turn its statistics, page-index, and bloom-filter pruning back on; realized bytes are then at most the plan's |
 | `ordered` | return rows in the plan's read order (`ScanPlan.order`, else entry order with row groups ascending), row by row |
-| `relocate` | where the engine reads the plan's files (a prefix rewrite: the folder served over HTTP, or mounted elsewhere); the plan is unchanged |
+| `relocate` | where the engine reads the plan's files (a prefix rewrite: the folder served over HTTP, or mounted elsewhere; on Windows a local folder relocated to a URL has its `\` separators written as `/`); the plan is unchanged |
 
 ## The residual: translated, never dropped
 
@@ -112,7 +112,7 @@ DataFusion's data bytes equal the plan's in every run, also behind a store that 
 | Test | What it proves |
 |---|---|
 | `tests/datafusion.rs` (feature) | every lookup shape of a corpus with every key type, composite prefixes, both float zeros and NaN, decimals at two scales, two timestamp units, null timestamps, ties, an all-null row group, Hive partition columns, a list and a text column, run from the description as printed (`from_json`): rows equal the reference evaluator's; data bytes equal the plan's, the planned row groups touched and no other, footers counted apart, nothing else read; engine pruning at most the plan's; a 100k-key keys file; a coalescing store's gap bytes counted apart from the requested data; partial residual modes |
-| `tests/duckdb.rs` | the same shapes in the `duckdb` CLI (rows exact; the refused shapes refused by name); ordered output; bytes at the range server (planned row groups all touched, no unplanned file's data, the delta printed) |
+| `tests/duckdb.rs` | the same shapes in the `duckdb` CLI (rows exact; the refused shapes refused by name); ordered output; bytes at the range server (planned row groups all touched, no unplanned file's data, the delta printed); a local folder with a space read at its relocated URL route |
 | `tests/spark.rs`, `shims/spark/test_bellwether_plan.py` | the same shapes in a local Spark session with every unplanned file unreadable during the run (and a control run that denies a planned file and fails); ordered output; NaN keys inline and composite; a 20k-key keys file |
 | `tests/residual.rs` | a reference evaluator over canonical bytes agrees with DataFusion's and DuckDB's typed translation on random rows |
 | `tests/corrupt.rs` | typed refusals for plans that do not belong to their inputs; every flipped byte of a residual value refused exactly when it does not decode, and otherwise translated as the value it re-encodes to; an edited DataFusion description refused |

@@ -62,7 +62,7 @@ pub use parquet_source::{load_reader_metadata, ParquetSource};
 pub use partition::{Partitioning, PathTemplate};
 pub use partitioned::{physical_schema, Partitioned};
 pub use storage::{LocalFs, ObjectMeta, Storage};
-pub use text::{ChunkedTextSource, TextFormat, DEFAULT_CHUNK_SIZE};
+pub use text::{is_within, ChunkedTextSource, TextFormat, DEFAULT_CHUNK_SIZE};
 
 /// Opens `file` and verifies, on the opened handle, that it still matches
 /// `file`: size, etag/mtime, and content hash under `policy`. Returns the

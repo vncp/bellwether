@@ -1122,9 +1122,10 @@ fn footer_hint_and_bytes_at_the_storage_boundary() {
         return;
     }
     let server = range_server::RangeServer::start(&f.data);
+    let from = server.root.display().to_string();
     let sql = f.work.join("relocated.sql");
     let rplan = emit(
-        &["locate", d, "--keys", k, "--relocate", "", &server.base],
+        &["locate", d, "--keys", k, "--relocate", &from, &server.base],
         "duckdb",
         &sql,
     );
@@ -1284,8 +1285,8 @@ fn measured_bytes_on_the_bench_corpus() {
             }
             if let Some(bin) = &duck {
                 let sql = f.work.join(format!("m{i}.sql"));
-                let base = server.base.clone();
-                a.extend(["--relocate", "", &base]);
+                let (from, base) = (server.root.display().to_string(), server.base.clone());
+                a.extend(["--relocate", &from, &base]);
                 assert_eq!(emit(&a, "duckdb", &sql), plan);
                 server.reset();
                 let got = normalized(&duckdb_rows(bin, &sql, "INSTALL httpfs; LOAD httpfs;\n"));

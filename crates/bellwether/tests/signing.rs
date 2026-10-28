@@ -437,10 +437,10 @@ fn unusable_signing_key_files_are_refused_with_the_fix_named() {
     }
     let e = bellwether::load_signing_key(&short).unwrap_err();
     assert!(e.to_string().contains("31 bytes"), "{e}");
-    assert!(bellwether::load_signing_key(dir.path())
-        .unwrap_err()
-        .to_string()
-        .contains("not a file"));
+    // A directory is refused the same typed way (on Windows, opening it is
+    // refused before its kind is seen).
+    let e = bellwether::load_signing_key(dir.path()).unwrap_err();
+    assert_eq!(field(&e), "signing_key", "{e}");
 }
 
 #[test]

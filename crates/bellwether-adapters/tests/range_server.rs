@@ -1,8 +1,9 @@
 //! The HTTP range server the DuckDB and Spark byte measurements stand on:
-//! every ranged `GET` is served exactly and recorded with its bytes, a
-//! `HEAD` is not, nothing outside the served root is reachable, and the
-//! classification splits fetched bytes into footer, data, and other bytes
-//! against the file's own layout.
+//! files are served at URL routes relative to the served root, every
+//! ranged `GET` is served exactly and recorded with its bytes against the
+//! local file, a `HEAD` is not, nothing outside the served root is
+//! reachable, and the classification splits fetched bytes into footer,
+//! data, and other bytes against the file's own layout.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::doc_markdown)]
 
@@ -43,39 +44,57 @@ fn ranges_parse_as_http_defines_them() {
 #[test]
 fn served_ranges_are_exact_and_recorded() {
     let tmp = tempfile::tempdir().unwrap();
-    let c = common::corpus(tmp.path());
-    let server = RangeServer::start(&c.root);
+    let served = tmp.path().join("served");
+    let c = common::corpus(&served.join("local lake"));
+    let server = RangeServer::start(&served);
     let f = &c.files[0];
+    // One percent-encoded segment per component below the served root.
+    let route = server.url_path(std::path::Path::new(&f.path));
+    assert!(
+        route.starts_with("/local%20lake/") && !route.contains('\\'),
+        "{route}"
+    );
     let bytes = std::fs::read(&f.path).unwrap();
     let r = request(
         &server.base,
-        &format!(
-            "GET {} HTTP/1.1\r\nHost: x\r\nRange: bytes=4-19\r\n\r\n",
-            f.path
-        ),
+        &format!("GET {route} HTTP/1.1\r\nHost: x\r\nRange: bytes=4-19\r\n\r\n"),
     );
     assert!(r.starts_with(b"HTTP/1.1 206"));
     assert_eq!(body(&r), &bytes[4..20]);
     let r = request(
         &server.base,
-        &format!("HEAD {} HTTP/1.1\r\nHost: x\r\n\r\n", f.path),
+        &format!("HEAD {route} HTTP/1.1\r\nHost: x\r\n\r\n"),
     );
     assert_eq!(body(&r), b"");
     let r = request(
         &server.base,
-        &format!(
-            "GET {} HTTP/1.1\r\nHost: x\r\nRange: bytes=-8\r\n\r\n",
-            f.path
-        ),
+        &format!("GET {route} HTTP/1.1\r\nHost: x\r\nRange: bytes=-8\r\n\r\n"),
     );
     assert_eq!(body(&r), &bytes[bytes.len() - 8..]);
     let fetches = server.fetches();
     assert_eq!(fetches.len(), 2, "{fetches:?}");
+    assert_eq!(fetches[0].path, f.path);
     assert_eq!(fetches[0].range, 4..20);
+    assert_eq!(fetches[1].path, f.path);
     assert_eq!(fetches[1].range.end, f.size);
-    // Nothing outside the root.
-    let r = request(&server.base, "GET /etc/hosts HTTP/1.1\r\nHost: x\r\n\r\n");
-    assert!(r.starts_with(b"HTTP/1.1 404"));
+    // Nothing outside the root: not an absolute path, not a file reached
+    // by climbing out of the root (raw or percent-encoded).
+    let outside = tmp.path().join("outside.parquet");
+    std::fs::write(&outside, &bytes).unwrap();
+    for target in [
+        "/etc/hosts",
+        "/../outside.parquet",
+        "/%2E%2E/outside.parquet",
+        "/..%2Foutside.parquet",
+        "/..%5Coutside.parquet",
+    ] {
+        let r = request(
+            &server.base,
+            &format!("GET {target} HTTP/1.1\r\nHost: x\r\n\r\n"),
+        );
+        assert!(r.starts_with(b"HTTP/1.1 404"), "{target}");
+    }
+    assert_eq!(server.fetches().len(), 2);
 }
 
 #[test]

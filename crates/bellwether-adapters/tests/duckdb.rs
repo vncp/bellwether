@@ -148,7 +148,7 @@ fn bytes_read_are_measured_at_a_range_server() {
     for case in common::cases(&c).into_iter().filter(|k| k.sql_exact) {
         let o = EmitOptions {
             relocate: Some(Relocate {
-                from: String::new(),
+                from: server.root.display().to_string(),
                 to: server.base.clone(),
             }),
             ..opts(&c)
@@ -227,6 +227,72 @@ fn bytes_read_are_measured_at_a_range_server() {
         "DuckDB at the range server (data = column-chunk bytes served):\n{}",
         table.join("\n")
     );
+}
+
+#[test]
+fn a_local_folder_with_a_space_is_read_at_its_url_route() {
+    // The served root holds the corpus in `local lake/`: each plan path,
+    // relocated from the local root to the server, is read by DuckDB at its
+    // URL route (`/local lake/region=…/part-….parquet`), and the server maps
+    // the route back to the planned local file.
+    let Some(bin) = common::require_duckdb() else {
+        return;
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    let c = common::corpus(&tmp.path().join("local lake"));
+    if let Err(e) = common::duckdb_run(&bin, "INSTALL httpfs; LOAD httpfs;") {
+        let why = format!("DuckDB's httpfs extension is not installable here ({e})");
+        common::skip_or_fail::<()>("BELLWETHER_REQUIRE_DUCKDB", &why);
+        return;
+    }
+    let server = RangeServer::start(tmp.path());
+    let spans: BTreeMap<String, FileSpans> = c
+        .files
+        .iter()
+        .map(|f| (f.path.clone(), FileSpans::of_local(&f.path).unwrap()))
+        .collect();
+    let schema = common::dataset();
+    let columns = common::all_columns();
+    let mut ran = 0;
+    for case in common::cases(&c).into_iter().filter(|k| k.sql_exact) {
+        let o = EmitOptions {
+            relocate: Some(Relocate {
+                from: server.root.display().to_string(),
+                to: server.base.clone(),
+            }),
+            ..opts(&c)
+        };
+        let sql = duckdb::sql(&case.plan, &schema, &o).unwrap();
+        server.reset();
+        let got = common::rendered(
+            &common::duckdb_rows(&bin, &sql, tmp.path(), "LOAD httpfs;\n"),
+            &columns,
+        );
+        common::assert_rows(&got, &common::expected(&c, &case.plan, &columns), case.name);
+        let fetches = server.fetches();
+        for f in &fetches {
+            assert!(
+                spans.contains_key(&f.path),
+                "{}: served {} is not a corpus file",
+                case.name,
+                f.path
+            );
+        }
+        let planned: BTreeSet<(String, u32)> = case
+            .plan
+            .entries
+            .iter()
+            .flat_map(|e| e.row_groups.iter().map(move |rg| (e.file.path.clone(), rg)))
+            .collect();
+        let touched = classify(&fetches, &spans).touched();
+        assert!(
+            touched.is_superset(&planned),
+            "{}: planned {planned:?}, touched {touched:?}",
+            case.name
+        );
+        ran += 1;
+    }
+    assert!(ran > 0);
 }
 
 #[test]

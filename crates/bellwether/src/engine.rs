@@ -1129,12 +1129,7 @@ pub(crate) fn folder_changes(
     let mut paths: Vec<String> = fs
         .list(root)?
         .into_iter()
-        .filter(|p| {
-            !exclude.iter().any(|d| {
-                p.strip_prefix(d.as_str())
-                    .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
-            })
-        })
+        .filter(|p| !exclude.iter().any(|d| bellwether_source::is_within(p, d)))
         .filter(|p| match &text {
             None => Path::new(p)
                 .extension()

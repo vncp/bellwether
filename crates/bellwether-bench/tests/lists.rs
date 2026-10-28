@@ -47,7 +47,13 @@ fn decode(out: &Path, column: &str) -> BTreeMap<(String, u32), Vec<Option<Vec<St
     files(&data, &mut paths);
     let mut m = BTreeMap::new();
     for p in paths {
-        let rel = p.strip_prefix(&data).unwrap().to_str().unwrap().to_string();
+        let rel = p
+            .strip_prefix(&data)
+            .unwrap()
+            .components()
+            .map(|c| c.as_os_str().to_str().unwrap())
+            .collect::<Vec<_>>()
+            .join("/");
         let n = ParquetRecordBatchReaderBuilder::try_new(File::open(&p).unwrap())
             .unwrap()
             .metadata()

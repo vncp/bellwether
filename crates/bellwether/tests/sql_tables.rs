@@ -535,22 +535,42 @@ fn key_file(dir: &Path, ids: &[i64]) -> PathBuf {
 /// before the certificate is written.
 #[test]
 fn a_table_changing_during_a_reconcile_writes_no_certificate() {
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     let d = tempfile::tempdir().unwrap();
     let folder = files(d.path());
     let root = sqlite(d.path()) + "&snapshot=reread";
     let db = d.path().join("t.sqlite");
-    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let flag = Arc::clone(&stop);
+    let stop = Arc::new(AtomicBool::new(false));
+    let commits = Arc::new(AtomicU64::new(0));
+    let (flag, count) = (Arc::clone(&stop), Arc::clone(&commits));
+    let (started, first_commit) = std::sync::mpsc::channel();
     let writer = std::thread::spawn(move || {
         let c = rusqlite::Connection::open(db).unwrap();
+        // WAL: the run's reads never make this writer wait, nor its commits
+        // the reads, so the table keeps changing while the run reads it. In
+        // a rollback journal the two take turns through file locks and the
+        // journal's deletion, and on Windows the writer can go a whole run
+        // without a commit.
+        let mode: String = c
+            .pragma_update_and_check(None, "journal_mode", "wal", |r| r.get(0))
+            .unwrap();
+        assert_eq!(mode, "wal");
         c.busy_timeout(std::time::Duration::from_secs(5)).unwrap();
         let mut n = 0;
-        while !flag.load(std::sync::atomic::Ordering::Relaxed) {
+        while !flag.load(Ordering::SeqCst) {
             n += 1;
-            let _ = c.execute("UPDATE trips SET amount = 1000 + ?1 WHERE id = 1", [n]);
+            if matches!(
+                c.execute("UPDATE trips SET amount = 1000 + ?1 WHERE id = 1", [n]),
+                Ok(1)
+            ) && count.fetch_add(1, Ordering::SeqCst) == 0
+            {
+                started.send(()).unwrap();
+            }
         }
     });
-    std::thread::sleep(std::time::Duration::from_millis(20));
+    // The run starts once the table is demonstrably changing.
+    first_commit.recv().unwrap();
+    let before = commits.load(Ordering::SeqCst);
     let index = d.path().join("m1");
     let r = open(&root, &index).reconcile(
         folder.to_str().unwrap(),
@@ -559,11 +579,13 @@ fn a_table_changing_during_a_reconcile_writes_no_certificate() {
             ..ReconcileRequest::default()
         },
     );
-    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    let during = commits.load(Ordering::SeqCst) - before;
+    stop.store(true, Ordering::SeqCst);
     writer.join().unwrap();
+    assert!(during > 0, "the table changed during the run");
     assert!(
         matches!(r, Err(Error::SourceChanged { .. })),
-        "{:?}",
+        "{during} commits during the run: {:?}",
         r.map(|_| ())
     );
     assert!(!ledger_kinds(&index).contains(&"certificate".to_string()));

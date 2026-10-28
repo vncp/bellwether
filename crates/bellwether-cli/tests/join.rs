@@ -156,6 +156,14 @@ fn refused(
     (refusal.fields, stderr)
 }
 
+/// The `… && …` command `text` prints to rebuild a join key.
+fn rebuild_command(text: &str) -> &str {
+    common::printed_commands(text)
+        .into_iter()
+        .find(|c| c.contains(" && "))
+        .unwrap_or_else(|| panic!("no rebuild command in {text}"))
+}
+
 #[test]
 fn join_tools_are_byte_identical_over_cli_and_mcp() {
     let dir = tempfile::tempdir().unwrap();
@@ -301,10 +309,12 @@ fn join_tools_are_byte_identical_over_cli_and_mcp() {
         "stale_join",
     );
     assert_eq!(fields["side"], "right");
-    assert!(
-        stderr.contains(&format!("bellwether index {d}")),
-        "{stderr}"
-    );
+    // The command rebuilds the left, whose join key it is.
+    let rebuild: Vec<_> = common::printed_commands(&stderr)
+        .into_iter()
+        .map(common::shell_words)
+        .collect();
+    assert_eq!(rebuild, [["bellwether", "index", d]], "{stderr}");
     let v = both(
         &srv,
         "observe.join_verify",
@@ -533,8 +543,9 @@ fn join_reader_pass_states_the_cause_and_the_next_step() {
         v.contains("1 new file the index does not cover (p2.parquet)"),
         "{v}"
     );
-    assert!(
-        v.contains(&format!("bellwether index {rd} && bellwether index {d}")),
+    assert_eq!(
+        common::shell_words(rebuild_command(&v)),
+        ["bellwether", "index", rd, "&&", "bellwether", "index", d],
         "{v}"
     );
     // b: the left's own commit is reported beside the join key it could
@@ -548,15 +559,15 @@ fn join_reader_pass_states_the_cause_and_the_next_step() {
     );
     // The cause is on the right (its files moved on), so the next step
     // indexes the right first, then the left (review round 2).
-    assert!(
-        idx.contains(&format!(
-            "run `bellwether index {rd} && bellwether index {d}` to rebuild it"
-        )),
+    // Followed as printed, the join key is fresh.
+    let next = rebuild_command(&idx);
+    assert_eq!(
+        common::shell_words(next),
+        ["bellwether", "index", rd, "&&", "bellwether", "index", d],
         "{idx}"
     );
-    run(&["index", rd], 0);
-    let idx = human(&["index", d], 0);
-    assert!(idx.contains(&format!("rebuilt; {counted}: fresh")), "{idx}");
+    let out = common::run_printed(next, 0);
+    assert!(out.contains(&format!("rebuilt; {counted}: fresh")), "{out}");
     assert!(human(&["join", "verify", d], 0).contains("every join key is fresh"));
     // The right lacks the exact key a counted join key reads: the next step
     // declares it there (`needs`), then rebuilds on the left; and a right
@@ -585,21 +596,27 @@ fn join_reader_pass_states_the_cause_and_the_next_step() {
             "{idx}"
         );
         // The join key was named on this call and is not declared yet, so
-        // the command names it again; followed literally, it is fresh.
-        let next = format!(
-            "bellwether index {rd} --key exact:paid_order,counts && bellwether index {d} --key \
-             {counted}"
-        );
-        assert!(
-            idx.contains(&format!("run `{next}` to rebuild it")),
+        // the command names it again; followed as printed, it is fresh.
+        let next = rebuild_command(&idx);
+        assert_eq!(
+            common::shell_words(next),
+            [
+                "bellwether",
+                "index",
+                rd,
+                "--key",
+                "exact:paid_order,counts",
+                "&&",
+                "bellwether",
+                "index",
+                d,
+                "--key",
+                counted.as_str(),
+            ],
             "{indexed}: {idx}"
         );
         assert!(!idx.contains("<spec>"), "{idx}");
-        let mut out = String::new();
-        for step in next.split(" && ") {
-            let words: Vec<&str> = step.split(' ').skip(1).collect();
-            out = human(&words, 0);
-        }
+        let out = common::run_printed(next, 0);
         assert!(out.contains(&format!("rebuilt; {counted}: fresh")), "{out}");
     }
     // i: a link beside the root to a folder elsewhere is refused by name,

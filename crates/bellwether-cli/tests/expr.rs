@@ -238,7 +238,10 @@ fn why_fix_receipt_locate_round_trip_with_cli_mcp_byte_identity() {
     assert!(
         err.contains("no expr key indexes json_get(payload,'$.Symbol')")
             && err.contains("expr:json_get_payload_symbol=json_get(payload,'$.symbol'):exact")
-            && err.contains(&format!("bellwether index {d} --key 'expr:json_get_payload_symbol=json_get(payload,'\\''$.Symbol'\\''):exact'")),
+            && err.contains("`bellwether index ")
+            && err.contains(
+                " --key 'expr:json_get_payload_symbol=json_get(payload,'\\''$.Symbol'\\''):exact'`"
+            ),
         "{err}"
     );
     let r = srv.call("observe.locate", json!({"keys": path(&near)}));
@@ -264,7 +267,8 @@ fn why_fix_receipt_locate_round_trip_with_cli_mcp_byte_identity() {
         let err = String::from_utf8_lossy(&o.stderr);
         assert!(
             err.contains("is an expression; an expr key answers point lookups only")
-                && err.contains(&format!("bellwether locate {d} --keys"))
+                && err.contains("`bellwether locate ")
+                && err.contains(" --keys")
                 && !err.contains("temporal:"),
             "{args:?}: {err}"
         );

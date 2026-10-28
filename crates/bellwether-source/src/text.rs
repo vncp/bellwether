@@ -148,6 +148,17 @@ impl TextFormat {
 /// A sniffed file's identity: path, size, and version token.
 type SniffKey = (String, u64, Option<String>);
 
+/// Whether the listed `path` is `dir` or lies below it, both spelled as
+/// listed paths are, with the platform's separators (`\` as well as `/` on
+/// Windows). A trailing separator on `dir` is ignored. Discovery and the
+/// facade's folder check share this test of an excluded index location.
+#[must_use]
+pub fn is_within(path: &str, dir: &str) -> bool {
+    let dir = dir.trim_end_matches(std::path::is_separator);
+    path.strip_prefix(dir)
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with(std::path::is_separator))
+}
+
 /// The longest line [`sniff_json_lines`] reads, in bytes.
 const MAX_SNIFF_LINE: usize = 256 * 1024 * 1024;
 
@@ -359,17 +370,12 @@ impl<S: Storage> ChunkedTextSource<S> {
     /// the platform's separators (`\` as well as `/` on Windows).
     #[must_use]
     pub fn with_excluded(mut self, dir: impl Into<String>) -> Self {
-        let dir = dir.into();
-        self.excluded
-            .push(dir.trim_end_matches(std::path::is_separator).to_string());
+        self.excluded.push(dir.into());
         self
     }
 
     fn is_excluded(&self, path: &str) -> bool {
-        self.excluded.iter().any(|d| {
-            path.strip_prefix(d.as_str())
-                .is_some_and(|rest| rest.is_empty() || rest.starts_with(std::path::is_separator))
-        })
+        self.excluded.iter().any(|d| is_within(path, d))
     }
 
     /// [`TextFormat::accepts`], remembering each sniffed file's verdict for
@@ -1010,5 +1016,17 @@ mod tests {
     fn delimiter_is_respected() {
         assert!(csv_ends_in_quotes(b"a;\"b,c\n", b';'));
         assert!(!csv_ends_in_quotes(b"a;\"b,c\n", b','));
+    }
+
+    #[test]
+    fn within_is_a_whole_path_component_under_the_platform_separators() {
+        use super::is_within;
+        assert!(is_within("/d/idx", "/d/idx"));
+        assert!(is_within("/d/idx/m.json", "/d/idx/"));
+        assert!(!is_within("/d/idx2/m.json", "/d/idx"));
+        // A backslash is a separator only where the platform says so: on
+        // Unix it is a character of the file name.
+        assert_eq!(is_within(r"C:\d\idx\m.json", r"C:\d\idx"), cfg!(windows));
+        assert_eq!(is_within(r"/d/idx\m.json", "/d/idx"), cfg!(windows));
     }
 }

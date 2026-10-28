@@ -108,7 +108,13 @@ fn decode_corpus(out: &Path) -> (Vec<DecodedRowGroup>, u64, u64) {
             );
             files_count += 1;
             bytes_count += std::fs::metadata(&part_path).unwrap().len();
-            let rel = part_path.strip_prefix(out).unwrap().display().to_string();
+            let rel = part_path
+                .strip_prefix(out)
+                .unwrap()
+                .components()
+                .map(|c| c.as_os_str().to_str().unwrap())
+                .collect::<Vec<_>>()
+                .join("/");
 
             let file = File::open(&part_path).unwrap();
             let builder = ParquetRecordBatchReaderBuilder::try_new(file).unwrap();

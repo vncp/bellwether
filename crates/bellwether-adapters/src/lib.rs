@@ -136,7 +136,9 @@ pub struct Partitions {
 /// A rewrite of the plan's file paths for the engine: every path that
 /// starts with `from` is read at `to` followed by the rest (a local folder
 /// served over HTTP, for example). The plan's identity is unchanged; only
-/// where the engine reads it.
+/// where the engine reads it. On Windows, a local `from` (no `://`)
+/// rewritten to a URL `to` has the rest's `\` separators written as `/`,
+/// the URL path separator; a URL `from` keeps the rest byte for byte.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Relocate {
     /// The prefix the plan's paths start with.
@@ -150,6 +152,11 @@ impl Relocate {
     #[must_use]
     pub fn apply(&self, path: &str) -> String {
         match path.strip_prefix(&self.from) {
+            Some(rest)
+                if cfg!(windows) && !self.from.contains("://") && self.to.contains("://") =>
+            {
+                format!("{}{}", self.to, rest.replace('\\', "/"))
+            }
             Some(rest) => format!("{}{rest}", self.to),
             None => path.to_string(),
         }
@@ -272,3 +279,76 @@ pub fn adapter(engine: &str) -> Option<&'static dyn Adapter> {
 
 /// The engines with an adapter.
 pub const ENGINES: [&str; 3] = ["datafusion", "duckdb", "spark"];
+
+#[cfg(test)]
+mod tests {
+    use super::Relocate;
+
+    fn relocate(from: &str, to: &str, path: &str) -> String {
+        Relocate {
+            from: from.into(),
+            to: to.into(),
+        }
+        .apply(path)
+    }
+
+    #[test]
+    fn a_url_source_keeps_its_rest_byte_for_byte() {
+        assert_eq!(
+            relocate(
+                "s3://bucket/lake",
+                "http://h:1/lake",
+                "s3://bucket/lake/my%20dir\\a b.parquet"
+            ),
+            "http://h:1/lake/my%20dir\\a b.parquet"
+        );
+    }
+
+    #[test]
+    fn a_path_outside_the_source_is_unchanged() {
+        assert_eq!(
+            relocate("/lake", "http://h:1", "/other/a.parquet"),
+            "/other/a.parquet"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_local_windows_folder_with_a_space_routes_to_url_segments() {
+        assert_eq!(
+            relocate(
+                r"C:\data",
+                "http://h:1/lake",
+                r"C:\data\my lake\day=1\p.parquet"
+            ),
+            "http://h:1/lake/my lake/day=1/p.parquet"
+        );
+        assert_eq!(
+            relocate(
+                r"\\?\C:\data",
+                "http://h:1",
+                r"\\?\C:\data\my lake\p.parquet"
+            ),
+            "http://h:1/my lake/p.parquet"
+        );
+        // Local to local keeps Windows separators.
+        assert_eq!(
+            relocate(r"C:\data", r"D:\mnt", r"C:\data\my lake\p.parquet"),
+            r"D:\mnt\my lake\p.parquet"
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn a_local_unix_folder_with_a_space_routes_to_url_segments() {
+        assert_eq!(
+            relocate("/data", "http://h:1/lake", "/data/my lake/day=1/p.parquet"),
+            "http://h:1/lake/my lake/day=1/p.parquet"
+        );
+        // A backslash is a file name byte here, not a separator.
+        assert_eq!(
+            relocate("/data", "http://h:1", "/data/a\\b.parquet"),
+            "http://h:1/a\\b.parquet"
+        );
+    }
+}
