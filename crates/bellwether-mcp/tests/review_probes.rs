@@ -381,7 +381,7 @@ fn loop_refusals_are_typed_and_name_mcp_fields() {
         (
             "observe.profile extra field",
             "observe.profile",
-            json!({"score": 1}),
+            json!({"colour": "red"}),
             "invalid_input",
             None,
         ),
