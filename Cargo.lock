@@ -609,6 +609,7 @@ dependencies = [
  "bellwether-adapters",
  "bellwether-build",
  "bellwether-core",
+ "bellwether-evolve",
  "bellwether-ledger",
  "bellwether-profile",
  "bellwether-replay",
@@ -732,6 +733,28 @@ dependencies = [
  "unicase",
  "unicode-segmentation",
  "xxhash-rust",
+]
+
+[[package]]
+name = "bellwether-evolve"
+version = "0.1.0"
+dependencies = [
+ "arrow",
+ "bellwether-build",
+ "bellwether-core",
+ "bellwether-ledger",
+ "bellwether-profile",
+ "bellwether-replay",
+ "bellwether-source",
+ "bellwether-store",
+ "bellwether-types",
+ "bellwether-verify",
+ "parquet",
+ "proptest",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 1.0.69",
 ]
 
 [[package]]

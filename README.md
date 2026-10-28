@@ -107,7 +107,7 @@ An agent (or a person) may **observe** and **propose**. Only the engine may **sc
 - [Gate a pull request](#gate-a-pull-request)
 - [For a coding agent](#for-a-coding-agent)
 - [How it compares](#how-it-compares)
-- [Planned: advise](#planned-advise)
+- [Workload-level physical design: `advise`](#workload-level-physical-design-advise)
 - [Architecture](#architecture)
 - [Run it](#run-it)
 - [Query engines as sources](#query-engines-as-sources)
@@ -349,7 +349,7 @@ The trust boundary at the wire: a proposal has no score field, so the input sche
 | Surface | What it can do | Worst case |
 |---|---|---|
 | `observe.*` (`observe.why` with no keys, `observe.profile`, `observe.locate`, `observe.asof`, `observe.text`, `observe.semijoin`, `observe.join_overlap`, `observe.join_verify`) | read footers and the index; write the profile Evidence and cache entries | the agent reads evidence |
-| `score.*` (`score.why` with keys, a workload, or text lookups, `score.verify`, `score.record` with a query engine) | ask the engine to replay and verify; the engine writes its own Proposals, Replays, plan Evidence, and Certificates; charged to the session budget; with `--twin-of`, the engine submits a keys query or a rewrite's queries read-only to the one engine the human named | the agent spends its budget and is refused with `budget_exceeded`; a cost or verdict field in the arguments is refused with `caller_supplied_cost` |
+| `score.*` (`score.why` with keys, a workload, or text lookups, `score.verify`, `score.advise`, `score.record` with a query engine) | ask the engine to replay, advise, and verify; the engine writes its own Proposals, Replays, plan Evidence, and Certificates; charged to the session budget; with `--twin-of`, the engine submits a keys query or a rewrite's queries read-only to the one engine the human named | the agent spends its budget and is refused with `budget_exceeded`; a cost or verdict field in the arguments is refused with `caller_supplied_cost` |
 | `propose.*` | write a `Proposal` with no score, or nothing with `dry_run` | the ledger holds a bad proposal that scores poorly and never gets a Certificate |
 | `apply.receipt`, `apply.refresh` | `apply.receipt` takes a Certificate hash only; the engine applies and then writes the Receipt. `apply.refresh` rebuilds stale declared index specs and join keys on the server's data folder in one manifest commit, charged to the session budget | the agent asks to apply something unverified and is told no, with a typed code |
 | `jobs.*` | start a score or apply call as a job, poll it, read its result | whatever the started tool may do |
@@ -378,9 +378,9 @@ What Bellwether deliberately is not:
 - **Not a table format.** It never rewrites your data or asks you to convert it.
 - **Not a database.** If your data fits in Postgres or SQL Server, use their indexes. Bellwether is for data that lives as files because it is too big, too shared, or owned by a pipeline.
 
-## Planned: advise
+## Workload-level physical design: `advise`
 
-Bellwether can price any key spec against your recorded runs exactly, by replay, and certify it by reconciliation. `advise` (M6) is to use that to choose for you: a set of key specs and the numeric knobs replay prices (bloom false-positive rate, key-count gates), searched against every recorded run, selected by Pareto across runs so the median batch cannot buy its gain from the p95 one, with index bytes and build time counted as cost and a receipt for every change it admits. No language model. It starts once planning is faster than a full scan (WP22b), because the loss is bytes read and today fewer bytes do not yet mean less time.
+Bellwether prices any key spec against your recorded runs exactly, by replay, and certifies it by reconciliation. `bellwether advise` (M6, WP13a; MCP `score.advise`) uses that to choose a set-valued configuration for you across one or more recorded workloads: deterministic rule-driven key enumeration, key subsumption (`exact:a,b` prefix seek over `exact:a`, counted/bounded/temporal dominance), exact numeric knob descent over bloom false-positive rates (`[0.0001 .. 0.1]`) and key-count gates (`broadcast` vs `in` vs `shuffle`), preserve-and-extend admission on p95/max anchor runs with regression allowance $\delta$ (default `0.05`, ADR 021), and a multi-objective Pareto frontier (`total_bytes_read`, `p95_run_bytes_read`, `max_run_bytes_read`, `spec_count`, `estimated_index_bytes`) with NSGA-II crowding distance and knee-point recommendation. With `--apply`, it verifies and applies the recommended configuration and emits a receipt per applied key spec. No language model.
 
 A language-model search over pipeline rewrites (`evolve --llm`) and a learned rulebook are designed ([`docs/evolve.md`](docs/evolve.md), ADRs [021](docs/adr/021-reflective-workload-optimization.md) through [025](docs/adr/025-rulebook-validation.md) and [031](docs/adr/031-scoped-proposers-and-a-frozen-outer-loop.md)) but deferred ([ADR 032](docs/adr/032-staged-delivery-with-a-measured-trigger.md), amended 2026-10-27): the rewrites they target cross pipeline steps, no recorded multi-step pipeline exists to search, and a coding agent already proposes keys and rewrites over MCP while the engine scores, verifies, and applies them.
 
@@ -409,8 +409,9 @@ Fifteen crates, dependencies pointing one way, enforced by a script in CI. The C
 | `bellwether-profile` | fanout, sortedness, range gaps, lints, candidate composites | every Evidence cites its inputs (invariant 6) |
 | `bellwether-replay` | the workload recorder; exact cost of current and hypothetical key specs per recorded run | invariant 3 (deterministic) |
 | `bellwether-verify` | reconcile two sources by key with latest-by, row hash, decimal totals; coverage statement | multi-pass inside a memory budget, never an unbounded collect |
+| `bellwether-evolve` | workload-level physical design (`advise`, WP13a): rule-driven key enumeration, subsumption, exact bloom FPR and gate descent, Pareto frontier with crowding distance and anchor admission | no language model; every frontier number is backed by a content-addressed `Replay` (ADR 021, 032) |
 | `bellwether` | the facade: `Engine`, every operation as a typed result; `fix` runs score → verify → apply → attest in that order | the one code path the CLI and MCP share (ADR 010) |
-| `bellwether-cli` | `why`, `index`, `locate`, `latest`, `asof`, `reconcile`, `propose`, `fix`, `receipt`, `report`, `ledger`, `keys`, `bench`, `mcp` | formatting and arguments only |
+| `bellwether-cli` | `why`, `advise`, `index`, `locate`, `latest`, `asof`, `reconcile`, `propose`, `fix`, `receipt`, `report`, `ledger`, `keys`, `bench`, `mcp` | formatting and arguments only |
 | `bellwether-mcp` | the same engine as MCP tools in tiers (observe, score, propose, apply, jobs), resources, the `diagnose_slow_query` prompt | envelopes over the facade; no engine logic |
 | `bellwether-bench` | synthetic versioned ledger and market corpora, recorded workloads, baselines, SLO assertions | depends on types and source only, never on the engine |
 
@@ -454,8 +455,8 @@ bellwether why ./orders/ --workload <workload hash> --twin-of "$ENGINE" --gate i
 bellwether propose ./orders/ --rewrite before.sql=after.sql --evidence <twin evidence> --by me
 bellwether fix ./orders/ --twin-of "$ENGINE" --proposal <proposal hash> --scratch ./orders/_scratch
 
-# Arriving later (M6): advise chooses a key set and knobs against the recorded workload, with no language model
-bellwether advise ./orders/ --workload <workload hash>
+# Workload-level physical design (M6): choose a key set and knobs against recorded workloads, with Pareto frontier and receipts
+bellwether advise ./orders/ --workload <workload hash> --apply
 ```
 
 Every command takes `--json` and then prints its typed result as one JSON line, with each ledger record it wrote embedded with its hash: the same value the MCP server returns (ADR 010). Exit codes: 0 success, 1 a certificate failed or mismatches were found, 2 usage, 3 refused at the trust boundary, 4 engine error.
@@ -518,7 +519,7 @@ Pre-alpha. The architecture and on-disk format are fixed and documented; the cra
 - [x] **M3** receipts: `fix` writes one
 - [x] **M4** agent-first: the loop runs end to end from an MCP client
 - [x] **M5** the format frozen: storage version 2 (per-key counts, per-column bytes, per-key time bounds and bitemporal versions folded into key specs) and record version 3, with compatibility fixtures read byte for byte in CI (ADR 028); records moved to version 4 with tombstones, storage stays version 2
-- [ ] **M6** `advise` against your recorded workload: a key set and knobs chosen by exact replay, Pareto across runs, a receipt for every admitted change, no language model; the loss covers the relational operators (projection, joins, windows, aggregation input) exactly. `evolve --llm` and the rulebook are deferred (ADR 032, amended 2026-10-27)
+- [x] **M6** `advise` against your recorded workload: a key set and knobs chosen by exact replay, Pareto across runs, a receipt for every admitted change, no language model; the loss covers the relational operators (projection, joins, windows, aggregation input) exactly. `evolve --llm` and the rulebook are deferred (ADR 032, amended 2026-10-27)
 - [ ] **M7** a SQL table reconciles against a folder of files with a certificate; plans execute inside DataFusion and DuckDB without a sidecar step; receipts gate pull requests
 - [ ] **M8** receipts are signed (landed with [#10](https://github.com/vncp/bellwether/pull/10)); rule transfer and the exact-versus-estimated ablation are deferred with the rulebook
 
@@ -528,7 +529,7 @@ Built beyond the milestones: the time-series keys (partition values from paths, 
 
 Not built, or not yet measured:
 
-- **`advise`.** Designed and reduced ([`docs/evolve.md`](docs/evolve.md) §3.1, ADR 032); no code yet. `evolve --llm` and the rulebook are deferred.
+- **`evolve --llm` and rulebook v2 (WP13b/13c).** Deferred (ADR 032 amendment 2026-10-27); reduced stage 1 (`bellwether advise`, WP13a) is built.
 - **Multi-machine build.** Parked (WP22b); builds run on one machine.
 - **Performance.** Release-build measurements ([`docs/measured/2026-10-26-performance.md`](docs/measured/2026-10-26-performance.md), then [`2026-10-27-performance.md`](docs/measured/2026-10-27-performance.md)). WP22a found plan plus read lost to both a full scan and DuckDB in all 42 lookups, though it read far fewer bytes, because planning made one store round trip per indexed value. WP22b fixed that first: plan plus read now beats the full scan in 11 of 42 lookups and DuckDB in 3, and planning beats the full scan on the 10× `market` corpus at 10 and 300 keys. On folders a full scan reads in 4 to 5 ms it does not: a plan's fixed cost is about 13.5 ms, half of it the durable write of its evidence.
 

@@ -8,6 +8,7 @@ members = [
     "crates/bellwether-cli",
     "crates/bellwether-core",
     "crates/bellwether-ledger",
+    "crates/bellwether-evolve",
     "crates/bellwether-mcp",
     "crates/bellwether-profile",
     "crates/bellwether-replay",

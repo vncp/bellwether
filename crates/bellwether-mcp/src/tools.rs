@@ -605,6 +605,42 @@ pub struct ScoreVerify {
     pub wait: bool,
 }
 
+/// `score.advise`: workload-level physical design advisor (milestone M6).
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ScoreAdvise {
+    /// A single recorded workload hash.
+    #[serde(default)]
+    pub workload: Option<Hash>,
+    /// Multiple recorded workload hashes.
+    #[serde(default)]
+    pub workloads: Vec<Hash>,
+    /// A Parquet file of keys to record as a workload (read, never written).
+    #[serde(default)]
+    pub keys: Option<String>,
+    /// Key columns to take from `keys`, in tuple order; default: all.
+    #[serde(default)]
+    pub key_columns: Option<Vec<String>>,
+    /// Further key files (read, never written), each recorded as one more run.
+    #[serde(default)]
+    pub more_keys: Vec<String>,
+    /// Maximum number of key specs in a joint configuration D; default 3.
+    #[serde(default)]
+    pub max_keys: Option<u32>,
+    /// Optional cap on index segment bytes m(D).
+    #[serde(default)]
+    pub max_index_bytes: Option<u64>,
+    /// Preserve-and-extend per-run regression allowance δ on anchor runs; default 0.05.
+    #[serde(default)]
+    pub delta: Option<f64>,
+    /// Optional key-count gates to evaluate and tune.
+    #[serde(default)]
+    pub gates: Vec<Gate>,
+    /// Run in this call instead of returning a job id.
+    #[serde(default)]
+    pub wait: bool,
+}
+
 /// `propose.key`: propose an index key.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -864,6 +900,16 @@ pub fn catalog() -> Vec<ToolDef> {
             "The engine scores a proposal (a Replay) and verifies it (a Certificate, written \
              passing or failing); nothing is applied. Pass the certificate hash to \
              apply.receipt. Charged to the session budget. Returns a job id unless wait is true.",
+        ),
+        def::<ScoreAdvise>(
+            "score.advise",
+            Tier::Score,
+            false,
+            "Workload-level physical design advisor (M6): rule-driven key enumeration, \
+             subsumption, exact bloom FPR and gate descent, and Pareto frontier with anchors \
+             and delta. Writes engine Proposals and Replays for every frontier member so you \
+             can call score.verify and apply.receipt on any frontier member. Charged to the \
+             session budget. Returns a job id unless wait is true.",
         ),
         def::<ScoreRecord>(
             "score.record",

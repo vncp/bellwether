@@ -2633,3 +2633,194 @@ pub(crate) fn join_verify(r: &bellwether::JoinVerifyResult, out: &Out) -> String
     }
     s
 }
+
+/// `advise`: baseline, Pareto frontier table, anchor checks, discarded reasons,
+/// recommended configuration, and (with `--apply`) receipts.
+#[allow(clippy::too_many_lines)]
+pub(crate) fn advise(r: &bellwether::AdviseResult, out: &Out) -> String {
+    let mut s = String::new();
+    let total_runs: u64 = r.workloads.iter().map(|w| w.runs).sum();
+    let _ = writeln!(
+        s,
+        "{}",
+        heading(
+            out,
+            &format!(
+                "advise {} at manifest sequence {}: {} ({}), {} anchor(s), delta {:.1}%",
+                r.root,
+                r.sequence,
+                count(r.workloads.len() as u64, "workload", "workloads"),
+                count(total_runs, "run", "runs"),
+                num(r.anchors.len() as u64),
+                r.baseline.anchor_check.delta * 100.0
+            )
+        )
+    );
+    if let Some(ev) = &r.evidence.hash {
+        let _ = writeln!(s, "  profile evidence {ev}");
+    }
+    let base_cfg = if r.baseline.labels.is_empty() {
+        "none (raw/min-max baseline)".to_string()
+    } else {
+        r.baseline.labels.join(" + ")
+    };
+    let _ = writeln!(
+        s,
+        "  baseline a_0: {base_cfg}  total {} ({})  p95 {} ({})  max {} ({})  index {}",
+        num(r.baseline.objectives.total_bytes_read),
+        size(r.baseline.objectives.total_bytes_read),
+        num(r.baseline.objectives.p95_run_bytes_read),
+        size(r.baseline.objectives.p95_run_bytes_read),
+        num(r.baseline.objectives.max_run_bytes_read),
+        size(r.baseline.objectives.max_run_bytes_read),
+        size(r.baseline.objectives.estimated_index_bytes)
+    );
+
+    let _ = writeln!(s, "\n{}", heading(out, "Pareto frontier"));
+    let cfg_width = label_width(
+        r.frontier.iter().map(|e| {
+            if e.labels.is_empty() {
+                "a_0 (baseline)"
+            } else {
+                e.labels[0].as_str()
+            }
+        }),
+        32,
+    )
+    .max(
+        r.frontier
+            .iter()
+            .map(|e| e.labels.join(" + ").len())
+            .max()
+            .unwrap_or(32),
+    );
+    let _ = writeln!(
+        s,
+        "  {:<4} {:<cfg_width$} {:>16} {:>16} {:>14} {:>14}  replay",
+        "rank", "configuration", "total bytes", "p95 bytes", "est. index", "crowding"
+    );
+    for e in &r.frontier {
+        let cfg_name = if e.is_baseline && e.labels.is_empty() {
+            "a_0 (baseline)".to_string()
+        } else if e.is_baseline {
+            format!("a_0 ({})", e.labels.join(" + "))
+        } else {
+            e.labels.join(" + ")
+        };
+        let replay_str = match e.replays.first() {
+            Some(h) if e.replays.len() == 1 => short(h),
+            Some(h) => format!("{} (+{})", short(h), e.replays.len() - 1),
+            None => "-".to_string(),
+        };
+        let crowd_str = if e.crowding_distance >= 999_999_999.0 {
+            "boundary".to_string()
+        } else {
+            format!("{:.3}", e.crowding_distance)
+        };
+        let mark = if e.is_recommended { " *" } else { "" };
+        let _ = writeln!(
+            s,
+            "  {:<4} {:<cfg_width$} {:>16} {:>16} {:>14} {:>14}  {replay_str}{mark}",
+            e.rank,
+            cfg_name,
+            num(e.objectives.total_bytes_read),
+            num(e.objectives.p95_run_bytes_read),
+            size(e.objectives.estimated_index_bytes),
+            crowd_str
+        );
+    }
+
+    if !r.bloom_sweeps.is_empty() {
+        let _ = writeln!(s, "\n{}", heading(out, "Bloom FPR descent"));
+        for sw in &r.bloom_sweeps {
+            let _ = writeln!(
+                s,
+                "  bloom:{}  chosen fpr {} ({} grid points evaluated)",
+                sw.columns.join(","),
+                sw.chosen_fpr,
+                sw.points.len()
+            );
+        }
+    }
+
+    if !r.discarded.is_empty() {
+        let mut by_reason: std::collections::BTreeMap<&str, usize> =
+            std::collections::BTreeMap::new();
+        for d in &r.discarded {
+            *by_reason.entry(d.reason.as_str()).or_default() += 1;
+        }
+        let summary: Vec<String> = by_reason
+            .into_iter()
+            .map(|(k, n)| format!("{n} {k}"))
+            .collect();
+        let _ = writeln!(
+            s,
+            "\n{} ({}: {})",
+            heading(out, "Discarded candidates"),
+            count(r.discarded.len() as u64, "candidate", "candidates"),
+            summary.join(", ")
+        );
+        for d in r.discarded.iter().take(10) {
+            let _ = writeln!(
+                s,
+                "  {}  [{}] {}",
+                d.labels.join(" + "),
+                d.reason.as_str(),
+                d.detail
+            );
+        }
+    }
+
+    match &r.recommended {
+        Some(rec) => {
+            let _ = writeln!(
+                s,
+                "\n{}: {} (frontier rank {}, proposal {}, replay {})",
+                heading(out, "recommended"),
+                rec.labels.join(" + "),
+                rec.frontier_rank,
+                rec.proposal,
+                rec.replays
+                    .first()
+                    .map_or_else(|| "-".to_string(), ToString::to_string)
+            );
+            let _ = writeln!(
+                s,
+                "  bytes read: {} ({}) -> {} ({}), est. index {}",
+                num(rec.baseline_bytes),
+                size(rec.baseline_bytes),
+                num(rec.proposed_bytes),
+                size(rec.proposed_bytes),
+                size(rec.estimated_index_bytes)
+            );
+        }
+        None => {
+            let _ = writeln!(
+                s,
+                "\n{}: baseline a_0 (no candidate configuration improved total bytes within anchor budget delta)",
+                heading(out, "recommended")
+            );
+        }
+    }
+
+    if !r.receipts.is_empty() {
+        let _ = writeln!(
+            s,
+            "\n{}: manifest {} -> {}",
+            heading(out, "applied"),
+            r.sequence,
+            r.sequence_after
+        );
+        for h in &r.receipts {
+            let _ = writeln!(s, "  receipt {h}");
+        }
+        for sig in &r.signatures {
+            let _ = writeln!(
+                s,
+                "  signed {} {} with key {} ({})",
+                sig.kind, sig.record, sig.key_id, sig.path
+            );
+        }
+    }
+    s
+}

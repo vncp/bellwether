@@ -85,7 +85,7 @@ The rule (the WP22 brief, [ADR 019](../adr/019-benchmark-design-is-fixed-before-
 | **H7** reconcile groups its later passes by a distinct-key count (HyperLogLog) from the first pass | reconcile on the small rung at 256 MiB, before vs after (H4 and the batched decode included) | 3 passes, 13.9 s | 2 passes, 11.8 s | −14.9% | **kept**; not isolated by its own pair. On taxi, keys are about as many as rows, so the pass counts did not change |
 | **Item 0** reconcile decodes a row group in batches of 8,192 rows (`Source::read_column_batches`) | peak physical footprint, small rung at 64 MiB | 1,615.9 MiB | 71.6 MiB | −95.6% | **kept**: a defect fix, not a speedup ([below](#reconcile-memory)) |
 | **Ledger listing** one listing of `ledger/` per command (`SignatureIndex`) | `ledger receipts` over the 10,000-file ledger, warm | 47.1 s | 0.31 s | −99.3% | **kept**; `ledger scorecard` 298 → 183 ms |
-| **H9** fsync once per commit, or not per staged file | see [H9](#h9-the-largest-remaining-candidate) | | | | **not taken** in S1 |
+| **H9** fsync once per commit, or not per staged file | see [H9](#h9-the-largest-remaining-candidate) | | | | **not taken** in S1; **resolved in WP22c** ([ADR 034](../adr/034-commit-boundary-durability-on-local-stores.md)) |
 | **H1** parallel reconcile passes; **H2** finer build work items on the ledger rung | | | | | **not taken** in S1 |
 | **H8** bitmap, bloom, and block-directory work in planning | | | | | superseded by C3 and C4: the bitmap path is now 0.0% of every profile ([generated](#profiles)) |
 
@@ -101,7 +101,7 @@ Every durable write the local store makes syncs its file and then its directory 
 | `index` of `market-default`, all threads, a fresh index | 91.7 ms | 28.4 ms | −69% |
 | `latest`, 10 keys, `market-default` | 13.0 ms | 6.5 ms | −50% |
 
-When the two binaries alternated run by run instead, the builds took 861.2 against 133.2 ms and 292.5 against 43.5 ms: each sync also waits on the other binary's writes, so the upper bound depends on what else writes to the disk. **It is not taken in S1**: syncing less changes the local store's durability contract (what a crash may lose, and whether a manifest can name a segment that did not reach the disk). That needs a store-durability ADR, with crash-consistency tests, before any code changes.
+When the two binaries alternated run by run instead, the builds took 861.2 against 133.2 ms and 292.5 against 43.5 ms: each sync also waits on the other binary's writes, so the upper bound depends on what else writes to the disk. **It is not taken in S1**: syncing less changes the local store's durability contract (what a crash may lose, and whether a manifest can name a segment that did not reach the disk). That needs a store-durability ADR, with crash-consistency tests, before any code changes. **Resolved in WP22c ([ADR 034](../adr/034-commit-boundary-durability-on-local-stores.md)):** segment and rebuildable cache writes stage and atomically rename without per-file `sync_all`, and `commit` calls `StoreExt::sync_segments` once before CASing `manifest.json`, while conditional writes and ledger records keep per-write `sync_all`.
 
 ## Byte identity
 
@@ -128,7 +128,7 @@ Computed from the two `perf.json` files (`reconcile/<pair>/<budget>/peak-footpri
 | taxi | 8G | 2 / 2 | 5,507.1 | 7,316.8 | 7,572.3 | 8,484.8 **(over)** | 8,590.2 / 8,449.1 |
 
 - **The small rung's defect is fixed.** At 64 MiB the footprint went from 1,615.9 MiB, 4.5 times its bound, to 71.6 MiB. Every budget on the rung is now under its bound on both measures, and so is every taxi budget up to 1 GiB.
-- **Taxi at 8 GiB: peak RSS is 0.4% over the bound.** RSS reached 8,484.8 MiB against an 8,449.1 MiB bound, while the footprint (7,316.8 MiB) is under it. Before, RSS was 7,572.3 MiB, under a bound 141 MiB larger (its batch was a whole 142 MiB row group). Two more runs of each binary at 8 GiB alone (not merged into `perf.json`) gave the same peaks to within 0.01%: after, RSS 8,484.4 and 8,484.6 MiB and footprint 7,317.0 and 7,317.1 MiB; before, RSS 7,572.1 and 7,572.3 MiB and footprint 5,506.8 and 5,507.1 MiB. So the rise is not noise: at 8 GiB on taxi the footprint went up by 1,810 MiB (33%) and the wall time by 8 to 11%. The meter's peak is the same in both builds (4,955.4 MiB), so the extra memory is outside the accounted state; its cause is not isolated here, and it is an open item ([below](#storage-version-3-and-next-candidates)). The local budget for this metric is capped at the bound, so `bench perf-check` without `--runner` reports it until it is resolved; CI does not run taxi.
+- **Taxi at 8 GiB: peak RSS is 0.4% over the bound.** RSS reached 8,484.8 MiB against an 8,449.1 MiB bound, while the footprint (7,316.8 MiB) is under it. Before, RSS was 7,572.3 MiB, under a bound 141 MiB larger (its batch was a whole 142 MiB row group). Two more runs of each binary at 8 GiB alone (not merged into `perf.json`) gave the same peaks to within 0.01%: after, RSS 8,484.4 and 8,484.6 MiB and footprint 7,317.0 and 7,317.1 MiB; before, RSS 7,572.1 and 7,572.3 MiB and footprint 5,506.8 and 5,507.1 MiB. So the rise is not noise: at 8 GiB on taxi the footprint went up by 1,810 MiB (33%) and the wall time by 8 to 11%. The meter's peak is the same in both builds (4,955.4 MiB), so the extra memory is outside the accounted state; its cause is not isolated here, and it is an open item ([below](#storage-version-3-and-next-candidates)). The local budget for this metric is capped at the bound, so `bench perf-check` without `--runner` reports it until it is resolved; CI does not run taxi. **Closed in WP22c:** `reconcile::attempt` now clears and reuses `PassState`'s `MeteredMap` bucket tables across passes instead of dropping and reallocating a multi-GiB table in a second virtual region on pass 2 (`Scratch` is also trimmed per pass, and `ParquetSource::decode` drops the intermediate batch before handing the projected batch to `f`).
 
 ## Resident bytes per key
 
@@ -146,12 +146,12 @@ H5's hash map holds 379 more bytes per open key than the ordered map it replaced
 
 No S1 change touches a persisted byte, so nothing here is a storage version 3 change yet.
 
-- **H9 (fsync), the largest remaining candidate:** measured upper bound −82% on a `market-10x` build, −69% on a `market-default` build, and −50% on a 10-key plan ([H9](#h9-the-largest-remaining-candidate)); not taken in S1, it needs a store-durability ADR with crash-consistency tests.
+- **H9 (fsync), resolved in WP22c ([ADR 034](../adr/034-commit-boundary-durability-on-local-stores.md)):** measured upper bound −82% on a `market-10x` build, −69% on a `market-default` build, and −50% on a 10-key plan ([H9](#h9-the-largest-remaining-candidate)); not taken in S1, resolved in WP22c with `StoreExt::sync_segments` at the commit boundary and atomic non-synced `cache/` writes.
 - **The plan floor after H9:** parsing the manifest is 8.4% of a small plan's main-thread wall time and pinning it 6.0%; a smaller manifest is a candidate once H9 is decided.
 - **H1, parallel reconcile passes,** unchanged from the 2026-10-26 document: reconcile still runs on one thread.
 - **H2, the ledger rung's build** still uses about one worker: throughput is 18.5 row groups per second on one thread and 21.8 on all.
 - **Resident overhead:** charging the segment writer's measured bytes per key to the caps (build and replay).
-- **Open: reconcile on taxi at 8 GiB** holds 1,810 MiB more footprint than before, outside the meter, and its RSS is 0.4% over the stated bound ([Reconcile memory](#reconcile-memory)). It needs a heap profile of the two builds at that budget.
+- **Closed in WP22c: reconcile on taxi at 8 GiB** held 1,810 MiB more footprint than before, outside the meter, with RSS 0.4% over the stated bound ([Reconcile memory](#reconcile-memory)); `reconcile::attempt` now reuses `PassState`'s hash tables across passes (`MeteredMap::clear`) and trims per-row scratch buffers after each pass.
 
 ## How it ran
 

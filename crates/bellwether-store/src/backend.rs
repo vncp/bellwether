@@ -211,6 +211,15 @@ pub trait StoreExt: Store {
         page_size: usize,
         f: &mut dyn FnMut(&[ObjectMeta]) -> Result<ControlFlow<()>>,
     ) -> Result<()>;
+    /// Flushes newly written segments under `<root>/segments/` before the
+    /// manifest is committed (ADR 034). On the local backend, segment
+    /// writes are atomic staging + rename without per-segment `sync_all`,
+    /// and this barrier fsyncs the segments directory once before
+    /// `manifest.json` is updated; on other backends it is a no-op.
+    fn sync_segments(&self, root: &str) -> Result<()> {
+        let _ = root;
+        Ok(())
+    }
 }
 
 /// The backend's private runtime. Dropping a tokio runtime from inside an
@@ -475,7 +484,7 @@ impl Store for ObjectStoreBackend {
 
     fn put_content_addressed(&self, path: &str, body: Bytes) -> Result<()> {
         if let Some(target) = self.local_target(path)? {
-            return local::put_overwrite(&target, &body);
+            return local::put_content_addressed(path, &target, &body);
         }
         let location = obj_path(path)?;
         self.block_on(async {
@@ -575,6 +584,14 @@ impl StoreExt for ObjectStoreBackend {
         }
         if !page.is_empty() {
             let _ = f(&page)?;
+        }
+        Ok(())
+    }
+
+    fn sync_segments(&self, root: &str) -> Result<()> {
+        let dir_path = crate::manifest::join(root, crate::manifest::SEGMENTS_DIR);
+        if let Some(target) = self.local_target(&dir_path)? {
+            local::sync_dir_if_exists(&target)?;
         }
         Ok(())
     }

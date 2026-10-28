@@ -71,6 +71,7 @@ fn the_tools_are_the_tiers_and_nothing_else() {
             ("observe.join_verify", Tier::Observe),
             ("score.why", Tier::Score),
             ("score.verify", Tier::Score),
+            ("score.advise", Tier::Score),
             ("score.record", Tier::Score),
             ("propose.key", Tier::Propose),
             ("propose.layout", Tier::Propose),
