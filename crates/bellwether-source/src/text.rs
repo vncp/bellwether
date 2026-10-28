@@ -355,18 +355,20 @@ impl<S: Storage> ChunkedTextSource<S> {
     /// Never lists a file under `dir`: discovery and schema inference skip
     /// it. For an index location inside the data root, whose own `.json`
     /// files (a single-line JSON object is valid JSON lines) would otherwise
-    /// be read as data. `dir` is compared as listed paths are spelled.
+    /// be read as data. `dir` is compared as listed paths are spelled, with
+    /// the platform's separators (`\` as well as `/` on Windows).
     #[must_use]
     pub fn with_excluded(mut self, dir: impl Into<String>) -> Self {
         let dir = dir.into();
-        self.excluded.push(dir.trim_end_matches('/').to_string());
+        self.excluded
+            .push(dir.trim_end_matches(std::path::is_separator).to_string());
         self
     }
 
     fn is_excluded(&self, path: &str) -> bool {
         self.excluded.iter().any(|d| {
             path.strip_prefix(d.as_str())
-                .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
+                .is_some_and(|rest| rest.is_empty() || rest.starts_with(std::path::is_separator))
         })
     }
 

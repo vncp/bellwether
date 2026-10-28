@@ -212,10 +212,12 @@ pub trait StoreExt: Store {
         f: &mut dyn FnMut(&[ObjectMeta]) -> Result<ControlFlow<()>>,
     ) -> Result<()>;
     /// Flushes newly written segments under `<root>/segments/` before the
-    /// manifest is committed (ADR 034). On the local backend, segment
+    /// manifest is committed (ADR 034). On the local backend on Unix, segment
     /// writes are atomic staging + rename without per-segment `sync_all`,
     /// and this barrier fsyncs the segments directory once before
-    /// `manifest.json` is updated; on other backends it is a no-op.
+    /// `manifest.json` is updated. On Windows, which has no directory sync,
+    /// each segment is fsynced as it is written and this barrier does
+    /// nothing; on other backends it is a no-op.
     fn sync_segments(&self, root: &str) -> Result<()> {
         let _ = root;
         Ok(())
@@ -404,13 +406,19 @@ impl ObjectStoreBackend {
         })
     }
 
-    /// For the local backend, the filesystem path of a store path.
+    /// For the local backend, the filesystem path of a store path. The root
+    /// is canonical, which on Windows is a verbatim (`\\?\`) path where `/`
+    /// is not a separator, so each part is pushed as its own component.
     fn local_target(&self, path: &str) -> Result<Option<PathBuf>> {
         let Some(root) = self.local_root.as_ref() else {
             return Ok(None);
         };
         let location = obj_path(path)?;
-        Ok(Some(root.join(location.as_ref())))
+        let mut target = root.clone();
+        for part in location.parts() {
+            target.push(part.as_ref());
+        }
+        Ok(Some(target))
     }
 }
 

@@ -76,6 +76,31 @@ bellwether fix ./orders/ --proposal <proposal hash> --workload <workload hash>
 
 No data at hand? `bellwether bench generate --out demo` writes a synthetic versioned ledger, `bellwether bench workload --corpus demo` records runs of lookups against it, and `bellwether why demo/data --bench-workload demo` starts from there. The `why`, `fix`, `report`, and MCP captures in this README start that way, on a smaller corpus; the time-series capture uses `bellwether bench market`. [`scripts/readme-captures.sh`](scripts/readme-captures.sh) has the exact commands.
 
+## Platforms
+
+One executable, `bellwether`, carries the CLI and the MCP server (`bellwether mcp`). [`.github/workflows/release.yml`](.github/workflows/release.yml) builds it with `--release --locked` for four targets and, on a `v*` tag, publishes each as `bellwether-<tag>-<target>.tar.gz`, the executable alone at the archive root, beside `checksums.txt`:
+
+| Platform | Target | Executable in the archive |
+|---|---|---|
+| Linux x86_64 (WSL included) | `x86_64-unknown-linux-gnu` | `bellwether` |
+| Linux arm64 | `aarch64-unknown-linux-gnu` | `bellwether` |
+| macOS on Apple silicon | `aarch64-apple-darwin` | `bellwether` |
+| Windows x64, native | `x86_64-pc-windows-msvc` | `bellwether.exe` |
+
+There is no archive for macOS on Intel, Windows on Arm, 32-bit, or musl Linux: build from source there (`cargo install` above; on Windows with the MSVC toolchain). The standalone `bellwether-mcp` binary is built from source only (`cargo install --locked --git https://github.com/vncp/bellwether bellwether-mcp`); `bellwether mcp` is the same server. The Windows executable links the C runtime statically, so it needs no Visual C++ Redistributable. Check an archive against `checksums.txt` before unpacking it; Windows 10 and later ship `tar`:
+
+```powershell
+(Get-FileHash bellwether-<tag>-x86_64-pc-windows-msvc.tar.gz -Algorithm SHA256).Hash.ToLower()  # equals its line in checksums.txt
+tar -xzf bellwether-<tag>-x86_64-pc-windows-msvc.tar.gz   # → bellwether.exe
+.\bellwether.exe --version
+```
+
+On Linux and macOS, `sha256sum -c --ignore-missing checksums.txt`, then `tar -xzf bellwether-<tag>-<target>.tar.gz`.
+
+Native Windows scope: [`.github/workflows/windows.yml`](.github/workflows/windows.yml) builds and tests the workspace's default features on `windows-latest`, runs the CLI on real Parquet (`why`, repeated `index`, `reconcile`) and the MCP server over stdio, and runs the Action's installer test under Git Bash. What runs outside the default features or outside the process is tested on Linux only: emitted scans executed in DataFusion (the `datafusion` feature), the DuckDB CLI, and Spark; DuckDB tables through its ADBC driver library; SQL Server through ODBC (the `odbc` feature, not in the release build); and ClickHouse (a service container). On Windows each needs its own install (a DuckDB or ADBC driver DLL named by `driver=` or `BELLWETHER_DUCKDB_DRIVER`, an ODBC driver manager, Java and PySpark, a reachable service) and is not exercised natively.
+
+The [Action](#gate-a-pull-request) installs the release executable on Linux, macOS on Apple silicon, and native Windows runners (its `bash` shell is Git Bash; WSL counts as Linux), checked against `checksums.txt` first, or builds it from the Action's own ref with `version: build`. The gate itself is tested on `ubuntu-latest`.
+
 ## How it works
 
 Bellwether is a standalone index and query advisor for Parquet lakes, written in Rust. Point it at a folder of files. It measures which columns actually discriminate rows, replays your real query keys against hypothetical indexes to compute exact savings, builds a row-group-precision index with composite and point-in-time keys, and attests every change with a reconciliation receipt.
@@ -97,6 +122,7 @@ An agent (or a person) may **observe** and **propose**. Only the engine may **sc
 - [What you can do with it](#what-you-can-do-with-it)
 - [In one minute](#in-one-minute)
 - [Thirty-second start](#thirty-second-start)
+- [Platforms](#platforms)
 - [How it works](#how-it-works)
 - [Results](#results)
 - [Highlights](#highlights)

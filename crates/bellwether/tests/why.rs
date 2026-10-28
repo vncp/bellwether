@@ -498,6 +498,7 @@ fn a_candidate_that_saves_nothing_is_not_recommended() {
 /// A read-only index that exists: `why` profiles in memory with the index's
 /// manifest (the Evidence names its sequence), records nothing, and says how
 /// to record it; `--columns` limits the profile's candidates.
+#[cfg(unix)]
 #[test]
 fn why_on_a_read_only_index_profiles_in_memory_with_its_manifest() {
     use std::os::unix::fs::PermissionsExt;

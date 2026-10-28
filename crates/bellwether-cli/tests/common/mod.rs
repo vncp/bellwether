@@ -152,6 +152,32 @@ pub fn path(p: &Path) -> &str {
     p.to_str().unwrap()
 }
 
+/// `file` (a recorded path) relative to `base`, an already canonical
+/// directory, with `/` separators on every platform.
+pub fn rel_under(base: &Path, file: &str) -> String {
+    Path::new(file)
+        .strip_prefix(base)
+        .unwrap_or_else(|_| panic!("{file} is not under {}", base.display()))
+        .to_str()
+        .unwrap()
+        .replace(std::path::MAIN_SEPARATOR, "/")
+}
+
+/// Makes `link` a symbolic link to the directory `target`. `false`, with a
+/// `SKIPPED:` note, only on Windows without the privilege to create one
+/// (`ERROR_PRIVILEGE_NOT_HELD`: neither elevation nor Developer Mode).
+pub fn dir_symlink(target: &Path, link: &Path) -> bool {
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(target, link).unwrap();
+    #[cfg(windows)]
+    if let Err(e) = std::os::windows::fs::symlink_dir(target, link) {
+        assert_eq!(e.raw_os_error(), Some(1314), "{e}");
+        eprintln!("SKIPPED: cannot create a directory symlink here ({e})");
+        return false;
+    }
+    true
+}
+
 pub fn index_dir(root: &Path) -> PathBuf {
     root.join(".bellwether")
 }

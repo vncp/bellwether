@@ -131,41 +131,46 @@ fn probe_observe_records_only_where_it_can_write() {
     // A read-only data root and no --index: observe still succeeds, the
     // Evidence is returned unrecorded with one line naming --index, and
     // nothing is written; recording keys fails with a one-line remedy
-    // naming --index; with --index elsewhere it works.
-    let data = dir.path().join("data");
-    ledger_corpus(&data, 1, 2, 10, 5);
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(&data, std::fs::Permissions::from_mode(0o555)).unwrap();
-    let e = Engine::open(data.to_str().unwrap(), EngineOptions::default()).unwrap();
-    let w = e.why(&WhyRequest::default()).unwrap();
-    assert_eq!(w.dataset.files, 1);
-    assert!(!w.evidence.recorded && w.evidence.hash.is_none());
-    let note = w.evidence.note.as_deref().unwrap();
-    assert!(note.contains("--index") && !note.contains('\n'), "{note}");
-    assert_ne!(w.profile.fanout.len(), 0, "profiled in memory");
-    assert!(!data.join(".bellwether").exists(), "nothing written");
-    let kf = dir.path().join("k.parquet");
-    write_keys(&kf, "id", &[1]);
-    let keyed = WhyRequest {
-        keys: Some(KeyFile::new(&kf)),
-        ..WhyRequest::default()
-    };
-    let err = e.why(&keyed).unwrap_err().to_string();
-    assert!(err.contains("--index") && !err.contains('\n'), "{err}");
-    let elsewhere = dir.path().join("idx");
-    let e = Engine::open(
-        data.to_str().unwrap(),
-        EngineOptions {
-            index: Some(elsewhere.to_str().unwrap().into()),
-            ..EngineOptions::default()
-        },
-    )
-    .unwrap();
-    let w = e.why(&keyed).unwrap();
-    assert!(w.evidence.recorded);
-    assert_eq!(w.candidates[0].spec.name(), "exact:id");
-    assert!(elsewhere.join("ledger").exists());
-    std::fs::set_permissions(&data, std::fs::Permissions::from_mode(0o755)).unwrap();
+    // naming --index; with --index elsewhere it works. Read-only directory
+    // modes are Unix semantics (Windows ignores the read-only attribute on
+    // directories).
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let data = dir.path().join("data");
+        ledger_corpus(&data, 1, 2, 10, 5);
+        std::fs::set_permissions(&data, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let e = Engine::open(data.to_str().unwrap(), EngineOptions::default()).unwrap();
+        let w = e.why(&WhyRequest::default()).unwrap();
+        assert_eq!(w.dataset.files, 1);
+        assert!(!w.evidence.recorded && w.evidence.hash.is_none());
+        let note = w.evidence.note.as_deref().unwrap();
+        assert!(note.contains("--index") && !note.contains('\n'), "{note}");
+        assert_ne!(w.profile.fanout.len(), 0, "profiled in memory");
+        assert!(!data.join(".bellwether").exists(), "nothing written");
+        let kf = dir.path().join("k.parquet");
+        write_keys(&kf, "id", &[1]);
+        let keyed = WhyRequest {
+            keys: Some(KeyFile::new(&kf)),
+            ..WhyRequest::default()
+        };
+        let err = e.why(&keyed).unwrap_err().to_string();
+        assert!(err.contains("--index") && !err.contains('\n'), "{err}");
+        let elsewhere = dir.path().join("idx");
+        let e = Engine::open(
+            data.to_str().unwrap(),
+            EngineOptions {
+                index: Some(elsewhere.to_str().unwrap().into()),
+                ..EngineOptions::default()
+            },
+        )
+        .unwrap();
+        let w = e.why(&keyed).unwrap();
+        assert!(w.evidence.recorded);
+        assert_eq!(w.candidates[0].spec.name(), "exact:id");
+        assert!(elsewhere.join("ledger").exists());
+        std::fs::set_permissions(&data, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
 }
 
 #[test]

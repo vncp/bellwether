@@ -1,11 +1,16 @@
 #!/usr/bin/env bash
 # install.sh's release-download and checksum verification path against a
-# stand-in for `gh release download`:
-#   (a) a valid checksum passes, unpacks `bellwether`, and appends its bin dir
-#       to GITHUB_PATH;
+# stand-in for `gh release download`, for the host's own release target and,
+# on a host that is not Windows, for x86_64-pc-windows-msvc as native Git
+# Bash reports it (stand-ins for `uname` and `cygpath`). For each target:
+#   (a) a valid checksum passes, unpacks the target's executable (`bellwether`,
+#       or `bellwether.exe` on Windows) and nothing else, and appends its bin
+#       dir to GITHUB_PATH (in Windows form on Windows);
 #   (b) a tampered archive fails with non-zero exit before unpacking;
 #   (c) a missing or duplicate entry in checksums.txt fails with exit 2 and
-#       the expected error message.
+#       the expected error message;
+#   (d) an archive whose root does not hold the target's executable name
+#       fails with exit 2 and installs nothing.
 set -euo pipefail
 
 here=$(cd "$(dirname "$0")" && pwd)
@@ -16,15 +21,20 @@ case "$(uname -s)-$(uname -m)" in
   Linux-x86_64) host_target=x86_64-unknown-linux-gnu ;;
   Linux-aarch64) host_target=aarch64-unknown-linux-gnu ;;
   Darwin-arm64) host_target=aarch64-apple-darwin ;;
+  MINGW*-x86_64|MSYS*-x86_64) host_target=x86_64-pc-windows-msvc ;;
   *) echo "unsupported host $(uname -s)-$(uname -m)" >&2; exit 2 ;;
 esac
 
 tag="v0.1.0"
-host_asset="bellwether-$tag-$host_target.tar.gz"
-linux_asset="bellwether-$tag-x86_64-unknown-linux-gnu.tar.gz"
+windows_target=x86_64-pc-windows-msvc
 
-mkdir -p "$work/src" "$work/release" "$work/bin"
-cat > "$work/src/bellwether" <<'FAKE'
+mkdir -p "$work/src" "$work/release" "$work/bin" "$work/windows-bin"
+
+# The stand-in binary under both names an archive may hold it by. Git Bash
+# runs a file by its contents (a #! line), so a script named bellwether.exe
+# runs there as it does on Linux and macOS.
+for exe in bellwether bellwether.exe; do
+  cat > "$work/src/$exe" <<'FAKE'
 #!/usr/bin/env bash
 if [ "${1:-}" = "--version" ]; then
   echo "bellwether 0.1.0"
@@ -33,28 +43,26 @@ fi
 echo "unexpected args: $*" >&2
 exit 1
 FAKE
-chmod +x "$work/src/bellwether"
+  chmod +x "$work/src/$exe"
+done
 
-# Pack both bellwether-v0.1.0-x86_64-unknown-linux-gnu.tar.gz and the current
-# host's target archive with `bellwether` at the archive root.
-COPYFILE_DISABLE=1 tar -C "$work/src" -czf "$work/release/$linux_asset" bellwether
-if [ "$host_asset" != "$linux_asset" ]; then
-  cp "$work/release/$linux_asset" "$work/release/$host_asset"
+# install.sh checks the archive with `sha256sum -c -`. Where the host's
+# sha256sum cannot (none, or macOS's BSD one), a stand-in first on PATH runs
+# a checker that can by its absolute path, never `sha256sum` by name, which
+# would find the stand-in itself again.
+printf 'probe' > "$work/probe"
+if ! (cd "$work" && sha256sum probe 2>/dev/null | sha256sum -c - >/dev/null 2>&1); then
+  if checker=$(command -v gsha256sum); then
+    run_checker=$(printf '%q' "$checker")
+  elif checker=$(command -v shasum); then
+    run_checker="$(printf '%q' "$checker") -a 256"
+  else
+    echo "no SHA-256 checker that supports -c on this host" >&2
+    exit 2
+  fi
+  printf '#!/usr/bin/env bash\nexec %s "$@"\n' "$run_checker" > "$work/bin/sha256sum"
+  chmod +x "$work/bin/sha256sum"
 fi
-
-# Ensure a GNU-compatible `sha256sum` (supporting `-c -`) is first on PATH on
-# macOS hosts where `/sbin/sha256sum` is BSD digest without `-c`.
-cat > "$work/bin/sha256sum" <<'SHASUM'
-#!/usr/bin/env bash
-if command -v gsha256sum >/dev/null 2>&1; then
-  exec gsha256sum "$@"
-elif command -v shasum >/dev/null 2>&1; then
-  exec shasum -a 256 "$@"
-else
-  exec /usr/bin/env sha256sum "$@"
-fi
-SHASUM
-chmod +x "$work/bin/sha256sum"
 
 cat > "$work/bin/gh" <<'STUB'
 #!/usr/bin/env bash
@@ -84,6 +92,22 @@ done
 STUB
 chmod +x "$work/bin/gh"
 
+# Native Windows Git Bash as install.sh sees it, for hosts that are not.
+cat > "$work/windows-bin/uname" <<'STUB'
+#!/usr/bin/env bash
+case "$*" in
+  -s) echo MINGW64_NT-10.0-20348 ;;
+  -m) echo x86_64 ;;
+  *) echo "stub uname: unexpected $*" >&2; exit 2 ;;
+esac
+STUB
+cat > "$work/windows-bin/cygpath" <<'STUB'
+#!/usr/bin/env bash
+[ "$#" -eq 2 ] && [ "$1" = -w ] || { echo "stub cygpath: unexpected $*" >&2; exit 2; }
+printf 'windows-form:%s\n' "$2"
+STUB
+chmod +x "$work/windows-bin/uname" "$work/windows-bin/cygpath"
+
 export PATH="$work/bin:$PATH"
 export RELEASE_DIR="$work/release"
 export EXPECTED_TAG="$tag"
@@ -91,102 +115,110 @@ export EXPECTED_REPO="vncp/bellwether"
 export BELLWETHER_VERSION="$tag"
 export BELLWETHER_RELEASES="vncp/bellwether"
 
-(cd "$work/release" && "$work/bin/sha256sum" "$host_asset" > "$work/good-checksums.txt")
-
-# (a) Valid checksum passes and puts `bellwether` on GITHUB_PATH.
-cp "$work/good-checksums.txt" "$work/release/checksums.txt"
-export RUNNER_TEMP="$work/run-valid"
-export GITHUB_PATH="$work/run-valid/github_path"
-mkdir -p "$RUNNER_TEMP"
-: > "$GITHUB_PATH"
-
-out=$("$here/../install.sh" 2>&1)
-echo "$out" | grep -qxF "bellwether 0.1.0" || {
-  echo "FAIL (a): expected 'bellwether 0.1.0' output, got: $out" >&2
-  exit 1
-}
-grep -qxF "$RUNNER_TEMP/bellwether-bin" "$GITHUB_PATH" || {
-  echo "FAIL (a): $RUNNER_TEMP/bellwether-bin not written to GITHUB_PATH" >&2
-  exit 1
-}
-[ -x "$RUNNER_TEMP/bellwether-bin/bellwether" ] || {
-  echo "FAIL (a): unpacked bellwether is missing or not executable" >&2
-  exit 1
+# pack <member> <asset>: a release archive holding <member> at its root.
+pack() {
+  (cd "$work/src" && COPYFILE_DISABLE=1 tar -czf - "$1") > "$work/release/$2"
 }
 
-# (b) Tampered archive fails with non-zero exit before unpacking.
-cp "$work/release/$host_asset" "$work/good-archive.tar.gz"
-printf 'tampered' >> "$work/release/$host_asset"
-export RUNNER_TEMP="$work/run-tampered"
-export GITHUB_PATH="$work/run-tampered/github_path"
-mkdir -p "$RUNNER_TEMP"
-: > "$GITHUB_PATH"
+# run_install <run>: install.sh with a fresh RUNNER_TEMP and GITHUB_PATH;
+# sets `out` and `code`.
+run_install() {
+  export RUNNER_TEMP="$work/run-$1"
+  export GITHUB_PATH="$RUNNER_TEMP/github_path"
+  mkdir -p "$RUNNER_TEMP"
+  : > "$GITHUB_PATH"
+  set +e
+  out=$("$here/../install.sh" 2>&1)
+  code=$?
+  set -e
+}
 
-set +e
-out=$("$here/../install.sh" 2>&1)
-code=$?
-set -e
-cp "$work/good-archive.tar.gz" "$work/release/$host_asset"
-if [ "$code" -eq 0 ]; then
-  echo "FAIL (b): tampered archive succeeded" >&2
-  exit 1
-fi
-if [ -e "$RUNNER_TEMP/bellwether-bin/bellwether" ]; then
-  echo "FAIL (b): tampered archive was unpacked despite checksum mismatch" >&2
-  exit 1
-fi
-if [ -s "$GITHUB_PATH" ]; then
-  echo "FAIL (b): GITHUB_PATH was modified on tampered archive" >&2
-  exit 1
-fi
-
-# (c.1) Missing entry in checksums.txt fails with exit 2 and the expected error message.
-printf '0000000000000000000000000000000000000000000000000000000000000000  bellwether-v0.1.0-other-target.tar.gz\n' \
-  > "$work/release/checksums.txt"
-export RUNNER_TEMP="$work/run-missing"
-export GITHUB_PATH="$work/run-missing/github_path"
-mkdir -p "$RUNNER_TEMP"
-: > "$GITHUB_PATH"
-
-set +e
-out=$("$here/../install.sh" 2>&1)
-code=$?
-set -e
-if [ "$code" -ne 2 ]; then
-  echo "FAIL (c.1): expected exit 2 for missing checksum entry, got $code ($out)" >&2
-  exit 1
-fi
-echo "$out" | grep -qE "^::error::checksums\\.txt of $tag lists $host_asset +0 times, not once$" || {
-  echo "FAIL (c.1): unexpected error message: $out" >&2
+fail() {
+  echo "FAIL ($target $1): $2" >&2
+  echo "$out" >&2
   exit 1
 }
-if [ -e "$RUNNER_TEMP/bellwether-bin/bellwether" ]; then
-  echo "FAIL (c.1): archive was unpacked when checksum entry was missing" >&2
-  exit 1
-fi
 
-# (c.2) Duplicate entry in checksums.txt fails with exit 2 and the expected error message.
-cat "$work/good-checksums.txt" "$work/good-checksums.txt" > "$work/release/checksums.txt"
-export RUNNER_TEMP="$work/run-dup"
-export GITHUB_PATH="$work/run-dup/github_path"
-mkdir -p "$RUNNER_TEMP"
-: > "$GITHUB_PATH"
-
-set +e
-out=$("$here/../install.sh" 2>&1)
-code=$?
-set -e
-if [ "$code" -ne 2 ]; then
-  echo "FAIL (c.2): expected exit 2 for duplicate checksum entry, got $code ($out)" >&2
-  exit 1
-fi
-echo "$out" | grep -qE "^::error::checksums\\.txt of $tag lists $host_asset +2 times, not once$" || {
-  echo "FAIL (c.2): unexpected error message: $out" >&2
-  exit 1
+# Nothing unpacked and nothing on GITHUB_PATH.
+refused() {
+  if [ -n "$(ls -A "$RUNNER_TEMP/bellwether-bin")" ]; then
+    fail "$1" "unpacked $(ls -A "$RUNNER_TEMP/bellwether-bin")"
+  fi
+  if [ -s "$GITHUB_PATH" ]; then
+    fail "$1" "GITHUB_PATH was written"
+  fi
 }
-if [ -e "$RUNNER_TEMP/bellwether-bin/bellwether" ]; then
-  echo "FAIL (c.2): archive was unpacked when checksum entry was duplicated" >&2
-  exit 1
+
+# check <target> <exe>: cases (a) through (d) against the archive of <target>.
+check() {
+  target=$1
+  local exe=$2 asset="bellwether-$tag-$1.tar.gz" bin_entry
+  rm -f "$work/release/"*
+  pack "$exe" "$asset"
+  (cd "$work/release" && sha256sum "$asset" > "$work/good-checksums.txt")
+
+  # (a) Valid checksum passes and puts the executable on GITHUB_PATH.
+  cp "$work/good-checksums.txt" "$work/release/checksums.txt"
+  run_install "$target-valid"
+  [ "$code" -eq 0 ] || fail a "exit $code"
+  echo "$out" | grep -qxF "bellwether 0.1.0" || fail a "expected 'bellwether 0.1.0' output"
+  [ -x "$RUNNER_TEMP/bellwether-bin/$exe" ] || fail a "unpacked $exe is missing or not executable"
+  [ "$(ls -A "$RUNNER_TEMP/bellwether-bin")" = "$exe" ] || fail a "bin dir holds more than $exe"
+  if [ "$target" = "$windows_target" ]; then
+    bin_entry=$(cygpath -w "$RUNNER_TEMP/bellwether-bin")
+  else
+    bin_entry="$RUNNER_TEMP/bellwether-bin"
+  fi
+  [ "$(cat "$GITHUB_PATH")" = "$bin_entry" ] || fail a "GITHUB_PATH is not exactly $bin_entry"
+
+  # (b) Tampered archive fails with non-zero exit before unpacking.
+  cp "$work/release/$asset" "$work/good-archive.tar.gz"
+  printf 'tampered' >> "$work/release/$asset"
+  run_install "$target-tampered"
+  cp "$work/good-archive.tar.gz" "$work/release/$asset"
+  [ "$code" -ne 0 ] || fail b "tampered archive succeeded"
+  refused b
+
+  # (c.1) Missing entry in checksums.txt fails with exit 2 and the expected error message.
+  printf '0000000000000000000000000000000000000000000000000000000000000000  bellwether-v0.1.0-other-target.tar.gz\n' \
+    > "$work/release/checksums.txt"
+  run_install "$target-missing"
+  [ "$code" -eq 2 ] || fail c.1 "expected exit 2 for missing checksum entry, got $code"
+  echo "$out" | grep -qE "^::error::checksums\\.txt of $tag lists $asset +0 times, not once$" \
+    || fail c.1 "unexpected error message"
+  refused c.1
+
+  # (c.2) Duplicate entry in checksums.txt fails with exit 2 and the expected error message.
+  cat "$work/good-checksums.txt" "$work/good-checksums.txt" > "$work/release/checksums.txt"
+  run_install "$target-dup"
+  [ "$code" -eq 2 ] || fail c.2 "expected exit 2 for duplicate checksum entry, got $code"
+  echo "$out" | grep -qE "^::error::checksums\\.txt of $tag lists $asset +2 times, not once$" \
+    || fail c.2 "unexpected error message"
+  refused c.2
+
+  # (d) An archive holding the other platform's executable name, correctly
+  # checksummed, fails with exit 2 and installs nothing.
+  local other=bellwether.exe
+  [ "$exe" = bellwether ] || other=bellwether
+  pack "$other" "$asset"
+  (cd "$work/release" && sha256sum "$asset" > checksums.txt)
+  run_install "$target-member"
+  [ "$code" -eq 2 ] || fail d "expected exit 2 for an archive without $exe, got $code"
+  echo "$out" | grep -qxF "::error::$asset does not hold $exe at its root" || fail d "unexpected error message"
+  refused d
+}
+
+out=""
+if [ "$host_target" = "$windows_target" ]; then
+  check "$windows_target" bellwether.exe
+  checked="$windows_target (native)"
+else
+  check "$host_target" bellwether
+  host_path=$PATH
+  PATH="$work/windows-bin:$host_path"
+  check "$windows_target" bellwether.exe
+  PATH=$host_path
+  checked="$host_target (native), $windows_target (Git Bash stand-ins)"
 fi
 
-echo "ok: release checksum verified, tampered archive and malformed checksums.txt refused"
+echo "ok: $checked: release checksum verified, executable unpacked by name, tampered archive, malformed checksums.txt, and wrong member refused"

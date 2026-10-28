@@ -479,18 +479,13 @@ fn bitemporal_lake(dir: &Path) -> Vec<BitemporalRow> {
 
 /// The (file, row group) pairs of a plan line's Evidence, relative to `root`.
 fn plan_row_groups(v: &Value, root: &Path) -> std::collections::BTreeSet<(String, u64)> {
-    let base = format!("{}/", path(&std::fs::canonicalize(root).unwrap()));
+    let base = std::fs::canonicalize(root).unwrap();
     v["evidence"]["record"]["body"]["plan"]["entries"]
         .as_array()
         .unwrap()
         .iter()
         .flat_map(|e| {
-            let rel = e["file"]["path"]
-                .as_str()
-                .unwrap()
-                .strip_prefix(&base)
-                .unwrap()
-                .to_string();
+            let rel = common::rel_under(&base, e["file"]["path"].as_str().unwrap());
             e["row_groups"]
                 .as_array()
                 .unwrap()

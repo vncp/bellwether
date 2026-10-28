@@ -1,0 +1,9 @@
+# Every checkout holds the bytes the repository stores, Windows included,
+# where Git for Windows defaults to core.autocrlf=true: text files are LF
+# (Git Bash cannot run a CRLF script; rustfmt --check and the golden
+# comparisons expect LF), and files Git detects as binary are untouched.
+* text=auto eol=lf
+*.sh text eol=lf
+
+# Fixtures are read, hashed, and compared byte for byte: never convert them.
+/fixtures/** -text

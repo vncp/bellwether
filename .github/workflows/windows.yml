@@ -1,0 +1,99 @@
+name: windows
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: '0'
+  CARGO_PROFILE_DEV_DEBUG: '0'
+  CARGO_PROFILE_TEST_DEBUG: '0'
+  RUSTFLAGS: '-D warnings'
+
+jobs:
+  native:
+    name: Native Windows x64 CLI and MCP
+    runs-on: windows-latest
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: windows-native
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: install the native DuckDB CLI and ADBC library
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $deps = Join-Path $env:RUNNER_TEMP 'duckdb'
+          New-Item -ItemType Directory -Force $deps | Out-Null
+          $assets = @{
+            'duckdb-cli-windows-amd64.tar.gz' = '91663c2f36c2a334b0e5e639006d8c29c29e013af0c477d80bb931df68870312'
+            'duckdb-shared-libs-windows-amd64.tar.gz' = '2b83169128239de5f45fe21de80f99bf436e53aa4bb24020dd951a1ba8d4b95f'
+          }
+          foreach ($asset in $assets.Keys) {
+            gh release download v2.0.0 --repo duckdb/duckdb --pattern $asset --dir $deps
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            $archive = Join-Path $deps $asset
+            if ((Get-FileHash $archive -Algorithm SHA256).Hash.ToLowerInvariant() -ne $assets[$asset]) {
+              throw "Checksum mismatch: $asset"
+            }
+            tar -xzf $archive -C $deps
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
+          "BELLWETHER_DUCKDB_DRIVER=$deps/duckdb.dll" >> $env:GITHUB_ENV
+          "BELLWETHER_DUCKDB=$deps/duckdb.exe" >> $env:GITHUB_ENV
+          'BELLWETHER_REQUIRE_DUCKDB=1' >> $env:GITHUB_ENV
+          & "$deps/duckdb.exe" -no-agent --version
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: format
+        run: cargo fmt --all -- --check
+      - name: compile every default-feature test target
+        run: cargo test --workspace --locked --no-run
+      - name: library behavior
+        run: cargo test --workspace --locked --lib --no-fail-fast
+      - name: engine and MCP integration
+        # ClickHouse requires a Linux service container; its real-service
+        # coverage remains in ci.yml. The native core uses default features.
+        run: cargo test --workspace --locked --exclude bellwether-cli --exclude bellwether-source-engine --tests --no-fail-fast
+      - name: CLI integration (external ClickHouse covered on Linux)
+        run: |
+          $targets = Get-ChildItem crates/bellwether-cli/tests/*.rs | Where-Object { $_.BaseName -ne 'engine_tools' }
+          $testArgs = @('test', '-p', 'bellwether-cli', '--locked', '--no-fail-fast')
+          foreach ($target in $targets) { $testArgs += @('--test', $target.BaseName) }
+          & cargo @testArgs
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: native executable smoke
+        run: |
+          & target/debug/bellwether.exe --version
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & target/debug/bellwether-mcp.exe --help
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $data = Join-Path $env:RUNNER_TEMP 'bellwether smoke data'
+          New-Item -ItemType Directory -Force $data | Out-Null
+          Copy-Item fixtures/source/multi_rg.parquet $data
+          & target/debug/bellwether.exe why $data --json
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & target/debug/bellwether.exe index $data --key exact:id
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          # Re-open and repeat: exercises Windows locks and replacement of
+          # existing manifest/cache files, not just compilation or --version.
+          & target/debug/bellwether.exe index $data --key exact:id
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & target/debug/bellwether.exe reconcile $data $data --key id --json
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: installer checksum behavior under Git Bash
+        shell: bash
+        run: bash action/tests/install-checksum.sh

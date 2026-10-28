@@ -1540,6 +1540,21 @@ fn the_prediction_error_is_kept_pair_by_pair_against_an_oracle() {
     assert_eq!(oracle(2, 3), "0.667");
 }
 
+/// Makes `link` a symbolic link to the directory `target`. `false`, with a
+/// `SKIPPED:` note, only on Windows without the privilege to create one
+/// (`ERROR_PRIVILEGE_NOT_HELD`: neither elevation nor Developer Mode).
+fn dir_symlink(target: &Path, link: &Path) -> bool {
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(target, link).unwrap();
+    #[cfg(windows)]
+    if let Err(e) = std::os::windows::fs::symlink_dir(target, link) {
+        assert_eq!(e.raw_os_error(), Some(1314), "{e}");
+        eprintln!("SKIPPED: cannot create a directory symlink here ({e})");
+        return false;
+    }
+    true
+}
+
 #[test]
 fn the_scratch_folder_is_a_hidden_folder_under_the_lake_with_its_permissions() {
     let w = World::new();
@@ -1561,8 +1576,7 @@ fn the_scratch_folder_is_a_hidden_folder_under_the_lake_with_its_permissions() {
     };
     let outside = w.dir.path().join("outside");
     std::fs::create_dir(&outside).unwrap();
-    #[cfg(unix)]
-    std::os::unix::fs::symlink(&outside, w.root.join("_link")).unwrap();
+    let linked = dir_symlink(&outside, &w.root.join("_link"));
     for bad in [
         outside.join("scratch"),
         w.root.join("exports"),
@@ -1570,7 +1584,7 @@ fn the_scratch_folder_is_a_hidden_folder_under_the_lake_with_its_permissions() {
         w.root.clone(),
         w.root.join("_link").join("x"),
     ] {
-        if !cfg!(unix) && bad.starts_with(w.root.join("_link")) {
+        if !linked && bad.starts_with(w.root.join("_link")) {
             continue;
         }
         let err = fix_in(&bad, true).unwrap_err();
@@ -1586,26 +1600,31 @@ fn the_scratch_folder_is_a_hidden_folder_under_the_lake_with_its_permissions() {
     assert_eq!(w.state.lock().unwrap().runs.len(), 0);
     assert!(!w.root.join("exports").exists() && !outside.join("scratch").exists());
     // A hidden folder under the lake, missing: created, with the run's
-    // folder, at the lake root's permissions; the kept exports never reach
-    // the twin's reads.
+    // folder, at the lake root's permissions (Unix mode bits; Windows has
+    // none to inherit); the kept exports never reach the twin's reads.
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&w.root, std::fs::Permissions::from_mode(0o750)).unwrap();
-        let r = fix_in(&w.root.join("_new").join("deeper"), true).unwrap();
-        assert!(
-            matches!(r.outcome, FixOutcome::Attested { .. }),
-            "{:?}",
-            r.outcome
-        );
-        let run = PathBuf::from(r.engine.unwrap().scratch.unwrap());
-        for d in [w.root.join("_new"), w.root.join("_new").join("deeper"), run] {
+    }
+    let r = fix_in(&w.root.join("_new").join("deeper"), true).unwrap();
+    assert!(
+        matches!(r.outcome, FixOutcome::Attested { .. }),
+        "{:?}",
+        r.outcome
+    );
+    let run = PathBuf::from(r.engine.unwrap().scratch.unwrap());
+    for d in [w.root.join("_new"), w.root.join("_new").join("deeper"), run] {
+        assert!(d.is_dir(), "{}", d.display());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
             let mode = std::fs::metadata(&d).unwrap().permissions().mode() & 0o777;
             assert_eq!(mode, 0o750, "{}", d.display());
         }
-        let (_, again) = w.why(&e);
-        assert_eq!(again.twin.unwrap().rows_read, 1600);
     }
+    let (_, again) = w.why(&e);
+    assert_eq!(again.twin.unwrap().rows_read, 1600);
 }
 
 #[test]

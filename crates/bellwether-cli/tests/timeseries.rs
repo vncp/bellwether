@@ -20,14 +20,12 @@ fn json(s: &str) -> Value {
 /// `(path relative to the corpus dir, row group)` of a lookup's plan.
 fn planned(v: &Value, out: &Path) -> BTreeSet<(String, u64)> {
     let base = std::fs::canonicalize(out).unwrap();
-    let base = format!("{}/", base.to_str().unwrap());
     v["evidence"]["record"]["body"]["plan"]["entries"]
         .as_array()
         .unwrap()
         .iter()
         .flat_map(|e| {
-            let p = e["file"]["path"].as_str().unwrap();
-            let rel = p.strip_prefix(&base).unwrap().to_string();
+            let rel = common::rel_under(&base, e["file"]["path"].as_str().unwrap());
             e["row_groups"]
                 .as_array()
                 .unwrap()

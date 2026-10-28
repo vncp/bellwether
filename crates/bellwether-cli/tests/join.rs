@@ -611,25 +611,26 @@ fn join_reader_pass_states_the_cause_and_the_next_step() {
         &["index", path(&outside), "--key", "exact:paid_order,counts"],
         0,
     );
-    std::os::unix::fs::symlink(&outside, l.parent().unwrap().join("linked")).unwrap();
-    let out = assert_cmd::Command::cargo_bin("bellwether")
-        .unwrap()
-        .args([
-            "index",
-            d,
-            "--key",
-            "join:orders.order_id=linked.paid_order,counts",
-        ])
-        .output()
-        .unwrap();
-    assert_eq!(out.status.code(), Some(2));
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        stderr.contains("the right dataset linked is") && stderr.contains("a link to"),
-        "{stderr}"
-    );
-    assert!(stderr.contains("not beside the data root"), "{stderr}");
-    assert!(stderr.contains("move or copy linked there"), "{stderr}");
+    if common::dir_symlink(&outside, &l.parent().unwrap().join("linked")) {
+        let out = assert_cmd::Command::cargo_bin("bellwether")
+            .unwrap()
+            .args([
+                "index",
+                d,
+                "--key",
+                "join:orders.order_id=linked.paid_order,counts",
+            ])
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(2));
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("the right dataset linked is") && stderr.contains("a link to"),
+            "{stderr}"
+        );
+        assert!(stderr.contains("not beside the data root"), "{stderr}");
+        assert!(stderr.contains("move or copy linked there"), "{stderr}");
+    }
 }
 
 /// Review of PR #32, reader item d, on the time-series corpus: a semi-join

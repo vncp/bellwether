@@ -123,21 +123,13 @@ fn json(s: &str) -> Value {
 }
 
 fn planned(v: &Value, root: &Path) -> BTreeSet<(String, u64)> {
-    let base = format!(
-        "{}/",
-        std::fs::canonicalize(root).unwrap().to_str().unwrap()
-    );
+    let base = std::fs::canonicalize(root).unwrap();
     v["evidence"]["record"]["body"]["plan"]["entries"]
         .as_array()
         .unwrap()
         .iter()
         .flat_map(|e| {
-            let rel = e["file"]["path"]
-                .as_str()
-                .unwrap()
-                .strip_prefix(&base)
-                .unwrap()
-                .to_string();
+            let rel = common::rel_under(&base, e["file"]["path"].as_str().unwrap());
             e["row_groups"]
                 .as_array()
                 .unwrap()
