@@ -48,6 +48,7 @@ bytes = { workspace = true }
 rand_core = { version = "0.6", features = ["getrandom"] }
 zeroize = "1"
 toml = "1"
+sqlparser = { workspace = true }
 
 [features]
 # SQL Server tables through ODBC (links the system ODBC driver manager).

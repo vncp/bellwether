@@ -128,6 +128,10 @@ fn make_world(signing: bool) -> World {
             json!({"keys": k, "at": "1970-01-01T00:00:10Z"}),
         );
         valid.insert(
+            "observe.plan_from_sql",
+            json!({"sql": "SELECT id, ts FROM main WHERE id IN (:keys)"}),
+        );
+        valid.insert(
             "propose.key",
             json!({"spec": {"kind": "exact", "columns": ["id"]}, "evidence": [ev], "by": "p"}),
         );
@@ -208,13 +212,14 @@ fn arb_json() -> impl Strategy<Value = Value> {
     })
 }
 
-const TOOLS: [&str; 17] = [
+const TOOLS: [&str; 19] = [
     "observe.why",
     "observe.cardinality",
     "observe.overlap",
     "observe.profile",
     "observe.locate",
     "observe.asof",
+    "observe.plan_from_sql",
     "score.why",
     "score.verify",
     "score.advise",
@@ -281,7 +286,9 @@ fn allowed(tool: &str, kinds: &[String], other: &[String], signing: bool) -> Res
         "propose.key" | "propose.layout" | "propose.rewrite" => {
             kinds.len() <= 1 && only(&["proposal"]) && other.is_empty()
         }
-        "observe.cardinality" | "observe.overlap" => kinds.is_empty() && cache_only,
+        "observe.cardinality" | "observe.overlap" | "observe.plan_from_sql" => {
+            kinds.is_empty() && cache_only
+        }
         "observe.why" | "observe.profile" | "observe.locate" | "observe.asof" => {
             only(&["evidence"]) && cache_only
         }

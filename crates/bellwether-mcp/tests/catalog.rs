@@ -69,6 +69,7 @@ fn the_tools_are_the_tiers_and_nothing_else() {
             ("observe.semijoin", Tier::Observe),
             ("observe.join_overlap", Tier::Observe),
             ("observe.join_verify", Tier::Observe),
+            ("observe.plan_from_sql", Tier::Observe),
             ("score.why", Tier::Score),
             ("score.verify", Tier::Score),
             ("score.advise", Tier::Score),
@@ -104,7 +105,6 @@ fn schemas_are_closed_and_carry_no_dangerous_field() {
             "confidence",
             "command",
             "shell",
-            "sql",
             "query",
             "exec",
             "output",
@@ -114,6 +114,9 @@ fn schemas_are_closed_and_carry_no_dangerous_field() {
             "path",
         ] {
             assert!(!props.contains(bad), "{} has a {bad:?} field", t.name);
+        }
+        if t.name != "observe.plan_from_sql" {
+            assert!(!props.contains("sql"), "{} has a \"sql\" field", t.name);
         }
         if t.name == "apply.receipt" {
             let top: BTreeSet<&str> = t.input["properties"]

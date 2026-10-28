@@ -641,3 +641,284 @@ fn a_plan_rewrite_is_scored_reconciled_and_attested() {
         fix.outcome
     );
 }
+
+#[test]
+fn plan_from_sql_cli_mcp_join_cte_latest_and_rewrite_receipt() {
+    let c = corpus();
+    let (ev, rp) = (path(&c.events), path(&c.repos));
+    let keys_file = c.root.join("workload/keys-sparse.parquet");
+    let k = sparse_keys(&c.events, 5, &keys_file);
+    run(&["index", rp, "--key", "exact:repo_id,counts"], 0);
+    run(&["index", ev, "--key", "exact:repo_id,counts"], 0);
+    let srv = server(&c);
+    let ds_flag = format!("repos={rp}");
+
+    // (a) scan + filter (IN (:keys) and range BETWEEN) + group by + project
+    let sql_a = "SELECT repo_id, COUNT(*), SUM(amount) FROM events WHERE repo_id IN (:keys) AND created_at BETWEEN '1970-01-01T00:00:00Z' AND '2030-01-01T00:00:00Z' GROUP BY repo_id";
+    let res_a: bellwether::PlanFromSqlResult =
+        typed(&cli(&["plan", "from-sql", ev, "--sql", sql_a], 0));
+    assert!(res_a.cached);
+    assert_eq!(res_a.datasets, ["main"]);
+    assert_eq!(res_a.plan.nodes.len(), 4);
+    assert!(matches!(
+        res_a.plan.nodes[0],
+        bellwether::types::PlanNode::Scan { .. }
+    ));
+    assert!(matches!(
+        res_a.plan.nodes[1],
+        bellwether::types::PlanNode::SemiJoin { .. }
+    ));
+    assert!(matches!(
+        res_a.plan.nodes[2],
+        bellwether::types::PlanNode::Filter { .. }
+    ));
+    assert!(matches!(
+        res_a.plan.nodes[3],
+        bellwether::types::PlanNode::Aggregate { .. }
+    ));
+    let mcp_a = srv.call("observe.plan_from_sql", json!({"sql": sql_a}));
+    assert!(!mcp_a.is_error(), "{mcp_a:?}");
+    assert_eq!(
+        serde_json::to_string(&res_a).unwrap(),
+        mcp_a.text,
+        "ADR 010: CLI `plan from-sql --json` and MCP `observe.plan_from_sql` must match byte-for-byte"
+    );
+
+    // (b) two-table join (`events JOIN repos ON ...`) priced end-to-end with `why` on the relational bench corpus
+    let sql_join = "SELECT e.repo_id, e.type, r.name FROM events e JOIN repos r ON e.repo_id = r.repo_id WHERE e.repo_id IN (:keys)";
+    let join_plan_file = c.root.join("sql-join-plan.json");
+    let human_join = run(
+        &[
+            "--clock",
+            CLOCK,
+            "--dataset",
+            &ds_flag,
+            "plan",
+            "from-sql",
+            ev,
+            "--sql",
+            sql_join,
+            "--main-table",
+            "events",
+            "--out",
+            path(&join_plan_file),
+        ],
+        0,
+    );
+    assert!(human_join.contains("consumer plan"), "{human_join}");
+    assert!(join_plan_file.exists());
+
+    // Price via `why --sql-plan` and compare with `why --plan` on the written file
+    let why_via_sql: WhyReport = typed(&cli(
+        &[
+            "--dataset",
+            &ds_flag,
+            "why",
+            ev,
+            "--from",
+            path(&keys_file),
+            "--sql-plan",
+            sql_join,
+            "--main-table",
+            "events",
+        ],
+        0,
+    ));
+    let why_via_file: WhyReport = typed(&cli(
+        &[
+            "--dataset",
+            &ds_flag,
+            "why",
+            ev,
+            "--from",
+            path(&keys_file),
+            "--plan",
+            path(&join_plan_file),
+        ],
+        0,
+    ));
+    assert_eq!(why_via_sql.plans, why_via_file.plans);
+    assert_eq!(why_via_sql.plans[0].datasets.len(), 2);
+    assert!(why_via_sql.plans[0]
+        .current
+        .iter()
+        .any(|o| o.op == "join" && o.rows_out.exactness.is_exact()));
+
+    // (c) a CTE referenced twice producing a shared DAG node (`consumers[i] == 2`)
+    let sql_cte = "
+        WITH scoped AS (
+            SELECT repo_id, type
+            FROM events
+            WHERE repo_id IN (:keys)
+        )
+        SELECT a.repo_id, a.type
+        FROM scoped a
+        WHERE a.repo_id IN (SELECT repo_id FROM scoped)
+    ";
+    let why_cte: WhyReport = typed(&cli(
+        &["why", ev, "--from", path(&keys_file), "--sql-plan", sql_cte],
+        0,
+    ));
+    assert!(
+        why_cte.plans[0].consumers.contains(&2),
+        "expected a shared node with consumers[i] == 2, got {:?}",
+        why_cte.plans[0].consumers
+    );
+    assert_eq!(why_cte.plans[0].shared.len(), 1);
+
+    // (d) `QUALIFY row_number() OVER (PARTITION BY id ORDER BY ts DESC) = 1` -> `Latest` and `AsOf`
+    let sql_latest = "
+        SELECT repo_id, name, created_at
+        FROM repos
+        WHERE repo_id IN (:keys)
+        QUALIFY row_number() OVER (PARTITION BY repo_id ORDER BY created_at DESC) = 1
+    ";
+    let latest_res: bellwether::PlanFromSqlResult =
+        typed(&cli(&["plan", "from-sql", rp, "--sql", sql_latest], 0));
+    assert!(latest_res
+        .plan
+        .nodes
+        .iter()
+        .any(|n| matches!(n, bellwether::types::PlanNode::Latest { .. })));
+    let asof_res: bellwether::PlanFromSqlResult = typed(&cli(
+        &["plan", "from-sql", rp, "--sql", sql_latest, "--as-of"],
+        0,
+    ));
+    assert!(asof_res
+        .plan
+        .nodes
+        .iter()
+        .any(|n| matches!(n, bellwether::types::PlanNode::AsOf { .. })));
+
+    // (e) before/after SQL queries translated to `ConsumerPlan`s and taken through `propose` + `fix` to an attest-only receipt
+    let before_sql_file = c.root.join("before.sql");
+    let after_sql_file = c.root.join("after.sql");
+    std::fs::write(
+        &before_sql_file,
+        "WITH agg AS (SELECT repo_id, COUNT(*) FROM events GROUP BY repo_id) SELECT repo_id FROM agg WHERE repo_id IN (:keys)",
+    )
+    .unwrap();
+    std::fs::write(
+        &after_sql_file,
+        "SELECT repo_id, COUNT(*) FROM events WHERE repo_id IN (:keys) GROUP BY repo_id",
+    )
+    .unwrap();
+    let before_plan_path = c.root.join("sql-before-plan.json");
+    let after_plan_path = c.root.join("sql-after-plan.json");
+    run(
+        &[
+            "plan",
+            "from-sql",
+            ev,
+            "--sql",
+            path(&before_sql_file),
+            "--out",
+            path(&before_plan_path),
+        ],
+        0,
+    );
+    run(
+        &[
+            "plan",
+            "from-sql",
+            ev,
+            "--sql",
+            path(&after_sql_file),
+            "--out",
+            path(&after_plan_path),
+        ],
+        0,
+    );
+    let why_before: WhyReport = typed(&cli(
+        &[
+            "why",
+            ev,
+            "--from",
+            path(&keys_file),
+            "--plan",
+            path(&before_plan_path),
+        ],
+        0,
+    ));
+    let wl_hash = why_before.workload.as_ref().unwrap().hash.to_hex();
+    let ev_hash = why_before.evidence.hash.unwrap().to_hex();
+    let prop_out = run(
+        &[
+            "propose",
+            ev,
+            "--evidence",
+            &ev_hash,
+            "--before",
+            "aggregate all events then filter by keys",
+            "--after",
+            "filter events by keys before aggregating",
+            "--invariant",
+            "identical per-repo_id event counts",
+            "--before-plan",
+            path(&before_plan_path),
+            "--after-plan",
+            path(&after_plan_path),
+        ],
+        0,
+    );
+    let prop_hash = prop_out.trim().trim_start_matches("proposal ").to_string();
+    let (bo, ao) = (c.root.join("sql-out-before"), c.root.join("sql-out-after"));
+    counts_output(&c.events, &k, &bo);
+    counts_output(&c.events, &k, &ao);
+    let fix_res: FixResult = typed(&cli(
+        &[
+            "fix",
+            ev,
+            "--proposal",
+            &prop_hash,
+            "--workload",
+            &wl_hash,
+            "--before-output",
+            path(&bo),
+            "--after-output",
+            path(&ao),
+            "--key",
+            "repo_id",
+        ],
+        0,
+    ));
+    let FixOutcome::Attested { receipt, .. } = &fix_res.outcome else {
+        panic!("expected Attested receipt, got {:?}", fix_res.outcome);
+    };
+    let bellwether::types::Record::Receipt(r) = &receipt.record else {
+        panic!("expected Receipt record");
+    };
+    assert!(r.attest_only);
+
+    // (f) unsupported SQL refused by name on CLI and MCP
+    for (bad_sql, token) in [
+        (
+            "SELECT repo_id FROM events UNION SELECT repo_id FROM events",
+            "UNION",
+        ),
+        (
+            "SELECT repo_id, COUNT(*) FROM events GROUP BY repo_id HAVING COUNT(*) > 1",
+            "HAVING",
+        ),
+        ("SELECT repo_id FROM events LIMIT 5", "LIMIT"),
+        ("SELECT 1", "without a `FROM` clause"),
+    ] {
+        let out = common::bw()
+            .args(["plan", "from-sql", ev, "--sql", bad_sql])
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(2), "{bad_sql}");
+        let stderr = String::from_utf8(out.stderr).unwrap();
+        assert!(stderr.contains(token), "{bad_sql}: {stderr}");
+
+        let mcp_bad = srv.call("observe.plan_from_sql", json!({"sql": bad_sql}));
+        assert!(mcp_bad.is_error(), "{bad_sql}");
+        let refusal = mcp_bad.envelope.refusal.unwrap();
+        assert_eq!(refusal.code.as_str(), "invalid_argument");
+        assert!(
+            refusal.message.contains(token),
+            "{bad_sql}: {}",
+            refusal.message
+        );
+    }
+}

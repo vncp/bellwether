@@ -51,10 +51,10 @@ mod results;
 mod signing;
 mod sketch;
 pub mod spec;
+mod sql_plan;
 mod text;
 mod twin;
 mod why;
-
 pub use advise::{AdviseRecommendation, AdviseRequest, AdviseResult};
 pub use agg::{AggValue, AggregateGroup, AggregateResult};
 pub use bellwether_evolve::{
@@ -124,6 +124,9 @@ pub use signing::{
 };
 pub use sketch::{
     CardinalityRequest, CardinalityResult, ItemCardinality, OverlapResult, SketchSource,
+};
+pub use sql_plan::{
+    plan_from_sql, PlanFromSqlOptions, PlanFromSqlRequest, PlanFromSqlResult, KEYS_TABLE,
 };
 pub use text::{high_entropy, TextQuery, HIGH_ENTROPY_TOKENS_PER_ROW};
 pub use twin::{

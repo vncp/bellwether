@@ -315,6 +315,10 @@ pub struct WhyRequest {
     /// no lookup option but `at`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plan: Option<PathBuf>,
+    /// An in-memory consumer plan (for example translated from SQL via
+    /// `why --sql-plan`), priced identically to `plan`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub consumer_plan: Option<bellwether_types::ConsumerPlan>,
     /// The datasets the plan scans besides the data root, by the names the
     /// operator bound (`--dataset NAME=ROOT`, or the MCP server's
     /// `--dataset`): a name, never a root. Empty: every dataset the plan
@@ -367,6 +371,7 @@ impl Default for WhyRequest {
             tombstone: None,
             aggregate: None,
             plan: None,
+            consumer_plan: None,
             datasets: Vec::new(),
         }
     }
@@ -425,7 +430,7 @@ impl WhyRequest {
     /// [`WhyRequest::lookup_mode`] before the tombstone's checks.
     #[allow(clippy::too_many_lines)] // one refusal per contradictory flag pair
     fn lookup_mode_untombstoned(&self) -> std::result::Result<LookupMode, String> {
-        if self.plan.is_some() {
+        if self.plan.is_some() || self.consumer_plan.is_some() {
             return self.plan_mode();
         }
         if let Some(l) = &self.lookback {
@@ -1192,11 +1197,18 @@ impl Engine {
         // A consumer plan (WP15) scans the datasets its operator bound,
         // each through its own index, opened before the replayer that
         // borrows them; a name not bound is refused before any is read.
-        let plan = req
-            .plan
-            .as_deref()
-            .map(crate::plans::read_plan)
-            .transpose()?;
+        let plan = match (&req.plan, &req.consumer_plan) {
+            (Some(_), Some(_)) => {
+                return Err(Error::InvalidArgument {
+                    field: "plan",
+                    reason: "give either `plan` (a plan JSON file) or `consumer_plan`, not both"
+                        .into(),
+                })
+            }
+            (Some(p), None) => Some(crate::plans::read_plan(p)?),
+            (None, Some(cp)) => Some(cp.clone()),
+            (None, None) => None,
+        };
         let mut plans: Vec<bellwether_types::ConsumerPlan> = plan.iter().cloned().collect();
         if let Some(h) = &req.workload {
             let cache = self.cache()?;
@@ -2088,10 +2100,11 @@ impl Engine {
                  --lookback <length>"
             )));
         }
+        let has_plan = req.plan.is_some() || req.consumer_plan.is_some();
         if matches!(mode, LookupMode::Latest | LookupMode::Asof)
             && req.keys.is_none()
             && req.workload.is_none()
-            && req.plan.is_none()
+            && !has_plan
         {
             return Err(Error::KeySpec(
                 "--latest-by prices a workload's keys under latest or asof lookups; pass --from \
@@ -2106,7 +2119,7 @@ impl Engine {
                     .into(),
             ));
         }
-        if req.plan.is_some() && (given[1] || given[2] || given[3]) {
+        if has_plan && (given[1] || given[2] || given[3]) {
             return Err(Error::InvalidArgument {
                 field: "plan",
                 reason: "a consumer plan is priced over the runs of a key file (--from); a \
@@ -2115,7 +2128,7 @@ impl Engine {
                     .into(),
             });
         }
-        if req.plan.is_some() && !given[0] {
+        if has_plan && !given[0] {
             return Err(Error::InvalidArgument {
                 field: "plan",
                 reason: "--plan prices the plan once per run, and a run is the keys it looked \
@@ -2124,7 +2137,7 @@ impl Engine {
                     .into(),
             });
         }
-        if !req.datasets.is_empty() && req.plan.is_none() && !given[2] {
+        if !req.datasets.is_empty() && !has_plan && !given[2] {
             return Err(Error::InvalidArgument {
                 field: "datasets",
                 reason: "datasets name what a consumer plan scans; give the plan (--plan) or a \

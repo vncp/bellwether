@@ -26,13 +26,15 @@ fail if the two differ.
    the engine's table identity beside the lake's sequence, gives per
    candidate the keyset against each gate, rows per key, and files per key,
    and adds the twin lints (advice that names a rewrite pattern). When the
-   slow query is more than a lookup (a join, a window, an aggregate), pass
-   its plan as a typed plan DAG in `plan` (a JSON file path; the datasets
-   it scans besides the folder are the ones the human bound with
-   `--dataset NAME=ROOT` when starting the server, named in `datasets`, and
-   `at` gives the instant of its `as_of` nodes): each run is priced through
-   the plan, and `plans` holds per node its bytes and rows, each `exact`,
-   `bounded` (an interval holding the truth), or `measured`.
+   slow query is more than a lookup (a join, a window, an aggregate),
+   call `observe.plan_from_sql` with the SQL `SELECT` query in `sql` (and
+   optional `main_table` or `as_of`) to translate it into a typed `ConsumerPlan`
+   DAG (never executed), or pass its plan as a typed plan DAG in `plan` (a JSON
+   file path; the datasets it scans besides the folder are the ones the human
+   bound with `--dataset NAME=ROOT` when starting the server, named in
+   `datasets`, and `at` gives the instant of its `as_of` nodes): each run is
+   priced through the plan, and `plans` holds per node its bytes and rows, each
+   `exact`, `bounded` (an interval holding the truth), or `measured`.
 2. **Read the evidence.** Quote the lint (`rule`, columns, message) and the
    fanout that explain the read. Every number is an exact sum of footer
    statistics; none is an estimate, except those labelled `approximate`:
@@ -93,7 +95,7 @@ already holds.
 
 | Tier | Tool | Writes |
 |---|---|---|
-| observe | `observe.why` (no keys), `observe.cardinality`, `observe.overlap`, `observe.profile`, `observe.locate` (`keys` or `key_values`; optional `emit`: `"datafusion" \| "duckdb" \| "spark"`), `observe.count` (`keys` or `key_values`), `observe.aggregate` (`keys` or `key_values`), `observe.asof` (`keys` or `key_values`; optional `emit`: `"datafusion" \| "duckdb" \| "spark"`), `observe.text`, `observe.semijoin`, `observe.join_overlap`, `observe.join_verify` | Evidence and cache entries only |
+| observe | `observe.why` (no keys), `observe.cardinality`, `observe.overlap`, `observe.profile`, `observe.locate` (`keys` or `key_values`; optional `emit`: `"datafusion" \| "duckdb" \| "spark"`), `observe.count` (`keys` or `key_values`), `observe.aggregate` (`keys` or `key_values`), `observe.asof` (`keys` or `key_values`; optional `emit`: `"datafusion" \| "duckdb" \| "spark"`), `observe.text`, `observe.semijoin`, `observe.join_overlap`, `observe.join_verify`, `observe.plan_from_sql` (`sql`, optional `main_table`, `as_of`) | Evidence and cache entries only |
 | score (engine-scored) | `score.why` (with `keys`, `key_values`, a `workload`, or `text` lookups; optional `plan`, `datasets`, `at`), `score.verify`, `score.advise` (workload-level Pareto frontier over key sets and knobs), `score.record` (keys from the query engine, with `--twin-of`) | engine Proposals, Replays, plan Evidence, Certificates; `score.record` a workload in the cache |
 | propose | `propose.key`, `propose.layout`, `propose.rewrite` | one Proposal, or nothing with `dry_run` |
 | apply | `apply.receipt`, `apply.refresh` (rebuilds stale index specs and stale join keys on the server's data folder in one manifest commit, charged to the session budget) | `apply.receipt`: Replay, the index commit, Receipt; `apply.refresh`: the index commit; nothing with `dry_run` or on a refusal, unless another commit lands during the apply (`concurrent_commit`: the key is built, the receipt withheld) |
