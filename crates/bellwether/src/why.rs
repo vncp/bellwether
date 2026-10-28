@@ -2300,7 +2300,7 @@ impl Engine {
                 } else {
                     format!("keys-{}", i + 1)
                 };
-                let batch = k.read()?;
+                let batch = k.read_with_schema(replayer.schema())?;
                 recorder.record_query(&id, KeyInput::Batch(&batch), query.clone(), None)?;
             }
             return Ok((recorder.finish()?, None));
@@ -2396,7 +2396,10 @@ impl Engine {
         let recorder = WorkloadRecorder::new(cache, std::sync::Arc::clone(replayer.schema()));
         if let Some(first) = &req.keys {
             let files: Vec<&KeyFile> = std::iter::once(first).chain(&req.more_keys).collect();
-            let batches = files.iter().map(|k| k.read()).collect::<Result<Vec<_>>>()?;
+            let batches = files
+                .iter()
+                .map(|k| k.read_with_schema(replayer.schema()))
+                .collect::<Result<Vec<_>>>()?;
             if let Some(t) = &resolved {
                 for batch in &batches {
                     for f in batch.schema().fields() {

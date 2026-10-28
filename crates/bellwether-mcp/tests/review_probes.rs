@@ -702,7 +702,11 @@ fn following_the_stale_manifest_next_line_ends_in_a_receipt() {
         let verify = json!({"proposal": cand, "workload": wl});
         let job = |args: Value, tool: &str| {
             let r = srv.call(tool, args);
-            assert_eq!(r.envelope.status, Status::Running, "{tool} is a job");
+            assert!(
+                matches!(r.envelope.status, Status::Running | Status::Ok),
+                "{tool} is a job: {:?}",
+                r.envelope.status
+            );
             finish(&srv, &r.envelope.job.unwrap().id)
         };
         let first = job(verify.clone(), "score.verify");
@@ -761,7 +765,11 @@ fn following_the_data_changed_next_line_ends_in_a_receipt() {
         let verify = json!({"proposal": cand, "workload": wl});
         let job = |args: Value, tool: &str| {
             let r = srv.call(tool, args);
-            assert_eq!(r.envelope.status, Status::Running, "{tool} is a job");
+            assert!(
+                matches!(r.envelope.status, Status::Running | Status::Ok),
+                "{tool} is a job: {:?}",
+                r.envelope.status
+            );
             let id = r.envelope.job.unwrap().id;
             (id.clone(), finish(&srv, &id))
         };

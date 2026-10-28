@@ -118,15 +118,69 @@ pub struct ScoreRecord {
 #[serde(deny_unknown_fields)]
 pub struct ObserveProfile {}
 
+/// The query engine an `emit` argument translates a plan for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum EmitEngine {
+    /// Apache `DataFusion`: a Parquet scan pinned to the planned row groups
+    /// (JSON).
+    Datafusion,
+    /// `DuckDB`: one SQL statement over the planned files.
+    Duckdb,
+    /// Apache Spark: a manifest for `shims/spark/bellwether_plan.py` (JSON).
+    Spark,
+}
+
+impl From<EmitEngine> for bellwether::EmitEngine {
+    fn from(e: EmitEngine) -> Self {
+        match e {
+            EmitEngine::Datafusion => Self::Datafusion,
+            EmitEngine::Duckdb => Self::Duckdb,
+            EmitEngine::Spark => Self::Spark,
+        }
+    }
+}
+
+/// Which part of the plan's residual `emit` applies.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum EmitResidual {
+    /// All of it, in order: exactly the lookup's rows.
+    #[default]
+    Full,
+    /// Only its key membership (`In`): a superset, labeled in the artifact.
+    KeysOnly,
+    /// None: every row of the planned row groups, labeled in the artifact.
+    None,
+}
+
+impl From<EmitResidual> for bellwether::EmitResidual {
+    fn from(r: EmitResidual) -> Self {
+        match r {
+            EmitResidual::Full => Self::Full,
+            EmitResidual::KeysOnly => Self::KeysOnly,
+            EmitResidual::None => Self::None,
+        }
+    }
+}
+
 /// `observe.locate`: which files and row groups hold the keys.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ObserveLocate {
-    /// A Parquet file of keys (read, never written); an absolute path.
-    pub keys: String,
-    /// Key columns to take from the file, in tuple order; default: all.
+    /// A Parquet file of keys (read, never written); an absolute path. Give
+    /// `keys` or `key_values` (with `key_columns`), not both.
+    #[serde(default)]
+    pub keys: Option<String>,
+    /// Key columns to take from `keys`, or the columns of `key_values`, in
+    /// tuple order; default for `keys`: all. Required with `key_values`.
     #[serde(default)]
     pub key_columns: Option<Vec<String>>,
+    /// Inline key tuples (one array of JSON scalars per key tuple, in
+    /// `key_columns` order) instead of a `keys` file, encoded at the
+    /// dataset's key column types and stored in the key-set cache.
+    #[serde(default)]
+    pub key_values: Option<Vec<Vec<Value>>>,
     /// Plan against the committed manifest at this sequence (a plan's
     /// `sequence`) instead of the current one, so a lookup repeated over a
     /// grown folder reads exactly what it read then: files indexed since are
@@ -146,6 +200,23 @@ pub struct ObserveLocate {
     /// point lookup of the key tuples.
     #[serde(default)]
     pub contains: Option<Membership>,
+    /// Translate the plan for a query engine (`datafusion` JSON, `duckdb`
+    /// SQL, `spark` manifest JSON) and return it in `emitted`; nothing is
+    /// executed.
+    #[serde(default)]
+    pub emit: Option<EmitEngine>,
+    /// With `emit`: refuse unless the plan has a read order, and have the
+    /// engine return rows in it.
+    #[serde(default)]
+    pub ordered: bool,
+    /// With `emit`: which part of the residual the engine applies (`full`,
+    /// `keys_only`, `none`; default `full`).
+    #[serde(default)]
+    pub residual: Option<EmitResidual>,
+    /// With `emit`: the engine reads every planned file whose path starts
+    /// with `[0]` (`from`) at `[1]` (`to`) followed by the rest of the path.
+    #[serde(default)]
+    pub relocate: Option<[String; 2]>,
 }
 
 /// Which rows a list-membership lookup keeps.
@@ -163,11 +234,18 @@ pub enum Membership {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ObserveCount {
-    /// A Parquet file of keys (read, never written); an absolute path.
-    pub keys: String,
-    /// Key columns to take from the file, in tuple order; default: all.
+    /// A Parquet file of keys (read, never written); an absolute path. Give
+    /// `keys` or `key_values` (with `key_columns`), not both.
+    #[serde(default)]
+    pub keys: Option<String>,
+    /// Key columns to take from `keys`, or the columns of `key_values`, in
+    /// tuple order; default for `keys`: all. Required with `key_values`.
     #[serde(default)]
     pub key_columns: Option<Vec<String>>,
+    /// Inline key tuples (one array of JSON scalars per key tuple, in
+    /// `key_columns` order) instead of a `keys` file.
+    #[serde(default)]
+    pub key_values: Option<Vec<Vec<Value>>>,
     /// Count against the committed manifest at this sequence instead of the
     /// current one. Default: the current manifest.
     #[serde(default)]
@@ -175,16 +253,23 @@ pub struct ObserveCount {
 }
 
 /// `observe.aggregate` (B7): per key, `sum`, `count`, `min`, `max` of one
-/// column over the keys in a Parquet key file, from the index's agg key
-/// (`bellwether aggregate`).
+/// column over the keys in a Parquet key file or inline `key_values`, from
+/// the index's agg key (`bellwether aggregate`).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ObserveAggregate {
-    /// A Parquet file of keys (read, never written); an absolute path.
-    pub keys: String,
-    /// Key columns to take from the file, in tuple order; default: all.
+    /// A Parquet file of keys (read, never written); an absolute path. Give
+    /// `keys` or `key_values` (with `key_columns`), not both.
+    #[serde(default)]
+    pub keys: Option<String>,
+    /// Key columns to take from `keys`, or the columns of `key_values`, in
+    /// tuple order; default for `keys`: all. Required with `key_values`.
     #[serde(default)]
     pub key_columns: Option<Vec<String>>,
+    /// Inline key tuples (one array of JSON scalars per key tuple, in
+    /// `key_columns` order) instead of a `keys` file.
+    #[serde(default)]
+    pub key_values: Option<Vec<Vec<Value>>>,
     /// The column to aggregate.
     pub value: String,
     /// The functions (`sum`, `count`, `min`, `max`); `count` is always
@@ -203,11 +288,18 @@ pub struct ObserveAggregate {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ObserveAsof {
-    /// A Parquet file of keys (read, never written); an absolute path.
-    pub keys: String,
-    /// Key columns to take from the file, in tuple order; default: all.
+    /// A Parquet file of keys (read, never written); an absolute path. Give
+    /// `keys` or `key_values` (with `key_columns`), not both.
+    #[serde(default)]
+    pub keys: Option<String>,
+    /// Key columns to take from `keys`, or the columns of `key_values`, in
+    /// tuple order; default for `keys`: all. Required with `key_values`.
     #[serde(default)]
     pub key_columns: Option<Vec<String>>,
+    /// Inline key tuples (one array of JSON scalars per key tuple, in
+    /// `key_columns` order) instead of a `keys` file.
+    #[serde(default)]
+    pub key_values: Option<Vec<Vec<Value>>>,
     /// The instant: RFC 3339, a date (YYYY-MM-DD), or an integer in the
     /// timestamp column's unit. Give `at`, or `valid` and/or `known`.
     #[serde(default)]
@@ -243,6 +335,23 @@ pub struct ObserveAsof {
     /// longer retains is refused with `not_retained`.
     #[serde(default)]
     pub at_manifest: Option<u64>,
+    /// Translate the plan for a query engine (`datafusion` JSON, `duckdb`
+    /// SQL, `spark` manifest JSON) and return it in `emitted`; nothing is
+    /// executed.
+    #[serde(default)]
+    pub emit: Option<EmitEngine>,
+    /// With `emit`: refuse unless the plan has a read order, and have the
+    /// engine return rows in it.
+    #[serde(default)]
+    pub ordered: bool,
+    /// With `emit`: which part of the residual the engine applies (`full`,
+    /// `keys_only`, `none`; default `full`).
+    #[serde(default)]
+    pub residual: Option<EmitResidual>,
+    /// With `emit`: the engine reads every planned file whose path starts
+    /// with `[0]` (`from`) at `[1]` (`to`) followed by the rest of the path.
+    #[serde(default)]
+    pub relocate: Option<[String; 2]>,
 }
 
 /// `observe.semijoin` (B3): `semijoin(keys)` through the join key the
@@ -323,6 +432,10 @@ pub struct ScoreWhy {
     /// Key columns to take from `keys`, in tuple order; default: all.
     #[serde(default)]
     pub key_columns: Option<Vec<String>>,
+    /// Inline key tuples (one array of JSON scalars per key tuple, in
+    /// `key_columns` order) instead of `keys`, recorded as one run.
+    #[serde(default)]
+    pub key_values: Option<Vec<Vec<Value>>>,
     /// Further key files (read, never written), each recorded as one more
     /// run of the same lookup as `keys` (`why --from` repeated); default:
     /// none.
@@ -609,6 +722,20 @@ pub struct ApplyReceipt {
     pub wait: bool,
 }
 
+/// `apply.refresh`: rebuild stale index specs and stale join keys on the
+/// server's data folder (`bellwether index` with no new declarations).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ApplyRefresh {
+    /// Check folder changes and join-key freshness and return what would be
+    /// refreshed, without writing anything.
+    #[serde(default)]
+    pub dry_run: bool,
+    /// Run in this call instead of returning a job id.
+    #[serde(default)]
+    pub wait: bool,
+}
+
 /// `jobs.start`: run any tool as a job. The job id is the hash of the
 /// request, so starting the same request again returns the same job.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -825,6 +952,15 @@ pub fn catalog() -> Vec<ToolDef> {
              computed against the current manifest, and the data is unchanged. Returns the \
              Receipt. With dry_run, runs the gate and writes nothing. Returns a job id unless \
              wait or dry_run is true.",
+        ),
+        def::<ApplyRefresh>(
+            "apply.refresh",
+            Tier::Apply,
+            false,
+            "Rebuild stale declared key specs, sidecars, and join keys over the data folder's \
+             new, changed, and removed files in one manifest commit (`bellwether index`). \
+             Charged to the session budget. With dry_run, checks folder changes and join \
+             freshness and writes nothing. Returns a job id unless wait or dry_run is true.",
         ),
         def::<JobsStart>(
             "jobs.start",

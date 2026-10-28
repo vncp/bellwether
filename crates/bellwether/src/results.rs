@@ -180,6 +180,35 @@ pub struct IndexResult {
     pub tombstone_rows: Vec<TombstoneRows>,
 }
 
+/// What [`crate::Engine::refresh_dry_run`] found (`apply.refresh` with
+/// `dry_run: true`): the folder changes (`folder_changes`) and declared
+/// join-key freshness (`join_verify`) that [`crate::Engine::index`] with
+/// no new declarations would refresh. Writes nothing.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RefreshDryRunResult {
+    /// The canonical data root.
+    pub root: String,
+    /// The current manifest sequence.
+    pub sequence: u64,
+    /// Files under the root the index does not track yet, sorted.
+    pub untracked: Vec<String>,
+    /// Tracked files whose size or etag/mtime changed (ADR 013), sorted.
+    pub changed: Vec<String>,
+    /// Tracked files no longer found, sorted.
+    pub missing: Vec<String>,
+    /// Declared key specs that are not complete at `sequence`.
+    pub incomplete_specs: Vec<KeySpec>,
+    /// Declared sidecars that are not complete at `sequence`, by name.
+    pub incomplete_sidecars: Vec<String>,
+    /// Every declared join key (B3) and whether it is fresh or would be
+    /// refreshed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub joins: Vec<crate::join::JoinKeyState>,
+    /// Whether calling `apply.refresh` (or `bellwether index`) would have
+    /// work to do.
+    pub would_refresh: bool,
+}
+
 /// A tombstone declaration (B8) this binary does not use
 /// ([`IndexResult::tombstones_unused`]).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -482,6 +511,11 @@ pub struct PlanResult {
     /// otherwise, so every other plan serializes as before.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub live: Option<LivePlan>,
+    /// With `emit` (WP16): the plan translated for a query engine
+    /// (`datafusion` JSON, `duckdb` SQL, `spark` manifest JSON); nothing is
+    /// executed. Absent otherwise, so every other plan serializes as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub emitted: Option<crate::emit::EmittedArtifact>,
 }
 
 /// What the tombstones of a `live` lookup (B8) did. The rows a consumer

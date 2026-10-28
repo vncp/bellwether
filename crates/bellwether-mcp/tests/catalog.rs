@@ -77,6 +77,7 @@ fn the_tools_are_the_tiers_and_nothing_else() {
             ("propose.layout", Tier::Propose),
             ("propose.rewrite", Tier::Propose),
             ("apply.receipt", Tier::Apply),
+            ("apply.refresh", Tier::Apply),
             ("jobs.start", Tier::Jobs),
             ("jobs.status", Tier::Jobs),
             ("jobs.result", Tier::Jobs),
@@ -123,6 +124,15 @@ fn schemas_are_closed_and_carry_no_dangerous_field() {
                 .collect();
             assert_eq!(top, BTreeSet::from(["certificate", "dry_run", "wait"]));
             assert_eq!(t.input["required"], serde_json::json!(["certificate"]));
+        }
+        if t.name == "apply.refresh" {
+            let top: BTreeSet<&str> = t.input["properties"]
+                .as_object()
+                .unwrap()
+                .keys()
+                .map(String::as_str)
+                .collect();
+            assert_eq!(top, BTreeSet::from(["dry_run", "wait"]));
         }
         if t.name == "observe.why" {
             assert!(!props.contains("keys") && !props.contains("workload"));

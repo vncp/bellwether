@@ -61,7 +61,7 @@ flowchart LR
 | `bellwether` | the facade: `Engine` with every operation as a typed result; the one code path the CLI and MCP share; `fix` runs score → verify → apply → attest in that order | 2 (the Receipt rule, with ledger) |
 | `bellwether-cli` | `why`, `index`, `locate`, `latest`, `asof`, `reconcile`, `propose`, `fix`, `receipt`, `report`, `bench`; formatting and arguments only | — |
 | `bellwether-mcp` | the same engine as MCP tools in three capability tiers | — |
-| `bellwether-adapters` | a `ScanPlan` translated for a query engine (WP16): a DataFusion scan pinned to the planned row groups, one DuckDB statement, a Spark manifest and shim; the residual decoded to typed values and run in the plan's order, or refused by name; `CountingStore` and byte classification at the storage boundary. Depends on `types` and `core` only; the CLI's `--emit` uses it and executes nothing | — |
+| `bellwether-adapters` | a `ScanPlan` translated for a query engine (WP16): a DataFusion scan pinned to the planned row groups, one DuckDB statement, a Spark manifest and shim; the residual decoded to typed values and run in the plan's order, or refused by name; `CountingStore` and byte classification at the storage boundary. Depends on `types` and `core` only; the facade's `Engine::emit_plan` and the CLI's `--emit` / MCP's `emit` use it and execute nothing | — |
 
 Dependency arrows point one way, and `dev/check-layering.py` fails CI on any edge not listed there. `core` and `source` know nothing above them. `cli` and `mcp` hold no engine logic: both call the `bellwether` facade, so a typed result serialized by the CLI's `--json` is byte for byte what an MCP tool returns.
 
@@ -123,7 +123,7 @@ flowchart TB
     PROF & REP & VER & BLD --> SRC["source<br/>Parquet · text · fingerprints · catalog"]
     FAC --> SQL["source-sql<br/>tables via ADBC · SQLite · ODBC"]
     SQL --> SRC
-    CLI --> ADP["adapters<br/>plan → DataFusion scan · DuckDB SQL · Spark manifest"]
+    FAC & CLI --> ADP["adapters<br/>plan → DataFusion scan · DuckDB SQL · Spark manifest"]
     ADP --> CORE & TY
     PROF & REP & VER & BLD --> STO["store<br/>object stores · manifest commits · GC"]
     LED & CORE & SRC & STO --> TY["types (the contract)"]

@@ -485,6 +485,21 @@ impl Engine {
             let KeySpec::Join { right, .. } = &spec else {
                 continue;
             };
+            if let Err(e) = self.check_join_scope(&spec) {
+                if committed {
+                    let right_root = right_root_of(self.root(), right)?;
+                    out.push(JoinKeyState {
+                        next: None,
+                        right_root,
+                        message: format!("{}: not rebuilt: {e}", spec.identity()),
+                        spec,
+                        state: JoinFreshness::NotRebuilt,
+                        refreshed: false,
+                    });
+                    continue;
+                }
+                return Err(e);
+            }
             let refreshed = (|| {
                 let right = self.right_engine(&spec)?;
                 let rpin = right.pin_required("a join key")?;
@@ -841,6 +856,7 @@ impl Engine {
                 if !matches!(spec, KeySpec::Join { .. }) {
                     continue;
                 }
+                self.check_join_scope(spec)?;
                 let right = self.right_engine(spec)?;
                 let rpin = right.pin_required("join verify")?;
                 let mut state = self.join_key_state(&pinned, spec, &right, &rpin)?;

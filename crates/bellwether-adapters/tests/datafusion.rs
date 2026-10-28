@@ -1,3 +1,5 @@
+#![allow(clippy::doc_markdown)]
+
 //! DataFusion (WP16 items 2, 5, 7): every lookup shape run in DataFusion
 //! returns exactly the reference evaluator's rows, and, with DataFusion's
 //! own pruning off, the bytes it fetched at the storage boundary
@@ -9,7 +11,6 @@
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
-    clippy::doc_markdown,
     clippy::single_range_in_vec_init
 )]
 

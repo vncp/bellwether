@@ -606,6 +606,7 @@ name = "bellwether"
 version = "0.1.0"
 dependencies = [
  "arrow",
+ "bellwether-adapters",
  "bellwether-build",
  "bellwether-core",
  "bellwether-evolve",
