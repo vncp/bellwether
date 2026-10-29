@@ -1051,7 +1051,11 @@ fn restore_separators(index: &str) -> Restored {
     for m in manifests {
         let text = std::fs::read_to_string(&m).unwrap();
         assert!(text.contains(&old_root), "{} names no root", m.display());
-        std::fs::write(&m, text.replace(&old_root, &new_root)).unwrap();
+        std::fs::write(
+            &m,
+            substitute_json(&text, &[(old_root.clone(), new_root.clone())]),
+        )
+        .unwrap();
     }
     Restored {
         _tmp: tmp,

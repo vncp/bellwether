@@ -371,13 +371,20 @@ fn a_snapshot_hides_a_write_that_lands_mid_run() {
     let (_d, dir) = tmp();
     for (engine, root) in engines(&dir) {
         let db = dir.join(format!("t.{engine}"));
+        // Keep the writable instance alive before opening the source, so
+        // both connections share one DuckDB database. A read-only instance
+        // cannot be upgraded by opening another read-write instance of the
+        // same file (Windows correctly refuses the second file lock).
+        let mut writer = (engine == "duckdb")
+            .then(|| bellwether_source_sql::open_driver(&duck_url(&db)).unwrap());
         let src = SqlSource::connect(&root(""), SqlOptions::default()).unwrap();
         let fps = src.discover(src.root()).unwrap();
         let rg = src.row_groups(&fps[0]).unwrap().remove(0);
         // Commit a change through another connection.
-        match engine {
-            "sqlite" => {}
-            _ => duck_exec(&db, &["UPDATE t SET amount = 0 WHERE id = 5"]),
+        if let Some(driver) = writer.as_mut() {
+            driver
+                .execute("UPDATE t SET amount = 0 WHERE id = 5")
+                .unwrap();
         }
         if engine == "sqlite" {
             // A SQLite reader's transaction holds a shared lock until it

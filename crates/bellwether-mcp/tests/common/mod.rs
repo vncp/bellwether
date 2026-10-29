@@ -231,7 +231,13 @@ pub fn objects(dir: &Path) -> std::collections::BTreeMap<String, Vec<u8>> {
             if p.is_dir() {
                 stack.push(p);
             } else {
-                let rel = p.strip_prefix(dir).unwrap().to_string_lossy().to_string();
+                let rel = p
+                    .strip_prefix(dir)
+                    .unwrap()
+                    .components()
+                    .map(|part| part.as_os_str().to_str().unwrap())
+                    .collect::<Vec<_>>()
+                    .join("/");
                 out.insert(rel, std::fs::read(&p).unwrap());
             }
         }

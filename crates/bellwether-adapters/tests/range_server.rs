@@ -44,9 +44,9 @@ fn ranges_parse_as_http_defines_them() {
 #[test]
 fn served_ranges_are_exact_and_recorded() {
     let tmp = tempfile::tempdir().unwrap();
-    let served = tmp.path().join("served");
-    let c = common::corpus(&served.join("local lake"));
-    let server = RangeServer::start(&served);
+    let root = tmp.path().join("served");
+    let c = common::corpus(&root.join("local lake"));
+    let server = RangeServer::start(&root);
     let f = &c.files[0];
     // One percent-encoded segment per component below the served root.
     let route = server.url_path(std::path::Path::new(&f.path));

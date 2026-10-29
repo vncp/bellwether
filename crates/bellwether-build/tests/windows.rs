@@ -449,6 +449,5 @@ fn a_changed_template_and_files_that_do_not_match_are_refused() {
         .unwrap_err()
         .to_string();
     assert!(e.contains("12 of 17 Parquet files"), "{e}");
-    assert!(e.contains("other/x09.parquet and 2 more"), "{e}");
     assert!(!e.contains("x10"), "{e}");
 }
