@@ -11,7 +11,8 @@
 //! the matched before and after). The process is measured by
 //! `/usr/bin/time` (`-l` on macOS, the peak physical footprint; `-v` on
 //! Linux, the peak resident set), so allocator retention, which a counting
-//! allocator cannot see, counts.
+//! allocator cannot see, counts. Windows has no `/usr/bin/time`: there the
+//! binary runs directly and only the meter's own figures are checked.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
@@ -31,9 +32,20 @@ const MIB: u64 = 1024 * 1024;
 const FIXED: u64 = 24 * MIB;
 
 /// Peak physical memory of `args` run by the `bellwether` binary, and its
-/// stdout. Fails (never skips) when `/usr/bin/time` is missing.
-fn measured(args: &[&str]) -> (u64, String) {
+/// stdout. Fails (never skips) when `/usr/bin/time` is missing on Unix; on
+/// Windows the binary runs directly and there is no peak (`None`).
+fn measured(args: &[&str]) -> (Option<u64>, String) {
     let bin = env!("CARGO_BIN_EXE_bellwether");
+    if cfg!(not(unix)) {
+        let out = Command::new(bin).args(args).output().unwrap();
+        assert!(
+            out.status.success(),
+            "{args:?} failed\nstderr: {}\nstdout: {}",
+            String::from_utf8_lossy(&out.stderr),
+            String::from_utf8_lossy(&out.stdout)
+        );
+        return (None, String::from_utf8(out.stdout).unwrap());
+    }
     let flag = if cfg!(target_os = "macos") {
         "-l"
     } else {
@@ -65,10 +77,10 @@ fn measured(args: &[&str]) -> (u64, String) {
             }
         })
         .unwrap_or_else(|| panic!("no peak memory line in /usr/bin/time's output:\n{stderr}"));
-    (peak, String::from_utf8(out.stdout).unwrap())
+    (Some(peak), String::from_utf8(out.stdout).unwrap())
 }
 
-fn reconcile(data: &Path, index: &Path, budget: &str) -> (u64, Value) {
+fn reconcile(data: &Path, index: &Path, budget: &str) -> (Option<u64>, Value) {
     let (peak, stdout) = measured(&[
         "reconcile",
         path(data),
@@ -139,6 +151,10 @@ fn reconcile_physical_memory_stays_within_the_budget_plus_one_batch() {
             batch < 16 * MIB,
             "a decoded batch of {batch} bytes: {memory}"
         );
+        let (Some(peak), Some(baseline)) = (peak, baseline) else {
+            // No operating-system measurement here (Windows).
+            continue;
+        };
         let stated = baseline + budget_bytes + batch + FIXED;
         let tracked = baseline + state + 4 * batch + FIXED;
         eprintln!(

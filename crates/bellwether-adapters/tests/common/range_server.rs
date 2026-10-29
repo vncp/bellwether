@@ -1,8 +1,9 @@
-//! A tiny HTTP/1.1 range server: serves the files under one root and
-//! records every byte range it sends (`GET`, with or without `Range`), so
-//! an engine in another process is measured at the storage boundary. A
-//! `HEAD` sends no body and is not recorded. Paths outside the root are
-//! refused with 404.
+//! A tiny HTTP/1.1 range server: serves the files under one root at URL
+//! paths relative to it (one percent-encoded path segment per component),
+//! and records every byte range it sends (`GET`, with or without `Range`)
+//! against the served file's canonical local path, so an engine in another
+//! process is measured at the storage boundary. A `HEAD` sends no body and
+//! is not recorded. Paths outside the root are refused with 404.
 
 #![allow(
     dead_code,
@@ -23,6 +24,8 @@ use bellwether_adapters::measure::Fetch;
 pub struct RangeServer {
     /// `http://127.0.0.1:<port>`.
     pub base: String,
+    /// The served folder, canonical.
+    pub root: PathBuf,
     log: Arc<Mutex<Vec<Fetch>>>,
     stop: Arc<AtomicBool>,
 }
@@ -35,6 +38,7 @@ impl RangeServer {
         let log = Arc::new(Mutex::new(Vec::new()));
         let stop = Arc::new(AtomicBool::new(false));
         let root = root.canonicalize().unwrap();
+        let served = root.clone();
         {
             let log = Arc::clone(&log);
             let stop = Arc::clone(&stop);
@@ -52,7 +56,24 @@ impl RangeServer {
                 }
             });
         }
-        Self { base, log, stop }
+        Self {
+            base,
+            root: served,
+            log,
+            stop,
+        }
+    }
+
+    /// The URL path (`/a/b.parquet`) of `path`, a file under the root:
+    /// each component relative to the root, percent-encoded, joined by `/`.
+    pub fn url_path(&self, path: &Path) -> String {
+        let canonical = path.canonicalize().unwrap();
+        let mut route = String::new();
+        for c in canonical.strip_prefix(&self.root).unwrap().components() {
+            route.push('/');
+            route.push_str(&percent_encode(c.as_os_str().to_str().unwrap()));
+        }
+        route
     }
 
     /// Every range sent so far.
@@ -72,6 +93,18 @@ impl Drop for RangeServer {
         // Wake the accept loop.
         let _ = TcpStream::connect(self.base.trim_start_matches("http://"));
     }
+}
+
+fn percent_encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~') {
+            out.push(char::from(b));
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
 }
 
 fn percent_decode(s: &str) -> String {
@@ -122,9 +155,13 @@ fn serve(conn: TcpStream, root: &Path, log: &Mutex<Vec<Fetch>>) -> std::io::Resu
         if reader.read_line(&mut line)? == 0 {
             return Ok(());
         }
-        let mut parts = line.split_whitespace();
-        let method = parts.next().unwrap_or("").to_string();
-        let target = parts.next().unwrap_or("").to_string();
+        // `METHOD target HTTP/1.1`; the target is everything between the
+        // method and the version, so a client that sends a space unencoded
+        // still names its file.
+        let line = line.trim_end();
+        let (method, rest) = line.split_once(' ').unwrap_or((line, ""));
+        let method = method.to_string();
+        let target = rest.rsplit_once(' ').map_or(rest, |(t, _)| t).to_string();
         let mut range = None;
         loop {
             let mut h = String::new();
@@ -141,7 +178,15 @@ fn serve(conn: TcpStream, root: &Path, log: &Mutex<Vec<Fetch>>) -> std::io::Resu
                 }
             }
         }
-        let path = PathBuf::from(percent_decode(target.split('?').next().unwrap_or("")));
+        // The URL path's segments, decoded, under the root; a segment that
+        // climbs out of it (`..`, or a decoded separator) is caught by the
+        // canonical containment check.
+        let mut path = root.to_path_buf();
+        for seg in target.split('?').next().unwrap_or("").split('/') {
+            if !seg.is_empty() {
+                path.push(percent_decode(seg));
+            }
+        }
         let file = path
             .canonicalize()
             .ok()

@@ -123,21 +123,13 @@ fn json(s: &str) -> Value {
 }
 
 fn planned(v: &Value, root: &Path) -> BTreeSet<(String, u64)> {
-    let base = format!(
-        "{}/",
-        std::fs::canonicalize(root).unwrap().to_str().unwrap()
-    );
+    let base = std::fs::canonicalize(root).unwrap();
     v["evidence"]["record"]["body"]["plan"]["entries"]
         .as_array()
         .unwrap()
         .iter()
         .flat_map(|e| {
-            let rel = e["file"]["path"]
-                .as_str()
-                .unwrap()
-                .strip_prefix(&base)
-                .unwrap()
-                .to_string();
+            let rel = common::rel_under(&base, e["file"]["path"].as_str().unwrap());
             e["row_groups"]
                 .as_array()
                 .unwrap()
@@ -853,12 +845,12 @@ fn fix_on_an_unindexed_partitioned_folder_records_its_partitioning() {
         } else {
             flags.join(" ")
         };
-        let canon = std::fs::canonicalize(&root).unwrap();
+        let command = refused
+            .split('`')
+            .find(|s| s.starts_with("bellwether index "))
+            .unwrap_or_else(|| panic!("{refused}"));
         assert!(
-            refused.contains(&format!(
-                "`bellwether index {} {flag} --key sketch:symbol`",
-                path(&canon)
-            )),
+            command.ends_with(&format!(" {flag} --key sketch:symbol")),
             "{refused}"
         );
         let fix = json(&call(
@@ -995,18 +987,8 @@ fn the_sketch_refusal_command_builds_what_fix_builds() {
     ));
     assert_eq!(refused["refusal"]["kind"], "sketch_not_proposable");
     let command = refused["refusal"]["command"].as_str().unwrap();
-    let rest = command.strip_prefix("bellwether ").unwrap();
-    let bin = assert_cmd::cargo::cargo_bin("bellwether");
-    let out = std::process::Command::new("sh")
-        .arg("-c")
-        .arg(format!("'{}' {rest}", bin.display()))
-        .output()
-        .unwrap();
-    assert!(
-        out.status.success(),
-        "{command}\n{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
+    assert!(command.starts_with("bellwether index "), "{command}");
+    common::run_printed(command, 0);
     let manifest = || -> Value {
         serde_json::from_slice(&std::fs::read(index.join("manifest.json")).unwrap()).unwrap()
     };

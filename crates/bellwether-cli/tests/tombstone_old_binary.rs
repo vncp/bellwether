@@ -128,18 +128,13 @@ fn truth(rows: &[LakeRow], ids: &[i64], at: Option<i64>) -> BTreeSet<(String, u6
 }
 
 fn plan_row_groups(v: &Value, root: &Path) -> BTreeSet<(String, u64)> {
-    let base = format!("{}/", path(&std::fs::canonicalize(root).unwrap()));
+    let base = std::fs::canonicalize(root).unwrap();
     v["evidence"]["record"]["body"]["plan"]["entries"]
         .as_array()
         .unwrap()
         .iter()
         .flat_map(|e| {
-            let rel = e["file"]["path"]
-                .as_str()
-                .unwrap()
-                .strip_prefix(&base)
-                .unwrap()
-                .to_string();
+            let rel = common::rel_under(&base, e["file"]["path"].as_str().unwrap());
             e["row_groups"]
                 .as_array()
                 .unwrap()

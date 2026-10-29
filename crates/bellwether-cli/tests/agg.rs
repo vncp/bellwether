@@ -397,9 +397,8 @@ fn agg_next_steps_can_be_followed_as_printed() {
         "{line}"
     );
     let cmd = line.split("allow that: ").nth(1).unwrap();
-    let args: Vec<&str> = cmd.split_whitespace().collect();
-    assert_eq!(args[..2], ["bellwether", "fix"], "{cmd}");
-    human(&args[1..], 0);
+    assert!(cmd.starts_with("bellwether fix "), "{cmd}");
+    common::run_printed(cmd, 0);
     assert!(
         first.contains("then run why again: it proposes the agg key"),
         "{first}"
@@ -507,7 +506,7 @@ fn agg_next_steps_can_be_followed_as_printed() {
         .find(|l| l.contains("bellwether index "))
         .unwrap_or_else(|| panic!("{partial}"));
     assert!(
-        line.ends_with("/data --key 'agg:account,entry@amount{sum,count}'"),
+        line.ends_with(" --key 'agg:account,entry@amount{sum,count}'"),
         "{line}"
     );
     run(

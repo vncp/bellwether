@@ -29,15 +29,22 @@ use std::fs::{File, OpenOptions};
 use std::io::{Cursor, Write};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+#[cfg(unix)]
+use std::sync::Mutex;
 
 use arrow::array::{ArrayRef, AsArray, Int64Array, RecordBatch};
 use arrow::datatypes::{DataType, Field, Int64Type, Schema, SchemaRef};
 use bellwether_source::{
     drift, fingerprint, fingerprint_with_policy, ChunkedTextSource, FingerprintPolicy, LocalFs,
-    ObjectMeta, ParquetSource, Storage, TextFormat, TAIL_BYTES,
+    ParquetSource, TextFormat, TAIL_BYTES,
 };
-use bellwether_types::{ColumnStats, Error, Result, RowGroupMeta, Source};
+#[cfg(unix)]
+use bellwether_source::{ObjectMeta, Storage};
+#[cfg(unix)]
+use bellwether_types::Result;
+use bellwether_types::{ColumnStats, Error, RowGroupMeta, Source};
+#[cfg(unix)]
 use bytes::Bytes;
 use common::{fixture, from_hex};
 use parquet::arrow::ArrowWriter;

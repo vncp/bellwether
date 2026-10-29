@@ -105,6 +105,59 @@ fn copy_tree(from: &Path, to: &Path, touch: bool) {
     }
 }
 
+/// Relocate path-valued strings using native components, and replace record
+/// hashes without altering any other bytes of the persisted fixture.
+fn substitute_value(value: &str, subs: &[(String, String)]) -> String {
+    let mut value = value.to_string();
+    for (from, to) in subs {
+        if let Some(suffix) = value
+            .strip_prefix(from)
+            .filter(|suffix| suffix.is_empty() || suffix.starts_with('/'))
+        {
+            let mut path = PathBuf::from(to);
+            for component in suffix.split('/').filter(|part| !part.is_empty()) {
+                path.push(component);
+            }
+            value = path.to_str().unwrap().to_string();
+        } else {
+            value = value.replace(from, to);
+        }
+    }
+    value
+}
+
+/// Substitute decoded JSON strings, re-escaping only changed tokens. Parsing
+/// and reserializing the whole object would reorder keys and invalidate the
+/// byte-for-byte compatibility comparison.
+fn substitute_json(text: &str, subs: &[(String, String)]) -> String {
+    let bytes = text.as_bytes();
+    let mut out = String::with_capacity(text.len());
+    let mut copied = 0;
+    let mut pos = 0;
+    while pos < bytes.len() {
+        if bytes[pos] != b'"' {
+            pos += 1;
+            continue;
+        }
+        let start = pos;
+        pos += 1;
+        while pos < bytes.len() && bytes[pos] != b'"' {
+            pos += if bytes[pos] == b'\\' { 2 } else { 1 };
+        }
+        assert!(pos < bytes.len(), "unterminated fixture JSON string");
+        pos += 1;
+        let value: String = serde_json::from_str(&text[start..pos]).unwrap();
+        let changed = substitute_value(&value, subs);
+        if changed != value {
+            out.push_str(&text[copied..start]);
+            out.push_str(&serde_json::to_string(&changed).unwrap());
+            copied = pos;
+        }
+    }
+    out.push_str(&text[copied..]);
+    out
+}
+
 /// A fixture restored under a fresh root.
 struct Restored {
     _tmp: tempfile::TempDir,
@@ -178,7 +231,7 @@ impl Restored {
             let before = std::fs::read(&m).unwrap();
             let text = String::from_utf8(before.clone()).unwrap();
             assert!(text.contains(&old_root), "{} names no root", m.display());
-            let after = text.replace(&old_root, &root);
+            let after = substitute_json(&text, &[(old_root.clone(), root.clone())]);
             std::fs::write(&m, &after).unwrap();
             subs.push((
                 Hash::of(&before).to_hex(),
@@ -195,11 +248,7 @@ impl Restored {
     }
 
     fn sub(&self, s: &str) -> String {
-        let mut s = s.to_string();
-        for (from, to) in &self.subs {
-            s = s.replace(from, to);
-        }
-        s
+        substitute_json(s, &self.subs)
     }
 
     /// A pinned argument list, under this restore.
@@ -209,7 +258,13 @@ impl Restored {
             .as_array()
             .unwrap()
             .iter()
-            .map(|a| self.sub(&a.as_str().unwrap().replace("<corpus>", &corpus)))
+            .map(|a| {
+                let arg = substitute_value(
+                    a.as_str().unwrap(),
+                    &[("<corpus>".to_string(), corpus.clone())],
+                );
+                substitute_value(&arg, &self.subs)
+            })
             .collect()
     }
 
@@ -996,7 +1051,11 @@ fn restore_separators(index: &str) -> Restored {
     for m in manifests {
         let text = std::fs::read_to_string(&m).unwrap();
         assert!(text.contains(&old_root), "{} names no root", m.display());
-        std::fs::write(&m, text.replace(&old_root, &new_root)).unwrap();
+        std::fs::write(
+            &m,
+            substitute_json(&text, &[(old_root.clone(), new_root.clone())]),
+        )
+        .unwrap();
     }
     Restored {
         _tmp: tmp,

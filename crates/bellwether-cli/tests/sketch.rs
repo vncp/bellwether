@@ -298,15 +298,15 @@ fn sketch_refusals_name_real_columns() {
     assert!(!e.contains('<'), "{e}");
     let srv = server(&data);
     let r = srv.call("observe.cardinality", json!({}));
-    let env = serde_json::to_string(&r.envelope).unwrap();
+    let refusal = r.envelope.refusal.expect("refused");
     // The next step names the (canonical) root.
     let canonical = std::fs::canonicalize(&data).unwrap();
     assert!(
-        env.contains(&format!(
+        refusal.next.contains(&format!(
             "bellwether index {} --key sketch:id,batch,payload",
             canonical.display()
         )),
-        "{env}"
+        "{refusal:?}"
     );
     // The suggested next step works.
     run(&["index", d, "--key", "sketch:id,batch,payload"], 0);

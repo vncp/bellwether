@@ -104,6 +104,7 @@ fn why_over_a_batch_stamp_index_recommends_the_true_key() {
 
 /// A read-only folder with no `--index`: `why` exits 0, the Evidence comes
 /// back unrecorded, and the human output says how to record it.
+#[cfg(unix)]
 #[test]
 fn why_on_a_read_only_folder_exits_0_with_the_evidence_unrecorded() {
     use std::os::unix::fs::PermissionsExt;

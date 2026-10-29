@@ -11,10 +11,13 @@
 //! - Durability follows the commit boundary (ADR 034): conditional writes
 //!   (`manifest.json`, `manifests/`, detached signatures) and ledger records
 //!   (`ledger/`) fsync their staging file and parent directory on write;
-//!   segment writes (`segments/`) defer their directory sync to
+//!   on Unix, segment writes (`segments/`) defer their sync to
 //!   [`crate::StoreExt::sync_segments`], called once by `commit` before
 //!   updating `manifest.json`; rebuildable cache entries (`cache/`) skip
-//!   `sync_all`.
+//!   `sync_all`. Where no directory sync exists ([`DIR_SYNC_BARRIER`] is
+//!   false: Windows, whose standard library cannot flush a directory), there
+//!   is no barrier to defer to, so each segment's staging file is fsynced
+//!   before its rename, as a ledger record's is.
 //! - Conditional writes (`put_if_absent`, `put_if_version`) run under an
 //!   exclusive kernel `flock` on `<target>.lock#0`, taken with `try_lock`
 //!   until a deadline ([`LOCK_TIMEOUT`]), then [`Error::Store`]. The kernel
@@ -51,6 +54,15 @@ pub(crate) fn content_token(bytes: &[u8]) -> StoreVersion {
     StoreVersion(Hash::of(bytes).to_hex())
 }
 
+/// Whether [`sync_dir`] flushes a directory on this platform, so segment
+/// writes may defer their durability to one [`crate::StoreExt::sync_segments`]
+/// barrier (ADR 034). On Windows the standard library has no directory
+/// handle to flush, `sync_dir` is a no-op, and segments are fsynced one by
+/// one instead.
+const DIR_SYNC_BARRIER: bool = cfg!(unix);
+
+/// Fsyncs directory `dir` (its entries) where the platform allows it; a
+/// no-op where it does not (see [`DIR_SYNC_BARRIER`]).
 pub(crate) fn sync_dir(dir: &Path) -> Result<()> {
     #[cfg(unix)]
     {
@@ -181,7 +193,8 @@ pub(crate) fn put_overwrite(target: &Path, body: &[u8]) -> Result<()> {
 
 /// Atomic unconditional write without per-file fsync (ADR 034): staging +
 /// rename. Readers never see a partial file; durability is either not
-/// required (`cache/`) or deferred to the commit barrier (`segments/`).
+/// required (`cache/`) or deferred to the commit barrier (`segments/`, on
+/// platforms with [`DIR_SYNC_BARRIER`]).
 pub(crate) fn put_atomic(target: &Path, body: &[u8]) -> Result<()> {
     let staging = write_staging_with(target, body, false)?;
     if let Err(e) = std::fs::rename(&staging, target) {
@@ -191,20 +204,27 @@ pub(crate) fn put_atomic(target: &Path, body: &[u8]) -> Result<()> {
     Ok(())
 }
 
-/// Content-addressed write of `path` (`target` on disk): segments and
-/// rebuildable cache entries use atomic staging + rename without per-file
-/// `sync_all` (`segments/` is synced at the commit barrier before
-/// `manifest.json` is updated; `cache/` is regenerable scratch), while ledger
-/// records and any other content-addressed objects sync on write (ADR 034).
-pub(crate) fn put_content_addressed(path: &str, target: &Path, body: &[u8]) -> Result<()> {
+/// Whether a content-addressed write of `path` may skip its per-file
+/// `sync_all` (ADR 034): rebuildable cache entries always (`cache/` is
+/// regenerable scratch); segments only where the commit barrier flushes them
+/// ([`DIR_SYNC_BARRIER`]: `segments/` is synced before `manifest.json` is
+/// updated); ledger records and any other content-addressed objects never.
+fn skips_file_sync(path: &str) -> bool {
     let dir = path
         .trim_matches('/')
         .rsplit_once('/')
         .and_then(|(parent, _)| parent.rsplit('/').next());
-    if matches!(
-        dir,
-        Some(crate::manifest::SEGMENTS_DIR | crate::manifest::CACHE_DIR)
-    ) {
+    match dir {
+        Some(crate::manifest::CACHE_DIR) => true,
+        Some(crate::manifest::SEGMENTS_DIR) => DIR_SYNC_BARRIER,
+        _ => false,
+    }
+}
+
+/// Content-addressed write of `path` (`target` on disk): atomic staging +
+/// rename, with the per-file sync [`skips_file_sync`] decides.
+pub(crate) fn put_content_addressed(path: &str, target: &Path, body: &[u8]) -> Result<()> {
+    if skips_file_sync(path) {
         put_atomic(target, body)
     } else {
         put_overwrite(target, body)
@@ -472,5 +492,15 @@ mod tests {
         // `sync_dir_if_exists` succeeds whether `segments/` exists or not.
         sync_dir_if_exists(&dir.path().join("idx/segments")).unwrap();
         sync_dir_if_exists(&dir.path().join("absent/segments")).unwrap();
+    }
+
+    #[test]
+    fn segments_defer_their_sync_only_where_a_directory_barrier_exists() {
+        assert!(skips_file_sync("idx/cache/entry.bin"));
+        assert!(skips_file_sync("idx/cache/entry.meta.json"));
+        assert_eq!(skips_file_sync("idx/segments/abc.seg"), cfg!(unix));
+        assert_eq!(skips_file_sync("idx/segments/abc.seg"), DIR_SYNC_BARRIER);
+        assert!(!skips_file_sync("ledger/rec.rec"));
+        assert!(!skips_file_sync("idx/manifests/00000000000000000001.json"));
     }
 }

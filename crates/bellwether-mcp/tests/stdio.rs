@@ -483,10 +483,8 @@ fn workspace_mode_serves_multiple_folders_and_refuses_escape() {
     assert_eq!(sql_plan_v["datasets"], json!(["main", "customers"]));
 
     // 2. Passing "../outside", "/etc", empty, or a symlink escaping the workspace is refused.
-    #[cfg(unix)]
-    {
-        let link = ws.join("escape_link");
-        std::os::unix::fs::symlink(&outside, &link).unwrap();
+    let link = ws.join("escape_link");
+    if common::dir_symlink(&outside, &link) {
         let esc = c.call("observe.why", json!({"dataset": "escape_link"}));
         assert_eq!(esc["isError"], true, "{esc}");
         assert_eq!(

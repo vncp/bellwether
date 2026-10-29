@@ -148,8 +148,110 @@ pub fn run(args: &[&str], code: i32) -> String {
     String::from_utf8(out.stdout).unwrap()
 }
 
+/// Runs `command`, a `bellwether …` command line a message printed, as a
+/// user pasting it would: through `sh -c` on Unix and PowerShell 7 (`pwsh
+/// -Command`, which takes the same single-quoted words and `&&`) on
+/// Windows, with the built binary first on `PATH`. Asserts exit code
+/// `code`, returns stdout.
+pub fn run_printed(command: &str, code: i32) -> String {
+    let bin = assert_cmd::cargo::cargo_bin("bellwether");
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    let dirs =
+        std::iter::once(bin.parent().unwrap().to_path_buf()).chain(std::env::split_paths(&path));
+    let mut shell = if cfg!(windows) {
+        let mut c = std::process::Command::new("pwsh");
+        c.args(["-NoLogo", "-NoProfile", "-NonInteractive", "-Command"])
+            .arg(format!("{command}; exit $LASTEXITCODE"));
+        c
+    } else {
+        let mut c = std::process::Command::new("sh");
+        c.arg("-c").arg(command);
+        c
+    };
+    let out = shell
+        .env("PATH", std::env::join_paths(dirs).unwrap())
+        .output()
+        .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(code),
+        "{command}\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8(out.stdout).unwrap()
+}
+
+/// The commands `text` names in backticks: each `` `bellwether …` `` span.
+pub fn printed_commands(text: &str) -> Vec<&str> {
+    text.split('`')
+        .skip(1)
+        .step_by(2)
+        .filter(|s| s.starts_with("bellwether "))
+        .collect()
+}
+
+/// The words a POSIX shell splits `command` into: `'…'` taken literally,
+/// `\` escaping the next character outside quotes; `&&` is a word.
+pub fn shell_words(command: &str) -> Vec<String> {
+    let (mut words, mut word, mut in_word) = (Vec::new(), String::new(), false);
+    let mut chars = command.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '\'' => {
+                in_word = true;
+                word.extend(chars.by_ref().take_while(|&q| q != '\''));
+            }
+            '\\' => {
+                in_word = true;
+                word.extend(chars.next());
+            }
+            c if c.is_whitespace() => {
+                if in_word {
+                    words.push(std::mem::take(&mut word));
+                    in_word = false;
+                }
+            }
+            c => {
+                in_word = true;
+                word.push(c);
+            }
+        }
+    }
+    if in_word {
+        words.push(word);
+    }
+    words
+}
+
 pub fn path(p: &Path) -> &str {
     p.to_str().unwrap()
+}
+
+/// `file` (a recorded path) relative to `base`, an already canonical
+/// directory, with `/` separators on every platform.
+pub fn rel_under(base: &Path, file: &str) -> String {
+    Path::new(file)
+        .strip_prefix(base)
+        .unwrap_or_else(|_| panic!("{file} is not under {}", base.display()))
+        .to_str()
+        .unwrap()
+        .replace(std::path::MAIN_SEPARATOR, "/")
+}
+
+/// Makes `link` a symbolic link to the directory `target`. `false`, with a
+/// `SKIPPED:` note, only on Windows without the privilege to create one
+/// (`ERROR_PRIVILEGE_NOT_HELD`: neither elevation nor Developer Mode).
+pub fn dir_symlink(target: &Path, link: &Path) -> bool {
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(target, link).unwrap();
+    #[cfg(windows)]
+    if let Err(e) = std::os::windows::fs::symlink_dir(target, link) {
+        assert_eq!(e.raw_os_error(), Some(1314), "{e}");
+        eprintln!("SKIPPED: cannot create a directory symlink here ({e})");
+        return false;
+    }
+    true
 }
 
 pub fn index_dir(root: &Path) -> PathBuf {

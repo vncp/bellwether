@@ -17,6 +17,7 @@ WP2. Implements `bellwether_types::Source` for Parquet and for CSV / JSON lines,
 | `Storage`, `LocalFs` | The byte-access seam: `list`, `head`, `read_range`, and `open`. `open` returns a parquet `ChunkReader` **plus the metadata of the opened handle**. Only the local filesystem is implemented. |
 | `canonical::{Canonical, DefaultCanonical}` | The canonical encoder used for `min`/`max` bytes (see below). |
 | `text::csv_ends_in_quotes(bytes, delimiter)` | csv_core's quoting rules as a scanner: whether a chunk parsed from a record boundary ends inside a quoted field. |
+| `is_within(path, dir)`, `ChunkedTextSource::with_excluded(dir)` | Whether a listed path is `dir` or below it, split at the platform's separators (`\` as well as `/` on Windows; a Unix name may hold `\`). Text discovery skips an excluded directory (an index inside the data root), and the facade's folder check uses the same test. |
 | `ParquetSource::column_bytes` | Compressed column-chunk bytes per row group and column, ready for the planned `ColumnStats.bytes` field. |
 | `ChunkedTextSource::byte_range(rg)` | A text row group's byte range, ready for the planned `RowGroupMeta.byte_range` field. |
 

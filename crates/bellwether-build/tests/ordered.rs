@@ -178,7 +178,13 @@ fn entries_follow_the_range_key_minimum_across_files_and_nulls_sort_last() {
     let files: Vec<&str> = plan
         .entries
         .iter()
-        .map(|e| e.file.path.rsplit('/').next().unwrap())
+        .map(|e| {
+            std::path::Path::new(&e.file.path)
+                .file_name()
+                .unwrap()
+                .to_str()
+                .unwrap()
+        })
         .collect();
     assert_eq!(files, ["c.parquet", "b.parquet", "a.parquet", "z.parquet"]);
     // Whole files are in order: no interleaved order is needed.
@@ -236,7 +242,16 @@ fn files_that_overlap_in_time_are_read_interleaved() {
     assert!(time_ordered(&read, &mins), "{read:?}");
     let names: Vec<(&str, u32)> = read
         .iter()
-        .map(|(p, rg)| (p.rsplit('/').next().unwrap(), *rg))
+        .map(|(p, rg)| {
+            (
+                std::path::Path::new(p)
+                    .file_name()
+                    .unwrap()
+                    .to_str()
+                    .unwrap(),
+                *rg,
+            )
+        })
         .collect();
     assert_eq!(
         names,

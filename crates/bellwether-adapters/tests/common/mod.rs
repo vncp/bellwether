@@ -931,12 +931,13 @@ pub fn skip_or_fail<T>(require: &str, why: &str) -> Option<T> {
 }
 
 /// Runs `script` in the DuckDB CLI exactly as the bench does
-/// (`-no-agent -init /dev/null`, `AI_AGENT` removed); any stderr output or
-/// a failure is an error.
+/// (`-no-agent -init /dev/null`, `NUL` on Windows, `AI_AGENT` removed); any
+/// stderr output or a failure is an error.
 pub fn duckdb_run(bin: &str, script: &str) -> Result<String, String> {
     use std::io::Write as _;
+    let null_init = if cfg!(windows) { "NUL" } else { "/dev/null" };
     let mut child = std::process::Command::new(bin)
-        .args(["-no-agent", "-init", "/dev/null", "-csv", "-noheader"])
+        .args(["-no-agent", "-init", null_init, "-csv", "-noheader"])
         .env_remove("AI_AGENT")
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())

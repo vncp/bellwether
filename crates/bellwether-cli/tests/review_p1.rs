@@ -29,7 +29,7 @@ use bellwether::{
     spec, CandidateOrigin, Engine, EngineOptions, FixOutcome, FixRequest, KeyFile, WhyReport,
     WhyRequest,
 };
-use common::{bw, corpus, keys, path, run, scattered};
+use common::{corpus, keys, path, run, scattered};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::arrow::ArrowWriter;
 
@@ -56,6 +56,7 @@ fn probes_left(dir: &Path) -> Vec<String> {
         .collect()
 }
 
+#[cfg(unix)]
 fn set_ro(p: &Path, ro: bool) {
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(
@@ -72,51 +73,57 @@ fn probe_recording_rule_and_data_folder_hygiene() {
     corpus(&data, 2, 3, 20, 30);
     let kf = dir.path().join("k.parquet");
     keys(&kf, "id", &[1, 2, 29]);
-    let before = listing(&data);
 
     // (a) read-only data folder, default index: profile computed, nothing written, exit 0.
-    set_ro(&data, true);
-    let out = run(&["--json", "why", path(&data)], 0);
-    let r: WhyReport = serde_json::from_str(&out).unwrap();
-    eprintln!(
-        "ro, no keys: recorded={} hash={:?} note={:?} fanout_entries={}",
-        r.evidence.recorded,
-        r.evidence.hash,
-        r.evidence.note,
-        r.profile.fanout.len()
-    );
-    assert!(!r.evidence.recorded);
-    assert!(r.evidence.note.as_deref().unwrap().contains("--index"));
-    assert_eq!(r.evidence.note.as_deref().unwrap().lines().count(), 1);
-    let human = bw().args(["why", path(&data)]).output().unwrap();
-    eprintln!(
-        "ro human exit={:?} last lines: {:?}",
-        human.status.code(),
-        String::from_utf8_lossy(&human.stdout)
-            .lines()
-            .rev()
-            .take(2)
-            .collect::<Vec<_>>()
-    );
-    // (b) read-only, with keys: the --index refusal wins.
-    let o = bw()
-        .args(["why", path(&data), "--from", path(&kf)])
-        .output()
-        .unwrap();
-    eprintln!(
-        "ro with keys: exit={:?} stderr={}",
-        o.status.code(),
-        String::from_utf8_lossy(&o.stderr).trim()
-    );
-    assert_eq!(o.status.code(), Some(4));
-    set_ro(&data, false);
-    assert_eq!(
-        listing(&data),
-        before,
-        "nothing written in a read-only data folder"
-    );
+    // Read-only directory modes are Unix semantics (Windows ignores the
+    // read-only attribute on directories).
+    #[cfg(unix)]
+    {
+        let before = listing(&data);
+        set_ro(&data, true);
+        let out = run(&["--json", "why", path(&data)], 0);
+        let r: WhyReport = serde_json::from_str(&out).unwrap();
+        eprintln!(
+            "ro, no keys: recorded={} hash={:?} note={:?} fanout_entries={}",
+            r.evidence.recorded,
+            r.evidence.hash,
+            r.evidence.note,
+            r.profile.fanout.len()
+        );
+        assert!(!r.evidence.recorded);
+        assert!(r.evidence.note.as_deref().unwrap().contains("--index"));
+        assert_eq!(r.evidence.note.as_deref().unwrap().lines().count(), 1);
+        let human = common::bw().args(["why", path(&data)]).output().unwrap();
+        eprintln!(
+            "ro human exit={:?} last lines: {:?}",
+            human.status.code(),
+            String::from_utf8_lossy(&human.stdout)
+                .lines()
+                .rev()
+                .take(2)
+                .collect::<Vec<_>>()
+        );
+        // (b) read-only, with keys: the --index refusal wins.
+        let o = common::bw()
+            .args(["why", path(&data), "--from", path(&kf)])
+            .output()
+            .unwrap();
+        eprintln!(
+            "ro with keys: exit={:?} stderr={}",
+            o.status.code(),
+            String::from_utf8_lossy(&o.stderr).trim()
+        );
+        assert_eq!(o.status.code(), Some(4));
+        set_ro(&data, false);
+        assert_eq!(
+            listing(&data),
+            before,
+            "nothing written in a read-only data folder"
+        );
+    }
 
     // (c) writable data folder, --index elsewhere: data folder untouched, no probe left.
+    let before = listing(&data);
     let idx = dir.path().join("idx");
     run(&["--index", path(&idx), "why", path(&data)], 0);
     run(
@@ -138,30 +145,33 @@ fn probe_recording_rule_and_data_folder_hygiene() {
     assert!(probes_left(&idx).is_empty(), "{:?}", probes_left(&idx));
 
     // (d) --index is an existing read-only directory inside a writable data folder.
-    let ro_idx = data.join("ro-idx");
-    std::fs::create_dir_all(&ro_idx).unwrap();
-    set_ro(&ro_idx, true);
-    let mut before_d = listing(&data);
-    let out = run(&["--json", "--index", path(&ro_idx), "why", path(&data)], 0);
-    let r: WhyReport = serde_json::from_str(&out).unwrap();
-    eprintln!(
-        "ro --index inside data: recorded={} note={:?}",
-        r.evidence.recorded, r.evidence.note
-    );
-    assert!(!r.evidence.recorded);
-    set_ro(&ro_idx, false);
-    before_d.retain(|_| true);
-    assert_eq!(
-        listing(&data),
-        before_d,
-        "nothing created in the data folder by the probe"
-    );
+    #[cfg(unix)]
+    {
+        let ro_idx = data.join("ro-idx");
+        std::fs::create_dir_all(&ro_idx).unwrap();
+        set_ro(&ro_idx, true);
+        let before_d = listing(&data);
+        let out = run(&["--json", "--index", path(&ro_idx), "why", path(&data)], 0);
+        let r: WhyReport = serde_json::from_str(&out).unwrap();
+        eprintln!(
+            "ro --index inside data: recorded={} note={:?}",
+            r.evidence.recorded, r.evidence.note
+        );
+        assert!(!r.evidence.recorded);
+        set_ro(&ro_idx, false);
+        assert_eq!(
+            listing(&data),
+            before_d,
+            "nothing created in the data folder by the probe"
+        );
+    }
 
     // (e) default index on a writable folder: the probe lives in .bellwether only and is removed.
+    let before_e = listing(&data);
     run(&["why", path(&data)], 0);
     let after: BTreeSet<String> = listing(&data);
     let new: Vec<_> = after
-        .difference(&before_d)
+        .difference(&before_e)
         .filter(|p| !p.starts_with(".bellwether"))
         .collect();
     eprintln!(

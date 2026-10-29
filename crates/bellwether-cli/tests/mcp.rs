@@ -163,8 +163,6 @@ fn every_tool_with_a_cli_counterpart_returns_the_cli_json_line() {
         3,
     );
     assert_eq!(refused["outcome"], "refused");
-    let canon = std::fs::canonicalize(&data).unwrap();
-    let canon = path(&canon);
     // Per-key time bounds and bitemporal versions are key specs (M5): the
     // short form proposes them, the same record from both sides, and a
     // repeated `--key` is the MCP `sidecars` argument.
@@ -236,9 +234,11 @@ fn every_tool_with_a_cli_counterpart_returns_the_cli_json_line() {
     assert_eq!(refused["refusal"]["kind"], "sketch_not_proposable");
     let refusal = srv.call("propose.key", args).envelope.refusal.unwrap();
     assert_eq!(refusal.code.as_str(), "sketch_not_proposable");
-    assert_eq!(
-        refusal.fields["command"],
-        json!(format!("bellwether index {canon} --key sketch:id"))
+    assert_eq!(refusal.fields["command"], refused["refusal"]["command"]);
+    let command = refusal.fields["command"].as_str().unwrap();
+    assert!(
+        command.starts_with("bellwether index ") && command.ends_with(" --key sketch:id"),
+        "{command}"
     );
     assert!(!refusal.next.contains("--"), "{}", refusal.next);
     let short = both(
@@ -479,18 +479,13 @@ fn bitemporal_lake(dir: &Path) -> Vec<BitemporalRow> {
 
 /// The (file, row group) pairs of a plan line's Evidence, relative to `root`.
 fn plan_row_groups(v: &Value, root: &Path) -> std::collections::BTreeSet<(String, u64)> {
-    let base = format!("{}/", path(&std::fs::canonicalize(root).unwrap()));
+    let base = std::fs::canonicalize(root).unwrap();
     v["evidence"]["record"]["body"]["plan"]["entries"]
         .as_array()
         .unwrap()
         .iter()
         .flat_map(|e| {
-            let rel = e["file"]["path"]
-                .as_str()
-                .unwrap()
-                .strip_prefix(&base)
-                .unwrap()
-                .to_string();
+            let rel = common::rel_under(&base, e["file"]["path"].as_str().unwrap());
             e["row_groups"]
                 .as_array()
                 .unwrap()

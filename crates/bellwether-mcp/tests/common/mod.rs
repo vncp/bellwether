@@ -119,6 +119,21 @@ pub fn write_keys(path: &Path, name: &str, keys: &[i64]) {
     w.close().unwrap();
 }
 
+/// Makes `link` a symbolic link to the directory `target`. `false`, with a
+/// `SKIPPED:` note, only on Windows without the privilege to create one
+/// (`ERROR_PRIVILEGE_NOT_HELD`: neither elevation nor Developer Mode).
+pub fn dir_symlink(target: &Path, link: &Path) -> bool {
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(target, link).unwrap();
+    #[cfg(windows)]
+    if let Err(e) = std::os::windows::fs::symlink_dir(target, link) {
+        assert_eq!(e.raw_os_error(), Some(1314), "{e}");
+        eprintln!("SKIPPED: cannot create a directory symlink here ({e})");
+        return false;
+    }
+    true
+}
+
 /// Oracle: `(file name, row group index)` of every row group under `dir`
 /// holding an `id` in `keys`, read with the `parquet` crate.
 pub fn oracle(dir: &Path, keys: &[i64]) -> BTreeSet<(String, usize)> {
@@ -216,7 +231,13 @@ pub fn objects(dir: &Path) -> std::collections::BTreeMap<String, Vec<u8>> {
             if p.is_dir() {
                 stack.push(p);
             } else {
-                let rel = p.strip_prefix(dir).unwrap().to_string_lossy().to_string();
+                let rel = p
+                    .strip_prefix(dir)
+                    .unwrap()
+                    .components()
+                    .map(|part| part.as_os_str().to_str().unwrap())
+                    .collect::<Vec<_>>()
+                    .join("/");
                 out.insert(rel, std::fs::read(&p).unwrap());
             }
         }
